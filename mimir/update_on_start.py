@@ -74,7 +74,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
@@ -104,6 +104,275 @@ _STARTUP_EVENTS_BASENAME = "startup-events.jsonl"
 # stacks; 5 minutes covers slow mirrors + cold-start. After that we
 # give up rather than hang the entire restart indefinitely.
 _PIP_TIMEOUT_S = 300
+
+# Post-update digest sidecar. Written by ``apply_pending_update`` after a
+# successful pip install (pre-execv), drained by ``consume_update_digest``
+# on the next boot. Captures the diff between the prior deployment state
+# and the newly installed version so the operator gets a one-line summary
+# of what changed (new scheduler ticks, drifted skills, missing env vars).
+_UPDATE_DIGEST_BASENAME = "post-update-digest.json"
+
+
+# ---------------------------------------------------------------------------
+# UpdateDigest — post-update diff surfaces
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class UpdateDigest:
+    """Snapshot of the deployment diff produced during ``apply_pending_update``.
+
+    Written to a sidecar file pre-execv, consumed on the next boot by
+    ``consume_update_digest`` which emits a ``mimir_update_digest`` event.
+
+    Attributes
+    ----------
+    prior_version:
+        ``mimir.__version__`` captured *before* pip ran.  The new version
+        is read from the freshly-installed package at consume time.
+    new_version:
+        ``mimir.__version__`` after the install (populated at digest
+        creation, after pip succeeds but before execv).
+    scheduler_delta:
+        Tick names present in the bundled ``scheduler_template.yaml``
+        but absent from the live ``<home>/scheduler.yaml``.  These ticks
+        shipped with the new version but won't activate until the
+        operator (or the agent) adds them to the live scheduler.
+    skills_drift:
+        Names of optional skills whose installed copy differs from the
+        bundled source.  Non-empty means the skill needs ``mimir skills
+        update --apply`` to pick up source changes.
+    env_gaps:
+        ``(skill_name, env_key)`` pairs where a bundled skill declares
+        a required env var that isn't set in the current environment.
+        Surfaced so the operator knows what to wire up after the upgrade.
+    """
+
+    prior_version: str
+    new_version: str
+    scheduler_delta: list[str] = field(default_factory=list)
+    skills_drift: list[str] = field(default_factory=list)
+    env_gaps: list[tuple[str, str]] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """JSON-serialisable representation. ``env_gaps`` uses lists
+        (JSON has no tuple type) and is round-tripped back via
+        ``UpdateDigest.from_dict``."""
+        return {
+            "prior_version": self.prior_version,
+            "new_version": self.new_version,
+            "scheduler_delta": list(self.scheduler_delta),
+            "skills_drift": list(self.skills_drift),
+            "env_gaps": [[s, k] for s, k in self.env_gaps],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "UpdateDigest":
+        return cls(
+            prior_version=str(data.get("prior_version") or ""),
+            new_version=str(data.get("new_version") or ""),
+            scheduler_delta=list(data.get("scheduler_delta") or []),
+            skills_drift=list(data.get("skills_drift") or []),
+            env_gaps=[(str(s), str(k)) for s, k in (data.get("env_gaps") or [])],
+        )
+
+
+def _current_version() -> str:
+    """Return ``mimir.__version__``.  Falls back to
+    ``importlib.metadata`` when the package is installed but the
+    in-process import hasn't reloaded yet (rare during the re-exec
+    cycle).  Returns ``"unknown"`` on any failure — the digest is
+    still useful even without a precise version string."""
+    try:
+        from . import __version__
+        return __version__
+    except Exception:
+        pass
+    try:
+        import importlib.metadata
+        return importlib.metadata.version("mimir-agent")
+    except Exception:
+        return "unknown"
+
+
+def _scheduler_delta(home: Path) -> list[str]:
+    """Return tick names present in the bundled ``scheduler_template.yaml``
+    but absent from the live ``<home>/scheduler.yaml``.
+
+    Only surfaces *additions* (ticks new to the template) — operator-
+    added or operator-removed entries in the live file are intentional
+    customisations and should not be surfaced as drift.
+
+    Returns an empty list if either file is missing or unreadable
+    (fresh install / template not packaged — handled gracefully).
+    """
+    try:
+        import yaml  # lazy — not always needed
+        from .skill_defs import _BUNDLED_SCHEDULER  # type: ignore[attr-defined]
+    except Exception:
+        return []
+
+    def _tick_names(path: Path) -> set[str]:
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+            if isinstance(data, list):
+                return {e["name"] for e in data if isinstance(e, dict) and "name" in e}
+        except Exception:
+            pass
+        return set()
+
+    template_names = _tick_names(_BUNDLED_SCHEDULER)
+    live_names = _tick_names(home / "scheduler.yaml")
+    return sorted(template_names - live_names)
+
+
+def _env_gaps(home: Path) -> list[tuple[str, str]]:
+    """Scan the installed package's bundled skills for ``env: required:``
+    blocks and return ``(skill_name, env_key)`` pairs whose key is absent
+    from the current environment.
+
+    Reads directly from the installed package's ``mimir/skills/*/SKILL.md``
+    (mirroring how ``_scheduler_delta`` reads the bundled
+    ``scheduler_template.yaml``) rather than from the home-seeded
+    ``<home>/.mimir_builtin_skills/``.  This matters because
+    ``_compute_update_digest`` runs inside ``apply_pending_update`` — the
+    *first* thing in ``server.main()`` — before ``os.execv`` is called.
+    The home-seeded ``.mimir_builtin_skills/`` is only refreshed from the
+    newly-installed package *after* execv, during the new code's boot.
+    Reading from the package directly ensures a skill added in this
+    update (with a new required env var) is surfaced on the very update
+    that introduces it, not silently missed.
+
+    Returns an empty list on any read / parse error.
+    """
+    try:
+        from .skill_defs import _BUNDLED_ROOT
+        from .skill_md import parse_env_block
+    except Exception:
+        return []
+
+    gaps: list[tuple[str, str]] = []
+    builtin_root = _BUNDLED_ROOT
+    if not builtin_root.is_dir():
+        return []
+
+    for skill_dir in sorted(builtin_root.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        try:
+            text = skill_md.read_text(encoding="utf-8")
+            required, _ = parse_env_block(text)
+        except Exception:
+            continue
+        for spec in required:
+            key = spec.get("name", "")
+            if key and key not in os.environ:
+                gaps.append((skill_dir.name, key))
+
+    return gaps
+
+
+def _compute_update_digest(home: Path, prior_version: str) -> UpdateDigest:
+    """Compute the post-update diff digest.
+
+    Called from ``apply_pending_update`` *after* a successful pip install
+    but *before* ``os.execv``.  At this point the newly-installed code is
+    on disk (pip replaced the package) but the running process image still
+    uses the old imports — hence ``_current_version()`` reads the metadata
+    from the *installed* package (importlib.metadata) rather than the
+    in-process ``mimir.__version__`` (which still reflects the old version
+    until after execv reloads everything).
+
+    Pure function in terms of observable side-effects: reads files and
+    the environment, creates no new state.
+
+    Parameters
+    ----------
+    home:
+        Agent home directory.
+    prior_version:
+        ``mimir.__version__`` captured *before* pip ran.
+    """
+    # After pip install, importlib.metadata reflects the new version;
+    # the in-process mimir.__version__ still reflects the old one.
+    # Force the importlib.metadata path so we get the new version number.
+    try:
+        import importlib.metadata
+        new_version = importlib.metadata.version("mimir-agent")
+    except Exception:
+        new_version = _current_version()
+
+    # detect_skill_drift only covers optional (home/skills/) installs;
+    # returns [] when no optional skills are installed — safe to call always.
+    skills_drift_names: list[str] = []
+    try:
+        from .skill_install import detect_skill_drift
+        drift_results = detect_skill_drift(home)
+        skills_drift_names = sorted(r.name for r in drift_results if not r.is_clean)
+    except Exception as exc:
+        log.warning("_compute_update_digest: skill drift check failed: %s", exc)
+
+    return UpdateDigest(
+        prior_version=prior_version,
+        new_version=new_version,
+        scheduler_delta=_scheduler_delta(home),
+        skills_drift=skills_drift_names,
+        env_gaps=_env_gaps(home),
+    )
+
+
+def _write_update_digest_sidecar(home: Path, digest: UpdateDigest) -> None:
+    """Persist the post-update digest to ``<home>/.mimir/post-update-digest.json``
+    so it survives the ``os.execv`` that follows. Consumed on the next boot by
+    ``consume_update_digest``.
+
+    Overwrites any prior sidecar (shouldn't exist at this point, but defensive
+    against a mid-install crash that left a stale file).  Best-effort: filesystem
+    failure here doesn't abort the install — the digest is informational.
+    """
+    sidecar = home / _FLAG_DIRNAME / _UPDATE_DIGEST_BASENAME
+    try:
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps(digest.to_dict(), indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("post-update digest sidecar write failed: %s", exc)
+
+
+async def consume_update_digest(
+    home: Path,
+    async_log_event: Callable[..., Awaitable[None]],
+) -> int:
+    """Drain the post-update digest sidecar, emitting a ``mimir_update_digest``
+    event into ``events.jsonl``.  Returns 1 if drained, 0 if absent.
+
+    Called from ``server._on_startup`` AFTER ``init_logger`` is up, alongside
+    ``consume_startup_events``.  The sidecar is written by ``apply_pending_update``
+    pre-execv; if no update ran this boot, the file won't exist (no-op).
+
+    Idempotency: the sidecar is deleted after a successful emit.  A crash between
+    emit and delete means the next restart re-emits one extra algedonic line
+    (acceptable).  A crash before emit means the digest was never surfaced — also
+    acceptable for informational content.
+    """
+    sidecar = home / _FLAG_DIRNAME / _UPDATE_DIGEST_BASENAME
+    if not sidecar.is_file():
+        return 0
+    try:
+        raw = sidecar.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        digest = UpdateDigest.from_dict(data)
+        await async_log_event("mimir_update_digest", **digest.to_dict())
+        try:
+            sidecar.unlink()
+        except OSError as exc:
+            log.warning("post-update digest sidecar unlink failed: %s", exc)
+        return 1
+    except Exception:  # noqa: BLE001 — drain is best-effort
+        log.exception("post-update digest drain failed")
+        return 0
 
 
 @dataclass(frozen=True)
@@ -429,6 +698,7 @@ def apply_pending_update(
     parsed = _read_flag(path)
     pkg = _pypi_package_name()
     spec = _install_spec(pkg, parsed)
+    prior_version = _current_version()
     rc = _run_pip_install(spec, parsed.include_prereleases, emit)
 
     # Always delete the flag — success means we don't re-attempt;
@@ -444,6 +714,14 @@ def apply_pending_update(
         # ``_run_pip_install`` (and written to the sidecar so the
         # algedonic block surfaces it on next turn).
         return True
+
+    # Compute + persist the deployment diff before execv so the next boot
+    # can surface "what changed" to the operator via the algedonic block.
+    try:
+        digest = _compute_update_digest(home, prior_version)
+        _write_update_digest_sidecar(home, digest)
+    except Exception as exc:  # noqa: BLE001 — digest is informational
+        log.warning("post-update digest computation failed: %s", exc)
 
     emit("mimir_update_applied", spec=spec, approved_at=parsed.approved_at)
     # Re-exec to pick up the new code. Same PID — supervisor stays

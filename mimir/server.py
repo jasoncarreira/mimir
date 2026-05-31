@@ -1031,13 +1031,19 @@ def build_app(config: Config) -> web.Application:
         # land in events.jsonl and surface in the algedonic feedback
         # block on the next turn. No-op when no pending-update flow
         # ran on this boot (the common case).
-        from .update_on_start import consume_startup_events
+        from .update_on_start import consume_startup_events, consume_update_digest
         try:
             drained = await consume_startup_events(config.home, log_event)
             if drained:
                 log.info("drained %d startup-update event(s) into events.jsonl", drained)
         except Exception:  # noqa: BLE001 — drain is best-effort
             log.exception("startup-events drain failed")
+        try:
+            drained_digest = await consume_update_digest(config.home, log_event)
+            if drained_digest:
+                log.info("drained post-update digest into events.jsonl")
+        except Exception:  # noqa: BLE001 — drain is best-effort
+            log.exception("post-update digest drain failed")
 
         asyncio.create_task(indexer.sweep())
 

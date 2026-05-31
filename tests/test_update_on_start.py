@@ -524,3 +524,403 @@ def test_apply_does_not_touch_sidecar_when_no_flag(
     assert result is False
     # Sidecar still has the sentinel content; truncate did not fire.
     assert sidecar.read_text() == sentinel
+
+
+# ─── UpdateDigest / _compute_update_digest helpers ──────────────────
+
+
+def test_update_digest_roundtrip(tmp_path: Path) -> None:
+    """``UpdateDigest.to_dict`` / ``from_dict`` round-trip preserves all
+    fields including the env_gaps tuples (which JSON serialises as lists
+    and must be restored correctly)."""
+    from mimir.update_on_start import UpdateDigest
+
+    orig = UpdateDigest(
+        prior_version="0.2.1",
+        new_version="0.2.2",
+        scheduler_delta=["issues-audit", "commitments-review"],
+        skills_drift=["github"],
+        env_gaps=[("weather", "OPENWEATHER_API_KEY"), ("ntfy", "NTFY_TOPIC")],
+    )
+    restored = UpdateDigest.from_dict(orig.to_dict())
+    assert restored == orig
+    assert isinstance(restored.env_gaps[0], tuple)
+
+
+def test_update_digest_empty_roundtrip() -> None:
+    """Empty digest serialises and restores correctly — the common case
+    when an update installs nothing new."""
+    from mimir.update_on_start import UpdateDigest
+
+    orig = UpdateDigest(prior_version="0.2.1", new_version="0.2.2")
+    restored = UpdateDigest.from_dict(orig.to_dict())
+    assert restored == orig
+    assert restored.scheduler_delta == []
+    assert restored.skills_drift == []
+    assert restored.env_gaps == []
+
+
+def test_scheduler_delta_returns_missing_ticks(tmp_path: Path) -> None:
+    """Tick names in the template but absent from the live scheduler.yaml
+    are returned as the scheduler delta."""
+    import yaml
+    from mimir.update_on_start import _scheduler_delta
+
+    template_path = tmp_path / "scheduler_template.yaml"
+    live_path = tmp_path / "scheduler.yaml"
+
+    template_path.write_text(
+        yaml.dump([{"name": "heartbeat"}, {"name": "reflect"}, {"name": "issues-audit"}])
+    )
+    # Live scheduler is missing "issues-audit" — it shipped in this version
+    live_path.write_text(
+        yaml.dump([{"name": "heartbeat"}, {"name": "reflect"}])
+    )
+
+    # Patch _BUNDLED_SCHEDULER to point at our fixture template.
+    import mimir.skill_defs as _sd
+    orig = _sd._BUNDLED_SCHEDULER
+    try:
+        _sd._BUNDLED_SCHEDULER = template_path
+        delta = _scheduler_delta(tmp_path)
+    finally:
+        _sd._BUNDLED_SCHEDULER = orig
+
+    assert delta == ["issues-audit"]
+
+
+def test_scheduler_delta_no_delta_when_live_has_all(tmp_path: Path) -> None:
+    """When the live scheduler already contains every template tick,
+    the delta is empty — no operator action needed."""
+    import yaml
+    from mimir.update_on_start import _scheduler_delta
+
+    template_path = tmp_path / "scheduler_template.yaml"
+    live_path = tmp_path / "scheduler.yaml"
+
+    both = [{"name": "heartbeat"}, {"name": "reflect"}]
+    template_path.write_text(yaml.dump(both))
+    live_path.write_text(yaml.dump(both))
+
+    import mimir.skill_defs as _sd
+    orig = _sd._BUNDLED_SCHEDULER
+    try:
+        _sd._BUNDLED_SCHEDULER = template_path
+        delta = _scheduler_delta(tmp_path)
+    finally:
+        _sd._BUNDLED_SCHEDULER = orig
+
+    assert delta == []
+
+
+def test_scheduler_delta_bundled_template_is_list_parseable(tmp_path: Path) -> None:
+    """The actual bundled scheduler_template.yaml must be parseable as a top-level
+    list of {name: ...} dicts — this test catches any schema drift in the template
+    itself before it can silently break _scheduler_delta at runtime."""
+    import yaml
+    from mimir.skill_defs import _BUNDLED_SCHEDULER
+
+    data = yaml.safe_load(_BUNDLED_SCHEDULER.read_text(encoding="utf-8"))
+    assert isinstance(data, list), (
+        f"scheduler_template.yaml must be a top-level list, got {type(data).__name__}"
+    )
+    names = [e["name"] for e in data if isinstance(e, dict) and "name" in e]
+    assert len(names) > 0, "scheduler_template.yaml must have at least one named entry"
+    # Live scheduler with an empty set (no entries) → all template ticks are delta.
+    live_path = tmp_path / "scheduler.yaml"
+    live_path.write_text("[]")
+    from mimir.update_on_start import _scheduler_delta
+
+    delta = _scheduler_delta(tmp_path)
+    assert sorted(delta) == sorted(names)
+
+
+def test_scheduler_delta_missing_files_returns_empty(tmp_path: Path) -> None:
+    """If either file is absent (e.g. fresh install with no scheduler.yaml yet),
+    return an empty list — don't crash."""
+    from mimir.update_on_start import _scheduler_delta
+
+    # Neither file exists in tmp_path.
+    import mimir.skill_defs as _sd
+    orig = _sd._BUNDLED_SCHEDULER
+    try:
+        _sd._BUNDLED_SCHEDULER = tmp_path / "nonexistent_template.yaml"
+        delta = _scheduler_delta(tmp_path)
+    finally:
+        _sd._BUNDLED_SCHEDULER = orig
+
+    assert delta == []
+
+
+def _make_fake_bundled_root(tmp_path: Path, skills: dict[str, str]) -> Path:
+    """Helper: create a fake _BUNDLED_ROOT directory with one SKILL.md per
+    entry in *skills* (``{skill_name: skill_md_content}``). Returns the root."""
+    root = tmp_path / "fake_pkg_skills"
+    root.mkdir(parents=True, exist_ok=True)
+    for name, content in skills.items():
+        d = root / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(content)
+    return root
+
+
+def test_env_gaps_returns_missing_required_vars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundled skill with a required env var absent from os.environ shows up
+    in the env_gaps list.  Reads from the installed package root (_BUNDLED_ROOT),
+    not the home-seeded .mimir_builtin_skills/."""
+    import mimir.skill_defs as _sd
+    from mimir.update_on_start import _env_gaps
+
+    skill_md = (
+        "---\n"
+        "name: weather\n"
+        "env:\n"
+        "  required:\n"
+        "    - name: OPENWEATHER_API_KEY\n"
+        "      description: OpenWeatherMap API key\n"
+        "---\n"
+        "# Weather skill\n"
+    )
+    fake_root = _make_fake_bundled_root(tmp_path, {"weather": skill_md})
+    orig = _sd._BUNDLED_ROOT
+    try:
+        _sd._BUNDLED_ROOT = fake_root
+        monkeypatch.delenv("OPENWEATHER_API_KEY", raising=False)
+        gaps = _env_gaps(tmp_path)
+    finally:
+        _sd._BUNDLED_ROOT = orig
+
+    assert ("weather", "OPENWEATHER_API_KEY") in gaps
+
+
+def test_env_gaps_empty_when_all_required_vars_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When all required env vars are present, env_gaps is empty."""
+    import mimir.skill_defs as _sd
+    from mimir.update_on_start import _env_gaps
+
+    skill_md = (
+        "---\n"
+        "name: weather\n"
+        "env:\n"
+        "  required:\n"
+        "    - name: OPENWEATHER_API_KEY\n"
+        "---\n"
+        "# Weather skill\n"
+    )
+    fake_root = _make_fake_bundled_root(tmp_path, {"weather": skill_md})
+    orig = _sd._BUNDLED_ROOT
+    try:
+        _sd._BUNDLED_ROOT = fake_root
+        monkeypatch.setenv("OPENWEATHER_API_KEY", "test-key-123")
+        gaps = _env_gaps(tmp_path)
+    finally:
+        _sd._BUNDLED_ROOT = orig
+
+    assert gaps == []
+
+
+def test_env_gaps_reads_package_not_home_seeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_env_gaps reads the installed package's bundled skills, not the
+    home-seeded .mimir_builtin_skills/ copy.
+
+    This is the staleness-prevention test: when a skill is added in a new
+    package version with a required env var, _compute_update_digest (which
+    runs pre-execv, before the new boot refreshes .mimir_builtin_skills/)
+    must still surface it.  The home-seeded copy reflects the *old*
+    version; only the package root reflects the *new* one.
+    """
+    import mimir.skill_defs as _sd
+    from mimir.update_on_start import _env_gaps
+
+    new_skill_md = (
+        "---\n"
+        "name: brand-new-skill\n"
+        "env:\n"
+        "  required:\n"
+        "    - name: BRAND_NEW_SKILL_API_KEY\n"
+        "      description: Key introduced in this update\n"
+        "---\n"
+        "# Brand-new skill (added in this version)\n"
+    )
+    # Package root HAS the new skill; home-seeded dir does NOT.
+    fake_pkg_root = _make_fake_bundled_root(tmp_path, {"brand-new-skill": new_skill_md})
+    # Deliberately leave .mimir_builtin_skills/ absent (simulates pre-execv state
+    # where the home copy hasn't been refreshed from the new package yet).
+    assert not (tmp_path / ".mimir_builtin_skills").exists()
+
+    orig = _sd._BUNDLED_ROOT
+    try:
+        _sd._BUNDLED_ROOT = fake_pkg_root
+        monkeypatch.delenv("BRAND_NEW_SKILL_API_KEY", raising=False)
+        gaps = _env_gaps(tmp_path)
+    finally:
+        _sd._BUNDLED_ROOT = orig
+
+    assert ("brand-new-skill", "BRAND_NEW_SKILL_API_KEY") in gaps, (
+        "_env_gaps should read the installed package root, not the home-seeded "
+        ".mimir_builtin_skills/ — the home copy is stale pre-execv and won't "
+        "contain skills added in this update"
+    )
+
+
+def test_compute_update_digest_scheduler_delta(tmp_path: Path) -> None:
+    """``_compute_update_digest`` assembles the delta from helper functions;
+    scheduler_delta reflects ticks added in template but missing from live."""
+    import yaml
+    from mimir.update_on_start import _compute_update_digest
+
+    template_path = tmp_path / "tpl.yaml"
+    live_path = tmp_path / "scheduler.yaml"
+    template_path.write_text(
+        yaml.dump([{"name": "heartbeat"}, {"name": "issues-audit"}])
+    )
+    live_path.write_text(yaml.dump([{"name": "heartbeat"}]))
+
+    import mimir.skill_defs as _sd
+    orig = _sd._BUNDLED_SCHEDULER
+    try:
+        _sd._BUNDLED_SCHEDULER = template_path
+        digest = _compute_update_digest(tmp_path, prior_version="0.2.1")
+    finally:
+        _sd._BUNDLED_SCHEDULER = orig
+
+    assert digest.prior_version == "0.2.1"
+    assert "issues-audit" in digest.scheduler_delta
+
+
+def test_compute_update_digest_no_delta(tmp_path: Path) -> None:
+    """When template and live scheduler are identical, scheduler_delta is empty."""
+    import yaml
+    from mimir.update_on_start import _compute_update_digest
+
+    both = yaml.dump([{"name": "heartbeat"}])
+    template_path = tmp_path / "tpl.yaml"
+    (tmp_path / "scheduler.yaml").write_text(both)
+    template_path.write_text(both)
+
+    import mimir.skill_defs as _sd
+    orig = _sd._BUNDLED_SCHEDULER
+    try:
+        _sd._BUNDLED_SCHEDULER = template_path
+        digest = _compute_update_digest(tmp_path, prior_version="0.2.2")
+    finally:
+        _sd._BUNDLED_SCHEDULER = orig
+
+    assert digest.scheduler_delta == []
+
+
+# ─── consume_update_digest sidecar roundtrip ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_digest_sidecar_roundtrip(tmp_path: Path) -> None:
+    """``_write_update_digest_sidecar`` + ``consume_update_digest`` round-trip:
+    writing a digest, then consuming it, emits a ``mimir_update_digest`` event
+    with the correct field values and deletes the sidecar so a second restart
+    doesn't re-emit."""
+    from mimir.update_on_start import (
+        UpdateDigest,
+        _write_update_digest_sidecar,
+        _UPDATE_DIGEST_BASENAME,
+        consume_update_digest,
+    )
+
+    digest = UpdateDigest(
+        prior_version="0.2.1",
+        new_version="0.2.2",
+        scheduler_delta=["issues-audit", "commitments-review"],
+        skills_drift=["github"],
+        env_gaps=[("weather", "OPENWEATHER_API_KEY")],
+    )
+    _write_update_digest_sidecar(tmp_path, digest)
+
+    captured: list[tuple[str, dict]] = []
+
+    async def _async_log(kind: str, **fields):  # type: ignore[misc]
+        captured.append((kind, fields))
+
+    drained = await consume_update_digest(tmp_path, _async_log)
+
+    assert drained == 1
+    assert len(captured) == 1
+    kind, fields = captured[0]
+    assert kind == "mimir_update_digest"
+    assert fields["prior_version"] == "0.2.1"
+    assert fields["new_version"] == "0.2.2"
+    assert "issues-audit" in fields["scheduler_delta"]
+    assert "github" in fields["skills_drift"]
+    assert ("weather", "OPENWEATHER_API_KEY") in [
+        tuple(g) for g in fields["env_gaps"]
+    ]
+    # Sidecar deleted after successful drain.
+    sidecar = tmp_path / ".mimir" / _UPDATE_DIGEST_BASENAME
+    assert not sidecar.exists()
+
+
+@pytest.mark.asyncio
+async def test_update_digest_consume_no_sidecar(tmp_path: Path) -> None:
+    """When no sidecar file exists (common path — no update on this restart),
+    ``consume_update_digest`` returns 0 and emits no events."""
+    from mimir.update_on_start import consume_update_digest
+
+    calls: list = []
+
+    async def _async_log(*args, **kwargs):  # type: ignore[misc]
+        calls.append((args, kwargs))
+
+    drained = await consume_update_digest(tmp_path, _async_log)
+
+    assert drained == 0
+    assert calls == []
+
+
+# ─── mimir_update_digest feedback renderer ───────────────────────────
+
+
+def test_mimir_update_digest_render_all_surfaces() -> None:
+    """When all three diff surfaces are non-empty the renderer produces
+    a one-liner covering scheduler delta, skills drift, and env gaps."""
+    from mimir.feedback import _render_event_line
+
+    line = _render_event_line(
+        "mimir_update_digest",
+        {
+            "prior_version": "0.2.1",
+            "new_version": "0.2.2",
+            "scheduler_delta": ["issues-audit", "commitments-review"],
+            "skills_drift": ["github"],
+            "env_gaps": [["weather", "OPENWEATHER_API_KEY"]],
+        },
+    )
+
+    assert "[mimir v0.2.1→0.2.2]" in line
+    assert "scheduler +2 tick(s)" in line
+    assert "issues-audit" in line
+    assert "skills drifted: github" in line
+    assert "env missing: weather/OPENWEATHER_API_KEY" in line
+
+
+def test_mimir_update_digest_render_nothing_required() -> None:
+    """When all three diff surfaces are empty the renderer returns the
+    'nothing requires action' fallback — the update was a no-op."""
+    from mimir.feedback import _render_event_line
+
+    line = _render_event_line(
+        "mimir_update_digest",
+        {
+            "prior_version": "0.2.2",
+            "new_version": "0.2.3",
+            "scheduler_delta": [],
+            "skills_drift": [],
+            "env_gaps": [],
+        },
+    )
+
+    assert "[mimir v0.2.2→0.2.3]" in line
+    assert "nothing requires action" in line
