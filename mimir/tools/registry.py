@@ -786,6 +786,11 @@ def _run_claude_subprocess(
         text=True,
         timeout=timeout_s,
         env=env,
+        # Headless spawn: never inherit the parent's stdin. ``codex exec``
+        # reads stdin (appends it to the prompt) and would block until the
+        # timeout if stdin is an open pipe/TTY; DEVNULL EOFs immediately so
+        # it uses the prompt arg only. Harmless for ``claude -p`` too.
+        stdin=subprocess.DEVNULL,
     )
     return proc.returncode, proc.stdout, proc.stderr
 
