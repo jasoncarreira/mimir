@@ -1551,6 +1551,14 @@ def _print_setup_report(status: dict[str, object]) -> None:
             f"  model spec:    {model_spec}   "
             f"(provider: {provider}; billing: {billing_mode})"
         )
+        # Surface the pip extra this model's chat adapter needs (chainlink
+        # #292) so the operator installs it now rather than hitting an
+        # ImportError on first run. claude-code is git-installed (no extra)
+        # and is covered by the LLM-auth steps printed below.
+        from ..providers import extra_for_spec
+        adapter_extra = extra_for_spec(model_spec)
+        if adapter_extra:
+            print(f"  model adapter: pip install mimir-agent[{adapter_extra}]")
     monitor_status = status.get("monitor_status")
     if monitor_status:
         print(f"  usage monitor: {monitor_status}")

@@ -264,3 +264,24 @@ def provider_for_quota(model_spec: str, anthropic_base_url: str = "") -> Provide
             if p.base_url_host_match and p.base_url_host_match in host:
                 return p
     return _default_provider()
+
+
+#: Pip extras (``mimir-agent[<extra>]``) per ``MIMIR_MODEL_SPEC`` provider
+#: prefix — the langchain adapter each prefix needs. ``claude-code`` is
+#: deliberately absent: ``langchain-claude-code`` isn't a published extra
+#: (PyPI rejects its direct-URL dep), so it's a git install handled
+#: specially in ``agent._build_chat_model``.
+SPEC_PREFIX_EXTRAS: dict[str, str] = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "codex-plus": "codex-plus",
+}
+
+
+def extra_for_spec(model_spec: str) -> str:
+    """The ``mimir-agent[<extra>]`` extra a given ``MIMIR_MODEL_SPEC``
+    needs for its chat adapter, or ``""`` when none applies — a bare name
+    with no provider prefix, or ``claude-code:`` (a git install rather
+    than a published extra; see ``agent._build_chat_model``)."""
+    prefix = (model_spec or "").strip().partition(":")[0].lower()
+    return SPEC_PREFIX_EXTRAS.get(prefix, "")
