@@ -474,7 +474,7 @@ def _install_spec(pkg: str, parsed: PendingUpdate) -> str:
 def _run_pip_install(
     spec: str, include_pre: bool, emit: Callable[..., None],
 ) -> int:
-    """Run ``python -m pip install --upgrade <spec>`` synchronously.
+    """Run ``python -m pip install --upgrade --no-cache-dir <spec>`` synchronously.
     Returns the exit code. Catches FileNotFoundError (no python on
     PATH — shouldn't happen, but defensive) and timeout (pip hung
     on a slow mirror) and translates to non-zero rc + event log.
@@ -486,6 +486,13 @@ def _run_pip_install(
     """
     argv = [
         sys.executable, "-m", "pip", "install", "--upgrade",
+        # --no-cache-dir: a flag-update right after a release can hit pip's
+        # stale cached simple-index page (lacking the just-published version)
+        # and fail with "No matching distribution found" even when the live
+        # index already has it. The flag is consumed-on-failure, so the agent
+        # would silently stay on the old version. Forcing a fresh index fetch
+        # avoids that (chainlink #295).
+        "--no-cache-dir",
     ]
     if include_pre:
         argv.append("--pre")
