@@ -48,16 +48,12 @@ from mimir.skill_defs import home_skills_dir
 from mimir.skill_md import parse_env_block, parse_frontmatter
 
 # Source root for optional-skills, relative to this file.
-#: ``mimir/skill_install.py`` lives at ``<repo>/mimir/skill_install.py``;
-#: optional-skills lives at ``<repo>/optional-skills/``. One level up
-#: from this file gives the repo root.
-#:
-#: Caveat: this resolves correctly only from a source-tree install (uv
-#: editable install, git clone). A pip-installed mimir wheel doesn't
-#: package the ``optional-skills/`` tree at all — callers that hit this
-#: path get a clear error message via ``_resolve_optional_skills_root``
-#: rather than the silent "no optional skills available" footgun.
-DEFAULT_OPTIONAL_SKILLS_ROOT = Path(__file__).parent.parent / "optional-skills"
+#: ``mimir/skill_install.py`` lives at ``mimir/skill_install.py`` and the
+#: optional-skills bundle lives alongside it at ``mimir/optional-skills/``.
+#: chainlink #299: moved under the package (was repo-root ``optional-skills/``)
+#: so it ships in the wheel and ``mimir skills install`` / ``list-optional``
+#: work on pip installs, not just source-tree checkouts.
+DEFAULT_OPTIONAL_SKILLS_ROOT = Path(__file__).parent / "optional-skills"
 
 #: Maximum width of the description column in CLI listings before we
 #: truncate with an ellipsis. Tuned so a single line stays under ~140
@@ -145,10 +141,10 @@ def _resolve_optional_skills_root(
 
 _PIP_INSTALL_HINT = (
     "optional-skills/ not found at {expected}.\n"
-    "This usually means mimir was installed from a wheel (pip / pipx) — "
-    "optional skills aren't packaged for wheel distribution. To use "
-    "`mimir skills install` / `list-optional`, run from a source-tree "
-    "install:\n"
+    "Optional skills ship inside the mimir package now "
+    "(``mimir/optional-skills/``, chainlink #299), so a missing tree usually "
+    "means a broken or partial install. Reinstall mimir-agent, or run from a "
+    "source tree:\n"
     "  git clone https://github.com/jasoncarreira/mimir.git\n"
     "  cd mimir && uv sync\n"
     "  uv run mimir skills list-optional"

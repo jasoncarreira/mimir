@@ -24,7 +24,7 @@ so the prompt-assembly layer can surface it inline.
 
 The other half (the per-poller action hint right next to the
 event itself) lives in the individual poller scripts (e.g.
-``optional-skills/social-cli/poller.py``).
+``mimir/optional-skills/social-cli/poller.py``).
 
 Behavior
 ========

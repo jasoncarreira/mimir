@@ -93,9 +93,25 @@ jobs:
       - name: Run mimir test suite
         # ``testpaths`` is set in pyproject.toml so no explicit path
         # arg needed. Excludes saga/saga/tests/ (workspace member's
-        # nested test tree) and optional-skills/github-poller/tests/
-        # by virtue of testpaths defaulting to "tests" only. Both
-        # exclusions are deliberate — saga has its own conftest, and
-        # github-poller's tests need the skill directory's
-        # conftest. Future matrix entries can cover those test trees.
+        # nested test tree) and the mimir/optional-skills/ test trees
+        # (each needs its own skill-dir conftest, and they collide on the
+        # shared ``poller`` / ``tests.conftest`` module names). saga has
+        # its own conftest; the optional-skills trees run in the dedicated
+        # per-skill step below (chainlink #299).
         run: uv run pytest -q --tb=short
+
+      - name: Run optional-skills tests (per-skill, isolated)
+        # Each optional skill under mimir/optional-skills/ ships its own
+        # poller.py + tests/conftest.py. Run together they collide
+        # (ImportPathMismatchError on the shared ``tests.conftest`` module
+        # name, plus duplicate ``poller`` modules), which is why the main
+        # suite excludes them. Run each skill's tests in its OWN pytest
+        # process so sys.modules starts fresh per skill. (chainlink #299)
+        run: |
+          set -e
+          for tdir in mimir/optional-skills/*/tests; do
+            if [ -d "$tdir" ]; then
+              echo "== $tdir =="
+              uv run pytest -q "$tdir"
+            fi
+          done

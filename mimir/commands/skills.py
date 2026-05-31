@@ -48,7 +48,7 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
         "list-optional",
         help=(
             "List skills available for opt-in install (walks "
-            "<repo>/optional-skills/). Use `mimir skills install <name>` "
+            "mimir/optional-skills/). Use `mimir skills install <name>` "
             "to copy one into an agent home."
         ),
     )
