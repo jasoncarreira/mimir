@@ -1072,8 +1072,6 @@ def all_mimir_tools() -> list:
         # Commitments
         commitment_complete, commitment_snooze,
         commitment_dismiss, commitment_list,
-        # Spawn
-        spawn_claude_code,
         # Mimir-package self-update (operator-approved, applied on
         # next restart). See mimir/update_on_start.py.
         request_mimir_update,
@@ -1085,6 +1083,14 @@ def all_mimir_tools() -> list:
             tools.append(web_search)
         if fetch_url_on:
             tools.append(fetch_url)
+    # Spawn — register only when the ``claude`` CLI it shells out to is on
+    # PATH (chainlink #292). A deployment routed to a non-Claude provider
+    # (e.g. Minimax) typically has no claude CLI, so registering it would
+    # only offer the agent a tool that fails with "'claude' CLI not on
+    # PATH". Gates on CLI presence, not auth — see claude_code_available.
+    from ..providers import claude_code_available
+    if claude_code_available():
+        tools.append(spawn_claude_code)
     # MCP-bridged tools (populated by server.py:_on_startup after the
     # MCP servers come up; empty when MCP is unconfigured).
     from .mcp import get_mcp_tools
