@@ -1171,6 +1171,19 @@ def setup_home(
     """
     from ..model_registry import detect_route
     route = detect_route(model, subscription=subscription)
+    # The runtime (``mimir run`` → ``Config.from_env``) reads
+    # MIMIR_MODEL_SPEC from the process environment (compose.env in
+    # docker, or an exported var) — it does NOT load <home>/.env, and it
+    # ignores this --model/default once the env var is set. So when the
+    # env var is present, THAT is the agent's real model: report it in
+    # the setup banner (deriving provider/billing via the same
+    # detect_route), or the banner contradicts what ``mimir run`` does.
+    # setup still scaffolds <home>/.env from ``route`` (the --model /
+    # default) as a template — separate from what the runtime resolves.
+    # (chainlink #297)
+    env_spec = os.environ.get("MIMIR_MODEL_SPEC", "").strip()
+    effective_route = detect_route(env_spec) if env_spec else route
+    model_spec_from_env = bool(env_spec)
     home = home.resolve()
     if home.exists() and not home.is_dir():
         raise ValueError(
@@ -1242,7 +1255,7 @@ def setup_home(
         # Non-empty non-default values stay untouched.
         if existing in (None, "", "0", "0.0"):
             _env_set_var(home / ".env", var_name, var_value, line_re)
-    monitor_status = route.monitor_label or "no monitor configured"
+    monitor_status = effective_route.monitor_label or "no monitor configured"
 
     # Generate a fresh MIMIR_API_KEY on first setup (or if the operator
     # left the value blank). Existing non-empty keys are preserved on
@@ -1419,10 +1432,15 @@ def setup_home(
         "onboarding_mode_action": onboarding_mode_action,
         "git_bootstrap": git_bootstrap_status,
         "embedding_preset": embedding,
-        "model_spec": route.model_spec,
-        "provider_name": route.provider_name,
-        "billing_mode": route.billing_mode,
+        "model_spec": effective_route.model_spec,
+        "provider_name": effective_route.provider_name,
+        "billing_mode": effective_route.billing_mode,
         "monitor_status": monitor_status,
+        # When MIMIR_MODEL_SPEC is set in the environment the three fields
+        # above reflect it (the runtime's real model) rather than the
+        # --model/default route scaffolded into <home>/.env. (chainlink #297)
+        "model_spec_from_env": model_spec_from_env,
+        "setup_default_spec": route.model_spec,
     }
 
 
@@ -1559,6 +1577,18 @@ def _print_setup_report(status: dict[str, object]) -> None:
         adapter_extra = extra_for_spec(model_spec)
         if adapter_extra:
             print(f"  model adapter: pip install mimir-agent[{adapter_extra}]")
+        if status.get("model_spec_from_env"):
+            print(
+                "                 ↑ from MIMIR_MODEL_SPEC in the environment "
+                "(e.g. compose.env) — this is what `mimir run` uses;"
+            )
+            print("                   <home>/.env is NOT read at runtime.")
+            _default_spec = status.get("setup_default_spec")
+            if _default_spec and _default_spec != model_spec:
+                print(
+                    f"                   (setup --model/default would be: "
+                    f"{_default_spec})"
+                )
     monitor_status = status.get("monitor_status")
     if monitor_status:
         print(f"  usage monitor: {monitor_status}")

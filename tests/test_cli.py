@@ -67,6 +67,39 @@ def test_setup_creates_home_layout(tmp_path: Path):
     assert "state/wiki/entities" in status["dirs_created"]
 
 
+def test_setup_banner_reports_effective_env_model_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """chainlink #297: the runtime (``mimir run`` → ``Config.from_env``)
+    resolves MIMIR_MODEL_SPEC from the environment — NOT <home>/.env or
+    the --model default. So when it's set, setup's status/banner must
+    report THAT, or it contradicts what the agent actually runs. (The
+    mimirbot Codex cutover hit exactly this: banner said anthropic while
+    the agent ran codex-plus.)"""
+    from mimir.model_registry import PROVIDER_OPENAI
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.4")
+    status = setup_home(tmp_path / "agent")  # no --model passed
+    assert status["model_spec"] == "codex-plus:gpt-5.4"
+    assert status["provider_name"] == PROVIDER_OPENAI
+    assert status["billing_mode"] == "subscription"
+    assert status["model_spec_from_env"] is True
+    # The --model/default route is still surfaced (banner note + the
+    # <home>/.env template scaffold).
+    assert str(status["setup_default_spec"]).startswith("anthropic:")
+
+
+def test_setup_banner_uses_default_route_without_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """No MIMIR_MODEL_SPEC in the env → banner reports setup's
+    --model/default route (unchanged behavior)."""
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    status = setup_home(tmp_path / "agent")
+    assert str(status["model_spec"]).startswith("anthropic:")
+    assert status["model_spec_from_env"] is False
+
+
 def test_setup_is_idempotent_and_preserves_user_edits(tmp_path: Path):
     home = tmp_path / "agent"
     setup_home(home)

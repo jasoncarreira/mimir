@@ -45,6 +45,7 @@ from .providers import (
     PROVIDER_MOONSHOT,
     PROVIDER_OPENAI,
     provider_for_model_name,
+    provider_for_quota,
 )
 
 #: Billing modes drive what ``--quota`` actually enables:
@@ -167,6 +168,23 @@ def detect_route(
                 billing_mode=BILLING_SUBSCRIPTION,
                 monitor_env=sub_monitor_env,
                 monitor_label=ANTHROPIC_OAUTH_MONITOR_LABEL,
+            )
+        if prefix_lower == "codex-plus":
+            # ChatGPT-account Codex — the OpenAI provider's subscription
+            # wire protocol (langchain-codex-plus over chatgpt.com), so
+            # it's inherently subscription billing, the OpenAI analogue of
+            # claude-code: for Anthropic; ``--subscription`` is implied.
+            # Without this branch a ``codex-plus:*`` spec fell through to
+            # the anthropic-api / API default below and was mislabeled
+            # (provider "anthropic-api", billing "api") in both setup
+            # output and the quota monitor. (chainlink #297)
+            cp = provider_for_quota(name)
+            return ModelRoute(
+                model_spec=name,
+                provider_name=cp.subscription_provider or cp.name,
+                billing_mode=BILLING_SUBSCRIPTION,
+                monitor_env=sub_monitor_env,
+                monitor_label=cp.subscription_monitor_label,
             )
         if prefix_lower == "openai":
             return _api_or_sub_route(
