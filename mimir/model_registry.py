@@ -33,15 +33,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-
-#: Stable short labels for human-facing setup output + quota-poller
-#: selection logic. Keep in sync with ``QuotaProvider.provider_name``
-#: in ``mimir/billing.py``.
-PROVIDER_ANTHROPIC_MAX = "anthropic-max"
-PROVIDER_ANTHROPIC_API = "anthropic-api"
-PROVIDER_MINIMAX = "minimax"
-PROVIDER_MOONSHOT = "moonshot"
-PROVIDER_OPENAI = "openai"
+# Provider labels (``PROVIDER_*``) and the bare-name → provider resolver
+# now live in ``mimir/providers.py`` (chainlink #292), the single source
+# of provider truth. Re-exported here so existing
+# ``from .model_registry import PROVIDER_*`` imports keep working.
+from .providers import (
+    PROVIDER_ANTHROPIC_API,
+    PROVIDER_ANTHROPIC_MAX,
+    PROVIDER_MINIMAX,
+    PROVIDER_MOONSHOT,
+    PROVIDER_OPENAI,
+    provider_for_model_name,
+)
 
 #: Billing modes drive what ``--quota`` actually enables:
 #:
@@ -130,7 +133,6 @@ def detect_route(
     a default ``$/hr`` ceiling.
     """
     name = (model or "").strip() or DEFAULT_MODEL_NAME
-    name_lower = name.lower()
 
     # API-mode monitor: enable per-turn cost tracking with a sane
     # default ceiling so unexpected runaway burn alerts. Spike-ratio
@@ -190,95 +192,38 @@ def detect_route(
             sub_monitor_env=sub_monitor_env,
         )
 
-    # ── Minimax (MiniMax-M2/M2.5/M2.7/M2.x, MiniMax-Text-01, abab*)
-    # Anthropic-compat endpoint at api.minimax.io/anthropic — same
-    # protocol whether you're on subscription or pay-per-token; only
-    # the API token's tier differs (per operator clarification
-    # 2026-05-20).
-    if name.startswith("MiniMax") or name_lower.startswith("abab"):
-        return _api_or_sub_route(
-            model_spec=f"anthropic:{name}",
-            env={"ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic"},
-            provider_name=PROVIDER_MINIMAX,
-            subscription=subscription,
-            api_monitor_env=api_monitor_env,
-            api_monitor_label=api_monitor_label,
-            sub_monitor_env=sub_monitor_env,
-        )
-
-    # ── Moonshot Kimi (kimi-k2-*, kimi-*) ───────────────────────────
-    # Same Anthropic-compat pattern as Minimax.
-    if name_lower.startswith("kimi") or name_lower.startswith("moonshot"):
-        return _api_or_sub_route(
-            model_spec=f"anthropic:{name}",
-            env={"ANTHROPIC_BASE_URL": "https://api.moonshot.ai/anthropic"},
-            provider_name=PROVIDER_MOONSHOT,
-            subscription=subscription,
-            api_monitor_env=api_monitor_env,
-            api_monitor_label=api_monitor_label,
-            sub_monitor_env=sub_monitor_env,
-        )
-
-    # ── OpenAI (gpt-*, o1-*, o3-*, o4-*) ────────────────────────────
-    # ``--subscription`` here flips to ``codex-plus:`` — the
-    # ChatGPT-account-backed Codex Plus protocol talks to
-    # ``chatgpt.com/backend-api/codex/responses`` (OAuth, SSE, custom
-    # request shape), which is a different wire protocol than the
-    # public ``api.openai.com``. Per-response ``x-codex-*`` headers
-    # feed ``OpenAIQuotaProvider`` via the chat model's
-    # ``rate_limit_callback`` (wired in ``agent._lazy_agent_build``).
-    # API-mode (default) keeps the existing ``openai:`` route through
-    # ``langchain-openai`` ChatOpenAI.
-    if (
-        name_lower.startswith("gpt-")
-        or name_lower.startswith("o1-")
-        or name_lower.startswith("o3-")
-        or name_lower.startswith("o4-")
-    ):
-        if subscription:
-            return ModelRoute(
-                model_spec=f"codex-plus:{name}",
-                env={},
-                provider_name=PROVIDER_OPENAI,
-                billing_mode=BILLING_SUBSCRIPTION,
-                monitor_env=sub_monitor_env,
-                monitor_label=(
-                    "OpenAI Codex Plus quota (x-codex-* response headers; "
-                    "no separate poller — fed by ChatCodexPlus callback)"
-                ),
-            )
-        return _api_or_sub_route(
-            model_spec=f"openai:{name}",
-            provider_name=PROVIDER_OPENAI,
-            subscription=False,
-            api_monitor_env=api_monitor_env,
-            api_monitor_label=api_monitor_label,
-            sub_monitor_env=sub_monitor_env,
-        )
-
-    # ── Claude family + unknown (default route) ─────────────────────
-    # ``--subscription`` for Claude family flips to ``claude-code:``
-    # provider — the protocol IS different here (Max OAuth via the
-    # claude CLI subprocess, not langchain-anthropic HTTP). Wires the
-    # Anthropic OAuth usage poller. Without the flag, direct API is
-    # the default — the durable path (Anthropic is sunsetting
-    # claude-code subscriptions; the API path works regardless).
-    if subscription:
+    # ── Bare name → provider via the registry (mimir/providers.py,
+    # chainlink #292) — the single source of provider truth. The Claude
+    # family and any unknown name fall to the default (direct Anthropic
+    # API). Per-provider facts — name patterns, the Anthropic-compat base
+    # URL to inject, and the ``--subscription`` wire-protocol flip (Claude
+    # family → ``claude-code:`` Max OAuth; OpenAI → ``codex-plus:``
+    # ChatGPT-account Codex) — all live in the ProviderSpec table now.
+    prov = provider_for_model_name(name)
+    if subscription and prov.subscription_spec_prefix:
+        # Subscription flips the wire protocol: a different spec prefix,
+        # provider label, and billing mode, surfaced with the provider's
+        # own monitor label (Anthropic OAuth poller / Codex Plus headers).
         return ModelRoute(
-            model_spec=f"claude-code:{name}",
+            model_spec=f"{prov.subscription_spec_prefix}:{name}",
             env={},
-            provider_name=PROVIDER_ANTHROPIC_MAX,
+            provider_name=prov.subscription_provider or prov.name,
             billing_mode=BILLING_SUBSCRIPTION,
             monitor_env=sub_monitor_env,
-            monitor_label="Anthropic OAuth quota poller (5h + 7d windows)",
+            monitor_label=prov.subscription_monitor_label,
         )
-    return ModelRoute(
-        model_spec=f"anthropic:{name}",
-        env={},
-        provider_name=PROVIDER_ANTHROPIC_API,
-        billing_mode=BILLING_API,
-        monitor_env=api_monitor_env,
-        monitor_label=api_monitor_label,
+    # API mode, or a monitor-only subscription (same endpoint, different
+    # billing tier — Minimax / Moonshot / direct Anthropic). Inject the
+    # provider's Anthropic-compat base URL when it declares one.
+    env = {"ANTHROPIC_BASE_URL": prov.base_url} if prov.base_url else {}
+    return _api_or_sub_route(
+        model_spec=f"{prov.spec_prefix}:{name}",
+        env=env,
+        provider_name=prov.name,
+        subscription=subscription,
+        api_monitor_env=api_monitor_env,
+        api_monitor_label=api_monitor_label,
+        sub_monitor_env=sub_monitor_env,
     )
 
 

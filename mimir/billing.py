@@ -438,6 +438,19 @@ def make_codex_plus_rate_limit_callback(
 # ─── Auto-discovery: which QuotaProvider(s) to register at boot ───────
 
 
+# Binds a ProviderSpec.quota_provider_key (the registry's billing key) to
+# its concrete QuotaProvider. The registry (mimir/providers.py) owns the
+# routing taxonomy — which model_spec / base_url maps to which provider —
+# and this table binds the resolved provider to its poller class.
+# Providers without a wrapped quota API (Moonshot today) carry the
+# ``"anthropic"`` key — the same fallback the old host-based detection gave.
+_QUOTA_PROVIDER_BUILDERS = {
+    "anthropic": AnthropicQuotaProvider,
+    "minimax": MinimaxQuotaProvider,
+    "openai": OpenAIQuotaProvider,
+}
+
+
 def build_quota_providers(
     *,
     store: RateLimitStore,
@@ -445,62 +458,28 @@ def build_quota_providers(
     model_spec: str = "",
     anthropic_base_url: str = "",
 ) -> list[QuotaProvider]:
-    """Return the right ``QuotaProvider`` list for this deployment's
-    routing. Replaces the hardcoded ``[AnthropicQuotaProvider(...)]``
-    that ``mimir.agent`` used to build directly.
+    """Return the ``QuotaProvider`` list for this deployment's routing.
 
-    Returns empty list for ``PAY_AS_YOU_GO`` — no quota signal exists,
-    cost-rate suppression handles the spending side instead.
+    Empty for ``PAY_AS_YOU_GO`` — no quota signal exists; cost-rate
+    suppression handles the spending side instead.
 
-    For ``QUOTA`` mode, picks providers based on the agent's routing.
-    Detection key precedence:
-
-    1. **``MIMIR_MODEL_SPEC`` prefix** (most specific):
-       * ``codex-plus:*`` → :class:`OpenAIQuotaProvider` (Codex Plus
-         subscription via ``langchain-codex-plus`` — same store keys
-         as ``openai:`` since both feed the same arbiter view, but the
-         writer is the chat model's ``rate_limit_callback`` rather
-         than a polling endpoint).
-       * ``openai:*`` → :class:`OpenAIQuotaProvider` (Codex Plus / Pro)
-       * ``claude-code:*`` → :class:`AnthropicQuotaProvider`
-         (Max OAuth — provider explicitly chosen via subprocess)
-    2. **``ANTHROPIC_BASE_URL`` host** (for ``anthropic:*`` routes
-       that didn't qualify the provider):
-       * ``api.minimax.io`` → :class:`MinimaxQuotaProvider`
-       * everything else (canonical / unset / unknown gateway) →
-         :class:`AnthropicQuotaProvider`
-
-    Adding a new provider (Moonshot subscription quota, gateway
-    quotas, etc.) is one ``elif`` branch.
+    For ``QUOTA`` mode the provider is resolved by the registry
+    (:func:`mimir.providers.provider_for_quota`) from the
+    ``MIMIR_MODEL_SPEC`` prefix + ``ANTHROPIC_BASE_URL`` host —
+    ``codex-plus:`` / ``openai:`` → OpenAI, ``claude-code:`` → Anthropic
+    Max, an ``anthropic:`` route on a ``minimax`` host → Minimax (chainlink
+    #259: matched by substring so regional gateways still qualify), and
+    everything else → Anthropic direct. ``_QUOTA_PROVIDER_BUILDERS`` binds
+    the resolved provider's ``quota_provider_key`` to its poller class.
+    Adding a provider is one ``ProviderSpec`` entry in the registry
+    (chainlink #292).
     """
     if billing_mode is not BillingMode.QUOTA:
         return []
-    spec = (model_spec or "").strip().lower()
-    if spec.startswith("codex-plus:") or spec.startswith("openai:"):
-        return [OpenAIQuotaProvider(store)]
-    if spec.startswith("claude-code:"):
-        return [AnthropicQuotaProvider(store)]
-    # ``anthropic:*`` and everything else falls through to URL-based
-    # detection — the host tells us whether we're routed to a compat
-    # endpoint or hitting Anthropic directly.
-    from urllib.parse import urlparse
-    base = (anthropic_base_url or "").strip()
-    host = ""
-    if base:
-        try:
-            host = urlparse(base).hostname or ""
-        except (ValueError, AttributeError):
-            host = ""
-    # chainlink #259: match the Minimax host by substring, not an exact
-    # literal — regional / gateway hosts (api.minimaxi.com, ...) must
-    # still route to MinimaxQuotaProvider. Falling through to Anthropic
-    # there reads empty keys → no quota signal → cost-rate demoted to
-    # advisory → no spend protection.
-    if host and "minimax" in host.lower():
-        return [MinimaxQuotaProvider(store)]
-    # Default: canonical Anthropic (unset URL OR api.anthropic.com OR
-    # any other host where we don't have a wrapped quota API yet).
-    return [AnthropicQuotaProvider(store)]
+    from .providers import provider_for_quota
+    prov = provider_for_quota(model_spec, anthropic_base_url)
+    builder = _QUOTA_PROVIDER_BUILDERS.get(prov.quota_provider_key)
+    return [builder(store)] if builder else []
 
 
 # ─── suppression evaluation ────────────────────────────────────────────
