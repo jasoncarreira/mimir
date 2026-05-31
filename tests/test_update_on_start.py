@@ -169,6 +169,9 @@ def test_apply_happy_path_runs_pip_then_execs(
     argv = captured_argv[0]
     assert argv[:5] == [sys.executable, "-m", "pip", "install", "--upgrade"]
     assert "--pre" not in argv
+    # --no-cache-dir forces a fresh index fetch so a flag-update right after
+    # a release can't fail on pip's stale cached index (chainlink #295).
+    assert "--no-cache-dir" in argv
     assert argv[-1] == "mimir-agent==0.2.0"
 
     # Events: starting + applied. failed should NOT have been logged.
