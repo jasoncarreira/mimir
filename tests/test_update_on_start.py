@@ -570,11 +570,11 @@ def test_scheduler_delta_returns_missing_ticks(tmp_path: Path) -> None:
     live_path = tmp_path / "scheduler.yaml"
 
     template_path.write_text(
-        yaml.dump({"jobs": {"heartbeat": {}, "reflect": {}, "issues-audit": {}}})
+        yaml.dump([{"name": "heartbeat"}, {"name": "reflect"}, {"name": "issues-audit"}])
     )
     # Live scheduler is missing "issues-audit" — it shipped in this version
     live_path.write_text(
-        yaml.dump({"jobs": {"heartbeat": {}, "reflect": {}}})
+        yaml.dump([{"name": "heartbeat"}, {"name": "reflect"}])
     )
 
     # Patch _BUNDLED_SCHEDULER to point at our fixture template.
@@ -598,7 +598,7 @@ def test_scheduler_delta_no_delta_when_live_has_all(tmp_path: Path) -> None:
     template_path = tmp_path / "scheduler_template.yaml"
     live_path = tmp_path / "scheduler.yaml"
 
-    both = {"jobs": {"heartbeat": {}, "reflect": {}}}
+    both = [{"name": "heartbeat"}, {"name": "reflect"}]
     template_path.write_text(yaml.dump(both))
     live_path.write_text(yaml.dump(both))
 
@@ -611,6 +611,28 @@ def test_scheduler_delta_no_delta_when_live_has_all(tmp_path: Path) -> None:
         _sd._BUNDLED_SCHEDULER = orig
 
     assert delta == []
+
+
+def test_scheduler_delta_bundled_template_is_list_parseable(tmp_path: Path) -> None:
+    """The actual bundled scheduler_template.yaml must be parseable as a top-level
+    list of {name: ...} dicts — this test catches any schema drift in the template
+    itself before it can silently break _scheduler_delta at runtime."""
+    import yaml
+    from mimir.skill_defs import _BUNDLED_SCHEDULER
+
+    data = yaml.safe_load(_BUNDLED_SCHEDULER.read_text(encoding="utf-8"))
+    assert isinstance(data, list), (
+        f"scheduler_template.yaml must be a top-level list, got {type(data).__name__}"
+    )
+    names = [e["name"] for e in data if isinstance(e, dict) and "name" in e]
+    assert len(names) > 0, "scheduler_template.yaml must have at least one named entry"
+    # Live scheduler with an empty set (no entries) → all template ticks are delta.
+    live_path = tmp_path / "scheduler.yaml"
+    live_path.write_text("[]")
+    from mimir.update_on_start import _scheduler_delta
+
+    delta = _scheduler_delta(tmp_path)
+    assert sorted(delta) == sorted(names)
 
 
 def test_scheduler_delta_missing_files_returns_empty(tmp_path: Path) -> None:
@@ -690,9 +712,9 @@ def test_compute_update_digest_scheduler_delta(tmp_path: Path) -> None:
     template_path = tmp_path / "tpl.yaml"
     live_path = tmp_path / "scheduler.yaml"
     template_path.write_text(
-        yaml.dump({"jobs": {"heartbeat": {}, "issues-audit": {}}})
+        yaml.dump([{"name": "heartbeat"}, {"name": "issues-audit"}])
     )
-    live_path.write_text(yaml.dump({"jobs": {"heartbeat": {}}}))
+    live_path.write_text(yaml.dump([{"name": "heartbeat"}]))
 
     import mimir.skill_defs as _sd
     orig = _sd._BUNDLED_SCHEDULER
@@ -711,7 +733,7 @@ def test_compute_update_digest_no_delta(tmp_path: Path) -> None:
     import yaml
     from mimir.update_on_start import _compute_update_digest
 
-    both = yaml.dump({"jobs": {"heartbeat": {}}})
+    both = yaml.dump([{"name": "heartbeat"}])
     template_path = tmp_path / "tpl.yaml"
     (tmp_path / "scheduler.yaml").write_text(both)
     template_path.write_text(both)
