@@ -316,11 +316,17 @@ def test_scaffold_installs_codex_for_codex_plus_extra(tmp_path: Path):
 
 
 def test_scaffold_installs_codex_for_workspace_uv_extra(tmp_path: Path):
-    """Workspace mode detects the codex subscription from uv_extras."""
+    """Workspace mode detects the codex subscription from uv_extras (and
+    omits the install without it — symmetry with the pypi test)."""
     home = tmp_path / "ws-codex-home"
     home.mkdir()
     scaffold(home, mode="workspace", uv_extras=["codex-plus"])
     assert "npm install -g @openai/codex" in (home / "Dockerfile").read_text()
+
+    plain = tmp_path / "ws-plain-home"
+    plain.mkdir()
+    scaffold(plain, mode="workspace", uv_extras=["discord"])
+    assert "npm install -g @openai/codex" not in (plain / "Dockerfile").read_text()
 
 
 # ── scaffold() end-to-end ──────────────────────────────────────────
