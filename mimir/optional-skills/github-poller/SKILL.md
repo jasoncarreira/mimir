@@ -87,8 +87,22 @@ For each repo in `GITHUB_REPOS`:
   surfaced (total count + first 3 subjects + "… N more" when truncated).
   Force-pushes that change the SHA but not the diff also fire — this is a
   known false-positive; compare-diff diffing on every poll is too expensive.
+- **Review requests** (`pr_review_requested`) — fired when `MIMIR_GITHUB_SELF_LOGIN`
+  appears in a PR's `requested_reviewers`. **State-reconciling retry** (chainlink
+  #299): a submitted review removes you from `requested_reviewers`, so while you
+  remain requested the poller RE-EMITS once per poll (up to
+  `REVIEW_REQUEST_MAX_ATTEMPTS`, default 3). This recovers a review whose
+  triggered turn died (e.g. a transient model 503) instead of silently dropping
+  it — the old emit-once model advanced the cursor past a dead turn and never
+  re-fired (observed on PR #511). On exhaustion it emits a one-shot
+  `pr_review_request_gave_up` **signal** (no turn; surfaces as a *negative
+  algedonic signal* via `feedback.classify`'s `*_gave_up` rule) and goes dormant
+  for that PR until you're removed and re-requested.
 
-All filtered by `created_at > cursor` and (when set) `user.login != MIMIR_GITHUB_SELF_LOGIN`.
+Issue / PR / comment / review detection is filtered by `created_at > cursor`
+and (when set) `user.login != MIMIR_GITHUB_SELF_LOGIN`. Push + review-request
+detection are state-based (head-SHA delta / `requested_reviewers` membership),
+not `created_at`-windowed.
 
 ## What it doesn't watch (deliberate)
 
@@ -112,6 +126,8 @@ Polling 1 repo every 15 min @ 4 endpoints = ~16 calls/hr/repo. For a 5-repo watc
 ## Cursor file
 
 Persists at `<home>/state/pollers/github-activity/cursor.json` (the framework-injected `STATE_DIR`). Survives container rebuilds. First run looks back 1 hour to bound the backfill burst.
+
+The `pr_review_requests` key maps `{repo: {pr_number: attempts}}` — `attempts` counts `pr_review_requested` emits while you stayed requested (chainlink #299; a dormant PR that gave up parks at `cap + 1`). The pre-#299 bare-list format (`{repo: [pr_number, ...]}`) migrates automatically on first load.
 
 ## Disabling temporarily
 

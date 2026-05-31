@@ -28,6 +28,21 @@ broken, so this is the deliberate tradeoff. Persistent failures
 surface as ``poller_stderr`` events for the affected endpoints, so
 operator audit can grep for them.
 
+Exception — review-requests (chainlink #299): that "advance regardless"
+tradeoff covers POLL-side (gh-api) failures, NOT the downstream review
+TURN failing. A ``pr_review_requested`` whose triggered turn dies (e.g.
+a transient model 503) would otherwise vanish — the cursor recorded the
+request as "already seen," so it never re-fired and the review was
+silently dropped (observed on PR #511). The review-request cursor now
+stores a per-PR ATTEMPT COUNT and RE-EMITS while ``me`` remains a
+requested reviewer — a submitted review removes ``me`` from
+``requested_reviewers``, so "still requested" means "review still
+pending" — bounded by ``REVIEW_REQUEST_MAX_ATTEMPTS``. On exhaustion it
+emits a one-shot ``pr_review_request_gave_up`` signal (negative
+algedonic; ``feedback.classify`` maps the ``*_gave_up`` suffix) and goes
+dormant for that PR. The bound is the wedge guard the original tradeoff
+was protecting against.
+
 Environment variables:
     STATE_DIR                  - Persistent state dir (set by framework)
     POLLER_NAME                - This poller's name
@@ -64,6 +79,16 @@ FIRST_RUN_LOOKBACK = timedelta(hours=1)
 # is the per-field cap before that runs.
 BODY_PREVIEW_CHARS = 300
 
+# chainlink #299: max ``pr_review_requested`` emits for the SAME PR while
+# ``me`` stays a requested reviewer, before giving up. The re-emit is a
+# state-reconciling retry — a submitted review clears ``me`` from
+# ``requested_reviewers``, so "still requested" means the review never
+# landed (e.g. the triggered turn hit a transient failure). Bounded so a
+# persistently-unreviewable PR can't re-fire forever (the wedge guard).
+# At ~15-min polls this is ~3 retries over ~45 min before the give-up
+# signal fires.
+REVIEW_REQUEST_MAX_ATTEMPTS = 3
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -83,6 +108,35 @@ def _save_cursor(cursor: dict) -> None:
     CURSOR_FILE.write_text(
         json.dumps(cursor, indent=2), encoding="utf-8",
     )
+
+
+def _coerce_review_requests(value: object) -> dict[str, int]:
+    """Coerce a per-repo review-request cursor entry to ``{pr_key: attempts}``.
+
+    chainlink #299 changed the shape of the review-request cursor from a
+    bare ``list`` of "already-emitted" PR-number strings (the pre-#299
+    emit-once-on-transition model) to ``{pr_key: attempt_count}`` so the
+    poller can re-emit a still-pending request up to a cap. This migrates
+    the old format on first load after the upgrade:
+
+    * ``list`` → ``{key: 1}`` — treat each previously-emitted request as
+      one recorded attempt, so a request that's still open becomes
+      eligible for the retry path rather than re-firing from scratch.
+    * ``dict`` → kept, filtered to ``str``-keyed non-negative ``int``
+      values (defends against a hand-edited / corrupted cursor).
+    * anything else → ``{}``.
+    """
+    if isinstance(value, dict):
+        out: dict[str, int] = {}
+        for k, v in value.items():
+            # bool is an int subclass — exclude it explicitly so a stray
+            # ``true`` doesn't read as attempts=1.
+            if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                out[k] = v
+        return out
+    if isinstance(value, list):
+        return {str(k): 1 for k in value if isinstance(k, (str, int)) and not isinstance(k, bool)}
+    return {}
 
 
 def _resolve_token() -> str:
@@ -264,6 +318,28 @@ def _emit(prompt: str, **extras: object) -> None:
     print(json.dumps(event), flush=True)
 
 
+def _emit_signal(signal_type: str, **extras: object) -> None:
+    """One signal-shaped JSONL line (chainlink #299).
+
+    Unlike :func:`_emit` (which writes a ``prompt`` → the framework builds
+    an AgentEvent and spawns a turn), a signal record carries ``signal``
+    instead of ``prompt``: ``mimir/pollers.py`` routes it to
+    ``events.jsonl`` via ``log_event`` WITHOUT spawning a turn, where
+    ``feedback.classify`` surfaces recognized types — including the
+    ``*_gave_up`` suffix — in the next turn's negative algedonic block.
+
+    Used for "give up" notifications that should be VISIBLE but must not
+    trigger more work — re-spawning a turn after the retry budget is
+    exhausted would just burn another likely-failing turn. ``extras``
+    (repo / number / url / attempts) flow through to the event payload
+    for the renderer; ``poller`` is re-stamped by the framework.
+    """
+    print(
+        json.dumps({"poller": POLLER_NAME, "signal": signal_type, **extras}),
+        flush=True,
+    )
+
+
 # ─── per-resource checks ──────────────────────────────────────────────
 
 
@@ -403,8 +479,8 @@ def _check_pr_pushes(
     token: str,
     me: str,
     pr_heads: dict[str, str],
-    pr_review_requests: set[str] | None = None,
-) -> tuple[int, dict[str, str], set[str]]:
+    pr_review_requests: dict[str, int] | None = None,
+) -> tuple[int, dict[str, str], dict[str, int]]:
     """Detect new commits pushed to existing open PRs AND new
     review-requests addressed to ``me`` on those same PRs.
 
@@ -431,14 +507,29 @@ def _check_pr_pushes(
     a known false-positive; the alternative (compare diffs) is too
     expensive to run on every poll.
 
-    ── Review-request detection ──
+    ── Review-request detection (state-reconciling re-emit, #299) ──
     Each PR's ``requested_reviewers`` list is checked against ``me``.
-    On the **transition** from "not requested" to "requested", emits
-    a ``pr_review_requested`` event. Tracked via
-    ``pr_review_requests`` (set of PR-number strings currently
-    flagged for ``me``). When ``me`` is removed from the list — review
-    submitted, PR closed, or operator un-requests — the PR drops out
-    of the set naturally so a later re-request fires again.
+    Tracked via ``pr_review_requests`` — ``{pr_key: attempt_count}`` —
+    where ``attempt_count`` is how many ``pr_review_requested`` events
+    we've emitted for this PR while ``me`` stayed requested.
+
+    While ``me`` is a requested reviewer the poller RE-EMITS
+    ``pr_review_requested`` once per poll (incrementing the count), up to
+    ``REVIEW_REQUEST_MAX_ATTEMPTS``. Rationale: a submitted review removes
+    ``me`` from ``requested_reviewers`` (GitHub clears it), so "still
+    requested on the next poll" means "no review landed" — the prior
+    attempt's turn failed, is still running, or never ran. Re-emitting
+    recovers a review dropped by a transient turn failure (the bug: the
+    old emit-once-on-transition model recorded the request as seen, so a
+    dead turn vanished — PR #511).
+
+    On exhaustion (``attempt_count`` reaches the cap and ``me`` is STILL
+    requested) it emits a one-shot ``pr_review_request_gave_up`` SIGNAL
+    (negative algedonic, no turn) and parks the key at a dormant sentinel
+    (``cap + 1``) so it neither retries nor re-gives-up. When ``me`` is
+    removed (review submitted, PR closed, operator un-requests) the key
+    drops out of the rebuilt dict, so a later re-request starts fresh at
+    attempt 1.
 
     Empty ``me`` (no agent login configured) → review-request
     detection is silently skipped; push detection still runs.
@@ -454,13 +545,15 @@ def _check_pr_pushes(
         token,
     )
     new_heads: dict[str, str] = {}
-    prior_review_requests = pr_review_requests or set()
-    new_review_requests: set[str] = set()
+    prior_review_requests: dict[str, int] = pr_review_requests or {}
+    new_review_requests: dict[str, int] = {}
     if not isinstance(data, list):
         # On API failure, preserve prior cursors so we don't false-fire
         # on the next successful poll. (If the poll truly missed a
-        # push or review-request, we'll catch it next time.)
-        return 0, dict(pr_heads), set(prior_review_requests)
+        # push or review-request, we'll catch it next time.) Preserving
+        # the attempt counts also means a transient poll failure doesn't
+        # reset a PR's retry budget.
+        return 0, dict(pr_heads), dict(prior_review_requests)
     count = 0
     for pr in data:
         # Push-detection self-filter: skip PRs the agent authored.
@@ -543,16 +636,34 @@ def _check_pr_pushes(
                 for r in requested
             )
             if currently_requested:
-                new_review_requests.add(key)
-                if key not in prior_review_requests:
-                    # Transition: ``me`` was just added (or this is the
-                    # first sighting of the PR). Emit.
-                    title = pr.get("title", "")
-                    url = pr.get("html_url", "")
+                # State reconciliation (chainlink #299): ``me`` being a
+                # requested reviewer is the authoritative "review still
+                # pending" signal — a submitted review clears ``me``, so a
+                # PR STILL requested on this poll means the prior attempt
+                # never landed (transient turn failure / still running /
+                # never ran). Re-emit up to the cap; on exhaustion emit a
+                # one-shot give-up signal and go dormant.
+                prior_attempts = prior_review_requests.get(key, 0)
+                title = pr.get("title", "")
+                url = pr.get("html_url", "")
+                if prior_attempts < REVIEW_REQUEST_MAX_ATTEMPTS:
+                    attempt = prior_attempts + 1
+                    if attempt == 1:
+                        status_line = (
+                            f"You (@{me}) were added to the reviewers list."
+                        )
+                    else:
+                        status_line = (
+                            f"You (@{me}) are STILL on the reviewers list "
+                            f"(re-request {attempt}/{REVIEW_REQUEST_MAX_ATTEMPTS}"
+                            f" — a prior review request produced no submitted "
+                            f"review; the turn may have failed). Submit the "
+                            f"review this time."
+                        )
                     prompt = (
                         f"Review requested on {repo} PR #{number}: "
                         f"{title} (by @{pr_author or 'unknown'})\n"
-                        f"You (@{me}) were added to the reviewers list.\n"
+                        f"{status_line}\n"
                         f"{url}"
                     )
                     _emit(
@@ -563,8 +674,34 @@ def _check_pr_pushes(
                         url=url,
                         requested_reviewer=me,
                         author=pr_author,
+                        attempt=attempt,
+                        max_attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
                     )
                     count += 1
+                    new_review_requests[key] = attempt
+                elif prior_attempts == REVIEW_REQUEST_MAX_ATTEMPTS:
+                    # Wedge guard exhausted: emitted the request
+                    # REVIEW_REQUEST_MAX_ATTEMPTS times and ``me`` is still
+                    # requested. Emit a one-shot give-up SIGNAL (no turn —
+                    # re-spawning would just burn another likely-failing
+                    # turn) so it surfaces in the negative algedonic block,
+                    # then park at the dormant sentinel (cap + 1).
+                    _emit_signal(
+                        "pr_review_request_gave_up",
+                        repo=repo,
+                        number=number,
+                        url=url,
+                        requested_reviewer=me,
+                        attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
+                    )
+                    count += 1
+                    new_review_requests[key] = prior_attempts + 1
+                else:
+                    # Already gave up (sentinel > cap) and ``me`` is still
+                    # requested. Stay dormant — carry the sentinel so we
+                    # neither retry nor re-emit the give-up. Resets when
+                    # ``me`` is removed (key drops from the rebuilt dict).
+                    new_review_requests[key] = prior_attempts
     return count, new_heads, new_review_requests
 
 
@@ -669,10 +806,12 @@ def main() -> None:
 
     pr_heads_all: dict[str, dict[str, str]] = cursor.get("pr_heads", {}) or {}
     new_pr_heads_all: dict[str, dict[str, str]] = {}
-    # Review-request cursor: ``{repo: [pr_number, ...]}``. JSON has no
-    # set type so we store as a list and convert at the boundaries.
-    rr_all: dict[str, list[str]] = cursor.get("pr_review_requests", {}) or {}
-    new_rr_all: dict[str, list[str]] = {}
+    # Review-request cursor (chainlink #299): ``{repo: {pr_key: attempts}}``
+    # where ``attempts`` counts pr_review_requested emits while ``me`` stayed
+    # a requested reviewer. _coerce_review_requests migrates the pre-#299
+    # bare-list format (``{repo: [pr_key, ...]}``) on first load.
+    rr_all: dict = cursor.get("pr_review_requests", {}) or {}
+    new_rr_all: dict[str, dict[str, int]] = {}
 
     total = 0
     for repo in repos:
@@ -683,13 +822,13 @@ def main() -> None:
         total += _check_pr_review_comments(repo, since, token, me)
         total += _check_pr_reviews(repo, since, token, me)
         repo_heads = pr_heads_all.get(repo, {}) or {}
-        repo_rr = set(rr_all.get(repo, []) or [])
+        repo_rr = _coerce_review_requests(rr_all.get(repo))
         push_count, new_repo_heads, new_repo_rr = _check_pr_pushes(
             repo, token, me, repo_heads, pr_review_requests=repo_rr,
         )
         total += push_count
         new_pr_heads_all[repo] = new_repo_heads
-        new_rr_all[repo] = sorted(new_repo_rr)
+        new_rr_all[repo] = new_repo_rr
 
     cursor["last_checked"] = new_cursor_ts
     cursor["pr_heads"] = new_pr_heads_all
