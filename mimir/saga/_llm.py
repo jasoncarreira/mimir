@@ -15,6 +15,10 @@ which delegates to either:
   the legacy ``requests.post`` path, kept so bench numbers stay
   comparable to the post-fix ``saga_p30_canon_v4`` baseline (0.774,
   characterized against gpt-5.4-nano).
+- **codex_plus** — ``langchain_codex_plus.ChatCodexPlus`` over the
+  ChatGPT/Codex subscription (OAuth from ``$CODEX_HOME/auth.json``,
+  default ``~/.codex``). Like claude_code it shares the operator's
+  plan-window quota and needs no API credit; native async (ainvoke).
 
 Per-subsystem ``[<section>] provider = "..."`` overrides
 ``[llm].provider``. See ``config.resolve_llm_config``.
@@ -27,10 +31,11 @@ multiple content blocks (text + tool_use); we collapse to text only
 Single async entry point:
 
 - ``async def call_llm(...)`` — async-native (chainlink #20). The
-  claude_code path runs on the caller's event loop via
-  ``_AsyncClaudePool`` (no daemon thread). ``anthropic`` and
-  ``openai_compat`` are sync HTTP libraries; the wrapper offloads
-  them via ``asyncio.to_thread`` so the loop stays responsive.
+  claude_code and codex_plus paths are native async on the caller's
+  event loop (claude_code via ``_AsyncClaudePool``; codex_plus via
+  ``ChatCodexPlus.ainvoke``). ``anthropic`` and ``openai_compat`` are
+  sync HTTP libraries; the wrapper offloads them via
+  ``asyncio.to_thread`` so the loop stays responsive.
 
 The legacy ``call_llm_sync`` + ``_PersistentClaudePool`` daemon-thread
 bridge was deleted in Phase 3 — saga's internals are now async-native.
@@ -236,6 +241,11 @@ async def call_llm(
             llm, prompt=prompt, max_tokens=max_tokens,
             temperature=temperature, system=system,
         )
+    if provider == "codex_plus":
+        return await _call_codex_plus_async(
+            llm, prompt=prompt, max_tokens=max_tokens,
+            temperature=temperature, system=system,
+        )
     if provider == "anthropic":
         return await asyncio.to_thread(
             _call_anthropic, llm,
@@ -251,7 +261,7 @@ async def call_llm(
     if provider != "openai_compat":
         log.warning(
             "call_llm: unknown provider %r — falling back to openai_compat. "
-            "Recognized: 'claude_code', 'anthropic', 'openai_compat'.",
+            "Recognized: 'claude_code', 'codex_plus', 'anthropic', 'openai_compat'.",
             raw_provider,
         )
     return await asyncio.to_thread(
@@ -259,6 +269,86 @@ async def call_llm(
         prompt=prompt, max_tokens=max_tokens,
         temperature=temperature, system=system,
     )
+
+
+def _flatten_text(content: Any) -> str:
+    """Collapse a chat model's ``.content`` to plain text.
+
+    ChatCodexPlus (responses API) may return either a string or a list
+    of content blocks (dicts with a ``text`` key, or objects with a
+    ``.text`` attr). saga's prompts never request tools, so text is all
+    we want."""
+    if isinstance(content, str):
+        return content.strip()
+    pieces: list[str] = []
+    for block in content or []:
+        if isinstance(block, str):
+            pieces.append(block)
+        elif isinstance(block, dict):
+            pieces.append(block.get("text") or "")
+        else:
+            pieces.append(getattr(block, "text", "") or "")
+    return "".join(pieces).strip()
+
+
+async def _call_codex_plus_async(
+    llm: dict[str, Any], *,
+    prompt: str, max_tokens: int, temperature: float,
+    system: str | None,
+) -> str:
+    """codex_plus path — saga's LLM calls ride the ChatGPT/Codex
+    subscription via ``langchain_codex_plus.ChatCodexPlus`` (OAuth from
+    ``$CODEX_HOME/auth.json``, default ``~/.codex``). Like the
+    claude_code path it shares the operator's plan-window quota and
+    needs no API credit; unlike it there's no subprocess — ChatCodexPlus
+    is a native async chat model, so we ``await`` it directly on the
+    caller's loop.
+
+    ``max_tokens``/``temperature`` are accepted but unused: the Codex
+    responses API (as surfaced by ChatCodexPlus) doesn't expose them.
+    ``reasoning_effort="none"`` keeps inference cheap and matches mimir's
+    main-agent codex-plus construction (agent.py).
+
+    A fresh ChatCodexPlus is built per call so its async HTTP client
+    binds to the *calling* loop — saga runs on different loops across
+    consolidation crons vs. chat turns, and a cached client bound to a
+    closed loop would raise. Construction is cheap (pydantic init; the
+    auth bundle is a small local file the lib reads + refreshes on 401,
+    persisting atomically). Returns "" on any failure — every saga call
+    site already handles empty.
+
+    NOTE: saga's codex_plus usage consumes the same subscription quota
+    as the main agent server-side, but isn't yet wired into mimir's
+    local ``rate_limits`` surface (no ``rate_limit_callback`` here) —
+    tracked as a follow-up."""
+    try:
+        from langchain_codex_plus import ChatCodexPlus
+        from langchain_core.messages import HumanMessage, SystemMessage
+    except ImportError:
+        # codex_plus selected but the extra isn't installed. Return ""
+        # (saga degrades gracefully) rather than silently re-routing to a
+        # different, possibly-paid provider — the misconfig is logged.
+        log.warning(
+            "codex_plus provider selected but langchain-codex-plus is not "
+            "installed; returning empty. Install the 'codex-plus' extra."
+        )
+        return ""
+
+    messages: list[Any] = []
+    if system:
+        messages.append(SystemMessage(content=system))
+    messages.append(HumanMessage(content=prompt))
+    try:
+        chat = ChatCodexPlus(
+            model=llm.get("model") or "gpt-5.4",
+            reasoning_effort="none",
+            timeout_seconds=float(llm.get("timeout", 120)),
+        )
+        result = await chat.ainvoke(messages)
+    except Exception as exc:  # noqa: BLE001 — saga's call sites swallow.
+        log.warning("codex_plus call failed: %s", exc)
+        return ""
+    return _flatten_text(result.content)
 
 
 async def _call_claude_code_async(

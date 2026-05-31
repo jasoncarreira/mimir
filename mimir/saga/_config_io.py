@@ -876,7 +876,10 @@ def resolve_llm_config(subsystem: str) -> dict:
 
     # v0.5 §7: provider knob. "anthropic" routes via anthropic.Anthropic;
     # "openai_compat" keeps the legacy requests.post path (default for
-    # bench harness so historical comparability is preserved).
+    # bench harness so historical comparability is preserved);
+    # "codex_plus" rides the ChatGPT/Codex subscription via ChatCodexPlus
+    # (no url/api_key needed — OAuth from ~/.codex); "claude_code" via
+    # the Claude CLI under Max OAuth.
     provider = (
         cfg(subsystem, 'provider', None)
         or cfg('llm', 'provider', None)
