@@ -47,6 +47,11 @@ from .rate_limits import (
     project_window_end,
     running_on_claude_max,
 )
+# Per-provider quota-window registry (chainlink #298) — the single source
+# the agent's Resource-usage view (rate_limits.py) also reads. The provider
+# classes below derive their window-hours from it instead of each carrying
+# a duplicate literal dict.
+from .quota_windows import ANTHROPIC, CODEX_PLUS, MINIMAX
 
 log = logging.getLogger(__name__)
 
@@ -162,21 +167,12 @@ class QuotaProvider(ABC):
 # ─── Anthropic concrete implementation ─────────────────────────────────
 
 
-# Window length per ``rate_limit_type`` we know about, in hours. The
-# 5h + 1-week shape is what Anthropic / Minimax / z.ai have all
-# standardized on; the per-model 7d windows (``seven_day_opus``,
-# ``seven_day_sonnet``) are Anthropic-specific extras with the same
-# 7d window-size, so they fall through the same on-pace threshold.
-# ``overage`` is open-ended (no fixed window), excluded from
-# projection — Anthropic exposes it as the pay-as-you-go bolt-on for
-# accounts that have it enabled, which is a different constraint
-# entirely.
-_ANTHROPIC_WINDOW_HOURS: dict[str, float] = {
-    "five_hour": 5.0,
-    "seven_day": 24.0 * 7,
-    "seven_day_opus": 24.0 * 7,
-    "seven_day_sonnet": 24.0 * 7,
-}
+# Window-hours per quota window now live in mimir/quota_windows.py (the
+# per-provider single source). ``window_hours()`` returns the same
+# ``{logical_key: hours}`` shape these provider classes expect, minus the
+# open-ended windows (Anthropic's ``overage``, excluded from projection).
+# (chainlink #298)
+_ANTHROPIC_WINDOW_HOURS = ANTHROPIC.window_hours()
 
 
 class _StorageBackedQuotaProvider(QuotaProvider):
@@ -262,17 +258,8 @@ class AnthropicQuotaProvider(_StorageBackedQuotaProvider):
 # ─── Minimax concrete implementation (stub — Issue #243) ──────────────
 
 
-# Window sizes for Minimax's quota plan. Presumed 5h + 7d in the same
-# shape as Anthropic / z.ai — the QuotaWindow contract should map
-# cleanly. NOT VERIFIED until the Minimax usage poller (Issue #243)
-# lands and confirms the actual windows the billing API exposes; if
-# the real values differ, this dict updates without breaking the
-# QuotaWindow interface. Per-model sub-buckets (if any) get added
-# here once the integration is wired.
-_MINIMAX_WINDOW_HOURS: dict[str, float] = {
-    "five_hour": 5.0,
-    "seven_day": 24.0 * 7,
-}
+# Minimax quota windows — see mimir/quota_windows.MINIMAX. (chainlink #298)
+_MINIMAX_WINDOW_HOURS = MINIMAX.window_hours()
 
 
 class MinimaxQuotaProvider(_StorageBackedQuotaProvider):
@@ -303,15 +290,9 @@ class MinimaxQuotaProvider(_StorageBackedQuotaProvider):
 # ─── OpenAI concrete implementation (stub — Codex Plus subscription) ──
 
 
-# OpenAI Codex Plus / Pro subscription documents window-based quota
-# in the same 5h + weekly shape as Anthropic Max / Minimax sub. The
-# weekly window length differs slightly (rolling 7d vs calendar-week)
-# but the QuotaWindow contract handles that fine — the arbiter just
-# cares about utilization + resets_at.
-_OPENAI_WINDOW_HOURS: dict[str, float] = {
-    "five_hour": 5.0,
-    "seven_day": 24.0 * 7,
-}
+# OpenAI Codex Plus quota windows — see mimir/quota_windows.CODEX_PLUS.
+# (chainlink #298)
+_OPENAI_WINDOW_HOURS = CODEX_PLUS.window_hours()
 
 
 class OpenAIQuotaProvider(_StorageBackedQuotaProvider):
