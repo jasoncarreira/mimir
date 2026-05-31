@@ -1,0 +1,14 @@
+{
+  "pollers": [
+    {
+      "name": "github-ci-watch",
+      "command": "python3 poller.py",
+      "cron": "*/15 * * * *",
+      "pass_env": [
+        "GITHUB_TOKEN",
+        "GITHUB_REPOS",
+        "STATE_DIR"
+      ]
+    }
+  ]
+}
