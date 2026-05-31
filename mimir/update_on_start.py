@@ -227,24 +227,32 @@ def _scheduler_delta(home: Path) -> list[str]:
 
 
 def _env_gaps(home: Path) -> list[tuple[str, str]]:
-    """Scan ``<home>/.mimir_builtin_skills/*/SKILL.md`` for ``env: required:``
-    blocks and return ``(skill_name, env_key)`` pairs whose key is absent from
-    the current environment.
+    """Scan the installed package's bundled skills for ``env: required:``
+    blocks and return ``(skill_name, env_key)`` pairs whose key is absent
+    from the current environment.
 
-    ``.mimir_builtin_skills/`` is refreshed from the package before
-    ``consume_update_digest`` runs (in ``server._on_startup``), so this
-    always reflects the *new* version's skill requirements.
+    Reads directly from the installed package's ``mimir/skills/*/SKILL.md``
+    (mirroring how ``_scheduler_delta`` reads the bundled
+    ``scheduler_template.yaml``) rather than from the home-seeded
+    ``<home>/.mimir_builtin_skills/``.  This matters because
+    ``_compute_update_digest`` runs inside ``apply_pending_update`` — the
+    *first* thing in ``server.main()`` — before ``os.execv`` is called.
+    The home-seeded ``.mimir_builtin_skills/`` is only refreshed from the
+    newly-installed package *after* execv, during the new code's boot.
+    Reading from the package directly ensures a skill added in this
+    update (with a new required env var) is surfaced on the very update
+    that introduces it, not silently missed.
 
     Returns an empty list on any read / parse error.
     """
     try:
-        from .skill_defs import home_builtin_skills_dir
+        from .skill_defs import _BUNDLED_ROOT
         from .skill_md import parse_env_block
     except Exception:
         return []
 
     gaps: list[tuple[str, str]] = []
-    builtin_root = home_builtin_skills_dir(home)
+    builtin_root = _BUNDLED_ROOT
     if not builtin_root.is_dir():
         return []
 

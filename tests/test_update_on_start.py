@@ -652,17 +652,28 @@ def test_scheduler_delta_missing_files_returns_empty(tmp_path: Path) -> None:
     assert delta == []
 
 
+def _make_fake_bundled_root(tmp_path: Path, skills: dict[str, str]) -> Path:
+    """Helper: create a fake _BUNDLED_ROOT directory with one SKILL.md per
+    entry in *skills* (``{skill_name: skill_md_content}``). Returns the root."""
+    root = tmp_path / "fake_pkg_skills"
+    root.mkdir(parents=True, exist_ok=True)
+    for name, content in skills.items():
+        d = root / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(content)
+    return root
+
+
 def test_env_gaps_returns_missing_required_vars(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A skill with a required env var absent from os.environ shows up
-    in the env_gaps list."""
+    """A bundled skill with a required env var absent from os.environ shows up
+    in the env_gaps list.  Reads from the installed package root (_BUNDLED_ROOT),
+    not the home-seeded .mimir_builtin_skills/."""
+    import mimir.skill_defs as _sd
     from mimir.update_on_start import _env_gaps
 
-    # Build a minimal .mimir_builtin_skills/weather/SKILL.md with env: required:.
-    skill_dir = tmp_path / ".mimir_builtin_skills" / "weather"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
+    skill_md = (
         "---\n"
         "name: weather\n"
         "env:\n"
@@ -672,9 +683,14 @@ def test_env_gaps_returns_missing_required_vars(
         "---\n"
         "# Weather skill\n"
     )
-
-    monkeypatch.delenv("OPENWEATHER_API_KEY", raising=False)
-    gaps = _env_gaps(tmp_path)
+    fake_root = _make_fake_bundled_root(tmp_path, {"weather": skill_md})
+    orig = _sd._BUNDLED_ROOT
+    try:
+        _sd._BUNDLED_ROOT = fake_root
+        monkeypatch.delenv("OPENWEATHER_API_KEY", raising=False)
+        gaps = _env_gaps(tmp_path)
+    finally:
+        _sd._BUNDLED_ROOT = orig
 
     assert ("weather", "OPENWEATHER_API_KEY") in gaps
 
@@ -683,11 +699,10 @@ def test_env_gaps_empty_when_all_required_vars_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When all required env vars are present, env_gaps is empty."""
+    import mimir.skill_defs as _sd
     from mimir.update_on_start import _env_gaps
 
-    skill_dir = tmp_path / ".mimir_builtin_skills" / "weather"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
+    skill_md = (
         "---\n"
         "name: weather\n"
         "env:\n"
@@ -696,11 +711,62 @@ def test_env_gaps_empty_when_all_required_vars_set(
         "---\n"
         "# Weather skill\n"
     )
-
-    monkeypatch.setenv("OPENWEATHER_API_KEY", "test-key-123")
-    gaps = _env_gaps(tmp_path)
+    fake_root = _make_fake_bundled_root(tmp_path, {"weather": skill_md})
+    orig = _sd._BUNDLED_ROOT
+    try:
+        _sd._BUNDLED_ROOT = fake_root
+        monkeypatch.setenv("OPENWEATHER_API_KEY", "test-key-123")
+        gaps = _env_gaps(tmp_path)
+    finally:
+        _sd._BUNDLED_ROOT = orig
 
     assert gaps == []
+
+
+def test_env_gaps_reads_package_not_home_seeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_env_gaps reads the installed package's bundled skills, not the
+    home-seeded .mimir_builtin_skills/ copy.
+
+    This is the staleness-prevention test: when a skill is added in a new
+    package version with a required env var, _compute_update_digest (which
+    runs pre-execv, before the new boot refreshes .mimir_builtin_skills/)
+    must still surface it.  The home-seeded copy reflects the *old*
+    version; only the package root reflects the *new* one.
+    """
+    import mimir.skill_defs as _sd
+    from mimir.update_on_start import _env_gaps
+
+    new_skill_md = (
+        "---\n"
+        "name: brand-new-skill\n"
+        "env:\n"
+        "  required:\n"
+        "    - name: BRAND_NEW_SKILL_API_KEY\n"
+        "      description: Key introduced in this update\n"
+        "---\n"
+        "# Brand-new skill (added in this version)\n"
+    )
+    # Package root HAS the new skill; home-seeded dir does NOT.
+    fake_pkg_root = _make_fake_bundled_root(tmp_path, {"brand-new-skill": new_skill_md})
+    # Deliberately leave .mimir_builtin_skills/ absent (simulates pre-execv state
+    # where the home copy hasn't been refreshed from the new package yet).
+    assert not (tmp_path / ".mimir_builtin_skills").exists()
+
+    orig = _sd._BUNDLED_ROOT
+    try:
+        _sd._BUNDLED_ROOT = fake_pkg_root
+        monkeypatch.delenv("BRAND_NEW_SKILL_API_KEY", raising=False)
+        gaps = _env_gaps(tmp_path)
+    finally:
+        _sd._BUNDLED_ROOT = orig
+
+    assert ("brand-new-skill", "BRAND_NEW_SKILL_API_KEY") in gaps, (
+        "_env_gaps should read the installed package root, not the home-seeded "
+        ".mimir_builtin_skills/ — the home copy is stale pre-execv and won't "
+        "contain skills added in this update"
+    )
 
 
 def test_compute_update_digest_scheduler_delta(tmp_path: Path) -> None:
