@@ -43,6 +43,7 @@ from .registry import (
     set_scheduler,
     set_spawn_config,
     spawn_claude_code,
+    spawn_codex,
 )
 from .web import (
     fetch_url,
@@ -90,6 +91,7 @@ __all__ = [
     "commitment_dismiss",
     "commitment_list",
     "spawn_claude_code",
+    "spawn_codex",
     # Web tools (gated on provider; see web_tools_enabled)
     "web_search",
     "fetch_url",

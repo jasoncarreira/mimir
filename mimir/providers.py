@@ -313,3 +313,22 @@ def claude_code_available() -> bool:
     probing is a heavier future refinement.
     """
     return shutil.which(_ANTHROPIC_MAX.requires_cli or "claude") is not None
+
+
+#: The Codex CLI that ``spawn_codex`` shells out to. Distinct from the
+#: codex-plus *API* provider (``langchain-codex-plus``, the ChatGPT-account
+#: chat adapter) — this is the local ``codex`` binary, a separate tool.
+_CODEX_CLI = "codex"
+
+
+def codex_available() -> bool:
+    """True when the ``codex`` CLI — which the ``spawn_codex`` tool shells
+    out to (``codex exec``) — is on ``PATH``.
+
+    Tool registration gates ``spawn_codex`` on this, mirroring
+    :func:`claude_code_available` / ``spawn_claude_code`` (chainlink #293):
+    a deployment without the codex CLI shouldn't be handed a tool that can
+    only fail. Checks *presence*, not auth state — auth-state probing is a
+    heavier future refinement.
+    """
+    return shutil.which(_CODEX_CLI) is not None

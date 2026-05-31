@@ -145,3 +145,18 @@ def test_claude_code_available_reflects_cli_on_path(monkeypatch):
 
     monkeypatch.setattr(P.shutil, "which", lambda cmd: None)
     assert P.claude_code_available() is False
+
+
+# ── codex availability — spawn_codex gate (chainlink #293) ──────────
+
+
+def test_codex_available_reflects_cli_on_path(monkeypatch):
+    import mimir.providers as P
+
+    monkeypatch.setattr(
+        P.shutil, "which", lambda cmd: "/usr/bin/codex" if cmd == "codex" else None
+    )
+    assert P.codex_available() is True
+
+    monkeypatch.setattr(P.shutil, "which", lambda cmd: None)
+    assert P.codex_available() is False
