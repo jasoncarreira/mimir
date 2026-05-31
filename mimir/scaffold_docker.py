@@ -65,7 +65,7 @@ class ScaffoldResult:
 #: files added to the bundled source won't be back-filled.
 _BUNDLED_SKILL_ROOTS = (
     Path(__file__).parent / "skills",
-    Path(__file__).parent.parent / "optional-skills",
+    Path(__file__).parent / "optional-skills",
 )
 
 

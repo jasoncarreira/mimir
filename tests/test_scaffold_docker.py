@@ -825,7 +825,7 @@ def test_gmail_fragment_has_bump_comment():
     so future maintainers know it's a pin, not a load-bearing constant."""
     frag_path = (
         Path(__file__).parent.parent
-        / "optional-skills" / "gmail-poller" / "dockerfile.fragment"
+        / "mimir" / "optional-skills" / "gmail-poller" / "dockerfile.fragment"
     )
     text = frag_path.read_text()
     # Some form of "bump" / "update" / "check" guidance near the version.
@@ -838,7 +838,7 @@ def test_social_cli_fragment_has_pin_comment():
     so a future maintainer pins when upstream stabilizes."""
     frag_path = (
         Path(__file__).parent.parent
-        / "optional-skills" / "social-cli" / "dockerfile.fragment"
+        / "mimir" / "optional-skills" / "social-cli" / "dockerfile.fragment"
     )
     text = frag_path.read_text()
     assert "pin" in text.lower() or "tag" in text.lower()
