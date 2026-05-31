@@ -399,3 +399,22 @@ def test_all_mimir_tools_includes_fetch_only_without_tavily(
     names = {t.name for t in all_mimir_tools()}
     assert "web_search" not in names
     assert "fetch_url" in names
+
+
+def test_all_mimir_tools_gates_spawn_codex_on_availability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # spawn_codex registers iff the codex CLI is available (chainlink #293),
+    # mirroring the spawn_claude_code gate. Patch the registry's
+    # codex_available so the test is deterministic regardless of whether a
+    # codex CLI is installed in the test environment.
+    import mimir.providers as providers
+    from mimir.tools import all_mimir_tools
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:claude-haiku-4-5")
+
+    monkeypatch.setattr(providers, "codex_available", lambda: True)
+    assert "spawn_codex" in {t.name for t in all_mimir_tools()}
+
+    monkeypatch.setattr(providers, "codex_available", lambda: False)
+    assert "spawn_codex" not in {t.name for t in all_mimir_tools()}

@@ -786,6 +786,11 @@ def _run_claude_subprocess(
         text=True,
         timeout=timeout_s,
         env=env,
+        # Headless spawn: never inherit the parent's stdin. ``codex exec``
+        # reads stdin (appends it to the prompt) and would block until the
+        # timeout if stdin is an open pipe/TTY; DEVNULL EOFs immediately so
+        # it uses the prompt arg only. Harmless for ``claude -p`` too.
+        stdin=subprocess.DEVNULL,
     )
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -929,6 +934,110 @@ async def spawn_claude_code(
         )
     except json.JSONDecodeError:
         return f"spawn_claude_code: raw output: {stdout[:2000]}"
+
+
+@tool
+async def spawn_codex(
+    prompt: str,
+    cwd: Optional[str] = None,
+    timeout_s: int = 1800,
+    name: Optional[str] = None,
+    model: Optional[str] = None,
+) -> str:
+    """Spawn a Codex CLI subprocess to execute a complex task.
+
+    The Codex analogue of ``spawn_claude_code``: runs ``codex exec
+    <prompt>`` once, non-interactively, and returns its output. Use for
+    work you'd rather hand to Codex (OpenAI) than the parent agent —
+    context isolation, independent execution, or a second model's take.
+    Registered only when the ``codex`` CLI is on PATH (the tool-list gate
+    consults ``providers.codex_available``), so it never appears on a
+    deployment that can't run it.
+
+    Shares the spawn caps with ``spawn_claude_code`` — the same
+    per-hour / concurrency / recursion-depth budget (a spawn is a spawn
+    regardless of which CLI), so an agent can't fork-bomb via either path.
+
+    Codex CLI invocation note: ``codex exec`` is the non-interactive
+    subcommand, but exact flags vary by codex version + setup. Extra
+    flags (sandbox / approval mode, ``--json``, ...) are injected
+    verbatim from ``MIMIR_CODEX_SPAWN_ARGS`` (shlex-split), so the
+    operator tunes the invocation without a code change.
+
+    Args:
+        prompt: The task to hand to the spawned Codex instance.
+        cwd: Working directory for the subprocess. Defaults to home.
+        timeout_s: Subprocess timeout (default 30 min).
+        name: Optional label recorded in the spawn log.
+        model: Codex model name, passed as ``--model``. Omit for the
+            CLI default.
+    """
+    cfg = _STATE["spawn_config"]
+    if cfg is None:
+        return "spawn_codex failed: no spawn config"
+    if not prompt or not prompt.strip():
+        return "spawn_codex failed: prompt is required"
+
+    # Shared spawn caps (same guard as spawn_claude_code — one budget
+    # across both spawn paths). Depth check first (cheapest), then the
+    # per-hour rate slot, then the concurrency semaphore.
+    guard = _spawn_guard_init()
+    current_depth = _env_int_floor1(_SPAWN_DEPTH_ENV, 0) if os.environ.get(
+        _SPAWN_DEPTH_ENV
+    ) else 0
+    if current_depth >= guard.max_depth:
+        return (
+            f"spawn_codex refused: recursion depth cap reached "
+            f"({current_depth} >= MIMIR_SPAWN_MAX_DEPTH={guard.max_depth}). "
+            f"The parent agent is already at this nesting level — "
+            f"deeper spawns would risk a fork-bomb / unbounded budget."
+        )
+    rate_err = await _spawn_acquire_rate_slot(guard)
+    if rate_err is not None:
+        # The shared helper names spawn_claude_code; retarget for this tool.
+        return rate_err.replace("spawn_claude_code", "spawn_codex")
+
+    cwd_path = Path(cwd).expanduser() if cwd else cfg.get("default_cwd")
+    import shlex
+    argv = ["codex", "exec"]
+    # Operator-tunable extra flags (sandbox/approval mode, --json, etc.) —
+    # the codex CLI surface varies by version, so don't hardcode beyond
+    # the subcommand. e.g. MIMIR_CODEX_SPAWN_ARGS="--full-auto".
+    argv += shlex.split(os.environ.get("MIMIR_CODEX_SPAWN_ARGS", ""))
+    if model:
+        argv += ["--model", model]
+    # ``--`` separator so a prompt starting with ``-`` isn't parsed as a flag.
+    argv += ["--", prompt]
+
+    child_env = dict(os.environ)
+    child_env[_SPAWN_DEPTH_ENV] = str(current_depth + 1)
+
+    assert guard.sem is not None
+    try:
+        async with guard.sem:
+            try:
+                returncode, stdout, stderr = await asyncio.to_thread(
+                    # Generic argv subprocess runner (shared with
+                    # spawn_claude_code despite the historical name).
+                    _run_claude_subprocess,
+                    argv,
+                    str(cwd_path) if cwd_path else None,
+                    timeout_s,
+                    child_env,
+                )
+            except subprocess.TimeoutExpired:
+                return f"spawn_codex timed out after {timeout_s}s"
+            except FileNotFoundError:
+                return "spawn_codex failed: 'codex' CLI not on PATH"
+    except BaseException:
+        _spawn_release_rate_slot(guard)
+        raise
+    if returncode != 0:
+        return f"spawn_codex failed: exit={returncode} stderr={stderr[:500]}"
+    # codex exec writes its result to stdout (text, or JSONL with --json).
+    # Return it verbatim (truncated); unlike claude -p's structured JSON the
+    # codex output shape varies by flags, so don't assume a parse.
+    return json.dumps({"result": stdout.strip()[:2000], "name": name}, indent=2)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -1088,9 +1197,12 @@ def all_mimir_tools() -> list:
     # (e.g. Minimax) typically has no claude CLI, so registering it would
     # only offer the agent a tool that fails with "'claude' CLI not on
     # PATH". Gates on CLI presence, not auth — see claude_code_available.
-    from ..providers import claude_code_available
+    from ..providers import claude_code_available, codex_available
     if claude_code_available():
         tools.append(spawn_claude_code)
+    # Same gate for spawn_codex on the ``codex`` CLI (chainlink #293).
+    if codex_available():
+        tools.append(spawn_codex)
     # MCP-bridged tools (populated by server.py:_on_startup after the
     # MCP servers come up; empty when MCP is unconfigured).
     from .mcp import get_mcp_tools

@@ -33,6 +33,7 @@ from mimir.tools.registry import (
     set_current_channel_id,
     set_spawn_config,
     spawn_claude_code,
+    spawn_codex,
 )
 
 
@@ -366,6 +367,65 @@ async def test_spawn_claude_code_omits_model_flag_when_not_set(
     argv = captured[0]
     assert "--model" not in argv
     assert argv[-1] == "run benchmark"
+
+
+# ─── spawn_codex (chainlink #293) ──────────────────────────────────
+
+
+def test_spawn_codex_is_coroutine() -> None:
+    # Same async wiring as spawn_claude_code — @tool routes async to
+    # ``.coroutine``; the sync ``.func`` must be unset so deepagents
+    # awaits it off the loop rather than blocking.
+    assert spawn_codex.coroutine is not None
+    assert asyncio.iscoroutinefunction(spawn_codex.coroutine)
+    assert spawn_codex.func is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_codex_handles_missing_config(tmp_path: Path) -> None:
+    set_spawn_config(None)
+    msg = await spawn_codex.ainvoke({"prompt": "x"})
+    assert "no spawn config" in msg
+
+
+@pytest.mark.asyncio
+async def test_spawn_codex_builds_codex_exec_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_spawn_config({"default_cwd": tmp_path})
+
+    from mimir.tools import registry
+
+    registry._spawn_reset_for_tests()  # isolate from other tests' rate window
+
+    captured: list[list[str]] = []
+
+    def _capture_argv(
+        argv: list[str],
+        cwd: str | None,
+        timeout_s: int,
+        env: dict[str, str] | None = None,
+    ) -> tuple[int, str, str]:
+        captured.append(argv)
+        return 0, "codex did the thing", ""
+
+    monkeypatch.setattr(registry, "_run_claude_subprocess", _capture_argv)
+    # Operator-injected extra flags must be threaded into the invocation.
+    monkeypatch.setenv("MIMIR_CODEX_SPAWN_ARGS", "--full-auto")
+
+    result_str = await spawn_codex.ainvoke(
+        {"prompt": "fix the bug", "model": "gpt-5-codex"}
+    )
+
+    assert captured, "subprocess was not called"
+    argv = captured[0]
+    assert argv[:2] == ["codex", "exec"]  # the non-interactive subcommand
+    assert "--full-auto" in argv  # MIMIR_CODEX_SPAWN_ARGS injected verbatim
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "gpt-5-codex"
+    assert argv[-2:] == ["--", "fix the bug"]  # -- separator, prompt last
+    # codex output is returned verbatim (no JSON parse like claude -p).
+    assert json.loads(result_str)["result"] == "codex did the thing"
 
 
 # ─── InjectedToolArg schema fix (chainlink #147) ───────────────────
