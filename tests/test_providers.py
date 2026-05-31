@@ -130,3 +130,18 @@ def test_extra_for_spec(model_spec, expected_extra):
     from mimir.providers import extra_for_spec
 
     assert extra_for_spec(model_spec) == expected_extra
+
+
+# ── claude-code availability — spawn_claude_code gate (PR3) ─────────
+
+
+def test_claude_code_available_reflects_cli_on_path(monkeypatch):
+    import mimir.providers as P
+
+    monkeypatch.setattr(
+        P.shutil, "which", lambda cmd: "/usr/bin/claude" if cmd == "claude" else None
+    )
+    assert P.claude_code_available() is True
+
+    monkeypatch.setattr(P.shutil, "which", lambda cmd: None)
+    assert P.claude_code_available() is False

@@ -32,6 +32,7 @@ the later slices in chainlink #292.)
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -104,6 +105,13 @@ class ProviderSpec:
             poller. Providers without their own poller (Moonshot today)
             map to ``"anthropic"`` — the same fallback the old
             ``build_quota_providers`` produced.
+
+        Runtime:
+        requires_cli: An external CLI that must be on ``PATH`` for this
+            provider's adapter to run (``"claude"`` for anthropic-max —
+            Max OAuth is driven through the ``claude`` subprocess). Empty
+            = no CLI dependency. Tool registration consults this via
+            :func:`claude_code_available` (chainlink #292).
     """
 
     name: str
@@ -118,6 +126,7 @@ class ProviderSpec:
     spec_prefixes: tuple[str, ...] = ()
     base_url_host_match: str = ""
     quota_provider_key: str = ""
+    requires_cli: str = ""
 
 
 # ── The registry ───────────────────────────────────────────────────────
@@ -172,6 +181,9 @@ _ANTHROPIC_MAX = ProviderSpec(
     # label directly (chainlink #292 review).
     spec_prefixes=("claude-code",),
     quota_provider_key="anthropic",
+    # Max OAuth runs through the ``claude`` CLI subprocess; spawn_claude_code
+    # shells out to it too. Tool registration gates on its presence.
+    requires_cli="claude",
 )
 _ANTHROPIC_API = ProviderSpec(
     name=PROVIDER_ANTHROPIC_API,
@@ -285,3 +297,19 @@ def extra_for_spec(model_spec: str) -> str:
     than a published extra; see ``agent._build_chat_model``)."""
     prefix = (model_spec or "").strip().partition(":")[0].lower()
     return SPEC_PREFIX_EXTRAS.get(prefix, "")
+
+
+def claude_code_available() -> bool:
+    """True when the ``claude`` CLI — the runtime dependency of the
+    claude-code (anthropic-max) provider, and of the ``spawn_claude_code``
+    tool that shells out to ``claude -p`` — is on ``PATH``.
+
+    Tool registration gates ``spawn_claude_code`` on this (chainlink #292):
+    a deployment routed to a non-Claude provider (e.g. Minimax) typically
+    has no ``claude`` CLI installed, so registering the tool there would
+    only offer the agent something that fails with "'claude' CLI not on
+    PATH". This checks *presence*, not auth state — a present-but-unauthed
+    CLI still surfaces the tool (it fails at call time instead); auth-state
+    probing is a heavier future refinement.
+    """
+    return shutil.which(_ANTHROPIC_MAX.requires_cli or "claude") is not None
