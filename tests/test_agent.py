@@ -530,6 +530,39 @@ async def test_run_turn_records_error_when_ainvoke_raises(tmp_path: Path):
     assert fake_saga.feedback_calls == []
 
 
+async def test_run_turn_emits_turn_failed_event_on_error(tmp_path: Path):
+    """Any turn that fails must emit a ``turn_failed`` event so the
+    failure is operator-visible (ops dashboard + events.jsonl), not just
+    a ``log.exception`` line. Uses a poller-trigger to confirm it fires
+    regardless of turn kind. Regression for the silently-dropped
+    poller-review 503 (chainlink #299)."""
+    import json
+
+    class _BoomAgent:
+        async def ainvoke(self, *a, **kw):
+            raise RuntimeError("codex 503 boom")
+
+        async def astream(self, *a, **kw):
+            raise RuntimeError("codex 503 boom")
+            yield  # unreachable — makes this an async generator
+
+    agent = _build_agent(tmp_path, fake_agent=_BoomAgent())  # type: ignore[arg-type]
+    event = AgentEvent(trigger="poller", channel_id="ch-1", content="review PR #511")
+    await agent.run_turn(event)
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    failed = [e for e in evs if e.get("type") == "turn_failed"]
+    assert len(failed) == 1, (
+        f"expected exactly one turn_failed event; "
+        f"got types {[e.get('type') for e in evs]}"
+    )
+    ev = failed[0]
+    assert ev.get("trigger") == "poller"  # fires for ANY turn kind
+    assert ev.get("channel_id") == "ch-1"
+    assert "codex 503 boom" in (ev.get("error") or "")
+
+
 # ── chat-history buffer append (regression for PR #181 drop) ────────
 
 
