@@ -9,8 +9,13 @@
 # Dockerfile when ANY poller is installed). pnpm is installed via
 # corepack which ships with Node 20.
 #
-# Pinned to a clone of main because letta-ai/social-cli is still
-# pre-tag. Bump to a release tag when one lands.
+# Pinned to a specific commit SHA because letta-ai/social-cli is still
+# pre-release (no tags published). Bump to the next SHA (or a release
+# tag when one lands) after verifying the fix/feature is included.
+#
+# Current pin: 4c8aab83 (2026-05-30) — includes the EXDEV fix from
+# PR #66 (shutil.move / moveFile fallback for cross-device rename) and
+# PR #68 (singular post.platform dispatch). chainlink #188.
 #
 # Symlink target: ``dist/cli.js`` (the built output) directly, NOT
 # the ``bin/`` directory listed in package.json's ``bin`` field —
@@ -24,15 +29,9 @@
 # ``chmod +x`` is required because ``dist/cli.js`` is shipped with
 # 0644 perms by default; the shebang (``#!/usr/bin/env node``)
 # handles dispatch once it's executable.
-
-# Clones letta-ai/social-cli's main branch (no tags published yet).
-# When upstream stabilizes + cuts tagged releases, pin to a commit hash
-# (``git clone ... && git -C /opt/social-cli checkout <sha>``) or a
-# release tag for build reproducibility. Until then, ``--depth 1`` on
-# main is the trade-off — fast clone, but the build is non-deterministic
-# across rebuilds.
 RUN corepack enable && corepack prepare pnpm@latest --activate \
- && git clone --depth 1 https://github.com/letta-ai/social-cli.git /opt/social-cli \
+ && git clone https://github.com/letta-ai/social-cli.git /opt/social-cli \
+ && git -C /opt/social-cli checkout 4c8aab8393a6c04568f8017f176d3d24055e3cc6 \
  && cd /opt/social-cli && pnpm install --frozen-lockfile && pnpm build \
  && chmod +x /opt/social-cli/dist/cli.js \
  && ln -sf /opt/social-cli/dist/cli.js /usr/local/bin/social-cli
