@@ -311,9 +311,14 @@ def _resolve_model(
         try:
             from langchain_codex_plus import ChatCodexPlus  # type: ignore[import-untyped]
         except ImportError as exc:
+            # Source the extra name from the registry (chainlink #292) so the
+            # hint stays correct as the table evolves; also the package is
+            # ``mimir-agent``, not ``mimir`` (the old hint named it wrong).
+            from .providers import extra_for_spec
+            extra = extra_for_spec(spec) or "codex-plus"
             raise ImportError(
-                "MIMIR_MODEL_SPEC=codex-plus:* requires the 'codex-plus' extra. "
-                "Install via `pip install 'mimir[codex-plus]'` "
+                f"MIMIR_MODEL_SPEC=codex-plus:* requires the '{extra}' extra. "
+                f"Install via `pip install 'mimir-agent[{extra}]'` "
                 "(or `uv pip install langchain-codex-plus`)."
             ) from exc
         model_name = spec.split(":", 1)[1]
