@@ -30,9 +30,9 @@ async def test_call_llm_warns_on_unknown_provider(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ):
     """When ``llm["provider"]`` is something other than the documented
-    three (``claude_code`` / ``anthropic`` / ``openai_compat``), the
-    fallback to openai_compat must emit a warning so the operator
-    can spot the typo."""
+    four (``claude_code`` / ``codex_plus`` / ``anthropic`` /
+    ``openai_compat``), the fallback to openai_compat must emit a
+    warning so the operator can spot the typo."""
     from mimir.saga import _llm
 
     # Stub _call_openai_compat so we don't hit the network.
@@ -69,19 +69,28 @@ async def test_call_llm_warns_on_unknown_provider(
 async def test_call_llm_no_warning_on_recognized_providers(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ):
-    """The fallback warning must NOT fire for the three documented
+    """The fallback warning must NOT fire for the four documented
     provider names — including ``openai_compat`` itself."""
     from mimir.saga import _llm
 
     def _stub_openai_compat(llm, *, prompt, max_tokens, temperature, system):
         return ""
 
+    async def _stub_codex_plus(llm, *, prompt, max_tokens, temperature, system):
+        return ""
+
     monkeypatch.setattr(_llm, "_call_openai_compat", _stub_openai_compat)
+    monkeypatch.setattr(_llm, "_call_codex_plus_async", _stub_codex_plus)
 
     with caplog.at_level(logging.WARNING, logger="mimir.saga._llm"):
         # openai_compat — the documented default; should not warn.
         await _llm.call_llm(
             {"provider": "openai_compat", "url": "http://stub"},
+            prompt="hello",
+        )
+        # codex_plus — recognized; dispatches to ChatCodexPlus, no warn.
+        await _llm.call_llm(
+            {"provider": "codex_plus", "model": "gpt-5.4-mini"},
             prompt="hello",
         )
         # No provider key at all — falls back to openai_compat; should not warn.
