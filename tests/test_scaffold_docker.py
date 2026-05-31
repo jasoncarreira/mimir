@@ -282,6 +282,53 @@ def test_render_dockerfile_has_base_layer():
     assert "astral.sh/uv/install.sh" in out
 
 
+# ── codex CLI install (chainlink #293) ─────────────────────────────
+
+
+def test_render_dockerfile_installs_codex_when_enabled():
+    """install_codex=True adds the codex CLI install to both modes."""
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode, install_codex=True)
+        assert "npm install -g @openai/codex" in out, mode
+
+
+def test_render_dockerfile_omits_codex_by_default():
+    """Default (no codex subscription) leaves the codex CLI out — and the
+    placeholder must always be substituted (no stray sentinel)."""
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode)
+        assert "npm install -g @openai/codex" not in out, mode
+        assert "__CODEX_INSTALL__" not in out, mode
+
+
+def test_scaffold_installs_codex_for_codex_plus_extra(tmp_path: Path):
+    """A pypi deployment with the codex-plus extra gets the codex CLI;
+    one without it doesn't."""
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", mimir_extras=["codex-plus", "discord"])
+    assert "npm install -g @openai/codex" in (home / "Dockerfile").read_text()
+
+    plain = tmp_path / "plain-home"
+    plain.mkdir()
+    scaffold(plain, mode="pypi", mimir_extras=["anthropic"])
+    assert "npm install -g @openai/codex" not in (plain / "Dockerfile").read_text()
+
+
+def test_scaffold_installs_codex_for_workspace_uv_extra(tmp_path: Path):
+    """Workspace mode detects the codex subscription from uv_extras (and
+    omits the install without it — symmetry with the pypi test)."""
+    home = tmp_path / "ws-codex-home"
+    home.mkdir()
+    scaffold(home, mode="workspace", uv_extras=["codex-plus"])
+    assert "npm install -g @openai/codex" in (home / "Dockerfile").read_text()
+
+    plain = tmp_path / "ws-plain-home"
+    plain.mkdir()
+    scaffold(plain, mode="workspace", uv_extras=["discord"])
+    assert "npm install -g @openai/codex" not in (plain / "Dockerfile").read_text()
+
+
 # ── scaffold() end-to-end ──────────────────────────────────────────
 
 

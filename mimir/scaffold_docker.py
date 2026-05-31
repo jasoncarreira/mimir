@@ -296,6 +296,8 @@ RUN apt-get update \\
 # mermaid CLI (used by mermaid-diagrams skill).
 RUN npm install -g @anthropic-ai/claude-code @mermaid-js/mermaid-cli
 
+__CODEX_INSTALL__
+
 # uv handles dep resolution + virtualenv inside the workspace clone.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \\
  && mv /root/.local/bin/uv /usr/local/bin/uv \\
@@ -392,6 +394,8 @@ RUN apt-get update \\
 # mermaid-diagrams skill. Both ship via npm.
 RUN npm install -g @anthropic-ai/claude-code @mermaid-js/mermaid-cli
 
+__CODEX_INSTALL__
+
 # (No ``uv`` install — PyPI mode uses pip directly against a
 # user-owned venv. Saves ~30 MB of image and one moving part.)
 
@@ -470,11 +474,30 @@ ENTRYPOINT ["/usr/local/bin/start.sh"]
 """
 
 
+def _codex_install_block(install_codex: bool) -> str:
+    """Dockerfile line installing the codex CLI, or a placeholder comment.
+
+    Installed for codex-subscription deployments (the ``codex-plus``
+    extra) so ``spawn_codex`` can shell out to ``codex exec`` and Codex
+    Plus auth (``~/.codex/auth.json``) is usable. Same npm-global pattern
+    as the bundled claude-code CLI.
+    """
+    if not install_codex:
+        return "# (codex CLI not installed — no codex-plus extra selected)"
+    return (
+        "# Codex CLI — codex-subscription deployments (codex-plus extra).\n"
+        "# spawn_codex shells out to ``codex exec``; Codex Plus auth lives\n"
+        "# at ~/.codex/auth.json. npm-global, like the claude-code CLI above.\n"
+        "RUN npm install -g @openai/codex"
+    )
+
+
 def render_dockerfile(
     fragments: list[Fragment],
     *,
     mode: ScaffoldMode = _DEFAULT_MODE,
     mimir_extras: list[str] | None = None,
+    install_codex: bool = False,
 ) -> str:
     """Stitch fragments into the base template via sentinel split, so
     a fragment that happens to contain the literal sentinel-string
@@ -506,6 +529,7 @@ def render_dockerfile(
     # Shared userdel/groupdel block — inlined here so the workspace
     # and pypi templates can't drift on the defensive cleanup logic.
     base = base.replace("__USERDEL_BLOCK__", _USERDEL_BLOCK)
+    base = base.replace("__CODEX_INSTALL__", _codex_install_block(install_codex))
     if not fragments:
         body = "# (no skills installed yet ship a dockerfile.fragment)"
     else:
@@ -1004,8 +1028,15 @@ def scaffold(
 
     # Dockerfile — full regen (sentinel-bounded fragments block lives
     # inside the generated content; the whole file is owned by us).
+    # Codex-subscription deployments (the ``codex-plus`` extra) need the
+    # codex CLI in the image — spawn_codex shells out to ``codex exec`` and
+    # Codex Plus auth uses it. Detect from whichever extras apply to the
+    # mode (pypi bakes mimir_extras into the image; workspace passes
+    # uv_extras to ``uv sync``).
+    _mode_extras = (mimir_extras if mode == "pypi" else uv_extras) or []
+    install_codex = "codex-plus" in _mode_extras
     df_text = render_dockerfile(
-        fragments, mode=mode, mimir_extras=mimir_extras,
+        fragments, mode=mode, mimir_extras=mimir_extras, install_codex=install_codex,
     )
     _write_if_changed(home / "Dockerfile", df_text, "Dockerfile")
 
