@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 # of provider truth. Re-exported here so existing
 # ``from .model_registry import PROVIDER_*`` imports keep working.
 from .providers import (
+    ANTHROPIC_OAUTH_MONITOR_LABEL,
     PROVIDER_ANTHROPIC_API,
     PROVIDER_ANTHROPIC_MAX,
     PROVIDER_MINIMAX,
@@ -165,7 +166,7 @@ def detect_route(
                 provider_name=PROVIDER_ANTHROPIC_MAX,
                 billing_mode=BILLING_SUBSCRIPTION,
                 monitor_env=sub_monitor_env,
-                monitor_label="Anthropic OAuth quota poller (5h + 7d windows)",
+                monitor_label=ANTHROPIC_OAUTH_MONITOR_LABEL,
             )
         if prefix_lower == "openai":
             return _api_or_sub_route(

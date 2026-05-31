@@ -44,6 +44,12 @@ PROVIDER_MINIMAX = "minimax"
 PROVIDER_MOONSHOT = "moonshot"
 PROVIDER_OPENAI = "openai"
 
+#: The Anthropic Max-OAuth usage-poller label. Shared by the
+#: ``anthropic-api`` subscription flip (below) and ``detect_route``'s
+#: explicit ``claude-code:`` branch, so the string lives in one place
+#: (chainlink #292 review).
+ANTHROPIC_OAUTH_MONITOR_LABEL = "Anthropic OAuth quota poller (5h + 7d windows)"
+
 
 @dataclass(frozen=True)
 class ProviderSpec:
@@ -160,10 +166,12 @@ _OPENAI = ProviderSpec(
 _ANTHROPIC_MAX = ProviderSpec(
     name=PROVIDER_ANTHROPIC_MAX,
     # Reached via an explicit ``claude-code:`` spec or the Claude-family
-    # ``--subscription`` flip — never by a bare name of its own.
+    # ``--subscription`` flip — never by a bare name of its own. No
+    # subscription_monitor_label: it's never the forward resolver's
+    # result, so detect_route's explicit claude-code: branch supplies the
+    # label directly (chainlink #292 review).
     spec_prefixes=("claude-code",),
     quota_provider_key="anthropic",
-    subscription_monitor_label="Anthropic OAuth quota poller (5h + 7d windows)",
 )
 _ANTHROPIC_API = ProviderSpec(
     name=PROVIDER_ANTHROPIC_API,
@@ -173,7 +181,7 @@ _ANTHROPIC_API = ProviderSpec(
     # (the protocol IS different — claude CLI subprocess, not HTTP).
     subscription_spec_prefix="claude-code",
     subscription_provider=PROVIDER_ANTHROPIC_MAX,
-    subscription_monitor_label="Anthropic OAuth quota poller (5h + 7d windows)",
+    subscription_monitor_label=ANTHROPIC_OAUTH_MONITOR_LABEL,
     spec_prefixes=("anthropic",),
     quota_provider_key="anthropic",
 )
