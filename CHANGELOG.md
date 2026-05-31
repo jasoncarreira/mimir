@@ -6,6 +6,53 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-05-31
+
+The unified provider-registry refactor, Codex support, and the
+post-update operator digest.
+
+### Added
+
+- **`spawn_codex` tool** (chainlink #293): a Codex analogue of
+  `spawn_claude_code` — runs `codex exec <prompt>` once, async, reusing
+  the shared spawn caps (per-hour / concurrency / recursion-depth).
+  Registered only when the `codex` CLI is on PATH. (#505)
+- **codex CLI in codex-subscription images** (chainlink #293):
+  `mimir scaffold-docker` installs `@openai/codex` when the deployment
+  uses the `codex-plus` extra, so `spawn_codex` + Codex Plus auth work in
+  the container. (#506)
+- **Post-update operator digest** (chainlink #284): after an approved
+  update, a first-occurrence `mimir_update_digest` feedback event
+  surfaces the scheduler-tick delta (new ticks to add), optional-skill
+  drift, and missing required env vars. (#499)
+- **`mimir setup` surfaces the model-adapter extra** — prints
+  `pip install mimir-agent[<extra>]` for the chosen model, so operators
+  install the adapter at setup rather than via a runtime ImportError.
+  (#504)
+
+### Changed
+
+- **Unified LLM-provider registry** (chainlink #292): the provider
+  taxonomy — name patterns, Anthropic-compat base URLs, quota pollers,
+  pip extras, CLI dependencies — now lives once in `mimir/providers.py`
+  as a `ProviderSpec` table. `detect_route` (routing) and
+  `build_quota_providers` (quota) consult it; adding a provider is one
+  table entry. Behavior-preserving. (#501, #504)
+- **`spawn_claude_code` is gated on claude-code availability** — moved
+  from the static tool list into a conditional registration on the
+  `claude` CLI being present, mirroring `spawn_codex`. (#503)
+- **social-cli pinned to a SHA** (chainlink #188): the scaffold fragment
+  now checks out a fixed commit instead of a floating `--depth 1` clone
+  of `main`, for reproducible image builds. (#500)
+
+### Fixed
+
+- **`mimir setup` codex-plus install hint** named the wrong distribution
+  (`mimir` → `mimir-agent`). (#504)
+- **`spawn_*` subprocesses no longer inherit stdin** (`DEVNULL`) —
+  `codex exec` reads stdin and would otherwise block a headless spawn
+  until timeout. (#505)
+
 ## [0.2.2] — 2026-05-30
 
 Packaging fix. The published wheel was missing several runtime data files,
@@ -434,7 +481,8 @@ stale docs pruned, license attribution corrected).
   tests pin the hook-pairing contract even when the integration test
   skips (CI without OAuth keychain, fresh contributors).
 
-[Unreleased]: https://github.com/jasoncarreira/mimir/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/jasoncarreira/mimir/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.3
 [0.2.2]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.2
 [0.2.1]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.1
 [0.2.0]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.0
