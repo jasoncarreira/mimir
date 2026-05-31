@@ -1241,6 +1241,24 @@ class Agent:
             except Exception:  # noqa: BLE001 — defensive boundary
                 log.exception("quota_pause emit failed; continuing")
 
+        # Algedonic: surface EVERY turn failure as an event so a dropped
+        # turn — a transient model 503, a timeout, quota exhaustion, or a
+        # plain bug — is operator-visible on the ops dashboard and
+        # queryable in events.jsonl, not just a ``log.exception`` line.
+        # Fires for ALL turn kinds (poller / user_message / scheduled /
+        # heartbeat) and ALL failure types; the ``turn_timeout`` and
+        # ``quota_exhausted`` events above remain as additional context.
+        # A transient poller-review 503 used to vanish entirely here —
+        # invisible AND (cursor-advanced) un-retried. (chainlink #299)
+        if error:
+            await log_event(
+                "turn_failed",
+                channel_id=event.channel_id,
+                turn_id=turn_id,
+                trigger=event.trigger,
+                error=error[:240],
+            )
+
         # Result fields drive the TurnRecord, so compute once and reuse.
         result_fields = derive_result_fields(messages)
 
