@@ -37,7 +37,7 @@ reachable only by the operator and their bridges. Defaults reflect that:
   home, run shell commands, and make outbound HTTP calls. Treat the agent
   home as you would any process with full local user privileges.
 - The agent does not have privilege separation between skills; a malicious
-  skill installed in `~/<agent-home>/.claude/skills/` can do anything the
+  skill installed in `~/<agent-home>/skills/` can do anything the
   agent process can do. Curate the skill set.
 - Outbound network calls (PyPI version-check, model-provider APIs, skill
   pollers) are not sandboxed; use OS-level egress filtering if that matters

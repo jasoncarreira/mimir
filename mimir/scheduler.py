@@ -401,7 +401,7 @@ class Scheduler:
         # ``docs/internal/SCHEDULER_CALLABLE_JOBS.md`` for the design.
         self._callables: dict[str, _CallableDef] = {}
         # Pollers framework (chainlink #3). Discovered from
-        # ``<home>/.claude/skills/**/pollers.json`` at startup +
+        # ``<home>/skills/**/pollers.json`` at startup +
         # on ``reload_pollers`` MCP tool. Skill directory drop is
         # the only install path; no mimir release required to add
         # a new poller. ``_pollers_dir`` is None until

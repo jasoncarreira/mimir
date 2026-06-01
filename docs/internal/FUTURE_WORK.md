@@ -583,7 +583,7 @@ per-author user-context enrichment.
   become `[[alice.bsky.social]]` for those entities. Other-platform
   entities stay lowercase-hyphenated.
 - **Skill:** an operator-supplied `bluesky/SKILL.md` under the agent's
-  `.claude/skills/`, NOT bundled. Teaches the sync→check→decide→dispatch
+  `skills/`, NOT bundled. Teaches the sync→check→decide→dispatch
   loop, the outbox YAML schema, the wiki integration ("ingest interesting
   notification authors as wiki entities"), and the failure modes from
   social-cli's `AGENT_GUIDE.md` (don't use `social-cli reply` on inbox
