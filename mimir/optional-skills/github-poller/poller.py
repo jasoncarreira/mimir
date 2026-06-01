@@ -248,29 +248,39 @@ def _load_review_skill_body(mimir_home: str, skill_path_override: str = "") -> s
     an absolute path that wins if non-empty (operator escape hatch
     for non-standard layouts).
     """
-    candidate = skill_path_override.strip()
-    if not candidate:
-        if not mimir_home:
-            return ""
-        # mimir skills live at ``<home>/skills/`` — NOT ``.claude/skills/``
-        # (that's the Claude Code convention; the framework migrates any
-        # legacy ``.claude/skills/`` into ``skills/`` at startup).
-        candidate = str(
-            Path(mimir_home) / "skills" / "review" / "SKILL.md"
-        )
-    try:
-        body = Path(candidate).read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        _eprint(
-            f"github-poller: review-skill preload disabled — "
-            f"could not read {candidate} ({exc})"
-        )
+    override = skill_path_override.strip()
+    if override:
+        candidates = [override]
+    elif mimir_home:
+        home = Path(mimir_home)
+        # mimir resolves skills from two locations, operator-first:
+        # ``<home>/skills/`` (operator-installed) then
+        # ``<home>/.mimir_builtin_skills/`` (the bundled refresh target).
+        # ``review`` is a BUNDLED skill (mimir/skills/review/), so on a
+        # normal install it lives in ``.mimir_builtin_skills/`` — checking
+        # only ``skills/`` (or, pre-#516, ``.claude/skills/``) missed it,
+        # so the preload silently no-op'd on every real deployment
+        # (chainlink #299 follow-up). ``.claude/skills/`` is the Claude
+        # Code convention; the framework migrates it into ``skills/`` at
+        # startup, so it isn't checked here.
+        candidates = [
+            str(home / "skills" / "review" / "SKILL.md"),
+            str(home / ".mimir_builtin_skills" / "review" / "SKILL.md"),
+        ]
+    else:
         return ""
-    if not body:
-        return ""
-    return (
-        "\n\n──── /review SKILL.md (pre-loaded) ────\n" + body
+    for candidate in candidates:
+        try:
+            body = Path(candidate).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if body:
+            return "\n\n──── /review SKILL.md (pre-loaded) ────\n" + body
+    _eprint(
+        "github-poller: review-skill preload disabled — none readable: "
+        + ", ".join(candidates)
     )
+    return ""
 
 
 def _eprint(*args: object, **kwargs: object) -> None:
