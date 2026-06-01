@@ -257,11 +257,14 @@ def test_review_needed_event_carries_submission_rule_and_marker(monkeypatch):
     assert isinstance(marker, dict)
     assert marker["signal_on_missing"] == "poller_review_missed_submission"
     assert "pull_request_review_write" in marker["tool_names"]
-    # Trailing space discriminates ``gh pr review <args>`` (real
-    # submission) from ``gh pr review-comment`` (standalone comment —
-    # NOT a submission). Mimir PR #236 review nit.
-    assert "gh pr review " in marker["bash_substrings"]
-    assert "gh pr review" not in marker["bash_substrings"]
+    # chainlink #308: the marker is now PR-specific so the framework can
+    # attribute WHICH review wasn't submitted (a duplicate review of one PR
+    # no longer masks an unreviewed sibling). The bash substring carries the
+    # PR number — ``gh pr review 234`` still discriminates a real submission
+    # from ``gh pr review-comment`` (which has no ``review 234`` substring) —
+    # and ``ref`` identifies the item in the emitted signal.
+    assert marker["bash_substrings"] == ["gh pr review 234"]
+    assert marker["ref"] == "#234"
 
 
 def test_non_review_events_carry_no_marker(monkeypatch):

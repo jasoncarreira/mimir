@@ -1494,6 +1494,97 @@ async def test_run_turn_emits_missed_submission_for_unsubmitted_poller_review(
     assert missed[0]["submitted"] == 0
 
 
+async def test_early_phase_poller_crash_still_emits_turn_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """chainlink #306: a crash in the EARLY phase of a poller turn (prompt
+    build / agent construction — before the model-loop try/except that emits
+    turn_failed) must still emit turn_failed, so poller-recovery doesn't leak
+    the in-flight item forever. The model-loop path is covered by
+    test_run_turn_emits_turn_failed_event_on_error; this covers the
+    pre-model-loop path, where the exception propagates out of
+    _run_turn_body."""
+    import json
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="x")])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=None,
+        session_manager=_FakeSessionManager(),
+    )
+
+    async def _boom(*a, **k):
+        raise RuntimeError("prompt build exploded")
+
+    monkeypatch.setattr(agent, "_build_turn_prompt", _boom)
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:gmail", content="x",
+        source_id="poller:gmail:1:batch:0",
+        extra={"poller_name": "gmail", "items": [{"event_type": "x", "number": 1}]},
+    )
+    with pytest.raises(RuntimeError, match="prompt build exploded"):
+        await agent.run_turn(event)
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    failed = [e for e in evs if e.get("type") == "turn_failed"]
+    assert len(failed) == 1, (
+        f"expected a turn_failed from the early-phase crash; "
+        f"got {[e.get('type') for e in evs]}"
+    )
+    assert failed[0]["trigger"] == "poller"
+    assert failed[0].get("phase") == "pre_model_loop"
+    assert failed[0].get("source_id") == "poller:gmail:1:batch:0"
+
+
+def test_expected_submission_markers_dedupes_top_level_when_items_present():
+    """chainlink #308 (finding #38): a top-level marker on a BATCH event is
+    the batch's shared declaration, NOT an extra Nth item — per-item markers
+    are authoritative, so ``expected`` isn't double-counted."""
+    from mimir.agent import _expected_submission_markers
+
+    m_top = {"bash_substrings": ["gh pr review "], "signal_on_missing": "x"}
+    m_item = {"bash_substrings": ["gh pr review 1"], "signal_on_missing": "x"}
+    batch = {"expected_tool_call": m_top, "items": [
+        {"number": 1, "expected_tool_call": m_item},
+        {"number": 2, "expected_tool_call": m_item},
+    ]}
+    # Per-item wins; the top-level marker is NOT added as a 3rd entry.
+    assert _expected_submission_markers(batch) == [m_item, m_item]
+
+
+async def test_no_missed_submission_signal_on_failed_poller_turn(tmp_path: Path):
+    """chainlink #308 (finding #22): a FAILED poller review turn already emits
+    turn_failed; the missed-submission check must NOT also fire (the review
+    obviously wasn't submitted because the turn died — double-signal noise)."""
+    import json
+
+    class _BoomAgent:
+        async def ainvoke(self, *a, **kw):
+            raise RuntimeError("codex 503 boom")
+
+        async def astream(self, *a, **kw):
+            raise RuntimeError("codex 503 boom")
+            yield  # unreachable — makes this an async generator
+
+    agent = _build_agent(tmp_path, fake_agent=_BoomAgent())  # type: ignore[arg-type]
+    marker = {
+        "tool_names": [], "bash_substrings": ["gh pr review "],
+        "signal_on_missing": "poller_review_missed_submission",
+    }
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:gh", content="review",
+        source_id="sid-1",
+        extra={"poller_name": "gh",
+               "items": [{"number": 5, "expected_tool_call": marker}]},
+    )
+    await agent.run_turn(event)
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    assert [e for e in evs if e.get("type") == "turn_failed"], "failure should be emitted"
+    assert [e for e in evs if e.get("type") == "poller_review_missed_submission"] == []
+
+
 async def test_run_turn_folds_injected_skill_atoms_into_record_no_autofeedback(
     tmp_path: Path, monkeypatch
 ):

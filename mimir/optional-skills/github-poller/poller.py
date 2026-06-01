@@ -321,7 +321,26 @@ def _emit(prompt: str, **extras: object) -> None:
         # skill closest to the domain) rather than hardcoded in
         # agent.py so adding a new poller's expectation is a skill-
         # side change.
-        extras["expected_tool_call"] = _REVIEW_EXPECTED_TOOL_CALL
+        # Per-PR marker (chainlink #308): a PR-specific ``gh pr review
+        # <number>`` substring (plus the PR url) lets the framework's
+        # per-item missed-submission check attribute WHICH review wasn't
+        # submitted, so a duplicate review of one PR can't mask an
+        # unreviewed sibling in the same batch. ``ref`` is surfaced in the
+        # signal. Falls back to the generic marker when the number is
+        # unavailable. (The MCP ``tool_names`` path isn't PR-attributable —
+        # it matches by name — but mimir-carreira reviews via ``gh``.)
+        marker = dict(_REVIEW_EXPECTED_TOOL_CALL)
+        number = extras.get("number")
+        url = extras.get("url")
+        pr_substrings: list[str] = []
+        if number is not None:
+            pr_substrings.append(f"gh pr review {number}")
+        if isinstance(url, str) and url:
+            pr_substrings.append(url)
+        if pr_substrings:
+            marker["bash_substrings"] = pr_substrings
+            marker["ref"] = url or f"#{number}"
+        extras["expected_tool_call"] = marker
     event = {
         "poller": POLLER_NAME,
         "source_platform": "github",
