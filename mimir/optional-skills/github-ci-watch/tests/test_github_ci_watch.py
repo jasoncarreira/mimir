@@ -48,8 +48,10 @@ def test_emits_only_new_completed_failures(monkeypatch, captured):
     assert {e["run_id"] for e in captured} == {2, 3}  # not 1 (green) or 4 (running)
     # url is populated (regression: poller used to read the wrong JSON field)
     assert all(e["url"].endswith(str(e["run_id"])) for e in captured)
-    # every observed run id is returned so the caller can update the seen-set
-    assert set(newly) == {1, 2, 3, 4}
+    # Only COMPLETED run ids are returned for the seen-set; the in-progress
+    # run (4) is intentionally left UNSEEN so its eventual failure can still
+    # emit on a later poll (chainlink #307).
+    assert set(newly) == {1, 2, 3}
 
 
 def test_skips_already_seen_failures(monkeypatch, captured):
@@ -63,3 +65,26 @@ def test_gh_error_yields_no_events(monkeypatch, captured):
     monkeypatch.setattr(poller, "_gh", lambda *a: None)  # gh CLI failed
     assert poller._check_repo("o/r", seen=set()) == []
     assert captured == []
+
+
+def test_in_progress_run_failure_emits_on_later_poll(monkeypatch, captured):
+    """chainlink #307: a run first observed while in-progress must NOT be
+    marked seen — so when it later completes as a failure, the failure still
+    emits. Pre-fix the in-progress observation recorded it as seen and its
+    eventual failure was silently skipped as already-reported."""
+    # Poll 1: run 7 is in-progress → no emit, and NOT added to the seen-set.
+    monkeypatch.setattr(
+        poller, "_gh", lambda *a: [_run(7, "failure", status="in_progress")]
+    )
+    newly1 = poller._check_repo("o/r", seen=set())
+    assert captured == []
+    assert set(newly1) == set()  # in-progress → left unseen for re-check
+
+    # Poll 2: run 7 has now completed as a failure. Because it was never
+    # recorded as seen, the failure emits.
+    monkeypatch.setattr(
+        poller, "_gh", lambda *a: [_run(7, "failure", status="completed")]
+    )
+    newly2 = poller._check_repo("o/r", seen=set(newly1))
+    assert {(e["event_type"], e["run_id"]) for e in captured} == {("ci_failure", 7)}
+    assert set(newly2) == {7}

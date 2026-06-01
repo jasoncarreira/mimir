@@ -108,16 +108,28 @@ def _check_repo(repo: str, seen: set[int]) -> list[int]:
         run_id = run.get("databaseId")
         if run_id is None:
             continue
+
+        status = run.get("status", "")
+        conclusion = run.get("conclusion", "")
+
+        # Only mark a run "seen" once it has COMPLETED (chainlink #307). An
+        # in-progress / queued run observed now concludes later — recording
+        # it as seen HERE meant its eventual failure was silently skipped on
+        # the next poll (it was already in ``seen``). A non-terminal run is
+        # left UNSEEN so it's re-checked each poll until it concludes, at
+        # which point a failure still emits.
+        if status != "completed":
+            continue
+        # Completed → record for the seen-set (whether new or already-seen,
+        # so the caller's union + cap keeps it).
         newly_seen.append(run_id)
 
         if run_id in seen:
             continue  # already reported
 
-        status = run.get("status", "")
-        conclusion = run.get("conclusion", "")
-
-        # Only emit for completed failures we haven't seen yet.
-        if status == "completed" and conclusion in FAILURE_CONCLUSIONS:
+        # A successful / skipped / cancelled run is recorded as seen above
+        # (so we don't re-check it) but isn't alerted — only failing ones.
+        if conclusion in FAILURE_CONCLUSIONS:
             workflow = run.get("workflowName") or run.get("name") or "unknown"
             created = run.get("createdAt", "")
             url = run.get("url", "")
