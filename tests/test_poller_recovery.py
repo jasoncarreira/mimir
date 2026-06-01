@@ -1,0 +1,220 @@
+"""Tests for ``mimir.poller_recovery`` — framework recovery of poller
+turns whose triggered turn failed (chainlink #262).
+
+The reconciler reads ``turn_failed`` / ``turn_completed`` outcome records
+(stamped with ``source_id`` by #517) from a synthetic events.jsonl and
+acts on the matching in-flight stash entries. No real agent / dispatcher
+is involved — outcomes are written directly and ``enqueue`` is a fake.
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from mimir import event_logger, poller_recovery
+from mimir.models import AgentEvent
+
+
+def _ts(seconds_ago: float) -> str:
+    return (datetime.now(tz=timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+
+
+def _write_outcome(events_path: Path, *, type_: str, channel_id: str,
+                   source_id: str, ts: str) -> None:
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    rec = {"type": type_, "timestamp": ts,
+           "channel_id": channel_id, "source_id": source_id}
+    with events_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def _make_event(source_id: str, *, channel_id: str = "poller:gmail",
+                items: list | None = None) -> AgentEvent:
+    return AgentEvent(
+        trigger="poller",
+        channel_id=channel_id,
+        content="do the thing",
+        source_id=source_id,
+        source="poller",
+        extra={"poller_name": "gmail", "items": items or [{"id": "m1"}]},
+    )
+
+
+class _FakeEnqueue:
+    def __init__(self) -> None:
+        self.calls: list[AgentEvent] = []
+
+    async def __call__(self, event: AgentEvent) -> bool:
+        self.calls.append(event)
+        return True
+
+
+# ── stash ────────────────────────────────────────────────────────────
+
+
+def test_stash_roundtrip(tmp_path: Path):
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    state = poller_recovery._load_state(tmp_path)
+    assert "sid-1" in state["inflight"]
+    assert state["inflight"]["sid-1"]["attempts"] == 0
+    assert state["inflight"]["sid-1"]["event"]["source_id"] == "sid-1"
+
+
+def test_stash_noop_without_source_id(tmp_path: Path):
+    ev = _make_event("x")
+    ev.source_id = None
+    poller_recovery.stash_enqueued_event(tmp_path, ev)
+    assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+
+
+# ── reconcile ────────────────────────────────────────────────────────
+
+
+async def test_reconcile_drops_completed(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    _write_outcome(events, type_="turn_completed", channel_id="poller:gmail",
+                   source_id="sid-1", ts=_ts(5))
+    enq = _FakeEnqueue()
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=events, enqueue=enq,
+    )
+    assert summary == {"reenqueued": 0, "completed": 1, "gave_up": 0}
+    assert enq.calls == []
+    assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+
+
+async def test_reconcile_reenqueues_failed(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                   source_id="sid-1", ts=_ts(5))
+    enq = _FakeEnqueue()
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=events, enqueue=enq, max_attempts=3,
+    )
+    assert summary["reenqueued"] == 1
+    assert len(enq.calls) == 1
+    # The re-enqueued event is a faithfully-rebuilt AgentEvent.
+    assert enq.calls[0].source_id == "sid-1"
+    assert enq.calls[0].trigger == "poller"
+    assert enq.calls[0].extra["items"] == [{"id": "m1"}]
+    # Still in-flight, attempt incremented (awaiting the retry's outcome).
+    st = poller_recovery._load_state(tmp_path)
+    assert st["inflight"]["sid-1"]["attempts"] == 1
+
+
+async def test_reconcile_gives_up_at_cap(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    event_logger._reset_logger_for_tests()
+    event_logger.init_logger(events, session_id="test")
+    try:
+        poller_recovery.stash_enqueued_event(
+            tmp_path, _make_event("sid-1", items=[{"id": "m1"}, {"id": "m2"}]),
+        )
+        _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                       source_id="sid-1", ts=_ts(5))
+        enq = _FakeEnqueue()
+        summary = await poller_recovery.reconcile_failed_turns(
+            poller_name="gmail", channel_id="poller:gmail",
+            persist_dir=tmp_path, events_path=events, enqueue=enq,
+            max_attempts=0,  # give up on the first failure
+        )
+        assert summary == {"reenqueued": 0, "completed": 0, "gave_up": 1}
+        assert enq.calls == []
+        assert "sid-1" not in poller_recovery._load_state(tmp_path)["inflight"]
+        # A one-shot gave-up SIGNAL landed in events.jsonl. ``*_gave_up`` →
+        # feedback.classify maps it to a negative algedonic signal (#515).
+        recs = [json.loads(ln) for ln in events.read_text().splitlines() if ln.strip()]
+        gave_up = [r for r in recs if r.get("type") == "poller_turn_gave_up"]
+        assert len(gave_up) == 1
+        assert gave_up[0]["source_id"] == "sid-1"
+        assert gave_up[0]["attempts"] == 1
+        assert gave_up[0]["poller"] == "gmail"
+    finally:
+        event_logger._reset_logger_for_tests()
+
+
+async def test_reconcile_cap_boundary_reenqueue_then_give_up(tmp_path: Path):
+    """``max_attempts=1``: the first failure re-enqueues, a second failure
+    for the same source_id gives up — exercises the cap transition in one
+    reconcile window (two failures, oldest-first)."""
+    events = tmp_path / "events.jsonl"
+    event_logger._reset_logger_for_tests()
+    event_logger.init_logger(events, session_id="test")
+    try:
+        poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+        _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                       source_id="sid-1", ts=_ts(10))
+        _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                       source_id="sid-1", ts=_ts(5))
+        enq = _FakeEnqueue()
+        summary = await poller_recovery.reconcile_failed_turns(
+            poller_name="gmail", channel_id="poller:gmail",
+            persist_dir=tmp_path, events_path=events, enqueue=enq, max_attempts=1,
+        )
+        assert summary["reenqueued"] == 1
+        assert summary["gave_up"] == 1
+        assert "sid-1" not in poller_recovery._load_state(tmp_path)["inflight"]
+    finally:
+        event_logger._reset_logger_for_tests()
+
+
+async def test_reconcile_ignores_other_channel(tmp_path: Path):
+    """A turn_failed on a DIFFERENT poller's channel must not touch this
+    poller's in-flight entry (channels are isolated)."""
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    _write_outcome(events, type_="turn_failed", channel_id="poller:OTHER",
+                   source_id="sid-1", ts=_ts(5))
+    enq = _FakeEnqueue()
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=events, enqueue=enq,
+    )
+    assert summary == {"reenqueued": 0, "completed": 0, "gave_up": 0}
+    assert poller_recovery._load_state(tmp_path)["inflight"]["sid-1"]["attempts"] == 0
+
+
+async def test_reconcile_no_inflight_fast_path(tmp_path: Path):
+    """Nothing stashed → no-op, but the watermark still advances so the
+    first real reconcile after events accrue doesn't rescan history."""
+    events = tmp_path / "events.jsonl"
+    _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                   source_id="whatever", ts=_ts(5))
+    enq = _FakeEnqueue()
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=events, enqueue=enq,
+    )
+    assert summary == {"reenqueued": 0, "completed": 0, "gave_up": 0}
+    assert poller_recovery._load_state(tmp_path)["last_reconciled"] != ""
+
+
+async def test_reconcile_watermark_prevents_reprocessing(tmp_path: Path):
+    """An outcome processed in one reconcile is older than the advanced
+    watermark on the next, so it isn't acted on twice."""
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                   source_id="sid-1", ts=_ts(5))
+    enq = _FakeEnqueue()
+    common = dict(poller_name="gmail", channel_id="poller:gmail",
+                  persist_dir=tmp_path, events_path=events, enqueue=enq,
+                  max_attempts=3)
+    s1 = await poller_recovery.reconcile_failed_turns(**common)
+    assert s1["reenqueued"] == 1
+    s2 = await poller_recovery.reconcile_failed_turns(**common)
+    assert s2["reenqueued"] == 0  # the same failure is now behind the watermark
+    assert len(enq.calls) == 1
+
+
+def test_reconcile_missing_events_file_is_safe(tmp_path: Path):
+    """Reading outcomes from a non-existent events.jsonl returns nothing
+    rather than raising."""
+    assert poller_recovery._read_outcomes_since(
+        tmp_path / "nope.jsonl", "poller:gmail", "",
+    ) == []
