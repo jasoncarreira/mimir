@@ -81,7 +81,8 @@ async def test_reconcile_drops_completed(tmp_path: Path):
         poller_name="gmail", channel_id="poller:gmail",
         persist_dir=tmp_path, events_path=events, enqueue=enq,
     )
-    assert summary == {"reenqueued": 0, "completed": 1, "gave_up": 0}
+    assert summary["completed"] == 1
+    assert summary["reenqueued"] == 0 and summary["gave_up"] == 0
     assert enq.calls == []
     assert poller_recovery._load_state(tmp_path)["inflight"] == {}
 
@@ -123,7 +124,8 @@ async def test_reconcile_gives_up_at_cap(tmp_path: Path):
             persist_dir=tmp_path, events_path=events, enqueue=enq,
             max_attempts=0,  # give up on the first failure
         )
-        assert summary == {"reenqueued": 0, "completed": 0, "gave_up": 1}
+        assert summary["gave_up"] == 1
+        assert summary["reenqueued"] == 0 and summary["completed"] == 0
         assert enq.calls == []
         assert "sid-1" not in poller_recovery._load_state(tmp_path)["inflight"]
         # A one-shot gave-up SIGNAL landed in events.jsonl. ``*_gave_up`` →
@@ -132,7 +134,8 @@ async def test_reconcile_gives_up_at_cap(tmp_path: Path):
         gave_up = [r for r in recs if r.get("type") == "poller_turn_gave_up"]
         assert len(gave_up) == 1
         assert gave_up[0]["source_id"] == "sid-1"
-        assert gave_up[0]["attempts"] == 1
+        # attempts = successful re-fires (#305/#317): max_attempts=0 → 0 re-fires.
+        assert gave_up[0]["attempts"] == 0
         assert gave_up[0]["poller"] == "gmail"
     finally:
         event_logger._reset_logger_for_tests()
@@ -175,7 +178,7 @@ async def test_reconcile_ignores_other_channel(tmp_path: Path):
         poller_name="gmail", channel_id="poller:gmail",
         persist_dir=tmp_path, events_path=events, enqueue=enq,
     )
-    assert summary == {"reenqueued": 0, "completed": 0, "gave_up": 0}
+    assert summary["reenqueued"] == 0 and summary["completed"] == 0 and summary["gave_up"] == 0
     assert poller_recovery._load_state(tmp_path)["inflight"]["sid-1"]["attempts"] == 0
 
 
@@ -190,7 +193,7 @@ async def test_reconcile_no_inflight_fast_path(tmp_path: Path):
         poller_name="gmail", channel_id="poller:gmail",
         persist_dir=tmp_path, events_path=events, enqueue=enq,
     )
-    assert summary == {"reenqueued": 0, "completed": 0, "gave_up": 0}
+    assert summary["reenqueued"] == 0 and summary["gave_up"] == 0
     assert poller_recovery._load_state(tmp_path)["last_reconciled"] != ""
 
 
@@ -218,3 +221,89 @@ def test_reconcile_missing_events_file_is_safe(tmp_path: Path):
     assert poller_recovery._read_outcomes_since(
         tmp_path / "nope.jsonl", "poller:gmail", "",
     ) == []
+
+
+# ── back-pressure + GC (chainlink #305 / #310) ───────────────────────
+
+
+class _FullEnqueue:
+    """enqueue() that rejects every event (channel queue full → False)."""
+    def __init__(self) -> None:
+        self.calls: list[AgentEvent] = []
+
+    async def __call__(self, event: AgentEvent) -> bool:
+        self.calls.append(event)
+        return False
+
+
+class _RaisingEnqueue:
+    def __init__(self) -> None:
+        self.calls: list[AgentEvent] = []
+
+    async def __call__(self, event: AgentEvent) -> bool:
+        self.calls.append(event)
+        raise RuntimeError("dispatcher boom")
+
+
+async def test_reconcile_defers_on_queue_full_without_burning_attempt(tmp_path: Path):
+    """chainlink #305: enqueue() returning False (queue full) must NOT count
+    as a re-enqueue or burn a wedge-guard attempt — the entry stays in-flight
+    and the watermark is not advanced past the outcome, so a later reconcile
+    with capacity re-fires it (rather than the item being silently re-dropped
+    and the attempt wasted)."""
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                   source_id="sid-1", ts=_ts(5))
+    full = _FullEnqueue()
+    s1 = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=events, enqueue=full, max_attempts=3,
+    )
+    assert s1["deferred"] == 1
+    assert s1["reenqueued"] == 0
+    # Entry retained, attempt NOT burned.
+    assert poller_recovery._load_state(tmp_path)["inflight"]["sid-1"]["attempts"] == 0
+
+    # A second reconcile, now with capacity, re-fires the same outcome.
+    ok = _FakeEnqueue()
+    s2 = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=events, enqueue=ok, max_attempts=3,
+    )
+    assert s2["reenqueued"] == 1
+    assert len(ok.calls) == 1
+
+
+async def test_reconcile_defers_when_enqueue_raises(tmp_path: Path):
+    """chainlink #305: a raising enqueue() is treated as back-pressure —
+    deferred, not a burned attempt or a lost item."""
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                   source_id="sid-1", ts=_ts(5))
+    s = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=events, enqueue=_RaisingEnqueue(),
+        max_attempts=3,
+    )
+    assert s["deferred"] == 1
+    assert s["reenqueued"] == 0
+    assert poller_recovery._load_state(tmp_path)["inflight"]["sid-1"]["attempts"] == 0
+
+
+async def test_reconcile_gcs_expired_stash(tmp_path: Path):
+    """chainlink #310: an in-flight entry with no terminal outcome within the
+    TTL is GC'd, so a vanished turn (crash/restart that never logged an
+    outcome) can't grow .recovery.json forever."""
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-old"))
+    st = poller_recovery._load_state(tmp_path)
+    st["inflight"]["sid-old"]["stashed_at"] = _ts(72 * 3600)  # 72h ago
+    poller_recovery._save_state(tmp_path, st)
+    s = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=tmp_path / "events.jsonl",
+        enqueue=_FakeEnqueue(), stash_ttl_hours=48.0,
+    )
+    assert s["expired"] == 1
+    assert poller_recovery._load_state(tmp_path)["inflight"] == {}
