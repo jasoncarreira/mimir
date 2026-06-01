@@ -274,29 +274,37 @@ class VectorIndex:
         callers must be tolerant (recall.py treats empty FAISS results
         as "no semantic candidates" and falls back to FTS5).
         """
-        if not FAISS_AVAILABLE or self._index is None or self._index.ntotal == 0:
+        if not FAISS_AVAILABLE:
             return []
 
         q = np.array(query_vec, dtype=np.float32).reshape(1, -1)
         faiss.normalize_L2(q)
-        # Over-fetch to account for soft-removed entries.
-        search_k = min(top_k + len(self._removed) + 10, self._index.ntotal)
 
-        with self._lock:
-            scores, indices = self._index.search(q, search_k)
-
+        # chainlink #319: hold the lock for the WHOLE read. The emptiness
+        # check, the soft-removed count, the FAISS search, AND the
+        # _removed / _pos_to_id post-processing all touch state that add() /
+        # remove() mutate under this same lock. Pre-fix only the .search()
+        # call was guarded, so a concurrent add/remove could race the
+        # pre-check or the position→id mapping (stale/torn reads, missing
+        # ids). The post-processing is O(top_k) so the hold stays short.
         out: list[tuple[str, float]] = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx < 0:
-                continue
-            if idx in self._removed:
-                continue
-            aid = self._pos_to_id.get(idx)
-            if aid is None:
-                continue
-            out.append((aid, float(score)))
-            if len(out) >= top_k:
-                break
+        with self._lock:
+            if self._index is None or self._index.ntotal == 0:
+                return []
+            # Over-fetch to account for soft-removed entries.
+            search_k = min(top_k + len(self._removed) + 10, self._index.ntotal)
+            scores, indices = self._index.search(q, search_k)
+            for score, idx in zip(scores[0], indices[0]):
+                if idx < 0:
+                    continue
+                if idx in self._removed:
+                    continue
+                aid = self._pos_to_id.get(idx)
+                if aid is None:
+                    continue
+                out.append((aid, float(score)))
+                if len(out) >= top_k:
+                    break
         return out
 
     def rebuild_if_needed(self, conn: sqlite3.Connection) -> None:

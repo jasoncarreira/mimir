@@ -109,9 +109,19 @@ jobs:
         # process so sys.modules starts fresh per skill. (chainlink #299)
         run: |
           set -e
+          ran=0
           for tdir in mimir/optional-skills/*/tests; do
             if [ -d "$tdir" ]; then
               echo "== $tdir =="
               uv run pytest -q "$tdir"
+              ran=$((ran + 1))
             fi
           done
+          # chainlink #330: fail loudly if the glob matched no test dirs
+          # (e.g. an optional-skills layout change) rather than passing
+          # vacuously and silently dropping this coverage.
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::no optional-skills test dirs matched mimir/optional-skills/*/tests"
+            exit 1
+          fi
+          echo "ran optional-skills tests for $ran skill(s)"

@@ -190,7 +190,7 @@ def _current_version() -> str:
         pass
     try:
         import importlib.metadata
-        return importlib.metadata.version("mimir-agent")
+        return importlib.metadata.version(_pypi_package_name())
     except Exception:
         return "unknown"
 
@@ -301,7 +301,7 @@ def _compute_update_digest(home: Path, prior_version: str) -> UpdateDigest:
     # Force the importlib.metadata path so we get the new version number.
     try:
         import importlib.metadata
-        new_version = importlib.metadata.version("mimir-agent")
+        new_version = importlib.metadata.version(_pypi_package_name())
     except Exception:
         new_version = _current_version()
 

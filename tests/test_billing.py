@@ -51,6 +51,20 @@ def test_detect_billing_mode_auto_quota_via_oauth_token(monkeypatch):
     assert detect_billing_mode() is BillingMode.QUOTA
 
 
+def test_detect_billing_mode_quota_via_codex_plus_spec(monkeypatch):
+    """chainlink #315: a ``codex-plus:`` subscription spec is its own QUOTA
+    signal, so a Codex-only install (no Anthropic creds, no explicit
+    override) keeps its quota view instead of auto-detecting PAY_AS_YOU_GO
+    and dropping the Codex quota provider. A bare ``openai:`` (pay-per-token
+    API) spec is NOT a subscription and stays pay-as-you-go."""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    assert detect_billing_mode(model_spec="codex-plus:gpt-5.4") is BillingMode.QUOTA
+    assert detect_billing_mode(model_spec="openai:gpt-4o") is BillingMode.PAY_AS_YOU_GO
+    assert detect_billing_mode(model_spec="anthropic:claude-x") is BillingMode.PAY_AS_YOU_GO
+
+
 def test_detect_billing_mode_auto_quota_via_oauth_credentials_path(
     monkeypatch, tmp_path
 ):
