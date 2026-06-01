@@ -142,12 +142,25 @@ class GitError(RuntimeError):
     are exposed for callers that want to discriminate (e.g. "nothing
     to commit" is a soft path)."""
 
-    def __init__(self, returncode: int, stderr: str, cmd: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        returncode: int,
+        stderr: str,
+        cmd: tuple[str, ...],
+        stdout: str = "",
+    ) -> None:
         super().__init__(
             f"git {' '.join(cmd)} failed (rc={returncode}): {stderr.strip()}"
         )
         self.returncode = returncode
         self.stderr = stderr
+        # git writes "nothing to commit, working tree clean" (and the
+        # "no changes added to commit" hint) to STDOUT, not stderr — so
+        # callers discriminating the soft "nothing to commit" path must
+        # inspect stdout too (chainlink #299 follow-up: the post-turn
+        # commit hook emitted a spurious git_commit_failed every turn
+        # because it only checked stderr, which is empty for that case).
+        self.stdout = stdout
         self.cmd = cmd
 
 
@@ -190,7 +203,7 @@ async def _git(
     stdout = stdout_b.decode("utf-8", errors="replace")
     stderr = stderr_b.decode("utf-8", errors="replace")
     if proc.returncode != 0:
-        raise GitError(proc.returncode or -1, stderr, args)
+        raise GitError(proc.returncode or -1, stderr, args, stdout=stdout)
     return GitResult(stdout=stdout, stderr=stderr)
 
 
@@ -280,9 +293,24 @@ async def commit_turn_changes(
     try:
         await _git("commit", "-m", msg, cwd=home)
     except GitError as exc:
-        # "nothing to commit" can happen if everything got gitignored
-        # between status and add. Treat as soft no-op.
-        if "nothing to commit" in (exc.stderr or "") or "nothing to commit" in str(exc):
+        # "nothing to commit" is a soft no-op, not a failure. It happens
+        # when everything staged got gitignored between status and add, or
+        # when the only ``git status`` changes are embedded-repo gitlinks
+        # that ``git add -A`` won't stage (e.g. a nested git repo the agent
+        # left in a scratch dir under the tracked home). git prints that
+        # message — and "no changes added to commit" / "working tree
+        # clean" — to STDOUT, so check both streams. Checking stderr alone
+        # (empty for this case) emitted a spurious git_commit_failed every
+        # turn (chainlink #299 follow-up).
+        combined = f"{exc.stdout or ''}\n{exc.stderr or ''}"
+        if any(
+            phrase in combined
+            for phrase in (
+                "nothing to commit",
+                "no changes added to commit",
+                "working tree clean",
+            )
+        ):
             return
         await log_event(
             "git_commit_failed",
