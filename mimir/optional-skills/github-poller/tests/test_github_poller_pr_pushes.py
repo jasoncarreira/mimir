@@ -180,7 +180,17 @@ def test_emit_payload_is_jsonable(monkeypatch):
     """
     captured_lines: list[str] = []
 
-    def fake_print(*args, **kwargs):
+    import sys as _sys
+
+    def fake_print(*args, file=_sys.stdout, **kwargs):
+        # Only stdout-bound JSONL lines are events. ``_eprint`` diagnostics
+        # (e.g. the review-skill-preload warning when
+        # MIMIR_GITHUB_PRELOAD_REVIEW_SKILL=1 but the skill is absent) go to
+        # stderr and must NOT be parsed as JSON — without this filter the
+        # warning string reached json.loads() and the test failed in the
+        # container (chainlink #299 review).
+        if file is not _sys.stdout:
+            return
         captured_lines.append(args[0])
 
     monkeypatch.setattr(poller, "print", fake_print, raising=False)
@@ -271,12 +281,12 @@ def test_non_review_events_carry_no_marker(monkeypatch):
 
 def test_review_skill_preload_inlines_full_body_when_env_set(monkeypatch, tmp_path):
     """``MIMIR_GITHUB_PRELOAD_REVIEW_SKILL=1`` inlines the
-    ``<MIMIR_HOME>/.claude/skills/review/SKILL.md`` body alongside the
+    ``<MIMIR_HOME>/skills/review/SKILL.md`` body alongside the
     rule. This is the workaround for the reasoning-before-Skill-loads
     issue — full rule set in context before the model commits its
     output structure."""
     mimir_home = tmp_path / "home"
-    skill_path = mimir_home / ".claude" / "skills" / "review" / "SKILL.md"
+    skill_path = mimir_home / "skills" / "review" / "SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.write_text(
         "---\nname: review\n---\n"
@@ -300,7 +310,7 @@ def test_review_skill_preload_off_by_default(monkeypatch, tmp_path):
     """No env var → rule only, no inline body. Default-off keeps the
     per-event token cost bounded."""
     mimir_home = tmp_path / "home"
-    skill_path = mimir_home / ".claude" / "skills" / "review" / "SKILL.md"
+    skill_path = mimir_home / "skills" / "review" / "SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.write_text("SHOULD NOT APPEAR", encoding="utf-8")
 
@@ -352,7 +362,7 @@ def test_review_skill_preload_explicit_path_override(monkeypatch, tmp_path):
 
 def test_review_requested_first_sighting_emits(captured_emits, monkeypatch):
     """Empty cursor + a PR where ``mimir-carreira`` is in
-    ``requested_reviewers`` → emit ``pr_review_requested``."""
+    ``requested_reviewers`` → emit ``pr_review_requested`` (attempt 1)."""
     monkeypatch.setattr(
         poller, "_gh_api",
         lambda endpoint, token: [
@@ -363,23 +373,28 @@ def test_review_requested_first_sighting_emits(captured_emits, monkeypatch):
     count, _, new_rr = poller._check_pr_pushes(
         "o/r", token="t", me="mimir-carreira",
         pr_heads={"42": "sha"},  # already seen, no push fires
-        pr_review_requests=set(),
+        pr_review_requests={},
     )
     assert count == 1
     rr_events = [e for e in captured_emits if e.get("event_type") == "pr_review_requested"]
     assert len(rr_events) == 1
     assert rr_events[0]["number"] == 42
     assert rr_events[0]["requested_reviewer"] == "mimir-carreira"
+    assert rr_events[0]["attempt"] == 1
+    assert rr_events[0]["max_attempts"] == poller.REVIEW_REQUEST_MAX_ATTEMPTS
     assert "Review requested" in rr_events[0]["prompt"]
-    # Cursor records the PR so we don't re-emit next poll.
-    assert new_rr == {"42"}
+    # Cursor records attempt 1; re-emits next poll if ``me`` stays
+    # requested (chainlink #299 — recovers a review dropped by a dead turn).
+    assert new_rr == {"42": 1}
 
 
-def test_review_requested_already_in_cursor_does_not_re_emit(
+def test_review_requested_re_emits_while_still_requested(
     captured_emits, monkeypatch,
 ):
-    """PR is in the prior cursor AND still requested → no re-emit.
-    The transition has already been surfaced."""
+    """PR already had one recorded attempt AND ``me`` is still requested
+    → RE-EMIT (attempt 2), not silence. The #299 fix: a still-requested
+    PR means the prior review never landed, so retry until the cap.
+    (Old behavior was emit-once-never-retry — the drop bug.)"""
     monkeypatch.setattr(
         poller, "_gh_api",
         lambda endpoint, token: [
@@ -390,19 +405,23 @@ def test_review_requested_already_in_cursor_does_not_re_emit(
     count, _, new_rr = poller._check_pr_pushes(
         "o/r", token="t", me="mimir-carreira",
         pr_heads={"42": "sha"},
-        pr_review_requests={"42"},
+        pr_review_requests={"42": 1},
     )
+    assert count == 1
     rr_events = [e for e in captured_emits if e.get("event_type") == "pr_review_requested"]
-    assert rr_events == []
-    # Still in the new cursor — the request is still active.
-    assert new_rr == {"42"}
+    assert len(rr_events) == 1
+    assert rr_events[0]["attempt"] == 2
+    # Retry prompts flag the re-request so the agent knows a prior
+    # attempt produced no submitted review.
+    assert "STILL on the reviewers list" in rr_events[0]["prompt"]
+    assert new_rr == {"42": 2}
 
 
 def test_review_request_removed_drops_from_cursor(captured_emits, monkeypatch):
-    """Cursor had PR #42 flagged but the latest poll shows ``me`` is
-    no longer in ``requested_reviewers`` (review submitted, request
-    removed, etc.) → PR drops from the cursor so a later re-request
-    would fire again. No event emitted on drop."""
+    """Cursor had PR #42 with a recorded attempt but the latest poll
+    shows ``me`` is no longer in ``requested_reviewers`` (review
+    submitted, request removed) → PR drops from the cursor so a later
+    re-request fires fresh at attempt 1. No event emitted on drop."""
     monkeypatch.setattr(
         poller, "_gh_api",
         lambda endpoint, token: [
@@ -412,18 +431,18 @@ def test_review_request_removed_drops_from_cursor(captured_emits, monkeypatch):
     count, _, new_rr = poller._check_pr_pushes(
         "o/r", token="t", me="mimir-carreira",
         pr_heads={"42": "sha"},
-        pr_review_requests={"42"},
+        pr_review_requests={"42": 1},
     )
     rr_events = [e for e in captured_emits if e.get("event_type") == "pr_review_requested"]
     assert rr_events == []
-    assert new_rr == set()
+    assert new_rr == {}
 
 
 def test_review_requested_re_fires_after_being_removed(
     captured_emits, monkeypatch,
 ):
     """Operator un-requests, then re-requests → second add fires
-    again. Tests the drop-and-rejoin cycle."""
+    again at attempt 1. Tests the drop-and-rejoin cycle (empty entry)."""
     monkeypatch.setattr(
         poller, "_gh_api",
         lambda endpoint, token: [
@@ -431,15 +450,16 @@ def test_review_requested_re_fires_after_being_removed(
                 requested_reviewers=["mimir-carreira"]),
         ],
     )
-    # Prior poll: was requested, then removed (cursor cleared).
+    # Prior poll: was requested, then removed (cursor cleared for #42).
     count, _, new_rr = poller._check_pr_pushes(
         "o/r", token="t", me="mimir-carreira",
         pr_heads={"42": "sha"},
-        pr_review_requests=set(),  # empty — last poll saw removal
+        pr_review_requests={},  # empty — last poll saw removal
     )
     rr_events = [e for e in captured_emits if e.get("event_type") == "pr_review_requested"]
     assert len(rr_events) == 1
-    assert new_rr == {"42"}
+    assert rr_events[0]["attempt"] == 1
+    assert new_rr == {"42": 1}
 
 
 def test_review_requested_other_reviewer_does_not_trigger(
@@ -457,11 +477,11 @@ def test_review_requested_other_reviewer_does_not_trigger(
     count, _, new_rr = poller._check_pr_pushes(
         "o/r", token="t", me="mimir-carreira",
         pr_heads={"42": "sha"},
-        pr_review_requests=set(),
+        pr_review_requests={},
     )
     rr_events = [e for e in captured_emits if e.get("event_type") == "pr_review_requested"]
     assert rr_events == []
-    assert new_rr == set()
+    assert new_rr == {}
 
 
 def test_review_requested_empty_me_skips_detection(captured_emits, monkeypatch):
@@ -477,11 +497,11 @@ def test_review_requested_empty_me_skips_detection(captured_emits, monkeypatch):
     count, _, new_rr = poller._check_pr_pushes(
         "o/r", token="t", me="",  # empty
         pr_heads={"42": "sha"},
-        pr_review_requests=set(),
+        pr_review_requests={},
     )
     rr_events = [e for e in captured_emits if e.get("event_type") == "pr_review_requested"]
     assert rr_events == []
-    assert new_rr == set()
+    assert new_rr == {}
 
 
 def test_review_requested_event_carries_submission_marker(monkeypatch):
@@ -507,6 +527,138 @@ def test_review_requested_event_carries_submission_marker(monkeypatch):
     marker = ev.get("expected_tool_call")
     assert isinstance(marker, dict)
     assert marker["signal_on_missing"] == "poller_review_missed_submission"
+
+
+# ─── re-emit / wedge-guard / give-up (chainlink #299) ───────────────
+
+
+def test_review_request_re_emits_until_cap_then_gives_up(monkeypatch):
+    """Full lifecycle: while ``me`` stays requested, each poll re-emits
+    pr_review_requested up to the cap; the next poll emits a one-shot
+    pr_review_request_gave_up SIGNAL; subsequent polls are dormant.
+    Drives the same PR through CAP+2 polls (print-capture so both the
+    prompt re-emits AND the signal are visible)."""
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda endpoint, token: [
+            _pr(42, "sha", login="alice",
+                requested_reviewers=["mimir-carreira"]),
+        ],
+    )
+    cap = poller.REVIEW_REQUEST_MAX_ATTEMPTS
+    rr: dict = {}
+    req_per_poll, gaveup_per_poll = [], []
+    for _ in range(cap + 2):
+        captured.clear()
+        _, _, rr = poller._check_pr_pushes(
+            "o/r", token="t", me="mimir-carreira",
+            pr_heads={"42": "sha"}, pr_review_requests=rr,
+        )
+        req_per_poll.append(
+            sum(1 for e in captured if e.get("event_type") == "pr_review_requested")
+        )
+        gaveup_per_poll.append(
+            sum(1 for e in captured if e.get("signal") == "pr_review_request_gave_up")
+        )
+    # Polls 1..cap: one review-request each. Poll cap+1: the give-up
+    # signal. Poll cap+2: dormant (nothing emitted).
+    assert req_per_poll == [1] * cap + [0, 0]
+    assert gaveup_per_poll == [0] * cap + [1, 0]
+    # Parked at the dormant sentinel (cap + 1).
+    assert rr == {"42": cap + 1}
+
+
+def test_review_request_gave_up_signal_shape(monkeypatch):
+    """At the cap (and ``me`` still requested) the poller emits a SIGNAL
+    record — ``signal`` not ``prompt`` (no turn) — that ``feedback.classify``
+    maps to a negative ``gave_up`` algedonic signal. Asserts the record
+    shape the renderer consumes (repo / number / url / attempts)."""
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda endpoint, token: [
+            _pr(42, "sha", login="alice", url="https://gh/o/r/pull/42",
+                requested_reviewers=["mimir-carreira"]),
+        ],
+    )
+    cap = poller.REVIEW_REQUEST_MAX_ATTEMPTS
+    count, _, new_rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"},
+        pr_review_requests={"42": cap},  # already at the cap
+    )
+    assert count == 1
+    assert [e for e in captured if e.get("event_type") == "pr_review_requested"] == []
+    gaveup = [e for e in captured if e.get("signal") == "pr_review_request_gave_up"]
+    assert len(gaveup) == 1
+    ev = gaveup[0]
+    assert "prompt" not in ev          # signal-only → no turn spawned
+    assert ev["number"] == 42
+    assert ev["repo"] == "o/r"
+    assert ev["url"] == "https://gh/o/r/pull/42"
+    assert ev["attempts"] == cap
+    assert new_rr == {"42": cap + 1}   # dormant sentinel
+
+
+def test_review_request_dormant_after_give_up(monkeypatch):
+    """Once parked at the dormant sentinel (cap+1) with ``me`` still
+    requested, the poller emits nothing — neither a retry nor another
+    give-up — and carries the sentinel forward."""
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda endpoint, token: [
+            _pr(42, "sha", login="alice",
+                requested_reviewers=["mimir-carreira"]),
+        ],
+    )
+    cap = poller.REVIEW_REQUEST_MAX_ATTEMPTS
+    count, _, new_rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"},
+        pr_review_requests={"42": cap + 1},  # dormant
+    )
+    assert count == 0
+    assert captured == []
+    assert new_rr == {"42": cap + 1}
+
+
+def test_review_request_give_up_resets_when_removed(monkeypatch):
+    """A given-up PR (dormant sentinel) whose ``me`` is later removed
+    drops from the cursor, so a future re-request starts fresh at
+    attempt 1 — the give-up doesn't permanently blacklist the PR."""
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda endpoint, token: [
+            _pr(42, "sha", login="alice", requested_reviewers=[]),
+        ],
+    )
+    cap = poller.REVIEW_REQUEST_MAX_ATTEMPTS
+    count, _, new_rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"},
+        pr_review_requests={"42": cap + 1},  # dormant, gave up earlier
+    )
+    assert count == 0
+    assert new_rr == {}
+
+
+def test_coerce_review_requests_migrates_and_validates():
+    """``_coerce_review_requests`` migrates the pre-#299 bare-list cursor
+    to ``{key: attempts}`` and defends against a corrupt/hand-edited
+    entry."""
+    # Pre-#299 list format → one recorded attempt each (eligible for retry).
+    assert poller._coerce_review_requests(["7", "9"]) == {"7": 1, "9": 1}
+    assert poller._coerce_review_requests([7, 9]) == {"7": 1, "9": 1}
+    # New dict format passes through.
+    assert poller._coerce_review_requests({"7": 2}) == {"7": 2}
+    # Defensive: bool (an int subclass), negatives, junk → dropped/empty.
+    assert poller._coerce_review_requests({"7": True}) == {}
+    assert poller._coerce_review_requests({"7": -1}) == {}
+    assert poller._coerce_review_requests(None) == {}
+    assert poller._coerce_review_requests("garbage") == {}
 
 
 # ── commit-enrichment tests ───────────────────────────────────────────────────
