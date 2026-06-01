@@ -563,6 +563,110 @@ async def test_run_turn_emits_turn_failed_event_on_error(tmp_path: Path):
     assert "codex 503 boom" in (ev.get("error") or "")
 
 
+# ── turn-outcome item identity for poller recovery (chainlink #262) ──
+
+
+async def test_turn_failed_carries_poller_item_identity(tmp_path: Path):
+    """A failed poller turn stamps the originating item identity
+    (source_id + poller_name + items) onto ``turn_failed`` so the
+    framework can correlate the failure to the specific poller item(s)
+    and re-emit them (chainlink #262). No ``turn_completed`` on failure."""
+    import json
+
+    class _BoomAgent:
+        async def ainvoke(self, *a, **kw):
+            raise RuntimeError("codex 503 boom")
+
+        async def astream(self, *a, **kw):
+            raise RuntimeError("codex 503 boom")
+            yield  # unreachable — makes this an async generator
+
+    agent = _build_agent(tmp_path, fake_agent=_BoomAgent())  # type: ignore[arg-type]
+    items = [{"event_type": "pr_review_requested",
+              "repo": "jasoncarreira/mimir", "number": 511}]
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="review PR #511",
+        source_id="poller:github-activity:1700:batch:0",
+        extra={"poller_name": "github-activity", "items": items},
+    )
+    await agent.run_turn(event)
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    failed = [e for e in evs if e.get("type") == "turn_failed"]
+    assert len(failed) == 1
+    ev = failed[0]
+    assert ev.get("source_id") == "poller:github-activity:1700:batch:0"
+    assert ev.get("poller_name") == "github-activity"
+    assert ev.get("items") == items
+    # No success event on a failed turn.
+    assert [e for e in evs if e.get("type") == "turn_completed"] == []
+
+
+async def test_turn_completed_emitted_for_successful_poller_turn(tmp_path: Path):
+    """A successful poller turn emits ``turn_completed`` carrying the same
+    item identity, so the framework can advance the per-poller watermark
+    past the processed item(s) and not re-emit them (chainlink #262)."""
+    import json
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="reviewed")])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=None,
+        session_manager=_FakeSessionManager(),
+    )
+    items = [{"event_type": "pr_review_requested",
+              "repo": "jasoncarreira/mimir", "number": 511}]
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="review PR #511",
+        source_id="poller:github-activity:1700:batch:0",
+        extra={"poller_name": "github-activity", "items": items},
+    )
+    await agent.run_turn(event)
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    completed = [e for e in evs if e.get("type") == "turn_completed"]
+    assert len(completed) == 1
+    ev = completed[0]
+    assert ev.get("trigger") == "poller"
+    assert ev.get("channel_id") == "poller:github-activity"
+    assert ev.get("source_id") == "poller:github-activity:1700:batch:0"
+    assert ev.get("poller_name") == "github-activity"
+    assert ev.get("items") == items
+    # Success ⇒ no failure event.
+    assert [e for e in evs if e.get("type") == "turn_failed"] == []
+
+
+async def test_turn_completed_not_emitted_for_non_poller_turn(tmp_path: Path):
+    """``turn_completed`` is poller-gated — a successful ``user_message``
+    turn must NOT emit it, so events.jsonl doesn't grow a success event
+    per conversational turn (chainlink #262)."""
+    import json
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="hi back")])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
+        session_manager=_FakeSessionManager(),
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-123",
+        content="hello",
+    )
+    await agent.run_turn(event)
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = (
+        [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+        if events_log.exists() else []
+    )
+    assert [e for e in evs if e.get("type") == "turn_completed"] == []
+
+
 # ── chat-history buffer append (regression for PR #181 drop) ────────
 
 
