@@ -409,6 +409,39 @@ def _rewrite_context_from_buffer(
 
 
 # Default system prompt — production cutover replaces this with mimir's
+def _turn_outcome_identity(event: AgentEvent) -> dict:
+    """Origin-correlation fields stamped onto the turn-outcome events
+    (``turn_failed`` / ``turn_completed``) so a turn's outcome can be
+    traced back to its triggering event — and, for poller turns, to the
+    specific item(s) the turn was meant to process (chainlink #262).
+
+    The framework consumer (``mimir.pollers``) reads these off
+    events.jsonl to gate a per-poller watermark: advance past items
+    whose turn succeeded, re-emit (capped) items whose turn failed —
+    closing the "poll advanced the cursor but the triggered turn died"
+    drop (#299) for pollers that have no live state to reconcile against
+    (gmail, issue comments), the way #516 did for review requests via
+    ``requested_reviewers``.
+
+    Returns ``source_id`` for any event that has one (the poller batch's
+    stable per-fire id); adds ``poller_name`` + ``items`` (the per-item
+    extras list) only for poller-triggered turns, so non-poller turns
+    don't bloat their outcome events with absent fields.
+    """
+    out: dict = {}
+    if event.source_id:
+        out["source_id"] = event.source_id
+    if event.trigger == "poller":
+        extra = event.extra or {}
+        poller_name = extra.get("poller_name")
+        if poller_name:
+            out["poller_name"] = poller_name
+        items = extra.get("items")
+        if items is not None:
+            out["items"] = items
+    return out
+
+
 def _turn_matched_expected_tool_call(events: list, markers: dict) -> bool:
     """Generic "did the turn satisfy an expected-tool-call expectation?"
 
@@ -1257,6 +1290,23 @@ class Agent:
                 turn_id=turn_id,
                 trigger=event.trigger,
                 error=error[:240],
+                **_turn_outcome_identity(event),
+            )
+        elif event.trigger == "poller":
+            # Success counterpart to ``turn_failed`` for poller turns
+            # (chainlink #262): records that this poller item's turn was
+            # processed without erroring, so the framework consumer can
+            # advance the per-poller watermark past it and NOT re-emit it.
+            # Poller-gated so events.jsonl doesn't grow a success event per
+            # user / scheduled / heartbeat turn; not in
+            # ``feedback._EVENT_RULES``, so it never surfaces algedonically
+            # — it's a plumbing record for the poller-recovery consumer.
+            await log_event(
+                "turn_completed",
+                channel_id=event.channel_id,
+                turn_id=turn_id,
+                trigger=event.trigger,
+                **_turn_outcome_identity(event),
             )
 
         # Result fields drive the TurnRecord, so compute once and reuse.
