@@ -248,6 +248,7 @@ def _resolve_model(
     *,
     max_retries: int = 6,
     max_tokens: int = 0,
+    reasoning_effort: str = "",
     rate_limit_callback: Callable[[Any], None] | None = None,
 ) -> BaseChatModel:
     """Translate a mimir-friendly model spec into a constructed BaseChatModel.
@@ -264,6 +265,8 @@ def _resolve_model(
       - BaseChatModel instance  → pass-through (Bedrock/Vertex/custom)
 
     ``max_retries`` / ``max_tokens`` only apply to the non-subprocess paths.
+    ``reasoning_effort`` is forwarded to Codex Plus (default ``"none"``) and to
+    OpenAI reasoning models; other providers ignore it.
 
     ``rate_limit_callback`` is currently honored only for
     ``codex-plus:``. Pass it from the agent so successful Codex Plus
@@ -292,7 +295,7 @@ def _resolve_model(
                 "mimir-agent extra — install it directly:\n"
                 "  pip install \"langchain-claude-code @ git+"
                 "https://github.com/jasoncarreira/langchain-claude-code"
-                "@f7af15b613d1e016437740f739321316730cdd39\"\n"
+                "@c03f075c8b84fb0c718de1aabdd6493f5d191786\"\n"
                 "Restored as an extra once upstream patches "
                 "(see issue #268) merge + a release is cut."
             ) from exc
@@ -305,10 +308,18 @@ def _resolve_model(
         # mimir deployment (bench / production mimirbot / future
         # daemons), so the approval gate is pure friction. Match the
         # SDK invariant.
-        return ChatClaudeCode(
-            model=model_name,
-            permission_mode="bypassPermissions",
-        )
+        # Thread reasoning effort when set to a real level; "none"/unset →
+        # omit it so Claude keeps its adaptive default. Needs the
+        # langchain-claude-code fork's ``effort`` field (re-pinned in
+        # pyproject) — only passed when non-empty so older builds don't choke.
+        cc_kwargs: dict[str, Any] = {
+            "model": model_name,
+            "permission_mode": "bypassPermissions",
+        }
+        _cc_eff = (reasoning_effort or "").strip()
+        if _cc_eff and _cc_eff != "none":
+            cc_kwargs["effort"] = _cc_eff
+        return ChatClaudeCode(**cc_kwargs)
     if spec.startswith("codex-plus:"):
         try:
             from langchain_codex_plus import ChatCodexPlus  # type: ignore[import-untyped]
@@ -324,14 +335,13 @@ def _resolve_model(
                 "(or `uv pip install langchain-codex-plus`)."
             ) from exc
         model_name = spec.split(":", 1)[1]
-        # ``reasoning_effort="none"`` matches mimir's general
-        # preference for cheap inference — operators who need deeper
-        # reasoning can override via the langchain-codex-plus
-        # construction parameters (out of scope for the spec string
-        # alone; bind a custom BaseChatModel instance for that).
+        # reasoning_effort defaults to "none" (mimir's cheap-inference
+        # baseline) but is settable across providers via
+        # MIMIR_MODEL_REASONING_EFFORT (config.model_reasoning_effort),
+        # threaded in here. An empty value keeps the "none" default.
         return ChatCodexPlus(
             model=model_name,
-            reasoning_effort="none",
+            reasoning_effort=(reasoning_effort or "none"),
             rate_limit_callback=rate_limit_callback,
         )
     # langchain ``init_chat_model`` resolves provider extras at call time
@@ -350,6 +360,17 @@ def _resolve_model(
         init_params["max_tokens"] = int(max_tokens)
     if spec.startswith("openai:") and _supports_responses_api():
         init_params["use_responses_api"] = True
+    # Reasoning effort, per provider. Skip when unset or "none" (only Codex
+    # has a "none" level). OpenAI reasoning models take ``reasoning_effort``;
+    # real Claude (langchain-anthropic) takes ``effort``. Gate the Anthropic
+    # case on a claude-named spec so Minimax / Kimi on the anthropic-compat
+    # endpoint — which don't support effort — are left untouched.
+    _effort = (reasoning_effort or "").strip()
+    if _effort and _effort != "none":
+        if spec.startswith("openai:"):
+            init_params["reasoning_effort"] = _effort
+        elif spec.startswith("anthropic:") and "claude" in spec.lower():
+            init_params["effort"] = _effort
     return init_chat_model(spec, **init_params)
 
 
@@ -968,6 +989,7 @@ class Agent:
                     model_spec,
                     max_retries=getattr(self._config, "model_max_retries", 6),
                     max_tokens=getattr(self._config, "model_max_tokens", 0),
+                    reasoning_effort=getattr(self._config, "model_reasoning_effort", ""),
                     rate_limit_callback=codex_plus_callback,
                 ),
                 tools=all_mimir_tools(),

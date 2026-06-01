@@ -1079,16 +1079,16 @@ wheels = [
 
 [[package]]
 name = "langchain-codex-plus"
-version = "0.0.1"
+version = "0.0.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "langchain-core" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/05/2e/575a90189e259f3753d32dadce58c91654d945fc882165f427a853450e9d/langchain_codex_plus-0.0.1.tar.gz", hash = "sha256:63fdb5870969b62cbedc7193f8e7a1ad029021eb3815fcd6a5e3f278da8efc7e", size = 131924, upload-time = "2026-05-21T03:07:37.799Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3a/c5/ebe2e03f5efd060f17bb1cec721558e4f9155f5a78e254612cdca392d648/langchain_codex_plus-0.0.2.tar.gz", hash = "sha256:72f590db118b7b2aae2ce811a550fa60d1d0f9ef557a3f11bddb6a9924582dd7", size = 132172, upload-time = "2026-06-01T20:45:42.892Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/47/65/5c1b40db498d5127c7aacb2619f95db61af0039d4e28768d45979613b5d1/langchain_codex_plus-0.0.1-py3-none-any.whl", hash = "sha256:7cb7d8346427a6f14139adc543bf6d0d07d742e3cb6144116b95edc89fc41a02", size = 33438, upload-time = "2026-05-21T03:07:36.52Z" },
+    { url = "https://files.pythonhosted.org/packages/13/f8/8bd004dc41475cda5d6d1d9039c08fac88dc1e2f212426eef66fe7c136bf/langchain_codex_plus-0.0.2-py3-none-any.whl", hash = "sha256:216640ac955ee6de8328268c98d87de75dd1a7b1aed4501f150ba306a9ec155a", size = 33752, upload-time = "2026-06-01T20:45:41.829Z" },
 ]
 
 [[package]]
@@ -1289,7 +1289,7 @@ wheels = [
 
 [[package]]
 name = "mimir-agent"
-version = "0.2.7"
+version = "0.2.8"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

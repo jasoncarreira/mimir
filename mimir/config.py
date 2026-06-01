@@ -703,6 +703,12 @@ class Config:
     # default so direct ``Config(...)`` constructions stay non-breaking.
     model_max_tokens: int = 0
 
+    # Reasoning effort for providers that support it. Forwarded to Codex Plus
+    # (default "none" — mimir's cheap-inference baseline) and to OpenAI
+    # reasoning models; Anthropic/minimax/claude-code ignore it (they use a
+    # thinking budget, not an effort level). "" leaves each provider's default.
+    model_reasoning_effort: str = ""
+
     @classmethod
     def from_env(cls) -> "Config":
         home = Path(_env("MIMIR_HOME") or Path.cwd()).resolve()
@@ -721,6 +727,7 @@ class Config:
             model_spec=_env("MIMIR_MODEL_SPEC", "claude-code:claude-sonnet-4-6"),
             model_max_retries=_env_int("MIMIR_MODEL_MAX_RETRIES", 6),
             model_max_tokens=_env_int("MIMIR_MODEL_MAX_TOKENS", 0),
+            model_reasoning_effort=_env("MIMIR_MODEL_REASONING_EFFORT", ""),
             effort=_env("MIMIR_EFFORT", "high"),
             embed_model=_env("MIMIR_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
             saga_endpoint=_env("SAGA_ENDPOINT", "http://localhost:3002"),
