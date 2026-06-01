@@ -306,6 +306,53 @@ def test_review_skill_preload_inlines_full_body_when_env_set(monkeypatch, tmp_pa
     assert "After drafting, **submit via `gh pr review`**" in ev["prompt"]
 
 
+def test_review_skill_preload_finds_bundled_builtin_skill(monkeypatch, tmp_path):
+    """``review`` is a BUNDLED skill, so on a real install it lives at
+    ``<home>/.mimir_builtin_skills/review/`` — NOT the operator
+    ``<home>/skills/`` dir. The preload must resolve it there too;
+    checking only ``skills/`` is why it silently no-op'd on mimirbot
+    (chainlink #299 follow-up — the review skill WAS installed, just in
+    the bundled location)."""
+    mimir_home = tmp_path / "home"
+    skill_path = mimir_home / ".mimir_builtin_skills" / "review" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text(
+        "---\nname: review\n---\n# PR Review\nBUNDLED REVIEW BODY.",
+        encoding="utf-8",
+    )
+
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(mimir_home))
+    monkeypatch.setenv("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL", "1")
+
+    poller._emit("base", event_type="pr_opened")
+    ev = captured[0]
+    assert "/review SKILL.md (pre-loaded)" in ev["prompt"]
+    assert "BUNDLED REVIEW BODY." in ev["prompt"]
+
+
+def test_review_skill_preload_operator_skill_wins_over_builtin(monkeypatch, tmp_path):
+    """When the review skill exists in BOTH the operator dir and the
+    bundled dir, the operator copy wins — matches mimir's dual-location
+    last-source-wins resolution (operator overrides bundled)."""
+    mimir_home = tmp_path / "home"
+    op = mimir_home / "skills" / "review" / "SKILL.md"
+    op.parent.mkdir(parents=True)
+    op.write_text("---\nname: review\n---\nOPERATOR REVIEW BODY.", encoding="utf-8")
+    bundled = mimir_home / ".mimir_builtin_skills" / "review" / "SKILL.md"
+    bundled.parent.mkdir(parents=True)
+    bundled.write_text("---\nname: review\n---\nBUNDLED REVIEW BODY.", encoding="utf-8")
+
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(mimir_home))
+    monkeypatch.setenv("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL", "1")
+
+    poller._emit("base", event_type="pr_opened")
+    ev = captured[0]
+    assert "OPERATOR REVIEW BODY." in ev["prompt"]
+    assert "BUNDLED REVIEW BODY." not in ev["prompt"]
+
+
 def test_review_skill_preload_off_by_default(monkeypatch, tmp_path):
     """No env var → rule only, no inline body. Default-off keeps the
     per-event token cost bounded."""

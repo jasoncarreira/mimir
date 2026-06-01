@@ -14,10 +14,10 @@ env:
       description: "GitHub login mimir authors as. Events from this login are filtered out."
       example: "mimir-carreira"
     - name: MIMIR_GITHUB_PRELOAD_REVIEW_SKILL
-      description: "Set to true to preload review SKILL.md on PR events. If yes also set MIMIR_GITHUB_REVIEW_SKILL_PATH."
+      description: "Set to true to inline the bundled review skill's SKILL.md into PR-review prompts. Auto-resolved from <home>/skills/review/ or <home>/.mimir_builtin_skills/review/ — no path needed for a standard install (the review skill ships bundled)."
       example: "true"
     - name: MIMIR_GITHUB_REVIEW_SKILL_PATH
-      description: "Absolute path to review SKILL.md on your install (only used when MIMIR_GITHUB_PRELOAD_REVIEW_SKILL=true)."
+      description: "Optional absolute-path override for the review SKILL.md. Defaults to the auto-resolved <home>/skills|.mimir_builtin_skills/review/ location; only set this for a non-standard layout."
       example: "<absolute path to review SKILL.md on your install>"
       only_if: "MIMIR_GITHUB_PRELOAD_REVIEW_SKILL=true"
 ---
