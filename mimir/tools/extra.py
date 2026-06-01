@@ -16,7 +16,6 @@ set_memory_client pattern; ``server.py:build_app`` wires them at startup.
 from __future__ import annotations
 
 import json
-import shlex
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
@@ -271,14 +270,23 @@ _SHELL_STATE: dict[str, Any] = {
 def shell_exec(command: str) -> str:
     """Execute a shell command and return stdout + stderr + exit code.
 
-    Runs commands via ``subprocess.run`` with ``shell=False`` after
-    ``shlex.split`` parsing — the real injection guard. There is no
-    allowlist; the agent is trusted with shell access within the
-    operator-configured container (see module docstring). Use
-    ``bash_async`` for jobs that may exceed the sync timeout.
+    Runs the command through ``bash -lc`` (a real login shell), so shell
+    syntax works: ``cd``-chains, pipes, redirects, ``&&`` / ``||``, globs,
+    and environment expansion. This matches ``bash_async`` and the #226
+    trust model — the agent is trusted with shell access within the
+    operator-configured container, which (not an in-process parse) is the
+    security boundary; the prohibited-action guard middleware still screens
+    the command string before it runs. Use ``bash_async`` for jobs that may
+    exceed the sync timeout.
+
+    Previously this used ``shlex.split`` + ``shell=False`` as an "injection
+    guard," but the module's own trust model contradicted it: ``bash_async``
+    already exposes a full shell, so half-gating only the sync path was
+    security theatre — while it silently broke ``cd``/pipes/redirects/``$``
+    for the agent (shell-wrapper fix, 2026-06).
 
     Args:
-        command: The full command line (will be split via shlex).
+        command: The full shell command line (run via ``bash -lc``).
 
     Returns:
         Formatted block: stdout, stderr, exit code.
@@ -286,12 +294,8 @@ def shell_exec(command: str) -> str:
     if not command or not command.strip():
         return "shell_exec failed: command is required"
     try:
-        argv = shlex.split(command)
-    except ValueError as exc:
-        return f"shell_exec failed: shell-parse error: {exc}"
-    try:
-        proc = subprocess.run(
-            argv,
+        proc = subprocess.run(  # noqa: S603 — shell exec by design; trusted container (#226), guard middleware screens the command
+            ["bash", "-lc", command],
             capture_output=True,
             text=True,
             timeout=_SHELL_STATE["timeout_s"],
@@ -300,7 +304,7 @@ def shell_exec(command: str) -> str:
     except subprocess.TimeoutExpired:
         return f"shell_exec timed out after {_SHELL_STATE['timeout_s']}s"
     except FileNotFoundError as exc:
-        return f"shell_exec failed: command not found: {exc}"
+        return f"shell_exec failed: bash not found: {exc}"
 
     parts = [f"exit={proc.returncode}"]
     if proc.stdout:

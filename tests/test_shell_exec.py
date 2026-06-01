@@ -1,11 +1,17 @@
-"""Tests for mimir.tools.extra:shell_exec (chainlink #226).
+"""Tests for mimir.tools.extra:shell_exec (chainlink #226 + the 2026-06
+shell-wrapper fix).
 
 Pins the trust posture of ``shell_exec``: the agent's shell tools
 (``shell_exec`` + ``bash_async``) are intentionally unrestricted within
 the trusted container. There is no allowlist gate. ``set_shell_allowlist``
 was a deepagents-migration PoC affordance that was never wired and has
-been removed; these tests defend against re-introducing a half-wired
-gate (the worst-of-both-worlds state the chainlink flagged).
+been removed; these tests defend against re-introducing a half-wired gate.
+
+shell_exec runs via ``bash -lc`` (a real shell, matching ``bash_async``),
+so shell syntax — cd-chains, pipes, redirects, env expansion — works; the
+prohibited-action guard middleware (not an in-process parse) screens
+commands. These tests pin that capability so a future refactor doesn't
+silently revert to the shlex+shell=False path that broke it.
 """
 from __future__ import annotations
 
@@ -58,18 +64,43 @@ def test_shell_exec_still_blocks_empty_command():
     assert "command is required" in result
 
 
-def test_shell_exec_still_uses_shlex_split_no_shell_expansion():
-    """Defence: shell=False via shlex.split is the *real* injection guard,
-    not the (now-removed) allowlist. Pin it.
-    """
+def test_shell_exec_expands_shell_syntax():
+    """shell-wrapper fix: shell_exec runs via bash -lc, so shell syntax is
+    honored — env vars expand (this test used to pin the OPPOSITE under the
+    shlex+shell=False path)."""
     result = shell_exec.invoke({"command": "echo $HOME"})
     assert "exit=0" in result
-    # shell=False means $HOME is passed as a literal token, not expanded.
-    assert "$HOME" in result
+    # bash -lc expands $HOME — the literal token must NOT survive in stdout.
+    assert "$HOME" not in result.split("stdout:")[-1]
+    # arithmetic expansion is an env-independent proof of shell parsing.
+    assert "42" in shell_exec.invoke({"command": "echo $((6 * 7))"})
 
 
-def test_shell_exec_reports_shell_parse_error_for_bad_quoting():
-    """shlex.split surfaces parse errors as a typed message rather than
-    crashing the tool call."""
+def test_shell_exec_supports_cd_chains_and_pipes():
+    """cd-chains and pipes work now (the && chain + pipe were swallowed as
+    literal args under shell=False)."""
+    out = shell_exec.invoke({"command": "cd /tmp && pwd"})
+    assert "exit=0" in out
+    assert "/tmp" in out  # cd took effect; the && chain ran
+    piped = shell_exec.invoke({"command": "echo hello | tr a-z A-Z"})
+    assert "exit=0" in piped
+    assert "HELLO" in piped
+
+
+def test_shell_exec_supports_redirects(tmp_path):
+    """Redirects write files now (``>`` was a literal arg before)."""
+    target = tmp_path / "se_redirect.txt"
+    out = shell_exec.invoke(
+        {"command": f"echo redirected > {target} && cat {target}"}
+    )
+    assert "exit=0" in out
+    assert "redirected" in out
+    assert target.read_text().strip() == "redirected"
+
+
+def test_shell_exec_surfaces_bash_syntax_error():
+    """A genuinely malformed command (unterminated quote) now surfaces as a
+    non-zero bash exit, not the old shlex 'shell-parse error'."""
     result = shell_exec.invoke({"command": "echo \"unterminated"})
-    assert "shell-parse error" in result
+    assert "exit=0" not in result  # bash reports the syntax error
+    assert "shell-parse error" not in result  # the shlex path is gone
