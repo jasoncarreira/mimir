@@ -139,3 +139,19 @@ def store_key_order() -> tuple[str, ...]:
     return tuple(
         p.store_key(w.key) for p in ALL_PROVIDERS for w in p.windows
     )
+
+
+def provider_store_keys(provider: str) -> tuple[str, ...]:
+    """Store keys owned by ONE quota provider, e.g. ``"openai"`` →
+    ``("openai_five_hour", "openai_seven_day")``; ``"anthropic"`` → the
+    bare ``five_hour`` / ``seven_day`` / per-model / ``overage`` keys.
+    Empty tuple for an unknown provider.
+
+    Used to filter the Resource-usage view to the ACTIVE provider's keys
+    so a deployment that switched providers (e.g. the Codex cutover)
+    doesn't render stale keys a now-disabled poller left behind in the
+    store (chainlink #301)."""
+    for p in ALL_PROVIDERS:
+        if p.provider == provider:
+            return tuple(p.store_key(w.key) for w in p.windows)
+    return ()
