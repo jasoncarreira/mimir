@@ -380,3 +380,31 @@ def test_claude_code_omits_effort_when_unset(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr("langchain_claude_code.ChatClaudeCode", _fake)
     _resolve_model("claude-code:claude-sonnet-4-6")
     assert "effort" not in captured
+
+
+# ─── per-provider effort validation (fail fast on an invalid level) ──
+
+
+def test_codex_invalid_effort_raises() -> None:
+    pytest.importorskip("langchain_codex_plus")
+    # "max" is valid for Claude but not Codex (none/low/medium/high/xhigh).
+    with pytest.raises(ValueError, match="codex-plus"):
+        _resolve_model("codex-plus:gpt-5.4", reasoning_effort="max")
+
+
+def test_openai_invalid_effort_raises() -> None:
+    # "xhigh" is valid for Codex/Claude but not OpenAI (minimal/low/medium/high).
+    with pytest.raises(ValueError, match="openai"):
+        _resolve_model("openai:gpt-5.4", reasoning_effort="xhigh")
+
+
+def test_anthropic_invalid_effort_raises() -> None:
+    # "minimal" is OpenAI-only; not valid for Claude.
+    with pytest.raises(ValueError, match="anthropic"):
+        _resolve_model("anthropic:claude-opus-4-8", reasoning_effort="minimal")
+
+
+def test_claude_code_invalid_effort_raises() -> None:
+    pytest.importorskip("langchain_claude_code")
+    with pytest.raises(ValueError, match="claude-code"):
+        _resolve_model("claude-code:claude-sonnet-4-6", reasoning_effort="minimal")

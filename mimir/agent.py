@@ -243,6 +243,33 @@ def _supports_responses_api() -> bool:
     return parsed_host == "api.openai.com"
 
 
+# Reasoning-effort levels each provider accepts, for fail-fast validation.
+# Mirrors what the provider packages enforce internally (codex's
+# VALID_REASONING_EFFORTS frozenset, langchain-anthropic / claude-agent-sdk
+# Literals, OpenAI's gpt-5 levels) so a bad MIMIR_MODEL_REASONING_EFFORT is
+# caught here at model construction — with the valid set named — rather than
+# erroring deep in a provider call on the first turn. NOTE "none" is
+# Codex-only (the others have no "no-reasoning" level).
+_EFFORT_LEVELS: dict[str, frozenset[str]] = {
+    "codex-plus": frozenset({"none", "low", "medium", "high", "xhigh"}),
+    "openai": frozenset({"minimal", "low", "medium", "high"}),
+    "anthropic": frozenset({"low", "medium", "high", "xhigh", "max"}),
+    "claude-code": frozenset({"low", "medium", "high", "max"}),
+}
+
+
+def _validate_effort(provider: str, effort: str) -> str:
+    """Return ``effort`` unchanged if valid for ``provider``, else raise
+    ValueError naming the accepted set. Unknown providers pass through."""
+    valid = _EFFORT_LEVELS.get(provider)
+    if valid is not None and effort not in valid:
+        raise ValueError(
+            f"MIMIR_MODEL_REASONING_EFFORT={effort!r} is not a valid reasoning "
+            f"effort for provider {provider!r}; choose one of {sorted(valid)}"
+        )
+    return effort
+
+
 def _resolve_model(
     spec: str | BaseChatModel,
     *,
@@ -265,8 +292,10 @@ def _resolve_model(
       - BaseChatModel instance  → pass-through (Bedrock/Vertex/custom)
 
     ``max_retries`` / ``max_tokens`` only apply to the non-subprocess paths.
-    ``reasoning_effort`` is forwarded to Codex Plus (default ``"none"``) and to
-    OpenAI reasoning models; other providers ignore it.
+    ``reasoning_effort`` is forwarded to every provider that supports it —
+    Codex Plus (default ``"none"``), OpenAI, real Claude (``anthropic:`` +
+    ``claude-code:``) — and validated against that provider's accepted set
+    (``_EFFORT_LEVELS``). Minimax / Kimi (anthropic-compat) are excluded.
 
     ``rate_limit_callback`` is currently honored only for
     ``codex-plus:``. Pass it from the agent so successful Codex Plus
@@ -318,7 +347,7 @@ def _resolve_model(
         }
         _cc_eff = (reasoning_effort or "").strip()
         if _cc_eff and _cc_eff != "none":
-            cc_kwargs["effort"] = _cc_eff
+            cc_kwargs["effort"] = _validate_effort("claude-code", _cc_eff)
         return ChatClaudeCode(**cc_kwargs)
     if spec.startswith("codex-plus:"):
         try:
@@ -341,7 +370,7 @@ def _resolve_model(
         # threaded in here. An empty value keeps the "none" default.
         return ChatCodexPlus(
             model=model_name,
-            reasoning_effort=(reasoning_effort or "none"),
+            reasoning_effort=_validate_effort("codex-plus", reasoning_effort or "none"),
             rate_limit_callback=rate_limit_callback,
         )
     # langchain ``init_chat_model`` resolves provider extras at call time
@@ -368,9 +397,9 @@ def _resolve_model(
     _effort = (reasoning_effort or "").strip()
     if _effort and _effort != "none":
         if spec.startswith("openai:"):
-            init_params["reasoning_effort"] = _effort
+            init_params["reasoning_effort"] = _validate_effort("openai", _effort)
         elif spec.startswith("anthropic:") and "claude" in spec.lower():
-            init_params["effort"] = _effort
+            init_params["effort"] = _validate_effort("anthropic", _effort)
     return init_chat_model(spec, **init_params)
 
 
