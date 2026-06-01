@@ -276,11 +276,17 @@ def _update_world_state(
       first claim.
     - Else: mark the prior current row as is_current=0, set its
       valid_until to the new row's valid_from (or now() if missing),
-      then insert the new row as is_current=1.
+      then upsert the new row as is_current=1.
 
-    Idempotent on PK collision: if a row with the same (subj, pred,
-    valid_from) already exists, INSERT OR IGNORE is a no-op. This
-    matters because the same triple may appear from multiple atoms.
+    chainlink #304: the insert is ``INSERT OR REPLACE``, not ``OR
+    IGNORE``. When a new (different) value shares the current row's
+    ``valid_from`` — a same-timestamp change — the PK
+    (subject, predicate, valid_from) collides with the row we just
+    end-dated, and ``OR IGNORE`` silently dropped the new value, leaving
+    is_current=0 on the old row and NO current row at all. ``OR REPLACE``
+    makes the new value win. Re-assertions of the SAME value are still a
+    no-op via the ``cur_value == value`` early return above, so a triple
+    appearing from multiple atoms stays idempotent.
     """
     current = conn.execute(
         "SELECT value, valid_from FROM world_state "
@@ -301,7 +307,10 @@ def _update_world_state(
             (end_ts, now, subject, predicate, cur_valid_from),
         )
     conn.execute(
-        "INSERT OR IGNORE INTO world_state "
+        # OR REPLACE (not OR IGNORE): a same-valid_from value change
+        # collides with the row we just end-dated; IGNORE would drop the
+        # new value and leave no current row (chainlink #304).
+        "INSERT OR REPLACE INTO world_state "
         "(subject, predicate, value, valid_from, valid_until, "
         " is_current, source_triple_id, updated_at) "
         "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
@@ -626,7 +635,7 @@ def detect_contradictions(
         where.append("predicate = ?")
         params.append(_PREDICATE_NORM.sub("_", predicate.lower()).strip("_"))
     rows = conn.execute(
-        f"SELECT subject, predicate, GROUP_CONCAT(value, '|||') AS values, "
+        f"SELECT subject, predicate, GROUP_CONCAT(value, '|||') AS vals, "
         f"COUNT(*) AS n "
         f"FROM world_state WHERE {' AND '.join(where)} "
         f"GROUP BY subject, predicate HAVING n > 1",

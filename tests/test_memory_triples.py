@@ -223,6 +223,51 @@ def test_world_state_no_op_on_reassertion(conn):
     assert len(history) == 1
 
 
+def test_world_state_same_valid_from_value_change_keeps_new_current(conn):
+    """chainlink #304: a value change that shares the prior row's
+    ``valid_from`` collides on the PK (subject, predicate, valid_from)
+    with the row we just end-dated. ``INSERT OR IGNORE`` silently dropped
+    the new value, leaving NO current row; ``INSERT OR REPLACE`` keeps the
+    new value current."""
+    _seed_atom(conn, "obs1", "obs1")
+    _seed_atom(conn, "obs2", "obs2")
+    store_triples(conn, [
+        {"subject": "Alice", "predicate": "status", "object": "active",
+         "valid_from": "2024-01-01"},
+    ], source_atom_id="obs1")
+    # Different value, SAME valid_from → PK collision on the end-dated row.
+    store_triples(conn, [
+        {"subject": "Alice", "predicate": "status", "object": "inactive",
+         "valid_from": "2024-01-01"},
+    ], source_atom_id="obs2")
+    fact = get_current_value(conn, "Alice", "status")
+    assert fact is not None, "new value dropped — no current row (the #304 bug)"
+    assert fact.value == "inactive"
+    assert fact.is_current is True
+
+
+def test_detect_contradictions_finds_dual_current_values(conn):
+    """chainlink #303: the query aliased GROUP_CONCAT ``AS values`` — a
+    SQLite reserved word — so it raised sqlite3.OperationalError on every
+    call. Seed two is_current=1 rows for one (subject, predicate) (the
+    transient race the function is meant to catch) and assert it returns
+    the conflict instead of raising."""
+    now = "2024-01-01T00:00:00Z"
+    for val, vf, tid in (("Boston", "2023-01-01", "t1"), ("SF", "2023-02-01", "t2")):
+        conn.execute(
+            "INSERT INTO world_state "
+            "(subject, predicate, value, valid_from, valid_until, "
+            " is_current, source_triple_id, updated_at) "
+            "VALUES (?, ?, ?, ?, NULL, 1, ?, ?)",
+            ("Alice", "lives_in", val, vf, tid, now),
+        )
+    conflicts = detect_contradictions(conn, subject="Alice")
+    assert len(conflicts) == 1
+    assert conflicts[0]["subject"] == "Alice"
+    assert conflicts[0]["count"] == 2
+    assert set(conflicts[0]["values"]) == {"Boston", "SF"}
+
+
 # ─── Triple-augment search ───────────────────────────────────────────
 
 
