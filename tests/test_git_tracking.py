@@ -817,3 +817,68 @@ def test_short_err_plain_message_unchanged():
     assert _short_err(Exception("fatal: not a git repository")) == (
         "fatal: not a git repository"
     )
+
+
+# ─── "nothing to commit" soft no-op via stdout (chainlink #299 follow-up) ──
+
+
+async def test_commit_nothing_to_commit_on_stdout_is_soft_noop(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """git reports "nothing to commit, working tree clean" on STDOUT (not
+    stderr) with rc=1 — e.g. when the only ``git status`` changes are
+    embedded-repo gitlinks that ``git add -A`` won't stage (the mimirbot
+    ``.review-scratch`` nested-repo case). The hook must treat that as a
+    no-op, NOT emit git_commit_failed. Pre-fix the guard only checked
+    stderr (empty here), so it fired every turn."""
+    _short_debounce(monkeypatch)
+
+    async def fake_git(*args: str, cwd=None, timeout: float = 0.0):
+        head = args[:1]
+        if head == ("status",):
+            return git_tracking.GitResult(
+                stdout=" M .review-scratch/nested\n", stderr="",
+            )
+        if head == ("add",):
+            return git_tracking.GitResult(stdout="", stderr="")
+        if head == ("commit",):
+            raise git_tracking.GitError(
+                1, "", args,
+                stdout="On branch main\nnothing to commit, working tree clean\n",
+            )
+        return git_tracking.GitResult(stdout="", stderr="")
+
+    monkeypatch.setattr(git_tracking, "_git", fake_git)
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="poller", home=home_repo, enabled=True,
+    )
+    failures = [e for e in _read_events(tmp_path) if e.get("type") == "git_commit_failed"]
+    assert not failures, f"'nothing to commit' must be a soft no-op; got {failures}"
+
+
+async def test_commit_real_error_still_emits_git_commit_failed(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The widened soft-no-op guard must NOT swallow genuine commit
+    failures — a non-benign error still surfaces as git_commit_failed."""
+    _short_debounce(monkeypatch)
+
+    async def fake_git(*args: str, cwd=None, timeout: float = 0.0):
+        head = args[:1]
+        if head == ("status",):
+            return git_tracking.GitResult(stdout=" M file.txt\n", stderr="")
+        if head == ("add",):
+            return git_tracking.GitResult(stdout="", stderr="")
+        if head == ("commit",):
+            raise git_tracking.GitError(
+                128, "fatal: unable to write commit object", args, stdout="",
+            )
+        return git_tracking.GitResult(stdout="", stderr="")
+
+    monkeypatch.setattr(git_tracking, "_git", fake_git)
+    await git_tracking.commit_turn_changes(
+        turn_id="t2", trigger="poller", home=home_repo, enabled=True,
+    )
+    failures = [e for e in _read_events(tmp_path) if e.get("type") == "git_commit_failed"]
+    assert len(failures) == 1, f"real commit error must emit git_commit_failed; got {failures}"
+    assert failures[0].get("stage") == "commit"
