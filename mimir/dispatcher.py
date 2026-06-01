@@ -118,17 +118,33 @@ class Dispatcher:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=idle_timeout)
                 except asyncio.TimeoutError:
+                    # chainlink #302: re-check the queue with NO intervening
+                    # await before retiring. A concurrent enqueue() that lands
+                    # an event during the ``worker_retired`` log (a yield point)
+                    # sees ``worker.done() is False`` and so spawns no
+                    # replacement; without these guards the worker would retire
+                    # anyway and strand that event — a silent drop, and the
+                    # put-but-never-got item keeps ``unfinished_tasks > 0`` so
+                    # ``drain()``'s ``queue.join()`` hangs shutdown forever.
+                    if queue.qsize() > 0:
+                        continue
                     await log_event("worker_retired", channel_id=channel_id, reason="idle")
+                    # Re-check after the await (the yield point above): an
+                    # enqueue may have raced in during the log. If so, keep
+                    # serving rather than retire — that enqueue did not spawn a
+                    # replacement (we were not yet done), so this worker owns it.
+                    if queue.qsize() > 0:
+                        continue
                     # CR2 (agent runtime) fix: clean up per-channel
                     # bookkeeping when the worker retires. Pre-fix the
                     # queue and high-water entry remained in the dicts
                     # forever — ephemeral channel_ids (transient web-
                     # ad-hoc channels, throwaway per-message channels)
-                    # accumulated indefinitely. Only purge if the
-                    # queue is actually empty AND not closed (the
-                    # ``drain()`` path may be holding a reference to
-                    # this queue while waiting on ``queue.join()``).
-                    if queue.qsize() == 0 and not self._closed:
+                    # accumulated indefinitely. The queue is empty here;
+                    # only skip the purge when ``drain()`` may be holding a
+                    # reference to this queue while waiting on
+                    # ``queue.join()`` (``self._closed``).
+                    if not self._closed:
                         self._queues.pop(channel_id, None)
                         self._high_water_logged.pop(channel_id, None)
                         # CR2 completion: also pop the worker task entry.

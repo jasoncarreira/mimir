@@ -79,6 +79,60 @@ async def test_separate_channels_run_concurrently(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_event_enqueued_during_worker_retire_is_not_stranded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """chainlink #302: an enqueue() that lands during the ``worker_retired``
+    log (a yield point) sees ``worker.done() is False`` and spawns no
+    replacement worker. The worker must notice the queued event and keep
+    serving instead of retiring and stranding it — which would be a silent
+    dropped event AND would hang ``drain()`` on the never-got item."""
+    import mimir.dispatcher as dispatcher_mod
+
+    cfg = _make_config(tmp_path, worker_idle_timeout_s=0.05)
+    processed: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        processed.append(event.content)
+
+    disp = Dispatcher(cfg, runner)
+
+    real_log_event = dispatcher_mod.log_event
+    raced = False
+
+    async def racing_log_event(event_type: str, **kw):
+        nonlocal raced
+        # On the worker's first retire log, slip an event into the SAME
+        # channel's queue before the worker decides to retire — exactly the
+        # race window (worker parked here, not yet done → no respawn).
+        if event_type == "worker_retired" and not raced:
+            raced = True
+            await disp.enqueue(
+                AgentEvent(trigger="x", channel_id="c1", content="raced")
+            )
+        return await real_log_event(event_type, **kw)
+
+    monkeypatch.setattr(dispatcher_mod, "log_event", racing_log_event)
+
+    # "first" spawns the worker + is processed; the worker then idles, times
+    # out, and on the worker_retired log our hook injects "raced".
+    await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="first"))
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        if raced:
+            break
+    # Buggy version strands "raced" → drain()'s queue.join() hangs; guard it
+    # so the test fails on the assertion rather than hanging the suite.
+    try:
+        await asyncio.wait_for(disp.drain(), timeout=3.0)
+    except asyncio.TimeoutError:
+        pass
+
+    assert "first" in processed
+    assert "raced" in processed, "event enqueued during worker retire was stranded"
+
+
+@pytest.mark.asyncio
 async def test_global_semaphore_caps_in_flight(tmp_path: Path):
     cfg = _make_config(tmp_path, max_concurrent_turns=2)
     in_flight = 0
