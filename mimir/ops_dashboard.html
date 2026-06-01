@@ -382,8 +382,17 @@
           return;
         }
         for (const [k, v] of entries) {
+          // textContent (not innerHTML): the keys here are agent / poller-
+          // controlled (channel_id, event_type) and would otherwise inject
+          // markup into the operator dashboard — stored XSS (chainlink #311).
           const tr = document.createElement('tr');
-          tr.innerHTML = '<td>' + k + '</td><td class="num">' + v + '</td>';
+          const tdK = document.createElement('td');
+          tdK.textContent = k;
+          const tdV = document.createElement('td');
+          tdV.className = 'num';
+          tdV.textContent = v;
+          tr.appendChild(tdK);
+          tr.appendChild(tdV);
           tbody.appendChild(tr);
         }
       }

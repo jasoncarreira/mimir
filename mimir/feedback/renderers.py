@@ -511,7 +511,10 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         cid = ev.get("commitment_id") or "?"
         text = _sanitize_field(ev.get("text") or "", max_len=80)
         channel = ev.get("channel_id")
-        recipient = ev.get("recipient_identity")
+        # recipient_identity is LLM-extracted (like ``text`` above), so it must
+        # be sanitized too — otherwise a newline / markup in it can break the
+        # algedonic block's formatting or inject content (chainlink #312).
+        recipient = _sanitize_field(ev.get("recipient_identity") or "", max_len=40)
         scope_parts: list[str] = []
         if channel:
             scope_parts.append(f"chan={channel}")
