@@ -172,6 +172,14 @@ def get_logger() -> EventLogger:
     return _logger
 
 
+def get_events_path() -> Path | None:
+    """Path the singleton EventLogger writes events.jsonl to, or ``None``
+    if the logger isn't initialized yet. Read-side consumers (poller
+    failed-turn recovery, chainlink #262) use this to tail turn-outcome
+    events without threading the path through every call site."""
+    return _logger._path if _logger is not None else None
+
+
 async def log_event(event_type: str, **payload: Any) -> None:
     await get_logger().log(event_type, **payload)
 

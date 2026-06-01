@@ -77,8 +77,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from .event_logger import log_event
+from .event_logger import log_event, get_events_path
 from .models import AgentEvent
+from . import poller_recovery
 
 log = logging.getLogger(__name__)
 
@@ -253,6 +254,18 @@ class PollerConfig:
     skill_dir: Path
     persist_dir: Path | None = None
     batch_size: int = POLLER_BATCH_SIZE_DEFAULT
+    #: ``recover_failed_turns`` (chainlink #262): opt into framework-side
+    #: recovery of poller turns whose triggered turn FAILED. When True,
+    #: ``run_poller`` stashes each enqueued event by ``source_id`` and, on
+    #: the next cycle, reads ``turn_failed`` / ``turn_completed`` outcomes
+    #: to re-enqueue (capped) the failed ones — closing the "poll advanced
+    #: the cursor but the triggered turn died" drop (#299) for pollers with
+    #: no live state to reconcile against (gmail, github issue/comment
+    #: turns). OFF by default; leave OFF for pollers that recover another
+    #: way — github-poller uses #516's ``requested_reviewers``
+    #: reconciliation, so framework re-enqueue on top would double-fire
+    #: review turns. See :mod:`mimir.poller_recovery`.
+    recover_failed_turns: bool = False
     pass_env: tuple[str, ...] = ()
     #: ``env_required`` (chainlink #108): env var names the poller
     #: **must** have in its subprocess env to function correctly.
@@ -490,6 +503,11 @@ def discover_pollers(
                     pollers_file, name, raw_batch,
                     POLLER_BATCH_SIZE_DEFAULT,
                 )
+            # chainlink #262: opt-in framework recovery of failed poller
+            # turns. ``bool(...)`` coerces truthy json values; a stray
+            # non-bool just reads as on/off rather than erroring (low-stakes
+            # flag, unlike batch_size which affects coalescing math).
+            recover_failed_turns = bool(entry.get("recover_failed_turns", False))
             pollers.append(
                 PollerConfig(
                     name=name,
@@ -499,6 +517,7 @@ def discover_pollers(
                     skill_dir=skill_dir,
                     persist_dir=persist_dir,
                     batch_size=batch_size,
+                    recover_failed_turns=recover_failed_turns,
                     pass_env=tuple(pass_env_clean),
                     env_required=tuple(env_required_clean),
                     manifest_path=pollers_file,
@@ -604,6 +623,39 @@ async def run_poller(
         )
         # Fall through; the subprocess might handle a missing dir,
         # OR fail and surface as poller_nonzero_exit.
+
+    # chainlink #262: framework recovery of prior failed turns. Before this
+    # cycle's poll, reconcile in-flight events against turn outcomes —
+    # re-enqueue (capped) the ones whose triggered turn died, drop the ones
+    # that completed. Opt-in per poller (off by default). Runs only when the
+    # circuit is closed (the poll is proceeding); a poll-side outage defers
+    # recovery until the poller is healthy again — the recovery watermark
+    # spans the gap, so nothing is lost. Wrapped so a recovery hiccup can
+    # never break the poll cycle that follows.
+    if poller.recover_failed_turns:
+        _events_path = get_events_path()
+        if _events_path is not None:
+            try:
+                _rec = await poller_recovery.reconcile_failed_turns(
+                    poller_name=poller.name,
+                    channel_id=poller.channel_id(),
+                    persist_dir=persist_dir,
+                    events_path=_events_path,
+                    enqueue=enqueue,
+                )
+                if _rec["reenqueued"] or _rec["gave_up"]:
+                    await log_event(
+                        "poller_recovery",
+                        poller=poller.name,
+                        reenqueued=_rec["reenqueued"],
+                        completed=_rec["completed"],
+                        gave_up=_rec["gave_up"],
+                    )
+            except Exception as exc:  # noqa: BLE001 — recovery must not break polling
+                log.warning(
+                    "poller recovery: reconcile failed for %s: %s",
+                    poller.name, exc,
+                )
 
     # CR2 (external I/O) fix: previously this passed ``{**os.environ,
     # **poller.env}`` — the entire mimir process env (including
@@ -1115,6 +1167,10 @@ async def run_poller(
             continue
         if accepted:
             event_count += 1
+            # chainlink #262: stash the enqueued event so a later failed
+            # turn can re-enqueue it (opt-in per poller; off by default).
+            if poller.recover_failed_turns:
+                poller_recovery.stash_enqueued_event(persist_dir, event)
         else:
             rejected_count += 1
             # Back-pressure observability: when the dispatcher refuses
