@@ -5,7 +5,11 @@
 # decides they should be tracked. See MIMIR_HOME_GIT_TRACKING.md
 # §"Allowlist .gitignore".
 
-# Block everything by default.
+# Block everything by default. Writable-but-ephemeral dirs (attachments/,
+# scratch/) are therefore untracked automatically — scratch/ in particular
+# is the agent's working area (drafts, throwaway clones, scratch notes) and
+# must NOT be unblocked: nested git repos there once broke the per-turn
+# commit hook (chainlink #299).
 *
 !*/
 

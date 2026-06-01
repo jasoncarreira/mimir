@@ -65,6 +65,41 @@ def test_system_prompt_omits_agent_home_when_unset():
     assert "## Agent home" not in sp
 
 
+def test_system_prompt_renders_writable_dirs_and_scratch_guidance():
+    """When ``writable_dirs`` is passed, the Agent home section lists them
+    and (when ``scratch`` is among them) steers ephemeral writes there — so
+    the agent doesn't discover writability by trial/error or invent ad-hoc
+    dirs the write-guard blocks (chainlink #299)."""
+    sp = build_system_prompt(
+        home_dir="/mimir-home",
+        writable_dirs=["state", "memory", "attachments", "scratch", "skills"],
+    )
+    assert "Writable workspace dirs:" in sp
+    assert "`scratch/`" in sp
+    assert "`state/`" in sp
+    assert "ephemeral" in sp.lower()
+    assert "throwaway clones" in sp
+
+
+def test_system_prompt_writable_dirs_absent_without_param():
+    """Back-compat: no ``writable_dirs`` → no writable-dirs line, so
+    existing callers and the prompt-cache prefix are unchanged."""
+    sp = build_system_prompt(home_dir="/mimir-home")
+    assert "## Agent home" in sp
+    assert "Writable workspace dirs:" not in sp
+
+
+def test_system_prompt_scratch_guidance_only_when_scratch_writable():
+    """If an operator's MIMIR_FOLDERS drops ``scratch``, the prompt lists
+    the writable dirs but omits the scratch steer (stays accurate)."""
+    sp = build_system_prompt(
+        home_dir="/mimir-home", writable_dirs=["state", "memory"],
+    )
+    assert "Writable workspace dirs:" in sp
+    assert "`scratch/`" not in sp
+    assert "throwaway clones" not in sp
+
+
 def test_system_prompt_omits_agent_home_when_empty_string():
     """Empty string is falsy and reflects ``home_dir=""`` from a config
     that hasn't resolved a path. Treat as unset rather than emitting a

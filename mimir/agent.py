@@ -1865,6 +1865,7 @@ class Agent:
                 ),
                 skill_block=None,
                 home_dir=str(self._config.home),
+                writable_dirs=self._config.writable_dirs,
             )
         except Exception:
             log.exception("_build_system_prompt failed; using minimal default")

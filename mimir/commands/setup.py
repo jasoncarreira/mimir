@@ -1207,6 +1207,7 @@ def setup_home(
         "messages",
         ".claude/agents",
         "skills",
+        "scratch",  # ephemeral writable workspace (gitignored; chainlink #299)
     ):
         p = home / sub
         if not p.exists():
