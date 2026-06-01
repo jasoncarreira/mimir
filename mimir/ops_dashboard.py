@@ -446,25 +446,32 @@ async def _load_chainlink_issues(home: Path) -> dict[str, Any]:
     }
 
 
-def build_dashboard_payload(events_log: Path, days: int) -> dict[str, Any]:
+def build_dashboard_payload(
+    events_log: Path, days: int, *, active_provider: str | None = None,
+) -> dict[str, Any]:
     """Sync top-level entry: load events, compute stats. Adds an
     empty ``chainlink_issues`` envelope so the frontend's tab renders
     consistently. For the chainlink-populated variant used by the
     live route handler, see ``build_dashboard_payload_async``."""
     from .token_usage_history import compute_token_usage_history
-    from .usage_history import compute_usage_history
+    from .usage_history import compute_usage_history, filter_history_to_provider
 
     events = _load_events(events_log, days)
     stats = compute_stats(events, days)
     stats["chainlink_issues"] = {
         "available": False, "issues": [], "error": None,
     }
-    # Per-provider subscription-quota history for the ops chart.
-    # Renders one chart per provider that has data, so a multi-
-    # subscription deployment (e.g. Anthropic Max OAuth for chat +
-    # Codex Plus for saga LLM calls) shows both concurrently.
+    # Per-provider subscription-quota history for the ops chart. Collapse to
+    # the ACTIVE provider (chainlink #301, dashboard side) so stale windows
+    # from a prior subscription — e.g. Anthropic OAuth keys still in the store
+    # after a Codex cutover — don't render a phantom chart next to the live
+    # one. ``active_provider=None`` (the default, and what tests / the sync
+    # entrypoint pass) keeps every provider, so genuine multi-subscription
+    # deployments are unaffected unless the caller opts in.
     # ``events`` is already date-filtered by ``_load_events``.
-    stats["usage_history"] = compute_usage_history(events)
+    stats["usage_history"] = filter_history_to_provider(
+        compute_usage_history(events), active_provider,
+    )
     # Per-day token volume history (Usage tab). Useful for both modes:
     # subscription deployments see absolute volume alongside
     # utilization-%; API-mode deployments use this as the PRIMARY
@@ -481,12 +488,16 @@ async def build_dashboard_payload_async(
     days: int,
     *,
     home: Path | None = None,
+    active_provider: str | None = None,
 ) -> dict[str, Any]:
     """Async variant: same as ``build_dashboard_payload`` plus the
     chainlink subprocess call when ``home`` is given. The route
     handler uses this; tests that don't exercise chainlink can stick
-    with the sync version."""
-    stats = build_dashboard_payload(events_log, days)
+    with the sync version. ``active_provider`` collapses the Usage chart
+    to that provider (see ``build_dashboard_payload``)."""
+    stats = build_dashboard_payload(
+        events_log, days, active_provider=active_provider,
+    )
     if home is not None:
         stats["chainlink_issues"] = await _load_chainlink_issues(home)
     return stats

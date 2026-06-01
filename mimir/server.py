@@ -613,6 +613,7 @@ def build_app(config: Config) -> web.Application:
     app.router.add_get("/health", _handle_health)
     app.router.add_post("/api/memory/consolidate", _handle_consolidate)
     # Turn viewer + log API (SPEC §11).
+    from .usage_history import active_provider_for_spec
     web_ui.register_routes(
         app,
         turns_log=config.turns_log,
@@ -624,6 +625,13 @@ def build_app(config: Config) -> web.Application:
         # ``<home>/state/saga.db`` fallback — which no longer exists and
         # produced "saga db not found or unreadable" on the page.
         saga_db=_db_path,
+        # Collapse the /ops Usage chart to the live subscription provider so
+        # stale windows from a prior provider (e.g. Anthropic after a Codex
+        # cutover, chainlink #301) don't render a second chart.
+        active_usage_provider=active_provider_for_spec(
+            config.model_spec,
+            getattr(config, "anthropic_base_url", ""),
+        ),
     )
     # Web chat bridge — POST /chat + GET /chat/stream for the local UI.
     web_chat.register_routes(app)

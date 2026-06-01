@@ -154,6 +154,49 @@ class TestResolveModelInitChat:
         _resolve_model("anthropic:claude-haiku-4-5")
         assert "use_responses_api" not in captured["kwargs"]
 
+    def test_passes_max_tokens_when_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def _fake_init(spec: str, **kwargs: Any) -> str:
+            captured["kwargs"] = kwargs
+            return "M"
+
+        monkeypatch.setattr("langchain.chat_models.init_chat_model", _fake_init)
+        # Thinking-via-Anthropic-compat models (Minimax / Kimi) need a raised
+        # output cap so reasoning blocks don't eat the whole budget (the M3
+        # fix — without it the turn hits max_tokens mid-thought, empty reply).
+        _resolve_model("anthropic:MiniMax-M3", max_tokens=32768)
+        assert captured["kwargs"]["max_tokens"] == 32768
+
+    def test_omits_max_tokens_when_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def _fake_init(spec: str, **kwargs: Any) -> str:
+            captured["kwargs"] = kwargs
+            return "M"
+
+        monkeypatch.setattr("langchain.chat_models.init_chat_model", _fake_init)
+        # 0 (the default) means "leave the provider default" — never pass it.
+        _resolve_model("anthropic:claude-haiku-4-5", max_tokens=0)
+        assert "max_tokens" not in captured["kwargs"]
+
+    def test_omits_max_tokens_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def _fake_init(spec: str, **kwargs: Any) -> str:
+            captured["kwargs"] = kwargs
+            return "M"
+
+        monkeypatch.setattr("langchain.chat_models.init_chat_model", _fake_init)
+        _resolve_model("anthropic:claude-haiku-4-5")
+        assert "max_tokens" not in captured["kwargs"]
+
 
 class TestResolveModelClaudeCode:
     def test_claude_code_path_returns_chat_claude_code(self) -> None:
@@ -187,3 +230,21 @@ def test_config_max_retries_env_override(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("MIMIR_MODEL_MAX_RETRIES", "12")
     cfg = Config.from_env()
     assert cfg.model_max_retries == 12
+
+
+def test_config_default_max_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir.config import Config
+
+    monkeypatch.setenv("MIMIR_HOME", "/tmp")
+    monkeypatch.delenv("MIMIR_MODEL_MAX_TOKENS", raising=False)
+    cfg = Config.from_env()
+    assert cfg.model_max_tokens == 0
+
+
+def test_config_max_tokens_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir.config import Config
+
+    monkeypatch.setenv("MIMIR_HOME", "/tmp")
+    monkeypatch.setenv("MIMIR_MODEL_MAX_TOKENS", "32768")
+    cfg = Config.from_env()
+    assert cfg.model_max_tokens == 32768

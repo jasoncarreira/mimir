@@ -66,15 +66,48 @@ REAL_PAYLOAD: dict[str, Any] = {
 }
 
 
+# Token-plan shape (2026-06+): chat models grouped under the ``general``
+# CATEGORY, quota reported as a remaining PERCENT, request-count fields
+# zeroed. ``video`` is the other category. Captured from muninn's live
+# response after the Coding Plan -> Token Plan migration.
+TOKEN_PAYLOAD: dict[str, Any] = {
+    "base_resp": {"status_code": 0, "status_msg": "success"},
+    "model_remains": [
+        {
+            "model_name": "general",
+            "start_time": 1780326000000,
+            "end_time": 1780344000000,
+            "current_interval_total_count": 0,
+            "current_interval_usage_count": 0,
+            "current_interval_remaining_percent": 83,
+            "weekly_start_time": 1780272000000,
+            "weekly_end_time": 1780876800000,
+            "current_weekly_total_count": 0,
+            "current_weekly_usage_count": 0,
+            "current_weekly_remaining_percent": 96,
+        },
+        {
+            "model_name": "video",
+            "current_interval_remaining_percent": 100,
+            "current_weekly_remaining_percent": 100,
+            "current_interval_total_count": 0,
+            "current_weekly_total_count": 0,
+        },
+    ],
+}
+
+
 # ─── pick_model_entry ────────────────────────────────────────────────
 
 
-def test_pick_model_glob_default():
-    """The default ``MiniMax-M*`` pattern matches the literal API
-    bucket name. Minimax names it exactly that way in the response."""
-    entry = pick_model_entry(REAL_PAYLOAD, DEFAULT_MODEL_NAME)
+def test_pick_model_default_is_general():
+    """The default bucket is ``general`` — Minimax's Token Plan keys the
+    chat-models category that way (2026-06; the old ``MiniMax-M*`` glob is
+    gone). Pins the default + that it matches the live ``general`` entry."""
+    assert DEFAULT_MODEL_NAME == "general"
+    entry = pick_model_entry(TOKEN_PAYLOAD, DEFAULT_MODEL_NAME)
     assert entry is not None
-    assert entry["model_name"] == "MiniMax-M*"
+    assert entry["model_name"] == "general"
 
 
 def test_pick_model_glob_matches_prefix():
@@ -176,6 +209,37 @@ def test_snapshot_clamps_used_when_remaining_exceeds_total():
     assert snap.utilization == 0.0
 
 
+# ─── token-plan (percent-based) shape ───────────────────────────────
+
+
+def test_interval_snapshot_from_remaining_percent():
+    """Token plan: count fields are 0 and quota lives in
+    ``current_interval_remaining_percent`` → utilization = (100-83)/100."""
+    entry = TOKEN_PAYLOAD["model_remains"][0]  # general, 83% remaining
+    snap = interval_snapshot(entry)
+    assert snap.utilization == pytest.approx(0.17)
+    assert snap.resets_at == 1780344000  # end_time ms → s
+
+
+def test_weekly_snapshot_from_remaining_percent():
+    """96% weekly remaining → 4% used."""
+    entry = TOKEN_PAYLOAD["model_remains"][0]
+    snap = weekly_snapshot(entry)
+    assert snap.utilization == pytest.approx(0.04)
+    assert snap.resets_at == 1780876800
+
+
+def test_remaining_percent_preferred_over_counts():
+    """When BOTH percent and counts are present the percent wins — the
+    token plan is the live shape; stale counts must not override it."""
+    entry = {
+        "current_interval_total_count": 100,
+        "current_interval_usage_count": 50,         # 0.5 via counts
+        "current_interval_remaining_percent": 90,   # 0.10 via percent
+    }
+    assert interval_snapshot(entry).utilization == pytest.approx(0.10)
+
+
 # ─── poll_once with mocked fetch ─────────────────────────────────────
 
 
@@ -208,7 +272,9 @@ async def test_poll_once_writes_both_windows(
         return fresh_payload
 
     monkeypatch.setattr("mimir.minimax_usage_poller.fetch_remains", _fake_fetch)
-    cfg = MinimaxPollerConfig(api_key="test-key")
+    # Legacy coding-plan payload (MiniMax-M* bucket) — point the poller at it
+    # explicitly, since the default model_name is now the Token Plan "general".
+    cfg = MinimaxPollerConfig(api_key="test-key", model_name="MiniMax-M*")
     result = await poll_once(cfg, store)
 
     assert result["ok"] is True
@@ -286,7 +352,10 @@ async def test_poll_once_skips_empty_plan(
         return empty_payload
 
     monkeypatch.setattr("mimir.minimax_usage_poller.fetch_remains", _fake)
-    cfg = MinimaxPollerConfig(api_key="test-key")
+    # The empty bucket is named "MiniMax-M*"; match it explicitly (the default
+    # is now "general") so we exercise empty_plan, not a model_match miss.
+    # No remaining_percent present → empty_plan is still the right verdict.
+    cfg = MinimaxPollerConfig(api_key="test-key", model_name="MiniMax-M*")
     result = await poll_once(cfg, store)
     assert result["ok"] is False
     assert result["stage"] == "empty_plan"
@@ -316,6 +385,68 @@ async def test_poll_once_handles_no_matching_model(
     result = await poll_once(cfg, store)
     assert result["ok"] is False
     assert result["stage"] == "model_match"
+
+
+@pytest.mark.asyncio
+async def test_poll_once_token_plan_general(
+    tmp_path: Path, event_logger_init, monkeypatch,
+):
+    """muninn's live scenario: Token Plan, default model_name ("general"),
+    quota as remaining_percent with zeroed counts. The poll must SUCCEED
+    (not empty_plan) and persist percent-derived utilization."""
+    store = RateLimitStore(path=tmp_path / "rate_limits.json")
+    fresh = copy.deepcopy(TOKEN_PAYLOAD)
+    now_ms = int(time.time() * 1000)
+    for entry in fresh["model_remains"]:
+        entry["end_time"] = now_ms + 5 * 3600 * 1000
+        entry["weekly_end_time"] = now_ms + 7 * 24 * 3600 * 1000
+
+    async def _fake(cfg, *, session=None):
+        return fresh
+
+    monkeypatch.setattr("mimir.minimax_usage_poller.fetch_remains", _fake)
+    cfg = MinimaxPollerConfig(api_key="test-key")  # default model_name="general"
+    result = await poll_once(cfg, store)
+
+    assert result["ok"] is True
+    assert result["model_name"] == "general"
+    persisted = store.current()
+    assert persisted["minimax_five_hour"].utilization == pytest.approx(0.17)
+    assert persisted["minimax_seven_day"].utilization == pytest.approx(0.04)
+
+
+@pytest.mark.asyncio
+async def test_poll_once_token_plan_not_empty_when_percent_present(
+    tmp_path: Path, event_logger_init, monkeypatch,
+):
+    """Regression: zeroed COUNT fields must NOT trip empty_plan when the
+    token-plan remaining_percent is present — that mis-classification is
+    exactly what spammed minimax_usage_failed every poll on M3."""
+    store = RateLimitStore(path=tmp_path / "rate_limits.json")
+    now_ms = int(time.time() * 1000)
+    payload = {
+        "base_resp": {"status_code": 0},
+        "model_remains": [{
+            "model_name": "general",
+            "current_interval_total_count": 0,
+            "current_weekly_total_count": 0,
+            "current_interval_remaining_percent": 100,
+            "current_weekly_remaining_percent": 100,
+            "end_time": now_ms + 5 * 3600 * 1000,
+            "weekly_end_time": now_ms + 7 * 24 * 3600 * 1000,
+        }],
+    }
+
+    async def _fake(cfg, *, session=None):
+        return payload
+
+    monkeypatch.setattr("mimir.minimax_usage_poller.fetch_remains", _fake)
+    cfg = MinimaxPollerConfig(api_key="test-key")
+    result = await poll_once(cfg, store)
+    assert result["ok"] is True
+    assert result.get("stage") != "empty_plan"
+    # 100% remaining → 0 utilization, but still WRITTEN (not skipped).
+    assert store.current()["minimax_five_hour"].utilization == pytest.approx(0.0)
 
 
 # ─── fetch_remains: response shape validation ───────────────────────
