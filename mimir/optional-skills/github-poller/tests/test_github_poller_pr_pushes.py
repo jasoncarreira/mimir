@@ -180,7 +180,17 @@ def test_emit_payload_is_jsonable(monkeypatch):
     """
     captured_lines: list[str] = []
 
-    def fake_print(*args, **kwargs):
+    import sys as _sys
+
+    def fake_print(*args, file=_sys.stdout, **kwargs):
+        # Only stdout-bound JSONL lines are events. ``_eprint`` diagnostics
+        # (e.g. the review-skill-preload warning when
+        # MIMIR_GITHUB_PRELOAD_REVIEW_SKILL=1 but the skill is absent) go to
+        # stderr and must NOT be parsed as JSON — without this filter the
+        # warning string reached json.loads() and the test failed in the
+        # container (chainlink #299 review).
+        if file is not _sys.stdout:
+            return
         captured_lines.append(args[0])
 
     monkeypatch.setattr(poller, "print", fake_print, raising=False)
@@ -271,12 +281,12 @@ def test_non_review_events_carry_no_marker(monkeypatch):
 
 def test_review_skill_preload_inlines_full_body_when_env_set(monkeypatch, tmp_path):
     """``MIMIR_GITHUB_PRELOAD_REVIEW_SKILL=1`` inlines the
-    ``<MIMIR_HOME>/.claude/skills/review/SKILL.md`` body alongside the
+    ``<MIMIR_HOME>/skills/review/SKILL.md`` body alongside the
     rule. This is the workaround for the reasoning-before-Skill-loads
     issue — full rule set in context before the model commits its
     output structure."""
     mimir_home = tmp_path / "home"
-    skill_path = mimir_home / ".claude" / "skills" / "review" / "SKILL.md"
+    skill_path = mimir_home / "skills" / "review" / "SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.write_text(
         "---\nname: review\n---\n"
@@ -300,7 +310,7 @@ def test_review_skill_preload_off_by_default(monkeypatch, tmp_path):
     """No env var → rule only, no inline body. Default-off keeps the
     per-event token cost bounded."""
     mimir_home = tmp_path / "home"
-    skill_path = mimir_home / ".claude" / "skills" / "review" / "SKILL.md"
+    skill_path = mimir_home / "skills" / "review" / "SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.write_text("SHOULD NOT APPEAR", encoding="utf-8")
 

@@ -252,8 +252,11 @@ def _load_review_skill_body(mimir_home: str, skill_path_override: str = "") -> s
     if not candidate:
         if not mimir_home:
             return ""
+        # mimir skills live at ``<home>/skills/`` — NOT ``.claude/skills/``
+        # (that's the Claude Code convention; the framework migrates any
+        # legacy ``.claude/skills/`` into ``skills/`` at startup).
         candidate = str(
-            Path(mimir_home) / ".claude" / "skills" / "review" / "SKILL.md"
+            Path(mimir_home) / "skills" / "review" / "SKILL.md"
         )
     try:
         body = Path(candidate).read_text(encoding="utf-8").strip()

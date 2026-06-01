@@ -1,6 +1,6 @@
 ---
 name: github-poller
-description: Watch one or more GitHub repositories for new issues, pull requests, comments, PR reviews, and inline diff comments — emits a fresh turn each time something actionable happens. Use when you've opened PRs / issues mimir should know about review activity for, when you want operator-actionable signals for repos mimir maintains, or when you need to track upstream activity on a watched repo. Filters out events authored by mimir's own GitHub identity (set ``MIMIR_GITHUB_SELF_LOGIN``) so the bot doesn't wake itself with its own comments. Companion to the ``pollers`` framework skill (mechanics) and the ``world-scanning`` skill (catalog of *what's worth polling*). Opt-in: copy this directory into ``<home>/.claude/skills/github-poller/`` then set the env vars below.
+description: Watch one or more GitHub repositories for new issues, pull requests, comments, PR reviews, and inline diff comments — emits a fresh turn each time something actionable happens. Use when you've opened PRs / issues mimir should know about review activity for, when you want operator-actionable signals for repos mimir maintains, or when you need to track upstream activity on a watched repo. Filters out events authored by mimir's own GitHub identity (set ``MIMIR_GITHUB_SELF_LOGIN``) so the bot doesn't wake itself with its own comments. Companion to the ``pollers`` framework skill (mechanics) and the ``world-scanning`` skill (catalog of *what's worth polling*). Opt-in: copy this directory into ``<home>/skills/github-poller/`` then set the env vars below.
 env:
   required:
     - name: GITHUB_REPOS
@@ -32,7 +32,7 @@ won't watch a GitHub repo, so the framework doesn't seed it by default.
 
 1. Copy the directory into your agent home:
    ```
-   cp -r mimir/optional-skills/github-poller <home>/.claude/skills/
+   cp -r mimir/optional-skills/github-poller <home>/skills/
    ```
    (Or run from inside the container against ``/workspace/mimir``.)
 
@@ -133,7 +133,7 @@ The `pr_review_requests` key maps `{repo: {pr_number: attempts}}` — `attempts`
 
 - Unset `GITHUB_REPOS` — the poller exits silently.
 - Or set the cron in `pollers.json` to a far-future expression.
-- Or remove the skill directory: `rm -rf <home>/.claude/skills/github-poller/` + `reload_pollers`.
+- Or remove the skill directory: `rm -rf <home>/skills/github-poller/` + `reload_pollers`.
 
 ## Debugging
 
