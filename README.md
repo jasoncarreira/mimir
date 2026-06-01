@@ -102,7 +102,7 @@ the fork as a separate step after `mimir-agent`:
 
 ```bash
 pip install mimir-agent[anthropic]
-pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39"
+pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@c03f075c8b84fb0c718de1aabdd6493f5d191786"
 claude setup-token   # OAuth dance — once per host
 ```
 
@@ -117,7 +117,7 @@ git clone https://github.com/jasoncarreira/mimir.git
 cd mimir
 uv sync --extra dev
 # For the Claude Code subprocess path, also:
-# uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39"
+# uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@c03f075c8b84fb0c718de1aabdd6493f5d191786"
 
 uv run mimir setup --home ~/mimir-home
 uv run mimir run --home ~/mimir-home
@@ -203,7 +203,7 @@ Claude Max path above):
 
 ```bash
 uv sync --extra dev
-uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39"
+uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@c03f075c8b84fb0c718de1aabdd6493f5d191786"
 ```
 
 ```bash
@@ -214,7 +214,7 @@ uv run pytest --ignore=tests/test_bench_via_mimir.py  # skip the slow integratio
 
 # Tests — full toolchain (claude-code-specific tests will run)
 uv pip install -e ".[dev]"
-uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@f7af15b613d1e016437740f739321316730cdd39"
+uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@c03f075c8b84fb0c718de1aabdd6493f5d191786"
 uv run pytest
 ```
 
