@@ -1553,7 +1553,7 @@ Channel-specific config (Bluesky/Slack) is live (both bridges implemented post-P
 - Copy verbatim: `five-whys`, `long-running-jobs`, `skill-acquisition`, `view-attachment`.
 - Adapt: `introspection` (drop journal refs; add events.jsonl pointers), `memory` (rewrite directory map), `onboarding` (point at memory/core/00-persona.md), `skill-creator` (target SDK skill format).
 - Skip: `mountaineering` (replaced by subagents), `prediction-review` (depends on the journal mimir doesn't have). `pollers` is ported earlier in Phase 6.3.
-- Confirm Claude Agent SDK auto-discovers them under `mimir/skills/` + `<home>/.claude/skills/`.
+- Confirm Claude Agent SDK auto-discovers them under `mimir/skills/` + `<home>/skills/`.
 
 ### Phase 6.8 — concurrency (1 day)
 - Multi-channel smoke: drive two channels in parallel, confirm interleaved turn IDs in turns.jsonl with distinct session_ids.

@@ -185,7 +185,7 @@ MIMIR_SCHEDULER_TZ=America/New_York   # ET-shaped crons
 Affects every cron in the agent home: `scheduler.yaml` LLM-tick jobs,
 auto-installed `saga-consolidate` and `introspection-report`,
 commitments-due-check, and every poller from
-`.claude/skills/*/pollers.json`. Invalid zone names fall back to UTC
+`skills/*/pollers.json`. Invalid zone names fall back to UTC
 with a logged warning rather than crashing the scheduler.
 
 ## Development
