@@ -813,6 +813,10 @@ class Config:
             billing_mode=detect_billing_mode(
                 explicit=_env("MIMIR_BILLING_MODE") or None,
                 oauth_credentials_path=oauth_credentials_path,
+                # chainlink #315: a codex-plus subscription spec is itself a
+                # QUOTA signal, so a Codex-only install keeps its quota view
+                # without relying on stale Anthropic creds.
+                model_spec=_env("MIMIR_MODEL_SPEC", "claude-code:claude-sonnet-4-6"),
             ),
 
             capture_rate_limits=_env_bool("MIMIR_CAPTURE_RATE_LIMITS", True),

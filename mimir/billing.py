@@ -71,6 +71,7 @@ def detect_billing_mode(
     *,
     explicit: str | None = None,
     oauth_credentials_path: Path | None = None,
+    model_spec: str = "",
 ) -> BillingMode:
     """Resolve ``BillingMode`` from explicit override + environment.
 
@@ -89,7 +90,11 @@ def detect_billing_mode(
        pay-as-you-go API-key installs. Result: API-key installs auto-
        detected as QUOTA, demoting ``cost_rate_alert`` to advisory and
        silently disabling the dollar-cost suppression layer.
-    4. Default → pay-as-you-go.
+    4. ``model_spec`` starts with ``codex-plus:`` → quota (the Codex /
+       ChatGPT-account subscription; the OpenAI analog of the OAuth
+       signals above). A bare ``openai:`` API-key spec is NOT a
+       subscription, so it's excluded — cost-rate handles that side.
+    5. Default → pay-as-you-go.
     """
     if explicit:
         try:
@@ -101,6 +106,15 @@ def detect_billing_mode(
                 explicit,
             )
     if running_on_claude_max():
+        return BillingMode.QUOTA
+    # A Codex (ChatGPT-account) subscription is QUOTA: the ``codex-plus:``
+    # model_spec is the operator's subscription declaration — the OpenAI
+    # analog of the Anthropic OAuth signals. Without it a Codex-only install
+    # (no Anthropic creds, no explicit MIMIR_BILLING_MODE) auto-detected
+    # PAY_AS_YOU_GO, so build_quota_providers returned [] and the Codex quota
+    # view disappeared (chainlink #315). A bare ``openai:`` spec is the
+    # pay-per-token API, NOT a subscription, so it is intentionally excluded.
+    if model_spec.strip().lower().startswith("codex-plus:"):
         return BillingMode.QUOTA
     if oauth_credentials_path is not None and oauth_credentials_path.is_file():
         return BillingMode.QUOTA
