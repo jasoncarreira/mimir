@@ -496,27 +496,34 @@ def _turn_matched_expected_tool_call(events: list, markers: dict) -> bool:
 
 
 def _expected_submission_markers(event_extra: dict) -> list[dict]:
-    """All expected-tool-call markers for an event — from the top level
-    (direct events) AND from each per-item ``extra`` under ``items``
-    (poller batch events wrap per-item metadata there). One marker dict
-    per review-needed item.
+    """The expected-tool-call markers for an event — one per review-needed
+    item.
 
-    The per-item lookup is the fix for chainlink #299's follow-up: every
-    poller AgentEvent is batch-wrapped (``extra={"items": [...]}``), so a
+    Per-item markers under ``extra["items"]`` (poller batch events wrap
+    per-item metadata there) are authoritative: when present they ARE the
+    set. A top-level ``expected_tool_call`` is consulted ONLY when there are
+    no per-item markers (a direct, non-batch event). Including both would
+    double-count ``expected`` — the top-level marker on a batch is the
+    shared declaration, not an extra Nth item (chainlink #308 / finding
+    #38).
+
+    The per-item lookup itself was chainlink #299's follow-up: every poller
+    AgentEvent is batch-wrapped (``extra={"items": [...]}``), so a
     top-level-only read found no marker and the missed-submission check
     never ran for poller reviews — letting "drafted but never submitted"
     reviews pass silently (observed: a turn claimed it approved PR #522 on
     GitHub but never called ``gh pr review``)."""
-    out: list[dict] = []
     if not isinstance(event_extra, dict):
-        return out
+        return []
+    item_markers = [
+        item["expected_tool_call"]
+        for item in (event_extra.get("items") or [])
+        if isinstance(item, dict) and isinstance(item.get("expected_tool_call"), dict)
+    ]
+    if item_markers:
+        return item_markers
     top = event_extra.get("expected_tool_call")
-    if isinstance(top, dict):
-        out.append(top)
-    for item in event_extra.get("items") or []:
-        if isinstance(item, dict) and isinstance(item.get("expected_tool_call"), dict):
-            out.append(item["expected_tool_call"])
-    return out
+    return [top] if isinstance(top, dict) else []
 
 
 # full system-prompt assembly (core memory + skills + persona).
@@ -1083,6 +1090,34 @@ class Agent:
                 event, ctx, ctx_token, turn_id, session_id, saga_session_id,
                 t_total_start,
             )
+        except Exception as exc:
+            # chainlink #306: _run_turn_body's model-loop try/except emits
+            # turn_failed/turn_completed only AFTER the early phase (prompt
+            # build, agent construction, model resolution). A crash in that
+            # early phase would otherwise propagate here with NO terminal
+            # outcome logged — and poller-recovery (#262), which keys off
+            # turn_failed/turn_completed, would leak the in-flight item
+            # forever (never retried). Guarantee a turn_failed for poller
+            # turns whose outcome wasn't already emitted, then re-raise so
+            # the dispatcher's own error handling is unchanged. Only
+            # ``Exception`` (not CancelledError) — a cancelled turn isn't a
+            # failure to recover.
+            if event.trigger == "poller" and not getattr(
+                ctx, "outcome_emitted", False
+            ):
+                try:
+                    await log_event(
+                        "turn_failed",
+                        channel_id=event.channel_id,
+                        turn_id=turn_id,
+                        trigger=event.trigger,
+                        error=f"{type(exc).__name__}: {exc}"[:240],
+                        phase="pre_model_loop",
+                        **_turn_outcome_identity(event),
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original
+                    log.exception("early-phase turn_failed emit failed")
+            raise
         finally:
             reset_current_turn(ctx_token)
             _reset_cid(cid_token)
@@ -1335,6 +1370,11 @@ class Agent:
                 trigger=event.trigger,
                 **_turn_outcome_identity(event),
             )
+        # chainlink #306: the terminal outcome for this turn has now been
+        # emitted (turn_failed on a model-loop error, turn_completed on a
+        # poller success). Mark it so run_turn's early-crash guard doesn't
+        # double-emit if a LATER step in this body raises.
+        ctx.outcome_emitted = True
 
         # Result fields drive the TurnRecord, so compute once and reuse.
         result_fields = derive_result_fields(messages)
@@ -1403,50 +1443,53 @@ class Agent:
                 session_id=saga_session_id,
                 trigger=event.trigger,
             )
-        # Expected-tool-call check (#234/#235; #299 follow-up): the event
-        # source can declare an ``expected_tool_call`` marker (a poller
-        # needing the turn to call a submission tool — github-poller's
-        # review events expect ``gh pr review``). Emit the declared signal
-        # when the turn submitted FEWER times than expected, so a "drafted
-        # but never submitted" review surfaces algedonically (the operator
-        # / next turn sees it). Markers live at the top level (direct
-        # events) OR per-item under ``extra["items"]`` (poller batch
-        # events) — checking both is the fix for this never firing on
-        # poller turns. Counting handles batches: N review items but only
-        # M submissions ⇒ N−M missed.
-        sub_markers = _expected_submission_markers(event.extra or {})
+        # Expected-tool-call check (#234/#235; #299 follow-up; per-item in
+        # #308): the event source can declare an ``expected_tool_call``
+        # marker (a poller needing the turn to call a submission tool —
+        # github-poller's review events expect ``gh pr review``). For a
+        # poller BATCH each review item carries its OWN marker; when that
+        # marker's ``bash_substrings`` is PR-specific (the PR number / url)
+        # we can tell WHICH item wasn't submitted — so a duplicate review of
+        # one PR no longer masks an unreviewed sibling (#308). A marker is
+        # "missed" when NONE of its declared submissions fired.
+        #
+        # Only checked on a SUCCEEDED turn (#308 / finding #22): a failed or
+        # timed-out turn already emits ``turn_failed``, so re-flagging the
+        # un-submitted review would be redundant noise.
+        sub_markers = [] if error else _expected_submission_markers(event.extra or {})
         if sub_markers:
-            marker = sub_markers[0]  # identical across one poller's review items
-            signal_type = marker.get("signal_on_missing")
-            expected = len(sub_markers)
-            submitted = _count_expected_tool_calls(events, marker)
-            if (
-                isinstance(signal_type, str)
-                and signal_type.strip()
-                and submitted < expected
-            ):
+            signal_type = sub_markers[0].get("signal_on_missing")
+            # Per-item: each marker is satisfied independently by its own
+            # submission(s). Generic (non-PR-specific) markers all match the
+            # same submissions and degrade to all-or-nothing — no false
+            # positives, just no per-item attribution.
+            missed = [
+                m for m in sub_markers
+                if _count_expected_tool_calls(events, m) == 0
+            ]
+            if isinstance(signal_type, str) and signal_type.strip() and missed:
                 ext = event.extra or {}
                 items = ext.get("items") or []
                 event_type = ext.get("event_type") or (
                     items[0].get("event_type")
                     if items and isinstance(items[0], dict) else None
                 )
+                # Which items were not submitted (PR url / #number) — for
+                # PR-specific markers; None for generic markers.
+                missed_refs = [m.get("ref") for m in missed if m.get("ref")]
                 await safe_log_event(
                     signal_type.strip(),
                     channel_id=event.channel_id,
                     # ``event_type`` is log_event's positional parameter, so the
                     # originating poller event type goes under a distinct key —
                     # else "multiple values for argument 'event_type'" (the same
-                    # collision pollers.py strips ``event_type`` to avoid). This
-                    # latent bug never surfaced pre-fix because the check never
-                    # fired for poller turns.
+                    # collision pollers.py strips ``event_type`` to avoid).
                     source_event_type=event_type,
-                    expected=expected,
-                    submitted=submitted,
-                    expected_tool_names=list(marker.get("tool_names") or []),
-                    expected_bash_substrings=list(
-                        marker.get("bash_substrings") or []
-                    ),
+                    expected=len(sub_markers),
+                    submitted=len(sub_markers) - len(missed),
+                    missed=len(missed),
+                    missed_refs=missed_refs or None,
+                    expected_tool_names=list(sub_markers[0].get("tool_names") or []),
                 )
         saga_calls = [
             {
