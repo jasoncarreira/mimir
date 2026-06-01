@@ -6,8 +6,7 @@
       "cron": "*/15 * * * *",
       "pass_env": [
         "GITHUB_TOKEN",
-        "GITHUB_REPOS",
-        "STATE_DIR"
+        "GITHUB_REPOS"
       ]
     }
   ]
