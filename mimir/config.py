@@ -68,6 +68,10 @@ DEFAULT_FOLDERS: dict[str, str] = {
     "state": "rw",       # Agent state files (commitments, sessions, etc.)
     "memory": "rw",      # Long-form text journal
     "attachments": "rw", # Agent-generated artifacts
+    "scratch": "rw",     # Ephemeral working area (drafts, throwaway clones,
+                         # scratch notes). Gitignored — not tracked state. The
+                         # blessed place for working files so the agent doesn't
+                         # invent ad-hoc dirs the write-guard then blocks (#299).
     "skills": "rw",      # Operator-supplied skill bundles (agent can refine)
     "logs": "ro",        # System-managed event/turn logs
     "messages": "ro",    # Channel history (read-only — never rewrite)

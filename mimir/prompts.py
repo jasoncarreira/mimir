@@ -123,6 +123,7 @@ def build_system_prompt(
     operator_alert_channel: str = "",
     skill_block: str | None = None,
     home_dir: str | None = None,
+    writable_dirs: list[str] | None = None,
 ) -> str:
     """Assemble the system prompt. ``state/INDEX.md`` is intentionally absent —
     it's read on demand (SPEC §9.1).
@@ -154,7 +155,7 @@ def build_system_prompt(
     # that might reference ``memory/...`` or ``state/...`` relative
     # paths. Cheap (~110 chars), install-stable, cache-friendly.
     if home_dir:
-        parts.append(
+        home_section = (
             "## Agent home\n\n"
             f"`MIMIR_HOME={home_dir}`\n\n"
             "All `memory/...` and `state/...` paths resolve under this "
@@ -163,6 +164,25 @@ def build_system_prompt(
             "not infer from `$HOME`, claude-code's default workspace, "
             "or any prose in subsequent blocks."
         )
+        # Writable-dir guidance (chainlink #299): the filesystem tools
+        # refuse writes outside ``Config.writable_dirs`` — without this the
+        # agent discovers that by trial-and-error (tool_call_denied), and
+        # invents ad-hoc dirs like ``.review-scratch/`` that aren't
+        # writable. Rendered from the live config so operator MIMIR_FOLDERS
+        # overrides stay accurate. Install-stable, so the cache prefix holds.
+        if writable_dirs:
+            listed = ", ".join(f"`{d}/`" for d in writable_dirs)
+            home_section += (
+                f"\n\nWritable workspace dirs: {listed}. Filesystem-tool "
+                "writes outside these are refused."
+            )
+            if "scratch" in writable_dirs:
+                home_section += (
+                    " For ephemeral working files — review drafts, scratch "
+                    "notes, throwaway clones — use `scratch/` (gitignored, "
+                    "not tracked state); don't invent ad-hoc top-level dirs."
+                )
+        parts.append(home_section)
 
     if core_blocks:
         rendered = render_core_section(core_blocks)
