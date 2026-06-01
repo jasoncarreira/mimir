@@ -1394,6 +1394,106 @@ def test_turn_matched_expected_tool_call_discriminates_review_from_review_commen
     ) is True
 
 
+# ── missed-submission detector: shell_exec + batched markers (#299 f/u) ──
+
+
+def test_count_expected_tool_calls_matches_shell_exec_and_counts():
+    """The shell tool is ``shell_exec`` (deepagents), not ``Bash`` — a
+    ``gh pr review`` via shell_exec must count. Pre-fix only ``Bash``
+    matched, so deepagents submissions were invisible and the
+    missed-submission check false-fired (chainlink #299 follow-up).
+    Also counts multiple submissions + MCP tool names."""
+    from mimir.agent import _count_expected_tool_calls
+
+    markers = {
+        "bash_substrings": ["gh pr review "],
+        "tool_names": ["pull_request_review_write"],
+        "signal_on_missing": "poller_review_missed_submission",
+    }
+    events = [
+        {"type": "tool_call", "name": "shell_exec",
+         "args": {"command": "gh pr review 1 --approve"}},
+        {"type": "tool_call", "name": "Bash",
+         "args": {"command": "gh pr review 2 --approve"}},  # legacy runtime
+        {"type": "tool_call", "name": "pull_request_review_write", "args": {}},
+    ]
+    assert _count_expected_tool_calls(events, markers) == 3
+    # ``gh pr view`` (not review) doesn't count.
+    assert _count_expected_tool_calls(
+        [{"type": "tool_call", "name": "shell_exec",
+          "args": {"command": "gh pr view 1"}}], markers,
+    ) == 0
+
+
+def test_expected_submission_markers_finds_top_level_and_items():
+    """Markers are collected from the top level AND from per-item
+    ``extra["items"]`` (poller batch shape). The per-item lookup is the
+    core fix — poller events are always batch-wrapped, so a top-level-only
+    read found nothing and the check never ran (chainlink #299 f/u)."""
+    from mimir.agent import _expected_submission_markers
+
+    m = {"bash_substrings": ["gh pr review "], "tool_names": [],
+         "signal_on_missing": "poller_review_missed_submission"}
+    assert _expected_submission_markers({"expected_tool_call": m}) == [m]
+    batch = {"items": [
+        {"event_type": "pr_opened", "expected_tool_call": m},
+        {"event_type": "pr_review_requested", "expected_tool_call": m},
+        {"event_type": "issue_comment"},  # non-review item — no marker
+    ]}
+    assert _expected_submission_markers(batch) == [m, m]
+    assert _expected_submission_markers({}) == []
+    assert _expected_submission_markers({"items": []}) == []
+    assert _expected_submission_markers(None) == []  # type: ignore[arg-type]
+
+
+async def test_run_turn_emits_missed_submission_for_unsubmitted_poller_review(
+    tmp_path: Path,
+):
+    """End-to-end regression for the PR #522 false-approval: a poller
+    review turn whose marker is in ``extra["items"]`` and that submits NO
+    review must emit ``poller_review_missed_submission``. Pre-fix the
+    top-level-only marker read skipped the check entirely, so a turn could
+    claim "Approved on GitHub" without ever calling ``gh pr review`` and
+    nothing flagged it (chainlink #299 follow-up)."""
+    import json
+
+    fake_agent = _FakeAgent(response_messages=[
+        AIMessage(content="Approved PR #522 (but never ran gh pr review)"),
+    ])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=None,
+        session_manager=_FakeSessionManager(),
+    )
+    marker = {
+        "tool_names": ["pull_request_review_write"],
+        "bash_substrings": ["gh pr review "],
+        "signal_on_missing": "poller_review_missed_submission",
+    }
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="Review PR #522 ...",
+        source_id="poller:github-activity:1:batch:0",
+        extra={
+            "poller_name": "github-activity",
+            "items": [
+                {"event_type": "pr_opened", "repo": "o/r", "number": 522,
+                 "expected_tool_call": marker},
+            ],
+        },
+    )
+    await agent.run_turn(event)
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    missed = [e for e in evs if e.get("type") == "poller_review_missed_submission"]
+    assert len(missed) == 1, (
+        f"expected the missed-submission signal; got {[e.get('type') for e in evs]}"
+    )
+    assert missed[0]["expected"] == 1
+    assert missed[0]["submitted"] == 0
+
+
 async def test_run_turn_folds_injected_skill_atoms_into_record_no_autofeedback(
     tmp_path: Path, monkeypatch
 ):
