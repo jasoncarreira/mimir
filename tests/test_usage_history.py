@@ -13,7 +13,9 @@ import pytest
 
 from mimir.usage_history import (
     UsagePoint,
+    active_provider_for_spec,
     compute_usage_history,
+    filter_history_to_provider,
     normalize_subscription_events,
 )
 
@@ -131,6 +133,52 @@ def test_normalize_multi_provider_deployment():
     assert set(out.keys()) == {"anthropic", "codex_plus"}
     assert len(out["anthropic"]["five_hour"]) == 2
     assert len(out["codex_plus"]["five_hour"]) == 1
+
+
+# ---- active_provider_for_spec + filter_history_to_provider (#280) --------
+
+
+def test_active_provider_codex_plus():
+    assert active_provider_for_spec("codex-plus:gpt-5.4") == "codex_plus"
+
+
+def test_active_provider_minimax_via_anthropic_compat():
+    # Minimax rides the ``anthropic:`` spec prefix; detect by name / base URL
+    # before the generic anthropic branch.
+    assert active_provider_for_spec(
+        "anthropic:MiniMax-M3", "https://api.minimax.io/anthropic"
+    ) == "minimax"
+    assert active_provider_for_spec("anthropic:MiniMax-M2.7") == "minimax"
+
+
+def test_active_provider_anthropic_and_claude_code():
+    assert active_provider_for_spec("anthropic:claude-opus-4-8") == "anthropic"
+    assert active_provider_for_spec("claude-code:claude-sonnet-4-6") == "anthropic"
+
+
+def test_active_provider_unknown_returns_none():
+    # Plain OpenAI has no subscription poller; empty/None can't be resolved.
+    assert active_provider_for_spec("openai:gpt-4o") is None
+    assert active_provider_for_spec("") is None
+    assert active_provider_for_spec(None) is None
+
+
+def test_filter_history_keeps_only_active():
+    hist = {
+        "anthropic": {"five_hour": [1]},
+        "codex_plus": {"five_hour": [2]},
+    }
+    assert filter_history_to_provider(hist, "codex_plus") == {
+        "codex_plus": {"five_hour": [2]},
+    }
+
+
+def test_filter_history_noop_on_none_or_absent():
+    # None (unknown active) or a provider not in the dict must never blank
+    # the chart — return everything rather than nothing.
+    hist = {"anthropic": {"five_hour": [1]}, "codex_plus": {"five_hour": [2]}}
+    assert filter_history_to_provider(hist, None) == hist
+    assert filter_history_to_provider(hist, "minimax") == hist
 
 
 def test_normalize_drops_unknown_event_types():

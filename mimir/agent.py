@@ -247,6 +247,7 @@ def _resolve_model(
     spec: str | BaseChatModel,
     *,
     max_retries: int = 6,
+    max_tokens: int = 0,
     rate_limit_callback: Callable[[Any], None] | None = None,
 ) -> BaseChatModel:
     """Translate a mimir-friendly model spec into a constructed BaseChatModel.
@@ -258,10 +259,11 @@ def _resolve_model(
                                   ``chatgpt.com/backend-api/codex/responses``)
       - ``<provider>:<model>``  → init_chat_model with ``max_retries`` (and,
                                   for OpenAI hitting api.openai.com,
-                                  ``use_responses_api=True``)
+                                  ``use_responses_api=True``; and ``max_tokens``
+                                  when a non-zero output cap is configured)
       - BaseChatModel instance  → pass-through (Bedrock/Vertex/custom)
 
-    ``max_retries`` only applies to the non-subprocess paths.
+    ``max_retries`` / ``max_tokens`` only apply to the non-subprocess paths.
 
     ``rate_limit_callback`` is currently honored only for
     ``codex-plus:``. Pass it from the agent so successful Codex Plus
@@ -339,6 +341,13 @@ def _resolve_model(
     # the right hint.
     from langchain.chat_models import init_chat_model
     init_params: dict[str, Any] = {"max_retries": max(0, int(max_retries))}
+    # Output token cap. 0 = leave the provider default. Set it (via
+    # MIMIR_MODEL_MAX_TOKENS) for thinking-via-Anthropic-compat models
+    # (Minimax / Kimi), whose reasoning blocks count against the output
+    # budget — a small default gets consumed entirely by thinking and the
+    # turn hits ``max_tokens`` mid-reasoning with an empty response.
+    if max_tokens and int(max_tokens) > 0:
+        init_params["max_tokens"] = int(max_tokens)
     if spec.startswith("openai:") and _supports_responses_api():
         init_params["use_responses_api"] = True
     return init_chat_model(spec, **init_params)
@@ -958,6 +967,7 @@ class Agent:
                 model=_resolve_model(
                     model_spec,
                     max_retries=getattr(self._config, "model_max_retries", 6),
+                    max_tokens=getattr(self._config, "model_max_tokens", 0),
                     rate_limit_callback=codex_plus_callback,
                 ),
                 tools=all_mimir_tools(),

@@ -693,6 +693,16 @@ class Config:
     max_events_kept: int
     turns_archive_dir: Path | None
 
+    # Per-call OUTPUT token cap for non-claude-code providers, threaded into
+    # ``init_chat_model`` via ``max_tokens=...`` (see ``mimir.agent._resolve_model``).
+    # 0 (default) leaves the provider default in place. RAISE IT for
+    # thinking-via-Anthropic-compat models (Minimax / Kimi): their reasoning
+    # blocks count against the output budget, so a small default (e.g. 4096)
+    # can be consumed entirely by thinking — the turn hits ``max_tokens``
+    # mid-reasoning and returns an empty response. Declared last with a
+    # default so direct ``Config(...)`` constructions stay non-breaking.
+    model_max_tokens: int = 0
+
     @classmethod
     def from_env(cls) -> "Config":
         home = Path(_env("MIMIR_HOME") or Path.cwd()).resolve()
@@ -710,6 +720,7 @@ class Config:
             model=_env("MIMIR_MODEL", "claude-opus-4-7"),
             model_spec=_env("MIMIR_MODEL_SPEC", "claude-code:claude-sonnet-4-6"),
             model_max_retries=_env_int("MIMIR_MODEL_MAX_RETRIES", 6),
+            model_max_tokens=_env_int("MIMIR_MODEL_MAX_TOKENS", 0),
             effort=_env("MIMIR_EFFORT", "high"),
             embed_model=_env("MIMIR_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
             saga_endpoint=_env("SAGA_ENDPOINT", "http://localhost:3002"),
@@ -839,7 +850,10 @@ class Config:
                 "MIMIR_MINIMAX_USAGE_POLL_CRON", "",
             ),
             minimax_usage_model_name=_env(
-                "MIMIR_MINIMAX_USAGE_MODEL", "MiniMax-M*",
+                # Minimax's coding_plan/remains endpoint keys buckets by
+                # category now ("general" for chat, "video"), not the old
+                # "MiniMax-M*" model glob (Coding Plan → Token Plan, 2026-06).
+                "MIMIR_MINIMAX_USAGE_MODEL", "general",
             ),
 
             health_probe_cron=_env(

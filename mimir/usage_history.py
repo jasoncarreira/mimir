@@ -66,6 +66,54 @@ _PROVIDER_BY_EVENT_TYPE: dict[str, str] = {
 }
 
 
+def active_provider_for_spec(
+    model_spec: str | None,
+    anthropic_base_url: str | None = None,
+) -> str | None:
+    """The usage_history provider key (one of the values in
+    ``_PROVIDER_BY_EVENT_TYPE`` above) whose subscription quota the agent is
+    actually consuming, derived from ``MIMIR_MODEL_SPEC`` (plus the Anthropic
+    base URL for the Minimax-via-Anthropic-compat case). ``None`` when it
+    can't be determined.
+
+    Lets the ops Usage chart collapse to the live subscription so stale
+    windows from a prior provider (e.g. Anthropic windows lingering after a
+    Codex cutover) don't render their own chart — the dashboard counterpart
+    of the agent-prompt projection in ``stats_block`` (chainlink #301). It
+    maps the spec straight into THIS module's key namespace, which differs
+    from billing's ``quota_provider_key`` (Codex is ``"openai"`` there but
+    ``"codex_plus"`` here), so it deliberately doesn't reuse
+    ``provider_for_quota``.
+    """
+    spec = (model_spec or "").strip().lower()
+    base = (anthropic_base_url or "").strip().lower()
+    if spec.startswith("codex-plus:"):
+        return "codex_plus"
+    # Minimax rides the Anthropic-compat envelope (spec ``anthropic:MiniMax-*``
+    # with an api.minimax.io base URL); match it before the generic anthropic
+    # branch so it isn't mis-bucketed as Anthropic.
+    if "minimax" in spec or "minimax" in base:
+        return "minimax"
+    if spec.startswith("anthropic:") or spec.startswith("claude-code:"):
+        return "anthropic"
+    return None
+
+
+def filter_history_to_provider(
+    history: dict[str, Any],
+    provider: str | None,
+) -> dict[str, Any]:
+    """Keep only ``provider``'s entry in a ``compute_usage_history`` dict.
+
+    Returns ``history`` unchanged when ``provider`` is falsy or absent from
+    it — an unknown / unmatched provider must never blank the chart (better
+    to show everything than nothing).
+    """
+    if not provider or provider not in history:
+        return history
+    return {provider: history[provider]}
+
+
 def _normalize_window_key(provider: str, raw_key: str) -> str:
     """Strip the provider prefix from window keys so the schema is uniform.
 

@@ -113,6 +113,7 @@ def register_routes(
     events_log: Path,
     home: Path | None = None,
     saga_db: Path | None = None,
+    active_usage_provider: str | None = None,
 ) -> None:
     """Add viewer + API routes to an existing aiohttp app.
 
@@ -125,7 +126,11 @@ def register_routes(
     (renders an "unavailable" message).
 
     ``saga_db`` is the path to the saga SQLite DB for the /saga viewer.
-    If None the viewer renders but API calls return an error payload."""
+    If None the viewer renders but API calls return an error payload.
+
+    ``active_usage_provider`` collapses the /ops Usage chart to that single
+    subscription provider (e.g. ``"codex_plus"``); None shows every provider
+    that has quota data."""
 
     existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
 
@@ -192,7 +197,10 @@ def register_routes(
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
         return web.json_response(
-            await build_dashboard_payload_async(events_log, days, home=home),
+            await build_dashboard_payload_async(
+                events_log, days, home=home,
+                active_provider=active_usage_provider,
+            ),
         )
 
     # ── /saga — saga DB viewer ───────────────────────────────────────
