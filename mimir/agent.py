@@ -442,54 +442,81 @@ def _turn_outcome_identity(event: AgentEvent) -> dict:
     return out
 
 
-def _turn_matched_expected_tool_call(events: list, markers: dict) -> bool:
-    """Generic "did the turn satisfy an expected-tool-call expectation?"
+def _count_expected_tool_calls(events: list, markers: dict) -> int:
+    """How many ``tool_call`` events satisfy ``markers`` — i.e. how many
+    submissions the turn actually made.
 
     ``markers`` is a dict declared by the event source (e.g. a poller
     putting an entry in its emitted JSONL's ``expected_tool_call``
     field). Shape:
 
       {
-        "tool_names":      ["pull_request_review_write", ...],   # exact match
-        "bash_substrings": ["gh pr review"],                       # substr in Bash arg.command
+        "tool_names":      ["pull_request_review_write", ...],   # exact name match
+        "bash_substrings": ["gh pr review "],                      # substr in shell command
         "signal_on_missing": "poller_review_missed_submission",     # event_type to emit
       }
 
-    Returns ``True`` if any ``tool_call`` event in ``events`` matches
-    any declared tool name OR any declared Bash substring. Designed
-    so policy (which tool calls count as "done") lives with the
-    source — adding a new expectation for a different poller is a
-    poller-side change, not an agent-core change.
+    Matches an exact tool name (MCP path) OR a shell command containing a
+    declared substring. The shell tool is ``shell_exec`` (deepagents);
+    ``Bash`` is also matched for the legacy claude-code runtime — pre-fix
+    only ``Bash`` was checked, so a ``gh pr review`` run via deepagents'
+    shell was invisible to this check (chainlink #299 follow-up).
 
-    Conservative on substring match: a passing reference to a
-    declared substring in some other context (echo, sed, grep) would
-    false-positive. Realistic exposure is low — the only way a
-    substring lands in a tool_call is if the model actually invoked
-    that command. The cost asymmetry (missed signal vs over-counted
-    success) favors over-counting.
+    Conservative on substring match: a passing reference to a declared
+    substring in some other context (echo, sed, grep) would over-count.
+    The cost asymmetry (missed signal vs over-counted success) favors
+    over-counting.
     """
     if not isinstance(markers, dict):
-        return False
+        return 0
     tool_names = set(markers.get("tool_names") or [])
     bash_substrings = list(markers.get("bash_substrings") or [])
     if not tool_names and not bash_substrings:
-        return False
+        return 0
+    count = 0
     for ev in events or []:
-        if not isinstance(ev, dict):
-            continue
-        if ev.get("type") != "tool_call":
+        if not isinstance(ev, dict) or ev.get("type") != "tool_call":
             continue
         name = ev.get("name") or ""
         if name and name in tool_names:
-            return True
-        if name == "Bash" and bash_substrings:
+            count += 1
+            continue
+        if name in ("shell_exec", "Bash") and bash_substrings:
             args = ev.get("args") or {}
             command = args.get("command") if isinstance(args, dict) else ""
-            if not isinstance(command, str):
-                continue
-            if any(s in command for s in bash_substrings):
-                return True
-    return False
+            if isinstance(command, str) and any(s in command for s in bash_substrings):
+                count += 1
+    return count
+
+
+def _turn_matched_expected_tool_call(events: list, markers: dict) -> bool:
+    """Back-compat boolean: did the turn make at least one matching
+    submission? (Equivalent to ``_count_expected_tool_calls(...) > 0``.)"""
+    return _count_expected_tool_calls(events, markers) > 0
+
+
+def _expected_submission_markers(event_extra: dict) -> list[dict]:
+    """All expected-tool-call markers for an event — from the top level
+    (direct events) AND from each per-item ``extra`` under ``items``
+    (poller batch events wrap per-item metadata there). One marker dict
+    per review-needed item.
+
+    The per-item lookup is the fix for chainlink #299's follow-up: every
+    poller AgentEvent is batch-wrapped (``extra={"items": [...]}``), so a
+    top-level-only read found no marker and the missed-submission check
+    never ran for poller reviews — letting "drafted but never submitted"
+    reviews pass silently (observed: a turn claimed it approved PR #522 on
+    GitHub but never called ``gh pr review``)."""
+    out: list[dict] = []
+    if not isinstance(event_extra, dict):
+        return out
+    top = event_extra.get("expected_tool_call")
+    if isinstance(top, dict):
+        out.append(top)
+    for item in event_extra.get("items") or []:
+        if isinstance(item, dict) and isinstance(item.get("expected_tool_call"), dict):
+            out.append(item["expected_tool_call"])
+    return out
 
 
 # full system-prompt assembly (core memory + skills + persona).
@@ -1376,32 +1403,49 @@ class Agent:
                 session_id=saga_session_id,
                 trigger=event.trigger,
             )
-        # Expected-tool-call check: when the inbound event declared
-        # an ``expected_tool_call`` markers dict (typically a poller
-        # that needs the turn to call a specific submission tool —
-        # github-poller's review-needed events expect ``gh pr review``),
-        # check whether the turn actually called the expected tool.
-        # Emit the declared signal when missing so the operator sees
-        # the failure mode in the algedonic block / introspection
-        # report. Generic on this side so a new poller adding its own
-        # expectation doesn't need to touch agent.py — it just emits
-        # the ``expected_tool_call`` marker in its JSONL.
-        # See Mimir's PR #234 / #235 investigation for the
-        # reasoning-before-Skill-loads root cause this detects.
-        markers = (event.extra or {}).get("expected_tool_call")
-        if (
-            isinstance(markers, dict)
-            and not _turn_matched_expected_tool_call(events, markers)
-        ):
-            signal_type = markers.get("signal_on_missing")
-            if isinstance(signal_type, str) and signal_type.strip():
+        # Expected-tool-call check (#234/#235; #299 follow-up): the event
+        # source can declare an ``expected_tool_call`` marker (a poller
+        # needing the turn to call a submission tool — github-poller's
+        # review events expect ``gh pr review``). Emit the declared signal
+        # when the turn submitted FEWER times than expected, so a "drafted
+        # but never submitted" review surfaces algedonically (the operator
+        # / next turn sees it). Markers live at the top level (direct
+        # events) OR per-item under ``extra["items"]`` (poller batch
+        # events) — checking both is the fix for this never firing on
+        # poller turns. Counting handles batches: N review items but only
+        # M submissions ⇒ N−M missed.
+        sub_markers = _expected_submission_markers(event.extra or {})
+        if sub_markers:
+            marker = sub_markers[0]  # identical across one poller's review items
+            signal_type = marker.get("signal_on_missing")
+            expected = len(sub_markers)
+            submitted = _count_expected_tool_calls(events, marker)
+            if (
+                isinstance(signal_type, str)
+                and signal_type.strip()
+                and submitted < expected
+            ):
+                ext = event.extra or {}
+                items = ext.get("items") or []
+                event_type = ext.get("event_type") or (
+                    items[0].get("event_type")
+                    if items and isinstance(items[0], dict) else None
+                )
                 await safe_log_event(
                     signal_type.strip(),
                     channel_id=event.channel_id,
-                    event_type=(event.extra or {}).get("event_type"),
-                    expected_tool_names=list(markers.get("tool_names") or []),
+                    # ``event_type`` is log_event's positional parameter, so the
+                    # originating poller event type goes under a distinct key —
+                    # else "multiple values for argument 'event_type'" (the same
+                    # collision pollers.py strips ``event_type`` to avoid). This
+                    # latent bug never surfaced pre-fix because the check never
+                    # fired for poller turns.
+                    source_event_type=event_type,
+                    expected=expected,
+                    submitted=submitted,
+                    expected_tool_names=list(marker.get("tool_names") or []),
                     expected_bash_substrings=list(
-                        markers.get("bash_substrings") or []
+                        marker.get("bash_substrings") or []
                     ),
                 )
         saga_calls = [
