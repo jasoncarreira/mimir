@@ -80,6 +80,14 @@ try:
 except Exception as e:
     print(f'Error fetching forecast: {e}', file=sys.stderr)
 
+# Both fetches failed → nothing to report. Exit non-zero so the caller (and
+# the agent) can distinguish a real failure from an empty result — previously
+# this exited 0 and masked auth/network errors (chainlink #325).
+if not result:
+    print('weather: both current-conditions and forecast fetches failed',
+          file=sys.stderr)
+    sys.exit(1)
+
 if output_json:
     print(json.dumps(result, indent=2))
 else:

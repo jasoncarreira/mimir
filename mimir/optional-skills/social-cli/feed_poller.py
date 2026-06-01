@@ -129,11 +129,15 @@ def _load_feed(path: Path) -> list[dict]:
         import yaml  # type: ignore[import-untyped]
         data = yaml.safe_load(text) or []
     except ImportError:
+        # Degrade gracefully (chainlink #324): the caller catches only
+        # (OSError, ValueError), so a re-raised ImportError crashed the whole
+        # poller when PyYAML was missing. Warn + return no posts instead —
+        # other platforms still run and the operator sees the cause.
         _eprint(
             "social-cli: PyYAML not installed; "
             "install pyyaml in mimir's venv for robust parsing"
         )
-        raise
+        return []
     if not isinstance(data, list):
         return []
     return [p for p in data if isinstance(p, dict)]

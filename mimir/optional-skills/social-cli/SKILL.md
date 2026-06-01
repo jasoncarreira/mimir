@@ -1,6 +1,6 @@
 ---
 name: social-cli
-description: Bluesky + X social loop. The bundled notifications poller runs `social-cli sync` on cron (default `*/15`), parses `inbox.yaml`, and wakes the agent in batches of up to 3 never-seen notifications per turn. The optional feed poller runs `social-cli feed` every 2h for timeline scanning. Agent reads inbox, writes `outbox.yaml`, runs `social-cli dispatch`. Also supports one-shot commands (post/reply/thread/like). Opt-in: install the skill, drop `.env` credentials into `<home>/state/pollers/social-cli-notifications/`. Companion to the `pollers` framework skill and the `world-scanning` skill.
+description: Bluesky + X social loop. The bundled notifications poller runs `social-cli sync` on cron (default `*/15`), parses the per-platform `inbox-<platform>.yaml` files, and wakes the agent in batches of up to 3 never-seen notifications per turn. The optional feed poller runs `social-cli feed` every 2h for timeline scanning. Agent reads inbox, writes `outbox.yaml`, runs `social-cli dispatch`. Also supports one-shot commands (post/reply/thread/like). Opt-in: install the skill, drop `.env` credentials into `<home>/state/pollers/social-cli-notifications/`. Companion to the `pollers` framework skill and the `world-scanning` skill.
 ---
 
 # social-cli — Bluesky + X social loop
@@ -10,7 +10,8 @@ This skill bundles both surfaces of the `social-cli` binary:
 - **Interactive (agent-driven):** inbox → outbox → dispatch loop for
   replying to mentions, posting threads, etc.
 - **Poller (cron-driven):** `social-cli sync` runs every 15min and
-  wakes the agent when there's something new in `inbox.yaml`.
+  wakes the agent when there's something new in the per-platform
+  `inbox-<platform>.yaml` files.
 
 **Full upstream spec** — outbox YAML shape, all action types, X auth
 details, dispatch hooks — lives at `/opt/social-cli/AGENT_GUIDE.md`
@@ -116,7 +117,7 @@ The poller surfaces notifications. The agent responds:
    ```
    Dispatch validates, executes per-action (one failure doesn't
    block the rest), archives `outbox.yaml`, and removes dispatched
-   notifications from `inbox.yaml`.
+   notifications from the per-platform `inbox-<platform>.yaml` files.
 
 ### Thread context — depth and your own prior contributions
 

@@ -245,3 +245,25 @@ def test_feed_limit_env_clamped(fresh_feed_poller, monkeypatch, capsys, tmp_path
     monkeypatch.setattr(fresh_feed_poller, "_fetch", fake_fetch)
     fresh_feed_poller.main()
     assert captured["limit"] == 200  # clamped from 500
+
+
+def test_load_feed_degrades_without_pyyaml(fresh_feed_poller, monkeypatch, tmp_path):
+    """chainlink #324: a missing PyYAML must NOT crash the poller. _load_feed
+    warns and returns no posts — the run loop catches only OSError/ValueError,
+    so a re-raised ImportError previously took down the whole poll (its
+    notifications sibling degraded gracefully; this one didn't)."""
+    import builtins
+
+    path = tmp_path / "feed-bsky.yaml"
+    path.write_text("- {id: p1, text: hi}\n", encoding="utf-8")
+
+    real_import = builtins.__import__
+
+    def _no_yaml(name, *args, **kwargs):
+        if name == "yaml":
+            raise ImportError("simulated: pyyaml not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_yaml)
+    # Returns [] (degraded) rather than raising ImportError.
+    assert fresh_feed_poller._load_feed(path) == []

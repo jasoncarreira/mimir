@@ -258,7 +258,7 @@ reflection.
 
 ## Cross-Referencing with Memory Skill
 
-The memory skill (`/mimir/skills/memory/SKILL.md`) covers:
+The **memory** skill (loaded from the skill catalog — not an absolute `/mimir` path) covers:
 - **When and how to write memory blocks** — criteria for block vs file storage
 - **Maintenance** — block size monitoring, pruning, file frequency analysis
 - **File organization** — cross-references between blocks and state files
@@ -267,27 +267,30 @@ Use introspection to find problems. Use memory to fix the persistent ones (updat
 blocks, reorganize files, add cross-references).
 
 For "which files am I reading most?" patterns, the analysis is a one-liner against
-`events.jsonl` — `tool_call` rows with `tool == "Read"` carry the `file_path`
+`events.jsonl` — `tool_call` rows with `name == "read_file"` carry the `file_path`
 arg; group by path and count. (open-strix's `file_frequency_report.py` was the
 prior art; mimir doesn't ship a port — write the jq pipeline inline when needed.)
 
 ## Companion Guides
 
-For specific debugging workflows, read these files:
+For specific debugging workflows, read these companion files. They live
+alongside this `SKILL.md` in the introspection skill's own directory — open
+the sibling file by name (there is no absolute `/mimir/skills` path in the
+deployed layout; bundled skills resolve under your home):
 
-- **Scheduled job issues?** → Read `/mimir/skills/introspection/debugging-jobs.md`
+- **Scheduled job issues?** → read `debugging-jobs.md`
   Covers: job not firing, firing at wrong time, cron vs time_of_day, timezone traps,
   validation errors, prompt failures
 
-- **Communication pattern issues?** → Read `/mimir/skills/introspection/debugging-communication.md`
+- **Communication pattern issues?** → read `debugging-communication.md`
   Covers: messages not sending, circuit breaker triggers, silent failures,
   duplicate messages, channel confusion, engagement pattern analysis
 
-- **Behavioral drift after model changes or block edits?** → Read `/mimir/skills/introspection/debugging-drift.md`
+- **Behavioral drift after model changes or block edits?** → read `debugging-drift.md`
   Covers: response rate tracking, cross-platform routing audit, model change
   before/after comparison, silence rate trends, topic engagement shifts
 
-- **Identity or operational drift?** → Read `/mimir/skills/onboarding/SKILL.md`
+- **Identity or operational drift?** → consult the **onboarding** skill
   Recovery from drift is structurally the same as onboarding. If introspection reveals
   stale blocks, broken schedules, or behavior that doesn't match your persona, the
   onboarding skill provides the framework for re-establishing each component.
