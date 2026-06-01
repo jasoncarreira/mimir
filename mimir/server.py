@@ -860,8 +860,21 @@ def build_app(config: Config) -> web.Application:
         rate_limit_store = RateLimitStore(
             path=config.home / ".mimir" / "rate_limits.json",
         )
+        # Only run the Anthropic OAuth usage poller when Anthropic is the
+        # ACTIVE quota provider. On a Codex / Minimax deployment it would
+        # otherwise keep refreshing stale Anthropic keys every few minutes
+        # (and spam refresh-token-age warnings), burying the live provider's
+        # quota in the Resource-usage view (chainlink #301).
+        from .providers import provider_for_quota
+
+        _active_quota_provider = provider_for_quota(
+            config.model_spec, config.anthropic_base_url
+        ).quota_provider_key
         oauth_poll_registered = False
-        if config.oauth_credentials_path is not None:
+        if (
+            config.oauth_credentials_path is not None
+            and _active_quota_provider == "anthropic"
+        ):
             try:
                 # Post-cutover (2026-05-15): agent._rate_limits is a no-op stub
                 # because the deepagents path no longer streams SDK

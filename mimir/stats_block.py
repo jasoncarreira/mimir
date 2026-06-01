@@ -142,8 +142,21 @@ def assemble_stats_block(
     rate_limit_current: dict[str, Any] = {}
     try:
         rate_limit_current = rate_limits.current()
-        plan_lines = render_plan_quota_lines(rate_limit_current)
-        off_pace = off_pace_buckets(rate_limit_current)
+        # Render/project only the ACTIVE quota provider's keys so stale
+        # keys a now-disabled poller left in the store (e.g. Anthropic keys
+        # after a Codex cutover) don't pollute the view or trigger phantom
+        # off-pace warnings (chainlink #301). The full unfiltered dict is
+        # still echoed on the result below.
+        from .providers import provider_for_quota
+        from .rate_limits import filter_to_active_provider
+
+        active_provider = provider_for_quota(
+            getattr(cfg, "model_spec", ""),
+            getattr(cfg, "anthropic_base_url", ""),
+        ).quota_provider_key
+        visible = filter_to_active_provider(rate_limit_current, active_provider)
+        plan_lines = render_plan_quota_lines(visible)
+        off_pace = off_pace_buckets(visible)
         off_pace_lines = render_off_pace_warning(off_pace)
     except Exception:  # noqa: BLE001
         log.exception("rate_limits read/projection failed")

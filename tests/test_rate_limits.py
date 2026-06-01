@@ -259,6 +259,59 @@ def test_render_uses_clean_labels_for_minimax_and_codex():
     assert "openai seven day" not in blob
 
 
+def test_filter_to_active_provider_drops_cross_provider_and_junk_keys():
+    """chainlink #301: after a provider switch (e.g. the Codex cutover) a
+    now-disabled poller can leave stale keys in the store. The view must
+    render only the ACTIVE provider's keys so the live provider's quota
+    isn't buried under continuously-refreshed stale ones."""
+    from mimir.rate_limits import filter_to_active_provider
+
+    snaps = {
+        "five_hour": RateLimitSnapshot(status="allowed", utilization=0.1, resets_at=None),
+        "seven_day": RateLimitSnapshot(status="allowed", utilization=0.2, resets_at=None),
+        "seven_day_sonnet": RateLimitSnapshot(status="allowed", utilization=0.3, resets_at=None),
+        "openai_five_hour": RateLimitSnapshot(status="allowed", utilization=0.8, resets_at=None),
+        "openai_seven_day": RateLimitSnapshot(status="allowed", utilization=0.18, resets_at=None),
+        # junk key not in any provider's window set
+        "seven_day_omelette": RateLimitSnapshot(status="allowed", utilization=0.0, resets_at=None),
+    }
+
+    # Codex deployment: only the openai_* keys survive.
+    assert set(filter_to_active_provider(snaps, "openai")) == {
+        "openai_five_hour", "openai_seven_day",
+    }
+
+    # Anthropic deployment: bare + per-model keys survive; the junk key and
+    # the openai_* keys are dropped.
+    anthropic = filter_to_active_provider(snaps, "anthropic")
+    assert set(anthropic) == {"five_hour", "seven_day", "seven_day_sonnet"}
+    assert "seven_day_omelette" not in anthropic
+
+    # Fail-open: unknown / falsy provider leaves the dict untouched.
+    assert filter_to_active_provider(snaps, "") == snaps
+    assert filter_to_active_provider(snaps, "nope") == snaps
+
+
+def test_render_plan_quota_lines_shows_only_active_provider_via_filter():
+    """End-to-end: rendering the filtered dict on a Codex box shows the
+    Codex lines and none of the leftover Anthropic ones (chainlink #301)."""
+    from mimir.rate_limits import filter_to_active_provider
+
+    snaps = {
+        "five_hour": RateLimitSnapshot(status="allowed", utilization=0.1, resets_at=None),
+        "seven_day": RateLimitSnapshot(status="allowed", utilization=0.2, resets_at=None),
+        "openai_five_hour": RateLimitSnapshot(status="allowed", utilization=0.8, resets_at=None),
+        "openai_seven_day": RateLimitSnapshot(status="allowed", utilization=0.18, resets_at=None),
+    }
+    blob = "\n".join(
+        render_plan_quota_lines(filter_to_active_provider(snaps, "openai"))
+    )
+    assert "Codex Plus 5-hour" in blob
+    assert "Codex Plus 7-day" in blob
+    assert "5-hour rolling" not in blob   # the Anthropic 5h label
+    assert "7-day plan-wide" not in blob  # the Anthropic 7d label
+
+
 def test_off_pace_fires_for_provider_windows():
     """off_pace_buckets must project burn rate for minimax_* / openai_*
     too (now that they're in _WINDOW_HOURS) — otherwise non-Anthropic

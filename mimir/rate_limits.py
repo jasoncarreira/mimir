@@ -48,7 +48,12 @@ from typing import Any
 # now applies the CR#7 invariant (fsync file + fsync parent dir)
 # uniformly across rate_limits, oauth_usage_poller, and quota_pause.
 from ._atomic import atomic_write_json
-from .quota_windows import store_key_order, store_label_map, store_window_hours
+from .quota_windows import (
+    provider_store_keys,
+    store_key_order,
+    store_label_map,
+    store_window_hours,
+)
 
 log = logging.getLogger(__name__)
 
@@ -203,6 +208,26 @@ def _as_float(v: Any) -> float | None:
     if isinstance(v, (int, float)):
         return float(v)
     return None
+
+
+def filter_to_active_provider(
+    snapshots: dict[str, RateLimitSnapshot],
+    active_provider: str | None,
+) -> dict[str, RateLimitSnapshot]:
+    """Keep only the store keys owned by ``active_provider`` (the resolved
+    quota-provider key for this deployment). Drops stale cross-provider
+    keys a now-disabled poller left behind AND junk keys not in any
+    provider's window set (chainlink #301).
+
+    An unknown / falsy ``active_provider`` (or one with no declared keys)
+    returns ``snapshots`` unchanged — fail-open so a routing gap never
+    blanks the whole view."""
+    if not active_provider:
+        return snapshots
+    allowed = set(provider_store_keys(active_provider))
+    if not allowed:
+        return snapshots
+    return {k: v for k, v in snapshots.items() if k in allowed}
 
 
 def render_plan_quota_lines(
