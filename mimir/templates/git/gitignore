@@ -83,3 +83,10 @@ rate_limits.json
 # allowlist exists; the explicit entry is belt-and-suspenders in case
 # an operator switches to a blocklist style.
 .mimir_builtin_skills/
+
+# scratch/ is already untracked via the allowlist, but ``!*/`` re-includes
+# directories — so an embedded git repo under scratch/ (e.g. a core-memory
+# proposal worktree under scratch/core-proposals/) would otherwise be grabbed
+# by the per-turn ``git add -A`` as a gitlink and break the commit hook
+# (chainlink #299). Ignore scratch/ explicitly so worktrees there stay invisible.
+scratch/

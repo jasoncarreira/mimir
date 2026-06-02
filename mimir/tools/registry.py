@@ -1144,6 +1144,11 @@ def all_mimir_tools() -> list:
     """
     from .memory import memory_query
     from .store import memory_store
+    from .core_memory import (
+        abandon_core_memory_proposal,
+        open_core_memory_proposal,
+        submit_core_memory_proposal,
+    )
     from .extra import file_search, get_turn, mimir_get_turn, rebuild_index, shell_exec
     from .web import web_tools_enabled
     from .shell_async import bash_async, bash_job_output, bash_jobs_list
@@ -1157,6 +1162,13 @@ def all_mimir_tools() -> list:
     tools = [
         # Memory (read + write)
         memory_query, memory_store,
+        # Core-memory change proposals (PR-gated; never writes live core).
+        # The sanctioned path for the agent to change memory/core/*: open a
+        # worktree sandbox under scratch/, edit it natively, then submit -> PR
+        # for operator approval (chainlink #337/#339).
+        open_core_memory_proposal,
+        submit_core_memory_proposal,
+        abandon_core_memory_proposal,
         # SAGA ops (outcome marker, manual credit, session boundary, forget,
         # per-skill learning capture)
         saga_feedback, saga_mark_contributions, saga_end_session, saga_forget,

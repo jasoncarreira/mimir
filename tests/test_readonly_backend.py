@@ -297,6 +297,36 @@ class TestCoreMemoryReflectionGate:
         finally:
             self._clear_turn(tok)
 
+    def test_allows_proposal_worktree_under_scratch(
+        self, home_with_memory: Path
+    ) -> None:
+        """Core-memory proposals (chainlink #339) edit a worktree under
+        scratch/. That path is NOT under home/memory/core, so the
+        reflection-only gate must allow it even on a normal turn where a live
+        memory/core/ write is refused — this is what lets the agent edit a
+        proposal natively while live core stays protected."""
+        wt_core = (
+            home_with_memory
+            / "scratch" / "core-proposals" / "core-memory_x" / "memory" / "core"
+        )
+        wt_core.mkdir(parents=True)
+        b = WriteGuardBackend(
+            root_dir=home_with_memory, writable_dirs=["memory", "scratch"]
+        )
+        ctx = self._make_turn_ctx(trigger="user_message", channel_id="discord-1")
+        tok = self._set_turn(ctx)
+        try:
+            blocked = b.write(file_path="/memory/core/00-persona.md", content="bad")
+            assert "reflection-only" in (getattr(blocked, "error", "") or "")
+            ok = b.write(
+                file_path="/scratch/core-proposals/core-memory_x/memory/core/00-persona.md",
+                content="proposed",
+            )
+            assert not (getattr(ok, "error", "") or "")
+            assert (wt_core / "00-persona.md").read_text() == "proposed"
+        finally:
+            self._clear_turn(tok)
+
     def test_blocks_core_memory_write_in_heartbeat_turn(
         self, home_with_memory: Path
     ) -> None:

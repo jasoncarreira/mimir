@@ -220,6 +220,7 @@ def build_turn_prompt(
     recent_message_chars: int = 0,
     resolver: object | None = None,
     feedback_block: str | None = None,
+    core_proposals_block: str | None = None,
     session_summaries_block: str | None = None,
     usage_block: str | None = None,
     upcoming_block: str | None = None,
@@ -287,6 +288,13 @@ def build_turn_prompt(
     # before it reads the conversation it's about to act on.
     if feedback_block:
         _add_labeled("Recent feedback signals", feedback_block)
+
+    # Open core-memory proposals (chainlink #337/#339): a live nudge right next
+    # to the feedback signals so the agent finishes/abandons an in-flight
+    # proposal instead of leaving it dangling. Driven off current state, so it
+    # auto-clears the moment the proposal is submitted or abandoned.
+    if core_proposals_block:
+        _add_labeled("Open core-memory proposals", core_proposals_block)
 
     # Recent session summaries (v0.4 §3): one rung wider than the message-
     # level recent activity. Placed before Recent activity so the agent

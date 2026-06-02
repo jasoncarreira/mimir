@@ -207,6 +207,90 @@ async def test_commit_and_schedule_push(
     assert push_failures[0]["turn_id"] == "t1"
 
 
+# ─── pull --rebase before push (#340) ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_debounced_push_pulls_rebase_before_push(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#340: the debounced push pulls --rebase first, so a merged PR (e.g. an
+    approved core-memory change) flows into the live home before we push."""
+    _short_debounce(monkeypatch, 0.05)
+    upstream = tmp_path / "up.git"
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(upstream)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(upstream)], cwd=home_repo, check=True)
+    subprocess.run(["git", "push", "-q", "-u", "origin", "main"], cwd=home_repo, check=True)
+
+    calls: list[tuple[str, ...]] = []
+    real_git = git_tracking._git
+
+    async def recording_git(*args: str, **kwargs: Any) -> Any:
+        calls.append(args)
+        return await real_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_git", recording_git)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("hello\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home_repo, enabled=True,
+    )
+    assert git_tracking._pending_push_task is not None
+    await asyncio.wait_for(git_tracking._pending_push_task, timeout=3.0)
+
+    seq = [" ".join(a) for a in calls]
+    pull_idx = next(i for i, s in enumerate(seq) if s.startswith("pull --rebase"))
+    push_idx = next(i for i, s in enumerate(seq) if s == "push")
+    assert pull_idx < push_idx
+    events = _read_events(tmp_path)
+    assert not [e for e in events if e["type"] in ("git_push_failed", "git_pull_blocked")]
+    assert [e for e in events if e["type"] == "git_push_ok"]
+
+
+@pytest.mark.asyncio
+async def test_debounced_push_aborts_rebase_and_skips_push_on_pull_failure(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If pull --rebase fails (e.g. a conflict), abort to leave the tree clean,
+    log git_pull_blocked, and skip the push this cycle (a later one catches up)."""
+    _short_debounce(monkeypatch, 0.05)
+    upstream = tmp_path / "up.git"
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(upstream)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(upstream)], cwd=home_repo, check=True)
+    subprocess.run(["git", "push", "-q", "-u", "origin", "main"], cwd=home_repo, check=True)
+
+    calls: list[tuple[str, ...]] = []
+    real_git = git_tracking._git
+
+    async def flaky_git(*args: str, **kwargs: Any) -> Any:
+        calls.append(args)
+        if args[:2] == ("pull", "--rebase"):
+            raise git_tracking.GitError(1, "simulated rebase conflict", args, stdout="")
+        if args[:2] == ("rebase", "--abort"):
+            # Pretend a rebase was in progress and got aborted → conflict path
+            # (rebase --abort succeeding is how the code detects a real conflict).
+            return git_tracking.GitResult(stdout="", stderr="")
+        return await real_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_git", flaky_git)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "y.md").write_text("hi\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t2", trigger="user_message", home=home_repo, enabled=True,
+    )
+    assert git_tracking._pending_push_task is not None
+    await asyncio.wait_for(git_tracking._pending_push_task, timeout=3.0)
+
+    seq = [" ".join(a) for a in calls]
+    assert any(s.startswith("pull --rebase") for s in seq)
+    assert "rebase --abort" in seq      # cleaned up the half-applied rebase
+    assert "push" not in seq            # push skipped this cycle
+    blocked = [e for e in _read_events(tmp_path) if e["type"] == "git_pull_blocked"]
+    assert blocked and blocked[0]["turn_id"] == "t2"
+
+
 # ─── debounce coalescing ────────────────────────────────────────────
 
 
