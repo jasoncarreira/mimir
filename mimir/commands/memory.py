@@ -26,11 +26,11 @@ from ..proposals import (
 
 
 def _run_open(args: argparse.Namespace) -> int:
-    result = open_proposal(Path(args.home).resolve())
+    result = open_proposal(Path(args.home).resolve(), lane=args.lane)
     if result.ok and result.worktree is not None:
-        print(f"opened {result.branch}")
+        print(f"opened {result.branch} (lane: {args.lane})")
         print(f"edit:  {result.worktree}/memory/core/ and {result.worktree}/prompts/")
-        print('then:  mimir memory submit --title "…" --rationale "…"')
+        print(f'then:  mimir memory submit --lane {args.lane} --title "…" --rationale "…"')
         return 0
     print(f"error ({result.reason}): {result.detail or ''}", file=sys.stderr)
     return 1
@@ -38,7 +38,7 @@ def _run_open(args: argparse.Namespace) -> int:
 
 def _run_submit(args: argparse.Namespace) -> int:
     result = finalize_proposal(
-        Path(args.home).resolve(), title=args.title, rationale=args.rationale
+        Path(args.home).resolve(), title=args.title, rationale=args.rationale, lane=args.lane
     )
     if result.ok:
         if result.pr_url:
@@ -51,15 +51,15 @@ def _run_submit(args: argparse.Namespace) -> int:
 
 
 def _run_abandon(args: argparse.Namespace) -> int:
-    if abandon_proposal(Path(args.home).resolve()):
-        print("abandoned the open proposal")
+    if abandon_proposal(Path(args.home).resolve(), lane=args.lane):
+        print(f"abandoned the open {args.lane} proposal")
     else:
-        print("(no open proposal to abandon)")
+        print(f"(no open {args.lane} proposal to abandon)")
     return 0
 
 
 def _run_status(args: argparse.Namespace) -> int:
-    opens = list_open_proposals(Path(args.home).resolve())
+    opens = list_open_proposals(Path(args.home).resolve(), lane=args.lane)
     if not opens:
         print("(no open proposals)")
         return 0
@@ -80,19 +80,23 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
         "open", help="Open a proposal worktree under scratch/ (prints the path to edit)."
     )
     op.add_argument("--home", type=Path, default=Path.cwd())
+    op.add_argument("--lane", choices=("agent", "upgrade"), default="agent")
 
     sb = mem_sub.add_parser(
         "submit", help="Commit + push the open proposal's memory/core + prompts changes and open a PR."
     )
     sb.add_argument("--home", type=Path, default=Path.cwd())
+    sb.add_argument("--lane", choices=("agent", "upgrade"), default="agent")
     sb.add_argument("--title", required=True, help="PR title.")
     sb.add_argument("--rationale", required=True, help="Why the change (PR body + commit).")
 
     ab = mem_sub.add_parser("abandon", help="Discard the open proposal (no PR).")
     ab.add_argument("--home", type=Path, default=Path.cwd())
+    ab.add_argument("--lane", choices=("agent", "upgrade"), default="agent")
 
     st = mem_sub.add_parser("status", help="List open proposals.")
     st.add_argument("--home", type=Path, default=Path.cwd())
+    st.add_argument("--lane", choices=("agent", "upgrade"), default="agent")
 
     return mem_p
 

@@ -36,7 +36,7 @@ def _home() -> Path | None:
 
 
 @tool
-async def open_proposal() -> str:
+async def open_proposal(lane: str = "agent") -> str:
     """Open a proposal to change protected files (memory/core/* and prompts/*).
 
     Core memory (identity, non-goals, action boundaries, learned behaviors,
@@ -48,29 +48,33 @@ async def open_proposal() -> str:
     move files freely across both; it's a sandbox, nothing is live yet. One
     proposal can touch both surfaces and becomes one PR. When you're done, call
     ``submit_proposal`` to open it for the operator to review. Only one proposal
-    can be open at a time (``abandon_proposal`` discards one).
+    can be open per lane (``abandon_proposal`` discards one). Supported lanes are
+    ``agent`` (default) and ``upgrade`` (for version-triggered default syncs).
+
+    Args:
+        lane: Proposal lane to open. Defaults to ``agent``.
 
     Returns the path to edit, or an explanation if a proposal can't be opened.
     """
     home = _home()
     if home is None:
         return "open_proposal failed: MIMIR_HOME not set — surface to the operator."
-    result = await asyncio.to_thread(_open_proposal, home)
+    result = await asyncio.to_thread(_open_proposal, home, lane=lane)
     if result.ok and result.worktree is not None:
         rel = result.worktree.relative_to(home.resolve())
         return (
-            f"Opened change proposal `{result.branch}`.\n"
+            f"Opened `{lane}` change proposal `{result.branch}`.\n"
             f"Edit the files under `{rel}/memory/core/` and/or `{rel}/prompts/` "
             f"with your normal file tools (add/edit/delete/move as needed) — this "
             f"is an isolated sandbox, the live files are untouched.\n"
-            f"When done, call submit_proposal(title, rationale) to open the PR "
+            f"When done, call submit_proposal(title, rationale, lane={lane!r}) to open the PR "
             f"for the operator to review and merge."
         )
     if result.reason == "exists":
         rel = result.worktree.relative_to(home.resolve()) if result.worktree else "?"
         return (
-            f"A change proposal is already open (`{result.branch}` at `{rel}`). "
-            f"Edit it and submit, or call abandon_proposal first."
+            f"A `{lane}` change proposal is already open (`{result.branch}` at `{rel}`). "
+            f"Edit it and submit, or call abandon_proposal(lane={lane!r}) first."
         )
     if result.reason == "no_remote":
         return (
@@ -82,7 +86,7 @@ async def open_proposal() -> str:
 
 
 @tool
-async def submit_proposal(title: str, rationale: str) -> str:
+async def submit_proposal(title: str, rationale: str, lane: str = "agent") -> str:
     """Submit the open change proposal: open a PR for operator approval.
 
     Commits the changes you made under the proposal's ``memory/core/`` and
@@ -95,6 +99,7 @@ async def submit_proposal(title: str, rationale: str) -> str:
         title: Short PR title summarizing the change.
         rationale: Why the change is warranted — goes in the PR body and the
             commit message; this is what the operator reviews against.
+        lane: Proposal lane to submit. Defaults to ``agent``.
     """
     home = _home()
     if home is None:
@@ -102,13 +107,13 @@ async def submit_proposal(title: str, rationale: str) -> str:
     if not (title and rationale):
         return "submit_proposal failed: title and rationale are both required."
     result = await asyncio.to_thread(
-        _finalize_proposal, home, title=title, rationale=rationale
+        _finalize_proposal, home, title=title, rationale=rationale, lane=lane
     )
     if result.ok and result.pr_url:
         # Positive feedback signal (chainlink #337/#339/#344): surfaces in the
         # prompt's feedback block and supersedes the open-proposal nudge (which
         # auto-clears now that the worktree is gone).
-        await log_event("proposal_pr_opened", pr_url=result.pr_url, branch=result.branch)
+        await log_event("proposal_pr_opened", pr_url=result.pr_url, branch=result.branch, lane=lane)
         return (
             f"Opened a change-proposal PR: {result.pr_url}\n"
             "Give the operator this URL and ask them to review and merge. "
@@ -123,7 +128,7 @@ async def submit_proposal(title: str, rationale: str) -> str:
         )
     if result.reason == "no_open":
         return (
-            "submit_proposal: no proposal is open. Call open_proposal first, "
+            f"submit_proposal: no `{lane}` proposal is open. Call open_proposal(lane={lane!r}) first, "
             "then edit the files."
         )
     if result.reason == "no_changes":
@@ -138,21 +143,24 @@ async def submit_proposal(title: str, rationale: str) -> str:
 
 
 @tool
-async def abandon_proposal() -> str:
+async def abandon_proposal(lane: str = "agent") -> str:
     """Discard the open change proposal without opening a PR.
 
     Removes the proposal's working copy and branch. Use this if you opened a
     proposal but decided not to propose the change after all.
+
+    Args:
+        lane: Proposal lane to abandon. Defaults to ``agent``.
     """
     home = _home()
     if home is None:
         return "abandon_proposal failed: MIMIR_HOME not set — surface to the operator."
-    open_now = await asyncio.to_thread(list_open_proposals, home)
-    removed = await asyncio.to_thread(_abandon_proposal, home)
+    open_now = await asyncio.to_thread(list_open_proposals, home, lane=lane)
+    removed = await asyncio.to_thread(_abandon_proposal, home, lane=lane)
     if removed:
         branch = open_now[0][0] if open_now else "?"
-        return f"Abandoned change proposal `{branch}`."
-    return "abandon_proposal: nothing to abandon (no proposal open)."
+        return f"Abandoned `{lane}` change proposal `{branch}`."
+    return f"abandon_proposal: nothing to abandon (no `{lane}` proposal open)."
 
 
 __all__ = (

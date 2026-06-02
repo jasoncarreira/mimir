@@ -48,19 +48,44 @@ PROPOSAL_SURFACES: tuple[Path, ...] = (Path("memory") / "core", Path("prompts"))
 #: Where proposal worktrees live — under the gitignored scratch workspace.
 PROPOSALS_REL = Path("scratch") / "proposals"
 
+#: Named proposal lanes. The agent lane is the existing manual/operator-facing
+#: proposal flow; the upgrade lane is reserved for version-triggered default syncs.
+AGENT_PROPOSAL_LANE = "agent"
+UPGRADE_PROPOSAL_LANE = "upgrade"
+PROPOSAL_LANES = (AGENT_PROPOSAL_LANE, UPGRADE_PROPOSAL_LANE)
+
 #: ``(home, branch, base, title, body) -> pr_url | None`` — injectable so tests
 #: exercise the git mechanics without a real GitHub.
 PrOpener = Callable[[Path, str, str, str, str], "str | None"]
 
 
-def default_branch_name(label: str = "proposal", *, ts: int | None = None) -> str:
-    """Derive a unique proposal branch ``proposal/<slug>-<unix-ts>``.
+def normalize_lane(lane: str | None) -> str:
+    """Return a supported proposal lane name, raising ``ValueError`` if invalid."""
+    value = (lane or AGENT_PROPOSAL_LANE).strip().lower()
+    if value not in PROPOSAL_LANES:
+        allowed = ", ".join(PROPOSAL_LANES)
+        raise ValueError(f"unsupported proposal lane {lane!r}; expected one of: {allowed}")
+    return value
 
-    ``ts`` is injectable for deterministic tests; production callers leave it
-    None to stamp with the current time."""
+
+def default_branch_name(
+    label: str = "proposal", *, ts: int | None = None, lane: str = AGENT_PROPOSAL_LANE
+) -> str:
+    """Derive a unique proposal branch for ``lane``.
+
+    Agent-lane branches keep the historical ``proposal/<slug>-<unix-ts>`` shape;
+    upgrade-lane branches use ``upgrade/<slug>-<unix-ts>`` so the lane is visible
+    in GitHub and never collides with manual proposals. ``ts`` is injectable for
+    deterministic tests; production callers leave it None to stamp with the
+    current time.
+    """
+    lane = normalize_lane(lane)
+    prefix = "upgrade" if lane == UPGRADE_PROPOSAL_LANE else "proposal"
     slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:40].rstrip("-")
+    if slug == "proposal" and lane != AGENT_PROPOSAL_LANE:
+        slug = prefix
     stamp = ts if ts is not None else int(time.time())
-    return f"proposal/{slug or 'proposal'}-{stamp}"
+    return f"{prefix}/{slug or prefix}-{stamp}"
 
 
 @dataclass
@@ -107,20 +132,45 @@ def _scan_for_secrets(text: str) -> bool:
     return bool(text) and _redact(text) != text
 
 
-def _proposals_dir(home: Path) -> Path:
-    return (home / PROPOSALS_REL).resolve()
+def _proposals_dir(home: Path, *, lane: str | None = None) -> Path:
+    root = (home / PROPOSALS_REL).resolve()
+    if lane is None:
+        return root
+    return root / normalize_lane(lane)
 
 
-def _worktree_dir(home: Path, branch: str) -> Path:
+def _lane_for_worktree(home: Path, worktree: Path) -> str | None:
+    """Infer a proposal lane from a worktree path under ``scratch/proposals``.
+
+    Pre-lane proposal worktrees lived directly under ``scratch/proposals/``;
+    treat those as the agent lane so an in-flight proposal survives an upgrade.
+    """
+    root = _proposals_dir(home)
+    try:
+        rel = worktree.relative_to(root)
+    except ValueError:
+        return None
+    if not rel.parts:
+        return None
+    candidate = rel.parts[0]
+    return candidate if candidate in PROPOSAL_LANES else AGENT_PROPOSAL_LANE
+
+
+def _worktree_dir(home: Path, branch: str, *, lane: str = AGENT_PROPOSAL_LANE) -> Path:
     # "/" isn't legal in a dir name; the branch is recovered from git, not the
     # dir name, so the sanitized form is just for a readable path.
-    return _proposals_dir(home) / branch.replace("/", "_")
+    return _proposals_dir(home, lane=lane) / branch.replace("/", "_")
 
 
-def list_open_proposals(home: Path) -> list[tuple[str, Path]]:
-    """``(branch, worktree_path)`` for each open proposal worktree under
-    ``scratch/proposals/``. Parsed from ``git worktree list``."""
+def list_open_proposals(home: Path, *, lane: str | None = None) -> list[tuple[str, Path]]:
+    """``(branch, worktree_path)`` for each open proposal worktree.
+
+    With ``lane`` omitted, returns proposals from all supported lanes under
+    ``scratch/proposals/<lane>/``. With ``lane`` set, filters to that lane. Parsed
+    from ``git worktree list`` so crash-orphaned paths disappear after prune.
+    """
     home = Path(home).resolve()
+    lane = normalize_lane(lane) if lane is not None else None
     pdir = _proposals_dir(home)
     res = _git(["worktree", "list", "--porcelain"], cwd=home)
     out: list[tuple[str, Path]] = []
@@ -131,7 +181,9 @@ def list_open_proposals(home: Path) -> list[tuple[str, Path]]:
         elif line.startswith("branch ") and cur_path is not None:
             name = line[len("branch "):].strip().replace("refs/heads/", "", 1)
             if pdir == cur_path or pdir in cur_path.parents:
-                out.append((name, cur_path))
+                inferred_lane = _lane_for_worktree(home, cur_path)
+                if inferred_lane and (lane is None or inferred_lane == lane):
+                    out.append((name, cur_path))
             cur_path = None
         elif not line.strip():
             cur_path = None
@@ -175,11 +227,21 @@ def _ensure_scratch_ignored(home: Path) -> str | None:
     return None
 
 
-def open_proposal(home: Path, *, base: str = "main", branch: str | None = None) -> OpenResult:
-    """Open a change proposal: a worktree off ``origin/<base>`` under
-    ``scratch/proposals/`` for the agent to edit (memory/core and prompts).
-    One proposal at a time."""
+def open_proposal(
+    home: Path,
+    *,
+    base: str = "main",
+    branch: str | None = None,
+    lane: str = AGENT_PROPOSAL_LANE,
+) -> OpenResult:
+    """Open a change proposal in ``lane``.
+
+    Each lane permits one open proposal at a time. Agent-lane worktrees live
+    under ``scratch/proposals/agent/``; upgrade-lane worktrees live under
+    ``scratch/proposals/upgrade/``.
+    """
     home = Path(home).resolve()
+    lane = normalize_lane(lane)
     if not _has_origin_remote(home):
         return OpenResult(
             ok=False, branch=None, worktree=None, reason="no_remote",
@@ -189,14 +251,14 @@ def open_proposal(home: Path, *, base: str = "main", branch: str | None = None) 
             ),
         )
     _git(["worktree", "prune"], cwd=home)  # clear crash-orphaned worktrees
-    existing = list_open_proposals(home)
+    existing = list_open_proposals(home, lane=lane)
     if existing:
         b, w = existing[0]
         return OpenResult(
             ok=False, branch=b, worktree=w, reason="exists",
             detail=(
-                f"a core-memory proposal is already open ({b}); submit or "
-                f"abandon it before opening another"
+                f"a {lane} proposal is already open ({b}); submit or "
+                f"abandon it before opening another {lane} proposal"
             ),
         )
     ignore_err = _ensure_scratch_ignored(home)
@@ -208,8 +270,8 @@ def open_proposal(home: Path, *, base: str = "main", branch: str | None = None) 
             ok=False, branch=None, worktree=None, reason="error",
             detail=_redact(f"git fetch origin {base} failed: {(fetch.stderr or '').strip()}"),
         )
-    branch = branch or default_branch_name()
-    wt = _worktree_dir(home, branch)
+    branch = branch or default_branch_name(lane=lane)
+    wt = _worktree_dir(home, branch, lane=lane)
     wt.parent.mkdir(parents=True, exist_ok=True)
     add = _git(
         ["worktree", "add", "--no-checkout", "-b", branch, str(wt), f"origin/{base}"],
@@ -268,6 +330,7 @@ def finalize_proposal(
     rationale: str,
     base: str = "main",
     branch: str | None = None,
+    lane: str = AGENT_PROPOSAL_LANE,
     open_pr: PrOpener | None = None,
 ) -> ProposalResult:
     """Commit the open proposal's changes (memory/core + prompts), push, and PR.
@@ -279,11 +342,12 @@ def finalize_proposal(
     intact so the agent can fix and resubmit.
     """
     home = Path(home).resolve()
-    opens = list_open_proposals(home)
+    lane = normalize_lane(lane)
+    opens = list_open_proposals(home, lane=lane)
     if not opens:
         return ProposalResult(
             ok=False, branch=None, pushed=False, pr_url=None, reason="no_open",
-            detail="no open core-memory proposal — open one first",
+            detail=f"no open {lane} proposal — open one first",
         )
     if branch is not None:
         match = [(b, w) for b, w in opens if b == branch]
@@ -332,7 +396,8 @@ def finalize_proposal(
 
     body = (
         f"{safe_rationale}\n\n---\n"
-        "Proposed by the mimir change-proposal workflow (chainlink #337/#344). "
+        f"Proposal lane: `{lane}`.\n"
+        "Proposed by the mimir change-proposal workflow (chainlink #337/#344/#348). "
         "Approval = merge; live files update after the merge (#340)."
     )
     opener = open_pr or _default_open_pr
@@ -346,11 +411,16 @@ def finalize_proposal(
     )
 
 
-def abandon_proposal(home: Path, *, branch: str | None = None) -> bool:
-    """Discard an open proposal (remove its worktree + local branch). Returns
-    True if one was found and removed, False if there was nothing open."""
+def abandon_proposal(
+    home: Path, *, branch: str | None = None, lane: str = AGENT_PROPOSAL_LANE
+) -> bool:
+    """Discard an open proposal in ``lane`` (remove its worktree + local branch).
+
+    Returns True if one was found and removed, False if there was nothing open.
+    """
     home = Path(home).resolve()
-    opens = list_open_proposals(home)
+    lane = normalize_lane(lane)
+    opens = list_open_proposals(home, lane=lane)
     if not opens:
         return False
     if branch is not None:
@@ -382,10 +452,13 @@ def render_open_proposals_block(home: Path) -> str | None:
             rel = worktree.relative_to(home)
         except ValueError:
             rel = worktree
+        lane = _lane_for_worktree(home, worktree) or "unknown"
+        args = "title, rationale" if lane == AGENT_PROPOSAL_LANE else f"title, rationale, lane='{lane}'"
+        abandon = "abandon_proposal" if lane == AGENT_PROPOSAL_LANE else f"abandon_proposal(lane='{lane}')"
         lines.append(
-            f"- `{branch}`: edit the files under `{rel}/memory/core/` or "
-            f"`{rel}/prompts/`, then `submit_proposal(title, rationale)` to open "
-            f"the PR — or `abandon_proposal` to discard."
+            f"- `{branch}` (lane `{lane}`): edit the files under `{rel}/memory/core/` or "
+            f"`{rel}/prompts/`, then `submit_proposal({args})` to open "
+            f"the PR — or `{abandon}` to discard."
         )
     return (
         "You have an open change proposal in progress — don't leave it "
@@ -402,6 +475,10 @@ __all__ = (
     "abandon_proposal",
     "list_open_proposals",
     "default_branch_name",
+    "normalize_lane",
     "PROPOSAL_SURFACES",
     "PROPOSALS_REL",
+    "AGENT_PROPOSAL_LANE",
+    "UPGRADE_PROPOSAL_LANE",
+    "PROPOSAL_LANES",
 )

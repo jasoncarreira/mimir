@@ -23,6 +23,7 @@ from mimir.proposals import (
     list_open_proposals,
     open_proposal,
     render_open_proposals_block,
+    normalize_lane,
 )
 
 TEMPLATE = Path(mimir.__file__).parent / "templates" / "git" / "gitignore"
@@ -115,11 +116,33 @@ def test_open_no_remote(tmp_path: Path) -> None:
     assert not r.ok and r.reason == "no_remote"
 
 
-def test_open_one_at_a_time(home: Path) -> None:
+def test_open_one_at_a_time_per_lane(home: Path) -> None:
     r1 = open_proposal(home)
     assert r1.ok
     r2 = open_proposal(home)
     assert not r2.ok and r2.reason == "exists" and r2.branch == r1.branch
+
+    # A simultaneous upgrade-lane proposal is allowed and has its own branch
+    # prefix + worktree namespace.
+    upgrade = open_proposal(home, lane="upgrade")
+    assert upgrade.ok and upgrade.branch is not None and upgrade.worktree is not None
+    assert upgrade.branch.startswith("upgrade/")
+    assert "scratch/proposals/upgrade" in str(upgrade.worktree.relative_to(home))
+    assert sorted(b for b, _ in list_open_proposals(home)) == sorted([r1.branch, upgrade.branch])
+    assert list_open_proposals(home, lane="agent") == [(r1.branch, r1.worktree)]
+    assert list_open_proposals(home, lane="upgrade") == [(upgrade.branch, upgrade.worktree)]
+
+
+def test_open_upgrade_lane_one_at_a_time(home: Path) -> None:
+    r1 = open_proposal(home, lane="upgrade")
+    assert r1.ok
+    r2 = open_proposal(home, lane="upgrade")
+    assert not r2.ok and r2.reason == "exists" and r2.branch == r1.branch
+
+
+def test_invalid_lane_rejected() -> None:
+    with pytest.raises(ValueError, match="unsupported proposal lane"):
+        normalize_lane("manual")
 
 
 # ─── submit / finalize ───────────────────────────────────────────────
@@ -222,16 +245,41 @@ def test_finalize_pushes_without_pr_when_opener_returns_none(home: Path) -> None
     assert res.ok and res.pushed and res.pr_url is None and res.reason == "pushed_no_pr"
 
 
+def test_finalize_selects_requested_lane(home: Path) -> None:
+    agent = open_proposal(home)
+    upgrade = open_proposal(home, lane="upgrade")
+    assert agent.ok and upgrade.ok
+    (agent.worktree / "memory" / "core" / "40-learned-behaviors.md").write_text(
+        SEED + "- agent\n", encoding="utf-8"
+    )
+    (upgrade.worktree / "prompts" / "reflect.md").write_text(
+        "# reflect\n\nupgrade revision\n", encoding="utf-8"
+    )
+    calls: list[dict] = []
+    res = finalize_proposal(
+        home, title="Upgrade defaults", rationale="new release", lane="upgrade", open_pr=_opener(calls)
+    )
+    assert res.ok and res.branch == upgrade.branch
+    assert calls and "Proposal lane: `upgrade`" in calls[0]["body"]
+    assert list_open_proposals(home, lane="upgrade") == []
+    assert list_open_proposals(home, lane="agent") == [(agent.branch, agent.worktree)]
+
+
 # ─── abandon ─────────────────────────────────────────────────────────
 
 
 def test_abandon(home: Path) -> None:
     r = open_proposal(home)
-    assert r.ok
+    upgrade = open_proposal(home, lane="upgrade")
+    assert r.ok and upgrade.ok
+    assert abandon_proposal(home, lane="upgrade") is True
+    assert list_open_proposals(home, lane="upgrade") == []
+    assert list_open_proposals(home, lane="agent") == [(r.branch, r.worktree)]
+    assert not upgrade.worktree.exists()
+    assert abandon_proposal(home, lane="upgrade") is False  # nothing open in that lane now
     assert abandon_proposal(home) is True
     assert list_open_proposals(home) == []
     assert not r.worktree.exists()
-    assert abandon_proposal(home) is False  # nothing open now
 
 
 # ─── scratch self-heal ───────────────────────────────────────────────
@@ -264,6 +312,8 @@ def test_open_self_heals_unignored_scratch(tmp_path: Path, upstream: Path) -> No
 def test_default_branch_name() -> None:
     assert default_branch_name("Add a Rule!", ts=5) == "proposal/add-a-rule-5"
     assert default_branch_name(ts=9) == "proposal/proposal-9"
+    assert default_branch_name("Sync Defaults", ts=10, lane="upgrade") == "upgrade/sync-defaults-10"
+    assert default_branch_name(ts=11, lane="upgrade") == "upgrade/upgrade-11"
 
 
 # ─── live-status nudge ───────────────────────────────────────────────
@@ -274,13 +324,18 @@ def test_render_open_proposals_block(home: Path) -> None:
     assert render_open_proposals_block(home) is None
     r = open_proposal(home)
     assert r.ok
+    upgrade = open_proposal(home, lane="upgrade")
+    assert upgrade.ok
     block = render_open_proposals_block(home)
     assert block is not None
-    assert r.branch in block
+    assert r.branch in block and upgrade.branch in block
+    assert "lane `agent`" in block and "lane `upgrade`" in block
     assert "submit_proposal" in block
     assert "abandon_proposal" in block
-    # Auto-clears once the proposal is gone.
+    # Auto-clears lane-by-lane once proposals are gone.
     abandon_proposal(home)
+    assert render_open_proposals_block(home) is not None
+    abandon_proposal(home, lane="upgrade")
     assert render_open_proposals_block(home) is None
 
 

@@ -29,19 +29,20 @@ def test_open_tool_returns_edit_path(monkeypatch, tmp_path) -> None:
     wt = (tmp_path / "scratch" / "proposals" / "proposal_x").resolve()
     monkeypatch.setattr(
         tp, "_open_proposal",
-        lambda home: OpenResult(ok=True, branch="proposal/x", worktree=wt),
+        lambda home, lane="agent": OpenResult(ok=True, branch="proposal/x", worktree=wt),
     )
     out = _inv(tp.open_proposal)
     assert "scratch/proposals/proposal_x/memory/core/" in out
     assert "scratch/proposals/proposal_x/prompts/" in out
     assert "submit_proposal" in out
+    assert "lane='agent'" in out
 
 
 def test_open_tool_no_remote(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setattr(
         tp, "_open_proposal",
-        lambda home: OpenResult(
+        lambda home, lane="agent": OpenResult(
             ok=False, branch=None, worktree=None, reason="no_remote", detail="x"
         ),
     )
@@ -53,12 +54,27 @@ def test_open_tool_already_open(monkeypatch, tmp_path) -> None:
     wt = (tmp_path / "scratch" / "proposals" / "proposal_y").resolve()
     monkeypatch.setattr(
         tp, "_open_proposal",
-        lambda home: OpenResult(
+        lambda home, lane="agent": OpenResult(
             ok=False, branch="proposal/y", worktree=wt, reason="exists", detail="x"
         ),
     )
     out = _inv(tp.open_proposal)
     assert "already open" in out and "proposal/y" in out
+
+
+def test_open_tool_forwards_lane(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    captured: dict = {}
+    wt = (tmp_path / "scratch" / "proposals" / "upgrade" / "upgrade_x").resolve()
+
+    def fake(home, lane="agent"):
+        captured["lane"] = lane
+        return OpenResult(ok=True, branch="upgrade/x", worktree=wt)
+
+    monkeypatch.setattr(tp, "_open_proposal", fake)
+    out = _inv(tp.open_proposal, lane="upgrade")
+    assert captured == {"lane": "upgrade"}
+    assert "upgrade" in out and "scratch/proposals/upgrade/upgrade_x" in out
 
 
 def test_open_tool_missing_home(monkeypatch) -> None:
@@ -79,20 +95,21 @@ def test_submit_tool_returns_url_forwards_args_and_emits_event(monkeypatch, tmp_
 
     monkeypatch.setattr(tp, "log_event", fake_log)
 
-    def fake(home, *, title, rationale):
-        captured.update(title=title, rationale=rationale)
+    def fake(home, *, title, rationale, lane="agent"):
+        captured.update(title=title, rationale=rationale, lane=lane)
         return ProposalResult(
             ok=True, branch="b", pushed=True,
             pr_url="https://github.com/x/y/pull/3", reason=None,
         )
 
     monkeypatch.setattr(tp, "_finalize_proposal", fake)
-    out = _inv(tp.submit_proposal, title="T", rationale="R")
+    out = _inv(tp.submit_proposal, title="T", rationale="R", lane="upgrade")
     assert "https://github.com/x/y/pull/3" in out and "merge" in out.lower()
-    assert captured == {"title": "T", "rationale": "R"}
+    assert captured == {"title": "T", "rationale": "R", "lane": "upgrade"}
     # Positive feedback event emitted with the PR URL (chainlink #337/#339/#344).
     assert events and events[0][0] == "proposal_pr_opened"
     assert events[0][1]["pr_url"] == "https://github.com/x/y/pull/3"
+    assert events[0][1]["lane"] == "upgrade"
 
 
 def test_submit_tool_no_open(monkeypatch, tmp_path) -> None:
@@ -103,9 +120,8 @@ def test_submit_tool_no_open(monkeypatch, tmp_path) -> None:
             ok=False, branch=None, pushed=False, pr_url=None, reason="no_open", detail="x"
         ),
     )
-    assert "no proposal is open" in _inv(
-        tp.submit_proposal, title="t", rationale="r"
-    )
+    out = _inv(tp.submit_proposal, title="t", rationale="r", lane="upgrade")
+    assert "no `upgrade` proposal is open" in out
 
 
 def test_submit_tool_secret(monkeypatch, tmp_path) -> None:
@@ -134,14 +150,14 @@ def test_submit_tool_requires_fields(monkeypatch, tmp_path) -> None:
 
 def test_abandon_tool(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    monkeypatch.setattr(tp, "list_open_proposals", lambda home: [("proposal/z", tmp_path)])
-    monkeypatch.setattr(tp, "_abandon_proposal", lambda home: True)
-    out = _inv(tp.abandon_proposal)
-    assert "proposal/z" in out and "bandon" in out
+    monkeypatch.setattr(tp, "list_open_proposals", lambda home, lane="agent": [("upgrade/z", tmp_path)])
+    monkeypatch.setattr(tp, "_abandon_proposal", lambda home, lane="agent": True)
+    out = _inv(tp.abandon_proposal, lane="upgrade")
+    assert "upgrade/z" in out and "upgrade" in out and "bandon" in out
 
 
 def test_abandon_tool_nothing_open(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    monkeypatch.setattr(tp, "list_open_proposals", lambda home: [])
-    monkeypatch.setattr(tp, "_abandon_proposal", lambda home: False)
-    assert "nothing to abandon" in _inv(tp.abandon_proposal).lower()
+    monkeypatch.setattr(tp, "list_open_proposals", lambda home, lane="agent": [])
+    monkeypatch.setattr(tp, "_abandon_proposal", lambda home, lane="agent": False)
+    assert "nothing to abandon" in _inv(tp.abandon_proposal, lane="upgrade").lower()
