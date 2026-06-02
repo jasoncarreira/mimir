@@ -1301,8 +1301,9 @@ class Scheduler:
                     )
                     skill_summary = _summarize_skill_consolidate(skill_payload)
                 except AttributeError:
-                    # Remote saga (_HttpSaga) has no skill-memory endpoint
-                    # yet; embedded SagaStore is the supported path.
+                    # Defensive: a SagaClient lacking consolidate_skill_memories
+                    # (a mock, or a future backend) degrades to skipped rather
+                    # than erroring. The embedded SagaStore implements it.
                     skill_summary = {"skipped": "unsupported"}
                 except Exception as exc:  # noqa: BLE001
                     skill_summary = {

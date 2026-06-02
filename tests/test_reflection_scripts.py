@@ -58,7 +58,6 @@ def _patch_script(monkeypatch, fake_client: _FakeClient, argv: list[str]) -> Non
     monkeypatch.setattr(script, "make_saga_client", lambda **kw: fake_client)
     monkeypatch.setattr("sys.argv", ["most_retrieved", *argv])
     monkeypatch.setenv("MIMIR_HOME", "/tmp/mimir-test")
-    monkeypatch.setenv("SAGA_ENDPOINT", "http://example.invalid")
 
 
 @pytest.mark.asyncio
@@ -133,7 +132,6 @@ def test_cli_subcommand_dispatches_to_script(monkeypatch: pytest.MonkeyPatch):
 
     fake = _FakeClient()
     monkeypatch.setattr(script, "make_saga_client", lambda **kw: fake)
-    monkeypatch.setenv("SAGA_ENDPOINT", "http://example.invalid")
 
     # SystemExit is the normal flow when the CLI completes (sys.exit(0)).
     out = io.StringIO()

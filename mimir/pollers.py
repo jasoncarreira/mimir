@@ -659,7 +659,7 @@ async def run_poller(
 
     # CR2 (external I/O) fix: previously this passed ``{**os.environ,
     # **poller.env}`` — the entire mimir process env (including
-    # MIMIR_API_KEY, SAGA_API_KEY, ANTHROPIC_API_KEY, DISCORD_TOKEN,
+    # MIMIR_API_KEY, ANTHROPIC_API_KEY, DISCORD_TOKEN,
     # SLACK_BOT_TOKEN, GITHUB_TOKEN, etc.) flowed to every poller
     # subprocess. A buggy poller that printed ``env`` to stderr would
     # leak every secret to events.jsonl (truncated to 2000 chars but

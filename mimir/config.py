@@ -348,8 +348,6 @@ class Config:
     model_max_retries: int
     effort: str
     embed_model: str
-    saga_endpoint: str
-    saga_api_key: str
     web_port: int
 
     # Concurrency (§4.5)
@@ -715,8 +713,6 @@ class Config:
             model_reasoning_effort=_env("MIMIR_MODEL_REASONING_EFFORT", ""),
             effort=_env("MIMIR_EFFORT", "high"),
             embed_model=_env("MIMIR_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
-            saga_endpoint=_env("SAGA_ENDPOINT", "http://localhost:3002"),
-            saga_api_key=_env("SAGA_API_KEY"),
             web_port=_env_int("MIMIR_WEB_PORT", 8080),
 
             max_concurrent_turns=_env_int("MIMIR_MAX_CONCURRENT_TURNS", 10),

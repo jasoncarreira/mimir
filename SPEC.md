@@ -44,11 +44,9 @@ The name is from Norse myth — Mímir, the keeper of memory and counsel.
 │   ├── core_blocks.py            # core memory block loading (was memory.py)
 │   ├── index.py                  # INDEX.md generator
 │   ├── search.py                 # fastembed + sqlite indexer
-│   ├── saga_client.py            # SagaClient Protocol + _InProcessSaga
-│   │                             # (default) / _HttpSaga (external-saga
-│   │                             # opt-out). v0.5 §2 — saga lives in the
-│   │                             # same process unless SAGA_ENDPOINT is set
-│   │                             # to a non-localhost URL.
+│   ├── saga_client.py            # SagaClient Protocol + in-process
+│   │                             # SagaStore (mimir.saga). saga always
+│   │                             # runs in the same process — no HTTP loop.
 │   ├── sagatools.py              # MCP tool wrappers around SagaClient
 │   ├── scheduler.py              # add/list/remove schedules (§6)
 │   ├── shell_jobs.py             # background bash jobs — bash_async / bash_job_output
@@ -236,7 +234,7 @@ One primary Python process inside the container (no supervisord):
 
 1. **Mimir** — Python service running the deepagents/LangGraph agent loop, plus the indexer thread, plus the channel bridges (§7.2.1) as asyncio tasks, plus a small HTTP control surface (event injection, health check, SAGA consolidate endpoint).
 
-**SAGA** runs **in-process** as `SagaStore` (the default since v0.5). `make_saga_client()` selects the implementation based on `Config.saga_endpoint`: when no endpoint is configured it instantiates `SagaStore` directly (SQLite, same process, no HTTP loop). The HTTP `_HttpSaga` adapter is preserved for operators running a separate saga HTTP server, but is not the default.
+**SAGA** runs **in-process** as `SagaStore` (the only mode since the external-saga HTTP path was retired). `make_saga_client()` instantiates `SagaStore` directly (SQLite, same process, no HTTP loop).
 
 Channel bridges (Slack, Discord, Bluesky, Web UI, Bench) are NOT separate processes — they run inside the mimir process as asyncio coroutines, sharing the per-channel dispatcher (§4.5) and the global concurrency cap. Subprocess pollers (§7.2.2) are the only out-of-process channel components, and they're inbound-only.
 
@@ -383,7 +381,7 @@ The context is set via `set_current_turn(ctx)` at the top of `run_turn` and rese
 | `events.jsonl` | Same — append-only with a lock. |
 | Indexer thread | Single writer, drains its own work queue. Concurrent file writes enqueue indexing tasks; eventually consistent within the 60s sweep. |
 | `INDEX.md` regeneration | Lock-serialized; the second writer overwrites with the newer snapshot. |
-| SAGA / SagaStore | In-process SQLite via `SagaStore`; thread-safety is `check_same_thread=False` on the connection pool + per-call serialization via `asyncio.to_thread`. The HTTP `_HttpSaga` adapter handles its own concurrency when an external saga server is configured. |
+| SAGA / SagaStore | In-process SQLite via `SagaStore`; thread-safety is `check_same_thread=False` on the connection pool + per-call serialization via `asyncio.to_thread`. |
 | `Write` / `Edit` (Claude Code built-in tools) | **Single-process serialization** via the dispatcher's per-channel queue + global semaphore. Within a turn, tool calls execute between graph steps (never interleaved). Across turns on the same channel, the per-channel worker FIFO serializes. Across channels, two simultaneous edits to the same memory file would race — but in practice each channel writes only to its own subtree. The actual write happens in the Claude Code CLI subprocess; mimir's process can't transactionally wrap it. If multi-process mimir ever ships, revisit. |
 | `Bash` writes | Out of band; we don't intercept syscalls. OS gives small-write atomicity. Semantic collisions are on the agent. The prompt steers content edits toward `Write` / `Edit`; bash is for moves, listings, processes. |
 | Per-channel writes (`memory/channels/<id>/`, etc.) | No contention in practice — only the channel's worker writes there, and the per-channel worker FIFO serializes its own writes. |
@@ -1432,7 +1430,6 @@ Caveats: `--dataset-path` must be explicit (default resolves incorrectly — see
 | `MIMIR_EFFORT` | `high` | Effort param |
 | `MIMIR_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed model |
 | `MIMIR_INDEX_DB` | `$MIMIR_HOME/.mimir/index.db` | SQLite path |
-| `SAGA_ENDPOINT` | `http://localhost:3002` | SAGA server |
 | `MIMIR_SAGA_SESSION_IDLE_MINUTES` | `10` | Per-channel SAGA session idle timeout (§5.6); session-end fires after this much silence on a channel |
 | `MIMIR_SAGA_CONSOLIDATE_CRON` | `0 4 * * *` | Cron expression for periodic `POST /v1/consolidate`; empty string disables (§5.6) |
 | `MIMIR_PROMPTS_DIR` | `mimir/prompts/` (bundled) | Override path for prompt templates; mimir falls back to bundled defaults if a file isn't found (§5.6) |

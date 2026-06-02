@@ -104,13 +104,9 @@ def test_setup_is_idempotent_and_preserves_user_edits(tmp_path: Path):
     home = tmp_path / "agent"
     setup_home(home)
     # User edits the .env to a minimal version (and includes their own keys).
-    # SAGA_API_KEY is included so setup doesn't auto-fill it on re-run
-    # (v0.5 §2: setup auto-generates SAGA_API_KEY when missing/blank, same
-    # policy as MIMIR_API_KEY).
     user_env = (
         "ANTHROPIC_API_KEY=user-key\n"
         "MIMIR_API_KEY=user-token\n"
-        "SAGA_API_KEY=user-saga-token\n"
     )
     (home / ".env").write_text(user_env)
     # User adds a custom skill at the operator-writable location.
@@ -123,7 +119,6 @@ def test_setup_is_idempotent_and_preserves_user_edits(tmp_path: Path):
     # Operator's set values must survive untouched.
     assert "ANTHROPIC_API_KEY=user-key" in body
     assert "MIMIR_API_KEY=user-token" in body
-    assert "SAGA_API_KEY=user-saga-token" in body
     # Setup IS allowed to append missing keys that the agent needs
     # (MIMIR_MODEL_SPEC, MIMIR_COST_HOURLY_LIMIT_USD for API-mode
     # cost monitoring). Operators get a working agent on re-run
@@ -203,20 +198,19 @@ def test_setup_invalid_preset_raises(tmp_path: Path):
         setup_home(home, embedding="does-not-exist")
 
 
-def test_setup_saga_toml_uses_generated_saga_api_key(tmp_path: Path):
-    """saga.toml's [server] api_key should match SAGA_API_KEY in .env so
-    that flipping to external-saga later doesn't require re-running setup."""
+def test_setup_writes_no_saga_credentials_or_endpoint(tmp_path: Path):
+    """saga runs in-process: setup writes no SAGA_API_KEY anywhere (not the
+    .env, not the git-tracked saga.toml — the dead, unread [server] api_key is
+    gone), and no longer emits the retired SAGA_ENDPOINT either."""
+    import re
     home = tmp_path / "agent"
     setup_home(home)
     env_text = (home / ".env").read_text()
     saga_text = (home / "saga.toml").read_text()
-    # Extract the SAGA_API_KEY value.
-    import re
-    m = re.search(r"^SAGA_API_KEY=(.+)$", env_text, re.MULTILINE)
-    assert m is not None
-    saga_key = m.group(1).strip()
-    assert saga_key  # non-empty
-    assert f'api_key = "{saga_key}"' in saga_text
+    assert re.search(r"^SAGA_API_KEY=\S", env_text, re.MULTILINE) is None
+    assert "SAGA_ENDPOINT" not in env_text
+    assert 'api_key = "' not in saga_text
+    assert "[server]" not in saga_text
 
 
 def test_setup_does_not_clobber_existing_saga_toml(tmp_path: Path):
@@ -233,7 +227,7 @@ def test_setup_env_template_lists_main_keys(tmp_path: Path):
     home = tmp_path / "agent"
     setup_home(home)
     env_text = (home / ".env").read_text()
-    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "SAGA_ENDPOINT", "DISCORD_TOKEN"):
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "DISCORD_TOKEN"):
         assert key in env_text
 
 
@@ -341,7 +335,7 @@ def test_regenerate_api_key_rotates_and_preserves_others(tmp_path: Path):
     )
     assert new_key == after_key
     assert new_key != before
-    for unrelated in ("ANTHROPIC_API_KEY=", "MIMIR_WEB_PORT=", "SAGA_ENDPOINT="):
+    for unrelated in ("ANTHROPIC_API_KEY=", "MIMIR_WEB_PORT=", "OPENAI_API_KEY="):
         assert unrelated in after
 
 
