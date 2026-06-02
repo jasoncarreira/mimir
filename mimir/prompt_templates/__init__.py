@@ -14,6 +14,8 @@ Currently seeded:
 - ``reflect.md`` — weekly cross-session audit workflow. Wraps the
   ``mimir reflection`` CLI subcommands (``most-retrieved``,
   ``introspection-report``, ``mark-applied``).
+- ``upgrade.md`` — version-triggered prompts/core defaults reconciliation
+  turn for startup-opened upgrade-lane proposals.
 
 The intent: a fresh ``mimir setup`` produces a deployment that already
 has a reasonable autonomous-work cadence wired up. Operators delete

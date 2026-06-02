@@ -205,3 +205,85 @@ def test_merge_error_cleans_open_upgrade_proposal(home: Path, monkeypatch: pytes
     assert not result.ok and result.detail == "boom"
     assert list_open_proposals(home, lane="upgrade") == []
     assert (home / du.LAST_SYNCED_VERSION_FILE).read_text(encoding="utf-8") == "1.0.0\n"
+
+
+def test_clean_upgrade_can_auto_submit_without_reconciliation_turn(
+    home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _defaults(monkeypatch, identity="identity v1\n", heartbeat="heartbeat v1\n")
+    assert du.check_and_open_defaults_upgrade(home, version="1.0.0").action == "baseline_initialized"
+    _defaults(monkeypatch, identity="identity v2\n", heartbeat="heartbeat v2\n")
+    captured: dict = {}
+
+    def fake_finalize(home_arg: Path, **kwargs):
+        captured.update(home=home_arg, **kwargs)
+        return du.ProposalResult(
+            ok=True,
+            branch="upgrade/defaults-1-1-0-123",
+            pushed=True,
+            pr_url="https://github.example/pr/1",
+            reason=None,
+        )
+
+    monkeypatch.setattr(du, "finalize_proposal", fake_finalize)
+
+    result = du.check_and_open_defaults_upgrade(
+        home, version="1.1.0", auto_submit_clean=True,
+    )
+
+    assert result.ok and result.action == "auto_submitted"
+    assert result.auto_submit and result.auto_submit.pr_url == "https://github.example/pr/1"
+    assert captured["lane"] == "upgrade"
+    assert captured["title"] == "Upgrade mimir defaults to 1.1.0"
+    assert (home / du.LAST_SYNCED_VERSION_FILE).read_text(encoding="utf-8") == "1.1.0\n"
+    assert _git("rev-parse", "--verify", du.PENDING_PREVIOUS_REF, cwd=home, check=False).returncode != 0
+
+
+@pytest.mark.asyncio
+async def test_upgrade_reconciliation_turn_renders_template_and_enqueues(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "prompts").mkdir()
+    (home / "prompts" / du.UPGRADE_PROMPT_TEMPLATE).write_text(
+        "Upgrade {version} branch={branch} wt={worktree} conflicts={conflicts}",
+        encoding="utf-8",
+    )
+    wt = home / "scratch" / "proposals" / "upgrade" / "upgrade_defaults"
+    result = du.DefaultsUpgradeResult(
+        ok=True,
+        action="proposal_opened_conflicts",
+        version="1.1.0",
+        proposal=du.OpenResult(ok=True, branch="upgrade/defaults", worktree=wt),
+        conflicts=True,
+    )
+    events = []
+
+    async def fake_enqueue(event):
+        events.append(event)
+        return True
+
+    assert await du.enqueue_upgrade_reconciliation_turn(home, result, fake_enqueue) is True
+    assert len(events) == 1
+    event = events[0]
+    assert event.trigger == "upgrade"
+    assert event.channel_id == "upgrade:1.1.0"
+    assert event.source == "system"
+    assert "Upgrade 1.1.0 branch=upgrade/defaults" in event.content
+    assert f"wt={wt}" in event.content
+    assert "conflicts=true" in event.content
+    assert event.extra["proposal_worktree"] == str(wt)
+
+
+@pytest.mark.asyncio
+async def test_upgrade_reconciliation_turn_skips_auto_submitted(tmp_path: Path) -> None:
+    result = du.DefaultsUpgradeResult(
+        ok=True,
+        action="auto_submitted",
+        version="1.1.0",
+        proposal=du.OpenResult(ok=True, branch="upgrade/defaults", worktree=tmp_path / "wt"),
+    )
+
+    async def fail_enqueue(event):  # pragma: no cover - should not be called
+        raise AssertionError(event)
+
+    assert await du.enqueue_upgrade_reconciliation_turn(tmp_path, result, fail_enqueue) is False

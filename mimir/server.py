@@ -671,7 +671,10 @@ def build_app(config: Config) -> web.Application:
                     log_event=_sync_log_event,
                 )
                 try:
-                    from .defaults_upgrade import check_and_open_defaults_upgrade
+                    from .defaults_upgrade import (
+                        check_and_open_defaults_upgrade,
+                        enqueue_upgrade_reconciliation_turn,
+                    )
 
                     defaults_result = await asyncio.to_thread(
                         check_and_open_defaults_upgrade,
@@ -684,6 +687,20 @@ def build_app(config: Config) -> web.Application:
                         proposal_branch=(defaults_result.proposal.branch if defaults_result.proposal else None),
                         conflicts=defaults_result.conflicts,
                     )
+                    upgrade_enqueued = await enqueue_upgrade_reconciliation_turn(
+                        config.home,
+                        defaults_result,
+                        dispatcher.enqueue,
+                    )
+                    if upgrade_enqueued:
+                        await log_event(
+                            "defaults_upgrade_turn_enqueued",
+                            version=defaults_result.version,
+                            proposal_branch=(
+                                defaults_result.proposal.branch if defaults_result.proposal else None
+                            ),
+                            conflicts=defaults_result.conflicts,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     await log_event(
                         "defaults_upgrade_failed",
