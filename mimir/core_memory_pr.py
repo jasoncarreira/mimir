@@ -354,8 +354,38 @@ def abandon_proposal(home: Path, *, branch: str | None = None) -> bool:
     return True
 
 
+def render_open_proposals_block(home: Path) -> str | None:
+    """Prompt nudge for any open core-memory proposal(s), or None if none.
+
+    Surfaced near the feedback block every turn so the agent doesn't leave a
+    proposal dangling (#337/#339). Auto-clears the moment the worktree is gone
+    (submitted or abandoned) — which is why the nudge is driven off live state
+    rather than a per-turn event.
+    """
+    opens = list_open_proposals(home)
+    if not opens:
+        return None
+    home = Path(home).resolve()
+    lines: list[str] = []
+    for branch, worktree in opens:
+        try:
+            rel = worktree.relative_to(home)
+        except ValueError:
+            rel = worktree
+        lines.append(
+            f"- `{branch}`: edit the files under `{rel}/memory/core/`, then "
+            f"`submit_core_memory_proposal(title, rationale)` to open the PR — "
+            f"or `abandon_core_memory_proposal` to discard."
+        )
+    return (
+        "You have an open core-memory proposal in progress — don't leave it "
+        "hanging:\n" + "\n".join(lines)
+    )
+
+
 __all__ = (
     "OpenResult",
+    "render_open_proposals_block",
     "ProposalResult",
     "open_proposal",
     "finalize_proposal",

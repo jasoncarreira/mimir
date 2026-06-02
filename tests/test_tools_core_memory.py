@@ -64,9 +64,15 @@ def test_open_tool_missing_home(monkeypatch) -> None:
 # ─── submit ──────────────────────────────────────────────────────────
 
 
-def test_submit_tool_returns_url_and_forwards_args(monkeypatch, tmp_path) -> None:
+def test_submit_tool_returns_url_forwards_args_and_emits_event(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     captured: dict = {}
+    events: list = []
+
+    async def fake_log(kind, **kw):
+        events.append((kind, kw))
+
+    monkeypatch.setattr(cm, "log_event", fake_log)
 
     def fake(home, *, title, rationale):
         captured.update(title=title, rationale=rationale)
@@ -79,6 +85,9 @@ def test_submit_tool_returns_url_and_forwards_args(monkeypatch, tmp_path) -> Non
     out = _inv(cm.submit_core_memory_proposal, title="T", rationale="R")
     assert "https://github.com/x/y/pull/3" in out and "merge" in out.lower()
     assert captured == {"title": "T", "rationale": "R"}
+    # Positive feedback event emitted with the PR URL (chainlink #337/#339).
+    assert events and events[0][0] == "core_pr_opened"
+    assert events[0][1]["pr_url"] == "https://github.com/x/y/pull/3"
 
 
 def test_submit_tool_no_open(monkeypatch, tmp_path) -> None:

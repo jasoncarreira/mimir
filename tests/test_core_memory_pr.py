@@ -22,6 +22,7 @@ from mimir.core_memory_pr import (
     finalize_proposal,
     list_open_proposals,
     open_proposal,
+    render_open_proposals_block,
 )
 
 TEMPLATE = Path(mimir.__file__).parent / "templates" / "git" / "gitignore"
@@ -237,3 +238,27 @@ def test_open_self_heals_unignored_scratch(tmp_path: Path, upstream: Path) -> No
 def test_default_branch_name() -> None:
     assert default_branch_name("Add a Rule!", ts=5) == "core-memory/add-a-rule-5"
     assert default_branch_name(ts=9) == "core-memory/proposal-9"
+
+
+# ─── live-status nudge ───────────────────────────────────────────────
+
+
+def test_render_open_proposals_block(home: Path) -> None:
+    # Nothing open → no nudge.
+    assert render_open_proposals_block(home) is None
+    r = open_proposal(home)
+    assert r.ok
+    block = render_open_proposals_block(home)
+    assert block is not None
+    assert r.branch in block
+    assert "submit_core_memory_proposal" in block
+    assert "abandon_core_memory_proposal" in block
+    # Auto-clears once the proposal is gone.
+    abandon_proposal(home)
+    assert render_open_proposals_block(home) is None
+
+
+def test_core_pr_opened_classifies_positive() -> None:
+    from mimir.feedback.rules import classify
+
+    assert classify("core_pr_opened") == ("positive", "core_pr_opened")

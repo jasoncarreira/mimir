@@ -2336,6 +2336,17 @@ class Agent:
             if self._config.feedback_limit_per_polarity > 0
             else None
         )
+        # Open core-memory proposals nudge (chainlink #337/#339), rendered next
+        # to the feedback signals so the agent finishes/abandons an in-flight
+        # proposal. Sync git call off the loop; a prompt section must never
+        # break the turn, hence the broad guard.
+        try:
+            from .core_memory_pr import render_open_proposals_block
+            core_proposals_block = await asyncio.to_thread(
+                render_open_proposals_block, self._config.home
+            )
+        except Exception:  # noqa: BLE001 — prompt assembly must not fail a turn
+            core_proposals_block = None
         session_summaries_block = await self._assemble_session_summaries(
             channel_id=event.channel_id,
         )
@@ -2423,6 +2434,7 @@ class Agent:
             recent_message_chars=self._config.recent_message_chars,
             resolver=self._buffer.resolver,
             feedback_block=feedback_block,
+            core_proposals_block=core_proposals_block,
             session_summaries_block=session_summaries_block,
             usage_block=usage_block,
             upcoming_block=upcoming_block,

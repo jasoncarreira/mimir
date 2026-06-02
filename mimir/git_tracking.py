@@ -381,6 +381,33 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
     if not await _has_origin_remote(home):
         return
     key = _home_key(home)
+    # Pull remote merges (e.g. an approved core-memory PR — chainlink #337/#340)
+    # before pushing, so the merge flows into the live working tree and the
+    # next turn's load_core picks it up. ``--rebase`` replays our local turn-
+    # commits on top. On failure (conflict / auth / timeout) abort any half-
+    # applied rebase to leave the tree clean, log, and skip the push this cycle
+    # — a later debounce / retry catches up. Conflicts shouldn't arise: core
+    # PRs touch memory/core, turn-commits touch turns.jsonl / state / *.db.
+    try:
+        await _git("pull", "--rebase", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
+    except (GitError, asyncio.TimeoutError, OSError) as exc:
+        # Distinguish a rebase CONFLICT from a transient/remote failure: if
+        # ``rebase --abort`` succeeds there WAS a rebase in progress (a
+        # conflict) — skip the push and surface git_pull_blocked, since pushing
+        # a half-reconciled tree is wrong. If there's nothing to abort, the
+        # pull failed before rebasing (unreachable remote / auth / timeout);
+        # fall through to the push so the existing retry/backoff path handles
+        # it just as it did before pull-before-push was added.
+        aborted = False
+        try:
+            await _git("rebase", "--abort", cwd=home, timeout=COMMAND_TIMEOUT_SECONDS)
+            aborted = True
+        except (GitError, asyncio.TimeoutError, OSError):
+            pass
+        if aborted:
+            await log_event("git_pull_blocked", reason=_short_err(exc), turn_id=turn_id)
+            return
+        # else: transient/remote pull failure — fall through to the push.
     try:
         await _git("push", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:

@@ -26,6 +26,7 @@ from ..core_memory_pr import (
     list_open_proposals,
     open_proposal,
 )
+from ..event_logger import log_event
 
 
 def _home() -> Path | None:
@@ -102,6 +103,10 @@ async def submit_core_memory_proposal(title: str, rationale: str) -> str:
         finalize_proposal, home, title=title, rationale=rationale
     )
     if result.ok and result.pr_url:
+        # Positive feedback signal (chainlink #337/#339): surfaces in the
+        # prompt's feedback block and supersedes the open-proposal nudge (which
+        # auto-clears now that the worktree is gone).
+        await log_event("core_pr_opened", pr_url=result.pr_url, branch=result.branch)
         return (
             f"Opened a core-memory PR: {result.pr_url}\n"
             "Give the operator this URL and ask them to review and merge. "

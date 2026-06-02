@@ -19,6 +19,10 @@ log = logging.getLogger(__name__)
 # ignored.
 _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "error": ("negative", "error"),
+    # Core-memory PR opened by the agent (chainlink #337/#339). Positive: it
+    # supersedes the "open proposal" nudge the prompt renders while a proposal
+    # is in flight (the nudge auto-clears once the worktree is gone).
+    "core_pr_opened": ("positive", "core_pr_opened"),
     "tool_call_denied": ("negative", "tool_denied"),
     "tool_call_budget_warning": ("negative", "tool_budget"),
     # Gap 4 fix: budget_gate.py emits these two names, not the legacy
