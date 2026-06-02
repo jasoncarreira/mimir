@@ -1,4 +1,4 @@
-"""Tests for ``mimir.core_memory_pr`` — the sandbox proposal workflow (#337/#339).
+"""Tests for ``mimir.proposals`` — the sandbox change-proposal workflow (#337/#339/#344).
 
 Real ``git`` against ``tmp_path``; the "remote" is a bare repo in a second tmp
 dir (no network). The PR step is injected (``open_pr``). The load-bearing
@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 import mimir
-from mimir.core_memory_pr import (
+from mimir.proposals import (
     abandon_proposal,
     default_branch_name,
     finalize_proposal,
@@ -62,7 +62,10 @@ def home(tmp_path: Path, upstream: Path) -> Path:
     h = tmp_path / "home"
     (h / "memory" / "core").mkdir(parents=True)
     (h / "memory" / "core" / "40-learned-behaviors.md").write_text(SEED, encoding="utf-8")
-    # A tracked NON-core file, to prove the sparse checkout excludes it.
+    # A tracked prompt template — prompts/ is the second proposable surface.
+    (h / "prompts").mkdir()
+    (h / "prompts" / "reflect.md").write_text("# reflect\n\noriginal prompt\n", encoding="utf-8")
+    # A tracked NON-surface file, to prove the sparse checkout excludes it.
     (h / "skills").mkdir()
     (h / "skills" / "x.md").write_text("skill", encoding="utf-8")
     shutil.copy(TEMPLATE, h / ".gitignore")
@@ -89,10 +92,12 @@ def test_open_creates_worktree_under_scratch(home: Path) -> None:
     r = open_proposal(home)
     assert r.ok and r.worktree is not None
     assert r.worktree.is_dir()
-    assert "scratch/core-proposals" in str(r.worktree.relative_to(home))
-    # It's a real checkout: the seeded core file is present to edit.
+    assert "scratch/proposals" in str(r.worktree.relative_to(home))
+    # It's a real checkout: the seeded core + prompt files are present to edit.
     assert (r.worktree / "memory" / "core" / "40-learned-behaviors.md").read_text() == SEED
-    # Sparse: only memory/core is materialized, not other tracked subtrees.
+    assert (r.worktree / "prompts" / "reflect.md").exists()
+    # Sparse: only the proposable surfaces (memory/core + prompts) are
+    # materialized, not other tracked subtrees.
     assert not (r.worktree / "skills" / "x.md").exists()
     assert [b for b, _ in list_open_proposals(home)] == [r.branch]
     # The worktree (an embedded repo) is invisible to the home's `git add -A`.
@@ -170,20 +175,41 @@ def test_finalize_rejects_secret_in_content(home: Path) -> None:
     assert list_open_proposals(home)
 
 
-def test_finalize_stages_only_core(home: Path) -> None:
+def test_finalize_stages_both_surfaces_only(home: Path) -> None:
     r = open_proposal(home)
     assert r.ok
+    # Edit BOTH proposable surfaces in the worktree — one proposal, one PR.
     (r.worktree / "memory" / "core" / "40-learned-behaviors.md").write_text(
         SEED + "- core change\n", encoding="utf-8"
     )
-    # Also touch a tracked non-core file in the worktree; it must NOT reach the PR.
+    (r.worktree / "prompts" / "reflect.md").write_text(
+        "# reflect\n\nrevised prompt\n", encoding="utf-8"
+    )
+    # Also touch a tracked non-surface file in the worktree; it must NOT reach the PR.
     (r.worktree / "state").mkdir(exist_ok=True)
     (r.worktree / "state" / "proposed-changes.md").write_text("stray\n", encoding="utf-8")
     res = finalize_proposal(home, title="t", rationale="r", open_pr=_opener([]))
     assert res.ok
     files = _git("show", "--name-only", "--format=", f"origin/{res.branch}", cwd=home).stdout
     assert "memory/core/40-learned-behaviors.md" in files
+    assert "prompts/reflect.md" in files
     assert "proposed-changes" not in files
+
+
+def test_finalize_proposes_prompts_only_change(home: Path) -> None:
+    """A prompts-only edit (no core change) is a valid proposal — prompts is a
+    first-class proposable surface, not just along for the ride."""
+    r = open_proposal(home)
+    assert r.ok
+    (r.worktree / "prompts" / "reflect.md").write_text(
+        "# reflect\n\nprompts-only revision\n", encoding="utf-8"
+    )
+    res = finalize_proposal(home, title="tweak prompt", rationale="clearer", open_pr=_opener([]))
+    assert res.ok and res.pushed
+    # Live prompt never moved.
+    assert (home / "prompts" / "reflect.md").read_text() == "# reflect\n\noriginal prompt\n"
+    shown = _git("show", f"origin/{res.branch}:prompts/reflect.md", cwd=home).stdout
+    assert "prompts-only revision" in shown
 
 
 def test_finalize_pushes_without_pr_when_opener_returns_none(home: Path) -> None:
@@ -236,8 +262,8 @@ def test_open_self_heals_unignored_scratch(tmp_path: Path, upstream: Path) -> No
 
 
 def test_default_branch_name() -> None:
-    assert default_branch_name("Add a Rule!", ts=5) == "core-memory/add-a-rule-5"
-    assert default_branch_name(ts=9) == "core-memory/proposal-9"
+    assert default_branch_name("Add a Rule!", ts=5) == "proposal/add-a-rule-5"
+    assert default_branch_name(ts=9) == "proposal/proposal-9"
 
 
 # ─── live-status nudge ───────────────────────────────────────────────
@@ -251,14 +277,14 @@ def test_render_open_proposals_block(home: Path) -> None:
     block = render_open_proposals_block(home)
     assert block is not None
     assert r.branch in block
-    assert "submit_core_memory_proposal" in block
-    assert "abandon_core_memory_proposal" in block
+    assert "submit_proposal" in block
+    assert "abandon_proposal" in block
     # Auto-clears once the proposal is gone.
     abandon_proposal(home)
     assert render_open_proposals_block(home) is None
 
 
-def test_core_pr_opened_classifies_positive() -> None:
+def test_proposal_pr_opened_classifies_positive() -> None:
     from mimir.feedback.rules import classify
 
-    assert classify("core_pr_opened") == ("positive", "core_pr_opened")
+    assert classify("proposal_pr_opened") == ("positive", "proposal_pr_opened")
