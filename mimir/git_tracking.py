@@ -285,6 +285,13 @@ async def commit_turn_changes(
         )
         return
 
+    # chainlink #353: before committing, surface any prose note under a tracked
+    # root that git is silently ignoring — ``git add -A`` drops it with no
+    # signal (the failure muninn hit with state/voice-drafts.md). Runs before
+    # the commit so it fires even when everything staged got ignored (the case
+    # where a dropped note IS the only change).
+    await _surface_ignored_notes(home=home, turn_id=turn_id)
+
     # 3. Commit. Auto message references turn_id + trigger.
     summary = _porcelain_summary(porcelain)
     msg = f"turn {turn_id} ({trigger})"
@@ -332,6 +339,42 @@ async def commit_turn_changes(
     #    debounce window cancel the pending task and reschedule, so
     #    a burst of N commits in <60s becomes 1 push.
     await _schedule_debounced_push(turn_id=turn_id, home=home)
+
+
+# chainlink #353: prose-note extensions whose presence under a tracked root
+# (memory/, state/, prompts/) while git-ignored signals a silently-dropped
+# write — ``git add -A`` skips it, the commit "succeeds", but the note never
+# persists. Surfaced as an algedonic event so the agent allowlists or relocates
+# it instead of losing it. Scoped to prose extensions to avoid flagging the
+# legitimately-ignored binary/log artifacts (*.db, *.jsonl, *.log) and secret
+# files (*.key/.env) that SHOULD stay ignored.
+_IGNORED_NOTE_EXTS = (".md", ".markdown", ".txt", ".rst")
+_IGNORED_NOTE_ROOTS = ("memory", "state", "prompts")
+
+
+async def _surface_ignored_notes(*, home: Path, turn_id: str) -> None:
+    """Emit ``git_ignored_note_skipped`` if a prose note under a tracked root is
+    git-ignored (untracked + ignored = silently dropped). Best-effort: any
+    failure here must never break the commit path."""
+    try:
+        res = await _git(
+            "ls-files", "--others", "--ignored", "--exclude-standard",
+            "--", *_IGNORED_NOTE_ROOTS, cwd=home,
+        )
+    except (GitError, asyncio.TimeoutError, OSError):
+        return
+    paths = [
+        p for p in (res.stdout or "").splitlines()
+        if p.strip() and p.lower().endswith(_IGNORED_NOTE_EXTS)
+    ]
+    if not paths:
+        return
+    await log_event(
+        "git_ignored_note_skipped",
+        turn_id=turn_id,
+        count=len(paths),
+        paths=paths[:10],
+    )
 
 
 # ─── debounced push coordination ─────────────────────────────────────

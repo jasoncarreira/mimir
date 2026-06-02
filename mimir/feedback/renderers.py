@@ -362,6 +362,16 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"Tracked-state changes from this turn are NOT staged. "
             f"Investigate /mimir-home git status; next successful turn re-tries."
         )
+    if rule_kind == "ignored_write":
+        count = ev.get("count", "?")
+        paths = ev.get("paths") or []
+        sample = ", ".join(str(p) for p in paths[:3]) if isinstance(paths, list) else ""
+        suffix = f" (e.g. {sample})" if sample else ""
+        return (
+            f"{count} note(s) under a tracked root are git-IGNORED and won't "
+            f"persist{suffix}. Allowlist the path in .gitignore or move the file "
+            f"to a tracked location, then re-save."
+        )
     if rule_kind == "git_push_failed":
         reason = _sanitize_field(ev.get("reason") or "(no detail)")
         rc = ev.get("returncode")

@@ -966,3 +966,59 @@ async def test_commit_real_error_still_emits_git_commit_failed(
     failures = [e for e in _read_events(tmp_path) if e.get("type") == "git_commit_failed"]
     assert len(failures) == 1, f"real commit error must emit git_commit_failed; got {failures}"
     assert failures[0].get("stage") == "commit"
+
+
+# ─── chainlink #353: surface silently-ignored notes ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_surfaces_ignored_note_under_tracked_root(
+    home_repo: Path, tmp_path: Path,
+) -> None:
+    """A prose note under a tracked root that git is ignoring is surfaced as
+    ``git_ignored_note_skipped`` — not silently dropped by ``git add -A`` (the
+    failure muninn hit with state/voice-drafts.md)."""
+    home = home_repo
+    # home_repo has no .gitignore; ignore one specific note under state/.
+    (home / ".gitignore").write_text("state/lost-note.md\n")
+    (home / "state").mkdir(exist_ok=True)
+    (home / "state" / "lost-note.md").write_text("a dropped note\n")
+    # A tracked change so commit_turn_changes proceeds past the no-op fast path.
+    (home / "memory").mkdir(exist_ok=True)
+    (home / "memory" / "real.md").write_text("real\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home, enabled=True,
+    )
+
+    skipped = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_ignored_note_skipped"
+    ]
+    assert skipped, "expected a git_ignored_note_skipped event"
+    assert any("state/lost-note.md" in p for p in skipped[0].get("paths", []))
+
+
+@pytest.mark.asyncio
+async def test_no_ignored_note_event_for_clean_tracked_write(
+    home_repo: Path, tmp_path: Path,
+) -> None:
+    """A normal tracked write emits no ignored-note signal (no false positive)."""
+    home = home_repo
+    (home / "memory").mkdir(exist_ok=True)
+    (home / "memory" / "note.md").write_text("real\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home, enabled=True,
+    )
+
+    assert not [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_ignored_note_skipped"
+    ]
+
+
+def test_git_ignored_note_skipped_classifies_negative() -> None:
+    from mimir.feedback.rules import classify
+
+    assert classify("git_ignored_note_skipped") == ("negative", "ignored_write")

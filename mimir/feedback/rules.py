@@ -23,6 +23,9 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # Positive: it supersedes the "open proposal" nudge the prompt renders while
     # a proposal is in flight (the nudge auto-clears once the worktree is gone).
     "proposal_pr_opened": ("positive", "proposal_pr_opened"),
+    # chainlink #353: a prose note under a tracked root (memory/state/prompts)
+    # is git-ignored, so the write was silently dropped and won't persist.
+    "git_ignored_note_skipped": ("negative", "ignored_write"),
     "tool_call_denied": ("negative", "tool_denied"),
     "tool_call_budget_warning": ("negative", "tool_budget"),
     # Gap 4 fix: budget_gate.py emits these two names, not the legacy
