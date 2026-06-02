@@ -41,7 +41,7 @@ def test_setup_creates_home_layout(tmp_path: Path):
     assert (home / "memory" / "core" / "00-identity.md").is_file()
     # 06-action-boundaries seeds the tri-zone action-policy model
     # (autonomous / escalate-first / prohibited). Pairs with the
-    # WriteGuardBackend's S5-2 reflection-only gate.
+    # WriteGuardBackend's core-memory read-only gate.
     assert (home / "memory" / "core" / "06-action-boundaries.md").is_file()
     assert (home / "state" / "wiki" / "AGENTS.md").is_file()
     assert (home / "state" / "wiki" / "index.md").is_file()

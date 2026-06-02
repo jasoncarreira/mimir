@@ -244,13 +244,13 @@ class TestWriteGuardBackend:
 
 
 class TestCoreMemoryReflectionGate:
-    """S5-2 — memory/core/ writes are reflection-turn-only by policy.
+    """memory/core/ is read-only at runtime (chainlink #342).
 
     Layered on top of the per-directory writable-roots check: even when
     ``memory`` is in ``writable_dirs`` (the production default), writes
-    under ``memory/core/`` are refused unless an active ``TurnContext``
-    declares ``trigger == "scheduled_tick"`` AND ``channel_id`` starts
-    with ``"scheduler:reflect"``.
+    under ``memory/core/`` are refused during ANY active turn — reflection
+    included. Changes go through the core-memory PR proposal flow; only
+    no-turn paths (the scaffold seed, ``mimir setup``, tests) may write.
     """
 
     @pytest.fixture
@@ -293,7 +293,7 @@ class TestCoreMemoryReflectionGate:
         tok = self._set_turn(ctx)
         try:
             r = b.write(file_path="/memory/core/00-persona.md", content="bad")
-            assert "reflection-only" in (getattr(r, "error", "") or "")
+            assert "read-only" in (getattr(r, "error", "") or "")
         finally:
             self._clear_turn(tok)
 
@@ -302,7 +302,7 @@ class TestCoreMemoryReflectionGate:
     ) -> None:
         """Core-memory proposals (chainlink #339) edit a worktree under
         scratch/. That path is NOT under home/memory/core, so the
-        reflection-only gate must allow it even on a normal turn where a live
+        read-only gate must allow it even on a normal turn where a live
         memory/core/ write is refused — this is what lets the agent edit a
         proposal natively while live core stays protected."""
         wt_core = (
@@ -317,7 +317,7 @@ class TestCoreMemoryReflectionGate:
         tok = self._set_turn(ctx)
         try:
             blocked = b.write(file_path="/memory/core/00-persona.md", content="bad")
-            assert "reflection-only" in (getattr(blocked, "error", "") or "")
+            assert "read-only" in (getattr(blocked, "error", "") or "")
             ok = b.write(
                 file_path="/scratch/core-proposals/core-memory_x/memory/core/00-persona.md",
                 content="proposed",
@@ -340,13 +340,15 @@ class TestCoreMemoryReflectionGate:
         try:
             r = b.write(file_path="/memory/core/40-learned-behaviors.md",
                         content="bad")
-            assert "reflection-only" in (getattr(r, "error", "") or "")
+            assert "read-only" in (getattr(r, "error", "") or "")
         finally:
             self._clear_turn(tok)
 
-    def test_allows_core_memory_write_in_reflection_turn(
+    def test_blocks_core_memory_write_in_reflection_turn(
         self, home_with_memory: Path
     ) -> None:
+        """chainlink #342: reflection no longer has a core-write exception —
+        even a reflection turn is blocked. Promotions go via the PR flow."""
         b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
         ctx = self._make_turn_ctx(
             trigger="scheduled_tick", channel_id="scheduler:reflect"
@@ -354,8 +356,8 @@ class TestCoreMemoryReflectionGate:
         tok = self._set_turn(ctx)
         try:
             r = b.write(file_path="/memory/core/40-learned-behaviors.md",
-                        content="ok")
-            assert getattr(r, "error", None) is None
+                        content="nope")
+            assert "read-only" in (getattr(r, "error", "") or "")
         finally:
             self._clear_turn(tok)
 
@@ -372,13 +374,12 @@ class TestCoreMemoryReflectionGate:
     def test_allows_core_memory_write_when_gate_disabled(
         self, home_with_memory: Path
     ) -> None:
-        """Bench / dev mode: pass ``enforce_core_memory_reflection_only=False``
-        to opt out of the S5-2 gate. Other write protections (writable
-        roots) still apply."""
+        """Bench / dev mode: pass ``enforce_core_memory_readonly=False`` to opt
+        out of the gate. Other write protections (writable roots) still apply."""
         b = WriteGuardBackend(
             root_dir=home_with_memory,
             writable_dirs=["memory"],
-            enforce_core_memory_reflection_only=False,
+            enforce_core_memory_readonly=False,
         )
         ctx = self._make_turn_ctx(trigger="user_message", channel_id="discord-123")
         tok = self._set_turn(ctx)
@@ -404,7 +405,7 @@ class TestCoreMemoryReflectionGate:
                 old_string="original",
                 new_string="bad",
             )
-            assert "reflection-only" in (getattr(r, "error", "") or "")
+            assert "read-only" in (getattr(r, "error", "") or "")
         finally:
             self._clear_turn(tok)
 
@@ -444,7 +445,7 @@ class TestCoreMemoryReflectionGate:
             )
             err = getattr(r, "error", "") or ""
             assert err  # must be blocked
-            assert ("reflection-only" in err) or ("Write blocked" in err)
+            assert ("read-only" in err) or ("Write blocked" in err)
         finally:
             self._clear_turn(tok)
 
@@ -462,14 +463,14 @@ class TestCoreMemoryReflectionGate:
             self._clear_turn(tok)
         denials = b.drain_denials()
         assert len(denials) == 1
-        assert denials[0]["op"] == "write_core_memory_non_reflection"
+        assert denials[0]["op"] == "write_core_memory_readonly"
         assert "memory/core" in denials[0]["file_path"]
 
     def test_upload_to_core_memory_blocks_batch(
         self, home_with_memory: Path
     ) -> None:
-        """Upload batches are atomic: if any path is core-memory-blocked
-        in a non-reflection turn, the whole batch fails."""
+        """Upload batches are atomic: if any path is core-memory-blocked,
+        the whole batch fails."""
         b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
         ctx = self._make_turn_ctx(trigger="user_message", channel_id="discord-123")
         tok = self._set_turn(ctx)
@@ -486,192 +487,7 @@ class TestCoreMemoryReflectionGate:
         # And the denial trail records the core-memory-specific op.
         denials = b.drain_denials()
         ops = [d["op"] for d in denials]
-        assert "upload_core_memory_non_reflection" in ops
-
-
-class TestOnboardingMode:
-    """S5-2 onboarding bypass via the ``onboarding_mode`` constructor
-    flag (sourced from ``MIMIR_ONBOARDING_MODE`` env var in
-    production). When True, the reflection-only gate on
-    ``memory/core/`` yields so the agent can collaboratively bootstrap
-    its persona / memory architecture during first-run setup.
-
-    Restart-to-flip is the tamper-resistance property: the flag is
-    read once at backend construction; mid-process env changes don't
-    re-evaluate. The agent can edit compose.env via bash but the
-    value isn't read until the next container restart, and the agent
-    has no docker socket to self-restart.
-    """
-
-    @pytest.fixture
-    def home_with_memory(self, tmp_path: Path) -> Path:
-        (tmp_path / "state").mkdir()
-        (tmp_path / "memory").mkdir()
-        (tmp_path / "memory" / "core").mkdir()
-        return tmp_path
-
-    @staticmethod
-    def _make_user_turn_ctx():
-        from mimir.models import TurnContext
-        return TurnContext(
-            turn_id="t-test", session_id="s-test", trigger="user_message",
-            channel_id="discord-123", started_at=0.0,
-        )
-
-    @staticmethod
-    def _set_turn(ctx):
-        from mimir._context import set_current_turn
-        return set_current_turn(ctx)
-
-    @staticmethod
-    def _clear_turn(token):
-        from mimir._context import reset_current_turn
-        reset_current_turn(token)
-
-    def test_bypass_active_when_onboarding_mode_true(
-        self, home_with_memory: Path
-    ) -> None:
-        """With onboarding_mode=True, non-reflection writes to
-        memory/core/ succeed — the bootstrap path."""
-        b = WriteGuardBackend(
-            root_dir=home_with_memory, writable_dirs=["memory"],
-            onboarding_mode=True,
-        )
-        ctx = self._make_user_turn_ctx()
-        tok = self._set_turn(ctx)
-        try:
-            r = b.write(file_path="/memory/core/00-persona.md", content="bootstrap")
-            assert getattr(r, "error", None) is None
-        finally:
-            self._clear_turn(tok)
-
-    def test_gate_enforced_when_onboarding_mode_false(
-        self, home_with_memory: Path
-    ) -> None:
-        """Default ``onboarding_mode=False`` → gate enforces in
-        non-reflection turns. The production steady-state."""
-        b = WriteGuardBackend(
-            root_dir=home_with_memory, writable_dirs=["memory"],
-            onboarding_mode=False,
-        )
-        ctx = self._make_user_turn_ctx()
-        tok = self._set_turn(ctx)
-        try:
-            r = b.write(file_path="/memory/core/00-persona.md", content="bad")
-            assert "reflection-only" in (getattr(r, "error", "") or "")
-        finally:
-            self._clear_turn(tok)
-
-    def test_default_constructor_arg_is_false(
-        self, home_with_memory: Path
-    ) -> None:
-        """Omitting onboarding_mode= falls back to False — fail-closed
-        default. A backend constructed without the flag enforces the
-        gate (matches the steady-state production shape)."""
-        b = WriteGuardBackend(
-            root_dir=home_with_memory, writable_dirs=["memory"],
-            # No onboarding_mode arg.
-        )
-        ctx = self._make_user_turn_ctx()
-        tok = self._set_turn(ctx)
-        try:
-            r = b.write(file_path="/memory/core/00-persona.md", content="bad")
-            assert "reflection-only" in (getattr(r, "error", "") or "")
-        finally:
-            self._clear_turn(tok)
-
-    def test_reflection_turn_unaffected_by_onboarding_mode(
-        self, home_with_memory: Path
-    ) -> None:
-        """Reflection turns always pass the gate, regardless of
-        onboarding_mode. The bypass is purely additive."""
-        from mimir.models import TurnContext
-        # onboarding_mode=False — reflection turn should still write.
-        b = WriteGuardBackend(
-            root_dir=home_with_memory, writable_dirs=["memory"],
-            onboarding_mode=False,
-        )
-        ctx = TurnContext(
-            turn_id="t", session_id="s", trigger="scheduled_tick",
-            channel_id="scheduler:reflect", started_at=0.0,
-        )
-        tok = self._set_turn(ctx)
-        try:
-            r = b.write(file_path="/memory/core/40-learned-behaviors.md", content="ok")
-            assert getattr(r, "error", None) is None
-        finally:
-            self._clear_turn(tok)
-
-    def test_onboarding_mode_does_not_unlock_writable_roots(
-        self, home_with_memory: Path
-    ) -> None:
-        """The bypass only affects the S5-2 memory/core/ gate. Writes
-        outside MIMIR_FOLDERS are still blocked by the standard
-        writable-roots check."""
-        (home_with_memory / "logs").mkdir()
-        b = WriteGuardBackend(
-            root_dir=home_with_memory, writable_dirs=["memory"],
-            onboarding_mode=True,  # bypass on
-        )
-        # logs/ is not in writable_dirs → blocked by the outer check,
-        # not by the S5-2 gate.
-        r = b.write(file_path="/logs/exfil.txt", content="nope")
-        assert "Writable directories" in (getattr(r, "error", "") or "")
-
-    def test_onboarding_mode_does_not_affect_non_core_paths(
-        self, home_with_memory: Path
-    ) -> None:
-        """Writes to non-core memory/ paths (e.g.
-        memory/learnings-pending.md) work the same whether
-        onboarding_mode is on or off — they were never gated."""
-        b = WriteGuardBackend(
-            root_dir=home_with_memory, writable_dirs=["memory"],
-            onboarding_mode=False,
-        )
-        ctx = self._make_user_turn_ctx()
-        tok = self._set_turn(ctx)
-        try:
-            r = b.write(
-                file_path="/memory/learnings-pending.md", content="entry",
-            )
-            assert getattr(r, "error", None) is None
-        finally:
-            self._clear_turn(tok)
-
-    def test_onboarding_mode_true_logs_warning(
-        self, home_with_memory: Path, caplog
-    ) -> None:
-        """Construction with ``onboarding_mode=True`` must emit a
-        WARNING log so the operator sees "I'm in onboarding mode" on
-        every container restart. Reviewer note 3 on PR #301."""
-        import logging
-        with caplog.at_level(logging.WARNING, logger="mimir.readonly_backend"):
-            WriteGuardBackend(
-                root_dir=home_with_memory, writable_dirs=["memory"],
-                onboarding_mode=True,
-            )
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert any(
-            "MIMIR_ONBOARDING_MODE=true" in r.getMessage() for r in warnings
-        ), "expected an onboarding-mode WARNING; got: " + ", ".join(
-            r.getMessage() for r in warnings
-        )
-
-    def test_onboarding_mode_false_does_not_log_warning(
-        self, home_with_memory: Path, caplog
-    ) -> None:
-        """Default state (bypass off) must NOT emit the warning —
-        otherwise every container restart would log a misleading line."""
-        import logging
-        with caplog.at_level(logging.WARNING, logger="mimir.readonly_backend"):
-            WriteGuardBackend(
-                root_dir=home_with_memory, writable_dirs=["memory"],
-                onboarding_mode=False,
-            )
-        assert not any(
-            "MIMIR_ONBOARDING_MODE" in r.getMessage()
-            for r in caplog.records if r.levelno == logging.WARNING
-        )
+        assert "upload_core_memory_readonly" in ops
 
 
 class TestReadOnlyFilesystemBackend:

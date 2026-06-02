@@ -95,12 +95,11 @@ class TestForcePushPatterns:
 
 
 class TestComposeEnvGuard:
-    """S5-2 onboarding layer: bash references to ``compose.env`` must
-    be blocked. WriteGuardBackend reads ``MIMIR_ONBOARDING_MODE`` once
-    at construction — the agent can't flip a live process's env — but
-    it could plant a dormant ``MIMIR_ONBOARDING_MODE=true`` line in
-    ``compose.env`` via shell that would take effect on the next
-    container restart. This guard closes that vector.
+    """Bash references to ``compose.env`` must be blocked. It's
+    operator-managed and holds real secrets (API keys, tokens) plus the
+    agent's own runtime config (model, flags), so editing it from the
+    in-container shell is both a secret-exposure and a self-modification
+    vector. This guard closes it.
 
     The operator's path (editing compose.env from the host) doesn't go
     through the agent's tool dispatch, so it's unaffected — only the
@@ -108,9 +107,9 @@ class TestComposeEnvGuard:
     """
 
     def test_compose_env_write_via_redirect_blocked(self) -> None:
-        # echo ... >> compose.env — dormant-plant attempt.
+        # echo ... >> compose.env — appending config/secrets.
         result = check_prohibited_bash(
-            'echo "MIMIR_ONBOARDING_MODE=true" >> /mimir-home/compose.env'
+            'echo "MIMIR_MODEL=evil" >> /mimir-home/compose.env'
         )
         assert result is not None
         assert _BLOCK_PREFIX in result
@@ -131,7 +130,7 @@ class TestComposeEnvGuard:
     def test_compose_env_via_sed_inplace_blocked(self) -> None:
         # sed -i to edit a specific line.
         result = check_prohibited_bash(
-            "sed -i 's/MIMIR_ONBOARDING_MODE=false/MIMIR_ONBOARDING_MODE=true/' "
+            "sed -i 's/MIMIR_MODEL=a/MIMIR_MODEL=b/' "
             "/mimir-home/compose.env"
         )
         assert result is not None

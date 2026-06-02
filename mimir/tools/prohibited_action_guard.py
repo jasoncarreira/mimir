@@ -80,21 +80,18 @@ _PROHIBITIONS: list[_Prohibition] = [
         ),
         "git push --force[--with-lease]/-f to main/master (reversed-arg form)",
     ),
-    # S5-2 onboarding layer: block bash writes to ``compose.env``. The
-    # WriteGuardBackend reads ``MIMIR_ONBOARDING_MODE`` once at
-    # construction; the agent can't flip it on a live process. But it
-    # could plant a dormant ``MIMIR_ONBOARDING_MODE=true`` line in
-    # ``compose.env`` via shell (``echo ... >> compose.env``), which
-    # would take effect on the next container restart. The operator's
-    # path (editing compose.env from the host) doesn't go through this
-    # guard, so it's unaffected — only the agent's in-container shell
-    # is constrained.
+    # Block bash reads/writes of ``compose.env``. It's operator-managed and
+    # holds real secrets (API keys, tokens) plus the agent's own runtime
+    # config (model, flags) — editing it from the in-container shell is both a
+    # secret-exposure and a self-modification vector, so it's off-limits. The
+    # operator edits compose.env from the host, which doesn't go through this
+    # guard.
     #
-    # Pattern matches any reference to ``compose.env`` in the command.
-    # Coarse on purpose: ``cat compose.env`` (reading) gets blocked too,
-    # but the agent has no legitimate reason to read it (no operator
-    # secrets are kept anywhere the agent needs to look up). False
-    # positives are acceptable; false negatives are not.
+    # Pattern matches any reference to ``compose.env`` in the command. Coarse
+    # on purpose: ``cat compose.env`` (reading) gets blocked too, but the
+    # agent has no legitimate reason to read it (no operator secrets are kept
+    # anywhere the agent needs to look up). False positives are acceptable;
+    # false negatives are not.
     _Prohibition(
         re.compile(r"\bcompose\.env\b"),
         "compose.env reference (operator-managed; agent must not read or write)",

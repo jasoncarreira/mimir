@@ -82,10 +82,13 @@ def test_setup_writes_reflection_policy(tmp_path: Path):
     # Two policy sections — autonomous and propose-only.
     assert "## Autonomous" in body
     assert "## Propose-only" in body
-    # Conservative defaults: persona / skill creation / deletions are HITL.
-    assert "Persona block edits" in body
+    # chainlink #342: ALL core edits (incl. persona + learned-behavior
+    # promotion), skill creation, and deletions are HITL — core is read-only
+    # at runtime, no autonomous core write.
+    assert "persona blocks" in body
     assert "Skill creation" in body
     assert "Memory file deletions" in body
+    assert "READ-ONLY at runtime" in body
 
 
 def test_setup_writes_learned_behaviors_starter(tmp_path: Path):
@@ -140,7 +143,10 @@ def test_default_reflection_policy_has_required_sections():
     assert "## Autonomous" in body
     assert "## Propose-only" in body
     assert "SAGA atom decay" in body
-    assert "Persona block edits" in body
+    assert "persona blocks" in body
+    # chainlink #342: core is read-only at runtime — no autonomous core write.
+    assert "READ-ONLY at runtime" in body
+    assert "Append-only edits to memory/core/40-learned-behaviors.md" not in body
 
 
 def test_default_learned_behaviors_starts_with_desc_comment():
