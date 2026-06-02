@@ -36,6 +36,7 @@ CRITICAL_RUNTIME_DATA = (
     "mimir/prompt_templates/reflect.md",
     "mimir/prompt_templates/issues-audit.md",
     "mimir/prompt_templates/commitments-review.md",
+    "mimir/prompt_templates/upgrade.md",  # version-triggered defaults reconciliation
     "mimir/memory_templates/core/00-identity.md",  # setup core-memory defaults
     "mimir/memory_templates/core/06-action-boundaries.md",
     "mimir/memory_templates/core/20-vsm-terms.md",

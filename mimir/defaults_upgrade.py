@@ -14,18 +14,22 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__
 from .git_bootstrap import _redact, _run
 from .memory_templates import bundled_defaults as bundled_core_defaults
+from .models import AgentEvent
 from .prompt_templates import bundled_defaults as bundled_prompt_defaults
 from .proposals import (
     OpenResult,
+    ProposalResult,
     UPGRADE_PROPOSAL_LANE,
     abandon_proposal,
     default_branch_name,
+    finalize_proposal,
     list_open_proposals,
     open_proposal,
 )
@@ -37,6 +41,10 @@ UPGRADE_STATE_DIR = Path(".mimir") / "upgrade-defaults"
 LAST_SYNCED_VERSION_FILE = UPGRADE_STATE_DIR / "last-synced-version"
 PENDING_PREVIOUS_REF = "refs/mimir/defaults-upgrade/previous"
 VENDOR_WORKTREE_REL = Path("scratch") / "defaults-vendor"
+UPGRADE_TRIGGER = "upgrade"
+UPGRADE_CHANNEL_PREFIX = "upgrade:"
+UPGRADE_PROMPT_TEMPLATE = "upgrade.md"
+AUTO_SUBMIT_CLEAN_ENV = "MIMIR_DEFAULTS_UPGRADE_AUTO_SUBMIT_CLEAN"
 
 
 @dataclass
@@ -49,6 +57,7 @@ class DefaultsUpgradeResult:
     detail: str | None = None
     proposal: OpenResult | None = None
     conflicts: bool = False
+    auto_submit: ProposalResult | None = None
 
 
 @dataclass
@@ -108,6 +117,30 @@ def _write_last_synced_version(home: Path, version: str) -> None:
     path = _state_file(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"{version}\n", encoding="utf-8")
+
+
+def _env_bool_value(raw: str | None, *, default: bool = False) -> bool:
+    if raw is None or raw == "":
+        return default
+    norm = raw.strip().lower()
+    if norm in {"1", "true", "yes", "on", "y"}:
+        return True
+    if norm in {"0", "false", "no", "off", "n"}:
+        return False
+    log.warning("%s=%r is not a recognised boolean; using default %r", AUTO_SUBMIT_CLEAN_ENV, raw, default)
+    return default
+
+
+def _read_prompt_template(home: Path, name: str) -> str:
+    """Read an operator-customized prompt template, falling back to bundled text."""
+    target = home / "prompts" / name
+    try:
+        if target.is_file():
+            return target.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        log.warning("could not read upgrade prompt template %s: %s", target, exc)
+    bundled = bundled_prompt_defaults().get(name, "")
+    return bundled.strip()
 
 
 def _shipped_default_files() -> dict[Path, str]:
@@ -345,6 +378,7 @@ def check_and_open_defaults_upgrade(
     version: str | None = None,
     base: str = "main",
     vendor_branch: str = DEFAULTS_VENDOR_BRANCH,
+    auto_submit_clean: bool | None = None,
 ) -> DefaultsUpgradeResult:
     """Update the defaults vendor branch and open an upgrade-lane proposal.
 
@@ -356,7 +390,9 @@ def check_and_open_defaults_upgrade(
     - the first run bootstraps the vendor branch as the baseline and records the
       current version (there is no prior defaults tree to merge from yet);
     - subsequent changed versions open an upgrade-lane proposal with new defaults
-      reconciled against home files via git's native ``merge-file`` 3-way.
+      reconciled against home files via git's native ``merge-file`` 3-way;
+    - optionally, a conflict-free proposal can be submitted immediately by
+      setting ``auto_submit_clean`` (or ``MIMIR_DEFAULTS_UPGRADE_AUTO_SUBMIT_CLEAN``).
     """
     home = Path(home).resolve()
     version = version or __version__
@@ -422,6 +458,43 @@ def check_and_open_defaults_upgrade(
         _delete_ref(home, PENDING_PREVIOUS_REF)
         return DefaultsUpgradeResult(ok=True, action="vendor_updated_no_home_diff", version=version)
 
+    if auto_submit_clean is None:
+        import os
+        auto_submit_clean = _env_bool_value(os.environ.get(AUTO_SUBMIT_CLEAN_ENV), default=False)
+    if auto_submit_clean and not conflicts:
+        submitted = finalize_proposal(
+            home,
+            title=f"Upgrade mimir defaults to {version}",
+            rationale=(
+                "Automatically proposed a conflict-free shipped-defaults upgrade for "
+                "memory/core/ and prompts/. Approval remains operator-controlled: "
+                "merge the PR to apply these files to the live home."
+            ),
+            lane=UPGRADE_PROPOSAL_LANE,
+        )
+        if submitted.ok:
+            _write_last_synced_version(home, version)
+            _delete_ref(home, PENDING_PREVIOUS_REF)
+            return DefaultsUpgradeResult(
+                ok=True,
+                action="auto_submitted",
+                version=version,
+                proposal=opened,
+                conflicts=False,
+                auto_submit=submitted,
+            )
+        # Leave the proposal open and spend a reconciliation turn rather than
+        # strand a valid worktree just because PR creation/push failed.
+        return DefaultsUpgradeResult(
+            ok=True,
+            action="proposal_opened",
+            version=version,
+            detail=submitted.detail or submitted.reason,
+            proposal=opened,
+            conflicts=False,
+            auto_submit=submitted,
+        )
+
     _write_last_synced_version(home, version)
     _delete_ref(home, PENDING_PREVIOUS_REF)
     return DefaultsUpgradeResult(
@@ -433,9 +506,69 @@ def check_and_open_defaults_upgrade(
     )
 
 
+async def enqueue_upgrade_reconciliation_turn(
+    home: Path,
+    result: DefaultsUpgradeResult,
+    enqueue: Callable[[AgentEvent], Awaitable[bool]],
+) -> bool:
+    """Fire the agent-facing upgrade turn when reconciliation is needed.
+
+    The S3 startup hook opens the upgrade proposal worktree; this S4-ish wake
+    gives the agent the work item with a purpose-built prompt. We only spend a
+    turn for proposals that still need reconciliation (conflicts) or for clean
+    proposals that were not auto-submitted because the operator kept the HITL
+    gate enabled.
+    """
+    if not result.ok or result.proposal is None or result.proposal.worktree is None:
+        return False
+    if result.action not in {"proposal_opened", "proposal_opened_conflicts"}:
+        return False
+
+    home = Path(home).resolve()
+    prompt = _read_prompt_template(home, UPGRADE_PROMPT_TEMPLATE)
+    if not prompt:
+        prompt = (
+            "# Upgrade defaults reconciliation\n\n"
+            "Review the open upgrade-lane proposal worktree, reconcile any "
+            "memory/core and prompts changes, resolve conflict markers, then "
+            "submit_proposal with lane='upgrade'."
+        )
+    worktree = result.proposal.worktree
+    branch = result.proposal.branch
+    replacements = {
+        "{version}": result.version,
+        "{action}": result.action,
+        "{branch}": branch or "(unknown)",
+        "{worktree}": str(worktree),
+        "{conflicts}": str(result.conflicts).lower(),
+    }
+    content = prompt
+    for placeholder, value in replacements.items():
+        content = content.replace(placeholder, value)
+    event = AgentEvent(
+        trigger=UPGRADE_TRIGGER,
+        channel_id=f"{UPGRADE_CHANNEL_PREFIX}{result.version}",
+        content=content,
+        source="system",
+        extra={
+            "version": result.version,
+            "action": result.action,
+            "proposal_branch": branch,
+            "proposal_worktree": str(worktree),
+            "conflicts": result.conflicts,
+        },
+    )
+    return await enqueue(event)
+
+
 __all__ = (
+    "AUTO_SUBMIT_CLEAN_ENV",
     "DEFAULTS_VENDOR_BRANCH",
     "LAST_SYNCED_VERSION_FILE",
+    "UPGRADE_CHANNEL_PREFIX",
+    "UPGRADE_PROMPT_TEMPLATE",
+    "UPGRADE_TRIGGER",
     "DefaultsUpgradeResult",
     "check_and_open_defaults_upgrade",
+    "enqueue_upgrade_reconciliation_turn",
 )

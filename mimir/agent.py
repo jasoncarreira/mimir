@@ -121,7 +121,7 @@ log = logging.getLogger(__name__)
 # is skipped entirely. Extraction as a frozenset constant keeps the
 # condition readable and easy to extend.
 NON_USER_QUERY_TRIGGERS: frozenset[str] = frozenset(
-    {"saga_session_end", "scheduled_tick", "poller"}
+    {"saga_session_end", "scheduled_tick", "poller", "upgrade"}
 )
 
 # Autonomous-work triggers — cron-fired and poller-fired turns that
@@ -134,7 +134,7 @@ NON_USER_QUERY_TRIGGERS: frozenset[str] = frozenset(
 # ``saga_session_end`` is excluded — that IS the synthesis turn; ending
 # the session that just produced it would loop.
 IMMEDIATE_SESSION_END_TRIGGERS: frozenset[str] = frozenset(
-    {"scheduled_tick", "poller"}
+    {"scheduled_tick", "poller", "upgrade"}
 )
 
 
@@ -1628,10 +1628,14 @@ class Agent:
         #   3. Otherwise (no tool calls, or streaming disabled because
         #      bench/no-bridge): single canonical ``output`` flush —
         #      matches pre-181-O behavior.
+        # ``upgrade`` turns are startup-created maintenance turns, but they
+        # target the WebChat/Bench-style synthetic channel and need their final
+        # text persisted just like a user-message turn so submit/abandon errors
+        # are visible instead of disappearing into turns.jsonl.
         if (
             self._channels is not None
             and event.channel_id
-            and event.trigger == "user_message"
+            and event.trigger in {"user_message", "upgrade"}
         ):
             bridge = self._channels.find(event.channel_id)
             if bridge is not None and hasattr(bridge, "send"):

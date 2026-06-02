@@ -2226,6 +2226,7 @@ def test_audit_prompt_templates_have_frontmatter():
     for fname, expect_name in (
         ("issues-audit.md", "issues-audit"),
         ("commitments-review.md", "commitments-review"),
+        ("upgrade.md", "upgrade"),
     ):
         text = (tpl_dir / fname).read_text(encoding="utf-8")
         assert text.startswith("---\n"), f"{fname} missing frontmatter"
@@ -2233,5 +2234,6 @@ def test_audit_prompt_templates_have_frontmatter():
         assert f"name: {expect_name}" in frontmatter, fname
         assert "description:" in frontmatter, fname
         assert "allowed-tools:" not in frontmatter, f"{fname} still has vestigial allowed-tools"
-        # the audit's chainlink-log target id appears in the body
-        assert ("#164" in text) or ("#283" in text), fname
+        if fname != "upgrade.md":
+            # the audit's chainlink-log target id appears in the body
+            assert ("#164" in text) or ("#283" in text), fname
