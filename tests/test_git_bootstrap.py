@@ -589,6 +589,28 @@ def test_gitignore_admits_arbitrary_state_file(tmp_path: Path) -> None:
     assert "state/voice-drafts.md" in res.stdout
 
 
+def test_gitignore_reblocks_dotenv_under_allowlisted_roots(tmp_path: Path) -> None:
+    """A ``.env`` under an allowlisted root (state/, memory/, ...) must be
+    IGNORED, not merely refused by the hook. The gitignore re-block must mirror
+    the pre-commit NAME_PATTERNS: if the hook refuses a name the gitignore
+    admits, ``git add -A`` stages it and the hook then hard-fails every
+    subsequent commit (chainlink #299 wedge)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    git_bootstrap.bootstrap_git_repo(home)
+
+    (home / "state").mkdir(exist_ok=True)
+    (home / "memory").mkdir(exist_ok=True)
+    (home / "state" / ".env").write_text("SECRET=1\n")
+    (home / "memory" / ".env.local").write_text("SECRET=1\n")
+
+    res = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=home, capture_output=True, text=True, check=True,
+    )
+    assert ".env" not in res.stdout
+
+
 def test_gitignore_admits_token_named_memory_note(tmp_path: Path) -> None:
     """chainlink #352: a legit note whose name merely contains "token" /
     "credential" (no secret content) is no longer blocked by the gitignore —
