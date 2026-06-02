@@ -264,11 +264,24 @@ def _git_files(repo: Path, ref: str) -> set[Path]:
     return {Path(line) for line in (res.stdout or "").splitlines() if line.strip()}
 
 
+def _conflict_block(text: str) -> str:
+    """Ensure a conflict-region side ends on its own line.
+
+    The ``=======`` / ``>>>>>>>`` markers must each start a fresh line. Operator
+    home files (``ours``) are read raw and are not guaranteed to end in a
+    newline, so without this the marker glues onto the last content line and the
+    result is not a well-formed conflict block.
+    """
+    if text and not text.endswith("\n"):
+        return text + "\n"
+    return text
+
+
 def _write_conflict(path: Path, ours: str, theirs: str, *, label: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        f"<<<<<<< home\n{ours}"
-        f"=======\n{theirs}"
+        f"<<<<<<< home\n{_conflict_block(ours)}"
+        f"=======\n{_conflict_block(theirs)}"
         f">>>>>>> {label}\n",
         encoding="utf-8",
     )
@@ -294,8 +307,14 @@ def _merge_file(ours: str, base: str, theirs: str, *, label: str, cwd: Path) -> 
             cwd=cwd,
             capture=True,
         )
-    if res.returncode in (0, 1):
-        return res.stdout or "", res.returncode == 1, None
+    # ``git merge-file`` exits 0 when the merge is clean, otherwise the number
+    # of conflict regions (saturated at 127); 255 (or a negative signal code)
+    # means a genuine failure. A file the operator edited in several separated
+    # spots that the new defaults also changed yields exit >= 2 — that is a
+    # normal multi-conflict result, NOT an error, so keep the conflict-marked
+    # stdout instead of discarding it and aborting the whole upgrade.
+    if 0 <= res.returncode <= 127:
+        return res.stdout or "", res.returncode > 0, None
     return ours, False, _redact((res.stderr or res.stdout or "git merge-file failed").strip())
 
 

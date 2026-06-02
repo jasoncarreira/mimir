@@ -287,3 +287,71 @@ async def test_upgrade_reconciliation_turn_skips_auto_submitted(tmp_path: Path) 
         raise AssertionError(event)
 
     assert await du.enqueue_upgrade_reconciliation_turn(tmp_path, result, fail_enqueue) is False
+
+
+def _multiline(top: str, bottom: str) -> str:
+    """A file with two edit anchors separated by stable context, so a 3-way
+    merge that conflicts at both anchors produces two *separate* regions."""
+    ctx = "".join(f"ctx{i}\n" for i in range(1, 11))
+    return f"{top}\n{ctx}{bottom}\n"
+
+
+def test_merge_file_keeps_multiple_conflict_regions(tmp_path: Path) -> None:
+    # git merge-file returns the conflict-region count as its exit code (2 here);
+    # the merge result must be kept, not treated as an error.
+    base = _multiline("top", "bottom")
+    ours = _multiline("ours-top", "ours-bottom")
+    theirs = _multiline("theirs-top", "theirs-bottom")
+
+    merged, had_conflict, err = du._merge_file(
+        ours, base, theirs, label="mimir-defaults", cwd=tmp_path
+    )
+
+    assert err is None
+    assert had_conflict is True
+    assert merged.count("<<<<<<< home") == 2
+    assert "ours-top" in merged and "theirs-top" in merged
+    assert "ours-bottom" in merged and "theirs-bottom" in merged
+
+
+def test_multi_region_operator_conflicts_open_proposal(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: an operator who customized a file in several separated spots
+    # that the new defaults also changed used to abort the whole upgrade with a
+    # fake "error" (exit code >= 2 mishandled). It must open a conflict proposal.
+    v1 = _multiline("identity TOP v1", "identity BOT v1")
+    (home / "memory" / "core" / "00-identity.md").write_text(v1, encoding="utf-8")
+    _git("add", "memory/core/00-identity.md", cwd=home)
+    _git("commit", "-q", "-m", "multiline identity v1", cwd=home)
+    _git("push", "-q", cwd=home)
+    _defaults(monkeypatch, identity=v1, heartbeat="heartbeat v1\n")
+    assert du.check_and_open_defaults_upgrade(home, version="1.0.0").action == "baseline_initialized"
+
+    operator = _multiline("identity TOP operator", "identity BOT operator")
+    (home / "memory" / "core" / "00-identity.md").write_text(operator, encoding="utf-8")
+    _git("add", "memory/core/00-identity.md", cwd=home)
+    _git("commit", "-q", "-m", "operator multi-region edit", cwd=home)
+    _git("push", "-q", cwd=home)
+    _defaults(monkeypatch, identity=_multiline("identity TOP v2", "identity BOT v2"), heartbeat="heartbeat v1\n")
+
+    result = du.check_and_open_defaults_upgrade(home, version="1.1.0")
+
+    assert result.ok and result.action == "proposal_opened_conflicts"
+    assert result.conflicts is True
+    assert result.proposal and result.proposal.worktree
+    body = (result.proposal.worktree / "memory" / "core" / "00-identity.md").read_text(encoding="utf-8")
+    assert body.count("<<<<<<< home") == 2
+    assert "identity TOP operator" in body and "identity TOP v2" in body
+    assert "identity BOT operator" in body and "identity BOT v2" in body
+
+
+def test_write_conflict_markers_stay_on_their_own_lines(tmp_path: Path) -> None:
+    target = tmp_path / "note.md"
+    du._write_conflict(
+        target, "home text no newline", "theirs text no newline", label="mimir-defaults"
+    )
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "<<<<<<< home"
+    assert "=======" in lines
+    assert lines[-1] == ">>>>>>> mimir-defaults"
