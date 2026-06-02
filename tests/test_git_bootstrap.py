@@ -494,6 +494,46 @@ def test_pre_commit_hook_passes_clean_content(tmp_path: Path) -> None:
     assert proc.returncode == 0
 
 
+def test_pre_commit_hook_allows_token_named_note(tmp_path: Path) -> None:
+    """chainlink #352: a note whose name contains "token"/"credential" but has
+    no secret content commits cleanly — the filename backstop no longer blocks
+    it; only the content scan applies."""
+    home = tmp_path / "home"
+    home.mkdir()
+    _seed_home_with_hook(home)
+
+    (home / "memory" / "issues").mkdir(parents=True, exist_ok=True)
+    (home / "memory" / "issues" / "gog-token-expiry.md").write_text(
+        "gog OAuth tokens expire; re-auth via `gog auth`. No secret here.\n"
+    )
+    _git("add", "memory/issues/gog-token-expiry.md", cwd=home)
+
+    proc = subprocess.run(
+        ["git", "commit", "-m", "token-named note, clean content"],
+        cwd=home, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_pre_commit_hook_still_refuses_dot_env(tmp_path: Path) -> None:
+    """Regression: the high-signal filename patterns #352 keeps still bite — a
+    ``.env`` is refused even with benign content (force-added past gitignore)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    _seed_home_with_hook(home)
+
+    (home / "memory" / ".env").write_text("BENIGN=1\n")
+    _git("add", "-f", "memory/.env", cwd=home)
+
+    proc = subprocess.run(
+        ["git", "commit", "-m", "should refuse"],
+        cwd=home, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode != 0
+    msg = (proc.stdout + proc.stderr).lower()
+    assert "filename" in msg or "secret" in msg
+
+
 # ─── allowlist .gitignore behaviour ──────────────────────────────────
 
 
@@ -547,6 +587,26 @@ def test_gitignore_admits_arbitrary_state_file(tmp_path: Path) -> None:
         cwd=home, capture_output=True, text=True, check=True,
     )
     assert "state/voice-drafts.md" in res.stdout
+
+
+def test_gitignore_admits_token_named_memory_note(tmp_path: Path) -> None:
+    """chainlink #352: a legit note whose name merely contains "token" /
+    "credential" (no secret content) is no longer blocked by the gitignore —
+    the *token*/*credential* filename re-blocks were dropped."""
+    home = tmp_path / "home"
+    home.mkdir()
+    git_bootstrap.bootstrap_git_repo(home)
+
+    (home / "memory" / "issues").mkdir(parents=True, exist_ok=True)
+    (home / "memory" / "issues" / "gog-token-expiry.md").write_text("note\n")
+    (home / "memory" / "issues" / "social-cli-credentials.md").write_text("note\n")
+
+    res = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=home, capture_output=True, text=True, check=True,
+    )
+    assert "memory/issues/gog-token-expiry.md" in res.stdout
+    assert "memory/issues/social-cli-credentials.md" in res.stdout
 
 
 # ─── token sanitisation in failure events ────────────────────────────

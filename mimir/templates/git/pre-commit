@@ -38,9 +38,14 @@ PATTERNS=(
 # Filename heuristics — refuse outright on suspicious names. The
 # allowlist .gitignore should already block these, but this is the
 # last line of defence if a future gitignore edit punches a hole.
+#
+# chainlink #352: ``*token*`` and ``*credential*`` were dropped — they're
+# weak filename signals that false-block legit human notes (e.g.
+# memory/issues/gog-token-expiry.md, social-cli-credentials.md) whose content
+# is secret-free. The CONTENT scan below is the real secret guard; the
+# remaining patterns are high-signal (a file literally named like a key / cert
+# / secret-store / .env is virtually never a note).
 NAME_PATTERNS=(
-  '*token*'
-  '*credential*'
   '*.key'
   '*.pem'
   'oauth_*.json'
