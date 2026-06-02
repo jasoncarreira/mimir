@@ -432,17 +432,6 @@ def check_and_open_defaults_upgrade(
         if err:
             return DefaultsUpgradeResult(ok=False, action="error", version=version, detail=err)
 
-    # A failed auto-submit leaves the proposal worktree open for agent/human
-    # reconciliation; on restart we should report that existing proposal rather
-    # than opening another or re-advancing the vendor branch.
-    if list_open_proposals(home, lane=UPGRADE_PROPOSAL_LANE):
-        return DefaultsUpgradeResult(
-            ok=True,
-            action="proposal_exists",
-            version=version,
-            detail="upgrade proposal already open; not overwriting it",
-        )
-
     proposal_branch = default_branch_name(f"defaults-{version}", lane=UPGRADE_PROPOSAL_LANE)
     opened = open_proposal(home, base=base, branch=proposal_branch, lane=UPGRADE_PROPOSAL_LANE)
     if not opened.ok or opened.worktree is None:
