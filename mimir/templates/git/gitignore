@@ -60,11 +60,12 @@ __pycache__/
 .cache/
 embeddings/
 
-# Re-block credential-shaped filenames as a content-of-last-resort
-# defence (the pre-commit hook is the primary line; this catches the
-# case where the hook is bypassed or absent).
-*token*
-*credential*
+# Re-block credential-shaped filenames as a content-of-last-resort defence
+# (the pre-commit content scan is the primary line; this catches the case
+# where the hook is bypassed or absent). chainlink #352: ``*token*`` /
+# ``*credential*`` were dropped — too-weak signals that false-block legit
+# notes (e.g. memory/issues/gog-token-expiry.md); the kept patterns are
+# high-signal and the content scan guards everything else.
 *.key
 *.pem
 oauth_*.json
