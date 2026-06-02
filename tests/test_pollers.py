@@ -145,6 +145,45 @@ def test_discover_skips_entries_missing_required_fields(tmp_path: Path):
     assert out[0].name == "valid"
 
 
+def test_discover_skips_poller_with_unset_required_env(tmp_path: Path, monkeypatch, caplog):
+    """chainlink #351: a poller declaring ``env_required`` is NOT scheduled when
+    a required var is unset — otherwise it fires every cron tick only to no-op.
+    One warning at discovery, no PollerConfig returned."""
+    monkeypatch.delenv("MIMIR_TEST_REQ_X", raising=False)
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "needy", [
+        {"name": "needy", "command": "python p.py", "cron": "*/15 * * * *",
+         "env_required": ["MIMIR_TEST_REQ_X"]},
+    ])
+    out = discover_pollers(skills)
+    assert out == []
+    assert "poller_skipped_unset_env" in caplog.text
+
+
+def test_discover_schedules_poller_when_required_env_set(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MIMIR_TEST_REQ_X", "present")
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "needy", [
+        {"name": "needy", "command": "python p.py", "cron": "*/15 * * * *",
+         "env_required": ["MIMIR_TEST_REQ_X"]},
+    ])
+    out = discover_pollers(skills)
+    assert len(out) == 1 and out[0].name == "needy"
+
+
+def test_discover_required_env_satisfied_by_manifest_override(tmp_path: Path, monkeypatch):
+    """``env_required`` can be satisfied by the manifest ``env`` override, not
+    only the parent process env — so it isn't skipped."""
+    monkeypatch.delenv("MIMIR_TEST_REQ_X", raising=False)
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "needy", [
+        {"name": "needy", "command": "python p.py", "cron": "*/15 * * * *",
+         "env": {"MIMIR_TEST_REQ_X": "v"}, "env_required": ["MIMIR_TEST_REQ_X"]},
+    ])
+    out = discover_pollers(skills)
+    assert len(out) == 1
+
+
 def test_discover_handles_top_level_array_instead_of_object(tmp_path: Path):
     """The contract requires ``{"pollers": [...]}`` not a bare array.
     Bare arrays log a warning and skip — no silent acceptance."""
@@ -2242,8 +2281,11 @@ async def test_circuit_breaker_resets_after_successful_run(tmp_path, home, clear
 # ─── chainlink #108: env_required validation ─────────────────────────────────
 
 
-def test_discover_pollers_parses_env_required_list(tmp_path: Path) -> None:
-    """``env_required`` field in pollers.json is parsed into PollerConfig.env_required."""
+def test_discover_pollers_parses_env_required_list(tmp_path: Path, monkeypatch) -> None:
+    """``env_required`` field in pollers.json is parsed into PollerConfig.env_required.
+    (Vars are set so #351's discovery-time skip doesn't drop the poller first.)"""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "x")
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir()
     (skill_dir / "pollers.json").write_text(
@@ -2282,9 +2324,12 @@ def test_discover_pollers_env_required_non_list_is_ignored(tmp_path: Path) -> No
     assert configs[0].env_required == ()
 
 
-def test_discover_pollers_env_required_non_string_items_are_dropped(tmp_path: Path) -> None:
+def test_discover_pollers_env_required_non_string_items_are_dropped(tmp_path: Path, monkeypatch) -> None:
     """Per-item filter: non-strings and empty-after-strip entries are
-    dropped individually; surviving string entries preserve order."""
+    dropped individually; surviving string entries preserve order.
+    (Surviving vars are set so #351's skip doesn't drop the poller first.)"""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    monkeypatch.setenv("MY_VAR", "x")
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir()
     (skill_dir / "pollers.json").write_text(
