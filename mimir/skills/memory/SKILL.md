@@ -59,6 +59,30 @@ files. The first line should be `<!-- desc: short description -->`; if absent,
 `memory/INDEX.md` falls back to the first sentence and prefixes the entry
 with `[auto]` so you can see your own oversight next turn.
 
+#### Changing `memory/core/` — propose, don't write
+
+You **cannot edit `memory/core/*` in place** — the write guard refuses direct
+`Edit`/`Write` to those paths. Core memory is your constitution; changes go
+through operator review as a PR. The flow (chainlink #337):
+
+1. `open_core_memory_proposal()` — creates an isolated working copy (a git
+   worktree under `scratch/`) and returns its path. Nothing is live yet.
+2. Edit the core files under `<that path>/memory/core/` with your normal
+   `Read`/`Edit`/`Write` tools — add, change, delete, or move files freely;
+   it's a sandbox.
+3. `submit_core_memory_proposal(title, rationale)` — commits your changes,
+   pushes them, opens a PR, and returns the **PR URL**. Give that URL to the
+   operator in the channel and ask them to review and merge.
+4. The change reaches live core memory only **after the operator merges** the
+   PR (it lands on a later turn, when the home pulls the merge). **Merge is the
+   approval** — don't expect the change to take effect just because you opened
+   the PR.
+
+`abandon_core_memory_proposal()` discards an open proposal; only one is open at
+a time. If the home has no git remote yet (first-run setup), proposals can't be
+opened — core memory is seeded at setup instead. This is the *only* path for
+you to change core memory.
+
 ### `memory/<anywhere>/` — non-core, indexed
 
 Anything under `memory/` outside `core/` is non-core. It's listed in

@@ -88,6 +88,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .commands import reflection as _reflection_cmd
     refl_p = _reflection_cmd.add_argparse(sub)
 
+    # `mimir memory <action>` — delegate to commands.memory (core-memory PR workflow)
+    from .commands import memory as _memory_cmd
+    mem_p = _memory_cmd.add_argparse(sub)
+
     regen_p = sub.add_parser(
         "regenerate-api-key",
         help="Rotate MIMIR_API_KEY in <home>/.env. Prints the new value.",
@@ -317,6 +321,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.command == "identities":
         code = _identities_cmd.dispatch(args, id_p)
+        if code:
+            sys.exit(code)
+        return
+
+    if args.command == "memory":
+        code = _memory_cmd.dispatch(args, mem_p)
         if code:
             sys.exit(code)
         return
