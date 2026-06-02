@@ -459,6 +459,10 @@ def build_app(config: Config) -> web.Application:
     from . import tools as _agent_tools
     from .tools import web as _web_tools
     _agent_tools.set_indexer(indexer)
+    # Wire the human-readable IndexGenerator (built above) into the
+    # rebuild_index tool — without this the tool is dead and always returns
+    # "no IndexGenerator configured". Mirrors set_indexer for the search Indexer.
+    _agent_tools.set_index_generator(indexes)
     _agent_tools.set_turns_log_path(config.turns_log)
     _agent_tools.set_channel_registry(channels)
     _agent_tools.set_dispatcher(dispatcher)
