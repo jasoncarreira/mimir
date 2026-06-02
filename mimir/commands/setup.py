@@ -329,8 +329,8 @@ DEFAULT_REFLECTION_POLICY = dedent(
     - ALL memory/core/ edits — cleanup, restructure, promote-to-core
       (including learned-behavior promotion), demote, persona blocks.
       Core memory is READ-ONLY at runtime; there is no autonomous core
-      write. Promotions land via the core-memory PR flow
-      (open_core_memory_proposal) the operator merges.
+      write. Promotions land via the change-proposal PR flow
+      (open_proposal) the operator merges.
     - Skill creation (skills/<name>/)
     - Wiki page deletions
     - Memory file deletions
@@ -841,14 +841,14 @@ DEFAULT_ACTION_BOUNDARIES = dedent(
       ``core_blocks.load_channel_memory``), but per-channel blast
       radius is bounded: edits only affect turns on *that* channel,
       not globally like ``memory/core/`` does.
-    - Writes to ``<home>/memory/core/`` — **blocked at runtime**. Core
-      blocks load every turn; unilateral edits inflate prompt cost
-      forever and can silently distort behavior, so core memory is
-      read-only during any turn (reflection included). To change it,
-      open a proposal with ``open_core_memory_proposal``, edit it there,
-      and ``submit_core_memory_proposal`` — the operator reviews and
-      merges the PR. For a non-diff suggestion, route through
-      ``state/proposed-changes.md``; the reflection skill's
+    - Writes to ``<home>/memory/core/`` and ``<home>/prompts/`` —
+      **blocked at runtime**. Core blocks load every turn and prompts
+      are operator-managed; unilateral edits inflate prompt cost forever
+      and can silently distort behavior, so both are read-only during
+      any turn (reflection included). To change either, open a proposal
+      with ``open_proposal``, edit it there, and ``submit_proposal`` —
+      the operator reviews and merges the PR. For a non-diff suggestion,
+      route through ``state/proposed-changes.md``; the reflection skill's
       applied-proposals loop can audit the effect.
     - Deletes under ``<home>`` — **escalate-first**. Drift is
       recoverable from git; deletion isn't.

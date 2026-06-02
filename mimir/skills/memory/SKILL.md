@@ -59,29 +59,30 @@ files. The first line should be `<!-- desc: short description -->`; if absent,
 `memory/INDEX.md` falls back to the first sentence and prefixes the entry
 with `[auto]` so you can see your own oversight next turn.
 
-#### Changing `memory/core/` — propose, don't write
+#### Changing `memory/core/` or `prompts/` — propose, don't write
 
-You **cannot edit `memory/core/*` in place** — the write guard refuses direct
-`Edit`/`Write` to those paths. Core memory is your constitution; changes go
-through operator review as a PR. The flow (chainlink #337):
+You **cannot edit `memory/core/*` or `prompts/*` in place** — the write guard
+refuses direct `Edit`/`Write` to those paths. Core memory is your constitution
+and prompts are operator-managed; changes to either go through operator review
+as a PR. The flow (chainlink #337/#344):
 
-1. `open_core_memory_proposal()` — creates an isolated working copy (a git
-   worktree under `scratch/`) and returns its path. Nothing is live yet.
-2. Edit the core files under `<that path>/memory/core/` with your normal
-   `Read`/`Edit`/`Write` tools — add, change, delete, or move files freely;
-   it's a sandbox.
-3. `submit_core_memory_proposal(title, rationale)` — commits your changes,
-   pushes them, opens a PR, and returns the **PR URL**. Give that URL to the
-   operator in the channel and ask them to review and merge.
-4. The change reaches live core memory only **after the operator merges** the
-   PR (it lands on a later turn, when the home pulls the merge). **Merge is the
+1. `open_proposal()` — creates an isolated working copy (a git worktree under
+   `scratch/`) and returns its path. Nothing is live yet.
+2. Edit the files under `<that path>/memory/core/` and/or `<that path>/prompts/`
+   with your normal `Read`/`Edit`/`Write` tools — add, change, delete, or move
+   files freely across both; it's a sandbox. One proposal can touch both.
+3. `submit_proposal(title, rationale)` — commits your changes, pushes them,
+   opens one PR, and returns the **PR URL**. Give that URL to the operator in
+   the channel and ask them to review and merge.
+4. The change reaches the live files only **after the operator merges** the PR
+   (it lands on a later turn, when the home pulls the merge). **Merge is the
    approval** — don't expect the change to take effect just because you opened
    the PR.
 
-`abandon_core_memory_proposal()` discards an open proposal; only one is open at
-a time. If the home has no git remote yet (first-run setup), proposals can't be
-opened — core memory is seeded at setup instead. This is the *only* path for
-you to change core memory.
+`abandon_proposal()` discards an open proposal; only one is open at a time. If
+the home has no git remote yet (first-run setup), proposals can't be opened —
+these files are seeded at setup instead. This is the *only* path for you to
+change core memory or prompts.
 
 ### `memory/<anywhere>/` — non-core, indexed
 
@@ -109,8 +110,8 @@ Organize however helps you. Common shapes:
   turns; reflection's §B.4 reviews them and *proposes* promoting durable
   ones into `memory/core/40-learned-behaviors.md`. **You can never write
   `40-learned-behaviors.md` (or any `memory/core/` file) directly — core
-  is read-only at runtime; promotions land via the core-memory PR flow
-  (`open_core_memory_proposal`) the operator merges.** Lifecycle:
+  is read-only at runtime; promotions land via the change-proposal PR flow
+  (`open_proposal`) the operator merges.** Lifecycle:
   - Synthesis turns **prepend** (newest-first) to the live file.
   - Reflection's B.4 pass keeps / drops entries and proposes promotions.
   - When the live file grows past ~1000 lines / 25k tokens, reflection

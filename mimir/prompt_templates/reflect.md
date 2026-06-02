@@ -238,8 +238,8 @@ just rotated or is only one week old) entry-by-entry. For each:
   read-only at runtime, so you cannot write `40-learned-behaviors.md`
   directly: write the promotion as a proposal in
   `state/proposed-changes.md` (the operator reviews it and merges it as
-  a core-memory PR — or open one yourself with
-  `open_core_memory_proposal`). Leave the entry in
+  a change-proposal PR — or open one yourself with
+  `open_proposal`). Leave the entry in
   `learnings-pending.md` until the promotion lands.
 - **Drop** — was a one-off, contradicted by other evidence, no longer
   applies, or has sat ≥3 reflection cycles unpromoted (the file's
@@ -285,8 +285,8 @@ Conservative defaults the policy ships with:
   - Wiki orphan tagging (just flag, don't delete)
 
 - **Propose-only** (HITL — write to `state/proposed-changes.md`; the
-  operator merges the core-memory PR, or you open one with
-  `open_core_memory_proposal`):
+  operator merges the change-proposal PR, or you open one with
+  `open_proposal`):
   - ALL `memory/core/` edits — cleanup, restructure, promote-to-core,
     demote-from-core, persona edits, AND learned-behavior promotion.
     Core memory is read-only at runtime; there is no autonomous core

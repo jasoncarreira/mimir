@@ -1,11 +1,11 @@
-"""``mimir memory`` — core-memory PR proposal workflow (chainlink #337/#339).
+"""``mimir memory`` — change-proposal PR workflow (chainlink #337/#339/#344).
 
-Operator/debug CLI over :mod:`mimir.core_memory_pr`. The agent's primary path
-is the tools (open/submit/abandon_core_memory_proposal); this mirrors them for
-manual use and tests:
+Operator/debug CLI over :mod:`mimir.proposals`. The agent's primary path is the
+tools (open/submit/abandon_proposal); this mirrors them for manual use and
+tests. A proposal can change both memory/core and prompts in one PR:
 
     mimir memory open                       # create the worktree, print its path
-    # ...edit <path>/memory/core/* by hand...
+    # ...edit <path>/memory/core/* and <path>/prompts/* by hand...
     mimir memory submit --title "…" --rationale "…"
     mimir memory abandon
     mimir memory status                     # list open proposals
@@ -17,7 +17,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..core_memory_pr import (
+from ..proposals import (
     abandon_proposal,
     finalize_proposal,
     list_open_proposals,
@@ -29,7 +29,7 @@ def _run_open(args: argparse.Namespace) -> int:
     result = open_proposal(Path(args.home).resolve())
     if result.ok and result.worktree is not None:
         print(f"opened {result.branch}")
-        print(f"edit:  {result.worktree}/memory/core/")
+        print(f"edit:  {result.worktree}/memory/core/ and {result.worktree}/prompts/")
         print('then:  mimir memory submit --title "…" --rationale "…"')
         return 0
     print(f"error ({result.reason}): {result.detail or ''}", file=sys.stderr)
@@ -61,7 +61,7 @@ def _run_abandon(args: argparse.Namespace) -> int:
 def _run_status(args: argparse.Namespace) -> int:
     opens = list_open_proposals(Path(args.home).resolve())
     if not opens:
-        print("(no open core-memory proposals)")
+        print("(no open proposals)")
         return 0
     for branch, worktree in opens:
         print(f"- {branch}  ({worktree})")
@@ -72,7 +72,7 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     """Register the ``mimir memory`` subcommand tree."""
     mem_p = sub.add_parser(
         "memory",
-        help="Core-memory PR proposal workflow (open/submit/abandon/status).",
+        help="Change-proposal PR workflow for memory/core + prompts (open/submit/abandon/status).",
     )
     mem_sub = mem_p.add_subparsers(dest="memory_action")
 
@@ -82,7 +82,7 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     op.add_argument("--home", type=Path, default=Path.cwd())
 
     sb = mem_sub.add_parser(
-        "submit", help="Commit + push the open proposal's memory/core changes and open a PR."
+        "submit", help="Commit + push the open proposal's memory/core + prompts changes and open a PR."
     )
     sb.add_argument("--home", type=Path, default=Path.cwd())
     sb.add_argument("--title", required=True, help="PR title.")
@@ -91,7 +91,7 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     ab = mem_sub.add_parser("abandon", help="Discard the open proposal (no PR).")
     ab.add_argument("--home", type=Path, default=Path.cwd())
 
-    st = mem_sub.add_parser("status", help="List open core-memory proposals.")
+    st = mem_sub.add_parser("status", help="List open proposals.")
     st.add_argument("--home", type=Path, default=Path.cwd())
 
     return mem_p

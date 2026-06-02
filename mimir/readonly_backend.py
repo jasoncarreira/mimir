@@ -146,12 +146,17 @@ class WriteGuardBackend:
         # When ``enforce_core_memory_readonly`` is True, writes under this
         # path are blocked during ANY active turn (chainlink #342): core
         # memory is the agent's constitution, and changes go through the PR
-        # proposal flow (open_core_memory_proposal) for operator review — not
+        # proposal flow (open_proposal) for operator review — not
         # an in-turn write, reflection included. Turns with no TurnContext
         # (the scaffold genesis seed, ``mimir setup``, tests, non-turn
         # callables) are unaffected, so the initial seed still works. Policy:
         # ``memory/core/30-reflection-policy.md``.
         self._memory_core_root: Path = (self._root / "memory" / "core").resolve()
+        # Pre-resolved prompts/ root. prompts is operator-managed and (by
+        # default) not a writable dir, so live writes are already blocked by the
+        # writable-root check; this lets the deny message point at the proposal
+        # flow (chainlink #344) instead of a generic "not writable".
+        self._prompts_root: Path = (self._root / "prompts").resolve()
         self._enforce_core_memory_readonly: bool = enforce_core_memory_readonly
         # Recorded denials, one per blocked Write/Edit/upload. The agent
         # drains this list at end-of-turn (``drain_denials()``) into
@@ -253,7 +258,7 @@ class WriteGuardBackend:
         tests, non-turn cron callables) → False, so the initial core seed and
         tooling are unaffected. There is no reflection exception and no
         onboarding bypass: every in-turn core change — reflection included —
-        goes through the PR proposal flow (open_core_memory_proposal). The
+        goes through the PR proposal flow (open_proposal). The
         first check (writable-root membership) is done by ``_is_write_allowed``;
         this gate stacks on top.
         """
@@ -273,12 +278,32 @@ class WriteGuardBackend:
         from ._context import get_current_turn
         return get_current_turn() is not None
 
+    def _is_prompts_path(self, file_path: str) -> bool:
+        """True if ``file_path`` resolves under ``prompts/`` — used only to
+        choose a more helpful deny message (point at the proposal flow) when a
+        prompts write is blocked. Does NOT itself block: prompts is gated by
+        the writable-root check (it isn't a writable dir by default)."""
+        resolved = self._resolve_target(file_path)
+        if resolved is None:
+            return False
+        return (
+            resolved == self._prompts_root
+            or resolved.is_relative_to(self._prompts_root)
+        )
+
     _CORE_MEMORY_DENY_REASON = (
         "Write blocked: memory/core/ is read-only at runtime by policy "
         "(memory/core/30-reflection-policy.md). To change core memory, open a "
-        "proposal with open_core_memory_proposal, edit it there, then "
-        "submit_core_memory_proposal — the operator reviews and merges the PR. "
-        "For a non-diff suggestion, write to state/proposed-changes.md."
+        "proposal with open_proposal, edit it there, then submit_proposal — the "
+        "operator reviews and merges the PR. For a non-diff suggestion, write to "
+        "state/proposed-changes.md."
+    )
+
+    _PROMPTS_DENY_REASON = (
+        "Write blocked: prompts/ is operator-managed and not writable at "
+        "runtime. To change a prompt template, open a proposal with "
+        "open_proposal, edit it there, then submit_proposal — the operator "
+        "reviews and merges the PR."
     )
 
     def _allowed_dirs_label(self) -> str:
@@ -286,6 +311,9 @@ class WriteGuardBackend:
 
     def write(self, file_path: str, content: str) -> WriteResult:
         if not self._is_write_allowed(file_path):
+            if self._is_prompts_path(file_path):
+                self._record_denial("write_prompts_readonly", file_path)
+                return WriteResult(error=self._PROMPTS_DENY_REASON)
             self._record_denial("write", file_path)
             return WriteResult(
                 error=f"Write blocked. Writable directories: {self._allowed_dirs_label()}",
@@ -313,6 +341,9 @@ class WriteGuardBackend:
         replace_all: bool = False,
     ) -> EditResult:
         if not self._is_write_allowed(file_path):
+            if self._is_prompts_path(file_path):
+                self._record_denial("edit_prompts_readonly", file_path)
+                return EditResult(error=self._PROMPTS_DENY_REASON)
             self._record_denial("edit", file_path)
             return EditResult(
                 error=f"Edit blocked. Writable directories: {self._allowed_dirs_label()}",

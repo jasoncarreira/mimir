@@ -2335,12 +2335,12 @@ class Agent:
             if self._config.feedback_limit_per_polarity > 0
             else None
         )
-        # Open core-memory proposals nudge (chainlink #337/#339), rendered next
+        # Open change-proposal nudge (chainlink #337/#339/#344), rendered next
         # to the feedback signals so the agent finishes/abandons an in-flight
         # proposal. Sync git call off the loop; a prompt section must never
         # break the turn, hence the broad guard.
         try:
-            from .core_memory_pr import render_open_proposals_block
+            from .proposals import render_open_proposals_block
             core_proposals_block = await asyncio.to_thread(
                 render_open_proposals_block, self._config.home
             )

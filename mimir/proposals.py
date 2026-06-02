@@ -1,13 +1,18 @@
-"""Open & finalize core-memory change proposals as PRs (chainlink #337/#339).
+"""Open & finalize change proposals for protected files as PRs (chainlink #337/#339/#344).
 
-The agent cannot write live ``memory/core/*`` (the write guard blocks it).
-To change core memory it opens a *proposal*: a throwaway ``git worktree`` of
-the home repo, checked out under the gitignored ``scratch/`` workspace, where
-it edits the core files with its normal file tools — add, edit, delete, move,
-any number of files. Submitting commits those changes (secret-scanned,
-credential-redacted), pushes the branch, and opens a PR. The operator reviews
-the diff and merges; live core memory updates only after the merge (the
+The agent cannot write live ``memory/core/*`` or ``prompts/*`` (the write
+guard blocks core memory at runtime; prompts aren't a writable dir). To change
+either, it opens a *proposal*: a throwaway ``git worktree`` of the home repo,
+checked out under the gitignored ``scratch/`` workspace, where it edits those
+files with its normal file tools — add, edit, delete, move, any number of
+files across both surfaces. Submitting commits the changes (secret-scanned,
+credential-redacted), pushes the branch, and opens one PR. The operator
+reviews the diff and merges; live files update only after the merge (the
 per-turn ``git pull --rebase`` apply path, #340). **Merge is the approval.**
+
+The proposable surfaces are :data:`PROPOSAL_SURFACES` (``memory/core`` and
+``prompts``) — both git-tracked in the home repo, both protected from live
+agent writes.
 
 Why ``scratch/``: it's already a writable root AND gitignored (config.py,
 chainlink #299) — so the agent's Read/Edit/Write reach the worktree, the core
@@ -36,10 +41,12 @@ from typing import Callable
 # subprocess wrapper. One redactor is the point — core diffs must not leak creds.
 from .git_bootstrap import _redact, _run
 
-#: Core-memory directory, relative to the home / repo root.
-CORE_REL = Path("memory") / "core"
+#: Protected surfaces a proposal can change, relative to the home / repo root.
+#: Both are git-tracked and blocked from live agent writes (memory/core via the
+#: runtime read-only gate, prompts by not being a writable dir).
+PROPOSAL_SURFACES: tuple[Path, ...] = (Path("memory") / "core", Path("prompts"))
 #: Where proposal worktrees live — under the gitignored scratch workspace.
-PROPOSALS_REL = Path("scratch") / "core-proposals"
+PROPOSALS_REL = Path("scratch") / "proposals"
 
 #: ``(home, branch, base, title, body) -> pr_url | None`` — injectable so tests
 #: exercise the git mechanics without a real GitHub.
@@ -47,19 +54,20 @@ PrOpener = Callable[[Path, str, str, str, str], "str | None"]
 
 
 def default_branch_name(label: str = "proposal", *, ts: int | None = None) -> str:
-    """Derive a unique proposal branch ``core-memory/<slug>-<unix-ts>``.
+    """Derive a unique proposal branch ``proposal/<slug>-<unix-ts>``.
 
     ``ts`` is injectable for deterministic tests; production callers leave it
     None to stamp with the current time."""
     slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:40].rstrip("-")
     stamp = ts if ts is not None else int(time.time())
-    return f"core-memory/{slug or 'proposal'}-{stamp}"
+    return f"proposal/{slug or 'proposal'}-{stamp}"
 
 
 @dataclass
 class OpenResult:
     """Outcome of opening a proposal. On success ``worktree`` is the dir the
-    agent edits (its ``memory/core/`` holds the core files)."""
+    agent edits (its ``memory/core/`` and ``prompts/`` hold the proposable
+    files)."""
 
     ok: bool
     branch: str | None
@@ -111,7 +119,7 @@ def _worktree_dir(home: Path, branch: str) -> Path:
 
 def list_open_proposals(home: Path) -> list[tuple[str, Path]]:
     """``(branch, worktree_path)`` for each open proposal worktree under
-    ``scratch/core-proposals/``. Parsed from ``git worktree list``."""
+    ``scratch/proposals/``. Parsed from ``git worktree list``."""
     home = Path(home).resolve()
     pdir = _proposals_dir(home)
     res = _git(["worktree", "list", "--porcelain"], cwd=home)
@@ -157,8 +165,8 @@ def _ensure_scratch_ignored(home: Path) -> str | None:
             if existing and not existing.endswith("\n"):
                 f.write("\n")
             f.write(
-                "\n# Core-memory proposal worktrees live under "
-                "scratch/core-proposals/; ignore scratch/ explicitly so the\n"
+                "\n# Change-proposal worktrees live under "
+                "scratch/proposals/; ignore scratch/ explicitly so the\n"
                 "# per-turn `git add -A` doesn't grab them as embedded repos "
                 "(chainlink #299/#339).\nscratch/\n"
             )
@@ -168,8 +176,9 @@ def _ensure_scratch_ignored(home: Path) -> str | None:
 
 
 def open_proposal(home: Path, *, base: str = "main", branch: str | None = None) -> OpenResult:
-    """Open a core-memory proposal: a worktree off ``origin/<base>`` under
-    ``scratch/core-proposals/`` for the agent to edit. One proposal at a time."""
+    """Open a change proposal: a worktree off ``origin/<base>`` under
+    ``scratch/proposals/`` for the agent to edit (memory/core and prompts).
+    One proposal at a time."""
     home = Path(home).resolve()
     if not _has_origin_remote(home):
         return OpenResult(
@@ -211,10 +220,11 @@ def open_proposal(home: Path, *, base: str = "main", branch: str | None = None) 
             ok=False, branch=branch, worktree=None, reason="error",
             detail=_redact(f"git worktree add failed: {(add.stderr or '').strip()}"),
         )
-    # Sparse-checkout to just memory/core so the worktree stays tiny and the
-    # agent only sees the core files (submit stages memory/core regardless).
+    # Sparse-checkout just the proposable surfaces so the worktree stays small
+    # and the agent only sees what it can change (submit stages them regardless).
     # Cone mode also materializes top-level files, which is harmless.
-    for step in (["sparse-checkout", "set", "--cone", "memory/core"], ["checkout"]):
+    surfaces = [s.as_posix() for s in PROPOSAL_SURFACES]
+    for step in (["sparse-checkout", "set", "--cone", *surfaces], ["checkout"]):
         r = _git(step, cwd=wt)
         if r.returncode != 0:
             _cleanup_worktree(home, wt, branch)
@@ -260,13 +270,13 @@ def finalize_proposal(
     branch: str | None = None,
     open_pr: PrOpener | None = None,
 ) -> ProposalResult:
-    """Commit the open proposal's ``memory/core/`` changes, push, and open a PR.
+    """Commit the open proposal's changes (memory/core + prompts), push, and PR.
 
-    Stages **only** ``memory/core/`` (so stray edits elsewhere in the worktree
-    never reach the PR), scans the staged diff for secrets, commits with a
-    redacted message, pushes, opens the PR, and tears down the worktree. On a
-    recoverable miss (no changes, secret found) the worktree is left intact so
-    the agent can fix and resubmit.
+    Stages **only** the proposable surfaces (so stray edits elsewhere in the
+    worktree never reach the PR), scans the staged diff for secrets, commits
+    with a redacted message, pushes, opens the PR, and tears down the worktree.
+    On a recoverable miss (no changes, secret found) the worktree is left
+    intact so the agent can fix and resubmit.
     """
     home = Path(home).resolve()
     opens = list_open_proposals(home)
@@ -286,12 +296,12 @@ def finalize_proposal(
     else:
         branch, wt = opens[0]
 
-    _git(["add", str(CORE_REL)], cwd=wt)
+    _git(["add", *[s.as_posix() for s in PROPOSAL_SURFACES]], cwd=wt)
     staged = _git(["diff", "--cached", "--name-only"], cwd=wt)
     if not (staged.stdout or "").strip():
         return ProposalResult(
             ok=False, branch=branch, pushed=False, pr_url=None, reason="no_changes",
-            detail="no changes under memory/core/ to propose",
+            detail="no changes under memory/core/ or prompts/ to propose",
         )
 
     diff = _git(["diff", "--cached", "-U0"], cwd=wt)
@@ -302,7 +312,7 @@ def finalize_proposal(
     if _scan_for_secrets(added):
         return ProposalResult(
             ok=False, branch=branch, pushed=False, pr_url=None, reason="secret",
-            detail="proposed core content contains a secret-shaped token — remove it; core memory must not hold credentials",
+            detail="proposed content contains a secret-shaped token — remove it; proposed files must not hold credentials",
         )
 
     safe_title = _redact(title)
@@ -322,8 +332,8 @@ def finalize_proposal(
 
     body = (
         f"{safe_rationale}\n\n---\n"
-        "Proposed by the mimir core-memory workflow (chainlink #337). "
-        "Approval = merge; live core memory updates after the merge (#340)."
+        "Proposed by the mimir change-proposal workflow (chainlink #337/#344). "
+        "Approval = merge; live files update after the merge (#340)."
     )
     opener = open_pr or _default_open_pr
     pr_url = opener(home, branch, base, safe_title, body)
@@ -355,7 +365,7 @@ def abandon_proposal(home: Path, *, branch: str | None = None) -> bool:
 
 
 def render_open_proposals_block(home: Path) -> str | None:
-    """Prompt nudge for any open core-memory proposal(s), or None if none.
+    """Prompt nudge for any open change proposal(s), or None if none.
 
     Surfaced near the feedback block every turn so the agent doesn't leave a
     proposal dangling (#337/#339). Auto-clears the moment the worktree is gone
@@ -373,12 +383,12 @@ def render_open_proposals_block(home: Path) -> str | None:
         except ValueError:
             rel = worktree
         lines.append(
-            f"- `{branch}`: edit the files under `{rel}/memory/core/`, then "
-            f"`submit_core_memory_proposal(title, rationale)` to open the PR — "
-            f"or `abandon_core_memory_proposal` to discard."
+            f"- `{branch}`: edit the files under `{rel}/memory/core/` or "
+            f"`{rel}/prompts/`, then `submit_proposal(title, rationale)` to open "
+            f"the PR — or `abandon_proposal` to discard."
         )
     return (
-        "You have an open core-memory proposal in progress — don't leave it "
+        "You have an open change proposal in progress — don't leave it "
         "hanging:\n" + "\n".join(lines)
     )
 
@@ -392,6 +402,6 @@ __all__ = (
     "abandon_proposal",
     "list_open_proposals",
     "default_branch_name",
-    "CORE_REL",
+    "PROPOSAL_SURFACES",
     "PROPOSALS_REL",
 )
