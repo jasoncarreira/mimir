@@ -42,6 +42,14 @@ def _template_names() -> list[str]:
     )
 
 
+def bundled_defaults() -> dict[str, str]:
+    """Bundled prompt defaults keyed by basename."""
+    return {
+        name: (_TEMPLATES_ROOT / name).read_text(encoding="utf-8")
+        for name in _template_names()
+    }
+
+
 def seed_prompts(home: Path) -> dict[str, str]:
     """Copy missing prompt templates to ``<home>/prompts/<name>.md``.
 
