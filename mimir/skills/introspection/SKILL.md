@@ -38,7 +38,7 @@ repeated tool denials, drift detection, "what was I doing the last time X happen
 The operator asking "what happened when..." is the canonical trigger.
 
 **Requires**: `logs/turns.jsonl` and `logs/events.jsonl` accessible under `<home>/logs/`
-(seeded by `mimir setup`); `jq` on PATH for the query recipes; Read tool for the
+(seeded by `mimir setup`); `jq` on PATH for the query recipes; `read_file` for
 `chat_history.jsonl` spot-checks.
 
 **Guarantees**:
@@ -60,7 +60,7 @@ happened", events.jsonl is closer to ground).
 
 1. **`logs/turns.jsonl`** — Per-turn summaries. One record per agent invocation with the full sequence of tool calls, results, and output. Best for understanding what happened during a specific turn.
 2. **`logs/events.jsonl`** — Ground truth. Every tool call, error, and scheduler event with timestamps and session IDs. Best for fine-grained analysis across turns.
-3. **`messages/chat_history.jsonl`** — What was actually sent and received on each channel. Read it directly (`Read` or `tail | jq`) when you need to verify a specific message landed.
+3. **`messages/chat_history.jsonl`** — What was actually sent and received on each channel. Read it directly (`read_file` or `tail | jq`) when you need to verify a specific message landed.
 4. **`scheduler.yaml`** — Current scheduled job definitions.
 5. **Wiki pages** — Your current beliefs about the world. May be stale.
 
@@ -258,7 +258,7 @@ reflection.
 
 ## Cross-Referencing with Memory Skill
 
-The **memory** skill (loaded from the skill catalog — not an absolute `/mimir` path) covers:
+The **memory** skill (loaded from the skill catalog — not an absolute `/mimir/skills` path) covers:
 - **When and how to write memory blocks** — criteria for block vs file storage
 - **Maintenance** — block size monitoring, pruning, file frequency analysis
 - **File organization** — cross-references between blocks and state files
