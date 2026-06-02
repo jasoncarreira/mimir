@@ -348,7 +348,8 @@ def build_app(config: Config) -> web.Application:
     seeded_skills_map = refresh_builtin_skills(config.home)
     # Seed default operator prompts (heartbeat.md, reflect.md) and the
     # default scheduler.yaml if missing. Idempotent — only writes when
-    # the target is absent, so operator customizations persist.
+    # the target is absent, so operator customizations persist. Existing-file
+    # default updates are handled by the startup defaults-upgrade proposal path.
     seed_prompts(config.home)
     seed_scheduler(config.home)
 
@@ -669,6 +670,26 @@ def build_app(config: Config) -> web.Application:
                     github_token=config.git_state_token,
                     log_event=_sync_log_event,
                 )
+                try:
+                    from .defaults_upgrade import check_and_open_defaults_upgrade
+
+                    defaults_result = await asyncio.to_thread(
+                        check_and_open_defaults_upgrade,
+                        config.home,
+                    )
+                    await log_event(
+                        "defaults_upgrade_checked",
+                        action=defaults_result.action,
+                        version=defaults_result.version,
+                        proposal_branch=(defaults_result.proposal.branch if defaults_result.proposal else None),
+                        conflicts=defaults_result.conflicts,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    await log_event(
+                        "defaults_upgrade_failed",
+                        home=str(config.home),
+                        error=str(exc)[:500],
+                    )
             except Exception as exc:  # noqa: BLE001
                 await log_event(
                     "git_bootstrap_failed",

@@ -150,6 +150,9 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # accepts the value. Surface as positive so the operator sees the
     # recovery (prior-stuck-low → accepted new reading).
     "quota_reading_anomaly_confirmed": ("positive", "quota_anomaly_confirmed"),
+    "defaults_upgrade_checked": ("positive", "defaults upgrade check"),
+    "defaults_upgrade_failed": ("negative", "defaults upgrade failed"),
+
     # PR 4a (git_tracking): post-turn commit/push failures. All three
     # are first-occurrence-only (see ``_FIRST_OCCURRENCE_ONLY_KINDS``)
     # because once git breaks every subsequent turn re-emits — without

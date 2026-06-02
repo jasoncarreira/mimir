@@ -39,6 +39,14 @@ def core_template_text(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def bundled_defaults() -> dict[str, str]:
+    """Bundled core-memory defaults keyed by basename."""
+    return {
+        name: core_template_text(name)
+        for name in _core_template_names()
+    }
+
+
 def seed_core_memory(home: Path) -> dict[str, str]:
     """Copy missing core-memory templates to ``<home>/memory/core/``.
 
