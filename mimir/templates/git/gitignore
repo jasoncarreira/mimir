@@ -66,10 +66,17 @@ embeddings/
 # ``*credential*`` were dropped — too-weak signals that false-block legit
 # notes (e.g. memory/issues/gog-token-expiry.md); the kept patterns are
 # high-signal and the content scan guards everything else.
+#
+# These MUST stay in sync with the pre-commit hook's NAME_PATTERNS. A name the
+# hook refuses but the gitignore admits is worse than useless: ``git add -A``
+# (per-turn commit) stages it, the hook then hard-fails the commit, and the
+# index stays poisoned so every later turn's commit also fails (chainlink #299).
 *.key
 *.pem
 oauth_*.json
 rate_limits.json
+.env
+.env.*
 
 # Re-allow the few jsonl files we genuinely want tracked.
 !state/applied-proposals.jsonl
