@@ -500,7 +500,7 @@ def test_pre_commit_hook_passes_clean_content(tmp_path: Path) -> None:
 def test_gitignore_blocks_atoms_db_under_state(tmp_path: Path) -> None:
     """Belt-and-suspenders: ``state/atoms.db`` (a likely accidental
     drop point) must be excluded by the gitignore even though
-    ``state/wiki/**`` is allowlisted."""
+    ``state/**`` is allowlisted — the wildcard ``*.db`` re-block wins."""
     home = tmp_path / "home"
     home.mkdir()
     git_bootstrap.bootstrap_git_repo(home)
@@ -529,6 +529,24 @@ def test_gitignore_admits_memory_markdown(tmp_path: Path) -> None:
         cwd=home, capture_output=True, text=True, check=True,
     )
     assert "memory/note.md" in res.stdout
+
+
+def test_gitignore_admits_arbitrary_state_file(tmp_path: Path) -> None:
+    """``state/**`` is allowlisted so the agent's working state persists by
+    default. An arbitrary, non-curated state note (e.g. voice-drafts.md) must
+    be tracked — not silently dropped the way the old narrow allowlist did."""
+    home = tmp_path / "home"
+    home.mkdir()
+    git_bootstrap.bootstrap_git_repo(home)
+
+    (home / "state").mkdir(exist_ok=True)
+    (home / "state" / "voice-drafts.md").write_text("draft\n")
+
+    res = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=home, capture_output=True, text=True, check=True,
+    )
+    assert "state/voice-drafts.md" in res.stdout
 
 
 # ─── token sanitisation in failure events ────────────────────────────
