@@ -119,20 +119,6 @@ DEFAULT_ENV_TEMPLATE = dedent(
     # dispatch failures). Leave blank to disable. Use a normal channel_id —
     # typically your DM with the bot, e.g. dm-slack-U05XXXX or dm-discord-NNN.
     MIMIR_OPERATOR_ALERT_CHANNEL=
-
-    # ---- S5-2 onboarding bypass ------------------------------------------
-    # Bypasses the reflection-only gate on memory/core/ writes so the
-    # agent can collaboratively bootstrap its persona / memory
-    # architecture during first-run setup. `mimir setup` writes this
-    # as `true` on first run; after onboarding completes, set to
-    # `false` (or delete the line) and `docker compose restart` to
-    # engage the gate.
-    #
-    # Restart-to-flip is the tamper-resistance property: the agent can
-    # edit this file via shell but the value isn't read until the next
-    # container restart. The agent has no docker socket to self-restart.
-    # `prohibited_action_guard` also blocks bash writes to compose.env.
-    MIMIR_ONBOARDING_MODE=true
     """
 )
 
@@ -336,13 +322,16 @@ DEFAULT_REFLECTION_POLICY = dedent(
 
     - SAGA atom decay calls
     - SAGA triples linking (additive)
-    - Append-only edits to memory/core/40-learned-behaviors.md
+    - Promote / drop entries in memory/learnings-pending.md
     - Wiki orphan tagging (writes to state/wiki/index.md — flag, don't delete)
 
     ## Propose-only (write to state/proposed-changes.md, operator reviews)
 
-    - Core memory edits (cleanup, restructure, promote-to-core, demote)
-    - Persona block edits (memory/core/00-*.md)
+    - ALL memory/core/ edits — cleanup, restructure, promote-to-core
+      (including learned-behavior promotion), demote, persona blocks.
+      Core memory is READ-ONLY at runtime; there is no autonomous core
+      write. Promotions land via the core-memory PR flow
+      (open_core_memory_proposal) the operator merges.
     - Skill creation (skills/<name>/)
     - Wiki page deletions
     - Memory file deletions
@@ -355,14 +344,16 @@ DEFAULT_REFLECTION_POLICY = dedent(
 
 DEFAULT_LEARNED_BEHAVIORS = dedent(
     """\
-    <!-- desc: behaviors learned through reflection - autonomous additions only -->
+    <!-- desc: behaviors learned through reflection; promoted via core-memory PR -->
     # Learned Behaviors
 
-    Append-only. The reflection turn writes here when it observes a
-    pattern worth keeping (a recurring approach that worked, a
-    failure mode worth avoiding, a heuristic that emerged across
-    several sessions). Never edit prior entries from a reflection —
-    propose any restructure via state/proposed-changes.md instead.
+    Durable behaviors the agent has learned — a recurring approach that
+    worked, a failure mode worth avoiding, a heuristic that emerged
+    across several sessions. This is core memory, so it is READ-ONLY at
+    runtime: reflection PROPOSES additions here (from
+    memory/learnings-pending.md) via state/proposed-changes.md, and they
+    land only when the operator merges the core-memory PR — nothing
+    writes this file directly during a turn.
 
     Format per entry:
 
@@ -416,9 +407,10 @@ DEFAULT_FILING_RULES = dedent(
       *Severity if misfiled: drift-amplifier (INDEX bloats or gotcha
       re-discovered from scratch).*
     - **`memory/learnings-pending.md`** — append-only buffer for candidate
-      learned behaviors. Reflection promotes durable ones to
-      `core/40-learned-behaviors.md`. Synthesis turns capture here, NOT
-      direct-to-core.
+      learned behaviors. Reflection PROPOSES promoting durable ones to
+      `core/40-learned-behaviors.md` (core is read-only at runtime — the
+      promotion lands as a core-memory PR). Synthesis turns capture here,
+      NOT direct-to-core.
     - **`memory/INDEX.md`** — auto-managed; hand-edits overwritten. The
       convention to enforce is the per-file `<!-- desc: ... -->` first-line.
 
@@ -515,7 +507,7 @@ DEFAULT_FILING_RULES = dedent(
     | Operator-decision-request in `state/spec/` (no proposed-changes pointer) | `state/proposed-changes.md` (or both, with pointer) | drift-amplifier |
     | Channel-scoped fact in `memory/issues/` or `state/wiki/` | `memory/channels/<id>/` | drift-amplifier |
     | Session-scoped note in `memory/core/` | `memory/learnings-pending.md` or discard | **system-breaking** |
-    | Candidate learning written directly to `memory/core/40-learned-behaviors.md` (not by reflection) | `memory/learnings-pending.md` | drift-amplifier |
+    | Candidate learning written directly to `memory/core/40-learned-behaviors.md` (core is read-only at runtime) | `memory/learnings-pending.md` | drift-amplifier |
     | Verbatim source under `state/wiki/` (no provenance header) | `state/raw/<YYYY-MM-DD>-<source>.md` (with synthesis at the wiki layer) | cosmetic |
     | Stub-shaped seed file persists alongside lived-in successor | retire the seed | drift-amplifier |
 
@@ -857,13 +849,15 @@ DEFAULT_ACTION_BOUNDARIES = dedent(
       ``core_blocks.load_channel_memory``), but per-channel blast
       radius is bounded: edits only affect turns on *that* channel,
       not globally like ``memory/core/`` does.
-    - Writes to ``<home>/memory/core/`` outside reflection turns —
-      **escalate-first**. Core blocks load every turn; unilateral
-      edits inflate prompt cost forever and can silently distort
-      behavior. Reflection turns have documented autonomy here (see
-      ``30-reflection-policy.md``). Outside reflection, route
-      changes through ``state/proposed-changes.md``; the reflection
-      skill's applied-proposals loop can audit the effect.
+    - Writes to ``<home>/memory/core/`` — **blocked at runtime**. Core
+      blocks load every turn; unilateral edits inflate prompt cost
+      forever and can silently distort behavior, so core memory is
+      read-only during any turn (reflection included). To change it,
+      open a proposal with ``open_core_memory_proposal``, edit it there,
+      and ``submit_core_memory_proposal`` — the operator reviews and
+      merges the PR. For a non-diff suggestion, route through
+      ``state/proposed-changes.md``; the reflection skill's
+      applied-proposals loop can audit the effect.
     - Deletes under ``<home>`` — **escalate-first**. Drift is
       recoverable from git; deletion isn't.
     - Writes outside the path-confinement allowlist —
@@ -1279,22 +1273,6 @@ def setup_home(
     # any local user on a multi-tenant host.
     _ensure_env_secure(home / ".env")
 
-    # S5-2 onboarding bypass — default ON for FRESH deployments only.
-    # The template (DEFAULT_ENV_TEMPLATE) already includes
-    # ``MIMIR_ONBOARDING_MODE=true``, so a freshly-created ``.env`` has
-    # the line. For existing deployments (``.env`` already present
-    # before this run, line possibly missing because the env var
-    # didn't exist in earlier mimir versions), we DO NOT auto-add the
-    # line — that would silently re-enable the bypass on every restart
-    # post-upgrade, which is a footgun. Operators upgrading who want
-    # the bypass can add ``MIMIR_ONBOARDING_MODE=true`` to compose.env
-    # manually. Reviewer note 2 on PR #301.
-    onboarding_mode_action: str | None = None
-    if env_was_new:
-        onboarding_mode_action = (
-            "set to true (first setup; mirror to compose.env)"
-        )
-
     # v0.5 §2: write saga.toml for in-process saga (skip if --no-saga; the
     # caller passes that signal by setting saga_key to None — but for now
     # setup always generates one).
@@ -1430,7 +1408,6 @@ def setup_home(
         "skills": seeded_skills,
         "api_key_action": api_key_action,
         "saga_api_key_action": saga_api_key_action,
-        "onboarding_mode_action": onboarding_mode_action,
         "git_bootstrap": git_bootstrap_status,
         "embedding_preset": embedding,
         "model_spec": effective_route.model_spec,
@@ -1547,19 +1524,6 @@ def _print_setup_report(status: dict[str, object]) -> None:
         print("  MIMIR_API_KEY:  generated (see .env; rotate via `mimir regenerate-api-key`)")
     if status.get("saga_api_key_action") == "generated":
         print("  SAGA_API_KEY:   generated (unused in in-process mode; preserved for external-saga use)")
-    onboarding_action = status.get("onboarding_mode_action")
-    if onboarding_action:
-        # First-setup signal: tell the operator to also set this in
-        # compose.env so docker actually injects it on container start.
-        # ``<home>/.env`` is mimir-managed; ``compose.env`` is operator-
-        # managed (docker reads it via ``env_file`` in compose.yml).
-        print(f"  MIMIR_ONBOARDING_MODE: {onboarding_action}")
-        print("                  ↑ ALSO add this line to compose.env before")
-        print("                    `docker compose up -d` — docker reads")
-        print("                    compose.env, not <home>/.env.")
-        print("                    After onboarding completes, set to")
-        print("                    `false` (or delete the line) in compose.env")
-        print("                    and `docker compose restart` to engage the gate.")
     # Model + usage-monitor routing — surface what setup decided so
     # the operator can confirm or override.
     model_spec = status.get("model_spec")

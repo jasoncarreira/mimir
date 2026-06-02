@@ -234,18 +234,23 @@ just rotated or is only one week old) entry-by-entry. For each:
 
 - **Promote** — the pattern recurred this week or holds up on broader
   review (cross-check against session boundaries, recent failures,
-  similar entries in `40-learned-behaviors.md`). Move (cut) the entry
-  to `memory/core/40-learned-behaviors.md`, drop the `Source:` line
-  (or rewrite as `Confirmed: <date>`), and append to the core block.
+  similar entries in `40-learned-behaviors.md`). Core memory is
+  read-only at runtime, so you cannot write `40-learned-behaviors.md`
+  directly: write the promotion as a proposal in
+  `state/proposed-changes.md` (the operator reviews it and merges it as
+  a core-memory PR — or open one yourself with
+  `open_core_memory_proposal`). Leave the entry in
+  `learnings-pending.md` until the promotion lands.
 - **Drop** — was a one-off, contradicted by other evidence, no longer
   applies, or has sat ≥3 reflection cycles unpromoted (the file's
   Lifecycle section sets the default-drop after 3 cycles).
 - **Keep pending** — promising but not yet enough evidence; leave for
   the next reflection cycle.
 
-This pass is autonomous per `30-reflection-policy.md`. The append-only
-`40-learned-behaviors.md` write you may do here is the promotion case,
-not arbitrary new content.
+The autonomous part of this pass is the `learnings-pending.md`
+bookkeeping (drop / keep). Promotion to `40-learned-behaviors.md` is
+propose-only — core memory is read-only at runtime (see Step 4); route
+it through `state/proposed-changes.md`, never a direct write.
 
 ### Promotion criteria (heuristic, not rigid)
 
@@ -275,16 +280,17 @@ Conservative defaults the policy ships with:
 - **Autonomous** (low-risk, reversible / additive):
   - SAGA atom decay calls
   - SAGA triples linking (additive)
-  - Append-only edits to `memory/core/40-learned-behaviors.md`
-    (typically by promoting from `memory/learnings-pending.md`)
   - Promote/drop entries in `memory/learnings-pending.md` (the
     weekly review pass — see §B.4 below)
   - Wiki orphan tagging (just flag, don't delete)
 
-- **Propose-only** (HITL — write to `state/proposed-changes.md`):
-  - Core memory edits (cleanup, restructure, promote-to-core,
-    demote-from-core)
-  - Persona block edits (`memory/core/00-persona.md`)
+- **Propose-only** (HITL — write to `state/proposed-changes.md`; the
+  operator merges the core-memory PR, or you open one with
+  `open_core_memory_proposal`):
+  - ALL `memory/core/` edits — cleanup, restructure, promote-to-core,
+    demote-from-core, persona edits, AND learned-behavior promotion.
+    Core memory is read-only at runtime; there is no autonomous core
+    write.
   - Skill creation
   - Wiki page deletions
   - Memory file deletions
@@ -347,8 +353,8 @@ to re-surface at next reflection. Multiple items OK: `accept 1 3 / reject 2`.
 ```
 
 **Silent rule**: if you wrote NO proposals this reflection — only
-autonomous changes like `saga_feedback` or `40-learned-behaviors.md`
-additions — skip this step entirely. No digest, no message.
+autonomous changes like `saga_feedback` or `learnings-pending.md`
+bookkeeping — skip this step entirely. No digest, no message.
 
 If `MIMIR_OPERATOR_ALERT_CHANNEL` is not set, log a one-line warning
 to stderr and skip silently.
@@ -358,8 +364,8 @@ to stderr and skip silently.
 Reflection turns end silently like heartbeats — no user-visible
 message. Output goes to:
 
-- `state/proposed-changes.md` — proposals (HITL items)
-- `memory/core/40-learned-behaviors.md` — autonomous additions
+- `state/proposed-changes.md` — proposals (HITL items), including any
+  core-memory promotions (core is read-only at runtime)
 - `events.jsonl` — your tool calls and results (automatic)
 - The SAGA atom decay / triples-linking calls land in SAGA
 

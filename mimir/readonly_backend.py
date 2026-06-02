@@ -125,8 +125,7 @@ class WriteGuardBackend:
         root_dir: Path,
         writable_dirs: list[str],
         *,
-        enforce_core_memory_reflection_only: bool = True,
-        onboarding_mode: bool = False,
+        enforce_core_memory_readonly: bool = True,
     ) -> None:
         self._root = Path(root_dir).resolve()
         self._fs = _RootAwareFilesystemBackend(root_dir=root_dir, virtual_mode=True)
@@ -143,40 +142,17 @@ class WriteGuardBackend:
         ]
         # For error messages — the friendlier "/state/" form.
         self._writable_labels: list[str] = ["/" + d for d in cleaned]
-        # Pre-resolved memory/core/ root for the S5-2 turn-type gate.
-        # When ``enforce_core_memory_reflection_only`` is True, writes
-        # under this path are only allowed during the weekly reflection
-        # turn (``trigger == "scheduled_tick"`` AND ``channel_id`` starts
-        # with ``"scheduler:reflect"``). All other turn types — heartbeats,
-        # user messages, react events, ad-hoc scheduled callables — are
-        # blocked. The policy is documented in
-        # ``memory/core/30-reflection-policy.md`` but was previously
-        # text-only; this is the code enforcement layer (VSM eval S5-2).
+        # Pre-resolved memory/core/ root for the runtime read-only gate.
+        # When ``enforce_core_memory_readonly`` is True, writes under this
+        # path are blocked during ANY active turn (chainlink #342): core
+        # memory is the agent's constitution, and changes go through the PR
+        # proposal flow (open_core_memory_proposal) for operator review — not
+        # an in-turn write, reflection included. Turns with no TurnContext
+        # (the scaffold genesis seed, ``mimir setup``, tests, non-turn
+        # callables) are unaffected, so the initial seed still works. Policy:
+        # ``memory/core/30-reflection-policy.md``.
         self._memory_core_root: Path = (self._root / "memory" / "core").resolve()
-        self._enforce_core_memory_reflection_only: bool = (
-            enforce_core_memory_reflection_only
-        )
-        # Onboarding-mode bypass — when True (sourced from the
-        # ``MIMIR_ONBOARDING_MODE`` env var, plumbed through
-        # ``Config.onboarding_mode``), the S5-2 reflection-only gate
-        # yields so the agent can collaboratively bootstrap its
-        # persona / memory architecture. Read once at __init__ from
-        # whatever Config supplies — a mid-process env mutation cannot
-        # flip the bypass live. Restart-to-flip is the operator's
-        # tamper-resistance guarantee: the agent CAN edit compose.env
-        # via shell to plant a dormant ``MIMIR_ONBOARDING_MODE=true``
-        # line, but the value isn't read until the next container
-        # restart, and the agent has no docker socket to self-restart.
-        # ``prohibited_action_guard`` separately blocks writes to
-        # ``compose.env`` from bash, closing the dormant-plant vector.
-        self._onboarding_mode: bool = onboarding_mode
-        if onboarding_mode and enforce_core_memory_reflection_only:
-            log.warning(
-                "MIMIR_ONBOARDING_MODE=true — S5-2 reflection-only gate "
-                "on memory/core/ is BYPASSED. Set MIMIR_ONBOARDING_MODE=false "
-                "(or remove the env var) and restart the container after "
-                "onboarding completes to engage the gate."
-            )
+        self._enforce_core_memory_readonly: bool = enforce_core_memory_readonly
         # Recorded denials, one per blocked Write/Edit/upload. The agent
         # drains this list at end-of-turn (``drain_denials()``) into
         # TurnRecord.permission_denials so the audit trail is visible
@@ -265,24 +241,23 @@ class WriteGuardBackend:
         )
 
     def _is_core_memory_write_blocked(self, file_path: str) -> bool:
-        """True iff this write should be refused by the S5-2 turn-type gate.
+        """True iff this write should be refused — ``memory/core/`` is
+        read-only at runtime (chainlink #342).
 
         Returns True only when ALL of these hold:
-          1. The resolved target is under ``memory/core/``
-          2. ``enforce_core_memory_reflection_only`` is True (default)
-          3. ``onboarding_mode`` is False (the
-             ``MIMIR_ONBOARDING_MODE`` env-var bypass is not active)
-          4. There is an active ``TurnContext``
-          5. That turn is NOT the weekly reflection
-             (``trigger != "scheduled_tick"`` or
-             ``channel_id`` does not start with ``"scheduler:reflect"``)
+          1. ``enforce_core_memory_readonly`` is True (default)
+          2. the resolved target is under ``memory/core/``
+          3. there is an active ``TurnContext``
 
-        Returns False in every other case — including "no active turn"
-        (so backend tests, ``mimir setup``, and non-turn callables are
-        not affected). The first check (writable-root membership) is
-        done by ``_is_write_allowed``; this gate stacks on top.
+        No active turn (the scaffold genesis seed, ``mimir setup``, backend
+        tests, non-turn cron callables) → False, so the initial core seed and
+        tooling are unaffected. There is no reflection exception and no
+        onboarding bypass: every in-turn core change — reflection included —
+        goes through the PR proposal flow (open_core_memory_proposal). The
+        first check (writable-root membership) is done by ``_is_write_allowed``;
+        this gate stacks on top.
         """
-        if not self._enforce_core_memory_reflection_only:
+        if not self._enforce_core_memory_readonly:
             return False
         resolved = self._resolve_target(file_path)
         if resolved is None:
@@ -293,32 +268,17 @@ class WriteGuardBackend:
         )
         if not under_core:
             return False
-        # Onboarding-mode bypass: when ``MIMIR_ONBOARDING_MODE=true``
-        # is set in the container env (typically via compose.env), the
-        # agent can freely edit ``memory/core/`` during first-run
-        # bootstrap. Operator restarts the container with the env var
-        # cleared to engage the gate after onboarding completes.
-        if self._onboarding_mode:
-            return False
-        # Lazy import to avoid a module cycle (mimir._context → models
-        # → potentially back into the agent layer that constructs the
-        # backend).
+        # Lazy import to avoid a module cycle (mimir._context → models →
+        # potentially back into the agent layer that constructs the backend).
         from ._context import get_current_turn
-        ctx = get_current_turn()
-        if ctx is None:
-            return False  # no turn → fall through (tests / setup / cron)
-        is_reflection = (
-            ctx.trigger == "scheduled_tick"
-            and (ctx.channel_id or "").startswith("scheduler:reflect")
-        )
-        return not is_reflection
+        return get_current_turn() is not None
 
     _CORE_MEMORY_DENY_REASON = (
-        "Write blocked: memory/core/ is reflection-only by policy "
-        "(memory/core/30-reflection-policy.md, §S5-2). Edit during a "
-        "trigger=scheduled_tick channel=scheduler:reflect turn, or "
-        "escalate to the operator. To stage a change, write to "
-        "state/proposed-changes.md."
+        "Write blocked: memory/core/ is read-only at runtime by policy "
+        "(memory/core/30-reflection-policy.md). To change core memory, open a "
+        "proposal with open_core_memory_proposal, edit it there, then "
+        "submit_core_memory_proposal — the operator reviews and merges the PR. "
+        "For a non-diff suggestion, write to state/proposed-changes.md."
     )
 
     def _allowed_dirs_label(self) -> str:
@@ -331,7 +291,7 @@ class WriteGuardBackend:
                 error=f"Write blocked. Writable directories: {self._allowed_dirs_label()}",
             )
         if self._is_core_memory_write_blocked(file_path):
-            self._record_denial("write_core_memory_non_reflection", file_path)
+            self._record_denial("write_core_memory_readonly", file_path)
             return WriteResult(error=self._CORE_MEMORY_DENY_REASON)
         # Idempotent with the strip already applied inside
         # ``_resolve_target`` during the writable-root check — the
@@ -358,7 +318,7 @@ class WriteGuardBackend:
                 error=f"Edit blocked. Writable directories: {self._allowed_dirs_label()}",
             )
         if self._is_core_memory_write_blocked(file_path):
-            self._record_denial("edit_core_memory_non_reflection", file_path)
+            self._record_denial("edit_core_memory_readonly", file_path)
             return EditResult(error=self._CORE_MEMORY_DENY_REASON)
         # Idempotent with ``_resolve_target`` — see ``write`` above.
         return self._fs.edit(
@@ -396,7 +356,7 @@ class WriteGuardBackend:
             for p in blocked_paths:
                 self._record_denial("upload", p)
             for p in core_blocked - blocked_paths:
-                self._record_denial("upload_core_memory_non_reflection", p)
+                self._record_denial("upload_core_memory_readonly", p)
             return [
                 FileUploadResponse(path=p, error="permission_denied")
                 for p, _ in files

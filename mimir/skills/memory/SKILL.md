@@ -106,11 +106,13 @@ Organize however helps you. Common shapes:
   every-turn INDEX?" Yes → here.
 - `memory/learnings-pending.md` — the live append-only buffer for
   candidate learned behaviors. Captured by `saga_session_end` synthesis
-  turns; reflection's §B.4 promotes durable ones to
-  `memory/core/40-learned-behaviors.md`. **Never write directly to
-  `40-learned-behaviors.md` outside a reflection turn.** Lifecycle:
+  turns; reflection's §B.4 reviews them and *proposes* promoting durable
+  ones into `memory/core/40-learned-behaviors.md`. **You can never write
+  `40-learned-behaviors.md` (or any `memory/core/` file) directly — core
+  is read-only at runtime; promotions land via the core-memory PR flow
+  (`open_core_memory_proposal`) the operator merges.** Lifecycle:
   - Synthesis turns **prepend** (newest-first) to the live file.
-  - Reflection's B.4 pass promotes / drops / keeps each entry.
+  - Reflection's B.4 pass keeps / drops entries and proposes promotions.
   - When the live file grows past ~1000 lines / 25k tokens, reflection
     rotates it: rename to `memory/learnings-pending/<YYYY-WNN>.md`
     (ISO week), create a fresh live file with just the header. Archives
