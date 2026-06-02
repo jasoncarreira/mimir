@@ -6,6 +6,52 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.11] — 2026-06-02
+
+Version-triggered defaults-upgrade proposals (epic #346) plus home-git
+tracking hardening.
+
+### Added
+
+- **Version-triggered defaults-upgrade proposals** (epic #346): on a
+  version bump, startup rewrites a local `mimir-defaults` vendor branch to
+  the shipped `prompts/` + `memory/core/` defaults, runs git's native 3-way
+  `merge-file` to reconcile them against the operator's home files in an
+  `upgrade`-lane proposal, and fires an agent reconciliation turn — or
+  auto-submits a conflict-free merge when
+  `MIMIR_DEFAULTS_UPGRADE_AUTO_SUBMIT_CLEAN` is set. Core memory + prompts
+  now seed from bundled templates and stay operator-editable; upgrades flow
+  through an operator-gated PR. (#552, #554, #555)
+- **Per-lane proposal worktrees** (chainlink #348): proposals are isolated
+  per lane (`agent` vs `upgrade`) with independent one-open guards. (#553)
+
+### Fixed
+
+- **Multi-region conflict merges no longer abort the upgrade** — a file the
+  operator customized in several spots that the new defaults also changed
+  now opens a conflict proposal instead of failing with a fake error
+  (`git merge-file` exit codes 2..127 are conflict-region counts, not
+  process errors). (#556)
+- **Home `.gitignore` tracks all of `state/**`** so agent state is not
+  silently dropped, and re-blocks `.env` / `.env.*` to match the pre-commit
+  hook's `NAME_PATTERNS` — preventing a wedged per-turn commit (or a
+  cleartext leak if the hook is bypassed). (#548, #557)
+- **Silently-ignored notes are surfaced** — prose written under a tracked
+  root that the `.gitignore` would drop now emits a feedback signal instead
+  of vanishing. (#551)
+- **Pollers with unset required env are skipped at discovery** rather than
+  scheduled to no-op every tick. (#549)
+- **`rebuild_index` tool wired up** — `set_index_generator(indexes)` is now
+  called in `build_app`; the tool was previously dead. (#547)
+
+### Changed
+
+- Dropped the over-broad `*token*` / `*credential*` gitignore + pre-commit
+  filename guards (they false-blocked legitimate notes); the content scan
+  remains the primary secret guard. (#550)
+- introspection skill docs reference the correct runtime tool name and
+  bundled-skill paths (`read_file`, `/mimir/skills`). (#541)
+
 ## [0.2.3] — 2026-05-31
 
 The unified provider-registry refactor, Codex support, and the
