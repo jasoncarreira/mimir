@@ -13,18 +13,15 @@
 *
 !*/
 
-# Tracked: human-readable curated state.
+# Tracked: human-readable curated state. ``state/**`` is allowlisted broadly
+# (like memory/prompts/skills) so the agent's working state persists by default
+# rather than being silently dropped — the binary/log + credential-shaped
+# re-blocks below still strip artifacts, and the pre-commit content scan is the
+# real secret guard. (chainlink #352/#353)
 !memory/**
 !prompts/**
 !skills/**
-!state/wiki/**
-!state/INDEX.md
-!state/heartbeat-backlog.md
-!state/proposed-changes.md
-!state/applied-proposals.jsonl
-!state/identities.yaml
-!state/raw/**
-!state/learnings-pending.md
+!state/**
 
 # Top-level tracked files.
 !.gitignore
