@@ -51,9 +51,8 @@ DEFAULT_ENV_TEMPLATE = dedent(
     ANTHROPIC_BASE_URL=
     ANTHROPIC_AUTH_TOKEN=
 
-    # ---- SAGA sidecar (memory) -------------------------------------------
-    SAGA_ENDPOINT=http://localhost:3002
-    SAGA_API_KEY=
+    # ---- saga memory (in-process) ----------------------------------------
+    # saga runs in-process — no endpoint or key to configure here.
     # OpenAI key for saga's embeddings (text-embedding-3-small) AND for
     # the bench harness's gpt-4o judge. Optional: if you leave it blank,
     # saga falls back to fastembed (local CPU, BAAI/bge-small-en-v1.5,
@@ -638,7 +637,6 @@ def _embedding_block_for_preset(preset: str) -> str:
 
 def _default_saga_toml(
     home: Path,
-    api_key: str,
     *,
     embedding: str = DEFAULT_EMBEDDING_PRESET,
 ) -> str:
@@ -667,9 +665,8 @@ def _default_saga_toml(
       on consolidation so future P41-style query-intent-gated work has
       data. ``[retrieval].enable_triple_augment_v2`` stays off (the
       post-fix bench showed -3.7pp multi-session, -2.3pp temporal).
-    - ``[server].api_key`` matches the SAGA_API_KEY in mimir's .env so
-      flipping to external-saga later doesn't require re-running setup.
-      Unused in-process.
+    - No credential is written into this tracked file. saga runs in-process
+      and needs no endpoint or key.
     """
     saga_dir = home / ".mimir"
     embedding_block = _embedding_block_for_preset(embedding)
@@ -754,12 +751,7 @@ def _default_saga_toml(
         # to override.
         similarity_threshold = "auto"
 
-        [server]
-        # Matches SAGA_API_KEY in mimir's .env. Unused in in-process mode;
-        # set up-front so flipping to external saga later (i.e., setting
-        # SAGA_ENDPOINT to a non-localhost URL) doesn't require re-running
-        # setup or rotating keys.
-        api_key = "{api_key}"
+        # saga runs in-process by default and keeps no credential in this file.
         """
     )
 
@@ -1081,7 +1073,6 @@ def _generate_api_key() -> str:
 # whitespace). The replacement preserves the leading whitespace so an
 # operator's indentation in their .env stays intact.
 _API_KEY_LINE_RE = re.compile(r"^(\s*)MIMIR_API_KEY\s*=.*$", re.MULTILINE)
-_SAGA_API_KEY_LINE_RE = re.compile(r"^(\s*)SAGA_API_KEY\s*=.*$", re.MULTILINE)
 _MIMIR_MODEL_SPEC_LINE_RE = re.compile(
     r"^(\s*)MIMIR_MODEL_SPEC\s*=.*$", re.MULTILINE,
 )
@@ -1210,7 +1201,6 @@ def setup_home(
 
     files_created: list[str] = []
     api_key_action: str | None = None
-    saga_api_key_action: str | None = None
     env_was_new = _write_if_missing(home / ".env", DEFAULT_ENV_TEMPLATE)
     if env_was_new:
         files_created.append(".env")
@@ -1258,19 +1248,13 @@ def setup_home(
     if (_env_get_api_key(home / ".env") or "") == "":
         _env_set_api_key(home / ".env", _generate_api_key())
         api_key_action = "generated"
-    # Same for SAGA_API_KEY — unused in in-process mode but generated up-front
-    # so flipping to external saga later doesn't require re-running setup.
-    if (_env_get_var(home / ".env", _SAGA_API_KEY_LINE_RE) or "") == "":
-        saga_key = _generate_api_key()
-        _env_set_var(home / ".env", "SAGA_API_KEY", saga_key, _SAGA_API_KEY_LINE_RE)
-        saga_api_key_action = "generated"
-    else:
-        saga_key = _env_get_var(home / ".env", _SAGA_API_KEY_LINE_RE) or ""
+    # saga runs in-process and uses no key, so no SAGA_API_KEY is generated.
+    # Nothing secret is written to .env or the tracked saga.toml.
 
     # Tighten .env to 0o600 (owner read-write only) after all secrets are
     # written. The file lands at the process umask default (typically 0644,
-    # world-readable) otherwise — leaking MIMIR_API_KEY and SAGA_API_KEY to
-    # any local user on a multi-tenant host.
+    # world-readable) otherwise — leaking MIMIR_API_KEY to any local user on a
+    # multi-tenant host.
     _ensure_env_secure(home / ".env")
 
     # v0.5 §2: write saga.toml for in-process saga (skip if --no-saga; the
@@ -1279,7 +1263,7 @@ def setup_home(
     (home / ".mimir").mkdir(parents=True, exist_ok=True)
     if _write_if_missing(
         home / "saga.toml",
-        _default_saga_toml(home, saga_key, embedding=embedding),
+        _default_saga_toml(home, embedding=embedding),
     ):
         files_created.append("saga.toml")
     # scheduler.yaml + prompts/ seed from the bundled templates (the
@@ -1407,7 +1391,6 @@ def setup_home(
         "subagents": seeded_subagents,
         "skills": seeded_skills,
         "api_key_action": api_key_action,
-        "saga_api_key_action": saga_api_key_action,
         "git_bootstrap": git_bootstrap_status,
         "embedding_preset": embedding,
         "model_spec": effective_route.model_spec,
@@ -1522,8 +1505,6 @@ def _print_setup_report(status: dict[str, object]) -> None:
             print(f"  subagents seeded: {', '.join(new_subs)}")
     if status.get("api_key_action") == "generated":
         print("  MIMIR_API_KEY:  generated (see .env; rotate via `mimir regenerate-api-key`)")
-    if status.get("saga_api_key_action") == "generated":
-        print("  SAGA_API_KEY:   generated (unused in in-process mode; preserved for external-saga use)")
     # Model + usage-monitor routing — surface what setup decided so
     # the operator can confirm or override.
     model_spec = status.get("model_spec")

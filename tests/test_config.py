@@ -10,7 +10,7 @@ Coverage map:
 - ``Config.from_env``    — defaults, MIMIR_HOME, MIMIR_AGENT_ID, MIMIR_WEB_PORT,
                            MIMIR_MODEL, MIMIR_FILE_OP_ROOTS, MIMIR_PROMPTS_DIR,
                            MIMIR_TURNS_ARCHIVE_DIR, MIMIR_RECENT_SOURCES,
-                           SAGA_ENDPOINT, MIMIR_TOOL_CALL_BUDGET
+                           MIMIR_TOOL_CALL_BUDGET
 - ``Config`` properties  — logs_dir, turns_log, events_log, commitments_log,
                            sdk_env_overrides (omits empty values)
 
@@ -255,20 +255,6 @@ class TestConfigFromEnv:
         from mimir.config import Config
         cfg = Config.from_env()
         assert cfg.model == "claude-haiku-4-5"
-
-    def test_saga_endpoint_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._base(monkeypatch)
-        monkeypatch.delenv("SAGA_ENDPOINT", raising=False)
-        from mimir.config import Config
-        cfg = Config.from_env()
-        assert cfg.saga_endpoint == "http://localhost:3002"
-
-    def test_saga_endpoint_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._base(monkeypatch)
-        monkeypatch.setenv("SAGA_ENDPOINT", "http://10.0.0.1:4001")
-        from mimir.config import Config
-        cfg = Config.from_env()
-        assert cfg.saga_endpoint == "http://10.0.0.1:4001"
 
     def test_tool_call_budget_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._base(monkeypatch)

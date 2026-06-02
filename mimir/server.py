@@ -400,11 +400,7 @@ def build_app(config: Config) -> web.Application:
     _db_path = Path(_toml_db)
     if not _db_path.is_absolute():
         _db_path = config.home / ".mimir" / _db_path
-    saga_client = make_saga_client(
-        endpoint=config.saga_endpoint,
-        api_key=config.saga_api_key or None,
-        db_path=_db_path,
-    )
+    saga_client = make_saga_client(db_path=_db_path)
     sessions = SessionManager(
         idle_minutes=config.saga_session_idle_minutes,
         max_turns=config.saga_session_max_turns,
@@ -1035,7 +1031,6 @@ def build_app(config: Config) -> web.Application:
             home=str(config.home),
             web_port=config.web_port,
             replayed_messages=replayed,
-            saga_endpoint=config.saga_endpoint,
             saga_consolidate_cron=config.saga_consolidate_cron if consolidate_registered else "",
             saga_session_idle_minutes=config.saga_session_idle_minutes,
             seeded_subagents=seeded,
