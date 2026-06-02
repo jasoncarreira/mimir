@@ -451,6 +451,26 @@ def discover_pollers(
                 key = item.strip()
                 if key:
                     env_required_clean.append(key)
+            # chainlink #351: don't even schedule a poller whose required env is
+            # unset. Without this the cron fires every tick only to no-op — via
+            # the #108 per-run env_required skip, or the script's own "nothing
+            # to do" — spamming logs (e.g. github-poller every 15m when
+            # GITHUB_REPOS is unset). #108 fails loudly per-run; this fails
+            # *quietly* at discovery (one warning, no cron job). Availability =
+            # the parent env (what pass_env forwards) plus any manifest ``env``
+            # override.
+            if env_required_clean:
+                _env_avail = set(os.environ) | (
+                    set(env_raw) if isinstance(env_raw, dict) else set()
+                )
+                _missing_req = [k for k in env_required_clean if k not in _env_avail]
+                if _missing_req:
+                    log.warning(
+                        "poller_skipped_unset_env: %s name=%r — not scheduling; "
+                        "required env unset: %s",
+                        pollers_file, name, ", ".join(_missing_req),
+                    )
+                    continue
             persist_dir = (
                 state_root / name if state_root is not None else None
             )
