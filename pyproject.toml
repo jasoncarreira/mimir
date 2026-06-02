@@ -164,6 +164,10 @@ include = [
     # prompts/; the previous "mimir/prompts/**/*.md" glob was a dead path,
     # so none of the templates ever shipped.
     "mimir/prompt_templates/**/*.md",
+    # Default core-memory templates — seed_core_memory() copies these into
+    # <home>/memory/core/ on setup. Keep them as bundled files so package
+    # upgrades can git-merge prompt/default-memory changes uniformly.
+    "mimir/memory_templates/**/*.md",
     # Default scheduler (seed_scheduler copies this to <home>/scheduler.yaml)
     # and the mimir-core credential manifest (cred_verify loads it at import
     # via _PACKAGE_MANIFEST). No glob covered top-level mimir/*.yaml before.
