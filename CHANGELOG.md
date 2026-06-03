@@ -30,6 +30,13 @@ Quota-pause hardening: short transient backoff + a recovery wake, and Codex
 ### Changed
 
 - Pin `langchain-codex-plus >= 0.0.3` (surfaces rate-limit headers on 429s). (#559)
+- **Optional-skill pollers seed a transient-state `.gitignore`.** Each poller
+  (github-poller, github-ci-watch, gmail-poller, and social-cli's notifications
+  + feed pollers) now writes a per-`STATE_DIR` `.gitignore` (write-if-missing)
+  so its high-churn cursor / dedup / working files aren't committed to the home
+  repo, while durable session logs, ledgers, and operator config stay tracked.
+  Removes the `git_ignored_note_skipped` noise seen when a home `.gitignore`
+  blanket-blocked `state/pollers/`. (#561)
 
 ## [0.2.11] — 2026-06-02
 
