@@ -1371,28 +1371,37 @@ class Agent:
             # run per §4.9 — they'll get their own 429 and surface
             # it to the operator via send_message rather than vanishing.
             try:
-                from .quota_pause import (
-                    QuotaPauseTracker,
-                    extract_reset_at,
-                    is_quota_exhaustion,
-                )
+                from .quota_pause import QuotaPauseTracker, is_quota_exhaustion
                 if is_quota_exhaustion(exc):
-                    reset_at, provider = extract_reset_at(exc)
                     tracker = QuotaPauseTracker(
                         self._config.home / ".mimir" / "quota_pause.json"
                     )
-                    tracker.pause_until(
-                        reset_at, reason="quota_exhausted", provider=provider,
-                    )
+                    # Classify: an authoritative reset → pause until then;
+                    # a header-less 429 → short escalating backoff (so a
+                    # transient burst doesn't sit out a full window).
+                    reset_at, pause_reason = tracker.record_rate_limit(exc)
                     await log_event(
                         "quota_exhausted",
                         channel_id=event.channel_id,
                         turn_id=turn_id,
                         reset_at=reset_at.isoformat(),
-                        provider=provider,
+                        pause_reason=pause_reason,
+                        provider=tracker.provider,
                         exception_class=type(exc).__name__,
                         exception_message=str(exc)[:240],
                     )
+                    # Arm a recovery wake so the agent retries exactly
+                    # when the window should roll over, instead of idling
+                    # until the next hourly scheduled tick.
+                    sched = getattr(self, "_scheduler", None)
+                    if sched is not None and hasattr(sched, "arm_quota_recovery_wake"):
+                        try:
+                            sched.arm_quota_recovery_wake(reset_at)
+                        except Exception:  # noqa: BLE001
+                            log.exception(
+                                "arm_quota_recovery_wake failed; next "
+                                "scheduled tick will still recover"
+                            )
             except Exception:  # noqa: BLE001 — defensive boundary
                 log.exception("quota_pause emit failed; continuing")
 

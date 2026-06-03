@@ -2237,3 +2237,78 @@ def test_audit_prompt_templates_have_frontmatter():
         if fname != "upgrade.md":
             # the audit's chainlink-log target id appears in the body
             assert ("#164" in text) or ("#283" in text), fname
+
+
+# ── quota-recovery wake (chainlink: quota-pause backoff) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_fire_quota_recovery_enqueues_heartbeat(tmp_path: Path):
+    """The wake body re-fires the heartbeat through _fire (no arbiter
+    here → it enqueues), so the pause clears and maintenance resumes."""
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    home = tmp_path / "home"
+    (home / "prompts").mkdir(parents=True)
+    (home / "prompts" / "heartbeat.md").write_text("run the heartbeat\n")
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=home)
+
+    await sched._fire_quota_recovery()
+
+    assert len(enqueued) == 1
+    assert enqueued[0].trigger == "scheduled_tick"
+    assert enqueued[0].channel_id == "scheduler:heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_arm_quota_recovery_wake_registers_one_shot(tmp_path: Path):
+    """arm_quota_recovery_wake registers a single one-shot job ~5s past
+    the reset, and re-arming replaces it (newest reset wins)."""
+    from datetime import datetime, timedelta, timezone
+    from mimir.scheduler import _QUOTA_RECOVERY_JOB_ID
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, home=tmp_path)
+    sched.start()
+    try:
+        reset = datetime.now(tz=timezone.utc) + timedelta(hours=2)
+        sched.arm_quota_recovery_wake(reset)
+        job = sched._scheduler.get_job(_QUOTA_RECOVERY_JOB_ID)
+        assert job is not None
+        assert abs((job.next_run_time - reset).total_seconds() - 5) < 2
+        # Re-arm with a later reset → replaced in place, never duplicated.
+        sched.arm_quota_recovery_wake(reset + timedelta(hours=1))
+        recovery_jobs = [j for j in sched._scheduler.get_jobs() if j.id == _QUOTA_RECOVERY_JOB_ID]
+        assert len(recovery_jobs) == 1
+    finally:
+        sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_rearm_quota_recovery_on_start_from_pause_file(tmp_path: Path):
+    """A pause recorded on disk before start() → the wake is re-armed on
+    startup (restart-safety: the in-memory wake is lost on restart, the
+    pause file is not)."""
+    from datetime import datetime, timedelta, timezone
+    from mimir.quota_pause import QuotaPauseTracker
+    from mimir.scheduler import _QUOTA_RECOVERY_JOB_ID
+
+    QuotaPauseTracker(tmp_path / ".mimir" / "quota_pause.json").pause_until(
+        datetime.now(tz=timezone.utc) + timedelta(hours=1), reason="quota_exhausted",
+    )
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, home=tmp_path)
+    sched.start()
+    try:
+        assert sched._scheduler.get_job(_QUOTA_RECOVERY_JOB_ID) is not None
+    finally:
+        sched.stop()

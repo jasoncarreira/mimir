@@ -29,7 +29,7 @@ import os
 import time
 import traceback as tb
 from dataclasses import dataclass, field
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -40,6 +40,7 @@ import yaml
 from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .event_logger import log_event
@@ -362,6 +363,12 @@ def _resolve_callable_cron(
 # ---------------------------------------------------------------------------
 
 
+# One-shot APScheduler job id for the quota-recovery wake (chainlink:
+# quota-pause backoff). A single id (replace_existing) means the newest
+# pause's reset always wins and we never accumulate stale wakes.
+_QUOTA_RECOVERY_JOB_ID = "__quota_recovery__"
+
+
 class Scheduler:
     """One AsyncIOScheduler. Owns LLM-tick jobs (from scheduler.yaml) plus the
     SAGA consolidation cron from Phase 4."""
@@ -666,6 +673,70 @@ class Scheduler:
                 channel_id=event.channel_id,
                 reason="dispatcher_rejected",
             )
+
+    # ── quota-recovery wake (chainlink: quota-pause backoff) ──────────
+    #
+    # When a turn hits a 429, the arbiter suppresses scheduled ticks
+    # until the recorded reset (``quota_pause.json``). Without this, the
+    # pause only gets re-evaluated on the NEXT scheduled tick — so a
+    # window that rolls over mid-hour leaves the agent idle for up to a
+    # full tick interval. Arming a one-shot wake at the reset time fires
+    # a catch-up heartbeat the moment the window should clear; combined
+    # with the short transient backoffs (quota_pause.record_rate_limit)
+    # a momentary 429 now recovers in ~a minute instead of hours.
+
+    def arm_quota_recovery_wake(self, reset_at: datetime) -> None:
+        """Register/replace a one-shot wake at ``reset_at`` that fires a
+        catch-up heartbeat. A reset already in the past fires almost
+        immediately (used by the startup re-arm). Best-effort: a failure
+        here just means recovery falls back to the next scheduled tick."""
+        now = datetime.now(tz=timezone.utc)
+        # Fire a few seconds past the recorded reset so the provider's
+        # window has definitely rolled; clamp into the future so a past
+        # reset doesn't get rejected by APScheduler.
+        when = reset_at + timedelta(seconds=5)
+        if when <= now:
+            when = now + timedelta(seconds=1)
+        try:
+            self._scheduler.add_job(
+                self._fire_quota_recovery,
+                trigger=DateTrigger(run_date=when),
+                id=_QUOTA_RECOVERY_JOB_ID,
+                replace_existing=True,
+                misfire_grace_time=300,
+            )
+        except Exception:  # noqa: BLE001 — defensive; recovery degrades to next tick
+            log.exception("failed to arm quota-recovery wake")
+
+    async def _fire_quota_recovery(self) -> None:
+        """One-shot wake body: re-run the heartbeat through the normal
+        arbiter path. ``should_fire_heartbeat`` lazy-expires the pause
+        (emitting ``quota_recovered``) and fires if utilization allows —
+        so this both clears the pause and resumes maintenance work."""
+        await log_event("quota_recovery_wake_fired")
+        # Synthetic heartbeat job: reuses the heartbeat channel + prompt
+        # (prompt_file falls back to the default heartbeat prompt if the
+        # operator hasn't customized prompts/heartbeat.md).
+        job = SchedulerJob(name="heartbeat", prompt_file="heartbeat.md")
+        await self._fire(job=job)
+
+    def rearm_quota_recovery_on_start(self) -> None:
+        """If a pause is recorded on disk, (re)arm the recovery wake.
+
+        APScheduler jobs live in memory, so a restart mid-pause loses the
+        wake — but ``quota_pause.json`` survives. Re-arming from it on
+        startup means a container that restarts during a pause still
+        recovers promptly (a past reset fires the catch-up right away)."""
+        if self._home is None:
+            return
+        try:
+            from .quota_pause import QuotaPauseTracker
+            tracker = QuotaPauseTracker(self._home / ".mimir" / "quota_pause.json")
+            reset_at = tracker.reset_at  # peek; does NOT lazy-expire
+            if reset_at is not None:
+                self.arm_quota_recovery_wake(reset_at)
+        except Exception:  # noqa: BLE001
+            log.exception("rearm_quota_recovery_on_start failed")
 
     async def add_job(self, job: SchedulerJob) -> SchedulerJob:
         """Atomic add-or-replace by name. Validates the trigger before
@@ -1993,6 +2064,11 @@ class Scheduler:
         if not self._started:
             self._scheduler.start()
             self._started = True
+            # Re-arm a quota-recovery wake if we restarted mid-pause
+            # (the in-memory wake is lost on restart; the pause file
+            # survives). Must run after start() so the job registers
+            # against a running scheduler.
+            self.rearm_quota_recovery_on_start()
 
     def stop(self) -> None:
         if self._started:
