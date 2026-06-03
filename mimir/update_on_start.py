@@ -311,7 +311,15 @@ def _compute_update_digest(home: Path, prior_version: str) -> UpdateDigest:
     try:
         from .skill_install import detect_skill_drift
         drift_results = detect_skill_drift(home)
-        skills_drift_names = sorted(r.name for r in drift_results if not r.is_clean)
+        # Only skills with a shipped source counterpart are actionable via
+        # ``mimir skills update --apply``. Orphaned skills (no source — the
+        # operator's own custom skills) aren't drift; including them just spams
+        # the digest with un-fixable names. (Follow-up to #363/#565: the 0.2.13
+        # rollout flagged ~12 orphaned skills per agent as "drift".)
+        skills_drift_names = sorted(
+            r.name for r in drift_results
+            if not r.is_clean and not r.orphaned
+        )
     except Exception as exc:
         log.warning("_compute_update_digest: skill drift check failed: %s", exc)
 
