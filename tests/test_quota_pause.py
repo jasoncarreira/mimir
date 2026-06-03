@@ -442,12 +442,37 @@ def test_authoritative_reset_clears_existing_transient_escalation(tmp_path: Path
     QuotaPauseTracker(path).record_rate_limit(exc, now=now0)
     r2, _ = QuotaPauseTracker(path).record_rate_limit(exc, now=now0 + timedelta(seconds=90))
     assert (r2 - (now0 + timedelta(seconds=90))).total_seconds() == 240
-    # an authoritative cap lands → clears the transient clock
-    reset_ts = int((now0 + timedelta(minutes=10)).timestamp())
+    # a (short-lived) authoritative cap lands at +120s → clears the transient clock
+    reset_ts = int((now0 + timedelta(seconds=125)).timestamp())
     QuotaPauseTracker(path).record_rate_limit(
         _codex_429(primary_used=100.0, reset_at=reset_ts), now=now0 + timedelta(seconds=120),
     )
-    # next header-less 429 (still within decay of the transient) → floor again
-    now1 = now0 + timedelta(seconds=150)
+    # the cap expires (lazy-expiry)
+    assert QuotaPauseTracker(path).is_paused(now=now0 + timedelta(seconds=130)).paused is False
+    # a header-less 429 AFTER the cap expired → floor again (clock was cleared).
+    # (While the cap was still active it would correctly report the cap, not 60s —
+    # see test_headerless_429_does_not_shorten_active_authoritative_pause.)
+    now1 = now0 + timedelta(seconds=140)
     r4, _ = QuotaPauseTracker(path).record_rate_limit(exc, now=now1)
     assert (r4 - now1).total_seconds() == 60
+
+
+def test_headerless_429_does_not_shorten_active_authoritative_pause(tmp_path: Path):
+    """Review fix (mimir-carreira #559): a header-less 429 carries no reset
+    info, so it must NOT shorten/downgrade an already-active authoritative cap.
+    The stored pause stays at the authoritative reset — a user-message turn's
+    bare 429 during a real cap can't re-enable work before the cap resets."""
+    path = tmp_path / "qp.json"
+    now = datetime.now(tz=timezone.utc)
+    auth_reset = (now + timedelta(minutes=10)).replace(microsecond=0)
+    QuotaPauseTracker(path).pause_until(auth_reset, reason="quota_exhausted", provider="anthropic")
+
+    new_reset, reason = QuotaPauseTracker(path).record_rate_limit(
+        Exception("HTTP 429: Rate limit exceeded"), now=now + timedelta(minutes=1),
+    )
+    assert reason == "quota_exhausted"
+    assert new_reset == auth_reset
+    # the stored pause is unchanged — not downgraded to a 60s transient backoff
+    reloaded = QuotaPauseTracker(path)
+    assert reloaded.reset_at == auth_reset
+    assert reloaded.is_paused(now=now + timedelta(minutes=1)).reason == "quota_exhausted"

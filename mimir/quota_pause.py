@@ -246,6 +246,21 @@ class QuotaPauseTracker:
             self.pause_until(parsed_reset, reason="quota_exhausted", provider=provider)
             return parsed_reset, "quota_exhausted"
 
+        # A header-less 429 carries no reset info, so it must NOT shorten or
+        # downgrade an already-active authoritative cap whose real reset is
+        # known and still in the future. While such a cap is unexpired, leave
+        # it intact and report it — the bare 429 is subsumed by the cap (and
+        # doesn't seed transient escalation). Without this, a user-message
+        # turn's 429 during an active cap (user turns run while scheduled ticks
+        # are suppressed) would overwrite the global pause down to the 60s
+        # floor and re-enable S4 work minutes before the cap actually resets.
+        if (
+            self._reset_at is not None
+            and self._reason == "quota_exhausted"
+            and self._reset_at > now
+        ):
+            return self._reset_at, "quota_exhausted"
+
         # Header-less 429 → transient backoff. Escalate only when the
         # previous *transient* backoff was recent; an authoritative pause
         # (or >30 min of quiet) leaves _last_transient_at None/stale, so
