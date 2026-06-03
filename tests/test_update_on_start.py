@@ -927,3 +927,111 @@ def test_mimir_update_digest_render_nothing_required() -> None:
 
     assert "[mimir v0.2.2→0.2.3]" in line
     assert "nothing requires action" in line
+
+
+# ─── emit_version_bump_digest (chainlink #363) ──────────────────────
+
+
+class _Drift:
+    """Minimal stand-in for SkillDriftResult (only fields the digest uses)."""
+    def __init__(self, name: str, is_clean: bool) -> None:
+        self.name = name
+        self.is_clean = is_clean
+
+
+def _capture_log():
+    calls: list = []
+
+    async def _async_log(kind, **fields):
+        calls.append((kind, fields))
+
+    return _async_log, calls
+
+
+def _patch_digest_inputs(monkeypatch, *, current, drift):
+    """Pin the version + skill-drift + zero out scheduler/env deltas so the
+    digest reflects only the injected drift."""
+    monkeypatch.setattr("mimir.update_on_start._current_version", lambda: current)
+    monkeypatch.setattr("mimir.skill_install.detect_skill_drift", lambda home, *a, **k: drift)
+    monkeypatch.setattr("mimir.update_on_start._scheduler_delta", lambda home: [])
+    monkeypatch.setattr("mimir.update_on_start._env_gaps", lambda home: [])
+
+
+@pytest.mark.asyncio
+async def test_version_bump_emits_digest_with_drift(tmp_path, monkeypatch):
+    from mimir.update_on_start import (
+        emit_version_bump_digest,
+        _write_last_booted_version,
+        _read_last_booted_version,
+    )
+    _write_last_booted_version(tmp_path, "0.2.11")
+    _patch_digest_inputs(
+        monkeypatch, current="0.2.12",
+        drift=[_Drift("social-cli", False), _Drift("github-poller", True)],
+    )
+    log, calls = _capture_log()
+    n = await emit_version_bump_digest(tmp_path, log, already_drained=False)
+    assert n == 1
+    assert len(calls) == 1
+    kind, fields = calls[0]
+    assert kind == "mimir_update_digest"
+    assert fields["prior_version"] == "0.2.11"
+    assert fields["new_version"] == "0.2.12"
+    assert fields["skills_drift"] == ["social-cli"]  # clean skill excluded
+    # baseline advanced so it won't re-fire next boot
+    assert _read_last_booted_version(tmp_path) == "0.2.12"
+
+
+@pytest.mark.asyncio
+async def test_version_bump_first_boot_baselines_silently(tmp_path, monkeypatch):
+    from mimir.update_on_start import emit_version_bump_digest, _read_last_booted_version
+    _patch_digest_inputs(monkeypatch, current="0.2.12", drift=[_Drift("social-cli", False)])
+    log, calls = _capture_log()
+    n = await emit_version_bump_digest(tmp_path, log, already_drained=False)
+    assert n == 0 and calls == []           # no prior baseline → no notice
+    assert _read_last_booted_version(tmp_path) == "0.2.12"
+
+
+@pytest.mark.asyncio
+async def test_version_bump_skipped_when_already_drained(tmp_path, monkeypatch):
+    from mimir.update_on_start import emit_version_bump_digest, _write_last_booted_version, _read_last_booted_version
+    _write_last_booted_version(tmp_path, "0.2.11")
+    _patch_digest_inputs(monkeypatch, current="0.2.12", drift=[_Drift("social-cli", False)])
+    log, calls = _capture_log()
+    n = await emit_version_bump_digest(tmp_path, log, already_drained=True)
+    assert n == 0 and calls == []           # self-update already surfaced it
+    assert _read_last_booted_version(tmp_path) == "0.2.12"  # still re-baselined
+
+
+@pytest.mark.asyncio
+async def test_version_bump_noop_when_unchanged(tmp_path, monkeypatch):
+    from mimir.update_on_start import emit_version_bump_digest
+    _patch_digest_inputs(monkeypatch, current="0.2.12", drift=[_Drift("social-cli", False)])
+    from mimir.update_on_start import _write_last_booted_version
+    _write_last_booted_version(tmp_path, "0.2.12")
+    log, calls = _capture_log()
+    n = await emit_version_bump_digest(tmp_path, log, already_drained=False)
+    assert n == 0 and calls == []
+
+
+@pytest.mark.asyncio
+async def test_version_bump_silent_when_no_actionable_delta(tmp_path, monkeypatch):
+    """Version bumped but nothing drifted / no scheduler/env delta → no notice."""
+    from mimir.update_on_start import emit_version_bump_digest, _write_last_booted_version
+    _write_last_booted_version(tmp_path, "0.2.11")
+    _patch_digest_inputs(monkeypatch, current="0.2.12", drift=[])
+    log, calls = _capture_log()
+    n = await emit_version_bump_digest(tmp_path, log, already_drained=False)
+    assert n == 0 and calls == []
+
+
+@pytest.mark.asyncio
+async def test_version_bump_fires_once(tmp_path, monkeypatch):
+    from mimir.update_on_start import emit_version_bump_digest, _write_last_booted_version
+    _write_last_booted_version(tmp_path, "0.2.11")
+    _patch_digest_inputs(monkeypatch, current="0.2.12", drift=[_Drift("social-cli", False)])
+    log, calls = _capture_log()
+    assert await emit_version_bump_digest(tmp_path, log, already_drained=False) == 1
+    # second boot on the same version → baseline matches → silent
+    assert await emit_version_bump_digest(tmp_path, log, already_drained=False) == 0
+    assert len(calls) == 1
