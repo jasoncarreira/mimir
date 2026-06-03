@@ -319,13 +319,29 @@ class SagaStore:
         with self._db_lock:
             with self._write_lock:
                 conn = self._ensure_conn()
+                # Best-effort + ownership-guarded. Access stats are
+                # non-essential reinforcement — a failure here must NOT fail the
+                # user-facing query (the read pass already ran on its own
+                # connection). And only roll back the transaction THIS block
+                # began: if BEGIN IMMEDIATE fails because a transaction is
+                # already open on the shared connection (e.g. an unlocked
+                # ``connection()`` caller mid-transaction), a blind rollback
+                # would abort THEIR uncommitted work.
+                began = False
                 try:
                     conn.execute("BEGIN IMMEDIATE")
+                    began = True
                     mark_access(conn, events, now=reference_date)
                     conn.commit()
-                except Exception:
-                    conn.rollback()
-                    raise
+                except Exception as exc:  # noqa: BLE001 — non-essential write
+                    if began:
+                        try:
+                            conn.rollback()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    log.warning(
+                        "retrieval access-event write skipped (%s)", exc,
+                    )
 
     async def _db_locked(self, fn):
         """Run a callable against the shared sqlite3 connection under lock.
@@ -670,6 +686,80 @@ class SagaStore:
                     or (result.rewritten_query or "")
                 ),
             }
+
+        def _do():
+            conn, should_close = self._operation_conn()
+            try:
+                return _do_with_conn(conn)
+            finally:
+                if should_close:
+                    conn.close()
+
+        if self._db_path is None:
+            return await self._db_locked(_do)
+        return await asyncio.to_thread(_do)
+
+    async def get_atoms(self, ids: list[str]) -> dict[str, Any]:
+        """Batch-load atoms by exact id. Pure read — no semantic search, no
+        access events, no transaction.
+
+        The by-id counterpart to ``query`` (semantic recall). Use it to
+        hydrate atoms whose ids are already known — e.g. ids cited in an
+        observation or in a session-boundary "atoms cited" list — so the
+        agent can read their content directly instead of stuffing each id
+        into a semantic ``query`` and fanning out parallel calls (which also
+        raced the shared connection's BEGIN IMMEDIATE; see recall.py).
+
+        Deliberately fires NO access events: a by-id load fetches atoms we
+        already know about (often to judge their usefulness), not a retrieval
+        that surfaced something — so it must not reinforce activation.
+
+        Like the other read paths (chainlink #365), it runs on a short-lived
+        per-call connection (``_operation_conn``) rather than the shared one,
+        so concurrent loads don't race sqlite connection state.
+
+        Returns ``{"atoms": [...], "missing": [...]}``: atoms preserve request
+        order and de-dupe; tombstoned / out-of-agent-scope / unknown ids are
+        excluded from ``atoms`` and listed in ``missing``.
+        """
+        clean = [i for i in (ids or []) if isinstance(i, str) and i]
+        if not clean:
+            return {"atoms": [], "missing": []}
+
+        def _do_with_conn(conn: sqlite3.Connection):
+            cols = ("id", "content", "stream", "profile", "memory_type",
+                    "source_type", "topics", "metadata", "agent_id",
+                    "is_pinned", "created_at", "session_id",
+                    "encoding_confidence")
+            unique = list(dict.fromkeys(clean))  # de-dupe, keep order
+            placeholders = ",".join(["?"] * len(unique))
+            rows = conn.execute(
+                f"SELECT {', '.join(cols)} FROM atoms "
+                f"WHERE id IN ({placeholders}) AND tombstoned = 0",
+                unique,
+            ).fetchall()
+            found = {row[0]: dict(zip(cols, row)) for row in rows}
+            atoms: list[dict[str, Any]] = []
+            for aid in unique:
+                a = found.get(aid)
+                if a is None:
+                    continue
+                # Match recall's visibility rules: own atoms + shared only.
+                if a["agent_id"] != self._agent_id and a["agent_id"] != "shared":
+                    continue
+                atoms.append({
+                    "id": a["id"],
+                    "content": a["content"],
+                    "stream": a.get("stream"),
+                    "memory_type": a.get("memory_type"),
+                    "source_type": a.get("source_type"),
+                    "created_at": a.get("created_at"),
+                    "topics": _safe_json_load(a.get("topics")),
+                    "metadata": _safe_json_load(a.get("metadata")),
+                })
+            returned = {a["id"] for a in atoms}
+            missing = [i for i in unique if i not in returned]
+            return {"atoms": atoms, "missing": missing}
 
         def _do():
             conn, should_close = self._operation_conn()

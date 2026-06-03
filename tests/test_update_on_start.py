@@ -950,8 +950,15 @@ def _capture_log():
 
 def _patch_digest_inputs(monkeypatch, *, current, drift):
     """Pin the version + skill-drift + zero out scheduler/env deltas so the
-    digest reflects only the injected drift."""
+    digest reflects only the injected drift.
+
+    Pins BOTH version sources to ``current``: the gate reads
+    ``_current_version()`` while ``_compute_update_digest`` reads the digest's
+    ``new_version`` from ``importlib.metadata``. In production both derive from
+    the same installed version; pin them together here so the test doesn't
+    couple to whatever the repo's current pyproject version happens to be."""
     monkeypatch.setattr("mimir.update_on_start._current_version", lambda: current)
+    monkeypatch.setattr("importlib.metadata.version", lambda *a, **k: current)
     monkeypatch.setattr("mimir.skill_install.detect_skill_drift", lambda home, *a, **k: drift)
     monkeypatch.setattr("mimir.update_on_start._scheduler_delta", lambda home: [])
     monkeypatch.setattr("mimir.update_on_start._env_gaps", lambda home: [])

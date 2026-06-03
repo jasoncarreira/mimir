@@ -128,6 +128,134 @@ async def test_client_end_session_idempotent(client, monkeypatch):
     assert r2["session_summary_written"] is False
 
 
+# ── get_atoms: batch by-id load (pure read) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_batch_load_preserves_order(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    a = await client.store("first atom about apples")
+    b = await client.store("second atom about bridges")
+    res = await client.get_atoms([b["atom_id"], a["atom_id"]])
+    assert [x["id"] for x in res["atoms"]] == [b["atom_id"], a["atom_id"]]
+    assert res["missing"] == []
+    contents = {x["id"]: x["content"] for x in res["atoms"]}
+    assert contents[a["atom_id"]] == "first atom about apples"
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_reports_missing(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    a = await client.store("a real atom")
+    res = await client.get_atoms([a["atom_id"], "0000nonexistent0000"])
+    assert [x["id"] for x in res["atoms"]] == [a["atom_id"]]
+    assert res["missing"] == ["0000nonexistent0000"]
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_excludes_tombstoned(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    a = await client.store("doomed atom")
+    conn = client.connection()
+    conn.execute("UPDATE atoms SET tombstoned = 1 WHERE id = ?", (a["atom_id"],))
+    conn.commit()
+    res = await client.get_atoms([a["atom_id"]])
+    assert res["atoms"] == []
+    assert res["missing"] == [a["atom_id"]]
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_fires_no_access_events(client, monkeypatch):
+    """A by-id load must NOT reinforce activation — unlike query()."""
+    _patch_provider(monkeypatch)
+    a = await client.store("atom we will load by id")
+    conn = client.connection()
+    before = conn.execute("SELECT COUNT(*) FROM access_events").fetchone()[0]
+    await client.get_atoms([a["atom_id"]])
+    after = conn.execute("SELECT COUNT(*) FROM access_events").fetchone()[0]
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_empty_and_dedupe(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    assert await client.get_atoms([]) == {"atoms": [], "missing": []}
+    a = await client.store("dedupe me")
+    res = await client.get_atoms([a["atom_id"], a["atom_id"]])
+    assert [x["id"] for x in res["atoms"]] == [a["atom_id"]]  # deduped
+
+
+# ── recall concurrency: access-event write must be best-effort ─────────
+
+
+@pytest.mark.asyncio
+async def test_query_access_write_is_best_effort(client, monkeypatch):
+    """Regression: recall's Pass-4 access-event write must not crash the
+    query when it can't BEGIN because the shared connection already has a
+    transaction open — exactly what concurrent memory_query calls caused.
+    Before the fix it raised 'cannot start a transaction within a
+    transaction'; now it logs and the query still returns its result.
+
+    AND (mimir-carreira #564 review): the best-effort failure path must NOT
+    roll back the OTHER open transaction — only the one this block began. We
+    open a transaction, make an uncommitted write, run query(), and assert the
+    write survives (the access-event handler's rollback is ownership-guarded)."""
+    _patch_provider(monkeypatch)
+    r = await client.store("Alice prefers concise replies")
+    conn = client.connection()
+    conn.execute("BEGIN IMMEDIATE")  # block recall's access-event write
+    # An uncommitted write owned by THIS (the caller's) transaction.
+    conn.execute("UPDATE atoms SET arousal = 0.99 WHERE id = ?", (r["atom_id"],))
+    try:
+        result = await client.query("Alice", top_k=5)  # must NOT raise
+        # recall's skipped access-event write must NOT have rolled us back.
+        arousal = conn.execute(
+            "SELECT arousal FROM atoms WHERE id = ?", (r["atom_id"],)
+        ).fetchone()[0]
+        assert arousal == 0.99  # victim transaction intact
+        conn.commit()
+    finally:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+    assert "raws" in result and "observations" in result
+
+
+# NOTE: a concurrent-query smoke test (asyncio.gather of N query() calls)
+# was deliberately NOT added here — it segfaults in fts_search, exposing a
+# deeper issue: concurrent READS on the single shared sqlite connection are
+# unsafe, not just the BEGIN IMMEDIATE write this PR makes best-effort. That
+# needs the connection model reworked (per-call connections / serialized DB
+# access) and is tracked separately. See chainlink.
+
+
+# ── memory_get tool wrapper ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_memory_get_tool_formats_and_reports_missing(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    from mimir.tools.memory import memory_get, set_memory_client
+    a = await client.store("apple atom content")
+    set_memory_client(client)
+    try:
+        out = await memory_get.ainvoke({"atom_ids": [a["atom_id"], "missing-id"]})
+    finally:
+        set_memory_client(None)
+    assert a["atom_id"] in out
+    assert "apple atom content" in out
+    assert "missing-id" in out and "not found" in out
+
+
+@pytest.mark.asyncio
+async def test_memory_get_tool_no_client():
+    from mimir.tools.memory import memory_get, set_memory_client
+    set_memory_client(None)
+    out = await memory_get.ainvoke({"atom_ids": ["x"]})
+    assert "no SagaStore configured" in out
+
+
 @pytest.mark.asyncio
 async def test_client_recent_session_boundaries(client, monkeypatch):
     _patch_provider(monkeypatch)

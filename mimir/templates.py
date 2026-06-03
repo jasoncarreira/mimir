@@ -123,7 +123,14 @@ no skill taught you anything this session — don't manufacture entries.
 
 The atom feedback section below lists every atom_id cited in this
 session along with which turns cited it — that citation context is
-enough to score without re-reading turns. For each atom, call:
+usually enough to score without re-reading turns. When it isn't — you
+need an atom's actual content to decide whether it was useful, wrong, or
+stale — load the cited ids in ONE call with:
+
+  memory_get(["<atom_id>", "<atom_id>", ...])   # batch by-id, exact load
+
+Do NOT score atoms blind, and do NOT pass ids to memory_query or fan out
+one lookup per id. For each atom, call:
 
   saga_feedback(atom_id, "useful")     # genuinely informed a reply
   saga_feedback(atom_id, "incorrect")  # was wrong or misleading

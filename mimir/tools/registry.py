@@ -1142,7 +1142,7 @@ def all_mimir_tools() -> list:
     Tavily on top would duplicate the surface. See
     ``mimir.tools.web.web_tools_enabled`` for the gating predicate.
     """
-    from .memory import memory_query
+    from .memory import memory_get, memory_query
     from .store import memory_store
     from .proposals import (
         abandon_proposal,
@@ -1161,7 +1161,7 @@ def all_mimir_tools() -> list:
     )
     tools = [
         # Memory (read + write)
-        memory_query, memory_store,
+        memory_query, memory_get, memory_store,
         # Change proposals for protected files (PR-gated; never writes live).
         # The sanctioned path for the agent to change memory/core/* or
         # prompts/*: open a worktree sandbox under scratch/, edit it natively,
