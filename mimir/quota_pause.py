@@ -331,6 +331,46 @@ _ANTHROPIC_RESET_HEADERS = (
 )
 
 
+# A Codex 429 surfaces both quota windows (langchain-codex-plus >= 0.0.3).
+# Only trust a window's reset as authoritative when that window is
+# genuinely near its cap — a 429 while utilization is low is far more
+# likely a transient burst limit (→ short escalating backoff), which is
+# exactly the "usage graph wasn't near quota" case. The headers turn the
+# transient-vs-cap guess into a real signal.
+_CODEX_CAP_THRESHOLD = 90.0
+
+
+def _codex_window_reset(rate_limits: Any, now: datetime) -> datetime | None:
+    """Reset datetime of the binding (most-utilized) Codex window when it
+    is at/near its cap, else ``None``.
+
+    Reads the parsed ``CodexRateLimits`` surfaced on a ``CodexResponseError``
+    (``primary`` / ``secondary`` windows, each with ``used_percent`` +
+    ``reset_at`` (unix ts) / ``reset_after_seconds``)."""
+    best_used = -1.0
+    best_when: datetime | None = None
+    for win in (getattr(rate_limits, "primary", None), getattr(rate_limits, "secondary", None)):
+        if win is None:
+            continue
+        used = getattr(win, "used_percent", None)
+        used = float(used) if isinstance(used, (int, float)) else 0.0
+        reset_at = getattr(win, "reset_at", None)
+        reset_after = getattr(win, "reset_after_seconds", None)
+        when: datetime | None = None
+        if isinstance(reset_at, (int, float)):
+            try:
+                when = datetime.fromtimestamp(int(reset_at), tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                when = None
+        elif isinstance(reset_after, (int, float)):
+            when = now + timedelta(seconds=int(reset_after))
+        if when is not None and used > best_used:
+            best_used, best_when = used, when
+    if best_when is not None and best_used >= _CODEX_CAP_THRESHOLD:
+        return best_when
+    return None
+
+
 def extract_reset_at(exc: BaseException) -> tuple[datetime | None, str | None]:
     """Best-effort: parse a real ``reset_at`` datetime from a 429
     exception. Returns ``(reset_at, provider_label)`` — ``reset_at`` is
@@ -340,8 +380,12 @@ def extract_reset_at(exc: BaseException) -> tuple[datetime | None, str | None]:
     1. If the exception carries an ``httpx.Response`` (anthropic /
        openai SDKs do), check its headers for a reset timestamp or
        ``Retry-After`` seconds value.
-    2. Otherwise scrape the exception message for an ISO timestamp.
-    3. Failing both, return ``(None, None)``. The caller decides the
+    2. Codex Plus (``langchain-codex-plus`` >= 0.0.3) surfaces the parsed
+       ``x-codex-*`` windows on the exception — use the binding window's
+       reset, but only when it's genuinely at cap (otherwise the 429 is a
+       transient burst and the caller's backoff is the right response).
+    3. Otherwise scrape the exception message for an ISO timestamp.
+    4. Failing all, return ``(None, None)``. The caller decides the
        backoff — a header-less 429 is treated as transient (short,
        escalating) rather than blindly pausing for a full window, which
        is what the old ``now + _DEFAULT_PAUSE_HOURS`` default did.
@@ -368,6 +412,19 @@ def extract_reset_at(exc: BaseException) -> tuple[datetime | None, str | None]:
         seconds = _parse_retry_after_header(retry_after)
         if seconds is not None:
             return _clamp_reset_at(now + timedelta(seconds=seconds), now), None
+
+    # Codex Plus: parsed x-codex-* windows surfaced on the exception.
+    rate_limits = getattr(exc, "rate_limits", None)
+    if rate_limits is not None:
+        reset = _codex_window_reset(rate_limits, now)
+        if reset is not None:
+            return _clamp_reset_at(reset, now), "codex-plus"
+    codex_headers = getattr(exc, "headers", None)
+    if isinstance(codex_headers, dict):
+        # Direct Retry-After fallback if the parsed windows weren't usable.
+        ra = _parse_retry_after_header(codex_headers.get("retry-after"))
+        if ra is not None:
+            return _clamp_reset_at(now + timedelta(seconds=ra), now), "codex-plus"
 
     # Fallback parse: scrape the exception message for an ISO-ish
     # timestamp. ChatClaudeCode surfaces 429s as plain text from the

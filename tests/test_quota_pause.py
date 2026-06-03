@@ -346,3 +346,57 @@ def test_record_rate_limit_resets_escalation_after_decay(tmp_path: Path):
     now1 = now0 + timedelta(hours=1)  # well past the 30-min decay window
     r2, _ = QuotaPauseTracker(path).record_rate_limit(exc, now=now1)
     assert (r2 - now1).total_seconds() == 60
+
+
+# ── Codex 429 with surfaced x-codex-* windows (langchain-codex-plus >= 0.0.3) ──
+
+
+def _codex_429(*, primary_used: float, reset_at: int) -> Exception:
+    """A CodexResponseError-shaped exception carrying parsed rate-limit
+    windows (duck-typed; extract_reset_at reads via getattr)."""
+    from types import SimpleNamespace
+    exc = Exception("HTTP 429: Rate limit exceeded")
+    exc.status_code = 429
+    exc.rate_limits = SimpleNamespace(
+        primary=SimpleNamespace(
+            used_percent=primary_used, reset_at=reset_at, reset_after_seconds=None,
+        ),
+        secondary=None,
+    )
+    return exc
+
+
+def test_extract_reset_at_codex_window_at_cap(tmp_path: Path):
+    """A 429 whose binding window is at cap → use its reset, provider codex-plus."""
+    reset_ts = int((datetime.now(tz=timezone.utc) + timedelta(hours=3)).timestamp())
+    reset, provider = extract_reset_at(_codex_429(primary_used=100.0, reset_at=reset_ts))
+    assert provider == "codex-plus"
+    assert reset is not None and abs(reset.timestamp() - reset_ts) < 2
+
+
+def test_extract_reset_at_codex_low_util_is_transient(tmp_path: Path):
+    """A 429 while utilization is low (the 'graph wasn't near quota' case)
+    → NOT treated as an authoritative cap; falls through to (None, None)
+    so the caller applies a short transient backoff."""
+    reset_ts = int((datetime.now(tz=timezone.utc) + timedelta(hours=3)).timestamp())
+    reset, _ = extract_reset_at(_codex_429(primary_used=12.0, reset_at=reset_ts))
+    assert reset is None
+
+
+def test_record_rate_limit_codex_cap_uses_window_reset(tmp_path: Path):
+    reset_ts = int((datetime.now(tz=timezone.utc) + timedelta(hours=3)).timestamp())
+    reset_at, reason = QuotaPauseTracker(tmp_path / "qp.json").record_rate_limit(
+        _codex_429(primary_used=100.0, reset_at=reset_ts)
+    )
+    assert reason == "quota_exhausted"
+    assert abs(reset_at.timestamp() - reset_ts) < 2
+
+
+def test_record_rate_limit_codex_low_util_falls_back_to_backoff(tmp_path: Path):
+    reset_ts = int((datetime.now(tz=timezone.utc) + timedelta(hours=3)).timestamp())
+    now = datetime.now(tz=timezone.utc)
+    reset_at, reason = QuotaPauseTracker(tmp_path / "qp.json").record_rate_limit(
+        _codex_429(primary_used=20.0, reset_at=reset_ts), now=now,
+    )
+    assert reason == "rate_limited_backoff"
+    assert (reset_at - now).total_seconds() == 60
