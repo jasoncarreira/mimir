@@ -635,7 +635,14 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             parts.append(f"scheduler +{len(sched)} tick(s): {names}")
         if drift:
             names = ", ".join(_sanitize_field(str(n)) for n in drift)
-            parts.append(f"skills drifted: {names}")
+            # Make it actionable: name the remediation so the agent isn't left
+            # knowing WHAT drifted but not HOW to fix it. `--apply` rewrites
+            # pollers.json/SKILL.md, so steer through the dry-run first.
+            parts.append(
+                f"skills drifted: {names} — `mimir skills update` to inspect, "
+                f"`mimir skills update --apply` to sync (rewrites "
+                f"pollers.json/SKILL.md; review or flag to operator)"
+            )
         if gaps:
             pairs = ", ".join(
                 f"{_sanitize_field(str(g[0]))}/{_sanitize_field(str(g[1]))}"

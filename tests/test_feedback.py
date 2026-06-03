@@ -2134,3 +2134,34 @@ def test_sanitize_field_applied_to_commitment_due_text(tmp_path: Path) -> None:
     assert "c-inject" in content
     # Collapsed text: leading words survive, whitespace runs collapsed.
     assert "ship PR" in content
+
+
+def test_mimir_update_digest_renders_skill_drift_with_remediation():
+    """chainlink #363 follow-up: the drifted-skills line must tell the agent
+    HOW to fix it (the `mimir skills update --apply` remediation), not just
+    WHAT drifted — otherwise the notice isn't actionable."""
+    from mimir.feedback.renderers import _render_event_line
+    line = _render_event_line("mimir_update_digest", {
+        "prior_version": "0.2.11",
+        "new_version": "0.2.12",
+        "skills_drift": ["social-cli", "github-poller"],
+        "scheduler_delta": [],
+        "env_gaps": [],
+    })
+    assert "social-cli" in line and "github-poller" in line
+    assert "mimir skills update --apply" in line   # actionable remediation
+    assert "v0.2.11→0.2.12" in line
+
+
+def test_mimir_update_digest_no_remediation_when_no_drift():
+    """No drift → no skills-update hint (silent on the skills dimension)."""
+    from mimir.feedback.renderers import _render_event_line
+    line = _render_event_line("mimir_update_digest", {
+        "prior_version": "0.2.11",
+        "new_version": "0.2.12",
+        "skills_drift": [],
+        "scheduler_delta": [],
+        "env_gaps": [],
+    })
+    assert "mimir skills update" not in line
+    assert "nothing requires action" in line
