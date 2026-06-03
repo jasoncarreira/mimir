@@ -400,3 +400,54 @@ def test_record_rate_limit_codex_low_util_falls_back_to_backoff(tmp_path: Path):
     )
     assert reason == "rate_limited_backoff"
     assert (reset_at - now).total_seconds() == 60
+
+
+def test_authoritative_reset_does_not_seed_transient_escalation(tmp_path: Path):
+    """Regression (mimir-carreira #559): an authoritative cap must NOT seed
+    the transient escalation clock. A header-less 429 shortly after an
+    authoritative pause recovers must start at the 60s floor, not the 4-min
+    second tier. (Lazy-expiry preserves the clock, so the authoritative
+    branch has to clear it explicitly.)"""
+    path = tmp_path / "qp.json"
+    now0 = datetime.now(tz=timezone.utc)
+
+    # 1) authoritative cap (Codex window at 100%, reset 20 min out)
+    reset_ts = int((now0 + timedelta(minutes=20)).timestamp())
+    _, reason1 = QuotaPauseTracker(path).record_rate_limit(
+        _codex_429(primary_used=100.0, reset_at=reset_ts), now=now0,
+    )
+    assert reason1 == "quota_exhausted"
+
+    # 2) the authoritative pause lazy-expires (window rolled over)
+    later = now0 + timedelta(minutes=25)
+    assert QuotaPauseTracker(path).is_paused(now=later).paused is False
+
+    # 3) a header-less 429 within the decay window → MUST be the 60s floor,
+    #    not 240s — the authoritative pause didn't seed escalation.
+    now1 = later + timedelta(seconds=30)
+    reset_at3, reason3 = QuotaPauseTracker(path).record_rate_limit(
+        Exception("HTTP 429: Rate limit exceeded"), now=now1,
+    )
+    assert reason3 == "rate_limited_backoff"
+    assert (reset_at3 - now1).total_seconds() == 60
+
+
+def test_authoritative_reset_clears_existing_transient_escalation(tmp_path: Path):
+    """The complement: an in-progress transient escalation is reset by an
+    authoritative cap, so the next header-less 429 is back to the floor."""
+    path = tmp_path / "qp.json"
+    exc = Exception("HTTP 429: Rate limit exceeded")
+    now0 = datetime.now(tz=timezone.utc)
+    # two header-less 429s → escalated to 240s
+    QuotaPauseTracker(path).record_rate_limit(exc, now=now0)
+    r2, _ = QuotaPauseTracker(path).record_rate_limit(exc, now=now0 + timedelta(seconds=90))
+    assert (r2 - (now0 + timedelta(seconds=90))).total_seconds() == 240
+    # an authoritative cap lands → clears the transient clock
+    reset_ts = int((now0 + timedelta(minutes=10)).timestamp())
+    QuotaPauseTracker(path).record_rate_limit(
+        _codex_429(primary_used=100.0, reset_at=reset_ts), now=now0 + timedelta(seconds=120),
+    )
+    # next header-less 429 (still within decay of the transient) → floor again
+    now1 = now0 + timedelta(seconds=150)
+    r4, _ = QuotaPauseTracker(path).record_rate_limit(exc, now=now1)
+    assert (r4 - now1).total_seconds() == 60

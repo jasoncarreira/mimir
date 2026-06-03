@@ -119,8 +119,11 @@ class QuotaPauseTracker:
         self._reason: str | None = None
         self._provider: str | None = None
         # Transient-backoff escalation state (see _transient_backoff_seconds).
+        # ``_last_transient_at`` tracks the last *header-less/transient*
+        # backoff only — authoritative caps deliberately leave it untouched
+        # (cleared) so they don't seed the burst escalation.
         self._consecutive: int = 0
-        self._last_pause_at: datetime | None = None
+        self._last_transient_at: datetime | None = None
         self._load()
 
     @property
@@ -167,12 +170,12 @@ class QuotaPauseTracker:
         self._provider = data.get("provider") or None
         raw_consecutive = data.get("consecutive")
         self._consecutive = raw_consecutive if isinstance(raw_consecutive, int) and raw_consecutive >= 0 else 0
-        raw_last = data.get("last_pause_at")
+        raw_last = data.get("last_transient_at")
         if isinstance(raw_last, str):
             try:
-                self._last_pause_at = datetime.fromisoformat(raw_last.replace("Z", "+00:00"))
+                self._last_transient_at = datetime.fromisoformat(raw_last.replace("Z", "+00:00"))
             except ValueError:
-                self._last_pause_at = None
+                self._last_transient_at = None
 
     def _save(self) -> None:
         payload: dict[str, Any] = {
@@ -180,7 +183,7 @@ class QuotaPauseTracker:
             "reason": self._reason,
             "provider": self._provider,
             "consecutive": self._consecutive,
-            "last_pause_at": self._last_pause_at.isoformat() if self._last_pause_at else None,
+            "last_transient_at": self._last_transient_at.isoformat() if self._last_transient_at else None,
         }
         # chainlink #239: shared atomic-write helper applies the CR#7
         # invariant (fsync file + fsync parent dir). Prior shape only
@@ -201,20 +204,18 @@ class QuotaPauseTracker:
         *,
         reason: str = "quota_exhausted",
         provider: str | None = None,
-        consecutive: int = 0,
-        paused_at: datetime | None = None,
     ) -> None:
         """Record that the agent should treat itself as quota-paused
         until ``reset_at``. Idempotent — overwrites any existing pause
         (the newest pause wins, since it has the freshest reset info).
 
-        ``consecutive`` / ``paused_at`` carry the transient-backoff
-        escalation state forward (see :meth:`record_rate_limit`)."""
+        Does NOT touch the transient-backoff escalation clock
+        (``_consecutive`` / ``_last_transient_at``) — only
+        :meth:`record_rate_limit`'s header-less branch advances that, so
+        an authoritative cap can't be mistaken for a transient burst."""
         self._reset_at = reset_at
         self._reason = reason
         self._provider = provider
-        self._consecutive = max(0, consecutive)
-        self._last_pause_at = paused_at or datetime.now(tz=timezone.utc)
         self._save()
 
     def record_rate_limit(
@@ -224,46 +225,50 @@ class QuotaPauseTracker:
         ``(reset_at, reason)``.
 
         - If the exception carries an authoritative reset (header /
-          Retry-After / ISO timestamp in the message), pause exactly
-          until then with reason ``quota_exhausted``.
+          Retry-After / ISO timestamp in the message, or a Codex window
+          at cap), pause exactly until then with reason ``quota_exhausted``
+          — and CLEAR the transient escalation clock, because an
+          authoritative cap is not part of a header-less burst chain.
         - Otherwise (a header-less 429 — e.g. Codex's bare "HTTP 429:
           Rate limit exceeded") treat it as a likely-transient burst:
           a short, escalating backoff (reason ``rate_limited_backoff``)
-          rather than blindly sitting out a full window. The escalation
-          counter decays after ``_TRANSIENT_DECAY_SECONDS`` of quiet so
-          isolated blips don't accumulate."""
+          that escalates only when the PREVIOUS transient backoff was
+          recent. The escalation decays after ``_TRANSIENT_DECAY_SECONDS``
+          of quiet (or an authoritative pause clearing it) so isolated
+          blips reset to the 60s floor."""
         now = now or datetime.now(tz=timezone.utc)
         parsed_reset, provider = extract_reset_at(exc)
         if parsed_reset is not None:
-            # Authoritative window reset — reset the transient counter
-            # (this wasn't a header-less burst).
-            self.pause_until(
-                parsed_reset, reason="quota_exhausted", provider=provider,
-                consecutive=0, paused_at=now,
-            )
+            # Authoritative cap — clear the transient clock so a later
+            # header-less 429 starts at the 60s floor, not mid-escalation.
+            self._consecutive = 0
+            self._last_transient_at = None
+            self.pause_until(parsed_reset, reason="quota_exhausted", provider=provider)
             return parsed_reset, "quota_exhausted"
 
-        # Header-less 429 → transient backoff with decaying escalation.
+        # Header-less 429 → transient backoff. Escalate only when the
+        # previous *transient* backoff was recent; an authoritative pause
+        # (or >30 min of quiet) leaves _last_transient_at None/stale, so
+        # this starts fresh at the floor.
         if (
-            self._last_pause_at is not None
-            and (now - self._last_pause_at).total_seconds() <= _TRANSIENT_DECAY_SECONDS
+            self._last_transient_at is not None
+            and (now - self._last_transient_at).total_seconds() <= _TRANSIENT_DECAY_SECONDS
         ):
             consecutive = self._consecutive + 1
         else:
             consecutive = 0
+        self._consecutive = consecutive
+        self._last_transient_at = now
         reset_at = now + timedelta(seconds=_transient_backoff_seconds(consecutive))
-        self.pause_until(
-            reset_at, reason="rate_limited_backoff", provider=provider,
-            consecutive=consecutive, paused_at=now,
-        )
+        self.pause_until(reset_at, reason="rate_limited_backoff", provider=provider)
         return reset_at, "rate_limited_backoff"
 
     def _mark_recovered(self) -> None:
-        """Clear the active pause on lazy-expiry but KEEP the escalation
-        counter / last-pause time, so a real (header-less) cap that
-        recovers and immediately 429s again keeps escalating instead of
-        resetting to the 60s floor every cycle. The decay in
-        :meth:`record_rate_limit` is what eventually resets it."""
+        """Clear the active pause on lazy-expiry but KEEP the transient
+        escalation state (``_consecutive`` / ``_last_transient_at``), so a
+        real header-less cap that recovers and immediately 429s again keeps
+        escalating instead of resetting to the 60s floor every cycle. The
+        decay in :meth:`record_rate_limit` is what eventually resets it."""
         self._reset_at = None
         self._reason = None
         self._provider = None
@@ -277,7 +282,7 @@ class QuotaPauseTracker:
         self._reason = None
         self._provider = None
         self._consecutive = 0
-        self._last_pause_at = None
+        self._last_transient_at = None
         try:
             self._path.unlink(missing_ok=True)
         except OSError as exc:
