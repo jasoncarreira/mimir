@@ -375,6 +375,83 @@ async def consume_update_digest(
         return 0
 
 
+_LAST_BOOTED_VERSION_BASENAME = "last-booted-version"
+
+
+def _last_booted_version_file(home: Path) -> Path:
+    return home / _FLAG_DIRNAME / _LAST_BOOTED_VERSION_BASENAME
+
+
+def _read_last_booted_version(home: Path) -> str | None:
+    try:
+        v = _last_booted_version_file(home).read_text(encoding="utf-8").strip()
+        return v or None
+    except OSError:
+        return None
+
+
+def _write_last_booted_version(home: Path, version: str) -> None:
+    path = _last_booted_version_file(home)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{version}\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("last-booted-version write failed: %s", exc)
+
+
+async def emit_version_bump_digest(
+    home: Path,
+    async_log_event: Callable[..., Awaitable[None]],
+    *,
+    already_drained: bool = False,
+) -> int:
+    """Deploy-agnostic version-bump notice (chainlink #363).
+
+    The self-update path (``request_mimir_update`` → ``apply_pending_update``)
+    writes a post-update digest sidecar that ``consume_update_digest`` drains.
+    But operator deploys — ``pip install mimir-agent==X`` / ``git pull`` +
+    ``docker restart`` — bump the version WITHOUT going through that path, so
+    the agent never learned its installed optional skills had drifted from the
+    newly shipped source. That's the gap behind muninn/mimirbot silently
+    running months-old poller code missing accumulated fixes.
+
+    On a boot where the running version differs from the version recorded on
+    the previous boot — and a self-update digest wasn't already emitted this
+    boot — compute the same digest (skill drift, scheduler delta, env gaps) and
+    emit ``mimir_update_digest`` so the agent surfaces it and can run
+    ``mimir skills update --apply``. Records the version so it fires once per
+    bump (the first boot just establishes the baseline silently). Notify-only —
+    never applies anything.
+
+    Returns 1 if a digest was emitted, else 0.
+    """
+    current = _current_version()
+    last = _read_last_booted_version(home)
+    emitted = 0
+    try:
+        if (
+            not already_drained
+            and last is not None
+            and current != "unknown"
+            and last != current
+        ):
+            # _compute_update_digest is a fast, side-effect-free read (hashes
+            # the installed skill dirs); fine to call inline at startup.
+            digest = _compute_update_digest(home, last)
+            # Speak only when there's something actionable — otherwise this was
+            # a silent version bump (no drift, no scheduler/env delta).
+            if digest.skills_drift or digest.scheduler_delta or digest.env_gaps:
+                await async_log_event("mimir_update_digest", **digest.to_dict())
+                emitted = 1
+    except Exception:  # noqa: BLE001 — notice is best-effort, never block boot
+        log.exception("version-bump digest emit failed")
+    finally:
+        # Record current as the baseline regardless, so the notice fires once
+        # per bump (and a self-update boot just re-baselines without re-emit).
+        _write_last_booted_version(home, current)
+    return emitted
+
+
 @dataclass(frozen=True)
 class PendingUpdate:
     """Parsed contents of the pending-update flag file.

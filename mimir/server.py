@@ -1089,19 +1089,37 @@ def build_app(config: Config) -> web.Application:
         # land in events.jsonl and surface in the algedonic feedback
         # block on the next turn. No-op when no pending-update flow
         # ran on this boot (the common case).
-        from .update_on_start import consume_startup_events, consume_update_digest
+        from .update_on_start import (
+            consume_startup_events,
+            consume_update_digest,
+            emit_version_bump_digest,
+        )
         try:
             drained = await consume_startup_events(config.home, log_event)
             if drained:
                 log.info("drained %d startup-update event(s) into events.jsonl", drained)
         except Exception:  # noqa: BLE001 — drain is best-effort
             log.exception("startup-events drain failed")
+        drained_digest = 0
         try:
             drained_digest = await consume_update_digest(config.home, log_event)
             if drained_digest:
                 log.info("drained post-update digest into events.jsonl")
         except Exception:  # noqa: BLE001 — drain is best-effort
             log.exception("post-update digest drain failed")
+        # chainlink #363: operator deploys (pip install / git pull + docker
+        # restart) bump the version WITHOUT the self-update path's digest, so
+        # installed optional skills go silently stale. Detect the bump here and
+        # emit the same mimir_update_digest (notably its skills_drift list) so
+        # the agent can run `mimir skills update --apply`. Notify-only.
+        try:
+            bumped = await emit_version_bump_digest(
+                config.home, log_event, already_drained=bool(drained_digest),
+            )
+            if bumped:
+                log.info("emitted version-bump digest (operator deploy)")
+        except Exception:  # noqa: BLE001 — best-effort
+            log.exception("version-bump digest emit failed")
 
         asyncio.create_task(indexer.sweep())
 
