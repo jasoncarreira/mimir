@@ -11,7 +11,7 @@ The tools split across four modules for readability, but the public
 API is the flat ``mimir.tools`` namespace.
 """
 
-from .memory import memory_query, set_memory_client
+from .memory import memory_get, memory_query, set_memory_client
 from .store import memory_store
 from .extra import (
     file_search,
@@ -73,6 +73,7 @@ from .saga_ops import (
 __all__ = [
     # Core tools (callable by the agent)
     "memory_query",
+    "memory_get",
     "memory_store",
     "file_search",
     "rebuild_index",
