@@ -6,6 +6,31 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.12] — 2026-06-03
+
+Quota-pause hardening: short transient backoff + a recovery wake, and Codex
+429 reset-header support.
+
+### Fixed
+
+- **Transient 429s no longer cause a multi-hour idle.** A header-less 429 (e.g.
+  Codex's bare "Rate limit exceeded") now gets a short, escalating, decaying
+  backoff (60s → 4m → 16m → …) instead of a blind 5-hour pause; a genuine cap
+  still pauses to its real reset. An active authoritative cap is never shortened
+  or seeded by a transient 429. (#559)
+- **Recovery no longer waits for the next scheduled tick.** A one-shot wake is
+  armed at the pause's reset (and re-armed on startup), so the agent retries the
+  moment the window rolls over instead of idling until the next hourly
+  heartbeat. (#559)
+- **Codex 429s carry their reset.** With `langchain-codex-plus >= 0.0.3`
+  surfacing the `x-codex-*` rate-limit headers on errors, a Codex cap pauses
+  until the real window reset when the binding window is genuinely at cap; a
+  low-utilization 429 is treated as transient. (#559)
+
+### Changed
+
+- Pin `langchain-codex-plus >= 0.0.3` (surfaces rate-limit headers on 429s). (#559)
+
 ## [0.2.11] — 2026-06-02
 
 Version-triggered defaults-upgrade proposals (epic #346) plus home-git
