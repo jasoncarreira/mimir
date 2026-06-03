@@ -155,7 +155,30 @@ def _check_repo(repo: str, seen: set[int]) -> list[int]:
     return newly_seen
 
 
+_STATE_GITIGNORE = """\
+# Transient github-ci-watch state — seeded by the github-ci-watch skill
+# (write-if-missing; edit freely). The seen-run-ids dedup set churns every
+# poll and has no audit value; per-directory .gitignore keeps it out of the
+# home's tracked git history.
+seen_run_ids.json
+*.tmp
+"""
+
+
+def _seed_state_gitignore() -> None:
+    """Seed STATE_DIR/.gitignore (only if absent) so the poller's transient
+    seen-ids set isn't committed to the home repo. Best-effort; never fatal."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        gi = STATE_DIR / ".gitignore"
+        if not gi.exists():
+            gi.write_text(_STATE_GITIGNORE, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def main() -> int:
+    _seed_state_gitignore()
     repos_raw = os.environ.get("GITHUB_REPOS", "").strip()
     if not repos_raw:
         _log("GITHUB_REPOS not set — nothing to watch")

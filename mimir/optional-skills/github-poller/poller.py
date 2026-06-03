@@ -794,7 +794,30 @@ def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
 # ─── main ─────────────────────────────────────────────────────────────
 
 
+_STATE_GITIGNORE = """\
+# Transient github-poller state — seeded by the github-poller skill
+# (write-if-missing; edit freely). git reads per-directory .gitignore natively,
+# so this keeps the high-churn cursor out of the home's tracked git history
+# while the home allowlist still tracks anything durable.
+cursor.json
+*.tmp
+"""
+
+
+def _seed_state_gitignore() -> None:
+    """Seed STATE_DIR/.gitignore (only if absent) so the poller's transient
+    cursor isn't committed to the home repo. Best-effort; never fatal."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        gi = STATE_DIR / ".gitignore"
+        if not gi.exists():
+            gi.write_text(_STATE_GITIGNORE, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def main() -> None:
+    _seed_state_gitignore()
     repos_str = os.environ.get("GITHUB_REPOS", "").strip()
     if not repos_str:
         # Silent exit: poller is installed but operator hasn't configured

@@ -567,3 +567,20 @@ def test_legacy_gog_account_still_works(
     assert events[0]["account"] == "legacy@x.com"
     assert events[0]["account_name"] == "default"
     assert events[0]["prompt"].startswith("[gmail] new message from bob@y.com")
+
+
+def test_seeds_state_gitignore(fresh_poller, tmp_path):
+    """Ignores the transient cursor but keeps config.json (operator config) tracked."""
+    fresh_poller._seed_state_gitignore()
+    gi = tmp_path / ".gitignore"
+    assert gi.exists()
+    active = [
+        ln.strip() for ln in gi.read_text().splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    assert "cursor.json" in active
+    # operator config (config.json) must NOT be an active ignore rule
+    assert not any(ln.startswith("config") for ln in active)
+    gi.write_text("operator-custom\n")
+    fresh_poller._seed_state_gitignore()
+    assert gi.read_text() == "operator-custom\n"

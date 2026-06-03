@@ -398,3 +398,23 @@ def test_own_handle_missing_env_returns_empty(fresh_poller, monkeypatch, tmp_pat
 
     handle = fresh_poller._own_handle_for("bsky")
     assert handle == ""
+
+
+def test_seeds_state_gitignore(fresh_poller, tmp_path):
+    """Seeds a carve-out .gitignore: transient/secret ignored, durable kept."""
+    fresh_poller._seed_state_gitignore()
+    gi = tmp_path / ".gitignore"
+    assert gi.exists()
+    active = [
+        ln.strip() for ln in gi.read_text().splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    assert "outbox_archive/" in active and "*.sh" in active and "emitted.json" in active
+    # durable state must NOT be an active ignore rule (tracked via the home allowlist)
+    assert not any(
+        ("session-" in ln) or ("sent_ledger" in ln) or ln.startswith("config")
+        for ln in active
+    )
+    gi.write_text("operator-custom\n")
+    fresh_poller._seed_state_gitignore()
+    assert gi.read_text() == "operator-custom\n"

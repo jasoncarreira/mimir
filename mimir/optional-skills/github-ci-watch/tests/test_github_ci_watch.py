@@ -88,3 +88,15 @@ def test_in_progress_run_failure_emits_on_later_poll(monkeypatch, captured):
     newly2 = poller._check_repo("o/r", seen=set(newly1))
     assert {(e["event_type"], e["run_id"]) for e in captured} == {("ci_failure", 7)}
     assert set(newly2) == {7}
+
+
+def test_seeds_state_gitignore(tmp_path, monkeypatch):
+    """Poller seeds a write-if-missing .gitignore ignoring the seen-ids set."""
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    poller._seed_state_gitignore()
+    gi = tmp_path / ".gitignore"
+    assert gi.exists()
+    assert "seen_run_ids.json" in gi.read_text()
+    gi.write_text("operator-custom\n")
+    poller._seed_state_gitignore()
+    assert gi.read_text() == "operator-custom\n"
