@@ -6,6 +6,15 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Version-bump skill-drift digest no longer lists orphaned skills.** The
+  `mimir_update_digest` skills_drift list (#363/#565) counted orphaned custom
+  skills (no shipped source) as "drift" — but they aren't fixable via
+  `mimir skills update --apply`, so they were noise. Now only skills with a
+  source counterpart (real differs/added drift) are reported. Surfaced by the
+  0.2.13 rollout, which flagged ~12 orphaned skills per agent.
+
 ## [0.2.13] — 2026-06-03
 
 Memory by-id loads, SAGA read concurrency, tool-error observability, and a

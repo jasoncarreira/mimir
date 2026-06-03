@@ -934,9 +934,10 @@ def test_mimir_update_digest_render_nothing_required() -> None:
 
 class _Drift:
     """Minimal stand-in for SkillDriftResult (only fields the digest uses)."""
-    def __init__(self, name: str, is_clean: bool) -> None:
+    def __init__(self, name: str, is_clean: bool, orphaned: bool = False) -> None:
         self.name = name
         self.is_clean = is_clean
+        self.orphaned = orphaned
 
 
 def _capture_log():
@@ -1042,3 +1043,27 @@ async def test_version_bump_fires_once(tmp_path, monkeypatch):
     # second boot on the same version → baseline matches → silent
     assert await emit_version_bump_digest(tmp_path, log, already_drained=False) == 0
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_version_bump_excludes_orphaned_from_drift(tmp_path, monkeypatch):
+    """Orphaned skills (no shipped source) must NOT appear in the digest's
+    skills_drift — they aren't fixable via `mimir skills update --apply`, so
+    listing them is noise. Only real drift (differs/added) is reported.
+    (Follow-up to #363/#565: the 0.2.13 rollout flagged ~12 orphaned skills.)"""
+    from mimir.update_on_start import (
+        emit_version_bump_digest,
+        _write_last_booted_version,
+    )
+    _write_last_booted_version(tmp_path, "0.2.13")
+    _patch_digest_inputs(monkeypatch, current="0.2.14", drift=[
+        _Drift("github-poller", is_clean=False, orphaned=False),    # real drift
+        _Drift("custom-watcher", is_clean=False, orphaned=True),    # orphaned — noise
+        _Drift("gmail-poller", is_clean=True, orphaned=False),      # clean
+    ])
+    log, calls = _capture_log()
+    n = await emit_version_bump_digest(tmp_path, log, already_drained=False)
+    assert n == 1
+    kind, fields = calls[0]
+    assert kind == "mimir_update_digest"
+    assert fields["skills_drift"] == ["github-poller"]  # orphaned + clean excluded
