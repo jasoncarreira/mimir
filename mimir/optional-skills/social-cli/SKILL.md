@@ -119,6 +119,16 @@ The poller surfaces notifications. The agent responds:
    block the rest), archives `outbox.yaml`, and removes dispatched
    notifications from the per-platform `inbox-<platform>.yaml` files.
 
+   **Convenience wrapper:** if you're dispatching from outside the
+   poller's STATE_DIR (so the cwd `.env` isn't auto-sourced), use the
+   bundled helper instead — it cds into the dir, loads `.env`, and
+   runs dispatch in one shot:
+   ```bash
+   skills/social-cli/dispatch-outbox.sh $STATE_DIR [bsky|x]
+   ```
+   The platform arg is optional (omit to dispatch all configured
+   platforms); it honors `SOCIAL_CLI_BIN`.
+
 ### Thread context — depth and your own prior contributions
 
 For Bluesky `reply` / `mention` / `quote` notifications, `social-cli
