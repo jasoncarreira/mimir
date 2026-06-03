@@ -6,6 +6,43 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.13] — 2026-06-03
+
+Memory by-id loads, SAGA read concurrency, tool-error observability, and a
+version-bump skill-drift notice.
+
+### Added
+
+- **`memory_get` tool** — batch by-id atom load. The agent can fetch atoms
+  whose ids it already knows (e.g. ids cited in an observation, or the
+  session-boundary "atoms cited" list) in ONE call, instead of stuffing each
+  id into the semantic `memory_query` tool and fanning out parallel calls.
+  Pure read, no access events (a by-id load doesn't reinforce activation); runs
+  on a per-call connection. The session-boundary synthesis prompt steers it to
+  load cited atoms before judging their usefulness. (#564)
+- **Tool call/error stats** — `tool_call`/`tool_error` events (tool name,
+  ok/error, duration, denial), a per-tool failure-rate panel on the ops
+  dashboard, and `mimir stats --tools`. `tool_error` is wired as a negative
+  algedonic signal — closes the gap where tool *errors* (vs denials) went
+  unaggregated. (#364, #566)
+- **Version-bump skill-drift notice** — operator deploys (`pip install` /
+  `git pull` + restart) now emit a `mimir_update_digest` when installed
+  optional skills have drifted from the shipped source, with the
+  `mimir skills update --apply` remediation, so skills don't go silently
+  stale. (#363, #565)
+
+### Fixed
+
+- **Concurrent SAGA reads no longer segfault.** Read-heavy `SagaStore` methods
+  open a short-lived per-call sqlite connection instead of sharing one across
+  worker threads — FTS5 on a shared `check_same_thread=False` connection could
+  segfault under concurrent `memory_query`. Writes stay serialized; FAISS index
+  mutation/build is lock-guarded. (#365, #566)
+- **Parallel `memory_query` no longer crashes with "cannot start a transaction
+  within a transaction".** The retrieval access-event write is serialized and
+  best-effort: a non-essential reinforcement write never fails the user-facing
+  query, and never rolls back another caller's open transaction. (#564)
+
 ## [0.2.12] — 2026-06-03
 
 Quota-pause hardening: short transient backoff + a recovery wake, and Codex
