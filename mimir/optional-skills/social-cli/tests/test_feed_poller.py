@@ -267,3 +267,22 @@ def test_load_feed_degrades_without_pyyaml(fresh_feed_poller, monkeypatch, tmp_p
     monkeypatch.setattr(builtins, "__import__", _no_yaml)
     # Returns [] (degraded) rather than raising ImportError.
     assert fresh_feed_poller._load_feed(path) == []
+
+
+def test_seeds_state_gitignore(fresh_feed_poller, tmp_path):
+    """Feed poller seeds the same carve-out .gitignore (write-if-missing)."""
+    fresh_feed_poller._seed_state_gitignore()
+    gi = tmp_path / ".gitignore"
+    assert gi.exists()
+    active = [
+        ln.strip() for ln in gi.read_text().splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    assert "outbox_archive/" in active and "feed-*.yaml" in active
+    assert not any(
+        ("session-" in ln) or ("sent_ledger" in ln) or ln.startswith("config")
+        for ln in active
+    )
+    gi.write_text("operator-custom\n")
+    fresh_feed_poller._seed_state_gitignore()
+    assert gi.read_text() == "operator-custom\n"

@@ -209,7 +209,41 @@ def _format_event(post: dict) -> dict | None:
     return out
 
 
+_STATE_GITIGNORE = """\
+# Transient social-cli poller state — seeded by the social-cli skill
+# (write-if-missing; edit freely). git reads per-directory .gitignore natively.
+# Ignore the high-churn / per-run / secret-bearing files; the home allowlist
+# still tracks the DURABLE state in this dir: session-*.md (audit trail),
+# sent_ledger-*/processed-* (dedup ledgers), and config.*.
+outbox_archive/
+feed-*.yaml
+inbox-*.yaml
+outbox.yaml
+dispatch_result-*.yaml
+*-new.yaml
+cursor.json
+emitted.json
+.env
+*.sh
+*.tmp
+"""
+
+
+def _seed_state_gitignore() -> None:
+    """Seed STATE_DIR/.gitignore (only if absent) so the poller's transient
+    working files + per-run archives + inline-cred scripts aren't committed,
+    while session logs / ledgers / config stay tracked. Best-effort; never fatal."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        gi = STATE_DIR / ".gitignore"
+        if not gi.exists():
+            gi.write_text(_STATE_GITIGNORE, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def main() -> int:
+    _seed_state_gitignore()
     platforms_csv = os.environ.get("MIMIR_SOCIAL_PLATFORMS", "bsky,x").strip()
     platforms = [p.strip() for p in platforms_csv.split(",") if p.strip()]
     if not platforms:

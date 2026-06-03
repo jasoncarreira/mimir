@@ -775,3 +775,15 @@ def test_compare_api_failure_degrades_gracefully(monkeypatch, captured_emits):
     prompt = captured_emits[0]["prompt"]
     assert "(commit details unavailable)" in prompt
     assert "PR #112 updated on o/r" in prompt
+
+
+def test_seeds_state_gitignore(tmp_path, monkeypatch):
+    """Poller seeds a write-if-missing .gitignore ignoring its transient cursor."""
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    poller._seed_state_gitignore()
+    gi = tmp_path / ".gitignore"
+    assert gi.exists()
+    assert "cursor.json" in gi.read_text()
+    gi.write_text("operator-custom\n")
+    poller._seed_state_gitignore()  # write-if-missing → not clobbered
+    assert gi.read_text() == "operator-custom\n"

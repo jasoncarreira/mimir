@@ -446,7 +446,31 @@ def _resolve_accounts_or_exit() -> list[Account] | None:
     return None
 
 
+_STATE_GITIGNORE = """\
+# Transient gmail-poller state — seeded by the gmail-poller skill
+# (write-if-missing; edit freely). The timestamp cursor churns every poll;
+# config.json (operator account config) is intentionally NOT ignored so it
+# stays tracked via the home allowlist.
+cursor.json
+*.tmp
+"""
+
+
+def _seed_state_gitignore() -> None:
+    """Seed STATE_DIR/.gitignore (only if absent) so the poller's transient
+    cursor isn't committed to the home repo, while config.json stays tracked.
+    Best-effort; never fatal."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        gi = STATE_DIR / ".gitignore"
+        if not gi.exists():
+            gi.write_text(_STATE_GITIGNORE, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def main() -> int:
+    _seed_state_gitignore()
     accounts = _resolve_accounts_or_exit()
     if accounts is None:
         return 1
