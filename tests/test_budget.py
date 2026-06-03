@@ -326,9 +326,9 @@ def test_quota_pause_suppresses_heartbeat(tmp_path: Path):
 
 
 def test_quota_pause_clears_after_reset(tmp_path: Path):
-    """Past-reset pause → lazy-expiry clears the state file and the
+    """Past-reset pause → lazy-expiry deactivates the pause and the
     arbiter returns to its normal behavior. The next read of the
-    tracker sees no pause."""
+    tracker sees no active pause."""
     from datetime import datetime, timedelta, timezone
     from mimir.quota_pause import QuotaPauseTracker
 
@@ -345,8 +345,9 @@ def test_quota_pause_clears_after_reset(tmp_path: Path):
     # cost rate, no other suppressors → should fire.
     assert fire
     assert reason == "ok"
-    # The lazy-expiry also removed the state file.
-    assert not pause_path.is_file()
+    # Lazy-expiry deactivates the pause (preserving the escalation
+    # counter), so a fresh read sees no active pause.
+    assert QuotaPauseTracker(pause_path).is_paused().paused is False
 
 
 def test_no_quota_pause_file_skips_check_cleanly(tmp_path: Path):

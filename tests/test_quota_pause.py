@@ -46,7 +46,7 @@ def test_pause_until_persists_across_instances(tmp_path: Path):
 
 def test_is_paused_lazy_expires_past_reset_time(tmp_path: Path):
     """When ``now`` is past the recorded reset, ``is_paused`` returns
-    paused=False AND clears the state file. The reset_at field on the
+    paused=False and deactivates the pause. The reset_at field on the
     result is preserved so the caller can emit ``quota_recovered``."""
     path = tmp_path / "qp.json"
     reset = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
@@ -57,8 +57,13 @@ def test_is_paused_lazy_expires_past_reset_time(tmp_path: Path):
     assert not status.paused
     assert status.reset_at == reset
     assert status.reason == "quota_exhausted"
-    # State file should be gone.
-    assert not path.is_file()
+    # Lazy-expiry deactivates the pause but PRESERVES the file (the
+    # escalation counter survives so a header-less cap that recovers and
+    # immediately re-429s keeps backing off). A fresh read sees no pause.
+    assert tracker.reset_at is None
+    reloaded = QuotaPauseTracker(path)
+    assert not reloaded.is_paused().paused
+    assert reloaded.reset_at is None
 
 
 def test_is_paused_respects_explicit_now(tmp_path: Path):
@@ -163,15 +168,14 @@ def test_extract_reset_at_from_retry_after_seconds():
     assert provider is None
 
 
-def test_extract_reset_at_fallback_default_5h(tmp_path):
-    """Exception without any reset signals → default 5h pause
-    (matches Anthropic's 5h rolling window)."""
+def test_extract_reset_at_fallback_returns_none(tmp_path):
+    """Exception without any parseable reset → ``(None, None)``. The old
+    behavior blindly defaulted to a 5h pause; now the caller
+    (``record_rate_limit``) treats a header-less 429 as transient with a
+    short escalating backoff instead."""
     exc = Exception("rate limited")
-    before = datetime.now(tz=timezone.utc)
     reset, provider = extract_reset_at(exc)
-    delta = reset - before
-    # Allow ~1s for test wall-clock jitter.
-    assert timedelta(hours=4, minutes=59) < delta < timedelta(hours=5, seconds=1)
+    assert reset is None
     assert provider is None
 
 
@@ -287,3 +291,188 @@ def test_is_quota_exhaustion_doesnt_match_random_429_in_text():
     positive. That's acceptable; pause is conservative."""
     # Confirms the documented behavior.
     assert is_quota_exhaustion(Exception("some errors=429 happened"))
+
+
+# ── record_rate_limit: transient-vs-cap policy (chainlink: quota backoff) ──
+
+
+def test_record_rate_limit_authoritative_reset_uses_it(tmp_path: Path):
+    """A 429 carrying a parseable reset → pause exactly until then,
+    reason 'quota_exhausted' (a real window, not a transient blip)."""
+    path = tmp_path / "qp.json"
+    now = datetime.now(tz=timezone.utc)
+    reset = (now + timedelta(minutes=30)).replace(microsecond=0)
+    exc = Exception(f"rate limited; retry after {reset.isoformat()}")
+    reset_at, reason = QuotaPauseTracker(path).record_rate_limit(exc, now=now)
+    assert reason == "quota_exhausted"
+    assert abs((reset_at - reset).total_seconds()) < 2
+
+
+def test_record_rate_limit_headerless_uses_short_backoff(tmp_path: Path):
+    """A header-less 429 (Codex's bare 'HTTP 429: Rate limit exceeded')
+    → a short 60s backoff, NOT a 5h window pause."""
+    path = tmp_path / "qp.json"
+    now = datetime.now(tz=timezone.utc)
+    exc = Exception("HTTP 429: Rate limit exceeded")
+    reset_at, reason = QuotaPauseTracker(path).record_rate_limit(exc, now=now)
+    assert reason == "rate_limited_backoff"
+    assert (reset_at - now).total_seconds() == 60
+
+
+def test_record_rate_limit_escalates_within_decay_window(tmp_path: Path):
+    """Repeated header-less 429s within the decay window escalate
+    (60s → 4m) so a real header-less cap backs off instead of being
+    hammered. Each call reloads the tracker (mirrors the per-turn
+    fresh-construction in agent.py)."""
+    path = tmp_path / "qp.json"
+    exc = Exception("HTTP 429: Rate limit exceeded")
+    now0 = datetime.now(tz=timezone.utc)
+    r1, _ = QuotaPauseTracker(path).record_rate_limit(exc, now=now0)
+    assert (r1 - now0).total_seconds() == 60
+    now1 = now0 + timedelta(seconds=90)  # within the 30-min decay window
+    r2, reason2 = QuotaPauseTracker(path).record_rate_limit(exc, now=now1)
+    assert reason2 == "rate_limited_backoff"
+    assert (r2 - now1).total_seconds() == 240  # 60 * 4
+
+
+def test_record_rate_limit_resets_escalation_after_decay(tmp_path: Path):
+    """An isolated header-less 429 long after the previous one resets to
+    the 60s floor (the escalation decays — blips hours apart don't
+    accumulate)."""
+    path = tmp_path / "qp.json"
+    exc = Exception("HTTP 429: Rate limit exceeded")
+    now0 = datetime.now(tz=timezone.utc)
+    QuotaPauseTracker(path).record_rate_limit(exc, now=now0)
+    now1 = now0 + timedelta(hours=1)  # well past the 30-min decay window
+    r2, _ = QuotaPauseTracker(path).record_rate_limit(exc, now=now1)
+    assert (r2 - now1).total_seconds() == 60
+
+
+# ── Codex 429 with surfaced x-codex-* windows (langchain-codex-plus >= 0.0.3) ──
+
+
+def _codex_429(*, primary_used: float, reset_at: int) -> Exception:
+    """A CodexResponseError-shaped exception carrying parsed rate-limit
+    windows (duck-typed; extract_reset_at reads via getattr)."""
+    from types import SimpleNamespace
+    exc = Exception("HTTP 429: Rate limit exceeded")
+    exc.status_code = 429
+    exc.rate_limits = SimpleNamespace(
+        primary=SimpleNamespace(
+            used_percent=primary_used, reset_at=reset_at, reset_after_seconds=None,
+        ),
+        secondary=None,
+    )
+    return exc
+
+
+def test_extract_reset_at_codex_window_at_cap(tmp_path: Path):
+    """A 429 whose binding window is at cap → use its reset, provider codex-plus."""
+    reset_ts = int((datetime.now(tz=timezone.utc) + timedelta(hours=3)).timestamp())
+    reset, provider = extract_reset_at(_codex_429(primary_used=100.0, reset_at=reset_ts))
+    assert provider == "codex-plus"
+    assert reset is not None and abs(reset.timestamp() - reset_ts) < 2
+
+
+def test_extract_reset_at_codex_low_util_is_transient(tmp_path: Path):
+    """A 429 while utilization is low (the 'graph wasn't near quota' case)
+    → NOT treated as an authoritative cap; falls through to (None, None)
+    so the caller applies a short transient backoff."""
+    reset_ts = int((datetime.now(tz=timezone.utc) + timedelta(hours=3)).timestamp())
+    reset, _ = extract_reset_at(_codex_429(primary_used=12.0, reset_at=reset_ts))
+    assert reset is None
+
+
+def test_record_rate_limit_codex_cap_uses_window_reset(tmp_path: Path):
+    reset_ts = int((datetime.now(tz=timezone.utc) + timedelta(hours=3)).timestamp())
+    reset_at, reason = QuotaPauseTracker(tmp_path / "qp.json").record_rate_limit(
+        _codex_429(primary_used=100.0, reset_at=reset_ts)
+    )
+    assert reason == "quota_exhausted"
+    assert abs(reset_at.timestamp() - reset_ts) < 2
+
+
+def test_record_rate_limit_codex_low_util_falls_back_to_backoff(tmp_path: Path):
+    reset_ts = int((datetime.now(tz=timezone.utc) + timedelta(hours=3)).timestamp())
+    now = datetime.now(tz=timezone.utc)
+    reset_at, reason = QuotaPauseTracker(tmp_path / "qp.json").record_rate_limit(
+        _codex_429(primary_used=20.0, reset_at=reset_ts), now=now,
+    )
+    assert reason == "rate_limited_backoff"
+    assert (reset_at - now).total_seconds() == 60
+
+
+def test_authoritative_reset_does_not_seed_transient_escalation(tmp_path: Path):
+    """Regression (mimir-carreira #559): an authoritative cap must NOT seed
+    the transient escalation clock. A header-less 429 shortly after an
+    authoritative pause recovers must start at the 60s floor, not the 4-min
+    second tier. (Lazy-expiry preserves the clock, so the authoritative
+    branch has to clear it explicitly.)"""
+    path = tmp_path / "qp.json"
+    now0 = datetime.now(tz=timezone.utc)
+
+    # 1) authoritative cap (Codex window at 100%, reset 20 min out)
+    reset_ts = int((now0 + timedelta(minutes=20)).timestamp())
+    _, reason1 = QuotaPauseTracker(path).record_rate_limit(
+        _codex_429(primary_used=100.0, reset_at=reset_ts), now=now0,
+    )
+    assert reason1 == "quota_exhausted"
+
+    # 2) the authoritative pause lazy-expires (window rolled over)
+    later = now0 + timedelta(minutes=25)
+    assert QuotaPauseTracker(path).is_paused(now=later).paused is False
+
+    # 3) a header-less 429 within the decay window → MUST be the 60s floor,
+    #    not 240s — the authoritative pause didn't seed escalation.
+    now1 = later + timedelta(seconds=30)
+    reset_at3, reason3 = QuotaPauseTracker(path).record_rate_limit(
+        Exception("HTTP 429: Rate limit exceeded"), now=now1,
+    )
+    assert reason3 == "rate_limited_backoff"
+    assert (reset_at3 - now1).total_seconds() == 60
+
+
+def test_authoritative_reset_clears_existing_transient_escalation(tmp_path: Path):
+    """The complement: an in-progress transient escalation is reset by an
+    authoritative cap, so the next header-less 429 is back to the floor."""
+    path = tmp_path / "qp.json"
+    exc = Exception("HTTP 429: Rate limit exceeded")
+    now0 = datetime.now(tz=timezone.utc)
+    # two header-less 429s → escalated to 240s
+    QuotaPauseTracker(path).record_rate_limit(exc, now=now0)
+    r2, _ = QuotaPauseTracker(path).record_rate_limit(exc, now=now0 + timedelta(seconds=90))
+    assert (r2 - (now0 + timedelta(seconds=90))).total_seconds() == 240
+    # a (short-lived) authoritative cap lands at +120s → clears the transient clock
+    reset_ts = int((now0 + timedelta(seconds=125)).timestamp())
+    QuotaPauseTracker(path).record_rate_limit(
+        _codex_429(primary_used=100.0, reset_at=reset_ts), now=now0 + timedelta(seconds=120),
+    )
+    # the cap expires (lazy-expiry)
+    assert QuotaPauseTracker(path).is_paused(now=now0 + timedelta(seconds=130)).paused is False
+    # a header-less 429 AFTER the cap expired → floor again (clock was cleared).
+    # (While the cap was still active it would correctly report the cap, not 60s —
+    # see test_headerless_429_does_not_shorten_active_authoritative_pause.)
+    now1 = now0 + timedelta(seconds=140)
+    r4, _ = QuotaPauseTracker(path).record_rate_limit(exc, now=now1)
+    assert (r4 - now1).total_seconds() == 60
+
+
+def test_headerless_429_does_not_shorten_active_authoritative_pause(tmp_path: Path):
+    """Review fix (mimir-carreira #559): a header-less 429 carries no reset
+    info, so it must NOT shorten/downgrade an already-active authoritative cap.
+    The stored pause stays at the authoritative reset — a user-message turn's
+    bare 429 during a real cap can't re-enable work before the cap resets."""
+    path = tmp_path / "qp.json"
+    now = datetime.now(tz=timezone.utc)
+    auth_reset = (now + timedelta(minutes=10)).replace(microsecond=0)
+    QuotaPauseTracker(path).pause_until(auth_reset, reason="quota_exhausted", provider="anthropic")
+
+    new_reset, reason = QuotaPauseTracker(path).record_rate_limit(
+        Exception("HTTP 429: Rate limit exceeded"), now=now + timedelta(minutes=1),
+    )
+    assert reason == "quota_exhausted"
+    assert new_reset == auth_reset
+    # the stored pause is unchanged — not downgraded to a 60s transient backoff
+    reloaded = QuotaPauseTracker(path)
+    assert reloaded.reset_at == auth_reset
+    assert reloaded.is_paused(now=now + timedelta(minutes=1)).reason == "quota_exhausted"
