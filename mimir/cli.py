@@ -114,6 +114,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         default=None,
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
+    stats_p.add_argument(
+        "--tools",
+        action="store_true",
+        help="Also show per-tool call/error counts from logs/events.jsonl.",
+    )
 
     # `mimir verify-cred` / `mimir verify-creds`
     verify_cred_p = sub.add_parser(
@@ -363,6 +368,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 f"On the agent loop, this would emit: {event_name} "
                 f"(reason={alert.reason})"
             )
+        if getattr(args, "tools", False):
+            from .ops_dashboard import build_dashboard_payload
+            payload = build_dashboard_payload(cfg.home / "logs" / "events.jsonl", days=7)
+            tools = payload.get("tools") or []
+            print("\nTool calls (last 7d):")
+            if not tools:
+                print("  (no tool_call events recorded)")
+            else:
+                for row in tools[:30]:
+                    rate = float(row.get("failure_rate") or 0.0) * 100.0
+                    avg = float(row.get("avg_duration_ms") or 0.0)
+                    print(
+                        f"  {row.get('tool')}: {row.get('calls', 0)} calls, "
+                        f"{row.get('errors', 0)} errors ({rate:.1f}%), "
+                        f"avg {avg:.0f}ms"
+                    )
         return
 
     if args.command == "regenerate-api-key":

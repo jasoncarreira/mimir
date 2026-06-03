@@ -164,6 +164,7 @@
         <button class="tab" data-panel="usage">Usage</button>
         <button class="tab" data-panel="invocations">Invocations</button>
         <button class="tab" data-panel="resolution">Resolution paths</button>
+        <button class="tab" data-panel="tools">Tools</button>
         <button class="tab" data-panel="shell">Shell jobs</button>
         <button class="tab" data-panel="chainlink">Chainlink</button>
         <button class="tab" data-panel="failures">Failures</button>
@@ -192,6 +193,11 @@
       <section id="resolution" class="panel">
         <p class="hint">Per-tool ctx-resolution path histograms (chainlink #23). <code>saga_session_id</code> = model passed it correctly. <code>single_active</code> = heuristic fallback (works in single-channel; fragile under concurrency). <code>contextvar</code> = direct-call fallback (test path). <code>missing</code> = no ctx found, the call's per-turn bookkeeping silently no-op'd.</p>
         <div class="resolution-grid" id="resolution-grid"></div>
+      </section>
+
+      <section id="tools" class="panel">
+        <p class="hint">Per-tool call counts and failures from <code>tool_call</code> events. Failure rate is <code>errors / calls</code>; duration is averaged over calls that reported it.</p>
+        <table id="tool-table"><thead><tr><th>Tool</th><th class="num">Calls</th><th class="num">Errors</th><th class="num">Failure rate</th><th class="num">Avg ms</th></tr></thead><tbody></tbody></table>
       </section>
 
       <section id="shell" class="panel">
@@ -342,6 +348,8 @@
         failures: 'Failures',
         high_water_events: 'Queue high-water hits',
         client_pool_drains: 'Pool drains',
+        tool_calls: 'Tool calls',
+        tool_errors: 'Tool errors',
       };
       const badKeys = new Set(['failures', 'high_water_events']);
       for (const [k, v] of Object.entries(D.summary)) {
@@ -400,6 +408,34 @@
       fillTable('channel-table', D.queued_by_channel, 'no events queued in window');
       fillTable('shell-channel-table', D.shell_jobs.spawn_by_channel, 'no shell jobs spawned in window');
       fillTable('failure-table', D.failures_by_kind, 'no failures in window');
+
+      const toolTbody = document.querySelector('#tool-table tbody');
+      const toolRows = D.tools || [];
+      if (!toolRows.length) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td colspan="5" style="color:var(--muted)">no tool_call events in window</td>';
+        toolTbody.appendChild(tr);
+      } else {
+        for (const row of toolRows) {
+          const tr = document.createElement('tr');
+          const tdTool = document.createElement('td');
+          tdTool.textContent = row.tool || 'unknown';
+          const tdCalls = document.createElement('td');
+          tdCalls.className = 'num';
+          tdCalls.textContent = row.calls || 0;
+          const tdErrors = document.createElement('td');
+          tdErrors.className = row.errors ? 'num bad' : 'num';
+          tdErrors.textContent = row.errors || 0;
+          const tdRate = document.createElement('td');
+          tdRate.className = row.errors ? 'num bad' : 'num';
+          tdRate.textContent = ((row.failure_rate || 0) * 100).toFixed(1) + '%';
+          const tdAvg = document.createElement('td');
+          tdAvg.className = 'num';
+          tdAvg.textContent = Math.round(row.avg_duration_ms || 0);
+          tr.append(tdTool, tdCalls, tdErrors, tdRate, tdAvg);
+          toolTbody.appendChild(tr);
+        }
+      }
 
       document.getElementById('recent-failures').textContent =
         D.recent_failures.length ? JSON.stringify(D.recent_failures, null, 2) : '(none)';
