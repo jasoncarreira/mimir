@@ -233,25 +233,123 @@ class SagaStore:
         # earlier tier-2 path was the only consumer. TODO(rename-pass):
         # ``_rich_synth_fn`` is the more accurate name.
         self._rich_synth_fn = None
-        # Write-serialization across threads. We open the connection
-        # with ``check_same_thread=False`` so each public method can
-        # run under ``asyncio.to_thread``; SQLite under WAL serializes
-        # writes at the file level, but the Python ``sqlite3`` module
-        # isn't thread-safe by default. Wrap writes in this lock so
-        # concurrent stores / consolidate passes / mark_access calls
-        # can't interleave a transaction. Readers don't need the lock
-        # — WAL handles snapshot isolation for them.
+        # Threading contract (chainlink #365): do NOT run concurrent work
+        # against one ``sqlite3.Connection`` object. Python's sqlite3 wrapper
+        # plus FTS5 can segfault even for concurrent reads when a single
+        # ``check_same_thread=False`` connection is shared across worker
+        # threads. SQLite/WAL permits concurrency across *connections*, so
+        # read-heavy public methods open a short-lived per-call connection
+        # when ``db_path`` is available. The shared connection remains the
+        # canonical write/migration connection and is protected by locks.
         import threading as _threading
         self._write_lock = _threading.Lock()
+        self._db_lock = _threading.RLock()
+        self._index_lock = _threading.RLock()
+        self._sessions_index_lock = _threading.RLock()
+
+    def _configure_connection(
+        self, conn: sqlite3.Connection, *, enable_wal: bool = True,
+    ) -> None:
+        """Apply runtime pragmas to SagaStore sqlite connections.
+
+        ``journal_mode=WAL`` is a writer-ish pragma; set it on the canonical
+        shared connection during initialization, then let per-call read
+        connections inherit the file mode instead of all racing to restate it.
+        """
+        if enable_wal:
+            conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        # chainlink #227: apply operator-configured busy_timeout so two
+        # concurrent writers (agent's store() + a cron-driven consolidate or
+        # forget in another thread/process) wait instead of raising
+        # OperationalError immediately. WAL serializes at the OS level but
+        # without busy_timeout the loser sees "database is locked" on the
+        # first millisecond of contention.
+        from ._config_io import get_config
+        _cfg = get_config()
+        _busy_timeout_ms = int(_cfg("storage", "db_busy_timeout_ms", 5000))
+        conn.execute(f"PRAGMA busy_timeout = {_busy_timeout_ms}")
+
+    def _connect_db_path(self, *, enable_wal: bool = True) -> sqlite3.Connection:
+        if self._db_path is None:
+            raise RuntimeError("SagaStore: cannot open path connection without db_path")
+        conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._configure_connection(conn, enable_wal=enable_wal)
+        return conn
+
+    def _operation_conn(self) -> tuple[sqlite3.Connection, bool]:
+        """Return a connection for one read-heavy operation.
+
+        When SagaStore was constructed with ``db_path`` (production shape),
+        callers get a short-lived independent connection so concurrent query()
+        calls do not share sqlite3 connection state. When tests inject only a
+        raw ``conn=`` with no path, there is no safe independent connection to
+        open, so we fall back to the shared connection and the caller must use
+        ``_db_locked``.
+        """
+        if self._db_path is None:
+            return self._ensure_conn(), False
+        # Ensure schema/migrations have run exactly once before a per-call
+        # worker connection observes the file. This lock is narrow and only
+        # protects shared-connection initialization, not the read operation.
+        with self._db_lock:
+            self._ensure_conn()
+        return self._connect_db_path(enable_wal=False), True
+
+    def _mark_retrieval_access_events(
+        self,
+        atom_ids: list[str],
+        *,
+        session_id: str | None,
+        reference_date=None,
+    ) -> None:
+        """Record query() retrieval access events under the write lock.
+
+        query() does its read pass on independent per-call connections so reads
+        can overlap. The Pass-4 access-event write is deliberately split out and
+        serialized here so concurrent retrievals do not race ``BEGIN IMMEDIATE``
+        on either the shared connection or the sqlite file.
+        """
+        if not atom_ids:
+            return
+        events = [
+            AccessEvent(atom_id=atom_id, source="retrieval", session_id=session_id)
+            for atom_id in atom_ids
+        ]
+        with self._db_lock:
+            with self._write_lock:
+                conn = self._ensure_conn()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    mark_access(conn, events, now=reference_date)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+    async def _db_locked(self, fn):
+        """Run a callable against the shared sqlite3 connection under lock.
+
+        This is the fallback for conn-injected tests and for operations that
+        intentionally mutate shared connection state. Do not route normal
+        production query() reads through this helper; use per-call connections
+        so SAGA read concurrency stays >1.
+        """
+        def _locked():
+            with self._db_lock:
+                return fn()
+        return await asyncio.to_thread(_locked)
 
     async def _write_locked(self, fn):
         """Run a write-path callable in a worker thread, serialized via
-        the connection write lock. Use for any method that mutates the
-        DB. Reads should call ``asyncio.to_thread(fn)`` directly — they
-        rely on WAL snapshot isolation and don't need serialization."""
+        both the shared connection lock and the write lock. ``_db_lock``
+        protects the shared sqlite3 connection object; ``_write_lock``
+        preserves the stronger transaction-level write serialization contract.
+        """
         def _locked():
-            with self._write_lock:
-                return fn()
+            with self._db_lock:
+                with self._write_lock:
+                    return fn()
         return await asyncio.to_thread(_locked)
 
     def connection(self) -> sqlite3.Connection:
@@ -260,8 +358,9 @@ class SagaStore:
         Used by the upper layer (chainlink #266: skill-memory load
         injection) to run the skill-learning scoped recall, which lives
         in ``mimir.skill_memory`` and can't be reached from this lower
-        layer (saga does not import up into ``mimir.*``). Reads under WAL
-        are safe across the ``asyncio.to_thread`` worker the caller uses.
+        layer (saga does not import up into ``mimir.*``). Callers that use
+        this connection from worker threads must provide their own
+        serialization; SagaStore's public methods do so via ``_db_lock``.
         """
         return self._ensure_conn()
 
@@ -283,19 +382,7 @@ class SagaStore:
         # silent and the migration never lands. (Hit on a v5 migration
         # bug: missing ``DELETE FROM atom_topics`` caused FK failures
         # that mimir kept working through with a stale schema.)
-        conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        # chainlink #227: apply operator-configured busy_timeout so two
-        # concurrent writers (agent's store() + a cron-driven consolidate or
-        # forget in another thread/process) wait instead of raising
-        # OperationalError immediately. WAL serializes at the OS level but
-        # without busy_timeout the loser sees "database is locked" on the
-        # first millisecond of contention.
-        from ._config_io import get_config
-        _cfg = get_config()
-        _busy_timeout_ms = int(_cfg("storage", "db_busy_timeout_ms", 5000))
-        conn.execute(f"PRAGMA busy_timeout = {_busy_timeout_ms}")
+        conn = self._connect_db_path()
         try:
             if fresh:
                 schema_path = Path(__file__).parent / "schema.sql"
@@ -506,9 +593,9 @@ class SagaStore:
                 rewritten_query = None
         effective_query = rewritten_query or query
 
-        def _do():
-            conn = self._ensure_conn()
-            index = self._ensure_index(conn)
+        def _do_with_conn(conn: sqlite3.Connection) -> dict[str, Any]:
+            with self._index_lock:
+                index = self._ensure_index(conn)
             # Triple-augment pathway uses the SAME embedding dim as the
             # atom-level FAISS index (triples are embedded under the
             # same provider). Pass dim through so triples with a stale
@@ -536,6 +623,15 @@ class SagaStore:
                 agent_id=self._agent_id,
                 reference_date=reference_date,
                 min_confidence_tier=min_confidence_tier,
+                fire_access_events=False,
+            )
+            returned_atom_ids = [
+                c.atom["id"] for c in (result.observations + result.raws)
+            ]
+            self._mark_retrieval_access_events(
+                returned_atom_ids,
+                session_id=session_id,
+                reference_date=reference_date,
             )
             # P42 half-2: surface a top-N triples block in the response so
             # production prompt rendering (mimir/sagatools.py:_format_saga_payload)
@@ -574,6 +670,17 @@ class SagaStore:
                     or (result.rewritten_query or "")
                 ),
             }
+
+        def _do():
+            conn, should_close = self._operation_conn()
+            try:
+                return _do_with_conn(conn)
+            finally:
+                if should_close:
+                    conn.close()
+
+        if self._db_path is None:
+            return await self._db_locked(_do)
         return await asyncio.to_thread(_do)
 
     async def contextual_rewrite(
@@ -637,13 +744,14 @@ class SagaStore:
                 # Incremental-add to the FAISS index if it's already
                 # been built. If not, the next query's lazy build
                 # will pick the new atom up from disk.
-                if self._index is not None and self._index.built:
-                    row = conn.execute(
-                        "SELECT vec FROM embeddings WHERE atom_id = ?",
-                        (result.atom_id,),
-                    ).fetchone()
-                    if row is not None and row[0] is not None:
-                        self._index.add(result.atom_id, row[0])
+                with self._index_lock:
+                    if self._index is not None and self._index.built:
+                        row = conn.execute(
+                            "SELECT vec FROM embeddings WHERE atom_id = ?",
+                            (result.atom_id,),
+                        ).fetchone()
+                        if row is not None and row[0] is not None:
+                            self._index.add(result.atom_id, row[0])
                 return {"stored": True, "atom_id": result.atom_id}
             return {
                 "stored": False, "atom_id": result.atom_id,
@@ -754,7 +862,8 @@ class SagaStore:
             )
             # Invalidate sessions index so the next search_sessions() call
             # picks up the newly-written session and its embedding.
-            self._sessions_index_built = False
+            with self._sessions_index_lock:
+                self._sessions_index_built = False
             return {
                 "session_id": session_id,
                 "channel": channel_id,
@@ -1306,14 +1415,15 @@ class SagaStore:
                 and self._index is not None
                 and self._index.built
             ):
-                for atom_id in result.tombstoned_ids:
-                    try:
-                        self._index.remove(atom_id)
-                    except Exception:  # noqa: BLE001
-                        log.warning(
-                            "FAISS index remove failed for atom_id=%r",
-                            atom_id, exc_info=True,
-                        )
+                with self._index_lock:
+                    for atom_id in result.tombstoned_ids:
+                        try:
+                            self._index.remove(atom_id)
+                        except Exception:  # noqa: BLE001
+                            log.warning(
+                                "FAISS index remove failed for atom_id=%r",
+                                atom_id, exc_info=True,
+                            )
             return {
                 "tombstoned_count": result.tombstoned_count,
                 "preview_ids": result.tombstoned_ids if dry_run else [],
@@ -1325,10 +1435,17 @@ class SagaStore:
         self, *, channel_id: str | None = None, count: int = 3,
     ) -> list[dict[str, Any]]:
         def _do():
-            conn = self._ensure_conn()
-            return _recent_boundaries(
-                conn, channel_id=channel_id, count=count,
-            )
+            conn, should_close = self._operation_conn()
+            try:
+                return _recent_boundaries(
+                    conn, channel_id=channel_id, count=count,
+                )
+            finally:
+                if should_close:
+                    conn.close()
+
+        if self._db_path is None:
+            return await self._db_locked(_do)
         return await asyncio.to_thread(_do)
 
     async def search_sessions(
@@ -1377,14 +1494,13 @@ class SagaStore:
         else:
             query_emb = []
 
-        def _do() -> list[dict]:
-            conn = self._ensure_conn()
-
+        def _do_with_conn(conn: sqlite3.Connection) -> list[dict]:
             # ── Step 1: build similarity map from sessions FAISS index ──
             sim_map: dict[str, float] = {}  # session_id → cosine similarity
 
             if query_emb:
-                index = self._ensure_sessions_index(conn)
+                with self._sessions_index_lock:
+                    index = self._ensure_sessions_index(conn)
                 if index is not None:
                     for sess_id, score in index.search(
                         query_emb, top_k=min(limit * 4, 200)
@@ -1470,6 +1586,16 @@ class SagaStore:
             results.sort(key=lambda r: r["blended_score"], reverse=True)
             return results[:limit]
 
+        def _do() -> list[dict]:
+            conn, should_close = self._operation_conn()
+            try:
+                return _do_with_conn(conn)
+            finally:
+                if should_close:
+                    conn.close()
+
+        if self._db_path is None:
+            return await self._db_locked(_do)
         return await asyncio.to_thread(_do)
 
     async def most_retrieved_atoms(
@@ -1495,7 +1621,14 @@ class SagaStore:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
         def _do():
-            conn = self._ensure_conn()
+            conn, should_close = self._operation_conn()
+            try:
+                return _most_retrieved_with_conn(conn)
+            finally:
+                if should_close:
+                    conn.close()
+
+        def _most_retrieved_with_conn(conn: sqlite3.Connection):
             if contributed_only:
                 sources = ("feedback_positive",)
             else:
@@ -1544,6 +1677,9 @@ class SagaStore:
                 {"id": r[0], "content": r[1], "retrieval_count": r[2]}
                 for r in rows
             ]
+
+        if self._db_path is None:
+            return await self._db_locked(_do)
         return await asyncio.to_thread(_do)
 
     async def mark_contributions(

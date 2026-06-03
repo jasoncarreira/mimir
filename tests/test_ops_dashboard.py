@@ -417,6 +417,44 @@ def test_ops_dashboard_loader_caches() -> None:
     assert first is second
 
 
+
+
+def test_compute_stats_rolls_up_tool_calls_and_failures():
+    events = [
+        {
+            "timestamp": _ts(), "type": "tool_call",
+            "tool": "memory_query", "ok": True, "duration_ms": 25,
+        },
+        {
+            "timestamp": _ts(), "type": "tool_call",
+            "tool": "memory_query", "ok": False, "duration_ms": 75,
+            "error": "boom",
+        },
+        {
+            "timestamp": _ts(), "type": "tool_call",
+            "tool": "shell_exec", "ok": True, "duration_ms": 10,
+        },
+        {
+            "timestamp": _ts(), "type": "tool_error",
+            "tool": "fetch_url", "error": "standalone producer",
+        },
+    ]
+    payload = compute_stats([
+        dict(e, _ts=datetime.fromisoformat(e["timestamp"]))
+        for e in events
+    ], days=7)
+
+    assert payload["summary"]["tool_calls"] == 3
+    assert payload["summary"]["tool_errors"] == 2
+    by_tool = {row["tool"]: row for row in payload["tools"]}
+    assert by_tool["memory_query"]["calls"] == 2
+    assert by_tool["memory_query"]["errors"] == 1
+    assert by_tool["memory_query"]["failure_rate"] == 0.5
+    assert by_tool["memory_query"]["avg_duration_ms"] == 50
+    assert by_tool["shell_exec"]["errors"] == 0
+    assert by_tool["fetch_url"]["calls"] == 0
+    assert by_tool["fetch_url"]["errors"] == 1
+
 # ─── Route wiring through register_routes ────────────────────────────
 
 

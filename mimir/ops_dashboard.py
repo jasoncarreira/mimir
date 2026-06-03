@@ -181,6 +181,14 @@ def compute_stats(events: list[dict[str, Any]], days: int) -> dict[str, Any]:
     shell_enqueue_failed = 0
     shell_spawn_by_channel: Counter[str] = Counter()
 
+    # Per-tool counters (chainlink #364). ``tool_call`` records carry an
+    # ``ok`` boolean; ``tool_error`` is also accepted so older/future
+    # producers that only emit the error branch still contribute to the
+    # failure-rate numerator.
+    tool_calls: Counter[str] = Counter()
+    tool_errors: Counter[str] = Counter()
+    tool_duration_ms: defaultdict[str, float] = defaultdict(float)
+
     for record in events:
         kind = record.get("type", "unknown")
         ts: datetime = record["_ts"]
@@ -207,6 +215,23 @@ def compute_stats(events: list[dict[str, Any]], days: int) -> dict[str, Any]:
             shell_no_channel += 1
         elif kind == "shell_job_complete_enqueue_failed":
             shell_enqueue_failed += 1
+        elif kind == "tool_call":
+            tool = record.get("tool") or "unknown"
+            tool_calls[tool] += 1
+            if record.get("ok") is False:
+                tool_errors[tool] += 1
+            try:
+                tool_duration_ms[tool] += float(record.get("duration_ms") or 0.0)
+            except (TypeError, ValueError):
+                pass
+        elif kind == "tool_error":
+            tool = record.get("tool") or "unknown"
+            if not record.get("paired_tool_call"):
+                # The normal middleware emits both tool_call(ok=false) and
+                # tool_error. Avoid double-counting that common case by
+                # letting the tool_call branch own the numerator; standalone
+                # tool_error producers still contribute to the numerator.
+                tool_errors[tool] += 1
 
         if _is_failure_kind(kind):
             failures_by_kind[kind] += 1
@@ -251,7 +276,26 @@ def compute_stats(events: list[dict[str, Any]], days: int) -> dict[str, Any]:
         "failures": sum(failures_by_kind.values()),
         "high_water_events": by_event.get("event_queue_high_water", 0),
         "client_pool_drains": by_event.get("client_pool_drained", 0),
+        "tool_calls": sum(tool_calls.values()),
+        "tool_errors": sum(tool_errors.values()),
     }
+
+    tool_stats = []
+    for tool in sorted(set(tool_calls) | set(tool_errors)):
+        calls = tool_calls.get(tool, 0)
+        errors = tool_errors.get(tool, 0)
+        tool_stats.append({
+            "tool": tool,
+            "calls": calls,
+            "errors": errors,
+            "failure_rate": (errors / calls) if calls else 0.0,
+            "avg_duration_ms": (tool_duration_ms.get(tool, 0.0) / calls)
+            if calls else 0.0,
+        })
+    tool_stats.sort(
+        key=lambda row: (row["errors"], row["calls"], row["tool"]),
+        reverse=True,
+    )
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -271,6 +315,7 @@ def compute_stats(events: list[dict[str, Any]], days: int) -> dict[str, Any]:
             "enqueue_failed": shell_enqueue_failed,
             "spawn_by_channel": dict(shell_spawn_by_channel.most_common(20)),
         },
+        "tools": tool_stats,
         "failures_by_kind": dict(failures_by_kind.most_common()),
         "timeseries": timeseries,
         "recent_failures": recent_failures,
@@ -297,28 +342,6 @@ def _backlog_items() -> list[dict[str, str]]:
     Visible on the Backlog tab so operators see what's not yet captured
     without leaving the page."""
     return [
-        {
-            "id": "tool-call-counters",
-            "title": "Per-tool call counts (Read / Write / Bash / Glob / etc.)",
-            "status": "Not instrumented",
-            "blocker": (
-                "SDK preset tools fire through hooks but mimir doesn't "
-                "emit a per-call event with the tool name. Add a "
-                "tool_call event in mimir.hooks PostToolUse so the "
-                "dashboard can surface tool-mix shifts (e.g. Bash spike "
-                "= subagent runaway, Read spike = navigation loop)."
-            ),
-        },
-        {
-            "id": "tool-failure-rate",
-            "title": "Tool failure rate (vs raw call counts)",
-            "status": "Blocked on tool-call-counters",
-            "blocker": (
-                "Once tool_call events exist, pair with a tool_error "
-                "branch (PreToolUse rejection, PostToolUse non-zero "
-                "result) so failure rate is computable per-tool."
-            ),
-        },
         {
             "id": "turn-timing-histogram",
             "title": "Turn duration histogram",

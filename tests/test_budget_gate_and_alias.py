@@ -418,3 +418,87 @@ async def test_emit_event_sync_task_held_in_background_tasks() -> None:
     assert len(_background_tasks) == 0, (
         "_background_tasks should be empty after task completes"
     )
+
+
+@pytest.mark.asyncio
+async def test_middleware_emits_tool_call_events_for_success_and_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every middleware-observed tool call emits a per-tool event; error
+    ToolMessages additionally emit tool_error so failure rate is computable."""
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    async def _capture(kind: str, **kw: Any) -> None:
+        captured.append((kind, kw))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", _capture)
+
+    mw = BudgetGateMiddleware()
+
+    async def ok_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="ok",
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+        )
+
+    async def err_handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="boom",
+            tool_call_id=req.tool_call["id"],
+            name=req.tool_call["name"],
+            status="error",
+        )
+
+    ctx = _make_ctx(budget=5)
+    token = set_current_turn(ctx)
+    try:
+        await mw.awrap_tool_call(_make_request("memory_query", "id-ok"), ok_handler)
+        await mw.awrap_tool_call(_make_request("memory_query", "id-err"), err_handler)
+    finally:
+        reset_current_turn(token)
+
+    import asyncio
+    await asyncio.sleep(0)
+
+    tool_calls = [kw for kind, kw in captured if kind == "tool_call"]
+    tool_errors = [kw for kind, kw in captured if kind == "tool_error"]
+    assert [kw["ok"] for kw in tool_calls] == [True, False]
+    assert all(kw["tool"] == "memory_query" for kw in tool_calls)
+    assert len(tool_errors) == 1
+    assert tool_errors[0]["tool"] == "memory_query"
+    assert tool_errors[0]["paired_tool_call"] is True
+    assert "boom" in tool_errors[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_middleware_emits_tool_error_for_budget_denial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    async def _capture(kind: str, **kw: Any) -> None:
+        captured.append((kind, kw))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", _capture)
+
+    mw = BudgetGateMiddleware()
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
+    ctx = _make_ctx(budget=1)
+    token = set_current_turn(ctx)
+    try:
+        await mw.awrap_tool_call(_make_request("shell_exec", "id-1"), handler)
+        await mw.awrap_tool_call(_make_request("shell_exec", "id-2"), handler)
+    finally:
+        reset_current_turn(token)
+
+    import asyncio
+    await asyncio.sleep(0)
+
+    denied_errors = [kw for kind, kw in captured if kind == "tool_error" and kw.get("denied")]
+    assert len(denied_errors) == 1
+    assert denied_errors[0]["tool"] == "shell_exec"
+    assert denied_errors[0]["paired_tool_call"] is True

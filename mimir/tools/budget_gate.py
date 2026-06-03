@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
@@ -161,6 +162,47 @@ def _tool_call_id(request: ToolCallRequest) -> str:
     return str(tc.get("id") or "")
 
 
+def _emit_tool_call_sync(
+    tool_name: str,
+    *,
+    ok: bool,
+    duration_ms: float | None = None,
+    error: str | None = None,
+    denied: bool = False,
+) -> None:
+    payload = {"tool": tool_name, "ok": ok}
+    if duration_ms is not None:
+        payload["duration_ms"] = round(duration_ms, 3)
+    if error:
+        payload["error"] = error[:500]
+    if denied:
+        payload["denied"] = True
+    _emit_event_sync("tool_call", **payload)
+    if not ok:
+        error_payload = {"tool": tool_name}
+        if error:
+            error_payload["error"] = error[:500]
+        if denied:
+            error_payload["denied"] = True
+        # The companion ``tool_call(ok=false)`` event owns the dashboard's
+        # error numerator. Mark this branch as paired so consumers that read
+        # both event types don't double-count the same failed invocation.
+        error_payload["paired_tool_call"] = True
+        _emit_event_sync("tool_error", **error_payload)
+
+
+def _result_is_error(result: ToolMessage | Command) -> bool:
+    return isinstance(result, ToolMessage) and getattr(result, "status", None) == "error"
+
+
+def _result_error_text(result: ToolMessage | Command) -> str | None:
+    if not isinstance(result, ToolMessage):
+        return None
+    content = getattr(result, "content", "")
+    text = content if isinstance(content, str) else str(content)
+    return text[:500] if text else None
+
+
 def _check_prohibited(tool_name: str, request: "ToolCallRequest") -> str | None:
     """Return a prohibition message if this bash call is prohibited, else None."""
     if not is_bash_tool(tool_name):
@@ -195,6 +237,9 @@ class BudgetGateMiddleware(AgentMiddleware):
         if prohibition is not None:
             _emit_event_sync("prohibited_action_blocked", tool=tool_name,
                              reason=prohibition[:200])
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=prohibition, denied=True,
+            )
             return ToolMessage(
                 content=prohibition,
                 tool_call_id=_tool_call_id(request),
@@ -204,13 +249,33 @@ class BudgetGateMiddleware(AgentMiddleware):
 
         denial = _check_and_increment_or_deny(tool_name)
         if denial is not None:
+            _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
             return ToolMessage(
                 content=denial,
                 tool_call_id=_tool_call_id(request),
                 name=tool_name,
                 status="error",
             )
-        return handler(request)
+        started = time.monotonic()
+        try:
+            result = handler(request)
+        except Exception as exc:
+            _emit_tool_call_sync(
+                tool_name,
+                ok=False,
+                duration_ms=(time.monotonic() - started) * 1000.0,
+                error=str(exc),
+            )
+            raise
+        duration_ms = (time.monotonic() - started) * 1000.0
+        is_error = _result_is_error(result)
+        _emit_tool_call_sync(
+            tool_name,
+            ok=not is_error,
+            duration_ms=duration_ms,
+            error=_result_error_text(result) if is_error else None,
+        )
+        return result
 
     async def awrap_tool_call(
         self,
@@ -228,6 +293,9 @@ class BudgetGateMiddleware(AgentMiddleware):
         if prohibition is not None:
             _emit_event_sync("prohibited_action_blocked", tool=tool_name,
                              reason=prohibition[:200])
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=prohibition, denied=True,
+            )
             return ToolMessage(
                 content=prohibition,
                 tool_call_id=_tool_call_id(request),
@@ -237,10 +305,30 @@ class BudgetGateMiddleware(AgentMiddleware):
 
         denial = _check_and_increment_or_deny(tool_name)
         if denial is not None:
+            _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
             return ToolMessage(
                 content=denial,
                 tool_call_id=_tool_call_id(request),
                 name=tool_name,
                 status="error",
             )
-        return await handler(request)
+        started = time.monotonic()
+        try:
+            result = await handler(request)
+        except Exception as exc:
+            _emit_tool_call_sync(
+                tool_name,
+                ok=False,
+                duration_ms=(time.monotonic() - started) * 1000.0,
+                error=str(exc),
+            )
+            raise
+        duration_ms = (time.monotonic() - started) * 1000.0
+        is_error = _result_is_error(result)
+        _emit_tool_call_sync(
+            tool_name,
+            ok=not is_error,
+            duration_ms=duration_ms,
+            error=_result_error_text(result) if is_error else None,
+        )
+        return result
