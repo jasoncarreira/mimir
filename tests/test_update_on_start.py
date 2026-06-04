@@ -934,10 +934,18 @@ def test_mimir_update_digest_render_nothing_required() -> None:
 
 class _Drift:
     """Minimal stand-in for SkillDriftResult (only fields the digest uses)."""
-    def __init__(self, name: str, is_clean: bool, orphaned: bool = False) -> None:
+    def __init__(
+        self,
+        name: str,
+        is_clean: bool,
+        orphaned: bool = False,
+        has_unaccepted_drift: bool | None = None,
+    ) -> None:
         self.name = name
         self.is_clean = is_clean
         self.orphaned = orphaned
+        if has_unaccepted_drift is not None:
+            self.has_unaccepted_drift = has_unaccepted_drift
 
 
 def _capture_log():
@@ -1067,3 +1075,23 @@ async def test_version_bump_excludes_orphaned_from_drift(tmp_path, monkeypatch):
     kind, fields = calls[0]
     assert kind == "mimir_update_digest"
     assert fields["skills_drift"] == ["github-poller"]  # orphaned + clean excluded
+
+
+@pytest.mark.asyncio
+async def test_version_bump_excludes_accepted_only_skill_drift(tmp_path, monkeypatch):
+    """Accepted-only skill drift must stay out of the version-bump digest."""
+    from mimir.update_on_start import (
+        emit_version_bump_digest,
+        _write_last_booted_version,
+    )
+    _write_last_booted_version(tmp_path, "0.2.14")
+    _patch_digest_inputs(monkeypatch, current="0.2.15", drift=[
+        _Drift("gmail-poller", is_clean=False, orphaned=False, has_unaccepted_drift=False),
+        _Drift("github-poller", is_clean=False, orphaned=False, has_unaccepted_drift=True),
+    ])
+    log, calls = _capture_log()
+    n = await emit_version_bump_digest(tmp_path, log, already_drained=False)
+    assert n == 1
+    kind, fields = calls[0]
+    assert kind == "mimir_update_digest"
+    assert fields["skills_drift"] == ["github-poller"]

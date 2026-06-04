@@ -318,7 +318,8 @@ def _compute_update_digest(home: Path, prior_version: str) -> UpdateDigest:
         # rollout flagged ~12 orphaned skills per agent as "drift".)
         skills_drift_names = sorted(
             r.name for r in drift_results
-            if not r.is_clean and not r.orphaned
+            if (not r.orphaned)
+            and getattr(r, "has_unaccepted_drift", (not r.is_clean))
         )
     except Exception as exc:
         log.warning("_compute_update_digest: skill drift check failed: %s", exc)
