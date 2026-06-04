@@ -20,7 +20,10 @@ from mimir.skill_install import (
     OptionalSkill,
     SkillDriftResult,
     SkillEnvSpec,
+    accept_skill_drift,
+    clear_accepted_skill_drift,
     apply_skill_update,
+    cmd_accept_skill_drift,
     cmd_configure,
     cmd_install,
     cmd_list,
@@ -28,6 +31,7 @@ from mimir.skill_install import (
     cmd_update_skills,
     detect_skill_drift,
     find_skill_path,
+    list_accepted_skill_drift,
     install,
     list_available,
     list_installed,
@@ -666,6 +670,136 @@ def test_drift_pycache_excluded(fake_optional_root: Path, fake_home: Path):
     results = detect_skill_drift(fake_home, fake_optional_root)
     r = next(r for r in results if r.name == "fake-poller")
     assert r.is_clean, f"Expected clean but got: {r}"
+
+
+
+
+def test_accept_skill_drift_records_hashes_and_marks_accepted(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """Accepting a changed file stores a two-sided fingerprint and tags drift."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    installed_pollers = fake_home / "skills" / "fake-poller" / "pollers.json"
+    installed_pollers.write_text('{"pollers": [{"name": "fake", "command": "true", "cron": "30 * * * *"}]}')
+
+    accepted = accept_skill_drift(
+        fake_home, "fake-poller", fake_optional_root, files=["pollers.json"],
+    )
+
+    assert accepted == ["pollers.json"]
+    entries = list_accepted_skill_drift(fake_home)
+    assert [(e.skill, e.relpath) for e in entries] == [("fake-poller", "pollers.json")]
+    assert entries[0].installed_hash
+    assert entries[0].source_hash
+    assert entries[0].installed_hash != entries[0].source_hash
+
+    r = detect_skill_drift(fake_home, fake_optional_root, name="fake-poller")[0]
+    assert not r.is_clean  # still visible on demand
+    assert r.differs == ["pollers.json"]
+    assert r.accepted == ["pollers.json"]
+    assert r.unaccepted_differs == []
+    assert not r.has_unaccepted_drift
+
+
+def test_accepted_skill_drift_resurfaces_when_source_hash_changes(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """Changing either side of an accepted fingerprint makes the drift actionable again."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    installed_pollers = fake_home / "skills" / "fake-poller" / "pollers.json"
+    installed_pollers.write_text('{"cron": "30 * * * *"}')
+    accept_skill_drift(fake_home, "fake-poller", fake_optional_root, files=["pollers.json"])
+
+    # Simulate a later release changing upstream pollers.json. The prior
+    # acceptance no longer applies because the source hash changed.
+    (fake_optional_root / "fake-poller" / "pollers.json").write_text('{"cron": "15 * * * *"}')
+
+    r = detect_skill_drift(fake_home, fake_optional_root, name="fake-poller")[0]
+    assert r.differs == ["pollers.json"]
+    assert r.accepted == []
+    assert r.unaccepted_differs == ["pollers.json"]
+    assert r.has_unaccepted_drift
+
+
+def test_accept_skill_drift_is_per_file_scoped(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """Accepting one file does not suppress drift in another file for the same skill."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    (fake_home / "skills" / "fake-poller" / "pollers.json").write_text('{"cron": "30 * * * *"}')
+    (fake_home / "skills" / "fake-poller" / "poller.py").write_text("# local behavior\n")
+
+    accept_skill_drift(fake_home, "fake-poller", fake_optional_root, files=["pollers.json"])
+
+    r = detect_skill_drift(fake_home, fake_optional_root, name="fake-poller")[0]
+    assert r.differs == ["poller.py", "pollers.json"]
+    assert r.accepted == ["pollers.json"]
+    assert r.unaccepted_differs == ["poller.py"]
+    assert r.has_unaccepted_drift
+
+
+def test_cmd_update_skills_accepted_only_exits_0_and_tags_drift(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """Accepted-only drift is shown on demand but does not make update exit dirty."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    (fake_home / "skills" / "fake-poller" / "pollers.json").write_text('{"cron": "30 * * * *"}')
+    accept_skill_drift(fake_home, "fake-poller", fake_optional_root, files=["pollers.json"])
+
+    rc = cmd_update_skills(Namespace(
+        home=fake_home, name="fake-poller", all_skills=False,
+        optional_skills_root=fake_optional_root, apply=False, force=False,
+    ))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "differs from source: pollers.json (accepted)" in out
+    assert "out of date" not in out
+
+
+def test_apply_skill_update_skips_accepted_differs(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """`mimir skills update --apply` must not overwrite accepted intentional drift."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    installed_pollers = fake_home / "skills" / "fake-poller" / "pollers.json"
+    local_text = '{"cron": "30 * * * *"}'
+    installed_pollers.write_text(local_text)
+    accept_skill_drift(fake_home, "fake-poller", fake_optional_root, files=["pollers.json"])
+
+    r = detect_skill_drift(fake_home, fake_optional_root, name="fake-poller")[0]
+    updated, failed, hint = apply_skill_update(r)
+
+    assert updated == []
+    assert failed == []
+    assert hint is None
+    assert installed_pollers.read_text() == local_text
+
+
+def test_cmd_accept_skill_drift_list_and_clear(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """The accept CLI can record, list, and clear accepted drift fingerprints."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    (fake_home / "skills" / "fake-poller" / "pollers.json").write_text('{"cron": "30 * * * *"}')
+
+    rc = cmd_accept_skill_drift(Namespace(
+        home=fake_home, skill="fake-poller", files=["pollers.json"],
+        list_entries=False, clear=None, optional_skills_root=fake_optional_root,
+    ))
+    assert rc == 0
+    assert "accepted 1 file" in capsys.readouterr().out
+
+    rc = cmd_accept_skill_drift(Namespace(
+        home=fake_home, skill=None, files=[], list_entries=True,
+        clear=None, optional_skills_root=fake_optional_root,
+    ))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "fake-poller/pollers.json" in out
+
+    assert clear_accepted_skill_drift(fake_home, "fake-poller") is True
+    assert list_accepted_skill_drift(fake_home) == []
 
 
 # ─── cmd_update_skills CLI ────────────────────────────────────────────

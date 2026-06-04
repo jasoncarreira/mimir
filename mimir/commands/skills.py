@@ -1,4 +1,4 @@
-"""Skills subcommand — ``mimir skills {catalog,list,list-optional,install,update,configure}``.
+"""Skills subcommand — ``mimir skills {catalog,list,list-optional,install,update,accept,configure}``.
 
 Extracted from ``mimir.cli`` (Phase 3, chainlink #240).
 Business logic lives in ``mimir.skill_catalog`` and ``mimir.skill_install``;
@@ -74,6 +74,16 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
         ),
     )
     _skill_install.add_argparse_update(skills_update_p)
+
+    skills_accept_p = skills_sub.add_parser(
+        "accept",
+        help=(
+            "Accept current intentional optional-skill drift by recording per-file "
+            "installed+source hashes. Accepted drift stays visible in update output "
+            "but is suppressed from version-bump digests while the hashes match."
+        ),
+    )
+    _skill_install.add_argparse_accept(skills_accept_p)
 
     skills_configure_p = skills_sub.add_parser(
         "configure",

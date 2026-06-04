@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -44,6 +45,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from mimir._atomic import atomic_write_json
 from mimir.skill_defs import home_skills_dir
 from mimir.skill_md import parse_env_block, parse_frontmatter
 
@@ -737,6 +739,17 @@ def _file_hashes(root: Path) -> dict[str, str]:
 
 
 @dataclass
+class AcceptedSkillDriftEntry:
+    """One content-fingerprinted accepted optional-skill divergence."""
+
+    skill: str
+    relpath: str
+    installed_hash: str
+    source_hash: str
+    accepted_at: str | None = None
+
+
+@dataclass
 class SkillDriftResult:
     """Comparison result for one installed optional skill vs its source.
 
@@ -764,6 +777,12 @@ class SkillDriftResult:
         ``True`` when the source root has no counterpart directory for
         this skill — it was installed from somewhere else, or the source
         tree was restructured.
+    accepted:
+        Relative file paths in ``differs`` whose installed+source hashes match
+        an operator-accepted fingerprint in
+        ``<home>/.mimir/accepted-skill-drift.json``. Accepted files are still
+        shown by ``mimir skills update`` but do not count as actionable drift
+        for version-bump digests or ``--apply``.
     """
 
     name: str
@@ -773,6 +792,7 @@ class SkillDriftResult:
     added: list[str] = field(default_factory=list)
     extra: list[str] = field(default_factory=list)
     orphaned: bool = False
+    accepted: list[str] = field(default_factory=list)
 
     @property
     def is_clean(self) -> bool:
@@ -780,8 +800,180 @@ class SkillDriftResult:
         return not (self.differs or self.added or self.extra or self.orphaned)
 
     @property
+    def unaccepted_differs(self) -> list[str]:
+        """Changed files that are not covered by a current accepted fingerprint."""
+        accepted = set(self.accepted)
+        return [rel for rel in self.differs if rel not in accepted]
+
+    @property
+    def has_unaccepted_drift(self) -> bool:
+        """True when a digest / CI check should surface this skill."""
+        return bool(self.orphaned or self.unaccepted_differs or self.added or self.extra)
+
+    @property
     def has_pollers_json(self) -> bool:
         return (self.installed_path / "pollers.json").is_file()
+
+
+def accepted_skill_drift_path(home: Path) -> Path:
+    """Return the operator-accepted skill-drift registry path."""
+    return home / ".mimir" / "accepted-skill-drift.json"
+
+
+def _empty_accepted_skill_drift_payload() -> dict:
+    return {"version": 1, "skills": {}}
+
+
+def load_accepted_skill_drift(home: Path) -> dict:
+    """Load ``<home>/.mimir/accepted-skill-drift.json`` defensively."""
+    path = accepted_skill_drift_path(home)
+    if not path.is_file():
+        return _empty_accepted_skill_drift_payload()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _empty_accepted_skill_drift_payload()
+    if not isinstance(data, dict):
+        return _empty_accepted_skill_drift_payload()
+    skills = data.get("skills")
+    if not isinstance(skills, dict):
+        data["skills"] = {}
+    data["version"] = 1
+    return data
+
+
+def save_accepted_skill_drift(home: Path, payload: dict) -> None:
+    """Atomically persist the accepted skill-drift registry."""
+    atomic_write_json(accepted_skill_drift_path(home), payload)
+
+
+def _validate_skill_relpath(relpath: str) -> None:
+    if not relpath or not relpath.strip():
+        raise ValueError("file path cannot be empty")
+    p = Path(relpath)
+    if p.is_absolute():
+        raise ValueError(f"file path must be relative to the skill root: {relpath!r}")
+    if any(part in ("", ".", "..") for part in p.parts):
+        raise ValueError(f"file path cannot contain empty/current/parent segments: {relpath!r}")
+
+
+def _accepted_differs_for_hashes(
+    home: Path,
+    skill_name: str,
+    differs: list[str],
+    installed_hashes: dict[str, str],
+    source_hashes: dict[str, str],
+) -> list[str]:
+    payload = load_accepted_skill_drift(home)
+    skill_entries = payload.get("skills", {}).get(skill_name, {})
+    if not isinstance(skill_entries, dict):
+        return []
+    accepted: list[str] = []
+    for rel in differs:
+        entry = skill_entries.get(rel)
+        if not isinstance(entry, dict):
+            continue
+        if (
+            entry.get("installed_hash") == installed_hashes.get(rel)
+            and entry.get("source_hash") == source_hashes.get(rel)
+        ):
+            accepted.append(rel)
+    return accepted
+
+
+def list_accepted_skill_drift(home: Path) -> list[AcceptedSkillDriftEntry]:
+    """Return accepted drift entries from the registry in stable order."""
+    payload = load_accepted_skill_drift(home)
+    out: list[AcceptedSkillDriftEntry] = []
+    skills = payload.get("skills", {})
+    if not isinstance(skills, dict):
+        return out
+    for skill in sorted(skills):
+        files = skills.get(skill)
+        if not isinstance(files, dict):
+            continue
+        for rel in sorted(files):
+            entry = files.get(rel)
+            if not isinstance(entry, dict):
+                continue
+            out.append(AcceptedSkillDriftEntry(
+                skill=skill,
+                relpath=rel,
+                installed_hash=str(entry.get("installed_hash") or ""),
+                source_hash=str(entry.get("source_hash") or ""),
+                accepted_at=(str(entry.get("accepted_at")) if entry.get("accepted_at") else None),
+            ))
+    return out
+
+
+def clear_accepted_skill_drift(home: Path, skill_name: str) -> bool:
+    """Remove all accepted drift entries for *skill_name*. Returns True if changed."""
+    _validate_skill_name(skill_name)
+    payload = load_accepted_skill_drift(home)
+    skills = payload.setdefault("skills", {})
+    if not isinstance(skills, dict) or skill_name not in skills:
+        return False
+    del skills[skill_name]
+    save_accepted_skill_drift(home, payload)
+    return True
+
+
+def accept_skill_drift(
+    home: Path,
+    skill_name: str,
+    optional_skills_root: Path | None = None,
+    *,
+    files: list[str] | None = None,
+) -> list[str]:
+    """Accept current per-file skill drift by recording both content hashes.
+
+    Only files that exist on both sides and currently differ can be accepted;
+    extras and added-in-source files lack one side of the fingerprint and remain
+    actionable. If *files* is omitted, every currently differing file for the
+    skill is accepted.
+    """
+    _validate_skill_name(skill_name)
+    requested = list(files or [])
+    for rel in requested:
+        _validate_skill_relpath(rel)
+
+    results = detect_skill_drift(home, optional_skills_root, name=skill_name)
+    result = results[0]
+    if result.orphaned or result.source_path is None:
+        raise ValueError(f"optional skill {skill_name!r} has no source counterpart to fingerprint")
+
+    targets = sorted(requested) if requested else list(result.differs)
+    if not targets:
+        return []
+
+    differs = set(result.differs)
+    invalid = [rel for rel in targets if rel not in differs]
+    if invalid:
+        raise ValueError(
+            "can only accept files that currently differ on both sides; "
+            f"not currently differing: {', '.join(invalid)}"
+        )
+
+    installed_hashes = _file_hashes(result.installed_path)
+    source_hashes = _file_hashes(result.source_path)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    payload = load_accepted_skill_drift(home)
+    skills = payload.setdefault("skills", {})
+    if not isinstance(skills, dict):
+        skills = {}
+        payload["skills"] = skills
+    skill_entries = skills.get(skill_name)
+    if not isinstance(skill_entries, dict):
+        skill_entries = {}
+        skills[skill_name] = skill_entries
+    for rel in targets:
+        skill_entries[rel] = {
+            "installed_hash": installed_hashes[rel],
+            "source_hash": source_hashes[rel],
+            "accepted_at": now,
+        }
+    save_accepted_skill_drift(home, payload)
+    return targets
 
 
 def detect_skill_drift(
@@ -850,6 +1042,10 @@ def detect_skill_drift(
         added = sorted(rel for rel in source_hashes if rel not in installed_hashes)
         extra = sorted(rel for rel in installed_hashes if rel not in source_hashes)
 
+        accepted = _accepted_differs_for_hashes(
+            home, skill_name, differs, installed_hashes, source_hashes,
+        )
+
         results.append(SkillDriftResult(
             name=skill_name,
             installed_path=installed_dir,
@@ -857,6 +1053,7 @@ def detect_skill_drift(
             differs=differs,
             added=added,
             extra=extra,
+            accepted=accepted,
         ))
 
     return results
@@ -878,8 +1075,10 @@ def _print_drift_report(result: SkillDriftResult) -> None:
     total = len(result.differs) + len(result.added) + len(result.extra)
     suffix = f" ({total} file{'s' if total != 1 else ''} differ)"
     print(f"{result.name}:{suffix}")
+    accepted = set(result.accepted)
     for rel in result.differs:
-        print(f"  differs from source: {rel}")
+        tag = " (accepted)" if rel in accepted else ""
+        print(f"  differs from source: {rel}{tag}")
     for rel in result.added:
         print(f"  added in source: {rel}")
     for rel in result.extra:
@@ -955,8 +1154,13 @@ def apply_skill_update(
             backup_root.mkdir(parents=True, exist_ok=True)
         return backup_root
 
-    # Overwrite changed files and copy new files from source.
-    for rel in result.differs + result.added:
+    # Overwrite changed files and copy new files from source. Accepted
+    # intentional local divergences stay visible in dry-run output but are not
+    # overwritten by --apply while their fingerprints remain current.
+    for rel in result.accepted:
+        print(f"  {result.name}: accepted drift {rel!r} kept")
+
+    for rel in result.unaccepted_differs + result.added:
         src_file = result.source_path / rel
         dst_file = result.installed_path / rel
 
@@ -1075,6 +1279,119 @@ def add_argparse_update(parser) -> None:
     parser.set_defaults(skill_install_cmd=cmd_update_skills)
 
 
+def add_argparse_accept(parser) -> None:
+    """Wire ``mimir skills accept <skill> [--file REL...]``."""
+    parser.add_argument(
+        "skill",
+        nargs="?",
+        default=None,
+        help="Skill whose current differing files should be accepted.",
+    )
+    parser.add_argument(
+        "--file",
+        action="append",
+        default=[],
+        dest="files",
+        help="Relative file path to accept. Repeat for multiple files. "
+             "Omit to accept every currently differing file for the skill.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        default=False,
+        dest="list_entries",
+        help="List accepted skill drift fingerprints.",
+    )
+    parser.add_argument(
+        "--clear",
+        metavar="SKILL",
+        default=None,
+        help="Clear all accepted drift fingerprints for a skill.",
+    )
+    parser.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Mimir home (default: $MIMIR_HOME or cwd).",
+    )
+    parser.add_argument(
+        "--optional-skills-root",
+        type=Path,
+        default=None,
+        dest="optional_skills_root",
+        help="Source root for optional skills (default: <repo>/optional-skills/).",
+    )
+    parser.set_defaults(skill_install_cmd=cmd_accept_skill_drift)
+
+
+def cmd_accept_skill_drift(args) -> int:
+    """``mimir skills accept`` entry point."""
+    home = _resolve_home(getattr(args, "home", None))
+    if not home.is_dir():
+        print(f"home not a directory: {home}")
+        return 2
+
+    skill_name: str | None = getattr(args, "skill", None)
+    clear_name: str | None = getattr(args, "clear", None)
+    list_entries: bool = getattr(args, "list_entries", False)
+    files: list[str] = list(getattr(args, "files", []) or [])
+
+    modes = sum(bool(x) for x in (list_entries, clear_name is not None, skill_name is not None))
+    if modes != 1:
+        print("error: choose exactly one of --list, --clear SKILL, or a skill name to accept.")
+        return 2
+    if files and skill_name is None:
+        print("error: --file can only be used when accepting a skill.")
+        return 2
+
+    if list_entries:
+        entries = list_accepted_skill_drift(home)
+        if not entries:
+            print("no accepted skill drift recorded.")
+            return 0
+        print(f"accepted skill drift in {accepted_skill_drift_path(home)}:\n")
+        for e in entries:
+            when = f" accepted_at={e.accepted_at}" if e.accepted_at else ""
+            print(
+                f"  {e.skill}/{e.relpath} "
+                f"installed={e.installed_hash[:12]} source={e.source_hash[:12]}{when}"
+            )
+        return 0
+
+    if clear_name is not None:
+        try:
+            changed = clear_accepted_skill_drift(home, clear_name)
+        except ValueError as exc:
+            print(str(exc))
+            return 2
+        if changed:
+            print(f"cleared accepted skill drift for {clear_name!r}")
+        else:
+            print(f"no accepted skill drift recorded for {clear_name!r}")
+        return 0
+
+    assert skill_name is not None
+    try:
+        accepted = accept_skill_drift(
+            home, skill_name, getattr(args, "optional_skills_root", None), files=files,
+        )
+    except FileNotFoundError as exc:
+        print(str(exc))
+        return 2
+    except ValueError as exc:
+        print(str(exc))
+        return 2
+
+    if not accepted:
+        print(f"{skill_name}: no currently differing files to accept")
+        return 0
+    print(
+        f"{skill_name}: accepted {len(accepted)} "
+        f"file{'s' if len(accepted) != 1 else ''}: {', '.join(accepted)}"
+    )
+    return 0
+
+
 def cmd_update_skills(args) -> int:
     """``mimir skills update`` entry point.
 
@@ -1127,9 +1444,9 @@ def cmd_update_skills(args) -> int:
         for r in results:
             _print_drift_report(r)
 
-        drift_found = any(not r.is_clean for r in results)
+        drift_found = any(r.has_unaccepted_drift for r in results)
         if drift_found:
-            dirty = [r.name for r in results if not r.is_clean]
+            dirty = [r.name for r in results if r.has_unaccepted_drift]
             print(
                 f"\n{len(dirty)} skill{'s' if len(dirty) != 1 else ''} out of date: "
                 f"{', '.join(dirty)}"
@@ -1144,6 +1461,11 @@ def cmd_update_skills(args) -> int:
     for r in results:
         if r.is_clean:
             print(f"{r.name}: up to date")
+            continue
+
+        if not r.has_unaccepted_drift and r.accepted:
+            _print_drift_report(r)
+            print(f"  {r.name}: accepted drift only — no files updated")
             continue
 
         updated, failed, hint = apply_skill_update(r, force=do_force)
