@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 import re
@@ -774,8 +775,13 @@ class Agent:
         # graph is heavyweight). asyncio.Lock created lazily because
         # __init__ may run outside a running event loop (tests).
         self._agent: Any | None = None
+        self._cached_system_prompt: str | None = None
         self._agent_lock: asyncio.Lock | None = None
         self._backend: Any | None = None
+        self._agent_model: Any | None = None
+        self._agent_tools: list[Any] | None = None
+        self._agent_middleware: tuple[Any, ...] | None = None
+        self._cached_skill_catalog_fingerprint: str | None = None
 
         # Memory-tool dep injection — only used if saga_client is a
         # SagaStore (post-saga cutover). Wires up the @tool's
@@ -922,117 +928,210 @@ class Agent:
                 "outbound buffer append failed for channel=%r", channel_id,
             )
 
+    def _current_system_prompt(self, *, emit_health_events: bool = False) -> str:
+        """Render the system prompt for the current turn.
+
+        ``create_deep_agent`` bakes ``system_prompt`` into the compiled
+        graph, so the graph must be rebuilt when the rendered prompt
+        changes. The comparison path suppresses health events; the
+        changed/first-build path re-renders with events enabled so
+        ``core_prompt_degraded`` fires once per changed prompt rather
+        than once per turn.
+        """
+        override = os.environ.get("MIMIR_SYSTEM_PROMPT_OVERRIDE")
+        if override is not None:
+            return override
+        return self._build_system_prompt(emit_health_events=emit_health_events)
+
+    def _current_skill_sources(self) -> list[str]:
+        """Return the skill source directories in deepagents shadowing order."""
+        from .skill_defs import (
+            home_builtin_skills_dir,
+            home_skills_dir,
+        )
+
+        skill_sources: list[str] = []
+        operator_dir = home_skills_dir(self._config.home)
+        builtin_dir = home_builtin_skills_dir(self._config.home)
+        # Bundled (read-only intent) listed first so operator entries
+        # shadow same-named bundled ones.
+        if builtin_dir.is_dir():
+            skill_sources.append(str(builtin_dir))
+        if operator_dir.is_dir():
+            skill_sources.append(str(operator_dir))
+        return skill_sources
+
+    def _skill_catalog_fingerprint(self, skill_sources: list[str]) -> str:
+        """Fingerprint the discovered skill catalog inputs.
+
+        Deepagents' SkillsMiddleware receives source directories, but the
+        middleware may cache the discovered catalog inside the compiled graph.
+        Include every ``SKILL.md`` file's path and content hash in the graph
+        cache key so adding/removing/editing a skill takes effect on the next
+        turn without rebuilding model/tool objects.
+        """
+        digest = hashlib.sha256()
+        for source in skill_sources:
+            root = Path(source)
+            digest.update(str(root).encode("utf-8", "surrogateescape"))
+            digest.update(b"\0")
+            if not root.is_dir():
+                digest.update(b"missing\0")
+                continue
+            for path in sorted(root.rglob("SKILL.md")):
+                try:
+                    rel = path.relative_to(root)
+                    data = path.read_bytes()
+                except OSError:
+                    continue
+                digest.update(str(rel).encode("utf-8", "surrogateescape"))
+                digest.update(b"\0")
+                digest.update(hashlib.sha256(data).digest())
+                digest.update(b"\0")
+        return digest.hexdigest()
+
     async def _build_agent_if_needed(self) -> Any:
-        # Double-checked init: fast path returns the cached agent
-        # without acquiring the lock; only the first-call window
-        # contends on the asyncio.Lock. Pre-fix two concurrent first
-        # turns each entered the ``is None`` branch and built their
-        # own CompiledStateGraph — the second one won, the first was
-        # GC'd, both paid the import cost.
-        if self._agent is not None:
+        # ``create_deep_agent`` freezes ``system_prompt`` at graph
+        # construction time. Re-render it on every call and use the
+        # byte-identical prompt as the cache key: unchanged turns reuse
+        # the graph (prompt-cache prefix stays warm), while core-memory /
+        # index / operator-config changes take effect on the next turn
+        # without a process restart (chainlink #369).
+        system_prompt = self._current_system_prompt(emit_health_events=False)
+        skill_sources = self._current_skill_sources()
+        skill_catalog_fingerprint = self._skill_catalog_fingerprint(skill_sources)
+        if self._agent is not None and self._cached_system_prompt is None:
+            # Unit tests inject a fake graph directly to avoid constructing
+            # deepagents. Production-built graphs always set
+            # ``_cached_system_prompt`` below, so this compatibility path
+            # does not bypass prompt-change invalidation in live runs.
             return self._agent
+        if (
+            self._agent is not None
+            and system_prompt == self._cached_system_prompt
+            and skill_catalog_fingerprint == self._cached_skill_catalog_fingerprint
+        ):
+            return self._agent
+
         if self._agent_lock is None:
             self._agent_lock = asyncio.Lock()
         async with self._agent_lock:
-            # Re-check under the lock: a contending turn may have just
-            # finished construction while we waited.
-            if self._agent is not None:
+            # Re-render under the lock: a contending turn may have just
+            # rebuilt the graph for the same prompt while we waited, or
+            # the prompt may have changed again on disk.
+            system_prompt = self._current_system_prompt(emit_health_events=False)
+            skill_sources = self._current_skill_sources()
+            skill_catalog_fingerprint = self._skill_catalog_fingerprint(skill_sources)
+            if (
+                self._agent is not None
+                and system_prompt == self._cached_system_prompt
+                and skill_catalog_fingerprint == self._cached_skill_catalog_fingerprint
+            ):
                 return self._agent
+
+            # This is the first build or an actual prompt change. Emit
+            # health events for the final rendered prompt only on this
+            # path, not on every unchanged-turn comparison.
+            if os.environ.get("MIMIR_SYSTEM_PROMPT_OVERRIDE") is None:
+                system_prompt = self._current_system_prompt(emit_health_events=True)
+                if (
+                    self._agent is not None
+                    and system_prompt == self._cached_system_prompt
+                    and skill_catalog_fingerprint
+                    == self._cached_skill_catalog_fingerprint
+                ):
+                    return self._agent
+
             from deepagents import create_deep_agent
             from .readonly_backend import WriteGuardBackend
             from .tools import all_mimir_tools
 
-            # Config carries the operator-set model spec; env override
-            # exists for ad-hoc bench / smoke runs that don't go through
-            # Config.from_env. See Config.model_spec for the format
-            # (``claude-code:<model>`` or ``<provider>:<model>``).
-            model_spec = os.environ.get(
-                "MIMIR_MODEL_SPEC",
-                getattr(self._config, "model_spec", "claude-code:claude-sonnet-4-6"),
-            )
-            # Assemble the real system prompt — core memory + memory index +
-            # operator alert channel + skill catalog. Built fresh per turn
-            # so skill bucket assignments / outcome aggregates stay current
-            # (chainlink #15: install-stable section comes first for cache).
-            system_prompt = os.environ.get(
-                "MIMIR_SYSTEM_PROMPT_OVERRIDE",
-                self._build_system_prompt(),
-            )
             # Per-directory write-permission enforcement (Config.folders).
             # Read tools (Glob/Grep/Read) stay unrestricted; Write/Edit/upload
             # outside ``writable_dirs`` return a permission error instead of
             # mutating the filesystem. ``.mimir/`` (saga db, metrics) is
             # implicitly blocked because it's not in the folders dict.
-            backend = WriteGuardBackend(
-                root_dir=self._config.home,
-                writable_dirs=self._config.writable_dirs,
-            )
-            # Stored so run_turn can drain recorded denials into the
-            # TurnRecord.permission_denials field at end of turn.
-            self._backend = backend
+            if self._backend is None:
+                self._backend = WriteGuardBackend(
+                    root_dir=self._config.home,
+                    writable_dirs=self._config.writable_dirs,
+                )
+
             # Bridge ChatCodexPlus's per-response x-codex-* headers
             # into the same RateLimitStore that OpenAIQuotaProvider
             # reads (closes the writer-side gap from PR #248). For
             # non-codex-plus specs the callback is unused — the
             # standard ChatOpenAI / Anthropic clients don't expose a
             # rate_limit_callback and the kwarg is ignored.
-            from .billing import make_codex_plus_rate_limit_callback
-            codex_plus_callback = make_codex_plus_rate_limit_callback(
-                self._rate_limits
-            )
-            # Skills surfaced via SkillsMiddleware: pass operator +
-            # bundled source paths as discovery sources. The framework
-            # scans each source for ``<name>/SKILL.md`` entries and
-            # renders a catalog into the system prompt at request time.
-            # Operator location wins on name collision per the
-            # framework's last-source-wins shadowing rule.
-            from .skill_defs import (
-                home_builtin_skills_dir,
-                home_skills_dir,
-            )
-            skill_sources: list[str] = []
-            operator_dir = home_skills_dir(self._config.home)
-            builtin_dir = home_builtin_skills_dir(self._config.home)
-            # Bundled (read-only intent) listed first so operator
-            # entries shadow same-named bundled ones.
-            if builtin_dir.is_dir():
-                skill_sources.append(str(builtin_dir))
-            if operator_dir.is_dir():
-                skill_sources.append(str(operator_dir))
-
-            # ``BudgetGateMiddleware`` enforces the per-turn tool-call
-            # budget at the langchain middleware layer so it catches
-            # BOTH mimir-registered tools and deepagents' built-ins
-            # (shell_exec, read_file, write_file, glob, edit_file,
-            # write_todos). Pre-fix the budget gate wrapped each
-            # ``all_mimir_tools()`` entry individually and missed the
-            # built-ins — production heartbeats hit 142 tool_calls
-            # vs a budget of 120 with zero denials firing.
-            from .tools.budget_gate import BudgetGateMiddleware
-            # chainlink #266 (slice 3): on non-poller turns the model
-            # loads a skill by read_file-ing its SKILL.md; this middleware
-            # appends that skill's recorded learnings to the result. Ordered
-            # AFTER the budget gate so a budget-denied read never triggers
-            # injection (it's order-robust regardless — it only augments
-            # successful read_file results on a <skill>/SKILL.md path).
-            from .tools.skill_memory_inject import SkillMemoryInjectionMiddleware
-            self._agent = create_deep_agent(
-                model=_resolve_model(
+            if self._agent_model is None:
+                from .billing import make_codex_plus_rate_limit_callback
+                codex_plus_callback = make_codex_plus_rate_limit_callback(
+                    self._rate_limits
+                )
+                # Config carries the operator-set model spec; env override
+                # exists for ad-hoc bench / smoke runs that don't go through
+                # Config.from_env. See Config.model_spec for the format
+                # (``claude-code:<model>`` or ``<provider>:<model>``).
+                model_spec = os.environ.get(
+                    "MIMIR_MODEL_SPEC",
+                    getattr(
+                        self._config,
+                        "model_spec",
+                        "claude-code:claude-sonnet-4-6",
+                    ),
+                )
+                self._agent_model = _resolve_model(
                     model_spec,
                     max_retries=getattr(self._config, "model_max_retries", 6),
                     max_tokens=getattr(self._config, "model_max_tokens", 0),
-                    reasoning_effort=getattr(self._config, "model_reasoning_effort", ""),
+                    reasoning_effort=getattr(
+                        self._config, "model_reasoning_effort", ""
+                    ),
                     rate_limit_callback=codex_plus_callback,
-                ),
-                tools=all_mimir_tools(),
-                system_prompt=system_prompt,
-                backend=backend,
-                skills=skill_sources or None,
-                middleware=(
+                )
+
+            if self._agent_tools is None:
+                self._agent_tools = all_mimir_tools()
+
+            # Skills surfaced via SkillsMiddleware: pass operator +
+            # bundled source paths as discovery sources. The framework
+            # scans each source for ``<name>/SKILL.md`` entries and
+            # renders a catalog into the system prompt. ``skill_sources``
+            # is recomputed each turn; its catalog fingerprint above
+            # decides whether the graph has to be rebuilt.
+
+            if self._agent_middleware is None:
+                # ``BudgetGateMiddleware`` enforces the per-turn tool-call
+                # budget at the langchain middleware layer so it catches
+                # BOTH mimir-registered tools and deepagents' built-ins
+                # (shell_exec, read_file, write_file, glob, edit_file,
+                # write_todos). Pre-fix the budget gate wrapped each
+                # ``all_mimir_tools()`` entry individually and missed the
+                # built-ins — production heartbeats hit 142 tool_calls
+                # vs a budget of 120 with zero denials firing.
+                from .tools.budget_gate import BudgetGateMiddleware
+                # chainlink #266 (slice 3): on non-poller turns the model
+                # loads a skill by read_file-ing its SKILL.md; this middleware
+                # appends that skill's recorded learnings to the result. Ordered
+                # AFTER the budget gate so a budget-denied read never triggers
+                # injection (it's order-robust regardless — it only augments
+                # successful read_file results on a <skill>/SKILL.md path).
+                from .tools.skill_memory_inject import SkillMemoryInjectionMiddleware
+                self._agent_middleware = (
                     BudgetGateMiddleware(),
                     SkillMemoryInjectionMiddleware(),
-                ),
+                )
+
+            self._agent = create_deep_agent(
+                model=self._agent_model,
+                tools=self._agent_tools,
+                system_prompt=system_prompt,
+                backend=self._backend,
+                skills=skill_sources or None,
+                middleware=self._agent_middleware,
             )
+            self._cached_system_prompt = system_prompt
+            self._cached_skill_catalog_fingerprint = skill_catalog_fingerprint
             return self._agent
 
     async def run_turn(self, event: AgentEvent) -> TurnRecord:
@@ -1982,12 +2081,16 @@ class Agent:
     # System prompt assembly
     # ────────────────────────────────────────────────────────────
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, *, emit_health_events: bool = True) -> str:
         """Assemble the per-turn system prompt: persona + core memory +
         memory index + operator alert channel + skill catalog. Rebuilt
         each turn so skill bucket assignments / outcome counters stay
         current (chainlink #15: install-stable section comes first so
         the prompt cache prefix extends through it).
+
+        ``emit_health_events`` lets the prompt-cache comparison path
+        inspect the rendered prompt without writing ``core_prompt_degraded``
+        on every unchanged turn; rebuilds enable it for the final prompt.
 
         Falls back to the minimal default prompt on any failure — a
         broken core-block read or skill-catalog crash should NEVER
@@ -2002,7 +2105,7 @@ class Agent:
             # log_event_sync is used because _build_system_prompt is sync;
             # the async counterpart (log_event) would need an awaitable caller.
             degraded, issues = check_core_blocks_health(core_blocks)
-            if degraded:
+            if degraded and emit_health_events:
                 log.warning(
                     "core_prompt_degraded: %s — agent will use degraded prompt",
                     "; ".join(issues),
