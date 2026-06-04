@@ -867,6 +867,69 @@ time.sleep(120)
     assert len(timeouts) == 1
 
 
+
+@pytest.mark.asyncio
+async def test_run_poller_timeout_kills_child_holding_pipes(
+    tmp_path: Path, home: Path,
+) -> None:
+    """Timeout kills the whole process group, not just the shell.
+
+    The poller exits after spawning a child that inherits stdout/stderr and
+    sleeps.  Killing only the shell leaves that child alive with the pipe FDs
+    open; the process-group hardening must reap it on timeout.
+    """
+    if not hasattr(os, "killpg") or not Path("/proc").is_dir():
+        pytest.skip("process-group liveness assertion requires POSIX /proc")
+
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os, subprocess, sys
+child = subprocess.Popen([
+    sys.executable,
+    "-c",
+    "import time; time.sleep(120)",
+])
+pid_path = os.path.join(os.environ["STATE_DIR"], "child.pid")
+with open(pid_path, "w", encoding="utf-8") as f:
+    f.write(str(child.pid))
+print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
+""")
+    cfg = PollerConfig(
+        name="child-holder",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+
+    n = await run_poller(cfg, enqueue=enq, timeout=0.25)
+
+    assert n == 0
+    assert enq.events == []
+    events = _read_events(home)
+    timeouts = [e for e in events if e["type"] == "poller_timeout"]
+    assert len(timeouts) == 1
+
+    child_pid = int((skill_dir / "child.pid").read_text())
+
+    def child_is_still_running() -> bool:
+        stat_path = Path(f"/proc/{child_pid}/stat")
+        try:
+            fields = stat_path.read_text().split()
+        except FileNotFoundError:
+            return False
+        # Zombies may remain briefly until PID 1 reaps them; they are dead
+        # for the regression this test guards against.
+        return len(fields) > 2 and fields[2] != "Z"
+
+    for _ in range(20):
+        if not child_is_still_running():
+            break
+        await asyncio.sleep(0.05)
+
+    assert not child_is_still_running()
+
 @pytest.mark.asyncio
 async def test_run_poller_nonexistent_command_logs_exec_error(
     tmp_path: Path, home: Path,
