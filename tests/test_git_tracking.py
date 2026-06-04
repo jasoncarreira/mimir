@@ -1254,3 +1254,38 @@ def test_git_ignored_note_skipped_classifies_negative() -> None:
     from mimir.feedback.rules import classify
 
     assert classify("git_ignored_note_skipped") == ("negative", "ignored_write")
+
+
+@pytest.mark.asyncio
+async def test_commit_refuses_when_live_home_is_on_feature_branch(
+    home_repo: Path, tmp_path: Path,
+) -> None:
+    """chainlink #368 update: the live home repo must not silently commit
+    turn state to a feature/proposal branch. Refuse the commit and surface an
+    invariant violation instead.
+    """
+    subprocess.run(["git", "checkout", "-q", "-b", "proposal/edit"], cwd=home_repo, check=True)
+    before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "off-main.md").write_text("should not commit\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t-off-main", trigger="user_message", home=home_repo, enabled=True,
+    )
+
+    after = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert after == before
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout
+    assert "memory/" in status
+    events = _read_events(tmp_path)
+    violations = [e for e in events if e["type"] == "git_home_invariant_violation"]
+    assert violations[-1]["invariant"] == "live_branch"
+    assert violations[-1]["observed"] == "proposal/edit"
+    assert violations[-1]["action"] == "commit_refused"

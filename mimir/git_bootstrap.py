@@ -313,6 +313,8 @@ def bootstrap_git_repo(
     _apply_identity(home, user_name, user_email)
     _ensure_gitignore(home, result)
     _ensure_hook(home, result)
+    live_home_ok = _ensure_live_home_on_main(home, log_event)
+
     if state_repo and github_token:
         _install_credential_helper(
             home, state_repo, github_token, result,
@@ -347,7 +349,7 @@ def bootstrap_git_repo(
         # agent's local commits stand and the next turn surfaces it.
         # Skip pull if we just did an initial push (nothing to pull —
         # remote is exactly what we just sent).
-        if not result.initial_push:
+        if not result.initial_push and live_home_ok:
             fetch = _run(
                 ["git", "fetch", "--all", "--tags", "--quiet"],
                 cwd=home, check=False, capture=True,
@@ -396,6 +398,72 @@ def bootstrap_git_repo(
     )
     return result
 
+
+
+def _ensure_live_home_on_main(home: Path, log_event: callable) -> bool:
+    """Startup guard: the live home working tree must stay on ``main``.
+
+    Proposal edits are made in scratch worktrees, not by checking the live
+    ``/mimir-home`` repo onto feature branches. If a previous turn left the
+    live repo on some other branch, per-turn git_tracking would commit fresh
+    sessions / memory writes to that feature branch and the prompt could load
+    stale core content. Detect that shape at startup and switch back to main
+    when the worktree is clean; otherwise emit a loud algedonic signal and
+    leave the repo untouched for manual reconciliation.
+    """
+    branch = _run(
+        ["git", "-C", str(home), "rev-parse", "--abbrev-ref", "HEAD"],
+        check=False, capture=True,
+    )
+    current = (branch.stdout or "").strip()
+    if branch.returncode != 0 or current in ("", "main"):
+        return True
+    observed = "detached" if current == "HEAD" else current
+
+    status = _run(
+        ["git", "-C", str(home), "status", "--porcelain"],
+        check=False, capture=True,
+    )
+    dirty = bool((status.stdout or "").strip()) if status.returncode == 0 else True
+    if dirty:
+        log_event(
+            "git_home_invariant_violation",
+            path=str(home),
+            invariant="live_branch",
+            observed=observed,
+            expected="main",
+            action="manual_reconcile_required",
+            dirty=True,
+        )
+        return False
+
+    checkout = _run(
+        ["git", "-C", str(home), "checkout", "-q", "main"],
+        check=False, capture=True,
+    )
+    if checkout.returncode == 0:
+        log_event(
+            "git_home_invariant_violation",
+            path=str(home),
+            invariant="live_branch",
+            observed=observed,
+            expected="main",
+            action="repaired",
+        )
+        return True
+
+    log_event(
+        "git_home_invariant_violation",
+        path=str(home),
+        invariant="live_branch",
+        observed=observed,
+        expected="main",
+        action="checkout_failed",
+        reason=_redact(
+            (checkout.stderr or checkout.stdout or "checkout failed")[:500]
+        ),
+    )
+    return False
 
 # ─── helpers ─────────────────────────────────────────────────────────
 
@@ -634,8 +702,18 @@ def _ensure_upstream_tracking(
          "--symbolic-full-name", "main@{upstream}"],
         check=False, capture=True,
     )
+    if upstream.returncode == 0 and (upstream.stdout or "").strip() == "origin/main":
+        return  # already tracking the correct remote — nothing to do
+
     if upstream.returncode == 0 and (upstream.stdout or "").strip():
-        return  # already tracking — nothing to do
+        log_event(
+            "git_home_invariant_violation",
+            path=str(home),
+            invariant="main_upstream",
+            observed=(upstream.stdout or "").strip(),
+            expected="origin/main",
+            action="repairing",
+        )
 
     # Step 2: probe remote for ``main``. If reachable + present we
     # just set tracking; if reachable + absent we'll push -u.

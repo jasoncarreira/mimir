@@ -388,6 +388,16 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"diverged from remote — operator must reconcile manually "
             f"(reset local to remote, or push divergent commits)."
         )
+    if rule_kind == "git_home_invariant_violation":
+        invariant = _sanitize_field(ev.get("invariant") or "?")
+        observed = _sanitize_field(ev.get("observed") or "?")
+        expected = _sanitize_field(ev.get("expected") or "?")
+        action = _sanitize_field(ev.get("action") or "surfaced")
+        return (
+            f"git home invariant violation ({invariant}): observed {observed}, "
+            f"expected {expected}; action={action}. Check /mimir-home branch "
+            f"and upstream before trusting tracked-state sync."
+        )
     if rule_kind == "shell_job_complete_enqueue_failed":
         job_id = ev.get("job_id") or "?"
         err = _sanitize_field(ev.get("error") or "(no detail)")

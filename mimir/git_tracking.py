@@ -277,6 +277,10 @@ async def commit_turn_changes(
         # active once .git is in place. Not a failure.
         return
 
+    if not await _live_home_branch_invariant_ok(home=home, turn_id=turn_id):
+        return
+    await _ensure_main_upstream_invariant(home=home, turn_id=turn_id)
+
     # 1. Fast check — anything to commit? Most turns hit this branch.
     try:
         result = await _git("status", "--porcelain", cwd=home)
@@ -523,6 +527,77 @@ async def _current_branch(home: Path) -> str | None:
     return branch if branch and branch != "HEAD" else None
 
 
+async def _live_home_branch_invariant_ok(*, home: Path, turn_id: str) -> bool:
+    """Per-turn guard: never commit live home state to a feature branch.
+
+    The state repository's live working tree is expected to be ``main``.
+    Proposal/revision work happens in separate worktrees under scratch/. If
+    ``/mimir-home`` is accidentally left on a feature branch, committing turn
+    artifacts there silently wedges sync and can leave core memory stale in the
+    prompt. Refuse to commit and emit an algedonic event instead.
+    """
+    branch = await _current_branch(home)
+    if branch == "main":
+        return True
+    if branch is None:
+        # If git itself failed or returned an unexpected empty branch, don't
+        # let the invariant guard mask the underlying status/commit/push error.
+        return True
+    await log_event(
+        "git_home_invariant_violation",
+        turn_id=turn_id,
+        path=str(home),
+        invariant="live_branch",
+        observed=branch,
+        expected="main",
+        action="commit_refused",
+    )
+    return False
+
+
+async def _ensure_main_upstream_invariant(*, home: Path, turn_id: str) -> None:
+    """Best-effort per-turn repair for stale ``main`` upstream tracking."""
+    if not await _has_origin_remote(home):
+        return
+    try:
+        upstream = (
+            await _git(
+                "rev-parse", "--abbrev-ref", "--symbolic-full-name",
+                "main@{upstream}", cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        ).stdout.strip()
+    except (GitError, asyncio.TimeoutError, OSError):
+        upstream = ""
+    if upstream == "origin/main":
+        return
+    if upstream:
+        await log_event(
+            "git_home_invariant_violation",
+            turn_id=turn_id,
+            path=str(home),
+            invariant="main_upstream",
+            observed=upstream,
+            expected="origin/main",
+            action="repairing",
+        )
+    try:
+        await _git(
+            "branch", "--set-upstream-to", "origin/main", "main",
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (GitError, asyncio.TimeoutError, OSError):
+        if not upstream:
+            await log_event(
+                "git_home_invariant_violation",
+                turn_id=turn_id,
+                path=str(home),
+                invariant="main_upstream",
+                observed="unset",
+                expected="origin/main",
+                action="repair_failed",
+            )
+
+
 async def _sync_remote_before_push(
     *, home: Path, turn_id: str, branch: str | None,
 ) -> bool:
@@ -541,6 +616,17 @@ async def _sync_remote_before_push(
         # Detached or otherwise unusual; keep the pre-#368 behavior and let the
         # eventual push surface any problem.
         return True
+    if branch != "main":
+        await log_event(
+            "git_home_invariant_violation",
+            turn_id=turn_id,
+            path=str(home),
+            invariant="live_branch",
+            observed=branch,
+            expected="main",
+            action="push_refused",
+        )
+        return False
 
     remote_ref = f"origin/{branch}"
     try:
