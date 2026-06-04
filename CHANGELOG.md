@@ -6,6 +6,26 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.14] — 2026-06-04
+
+Release hardening for scheduler recovery, skill drift, git tracking, prompt
+refresh, event redaction, background tasks, and weather timeouts.
+
+### Added
+
+- **Poller recovery wiring is now covered by regression tests.** Added coverage
+  for poller recovery wake-up registration and timeout process-group cleanup,
+  plus shell-job output-drainer completion handling before jobs are marked done.
+  (#568)
+- **Deepagents graph rebuilds when prompt inputs change.** The agent now
+  re-renders the system prompt on each build check, fingerprints the rendered
+  prompt plus skill catalog, reuses the graph when bytes are unchanged, and
+  rebuilds when core memory, memory index, operator-alert config, or bundled
+  skill docs change without requiring a process restart. (#572)
+- **Shared background-task helper.** Fire-and-forget bridge/server tasks now go
+  through a shared strong-reference helper so asyncio tasks are retained until
+  completion. (#371, #573)
+
 ### Fixed
 
 - **Version-bump skill-drift digest no longer lists orphaned skills.** The
@@ -13,7 +33,28 @@ All notable changes will land here. Format loosely follows
   skills (no shipped source) as "drift" — but they aren't fixable via
   `mimir skills update --apply`, so they were noise. Now only skills with a
   source counterpart (real differs/added drift) are reported. Surfaced by the
-  0.2.13 rollout, which flagged ~12 orphaned skills per agent.
+  0.2.13 rollout, which flagged ~12 orphaned skills per agent. (#567)
+- **Transient Codex Plus stream drops are retried.** The agent patches the
+  langchain-codex-plus streaming path to retry transient stream failures instead
+  of failing the whole turn immediately. (#569)
+- **Fingerprint-accepted skill drift stays accepted.** Optional-skill drift
+  acceptance now records and honors source fingerprints so operator-accepted
+  drift does not keep resurfacing as actionable drift. (#570)
+- **Release-polish fixes for git tracking, poller feedback, and OAuth usage.**
+  Home git tracking is guarded on main, squash-sync/proposal bookkeeping is
+  tightened, poller feedback rendering is cleaned up, and OAuth usage polling
+  handles the release-polish edge cases tracked by #357/#320/#322/#368. (#571)
+- **Event logs redact token-shaped secrets at the sink.** `EventLogger._record()`
+  now recursively redacts token-shaped strings before writing `events.jsonl`, and
+  `git_bootstrap` reuses the shared redactor instead of carrying duplicate
+  regexes. (#370, #573)
+- **Bridge/server fire-and-forget tasks retain strong references.** Discord and
+  Slack bridge retry/logging tasks, Discord typing-trigger work, and startup
+  index sweeps now keep tasks strongly referenced until they finish. (#371,
+  #573)
+- **Weather skill network calls have explicit timeouts.** OpenWeather `urlopen()`
+  calls now use a 10-second timeout so a stalled network request does not hang
+  the skill path indefinitely. (#372, #573)
 
 ## [0.2.13] — 2026-06-03
 
