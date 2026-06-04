@@ -35,7 +35,7 @@ unit_label = '°F'
 
 
 def fetch(url):
-    with urllib.request.urlopen(url) as r:
+    with urllib.request.urlopen(url, timeout=10) as r:
         return json.load(r)
 
 

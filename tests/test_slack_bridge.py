@@ -3,6 +3,7 @@ under a fake slack-bolt AsyncApp (SPEC §7.2.1)."""
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -667,6 +668,48 @@ async def test_fetch_history_files_surface_as_attachment_urls(bridge_with_fake_a
 
 
 # ---- supervisor: retry-with-backoff around handler.start_async() ---------
+
+
+@pytest.mark.asyncio
+async def test_slack_connect_retains_runner_task(monkeypatch):
+    bridge = SlackBridge(
+        bot_token="xoxb-x",
+        app_token="xapp-x",
+        enqueue=AsyncMock(return_value=True),
+    )
+    bridge._bot_user_id = "U_BOT_TEST"  # short-circuit auth_test in supervisor
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_start_async():
+        started.set()
+        await release.wait()
+
+    fake_handler = SimpleNamespace(
+        start_async=fake_start_async,
+        close_async=AsyncMock(),
+    )
+    fake_app = SimpleNamespace(
+        message=lambda handler: handler,
+        event=lambda name: (lambda handler: handler),
+        client=SimpleNamespace(auth_test=AsyncMock()),
+    )
+    monkeypatch.setattr(
+        "mimir.bridges.slack.AsyncApp", lambda token: fake_app,
+    )
+    monkeypatch.setattr(
+        "mimir.bridges.slack.AsyncSocketModeHandler",
+        lambda app, app_token: fake_handler,
+    )
+
+    await bridge.connect()
+    assert bridge._runner in bridge._background_tasks
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    release.set()
+    await asyncio.wait_for(bridge._runner, timeout=1.0)
+    await asyncio.sleep(0)
+    assert bridge._runner not in bridge._background_tasks
 
 
 @pytest.mark.asyncio

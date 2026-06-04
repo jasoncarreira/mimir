@@ -835,6 +835,35 @@ async def test_fetch_history_bad_channel_id_returns_empty(bridge_with_fake_clien
 
 
 @pytest.mark.asyncio
+async def test_discord_connect_retains_runner_task(monkeypatch):
+    bridge = DiscordBridge(token="x", enqueue=AsyncMock(return_value=True))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_start(token):
+        started.set()
+        await release.wait()
+
+    fake_client = SimpleNamespace(
+        start=fake_start,
+        close=AsyncMock(),
+        is_closed=lambda: False,
+    )
+    monkeypatch.setattr(
+        "mimir.bridges.discord._DiscordClient", lambda owner: fake_client,
+    )
+
+    await bridge.connect()
+    assert bridge._runner in bridge._background_tasks
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    release.set()
+    await asyncio.wait_for(bridge._runner, timeout=1.0)
+    await asyncio.sleep(0)
+    assert bridge._runner not in bridge._background_tasks
+
+
+@pytest.mark.asyncio
 async def test_supervisor_retries_on_transient_5xx(monkeypatch, tmp_path: Path):
     """A 503 at token-auth (the actual production failure mode that
     motivated this) gets retried with backoff, not a one-shot kill.
