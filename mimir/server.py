@@ -22,6 +22,7 @@ from typing import Any
 from aiohttp import web
 
 from .agent import Agent
+from .background_tasks import spawn_background
 from .bridges.bench import BenchBridge
 from .bridges.web_chat import WebChatBridge
 from .channel_registry import ChannelRegistry
@@ -50,6 +51,9 @@ from .turn_logger import TurnLogger
 from . import web_ui
 
 log = logging.getLogger(__name__)
+
+_STARTUP_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
 
 
 async def _handle_event(request: web.Request) -> web.Response:
@@ -1121,7 +1125,11 @@ def build_app(config: Config) -> web.Application:
         except Exception:  # noqa: BLE001 — best-effort
             log.exception("version-bump digest emit failed")
 
-        asyncio.create_task(indexer.sweep())
+        spawn_background(
+            _STARTUP_BACKGROUND_TASKS,
+            indexer.sweep(),
+            name="mimir-startup-indexer-sweep",
+        )
 
     async def _on_cleanup(app: web.Application) -> None:
         await log_event("shutdown", reason="cleanup")

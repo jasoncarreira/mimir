@@ -39,6 +39,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
         "`pip install mimir[slack]` or `pip install slack-bolt`."
     ) from _exc
 
+from ..background_tasks import spawn_background
 from ..models import AgentEvent
 from ._attachments import _SLACK_CDN_HOSTS, build_inbound_path, download_to_path
 from ._history import ChannelMessage
@@ -230,6 +231,9 @@ class SlackBridge(Bridge):
     _app: Any | None = field(default=None, init=False, repr=False)
     _handler: Any | None = field(default=None, init=False, repr=False)
     _runner: asyncio.Task | None = field(default=None, init=False, repr=False)
+    _background_tasks: set[asyncio.Task[Any]] = field(
+        default_factory=set, init=False, repr=False
+    )
     _bot_user_id: str | None = field(default=None, init=False, repr=False)
     # In-memory cache of users.info results, populated lazily on first
     # message from each user. Bounded by workspace size; lives one
@@ -270,7 +274,7 @@ class SlackBridge(Bridge):
         # config gap), ``token_revoked`` — propagate up so retrying
         # doesn't mask a config issue. Same shape as DiscordBridge's
         # supervisor.
-        self._runner = asyncio.create_task(
+        self._runner = self._spawn_background(
             self._supervised_run(), name="mimir-slack-runner"
         )
         # ``_bot_user_id`` is filled by the supervisor (see
@@ -303,6 +307,11 @@ class SlackBridge(Bridge):
                 log.info("SlackBridge: bot_user_id resolved to %s", user_id)
         except Exception as exc:  # noqa: BLE001
             log.warning("SlackBridge auth_test (supervisor) failed: %s", exc)
+
+    def _spawn_background(
+        self, coro: Awaitable[Any], *, name: str | None = None,
+    ) -> asyncio.Task[Any]:
+        return spawn_background(self._background_tasks, coro, name=name)
 
     async def _supervised_run(self) -> None:
         """Retry-with-exponential-backoff wrapper around
@@ -385,11 +394,14 @@ class SlackBridge(Bridge):
                         if err_code == "missing_scope"
                         else "slack_bridge_auth_failure"
                     )
-                    asyncio.create_task(_safe_log_event(
-                        event_kind,
-                        slack_error=err_code,
-                        error=str(exc)[:300],
-                    ))
+                    self._spawn_background(
+                        _safe_log_event(
+                            event_kind,
+                            slack_error=err_code,
+                            error=str(exc)[:300],
+                        ),
+                        name=f"mimir-slack-log-{event_kind}",
+                    )
                     raise
                 attempt += 1
                 log.warning(
@@ -398,13 +410,16 @@ class SlackBridge(Bridge):
                     err_code or exc, attempt, backoff,
                 )
                 if _should_emit_retry_algedonic(attempt):
-                    asyncio.create_task(_safe_log_event(
-                        "slack_bridge_retry",
-                        attempt=attempt,
-                        backoff_seconds=round(backoff, 1),
-                        slack_error=err_code,
-                        error=f"SlackApiError: {str(exc)[:200]}",
-                    ))
+                    self._spawn_background(
+                        _safe_log_event(
+                            "slack_bridge_retry",
+                            attempt=attempt,
+                            backoff_seconds=round(backoff, 1),
+                            slack_error=err_code,
+                            error=f"SlackApiError: {str(exc)[:200]}",
+                        ),
+                        name="mimir-slack-log-retry",
+                    )
             except Exception as exc:  # noqa: BLE001
                 # Unexpected exception (network errors from aiohttp,
                 # WebSocket disconnect storms, slack_sdk internals).
@@ -416,12 +431,15 @@ class SlackBridge(Bridge):
                     exc, attempt, backoff,
                 )
                 if _should_emit_retry_algedonic(attempt):
-                    asyncio.create_task(_safe_log_event(
-                        "slack_bridge_retry",
-                        attempt=attempt,
-                        backoff_seconds=round(backoff, 1),
-                        error=f"{type(exc).__name__}: {str(exc)[:200]}",
-                    ))
+                    self._spawn_background(
+                        _safe_log_event(
+                            "slack_bridge_retry",
+                            attempt=attempt,
+                            backoff_seconds=round(backoff, 1),
+                            error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                        ),
+                        name="mimir-slack-log-retry",
+                    )
 
             await asyncio.sleep(backoff)
             backoff = min(

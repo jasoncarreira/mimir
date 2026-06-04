@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ._jsonl_tail import _tail_lines, count_lines_chunked
+from .redaction import redact_payload
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +110,7 @@ class EventLogger:
         }
         if self._agent_id is not None:
             rec["agent_id"] = self._agent_id
-        rec.update(payload)
+        rec.update(redact_payload(payload))
         return rec
 
     async def _trim(self) -> None:

@@ -1917,6 +1917,7 @@ async def test_run_poller_pass_env_bypasses_deny_filter(
     _install_script(skill_dir, "poller.py", """
 import os, sys
 print(f"TOKEN={os.environ.get('GITHUB_TOKEN', 'absent')}", file=sys.stderr)
+print(f"TOKEN_PRESENT={bool(os.environ.get('GITHUB_TOKEN'))}", file=sys.stderr)
 print(f"LOGIN={os.environ.get('MIMIR_GITHUB_SELF_LOGIN', 'absent')}", file=sys.stderr)
 print('{"poller": "x", "prompt": "ok"}')
 """)
@@ -1933,7 +1934,11 @@ print('{"poller": "x", "prompt": "ok"}')
         for e in events if e.get("type") == "poller_stderr"
     ]
     combined_stderr = "|".join(stderr_payloads)
-    assert "TOKEN=ghp_test_pass_env_value" in combined_stderr
+    # The pass_env token reached the subprocess (TOKEN_PRESENT=True), but the
+    # event sink redacts the token-shaped value before events.jsonl.
+    assert "TOKEN_PRESENT=True" in combined_stderr
+    assert "ghp_test_pass_env_value" not in combined_stderr
+    assert "TOKEN=[REDACTED]" in combined_stderr
     assert "LOGIN=mimir-bot" in combined_stderr
 
 
@@ -1950,6 +1955,7 @@ async def test_run_poller_pass_env_unset_in_environ_is_skipped(
     _install_script(skill_dir, "poller.py", """
 import os, sys
 print(f"TOKEN={os.environ.get('GITHUB_TOKEN', 'absent')}", file=sys.stderr)
+print(f"TOKEN_PRESENT={bool(os.environ.get('GITHUB_TOKEN'))}", file=sys.stderr)
 print('{"poller": "x", "prompt": "ok"}')
 """)
     cfg = PollerConfig(
@@ -1965,7 +1971,9 @@ print('{"poller": "x", "prompt": "ok"}')
         for e in events if e.get("type") == "poller_stderr"
     ]
     combined_stderr = "|".join(stderr_payloads)
-    assert "TOKEN=absent" in combined_stderr
+    assert "TOKEN_PRESENT=False" in combined_stderr
+    assert "absent" not in combined_stderr
+    assert "TOKEN=[REDACTED]" in combined_stderr
 
 
 @pytest.mark.asyncio

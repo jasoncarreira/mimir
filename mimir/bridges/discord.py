@@ -33,6 +33,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
         "`pip install mimir[discord]` or `pip install discord-py`."
     ) from _exc
 
+from ..background_tasks import spawn_background
 from ..models import AgentEvent
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
@@ -287,6 +288,9 @@ class DiscordBridge(Bridge):
     attachments_max_bytes: int | None = None
     _client: _DiscordClient | None = field(default=None, init=False, repr=False)
     _runner: asyncio.Task | None = field(default=None, init=False, repr=False)
+    _background_tasks: set[asyncio.Task[Any]] = field(
+        default_factory=set, init=False, repr=False
+    )
     # Per-channel "hold typing open" tasks, created on inbound and cancelled
     # on outbound (or when the agent loop calls ``cancel_typing`` after a
     # turn finishes). See ``send_typing_indicator``.
@@ -333,9 +337,14 @@ class DiscordBridge(Bridge):
         # bridge for the rest of the container's life. Operator-actionable
         # errors (LoginFailure = bad token, PrivilegedIntentsRequired =
         # missing intent) propagate up — retrying those just spams.
-        self._runner = asyncio.create_task(
+        self._runner = self._spawn_background(
             self._supervised_run(), name="mimir-discord-runner"
         )
+
+    def _spawn_background(
+        self, coro: Awaitable[Any], *, name: str | None = None,
+    ) -> asyncio.Task[Any]:
+        return spawn_background(self._background_tasks, coro, name=name)
 
     async def _supervised_run(self) -> None:
         """Retry-with-exponential-backoff wrapper around
@@ -399,9 +408,10 @@ class DiscordBridge(Bridge):
                 )
                 # Fire-and-forget so we don't block the supervisor on a
                 # logger that might itself be backing off.
-                asyncio.create_task(_safe_log_event(
-                    event_kind, error=str(exc)[:300],
-                ))
+                self._spawn_background(
+                    _safe_log_event(event_kind, error=str(exc)[:300]),
+                    name=f"mimir-discord-log-{event_kind}",
+                )
                 raise
             except (discord.HTTPException, discord.ConnectionClosed) as exc:
                 # ``HTTPException`` is the parent of ``DiscordServerError``
@@ -416,12 +426,15 @@ class DiscordBridge(Bridge):
                     exc, attempt, backoff,
                 )
                 if _should_emit_retry_algedonic(attempt):
-                    asyncio.create_task(_safe_log_event(
-                        "discord_bridge_retry",
-                        attempt=attempt,
-                        backoff_seconds=round(backoff, 1),
-                        error=f"{type(exc).__name__}: {str(exc)[:200]}",
-                    ))
+                    self._spawn_background(
+                        _safe_log_event(
+                            "discord_bridge_retry",
+                            attempt=attempt,
+                            backoff_seconds=round(backoff, 1),
+                            error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                        ),
+                        name="mimir-discord-log-retry",
+                    )
             except Exception as exc:  # noqa: BLE001
                 # Catch-all for unexpected exception types (network errors
                 # from aiohttp surface as multiple class hierarchies). Treat
@@ -435,12 +448,15 @@ class DiscordBridge(Bridge):
                     exc, attempt, backoff,
                 )
                 if _should_emit_retry_algedonic(attempt):
-                    asyncio.create_task(_safe_log_event(
-                        "discord_bridge_retry",
-                        attempt=attempt,
-                        backoff_seconds=round(backoff, 1),
-                        error=f"{type(exc).__name__}: {str(exc)[:200]}",
-                    ))
+                    self._spawn_background(
+                        _safe_log_event(
+                            "discord_bridge_retry",
+                            attempt=attempt,
+                            backoff_seconds=round(backoff, 1),
+                            error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                        ),
+                        name="mimir-discord-log-retry",
+                    )
 
             # Sleep before retry. ``CancelledError`` here aborts the loop
             # cleanly via the outer except clause.
@@ -855,7 +871,10 @@ class DiscordBridge(Bridge):
         # the dots for ~10s on a single trigger; for longer turns
         # it'll just expire naturally — that's better than blocking
         # enqueue on a typing call.
-        asyncio.create_task(self.send_typing_indicator(channel_id))
+        self._spawn_background(
+            self.send_typing_indicator(channel_id),
+            name=f"mimir-discord-typing-trigger-{channel_id}",
+        )
         await self.enqueue(event)
 
     # VSM: algedonic (in) — inbound reactions on the bot's own messages,
