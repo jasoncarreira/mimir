@@ -166,6 +166,7 @@ def test_discover_schedules_poller_when_required_env_set(tmp_path: Path, monkeyp
     skills = tmp_path / "skills"
     _write_pollers_json(skills / "needy", [
         {"name": "needy", "command": "python p.py", "cron": "*/15 * * * *",
+         "pass_env": ["MIMIR_TEST_REQ_X"],
          "env_required": ["MIMIR_TEST_REQ_X"]},
     ])
     out = discover_pollers(skills)
@@ -184,6 +185,74 @@ def test_discover_required_env_satisfied_by_manifest_override(tmp_path: Path, mo
     out = discover_pollers(skills)
     assert len(out) == 1
 
+
+
+def test_discover_required_env_uses_runtime_env_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chainlink #357: discovery mirrors the env assembled by run_poller.
+
+    A raw os.environ secret that is not in pass_env is not available at runtime,
+    while injected STATE_DIR is available even though it is absent from the host
+    process env.
+    """
+    monkeypatch.setenv("MIMIR_TEST_SECRET_TOKEN", "present-but-denied")
+    monkeypatch.delenv("STATE_DIR", raising=False)
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "env-model", [
+        {
+            "name": "denied",
+            "command": "python p.py",
+            "cron": "*/15 * * * *",
+            "env_required": ["MIMIR_TEST_SECRET_TOKEN"],
+        },
+        {
+            "name": "passed",
+            "command": "python p.py",
+            "cron": "*/15 * * * *",
+            "pass_env": ["MIMIR_TEST_SECRET_TOKEN"],
+            "env_required": ["MIMIR_TEST_SECRET_TOKEN"],
+        },
+        {
+            "name": "injected",
+            "command": "python p.py",
+            "cron": "*/15 * * * *",
+            "env_required": ["STATE_DIR", "POLLER_NAME"],
+        },
+    ])
+
+    out = discover_pollers(skills, state_root=tmp_path / "state" / "pollers")
+
+    assert sorted(p.name for p in out) == ["injected", "passed"]
+
+
+def test_discover_required_env_honors_allowlist_and_process_control_deny(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery should follow runtime allowlist and pass_env hard-deny rules."""
+    monkeypatch.setenv("MY_CUSTOM_ENV", "available-via-allowlist")
+    monkeypatch.setenv("MIMIR_POLLER_ENV_ALLOWLIST", "MY_CUSTOM_ENV")
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/evil.so")
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "env-model", [
+        {
+            "name": "custom",
+            "command": "python p.py",
+            "cron": "*/15 * * * *",
+            "env_required": ["MY_CUSTOM_ENV"],
+        },
+        {
+            "name": "blocked-loader",
+            "command": "python p.py",
+            "cron": "*/15 * * * *",
+            "pass_env": ["LD_PRELOAD"],
+            "env_required": ["LD_PRELOAD"],
+        },
+    ])
+
+    out = discover_pollers(skills)
+
+    assert [p.name for p in out] == ["custom"]
 
 def test_discover_handles_top_level_array_instead_of_object(tmp_path: Path):
     """The contract requires ``{"pollers": [...]}`` not a bare array.
@@ -2543,7 +2612,8 @@ async def test_circuit_breaker_resets_after_successful_run(tmp_path, home, clear
 
 def test_discover_pollers_parses_env_required_list(tmp_path: Path, monkeypatch) -> None:
     """``env_required`` field in pollers.json is parsed into PollerConfig.env_required.
-    (Vars are set so #351's discovery-time skip doesn't drop the poller first.)"""
+    (Vars are set and pass_env-declared so #351/#357 discovery-time skip
+    doesn't drop the poller first.)"""
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "x")
     skill_dir = tmp_path / "skill"
@@ -2551,6 +2621,7 @@ def test_discover_pollers_parses_env_required_list(tmp_path: Path, monkeypatch) 
     (skill_dir / "pollers.json").write_text(
         '{"pollers": [{"name": "x", "command": "true",'
         ' "cron": "* * * * *",'
+        ' "pass_env": ["GITHUB_TOKEN", "MIMIR_GITHUB_SELF_LOGIN"],'
         ' "env_required": ["GITHUB_TOKEN", "MIMIR_GITHUB_SELF_LOGIN"]}]}'
     )
     configs = discover_pollers(tmp_path)
@@ -2584,10 +2655,13 @@ def test_discover_pollers_env_required_non_list_is_ignored(tmp_path: Path) -> No
     assert configs[0].env_required == ()
 
 
-def test_discover_pollers_env_required_non_string_items_are_dropped(tmp_path: Path, monkeypatch) -> None:
+def test_discover_pollers_env_required_non_string_items_are_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Per-item filter: non-strings and empty-after-strip entries are
     dropped individually; surviving string entries preserve order.
-    (Surviving vars are set so #351's skip doesn't drop the poller first.)"""
+    (Surviving vars are set and pass_env-declared so #351/#357's skip doesn't
+    drop the poller first.)"""
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     monkeypatch.setenv("MY_VAR", "x")
     skill_dir = tmp_path / "skill"
@@ -2595,6 +2669,7 @@ def test_discover_pollers_env_required_non_string_items_are_dropped(tmp_path: Pa
     (skill_dir / "pollers.json").write_text(
         '{"pollers": [{"name": "x", "command": "true",'
         ' "cron": "* * * * *",'
+        ' "pass_env": ["GITHUB_TOKEN", "MY_VAR"],'
         ' "env_required": ["GITHUB_TOKEN", 42, null, "", "  ", "MY_VAR", true]}]}'
     )
     configs = discover_pollers(tmp_path)

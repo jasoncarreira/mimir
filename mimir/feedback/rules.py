@@ -161,6 +161,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "git_commit_failed": ("negative", "git_commit_failed"),
     "git_push_failed": ("negative", "git_push_failed"),
     "git_pull_blocked": ("negative", "git_pull_blocked"),
+    "git_home_invariant_violation": ("negative", "git_home_invariant_violation"),
     # PR 56 (shell-jobs): the cross-thread bridge from waiter thread
     # back to the dispatcher raised. Means a finished async shell job
     # never woke the spawning channel — the operator sees a missing
@@ -425,6 +426,7 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "git_commit_failed",
     "git_push_failed",
     "git_pull_blocked",
+    "git_home_invariant_violation",
     # PR 56: a broken bridge fires on every async shell job that
     # completes. Same shape as git_*_failed — dedup so the operator
     # sees the latest failure, not N stale copies.

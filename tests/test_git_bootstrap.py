@@ -1189,3 +1189,61 @@ def test_credential_helper_idempotent_across_bootstraps(tmp_path: Path) -> None:
     assert values == ["", f"store --file={expected}"], (
         f"credential.helper accumulated across bootstraps: {values!r}"
     )
+
+
+def test_bootstrap_repairs_clean_live_home_feature_branch(
+    tmp_path: Path, captured_events: tuple[list, Any],
+) -> None:
+    """chainlink #368 update: startup should catch a live /mimir-home repo
+    left on a feature branch and restore main when the worktree is clean.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    git_bootstrap.bootstrap_git_repo(home)
+    _git("checkout", "-q", "-b", "tighten-pr5", cwd=home)
+
+    events, cb = captured_events
+    events.clear()
+    git_bootstrap.bootstrap_git_repo(home, log_event=cb)
+
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=home).stdout.strip()
+    assert branch == "main"
+    matches = [
+        fields for kind, fields in events
+        if kind == "git_home_invariant_violation"
+    ]
+    assert matches
+    assert matches[-1]["invariant"] == "live_branch"
+    assert matches[-1]["observed"] == "tighten-pr5"
+    assert matches[-1]["action"] == "repaired"
+
+
+def test_bootstrap_surfaces_dirty_live_home_feature_branch_without_checkout(
+    tmp_path: Path, captured_events: tuple[list, Any],
+) -> None:
+    """If the live repo is off main but dirty, startup must not guess how to
+    move uncommitted state; it should leave the branch in place and surface the
+    invariant violation for manual reconciliation.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    git_bootstrap.bootstrap_git_repo(home)
+    _git("checkout", "-q", "-b", "tighten-pr5", cwd=home)
+    (home / "memory").mkdir(exist_ok=True)
+    (home / "memory" / "dirty.md").write_text("dirty\n")
+
+    events, cb = captured_events
+    events.clear()
+    git_bootstrap.bootstrap_git_repo(home, log_event=cb)
+
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=home).stdout.strip()
+    assert branch == "tighten-pr5"
+    matches = [
+        fields for kind, fields in events
+        if kind == "git_home_invariant_violation"
+    ]
+    assert matches
+    assert matches[-1]["invariant"] == "live_branch"
+    assert matches[-1]["observed"] == "tighten-pr5"
+    assert matches[-1]["action"] == "manual_reconcile_required"
+    assert matches[-1]["dirty"] is True

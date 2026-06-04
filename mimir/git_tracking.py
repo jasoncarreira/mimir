@@ -207,6 +207,26 @@ async def _git(
     return GitResult(stdout=stdout, stderr=stderr)
 
 
+def _schedule_push_retry_locked(
+    *,
+    key: str,
+    home: Path,
+    turn_id: str,
+    attempt: int = 0,
+) -> None:
+    """Schedule a retry task while the caller holds the per-home lock."""
+    existing = _push_retry_tasks.get(key)
+    if existing is None or existing.done():
+        _push_retry_tasks[key] = asyncio.create_task(
+            _retry_push(
+                home=home,
+                delay=PUSH_RETRY_DELAYS[attempt],
+                attempt=attempt,
+                turn_id=turn_id,
+            )
+        )
+
+
 # ─── public API: commit_turn_changes ──────────────────────────────────
 
 
@@ -256,6 +276,10 @@ async def commit_turn_changes(
         # may not be a git repo yet. Silently skip; the hook becomes
         # active once .git is in place. Not a failure.
         return
+
+    if not await _live_home_branch_invariant_ok(home=home, turn_id=turn_id):
+        return
+    await _ensure_main_upstream_invariant(home=home, turn_id=turn_id)
 
     # 1. Fast check — anything to commit? Most turns hit this branch.
     try:
@@ -390,12 +414,12 @@ async def _schedule_debounced_push(*, turn_id: str, home: Path) -> None:
     dev / parallel tests) no longer collide.
     """
     key = _home_key(home)
-    # Cancel any pending retry task before creating a new debounce — the new
-    # debounce push will cover all unpushed commits, making the retry redundant.
-    existing_retry = _push_retry_tasks.pop(key, None)
-    if existing_retry is not None and not existing_retry.done():
-        existing_retry.cancel()
     async with _get_lock(home):
+        # Cancel any pending retry task before creating a new debounce — the new
+        # debounce push will cover all unpushed commits, making the retry redundant.
+        existing_retry = _push_retry_tasks.pop(key, None)
+        if existing_retry is not None and not existing_retry.done():
+            existing_retry.cancel()
         existing = _pending_push_tasks.get(key)
         if existing is not None and not existing.done():
             existing.cancel()
@@ -424,35 +448,19 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
     if not await _has_origin_remote(home):
         return
     key = _home_key(home)
-    # Pull remote merges (e.g. an approved core-memory PR — chainlink #337/#340)
-    # before pushing, so the merge flows into the live working tree and the
-    # next turn's load_core picks it up. ``--rebase`` replays our local turn-
-    # commits on top. On failure (conflict / auth / timeout) abort any half-
-    # applied rebase to leave the tree clean, log, and skip the push this cycle
-    # — a later debounce / retry catches up. Conflicts shouldn't arise: core
-    # PRs touch memory/core, turn-commits touch turns.jsonl / state / *.db.
+    branch = await _current_branch(home)
+    if not await _sync_remote_before_push(home=home, turn_id=turn_id, branch=branch):
+        async with _get_lock(home):
+            _schedule_push_retry_locked(key=key, home=home, turn_id=turn_id)
+        return
     try:
-        await _git("pull", "--rebase", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
-    except (GitError, asyncio.TimeoutError, OSError) as exc:
-        # Distinguish a rebase CONFLICT from a transient/remote failure: if
-        # ``rebase --abort`` succeeds there WAS a rebase in progress (a
-        # conflict) — skip the push and surface git_pull_blocked, since pushing
-        # a half-reconciled tree is wrong. If there's nothing to abort, the
-        # pull failed before rebasing (unreachable remote / auth / timeout);
-        # fall through to the push so the existing retry/backoff path handles
-        # it just as it did before pull-before-push was added.
-        aborted = False
-        try:
-            await _git("rebase", "--abort", cwd=home, timeout=COMMAND_TIMEOUT_SECONDS)
-            aborted = True
-        except (GitError, asyncio.TimeoutError, OSError):
-            pass
-        if aborted:
-            await log_event("git_pull_blocked", reason=_short_err(exc), turn_id=turn_id)
-            return
-        # else: transient/remote pull failure — fall through to the push.
-    try:
-        await _git("push", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
+        if branch:
+            await _git(
+                "push", "origin", f"HEAD:{branch}",
+                cwd=home, timeout=PUSH_TIMEOUT_SECONDS,
+            )
+        else:
+            await _git("push", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         await log_event(
             "git_push_failed",
@@ -460,11 +468,8 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
             timeout_s=PUSH_TIMEOUT_SECONDS,
             turn_id=turn_id,
         )
-        existing = _push_retry_tasks.get(key)
-        if existing is None or existing.done():
-            _push_retry_tasks[key] = asyncio.create_task(
-                _retry_push(home=home, delay=PUSH_RETRY_DELAYS[0], attempt=0, turn_id=turn_id)
-            )
+        async with _get_lock(home):
+            _schedule_push_retry_locked(key=key, home=home, turn_id=turn_id)
         return
     except GitError as exc:
         await log_event(
@@ -473,11 +478,8 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
             returncode=exc.returncode,
             turn_id=turn_id,
         )
-        existing = _push_retry_tasks.get(key)
-        if existing is None or existing.done():
-            _push_retry_tasks[key] = asyncio.create_task(
-                _retry_push(home=home, delay=PUSH_RETRY_DELAYS[0], attempt=0, turn_id=turn_id)
-            )
+        async with _get_lock(home):
+            _schedule_push_retry_locked(key=key, home=home, turn_id=turn_id)
         return
     except (OSError, asyncio.CancelledError) as exc:
         # OSError: git binary missing / fork failed. CancelledError
@@ -489,17 +491,15 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
             reason=_short_err(exc),
             turn_id=turn_id,
         )
-        existing = _push_retry_tasks.get(key)
-        if existing is None or existing.done():
-            _push_retry_tasks[key] = asyncio.create_task(
-                _retry_push(home=home, delay=PUSH_RETRY_DELAYS[0], attempt=0, turn_id=turn_id)
-            )
+        async with _get_lock(home):
+            _schedule_push_retry_locked(key=key, home=home, turn_id=turn_id)
         return
     # Success — cancel any pending retry (e.g. from a prior failure in
     # this session) before emitting the ok event.
-    existing_retry = _push_retry_tasks.pop(key, None)
-    if existing_retry is not None and not existing_retry.done():
-        existing_retry.cancel()
+    async with _get_lock(home):
+        existing_retry = _push_retry_tasks.pop(key, None)
+        if existing_retry is not None and not existing_retry.done():
+            existing_retry.cancel()
     # chainlink #65 (sub B): paired-positive emit. The push succeeded;
     # surface it so the algedonic block can show "old git_push_failed
     # + recent git_push_ok = transient, recovered" against the sticky
@@ -512,6 +512,276 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
 
 
 # ─── helpers ─────────────────────────────────────────────────────────
+
+
+async def _current_branch(home: Path) -> str | None:
+    """Return the checked-out branch name, or None for detached/unknown HEAD."""
+    try:
+        result = await _git(
+            "rev-parse", "--abbrev-ref", "HEAD",
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (GitError, asyncio.TimeoutError, OSError):
+        return None
+    branch = result.stdout.strip()
+    return branch if branch and branch != "HEAD" else None
+
+
+async def _live_home_branch_invariant_ok(*, home: Path, turn_id: str) -> bool:
+    """Per-turn guard: never commit live home state to a feature branch.
+
+    The state repository's live working tree is expected to be ``main``.
+    Proposal/revision work happens in separate worktrees under scratch/. If
+    ``/mimir-home`` is accidentally left on a feature branch, committing turn
+    artifacts there silently wedges sync and can leave core memory stale in the
+    prompt. Refuse to commit and emit an algedonic event instead.
+    """
+    branch = await _current_branch(home)
+    if branch == "main":
+        return True
+    if branch is None:
+        # If git itself failed or returned an unexpected empty branch, don't
+        # let the invariant guard mask the underlying status/commit/push error.
+        return True
+    await log_event(
+        "git_home_invariant_violation",
+        turn_id=turn_id,
+        path=str(home),
+        invariant="live_branch",
+        observed=branch,
+        expected="main",
+        action="commit_refused",
+    )
+    return False
+
+
+async def _ensure_main_upstream_invariant(*, home: Path, turn_id: str) -> None:
+    """Best-effort per-turn repair for stale ``main`` upstream tracking."""
+    if not await _has_origin_remote(home):
+        return
+    try:
+        upstream = (
+            await _git(
+                "rev-parse", "--abbrev-ref", "--symbolic-full-name",
+                "main@{upstream}", cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        ).stdout.strip()
+    except (GitError, asyncio.TimeoutError, OSError):
+        upstream = ""
+    if upstream == "origin/main":
+        return
+    if upstream:
+        await log_event(
+            "git_home_invariant_violation",
+            turn_id=turn_id,
+            path=str(home),
+            invariant="main_upstream",
+            observed=upstream,
+            expected="origin/main",
+            action="repairing",
+        )
+    try:
+        await _git(
+            "branch", "--set-upstream-to", "origin/main", "main",
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (GitError, asyncio.TimeoutError, OSError):
+        if not upstream:
+            await log_event(
+                "git_home_invariant_violation",
+                turn_id=turn_id,
+                path=str(home),
+                invariant="main_upstream",
+                observed="unset",
+                expected="origin/main",
+                action="repair_failed",
+            )
+
+
+async def _sync_remote_before_push(
+    *, home: Path, turn_id: str, branch: str | None,
+) -> bool:
+    """Fetch/rebase the current branch before pushing.
+
+    The normal state-repo path is ``main`` tracking ``origin/main``. Proposal
+    work and squash merges can leave two sharp edges (chainlink #368): the
+    branch upstream can point at a stale proposal ref, and a squash-merged
+    proposal can make ``pull --rebase`` conflict even when the remote-edited
+    paths already match local content. This helper makes the push path explicit
+    about the remote branch, restores tracking best-effort, and reconciles the
+    redundant-squash case by resetting onto origin while preserving any
+    local-only diff as a fresh commit.
+    """
+    if branch is None:
+        # Detached or otherwise unusual; keep the pre-#368 behavior and let the
+        # eventual push surface any problem.
+        return True
+    if branch != "main":
+        await log_event(
+            "git_home_invariant_violation",
+            turn_id=turn_id,
+            path=str(home),
+            invariant="live_branch",
+            observed=branch,
+            expected="main",
+            action="push_refused",
+        )
+        return False
+
+    remote_ref = f"origin/{branch}"
+    try:
+        await _git("fetch", "origin", branch, cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
+    except (GitError, asyncio.TimeoutError, OSError):
+        return True  # transient/auth failures are handled by the push retry path.
+
+    # Best-effort self-heal for a stale upstream (e.g. main tracking a proposal
+    # branch after a proposal worktree cycle). Subsequent ``git push`` calls from
+    # humans/scripts then work too, but the agent push below is explicit anyway.
+    try:
+        await _git(
+            "branch", "--set-upstream-to", remote_ref, branch,
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (GitError, asyncio.TimeoutError, OSError):
+        pass
+
+    try:
+        await _git(
+            "pull", "--rebase", "origin", branch,
+            cwd=home, timeout=PUSH_TIMEOUT_SECONDS,
+        )
+        return True
+    except (GitError, asyncio.TimeoutError, OSError) as exc:
+        # Distinguish a rebase CONFLICT from a transient/remote failure: if
+        # ``rebase --abort`` succeeds there WAS a rebase in progress.
+        aborted = False
+        try:
+            await _git("rebase", "--abort", cwd=home, timeout=COMMAND_TIMEOUT_SECONDS)
+            aborted = True
+        except (GitError, asyncio.TimeoutError, OSError):
+            pass
+        if not aborted:
+            return True  # unreachable remote/auth/etc.; let push retry handle it.
+
+        if await _reconcile_redundant_remote_changes(
+            home=home, remote_ref=remote_ref, turn_id=turn_id, branch=branch,
+        ):
+            return True
+
+        await log_event("git_pull_blocked", reason=_short_err(exc), turn_id=turn_id)
+        return False
+
+
+async def _reconcile_redundant_remote_changes(
+    *, home: Path, remote_ref: str, turn_id: str, branch: str,
+) -> bool:
+    """Self-heal a squash-merge rebase conflict when remote changes are already local.
+
+    If every path changed by ``remote_ref`` since the merge-base has the same
+    blob at local HEAD, then the remote merge is content-redundant with local
+    history. Reset to the remote commit and recommit any remaining local-only
+    diff as one reconciliation commit. If a remote-touched path differs locally
+    (e.g. the local version is a substantive revision the operator has not
+    merged), refuse to guess.
+    """
+    try:
+        merge_base = (
+            await _git(
+                "merge-base", "HEAD", remote_ref,
+                cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        ).stdout.strip()
+        changed = await _git(
+            "diff", "--name-only", merge_base, remote_ref,
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+        local_changed = await _git(
+            "diff", "--name-only", merge_base, "HEAD",
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (GitError, asyncio.TimeoutError, OSError):
+        return False
+
+    paths = [p for p in changed.stdout.splitlines() if p.strip()]
+    local_paths = {p for p in local_changed.stdout.splitlines() if p.strip()}
+    mode = "remote_changes_already_local"
+    for path in paths:
+        if await _blob_equal(home=home, left="HEAD", right=remote_ref, path=path):
+            continue
+        if not _is_proposal_surface_path(path) or path not in local_paths:
+            return False
+        # Protected-surface proposal merges can be superseded by the live local
+        # version (e.g. operator asked for a tightening after the PR branch was
+        # already opened). In that narrow surface, preserve local HEAD over the
+        # squash-merged remote and recommit the delta after resetting to origin.
+        mode = "remote_changes_superseded_locally"
+
+    try:
+        await _git(
+            "reset", "--soft", remote_ref,
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+        has_cached = await _has_diff(home, "--cached")
+        has_worktree = await _has_diff(home)
+        if has_cached or has_worktree:
+            await _git(
+                "add", "-A", cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+            await _git(
+                "commit", "-m",
+                (
+                    f"Reconcile local state after {remote_ref} merge\n\n"
+                    f"turn {turn_id}; branch {branch}"
+                ),
+                cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+    except (GitError, asyncio.TimeoutError, OSError):
+        return False
+
+    await log_event(
+        "git_pull_reconciled",
+        mode=mode,
+        remote_ref=remote_ref,
+        turn_id=turn_id,
+    )
+    return True
+
+
+def _is_proposal_surface_path(path: str) -> bool:
+    return (
+        path == "prompts"
+        or path.startswith("prompts/")
+        or path.startswith("memory/core/")
+    )
+
+
+async def _blob_equal(*, home: Path, left: str, right: str, path: str) -> bool:
+    async def show(ref: str) -> bytes | None:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "show", f"{ref}:{path}",
+            cwd=str(home),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_b, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return None
+        return stdout_b
+
+    try:
+        return await show(left) == await show(right)
+    except (asyncio.TimeoutError, OSError):
+        return False
+
+
+async def _has_diff(home: Path, *args: str) -> bool:
+    try:
+        await _git("diff", "--quiet", *args, cwd=home, timeout=COMMAND_TIMEOUT_SECONDS)
+        return False
+    except GitError as exc:
+        return exc.returncode == 1
+    except (asyncio.TimeoutError, OSError):
+        return True
 
 
 async def _has_origin_remote(home: Path) -> bool:
@@ -541,30 +811,47 @@ async def _retry_push(*, home: Path, delay: float, attempt: int, turn_id: str) -
         return
 
     key = _home_key(home)
-    # Try the push.
+    branch = await _current_branch(home)
+    # Try the pull/reconcile + push.
     error_reason = None
     error_returncode = None
-    try:
-        await _git("push", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        error_reason = "timeout"
-    except GitError as exc:
-        error_reason = _short_err(exc)
-        error_returncode = exc.returncode
-    except asyncio.CancelledError:
-        return
-    except OSError as exc:
-        error_reason = _short_err(exc)
+    if not await _sync_remote_before_push(home=home, turn_id=turn_id, branch=branch):
+        error_reason = "pull_blocked"
+    else:
+        try:
+            if branch:
+                await _git(
+                    "push", "origin", f"HEAD:{branch}",
+                    cwd=home, timeout=PUSH_TIMEOUT_SECONDS,
+                )
+            else:
+                await _git("push", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            error_reason = "timeout"
+        except GitError as exc:
+            error_reason = _short_err(exc)
+            error_returncode = exc.returncode
+        except asyncio.CancelledError:
+            return
+        except OSError as exc:
+            error_reason = _short_err(exc)
 
     if error_reason is None:
         # Success.
-        _push_retry_tasks.pop(key, None)
+        async with _get_lock(home):
+            current = _push_retry_tasks.get(key)
+            if current is asyncio.current_task():
+                _push_retry_tasks.pop(key, None)
         extra: dict[str, Any] = {"via": "retry", "attempt": attempt + 1}
         await log_event("git_push_ok", turn_id=turn_id, **extra)
         return
 
     # Failure — log it.
-    fail_extra: dict[str, Any] = {"reason": error_reason, "attempt": attempt + 1, "turn_id": turn_id}
+    fail_extra: dict[str, Any] = {
+        "reason": error_reason,
+        "attempt": attempt + 1,
+        "turn_id": turn_id,
+    }
     if error_returncode is not None:
         fail_extra["returncode"] = error_returncode
     await log_event("git_push_failed", **fail_extra)
@@ -574,15 +861,31 @@ async def _retry_push(*, home: Path, delay: float, attempt: int, turn_id: str) -
     if next_attempt >= len(PUSH_RETRY_DELAYS):
         # Retries exhausted — emit algedonic escalation.
         unpushed = await _count_unpushed_commits(home)
-        await log_event("git_push_stale", unpushed_commits=unpushed, attempts=next_attempt, turn_id=turn_id)
-        _push_retry_tasks.pop(key, None)
+        await log_event(
+            "git_push_stale",
+            unpushed_commits=unpushed,
+            attempts=next_attempt,
+            turn_id=turn_id,
+        )
+        async with _get_lock(home):
+            current = _push_retry_tasks.get(key)
+            if current is asyncio.current_task():
+                _push_retry_tasks.pop(key, None)
         return
 
     # Schedule next retry. This overwrites our own ref in the dict (we're done
     # after this return; the new task is the live retry).
-    _push_retry_tasks[key] = asyncio.create_task(
-        _retry_push(home=home, delay=PUSH_RETRY_DELAYS[next_attempt], attempt=next_attempt, turn_id=turn_id)
-    )
+    async with _get_lock(home):
+        current = _push_retry_tasks.get(key)
+        if current is asyncio.current_task():
+            _push_retry_tasks[key] = asyncio.create_task(
+                _retry_push(
+                    home=home,
+                    delay=PUSH_RETRY_DELAYS[next_attempt],
+                    attempt=next_attempt,
+                    turn_id=turn_id,
+                )
+            )
 
 
 async def _count_unpushed_commits(home: Path) -> int:
