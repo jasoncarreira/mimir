@@ -271,6 +271,14 @@ class ShellJobRegistry:
                 rc = proc.wait()
             except Exception:
                 rc = -1
+            # proc.wait() can return before the stdout/stderr drainer
+            # threads have copied the final pipe bytes into the files
+            # read_output() tails. Do not mark the job finished until the
+            # drainers have closed; otherwise callers that wait on
+            # ``exit_code is not None`` can race and see an empty tail for
+            # short commands such as ``echo two``.
+            for thread in drain_threads:
+                thread.join()
             with job._lock:
                 job.exit_code = rc
                 job.finished_at = time.time()
@@ -281,18 +289,23 @@ class ShellJobRegistry:
                     # Never let a callback error break the registry.
                     log.exception("on_complete callback raised for job %s", job_id)
 
-        threading.Thread(
-            target=_drain,
-            args=(proc.stdout, stdout_f, job.touch),
-            daemon=True,
-            name=f"shelljob-out-{job_id}",
-        ).start()
-        threading.Thread(
-            target=_drain,
-            args=(proc.stderr, stderr_f, job.touch),
-            daemon=True,
-            name=f"shelljob-err-{job_id}",
-        ).start()
+        drain_threads = [
+            threading.Thread(
+                target=_drain,
+                args=(proc.stdout, stdout_f, job.touch),
+                daemon=True,
+                name=f"shelljob-out-{job_id}",
+            ),
+            threading.Thread(
+                target=_drain,
+                args=(proc.stderr, stderr_f, job.touch),
+                daemon=True,
+                name=f"shelljob-err-{job_id}",
+            ),
+        ]
+
+        for thread in drain_threads:
+            thread.start()
         threading.Thread(
             target=_waiter,
             daemon=True,
