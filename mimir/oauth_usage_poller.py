@@ -407,6 +407,17 @@ def days_since_first_login(
 # ─── HTTP: refresh + usage fetch ───────────────────────────────────────
 
 
+def _redacted_error_body(text: str, *, limit: int = 200) -> str:
+    """Bounded placeholder for upstream error bodies that may echo secrets.
+
+    OAuth providers can mirror the submitted refresh token in error responses.
+    Those exception messages flow into events.jsonl via poll_once, so never copy
+    response bytes into them — preserve only size/truncation metadata for debug.
+    """
+    suffix = "; truncated" if len(text) > limit else ""
+    return f"<redacted response body; {len(text)} chars{suffix}>"
+
+
 class OAuthRefreshError(Exception):
     """Raised when the refresh-token grant fails. Distinguishes the
     `logged_out` algedonic case (4xx invalid_grant) from transient
@@ -457,7 +468,7 @@ async def refresh_access_token(
 
     if status >= 500:
         raise OAuthRefreshError(
-            f"refresh server error {status}: {text[:200]}",
+            f"refresh server error {status}: {_redacted_error_body(text)}",
             logged_out=False,
             status=status,
         )
@@ -465,7 +476,7 @@ async def refresh_access_token(
         # 400/401 with invalid_grant means the refresh token itself is
         # dead — operator must re-/login.
         raise OAuthRefreshError(
-            f"refresh denied {status}: {text[:200]}",
+            f"refresh denied {status}: {_redacted_error_body(text)}",
             logged_out=True,
             status=status,
         )
@@ -473,7 +484,7 @@ async def refresh_access_token(
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
         raise OAuthRefreshError(
-            f"refresh response not JSON: {exc}; body={text[:200]}",
+            f"refresh response not JSON: {exc}; body={_redacted_error_body(text)}",
             logged_out=False,
         ) from exc
 
@@ -536,13 +547,13 @@ async def fetch_usage(
         ) from exc
     if status == 401:
         raise UsageFetchError(
-            f"usage endpoint 401: {text[:200]}",
+            f"usage endpoint 401: {_redacted_error_body(text)}",
             unauthorized=True,
             status=status,
         )
     if status >= 400:
         raise UsageFetchError(
-            f"usage endpoint {status}: {text[:200]}",
+            f"usage endpoint {status}: {_redacted_error_body(text)}",
             unauthorized=False,
             status=status,
         )
@@ -550,7 +561,7 @@ async def fetch_usage(
         return json.loads(text)
     except json.JSONDecodeError as exc:
         raise UsageFetchError(
-            f"usage response not JSON: {exc}; body={text[:200]}",
+            f"usage response not JSON: {exc}; body={_redacted_error_body(text)}",
             unauthorized=False,
         ) from exc
 

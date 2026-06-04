@@ -56,10 +56,11 @@ Output contract (matches open-strix):
   to report). **Non-zero**: error, surfaces as ``poller_nonzero_exit``.
 
 Subprocess gets these env vars injected automatically:
-- ``STATE_DIR`` — the skill directory (writable, cursor/state files).
+- ``STATE_DIR`` — the poller's persistent state directory.
 - ``POLLER_NAME`` — the poller's name from pollers.json.
-- The host process's environment, plus ``env`` overrides from the
-  poller's pollers.json entry.
+- A scrubbed subset of the host process environment, explicit ``pass_env``
+  passthrough keys, plus literal ``env`` overrides from the poller's
+  pollers.json entry.
 
 The 60-second timeout is hard-capped; longer-running pollers should
 either run faster or restructure as ``async-tasks``-style background
@@ -135,6 +136,91 @@ POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS = 300
 #: prefix without duplicating the literal. Sibling of
 #: :data:`mimir.scheduler.SCHEDULER_CHANNEL_PREFIX`.
 POLLER_CHANNEL_PREFIX = "poller:"
+
+
+_BUILTIN_POLLER_ENV_ALLOWLIST = frozenset({
+    # Shell + locale
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TZ",
+    "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+    "LC_COLLATE", "LC_NUMERIC", "LC_TIME",
+    # XDG basedirs (gh + other CLIs respect XDG_CONFIG_HOME)
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR", "XDG_STATE_HOME",
+    # Temp-dir overrides for noexec-/tmp setups
+    "TMPDIR", "TMP", "TEMP",
+    # CA bundles for custom-cert containers
+    "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    # Python
+    "PYTHONUNBUFFERED",
+    # Terminal
+    "TERM", "COLUMNS", "LINES",
+})
+_DENY_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
+_DENY_ENV_PREFIXES = ("MIMIR_",)
+# chainlink #229: hard-deny on process-control / loader env vars that can
+# hijack the subprocess. Unlike suffix/prefix names (which can pass via
+# ``pass_env`` with an audit event), these never pass through.
+_PROCESS_CONTROL_ENV_DENY = frozenset({
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FORCE_FLAT_NAMESPACE",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PYTHONHOME",
+    "PYTHONUSERBASE",
+})
+_POLLER_INJECTED_ENV_KEYS = frozenset({"STATE_DIR", "POLLER_NAME"})
+
+
+def _extra_poller_env_allowlist() -> set[str]:
+    return {
+        k.strip()
+        for k in os.environ.get("MIMIR_POLLER_ENV_ALLOWLIST", "").split(",")
+        if k.strip()
+    }
+
+
+def _allowed_poller_env_key(k: str, *, allowed: set[str] | frozenset[str] | None = None) -> bool:
+    if allowed is None:
+        allowed = _BUILTIN_POLLER_ENV_ALLOWLIST | _extra_poller_env_allowlist()
+    if k not in allowed:
+        return False
+    if any(k.endswith(s) for s in _DENY_ENV_SUFFIXES):
+        return False
+    if any(k.startswith(p) for p in _DENY_ENV_PREFIXES):
+        return False
+    return True
+
+
+def _poller_env_available_at_discovery(
+    *,
+    env_raw: dict[str, object],
+    pass_env: list[str],
+    injected_keys: set[str] | frozenset[str] = _POLLER_INJECTED_ENV_KEYS,
+) -> set[str]:
+    """Return env keys that will exist in the assembled subprocess env.
+
+    Mirrors ``run_poller`` without values or async logging: scrubbed host env,
+    explicit ``pass_env`` passthrough except process-control hard-denies, literal
+    manifest ``env`` overrides, and framework-injected names. Discovery uses this
+    to decide whether ``env_required`` pollers are schedulable.
+    """
+    allowed = _BUILTIN_POLLER_ENV_ALLOWLIST | _extra_poller_env_allowlist()
+    available = {
+        k for k in os.environ
+        if _allowed_poller_env_key(k, allowed=allowed)
+    }
+    available.update(
+        k for k in pass_env
+        if k not in _PROCESS_CONTROL_ENV_DENY and k in os.environ
+    )
+    available.update(str(k) for k in env_raw)
+    available.update(injected_keys)
+    return available
 
 # Pollers manifest schema version history:
 #
@@ -452,17 +538,17 @@ def discover_pollers(
                 key = item.strip()
                 if key:
                     env_required_clean.append(key)
-            # chainlink #351: don't even schedule a poller whose required env is
-            # unset. Without this the cron fires every tick only to no-op — via
-            # the #108 per-run env_required skip, or the script's own "nothing
-            # to do" — spamming logs (e.g. github-poller every 15m when
-            # GITHUB_REPOS is unset). #108 fails loudly per-run; this fails
-            # *quietly* at discovery (one warning, no cron job). Availability =
-            # the parent env (what pass_env forwards) plus any manifest ``env``
-            # override.
+            # chainlink #351/#357: don't even schedule a poller whose
+            # required env is unset in the env that ``run_poller`` will actually
+            # assemble. This must mirror runtime: scrubbed allowlist-filtered
+            # os.environ + explicit pass_env + manifest env + injected STATE_DIR
+            # / POLLER_NAME. Checking raw os.environ here schedules pollers that
+            # later no-op every tick because the required key is denied; failing
+            # to include injected keys skips pollers that would run.
             if env_required_clean:
-                _env_avail = set(os.environ) | (
-                    set(env_raw) if isinstance(env_raw, dict) else set()
+                _env_avail = _poller_env_available_at_discovery(
+                    env_raw=env_raw,
+                    pass_env=pass_env_clean,
                 )
                 _missing_req = [k for k in env_required_clean if k not in _env_avail]
                 if _missing_req:
@@ -710,74 +796,11 @@ async def run_poller(
     # Allowlist: shell/locale basics, XDG paths, CA bundles, TMPDIR.
     # PR #111 review widening — initial allowlist was too narrow and
     # would break common pollers (``gh`` users with custom XDG,
-    # custom-CA containers, noexec-/tmp setups).
-    #
-    # Skill authors who need an additional env key declare it in
-    # ``pollers.json``'s ``env`` block (per-skill operator-review
-    # surface) OR the operator can extend the global allowlist via
-    # ``MIMIR_POLLER_ENV_ALLOWLIST`` (comma-separated keys).
-    #
-    # Hard-deny suffixes / prefixes apply REGARDLESS of operator
-    # allowlist additions: ``*_API_KEY``, ``*_TOKEN``, ``*_SECRET``,
-    # ``*_PASSWORD`` and ``MIMIR_*`` never reach a poller subprocess.
-    _BUILTIN_ALLOWLIST = {
-        # Shell + locale
-        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TZ",
-        "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
-        "LC_COLLATE", "LC_NUMERIC", "LC_TIME",
-        # XDG basedirs (gh + other CLIs respect XDG_CONFIG_HOME)
-        "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
-        "XDG_RUNTIME_DIR", "XDG_STATE_HOME",
-        # Temp-dir overrides for noexec-/tmp setups
-        "TMPDIR", "TMP", "TEMP",
-        # CA bundles for custom-cert containers
-        "SSL_CERT_FILE", "SSL_CERT_DIR",
-        "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
-        # Python
-        "PYTHONUNBUFFERED",
-        # Terminal
-        "TERM", "COLUMNS", "LINES",
-    }
-    extra_keys = {
-        k.strip()
-        for k in os.environ.get(
-            "MIMIR_POLLER_ENV_ALLOWLIST", "",
-        ).split(",")
-        if k.strip()
-    }
-    _allowed = _BUILTIN_ALLOWLIST | extra_keys
-    _DENY_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
-    _DENY_PREFIXES = ("MIMIR_",)
-    # chainlink #229: hard-deny on process-control / loader env vars that
-    # can hijack the subprocess. UNLIKE the suffix/prefix patterns above
-    # (which emit ``poller_env_passthrough_named_secret`` but still
-    # propagate the value), these are NEVER passed through — even via
-    # ``pass_env``. A skill manifest containing
-    # ``pass_env: ["LD_PRELOAD"]`` would otherwise silently inject an
-    # arbitrary shared library into the poller subprocess.
-    _PROCESS_CONTROL_DENY = frozenset({
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "LD_AUDIT",
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH",
-        "DYLD_FORCE_FLAT_NAMESPACE",
-        "PYTHONPATH",
-        "PYTHONSTARTUP",
-        "PYTHONHOME",
-        "PYTHONUSERBASE",
-    })
-
-    def _allowed_env_key(k: str) -> bool:
-        if k not in _allowed:
-            return False
-        if any(k.endswith(s) for s in _DENY_SUFFIXES):
-            return False
-        if any(k.startswith(p) for p in _DENY_PREFIXES):
-            return False
-        return True
-
-    env = {k: v for k, v in os.environ.items() if _allowed_env_key(k)}
+    # custom-CA containers, noexec-/tmp setups). Skill authors who need
+    # additional keys use manifest ``env``, manifest ``pass_env``, or the
+    # global ``MIMIR_POLLER_ENV_ALLOWLIST``. Keep this path in sync with
+    # ``_poller_env_available_at_discovery``.
+    env = {k: v for k, v in os.environ.items() if _allowed_poller_env_key(k)}
     # Per-poller pass_env (chainlink #82 sub #83/#85): explicit
     # whitelist of env keys that bypass the deny-suffix/deny-prefix
     # filter AND the built-in allowlist. This is how pollers get
@@ -813,7 +836,7 @@ async def run_poller(
         # the os.environ check, so the deny fires even when the var is
         # set in os.environ (the only interesting case from a security
         # standpoint — if it's unset, propagation is moot).
-        if key in _PROCESS_CONTROL_DENY:
+        if key in _PROCESS_CONTROL_ENV_DENY:
             await log_event(
                 "poller_env_process_control_blocked",
                 poller=poller.name,
@@ -823,8 +846,8 @@ async def run_poller(
         if key not in os.environ:
             continue
         env[key] = os.environ[key]
-        if any(key.endswith(s) for s in _DENY_SUFFIXES) or any(
-            key.startswith(p) for p in _DENY_PREFIXES
+        if any(key.endswith(s) for s in _DENY_ENV_SUFFIXES) or any(
+            key.startswith(p) for p in _DENY_ENV_PREFIXES
         ):
             await log_event(
                 "poller_env_passthrough_named_secret",
@@ -844,8 +867,8 @@ async def run_poller(
     # the wrong thing in ``env``).  Emit a negative event so the algedonic
     # block surfaces this configuration smell.  The value is NOT logged.
     for key in poller.env:
-        if any(key.endswith(s) for s in _DENY_SUFFIXES) or any(
-            key.startswith(p) for p in _DENY_PREFIXES
+        if any(key.endswith(s) for s in _DENY_ENV_SUFFIXES) or any(
+            key.startswith(p) for p in _DENY_ENV_PREFIXES
         ):
             await log_event(
                 "poller_env_secret_reintroduced",

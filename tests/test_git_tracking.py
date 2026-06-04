@@ -743,6 +743,46 @@ async def test_push_failure_schedules_retry(
 
 
 @pytest.mark.asyncio
+async def test_debounced_push_schedules_retry_under_home_lock(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chainlink #322: retry-task state is mutated while holding the per-home lock."""
+    _short_debounce(monkeypatch, 0.01)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
+    key = git_tracking._home_key(home_repo)
+    observed: list[bool] = []
+
+    async def fake_has_origin(_home: Path) -> bool:
+        return True
+
+    async def fake_git(*args: str, **kwargs: Any) -> Any:
+        if args and args[0] == "pull":
+            return git_tracking.GitResult(stdout="", stderr="")
+        if args and args[0] == "push":
+            raise git_tracking.GitError(1, "network error", args)
+        return git_tracking.GitResult(stdout="", stderr="")
+
+    def fake_schedule_retry_locked(**kwargs: Any) -> None:
+        observed.append(git_tracking._get_lock(home_repo).locked())
+        git_tracking._push_retry_tasks[key] = asyncio.create_task(asyncio.sleep(10))
+
+    monkeypatch.setattr(git_tracking, "_has_origin_remote", fake_has_origin)
+    monkeypatch.setattr(git_tracking, "_git", fake_git)
+    monkeypatch.setattr(git_tracking, "_schedule_push_retry_locked", fake_schedule_retry_locked)
+
+    task = asyncio.create_task(git_tracking._debounced_push(turn_id="t-lock", home=home_repo))
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert observed == [True]
+    retry = git_tracking._push_retry_tasks.get(key)
+    assert retry is not None
+    retry.cancel()
+
+
+@pytest.mark.asyncio
 async def test_retry_success_emits_git_push_ok(
     home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

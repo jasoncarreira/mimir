@@ -340,6 +340,43 @@ async def test_refresh_access_token_5xx_is_transient(
 
 
 @pytest.mark.asyncio
+async def test_refresh_access_token_redacts_error_body_secrets(
+    cfg: PollerConfig, credentials_path: Path,
+) -> None:
+    oauth = read_credentials(credentials_path)
+    secret = oauth["refreshToken"]
+    session = _MockSession(post_resp=_MockResponse(400, {
+        "error": "invalid_grant",
+        "echoed_refresh_token": secret,
+    }))
+
+    with pytest.raises(OAuthRefreshError) as exc:
+        await op.refresh_access_token(session, oauth, cfg)
+
+    message = str(exc.value)
+    assert secret not in message
+    assert "echoed_refresh_token" not in message
+    assert "<redacted response body;" in message
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_redacts_non_json_error_body(
+    cfg: PollerConfig, credentials_path: Path,
+) -> None:
+    oauth = read_credentials(credentials_path)
+    secret = oauth["refreshToken"]
+    session = _MockSession(post_resp=_MockResponse(503, f"upstream echoed {secret}"))
+
+    with pytest.raises(OAuthRefreshError) as exc:
+        await op.refresh_access_token(session, oauth, cfg)
+
+    message = str(exc.value)
+    assert secret not in message
+    assert "upstream echoed" not in message
+    assert "<redacted response body;" in message
+
+
+@pytest.mark.asyncio
 async def test_refresh_access_token_falls_back_to_old_refresh_when_omitted(
     cfg: PollerConfig, credentials_path: Path,
 ) -> None:
@@ -392,6 +429,23 @@ async def test_fetch_usage_403_not_unauthorized(cfg: PollerConfig) -> None:
         await op.fetch_usage(session, "tok", cfg)
     assert exc.value.unauthorized is False
     assert exc.value.status == 403
+
+
+@pytest.mark.asyncio
+async def test_fetch_usage_redacts_error_body_secrets(cfg: PollerConfig) -> None:
+    secret = "sk-ant-oat01-secret-token"
+    session = _MockSession(get_resps=[_MockResponse(403, {
+        "error": "forbidden",
+        "echoed_access_token": secret,
+    })])
+
+    with pytest.raises(UsageFetchError) as exc:
+        await op.fetch_usage(session, secret, cfg)
+
+    message = str(exc.value)
+    assert secret not in message
+    assert "echoed_access_token" not in message
+    assert "<redacted response body;" in message
 
 
 # ─── snapshot recording ───────────────────────────────────────────────
