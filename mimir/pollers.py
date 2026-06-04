@@ -72,6 +72,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -546,6 +547,25 @@ def discover_pollers(
     return pollers
 
 
+def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    """Kill a shell poller and any child process it spawned.
+
+    ``create_subprocess_shell`` starts a shell wrapper; killing only the
+    shell can leave the actual poller child holding stdout/stderr pipes
+    open, which makes timeout handling hang while drain tasks wait for
+    EOF. Pollers are launched in their own session, so POSIX platforms can
+    kill the whole process group. Fall back to ``proc.kill()`` where
+    process groups are unavailable.
+    """
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:  # pragma: no cover - non-POSIX fallback
+            proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 async def _drain_capped(
     stream: "asyncio.StreamReader | None",
     limit: int,
@@ -863,6 +883,7 @@ async def run_poller(
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(poller.skill_dir),
                 env=env,
+                start_new_session=True,
             )
             # chainlink #258: drain stdout/stderr with hard byte ceilings
             # rather than communicate() (which buffers the WHOLE stream
@@ -875,22 +896,30 @@ async def run_poller(
             def _on_overflow() -> None:
                 if not _overflow["hit"]:
                     _overflow["hit"] = True
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
+                    _kill_process_group(proc)
 
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                asyncio.gather(
-                    _drain_capped(
-                        proc.stdout, MAX_POLLER_STDOUT_BYTES, _on_overflow,
-                    ),
-                    _drain_capped(
-                        proc.stderr, MAX_POLLER_STDERR_BYTES, _on_overflow,
-                    ),
+            stdout_task = asyncio.create_task(
+                _drain_capped(
+                    proc.stdout, MAX_POLLER_STDOUT_BYTES, _on_overflow,
                 ),
-                timeout=timeout,
             )
+            stderr_task = asyncio.create_task(
+                _drain_capped(
+                    proc.stderr, MAX_POLLER_STDERR_BYTES, _on_overflow,
+                ),
+            )
+            _, pending = await asyncio.wait(
+                {stdout_task, stderr_task}, timeout=timeout,
+            )
+            if pending:
+                _kill_process_group(proc)
+                await proc.wait()
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                raise asyncio.TimeoutError
+            stdout_bytes = stdout_task.result()
+            stderr_bytes = stderr_task.result()
             await proc.wait()
             if _overflow["hit"]:
                 await log_event(
@@ -947,10 +976,7 @@ async def run_poller(
         # exited via ``communicate``); on timeout or exception it
         # ensures we don't leak orphans / zombies.
         if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+            _kill_process_group(proc)
             try:
                 await proc.wait()
             except (ProcessLookupError, asyncio.CancelledError):

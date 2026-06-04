@@ -660,7 +660,8 @@ def test_activation_hist_no_summary_counts_as_never_accessed(tmp_path: Path) -> 
     db_path = tmp_path / "saga.db"
     conn = _make_db(db_path)
     # Atom exists but has no atom_access_summary row.
-    _insert_atom(conn, "nosummary", created_at="2026-05-28T05:00:00Z")
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _insert_atom(conn, "nosummary", created_at=now_ts)
     conn.close()
 
     result = build_activation_hist_payload(db_path, days=7)
@@ -674,16 +675,21 @@ def test_activation_hist_produces_buckets(tmp_path: Path) -> None:
     db_path = tmp_path / "saga.db"
     conn = _make_db(db_path)
     # Two atoms with access summaries — different recency → different activation.
-    _insert_atom(conn, "recent", created_at="2026-05-28T05:00:00Z")
+    now_dt = datetime.now(timezone.utc)
+    now_ts = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    one_hour_ago = (now_dt - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    two_hours_ago = (now_dt - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    seven_days_ago = (now_dt - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _insert_atom(conn, "recent", created_at=now_ts)
     _insert_access_summary(
         conn, "recent",
-        recent_ts=["2026-05-28T04:00:00Z", "2026-05-28T03:00:00Z"],
+        recent_ts=[one_hour_ago, two_hours_ago],
         recent_weights=[1.0, 1.0],
     )
-    _insert_atom(conn, "old-atom", created_at="2026-05-28T05:00:00Z")
+    _insert_atom(conn, "old-atom", created_at=now_ts)
     _insert_access_summary(
         conn, "old-atom",
-        recent_ts=["2026-05-21T00:00:00Z"],
+        recent_ts=[seven_days_ago],
         recent_weights=[1.0],
     )
     conn.close()
@@ -721,8 +727,12 @@ def test_activation_hist_single_activation_produces_one_bucket(tmp_path: Path) -
     """When all activations are identical, should get one bucket (not error)."""
     db_path = tmp_path / "saga.db"
     conn = _make_db(db_path)
-    _insert_atom(conn, "a1", created_at="2026-05-28T05:00:00Z")
-    _insert_access_summary(conn, "a1", recent_ts=["2026-05-28T03:00:00Z"])
+    now_dt = datetime.now(timezone.utc)
+    _insert_atom(conn, "a1", created_at=now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    _insert_access_summary(
+        conn, "a1",
+        recent_ts=[(now_dt - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")],
+    )
     conn.close()
 
     result = build_activation_hist_payload(db_path, days=7)
@@ -841,10 +851,17 @@ def saga_app_phase2(tmp_path: Path):
     db_path = tmp_path / "saga.db"
     conn = _make_db(db_path)
     _insert_session(conn, "sess-1", "discord-1")
-    _insert_atom(conn, "atom-A", content="alpha atom content here", session_id="sess-1")
-    _insert_atom(conn, "atom-B", content="beta atom here too")
-    _insert_atom(conn, "atom-C", content="gamma content", session_id="sess-1")
-    _insert_access_summary(conn, "atom-A")
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _insert_atom(
+        conn, "atom-A", content="alpha atom content here",
+        session_id="sess-1", created_at=now_ts,
+    )
+    _insert_atom(conn, "atom-B", content="beta atom here too", created_at=now_ts)
+    _insert_atom(
+        conn, "atom-C", content="gamma content",
+        session_id="sess-1", created_at=now_ts,
+    )
+    _insert_access_summary(conn, "atom-A", recent_ts=[now_ts], last_updated_ts=now_ts)
     conn.close()
 
     a = web.Application()

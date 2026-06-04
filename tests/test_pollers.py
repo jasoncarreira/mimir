@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from mimir import poller_recovery
 from mimir.event_logger import init_logger
 from mimir.models import AgentEvent
 from mimir.pollers import (
@@ -501,6 +502,202 @@ print(json.dumps({
     # framework-required keys, not metadata.
     assert "prompt" not in item
     assert "poller" not in item
+
+
+# ─── poller_recovery framework wiring (chainlink #314) ────────────────
+
+
+def test_discover_pollers_reads_recover_failed_turns_flag(tmp_path: Path):
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {
+            "name": "recovering",
+            "command": "x",
+            "cron": "* * * * *",
+            "recover_failed_turns": True,
+        },
+    ])
+    [p] = discover_pollers(skills)
+    assert p.recover_failed_turns is True
+
+
+@pytest.mark.asyncio
+async def test_run_poller_stashes_accepted_events_when_recovery_enabled(
+    tmp_path: Path, home: Path,
+) -> None:
+    """The run_poller integration path must stash accepted AgentEvents
+    when recover_failed_turns=True; unit tests for poller_recovery alone
+    don't prove the framework actually calls stash_enqueued_event()."""
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "prompt": "needs review", "id": "evt-1"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir, recover_failed_turns=True,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+
+    assert n == 1
+    assert len(enq.events) == 1
+    source_id = enq.events[0].source_id
+    state = poller_recovery._load_state(persist_dir)
+    assert source_id in state["inflight"]
+    stashed = state["inflight"][source_id]["event"]
+    assert stashed["content"] == "needs review"
+    assert stashed["extra"]["items"] == [{"id": "evt-1"}]
+
+
+@pytest.mark.asyncio
+async def test_run_poller_does_not_stash_rejected_events_when_recovery_enabled(
+    tmp_path: Path, home: Path,
+) -> None:
+    """A dispatcher rejection is back-pressure, not an in-flight turn;
+    it must not be stashed for later recovery."""
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "prompt": "queue full"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir, recover_failed_turns=True,
+    )
+    n = await run_poller(cfg, enqueue=_CapturingEnqueue(accept=False))
+
+    assert n == 0
+    assert poller_recovery._load_state(persist_dir)["inflight"] == {}
+
+
+@pytest.mark.asyncio
+async def test_run_poller_reconciles_failed_turn_before_next_poll(
+    tmp_path: Path, home: Path,
+) -> None:
+    """The framework-level hook must run reconcile_failed_turns() before
+    the subprocess poll so failed prior turns are re-enqueued on the next
+    healthy poll cycle."""
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir, recover_failed_turns=True,
+    )
+    prior = AgentEvent(
+        trigger="poller",
+        channel_id="poller:x",
+        content="retry me",
+        source="poller",
+        source_id="poller:x:123:batch:0",
+        extra={"poller_name": "x", "items": [{"id": "old"}]},
+    )
+    poller_recovery.stash_enqueued_event(persist_dir, prior)
+    events_path = home / "logs" / "events.jsonl"
+    with events_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "type": "turn_failed",
+            "timestamp": "2026-06-04T08:00:00+00:00",
+            "channel_id": "poller:x",
+            "source_id": "poller:x:123:batch:0",
+        }) + "\n")
+
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+
+    assert n == 0  # the subprocess was silent; recovery re-fire is separate
+    assert [e.content for e in enq.events] == ["retry me"]
+    state = poller_recovery._load_state(persist_dir)
+    assert state["inflight"]["poller:x:123:batch:0"]["attempts"] == 1
+    recovery_events = [
+        e for e in _read_events(home) if e["type"] == "poller_recovery"
+    ]
+    assert recovery_events[-1]["poller"] == "x"
+    assert recovery_events[-1]["reenqueued"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_poller_recovery_back_pressure_does_not_advance_attempts(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir, recover_failed_turns=True,
+    )
+    prior = AgentEvent(
+        trigger="poller", channel_id="poller:x", content="retry later",
+        source="poller", source_id="poller:x:456:batch:0",
+        extra={"poller_name": "x", "items": []},
+    )
+    poller_recovery.stash_enqueued_event(persist_dir, prior)
+    events_path = home / "logs" / "events.jsonl"
+    with events_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "type": "turn_failed",
+            "timestamp": "2026-06-04T08:00:00+00:00",
+            "channel_id": "poller:x",
+            "source_id": "poller:x:456:batch:0",
+        }) + "\n")
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue(accept=False))
+
+    state = poller_recovery._load_state(persist_dir)
+    assert state["inflight"]["poller:x:456:batch:0"]["attempts"] == 0
+    recovery_events = [
+        e for e in _read_events(home) if e["type"] == "poller_recovery"
+    ]
+    # Deferred-only recovery does not log the summary event; it remains
+    # pending for the next poll cycle.
+    assert recovery_events == []
+
+
+@pytest.mark.asyncio
+async def test_run_poller_recovery_give_up_logs_summary_and_drops_entry(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", "pass\n")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir, recover_failed_turns=True,
+    )
+    prior = AgentEvent(
+        trigger="poller", channel_id="poller:x", content="wedge",
+        source="poller", source_id="poller:x:789:batch:0",
+        extra={"poller_name": "x", "items": []},
+    )
+    poller_recovery.stash_enqueued_event(persist_dir, prior)
+    state = poller_recovery._load_state(persist_dir)
+    state["inflight"]["poller:x:789:batch:0"]["attempts"] = 3
+    poller_recovery._save_state(persist_dir, state)
+    events_path = home / "logs" / "events.jsonl"
+    with events_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "type": "turn_failed",
+            "timestamp": "2026-06-04T08:00:00+00:00",
+            "channel_id": "poller:x",
+            "source_id": "poller:x:789:batch:0",
+        }) + "\n")
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue())
+
+    assert poller_recovery._load_state(persist_dir)["inflight"] == {}
+    events = _read_events(home)
+    assert any(e["type"] == "poller_turn_gave_up" for e in events)
+    recovery_events = [e for e in events if e["type"] == "poller_recovery"]
+    assert recovery_events[-1]["gave_up"] == 1
 
 
 # ─── run_poller: error paths ─────────────────────────────────────────
