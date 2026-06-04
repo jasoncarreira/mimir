@@ -363,6 +363,10 @@ def _resolve_model(
                 f"Install via `pip install 'mimir-agent[{extra}]'` "
                 "(or `uv pip install langchain-codex-plus`)."
             ) from exc
+        from ._langchain_codex_plus_patches import (
+            install_codex_plus_transient_retry_patch,
+        )
+        install_codex_plus_transient_retry_patch(ChatCodexPlus)
         model_name = spec.split(":", 1)[1]
         # reasoning_effort defaults to "none" (mimir's cheap-inference
         # baseline) but is settable across providers via
