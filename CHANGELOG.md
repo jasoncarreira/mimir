@@ -24,12 +24,12 @@ refresh, event redaction, background tasks, and weather timeouts.
   skill docs change without requiring a process restart. (#572)
 - **Shared background-task helper.** Fire-and-forget bridge/server tasks now go
   through a shared strong-reference helper so asyncio tasks are retained until
-  completion. (#371, #573)
+  completion. (#573)
 
 ### Fixed
 
 - **Version-bump skill-drift digest no longer lists orphaned skills.** The
-  `mimir_update_digest` skills_drift list (#363/#565) counted orphaned custom
+  `mimir_update_digest` skills_drift list (#565) counted orphaned custom
   skills (no shipped source) as "drift" — but they aren't fixable via
   `mimir skills update --apply`, so they were noise. Now only skills with a
   source counterpart (real differs/added drift) are reported. Surfaced by the
@@ -43,18 +43,17 @@ refresh, event redaction, background tasks, and weather timeouts.
 - **Release-polish fixes for git tracking, poller feedback, and OAuth usage.**
   Home git tracking is guarded on main, squash-sync/proposal bookkeeping is
   tightened, poller feedback rendering is cleaned up, and OAuth usage polling
-  handles the release-polish edge cases tracked by #357/#320/#322/#368. (#571)
+  handles the release-polish edge cases. (#571)
 - **Event logs redact token-shaped secrets at the sink.** `EventLogger._record()`
   now recursively redacts token-shaped strings before writing `events.jsonl`, and
   `git_bootstrap` reuses the shared redactor instead of carrying duplicate
-  regexes. (#370, #573)
+  regexes. (#573)
 - **Bridge/server fire-and-forget tasks retain strong references.** Discord and
   Slack bridge retry/logging tasks, Discord typing-trigger work, and startup
-  index sweeps now keep tasks strongly referenced until they finish. (#371,
-  #573)
+  index sweeps now keep tasks strongly referenced until they finish. (#573)
 - **Weather skill network calls have explicit timeouts.** OpenWeather `urlopen()`
   calls now use a 10-second timeout so a stalled network request does not hang
-  the skill path indefinitely. (#372, #573)
+  the skill path indefinitely. (#573)
 
 ## [0.2.13] — 2026-06-03
 
