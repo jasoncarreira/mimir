@@ -218,9 +218,18 @@ async def test_debounced_push_pulls_rebase_before_push(
     approved core-memory change) flows into the live home before we push."""
     _short_debounce(monkeypatch, 0.05)
     upstream = tmp_path / "up.git"
-    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(upstream)], check=True)
-    subprocess.run(["git", "remote", "add", "origin", str(upstream)], cwd=home_repo, check=True)
-    subprocess.run(["git", "push", "-q", "-u", "origin", "main"], cwd=home_repo, check=True)
+    subprocess.run(
+        ["git", "init", "--bare", "-q", "-b", "main", str(upstream)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(upstream)],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", "-u", "origin", "main"],
+        cwd=home_repo, check=True,
+    )
 
     calls: list[tuple[str, ...]] = []
     real_git = git_tracking._git
@@ -241,10 +250,17 @@ async def test_debounced_push_pulls_rebase_before_push(
 
     seq = [" ".join(a) for a in calls]
     pull_idx = next(i for i, s in enumerate(seq) if s.startswith("pull --rebase"))
-    push_idx = next(i for i, s in enumerate(seq) if s == "push")
+    push_idx = next(
+        i for i, s in enumerate(seq)
+        if s == "push" or s.startswith("push origin HEAD:")
+    )
     assert pull_idx < push_idx
     events = _read_events(tmp_path)
-    assert not [e for e in events if e["type"] in ("git_push_failed", "git_pull_blocked")]
+    failures = [
+        e for e in events
+        if e["type"] in ("git_push_failed", "git_pull_blocked")
+    ]
+    assert not failures
     assert [e for e in events if e["type"] == "git_push_ok"]
 
 
@@ -256,9 +272,18 @@ async def test_debounced_push_aborts_rebase_and_skips_push_on_pull_failure(
     log git_pull_blocked, and skip the push this cycle (a later one catches up)."""
     _short_debounce(monkeypatch, 0.05)
     upstream = tmp_path / "up.git"
-    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(upstream)], check=True)
-    subprocess.run(["git", "remote", "add", "origin", str(upstream)], cwd=home_repo, check=True)
-    subprocess.run(["git", "push", "-q", "-u", "origin", "main"], cwd=home_repo, check=True)
+    subprocess.run(
+        ["git", "init", "--bare", "-q", "-b", "main", str(upstream)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(upstream)],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", "-u", "origin", "main"],
+        cwd=home_repo, check=True,
+    )
 
     calls: list[tuple[str, ...]] = []
     real_git = git_tracking._git
@@ -271,6 +296,14 @@ async def test_debounced_push_aborts_rebase_and_skips_push_on_pull_failure(
             # Pretend a rebase was in progress and got aborted → conflict path
             # (rebase --abort succeeding is how the code detects a real conflict).
             return git_tracking.GitResult(stdout="", stderr="")
+        if len(args) >= 3 and args[0] == "diff" and args[1] == "--name-only":
+            # Non-proposal-surface remote change: not safe for the #368
+            # redundant/superseded-proposal reconciliation path.
+            return git_tracking.GitResult(stdout="memory/conflict.md\n", stderr="")
+        if args[:2] == ("reset", "--soft"):
+            raise git_tracking.GitError(
+                1, "simulated unsafe reconcile", args, stdout=""
+            )
         return await real_git(*args, **kwargs)
 
     monkeypatch.setattr(git_tracking, "_git", flaky_git)
@@ -283,10 +316,25 @@ async def test_debounced_push_aborts_rebase_and_skips_push_on_pull_failure(
     assert git_tracking._pending_push_task is not None
     await asyncio.wait_for(git_tracking._pending_push_task, timeout=3.0)
 
+    # Let the retry task that was scheduled for the blocked pull shut down before
+    # inspecting the call log; this test is about the debounced push cycle, not
+    # the later retry path.
+    for task in list(git_tracking._push_retry_tasks.values()):
+        if task is not None and not task.done():
+            task.cancel()
+    await asyncio.sleep(0)
+
     seq = [" ".join(a) for a in calls]
-    assert any(s.startswith("pull --rebase") for s in seq)
-    assert "rebase --abort" in seq      # cleaned up the half-applied rebase
-    assert "push" not in seq            # push skipped this cycle
+    first_abort_idx = seq.index("rebase --abort")
+    before_retry = seq[: first_abort_idx + 1]
+    assert any(s.startswith("pull --rebase") for s in before_retry)
+    # cleaned up the half-applied rebase, then skipped push for this cycle.
+    assert "rebase --abort" in before_retry
+    pushed = any(
+        s == "push" or s.startswith("push origin HEAD:")
+        for s in before_retry
+    )
+    assert not pushed
     blocked = [e for e in _read_events(tmp_path) if e["type"] == "git_pull_blocked"]
     assert blocked and blocked[0]["turn_id"] == "t2"
 
@@ -600,6 +648,135 @@ async def test_no_remote_skips_push_silently(
     push_failures = [e for e in events if e["type"] == "git_push_failed"]
     assert push_failures == []
 
+@pytest.mark.asyncio
+async def test_debounced_push_reconciles_squash_merged_proposal_surface(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chainlink #368: a squash-merged proposal commit can conflict with local
+    commits that already contain a tightened/superseding version of the same
+    protected file. The push sync should reset onto origin and preserve the live
+    local protected-surface content as a fresh commit instead of wedging forever.
+    """
+    _short_debounce(monkeypatch, 0.0)
+    upstream = tmp_path / "upstream.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-q", "-b", "main", str(upstream)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(upstream)],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", "-u", "origin", "main"],
+        cwd=home_repo, check=True,
+    )
+
+    core = home_repo / "memory" / "core"
+    core.mkdir(parents=True)
+    rule = core / "40-learned-behaviors.md"
+    rule.write_text("local tightened rule\n")
+    subprocess.run(
+        ["git", "add", str(rule.relative_to(home_repo))],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "local tightened proposal"],
+        cwd=home_repo, check=True,
+    )
+
+    remote_work = tmp_path / "remote-work"
+    subprocess.run(["git", "clone", "-q", str(upstream), str(remote_work)], check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "remote@example.com"],
+        cwd=remote_work, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "remote"],
+        cwd=remote_work, check=True,
+    )
+    (remote_work / "memory" / "core").mkdir(parents=True, exist_ok=True)
+    (remote_work / "memory" / "core" / "40-learned-behaviors.md").write_text(
+        "remote squash version\n"
+    )
+    subprocess.run(
+        ["git", "add", "memory/core/40-learned-behaviors.md"],
+        cwd=remote_work, check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "squash merged proposal"],
+        cwd=remote_work, check=True,
+    )
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=remote_work, check=True)
+
+    await git_tracking._debounced_push(turn_id="t-squash", home=home_repo)
+
+    assert rule.read_text() == "local tightened rule\n"
+    remote_show = subprocess.run(
+        ["git", "show", "origin/main:memory/core/40-learned-behaviors.md"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    )
+    assert remote_show.stdout == "local tightened rule\n"
+    events = _read_events(tmp_path)
+    reconciled = [e for e in events if e["type"] == "git_pull_reconciled"]
+    assert reconciled[-1]["mode"] == "remote_changes_superseded_locally"
+    assert [e for e in events if e["type"] == "git_pull_blocked"] == []
+    assert [e for e in events if e["type"] == "git_push_failed"] == []
+
+
+@pytest.mark.asyncio
+async def test_debounced_push_restores_stale_main_upstream_and_pushes_explicit_branch(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chainlink #368: if main's upstream is stale (e.g. points at a proposal
+    branch), sync should restore origin/main and push HEAD:main explicitly.
+    """
+    _short_debounce(monkeypatch, 0.0)
+    upstream = tmp_path / "upstream.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-q", "-b", "main", str(upstream)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(upstream)],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", "-u", "origin", "main"],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", "origin", "main:proposal/stale"],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "branch", "--set-upstream-to", "origin/proposal/stale", "main"],
+        cwd=home_repo, check=True,
+    )
+
+    (home_repo / "memory").mkdir(exist_ok=True)
+    (home_repo / "memory" / "x.md").write_text("x\n")
+    subprocess.run(["git", "add", "memory/x.md"], cwd=home_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "local state"],
+        cwd=home_repo, check=True,
+    )
+
+    await git_tracking._debounced_push(turn_id="t-upstream", home=home_repo)
+
+    upstream_ref = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    )
+    assert upstream_ref.stdout.strip() == "origin/main"
+    remote_file = subprocess.run(
+        ["git", "show", "origin/main:memory/x.md"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    )
+    assert remote_file.stdout == "x\n"
+    events = _read_events(tmp_path)
+    assert [e for e in events if e["type"] == "git_push_failed"] == []
+
 
 # ─── porcelain summary helper ───────────────────────────────────────
 
@@ -712,7 +889,8 @@ async def test_push_failure_schedules_retry(
 ) -> None:
     """A push failure should schedule a retry task in _push_retry_tasks."""
     _short_debounce(monkeypatch, 0.02)
-    monkeypatch.setattr(git_tracking, "PUSH_RETRY_DELAYS", (5.0, 10.0, 20.0))  # long — just check scheduling
+    # long delays — this test only checks scheduling.
+    monkeypatch.setattr(git_tracking, "PUSH_RETRY_DELAYS", (5.0, 10.0, 20.0))
 
     subprocess.run(
         ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
@@ -771,9 +949,13 @@ async def test_debounced_push_schedules_retry_under_home_lock(
 
     monkeypatch.setattr(git_tracking, "_has_origin_remote", fake_has_origin)
     monkeypatch.setattr(git_tracking, "_git", fake_git)
-    monkeypatch.setattr(git_tracking, "_schedule_push_retry_locked", fake_schedule_retry_locked)
+    monkeypatch.setattr(
+        git_tracking, "_schedule_push_retry_locked", fake_schedule_retry_locked
+    )
 
-    task = asyncio.create_task(git_tracking._debounced_push(turn_id="t-lock", home=home_repo))
+    task = asyncio.create_task(
+        git_tracking._debounced_push(turn_id="t-lock", home=home_repo)
+    )
     await asyncio.wait_for(task, timeout=2.0)
 
     assert observed == [True]
@@ -876,9 +1058,11 @@ async def test_retry_exhaustion_emits_git_push_stale(
 async def test_new_commit_cancels_retry(
     home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A new commit (triggering a debounce push) should cancel any pending retry task."""
+    """A new commit (triggering a debounce push) should cancel any pending
+    retry task."""
     _short_debounce(monkeypatch, 0.02)
-    monkeypatch.setattr(git_tracking, "PUSH_RETRY_DELAYS", (10.0, 20.0, 40.0))  # long so retry stays pending
+    # long delays so retry stays pending.
+    monkeypatch.setattr(git_tracking, "PUSH_RETRY_DELAYS", (10.0, 20.0, 40.0))
 
     subprocess.run(
         ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
@@ -976,7 +1160,10 @@ async def test_commit_nothing_to_commit_on_stdout_is_soft_noop(
     await git_tracking.commit_turn_changes(
         turn_id="t1", trigger="poller", home=home_repo, enabled=True,
     )
-    failures = [e for e in _read_events(tmp_path) if e.get("type") == "git_commit_failed"]
+    failures = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_commit_failed"
+    ]
     assert not failures, f"'nothing to commit' must be a soft no-op; got {failures}"
 
 
@@ -1003,8 +1190,13 @@ async def test_commit_real_error_still_emits_git_commit_failed(
     await git_tracking.commit_turn_changes(
         turn_id="t2", trigger="poller", home=home_repo, enabled=True,
     )
-    failures = [e for e in _read_events(tmp_path) if e.get("type") == "git_commit_failed"]
-    assert len(failures) == 1, f"real commit error must emit git_commit_failed; got {failures}"
+    failures = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_commit_failed"
+    ]
+    assert len(failures) == 1, (
+        f"real commit error must emit git_commit_failed; got {failures}"
+    )
     assert failures[0].get("stage") == "commit"
 
 

@@ -444,35 +444,19 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
     if not await _has_origin_remote(home):
         return
     key = _home_key(home)
-    # Pull remote merges (e.g. an approved core-memory PR — chainlink #337/#340)
-    # before pushing, so the merge flows into the live working tree and the
-    # next turn's load_core picks it up. ``--rebase`` replays our local turn-
-    # commits on top. On failure (conflict / auth / timeout) abort any half-
-    # applied rebase to leave the tree clean, log, and skip the push this cycle
-    # — a later debounce / retry catches up. Conflicts shouldn't arise: core
-    # PRs touch memory/core, turn-commits touch turns.jsonl / state / *.db.
+    branch = await _current_branch(home)
+    if not await _sync_remote_before_push(home=home, turn_id=turn_id, branch=branch):
+        async with _get_lock(home):
+            _schedule_push_retry_locked(key=key, home=home, turn_id=turn_id)
+        return
     try:
-        await _git("pull", "--rebase", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
-    except (GitError, asyncio.TimeoutError, OSError) as exc:
-        # Distinguish a rebase CONFLICT from a transient/remote failure: if
-        # ``rebase --abort`` succeeds there WAS a rebase in progress (a
-        # conflict) — skip the push and surface git_pull_blocked, since pushing
-        # a half-reconciled tree is wrong. If there's nothing to abort, the
-        # pull failed before rebasing (unreachable remote / auth / timeout);
-        # fall through to the push so the existing retry/backoff path handles
-        # it just as it did before pull-before-push was added.
-        aborted = False
-        try:
-            await _git("rebase", "--abort", cwd=home, timeout=COMMAND_TIMEOUT_SECONDS)
-            aborted = True
-        except (GitError, asyncio.TimeoutError, OSError):
-            pass
-        if aborted:
-            await log_event("git_pull_blocked", reason=_short_err(exc), turn_id=turn_id)
-            return
-        # else: transient/remote pull failure — fall through to the push.
-    try:
-        await _git("push", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
+        if branch:
+            await _git(
+                "push", "origin", f"HEAD:{branch}",
+                cwd=home, timeout=PUSH_TIMEOUT_SECONDS,
+            )
+        else:
+            await _git("push", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         await log_event(
             "git_push_failed",
@@ -526,6 +510,194 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
 # ─── helpers ─────────────────────────────────────────────────────────
 
 
+async def _current_branch(home: Path) -> str | None:
+    """Return the checked-out branch name, or None for detached/unknown HEAD."""
+    try:
+        result = await _git(
+            "rev-parse", "--abbrev-ref", "HEAD",
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (GitError, asyncio.TimeoutError, OSError):
+        return None
+    branch = result.stdout.strip()
+    return branch if branch and branch != "HEAD" else None
+
+
+async def _sync_remote_before_push(
+    *, home: Path, turn_id: str, branch: str | None,
+) -> bool:
+    """Fetch/rebase the current branch before pushing.
+
+    The normal state-repo path is ``main`` tracking ``origin/main``. Proposal
+    work and squash merges can leave two sharp edges (chainlink #368): the
+    branch upstream can point at a stale proposal ref, and a squash-merged
+    proposal can make ``pull --rebase`` conflict even when the remote-edited
+    paths already match local content. This helper makes the push path explicit
+    about the remote branch, restores tracking best-effort, and reconciles the
+    redundant-squash case by resetting onto origin while preserving any
+    local-only diff as a fresh commit.
+    """
+    if branch is None:
+        # Detached or otherwise unusual; keep the pre-#368 behavior and let the
+        # eventual push surface any problem.
+        return True
+
+    remote_ref = f"origin/{branch}"
+    try:
+        await _git("fetch", "origin", branch, cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
+    except (GitError, asyncio.TimeoutError, OSError):
+        return True  # transient/auth failures are handled by the push retry path.
+
+    # Best-effort self-heal for a stale upstream (e.g. main tracking a proposal
+    # branch after a proposal worktree cycle). Subsequent ``git push`` calls from
+    # humans/scripts then work too, but the agent push below is explicit anyway.
+    try:
+        await _git(
+            "branch", "--set-upstream-to", remote_ref, branch,
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (GitError, asyncio.TimeoutError, OSError):
+        pass
+
+    try:
+        await _git(
+            "pull", "--rebase", "origin", branch,
+            cwd=home, timeout=PUSH_TIMEOUT_SECONDS,
+        )
+        return True
+    except (GitError, asyncio.TimeoutError, OSError) as exc:
+        # Distinguish a rebase CONFLICT from a transient/remote failure: if
+        # ``rebase --abort`` succeeds there WAS a rebase in progress.
+        aborted = False
+        try:
+            await _git("rebase", "--abort", cwd=home, timeout=COMMAND_TIMEOUT_SECONDS)
+            aborted = True
+        except (GitError, asyncio.TimeoutError, OSError):
+            pass
+        if not aborted:
+            return True  # unreachable remote/auth/etc.; let push retry handle it.
+
+        if await _reconcile_redundant_remote_changes(
+            home=home, remote_ref=remote_ref, turn_id=turn_id, branch=branch,
+        ):
+            return True
+
+        await log_event("git_pull_blocked", reason=_short_err(exc), turn_id=turn_id)
+        return False
+
+
+async def _reconcile_redundant_remote_changes(
+    *, home: Path, remote_ref: str, turn_id: str, branch: str,
+) -> bool:
+    """Self-heal a squash-merge rebase conflict when remote changes are already local.
+
+    If every path changed by ``remote_ref`` since the merge-base has the same
+    blob at local HEAD, then the remote merge is content-redundant with local
+    history. Reset to the remote commit and recommit any remaining local-only
+    diff as one reconciliation commit. If a remote-touched path differs locally
+    (e.g. the local version is a substantive revision the operator has not
+    merged), refuse to guess.
+    """
+    try:
+        merge_base = (
+            await _git(
+                "merge-base", "HEAD", remote_ref,
+                cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        ).stdout.strip()
+        changed = await _git(
+            "diff", "--name-only", merge_base, remote_ref,
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+        local_changed = await _git(
+            "diff", "--name-only", merge_base, "HEAD",
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (GitError, asyncio.TimeoutError, OSError):
+        return False
+
+    paths = [p for p in changed.stdout.splitlines() if p.strip()]
+    local_paths = {p for p in local_changed.stdout.splitlines() if p.strip()}
+    mode = "remote_changes_already_local"
+    for path in paths:
+        if await _blob_equal(home=home, left="HEAD", right=remote_ref, path=path):
+            continue
+        if not _is_proposal_surface_path(path) or path not in local_paths:
+            return False
+        # Protected-surface proposal merges can be superseded by the live local
+        # version (e.g. operator asked for a tightening after the PR branch was
+        # already opened). In that narrow surface, preserve local HEAD over the
+        # squash-merged remote and recommit the delta after resetting to origin.
+        mode = "remote_changes_superseded_locally"
+
+    try:
+        await _git(
+            "reset", "--soft", remote_ref,
+            cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+        has_cached = await _has_diff(home, "--cached")
+        has_worktree = await _has_diff(home)
+        if has_cached or has_worktree:
+            await _git(
+                "add", "-A", cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+            await _git(
+                "commit", "-m",
+                (
+                    f"Reconcile local state after {remote_ref} merge\n\n"
+                    f"turn {turn_id}; branch {branch}"
+                ),
+                cwd=home, timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+    except (GitError, asyncio.TimeoutError, OSError):
+        return False
+
+    await log_event(
+        "git_pull_reconciled",
+        mode=mode,
+        remote_ref=remote_ref,
+        turn_id=turn_id,
+    )
+    return True
+
+
+def _is_proposal_surface_path(path: str) -> bool:
+    return (
+        path == "prompts"
+        or path.startswith("prompts/")
+        or path.startswith("memory/core/")
+    )
+
+
+async def _blob_equal(*, home: Path, left: str, right: str, path: str) -> bool:
+    async def show(ref: str) -> bytes | None:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "show", f"{ref}:{path}",
+            cwd=str(home),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_b, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return None
+        return stdout_b
+
+    try:
+        return await show(left) == await show(right)
+    except (asyncio.TimeoutError, OSError):
+        return False
+
+
+async def _has_diff(home: Path, *args: str) -> bool:
+    try:
+        await _git("diff", "--quiet", *args, cwd=home, timeout=COMMAND_TIMEOUT_SECONDS)
+        return False
+    except GitError as exc:
+        return exc.returncode == 1
+    except (asyncio.TimeoutError, OSError):
+        return True
+
+
 async def _has_origin_remote(home: Path) -> bool:
     """Return True iff ``git remote get-url origin`` succeeds.
 
@@ -553,20 +725,30 @@ async def _retry_push(*, home: Path, delay: float, attempt: int, turn_id: str) -
         return
 
     key = _home_key(home)
-    # Try the push.
+    branch = await _current_branch(home)
+    # Try the pull/reconcile + push.
     error_reason = None
     error_returncode = None
-    try:
-        await _git("push", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        error_reason = "timeout"
-    except GitError as exc:
-        error_reason = _short_err(exc)
-        error_returncode = exc.returncode
-    except asyncio.CancelledError:
-        return
-    except OSError as exc:
-        error_reason = _short_err(exc)
+    if not await _sync_remote_before_push(home=home, turn_id=turn_id, branch=branch):
+        error_reason = "pull_blocked"
+    else:
+        try:
+            if branch:
+                await _git(
+                    "push", "origin", f"HEAD:{branch}",
+                    cwd=home, timeout=PUSH_TIMEOUT_SECONDS,
+                )
+            else:
+                await _git("push", cwd=home, timeout=PUSH_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            error_reason = "timeout"
+        except GitError as exc:
+            error_reason = _short_err(exc)
+            error_returncode = exc.returncode
+        except asyncio.CancelledError:
+            return
+        except OSError as exc:
+            error_reason = _short_err(exc)
 
     if error_reason is None:
         # Success.
