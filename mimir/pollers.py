@@ -58,6 +58,9 @@ Output contract (matches open-strix):
 Subprocess gets these env vars injected automatically:
 - ``STATE_DIR`` — the poller's persistent state directory.
 - ``POLLER_NAME`` — the poller's name from pollers.json.
+- ``MIMIR_HOME`` — the agent home root (chainlink #376), so a poller can
+  resolve paths under ``<MIMIR_HOME>/`` without listing it in per-entry
+  ``pass_env`` (accepted skill-drift can otherwise freeze that entry out).
 - A scrubbed subset of the host process environment, explicit ``pass_env``
   passthrough keys, plus literal ``env`` overrides from the poller's
   pollers.json entry.
@@ -173,7 +176,7 @@ _PROCESS_CONTROL_ENV_DENY = frozenset({
     "PYTHONHOME",
     "PYTHONUSERBASE",
 })
-_POLLER_INJECTED_ENV_KEYS = frozenset({"STATE_DIR", "POLLER_NAME"})
+_POLLER_INJECTED_ENV_KEYS = frozenset({"STATE_DIR", "POLLER_NAME", "MIMIR_HOME"})
 
 
 def _extra_poller_env_allowlist() -> set[str]:
@@ -877,6 +880,18 @@ async def run_poller(
             )
     env["STATE_DIR"] = str(persist_dir)
     env["POLLER_NAME"] = poller.name
+    # chainlink #376: the agent home is fundamental for pollers that resolve
+    # paths under ``<MIMIR_HOME>/`` (e.g. gmail-poller's per-account prompt-file
+    # under ``<home>/prompts/``). The ``MIMIR_`` deny-prefix strips it from the
+    # base allowlist, and relying on per-entry ``pass_env`` is fragile — accepted
+    # skill-drift can freeze the entry out (the real gmail-poller bug). Inject it
+    # like STATE_DIR/POLLER_NAME so every poller has it regardless of pass_env.
+    # Source: os.environ (cli.py sets MIMIR_HOME from ``--home``), falling back
+    # to the install layout (``<home>/skills/<skill>`` → home). Injected AFTER
+    # ``poller.env`` so the framework value wins, matching STATE_DIR/POLLER_NAME.
+    env["MIMIR_HOME"] = os.environ.get("MIMIR_HOME") or str(
+        poller.skill_dir.parent.parent
+    )
 
     # chainlink #108: env_required validation — check after the env dict is
     # fully assembled (allowlist + pass_env + poller.env + injected vars).

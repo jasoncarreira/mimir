@@ -514,6 +514,52 @@ print(json.dumps({"poller": "x", "prompt": prompt}))
 
 
 @pytest.mark.asyncio
+async def test_run_poller_injects_mimir_home_from_env(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """chainlink #376: MIMIR_HOME is injected into the poller subprocess so a
+    poller can resolve ``<MIMIR_HOME>/`` paths without listing it in pass_env
+    (the ``MIMIR_`` deny-prefix otherwise strips it from the base env)."""
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({"poller": "x",
+                  "prompt": "mimir_home=" + os.environ.get("MIMIR_HOME", "UNSET")}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    assert enq.events[0].content == f"mimir_home={home}"
+
+
+@pytest.mark.asyncio
+async def test_run_poller_mimir_home_falls_back_to_install_layout(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """When MIMIR_HOME is absent from os.environ, the injection derives it from
+    the install layout (``<home>/skills/<skill>`` → home)."""
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    fake_home = tmp_path / "agent-home"
+    skill_dir = fake_home / "skills" / "my-skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({"poller": "x",
+                  "prompt": "mimir_home=" + os.environ.get("MIMIR_HOME", "UNSET")}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    assert enq.events[0].content == f"mimir_home={fake_home}"
+
+
+@pytest.mark.asyncio
 async def test_run_poller_passes_custom_env_from_config(
     tmp_path: Path, home: Path,
 ) -> None:
