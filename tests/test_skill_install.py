@@ -865,6 +865,88 @@ def test_cmd_update_skills_drift_exits_1(
     assert "1 skill" in out
 
 
+def test_render_file_diff_bounded_and_redacted(tmp_path: Path):
+    """chainlink #378: _render_file_diff yields a redacted, length-bounded diff."""
+    from mimir.skill_install import _MAX_DIFF_LINES_PER_FILE, _render_file_diff
+
+    installed = tmp_path / "installed"
+    source = tmp_path / "source"
+    installed.mkdir()
+    source.mkdir()
+    # A token-shaped value on the installed side must be masked in the output.
+    (installed / "f.txt").write_text("token=ghp_" + "a" * 30 + "\nsame\n")
+    (source / "f.txt").write_text("clean\nsame\n")
+    body = "\n".join(_render_file_diff(installed, source, "f.txt"))
+    assert "installed/f.txt" in body and "source/f.txt" in body
+    assert "ghp_" not in body  # token redacted
+    assert "[REDACTED]" in body
+
+    # A large change is capped with an explicit truncation marker (no silent cut).
+    (installed / "big.txt").write_text("\n".join(f"line-{i}" for i in range(500)))
+    (source / "big.txt").write_text("")
+    big = _render_file_diff(installed, source, "big.txt")
+    assert len(big) <= _MAX_DIFF_LINES_PER_FILE + 1  # +1 for the marker
+    assert any("more diff line" in ln for ln in big)
+
+
+def test_render_file_diff_missing_file_does_not_raise(tmp_path: Path):
+    """Unreadable/missing files yield a note, never an exception."""
+    from mimir.skill_install import _render_file_diff
+
+    (tmp_path / "installed").mkdir()
+    (tmp_path / "source").mkdir()
+    out = _render_file_diff(tmp_path / "installed", tmp_path / "source", "nope.txt")
+    assert out and "no textual diff" in out[0]
+
+
+def test_cmd_update_skills_single_skill_shows_diff_by_default(
+    fake_optional_root: Path, fake_home: Path, capsys, monkeypatch,
+):
+    """chainlink #378: inspecting a single named skill shows the content diff."""
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT", fake_optional_root,
+    )
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    (fake_optional_root / "fake-skill" / "SKILL.md").write_text(
+        "---\nname: fake-skill\ndescription: Updated description.\n---\n"
+    )
+    rc = cmd_update_skills(Namespace(
+        home=fake_home, name="fake-skill", all_skills=False,
+        optional_skills_root=fake_optional_root, apply=False, force=False, diff=False,
+    ))
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "differs from source: SKILL.md" in out
+    assert "installed/SKILL.md" in out and "source/SKILL.md" in out  # diff headers
+    assert "Updated description" in out  # the changed line is shown
+
+
+def test_cmd_update_skills_all_terse_unless_diff_flag(
+    fake_optional_root: Path, fake_home: Path, capsys, monkeypatch,
+):
+    """--all stays terse (file-level) by default; --diff forces the content diff."""
+    monkeypatch.setattr(
+        "mimir.skill_install.DEFAULT_OPTIONAL_SKILLS_ROOT", fake_optional_root,
+    )
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    (fake_optional_root / "fake-skill" / "SKILL.md").write_text(
+        "---\nname: fake-skill\ndescription: Updated description.\n---\n"
+    )
+    cmd_update_skills(Namespace(
+        home=fake_home, name=None, all_skills=True,
+        optional_skills_root=fake_optional_root, apply=False, force=False, diff=False,
+    ))
+    terse = capsys.readouterr().out
+    assert "differs from source: SKILL.md" in terse
+    assert "installed/SKILL.md" not in terse  # no diff body under --all by default
+
+    cmd_update_skills(Namespace(
+        home=fake_home, name=None, all_skills=True,
+        optional_skills_root=fake_optional_root, apply=False, force=False, diff=True,
+    ))
+    assert "installed/SKILL.md" in capsys.readouterr().out  # --diff forces it
+
+
 def test_cmd_update_skills_no_home(tmp_path: Path, capsys):
     """``mimir skills update`` with a non-existent home exits 2."""
     rc = cmd_update_skills(Namespace(
