@@ -53,6 +53,10 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         used = ev.get("count")
         cap = ev.get("budget")
         return f"tool_budget_warning ({used}/{cap})"
+    if rule_kind == "background_task_failed":
+        name = _sanitize_field(ev.get("name") or "?")
+        error = _sanitize_field(ev.get("error") or "(no detail)")
+        return f"background task {name!r} failed: {error}"
     if rule_kind == "loop_stop":
         return f"send_message_loop_hard_stop after {ev.get('count', '?')}"
     if rule_kind == "loop_warn":
