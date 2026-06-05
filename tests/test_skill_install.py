@@ -10,7 +10,7 @@ a non-zero exit cleanly), and the drift-detection logic
 
 from __future__ import annotations
 
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
 import pytest
@@ -800,6 +800,26 @@ def test_cmd_accept_skill_drift_list_and_clear(
 
     assert clear_accepted_skill_drift(fake_home, "fake-poller") is True
     assert list_accepted_skill_drift(fake_home) == []
+
+
+
+def test_skills_update_and_accept_help_cross_reference_intent() -> None:
+    """Update/apply and accept help should expose the inspect / overwrite / keep split."""
+    from mimir.skill_install import add_argparse_accept, add_argparse_update
+
+    update_parser = ArgumentParser(prog="mimir skills update")
+    add_argparse_update(update_parser)
+    update_help = update_parser.format_help()
+
+    accept_parser = ArgumentParser(prog="mimir skills accept")
+    add_argparse_accept(accept_parser)
+    accept_help = accept_parser.format_help()
+
+    assert "read-only (dry-run)" in update_help
+    assert "mimir" in update_help and "skills accept <skill>" in update_help
+    assert "intentional local drift" in accept_help
+    assert "mimir" in accept_help and "skills update --apply" in accept_help
+    assert "overwrite local files with source" in accept_help
 
 
 # ─── cmd_update_skills CLI ────────────────────────────────────────────

@@ -1249,7 +1249,8 @@ def add_argparse_update(parser) -> None:
         help=(
             "Overwrite installed files that differ from source and copy new "
             "files added in source.  Without this flag the command is "
-            "read-only (dry-run)."
+            "read-only (dry-run).  To keep intentional local changes instead "
+            "of overwriting them, use `mimir skills accept <skill>`."
         ),
     )
     parser.add_argument(
@@ -1285,7 +1286,12 @@ def add_argparse_accept(parser) -> None:
         "skill",
         nargs="?",
         default=None,
-        help="Skill whose current differing files should be accepted.",
+        help=(
+            "Skill whose current differing files should be accepted.  Use this "
+            "after `mimir skills update` shows intentional local drift you want "
+            "to keep; use `mimir skills update --apply` for the opposite intent "
+            "(overwrite local files with source)."
+        ),
     )
     parser.add_argument(
         "--file",
