@@ -1278,7 +1278,7 @@ class Scheduler:
             await self._poller_semaphore.acquire()
 
         try:
-            await run_poller(poller, enqueue=self._enqueue)
+            await run_poller(poller, enqueue=self._enqueue, home=self._home)
         finally:
             self._poller_semaphore.release()
 

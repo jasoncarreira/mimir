@@ -193,11 +193,12 @@ def test_discover_required_env_uses_runtime_env_model(
     """chainlink #357: discovery mirrors the env assembled by run_poller.
 
     A raw os.environ secret that is not in pass_env is not available at runtime,
-    while injected STATE_DIR is available even though it is absent from the host
-    process env.
+    while injected STATE_DIR and MIMIR_HOME are available even though they are absent
+    from the host process env.
     """
     monkeypatch.setenv("MIMIR_TEST_SECRET_TOKEN", "present-but-denied")
     monkeypatch.delenv("STATE_DIR", raising=False)
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
     skills = tmp_path / "skills"
     _write_pollers_json(skills / "env-model", [
         {
@@ -217,7 +218,7 @@ def test_discover_required_env_uses_runtime_env_model(
             "name": "injected",
             "command": "python p.py",
             "cron": "*/15 * * * *",
-            "env_required": ["STATE_DIR", "POLLER_NAME"],
+            "env_required": ["STATE_DIR", "POLLER_NAME", "MIMIR_HOME"],
         },
     ])
 
@@ -489,16 +490,21 @@ async def test_run_poller_silence_emits_zero_events(
 
 
 @pytest.mark.asyncio
-async def test_run_poller_injects_state_dir_and_poller_name(
-    tmp_path: Path, home: Path,
+async def test_run_poller_injects_framework_env(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Subprocess receives STATE_DIR + POLLER_NAME env vars per the
+    """Subprocess receives framework-injected env vars per the
     pollers contract. Verified by having the poller print them back
     in its emitted prompt."""
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", """
 import json, os
-prompt = f"state_dir={os.environ['STATE_DIR']} poller_name={os.environ['POLLER_NAME']}"
+prompt = (
+    f"state_dir={os.environ['STATE_DIR']} "
+    f"poller_name={os.environ['POLLER_NAME']} "
+    f"mimir_home={os.environ['MIMIR_HOME']}"
+)
 print(json.dumps({"poller": "x", "prompt": prompt}))
 """)
     cfg = PollerConfig(
@@ -506,11 +512,12 @@ print(json.dumps({"poller": "x", "prompt": prompt}))
         cron="* * * * *", env={}, skill_dir=skill_dir,
     )
     enq = _CapturingEnqueue()
-    await run_poller(cfg, enqueue=enq)
+    await run_poller(cfg, enqueue=enq, home=home)
     assert len(enq.events) == 1
     content = enq.events[0].content
     assert f"state_dir={skill_dir}" in content
     assert "poller_name=my-poller" in content
+    assert f"mimir_home={home}" in content
 
 
 @pytest.mark.asyncio
