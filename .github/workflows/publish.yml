@@ -85,6 +85,11 @@ jobs:
     # (only the one manually-created v0.2.11 did). This closes that gap: every
     # ``v*`` tag now gets a Release with notes from its CHANGELOG section.
     needs: publish
+    # Guard to tag refs: the workflow also has a ``workflow_dispatch`` trigger,
+    # and on a manual dispatch from a branch ``GITHUB_REF_NAME`` is the branch
+    # (e.g. ``main``), which would make ``gh release create main --verify-tag``
+    # fail (or target the wrong ref). Only run this job on a ``v*`` tag push.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write  # the only job that needs write; build/publish stay read
