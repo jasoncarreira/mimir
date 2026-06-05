@@ -227,6 +227,20 @@ def _schedule_push_retry_locked(
         )
 
 
+
+async def _cleanup_resolved_proposal_branches(*, home: Path, turn_id: str) -> None:
+    """Best-effort sweep for resolved protected-file proposal branches (#374)."""
+    try:
+        from .proposals import cleanup_resolved_proposal_branches
+
+        await asyncio.to_thread(cleanup_resolved_proposal_branches, home)
+    except Exception as exc:  # pragma: no cover - defensive; must not block commits
+        await log_event(
+            "proposal_cleanup_failed",
+            turn_id=turn_id,
+            error=_short_err(exc),
+        )
+
 # ─── public API: commit_turn_changes ──────────────────────────────────
 
 
@@ -280,6 +294,7 @@ async def commit_turn_changes(
     if not await _live_home_branch_invariant_ok(home=home, turn_id=turn_id):
         return
     await _ensure_main_upstream_invariant(home=home, turn_id=turn_id)
+    await _cleanup_resolved_proposal_branches(home=home, turn_id=turn_id)
 
     # 1. Fast check — anything to commit? Most turns hit this branch.
     try:

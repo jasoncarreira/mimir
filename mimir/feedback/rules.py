@@ -23,6 +23,8 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # Positive: it supersedes the "open proposal" nudge the prompt renders while
     # a proposal is in flight (the nudge auto-clears once the worktree is gone).
     "proposal_pr_opened": ("positive", "proposal_pr_opened"),
+    "proposal_branch_cleaned": ("positive", "proposal_branch_cleaned"),
+    "proposal_cleanup_failed": ("negative", "proposal_cleanup_failed"),
     # chainlink #353: a prose note under a tracked root (memory/state/prompts)
     # is git-ignored, so the write was silently dropped and won't persist.
     "git_ignored_note_skipped": ("negative", "ignored_write"),

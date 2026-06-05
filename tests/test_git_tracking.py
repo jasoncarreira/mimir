@@ -778,6 +778,27 @@ async def test_debounced_push_restores_stale_main_upstream_and_pushes_explicit_b
     assert [e for e in events if e["type"] == "git_push_failed"] == []
 
 
+# ─── proposal cleanup hook ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_commit_turn_changes_runs_proposal_cleanup_before_status(
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called: list[Path] = []
+
+    def fake_cleanup(home: Path) -> list[object]:
+        called.append(home)
+        return []
+
+    monkeypatch.setattr("mimir.proposals.cleanup_resolved_proposal_branches", fake_cleanup)
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t-cleanup", trigger="scheduled_tick", home=home_repo, enabled=True,
+    )
+
+    assert called == [home_repo]
+
 # ─── porcelain summary helper ───────────────────────────────────────
 
 

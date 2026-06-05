@@ -29,6 +29,7 @@ Sync by design; async callers (the agent tools) wrap in ``asyncio.to_thread``.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import time
@@ -39,6 +40,7 @@ from typing import Callable
 # Reuse the hardened helpers rather than reimplement: ``_redact`` is the shared
 # token scrubber (git_tracking imports it too), ``_run`` the uniform 30s-timeout
 # subprocess wrapper. One redactor is the point — core diffs must not leak creds.
+from .event_logger import log_event_sync
 from .git_bootstrap import _redact, _run
 
 #: Protected surfaces a proposal can change, relative to the home / repo root.
@@ -53,6 +55,8 @@ PROPOSALS_REL = Path("scratch") / "proposals"
 AGENT_PROPOSAL_LANE = "agent"
 UPGRADE_PROPOSAL_LANE = "upgrade"
 PROPOSAL_LANES = (AGENT_PROPOSAL_LANE, UPGRADE_PROPOSAL_LANE)
+#: Remote branch prefixes owned by the protected-file proposal workflow.
+PROPOSAL_BRANCH_PREFIXES = ("proposal/", "upgrade/")
 
 #: ``(home, branch, base, title, body) -> pr_url | None`` — injectable so tests
 #: exercise the git mechanics without a real GitHub.
@@ -114,6 +118,20 @@ class ProposalResult:
     #: "pushed_no_pr" | "error".
     reason: str | None
     detail: str | None = None
+
+
+@dataclass
+class ProposalCleanupRecord:
+    """One proposal-branch cleanup decision.
+
+    ``action`` is ``"deleted"`` when the branch/worktree was removed, otherwise
+    ``"skipped"`` with a reason. The branch tip is recorded for auditability.
+    """
+
+    branch: str
+    tip: str | None
+    action: str
+    reason: str
 
 
 def _git(args: list[str], cwd: Path):
@@ -434,6 +452,179 @@ def abandon_proposal(
     return True
 
 
+
+def _is_proposal_branch(branch: str) -> bool:
+    return branch.startswith(PROPOSAL_BRANCH_PREFIXES)
+
+
+def _is_proposal_surface_path(path: str) -> bool:
+    rel = Path(path)
+    return any(
+        rel == surface or rel.is_relative_to(surface)
+        for surface in PROPOSAL_SURFACES
+    )
+
+
+def _remote_proposal_branches(home: Path) -> list[tuple[str, str | None]]:
+    """Return ``(branch, tip_sha)`` for remote proposal branches under origin."""
+    res = _git(
+        ["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/remotes/origin"],
+        cwd=home,
+    )
+    if res.returncode != 0:
+        return []
+    out: list[tuple[str, str | None]] = []
+    for line in (res.stdout or "").splitlines():
+        if not line.startswith("origin/"):
+            continue
+        rest = line[len("origin/"):]
+        try:
+            branch, tip = rest.rsplit(" ", 1)
+        except ValueError:
+            branch, tip = rest.strip(), None
+        if _is_proposal_branch(branch):
+            out.append((branch, tip or None))
+    return out
+
+
+def _proposal_branch_has_open_pr(home: Path, branch: str) -> bool | None:
+    """Return True/False for an open PR on ``branch``; None when unknown."""
+    if shutil.which("gh") is None:
+        return None
+    res = _run(
+        [
+            "gh", "pr", "list", "--state", "open", "--head", branch,
+            "--json", "number", "--limit", "1",
+        ],
+        cwd=home,
+        capture=True,
+    )
+    if res.returncode != 0:
+        return None
+    try:
+        return bool(json.loads(res.stdout or "[]"))
+    except json.JSONDecodeError:
+        return None
+
+
+def _blob_oid(home: Path, ref: str, path: str) -> str | None:
+    res = _git(["rev-parse", f"{ref}:{path}"], cwd=home)
+    if res.returncode != 0:
+        return None
+    value = (res.stdout or "").strip()
+    return value or None
+
+
+def _proposal_branch_content_is_on_main(
+    home: Path, branch: str, *, main_ref: str = "origin/main"
+) -> bool:
+    """True when ``origin/<branch>`` is merged or content-superseded by main.
+
+    Squash merges change commit SHAs, so ancestry alone is insufficient. For
+    proposal-owned branches, it is safe to compare only the protected proposal
+    surfaces: if every file the branch changed under ``memory/core`` or
+    ``prompts`` has the same blob on ``main_ref``, the proposal content is
+    already present (or superseded by identical content) and the branch can be
+    swept. Any non-proposal-surface change makes the branch ineligible.
+    """
+    remote_ref = f"origin/{branch}"
+    ancestor = _git(["merge-base", "--is-ancestor", remote_ref, main_ref], cwd=home)
+    if ancestor.returncode == 0:
+        return True
+    merge_base = _git(["merge-base", remote_ref, main_ref], cwd=home)
+    base = (merge_base.stdout or "").strip()
+    if merge_base.returncode != 0 or not base:
+        return False
+    changed = _git(["diff", "--name-only", base, remote_ref], cwd=home)
+    if changed.returncode != 0:
+        return False
+    paths = [p for p in (changed.stdout or "").splitlines() if p.strip()]
+    if not paths:
+        return True
+    for path in paths:
+        if not _is_proposal_surface_path(path):
+            return False
+        if _blob_oid(home, remote_ref, path) != _blob_oid(home, main_ref, path):
+            return False
+    return True
+
+
+def _remove_worktree_for_branch(home: Path, branch: str) -> None:
+    for open_branch, worktree in list_open_proposals(home):
+        if open_branch == branch:
+            _cleanup_worktree(home, worktree, branch)
+            return
+    _git(["branch", "-D", branch], cwd=home)
+
+
+def _log_proposal_cleanup(record: ProposalCleanupRecord) -> None:
+    event_type = (
+        "proposal_branch_cleaned"
+        if record.action == "deleted"
+        else "proposal_branch_cleanup_skipped"
+    )
+    try:
+        log_event_sync(
+            event_type,
+            branch=record.branch,
+            tip=record.tip,
+            reason=record.reason,
+        )
+    except Exception:
+        # Cleanup is best-effort audit sugar; absence of an initialized event
+        # logger in CLI/tests must not make branch cleanup fail.
+        pass
+
+
+def cleanup_resolved_proposal_branches(home: Path) -> list[ProposalCleanupRecord]:
+    """Delete remote/local proposal branches whose PR is resolved and content is on main.\n\n    Safety gates:\n    - only proposal-owned prefixes (``proposal/`` and ``upgrade/``),
+    - preserve any branch with an open PR,
+    - delete only when the branch is ancestry-merged or the protected-surface
+      content matches ``origin/main`` (squash-merge/superseded path),
+    - log every deletion with branch name + tip SHA for auditability.
+    """
+    home = Path(home).resolve()
+    if not _has_origin_remote(home):
+        return []
+    records: list[ProposalCleanupRecord] = []
+    # Refresh the proposal refs without mutating main; prune makes already-deleted
+    # GitHub branches disappear from the local remote-tracking view.
+    _git(["fetch", "--prune", "origin"], cwd=home)
+    for branch, tip in _remote_proposal_branches(home):
+        has_open_pr = _proposal_branch_has_open_pr(home, branch)
+        if has_open_pr is True:
+            record = ProposalCleanupRecord(branch, tip, "skipped", "open_pr")
+            _log_proposal_cleanup(record)
+            records.append(record)
+            continue
+        if has_open_pr is None:
+            record = ProposalCleanupRecord(branch, tip, "skipped", "open_pr_unknown")
+            _log_proposal_cleanup(record)
+            records.append(record)
+            continue
+        if not _proposal_branch_content_is_on_main(home, branch):
+            record = ProposalCleanupRecord(branch, tip, "skipped", "content_not_on_main")
+            _log_proposal_cleanup(record)
+            records.append(record)
+            continue
+        delete = _git(["push", "origin", "--delete", branch], cwd=home)
+        if delete.returncode != 0:
+            record = ProposalCleanupRecord(
+                branch,
+                tip,
+                "skipped",
+                _redact(f"delete_failed: {(delete.stderr or '').strip()}"),
+            )
+            _log_proposal_cleanup(record)
+            records.append(record)
+            continue
+        _remove_worktree_for_branch(home, branch)
+        record = ProposalCleanupRecord(branch, tip, "deleted", "resolved_content_on_main")
+        _log_proposal_cleanup(record)
+        records.append(record)
+    return records
+
+
 def render_open_proposals_block(home: Path) -> str | None:
     """Prompt nudge for any open change proposal(s), or None if none.
 
@@ -470,6 +661,8 @@ __all__ = (
     "OpenResult",
     "render_open_proposals_block",
     "ProposalResult",
+    "ProposalCleanupRecord",
+    "cleanup_resolved_proposal_branches",
     "open_proposal",
     "finalize_proposal",
     "abandon_proposal",
@@ -481,4 +674,5 @@ __all__ = (
     "AGENT_PROPOSAL_LANE",
     "UPGRADE_PROPOSAL_LANE",
     "PROPOSAL_LANES",
+    "PROPOSAL_BRANCH_PREFIXES",
 )
