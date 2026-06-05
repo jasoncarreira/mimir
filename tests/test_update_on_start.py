@@ -906,6 +906,7 @@ def test_mimir_update_digest_render_all_surfaces() -> None:
     assert "scheduler +2 tick(s)" in line
     assert "issues-audit" in line
     assert "skills drifted: github" in line
+    assert "mimir skills accept <name>" in line
     assert "env missing: weather/OPENWEATHER_API_KEY" in line
 
 

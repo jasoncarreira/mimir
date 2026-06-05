@@ -2171,7 +2171,10 @@ def test_mimir_update_digest_renders_skill_drift_with_remediation():
         "env_gaps": [],
     })
     assert "social-cli" in line and "github-poller" in line
-    assert "mimir skills update --apply" in line   # actionable remediation
+    assert "mimir skills update --apply" in line   # overwrite remediation
+    assert "mimir skills accept <name>" in line     # keep-local-drift remediation
+    assert "overwrite local files" in line
+    assert "keep intentional local changes" in line
     assert "v0.2.11→0.2.12" in line
 
 
