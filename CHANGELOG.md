@@ -6,6 +6,46 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.15] — 2026-06-05
+
+Reliability + observability: automatic GitHub Releases, poller `MIMIR_HOME`
+injection, proposal-branch cleanup, richer skills-drift remediation, background-
+task failure logging, and a world_state dual-current repair.
+
+### Added
+
+- **Automatic GitHub Releases.** `publish.yml` now creates a GitHub Release for
+  each `v*` tag (after the PyPI publish gate), with notes from the matching
+  CHANGELOG section — so tags appear on the repo's Releases page, not just PyPI.
+  (#581)
+- **`mimir skills update` shows a content diff.** A bounded, redacted unified diff
+  (installed vs source) per drifted file, so the agent can tell intentional drift
+  (→ `mimir skills accept`) from stale drift (→ `--apply`). Shown by default for a
+  single named skill; `--diff` forces it under `--all`. (#579)
+- **Resolved proposal branches are cleaned up.** Consolidation sweeps merged /
+  closed `proposal/*` branches (and their worktrees), fail-closed on unknown PR
+  status so it never deletes a branch with novel unmerged content. (#576)
+
+### Fixed
+
+- **Pollers always get `MIMIR_HOME`.** The poller runner injects `MIMIR_HOME` (from
+  `Config.home`) alongside `STATE_DIR`/`POLLER_NAME`, so a poller resolving paths
+  under the agent home no longer depends on per-entry `pass_env` — which accepted
+  skill-drift could freeze out (the gmail-poller "MIMIR_HOME is unset" warning).
+  (#580)
+- **The skills-drift digest names the keep-vs-overwrite choice.** It now points to
+  `mimir skills accept` (keep intentional local changes) alongside `--apply`
+  (overwrite from source), instead of steering an agent with intentional drift into
+  a clobber loop. (#577)
+- **world_state dual-current rows are repaired.** Consolidation collapses any
+  `(subject, predicate)` left with >1 `is_current` row by a transient write race —
+  keeping the newest, end-dating the rest — so `get_current_value` can't stay
+  ambiguous. Runs on every non-dry-run consolidate. (#582)
+- **Background-task failures are logged.** Fire-and-forget tasks spawned via
+  `spawn_background` emit a `background_task_failed` event (redacted, bounded) on a
+  non-cancellation exception, instead of surfacing only via asyncio's default
+  handler. (#575)
+
 ## [0.2.14] — 2026-06-04
 
 Release hardening for scheduler recovery, skill drift, git tracking, prompt
