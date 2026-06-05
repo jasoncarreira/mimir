@@ -884,10 +884,13 @@ async def run_poller(
     env["STATE_DIR"] = str(persist_dir)
     env["POLLER_NAME"] = poller.name
     # Scheduler passes Config.home here. Direct test/niche callers that omit
-    # it still get a deterministic local home-ish path rather than reading
+    # it still get a deterministic home path from the install layout
+    # (``<home>/skills/<skill>`` → home) rather than reading
     # os.environ["MIMIR_HOME"], which may be absent or stale when mimir is
     # launched with --home.
-    env["MIMIR_HOME"] = str(home if home is not None else poller.skill_dir.parent)
+    env["MIMIR_HOME"] = str(
+        home if home is not None else poller.skill_dir.parent.parent
+    )
 
     # chainlink #108: env_required validation — check after the env dict is
     # fully assembled (allowlist + pass_env + poller.env + injected vars).

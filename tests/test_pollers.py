@@ -521,6 +521,30 @@ print(json.dumps({"poller": "x", "prompt": prompt}))
 
 
 @pytest.mark.asyncio
+async def test_run_poller_mimir_home_falls_back_to_install_layout(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the scheduler doesn't pass ``home`` (direct/niche callers), MIMIR_HOME
+    falls back to the install layout (``<home>/skills/<skill>`` → home), NOT the
+    skills dir and NOT a possibly-stale os.environ value."""
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    fake_home = tmp_path / "agent-home"
+    skill_dir = fake_home / "skills" / "my-skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({"poller": "x",
+                  "prompt": "mimir_home=" + os.environ.get("MIMIR_HOME", "UNSET")}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)  # no home passed → fallback path
+    assert enq.events[0].content == f"mimir_home={fake_home}"
+
+
+@pytest.mark.asyncio
 async def test_run_poller_passes_custom_env_from_config(
     tmp_path: Path, home: Path,
 ) -> None:
