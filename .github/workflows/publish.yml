@@ -75,3 +75,42 @@ jobs:
         # Trusted publishing — no ``password`` / ``username`` /
         # ``api_token`` needed. PyPI verifies the OIDC claim against
         # the pending-publisher config registered for this project.
+
+  github-release:
+    name: Create GitHub Release
+    # Runs only after the PyPI publish (and its ``pypi`` environment gate)
+    # succeeds, so a GitHub Release always implies a published package. Before
+    # this job, ``publish.yml`` only shipped to PyPI and never created a Release
+    # object — so tags showed up on PyPI but not the repo's Releases sidebar
+    # (only the one manually-created v0.2.11 did). This closes that gap: every
+    # ``v*`` tag now gets a Release with notes from its CHANGELOG section.
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # the only job that needs write; build/publish stay read
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create the GitHub Release from the tag + CHANGELOG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"        # e.g. v0.2.15
+          version="${tag#v}"              # e.g. 0.2.15
+          # Idempotent: a re-run on an existing tag must not fail the workflow.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; nothing to do."
+            exit 0
+          fi
+          # Extract the ``## [<version>]`` section (header through the line
+          # before the next ``## [`` heading) as the release notes.
+          notes="$(awk -v v="$version" '/^## \[/{p=($0 ~ "\\["v"\\]")} p' CHANGELOG.md)"
+          if [ -n "$notes" ]; then
+            printf '%s\n' "$notes" > /tmp/relnotes.md
+            gh release create "$tag" --title "$tag" --verify-tag \
+              --notes-file /tmp/relnotes.md
+          else
+            # No CHANGELOG section (shouldn't happen for a release-prepped tag) —
+            # fall back to GitHub's commit/PR auto-generated notes.
+            echo "No CHANGELOG section for $version; using --generate-notes."
+            gh release create "$tag" --title "$tag" --verify-tag --generate-notes
+          fi
