@@ -1469,7 +1469,8 @@ async def test_fire_poller_serializes_through_semaphore(
     max_in_flight = 0
     lock = asyncio.Lock()
 
-    async def fake_run_poller(poller, enqueue):
+    async def fake_run_poller(poller, enqueue, home=None):
+        assert home is sched._home
         nonlocal in_flight, max_in_flight
         async with lock:
             in_flight += 1
@@ -1494,6 +1495,34 @@ async def test_fire_poller_serializes_through_semaphore(
     )
     # All four eventually completed.
     assert in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_fire_poller_passes_scheduler_home_to_run_poller(
+    tmp_path: Path, monkeypatch,
+):
+    """Pollers get the scheduler's authoritative Config.home path, not
+    os.environ, when the framework injects MIMIR_HOME."""
+    async def noop(_e):
+        return True
+
+    home = tmp_path / "agent-home"
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, home=home)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)
+
+    captured = {}
+
+    async def fake_run_poller(poller, enqueue, home=None):
+        captured["poller"] = poller.name
+        captured["home"] = home
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+
+    await sched._fire_poller(poller_name="p1")
+
+    assert captured == {"poller": "p1", "home": home}
 
 
 @pytest.mark.asyncio

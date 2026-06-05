@@ -58,6 +58,7 @@ Output contract (matches open-strix):
 Subprocess gets these env vars injected automatically:
 - ``STATE_DIR`` — the poller's persistent state directory.
 - ``POLLER_NAME`` — the poller's name from pollers.json.
+- ``MIMIR_HOME`` — the authoritative agent home path from ``Config.home``.
 - A scrubbed subset of the host process environment, explicit ``pass_env``
   passthrough keys, plus literal ``env`` overrides from the poller's
   pollers.json entry.
@@ -173,7 +174,7 @@ _PROCESS_CONTROL_ENV_DENY = frozenset({
     "PYTHONHOME",
     "PYTHONUSERBASE",
 })
-_POLLER_INJECTED_ENV_KEYS = frozenset({"STATE_DIR", "POLLER_NAME"})
+_POLLER_INJECTED_ENV_KEYS = frozenset({"STATE_DIR", "POLLER_NAME", "MIMIR_HOME"})
 
 
 def _extra_poller_env_allowlist() -> set[str]:
@@ -542,7 +543,7 @@ def discover_pollers(
             # required env is unset in the env that ``run_poller`` will actually
             # assemble. This must mirror runtime: scrubbed allowlist-filtered
             # os.environ + explicit pass_env + manifest env + injected STATE_DIR
-            # / POLLER_NAME. Checking raw os.environ here schedules pollers that
+            # / POLLER_NAME / MIMIR_HOME. Checking raw os.environ here schedules pollers that
             # later no-op every tick because the required key is denied; failing
             # to include injected keys skips pollers that would run.
             if env_required_clean:
@@ -689,6 +690,7 @@ async def run_poller(
     *,
     enqueue: Callable[[AgentEvent], Awaitable[bool]],
     timeout: float = POLLER_TIMEOUT_SECONDS,
+    home: Path | None = None,
 ) -> int:
     """Run one poller subprocess; parse its stdout JSONL; enqueue
     each emitted event. Returns the count of events successfully
@@ -709,6 +711,10 @@ async def run_poller(
     killed and reaped on every exit path (timeout, exception, normal
     completion), so cancellation mid-run doesn't leak orphan
     subprocesses or kernel-side zombies on long-lived mimir processes.
+
+    ``home`` is the authoritative agent home path supplied by the scheduler
+    from ``Config.home``. It is injected as ``MIMIR_HOME`` for pollers that
+    need to resolve files under the agent home without depending on host env.
 
     Always logs a ``poller_complete`` event at the end so the operator
     can audit "did the poll cycle run?" even when nothing was emitted.
@@ -877,6 +883,14 @@ async def run_poller(
             )
     env["STATE_DIR"] = str(persist_dir)
     env["POLLER_NAME"] = poller.name
+    # Scheduler passes Config.home here. Direct test/niche callers that omit
+    # it still get a deterministic home path from the install layout
+    # (``<home>/skills/<skill>`` → home) rather than reading
+    # os.environ["MIMIR_HOME"], which may be absent or stale when mimir is
+    # launched with --home.
+    env["MIMIR_HOME"] = str(
+        home if home is not None else poller.skill_dir.parent.parent
+    )
 
     # chainlink #108: env_required validation — check after the env dict is
     # fully assembled (allowlist + pass_env + poller.env + injected vars).
