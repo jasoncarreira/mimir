@@ -37,6 +37,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import difflib
 import os
 import re
 import shutil
@@ -46,6 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from mimir._atomic import atomic_write_json
+from mimir.redaction import redact_text
 from mimir.skill_defs import home_skills_dir
 from mimir.skill_md import parse_env_block, parse_frontmatter
 
@@ -1062,8 +1064,53 @@ def detect_skill_drift(
 # ─── CLI wiring (mimir skills update) ────────────────────────────────
 
 
-def _print_drift_report(result: SkillDriftResult) -> None:
-    """Print one skill's drift result to stdout."""
+# Bound on diff lines printed per file so a hand-rewritten SKILL.md doesn't
+# flood the agent's context; the marker keeps truncation explicit (chainlink
+# #378 / no-silent-caps norm).
+_MAX_DIFF_LINES_PER_FILE = 60
+
+
+def _render_file_diff(installed_path: Path, source_path: Path, rel: str) -> list[str]:
+    """Bounded, redacted unified diff (installed vs source) for one differing file.
+
+    Returns indented stdout lines. Best-effort: unreadable files yield a note
+    rather than raising — ``inspect`` must never crash the drift report. The diff
+    is run through the shared ``redact_text`` since it lands in agent context /
+    may be logged (pollers.json / SKILL.md aren't secrets, but cheap insurance).
+    """
+    def _read(p: Path) -> list[str]:
+        try:
+            return p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return []
+
+    diff = list(difflib.unified_diff(
+        _read(installed_path / rel), _read(source_path / rel),
+        fromfile=f"installed/{rel}", tofile=f"source/{rel}", lineterm="",
+    ))
+    if not diff:
+        return ["    (no textual diff — likely a binary or mode-only change)"]
+    omitted = 0
+    if len(diff) > _MAX_DIFF_LINES_PER_FILE:
+        omitted = len(diff) - _MAX_DIFF_LINES_PER_FILE
+        diff = diff[:_MAX_DIFF_LINES_PER_FILE]
+    out = [f"    {redact_text(line)}" for line in diff]
+    if omitted:
+        out.append(
+            f"    … ({omitted} more diff line{'s' if omitted != 1 else ''} "
+            f"omitted — open the files to see the rest)"
+        )
+    return out
+
+
+def _print_drift_report(result: SkillDriftResult, *, show_diff: bool = False) -> None:
+    """Print one skill's drift result to stdout.
+
+    With ``show_diff`` (default when inspecting a single named skill; ``--diff``
+    forces it under ``--all``), each differing file is followed by a bounded,
+    redacted unified diff — so ``inspect`` actually shows WHAT changed, letting
+    the agent choose ``--apply`` (overwrite) vs ``mimir skills accept`` (keep)
+    deliberately rather than blind (chainlink #378)."""
     if result.orphaned:
         print(f"{result.name}: orphaned (no source counterpart in optional-skills/)")
         return
@@ -1079,6 +1126,9 @@ def _print_drift_report(result: SkillDriftResult) -> None:
     for rel in result.differs:
         tag = " (accepted)" if rel in accepted else ""
         print(f"  differs from source: {rel}{tag}")
+        if show_diff and result.source_path is not None:
+            for line in _render_file_diff(result.installed_path, result.source_path, rel):
+                print(line)
     for rel in result.added:
         print(f"  added in source: {rel}")
     for rel in result.extra:
@@ -1251,6 +1301,18 @@ def add_argparse_update(parser) -> None:
             "files added in source.  Without this flag the command is "
             "read-only (dry-run).  To keep intentional local changes instead "
             "of overwriting them, use `mimir skills accept <skill>`."
+        ),
+    )
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        default=False,
+        help=(
+            "Show a bounded, redacted unified diff for each differing file "
+            "(installed vs source) so you can see WHAT changed before choosing "
+            "`--apply` (overwrite) or `mimir skills accept` (keep).  Shown by "
+            "default when a single skill is named; pass this to force diffs "
+            "under --all.  No effect with --apply."
         ),
     )
     parser.add_argument(
@@ -1434,6 +1496,10 @@ def cmd_update_skills(args) -> int:
     src_root: Path | None = getattr(args, "optional_skills_root", None)
     do_apply: bool = getattr(args, "apply", False)
     do_force: bool = getattr(args, "force", False)
+    # chainlink #378: show the content diff so 'inspect' is meaningful. Default
+    # on when a single skill is named (the "inspect this one" case); --diff forces
+    # it under --all. Apply mode stays terse (it's acting, not inspecting).
+    show_diff: bool = getattr(args, "diff", False) or (resolved_name is not None)
 
     try:
         results = detect_skill_drift(home, src_root, name=resolved_name)
@@ -1448,7 +1514,7 @@ def cmd_update_skills(args) -> int:
     if not do_apply:
         # Dry-run: print drift report and exit.
         for r in results:
-            _print_drift_report(r)
+            _print_drift_report(r, show_diff=show_diff)
 
         drift_found = any(r.has_unaccepted_drift for r in results)
         if drift_found:
