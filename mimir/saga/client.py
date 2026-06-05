@@ -1319,19 +1319,29 @@ class SagaStore:
             # supersedes edges (newer-atom-wins strategy). One pass
             # at end of consolidate so the run sees a consistent view
             # of all contradictions discovered together.
-            from .triples import resolve_contradictions_to_supersedes
+            from .triples import (
+                repair_world_state_dual_current,
+                resolve_contradictions_to_supersedes,
+            )
             new_supersedes_from_contra = (
                 resolve_contradictions_to_supersedes(conn) if contradicts_stored
                 else 0
             )
+            # chainlink #331: collapse any world_state (subject, predicate) left
+            # with >1 is_current row by a transient write race. Independent of
+            # the atom-level contradicts pass above (that resolves semantic atom
+            # conflicts to supersedes edges; this fixes world_state structural
+            # integrity), so it runs unconditionally — the detect query is cheap
+            # (a GROUP BY HAVING n>1) and usually finds nothing.
+            world_state_repairs = repair_world_state_dual_current(conn)
             return (emitted, superseded, triples_stored,
-                    contradicts_stored, new_supersedes_from_contra)
+                    contradicts_stored, new_supersedes_from_contra,
+                    world_state_repairs)
 
         # _restructure mutates atoms/observations/triples — write lock
         # serializes it against any concurrent agent-loop store / feedback.
-        emitted, superseded, n_triples, n_contra, n_supersedes_contra = (
-            await self._write_locked(_restructure)
-        )
+        (emitted, superseded, n_triples, n_contra, n_supersedes_contra,
+         world_state_repairs) = await self._write_locked(_restructure)
         return {
             "candidates_scanned": len(raws),
             "clusters_found": len(clusters),
@@ -1342,6 +1352,7 @@ class SagaStore:
             "triples_stored": n_triples,
             "contradicts_stored": n_contra,
             "supersedes_from_contradictions": n_supersedes_contra,
+            "world_state_dual_current_repaired": len(world_state_repairs),
             "dedup": dedup_payload,
         }
 
