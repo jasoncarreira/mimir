@@ -717,6 +717,83 @@ def resolve_contradictions_to_supersedes(
     return added
 
 
+def repair_world_state_dual_current(conn: sqlite3.Connection) -> list[dict]:
+    """Collapse any (subject, predicate) carrying >1 ``is_current=1`` row down to
+    a single current value, end-dating the rest (chainlink #331).
+
+    ``detect_contradictions`` REPORTS the dual-current transient race — triples
+    landing faster than ``_update_world_state`` can end-date the prior current
+    row, or bulk-migrated rows that bypassed the writer — but never repaired it,
+    so ``get_current_value`` stayed ambiguous and nothing fixed it. This is the
+    repair: for each offending key, keep the newest row by ``valid_from`` and set
+    the losers to ``is_current=0`` with ``valid_until`` = the winner's
+    ``valid_from``.
+
+    Returns one record per repaired key —
+    ``{subject, predicate, kept_value, kept_valid_from, superseded:[{value,
+    valid_from}, ...]}`` — and an empty list when world_state is already
+    consistent. Each repair logs at WARNING so the race is observable rather than
+    silent.
+
+    Manages its own transaction (BEGIN IMMEDIATE / COMMIT), matching
+    ``resolve_contradictions_to_supersedes`` — so it composes in the
+    consolidation pass without leaving an open implicit transaction for the next
+    ``BEGIN IMMEDIATE`` caller to trip over.
+    """
+    conflicts = detect_contradictions(conn)  # read-only; identifies candidate keys
+    if not conflicts:
+        return []
+    now = datetime.now(timezone.utc).isoformat()
+    repairs: list[dict] = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for conflict in conflicts:
+            subject = conflict["subject"]
+            predicate = conflict["predicate"]
+            # Re-read under the write lock — the candidate may have raced clean
+            # between detect and here. ``rowid`` keys the UPDATE so it is
+            # NULL-safe (bulk-migrated rows may have NULL valid_from) and never
+            # matches the winner. NULLs sort last under DESC, so a timestamped
+            # row wins; ties fall back to rowid for a deterministic winner.
+            rows = conn.execute(
+                "SELECT rowid, value, valid_from FROM world_state "
+                "WHERE subject = ? AND predicate = ? AND is_current = 1 "
+                "ORDER BY valid_from DESC, rowid DESC",
+                (subject, predicate),
+            ).fetchall()
+            if len(rows) <= 1:
+                continue
+            _, kept_value, kept_valid_from = rows[0]
+            superseded: list[dict] = []
+            for loser_rowid, loser_value, loser_valid_from in rows[1:]:
+                conn.execute(
+                    "UPDATE world_state SET is_current = 0, valid_until = ?, "
+                    "updated_at = ? WHERE rowid = ?",
+                    (kept_valid_from, now, loser_rowid),
+                )
+                superseded.append(
+                    {"value": loser_value, "valid_from": loser_valid_from}
+                )
+            logger.warning(
+                "world_state_dual_current_repaired: (%r, %r) kept %r "
+                "(valid_from=%s); end-dated %d stale current row(s): %s",
+                subject, predicate, kept_value, kept_valid_from,
+                len(superseded), [s["value"] for s in superseded],
+            )
+            repairs.append({
+                "subject": subject,
+                "predicate": predicate,
+                "kept_value": kept_value,
+                "kept_valid_from": kept_valid_from,
+                "superseded": superseded,
+            })
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return repairs
+
+
 __all__ = [
     "make_triple_id",
     "parse_triples",
@@ -728,6 +805,7 @@ __all__ = [
     "WorldFact",
     "detect_contradictions",
     "resolve_contradictions_to_supersedes",
+    "repair_world_state_dual_current",
     "MAX_SUBJECT_CHARS",
     "MAX_OBJECT_CHARS",
 ]

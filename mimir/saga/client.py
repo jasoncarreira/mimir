@@ -1095,10 +1095,27 @@ class SagaStore:
             agent_id=self._agent_id,
             reference_date=reference_date,
         )
+        # chainlink #331: world_state structural integrity — collapse any
+        # dual-current rows from a transient cross-caller write race — is
+        # independent of whether there are enough raws to consolidate. Run it for
+        # EVERY non-dry-run consolidate, BEFORE the candidate-count early return,
+        # so migrated/old corruption sitting in a quiet DB still gets repaired
+        # (the case that's never reached if it lives only in the cluster path).
+        # Within one serialized consolidate ``_update_world_state`` can't create a
+        # dual-current row, so running it here rather than after synthesis loses
+        # nothing; the race is a cross-caller phenomenon this pass cleans up.
+        world_state_repairs: list = []
+        if not dry_run:
+            from .triples import repair_world_state_dual_current
+            world_state_repairs = await self._write_locked(
+                lambda: repair_world_state_dual_current(conn)
+            )
+
         if len(raws) < min_cluster_size:
             return {
                 "clusters_formed": 0,
                 "observations_emitted": [],
+                "world_state_dual_current_repaired": len(world_state_repairs),
                 "dedup": dedup_payload,
             }
 
@@ -1342,6 +1359,7 @@ class SagaStore:
             "triples_stored": n_triples,
             "contradicts_stored": n_contra,
             "supersedes_from_contradictions": n_supersedes_contra,
+            "world_state_dual_current_repaired": len(world_state_repairs),
             "dedup": dedup_payload,
         }
 

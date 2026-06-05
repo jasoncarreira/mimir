@@ -116,6 +116,56 @@ async def test_saga_forget_removes_tombstoned_atoms_from_faiss_index(
             )
 
 
+@pytest.mark.asyncio
+async def test_consolidate_repairs_dual_current_world_state_with_few_raws(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """chainlink #331: the world_state dual-current repair must run on EVERY
+    non-dry-run consolidate — including when there are too few raw atoms to
+    cluster and consolidate short-circuits at the ``< min_cluster_size`` early
+    return. That early-return path is exactly where migrated/old structural
+    corruption sits (a quiet DB with nothing to consolidate). Seed dual-current
+    rows in an otherwise-empty store, run consolidate, and assert the repair
+    fired despite the short-circuit (the bug mimir caught on PR #582)."""
+    from mimir.saga.client import SagaStore
+
+    monkeypatch.setattr(
+        "mimir.saga._config_io.get_config",
+        lambda: lambda s, k, d=None: {
+            ("embedding", "max_input_chars"): 2000,
+            ("embedding", "provider"): "stub",
+            ("embedding", "model"): "stub-4d",
+        }.get((s, k), d),
+    )
+    store = SagaStore(db_path=tmp_path / "test.saga.db", embedding_dim=4)
+    conn = store._ensure_conn()
+    # Seed two is_current=1 rows for one (subject, predicate) — the dual-current
+    # race — directly, bypassing _update_world_state.
+    now = "2024-01-01T00:00:00Z"
+    # source_triple_id stays NULL — the SagaStore connection enforces the FK to
+    # triples(id), and these synthetic rows have no backing triple.
+    for val, vf in (("Boston", "2023-01-01"), ("SF", "2023-02-01")):
+        conn.execute(
+            "INSERT INTO world_state "
+            "(subject, predicate, value, valid_from, valid_until, "
+            " is_current, source_triple_id, updated_at) "
+            "VALUES (?, ?, ?, ?, NULL, 1, NULL, ?)",
+            ("Alice", "lives_in", val, vf, now),
+        )
+    conn.commit()
+
+    # No raw atoms → consolidate hits the < min_cluster_size early return; the
+    # repair must still have run on the way out.
+    result = await store.consolidate()
+
+    assert result["world_state_dual_current_repaired"] == 1
+    current = conn.execute(
+        "SELECT value FROM world_state "
+        "WHERE subject='Alice' AND predicate='lives_in' AND is_current=1",
+    ).fetchall()
+    assert current == [("SF",)]  # newest valid_from kept; the other end-dated
+
+
 # ─── Activation decay edge cases ─────────────────────────────────────
 
 

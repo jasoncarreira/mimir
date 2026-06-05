@@ -13,6 +13,7 @@ from mimir.saga.triples import (
     get_history,
     make_triple_id,
     parse_triples,
+    repair_world_state_dual_current,
     resolve_contradictions_to_supersedes,
     retrieve_by_entity,
     store_triples,
@@ -266,6 +267,73 @@ def test_detect_contradictions_finds_dual_current_values(conn):
     assert conflicts[0]["subject"] == "Alice"
     assert conflicts[0]["count"] == 2
     assert set(conflicts[0]["values"]) == {"Boston", "SF"}
+
+
+def test_repair_world_state_dual_current_keeps_newest_end_dates_rest(conn):
+    """chainlink #331: detect_contradictions reported dual-current rows but never
+    repaired them. Seed three is_current=1 rows for one (subject, predicate) (the
+    transient race) and assert the repair collapses to exactly one current row —
+    the newest by valid_from — with the rest end-dated to the winner's
+    valid_from."""
+    now = "2024-01-01T00:00:00Z"
+    # NYC is newest (2023-03-01); Boston + SF are older and should be end-dated.
+    for val, vf in (("Boston", "2023-01-01"), ("SF", "2023-02-01"),
+                    ("NYC", "2023-03-01")):
+        conn.execute(
+            "INSERT INTO world_state "
+            "(subject, predicate, value, valid_from, valid_until, "
+            " is_current, source_triple_id, updated_at) "
+            "VALUES (?, ?, ?, ?, NULL, 1, ?, ?)",
+            ("Alice", "lives_in", val, vf, f"t-{val}", now),
+        )
+    conn.commit()
+
+    repairs = repair_world_state_dual_current(conn)
+
+    current = conn.execute(
+        "SELECT value, valid_from FROM world_state "
+        "WHERE subject='Alice' AND predicate='lives_in' AND is_current=1",
+    ).fetchall()
+    assert current == [("NYC", "2023-03-01")]  # exactly one, the newest
+
+    ended = conn.execute(
+        "SELECT value, is_current, valid_until FROM world_state "
+        "WHERE subject='Alice' AND predicate='lives_in' AND is_current=0 "
+        "ORDER BY value",
+    ).fetchall()
+    assert ended == [
+        ("Boston", 0, "2023-03-01"),  # end-dated to the winner's valid_from
+        ("SF", 0, "2023-03-01"),
+    ]
+
+    assert len(repairs) == 1
+    r = repairs[0]
+    assert (r["subject"], r["predicate"]) == ("Alice", "lives_in")
+    assert r["kept_value"] == "NYC"
+    assert r["kept_valid_from"] == "2023-03-01"
+    assert {s["value"] for s in r["superseded"]} == {"Boston", "SF"}
+
+    # get_current_value is now unambiguous, and a second pass is a no-op.
+    assert get_current_value(conn, "Alice", "lives_in").value == "NYC"
+    assert repair_world_state_dual_current(conn) == []
+
+
+def test_repair_world_state_dual_current_no_op_when_consistent(conn):
+    """A single current row per key is already consistent — repair is a no-op
+    and leaves the row untouched."""
+    conn.execute(
+        "INSERT INTO world_state "
+        "(subject, predicate, value, valid_from, valid_until, "
+        " is_current, source_triple_id, updated_at) "
+        "VALUES ('Alice', 'lives_in', 'Boston', '2023-01-01', NULL, 1, 't1', ?)",
+        ("2024-01-01T00:00:00Z",),
+    )
+    conn.commit()
+    assert repair_world_state_dual_current(conn) == []
+    row = conn.execute(
+        "SELECT value, is_current FROM world_state WHERE subject='Alice'",
+    ).fetchone()
+    assert row == ("Boston", 1)
 
 
 # ─── Triple-augment search ───────────────────────────────────────────
