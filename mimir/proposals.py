@@ -587,8 +587,13 @@ def cleanup_resolved_proposal_branches(home: Path) -> list[ProposalCleanupRecord
     if not _has_origin_remote(home):
         return []
     records: list[ProposalCleanupRecord] = []
-    # Refresh the proposal refs without mutating main; prune makes already-deleted
-    # GitHub branches disappear from the local remote-tracking view.
+    # Avoid a network fetch on the per-turn hot path when there are no local
+    # proposal remote-tracking refs. An empty local view means there is nothing
+    # cleanup can safely act on; when a proposal ref exists, refresh/prune before
+    # making deletion decisions.
+    branches = _remote_proposal_branches(home)
+    if not branches:
+        return []
     _git(["fetch", "--prune", "origin"], cwd=home)
     for branch, tip in _remote_proposal_branches(home):
         has_open_pr = _proposal_branch_has_open_pr(home, branch)

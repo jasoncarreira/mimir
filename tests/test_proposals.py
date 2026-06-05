@@ -371,6 +371,61 @@ def test_cleanup_preserves_open_pr_branch(
     ).stdout
 
 
+def test_cleanup_skips_fetch_when_no_local_proposal_refs(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.proposals as proposals
+
+    calls: list[list[str]] = []
+    real_git = proposals._git
+
+    def spy_git(args: list[str], cwd: Path):  # type: ignore[no-untyped-def]
+        calls.append(args)
+        return real_git(args, cwd)
+
+    monkeypatch.setattr(proposals, "_git", spy_git)
+
+    records = proposals.cleanup_resolved_proposal_branches(home)
+
+    assert records == []
+    assert ["fetch", "--prune", "origin"] not in calls
+
+
+def test_cleanup_skips_branch_when_open_pr_status_unknown_and_logs(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r = open_proposal(home, branch="proposal/open-pr-unknown")
+    assert r.ok
+    (r.worktree / "prompts" / "reflect.md").write_text(
+        "# reflect\n\nunknown\n", encoding="utf-8"
+    )
+    res = finalize_proposal(
+        home, title="unknown", rationale="r", open_pr=lambda *a: "url"
+    )
+    assert res.ok
+
+    events: list[dict] = []
+
+    def fake_log(event_type: str, **payload) -> None:  # type: ignore[no-untyped-def]
+        events.append({"type": event_type, **payload})
+
+    monkeypatch.setattr("mimir.proposals.log_event_sync", fake_log, raising=False)
+    monkeypatch.setattr("mimir.proposals.shutil.which", lambda name: None)
+
+    from mimir.proposals import cleanup_resolved_proposal_branches
+
+    records = cleanup_resolved_proposal_branches(home)
+    skipped = [r for r in records if r.branch == "proposal/open-pr-unknown"]
+    assert skipped and skipped[0].action == "skipped"
+    assert skipped[0].reason == "open_pr_unknown"
+    assert "refs/heads/proposal/open-pr-unknown" in _git(
+        "ls-remote", "--heads", "origin", "proposal/open-pr-unknown", cwd=home
+    ).stdout
+    assert events[-1]["type"] == "proposal_branch_cleanup_skipped"
+    assert events[-1]["branch"] == "proposal/open-pr-unknown"
+    assert events[-1]["reason"] == "open_pr_unknown"
+
+
 def test_cleanup_skips_unmerged_novel_branch(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     r = open_proposal(home, branch="proposal/novel")
     assert r.ok
