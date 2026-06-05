@@ -282,6 +282,204 @@ def test_abandon(home: Path) -> None:
     assert not r.worktree.exists()
 
 
+# ─── resolved-branch cleanup ──────────────────────────────────────────
+
+
+def test_cleanup_resolved_squash_merged_branch_removes_remote_local_worktree_and_logs(
+    home: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r = open_proposal(home, branch="proposal/cleanup-test")
+    assert r.ok
+    target = r.worktree / "memory" / "core" / "40-learned-behaviors.md"
+    target.write_text(SEED + "- cleanup landed\n", encoding="utf-8")
+    res = finalize_proposal(
+        home, title="cleanup", rationale="r", open_pr=lambda *a: "url"
+    )
+    assert res.ok
+
+    # Simulate GitHub squash-merging the proposal: main receives identical
+    # protected-surface content via a different commit SHA, while the proposal
+    # branch remains on the remote.
+    remote_work = home.parent / "remote-work"
+    _git("clone", "-q", str(upstream), str(remote_work), cwd=home)
+    _git("config", "user.email", "remote@example.com", cwd=remote_work)
+    _git("config", "user.name", "remote", cwd=remote_work)
+    (remote_work / "memory" / "core" / "40-learned-behaviors.md").write_text(
+        SEED + "- cleanup landed\n", encoding="utf-8"
+    )
+    _git("add", "memory/core/40-learned-behaviors.md", cwd=remote_work)
+    _git("commit", "-q", "-m", "squash proposal", cwd=remote_work)
+    _git("push", "-q", "origin", "main", cwd=remote_work)
+
+    # Recreate a local worktree for the now-resolved remote branch; cleanup must
+    # remove both remote branch and local worktree/branch.
+    local_wt = home / "scratch" / "proposals" / "agent" / "proposal_cleanup-test"
+    _git("fetch", "origin", "proposal/cleanup-test", cwd=home)
+    _git(
+        "worktree", "add", "--no-checkout", "-b", "proposal/cleanup-test",
+        str(local_wt), "origin/proposal/cleanup-test", cwd=home,
+    )
+
+    events: list[dict] = []
+
+    def fake_log(event_type: str, **payload) -> None:  # type: ignore[no-untyped-def]
+        events.append({"type": event_type, **payload})
+
+    monkeypatch.setattr("mimir.proposals.log_event_sync", fake_log, raising=False)
+    monkeypatch.setattr(
+        "mimir.proposals._proposal_branch_has_open_pr", lambda home, branch: False
+    )
+
+    from mimir.proposals import cleanup_resolved_proposal_branches
+
+    records = cleanup_resolved_proposal_branches(home)
+    deleted = [r for r in records if r.branch == "proposal/cleanup-test"]
+    assert deleted and deleted[0].action == "deleted"
+    assert deleted[0].tip
+    assert "proposal/cleanup-test" not in _git(
+        "ls-remote", "--heads", "origin", "proposal/cleanup-test", cwd=home
+    ).stdout
+    assert not local_wt.exists()
+    assert events[-1]["type"] == "proposal_branch_cleaned"
+    assert events[-1]["branch"] == "proposal/cleanup-test"
+    assert events[-1]["tip"] == deleted[0].tip
+
+
+def test_cleanup_preserves_open_pr_branch(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r = open_proposal(home, branch="proposal/open-pr")
+    assert r.ok
+    (r.worktree / "prompts" / "reflect.md").write_text(
+        "# reflect\n\nopen\n", encoding="utf-8"
+    )
+    res = finalize_proposal(
+        home, title="open", rationale="r", open_pr=lambda *a: "url"
+    )
+    assert res.ok
+
+    monkeypatch.setattr(
+        "mimir.proposals._proposal_branch_has_open_pr", lambda home, branch: True
+    )
+    from mimir.proposals import cleanup_resolved_proposal_branches
+
+    records = cleanup_resolved_proposal_branches(home)
+    skipped = [r for r in records if r.branch == "proposal/open-pr"]
+    assert skipped and skipped[0].action == "skipped" and skipped[0].reason == "open_pr"
+    assert "refs/heads/proposal/open-pr" in _git(
+        "ls-remote", "--heads", "origin", "proposal/open-pr", cwd=home
+    ).stdout
+
+
+def test_cleanup_skips_fetch_when_no_local_proposal_refs(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.proposals as proposals
+
+    calls: list[list[str]] = []
+    real_git = proposals._git
+
+    def spy_git(args: list[str], cwd: Path):  # type: ignore[no-untyped-def]
+        calls.append(args)
+        return real_git(args, cwd)
+
+    monkeypatch.setattr(proposals, "_git", spy_git)
+
+    records = proposals.cleanup_resolved_proposal_branches(home)
+
+    assert records == []
+    assert ["fetch", "--prune", "origin"] not in calls
+
+
+def test_cleanup_skips_branch_when_open_pr_status_unknown_and_logs(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r = open_proposal(home, branch="proposal/open-pr-unknown")
+    assert r.ok
+    (r.worktree / "prompts" / "reflect.md").write_text(
+        "# reflect\n\nunknown\n", encoding="utf-8"
+    )
+    res = finalize_proposal(
+        home, title="unknown", rationale="r", open_pr=lambda *a: "url"
+    )
+    assert res.ok
+
+    events: list[dict] = []
+
+    def fake_log(event_type: str, **payload) -> None:  # type: ignore[no-untyped-def]
+        events.append({"type": event_type, **payload})
+
+    monkeypatch.setattr("mimir.proposals.log_event_sync", fake_log, raising=False)
+    monkeypatch.setattr("mimir.proposals.shutil.which", lambda name: None)
+
+    from mimir.proposals import cleanup_resolved_proposal_branches
+
+    records = cleanup_resolved_proposal_branches(home)
+    skipped = [r for r in records if r.branch == "proposal/open-pr-unknown"]
+    assert skipped and skipped[0].action == "skipped"
+    assert skipped[0].reason == "open_pr_unknown"
+    assert "refs/heads/proposal/open-pr-unknown" in _git(
+        "ls-remote", "--heads", "origin", "proposal/open-pr-unknown", cwd=home
+    ).stdout
+    assert events[-1]["type"] == "proposal_branch_cleanup_skipped"
+    assert events[-1]["branch"] == "proposal/open-pr-unknown"
+    assert events[-1]["reason"] == "open_pr_unknown"
+
+
+def test_cleanup_skips_unmerged_novel_branch(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    r = open_proposal(home, branch="proposal/novel")
+    assert r.ok
+    (r.worktree / "prompts" / "reflect.md").write_text("# reflect\n\nnovel\n", encoding="utf-8")
+    res = finalize_proposal(
+        home, title="novel", rationale="r", open_pr=lambda *a: "url"
+    )
+    assert res.ok
+
+    monkeypatch.setattr(
+        "mimir.proposals._proposal_branch_has_open_pr", lambda home, branch: False
+    )
+    from mimir.proposals import cleanup_resolved_proposal_branches
+
+    records = cleanup_resolved_proposal_branches(home)
+    skipped = [r for r in records if r.branch == "proposal/novel"]
+    assert skipped and skipped[0].action == "skipped"
+    assert skipped[0].reason == "content_not_on_main"
+    assert "refs/heads/proposal/novel" in _git(
+        "ls-remote", "--heads", "origin", "proposal/novel", cwd=home
+    ).stdout
+
+
+def test_cleanup_skips_non_surface_changes_even_if_open_pr_closed(
+    home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r = open_proposal(home, branch="proposal/non-surface")
+    assert r.ok
+    # Force a non-proposal-surface commit onto the proposal branch to verify the
+    # cleanup sweep does not delete branches whose content is outside its safety
+    # envelope.
+    (r.worktree / "state").mkdir()
+    (r.worktree / "state" / "note.md").write_text(
+        "not a proposal surface\n", encoding="utf-8"
+    )
+    _git("add", "--sparse", "state/note.md", cwd=r.worktree)
+    _git("commit", "-q", "-m", "non surface", cwd=r.worktree)
+    _git("push", "-q", "-u", "origin", "proposal/non-surface", cwd=r.worktree)
+    _git("worktree", "remove", "--force", str(r.worktree), cwd=home)
+    _git("branch", "-D", "proposal/non-surface", cwd=home)
+
+    monkeypatch.setattr(
+        "mimir.proposals._proposal_branch_has_open_pr", lambda home, branch: False
+    )
+    from mimir.proposals import cleanup_resolved_proposal_branches
+
+    records = cleanup_resolved_proposal_branches(home)
+    skipped = [r for r in records if r.branch == "proposal/non-surface"]
+    assert skipped and skipped[0].action == "skipped"
+    assert skipped[0].reason == "content_not_on_main"
+    assert "refs/heads/proposal/non-surface" in _git(
+        "ls-remote", "--heads", "origin", "proposal/non-surface", cwd=home
+    ).stdout
+
 # ─── scratch self-heal ───────────────────────────────────────────────
 
 

@@ -986,7 +986,7 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
         stat_path = Path(f"/proc/{child_pid}/stat")
         try:
             fields = stat_path.read_text().split()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             return False
         # Zombies may remain briefly until PID 1 reaps them; they are dead
         # for the regression this test guards against.
