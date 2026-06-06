@@ -196,6 +196,61 @@ class Dispatcher:
             )
         return True
 
+    def drain_startup_user_messages(self, channel_id: str | None) -> list[AgentEvent]:
+        """Remove startup-queued same-channel user messages for the turn that
+        just became injectable (chainlink #383).
+
+        This is the complementary half of mid-turn injection's normal
+        ``queue-empty`` ordering guard. If a user sends messages back-to-back
+        before the first turn has reached ``_in_flight``/``register_inflight``,
+        those follow-ups are already sitting behind the current event in the
+        per-channel FIFO when ``run_turn`` starts. They are still older than
+        the turn's first model boundary, so fold them into the starting turn
+        instead of processing them as separate follow-up turns.
+
+        Only drain the contiguous user_message prefix. A non-user predecessor
+        is a hard ordering boundary: anything behind it must not overtake it,
+        even if it is a user_message. For every queue.get() consumed here we
+        call task_done() immediately; the event is no longer a queued turn, and
+        the turn record's ``injected_inputs`` is the durable accounting surface.
+        """
+        if not channel_id or not self._injection_enabled(channel_id):
+            return []
+        queue = self._queues.get(channel_id)
+        if queue is None or queue.qsize() == 0:
+            return []
+
+        drained: list[AgentEvent] = []
+        while queue.qsize() > 0:
+            try:
+                next_event = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if next_event.trigger != "user_message":
+                # We consumed one queue item speculatively. Mark that get() done
+                # before re-inserting it as queued work; putleft/put_nowait will
+                # create the replacement unfinished-task accounting entry.
+                queue.task_done()
+                if isinstance(queue, _ChannelQueue):
+                    queue.putleft_nowait(next_event)
+                else:
+                    # Plain-queue fallback for tests: preserve the event and stop
+                    # rather than dropping it if a test pre-seeded asyncio.Queue.
+                    restored = _ChannelQueue(maxsize=self._config.max_channel_queue)
+                    restored.putleft_nowait(next_event)
+                    while True:
+                        try:
+                            tail_event = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        queue.task_done()
+                        restored.put_nowait(tail_event)
+                    self._queues[channel_id] = restored
+                break
+            queue.task_done()
+            drained.append(next_event)
+        return drained
+
     def requeue_front(self, events: list[AgentEvent]) -> int:
         """Re-route accepted-but-unfolded mid-turn injections to the FRONT of
         their channel's queue (chainlink #376; mimir's #593 ordering finding).

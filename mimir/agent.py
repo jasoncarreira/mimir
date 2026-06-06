@@ -1161,6 +1161,18 @@ class Agent:
         """Run one agent turn — preserves the SDK Agent.run_turn contract."""
         turn_id = make_turn_id()
         t_total_start = time.monotonic()
+        # chainlink #383: arm mid-turn injection before any slow setup work
+        # (session touch, SAGA query, prompt/index assembly). The dispatcher
+        # already marks the channel in-flight before invoking run_turn; keeping
+        # the registry in lockstep closes the setup blind window where a
+        # follow-up user_message saw dispatcher._in_flight but inject_message()
+        # returned no_active_turn and fell into the FIFO. The model-loop finally
+        # still owns deactivate(); setup-phase exceptions explicitly deactivate
+        # below so early arming cannot leak a stale active entry.
+        injection_registered = False
+        if event.channel_id:
+            mid_turn_injection.register_inflight(event.channel_id)
+            injection_registered = True
         # Capture the asyncio loop once so shell-job waiter threads
         # can schedule their completion handlers back onto it via
         # ``asyncio.run_coroutine_threadsafe``.
@@ -1277,6 +1289,15 @@ class Agent:
                 t_total_start,
             )
         except Exception as exc:
+            # If setup fails before _run_turn_body reaches its model-loop
+            # finally, clean up the early-armed injection registry so later
+            # turns do not inherit a stale active entry. Any accepted follow-ups
+            # are put back at the front of the dispatcher queue, preserving the
+            # same ordering contract as normal end-of-turn leftovers.
+            if injection_registered:
+                leftover_injections = mid_turn_injection.deactivate(event.channel_id)
+                if leftover_injections and self._dispatcher is not None:
+                    self._dispatcher.requeue_front(leftover_injections)
             # chainlink #306: _run_turn_body's model-loop try/except emits
             # turn_failed/turn_completed only AFTER the early phase (prompt
             # build, agent construction, model resolution). A crash in that
@@ -1305,6 +1326,13 @@ class Agent:
                     log.exception("early-phase turn_failed emit failed")
             raise
         finally:
+            if injection_registered:
+                # _run_turn_body normally deactivates once the model loop starts.
+                # This covers pre-body cancellations/exceptions that bypass that
+                # finally without relying on register_inflight's next-turn overwrite.
+                leftover_injections = mid_turn_injection.deactivate(event.channel_id)
+                if leftover_injections and self._dispatcher is not None:
+                    self._dispatcher.requeue_front(leftover_injections)
             reset_current_turn(ctx_token)
             _reset_cid(cid_token)
 
@@ -1325,6 +1353,29 @@ class Agent:
         # context. No-op for triggers that don't represent conversation
         # (scheduled_tick / saga_session_end / shell_job_complete).
         await self._append_inbound_to_buffer(event)
+
+        # chainlink #383 facet 1: mop up same-channel user messages that
+        # queued behind this event before the dispatcher/registry made the
+        # turn injectable. The dispatcher drains only the contiguous user_message
+        # prefix, so non-user queued predecessors remain an ordering boundary.
+        # This mirrors the normal enqueue-time route, which allows a user_message
+        # to fold into any opted-in same-channel in-flight turn once armed.
+        if self._dispatcher is not None:
+            startup_events = self._dispatcher.drain_startup_user_messages(event.channel_id)
+            if startup_events:
+                accepted = mid_turn_injection.inject_startup_messages(
+                    event.channel_id, startup_events,
+                )
+                if accepted:
+                    await log_event(
+                        "mid_turn_startup_injected",
+                        channel_id=event.channel_id,
+                        count=accepted,
+                    )
+                    for startup_event in startup_events[:accepted]:
+                        await self.on_message_injected(startup_event)
+                if accepted < len(startup_events) and self._dispatcher is not None:
+                    self._dispatcher.requeue_front(startup_events[accepted:])
 
         # Pre-message memory inject. Builds the "Possibly relevant
         # memories" block + collects atom_ids for the post-turn
@@ -1438,11 +1489,6 @@ class Agent:
         # message was actually folded. (Chat-history recording happens at inject
         # time via the dispatcher's on_inject hook, not here — PR 4.)
         folded_records: list[tuple[AgentEvent, float]] = []
-        # chainlink #376 (PR 1): mark this channel's turn in-flight so the
-        # MidTurnInjectionMiddleware can fold queued user messages in at each
-        # model-call boundary. Dormant until the dispatcher feeds the queue (PR 2);
-        # the matching deactivate() is in the finally below.
-        mid_turn_injection.register_inflight(event.channel_id)
         try:
             async with _timeout_ctx:
                 # ``stream_mode="values"`` yields the full state snapshot
