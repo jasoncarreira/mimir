@@ -67,12 +67,45 @@ class Dispatcher:
         ↔ scheduler initialization cycle in server.py."""
         self._run_turn = run_turn
 
+    def _injection_enabled(self, channel_id: str) -> bool:
+        """True iff ``channel_id`` opts into mid-turn message injection
+        (chainlink #376). Prefix allow-list from
+        ``MIMIR_MIDTURN_INJECTION_CHANNELS``; ``"*"`` enables all. Empty
+        (default) keeps the feature off."""
+        prefixes = self._config.midturn_injection_channels
+        if not prefixes:
+            return False
+        if "*" in prefixes:
+            return True
+        return any(channel_id.startswith(p) for p in prefixes)
+
     async def enqueue(self, event: AgentEvent) -> bool:
         """Returns True if accepted, False if the per-channel queue is full."""
         if self._closed:
             return False
 
         channel_id = event.channel_id
+
+        # chainlink #376: fold an in-flight follow-up into the running turn
+        # instead of queuing it as the next turn. Eligible only for
+        # ``user_message`` events on an opted-in channel that has an active turn
+        # AND no queued predecessor — gating on an empty queue preserves
+        # ordering (a later message must never overtake an already-queued
+        # earlier one; that's stricter than ``is_channel_busy()``).
+        if (
+            event.trigger == "user_message"
+            and self._injection_enabled(channel_id)
+            and channel_id in self._in_flight
+        ):
+            existing = self._queues.get(channel_id)
+            if existing is None or existing.qsize() == 0:
+                from .mid_turn_injection import inject_message
+                if inject_message(channel_id, event) == "injected":
+                    await log_event("mid_turn_injected", channel_id=channel_id)
+                    return True
+                # "no_active_turn" — the turn ended during the race; fall
+                # through and enqueue it as a normal next-turn event.
+
         queue = self._queues.get(channel_id)
         if queue is None:
             queue = asyncio.Queue(maxsize=self._config.max_channel_queue)

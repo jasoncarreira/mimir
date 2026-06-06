@@ -530,3 +530,106 @@ async def test_drain_does_not_purge_dict_entries_for_busy_channels(
     assert "c-busy" in disp._queues
     release.set()
     await drain_task
+
+
+# ─── chainlink #376: mid-turn injection routing ──────────────────────
+
+from mimir import mid_turn_injection as _mti  # noqa: E402
+
+
+def _inj_config(home: Path, channels: tuple[str, ...]) -> Config:
+    return replace(
+        Config.from_env(),
+        home=home,
+        max_concurrent_turns=4,
+        max_channel_queue=100,
+        worker_idle_timeout_s=1,
+        midturn_injection_channels=channels,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _clear_injection_registry():
+    _mti._REGISTRY.clear()
+    yield
+    _mti._REGISTRY.clear()
+
+
+def test_injection_enabled_prefix_matching(tmp_path: Path):
+    disp = Dispatcher(_inj_config(tmp_path, ("discord-", "slack-")), None)
+    assert disp._injection_enabled("discord-99")
+    assert disp._injection_enabled("slack-C1")
+    assert not disp._injection_enabled("poller:gmail-inbox")
+    # Disabled by default (empty allow-list).
+    assert not Dispatcher(_inj_config(tmp_path, ()), None)._injection_enabled("discord-99")
+    # Wildcard enables all.
+    assert Dispatcher(_inj_config(tmp_path, ("*",)), None)._injection_enabled("anything")
+
+
+@pytest.mark.asyncio
+async def test_enqueue_injects_when_in_flight_and_opted_in(tmp_path: Path):
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
+    disp._in_flight.add("c1")          # simulate a running turn
+    _mti.register_inflight("c1")
+    accepted = await disp.enqueue(
+        AgentEvent(trigger="user_message", channel_id="c1", content="folded")
+    )
+    assert accepted is True
+    # Folded into the registry, NOT queued.
+    assert "c1" not in disp._queues or disp._queues["c1"].qsize() == 0
+    assert [e.content for e in _mti._drain("c1")] == ["folded"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_falls_back_to_queue_when_no_active_turn(tmp_path: Path):
+    """In-flight + opted-in, but the registry has no active entry (the race where
+    the turn ended) → inject_message returns no_active_turn → normal enqueue."""
+    seen: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        seen.append(event.content)
+
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), runner)
+    disp._in_flight.add("c1")          # busy, but...
+    # ...no register_inflight → inject_message → no_active_turn.
+    await disp.enqueue(
+        AgentEvent(trigger="user_message", channel_id="c1", content="fallback")
+    )
+    assert _mti._drain("c1") == []     # not injected
+    await disp.drain()
+    assert seen == ["fallback"]        # ran as a normal turn
+
+
+@pytest.mark.asyncio
+async def test_enqueue_skips_injection_with_queued_predecessor(tmp_path: Path):
+    """A later user_message must not overtake an already-queued earlier event —
+    injection is gated on an EMPTY queue, not the broad is_channel_busy()."""
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
+    disp._in_flight.add("c1")
+    _mti.register_inflight("c1")
+    # Pre-seed a queued predecessor.
+    q = asyncio.Queue(maxsize=disp._config.max_channel_queue)
+    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="earlier"))
+    disp._queues["c1"] = q
+    disp._high_water_logged["c1"] = False
+
+    await disp.enqueue(
+        AgentEvent(trigger="user_message", channel_id="c1", content="later")
+    )
+    # NOT injected (queue had a predecessor) → enqueued behind it.
+    assert _mti._drain("c1") == []
+    assert disp._queues["c1"].qsize() == 2
+
+
+@pytest.mark.asyncio
+async def test_enqueue_skips_injection_for_non_user_message(tmp_path: Path):
+    """Only user_message events are eligible — a poller tick on an in-flight
+    opted-in channel must not be folded."""
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
+    disp._in_flight.add("c1")
+    _mti.register_inflight("c1")
+    await disp.enqueue(
+        AgentEvent(trigger="poller", channel_id="c1", content="tick")
+    )
+    assert _mti._drain("c1") == []     # not injected
+    assert disp._queues["c1"].qsize() == 1

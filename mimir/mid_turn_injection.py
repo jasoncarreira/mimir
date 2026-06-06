@@ -22,19 +22,29 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage
 from langgraph.config import get_config
+
+if TYPE_CHECKING:
+    from .models import AgentEvent
 
 log = logging.getLogger(__name__)
 
 
 @dataclass
 class _Inflight:
-    """One in-flight turn's pending-injection queue + liveness flag."""
+    """One in-flight turn's pending-injection queue + liveness flag.
 
-    queue: list[str] = field(default_factory=list)
+    The queue holds whole ``AgentEvent``s (not just text) so a leftover — a
+    message accepted after the turn's final ``before_model`` boundary — can be
+    re-enqueued faithfully as its own next turn (PR 2), preserving author / ids /
+    trigger. The middleware folds ``event.content`` at the boundary.
+    """
+
+    queue: list["AgentEvent"] = field(default_factory=list)
     active: bool = True
 
 
@@ -57,12 +67,13 @@ def register_inflight(channel_id: str | None) -> None:
         _REGISTRY[channel_id] = _Inflight()
 
 
-def deactivate(channel_id: str | None) -> list[str]:
+def deactivate(channel_id: str | None) -> list["AgentEvent"]:
     """Mark the turn done and drop the registry entry (``run_turn`` finally).
 
-    Returns any messages still queued (none were folded, or they arrived after
-    the last model call) so a later slice can record / re-route them. PR 1
-    ignores the return value.
+    Returns any events still queued — accepted by :func:`inject_message` but not
+    folded (they arrived after the turn's final ``before_model`` boundary, e.g.
+    while the model was generating its final response). ``run_turn`` re-enqueues
+    these so the follow-up becomes its own next turn rather than vanishing.
     """
     if not channel_id:
         return []
@@ -74,22 +85,23 @@ def deactivate(channel_id: str | None) -> list[str]:
         return list(inflight.queue)
 
 
-def inject_message(channel_id: str, content: str) -> str:
-    """Queue a user message for the in-flight turn on ``channel_id``.
+def inject_message(channel_id: str, event: "AgentEvent") -> str:
+    """Queue a user-message ``event`` for the in-flight turn on ``channel_id``.
 
     Returns ``"injected"`` when the turn is active, or ``"no_active_turn"`` when
     no turn is running (so the dispatcher falls back to enqueuing a fresh event).
+    The whole event is stored so an un-folded leftover re-enqueues faithfully.
     """
     with _LOCK:
         inflight = _REGISTRY.get(channel_id)
         if inflight is None or not inflight.active:
             return "no_active_turn"
-        inflight.queue.append(content)
+        inflight.queue.append(event)
         return "injected"
 
 
-def _drain(channel_id: str | None) -> list[str]:
-    """Pop all queued messages for ``channel_id`` (FIFO); ``[]`` when none."""
+def _drain(channel_id: str | None) -> list["AgentEvent"]:
+    """Pop all queued events for ``channel_id`` (FIFO); ``[]`` when none."""
     if not channel_id:
         return []
     with _LOCK:
@@ -125,4 +137,4 @@ class MidTurnInjectionMiddleware(AgentMiddleware):
             return None  # common case: one dict lookup, no state change
         # The ``messages`` channel uses an append reducer, so returning new
         # HumanMessages folds them into the conversation before the next call.
-        return {"messages": [HumanMessage(content=c) for c in pending]}
+        return {"messages": [HumanMessage(content=e.content) for e in pending]}
