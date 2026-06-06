@@ -354,6 +354,12 @@ class Config:
     max_concurrent_turns: int
     max_channel_queue: int
     worker_idle_timeout_s: int
+    # chainlink #376: channel-id prefixes opted into mid-turn user-message
+    # injection (fold a message into the running turn instead of queuing it as
+    # the next turn). Empty (default) disables the feature; "*" enables it for
+    # all channels. Pollers / scheduled ticks are excluded regardless (only
+    # ``user_message`` events are eligible).
+    midturn_injection_channels: tuple[str, ...]
 
     # Message buffer (§5.4)
     history_global_max: int
@@ -718,6 +724,10 @@ class Config:
             max_concurrent_turns=_env_int("MIMIR_MAX_CONCURRENT_TURNS", 10),
             max_channel_queue=_env_int("MIMIR_MAX_CHANNEL_QUEUE", 100),
             worker_idle_timeout_s=_env_int("MIMIR_WORKER_IDLE_TIMEOUT_S", 60),
+            midturn_injection_channels=tuple(
+                p.strip() for p in _env("MIMIR_MIDTURN_INJECTION_CHANNELS", "").split(",")
+                if p.strip()
+            ),
 
             history_global_max=_env_int("MIMIR_HISTORY_GLOBAL_MAX", 500),
             history_per_channel_max=_env_int("MIMIR_HISTORY_PER_CHANNEL_MAX", 250),

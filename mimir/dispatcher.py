@@ -13,6 +13,7 @@ a channel — see SPEC §4.5 "Workers swallow exceptions".
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import traceback
 from typing import Awaitable, Callable
@@ -25,6 +26,42 @@ from .scheduler import SCHEDULER_CHANNEL_PREFIX
 log = logging.getLogger(__name__)
 
 TurnRunner = Callable[[AgentEvent], Awaitable[object]]
+
+
+class _ChannelQueue(asyncio.Queue):
+    """A per-channel FIFO queue that also supports front-insertion.
+
+    :meth:`putleft_nowait` re-routes an accepted-but-unfolded mid-turn injection
+    (chainlink #376) *ahead* of same-channel events that queued after it while
+    the turn ran — preserving the dispatcher's within-channel arrival order
+    (mimir's #593 review). Built only on ``asyncio.Queue``'s documented
+    subclassing extension points (``_init``/``_get``/``_put`` over a deque, as
+    ``LifoQueue``/``PriorityQueue`` do); ``put_nowait`` still owns the
+    unfinished-task counter and getter wake-up, so ``join()`` accounting stays
+    correct.
+    """
+
+    _put_front = False
+
+    def _init(self, maxsize: int) -> None:
+        self._queue: collections.deque = collections.deque()
+
+    def _get(self):
+        return self._queue.popleft()
+
+    def _put(self, item) -> None:
+        if self._put_front:
+            self._queue.appendleft(item)
+        else:
+            self._queue.append(item)
+
+    def putleft_nowait(self, item) -> None:
+        """Insert ``item`` at the FRONT; identical to ``put_nowait`` otherwise."""
+        self._put_front = True
+        try:
+            self.put_nowait(item)
+        finally:
+            self._put_front = False
 
 
 class Dispatcher:
@@ -67,15 +104,48 @@ class Dispatcher:
         ↔ scheduler initialization cycle in server.py."""
         self._run_turn = run_turn
 
+    def _injection_enabled(self, channel_id: str) -> bool:
+        """True iff ``channel_id`` opts into mid-turn message injection
+        (chainlink #376). Prefix allow-list from
+        ``MIMIR_MIDTURN_INJECTION_CHANNELS``; ``"*"`` enables all. Empty
+        (default) keeps the feature off."""
+        prefixes = self._config.midturn_injection_channels
+        if not prefixes:
+            return False
+        if "*" in prefixes:
+            return True
+        return any(channel_id.startswith(p) for p in prefixes)
+
     async def enqueue(self, event: AgentEvent) -> bool:
         """Returns True if accepted, False if the per-channel queue is full."""
         if self._closed:
             return False
 
         channel_id = event.channel_id
+
+        # chainlink #376: fold an in-flight follow-up into the running turn
+        # instead of queuing it as the next turn. Eligible only for
+        # ``user_message`` events on an opted-in channel that has an active turn
+        # AND no queued predecessor — gating on an empty queue preserves
+        # ordering (a later message must never overtake an already-queued
+        # earlier one; that's stricter than ``is_channel_busy()``).
+        if (
+            event.trigger == "user_message"
+            and self._injection_enabled(channel_id)
+            and channel_id in self._in_flight
+        ):
+            existing = self._queues.get(channel_id)
+            if existing is None or existing.qsize() == 0:
+                from .mid_turn_injection import inject_message
+                if inject_message(channel_id, event) == "injected":
+                    await log_event("mid_turn_injected", channel_id=channel_id)
+                    return True
+                # "no_active_turn" — the turn ended during the race; fall
+                # through and enqueue it as a normal next-turn event.
+
         queue = self._queues.get(channel_id)
         if queue is None:
-            queue = asyncio.Queue(maxsize=self._config.max_channel_queue)
+            queue = _ChannelQueue(maxsize=self._config.max_channel_queue)
             self._queues[channel_id] = queue
             self._high_water_logged[channel_id] = False
 
@@ -105,6 +175,57 @@ class Dispatcher:
                 self._worker_loop(channel_id), name=f"mimir-worker-{channel_id}"
             )
         return True
+
+    def requeue_front(self, events: list[AgentEvent]) -> int:
+        """Re-route accepted-but-unfolded mid-turn injections to the FRONT of
+        their channel's queue (chainlink #376; mimir's #593 ordering finding).
+
+        ``run_turn`` calls this from its ``finally`` for leftover injections —
+        events :func:`mid_turn_injection.inject_message` accepted but the turn
+        ended before the next ``before_model`` boundary could fold them. They
+        arrived *before* any same-channel event that queued while the turn ran,
+        so appending them via :meth:`enqueue` would place them behind those
+        later events and break within-channel FIFO. Front-insertion restores
+        arrival order; ``events`` keep their relative order. Synchronous (queue
+        ops only) — call without ``await``. Returns the count requeued.
+        """
+        if not events or self._closed:
+            return 0
+        channel_id = events[0].channel_id
+        queue = self._queues.get(channel_id)
+        if queue is None or not isinstance(queue, _ChannelQueue):
+            # No live queue (worker retired), or a plain queue pre-seeded in a
+            # test: (re)create a front-insertable one. A retired worker is
+            # respawned below; a test-seeded plain queue is replaced wholesale,
+            # which is safe because that path has no concurrent worker.
+            queue = _ChannelQueue(maxsize=self._config.max_channel_queue)
+            self._queues[channel_id] = queue
+            self._high_water_logged.setdefault(channel_id, False)
+        requeued = 0
+        # appendleft reverses insertion order, so push the events in reverse to
+        # land them front-to-back in their original order, ahead of the tail.
+        for event in reversed(events):
+            try:
+                queue.putleft_nowait(event)
+            except asyncio.QueueFull:
+                # Channel saturated: match enqueue()'s drop-on-full rather than
+                # raising inside run_turn's finally. The caller logs the leftover
+                # batch; record the drop here too.
+                log.warning(
+                    "requeue_front dropped a leftover injection on %s (queue full)",
+                    channel_id,
+                )
+                continue
+            requeued += 1
+        # The in-flight turn's worker is mid-return when this runs (it hasn't
+        # looped back to queue.get() yet), so it will pick these up; respawn only
+        # if it already retired.
+        worker = self._workers.get(channel_id)
+        if worker is None or worker.done():
+            self._workers[channel_id] = asyncio.create_task(
+                self._worker_loop(channel_id), name=f"mimir-worker-{channel_id}"
+            )
+        return requeued
 
     async def _worker_loop(self, channel_id: str) -> None:
         queue = self._queues[channel_id]

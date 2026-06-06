@@ -284,6 +284,18 @@ return await self._normal_enqueue(event)
   it's the same budget that bounds any long turn).
 - **Cleanup** — `run_turn`'s `finally` flips `active=False` and removes the
   registry entry, so a channel never leaks a stale queue.
+- **Leftover re-routing & ordering** — a message accepted by `inject_message`
+  but never folded (it arrived after the turn's final `before_model` boundary)
+  is returned by `deactivate()` in `run_turn`'s `finally`. It arrived **before**
+  any same-channel event that queued while the turn ran, so it must become the
+  *next* turn — ahead of those later events. Re-routing via `enqueue()` would
+  append it to the queue **tail**, behind a later `react_received` /
+  `shell_job_complete`, breaking within-channel FIFO and weakening §4's ordering
+  guard. So the dispatcher exposes `requeue_front(events)`, which inserts the
+  leftovers at the **head** of the channel queue (preserving their relative
+  order) via a small `asyncio.Queue` subclass (`_ChannelQueue.putleft_nowait`,
+  built on the documented `_init`/`_get`/`_put` extension points so `join()`
+  accounting is unaffected).
 
 ## Open decisions
 

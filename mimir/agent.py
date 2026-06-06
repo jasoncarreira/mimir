@@ -1521,10 +1521,25 @@ class Agent:
             except Exception:  # noqa: BLE001 — defensive boundary
                 log.exception("quota_pause emit failed; continuing")
         finally:
-            # chainlink #376 (PR 1): drop the in-flight registry entry so a late
-            # inject after the turn ends is rejected (no_active_turn), and a
-            # crashed turn can't leak a stale active queue.
-            mid_turn_injection.deactivate(event.channel_id)
+            # chainlink #376: drop the in-flight registry entry (rejects a late
+            # inject as no_active_turn; a crashed turn can't leak a stale active
+            # queue). Any leftover events were accepted by inject_message AFTER
+            # the turn's final before_model boundary (e.g. a follow-up sent while
+            # the model was generating its last response) so they were never
+            # folded. They arrived BEFORE any same-channel event that queued
+            # while this turn ran, so route them to the FRONT of the channel
+            # queue (ahead of those later events) rather than appending via
+            # enqueue() — preserving within-channel arrival order (PR 2; mimir's
+            # #591 + #593 review notes).
+            leftover_injections = mid_turn_injection.deactivate(event.channel_id)
+            if leftover_injections and self._dispatcher is not None:
+                await log_event(
+                    "mid_turn_injection_leftover",
+                    channel_id=event.channel_id,
+                    turn_id=turn_id,
+                    count=len(leftover_injections),
+                )
+                self._dispatcher.requeue_front(leftover_injections)
 
         # Algedonic: surface EVERY turn failure as an event so a dropped
         # turn — a transient model 503, a timeout, quota exhaustion, or a
