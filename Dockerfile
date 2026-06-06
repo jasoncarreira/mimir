@@ -35,7 +35,7 @@ FROM python:3.11-slim AS base
 #     mimir-agent extra (PyPI rejects direct git URLs), so it ships
 #     as an EXTRA build step that builds add explicitly (see the
 #     ``MIMIR_ENABLE_CLAUDE_CODE`` block below).
-#   - nodejs + npm + @anthropic-ai/claude-code: the Claude Code CLI
+#   - nodejs + npm + @anthropic-ai/claude-code@2.1.166: the Claude Code CLI
 #     binary, needed when the deployment routes through the
 #     subprocess provider (Max OAuth path).
 #   - poppler-utils, tesseract-ocr, tesseract-ocr-eng: PDF-ingest
@@ -50,7 +50,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         poppler-utils tesseract-ocr tesseract-ocr-eng \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @anthropic-ai/claude-code \
+    && npm install -g @anthropic-ai/claude-code@2.1.166 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
