@@ -454,6 +454,9 @@ def build_app(config: Config) -> web.Application:
         commitments_store=commitments_store,
     )
     dispatcher.set_run_turn(agent.run_turn)
+    # chainlink #376 (PR 4): record mid-turn injected messages in chat history at
+    # inject time so they thread chronologically with the turn's mid-flight replies.
+    dispatcher.set_on_inject(agent.on_message_injected)
 
     # Wire dep-injection setters on the production tool surface so
     # langchain @tool functions can reach the same singletons the SDK

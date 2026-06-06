@@ -267,8 +267,12 @@ class _FoldingFakeAgent(_FakeAgent):
     """Fake graph that simulates the MidTurnInjectionMiddleware folding a
     mid-turn user message mid-stream: during ``astream`` it injects + drains
     the registry for the turn's channel (exactly what ``before_model`` does on
-    a real boundary), so ``run_turn``'s finally sees a folded event to thread
-    into the record + chat-history buffer (chainlink #376 PR 3)."""
+    a real boundary), so ``run_turn``'s finally sees a folded record to thread
+    into ``TurnRecord.injected_inputs`` (chainlink #376 PR 3/4).
+
+    Note: this drives the registry directly, NOT the dispatcher's enqueue path,
+    so the inject-time chat-history append (PR 4) does not fire here — that's
+    covered in test_dispatcher. This test pins the turn-record threading."""
 
     def __init__(self, response_messages: list[Any], *, folded: list[AgentEvent]) -> None:
         super().__init__(response_messages)
@@ -284,10 +288,10 @@ class _FoldingFakeAgent(_FakeAgent):
 
 
 async def test_run_turn_records_folded_mid_turn_inputs(tmp_path: Path):
-    """A message folded into the turn lands in TurnRecord.injected_inputs
-    (rendered as the model saw it), round-trips through turns.jsonl, and is
-    recorded in the chat-history buffer — while ``input`` stays the original
-    prompt (PR 3 durable visibility readers a/b/e)."""
+    """A message folded into the turn lands in TurnRecord.injected_inputs as
+    {t_ms, text} (rendered as the model saw it, with a start-relative offset)
+    and round-trips through turns.jsonl — while ``input`` stays the original
+    prompt (PR 3/4 durable visibility readers a/b)."""
     _mti._REGISTRY.clear()
     folded = [AgentEvent(
         trigger="user_message", channel_id="ch-1",
@@ -300,10 +304,12 @@ async def test_run_turn_records_folded_mid_turn_inputs(tmp_path: Path):
     event = AgentEvent(trigger="user_message", channel_id="ch-1", content="deploy please")
     record = await agent.run_turn(event)
 
-    # (a) the folded input is on the record, rendered with its author header.
+    # (a) the folded input is on the record as {t_ms, text}, rendered with header.
     assert len(record.injected_inputs) == 1
-    assert "also check the staging logs" in record.injected_inputs[0]
-    assert "mid-turn message from alice" in record.injected_inputs[0]
+    entry = record.injected_inputs[0]
+    assert "also check the staging logs" in entry["text"]
+    assert "mid-turn message from alice" in entry["text"]
+    assert isinstance(entry["t_ms"], (int, float)) and entry["t_ms"] >= 0
     # original prompt unchanged — this is an ADDITIONAL input, not a rewrite.
     assert "deploy please" in record.input
 
@@ -312,12 +318,6 @@ async def test_run_turn_records_folded_mid_turn_inputs(tmp_path: Path):
     turns = (tmp_path / "home" / "logs" / "turns.jsonl").read_text().splitlines()
     row = json.loads(turns[-1])
     assert row["injected_inputs"] == record.injected_inputs
-
-    # (e) recorded in the chat-history buffer (original inbound + the fold).
-    assert agent._buffer.channel_count("ch-1") == 2
-    contents = [m.content for m in agent._buffer.recent_for_channel("ch-1", 10)]
-    assert "also check the staging logs" in contents
-    assert "deploy please" in contents
 
 
 async def test_run_turn_no_injected_inputs_when_nothing_folded(tmp_path: Path):
@@ -330,6 +330,21 @@ async def test_run_turn_no_injected_inputs_when_nothing_folded(tmp_path: Path):
         AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
     )
     assert record.injected_inputs == []
+    assert agent._buffer.channel_count("ch-1") == 1
+
+
+async def test_append_inbound_to_buffer_is_idempotent(tmp_path: Path):
+    """chainlink #376 PR 4: a message recorded at inject time must not be
+    double-recorded if it later re-routes as its own turn (leftover) and the
+    normal inbound path appends it again. The ``_buffer_recorded`` flag guards it."""
+    agent = _build_agent(
+        tmp_path, fake_agent=_FakeAgent(response_messages=[AIMessage(content="ok")]),
+        fake_saga=None,
+    )
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hello")
+    await agent.on_message_injected(event)   # inject-time record
+    assert agent._buffer.channel_count("ch-1") == 1
+    await agent._append_inbound_to_buffer(event)  # leftover re-route → no-op
     assert agent._buffer.channel_count("ch-1") == 1
 
 

@@ -211,13 +211,16 @@ class TurnRecord:
     events: list[dict[str, Any]] = field(default_factory=list)
     output: str = ""
     # chainlink #376: user messages that arrived mid-turn and were FOLDED into
-    # this turn at a before_model boundary (the rendered text the model saw, one
-    # entry per fold, in fold order). ``input`` stays the original turn prompt;
-    # these are the additional inputs this single turn absorbed. Empty for the
-    # overwhelming majority of turns (no mid-turn message). Threaded here so the
-    # durable surfaces — turn log, synthesis summary, turn viewer — report what
-    # the turn actually consumed, not just the model's live message list.
-    injected_inputs: list[str] = field(default_factory=list)
+    # this turn at a before_model boundary. Each entry is ``{"t_ms": float,
+    # "text": str}`` (PR 4) — the rendered text the model saw plus a
+    # start-relative fold offset (same axis as event/saga ``t_ms``) so the turn
+    # viewer can place it on the timeline. One entry per fold, in fold order.
+    # ``input`` stays the original turn prompt; these are the additional inputs
+    # this single turn absorbed. Empty for the overwhelming majority of turns.
+    # Threaded here so the durable surfaces — turn log, synthesis summary, turn
+    # viewer — report what the turn consumed, not just the live message list.
+    # (PR 3 shipped this as ``list[str]``; readers tolerate both.)
+    injected_inputs: list[dict[str, Any]] = field(default_factory=list)
     duration_ms: int = 0
     error: str | None = None
     # SDK ResultMessage capture (Phase 8 — resume detection + cost). Populated

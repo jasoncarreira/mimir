@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -43,15 +44,19 @@ class _Inflight:
     re-enqueued faithfully as its own next turn (PR 2), preserving author / ids /
     trigger. The middleware folds ``event.content`` at the boundary.
 
-    ``folded`` accumulates the events actually drained into the turn (PR 3) so
-    ``run_turn`` can record them durably — ``TurnRecord.injected_inputs``, the
-    synthesis summary, the chat-history buffer — at turn end. ``queue`` (pending)
-    and ``folded`` (consumed) are disjoint: ``_drain`` moves events from one to
-    the other.
+    ``folded`` accumulates the events actually drained into the turn so
+    ``run_turn`` can record them durably (``TurnRecord.injected_inputs``,
+    synthesis summary, turn viewer). Each entry is ``(event, fold_monotonic)``
+    where ``fold_monotonic`` is ``time.monotonic()`` at the boundary that folded
+    it — the SAME clock as ``TurnContext.started_at`` (PR 4), so ``run_turn`` can
+    compute a ``t_ms`` offset that lines the message up on the turn-viewer
+    timeline next to the events/tool-calls it interleaved with. ``queue``
+    (pending) and ``folded`` (consumed) are disjoint: ``_drain`` moves events
+    from one to the other.
     """
 
     queue: list["AgentEvent"] = field(default_factory=list)
-    folded: list["AgentEvent"] = field(default_factory=list)
+    folded: list[tuple["AgentEvent", float]] = field(default_factory=list)
     active: bool = True
 
 
@@ -110,8 +115,9 @@ def inject_message(channel_id: str, event: "AgentEvent") -> str:
 def _drain(channel_id: str | None) -> list["AgentEvent"]:
     """Pop all queued events for ``channel_id`` (FIFO); ``[]`` when none.
 
-    Drained events are recorded on ``folded`` so :func:`folded_events` can report
-    what the turn actually absorbed (PR 3 durable visibility).
+    Drained events are recorded on ``folded`` (stamped with the fold time) so
+    :func:`folded_records` can report what the turn absorbed and when (durable
+    visibility).
     """
     if not channel_id:
         return []
@@ -121,17 +127,19 @@ def _drain(channel_id: str | None) -> list["AgentEvent"]:
             return []
         drained = inflight.queue[:]
         inflight.queue.clear()
-        inflight.folded.extend(drained)
+        now = time.monotonic()
+        inflight.folded.extend((e, now) for e in drained)
         return drained
 
 
-def folded_events(channel_id: str | None) -> list["AgentEvent"]:
-    """Events folded into the in-flight turn on ``channel_id`` so far.
+def folded_records(channel_id: str | None) -> list[tuple["AgentEvent", float]]:
+    """``(event, fold_monotonic)`` for every message folded into the in-flight
+    turn on ``channel_id`` so far.
 
     Read in ``run_turn`` BEFORE :func:`deactivate` pops the entry, so the turn
-    can record the mid-turn inputs it consumed (``TurnRecord.injected_inputs``,
-    synthesis summary, chat-history buffer). ``[]`` when nothing was folded or
-    the channel has no active turn.
+    can record the mid-turn inputs it consumed and place them on the timeline
+    (``TurnRecord.injected_inputs`` with a start-relative ``t_ms``). ``[]`` when
+    nothing was folded or the channel has no active turn.
     """
     if not channel_id:
         return []

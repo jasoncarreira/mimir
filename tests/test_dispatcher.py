@@ -714,3 +714,48 @@ async def test_requeue_front_noop_on_empty_or_closed(tmp_path: Path):
     assert disp.requeue_front(
         [AgentEvent(trigger="user_message", channel_id="c1", content="x")]
     ) == 0
+
+
+@pytest.mark.asyncio
+async def test_enqueue_calls_on_inject_at_inject_time(tmp_path: Path):
+    """PR 4: when a message is folded, on_inject fires immediately (true arrival
+    time) so chat history threads it ahead of the running turn's later replies."""
+    recorded: list[str] = []
+
+    async def on_inject(event: AgentEvent) -> None:
+        recorded.append(event.content)
+
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
+    disp.set_on_inject(on_inject)
+    disp._in_flight.add("c1")
+    _mti.register_inflight("c1")
+    accepted = await disp.enqueue(
+        AgentEvent(trigger="user_message", channel_id="c1", content="folded")
+    )
+    assert accepted is True
+    assert recorded == ["folded"]                       # recorded at inject time
+    assert [e.content for e in _mti._drain("c1")] == ["folded"]  # and folded
+
+
+@pytest.mark.asyncio
+async def test_enqueue_skips_on_inject_when_not_folded(tmp_path: Path):
+    """on_inject fires ONLY on a real fold — not on the no_active_turn fallback
+    (in-flight but no active registry entry) which enqueues a normal turn."""
+    recorded: list[str] = []
+    ran: list[str] = []
+
+    async def on_inject(event: AgentEvent) -> None:
+        recorded.append(event.content)
+
+    async def runner(event: AgentEvent) -> None:
+        ran.append(event.content)
+
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), runner)
+    disp.set_on_inject(on_inject)
+    disp._in_flight.add("c1")          # busy, but no register_inflight → no_active_turn
+    await disp.enqueue(
+        AgentEvent(trigger="user_message", channel_id="c1", content="fallback")
+    )
+    await disp.drain()
+    assert recorded == []              # never folded → on_inject not called
+    assert ran == ["fallback"]         # ran as a normal turn instead

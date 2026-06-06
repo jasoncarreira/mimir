@@ -185,19 +185,30 @@ class TestTurnSummaryLines:
 
     def test_injected_inputs_surfaced(self) -> None:
         """chainlink #376: mid-turn folded messages appear in the
-        synthesis-visible summary so session-end synthesis sees them."""
+        synthesis-visible summary so session-end synthesis sees them. Entries
+        are {t_ms, text} (PR 4)."""
         turns = [{
             "turn_id": "t", "trigger": "user_message",
             "events": [], "output": "ok",
             "injected_inputs": [
-                "[mid-turn message from alice]\nalso check staging",
-                "[mid-turn message from alice]\nand prod",
+                {"t_ms": 1200, "text": "[mid-turn message from alice]\nalso check staging"},
+                {"t_ms": 3400, "text": "[mid-turn message from alice]\nand prod"},
             ],
         }]
         out = _turn_summary_lines(turns)
         assert "injected mid-turn (2)" in out
         assert "also check staging" in out
         assert "and prod" in out
+
+    def test_injected_inputs_tolerates_legacy_strings(self) -> None:
+        """PR-3-era records stored bare strings; the summary must still render."""
+        turns = [{
+            "turn_id": "t", "trigger": "user_message", "events": [], "output": "o",
+            "injected_inputs": ["a bare legacy string"],
+        }]
+        out = _turn_summary_lines(turns)
+        assert "injected mid-turn (1)" in out
+        assert "a bare legacy string" in out
 
     def test_no_injected_line_when_absent(self) -> None:
         turns = [{"turn_id": "t", "trigger": "x", "events": [], "output": "o"}]
