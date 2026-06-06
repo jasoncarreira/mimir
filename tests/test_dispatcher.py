@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from mimir.config import Config
-from mimir.dispatcher import Dispatcher
+from mimir.dispatcher import Dispatcher, _ChannelQueue
 from mimir.event_logger import init_logger
 from mimir.models import AgentEvent
 
@@ -759,3 +759,41 @@ async def test_enqueue_skips_on_inject_when_not_folded(tmp_path: Path):
     await disp.drain()
     assert recorded == []              # never folded → on_inject not called
     assert ran == ["fallback"]         # ran as a normal turn instead
+
+
+@pytest.mark.asyncio
+async def test_drain_startup_user_messages_drains_contiguous_user_prefix(tmp_path: Path):
+    """chainlink #383 facet 1: back-to-back same-channel user messages that
+    queued before the turn armed are drained for folding into the starting turn,
+    and task_done accounting lets drain()/join() finish."""
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
+    q = disp._queues["c1"] = _ChannelQueue(maxsize=disp._config.max_channel_queue)  # type: ignore[name-defined]
+    disp._high_water_logged["c1"] = False
+    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="follow-1"))
+    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="follow-2"))
+
+    drained = disp.drain_startup_user_messages("c1")
+
+    assert [e.content for e in drained] == ["follow-1", "follow-2"]
+    assert q.qsize() == 0
+    await asyncio.wait_for(q.join(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_drain_startup_user_messages_stops_at_non_user_boundary(tmp_path: Path):
+    """A queued non-user event remains an ordering boundary: user messages behind
+    it must not be startup-folded ahead of it."""
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
+    q = disp._queues["c1"] = _ChannelQueue(maxsize=disp._config.max_channel_queue)  # type: ignore[name-defined]
+    disp._high_water_logged["c1"] = False
+    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="follow-1"))
+    await q.put(AgentEvent(trigger="react_received", channel_id="c1", content="react"))
+    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="follow-2"))
+
+    drained = disp.drain_startup_user_messages("c1")
+
+    assert [e.content for e in drained] == ["follow-1"]
+    assert [q.get_nowait().content, q.get_nowait().content] == ["react", "follow-2"]
+    q.task_done()
+    q.task_done()
+    await asyncio.wait_for(q.join(), timeout=1.0)

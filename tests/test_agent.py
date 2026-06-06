@@ -13,6 +13,8 @@ deepagents graph is constructed. We're verifying the
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -127,6 +129,48 @@ class _FakeSaga:
             "atom_ids": list(atom_ids), "output": output,
             "session_id": session_id, "feedback": feedback,
         })
+
+
+
+
+class _BarrierSaga(_FakeSaga):
+    """Saga double that pauses during pre-message query so tests can inject a
+    follow-up while run_turn is still in setup (before the first model boundary)."""
+
+    def __init__(self) -> None:
+        super().__init__(query_hits=[])
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def query(
+        self, content: str, *, top_k: int = 12,
+        session_id: str | None = None,
+        context: list[dict[str, str]] | None = None,
+        **_ignored: object,
+    ):
+        self.started.set()
+        await self.release.wait()
+        return await super().query(
+            content, top_k=top_k, session_id=session_id, context=context,
+        )
+
+
+class _BoundaryFakeAgent(_FakeAgent):
+    """Fake graph that simulates the first before_model boundary by draining
+    whatever the injection registry has accumulated before returning."""
+
+    async def astream(
+        self,
+        state: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        stream_mode: str = "values",
+    ):
+        _mti._drain(config["configurable"]["channel_id"])
+        async for chunk in super().astream(
+            state, config=config, stream_mode=stream_mode,
+        ):
+            yield chunk
 
 
 class _FakeChannelSession:
@@ -1704,3 +1748,143 @@ async def test_run_turn_folds_injected_skill_atoms_into_record_no_autofeedback(
     assert "a" * 16 in record.saga_atom_ids
     # ...but NOT auto-credited (per-turn feedback removed).
     assert fake_saga.feedback_calls == []
+
+
+async def test_run_turn_arms_injection_before_saga_setup(tmp_path: Path):
+    """chainlink #383 facet 2: a follow-up arriving during slow setup (SAGA
+    query/prompt assembly), after dispatcher marks the channel in-flight but
+    before the first model boundary, is accepted into the active turn instead
+    of falling back to a queued next turn."""
+    _mti._REGISTRY.clear()
+    fake_saga = _BarrierSaga()
+    fake_agent = _BoundaryFakeAgent(response_messages=[AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=fake_saga)
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="first")
+    task = asyncio.create_task(agent.run_turn(event))
+    await asyncio.wait_for(fake_saga.started.wait(), timeout=1.0)
+
+    assert _mti.inject_message(
+        "ch-1",
+        AgentEvent(trigger="user_message", channel_id="ch-1", content="during setup"),
+    ) == "injected"
+
+    fake_saga.release.set()
+    record = await asyncio.wait_for(task, timeout=2.0)
+
+    assert record.injected_inputs
+    assert "during setup" in record.injected_inputs[0]["text"]
+
+
+async def test_run_turn_drains_startup_queued_followups(tmp_path: Path):
+    """chainlink #383 facet 1: user messages already queued behind the current
+    event at turn start are folded into the starting turn and do not remain in
+    the dispatcher queue as separate follow-up turns."""
+    from mimir.dispatcher import Dispatcher
+
+    _mti._REGISTRY.clear()
+    fake_agent = _BoundaryFakeAgent(response_messages=[AIMessage(content="done")])
+
+    disp = Dispatcher(
+        replace(_make_config(tmp_path / "home"), midturn_injection_channels=("ch-",)),
+        None,
+    )
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
+    agent._dispatcher = disp
+
+    q = disp._queues["ch-1"] = asyncio.Queue()
+    await q.put(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="ch-1",
+            content="queued followup",
+        ),
+    )
+
+    record = await agent.run_turn(
+        AgentEvent(trigger="user_message", channel_id="ch-1", content="first"),
+    )
+
+    assert "queued followup" in record.injected_inputs[0]["text"]
+    assert q.qsize() == 0
+    await asyncio.wait_for(q.join(), timeout=1.0)
+
+
+async def test_run_turn_does_not_drain_startup_followups_for_non_user_turn(
+    tmp_path: Path,
+):
+    """Startup-queued user messages must not be folded into non-user turns.
+
+    A saga_session_end/react/shell-job turn may be silent or non-conversational;
+    absorbing a queued user message there would acknowledge it nowhere.
+    """
+    from mimir.dispatcher import Dispatcher
+
+    _mti._REGISTRY.clear()
+    fake_agent = _BoundaryFakeAgent(response_messages=[AIMessage(content="done")])
+
+    disp = Dispatcher(
+        replace(_make_config(tmp_path / "home"), midturn_injection_channels=("ch-",)),
+        None,
+    )
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
+    agent._dispatcher = disp
+
+    q = disp._queues["ch-1"] = asyncio.Queue()
+    await q.put(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="ch-1",
+            content="queued followup",
+        ),
+    )
+
+    record = await agent.run_turn(
+        AgentEvent(
+            trigger="saga_session_end",
+            channel_id="ch-1",
+            content="summarize session",
+            extra={"saga_session_id": "saga-test"},
+        ),
+    )
+
+    assert record.injected_inputs == []
+    assert q.qsize() == 1
+    assert q.get_nowait().content == "queued followup"
+    q.task_done()
+
+
+async def test_run_turn_early_armed_injection_deactivates_on_setup_error(
+    tmp_path: Path,
+):
+    """chainlink #383 watch item: arming the injection registry before setup
+    must still clean up if setup fails before the model-loop finally runs."""
+    _mti._REGISTRY.clear()
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="unused")]),
+        fake_saga=None,
+    )
+
+    async def failing_body(*_args: object, **_kwargs: object):
+        assert _mti.inject_message(
+            "ch-1",
+            AgentEvent(
+                trigger="user_message",
+                channel_id="ch-1",
+                content="accepted before setup crash",
+            ),
+        ) == "injected"
+        raise RuntimeError("setup exploded")
+
+    agent._run_turn_body = failing_body  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="setup exploded"):
+        await agent.run_turn(
+            AgentEvent(trigger="user_message", channel_id="ch-1", content="first"),
+        )
+
+    assert _mti.inject_message(
+        "ch-1",
+        AgentEvent(trigger="user_message", channel_id="ch-1", content="later"),
+    ) == "no_active_turn"

@@ -97,6 +97,26 @@ def deactivate(channel_id: str | None) -> list["AgentEvent"]:
         return list(inflight.queue)
 
 
+def inject_startup_messages(channel_id: str | None, events: list["AgentEvent"]) -> int:
+    """Queue startup-drained follow-ups for the active turn (chainlink #383).
+
+    Unlike :func:`inject_message`, this path runs inside ``run_turn`` after
+    :func:`register_inflight` has armed the channel and after the dispatcher has
+    removed the events from its per-channel FIFO. A concurrent ``deactivate``
+    race cannot happen on this path, but keep the same active-entry check so a
+    setup-phase failure never silently parks events on a stale registry. Returns
+    the number accepted.
+    """
+    if not channel_id or not events:
+        return 0
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None or not inflight.active:
+            return 0
+        inflight.queue.extend(events)
+        return len(events)
+
+
 def inject_message(channel_id: str, event: "AgentEvent") -> str:
     """Queue a user-message ``event`` for the in-flight turn on ``channel_id``.
 
