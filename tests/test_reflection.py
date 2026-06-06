@@ -68,6 +68,20 @@ def test_reflection_prompt_references_cli_subcommand():
     assert "--contributed-only" in body
 
 
+def test_reflection_prompt_defines_gepa_recommendation_boundary():
+    body = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "prompt_templates"
+        / "reflect.md"
+    ).read_text()
+    assert "GEPA-shaped artifact failures" in body
+    assert "bounded textual artifact" in body
+    assert "meaningful evaluator or trace set" in body
+    assert "must not auto-run GEPA" in body
+    assert "auto-apply an optimized artifact" in body
+
+
 # ---- setup_home additions -----------------------------------------------
 
 
