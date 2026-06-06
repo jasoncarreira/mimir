@@ -380,15 +380,15 @@ async def commit_turn_changes(
     await _schedule_debounced_push(turn_id=turn_id, home=home)
 
 
-# chainlink #353: prose-note extensions whose presence under a tracked root
-# (memory/, state/, prompts/) while git-ignored signals a silently-dropped
-# write — ``git add -A`` skips it, the commit "succeeds", but the note never
-# persists. Surfaced as an algedonic event so the agent allowlists or relocates
-# it instead of losing it. Scoped to prose extensions to avoid flagging the
-# legitimately-ignored binary/log artifacts (*.db, *.jsonl, *.log) and secret
-# files (*.key/.env) that SHOULD stay ignored.
+# chainlink #353/#356: prose-note extensions whose presence under a durable
+# writable root (memory/, state/, attachments/) while git-ignored signals a
+# silently-dropped write — ``git add -A`` skips it, the commit "succeeds", but
+# the note never persists. Surfaced as an algedonic event so the agent allowlists
+# or relocates it instead of losing it. Scoped to prose extensions to avoid
+# flagging the legitimately-ignored binary/log artifacts (*.db, *.jsonl, *.log)
+# and secret files (*.key/.env) that SHOULD stay ignored.
 _IGNORED_NOTE_EXTS = (".md", ".markdown", ".txt", ".rst")
-_IGNORED_NOTE_ROOTS = ("memory", "state", "prompts")
+_IGNORED_NOTE_ROOTS = ("memory", "state", "attachments")
 
 
 async def _surface_ignored_notes(*, home: Path, turn_id: str) -> None:
