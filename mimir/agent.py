@@ -39,7 +39,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable
@@ -1483,6 +1483,10 @@ class Agent:
         # message was actually folded. (Chat-history recording happens at inject
         # time via the dispatcher's on_inject hook, not here — PR 4.)
         folded_records: list[tuple[AgentEvent, float]] = []
+        # chainlink #384: (event, reason) for folded messages the agent chose to
+        # DEFER (via defer_injected_message) — re-enqueued as their own turns in
+        # the finally, and marked deferred=true in injected_inputs below.
+        deferred_records: list[tuple[AgentEvent, str]] = []
         try:
             async with _timeout_ctx:
                 # ``stream_mode="values"`` yields the full state snapshot
@@ -1599,6 +1603,9 @@ class Agent:
             # folded) are disjoint — leftovers re-route as the next turn; folded
             # ones belong to this turn's durable record.
             folded_records = mid_turn_injection.folded_records(event.channel_id)
+            # chainlink #384: read deferred records BEFORE deactivate pops the
+            # entry (same reason as folded_records).
+            deferred_records = mid_turn_injection.deferred_records(event.channel_id)
             leftover_injections = mid_turn_injection.deactivate(event.channel_id)
             if leftover_injections and self._dispatcher is not None:
                 await log_event(
@@ -1608,6 +1615,30 @@ class Agent:
                     count=len(leftover_injections),
                 )
                 self._dispatcher.requeue_front(leftover_injections)
+            # chainlink #384: re-enqueue deferred messages as their own fresh
+            # turns. force_new_turn=True makes Dispatcher.enqueue / startup-drain
+            # refuse to re-fold them (loop guard); deferred_from_turn_id +
+            # deferred_reason make the later delivery traceable. Front of the
+            # queue (like leftovers) preserves their mid-turn arrival order ahead
+            # of post-turn events. _buffer_recorded is preserved from the original
+            # inject-time record, so chat history isn't duplicated.
+            if deferred_records and self._dispatcher is not None:
+                deferred_events = [
+                    replace(ev, extra={
+                        **ev.extra,
+                        "force_new_turn": True,
+                        "deferred_from_turn_id": turn_id,
+                        "deferred_reason": reason,
+                    })
+                    for ev, reason in deferred_records
+                ]
+                await log_event(
+                    "mid_turn_deferred",
+                    channel_id=event.channel_id,
+                    turn_id=turn_id,
+                    count=len(deferred_events),
+                )
+                self._dispatcher.requeue_front(deferred_events)
 
         # Algedonic: surface EVERY turn failure as an event so a dropped
         # turn — a transient model 503, a timeout, quota exhaustion, or a
@@ -1801,6 +1832,13 @@ class Agent:
                 {
                     "t_ms": max(0, round((mono - t_total_start) * 1000, 2)),
                     "text": truncate_input(mid_turn_injection.render_injected_message(e)),
+                    # chainlink #384: mark entries the agent deferred to their own
+                    # turn, so "why didn't turn N answer this folded message?" is
+                    # traceable from turn N's own record (pairs with the
+                    # deferred_from_turn_id on the re-delivered turn).
+                    **({"deferred": True}
+                       if e.source_id in {ev.source_id for ev, _r in deferred_records}
+                       else {}),
                 }
                 for e, mono in folded_records
             ],

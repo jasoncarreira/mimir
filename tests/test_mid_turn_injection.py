@@ -115,6 +115,84 @@ def test_folded_records_dropped_after_deactivate():
     assert mti.folded_records("ch1") == []
 
 
+# ─── defer_message / deferred_records (chainlink #384) ───────────────
+
+
+def _ev_id(content: str, source_id: str, channel_id: str = "ch1") -> AgentEvent:
+    return AgentEvent(
+        trigger="user_message", channel_id=channel_id, content=content,
+        source_id=source_id,
+    )
+
+
+def test_defer_message_marks_folded_message():
+    mti.register_inflight("ch1")
+    mti.inject_message("ch1", _ev_id("a true topic switch", "m1"))
+    mti._drain("ch1")  # fold it
+    assert mti.defer_message("ch1", "m1", "unrelated work") == "deferred"
+    recs = mti.deferred_records("ch1")
+    assert [(e.source_id, r) for e, r in recs] == [("m1", "unrelated work")]
+
+
+def test_defer_message_not_found_for_unfolded_id():
+    mti.register_inflight("ch1")
+    mti.inject_message("ch1", _ev_id("x", "m1"))
+    mti._drain("ch1")
+    # Only a message actually folded into THIS turn can be deferred.
+    assert mti.defer_message("ch1", "m-nope", "r") == "not_found"
+    assert mti.deferred_records("ch1") == []
+
+
+def test_defer_message_idempotent_keeps_first_reason():
+    mti.register_inflight("ch1")
+    mti.inject_message("ch1", _ev_id("x", "m1"))
+    mti._drain("ch1")
+    assert mti.defer_message("ch1", "m1", "first") == "deferred"
+    assert mti.defer_message("ch1", "m1", "second") == "already_deferred"
+    assert mti.deferred_records("ch1")[0][1] == "first"
+
+
+def test_defer_message_no_active_turn():
+    assert mti.defer_message("ch1", "m1", "r") == "no_active_turn"
+
+
+def test_deferred_records_empty_without_turn():
+    assert mti.deferred_records("ch1") == []
+    assert mti.deferred_records(None) == []
+
+
+def test_defer_message_dropped_after_deactivate():
+    mti.register_inflight("ch1")
+    mti.inject_message("ch1", _ev_id("x", "m1"))
+    mti._drain("ch1")
+    mti.defer_message("ch1", "m1", "r")
+    mti.deactivate("ch1")
+    assert mti.deferred_records("ch1") == []
+    assert mti.defer_message("ch1", "m1", "r") == "no_active_turn"
+
+
+def test_defer_injected_message_tool_maps_results():
+    """The defer_injected_message tool resolves the channel from config and maps
+    defer_message's status to clear agent-facing strings; invalid ids fail safely."""
+    from mimir.tools.registry import defer_injected_message
+    cfg = {"configurable": {"channel_id": "ch1"}}
+    mti.register_inflight("ch1")
+    mti.inject_message("ch1", _ev_id("topic switch", "m1"))
+    mti._drain("ch1")
+
+    ok = defer_injected_message.func(message_id="m1", reason="topic switch", config=cfg)
+    assert "Deferred message m1" in ok
+    assert [(e.source_id, r) for e, r in mti.deferred_records("ch1")] == [("m1", "topic switch")]
+
+    # Invalid (non-folded) id fails safely, no state change.
+    bad = defer_injected_message.func(message_id="m-nope", reason="x", config=cfg)
+    assert "failed: no injected message" in bad
+
+    # No channel context fails safely.
+    none_ch = defer_injected_message.func(message_id="m1", reason="x", config={})
+    assert "no current channel context" in none_ch
+
+
 # ─── MidTurnInjectionMiddleware.before_model ─────────────────────────
 
 

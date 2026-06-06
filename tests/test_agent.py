@@ -392,6 +392,67 @@ async def test_append_inbound_to_buffer_is_idempotent(tmp_path: Path):
     assert agent._buffer.channel_count("ch-1") == 1
 
 
+class _RequeueCaptureDispatcher:
+    """Minimal dispatcher double: records requeue_front calls, no startup drain."""
+
+    def __init__(self) -> None:
+        self.requeued: list[AgentEvent] = []
+
+    def drain_startup_user_messages(self, channel_id):  # noqa: ANN001
+        return []
+
+    def requeue_front(self, events):  # noqa: ANN001
+        self.requeued.extend(events)
+        return len(events)
+
+
+async def test_run_turn_defers_folded_message(tmp_path: Path):
+    """chainlink #384: a folded message the agent defers is (a) marked
+    deferred=true in this turn's injected_inputs, and (b) re-enqueued as its own
+    fresh turn (requeue_front) carrying force_new_turn + deferred_from_turn_id +
+    deferred_reason, with the original content/author preserved."""
+    _mti._REGISTRY.clear()
+    folded = AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="unrelated new ask",
+        author="discord-9", author_display="bob", source_id="m-999",
+    )
+
+    class _DeferringFakeAgent(_FakeAgent):
+        async def astream(self, state, *, config, stream_mode="values"):
+            ch = config["configurable"]["channel_id"]
+            assert _mti.inject_message(ch, folded) == "injected"
+            _mti._drain(ch)                                   # fold it
+            assert _mti.defer_message(ch, "m-999", "topic switch") == "deferred"
+            async for chunk in super().astream(state, config=config, stream_mode=stream_mode):
+                yield chunk
+
+    agent = _build_agent(
+        tmp_path, fake_agent=_DeferringFakeAgent([AIMessage(content="on the first task")]),
+        fake_saga=None,
+    )
+    cap = _RequeueCaptureDispatcher()
+    agent._dispatcher = cap  # type: ignore[assignment]
+
+    record = await agent.run_turn(
+        AgentEvent(trigger="user_message", channel_id="ch-1", content="first task")
+    )
+
+    # (a) originating turn's injected_inputs entry marked deferred.
+    assert len(record.injected_inputs) == 1
+    entry = record.injected_inputs[0]
+    assert entry.get("deferred") is True
+    assert "unrelated new ask" in entry["text"]
+
+    # (b) re-enqueued as a force_new_turn own-turn, traceable, content preserved.
+    assert len(cap.requeued) == 1
+    dev = cap.requeued[0]
+    assert dev.source_id == "m-999"
+    assert dev.content == "unrelated new ask"
+    assert dev.extra.get("force_new_turn") is True
+    assert dev.extra.get("deferred_from_turn_id") == record.turn_id
+    assert dev.extra.get("deferred_reason") == "topic switch"
+
+
 async def test_run_turn_no_saga_skips_query_and_feedback(tmp_path: Path):
     fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
