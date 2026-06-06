@@ -275,10 +275,11 @@ def test_render_dockerfile_empty_fragments():
 
 def test_render_dockerfile_has_base_layer():
     """Sanity: regardless of fragments, the base image + tooling are
-    present (git, gh, uv, claude-code, mermaid)."""
+    present (git, gh, uv, pinned claude-code, pinned mermaid)."""
     out = render_dockerfile([])
     assert "FROM python:3.11-slim" in out
-    assert "@anthropic-ai/claude-code" in out
+    assert "@anthropic-ai/claude-code@2.1.166" in out
+    assert "@mermaid-js/mermaid-cli@11.15.0" in out
     assert "astral.sh/uv/install.sh" in out
 
 
@@ -289,7 +290,7 @@ def test_render_dockerfile_installs_codex_when_enabled():
     """install_codex=True adds the codex CLI install to both modes."""
     for mode in ("workspace", "pypi"):
         out = render_dockerfile([], mode=mode, install_codex=True)
-        assert "npm install -g @openai/codex" in out, mode
+        assert "npm install -g @openai/codex@0.135.0" in out, mode
 
 
 def test_render_dockerfile_omits_codex_by_default():
@@ -307,7 +308,7 @@ def test_scaffold_installs_codex_for_codex_plus_extra(tmp_path: Path):
     home = tmp_path / "codex-home"
     home.mkdir()
     scaffold(home, mode="pypi", mimir_extras=["codex-plus", "discord"])
-    assert "npm install -g @openai/codex" in (home / "Dockerfile").read_text()
+    assert "npm install -g @openai/codex@0.135.0" in (home / "Dockerfile").read_text()
 
     plain = tmp_path / "plain-home"
     plain.mkdir()
@@ -321,7 +322,7 @@ def test_scaffold_installs_codex_for_workspace_uv_extra(tmp_path: Path):
     home = tmp_path / "ws-codex-home"
     home.mkdir()
     scaffold(home, mode="workspace", uv_extras=["codex-plus"])
-    assert "npm install -g @openai/codex" in (home / "Dockerfile").read_text()
+    assert "npm install -g @openai/codex@0.135.0" in (home / "Dockerfile").read_text()
 
     plain = tmp_path / "ws-plain-home"
     plain.mkdir()

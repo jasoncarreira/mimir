@@ -271,7 +271,7 @@ FROM python:3.11-slim
 # 2026-05: git for the source clone + agent dev loop, gh for PR
 # creation, build-essential for any C extensions, ca-certificates for
 # HTTPS clones, poppler-utils for Claude Code's PDF Read, Node 20
-# (claude-agent-sdk + mermaid-cli are npm packages), jq for JSONL
+# (claude-agent-sdk + mermaid-cli are pinned npm packages), jq for JSONL
 # log parsing across many skill bodies + the introspection recipes.
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends \\
@@ -293,8 +293,8 @@ RUN apt-get update \\
  && rm -rf /var/lib/apt/lists/*
 
 # Claude Code CLI (claude-agent-sdk shells out to this binary) +
-# mermaid CLI (used by mermaid-diagrams skill).
-RUN npm install -g @anthropic-ai/claude-code @mermaid-js/mermaid-cli
+# pinned mermaid CLI (used by mermaid-diagrams skill).
+RUN npm install -g @anthropic-ai/claude-code@2.1.166 @mermaid-js/mermaid-cli@11.15.0
 
 __CODEX_INSTALL__
 
@@ -391,8 +391,8 @@ RUN apt-get update \\
  && rm -rf /var/lib/apt/lists/*
 
 # Claude Code CLI subprocess transport + mermaid CLI for the
-# mermaid-diagrams skill. Both ship via npm.
-RUN npm install -g @anthropic-ai/claude-code @mermaid-js/mermaid-cli
+# mermaid-diagrams skill. Both ship via pinned npm package versions.
+RUN npm install -g @anthropic-ai/claude-code@2.1.166 @mermaid-js/mermaid-cli@11.15.0
 
 __CODEX_INSTALL__
 
@@ -488,7 +488,7 @@ def _codex_install_block(install_codex: bool) -> str:
         "# Codex CLI — codex-subscription deployments (codex-plus extra).\n"
         "# spawn_codex shells out to ``codex exec``; Codex Plus auth lives\n"
         "# at ~/.codex/auth.json. npm-global, like the claude-code CLI above.\n"
-        "RUN npm install -g @openai/codex"
+        "RUN npm install -g @openai/codex@0.135.0"
     )
 
 
