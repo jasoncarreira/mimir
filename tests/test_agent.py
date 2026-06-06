@@ -1810,6 +1810,50 @@ async def test_run_turn_drains_startup_queued_followups(tmp_path: Path):
     await asyncio.wait_for(q.join(), timeout=1.0)
 
 
+async def test_run_turn_does_not_drain_startup_followups_for_non_user_turn(
+    tmp_path: Path,
+):
+    """Startup-queued user messages must not be folded into non-user turns.
+
+    A saga_session_end/react/shell-job turn may be silent or non-conversational;
+    absorbing a queued user message there would acknowledge it nowhere.
+    """
+    from mimir.dispatcher import Dispatcher
+
+    _mti._REGISTRY.clear()
+    fake_agent = _BoundaryFakeAgent(response_messages=[AIMessage(content="done")])
+
+    disp = Dispatcher(
+        replace(_make_config(tmp_path / "home"), midturn_injection_channels=("ch-",)),
+        None,
+    )
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
+    agent._dispatcher = disp
+
+    q = disp._queues["ch-1"] = asyncio.Queue()
+    await q.put(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="ch-1",
+            content="queued followup",
+        ),
+    )
+
+    record = await agent.run_turn(
+        AgentEvent(
+            trigger="saga_session_end",
+            channel_id="ch-1",
+            content="summarize session",
+            extra={"saga_session_id": "saga-test"},
+        ),
+    )
+
+    assert record.injected_inputs == []
+    assert q.qsize() == 1
+    assert q.get_nowait().content == "queued followup"
+    q.task_done()
+
+
 async def test_run_turn_early_armed_injection_deactivates_on_setup_error(
     tmp_path: Path,
 ):

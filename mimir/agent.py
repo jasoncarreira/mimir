@@ -1289,15 +1289,6 @@ class Agent:
                 t_total_start,
             )
         except Exception as exc:
-            # If setup fails before _run_turn_body reaches its model-loop
-            # finally, clean up the early-armed injection registry so later
-            # turns do not inherit a stale active entry. Any accepted follow-ups
-            # are put back at the front of the dispatcher queue, preserving the
-            # same ordering contract as normal end-of-turn leftovers.
-            if injection_registered:
-                leftover_injections = mid_turn_injection.deactivate(event.channel_id)
-                if leftover_injections and self._dispatcher is not None:
-                    self._dispatcher.requeue_front(leftover_injections)
             # chainlink #306: _run_turn_body's model-loop try/except emits
             # turn_failed/turn_completed only AFTER the early phase (prompt
             # build, agent construction, model resolution). A crash in that
@@ -1355,12 +1346,16 @@ class Agent:
         await self._append_inbound_to_buffer(event)
 
         # chainlink #383 facet 1: mop up same-channel user messages that
-        # queued behind this event before the dispatcher/registry made the
-        # turn injectable. The dispatcher drains only the contiguous user_message
-        # prefix, so non-user queued predecessors remain an ordering boundary.
-        # This mirrors the normal enqueue-time route, which allows a user_message
-        # to fold into any opted-in same-channel in-flight turn once armed.
-        if self._dispatcher is not None:
+        # queued behind an interactive user turn before the dispatcher/registry
+        # made it injectable. The dispatcher drains only the contiguous
+        # user_message prefix, so non-user queued predecessors remain an
+        # ordering boundary. Do NOT drain for non-user triggers (session
+        # synthesis, react, shell-job, etc.): folding a user's queued message
+        # into a non-conversational turn can silently swallow it with no
+        # user-facing reply. The enqueue-time path still has a broader latent
+        # trigger-gating issue because the dispatcher does not yet track the
+        # active turn's trigger.
+        if self._dispatcher is not None and event.trigger == "user_message":
             startup_events = self._dispatcher.drain_startup_user_messages(event.channel_id)
             if startup_events:
                 accepted = mid_turn_injection.inject_startup_messages(

@@ -236,6 +236,9 @@ class Dispatcher:
                 else:
                     # Plain-queue fallback for tests: preserve the event and stop
                     # rather than dropping it if a test pre-seeded asyncio.Queue.
+                    # Production workers cache their queue reference, so swapping
+                    # ``self._queues[channel_id]`` would strand a live worker;
+                    # production creates only _ChannelQueue via enqueue().
                     restored = _ChannelQueue(maxsize=self._config.max_channel_queue)
                     restored.putleft_nowait(next_event)
                     while True:

@@ -97,8 +97,6 @@ def deactivate(channel_id: str | None) -> list["AgentEvent"]:
         return list(inflight.queue)
 
 
-
-
 def inject_startup_messages(channel_id: str | None, events: list["AgentEvent"]) -> int:
     """Queue startup-drained follow-ups for the active turn (chainlink #383).
 
