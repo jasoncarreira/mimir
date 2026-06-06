@@ -380,15 +380,25 @@ async def commit_turn_changes(
     await _schedule_debounced_push(turn_id=turn_id, home=home)
 
 
-# chainlink #353/#356: prose-note extensions whose presence under a durable
-# writable root (memory/, state/, attachments/) while git-ignored signals a
-# silently-dropped write — ``git add -A`` skips it, the commit "succeeds", but
-# the note never persists. Surfaced as an algedonic event so the agent allowlists
-# or relocates it instead of losing it. Scoped to prose extensions to avoid
-# flagging the legitimately-ignored binary/log artifacts (*.db, *.jsonl, *.log)
-# and secret files (*.key/.env) that SHOULD stay ignored.
+# chainlink #353: prose-note extensions whose presence under a TRACKED root
+# (memory/, state/) while git-ignored signals a silently-dropped write —
+# ``git add -A`` skips it, the commit "succeeds", but the note never persists.
+# Surfaced as an algedonic event so the agent allowlists or relocates it instead
+# of losing it. Scoped to prose extensions to avoid flagging the
+# legitimately-ignored binary/log artifacts (*.db, *.jsonl, *.log) and secret
+# files (*.key/.env) that SHOULD stay ignored.
+#
+# chainlink #356 reverted (2026-06-06): attachments/ is intentionally NOT a
+# tracked root. The home .gitignore is an allowlist (memory/prompts/skills/
+# scripts/state); attachments/ is excluded by design — inbound downloads +
+# transient artifacts (~18 MB of binaries/json/pdf), not durable state. A prose
+# note there is *expected* to be ignored, so scanning it produced false-positive
+# "dropped write" signals. If a note under attachments/ needs to persist, the
+# right move is to relocate it to memory/state — not to warn on every transient
+# note. So only the tracked roots are scanned. (prompts/ stays out too: it's ro
+# + force-tracked via ``!prompts/**``, so the scan can never fire there.)
 _IGNORED_NOTE_EXTS = (".md", ".markdown", ".txt", ".rst")
-_IGNORED_NOTE_ROOTS = ("memory", "state", "attachments")
+_IGNORED_NOTE_ROOTS = ("memory", "state")
 
 
 async def _surface_ignored_notes(*, home: Path, turn_id: str) -> None:
