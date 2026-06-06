@@ -97,7 +97,9 @@ def test_before_model_folds_queued_messages_fifo(monkeypatch):
     assert out is not None
     msgs = out["messages"]
     assert all(isinstance(m, HumanMessage) for m in msgs)
-    assert [m.content for m in msgs] == ["first", "second"]  # FIFO
+    # Rendered (header + body), so check containment + FIFO order.
+    assert len(msgs) == 2
+    assert "first" in msgs[0].content and "second" in msgs[1].content
 
     assert mw.before_model(state={}, runtime=None) is None  # drained → no-op
 
@@ -113,7 +115,7 @@ def test_before_model_reads_channel_id_from_get_config(monkeypatch):
 
     mw = mti.MidTurnInjectionMiddleware()
     out = mw.before_model(state={}, runtime=None)
-    assert [m.content for m in out["messages"]] == ["for A"]
+    assert len(out["messages"]) == 1 and "for A" in out["messages"][0].content
     # ch-B's queue is untouched by the ch-A turn.
     assert [e.content for e in mti._drain("ch-B")] == ["for B"]
 
@@ -127,3 +129,34 @@ def test_before_model_noop_when_get_config_unavailable(monkeypatch):
     mti.inject_message("ch1", _ev("x"))
     mw = mti.MidTurnInjectionMiddleware()
     assert mw.before_model(state={}, runtime=None) is None
+
+
+# ─── render_injected_message (attachments + author/msg-id) ───────────
+
+
+def test_render_injected_message_includes_attachments_and_author():
+    ev = AgentEvent(
+        trigger="user_message", channel_id="ch1", content="look at this",
+        author_display="alice", source_id="m123",
+        attachment_names=["attachments/foo.png", "attachments/bar.pdf"],
+    )
+    rendered = mti.render_injected_message(ev)
+    assert "look at this" in rendered
+    assert "alice" in rendered and "msg_id: m123" in rendered
+    assert "Attachments:\n- attachments/foo.png\n- attachments/bar.pdf" in rendered
+
+
+def test_before_model_folds_attachments_not_just_content(monkeypatch):
+    """Guards mimir's #593 finding: a mid-turn message with an attachment must
+    reach the model with its attachment paths, not a text-only HumanMessage."""
+    _patch_channel(monkeypatch, "ch1")
+    mti.register_inflight("ch1")
+    mti.inject_message("ch1", AgentEvent(
+        trigger="user_message", channel_id="ch1", content="see attached",
+        author_display="bob", attachment_names=["attachments/x.png"],
+    ))
+    mw = mti.MidTurnInjectionMiddleware()
+    folded = mw.before_model(state={}, runtime=None)["messages"][0].content
+    assert "see attached" in folded
+    assert "Attachments:\n- attachments/x.png" in folded  # not dropped
+    assert "bob" in folded

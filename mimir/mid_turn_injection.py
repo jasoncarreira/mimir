@@ -113,6 +113,25 @@ def _drain(channel_id: str | None) -> list["AgentEvent"]:
         return drained
 
 
+def render_injected_message(event: "AgentEvent") -> str:
+    """Render a folded event into the text the model sees mid-turn.
+
+    A normal ``user_message`` reaches the model via
+    ``prompts.build_turn_prompt``, which appends an ``Attachments:`` block and an
+    author / msg-id header to the body. Folding only ``event.content`` would
+    silently drop attachment paths (and authorship) so the model couldn't act on
+    a mid-turn attachment (mimir's #593 review). This mirrors that body
+    rendering so a folded message carries the same actionable content.
+    """
+    author = event.author_display or event.author or "-"
+    msg_id_part = f", msg_id: {event.source_id}" if event.source_id else ""
+    body = event.content or "(no content)"
+    if event.attachment_names:
+        paths = "\n".join(f"- {p}" for p in event.attachment_names)
+        body = f"{body}\n\nAttachments:\n{paths}"
+    return f"[mid-turn message from {author}{msg_id_part}]\n{body}"
+
+
 def _current_channel_id() -> str | None:
     """Read ``channel_id`` from the live LangGraph config.
 
@@ -137,4 +156,10 @@ class MidTurnInjectionMiddleware(AgentMiddleware):
             return None  # common case: one dict lookup, no state change
         # The ``messages`` channel uses an append reducer, so returning new
         # HumanMessages folds them into the conversation before the next call.
-        return {"messages": [HumanMessage(content=e.content) for e in pending]}
+        # Render each event (content + attachments + author/msg-id) so a
+        # mid-turn attachment isn't dropped — NOT just ``event.content``.
+        return {
+            "messages": [
+                HumanMessage(content=render_injected_message(e)) for e in pending
+            ]
+        }
