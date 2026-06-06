@@ -1526,8 +1526,11 @@ class Agent:
             # queue). Any leftover events were accepted by inject_message AFTER
             # the turn's final before_model boundary (e.g. a follow-up sent while
             # the model was generating its last response) so they were never
-            # folded — re-enqueue them as fresh next-turn events rather than
-            # dropping them (PR 2; mimir's #591 review note).
+            # folded. They arrived BEFORE any same-channel event that queued
+            # while this turn ran, so route them to the FRONT of the channel
+            # queue (ahead of those later events) rather than appending via
+            # enqueue() — preserving within-channel arrival order (PR 2; mimir's
+            # #591 + #593 review notes).
             leftover_injections = mid_turn_injection.deactivate(event.channel_id)
             if leftover_injections and self._dispatcher is not None:
                 await log_event(
@@ -1536,8 +1539,7 @@ class Agent:
                     turn_id=turn_id,
                     count=len(leftover_injections),
                 )
-                for _leftover in leftover_injections:
-                    await self._dispatcher.enqueue(_leftover)
+                self._dispatcher.requeue_front(leftover_injections)
 
         # Algedonic: surface EVERY turn failure as an event so a dropped
         # turn — a transient model 503, a timeout, quota exhaustion, or a

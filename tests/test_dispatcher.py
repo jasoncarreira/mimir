@@ -633,3 +633,84 @@ async def test_enqueue_skips_injection_for_non_user_message(tmp_path: Path):
     )
     assert _mti._drain("c1") == []     # not injected
     assert disp._queues["c1"].qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_leftover_injection_reroutes_ahead_of_later_queued_event(tmp_path: Path):
+    """mimir's #593 ordering finding: a mid-turn user message accepted by
+    inject_message but never folded (the turn ended before the next
+    before_model boundary) must run BEFORE a later non-user same-channel event
+    that queued while the turn ran — and leftovers keep their own order.
+
+    Re-routing via enqueue() would append the leftover behind the later event
+    (tail); requeue_front() puts it at the head, preserving arrival order."""
+    order: list[str] = []
+    started = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def runner(event: AgentEvent) -> None:
+        order.append(event.content)
+        if event.content == "turn1":
+            started.set()
+            await gate.wait()          # occupy the worker → channel in-flight
+
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), runner)
+    await disp.enqueue(AgentEvent(trigger="user_message", channel_id="c1", content="turn1"))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert "c1" in disp._in_flight
+
+    # Two follow-ups arrive mid-turn and are accepted as injections, but the
+    # stubbed turn never reaches a before_model boundary to fold them.
+    _mti.register_inflight("c1")
+    assert _mti.inject_message(
+        "c1", AgentEvent(trigger="user_message", channel_id="c1", content="inject1")
+    ) == "injected"
+    assert _mti.inject_message(
+        "c1", AgentEvent(trigger="user_message", channel_id="c1", content="inject2")
+    ) == "injected"
+    # A later NON-user same-channel event queues behind the running turn.
+    await disp.enqueue(AgentEvent(trigger="react_received", channel_id="c1", content="later"))
+    assert disp._queues["c1"].qsize() == 1
+
+    # Turn ends: deactivate yields the unfolded leftovers; agent.py's finally
+    # re-routes them to the FRONT (ahead of "later").
+    leftovers = _mti.deactivate("c1")
+    assert [e.content for e in leftovers] == ["inject1", "inject2"]
+    assert disp.requeue_front(leftovers) == 2
+    assert disp._queues["c1"].qsize() == 3     # leftovers ahead of the react
+
+    gate.set()
+    await disp.drain()
+
+    # Both injected messages ran, in order, BEFORE the later-queued react.
+    assert order == ["turn1", "inject1", "inject2", "later"]
+
+
+@pytest.mark.asyncio
+async def test_requeue_front_delivers_when_worker_already_retired(tmp_path: Path):
+    """If no live queue exists (the worker retired before the leftover was
+    re-routed), requeue_front still creates a queue + worker and delivers it."""
+    seen: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        seen.append(event.content)
+
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), runner)
+    assert "c1" not in disp._queues
+    assert disp.requeue_front(
+        [AgentEvent(trigger="user_message", channel_id="c1", content="orphan")]
+    ) == 1
+    await disp.drain()
+    assert seen == ["orphan"]
+
+
+@pytest.mark.asyncio
+async def test_requeue_front_noop_on_empty_or_closed(tmp_path: Path):
+    """No events, or a closed dispatcher, is a zero-count no-op (never raises in
+    run_turn's finally)."""
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
+    assert disp.requeue_front([]) == 0
+    disp._closed = True
+    assert disp.requeue_front(
+        [AgentEvent(trigger="user_message", channel_id="c1", content="x")]
+    ) == 0
