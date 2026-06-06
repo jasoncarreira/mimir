@@ -14,6 +14,9 @@ Currently seeded:
 - ``reflect.md`` — weekly cross-session audit workflow. Wraps the
   ``mimir reflection`` CLI subcommands (``most-retrieved``,
   ``introspection-report``, ``mark-applied``).
+- ``commitments-review.md`` — scheduled commitments hygiene workflow.
+- ``issues-audit.md`` — scheduled ``memory/issues`` notability and drift
+  audit workflow.
 - ``upgrade.md`` — version-triggered prompts/core defaults reconciliation
   turn for startup-opened upgrade-lane proposals.
 
