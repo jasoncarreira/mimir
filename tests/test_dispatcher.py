@@ -797,3 +797,44 @@ async def test_drain_startup_user_messages_stops_at_non_user_boundary(tmp_path: 
     q.task_done()
     q.task_done()
     await asyncio.wait_for(q.join(), timeout=1.0)
+
+
+# ─── chainlink #384: force_new_turn (deferred messages) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_force_new_turn_event_is_not_injected(tmp_path: Path):
+    """A deferred (force_new_turn) message must NEVER be folded — even with an
+    active in-flight turn it falls through to its own queued turn (loop guard)."""
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
+    disp._in_flight.add("c1")
+    _mti.register_inflight("c1")
+    await disp.enqueue(AgentEvent(
+        trigger="user_message", channel_id="c1", content="deferred topic",
+        extra={"force_new_turn": True},
+    ))
+    assert _mti._drain("c1") == []                  # not injected
+    assert disp._queues["c1"].qsize() == 1          # queued as its own turn
+
+
+@pytest.mark.asyncio
+async def test_drain_startup_treats_force_new_turn_as_boundary(tmp_path: Path):
+    """A force_new_turn event in the queue prefix is a hard boundary: startup-
+    drain stops at it so the deferred message keeps its own turn."""
+    disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
+    q = disp._queues["c1"] = _ChannelQueue(maxsize=disp._config.max_channel_queue)  # type: ignore[name-defined]
+    disp._high_water_logged["c1"] = False
+    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="foldable"))
+    await q.put(AgentEvent(
+        trigger="user_message", channel_id="c1", content="deferred",
+        extra={"force_new_turn": True},
+    ))
+    await q.put(AgentEvent(trigger="user_message", channel_id="c1", content="behind"))
+
+    drained = disp.drain_startup_user_messages("c1")
+
+    assert [e.content for e in drained] == ["foldable"]          # stops at force_new_turn
+    assert [q.get_nowait().content, q.get_nowait().content] == ["deferred", "behind"]
+    q.task_done()
+    q.task_done()
+    await asyncio.wait_for(q.join(), timeout=1.0)

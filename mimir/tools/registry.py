@@ -390,6 +390,67 @@ async def fetch_channel_history(
     return json.dumps(history, indent=2, ensure_ascii=False, default=str)
 
 
+@tool
+def defer_injected_message(
+    message_id: str,
+    reason: str,
+    config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
+) -> str:
+    """Defer a mid-turn-injected user message to its own later turn (chainlink #384).
+
+    Mid-turn injection folds a user's follow-up into the turn you're already
+    working on. Usually that's right — clarifications, corrections, "also do X",
+    cancels, or priority changes should fold. But sometimes an injected message
+    is a TRUE topic switch or substantial unrelated new work — common in a
+    multi-person channel where several people ask independent things while you're
+    mid-turn. Folding those into the current answer makes a worse, mixed response
+    and blurs audit / commitment boundaries.
+
+    Call this to hand such a message its OWN response boundary: it's re-queued as
+    a fresh turn right after this one, with its original author/content preserved,
+    and will not be folded again.
+
+    CONTRACT (not runtime-enforced): if you defer a message, do NOT also answer it
+    substantively in your current final response — it's already in your context,
+    but answering it defeats the purpose. A brief "I'll take your other question
+    as its own turn" is fine.
+
+    Use for: a true topic switch, substantial unrelated work, a message that needs
+    its own auditable response/tool-use boundary, or an explicit "separate
+    question" / "new thread".
+    Do NOT use for: clarifications, corrections, "also..." additions, cancels, or
+    priority changes to what you're already doing — those should fold.
+
+    Args:
+        message_id: The msg_id from the injected message's header
+            "[mid-turn message from <author>, msg_id: <id>]".
+        reason: Short why (e.g. "topic switch", "unrelated new work").
+    """
+    cid = _channel_from_config_or_state(None, config)
+    if not cid:
+        return "defer_injected_message failed: no current channel context"
+    mid = (message_id or "").strip()
+    if not mid:
+        return "defer_injected_message failed: message_id is required"
+    from .. import mid_turn_injection
+    result = mid_turn_injection.defer_message(cid, mid, (reason or "").strip())
+    if result == "deferred":
+        return (
+            f"Deferred message {mid} to its own next turn. Do NOT answer it "
+            "substantively in this response."
+        )
+    if result == "already_deferred":
+        return f"Message {mid} is already deferred for this turn (no-op)."
+    if result == "not_found":
+        return (
+            f"defer_injected_message failed: no injected message with msg_id {mid} "
+            "in the current turn. Only messages folded into THIS turn can be deferred."
+        )
+    return (
+        "defer_injected_message failed: no active injectable turn — nothing to defer."
+    )
+
+
 # ────────────────────────────────────────────────────────────────────
 # Scheduler tools (mimir/scheduletools.py)
 # ────────────────────────────────────────────────────────────────────
@@ -1188,6 +1249,9 @@ def all_mimir_tools() -> list:
         bash_async, bash_jobs_list, bash_job_output,
         # Channel ops
         send_message, react, fetch_channel_history,
+        # Mid-turn injection escape hatch (chainlink #384): punt a folded
+        # follow-up to its own turn instead of answering it in this one.
+        defer_injected_message,
         # Scheduler
         list_schedules, add_schedule, remove_schedule, reload_pollers,
         # Commitments

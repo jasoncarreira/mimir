@@ -378,8 +378,29 @@ return await self._normal_enqueue(event)
      chronological event timeline at that offset (`renderInjected`, `ev-injected`)
      instead of a side list; the standalone "Injected mid-turn" section remains a
      fallback for legacy/untimed entries.
-5. **(Optional follow-on)** cancel/stop signal.
-6. **(Optional follow-on)** checkpointer + park-and-resume + session resumption.
+5. **Defer tool** *(implemented, chainlink #384)* — a `defer_injected_message(message_id, reason)`
+   tool the agent calls when a folded message is a true topic switch / substantial
+   unrelated work (esp. in a multi-person channel) that deserves its own response
+   boundary, rather than being mixed into the current answer.
+   - `mid_turn_injection.defer_message(channel_id, source_id, reason)` records the
+     intent on `_Inflight.deferred` (validates the id is actually a folded message
+     of this turn; returns `not_found`/`already_deferred`/`no_active_turn` otherwise).
+     Address is the `source_id` already shown in the folded message's `msg_id:` header.
+   - At turn end `run_turn` reads `deferred_records()` (before `deactivate`), marks
+     the originating turn's `injected_inputs[]` entry `deferred: true`, and
+     **re-enqueues** each deferred event via `requeue_front` as a fresh event with
+     `extra.force_new_turn=True` + `deferred_from_turn_id` + `deferred_reason`.
+     `_buffer_recorded` is preserved so chat history isn't duplicated.
+   - **`force_new_turn` is the loop guard**: `Dispatcher.enqueue`'s inject branch and
+     `drain_startup_user_messages` both treat such an event as never-foldable (a hard
+     boundary), so a deferred message can never be re-folded into another turn.
+   - **Cooperative invariant (not runtime-enforceable):** the folded text is already
+     in the model's context, so nothing mechanically stops the model from answering a
+     deferred message anyway. The tool docstring states the "don't also answer it"
+     rule as an agent contract; the `injected_inputs[].deferred` marking makes a
+     contract violation auditable after the fact.
+6. **(Optional follow-on)** cancel/stop signal.
+7. **(Optional follow-on)** checkpointer + park-and-resume + session resumption.
 
 ## Testing strategy
 

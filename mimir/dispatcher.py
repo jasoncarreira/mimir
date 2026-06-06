@@ -142,8 +142,12 @@ class Dispatcher:
         # AND no queued predecessor — gating on an empty queue preserves
         # ordering (a later message must never overtake an already-queued
         # earlier one; that's stricter than ``is_channel_busy()``).
+        # chainlink #384: a ``force_new_turn`` event (a message the agent
+        # explicitly deferred) is NEVER folded — it must get its own turn. This
+        # is the loop guard: a re-enqueued deferred message can't be re-injected.
         if (
             event.trigger == "user_message"
+            and not event.extra.get("force_new_turn")
             and self._injection_enabled(channel_id)
             and channel_id in self._in_flight
         ):
@@ -226,7 +230,10 @@ class Dispatcher:
                 next_event = queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            if next_event.trigger != "user_message":
+            # A non-user event is a hard boundary; so is a ``force_new_turn``
+            # event (chainlink #384 — a deferred message must get its own turn,
+            # never be folded, even into a starting turn).
+            if next_event.trigger != "user_message" or next_event.extra.get("force_new_turn"):
                 # We consumed one queue item speculatively. Mark that get() done
                 # before re-inserting it as queued work; putleft/put_nowait will
                 # create the replacement unfinished-task accounting entry.

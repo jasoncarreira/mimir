@@ -53,10 +53,16 @@ class _Inflight:
     timeline next to the events/tool-calls it interleaved with. ``queue``
     (pending) and ``folded`` (consumed) are disjoint: ``_drain`` moves events
     from one to the other.
+
+    ``deferred`` maps the ``source_id`` of a folded message to the reason the
+    agent punted it (chainlink #384 — the ``defer_injected_message`` tool). At
+    turn end ``run_turn`` re-enqueues those events as their own fresh turns and
+    marks the originating turn's ``injected_inputs`` entries ``deferred``.
     """
 
     queue: list["AgentEvent"] = field(default_factory=list)
     folded: list[tuple["AgentEvent", float]] = field(default_factory=list)
+    deferred: dict[str, str] = field(default_factory=dict)
     active: bool = True
 
 
@@ -168,6 +174,55 @@ def folded_records(channel_id: str | None) -> list[tuple["AgentEvent", float]]:
         if inflight is None:
             return []
         return list(inflight.folded)
+
+
+def defer_message(channel_id: str | None, source_id: str | None, reason: str) -> str:
+    """Mark a folded message as deferred to its own later turn (chainlink #384).
+
+    Returns one of:
+      - ``"deferred"`` — recorded; ``run_turn`` will re-enqueue it as a fresh
+        force-new-turn event at turn end.
+      - ``"not_found"`` — no message with that ``source_id`` was folded into the
+        current turn (the only messages eligible to defer).
+      - ``"already_deferred"`` — idempotent no-op; it's already marked.
+      - ``"no_active_turn"`` — no injectable turn is in flight on the channel.
+
+    Note this only RECORDS intent. Whether the model also answers the deferred
+    message in this turn's final response is a cooperative contract the runtime
+    cannot enforce — the text is already in the model's context.
+    """
+    if not channel_id or not source_id:
+        return "not_found"
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None or not inflight.active:
+            return "no_active_turn"
+        if source_id in inflight.deferred:
+            return "already_deferred"
+        if not any(e.source_id == source_id for e, _t in inflight.folded):
+            return "not_found"
+        inflight.deferred[source_id] = reason or ""
+        return "deferred"
+
+
+def deferred_records(channel_id: str | None) -> list[tuple["AgentEvent", str]]:
+    """``(folded_event, reason)`` for every message the agent deferred this turn.
+
+    Read in ``run_turn`` BEFORE :func:`deactivate` pops the entry, so the turn
+    can (a) re-enqueue each as its own fresh turn and (b) mark the matching
+    ``injected_inputs`` entry ``deferred``. ``[]`` when nothing was deferred.
+    """
+    if not channel_id:
+        return []
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None:
+            return []
+        return [
+            (e, inflight.deferred[e.source_id])
+            for e, _t in inflight.folded
+            if e.source_id in inflight.deferred
+        ]
 
 
 def render_injected_message(event: "AgentEvent") -> str:
