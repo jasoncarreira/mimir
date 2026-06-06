@@ -210,6 +210,14 @@ class TurnRecord:
     saga_atom_ids: list[str] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     output: str = ""
+    # chainlink #376: user messages that arrived mid-turn and were FOLDED into
+    # this turn at a before_model boundary (the rendered text the model saw, one
+    # entry per fold, in fold order). ``input`` stays the original turn prompt;
+    # these are the additional inputs this single turn absorbed. Empty for the
+    # overwhelming majority of turns (no mid-turn message). Threaded here so the
+    # durable surfaces — turn log, synthesis summary, turn viewer — report what
+    # the turn actually consumed, not just the model's live message list.
+    injected_inputs: list[str] = field(default_factory=list)
     duration_ms: int = 0
     error: str | None = None
     # SDK ResultMessage capture (Phase 8 — resume detection + cost). Populated

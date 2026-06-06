@@ -408,10 +408,19 @@ def _turn_summary_lines(turns_window: list[dict]) -> str:
             f"atoms: {', '.join(atoms)}" if atoms else "atoms: (none)"
         )
         preview = _output_preview(t.get("output") or "")
-        lines.append(
+        line = (
             f"- turn {turn_id} ({trigger}, {cost_part}, {tool_calls} tool calls, {atoms_part})\n"
             f"    output: {preview}"
         )
+        # chainlink #376: surface mid-turn messages folded into this turn so
+        # session-end synthesis + commitment extraction see the user's
+        # follow-ups — not just the original prompt (the model saw them, but
+        # this summary is the synthesis-visible projection).
+        injected = t.get("injected_inputs") or []
+        if injected:
+            previews = " | ".join(_output_preview(m) for m in injected)
+            line += f"\n    injected mid-turn ({len(injected)}): {previews}"
+        lines.append(line)
     return "\n".join(lines)
 
 

@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
+from mimir import mid_turn_injection as _mti
 from mimir.agent import Agent
 from mimir.config import Config
 from mimir.history import MessageBuffer
@@ -260,6 +261,76 @@ async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
     # The TurnLogger appended one record
     turns = (tmp_path / "home" / "logs" / "turns.jsonl").read_text().splitlines()
     assert len(turns) == 1
+
+
+class _FoldingFakeAgent(_FakeAgent):
+    """Fake graph that simulates the MidTurnInjectionMiddleware folding a
+    mid-turn user message mid-stream: during ``astream`` it injects + drains
+    the registry for the turn's channel (exactly what ``before_model`` does on
+    a real boundary), so ``run_turn``'s finally sees a folded event to thread
+    into the record + chat-history buffer (chainlink #376 PR 3)."""
+
+    def __init__(self, response_messages: list[Any], *, folded: list[AgentEvent]) -> None:
+        super().__init__(response_messages)
+        self._folded = folded
+
+    async def astream(self, state: dict[str, Any], *, config: dict[str, Any], stream_mode: str = "values"):
+        ch = config["configurable"]["channel_id"]
+        for ev in self._folded:
+            assert _mti.inject_message(ch, ev) == "injected"
+            _mti._drain(ch)            # the boundary fold — records to `folded`
+        async for chunk in super().astream(state, config=config, stream_mode=stream_mode):
+            yield chunk
+
+
+async def test_run_turn_records_folded_mid_turn_inputs(tmp_path: Path):
+    """A message folded into the turn lands in TurnRecord.injected_inputs
+    (rendered as the model saw it), round-trips through turns.jsonl, and is
+    recorded in the chat-history buffer — while ``input`` stays the original
+    prompt (PR 3 durable visibility readers a/b/e)."""
+    _mti._REGISTRY.clear()
+    folded = [AgentEvent(
+        trigger="user_message", channel_id="ch-1",
+        content="also check the staging logs",
+        author="discord-7", author_display="alice",
+    )]
+    fake_agent = _FoldingFakeAgent([AIMessage(content="done")], folded=folded)
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="deploy please")
+    record = await agent.run_turn(event)
+
+    # (a) the folded input is on the record, rendered with its author header.
+    assert len(record.injected_inputs) == 1
+    assert "also check the staging logs" in record.injected_inputs[0]
+    assert "mid-turn message from alice" in record.injected_inputs[0]
+    # original prompt unchanged — this is an ADDITIONAL input, not a rewrite.
+    assert "deploy please" in record.input
+
+    # (b) round-trips through turns.jsonl.
+    import json
+    turns = (tmp_path / "home" / "logs" / "turns.jsonl").read_text().splitlines()
+    row = json.loads(turns[-1])
+    assert row["injected_inputs"] == record.injected_inputs
+
+    # (e) recorded in the chat-history buffer (original inbound + the fold).
+    assert agent._buffer.channel_count("ch-1") == 2
+    contents = [m.content for m in agent._buffer.recent_for_channel("ch-1", 10)]
+    assert "also check the staging logs" in contents
+    assert "deploy please" in contents
+
+
+async def test_run_turn_no_injected_inputs_when_nothing_folded(tmp_path: Path):
+    """The common case: no mid-turn message → injected_inputs is empty and the
+    buffer holds only the original inbound."""
+    _mti._REGISTRY.clear()
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
+    record = await agent.run_turn(
+        AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    )
+    assert record.injected_inputs == []
+    assert agent._buffer.channel_count("ch-1") == 1
 
 
 async def test_run_turn_no_saga_skips_query_and_feedback(tmp_path: Path):

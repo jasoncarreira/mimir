@@ -345,13 +345,26 @@ return await self._normal_enqueue(event)
    fallback path, `MIMIR_MIDTURN_INJECTION_CHANNELS`. Tests for the routing race
    (inject vs `no_active_turn` fallback), the **ordering guard** (a queued
    predecessor must NOT be bypassed), and the poller/scheduler exclusion.
-3. **Durable visibility** — `injected_inputs` field + the full reader threading
-   (a)–(e) from "Durable visibility": `run_turn` population, `turn_logger`
-   serialization, the synthesis-visible summary (`_turn_summary_lines` /
-   `mimir_get_turn`), turn-viewer markers, and `_append_inbound_to_buffer` on the
-   inject path. Tests: one `turn_id` with multiple inputs, cost roll-up, the
-   injected input present in the synthesis-visible summary, and a
-   `chat_history.jsonl` entry for the injected message.
+3. **Durable visibility** *(implemented)* — `TurnRecord.injected_inputs` +
+   the full reader threading (a)–(e): `run_turn` snapshots the folded events via
+   `mid_turn_injection.folded_events()` before `deactivate()` pops the entry and
+   populates `injected_inputs` (rendered with `render_injected_message`, bounded
+   by `truncate_input`); `turn_logger` serializes it for free (`asdict`); the
+   synthesis-visible summary (`_turn_summary_lines` adds an "injected mid-turn
+   (N)" line; `mimir_get_turn` keeps the field — it's *not* in the strip list);
+   the turn viewer renders an "Injected mid-turn (N)" section + includes the text
+   in search; and `_append_inbound_to_buffer` records each folded event in the
+   chat-history buffer.
+   - **Deviation from the sketch:** `_append_inbound_to_buffer` is called at
+     **turn end** (over `folded_events`), not from the dispatcher's inject path —
+     the dispatcher has no handle on the agent's buffer, and turn-end keeps the
+     coupling minimal. Trade-off: a mid-turn arrival is buffer-recorded after the
+     turn's own outbound, so it can sort after the reply it preceded. Acceptable
+     — presence is what matters, and the buffer's cross-message interleave is
+     already approximate across concurrent async sends. The `injected_inputs`
+     record (turn log + viewer + summary) preserves the exact fold order.
+   - To capture what was folded, `_Inflight` gained a `folded` list that `_drain`
+     appends to; `folded` (consumed) and `queue` (pending leftovers) are disjoint.
 4. **(Optional follow-on)** cancel/stop signal.
 5. **(Optional follow-on)** checkpointer + park-and-resume + session resumption.
 

@@ -183,6 +183,10 @@ tr:hover td{background:var(--surface2);cursor:pointer}
       <div class="section-label">Input</div>
       <div class="msg-box" id="detailInput"></div>
     </div>
+    <div class="section" id="detailInjectedSection" style="display:none">
+      <div class="section-label">Injected mid-turn (<span id="detailInjectedCount">0</span>)</div>
+      <div class="msg-box" id="detailInjected"></div>
+    </div>
     <div class="section" id="detailErrorSection" style="display:none">
       <div class="section-label">Error</div>
       <div class="error-box" id="detailError"></div>
@@ -344,7 +348,14 @@ function filterTurns() {
     if (hidePollers && activeTrigger === 'all' && t.trigger === 'poller') return false;
     if (searchQuery) {
       var q = searchQuery.toLowerCase();
-      if (((t.input||'').toLowerCase().indexOf(q)===-1) && ((t.output||'').toLowerCase().indexOf(q)===-1)) return false;
+      // chainlink #376: search mid-turn injected inputs too, so a follow-up
+      // sent during a turn is findable even though it isn't in `input`.
+      var injectedHit = (t.injected_inputs||[]).some(function(m){
+        return (m||'').toLowerCase().indexOf(q) !== -1;
+      });
+      if (((t.input||'').toLowerCase().indexOf(q)===-1)
+          && ((t.output||'').toLowerCase().indexOf(q)===-1)
+          && !injectedHit) return false;
     }
     return true;
   });
@@ -551,6 +562,19 @@ function openDetail(turn) {
   document.getElementById('detailTurnId').textContent = turn.turn_id ? 'turn: '+turn.turn_id : '';
   document.getElementById('detailInput').textContent = turn.input||'(empty)';
   document.getElementById('detailOutput').textContent = turn.output||'(empty)';
+
+  // chainlink #376: mid-turn messages the user sent while this turn was
+  // running, folded in at a model-call boundary. Hidden unless present.
+  var injected = turn.injected_inputs||[];
+  var injectedSection = document.getElementById('detailInjectedSection');
+  if (injected.length) {
+    injectedSection.style.display = '';
+    document.getElementById('detailInjectedCount').textContent = injected.length;
+    document.getElementById('detailInjected').textContent =
+      injected.join('\n\n— — —\n\n');
+  } else {
+    injectedSection.style.display = 'none';
+  }
 
   var errorSection = document.getElementById('detailErrorSection');
   if (turn.error) {

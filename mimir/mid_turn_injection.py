@@ -42,9 +42,16 @@ class _Inflight:
     message accepted after the turn's final ``before_model`` boundary — can be
     re-enqueued faithfully as its own next turn (PR 2), preserving author / ids /
     trigger. The middleware folds ``event.content`` at the boundary.
+
+    ``folded`` accumulates the events actually drained into the turn (PR 3) so
+    ``run_turn`` can record them durably — ``TurnRecord.injected_inputs``, the
+    synthesis summary, the chat-history buffer — at turn end. ``queue`` (pending)
+    and ``folded`` (consumed) are disjoint: ``_drain`` moves events from one to
+    the other.
     """
 
     queue: list["AgentEvent"] = field(default_factory=list)
+    folded: list["AgentEvent"] = field(default_factory=list)
     active: bool = True
 
 
@@ -101,7 +108,11 @@ def inject_message(channel_id: str, event: "AgentEvent") -> str:
 
 
 def _drain(channel_id: str | None) -> list["AgentEvent"]:
-    """Pop all queued events for ``channel_id`` (FIFO); ``[]`` when none."""
+    """Pop all queued events for ``channel_id`` (FIFO); ``[]`` when none.
+
+    Drained events are recorded on ``folded`` so :func:`folded_events` can report
+    what the turn actually absorbed (PR 3 durable visibility).
+    """
     if not channel_id:
         return []
     with _LOCK:
@@ -110,7 +121,25 @@ def _drain(channel_id: str | None) -> list["AgentEvent"]:
             return []
         drained = inflight.queue[:]
         inflight.queue.clear()
+        inflight.folded.extend(drained)
         return drained
+
+
+def folded_events(channel_id: str | None) -> list["AgentEvent"]:
+    """Events folded into the in-flight turn on ``channel_id`` so far.
+
+    Read in ``run_turn`` BEFORE :func:`deactivate` pops the entry, so the turn
+    can record the mid-turn inputs it consumed (``TurnRecord.injected_inputs``,
+    synthesis summary, chat-history buffer). ``[]`` when nothing was folded or
+    the channel has no active turn.
+    """
+    if not channel_id:
+        return []
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None:
+            return []
+        return list(inflight.folded)
 
 
 def render_injected_message(event: "AgentEvent") -> str:
