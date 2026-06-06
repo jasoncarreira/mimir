@@ -228,11 +228,13 @@ return await self._normal_enqueue(event)
 
 ## Turn lifecycle & data-model changes
 
-- **TurnRecord** — add `injected_inputs: list[str] = field(default_factory=list)`.
-  Keep `input: str` as the original turn prompt (backward compatible); folded
-  messages append to `injected_inputs`. Preserves one-turn semantics + a stable
-  `turn_id`. **This field is only the carrier — it is inert until the readers in
-  "Durable visibility" are taught to consult it.**
+- **TurnRecord** — add `injected_inputs: list[dict] = field(default_factory=list)`,
+  each entry `{t_ms, text}` (PR 4; PR 3 shipped it as `list[str]` — readers
+  tolerate both). Keep `input: str` as the original turn prompt (backward
+  compatible); folded messages append to `injected_inputs`. `t_ms` is the
+  start-relative fold time so the turn viewer can place each on the timeline.
+  Preserves one-turn semantics + a stable `turn_id`. **This field is only the
+  carrier — it is inert until the readers in "Durable visibility" consult it.**
 - **Durable visibility (the easy-to-get-wrong part).** Folding a `HumanMessage`
   into live graph state makes the *model* see it, but the durable
   observability / session / audit surfaces do **not** pick it up automatically:
@@ -347,26 +349,37 @@ return await self._normal_enqueue(event)
    predecessor must NOT be bypassed), and the poller/scheduler exclusion.
 3. **Durable visibility** *(implemented)* — `TurnRecord.injected_inputs` +
    the full reader threading (a)–(e): `run_turn` snapshots the folded events via
-   `mid_turn_injection.folded_events()` before `deactivate()` pops the entry and
+   `mid_turn_injection.folded_records()` before `deactivate()` pops the entry and
    populates `injected_inputs` (rendered with `render_injected_message`, bounded
    by `truncate_input`); `turn_logger` serializes it for free (`asdict`); the
    synthesis-visible summary (`_turn_summary_lines` adds an "injected mid-turn
    (N)" line; `mimir_get_turn` keeps the field — it's *not* in the strip list);
-   the turn viewer renders an "Injected mid-turn (N)" section + includes the text
-   in search; and `_append_inbound_to_buffer` records each folded event in the
+   the turn viewer surfaces it; and folded messages are recorded in the
    chat-history buffer.
-   - **Deviation from the sketch:** `_append_inbound_to_buffer` is called at
-     **turn end** (over `folded_events`), not from the dispatcher's inject path —
-     the dispatcher has no handle on the agent's buffer, and turn-end keeps the
-     coupling minimal. Trade-off: a mid-turn arrival is buffer-recorded after the
-     turn's own outbound, so it can sort after the reply it preceded. Acceptable
-     — presence is what matters, and the buffer's cross-message interleave is
-     already approximate across concurrent async sends. The `injected_inputs`
-     record (turn log + viewer + summary) preserves the exact fold order.
    - To capture what was folded, `_Inflight` gained a `folded` list that `_drain`
      appends to; `folded` (consumed) and `queue` (pending leftovers) are disjoint.
-4. **(Optional follow-on)** cancel/stop signal.
-5. **(Optional follow-on)** checkpointer + park-and-resume + session resumption.
+4. **Correct chat-history threading + timeline placement** *(implemented, PR 4)* —
+   PR 3's first cut recorded folded messages in the buffer at **turn end**, so a
+   mid-turn arrival sorted *after* the turn's own replies (the buffer is
+   append-ordered: `recent_for_channel` returns `pool[-limit:]`). PR 4 fixes the
+   ordering on both surfaces:
+   - **Chat history at inject time.** The dispatcher gained an `on_inject`
+     callback (`set_on_inject`), wired in `server.py` to `Agent.on_message_injected`
+     → `_append_inbound_to_buffer`. When `enqueue` folds a message it records it
+     in the buffer immediately (true arrival time), so it threads ahead of the
+     turn's later replies. `_append_inbound_to_buffer` is now **idempotent** per
+     event (an `event.extra["_buffer_recorded"]` flag) so an un-folded leftover
+     that re-routes as its own turn (`requeue_front`) isn't double-recorded. The
+     turn-end append loop is removed.
+   - **Timeline placement in the viewer.** `injected_inputs` entries are now
+     `{t_ms, text}` — `t_ms` is the fold time captured in `_drain`
+     (`time.monotonic()`), made start-relative against `TurnContext.started_at`
+     (same axis as event/saga `t_ms`). The turn viewer weaves them into the
+     chronological event timeline at that offset (`renderInjected`, `ev-injected`)
+     instead of a side list; the standalone "Injected mid-turn" section remains a
+     fallback for legacy/untimed entries.
+5. **(Optional follow-on)** cancel/stop signal.
+6. **(Optional follow-on)** checkpointer + park-and-resume + session resumption.
 
 ## Testing strategy
 

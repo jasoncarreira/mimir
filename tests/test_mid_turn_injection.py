@@ -76,40 +76,43 @@ def test_none_channel_is_a_safe_noop():
     assert mti._drain(None) == []
 
 
-# ─── folded_events (PR 3 durable visibility) ─────────────────────────
+# ─── folded_records (PR 3/4 durable visibility + timing) ─────────────
 
 
-def test_drain_records_folded_events_in_order():
+def test_drain_records_folded_records_in_order_with_timing():
     mti.register_inflight("ch1")
     mti.inject_message("ch1", _ev("first"))
     mti.inject_message("ch1", _ev("second"))
     mti._drain("ch1")  # the fold
-    assert [e.content for e in mti.folded_events("ch1")] == ["first", "second"]
+    recs = mti.folded_records("ch1")
+    assert [e.content for e, _t in recs] == ["first", "second"]
+    # Each carries a monotonic fold timestamp (float) for t_ms computation.
+    assert all(isinstance(t, float) for _e, t in recs)
 
 
-def test_folded_events_excludes_unfolded_leftovers():
-    """Folded (drained) and pending (still queued) are disjoint: folded_events
+def test_folded_records_excludes_unfolded_leftovers():
+    """Folded (drained) and pending (still queued) are disjoint: folded_records
     reports only what a before_model boundary consumed; the rest is a leftover."""
     mti.register_inflight("ch1")
     mti.inject_message("ch1", _ev("folded-1"))
     mti._drain("ch1")                       # first boundary folds folded-1
     mti.inject_message("ch1", _ev("leftover"))  # arrives after the last boundary
-    assert [e.content for e in mti.folded_events("ch1")] == ["folded-1"]
+    assert [e.content for e, _t in mti.folded_records("ch1")] == ["folded-1"]
     # The unfolded one comes back from deactivate as a leftover, not folded.
     assert [e.content for e in mti.deactivate("ch1")] == ["leftover"]
 
 
-def test_folded_events_empty_without_active_turn():
-    assert mti.folded_events("ch1") == []   # never registered
-    assert mti.folded_events(None) == []
+def test_folded_records_empty_without_active_turn():
+    assert mti.folded_records("ch1") == []   # never registered
+    assert mti.folded_records(None) == []
 
 
-def test_folded_events_dropped_after_deactivate():
+def test_folded_records_dropped_after_deactivate():
     mti.register_inflight("ch1")
     mti.inject_message("ch1", _ev("x"))
     mti._drain("ch1")
     mti.deactivate("ch1")                   # turn ended → entry popped
-    assert mti.folded_events("ch1") == []
+    assert mti.folded_records("ch1") == []
 
 
 # ─── MidTurnInjectionMiddleware.before_model ─────────────────────────

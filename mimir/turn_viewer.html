@@ -97,6 +97,9 @@ tr:hover td{background:var(--surface2);cursor:pointer}
 .ev-saga{background:#1f1b2e;border:1px solid #3b2d54}
 .ev-saga .event-hdr{background:#3b2d54;color:#d8b4fe}
 .ev-saga .event-bdy{color:#e9d5ff}
+.ev-injected{background:#2a1f12;border:1px solid #5a3d1a}
+.ev-injected .event-hdr{background:#5a3d1a;color:#fcd9a8}
+.ev-injected .event-bdy{color:#fde9cf}
 .ev-saga.is-error{background:var(--treb);border-color:var(--trebd)}
 .ev-saga.is-error .event-hdr{background:var(--trebd);color:#fecaca}
 .ev-saga.is-error .event-bdy{color:#fee2e2}
@@ -350,8 +353,10 @@ function filterTurns() {
       var q = searchQuery.toLowerCase();
       // chainlink #376: search mid-turn injected inputs too, so a follow-up
       // sent during a turn is findable even though it isn't in `input`.
+      // Entries are {t_ms, text} (PR 4); tolerate PR-3-era bare strings.
       var injectedHit = (t.injected_inputs||[]).some(function(m){
-        return (m||'').toLowerCase().indexOf(q) !== -1;
+        var txt = (typeof m === 'string') ? m : (m && m.text) || '';
+        return txt.toLowerCase().indexOf(q) !== -1;
       });
       if (((t.input||'').toLowerCase().indexOf(q)===-1)
           && ((t.output||'').toLowerCase().indexOf(q)===-1)
@@ -496,6 +501,36 @@ function renderSagaCall(c, i) {
     '<div class="event-bdy">'+esc(body)+'</div></div>';
 }
 
+// chainlink #376: a mid-turn user message folded into the turn at a
+// model-call boundary. Rendered as a timeline entry (same .event shell so
+// it gets toggle + scroll-preservation for free) placed at its t_ms — so
+// it reads in chronological order next to the replies it interleaved with.
+function renderInjected(inj) {
+  var tHtml = inj.t_ms != null
+    ? '<span class="t-marker" title="ms since turn start">'+fmtTMs(inj.t_ms)+'</span>'
+    : '';
+  return '<div class="event ev-injected">'+
+    '<div class="event-hdr"><span>&#x21AA;&#xFE0F; Mid-turn user message</span>'+
+    tHtml+
+    '<span class="event-toggle">&#x25B2;</span></div>'+
+    '<div class="event-bdy">'+esc(inj.text||'')+'</div></div>';
+}
+
+// Populate (or hide) the standalone "Injected mid-turn" section — the
+// fallback for entries that can't be woven into the timeline (legacy turns
+// with no t_ms). Modern turns weave into the event list instead.
+function showInjectedSection(list) {
+  var section = document.getElementById('detailInjectedSection');
+  if (list && list.length) {
+    section.style.display = '';
+    document.getElementById('detailInjectedCount').textContent = list.length;
+    document.getElementById('detailInjected').textContent =
+      list.map(function(i){ return i.text; }).join('\n\n— — —\n\n');
+  } else {
+    section.style.display = 'none';
+  }
+}
+
 // Attach click-to-toggle to all .event-hdr children of ``container``.
 // Used by both the model-event list and the saga-call list — same
 // expand/collapse behavior, same indicator glyph.
@@ -564,17 +599,15 @@ function openDetail(turn) {
   document.getElementById('detailOutput').textContent = turn.output||'(empty)';
 
   // chainlink #376: mid-turn messages the user sent while this turn was
-  // running, folded in at a model-call boundary. Hidden unless present.
-  var injected = turn.injected_inputs||[];
-  var injectedSection = document.getElementById('detailInjectedSection');
-  if (injected.length) {
-    injectedSection.style.display = '';
-    document.getElementById('detailInjectedCount').textContent = injected.length;
-    document.getElementById('detailInjected').textContent =
-      injected.join('\n\n— — —\n\n');
-  } else {
-    injectedSection.style.display = 'none';
-  }
+  // running, folded in at a model-call boundary. Normalize to {t_ms, text}
+  // (PR-3-era records were bare strings, no timing); timed entries get woven
+  // into the event timeline below at their fold point, untimed ones fall back
+  // to the standalone section.
+  var injected = (turn.injected_inputs||[]).map(function(m){
+    return (typeof m === 'string')
+      ? {t_ms: null, text: m}
+      : {t_ms: (typeof m.t_ms === 'number' ? m.t_ms : null), text: m.text||''};
+  });
 
   var errorSection = document.getElementById('detailErrorSection');
   if (turn.error) {
@@ -594,6 +627,18 @@ function openDetail(turn) {
     && sagaCalls.every(function(c){ return typeof c.t_ms === 'number'; })
     && events.every(function(e){ return typeof e.t_ms === 'number'; });
 
+  // chainlink #376 (PR 4): weave timed injected messages into the event
+  // timeline at their t_ms (works whether or not saga interleaving is on, as
+  // long as the events carry t_ms). Untimed (legacy) entries can't be placed,
+  // so they go to the standalone section.
+  var eventsTimed = events.length === 0
+    || events.every(function(e){ return typeof e.t_ms === 'number'; });
+  var injectedTimed = injected.filter(function(i){ return typeof i.t_ms === 'number'; });
+  var weaveInjected = injectedTimed.length > 0 && eventsTimed;
+  showInjectedSection(weaveInjected
+    ? injected.filter(function(i){ return i.t_ms === null; })
+    : injected);
+
   var sagaSection = document.getElementById('detailSagaCallsSection');
   var sagaInlineCount = document.getElementById('detailSagaInline');
   if (canInterleave) {
@@ -603,6 +648,10 @@ function openDetail(turn) {
     sagaSection.style.display = 'none';
     var combined = events.map(function(e){ return {kind:'event', t:e.t_ms, item:e}; })
       .concat(sagaCalls.map(function(c){ return {kind:'saga', t:c.t_ms, item:c}; }));
+    if (weaveInjected) {
+      combined = combined.concat(injectedTimed.map(function(i){
+        return {kind:'injected', t:i.t_ms, item:i}; }));
+    }
     // Stable sort by t_ms — JS Array.prototype.sort is stable in
     // modern engines. Ties preserve insertion order, which keeps
     // tool_call + saga + tool_result for the same MCP saga_query
@@ -620,10 +669,12 @@ function openDetail(turn) {
         var html = renderEvent(entry.item, seq.ev);
         seq.ev += 1;
         return html;
-      } else {
+      } else if (entry.kind === 'saga') {
         var html = renderSagaCall(entry.item, seq.saga);
         seq.saga += 1;
         return html;
+      } else {
+        return renderInjected(entry.item);
       }
     }).join('') || '<div class="no-events">No events recorded for this turn.</div>';
     bindEventToggles(evList);
@@ -648,9 +699,22 @@ function openDetail(turn) {
     document.getElementById('detailEventsCount').textContent = events.length;
     var evList = document.getElementById('detailEvents');
     var savedEvScrolls = isRefresh ? captureEventBdyScrolls(evList) : [];
-    evList.innerHTML = events.length===0
-      ? '<div class="no-events">No events recorded for this turn.</div>'
-      : events.map(renderEvent).join('');
+    if (weaveInjected) {
+      // No saga interleave here, but still place injected messages on the
+      // event timeline at their t_ms (PR 4).
+      var evItems = events.map(function(e){ return {kind:'event', t:e.t_ms, item:e}; })
+        .concat(injectedTimed.map(function(i){ return {kind:'injected', t:i.t_ms, item:i}; }));
+      evItems.sort(function(a,b){ return a.t - b.t; });
+      var seqL = {ev: 0};
+      evList.innerHTML = evItems.map(function(entry){
+        if (entry.kind === 'event') { var h = renderEvent(entry.item, seqL.ev); seqL.ev += 1; return h; }
+        return renderInjected(entry.item);
+      }).join('') || '<div class="no-events">No events recorded for this turn.</div>';
+    } else {
+      evList.innerHTML = events.length===0
+        ? '<div class="no-events">No events recorded for this turn.</div>'
+        : events.map(renderEvent).join('');
+    }
     bindEventToggles(evList);
     restoreEventBdyScrolls(evList, savedEvScrolls);
   }

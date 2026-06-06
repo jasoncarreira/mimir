@@ -26,6 +26,7 @@ from .scheduler import SCHEDULER_CHANNEL_PREFIX
 log = logging.getLogger(__name__)
 
 TurnRunner = Callable[[AgentEvent], Awaitable[object]]
+InjectCallback = Callable[[AgentEvent], Awaitable[None]]
 
 
 class _ChannelQueue(asyncio.Queue):
@@ -68,6 +69,12 @@ class Dispatcher:
     def __init__(self, config: Config, run_turn: TurnRunner | None = None) -> None:
         self._config = config
         self._run_turn = run_turn
+        # chainlink #376 (PR 4): called with the AgentEvent at the moment a
+        # mid-turn message is INJECTED into a running turn, so the agent records
+        # it in the chat-history buffer at its true arrival time (correctly
+        # interleaved with the turn's mid-flight replies) instead of at turn end.
+        # None until wired (server.py); injection still works without it.
+        self._on_inject: InjectCallback | None = None
         self._queues: dict[str, asyncio.Queue[AgentEvent]] = {}
         self._workers: dict[str, asyncio.Task] = {}
         self._semaphore = asyncio.Semaphore(config.max_concurrent_turns)
@@ -104,6 +111,12 @@ class Dispatcher:
         ↔ scheduler initialization cycle in server.py."""
         self._run_turn = run_turn
 
+    def set_on_inject(self, on_inject: "InjectCallback") -> None:
+        """Late-bind the inject callback (chainlink #376 PR 4). Invoked with the
+        event when a mid-turn message is folded into a running turn, so the agent
+        records it in chat history at its true arrival time."""
+        self._on_inject = on_inject
+
     def _injection_enabled(self, channel_id: str) -> bool:
         """True iff ``channel_id`` opts into mid-turn message injection
         (chainlink #376). Prefix allow-list from
@@ -139,6 +152,13 @@ class Dispatcher:
                 from .mid_turn_injection import inject_message
                 if inject_message(channel_id, event) == "injected":
                     await log_event("mid_turn_injected", channel_id=channel_id)
+                    # PR 4: record the message in chat history NOW (true arrival
+                    # time), so it threads ahead of the running turn's later
+                    # replies instead of being appended at turn end. Idempotent
+                    # on the agent side, so an un-folded leftover that re-routes
+                    # as its own turn won't double-record.
+                    if self._on_inject is not None:
+                        await self._on_inject(event)
                     return True
                 # "no_active_turn" — the turn ended during the race; fall
                 # through and enqueue it as a normal next-turn event.

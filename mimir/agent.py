@@ -871,10 +871,17 @@ class Agent:
         pre-#181's ``_record_inbound``: drop empty-content events
         and internal-wake triggers (``saga_session_end``,
         ``shell_job_complete``); log everything else.
+
+        Idempotent per event (chainlink #376 PR 4): a mid-turn message is
+        recorded here at inject time (via the dispatcher's on_inject hook); if it
+        was never folded and re-routes as its own turn, the normal inbound call
+        sees the ``_buffer_recorded`` flag and no-ops instead of double-recording.
         """
         if not event.content or not event.channel_id:
             return
         if event.trigger in self._INBOUND_SKIP_TRIGGERS:
+            return
+        if event.extra.get("_buffer_recorded"):
             return
         try:
             msg = self._buffer.make_message(
@@ -889,11 +896,19 @@ class Agent:
                 source=event.source,
             )
             await self._buffer.append(msg)
+            event.extra["_buffer_recorded"] = True
         except Exception:  # noqa: BLE001
             log.exception(
                 "inbound buffer append failed for event trigger=%r channel=%r",
                 event.trigger, event.channel_id,
             )
+
+    async def on_message_injected(self, event: AgentEvent) -> None:
+        """Dispatcher ``on_inject`` hook (chainlink #376 PR 4): a mid-turn
+        message was just folded into a running turn. Record it in chat history
+        now, at its true arrival time, so Recent activity threads it ahead of the
+        turn's later replies. Wired in server.py via ``set_on_inject``."""
+        await self._append_inbound_to_buffer(event)
 
     async def _append_outbound_to_buffer(
         self,
@@ -1416,11 +1431,13 @@ class Agent:
         error: str | None = None
         messages: list[Any] = []
         output = ""
-        # chainlink #376 (PR 3): events folded into THIS turn mid-stream, read
-        # from the registry in the finally below (before deactivate pops it) so
-        # the durable surfaces can record them. Stays empty unless a mid-turn
-        # message was actually folded.
-        folded_injections: list[AgentEvent] = []
+        # chainlink #376 (PR 3/4): (event, fold_monotonic) for each message
+        # folded into THIS turn mid-stream, read from the registry in the finally
+        # below (before deactivate pops it) so the turn record can carry the
+        # mid-turn inputs WITH a start-relative t_ms. Empty unless a mid-turn
+        # message was actually folded. (Chat-history recording happens at inject
+        # time via the dispatcher's on_inject hook, not here — PR 4.)
+        folded_records: list[tuple[AgentEvent, float]] = []
         # chainlink #376 (PR 1): mark this channel's turn in-flight so the
         # MidTurnInjectionMiddleware can fold queued user messages in at each
         # model-call boundary. Dormant until the dispatcher feeds the queue (PR 2);
@@ -1536,12 +1553,12 @@ class Agent:
             # queue (ahead of those later events) rather than appending via
             # enqueue() — preserving within-channel arrival order (PR 2; mimir's
             # #591 + #593 review notes).
-            # PR 3: snapshot what this turn folded BEFORE deactivate pops the
-            # registry entry, so the record build + chat-history append below see
-            # it. ``folded`` (consumed) and ``leftovers`` (never folded) are
-            # disjoint — leftovers re-route as the next turn; folded ones belong
-            # to this turn's durable record.
-            folded_injections = mid_turn_injection.folded_events(event.channel_id)
+            # PR 3/4: snapshot what this turn folded (with fold times) BEFORE
+            # deactivate pops the registry entry, so the record build below can
+            # carry it with a t_ms. ``folded`` (consumed) and ``leftovers`` (never
+            # folded) are disjoint — leftovers re-route as the next turn; folded
+            # ones belong to this turn's durable record.
+            folded_records = mid_turn_injection.folded_records(event.channel_id)
             leftover_injections = mid_turn_injection.deactivate(event.channel_id)
             if leftover_injections and self._dispatcher is not None:
                 await log_event(
@@ -1735,14 +1752,17 @@ class Agent:
             agent_id=self._config.agent_id,
             saga_atom_ids=saga_atom_ids,
             events=events,
-            # chainlink #376 (PR 3): the rendered text of each mid-turn message
-            # folded into this turn, so the durable record reflects every input
-            # the turn consumed — not just the original prompt. Each is rendered
-            # the same way the model saw it (author + attachments header) and
-            # bounded by the same input cap.
+            # chainlink #376 (PR 3/4): each mid-turn message folded into this turn
+            # as ``{t_ms, text}`` — rendered the way the model saw it (author +
+            # attachments header, capped) plus a start-relative offset (same axis
+            # as event/saga t_ms) so the turn viewer can place it on the timeline
+            # at the boundary it was folded, not in a side list.
             injected_inputs=[
-                truncate_input(mid_turn_injection.render_injected_message(e))
-                for e in folded_injections
+                {
+                    "t_ms": max(0, round((mono - t_total_start) * 1000, 2)),
+                    "text": truncate_input(mid_turn_injection.render_injected_message(e)),
+                }
+                for e, mono in folded_records
             ],
             output=(output or "")[:2048],
             duration_ms=int((time.monotonic() - t_total_start) * 1000),
@@ -1753,18 +1773,6 @@ class Agent:
             **result_fields,
         )
         await self._turn_logger.write(record)
-
-        # chainlink #376 (PR 3): record each folded mid-turn message in the
-        # chat-history buffer too, so ``## Recent activity`` on the next turn —
-        # and any chat_history.jsonl consumer — reflects that the user spoke
-        # mid-turn. The dispatcher's inject path bypasses the normal
-        # ``_append_inbound_to_buffer`` (agent.py inbound) call, so without this
-        # the buffer under-reports. Appended at turn end (after the original
-        # inbound + this turn's outbound), so a mid-turn arrival may sort after
-        # the reply it preceded — acceptable; presence matters more than exact
-        # interleave, which is already fuzzy across concurrent async sends.
-        for _folded in folded_injections:
-            await self._append_inbound_to_buffer(_folded)
 
         # Fire the finalize stage of the turn hook chain. The default
         # ``CommitmentExtractionHook`` runs Phase 2a commitment

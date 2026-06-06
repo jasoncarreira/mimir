@@ -415,10 +415,12 @@ def _turn_summary_lines(turns_window: list[dict]) -> str:
         # chainlink #376: surface mid-turn messages folded into this turn so
         # session-end synthesis + commitment extraction see the user's
         # follow-ups — not just the original prompt (the model saw them, but
-        # this summary is the synthesis-visible projection).
+        # this summary is the synthesis-visible projection). Entries are
+        # ``{t_ms, text}`` (PR 4); tolerate bare strings from PR-3-era records.
         injected = t.get("injected_inputs") or []
         if injected:
-            previews = " | ".join(_output_preview(m) for m in injected)
+            texts = [m.get("text", "") if isinstance(m, dict) else m for m in injected]
+            previews = " | ".join(_output_preview(x) for x in texts)
             line += f"\n    injected mid-turn ({len(injected)}): {previews}"
         lines.append(line)
     return "\n".join(lines)
