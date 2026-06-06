@@ -1170,7 +1170,7 @@ class Agent:
         # still owns deactivate(); setup-phase exceptions explicitly deactivate
         # below so early arming cannot leak a stale active entry.
         injection_registered = False
-        if event.channel_id:
+        if event.channel_id and event.trigger == "user_message":
             mid_turn_injection.register_inflight(event.channel_id)
             injection_registered = True
         # Capture the asyncio loop once so shell-job waiter threads
@@ -1352,9 +1352,8 @@ class Agent:
         # ordering boundary. Do NOT drain for non-user triggers (session
         # synthesis, react, shell-job, etc.): folding a user's queued message
         # into a non-conversational turn can silently swallow it with no
-        # user-facing reply. The enqueue-time path still has a broader latent
-        # trigger-gating issue because the dispatcher does not yet track the
-        # active turn's trigger.
+        # user-facing reply. Enqueue-time injection is likewise limited by
+        # only arming the registry for user_message turns at run_turn start.
         if self._dispatcher is not None and event.trigger == "user_message":
             startup_events = self._dispatcher.drain_startup_user_messages(event.channel_id)
             if startup_events:

@@ -1854,6 +1854,60 @@ async def test_run_turn_does_not_drain_startup_followups_for_non_user_turn(
     q.task_done()
 
 
+async def test_run_turn_non_user_turn_does_not_arm_mid_turn_injection(
+    tmp_path: Path,
+):
+    """chainlink #385: non-user same-channel turns must not arm the registry.
+
+    The dispatcher may mark a saga_session_end/react/shell-job turn in-flight,
+    but enqueue-time folding still depends on run_turn registering an active
+    mid-turn injection entry. For non-user turns, inject_message must see no
+    active turn and fall back to normal queueing.
+    """
+
+    class _InjectionProbeAgent(_FakeAgent):
+        def __init__(self) -> None:
+            super().__init__([AIMessage(content="done")])
+            self.inject_result: str | None = None
+
+        async def astream(
+            self,
+            state: dict[str, Any],
+            *,
+            config: dict[str, Any],
+            stream_mode: str = "values",
+        ):
+            self.inject_result = _mti.inject_message(
+                config["configurable"]["channel_id"],
+                AgentEvent(
+                    trigger="user_message",
+                    channel_id=config["configurable"]["channel_id"],
+                    content="during synthesis",
+                ),
+            )
+            async for chunk in super().astream(
+                state, config=config, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    _mti._REGISTRY.clear()
+    fake_agent = _InjectionProbeAgent()
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
+
+    record = await agent.run_turn(
+        AgentEvent(
+            trigger="saga_session_end",
+            channel_id="ch-1",
+            content="summarize session",
+            extra={"saga_session_id": "saga-test"},
+        ),
+    )
+
+    assert fake_agent.inject_result == "no_active_turn"
+    assert record.injected_inputs == []
+    assert _mti._drain("ch-1") == []
+
+
 async def test_run_turn_early_armed_injection_deactivates_on_setup_error(
     tmp_path: Path,
 ):
