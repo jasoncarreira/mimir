@@ -205,6 +205,10 @@ def _read_turn_record(turn_id: str) -> str:
             except json.JSONDecodeError:
                 continue
             if row.get("turn_id") == target:
+                # Strip large/derived fields to preserve context budget. NOTE:
+                # ``injected_inputs`` (chainlink #376 mid-turn folds) is small and
+                # deliberately kept — it's the only place the synthesis-visible
+                # reader can see what the turn absorbed beyond ``input``.
                 for k in ("input", "saga_atom_ids", "usage"):
                     row.pop(k, None)
                 return json.dumps(row, indent=2, ensure_ascii=False)
