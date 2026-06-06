@@ -134,10 +134,15 @@ _LOCK = threading.Lock()               # before_model may run in a worker thread
 
 **Keying.** Route by `channel_id` (the dispatcher serializes per channel, so at
 most one turn per channel is in flight). The `before_model` hook reads the
-current `channel_id` from the middleware request's `configurable` (the same
-`invoke_config` the turn set at `agent.py:1429`); `inject_message` writes by
-`channel_id`. `thread_id` (saga session) is an alternative key but is coarser
-(a session spans turns) — `channel_id` matches "this running turn" exactly.
+current `channel_id` via `langgraph.config.get_config()["configurable"]["channel_id"]`
+— **not** off the `runtime` argument: in the installed LangGraph the hook
+signature is `before_model(self, state, runtime)` and `Runtime` does **not**
+carry the `RunnableConfig` (its docstring directs callers to `get_config()`). The
+turn already sets `configurable.channel_id` in `invoke_config` (`agent.py:1429`),
+so `get_config()` inside the hook sees it. `inject_message` writes by
+`channel_id`. `thread_id` (saga session) is a coarser alternative (a session
+spans turns) — `channel_id` matches "this running turn" exactly. A unit test must
+assert the middleware actually reads the configured `channel_id`.
 
 `run_turn` registers `_Inflight(active=True)` at start and flips `active=False`
 in its `finally` (so a late inject after completion is rejected, not lost — see
@@ -146,10 +151,13 @@ the routing race below).
 ### 2. `MidTurnInjectionMiddleware.before_model`
 
 ```python
+from langgraph.config import get_config
+
 class MidTurnInjectionMiddleware(AgentMiddleware):
     def before_model(self, state, runtime):
-        channel_id = _channel_id_from(runtime)        # from configurable
-        pending = _drain(channel_id)                  # [] when empty (common case)
+        # Runtime does NOT carry RunnableConfig — read configurable via get_config().
+        channel_id = get_config()["configurable"].get("channel_id")
+        pending = _drain(channel_id) if channel_id else []   # [] = common case
         if not pending:
             return None                                # zero-overhead no-op
         # Fold each queued message in as a HumanMessage at this reasoning boundary.
@@ -184,8 +192,16 @@ the dispatcher can fall back cleanly.
 On an inbound `user_message` AgentEvent (`enqueue` path):
 
 ```python
-if self._injection_enabled(channel_id) and self.is_channel_busy(channel_id):
-    if inject_message(channel_id, event.text) == "injected":
+# Inject ONLY when a turn is actively running AND nothing is already queued
+# ahead of this message — otherwise a later message would overtake an earlier
+# queued event (an ordering violation). This is STRICTER than is_channel_busy(),
+# which is true for in-flight OR queued; we require in-flight AND empty queue.
+queue = self._queues.get(channel_id)
+no_queued_predecessor = queue is None or queue.qsize() == 0
+if (self._injection_enabled(channel_id)
+        and channel_id in self._in_flight
+        and no_queued_predecessor):
+    if inject_message(channel_id, event.content) == "injected":   # AgentEvent.content
         return True                       # folded into the running turn
     # else: turn finished during the race → fall through to normal enqueue
 return await self._normal_enqueue(event)
@@ -193,7 +209,10 @@ return await self._normal_enqueue(event)
 
 - Only `user_message`-trigger events are eligible (never poller / scheduled
   ticks — those are not interactive and must keep clean turn boundaries).
-- `is_channel_busy` already exists (`dispatcher.py:56`); reuse it.
+- The condition is **stricter** than `is_channel_busy()` (`dispatcher.py:56`),
+  which is true for in-flight **or** queued. Injection requires `channel_id in
+  self._in_flight` **and** an empty per-channel queue, so an injected message can
+  never jump ahead of an already-queued earlier event.
 - The **routing race** (turn completes between the busy-check and the inject) is
   handled by `inject_message` returning `no_active_turn`, in which case the
   dispatcher enqueues normally. The message is never dropped and never injected
@@ -212,18 +231,40 @@ return await self._normal_enqueue(event)
 - **TurnRecord** — add `injected_inputs: list[str] = field(default_factory=list)`.
   Keep `input: str` as the original turn prompt (backward compatible); folded
   messages append to `injected_inputs`. Preserves one-turn semantics + a stable
-  `turn_id`.
-- **Saga session** — stays bound to the turn, not the input. Injection does
-  **not** trigger a session boundary; the folded `HumanMessage`s are part of the
-  turn's message list and are seen by `saga_session_end` synthesis as usual.
-- **Commitments / feedback** — run at session-end as today; they just see a
-  longer message list.
+  `turn_id`. **This field is only the carrier — it is inert until the readers in
+  "Durable visibility" are taught to consult it.**
+- **Durable visibility (the easy-to-get-wrong part).** Folding a `HumanMessage`
+  into live graph state makes the *model* see it, but the durable
+  observability / session / audit surfaces do **not** pick it up automatically:
+  - `extract_turn_events()` ignores `HumanMessage`s — the injected text never
+    reaches `events` / `output`.
+  - `TurnRecord.input` is the original `turn_prompt`; `mimir_get_turn` (the
+    synthesis-visible turn reader, `tools/extra.py:226`) **strips `input`**; and
+    `_turn_summary_lines()` (`templates.py:379`) renders only output / tool /
+    atom metadata.
+  - If the dispatcher injects instead of enqueuing, `_append_inbound_to_buffer()`
+    (`agent.py:867`) never runs for that message → it's absent from
+    `chat_history.jsonl` and Recent-activity.
+
+  So the implementation MUST explicitly thread `injected_inputs` through:
+  (a) `run_turn` populating it (from the drained queue / what the middleware
+  folded); (b) `turn_logger` serialization; (c) a **synthesis-visible** summary —
+  `_turn_summary_lines()` and/or the `mimir_get_turn` projection — so session-end
+  synthesis + commitments actually see the injected input; (d) the turn-viewer
+  markers; (e) the inject path calling `_append_inbound_to_buffer(event)` so
+  chat-history / Recent-activity record the message. Without (a)–(e) the model
+  sees the injection but every memory / audit surface under-reports it.
+- **Saga session** — stays bound to the turn, not the input; injection does NOT
+  trigger a session boundary. But the folded input reaches synthesis **only if
+  (c) above is implemented** — it is not automatic (correcting the earlier draft).
+- **Commitments / feedback** — run at session-end over whatever the
+  synthesis-visible summary exposes, so they depend on (c).
 - **Cost attribution** — each fold-in is a fresh model call **within the same
   `astream`**, so its tokens already roll into the turn's `usage` /
   `total_cost_usd`. No split needed; cost stays turn-attributed (a plus for
   budgeting + reflection).
 - **Turn viewer** (`§11`) — render an "input arrived during turn at t=X" marker
-  in the reasoning stream wherever an `injected_inputs` entry was folded.
+  wherever an `injected_inputs` entry was folded (reader (d)).
 
 ## Concurrency & correctness
 
@@ -263,32 +304,46 @@ return await self._normal_enqueue(event)
 ## Rollout plan (sequenced PRs)
 
 1. **Registry + middleware** — `mimir/mid_turn_injection.py` (registry,
-   `inject_message`), `MidTurnInjectionMiddleware`, wired into the middleware
-   tuple; `run_turn` registers/deregisters the in-flight entry. Unit tests for
-   the `before_model` no-op and the fold-in. *No dispatcher change yet — feature
-   dormant (queue never fed).*
+   `inject_message`), `MidTurnInjectionMiddleware` reading `channel_id` via
+   `get_config()`, wired into the middleware tuple; `run_turn`
+   registers/deregisters the in-flight entry. Unit tests: `before_model` no-op on
+   empty queue, FIFO fold-in, AND that the hook reads the configured `channel_id`
+   from `get_config()`. *No dispatcher change yet — feature dormant.*
 2. **Dispatcher routing + opt-in** — `_injection_enabled`, the
-   busy-check→inject→fallback path, `MIMIR_MIDTURN_INJECTION_CHANNELS`. Tests for
-   the routing race (inject vs `no_active_turn` fallback) and the
-   poller/scheduler exclusion.
-3. **TurnRecord + observability** — `injected_inputs` field, `turn_logger`
-   plumbing, the turn-viewer markers. Tests asserting one `turn_id` with multiple
-   inputs and correct cost roll-up.
+   in-flight-AND-empty-queue → `inject_message(channel_id, event.content)` →
+   fallback path, `MIMIR_MIDTURN_INJECTION_CHANNELS`. Tests for the routing race
+   (inject vs `no_active_turn` fallback), the **ordering guard** (a queued
+   predecessor must NOT be bypassed), and the poller/scheduler exclusion.
+3. **Durable visibility** — `injected_inputs` field + the full reader threading
+   (a)–(e) from "Durable visibility": `run_turn` population, `turn_logger`
+   serialization, the synthesis-visible summary (`_turn_summary_lines` /
+   `mimir_get_turn`), turn-viewer markers, and `_append_inbound_to_buffer` on the
+   inject path. Tests: one `turn_id` with multiple inputs, cost roll-up, the
+   injected input present in the synthesis-visible summary, and a
+   `chat_history.jsonl` entry for the injected message.
 4. **(Optional follow-on)** cancel/stop signal.
 5. **(Optional follow-on)** checkpointer + park-and-resume + session resumption.
 
 ## Testing strategy
 
 - **Middleware unit** — empty queue → `before_model` returns `None` (no state
-  change); non-empty → returns the `HumanMessage`s in FIFO order.
+  change); non-empty → returns the `HumanMessage`s in FIFO order; **and the hook
+  reads the configured `channel_id` via `get_config()`** (guards finding #1).
 - **Injection API** — `injected` when active, `no_active_turn` after the
   `finally` flips it.
-- **Dispatcher routing** — in-flight + opted-in → injected; not busy → normal
-  enqueue; opted-out / poller channel → normal enqueue; **race**: stub the turn
-  to finish mid-route → assert fallback enqueue, message not lost.
+- **Dispatcher routing** — in-flight + empty queue + opted-in → injected; not
+  in-flight → normal enqueue; opted-out / poller channel → normal enqueue;
+  **ordering guard**: a queued predecessor present → later `user_message` must
+  enqueue behind it, NOT inject (guards finding #2); **race**: stub the turn to
+  finish mid-route → assert fallback enqueue, message not lost.
 - **Integration** — a turn whose first model step is slow; inject mid-flight;
   assert the second model call's message list contains the injected
   `HumanMessage`, one `turn_id`, `injected_inputs` populated, cost rolled up.
+- **Durable surfaces** (guards finding #3) — after an injected turn: the injected
+  text appears in the synthesis-visible summary (`_turn_summary_lines` /
+  `mimir_get_turn`), and a `chat_history.jsonl` entry exists for the injected
+  message. (A pre-fix version of these would pass the model-sees-it integration
+  test but fail these — the exact gap mimir's review caught.)
 - **Regression** — feature off (default) → behavior byte-identical to today
   (messages queue as next turns).
 
