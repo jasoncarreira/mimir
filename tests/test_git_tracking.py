@@ -1252,6 +1252,36 @@ async def test_surfaces_ignored_note_under_tracked_root(
     assert any("state/lost-note.md" in p for p in skipped[0].get("paths", []))
 
 
+
+@pytest.mark.asyncio
+async def test_surfaces_ignored_note_under_attachments_root(
+    home_repo: Path, tmp_path: Path,
+) -> None:
+    """Attachments is a durable writable root, so ignored prose there must
+    surface the same skipped-note signal as memory/ and state/."""
+    home = home_repo
+    (home / ".gitignore").write_text("attachments/lost-note.md\n")
+    (home / "attachments").mkdir(exist_ok=True)
+    (home / "attachments" / "lost-note.md").write_text("a dropped attachment note\n")
+    # A tracked change so commit_turn_changes proceeds past the no-op fast path.
+    (home / "memory").mkdir(exist_ok=True)
+    (home / "memory" / "real.md").write_text("real\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home, enabled=True,
+    )
+
+    skipped = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_ignored_note_skipped"
+    ]
+    assert skipped, "expected a git_ignored_note_skipped event"
+    assert any(
+        "attachments/lost-note.md" in p
+        for p in skipped[0].get("paths", [])
+    )
+
+
 @pytest.mark.asyncio
 async def test_no_ignored_note_event_for_clean_tracked_write(
     home_repo: Path, tmp_path: Path,
