@@ -133,6 +133,35 @@ is an edit to a file, anyone can check the diff.
 
 Behavioral resolutions don't survive context windows. File edits do.
 
+#### When the action item is artifact optimization
+
+Sometimes bedrock is not a missing rule or broken code path; it is a bounded
+textual artifact that keeps underperforming. Examples: a prompt, rubric, tool
+description, extraction instruction, or routing rule whose wording repeatedly
+drives the wrong behavior.
+
+In that case, one valid action item is to file a GEPA optimization task — but
+only when **all** of these are true:
+
+- the artifact is textual and bounded enough to freeze as a baseline
+- the same artifact is implicated in recurring failures or a high-impact path
+- success can be measured with a meaningful evaluator, dataset, or trace set
+- the issue is local wording/selection behavior, not identity, governance,
+  missing instrumentation, or ambiguous goals
+- the optimized candidate can go through the normal adoption gate as a diff /
+  proposal / PR, not replace the artifact automatically
+
+Do not use GEPA as a generic response to repeated problems. If the honest first
+action is "define the evaluator", "collect examples", or "decide what we
+actually want", then GEPA is not the action item yet; file that prerequisite
+instead.
+
+A good GEPA-shaped action item names the target artifact, the evaluator or trace
+set, the budget/stopping rule, and the adoption gate. Example: "Create a GEPA
+pilot for the commitment-extraction prompt using 50 labeled historical turns,
+precision/recall plus due-window correctness as the evaluator, max 100 metric
+calls, and PR review before adoption."
+
 ### Step 6: Verify the Chain
 
 Read the full tree from the problem to each bedrock node. The chain should be a
