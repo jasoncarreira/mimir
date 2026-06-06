@@ -54,6 +54,7 @@ from .config import Config
 from .event_logger import log_event, log_event_sync, safe_log_event
 from .feedback import FeedbackLog
 from . import health
+from . import mid_turn_injection
 from .history import Message, MessageBuffer
 from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
@@ -1117,9 +1118,16 @@ class Agent:
                 # injection (it's order-robust regardless — it only augments
                 # successful read_file results on a <skill>/SKILL.md path).
                 from .tools.skill_memory_inject import SkillMemoryInjectionMiddleware
+                # chainlink #376 (PR 1): folds queued mid-turn user messages into
+                # the running turn at each model-call boundary. Ordered LAST so
+                # the fold-in is additive and never bypasses the budget gate.
+                # Dormant until the dispatcher feeds the queue (PR 2) — a no-op
+                # (empty queue) on every turn today.
+                from .mid_turn_injection import MidTurnInjectionMiddleware
                 self._agent_middleware = (
                     BudgetGateMiddleware(),
                     SkillMemoryInjectionMiddleware(),
+                    MidTurnInjectionMiddleware(),
                 )
 
             self._agent = create_deep_agent(
@@ -1408,6 +1416,11 @@ class Agent:
         error: str | None = None
         messages: list[Any] = []
         output = ""
+        # chainlink #376 (PR 1): mark this channel's turn in-flight so the
+        # MidTurnInjectionMiddleware can fold queued user messages in at each
+        # model-call boundary. Dormant until the dispatcher feeds the queue (PR 2);
+        # the matching deactivate() is in the finally below.
+        mid_turn_injection.register_inflight(event.channel_id)
         try:
             async with _timeout_ctx:
                 # ``stream_mode="values"`` yields the full state snapshot
@@ -1507,6 +1520,11 @@ class Agent:
                             )
             except Exception:  # noqa: BLE001 — defensive boundary
                 log.exception("quota_pause emit failed; continuing")
+        finally:
+            # chainlink #376 (PR 1): drop the in-flight registry entry so a late
+            # inject after the turn ends is rejected (no_active_turn), and a
+            # crashed turn can't leak a stale active queue.
+            mid_turn_injection.deactivate(event.channel_id)
 
         # Algedonic: surface EVERY turn failure as an event so a dropped
         # turn — a transient model 503, a timeout, quota exhaustion, or a
