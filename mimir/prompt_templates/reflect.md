@@ -104,6 +104,15 @@ every week — pick the 2-3 that have the strongest signal.
   cluster worth a 5-whys (use the existing skill). The terminal "I
   lack X" of a 5-whys is a candidate for a new skill, wiki section,
   or subagent.
+- **GEPA-shaped artifact failures** — When the same failure recurs
+  after direct fixes and points to a bounded textual artifact (prompt,
+  rubric, tool description, extraction instruction), run the GEPA fit
+  check before proposing yet another hand edit. Recommend GEPA only
+  when there is a meaningful evaluator or trace set; if the first honest
+  step is "define the evaluator" or "collect examples," propose that
+  dataset/evaluator task instead. Reflection may file a chainlink issue
+  or proposal for a GEPA optimization pass, but must not auto-run GEPA
+  or auto-apply an optimized artifact.
 - **Recurring topics in `unfinished:`** — Look across boundary atoms.
   If three different sessions ended with "follow up on heap config"
   or similar, that's a topic the operator is dropping or you're
