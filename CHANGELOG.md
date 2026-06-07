@@ -6,6 +6,63 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.16] — 2026-06-07
+
+Mid-turn user-message injection (Claude Code-style continuous input) plus a
+codebase-review batch of concurrency / correctness fixes.
+
+### Added
+
+- **Mid-turn user-message injection (#376).** On opted-in channels
+  (`MIMIR_MIDTURN_INJECTION_CHANNELS` — comma-separated channel-id prefixes, or
+  `*`; empty/default = off), a follow-up sent while a turn is running folds into
+  that turn at the next reasoning-step boundary instead of queuing as a separate
+  next turn. Durably recorded in `TurnRecord.injected_inputs`, the synthesis
+  summary, chat history, and the turn viewer (woven into the chronological
+  timeline at its fold time). (#591, #593, #594, #595, #596, #597)
+- **`defer_injected_message` tool (#384).** Escape hatch so the agent can punt a
+  folded message to its own later turn when it's a true topic switch / unrelated
+  work (e.g. several people in one channel) rather than mixing it into the
+  current answer. Loop-guarded via `force_new_turn`; the originating turn's
+  `injected_inputs` entry is marked `deferred` for auditability. (#598)
+- **Turn viewer: progressive (infinite-scroll) loading.** `/api/turns` now
+  paginates (`?limit` / `?before` / `?after`); the viewer loads the newest page,
+  fetches older pages on scroll, and polls only new turns — replacing the
+  whole-file refetch every 5s that got slow as `turns.jsonl` grew. (#599)
+- Pinned bundled npm CLI versions for reproducible images. (#585)
+- Reflection / five-whys GEPA recommendation hooks (docs). (#587, #588)
+
+### Fixed
+
+Codebase-review batch — 1 critical, 2 high, 5 medium:
+
+- **saga consolidate could segfault under concurrent load (critical).**
+  Consolidate's shared-sqlite-connection reads now run under `_db_lock`, so a
+  concurrent turn's write never touches the same connection object at the same
+  time (sqlite3 + FTS5 hazard). (#386)
+- **`bash_async` stuck-job leak (high).** A command that backgrounds a grandchild
+  holding the pipe open no longer wedges the waiter forever (leaking the job +
+  threads + FDs): bounded drainer-join, pipe close, and a live-job cap. (#387)
+- **Synthesis crash on a malformed operator template (high).** A stray brace in
+  an operator `saga_session_end.md` override no longer crashes every session-end
+  turn — `_safe_format` falls back to the bundled default. (#388)
+- **Post-turn work could wedge a channel (medium).** Finalize hooks and the
+  end-of-turn `bridge.send` are now bounded by `MIMIR_POST_TURN_TIMEOUT_SECONDS`
+  (default 180s); the model-loop timeout didn't cover post-loop awaits. (#389)
+- **saga consolidate index / restructure correctness (medium).** Dedup-tombstoned
+  atoms are removed from the FAISS index; a `_restructure` rollback tombstones the
+  orphan observation instead of leaving it unbacked (and retry-duplicated).
+  (#390, #391)
+- **`bash_async` routed to no channel under MCP dispatch (medium).** Channel
+  resolution uses `resolve_active_ctx` + the live ContextVar instead of a dead
+  `_STATE` key — restoring the duplicate-spawn guard and the completion wake-up.
+  (#392)
+- **event_logger could lose a sync write during a trim (medium).** A shared
+  threading lock serializes `log_sync` against the async `_trim_sync` rename.
+  (#393)
+- git-tracking no longer surfaces transient `attachments/` notes (reverts #356's
+  attachments add). (#590)
+
 ## [0.2.15] — 2026-06-05
 
 Reliability + observability: automatic GitHub Releases, poller `MIMIR_HOME`
