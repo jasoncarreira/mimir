@@ -609,3 +609,21 @@ async def test_bash_async_refused_emits_algedonic_event(
     assert ev["running_job_id"] == "j_running"
     assert "social-cli dispatch" in ev["new_command"]
     assert isinstance(ev["intent_prefix"], str)
+
+
+@pytest.mark.asyncio
+async def test_bash_async_resolves_channel_from_live_contextvar(
+    fake_registry: ShellJobRegistry,
+) -> None:
+    """chainlink #392: with no active-turn context (the SDK/MCP forked-task
+    case), bash_async must resolve the routing channel from the live per-task
+    ContextVar — NOT the dead _STATE key, which left channel_id=None and dropped
+    the shell_job_complete wake-up."""
+    from mimir.tools import registry as tool_registry
+
+    token = tool_registry.set_current_channel_id("ch-live")
+    try:
+        await shell_async.bash_async.ainvoke({"command": "echo hi"})
+    finally:
+        tool_registry.reset_current_channel_id(token)
+    assert fake_registry._spawned_log[0]["channel_id"] == "ch-live"  # type: ignore[attr-defined]

@@ -232,14 +232,24 @@ async def bash_async(
     # turn-current channel (set by Agent.run_turn) when available; if
     # we can't find one, the job still spawns but the completion
     # event fires on no channel (operator-visible via events.jsonl).
-    from .._context import get_current_turn
-    from .registry import _STATE as _registry_state
-    ctx = get_current_turn()
+    # chainlink #392: resolve the routing channel via the purpose-built
+    # three-level chain (saga_session_id -> single_active -> contextvar). The
+    # old _STATE["current_channel_id"] fallback was DEAD — the S2-1 fix moved the
+    # per-turn channel to a ContextVar (_current_channel_id_var) this path never
+    # read — and get_current_turn() alone returns stale None under SDK/MCP
+    # forked-task dispatch. The result was channel_id=None: the dup-spawn guard
+    # below was silently skipped and the shell_job_complete wake-up was dropped
+    # (_on_shell_job_complete early-returns on a None channel).
+    from .._context import resolve_active_ctx
+    from .registry import _current_channel_id_var
+    ctx, _resolution = resolve_active_ctx({"session_id": session_id})
     channel_id: str | None = None
     if ctx is not None:
         channel_id = getattr(ctx, "channel_id", None)
     if not channel_id:
-        channel_id = (_registry_state.get("current_channel_id") or "").strip() or None
+        # Live per-task channel id (set by the dispatcher), replacing the dead
+        # _STATE key.
+        channel_id = (_current_channel_id_var.get() or "").strip() or None
 
     # Wait-on-pending guard (chainlink #189 / #192): refuse if a same-intent
     # job is already running on this channel.  Prevents the retry-escalation

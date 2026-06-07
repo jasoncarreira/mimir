@@ -60,12 +60,10 @@ def _channel_from_config_or_state(
     Precedence (highest first):
       1. Explicit ``channel_id`` argument from the model
       2. LangGraph ``configurable["channel_id"]`` (set by run_turn)
-      3. Module-global ``_STATE["current_channel_id"]`` (legacy
-         dispatcher-set; back-compat path for callers that still
-         use ``set_current_channel_id``)
+      3. The per-task ``_current_channel_id_var`` ContextVar (set by the
+         dispatcher via ``set_current_channel_id``; isolated across concurrent
+         turns — the S2-1 fix replaced the old process-global ``_STATE`` write).
 
-    The LangGraph path is the new canonical route — ``_STATE`` is
-    process-global and races across concurrent dispatcher turns.
     Returns ``""`` if no source supplies a channel.
     """
     cid = (channel_id or "").strip()
@@ -91,7 +89,9 @@ _STATE: dict[str, Any] = {
     "scheduler": None,
     "commitments_store": None,
     "spawn_config": None,
-    "current_channel_id": None,  # set per-turn by the dispatcher
+    # chainlink #392: the old "current_channel_id" key was dead — the per-turn
+    # channel lives in the _current_channel_id_var ContextVar (set via
+    # set_current_channel_id). Removed so nothing reads a never-written key.
 }
 
 
