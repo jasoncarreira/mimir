@@ -179,3 +179,48 @@ def test_parse_frontmatter_folded_block_rejects_unindented_continuation() -> Non
         _parse_frontmatter(text)
 
 
+
+
+# ─── strict-YAML frontmatter guard (chainlink #386-review follow-on) ───
+
+import yaml as _yaml
+
+_OPTIONAL_SKILLS_ROOT = Path(__file__).parent.parent / "mimir" / "optional-skills"
+
+
+def _all_bundled_skill_mds() -> list[Path]:
+    roots = [SKILLS_ROOT, _OPTIONAL_SKILLS_ROOT]
+    out: list[Path] = []
+    for root in roots:
+        if root.is_dir():
+            out.extend(sorted(root.rglob("SKILL.md")))
+    return out
+
+
+@pytest.mark.parametrize(
+    "skill_md", _all_bundled_skill_mds(), ids=lambda p: f"{p.parent.parent.name}/{p.parent.name}"
+)
+def test_skill_frontmatter_is_valid_yaml(skill_md: Path) -> None:
+    """Every bundled SKILL.md (skills/ AND optional-skills/) must have frontmatter
+    that parses with the STRICT YAML loader the runtime uses.
+
+    The pre-existing conformance test only scanned ``mimir/skills/`` and used the
+    lenient ``parse_frontmatter``, so it missed five skills whose ``description:``
+    contained an unquoted colon-space (e.g. ``Opt-in: copy ...``). YAML reads that
+    as a nested mapping ("mapping values are not allowed here"), and BOTH the
+    deepagents SkillsMiddleware and ``skill_outcomes`` then skip the skill
+    entirely — silently dropping it from the agent. This guards that class.
+    """
+    parts = skill_md.read_text().split("---", 2)
+    assert len(parts) >= 3, f"{skill_md}: missing '---' frontmatter delimiters"
+    try:
+        meta = _yaml.safe_load(parts[1])
+    except _yaml.YAMLError as exc:
+        pytest.fail(
+            f"{skill_md}: frontmatter is not valid YAML ({type(exc).__name__}: {exc}). "
+            f"A common cause is an unquoted colon-space in 'description:' — quote the "
+            f"value (double-quotes) so the skill isn't silently skipped at load."
+        )
+    assert isinstance(meta, dict), f"{skill_md}: frontmatter is not a mapping"
+    assert (meta.get("name") or "").strip(), f"{skill_md}: missing 'name'"
+    assert (meta.get("description") or "").strip(), f"{skill_md}: missing 'description'"

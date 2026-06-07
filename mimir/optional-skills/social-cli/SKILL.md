@@ -1,6 +1,6 @@
 ---
 name: social-cli
-description: Bluesky + X social loop. The bundled notifications poller runs `social-cli sync` on cron (default `*/15`), parses the per-platform `inbox-<platform>.yaml` files, and wakes the agent in batches of up to 3 never-seen notifications per turn. The optional feed poller runs `social-cli feed` every 2h for timeline scanning. Agent reads inbox, writes `outbox.yaml`, runs `social-cli dispatch`. Also supports one-shot commands (post/reply/thread/like). Opt-in: install the skill, drop `.env` credentials into `<home>/state/pollers/social-cli-notifications/`. Companion to the `pollers` framework skill and the `world-scanning` skill.
+description: "Bluesky + X social loop. The bundled notifications poller runs `social-cli sync` on cron (default `*/15`), parses the per-platform `inbox-<platform>.yaml` files, and wakes the agent in batches of up to 3 never-seen notifications per turn. The optional feed poller runs `social-cli feed` every 2h for timeline scanning. Agent reads inbox, writes `outbox.yaml`, runs `social-cli dispatch`. Also supports one-shot commands (post/reply/thread/like). Opt-in: install the skill, drop `.env` credentials into `<home>/state/pollers/social-cli-notifications/`. Companion to the `pollers` framework skill and the `world-scanning` skill."
 ---
 
 # social-cli — Bluesky + X social loop
