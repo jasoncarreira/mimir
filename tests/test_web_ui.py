@@ -61,6 +61,37 @@ async def test_api_turns_with_after_filter(app):
 
 
 @pytest.mark.asyncio
+async def test_api_turns_limit_returns_newest_page(app):
+    """Progressive loading: ?limit=N returns the newest N turns (file tail)."""
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(5)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/turns?limit=2")
+        body = await resp.json()
+    # Newest 2 (file is oldest-first; tail is t3, t4).
+    assert [t["turn_id"] for t in body["turns"]] == ["t3", "t4"]
+
+
+@pytest.mark.asyncio
+async def test_api_turns_before_returns_older_page(app):
+    """Progressive loading: ?before=<id>&limit=N returns up to N turns
+    immediately OLDER than the cursor (scroll-back page)."""
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(6)]  # t0..t5
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    async with TestClient(TestServer(a)) as client:
+        # Two turns older than t4 -> t2, t3.
+        resp = await client.get("/api/turns?before=t4&limit=2")
+        body = await resp.json()
+        # Unknown cursor -> empty (treated as "no older page").
+        resp2 = await client.get("/api/turns?before=nope&limit=2")
+        body2 = await resp2.json()
+    assert [t["turn_id"] for t in body["turns"]] == ["t2", "t3"]
+    assert body2["turns"] == []
+
+
+@pytest.mark.asyncio
 async def test_api_turns_handles_missing_file(app):
     a, _, _ = app
     async with TestClient(TestServer(a)) as client:

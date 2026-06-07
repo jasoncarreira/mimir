@@ -138,8 +138,21 @@ def register_routes(
         return web.Response(text=_load_viewer_html(), content_type="text/html")
 
     async def turns_data(request: web.Request) -> web.Response:
+        # Records are oldest-first (append order). The viewer reverses to
+        # newest-first for display. Pagination params (progressive loading —
+        # the viewer no longer pulls the whole — now 140MB+ — file up front):
+        #   ?after=<turn_id>           — turns strictly newer than turn_id (live poll)
+        #   ?before=<turn_id>&limit=N  — up to N turns immediately OLDER than turn_id
+        #                                (scroll-back page)
+        #   ?limit=N                   — newest N turns (initial page)
+        #   (none)                     — all turns (back-compat)
         records = _read_jsonl(turns_log)
         after = request.query.get("after", "")
+        before = request.query.get("before", "")
+        try:
+            limit = int(request.query.get("limit") or 0)
+        except ValueError:
+            limit = 0
         if after:
             # Return everything strictly after the named turn_id. If the id
             # isn't found we return the empty list (consistent with open-strix).
@@ -151,6 +164,22 @@ def register_routes(
                 elif r.get("turn_id") == after:
                     seen = True
             return web.json_response({"turns": cut})
+        if before:
+            # The page of records immediately older than ``before``. Empty list
+            # when the id isn't found (e.g. rotated out) — the viewer treats that
+            # as "no older page".
+            idx = next(
+                (i for i, r in enumerate(records) if r.get("turn_id") == before),
+                None,
+            )
+            if idx is None:
+                window: list[dict[str, Any]] = []
+            else:
+                start = max(0, idx - limit) if limit > 0 else 0
+                window = records[start:idx]
+            return web.json_response({"turns": window})
+        if limit > 0:
+            records = records[-limit:]
         return web.json_response({"turns": records})
 
     async def events_data(request: web.Request) -> web.Response:
