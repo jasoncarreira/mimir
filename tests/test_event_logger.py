@@ -148,3 +148,29 @@ def test_log_sync_redacts_token_shaped_values(tmp_path: Path):
     record = json.loads(path.read_text().strip())
     assert "sk-proj_" not in record["stderr"]
     assert record["stderr"] == "OPENAI_API_KEY=[REDACTED]"
+
+
+def test_log_sync_holds_io_lock(tmp_path):
+    """chainlink #393: log_sync must acquire _io_lock so it can't write
+    concurrently with _trim_sync's tail-read+rename (which would lose the
+    record). Proof: while the test holds _io_lock, a log_sync on another thread
+    blocks; once released it proceeds and the record lands."""
+    import threading
+    from mimir.event_logger import EventLogger
+
+    logger = EventLogger(tmp_path / "events.jsonl", session_id="t")
+    done = threading.Event()
+
+    logger._io_lock.acquire()
+    try:
+        threading.Thread(
+            target=lambda: (logger.log_sync("evt_x"), done.set()),
+            daemon=True,
+        ).start()
+        # Blocked while we hold the lock (would NOT block pre-fix).
+        assert not done.wait(timeout=0.4), "log_sync did not respect _io_lock"
+    finally:
+        logger._io_lock.release()
+
+    assert done.wait(timeout=2.0), "log_sync did not proceed after lock release"
+    assert '"type": "evt_x"' in (tmp_path / "events.jsonl").read_text()
