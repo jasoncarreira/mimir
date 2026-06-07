@@ -367,3 +367,55 @@ class TestRenderSagaSessionEnd:
             assert "{saga_session_id}" in tmpl
             assert "{idle_minutes}" in tmpl
             assert "{turn_summary_block}" in tmpl
+
+
+# ─── chainlink #388: malformed operator template must not crash synthesis ──
+
+
+def test_render_saga_session_end_survives_malformed_operator_template(tmp_path):
+    """chainlink #388: an operator override with a stray brace (e.g. a pasted
+    JSON example) makes str.format raise; render must fall back to the bundled
+    default instead of crashing the session-end turn."""
+    from mimir.templates import render_saga_session_end
+
+    turns = [{
+        "turn_id": "t1", "trigger": "user_message", "events": [],
+        "output": "did a thing", "saga_atom_ids": ["a" * 16],  # full-template path
+    }]
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    # Stray { } an operator might paste — raises KeyError/ValueError in .format.
+    (prompts_dir / "saga_session_end.md").write_text(
+        'Summarize. Example payload: {"key": "value"} and also {bogus_field}.\n'
+        "channel={channel_id} session={saga_session_id} idle={idle_minutes}"
+    )
+
+    # Must not raise.
+    out = render_saga_session_end(
+        channel_id="c1", saga_session_id="s1", idle_minutes=10,
+        turns_window=turns, prompts_dir=prompts_dir,
+    )
+    # Fell back to the bundled default (renders the real values), and did NOT
+    # use the malformed override.
+    assert "c1" in out and "s1" in out
+    assert "bogus_field" not in out
+
+
+def test_render_saga_session_end_uses_valid_operator_template(tmp_path):
+    """Sanity: a well-formed operator override is still honored (the #388 guard
+    only kicks in on a format error)."""
+    from mimir.templates import render_saga_session_end
+
+    turns = [{"turn_id": "t1", "trigger": "user_message", "events": [],
+              "output": "x", "saga_atom_ids": ["a" * 16]}]
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "saga_session_end.md").write_text(
+        "OPERATOR-OVERRIDE channel={channel_id} session={saga_session_id} "
+        "idle={idle_minutes}\n{turn_summary_block}\n{atom_feedback_block}"
+    )
+    out = render_saga_session_end(
+        channel_id="c1", saga_session_id="s1", idle_minutes=10,
+        turns_window=turns, prompts_dir=prompts_dir,
+    )
+    assert "OPERATOR-OVERRIDE" in out and "c1" in out

@@ -499,7 +499,8 @@ def render_saga_session_end(
         template = load_template(
             "saga_session_end", SAGA_SESSION_END_DEFAULT, prompts_dir,
         )
-        return template.format(
+        return _safe_format(
+            template, SAGA_SESSION_END_DEFAULT, "saga_session_end",
             channel_id=channel_id,
             saga_session_id=saga_session_id,
             idle_minutes=idle_minutes,
@@ -509,9 +510,33 @@ def render_saga_session_end(
     template = load_template(
         "saga_session_end_lean", SAGA_SESSION_END_LEAN_DEFAULT, prompts_dir,
     )
-    return template.format(
+    return _safe_format(
+        template, SAGA_SESSION_END_LEAN_DEFAULT, "saga_session_end_lean",
         channel_id=channel_id,
         saga_session_id=saga_session_id,
         idle_minutes=idle_minutes,
         turn_summary_block=_turn_summary_lines(turns_window),
     )
+
+
+def _safe_format(template: str, default_template: str, label: str, **kwargs) -> str:
+    """``template.format(**kwargs)`` that survives a malformed OPERATOR override.
+
+    chainlink #388: ``load_template`` may return an operator-edited
+    ``<prompts_dir>/saga_session_end.md``; a stray ``{`` or ``}`` (e.g. a JSON
+    example) makes ``str.format`` raise ``KeyError`` / ``ValueError`` /
+    ``IndexError``, which would otherwise propagate out of synthesis-prompt
+    assembly and crash EVERY session-end turn while the bad template is in place
+    (saga_session_end is not a poller trigger, so the early-crash guard doesn't
+    cover it). Fall back to the bundled default (known-good, placeholder-clean)
+    and log, instead of crashing the turn."""
+    try:
+        return template.format(**kwargs)
+    except (KeyError, ValueError, IndexError) as exc:
+        log.warning(
+            "synthesis template %r failed to format (%s: %s) — falling back to "
+            "the bundled default. Check the operator override for stray { } "
+            "(e.g. unescaped JSON examples; double them as {{ }}).",
+            label, type(exc).__name__, exc,
+        )
+        return default_template.format(**kwargs)
