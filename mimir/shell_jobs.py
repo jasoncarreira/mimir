@@ -50,6 +50,13 @@ log = logging.getLogger(__name__)
 UI_VISIBILITY_THRESHOLD_SECONDS = 10
 POST_EXIT_GRACE_SECONDS = 15
 EVICT_AFTER_SECONDS = 3600  # evict finished jobs + unlink output files after this window
+# chainlink #387: a bounded window for the waiter to let the stdout/stderr
+# drainers flush final bytes after the process exits. Never block longer — a
+# backgrounded grandchild can hold the pipe open so a drainer never hits EOF.
+DRAIN_JOIN_TIMEOUT_SECONDS = 10.0
+# chainlink #387: refuse to start more than this many concurrently-live jobs so
+# a flood can't spawn unbounded subprocesses/threads/FDs.
+MAX_LIVE_SHELL_JOBS = 32
 SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES = 1000
 SHELL_JOB_OUTPUT_MAX_TAIL_LINES = 2000
 DEFAULT_SHELL_JOB_SCOPE = "running"
@@ -198,6 +205,18 @@ class ShellJobRegistry:
         # registry size and freeing their on-disk output files.
         self._evict_stale()
 
+        # chainlink #387: cap concurrently-live jobs. The waiter fix stops stuck
+        # jobs from leaking forever, but a flood of legitimately-running jobs
+        # should still be refused rather than spawning unbounded resources. The
+        # bash_async tool surfaces this as "bash_async failed: ...".
+        with self._lock:
+            live = sum(1 for j in self._jobs.values() if j.exit_code is None)
+        if live >= MAX_LIVE_SHELL_JOBS:
+            raise RuntimeError(
+                f"too many live shell jobs ({live}/{MAX_LIVE_SHELL_JOBS}); wait "
+                "for some to finish (see bash_jobs_list) before starting more"
+            )
+
         job_id = self._make_job_id()
         stdout_path = self.jobs_dir / f"{job_id}.out"
         stderr_path = self.jobs_dir / f"{job_id}.err"
@@ -254,7 +273,12 @@ class ShellJobRegistry:
         def _drain(stream, outfile, on_signal):
             try:
                 while True:
-                    chunk = stream.read(4096)
+                    try:
+                        chunk = stream.read(4096)
+                    except (ValueError, OSError):
+                        # Our pipe end was closed by _waiter to reclaim a drainer
+                        # wedged on a backgrounded grandchild's held pipe (#387).
+                        break
                     if not chunk:
                         break
                     outfile.write(chunk)
@@ -271,17 +295,34 @@ class ShellJobRegistry:
                 rc = proc.wait()
             except Exception:
                 rc = -1
-            # proc.wait() can return before the stdout/stderr drainer
-            # threads have copied the final pipe bytes into the files
-            # read_output() tails. Do not mark the job finished until the
-            # drainers have closed; otherwise callers that wait on
-            # ``exit_code is not None`` can race and see an empty tail for
-            # short commands such as ``echo two``.
+            # proc.wait() can return before the stdout/stderr drainer threads
+            # have copied the final pipe bytes into the files read_output()
+            # tails. Give them a BOUNDED window to flush (so short commands like
+            # ``echo two`` don't lose their tail) — but never block forever: a
+            # backgrounded grandchild can hold the pipe open so a drainer never
+            # hits EOF, which pre-fix left the job stuck status=running and never
+            # evicted, leaking the job + its threads + pipe FDs (chainlink #387).
+            deadline = time.time() + DRAIN_JOIN_TIMEOUT_SECONDS
             for thread in drain_threads:
-                thread.join()
+                remaining = deadline - time.time()
+                if remaining > 0:
+                    thread.join(timeout=remaining)
+            # Mark finished regardless, so status/eviction reflect the real exit
+            # even if a drainer is still wedged.
             with job._lock:
                 job.exit_code = rc
                 job.finished_at = time.time()
+            # If a drainer is still alive (wedged on a held pipe), close our pipe
+            # ends so its blocked read() unblocks and the thread + FDs are
+            # reclaimed. The detached grandchild keeps its own write end; we only
+            # reap OUR resources here.
+            if any(t.is_alive() for t in drain_threads):
+                for stream in (proc.stdout, proc.stderr):
+                    try:
+                        if stream is not None:
+                            stream.close()
+                    except Exception:
+                        pass
             if on_complete is not None:
                 try:
                     on_complete(job)
