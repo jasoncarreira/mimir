@@ -211,7 +211,15 @@ tr:hover td{background:var(--surface2);cursor:pointer}
 
 <script>
 (function() {
-var allTurns = [];
+var allTurns = [];                 // loaded turns, newest-first (NOT the whole file)
+// Progressive loading: start with the newest PAGE_SIZE turns, fetch older pages
+// on scroll, and poll only for turns newer than what we have. Avoids pulling the
+// entire (140MB+) turns.jsonl up front on every 5s refresh.
+var PAGE_SIZE = 200;
+var oldestId = null;               // turn_id of the oldest loaded turn (scroll-back cursor)
+var newestId = null;               // turn_id of the newest loaded turn (live-poll cursor)
+var allOlderLoaded = false;        // true once a scroll-back page returns < PAGE_SIZE
+var loadingMore = false;           // in-flight guard for loadOlder
 // activeTrigger and hidePollers persist in localStorage so a refresh
 // during dev (the viewer is typically left open in a browser tab)
 // keeps the operator's chosen view rather than snapping back to the
@@ -276,8 +284,8 @@ function authedFetch(url, opts) {
 window.__mimir_resetApiKey = function() {
   setApiKey('');
   promptApiKey('manual rotation');
-  // Force a refresh so the next poll uses the new key.
-  if (typeof loadTurns === 'function') loadTurns();
+  // Force a fresh initial load so the next poll uses the new key.
+  if (typeof loadInitial === 'function') loadInitial();
 };
 // Toggle the "↻ Reset key" link visibility on page load.
 document.addEventListener('DOMContentLoaded', function() {
@@ -366,8 +374,28 @@ function filterTurns() {
   });
 }
 
-function setTurns(turns) {
-  allTurns = turns.slice().reverse(); // newest first
+function _syncBounds() {
+  newestId = allTurns.length ? allTurns[0].turn_id : null;
+  oldestId = allTurns.length ? allTurns[allTurns.length - 1].turn_id : null;
+}
+
+function setTurns(turns) {            // initial / replace
+  allTurns = turns.slice().reverse(); // server sends oldest-first; we want newest-first
+  _syncBounds();
+  render();
+}
+
+function appendOlder(turns) {         // scroll-back page (older than oldestId)
+  if (!turns.length) return;
+  allTurns = allTurns.concat(turns.slice().reverse());  // older turns go after (newest-first)
+  _syncBounds();
+  render();
+}
+
+function prependNew(turns) {          // live poll (newer than newestId)
+  if (!turns.length) return;
+  allTurns = turns.slice().reverse().concat(allTurns);  // newer turns go on top
+  _syncBounds();
   render();
 }
 
@@ -386,8 +414,11 @@ function renderTable() {
   var turns = filterTurns();
   var tbody = document.getElementById('tableBody');
   var empty = document.getElementById('emptyState');
+  var more = allOlderLoaded ? '' : ' (scroll for more)';
   document.getElementById('turnCount').textContent =
-    allTurns.length === turns.length ? allTurns.length+' turns' : turns.length+' / '+allTurns.length+' turns';
+    allTurns.length === turns.length
+      ? allTurns.length+' turns'+more
+      : turns.length+' / '+allTurns.length+' loaded'+more;
 
   if (!turns.length) {
     tbody.innerHTML = '';
@@ -580,7 +611,7 @@ function restoreEventBdyScrolls(container, saved) {
 function openDetail(turn) {
   if (!turn) return;
   // Preserve scroll position across re-renders for the SAME turn —
-  // the polling loop (loadTurns, every 5s) calls openDetail again
+  // the polling loop (pollNew, every 5s) calls openDetail again
   // for the currently-open turn so freshly-arrived events render
   // mid-stream. Without this, the panel scroll-resets to top on
   // every poll, making it impossible to read further down. First
@@ -776,30 +807,68 @@ document.getElementById('searchInput').addEventListener('input', function(e) {
 // ── Data loading ──────────────────────────────────────────────────────────
 var dot = document.getElementById('statusDot');
 
-function loadTurns() {
-  authedFetch('/api/turns')
-    .then(function(r) {
-      if (!r.ok) throw new Error('http ' + r.status);
-      return r.json();
-    })
+function _live() { dot.className = 'status-dot live'; dot.title = 'Live \u2014 auto-updating'; }
+function _stale() { dot.className = 'status-dot stale'; dot.title = 'Disconnected'; }
+
+// Initial page: newest PAGE_SIZE turns only.
+function loadInitial() {
+  authedFetch('/api/turns?limit=' + PAGE_SIZE)
+    .then(function(r) { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
     .then(function(data) {
-      setTurns(data.turns || []);
-      dot.className = 'status-dot live';
-      dot.title = 'Live \u2014 auto-updating';
+      var turns = data.turns || [];
+      allOlderLoaded = turns.length < PAGE_SIZE;
+      setTurns(turns);
+      _live();
+      maybeLoadMore();   // top up if the first page doesn't fill the viewport
     })
-    .catch(function() {
-      dot.className = 'status-dot stale';
-      dot.title = 'Disconnected';
-    });
+    .catch(_stale);
 }
+
+// Scroll-back: fetch the page of turns older than what we have.
+function loadOlder() {
+  if (allOlderLoaded || loadingMore || !oldestId) return;
+  loadingMore = true;
+  authedFetch('/api/turns?before=' + encodeURIComponent(oldestId) + '&limit=' + PAGE_SIZE)
+    .then(function(r) { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+    .then(function(data) {
+      var older = data.turns || [];
+      if (older.length < PAGE_SIZE) allOlderLoaded = true;
+      appendOlder(older);
+      loadingMore = false;
+      maybeLoadMore();   // keep filling if pages are small
+    })
+    .catch(function() { loadingMore = false; _stale(); });
+}
+
+// Live poll: only turns newer than what we have (tiny payload, every 5s).
+function pollNew() {
+  if (!newestId) { loadInitial(); return; }
+  authedFetch('/api/turns?after=' + encodeURIComponent(newestId))
+    .then(function(r) { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+    .then(function(data) { prependNew(data.turns || []); _live(); })
+    .catch(_stale);
+}
+
+// Load another older page if the content doesn't fill the scroll area (small
+// dataset / short viewport), so there's always something to scroll for.
+function maybeLoadMore() {
+  if (allOlderLoaded || loadingMore) return;
+  var w = document.getElementById('tableWrapper');
+  if (w && w.scrollHeight <= w.clientHeight + 100) loadOlder();
+}
+
+document.getElementById('tableWrapper').addEventListener('scroll', function() {
+  // Near the bottom -> pull the next older page.
+  if (this.scrollTop + this.clientHeight >= this.scrollHeight - 300) loadOlder();
+});
 
 // First-load: if no key is stored, prompt once before the initial fetch.
 // Subsequent visits with a saved key skip the prompt and go straight to
 // loading. If the server has MIMIR_API_KEY unset, an empty key still
 // works (the middleware short-circuits when expected_key is empty).
 if (!getApiKey()) promptApiKey('first visit');
-loadTurns();
-pollInterval = setInterval(loadTurns, 5000);
+loadInitial();
+pollInterval = setInterval(pollNew, 5000);
 })();
 </script>
 </body>
