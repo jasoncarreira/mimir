@@ -6,6 +6,21 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.17] — 2026-06-07
+
+### Fixed
+
+- **Five bundled skills were silently dropped** by a malformed-YAML frontmatter
+  description. `try-harder`, `social-cli`, `gmail-poller`, `github-ci-watch`, and
+  `github-poller` had an unquoted colon-space in their `description:` (e.g.
+  `Opt-in: copy ...`, `verifiable diff: edit ...`); YAML reads that as a nested
+  mapping ("mapping values are not allowed here"), so both the deepagents
+  `SkillsMiddleware` and `skill_outcomes` failed to parse the frontmatter and
+  skipped the skill entirely. Descriptions are now quoted. Added a strict-YAML
+  conformance guard (`test_skill_frontmatter_is_valid_yaml`) over both
+  `mimir/skills/` and `mimir/optional-skills/` — the existing test only scanned
+  `skills/` and used the lenient parser, which is how this shipped. (#608)
+
 ## [0.2.16] — 2026-06-07
 
 Mid-turn user-message injection (Claude Code-style continuous input) plus a
