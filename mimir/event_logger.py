@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,15 @@ class EventLogger:
         self._agent_id = agent_id
         self._max_events = max_events
         self._lock: asyncio.Lock | None = None
+        # chainlink #393: serialize the SYNC file mutators that can run on
+        # different threads — log_sync (loop thread) and _trim_sync (worker
+        # thread, via to_thread). Without it, a log_sync append could land on
+        # the old inode in the window between _trim_sync's tail-read and its
+        # tmp.rename(), losing that record, and _line_count drifts (loop +=1 vs
+        # worker =len(kept)). A threading.Lock, NOT the asyncio lock, because
+        # _trim_sync runs off-loop. (The async log() path is already serialized
+        # by the asyncio lock and awaits its own _trim, so it never races.)
+        self._io_lock = threading.Lock()
         self._line_count = 0
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -94,10 +104,13 @@ class EventLogger:
         primary work path."""
         record = self._record(event_type, payload)
         try:
-            self._ensure_dir()
-            with self._path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
-            self._line_count += 1
+            # chainlink #393: hold _io_lock so this append can't interleave with
+            # _trim_sync's tail-read + rename on the worker thread.
+            with self._io_lock:
+                self._ensure_dir()
+                with self._path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
+                self._line_count += 1
             # Trim deferred to the async path — see comment in log().
         except OSError as exc:
             log.warning("events.jsonl sync write failed: %s", exc)
@@ -128,26 +141,30 @@ class EventLogger:
             log.warning("events.jsonl trim failed: %s", exc)
 
     def _trim_sync(self) -> None:
-        kept_reversed: list[str] = []
-        try:
-            for line in _tail_lines(self._path):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                kept_reversed.append(stripped)
-                if len(kept_reversed) >= self._max_events:
-                    break
-        except OSError as exc:
-            log.warning("events.jsonl trim tail-read failed: %s", exc)
-            return
-        if not kept_reversed:
-            return
-        # tail yields newest-first; reverse for chronological rewrite.
-        kept = list(reversed(kept_reversed))
-        tmp = self._path.with_suffix(".jsonl.tmp")
-        tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
-        tmp.rename(self._path)
-        self._line_count = len(kept)
+        # chainlink #393: hold _io_lock across the whole tail-read → rename so a
+        # concurrent log_sync append (loop thread) can't be lost in the rename
+        # window, and _line_count is written under the same lock as log_sync's.
+        with self._io_lock:
+            kept_reversed: list[str] = []
+            try:
+                for line in _tail_lines(self._path):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    kept_reversed.append(stripped)
+                    if len(kept_reversed) >= self._max_events:
+                        break
+            except OSError as exc:
+                log.warning("events.jsonl trim tail-read failed: %s", exc)
+                return
+            if not kept_reversed:
+                return
+            # tail yields newest-first; reverse for chronological rewrite.
+            kept = list(reversed(kept_reversed))
+            tmp = self._path.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+            tmp.rename(self._path)
+            self._line_count = len(kept)
 
 
 _logger: EventLogger | None = None
