@@ -510,3 +510,33 @@ def test_spawn_triggers_eviction_of_old_jobs(tmp_path: Path):
 
     assert registry.get(old_job.job_id) is None, "old job must be evicted by spawn()"
     assert registry.get(new_job.job_id) is not None, "new job must still be in registry"
+
+
+# ─── chainlink #387: stuck-job leak + job cap ──────────────────────────
+
+
+def test_backgrounded_grandchild_does_not_block_waiter(tmp_path: Path, monkeypatch):
+    """chainlink #387: a job whose process backgrounds a grandchild that keeps
+    the stdout/stderr pipe open must still be marked finished within the bounded
+    drain-join window — not stuck status=running forever (which pre-fix also
+    leaked the job + its drainer threads + pipe FDs)."""
+    monkeypatch.setattr("mimir.shell_jobs.DRAIN_JOIN_TIMEOUT_SECONDS", 0.5)
+    registry = _make_registry(tmp_path)
+    # Parent exits 0 immediately but backgrounds a sleeper that inherits the
+    # pipe, so the drainers can't EOF on the parent's exit.
+    job = registry.spawn("bg", argv=["sh", "-c", "sleep 3 & exit 0"])
+    # Pre-fix the waiter would block ~3s on the unbounded drainer join; the fix
+    # marks it finished within the 0.5s bounded window + pipe close.
+    _wait_until_done(registry, job.job_id, timeout=2.5)
+    assert job.exit_code == 0
+
+
+def test_spawn_refuses_beyond_live_job_cap(tmp_path: Path, monkeypatch):
+    """chainlink #387: spawning past the concurrently-live cap is refused with a
+    clear error (the bash_async tool surfaces it)."""
+    monkeypatch.setattr("mimir.shell_jobs.MAX_LIVE_SHELL_JOBS", 2)
+    registry = _make_registry(tmp_path)
+    registry.spawn("s1", argv=["bash", "-c", "sleep 2"])
+    registry.spawn("s2", argv=["bash", "-c", "sleep 2"])
+    with pytest.raises(RuntimeError, match="too many live shell jobs"):
+        registry.spawn("s3", argv=["bash", "-c", "sleep 2"])
