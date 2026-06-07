@@ -581,3 +581,98 @@ def test_migrate_init_includes_busy_timeout_pragma():
     assert "db_busy_timeout_ms" in src, (
         "saga/migrate.py should read db_busy_timeout_ms from config per chainlink #227"
     )
+
+
+# ─── chainlink #390/#391: consolidate index sync + restructure orphan ──
+
+
+def _stub_embeddings(monkeypatch):
+    """All-identical 4-d embeddings + stub config, so atoms cluster."""
+    class _StubProvider:
+        def embed(self, text, *, input_type="passage"):
+            return [1.0, 0.0, 0.0, 0.0]
+
+        def dimensions(self):
+            return 4
+
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: _StubProvider())
+    monkeypatch.setattr(
+        "mimir.saga._config_io.get_config",
+        lambda: lambda s, k, d=None: {
+            ("embedding", "max_input_chars"): 2000,
+            ("embedding", "provider"): "stub",
+            ("embedding", "model"): "stub-4d",
+        }.get((s, k), d),
+    )
+
+
+@pytest.mark.asyncio
+async def test_consolidate_removes_dedup_tombstoned_from_faiss_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """chainlink #390: dedup-tombstoned raws must be removed from the FAISS index
+    (mirror forget) so their vectors don't keep consuming top_k slots."""
+    from mimir.saga.client import SagaStore
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "t.saga.db", embedding_dim=4)
+    for i in range(2):  # distinct content, identical embedding -> dedup cluster
+        await store.store(content=f"fact number {i}", stream="semantic")
+    conn = store._ensure_conn()
+    index = store._ensure_index(conn)
+    assert index is not None and len(index._id_to_pos) == 2
+
+    # dedup_first runs the dedup pass (internal min_cluster_size=2); high
+    # min_cluster_size short-circuits thematic synthesis (no LLM needed).
+    result = await store.consolidate(dedup_first=True, min_cluster_size=99)
+
+    tombstoned = result["dedup"]["duplicates_tombstoned"]
+    assert tombstoned, "dedup should have tombstoned the duplicate"
+    for atom_id in tombstoned:
+        # Removed from the index: gone from id_to_pos, or its position is marked.
+        if atom_id in index._id_to_pos:
+            assert index._id_to_pos[atom_id] in index._removed, (
+                f"dedup-tombstoned {atom_id} still active in FAISS — #390 regression"
+            )
+
+
+@pytest.mark.asyncio
+async def test_consolidate_restructure_tombstones_orphan_on_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """chainlink #391: if the relations transaction fails after the observation
+    atom was already committed by _store_atom, the orphan must be tombstoned (not
+    left surfacing unbacked / causing a retry duplicate)."""
+    from mimir.saga.client import SagaStore
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "t.saga.db", embedding_dim=4)
+    for i in range(3):  # identical embedding -> one thematic cluster
+        await store.store(content=f"observation seed {i}", stream="semantic")
+
+    async def _stub_synth(cluster, *, prior_block="", vocab_block=""):
+        return {"content": "synthesized observation", "topics": [],
+                "triples": [], "contradictions": []}
+
+    store._rich_synth_fn = _stub_synth
+    # Force the relations transaction to fail AFTER the observation atom is
+    # committed (find_superseded_observations runs inside the BEGIN IMMEDIATE).
+    import mimir.saga.consolidate as consolidate_mod
+
+    def _boom(*a, **k):
+        raise RuntimeError("injected relations-txn failure")
+
+    monkeypatch.setattr(consolidate_mod, "find_superseded_observations", _boom)
+
+    with pytest.raises(RuntimeError, match="injected relations-txn failure"):
+        await store.consolidate(dedup_first=False, min_cluster_size=2)
+
+    conn = store._ensure_conn()
+    rows = conn.execute(
+        "SELECT id, tombstoned FROM atoms WHERE memory_type='observation'"
+    ).fetchall()
+    assert rows, "the observation atom should have been created by _store_atom"
+    assert all(r[1] == 1 for r in rows), (
+        "orphaned observation must be tombstoned after the relations rollback "
+        "(#391) — found a live unbacked observation"
+    )
