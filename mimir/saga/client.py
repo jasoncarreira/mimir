@@ -1088,12 +1088,19 @@ class SagaStore:
             _candidate_raws, MIN_CLUSTER_SIZE_FOR_OBSERVATION,
             MAX_OBSERVATIONS_PER_RUN,
         )
-        raws = await asyncio.to_thread(
-            _candidate_raws,
-            conn,
-            lookback_days=lookback_days,
-            agent_id=self._agent_id,
-            reference_date=reference_date,
+        # chainlink #386: shared-connection reads run under _db_lock so a
+        # concurrent turn's write (also _db_lock-guarded) never touches the same
+        # sqlite3 connection object at the same time — Python's sqlite3 + FTS5
+        # can segfault on concurrent access to one shared connection (class
+        # docstring / chainlink #365). The dedup pass above already clusters
+        # under the write lock; this brings the thematic read phase in line.
+        raws = await self._db_locked(
+            lambda: _candidate_raws(
+                conn,
+                lookback_days=lookback_days,
+                agent_id=self._agent_id,
+                reference_date=reference_date,
+            )
         )
         # chainlink #331: world_state structural integrity — collapse any
         # dual-current rows from a transient cross-caller write race — is
@@ -1120,7 +1127,7 @@ class SagaStore:
             }
 
         cluster_fn = make_default_cluster_fn(conn)
-        clusters = await asyncio.to_thread(cluster_fn, raws)
+        clusters = await self._db_locked(lambda: cluster_fn(raws))  # chainlink #386
 
         if dry_run:
             return {
@@ -1151,14 +1158,17 @@ class SagaStore:
         # cluster. Both inject into the rich prompt. Empty when DB is
         # cold or there are no priors — bench-neutral.
         from .synthesize import build_vocab_block, build_prior_block
-        vocab_block = await asyncio.to_thread(
-            build_vocab_block, conn,
-            extra_subjects=list(extra_canonical_subjects or []),
+        vocab_block = await self._db_locked(  # chainlink #386
+            lambda: build_vocab_block(
+                conn, extra_subjects=list(extra_canonical_subjects or []),
+            )
         )
         prior_blocks: list[str] = []
         for cluster in eligible:
             evidence_ids = [a["id"] for a in cluster]
-            pb = await asyncio.to_thread(build_prior_block, conn, evidence_ids)
+            pb = await self._db_locked(  # chainlink #386
+                lambda eids=evidence_ids: build_prior_block(conn, eids)
+            )
             prior_blocks.append(pb)
 
         async def _synth(cluster, prior_block):
@@ -1401,8 +1411,9 @@ class SagaStore:
         from ._config_io import get_config
 
         conn = self._ensure_conn()
-        skills = await asyncio.to_thread(
-            distinct_skill_scopes, conn, agent_id=self._agent_id,
+        # chainlink #386: shared-conn read under _db_lock (see consolidate()).
+        skills = await self._db_locked(
+            lambda: distinct_skill_scopes(conn, agent_id=self._agent_id)
         )
         summary: dict[str, Any] = {
             "skills_scanned": len(skills),
