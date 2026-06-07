@@ -166,6 +166,59 @@ async def test_consolidate_repairs_dual_current_world_state_with_few_raws(
     assert current == [("SF",)]  # newest valid_from kept; the other end-dated
 
 
+@pytest.mark.asyncio
+async def test_consolidate_reads_hold_db_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """chainlink #386: consolidate's shared-connection reads must run while
+    _db_lock is held, so a concurrent turn's write (also _db_lock-guarded) can
+    never touch the shared sqlite3 connection at the same time (sqlite3 + FTS5
+    can segfault on concurrent access to one connection). Probe _candidate_raws:
+    while it runs, a FOREIGN thread must not be able to acquire _db_lock. This
+    fails on the pre-fix bare ``asyncio.to_thread`` read."""
+    import threading
+    from mimir.saga.client import SagaStore
+    from mimir.saga import consolidate as consolidate_mod
+
+    monkeypatch.setattr(
+        "mimir.saga._config_io.get_config",
+        lambda: lambda s, k, d=None: {
+            ("embedding", "max_input_chars"): 2000,
+            ("embedding", "provider"): "stub",
+            ("embedding", "model"): "stub-4d",
+        }.get((s, k), d),
+    )
+    store = SagaStore(db_path=tmp_path / "test.saga.db", embedding_dim=4)
+
+    observed: dict[str, bool] = {}
+    orig = consolidate_mod._candidate_raws
+
+    def probe(conn, **kwargs):
+        # Runs inside _db_locked's worker thread, which holds store._db_lock.
+        # A foreign thread must NOT be able to acquire it concurrently.
+        foreign: dict[str, bool] = {}
+
+        def _try():
+            got = store._db_lock.acquire(blocking=False)
+            foreign["acquired"] = got
+            if got:
+                store._db_lock.release()
+
+        t = threading.Thread(target=_try)
+        t.start()
+        t.join()
+        observed["lock_held"] = foreign.get("acquired") is False
+        return orig(conn, **kwargs)
+
+    monkeypatch.setattr(consolidate_mod, "_candidate_raws", probe)
+    await store.consolidate(dry_run=True, dedup_first=False)
+
+    assert observed.get("lock_held") is True, (
+        "consolidate's candidate read did not hold _db_lock — a concurrent "
+        "shared-connection write could race it on the same sqlite3 connection"
+    )
+
+
 # ─── Activation decay edge cases ─────────────────────────────────────
 
 
