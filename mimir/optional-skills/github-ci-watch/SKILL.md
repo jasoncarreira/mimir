@@ -1,6 +1,6 @@
 ---
 name: github-ci-watch
-description: Watch the main branch of one or more GitHub repositories for new CI (GitHub Actions) workflow-run failures — emits a fresh turn the moment a build breaks and stays silent while CI is green. Use when mimir maintains repos whose CI it should react to (e.g. a failing build on main after a merge it landed). Seen-set deduped so each failed run is reported exactly once. Companion to the ``pollers`` framework skill (mechanics) and the ``world-scanning`` skill (catalog of what's worth polling). Opt-in: copy this directory into ``<home>/skills/github-ci-watch/`` then set the env vars below.
+description: "Watch the main branch of one or more GitHub repositories for new CI (GitHub Actions) workflow-run failures — emits a fresh turn the moment a build breaks and stays silent while CI is green. Use when mimir maintains repos whose CI it should react to (e.g. a failing build on main after a merge it landed). Seen-set deduped so each failed run is reported exactly once. Companion to the ``pollers`` framework skill (mechanics) and the ``world-scanning`` skill (catalog of what's worth polling). Opt-in: copy this directory into ``<home>/skills/github-ci-watch/`` then set the env vars below."
 env:
   required:
     - name: GITHUB_REPOS

@@ -1,6 +1,6 @@
 ---
 name: gmail-poller
-description: Watch a Gmail inbox for new messages via the `gog` Google Workspace CLI — emits one turn per new message ID since the last poll. Cursor is a SET of message IDs (not a timestamp), so reordered or backdated deliveries don't double-emit. Opt-in: copy this directory into `<home>/skills/gmail-poller/`, install `gog`, run the OAuth setup once, set `GOG_ACCOUNT`, then `reload_pollers`. Companion to the `pollers` framework skill and the `world-scanning` skill (catalog of what's worth polling). For a sender-allowlist / label-filter, use a Gmail search query in `MIMIR_GMAIL_QUERY` — the Gmail search language IS the filter mechanism, this poller doesn't reimplement it.
+description: "Watch a Gmail inbox for new messages via the `gog` Google Workspace CLI — emits one turn per new message ID since the last poll. Cursor is a SET of message IDs (not a timestamp), so reordered or backdated deliveries don't double-emit. Opt-in: copy this directory into `<home>/skills/gmail-poller/`, install `gog`, run the OAuth setup once, set `GOG_ACCOUNT`, then `reload_pollers`. Companion to the `pollers` framework skill and the `world-scanning` skill (catalog of what's worth polling). For a sender-allowlist / label-filter, use a Gmail search query in `MIMIR_GMAIL_QUERY` — the Gmail search language IS the filter mechanism, this poller doesn't reimplement it."
 ---
 
 # gmail-poller — watch a Gmail inbox
