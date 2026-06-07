@@ -1080,6 +1080,27 @@ class SagaStore:
                 "duplicates_tombstoned": dedup_result.duplicates_tombstoned,
                 "threshold": effective_dedup_threshold,
             }
+            # chainlink #390: remove the dedup-tombstoned raws from the FAISS
+            # index too (mirror forget()). WHERE tombstoned=0 masks them from
+            # final SQL results, but their vectors still consume FAISS top_k
+            # slots — so over-fetch climbs and genuinely-relevant atoms can get
+            # pushed out of the candidate set until a cold rebuild. Best-effort:
+            # a missed removal degrades gracefully (SQL still masks the row).
+            if (
+                not dry_run
+                and dedup_result.duplicates_tombstoned
+                and self._index is not None
+                and self._index.built
+            ):
+                with self._index_lock:
+                    for atom_id in dedup_result.duplicates_tombstoned:
+                        try:
+                            self._index.remove(atom_id)
+                        except Exception:  # noqa: BLE001
+                            log.warning(
+                                "FAISS index remove failed for dedup-tombstoned "
+                                "atom_id=%r", atom_id, exc_info=True,
+                            )
 
         # 1. Candidate selection + clustering (sync; reads only).
         # Re-fetches raws so the tombstoned duplicates from pass 1
@@ -1323,6 +1344,32 @@ class SagaStore:
                     conn.commit()
                 except Exception:
                     conn.rollback()
+                    # chainlink #391: _store_atom above committed the observation
+                    # in its OWN transaction before this relations transaction.
+                    # On rollback it would remain an orphan — no evidenced_by /
+                    # observations_metadata — that recall surfaces unbacked, and
+                    # find_equal_evidence_obs can't match on retry (it has no
+                    # evidence edges) so a re-run duplicates it. Tombstone it
+                    # (matches forget's removal model; avoids FK/FTS/embedding
+                    # orphan issues a DELETE would risk) before re-raising. It
+                    # was never added to the FAISS index (that happens only after
+                    # the commit below), so no index cleanup is needed.
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        conn.execute(
+                            "UPDATE atoms SET tombstoned=1 WHERE id=?",
+                            (observation_id,),
+                        )
+                        conn.commit()
+                    except Exception:  # noqa: BLE001
+                        try:
+                            conn.rollback()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        log.warning(
+                            "failed to tombstone orphaned observation %s after "
+                            "restructure rollback", observation_id, exc_info=True,
+                        )
                     raise
 
                 # Trend recompute in its own short txn (refresh_trend
