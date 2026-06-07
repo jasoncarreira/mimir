@@ -2003,3 +2003,28 @@ async def test_run_turn_early_armed_injection_deactivates_on_setup_error(
         "ch-1",
         AgentEvent(trigger="user_message", channel_id="ch-1", content="later"),
     ) == "no_active_turn"
+
+
+async def test_run_turn_bounds_hung_finalize_hook(tmp_path: Path, monkeypatch):
+    """chainlink #389: a hung finalize hook is bounded by
+    post_turn_timeout_seconds so it can't hold the dispatcher worker (and thus
+    the channel) forever. run_turn still returns and the record is written —
+    post-loop work runs OUTSIDE the model-loop timeout, so without the bound a
+    hook hang would wedge the turn indefinitely."""
+    import asyncio
+    monkeypatch.setenv("MIMIR_POST_TURN_TIMEOUT_SECONDS", "2")
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
+
+    class _HangFinalizeHook:
+        async def finalize(self, ctx, event, record):
+            await asyncio.Event().wait()  # never returns
+
+    agent._hooks.append(_HangFinalizeHook())
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+
+    # Must return well under the guard despite the hung hook (would hang forever
+    # pre-fix). The TurnRecord is still produced (written before finalize).
+    record = await asyncio.wait_for(agent.run_turn(event), timeout=15.0)
+    assert record is not None
+    assert record.output == "ok"

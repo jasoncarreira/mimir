@@ -1861,7 +1861,22 @@ class Agent:
         # via the ``Agent(turn_hooks=...)`` constructor parameter or
         # ``Agent.add_hook(...)``. Per-hook exception isolation —
         # see ``mimir.turn_hooks.fire_hooks``.
-        await fire_hooks("finalize", self._hooks, ctx, event, record)
+        # chainlink #389: bound finalize hooks. Operator-registered hooks are
+        # arbitrary code; a hang here would hold the dispatcher worker (and thus
+        # the whole channel) forever — turn_timeout_seconds only covers the model
+        # stream, not this post-loop work. The TurnRecord is already written
+        # above, so a timeout here only drops best-effort finalize work.
+        try:
+            await asyncio.wait_for(
+                fire_hooks("finalize", self._hooks, ctx, event, record),
+                timeout=self._config.post_turn_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "finalize hooks exceeded post_turn_timeout (%ss) — skipped to "
+                "avoid wedging the channel",
+                self._config.post_turn_timeout_seconds,
+            )
 
         # Post-turn observability hooks (181-M). Order matters:
         #   1. wiki_backlinks: regenerates state/wiki/{orphans,
@@ -1917,7 +1932,13 @@ class Agent:
                     sent_result = None
                     if clean:
                         try:
-                            sent_result = await bridge.send(event.channel_id, clean)
+                            # chainlink #389: bound the external send so a hung
+                            # bridge HTTP call can't hold the worker forever. The
+                            # existing handler catches the resulting TimeoutError.
+                            sent_result = await asyncio.wait_for(
+                                bridge.send(event.channel_id, clean),
+                                timeout=self._config.post_turn_timeout_seconds,
+                            )
                         except Exception as exc:
                             log.warning("bridge.send failed: %s", exc)
                             # Gap 5 fix: emit algedonic negative so the
