@@ -525,6 +525,13 @@ class Config:
     # allowing legitimate long heartbeat or reflection work.
     turn_timeout_seconds: int
 
+    # chainlink #389: ceiling for post-model-loop external awaits (finalize
+    # hooks, end-of-turn bridge.send). turn_timeout_seconds only bounds the
+    # model stream; without this a hung bridge send or operator finalize hook
+    # would hold the dispatcher worker forever and wedge the whole channel.
+    # Generous enough for a legitimate commitment-extraction LLM call.
+    post_turn_timeout_seconds: int
+
     # Algedonic surfacing (v0.4 §2). Window for the Recent feedback
     # signals prompt section; per-polarity cap on rendered items. 0 for
     # the limit disables the section entirely. Tune small if the prompt
@@ -797,6 +804,7 @@ class Config:
             web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),
             allow_unauthenticated=_env_bool("MIMIR_ALLOW_UNAUTHENTICATED", False),
             turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", 3600),
+            post_turn_timeout_seconds=_env_int("MIMIR_POST_TURN_TIMEOUT_SECONDS", 180),
 
             feedback_window_hours=_env_int("MIMIR_FEEDBACK_WINDOW_HOURS", 24),
             feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),
