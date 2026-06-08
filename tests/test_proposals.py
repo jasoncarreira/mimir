@@ -198,6 +198,40 @@ def test_finalize_rejects_secret_in_content(home: Path) -> None:
     assert list_open_proposals(home)
 
 
+def test_finalize_rejects_conflict_markers_in_protected_surfaces(home: Path) -> None:
+    r = open_proposal(home, lane="upgrade")
+    assert r.ok
+    (r.worktree / "prompts" / "reflect.md").write_text(
+        "# reflect\n\n<<<<<<< home\noperator prompt\n=======\ndefault prompt\n>>>>>>> mimir-defaults\n",
+        encoding="utf-8",
+    )
+
+    res = finalize_proposal(home, title="upgrade", rationale="r", lane="upgrade", open_pr=_opener([]))
+
+    assert not res.ok and res.reason == "conflict_marker"
+    assert res.branch == r.branch
+    assert "prompts/reflect.md" in (res.detail or "")
+    assert list_open_proposals(home, lane="upgrade") == [(r.branch, r.worktree)]
+    assert r.worktree.exists()
+    assert r.branch not in _git("branch", "-r", cwd=home).stdout
+
+
+def test_finalize_allows_setext_heading_equals_underline(home: Path) -> None:
+    r = open_proposal(home, lane="upgrade")
+    assert r.ok
+    (r.worktree / "prompts" / "reflect.md").write_text(
+        "# reflect\n\nLegitimate setext heading\n========\n\nbody\n",
+        encoding="utf-8",
+    )
+
+    calls: list[dict] = []
+    res = finalize_proposal(home, title="upgrade", rationale="r", lane="upgrade", open_pr=_opener(calls))
+
+    assert res.ok and res.pushed
+    assert calls
+    assert list_open_proposals(home, lane="upgrade") == []
+
+
 def test_finalize_stages_both_surfaces_only(home: Path) -> None:
     r = open_proposal(home)
     assert r.ok
