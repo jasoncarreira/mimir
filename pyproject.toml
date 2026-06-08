@@ -97,6 +97,21 @@ discord = [
 slack = [
     "slack-bolt>=1.18",
 ]
+# GEPA prompt-optimization skill (chainlink #332 / #405). Opt-in: the
+# standalone reflective-prompt optimizer (github.com/gepa-ai/gepa) is
+# only needed while a GEPA pilot runs, so it ships as an extra rather
+# than a core dep — the base runtime stays lean. gepa's core is
+# dependency-free; mimir routes its ``reflection_lm`` through the
+# already-configured ChatModel (see ``mimir/gepa_support.py``), so no
+# ``gepa[full]`` / LiteLLM extra is needed. Install:
+#   pip install 'mimir-agent[gepa]'        (pypi mode)
+#   uv sync --extra gepa                   (workspace mode)
+# A dockerfile.fragment can't carry it: fragments run as root before
+# the user venv exists, so a pip-install there lands in system Python,
+# not where the agent imports from — hence an extra, not a fragment.
+gepa = [
+    "gepa>=0.1.1,<0.2",
+]
 # ``pip install -e ".[dev]"`` — minimal dev toolchain. Does NOT pull
 # the langchain-claude-code git fork; that path is in
 # ``dev-claude-code`` below. Tests that touch the claude-code module
@@ -119,6 +134,10 @@ dev = [
     # level is debatable (some operators may want BM25-only); pinning
     # in dev means tests always exercise the real path.
     "faiss-cpu>=1.13",
+    # gepa optimizer (chainlink #405) — dependency-free core. Included
+    # in dev so CI exercises the reflection_lm wiring against the real
+    # library; tests still ``importorskip`` it so a non-dev env stays green.
+    "gepa>=0.1.1,<0.2",
 ]
 
 # For dev work on the Claude Code subprocess path, install ``[dev]``

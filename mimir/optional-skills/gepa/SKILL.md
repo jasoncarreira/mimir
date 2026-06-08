@@ -102,26 +102,33 @@ If the evaluator cannot produce this, stop. Improve the evaluator first.
 
 ### 3. Run a bounded optimization pass
 
-Use the standalone `gepa` library rather than reimplementing the optimizer. Prefer
-`gepa[langchain]` so task and reflection LMs route through mimir's existing model
-adapters.
+Use the standalone `gepa` library rather than reimplementing the optimizer. It is
+not installed by default — it ships as the opt-in `gepa` extra (the optimizer is
+only needed while a pilot runs, so the base runtime stays lean):
 
-Expected first-run shape:
+- PyPI deployments: `pip install 'mimir-agent[gepa]'`
+- workspace / uv deployments: `uv sync --extra gepa`
+
+gepa has no `langchain` extra. Route its reflection LM (and the task model) through
+mimir's already-configured ChatModel via `mimir.gepa_support` rather than a separate
+LiteLLM / OpenAI key — `reflection_lm` takes a plain `(prompt: str) -> str` callable:
 
 ```python
 import gepa
+from mimir.gepa_support import reflection_lm_from_config
 
 result = gepa.optimize(
-    seed_candidate=baseline_prompt,
+    seed_candidate={"instructions": baseline_prompt},
     trainset=train_examples,
     valset=holdout_examples,
-    metric_fn=evaluate_with_asi,
-    max_metric_calls=100,  # explicit cost cap; raise only after a useful pilot
+    adapter=my_pilot_adapter,           # evaluator + ASI; see step 2 and chainlink #404
+    reflection_lm=reflection_lm_from_config(),
+    max_metric_calls=100,               # explicit cost cap; raise only after a useful pilot
 )
 ```
 
 Adapt the exact API to the installed `gepa` version, but keep the invariants:
-explicit baseline, explicit examples, ASI-rich metric, explicit metric-call cap,
+explicit baseline, explicit examples, ASI-rich evaluator, explicit metric-call cap,
 and no auto-application of `result.best_candidate`.
 
 ### 4. Compare on holdout and write the decision record

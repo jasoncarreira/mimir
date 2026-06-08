@@ -7,7 +7,9 @@ from pathlib import Path
 from mimir.skill_md import parse_frontmatter
 
 
-SKILL_PATH = Path(__file__).parent.parent / "mimir" / "skills" / "gepa" / "SKILL.md"
+SKILL_PATH = (
+    Path(__file__).parent.parent / "mimir" / "optional-skills" / "gepa" / "SKILL.md"
+)
 
 
 def _body() -> str:
