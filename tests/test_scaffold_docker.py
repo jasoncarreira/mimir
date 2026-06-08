@@ -154,6 +154,33 @@ def test_collect_fragments_ordered_by_skill_name(tmp_path: Path):
     assert [f.skill_name for f in frags] == ["a-skill", "m-skill", "z-skill"]
 
 
+def test_bundled_chainlink_fragment_is_pinned_to_tag():
+    """The bundled chainlink fragment should not float git HEAD."""
+    fragment = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "skills"
+        / "chainlink"
+        / "dockerfile.fragment"
+    ).read_text()
+    assert "--git https://github.com/dollspace-gay/chainlink.git" in fragment
+    assert "--tag chainlink-1.6.0" in fragment
+
+
+def test_gmail_poller_fragment_pins_go_and_gogcli_versions():
+    """Optional gmail-poller builds should be reproducible, not @latest."""
+    fragment = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "optional-skills"
+        / "gmail-poller"
+        / "dockerfile.fragment"
+    ).read_text()
+    assert "go1.26.4.linux-${ARCH}.tar.gz" in fragment
+    assert "github.com/steipete/gogcli/cmd/gog@v0.9.0" in fragment
+    assert "@latest" not in fragment
+
+
 # ── collect_required_env_vars ───────────────────────────────────────
 
 
@@ -278,7 +305,7 @@ def test_render_dockerfile_has_base_layer():
     present (git, gh, uv, pinned claude-code, pinned mermaid)."""
     out = render_dockerfile([])
     assert "FROM python:3.11-slim" in out
-    assert "@anthropic-ai/claude-code@2.1.166" in out
+    assert "@anthropic-ai/claude-code@2.1.168" in out
     assert "@mermaid-js/mermaid-cli@11.15.0" in out
     assert "astral.sh/uv/install.sh" in out
 
@@ -290,7 +317,7 @@ def test_render_dockerfile_installs_codex_when_enabled():
     """install_codex=True adds the codex CLI install to both modes."""
     for mode in ("workspace", "pypi"):
         out = render_dockerfile([], mode=mode, install_codex=True)
-        assert "npm install -g @openai/codex@0.135.0" in out, mode
+        assert "npm install -g @openai/codex@0.137.0" in out, mode
 
 
 def test_render_dockerfile_omits_codex_by_default():
@@ -308,7 +335,7 @@ def test_scaffold_installs_codex_for_codex_plus_extra(tmp_path: Path):
     home = tmp_path / "codex-home"
     home.mkdir()
     scaffold(home, mode="pypi", mimir_extras=["codex-plus", "discord"])
-    assert "npm install -g @openai/codex@0.135.0" in (home / "Dockerfile").read_text()
+    assert "npm install -g @openai/codex@0.137.0" in (home / "Dockerfile").read_text()
 
     plain = tmp_path / "plain-home"
     plain.mkdir()
@@ -322,7 +349,7 @@ def test_scaffold_installs_codex_for_workspace_uv_extra(tmp_path: Path):
     home = tmp_path / "ws-codex-home"
     home.mkdir()
     scaffold(home, mode="workspace", uv_extras=["codex-plus"])
-    assert "npm install -g @openai/codex@0.135.0" in (home / "Dockerfile").read_text()
+    assert "npm install -g @openai/codex@0.137.0" in (home / "Dockerfile").read_text()
 
     plain = tmp_path / "ws-plain-home"
     plain.mkdir()

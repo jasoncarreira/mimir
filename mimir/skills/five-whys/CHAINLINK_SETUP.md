@@ -49,7 +49,7 @@ cargo --version
 machine significantly. They should avoid running heavy tasks during the install.
 
 ```bash
-cargo install --git https://github.com/dollspace-gay/chainlink.git chainlink-tracker
+cargo install --git https://github.com/dollspace-gay/chainlink.git --tag chainlink-1.6.0 chainlink-tracker
 ```
 
 This compiles from source. On resource-constrained machines (< 2GB RAM), it may be
@@ -57,7 +57,7 @@ slow or fail. If it fails with an OOM:
 
 ```bash
 # Reduce parallel compilation
-CARGO_BUILD_JOBS=1 cargo install --git https://github.com/dollspace-gay/chainlink.git chainlink-tracker
+CARGO_BUILD_JOBS=1 cargo install --git https://github.com/dollspace-gay/chainlink.git --tag chainlink-1.6.0 chainlink-tracker
 ```
 
 Verify:

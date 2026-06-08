@@ -347,7 +347,8 @@ def get_current_value(
         "SELECT subject, predicate, value, valid_from, valid_until, "
         "is_current, source_triple_id "
         "FROM world_state WHERE subject = ? AND predicate = ? "
-        "AND is_current = 1",
+        "AND is_current = 1 "
+        "ORDER BY valid_from DESC, rowid DESC LIMIT 1",
         (subject, pred),
     ).fetchone()
     if row is None:
