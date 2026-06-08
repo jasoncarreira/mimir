@@ -5,17 +5,17 @@
 # Install path: fetch the Go toolchain matching the build arch
 # (``dpkg --print-architecture`` returns amd64 / arm64 / etc., which
 # matches Go's tarball naming), build the binary, drop the toolchain.
-# Pinned to ``@latest`` because steipete hasn't cut tagged releases
-# yet — switch to ``@v0.x.y`` when one lands.
+# Pinned to a tagged gogcli release for reproducible builds; bump
+# during the weekly external-tool pin scan when upstream cuts a new tag.
 #
 # Image cost: ~30 MB after the toolchain cleanup. Build cost: ~60s on
 # first build, cached after.
 
-# Go version pinned to 1.23.4. Bump when a security advisory drops or
+# Go version pinned to 1.26.4. Bump when a security advisory drops or
 # gogcli's go.mod requires a newer toolchain. Check
 # https://go.dev/dl/ for the current stable release.
 RUN ARCH=$(dpkg --print-architecture) \
- && curl -fsSL "https://go.dev/dl/go1.23.4.linux-${ARCH}.tar.gz" | tar -C /usr/local -xz \
+ && curl -fsSL "https://go.dev/dl/go1.26.4.linux-${ARCH}.tar.gz" | tar -C /usr/local -xz \
  && PATH=$PATH:/usr/local/go/bin GOPATH=/tmp/go GOBIN=/usr/local/bin \
-        go install github.com/steipete/gogcli/cmd/gog@latest \
+        go install github.com/steipete/gogcli/cmd/gog@v0.9.0 \
  && rm -rf /usr/local/go /tmp/go /root/go

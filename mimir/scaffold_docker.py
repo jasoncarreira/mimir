@@ -294,7 +294,7 @@ RUN apt-get update \\
 
 # Claude Code CLI (claude-agent-sdk shells out to this binary) +
 # pinned mermaid CLI (used by mermaid-diagrams skill).
-RUN npm install -g @anthropic-ai/claude-code@2.1.166 @mermaid-js/mermaid-cli@11.15.0
+RUN npm install -g @anthropic-ai/claude-code@2.1.168 @mermaid-js/mermaid-cli@11.15.0
 
 __CODEX_INSTALL__
 
@@ -392,7 +392,7 @@ RUN apt-get update \\
 
 # Claude Code CLI subprocess transport + mermaid CLI for the
 # mermaid-diagrams skill. Both ship via pinned npm package versions.
-RUN npm install -g @anthropic-ai/claude-code@2.1.166 @mermaid-js/mermaid-cli@11.15.0
+RUN npm install -g @anthropic-ai/claude-code@2.1.168 @mermaid-js/mermaid-cli@11.15.0
 
 __CODEX_INSTALL__
 
@@ -452,7 +452,7 @@ RUN pip install --no-cache-dir --upgrade pip \\
 # ``LANGCHAIN_CLAUDE_CODE_REF`` when upstream rolls (tracked at
 # mimir-repo issue #268).
 ARG MIMIR_ENABLE_CLAUDE_CODE=0
-ARG LANGCHAIN_CLAUDE_CODE_REF=c03f075c8b84fb0c718de1aabdd6493f5d191786
+ARG LANGCHAIN_CLAUDE_CODE_REF=c723d702dfac1ff6e2b22b8bde661cb17a17b0de
 RUN if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \\
         pip install --no-cache-dir \\
             "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@${LANGCHAIN_CLAUDE_CODE_REF}" ; \\
@@ -488,7 +488,7 @@ def _codex_install_block(install_codex: bool) -> str:
         "# Codex CLI — codex-subscription deployments (codex-plus extra).\n"
         "# spawn_codex shells out to ``codex exec``; Codex Plus auth lives\n"
         "# at ~/.codex/auth.json. npm-global, like the claude-code CLI above.\n"
-        "RUN npm install -g @openai/codex@0.135.0"
+        "RUN npm install -g @openai/codex@0.137.0"
     )
 
 
