@@ -71,3 +71,6 @@ home/
 # generates its own ``state/`` on first run.
 /state/
 .bench-experiments-backup/
+
+# GEPA pilot run outputs (chainlink #404) — generated, not committed
+evals/**/pilot_output/
