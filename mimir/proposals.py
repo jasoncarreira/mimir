@@ -58,7 +58,7 @@ PROPOSAL_LANES = (AGENT_PROPOSAL_LANE, UPGRADE_PROPOSAL_LANE)
 #: Remote branch prefixes owned by the protected-file proposal workflow.
 PROPOSAL_BRANCH_PREFIXES = ("proposal/", "upgrade/")
 #: Git conflict markers must never be submitted as protected-surface content.
-CONFLICT_MARKER_RE = re.compile(r"^(<<<<<<<|=======|>>>>>>>)", re.MULTILINE)
+CONFLICT_MARKER_RE = re.compile(r"^(?:<<<<<<<|=======$|>>>>>>>)", re.MULTILINE)
 
 #: ``(home, branch, base, title, body) -> pr_url | None`` — injectable so tests
 #: exercise the git mechanics without a real GitHub.
