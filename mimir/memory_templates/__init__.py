@@ -76,6 +76,7 @@ def seed_core_memory(home: Path) -> dict[str, str]:
 
 
 DEFAULT_IDENTITY_MD = core_template_text("00-identity.md")
+DEFAULT_NON_GOALS = core_template_text("05-non-goals.md")
 DEFAULT_ACTION_BOUNDARIES = core_template_text("06-action-boundaries.md")
 DEFAULT_VSM_TERMS = core_template_text("20-vsm-terms.md")
 DEFAULT_REFLECTION_POLICY = core_template_text("30-reflection-policy.md")
