@@ -164,6 +164,73 @@ def _extract_env_yaml(raw: str) -> str | None:
     return "\n".join(env_lines)
 
 
+def _extract_top_level_key_yaml(raw: str, key: str) -> str | None:
+    """Extract a single top-level ``key:`` line (plus its indented children,
+    if it opens a block) from raw frontmatter — without yaml-parsing the rest.
+
+    Same rationale as :func:`_extract_env_yaml`: SKILL.md descriptions
+    routinely contain bare colons that the flat :func:`parse_frontmatter`
+    accepts but ``yaml.safe_load`` over the whole block chokes on. Parsing
+    only the target key keeps a list field readable regardless of what the
+    description looks like. Handles inline (``key: [a, b]`` / ``key: a``)
+    and block (``key:`` then ``  - a``) forms. Returns ``None`` when the
+    key is absent.
+    """
+    lines = raw.splitlines()
+    pat = re.compile(rf"^{re.escape(key)}:(?:\s|$)")
+    start: int | None = None
+    for i, line in enumerate(lines):
+        if pat.match(line):
+            start = i
+            break
+    if start is None:
+        return None
+    out = [lines[start]]
+    for line in lines[start + 1 :]:
+        if line and not line[0].isspace():
+            break  # next top-level key
+        out.append(line)
+    return "\n".join(out)
+
+
+def frontmatter_list_field(text: str, key: str) -> list[str]:
+    """Return a frontmatter list field (e.g. ``requires_extras``) as strings.
+
+    Parses ONLY ``key:`` and its indented children — never the whole
+    frontmatter block — so an unquoted description with a bare ``: ``
+    (accepted by the flat :func:`parse_frontmatter` contract, but invalid
+    YAML) can't make the field silently vanish (chainlink #406 review).
+    Accepts inline (``key: [a, b]`` / ``key: a``) and block (``key:`` then
+    ``- a``) forms. Returns ``[]`` when the key is absent, empty, or
+    unparseable — never raises (runs at container boot).
+    """
+    import yaml  # lazy: only needed for skills that declare the field
+
+    try:
+        raw = _raw_frontmatter_yaml(text)
+    except ValueError:
+        return []
+    snippet = _extract_top_level_key_yaml(raw, key)
+    if snippet is None:
+        return []
+    try:
+        data = yaml.safe_load(snippet)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    value = data.get(key)
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [
+        str(item).strip()
+        for item in value
+        if isinstance(item, (str, int, float)) and str(item).strip()
+    ]
+
+
 def parse_env_block(text: str) -> tuple[list[dict], list[dict]]:
     """Return ``(required, optional)`` env-var spec dicts from the frontmatter.
 

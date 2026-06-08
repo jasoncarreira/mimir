@@ -1,4 +1,4 @@
-"""Skills subcommand — ``mimir skills {catalog,list,list-optional,install,update,accept,configure}``.
+"""Skills subcommand — ``mimir skills {catalog,list,list-optional,required-extras,install,update,accept,configure}``.
 
 Extracted from ``mimir.cli`` (Phase 3, chainlink #240).
 Business logic lives in ``mimir.skill_catalog`` and ``mimir.skill_install``;
@@ -53,6 +53,17 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
         ),
     )
     _skill_install.add_argparse_list_optional(skills_list_opt_p)
+
+    skills_req_extras_p = skills_sub.add_parser(
+        "required-extras",
+        help=(
+            "Print the pip extras that installed skills declare they need "
+            "(SKILL.md `requires_extras`), as the deduped union across "
+            "<home>/skills/ + builtins. Workspace-mode start.sh folds these "
+            "into `uv sync` so a restart doesn't prune a skill's dependency."
+        ),
+    )
+    _skill_install.add_argparse_required_extras(skills_req_extras_p)
 
     skills_install_p = skills_sub.add_parser(
         "install",

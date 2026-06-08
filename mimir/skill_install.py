@@ -48,8 +48,8 @@ from pathlib import Path
 
 from mimir._atomic import atomic_write_json
 from mimir.redaction import redact_text
-from mimir.skill_defs import home_skills_dir
-from mimir.skill_md import parse_env_block, parse_frontmatter
+from mimir.skill_defs import home_builtin_skills_dir, home_skills_dir
+from mimir.skill_md import frontmatter_list_field, parse_env_block, parse_frontmatter
 
 # Source root for optional-skills, relative to this file.
 #: ``mimir/skill_install.py`` lives at ``mimir/skill_install.py`` and the
@@ -578,6 +578,75 @@ def add_argparse_install(parser) -> None:
 def add_argparse_list_optional(parser) -> None:
     """Wire ``mimir skills list-optional``."""
     parser.set_defaults(skill_install_cmd=cmd_list_optional)
+
+
+def required_extras(home: Path) -> list[str]:
+    """Deduped, sorted union of ``requires_extras`` declared by installed skills.
+
+    Scans the home's active skill dirs (``<home>/skills/`` and
+    ``<home>/.mimir_builtin_skills/``) for SKILL.md frontmatter
+    ``requires_extras`` — a list of mimir-agent pip-extra names a skill
+    needs (e.g. the gepa optimizer declares ``[gepa]``). A workspace-mode
+    start.sh folds these into its boot ``uv sync`` so a restart doesn't
+    prune a skill's dependency (chainlink #406).
+
+    Best-effort: skills with no SKILL.md, no field, or unparseable
+    frontmatter contribute nothing and never raise — this runs at
+    container boot and must degrade gracefully.
+    """
+    extras: set[str] = set()
+    for root in (home_skills_dir(home), home_builtin_skills_dir(home)):
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            skill_md = entry / "SKILL.md"
+            if not skill_md.is_file():
+                continue
+            try:
+                text = skill_md.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            # Parse ONLY the requires_extras field — not the whole frontmatter
+            # block — so a skill whose (unquoted) description carries a bare
+            # ``: `` doesn't make its declared extra silently vanish (#406 review).
+            extras.update(frontmatter_list_field(text, "requires_extras"))
+    return sorted(extras)
+
+
+def add_argparse_required_extras(parser) -> None:
+    """Wire ``mimir skills required-extras [--home PATH] [--as-uv-flags]``."""
+    parser.add_argument(
+        "--home", type=Path, default=None,
+        help="Mimir home to scan (default: $MIMIR_HOME or cwd).",
+    )
+    parser.add_argument(
+        "--as-uv-flags", action="store_true", dest="as_uv_flags",
+        help="Emit as ``--extra <name>`` tokens for splicing into `uv sync` "
+             "(default: one extra name per line).",
+    )
+    parser.set_defaults(skill_install_cmd=cmd_required_extras)
+
+
+def cmd_required_extras(args) -> int:
+    """``mimir skills required-extras`` entry point.
+
+    Prints the pip extras installed skills declare they need so a
+    workspace-mode start.sh can fold them into ``uv sync`` and stop
+    pruning skill deps on restart (chainlink #406). Prints nothing (and
+    still exits 0) when the home is missing or nothing is declared, so
+    the calling shell's ``$(...)`` is simply empty.
+    """
+    home = _resolve_home(args.home)
+    extras = required_extras(home) if home.is_dir() else []
+    if getattr(args, "as_uv_flags", False):
+        out = " ".join(f"--extra {e}" for e in extras)
+    else:
+        out = "\n".join(extras)
+    if out:
+        print(out)
+    return 0
 
 
 def _resolve_home(home_arg: Path | None) -> Path:
