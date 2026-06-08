@@ -91,6 +91,38 @@ def parse_frontmatter(text: str) -> dict[str, str]:
     return out
 
 
+def frontmatter_yaml(text: str) -> dict:
+    """``yaml.safe_load`` the leading ``--- ... ---`` block.
+
+    :func:`parse_frontmatter` is string-only by design (flat
+    ``key: value``); use this when a field needs real YAML typing —
+    notably list values like ``requires_extras: [gepa]`` (chainlink
+    #406). Returns ``{}`` when there is no opening delimiter, no closing
+    delimiter, an empty block, or the block doesn't parse to a mapping.
+    Never raises on malformed YAML: callers run at container boot (the
+    start.sh extras resolver) and must degrade gracefully.
+    """
+    import yaml  # lazy: only needed for schema fields that aren't flat strings
+
+    lines = text.splitlines()
+    if not lines or not _FRONTMATTER_DELIM.match(lines[0]):
+        return {}
+    block: list[str] = []
+    closed = False
+    for raw in lines[1:]:
+        if _FRONTMATTER_DELIM.match(raw):
+            closed = True
+            break
+        block.append(raw)
+    if not closed:
+        return {}
+    try:
+        data = yaml.safe_load("\n".join(block))
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def strip_frontmatter(text: str) -> str:
     """Return the body — everything after the closing ``---`` delimiter.
 

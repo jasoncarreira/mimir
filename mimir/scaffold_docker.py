@@ -741,6 +741,19 @@ UV_EXTRAS="{UV_EXTRAS}"
 echo "[start.sh] uv sync (extras: ${UV_EXTRAS:-(none)})"
 uv sync $UV_EXTRAS
 
+# ─── skill-required extras (chainlink #406) ────────────────────────
+# Optional skills can declare ``requires_extras`` in their SKILL.md
+# (e.g. the gepa optimizer needs the ``gepa`` extra). Without folding
+# them in, the base sync above PRUNES a skill's dependency on every
+# restart. The base sync already made ``mimir`` importable, so query it
+# for what the installed skills need and re-sync with them included.
+# Best-effort: if the query fails we keep the base extras and carry on.
+SKILL_EXTRAS="$(uv run mimir skills required-extras --home "${MIMIR_HOME}" --as-uv-flags 2>/dev/null || true)"
+if [ -n "${SKILL_EXTRAS}" ]; then
+    echo "[start.sh] + skill-required extras: ${SKILL_EXTRAS}"
+    uv sync $UV_EXTRAS $SKILL_EXTRAS
+fi
+
 # ─── home seed (idempotent — only writes missing files) ────────────
 mkdir -p "${MIMIR_HOME}"
 echo "[start.sh] mimir setup (idempotent)"

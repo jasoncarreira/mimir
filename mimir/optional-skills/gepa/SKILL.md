@@ -1,6 +1,7 @@
 ---
 name: gepa
 description: Use when a bounded textual artifact (prompt, rubric, tool description, extraction instruction) keeps underperforming and success can be measured with an evaluator, dataset, or trace set. GEPA proposes evaluator-backed candidate rewrites through a normal PR/proposal adoption gate. Do not use for vague behavior changes, governance/persona/core-memory edits, fake metrics, or problems whose first honest task is defining the evaluator or collecting data.
+requires_extras: [gepa]
 ---
 
 <!-- desc: Optimize bounded textual artifacts with GEPA only when evaluator-backed examples, budget, and a normal adoption gate exist. -->
