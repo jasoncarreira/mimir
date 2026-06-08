@@ -57,6 +57,8 @@ UPGRADE_PROPOSAL_LANE = "upgrade"
 PROPOSAL_LANES = (AGENT_PROPOSAL_LANE, UPGRADE_PROPOSAL_LANE)
 #: Remote branch prefixes owned by the protected-file proposal workflow.
 PROPOSAL_BRANCH_PREFIXES = ("proposal/", "upgrade/")
+#: Git conflict markers must never be submitted as protected-surface content.
+CONFLICT_MARKER_RE = re.compile(r"^(<<<<<<<|=======|>>>>>>>)", re.MULTILINE)
 
 #: ``(home, branch, base, title, body) -> pr_url | None`` — injectable so tests
 #: exercise the git mechanics without a real GitHub.
@@ -115,7 +117,7 @@ class ProposalResult:
     pushed: bool
     pr_url: str | None
     #: None on full success; else "no_open" | "no_changes" | "secret" |
-    #: "pushed_no_pr" | "error".
+    #: "conflict_marker" | "pushed_no_pr" | "error".
     reason: str | None
     detail: str | None = None
 
@@ -148,6 +150,33 @@ def _scan_for_secrets(text: str) -> bool:
     ``_redact`` patterns). A deployment-independent fast-fail before push; the
     pre-commit secret-scan hook is the authoritative commit-time backstop."""
     return bool(text) and _redact(text) != text
+
+
+def _staged_conflict_marker_paths(worktree: Path) -> list[str]:
+    """Return staged protected-surface files containing git conflict markers.
+
+    The upgrade/defaults reconciliation flow can intentionally write conflict
+    blocks into the proposal worktree for the agent to resolve. Submission is
+    the safety boundary: any remaining ``<<<<<<<`` / ``=======`` / ``>>>>>>>``
+    line means the merge was not actually resolved, so fail closed before the
+    corrupt prompt/core file can be committed and pushed.
+    """
+    paths = _git(["diff", "--cached", "--name-only"], cwd=worktree)
+    marked: list[str] = []
+    for line in (paths.stdout or "").splitlines():
+        rel = line.strip()
+        if not rel:
+            continue
+        path = worktree / rel
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if CONFLICT_MARKER_RE.search(text):
+            marked.append(rel)
+    return marked
 
 
 def _proposals_dir(home: Path, *, lane: str | None = None) -> Path:
@@ -384,6 +413,18 @@ def finalize_proposal(
         return ProposalResult(
             ok=False, branch=branch, pushed=False, pr_url=None, reason="no_changes",
             detail="no changes under memory/core/ or prompts/ to propose",
+        )
+
+    conflict_marked = _staged_conflict_marker_paths(wt)
+    if conflict_marked:
+        paths = ", ".join(conflict_marked[:5])
+        suffix = "" if len(conflict_marked) <= 5 else f" (+{len(conflict_marked) - 5} more)"
+        return ProposalResult(
+            ok=False, branch=branch, pushed=False, pr_url=None, reason="conflict_marker",
+            detail=(
+                "proposed content still contains git conflict markers "
+                f"(^<<<<<<<, ^=======, or ^>>>>>>>): {paths}{suffix}; resolve them before submitting"
+            ),
         )
 
     diff = _git(["diff", "--cached", "-U0"], cwd=wt)
