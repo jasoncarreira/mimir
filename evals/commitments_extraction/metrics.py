@@ -5,8 +5,9 @@ gold labels** — every signal is computed from (source_text, extracted_texts)
 alone, so no hand-annotated corpus is needed. The objective they encode is the
 one v3→v4 was about (``state/spec/commitments-v4-evaluation.md``): commitment
 texts should be *self-contained* — not over-compressed, not hallucinating
-artifact ids, retaining the ids that are actually in the source — while holding
-extraction volume roughly constant.
+artifact ids, and **retaining the source's artifact ids** so a follow-up is
+evaluable without backtracking — while holding extraction volume roughly
+constant.
 
 What these metrics deliberately do NOT measure: precision/recall, i.e. whether
 the *right* set of commitments was extracted. That needs gold labels (Path B).
@@ -14,13 +15,27 @@ Treat a winning candidate here as "more self-contained," not "more correct" —
 the adoption gate (a reviewed PR + human spot-check) is where correctness is
 judged.
 
-Anti-Goodhart guards (a text-only optimizer will try to game a scalar):
-  * hallucinated ids → strong penalty (blocks "invent ids to look specific").
-  * length cap (>120, the schema limit) → penalty (blocks "stuff everything in").
-  * count anchored to the baseline's count on the same example → penalty for
-    deviation (blocks "extract nothing → no bad texts → perfect" and
-    "extract everything → maximize id coverage").
-  * the retained-id bonus is small and capped, so it can't dominate.
+Scoring shape (per example):
+
+    score = mean(per_text_quality) × (1 − count_penalty) × coverage_factor
+
+  * per_text_quality — intrinsic defects only: over-compression, over-length,
+    hallucinated ids. (Retention is NOT scored here — see below.)
+  * count_penalty — deviation from the baseline's extraction volume.
+  * coverage_factor — of the source's artifact ids, the fraction retained
+    across all extracted texts, weighted by ``_COVERAGE_WEIGHT``.
+
+Why coverage is a *factor*, not a per-text bonus (chainlink #404 review): a
+per-text "+bonus on top of 1.0" is erased by the [0,1] clamp, so an id-dropping
+paraphrase scored identically to an id-preserving one and GEPA got no pressure
+to keep refs. An example-level coverage factor cannot be clamped away — dropping
+the source's ids measurably lowers the score.
+
+Anti-Goodhart guards: hallucinated ids → strong per-text penalty; length cap;
+count anchored to the baseline. Reference-free confound (same one the v4 spec
+flagged): coverage can't tell which id "belongs" to which commitment, and a
+correctly-dropped commitment also drops its ids — the count anchor and the
+human spot-check at the adoption gate mitigate this.
 """
 
 from __future__ import annotations
@@ -32,16 +47,19 @@ from dataclasses import dataclass, field
 MIN_SELF_CONTAINED_CHARS = 40
 MAX_TEXT_CHARS = 120
 
-# Per-text quality penalties/bonus (tuned so hallucination dominates and the
-# id bonus can't be farmed past a small cap).
+# Per-text quality penalties (intrinsic defects). Hallucination dominates.
 _PENALTY_OVER_COMPRESSED = 0.5
 _PENALTY_OVER_LONG = 0.3
 _PENALTY_HALLUCINATED = 0.8
-_BONUS_PER_RETAINED_ID = 0.1
-_BONUS_RETAINED_CAP = 0.2
+
 # Example-level volume anchor: penalty = min(rel_dev * slope, cap).
 _COUNT_PENALTY_SLOPE = 0.5
 _COUNT_PENALTY_CAP = 0.5
+
+# Id-coverage weight: coverage_factor = (1 - w) + w * coverage. With w=0.4,
+# retaining all source ids → factor 1.0; dropping them all → 0.6. Big enough to
+# be a real GEPA gradient, small enough that intrinsic quality still dominates.
+_COVERAGE_WEIGHT = 0.4
 
 
 # Artifact-id patterns — high-signal, low-false-positive. Normalized to a
@@ -92,11 +110,17 @@ class ExampleEval:
     count: int
     baseline_count: int
     count_penalty: float
+    coverage: float
+    source_ids: set[str]
     texts: list[TextEval]
     asi: str
 
 
 def _eval_text(text: str, source_ids: set[str]) -> TextEval:
+    """Intrinsic per-text quality: penalize over-compression, over-length, and
+    hallucinated ids. Retention is scored at the example level (coverage), NOT
+    here — a per-text retention bonus gets erased by the [0,1] clamp (#404 review).
+    """
     length = len(text)
     over_compressed = length < MIN_SELF_CONTAINED_CHARS
     over_long = length > MAX_TEXT_CHARS
@@ -111,7 +135,6 @@ def _eval_text(text: str, source_ids: set[str]) -> TextEval:
         q -= _PENALTY_OVER_LONG
     if hallucinated:
         q -= _PENALTY_HALLUCINATED
-    q += min(len(retained) * _BONUS_PER_RETAINED_ID, _BONUS_RETAINED_CAP)
     q = max(0.0, min(1.0, q))
 
     return TextEval(
@@ -132,11 +155,18 @@ def _count_penalty(count: int, baseline_count: int) -> float:
     texts) or everything (max id coverage). Relative deviation, capped.
     """
     if baseline_count <= 0:
-        # Baseline found nothing. Any extraction is over-extraction; scale by
-        # how many were produced (1 extra ≈ full slope, capped).
         return min(count * _COUNT_PENALTY_SLOPE, _COUNT_PENALTY_CAP)
     rel_dev = abs(count - baseline_count) / baseline_count
     return min(rel_dev * _COUNT_PENALTY_SLOPE, _COUNT_PENALTY_CAP)
+
+
+def _coverage(source_ids: set[str], retained_union: set[str]) -> float:
+    """Fraction of the source's artifact ids retained across all texts.
+
+    1.0 when the source has no ids (nothing to preserve → no pressure)."""
+    if not source_ids:
+        return 1.0
+    return len(retained_union & source_ids) / len(source_ids)
 
 
 def score_extraction(
@@ -148,43 +178,51 @@ def score_extraction(
     """Reference-free score in [0, 1] + ASI for one example.
 
     ``baseline_count`` is how many commitments the *baseline* prompt extracted
-    from the same source — the volume anchor. Score combines mean per-text
-    quality with the count-deviation penalty.
+    from the same source — the volume anchor. Score = mean per-text quality ×
+    (1 − count_penalty) × coverage_factor.
     """
     source_ids = artifact_ids(source_text)
     texts = [_eval_text(t, source_ids) for t in commitment_texts]
     n = len(texts)
     cpen = _count_penalty(n, baseline_count)
+    retained_union: set[str] = set().union(*[t.retained_ids for t in texts]) if texts else set()
+    coverage = _coverage(source_ids, retained_union)
 
     if n == 0:
         # No texts to grade. Perfect only if the baseline also found nothing;
-        # otherwise this is under-extraction and the count penalty bites.
-        base_q = 1.0 if baseline_count <= 0 else 0.0
+        # otherwise under-extraction. Coverage does not apply (no commitments to
+        # carry ids).
+        score = (1.0 if baseline_count <= 0 else 0.0) * (1.0 - cpen)
     else:
         base_q = sum(t.quality for t in texts) / n
+        cov_factor = (1.0 - _COVERAGE_WEIGHT) + _COVERAGE_WEIGHT * coverage
+        score = base_q * (1.0 - cpen) * cov_factor
 
-    score = max(0.0, min(1.0, base_q * (1.0 - cpen)))
     return ExampleEval(
-        score=score,
+        score=max(0.0, min(1.0, score)),
         count=n,
         baseline_count=baseline_count,
         count_penalty=cpen,
+        coverage=coverage,
+        source_ids=source_ids,
         texts=texts,
-        asi=_build_asi(source_ids, texts, n, baseline_count, cpen),
+        asi=_build_asi(source_ids, retained_union, texts, n, baseline_count, cpen, coverage),
     )
 
 
 def _build_asi(
     source_ids: set[str],
+    retained_union: set[str],
     texts: list[TextEval],
     count: int,
     baseline_count: int,
     count_penalty: float,
+    coverage: float,
 ) -> str:
     """Actionable Side Information: the diagnostic text GEPA reflects on.
 
-    Not just a number — names *which* text failed *why*, with the source ids,
-    so the reflection LM can rewrite the prompt to fix the specific failure.
+    Names *which* text failed *why* and *which* source ids were dropped, so the
+    reflection LM can rewrite the prompt to fix the specific failure.
     """
     lines: list[str] = []
     src = ", ".join(sorted(source_ids)) if source_ids else "(none)"
@@ -196,6 +234,17 @@ def _build_asi(
             f"VOLUME: count deviates from baseline ({direction}); "
             f"penalty {count_penalty:.2f}. Match the baseline's extraction scope."
         )
+    # Example-level id preservation — the load-bearing self-containment signal.
+    if source_ids:
+        missing = sorted(source_ids - retained_union)
+        if missing:
+            lines.append(
+                f"MISSING source ids (in no extracted text): {', '.join(missing)} "
+                f"— coverage {len(retained_union & source_ids)}/{len(source_ids)}. "
+                "Preserve these artifact refs in the commitment text(s) they belong to."
+            )
+        else:
+            lines.append(f"id coverage: {len(source_ids)}/{len(source_ids)} — all source refs preserved.")
     if not texts:
         if baseline_count > 0:
             lines.append("MISS: extracted nothing while the baseline found commitments.")
@@ -217,7 +266,7 @@ def _build_asi(
             )
         if t.retained_ids:
             issues.append("retained: " + ", ".join(sorted(t.retained_ids)))
-        verdict = "; ".join(issues) if issues else "ok, self-contained"
+        verdict = "; ".join(issues) if issues else "no intrinsic defects"
         lines.append(f"  [{i}] q={t.quality:.2f} {verdict}\n      text: {t.text!r}")
     return "\n".join(lines)
 
@@ -233,6 +282,7 @@ def aggregate(evals: list[ExampleEval]) -> dict[str, float]:
         return {}
     all_texts = [t for e in evals for t in e.texts]
     n_texts = len(all_texts)
+    with_ids = [e for e in evals if e.source_ids]
     return {
         "mean_score": sum(e.score for e in evals) / len(evals),
         "avg_commitments_per_example": sum(e.count for e in evals) / len(evals),
@@ -243,4 +293,7 @@ def aggregate(evals: list[ExampleEval]) -> dict[str, float]:
         "hallucinated_text_rate": (
             sum(1 for t in all_texts if t.hallucinated_ids) / n_texts if n_texts else 0.0
         ),
+        # The v4 spec's headline signal: of source artifact ids, fraction retained
+        # (averaged over examples whose source actually carried ids).
+        "id_coverage_mean": (sum(e.coverage for e in with_ids) / len(with_ids)) if with_ids else 1.0,
     }

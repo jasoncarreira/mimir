@@ -61,11 +61,37 @@ def test_hallucinated_id_is_strongly_penalized():
 
 
 def test_over_long_is_penalized():
-    src = "Do the thing with PR #1."
+    # No artifact ids in the source, so coverage is N/A (1.0) and the score
+    # isolates the over-length penalty.
+    src = "Do the thing described in the session at some length without any refs."
     long_text = "x" * 130
     ev = metrics.score_extraction(src, [long_text], baseline_count=1)
     assert ev.texts[0].over_long
     assert ev.score == pytest.approx(0.7)  # 1.0 - 0.3
+
+
+def test_retained_ids_beat_generic_paraphrase():
+    """#404 review: an id-preserving extraction must score strictly higher than a
+    generic paraphrase that drops the source's artifact ids. (The old per-text
+    bonus was erased by the [0,1] clamp, so the two tied — GEPA got no pressure
+    to preserve refs.)"""
+    src = "Review and merge PR #199 (skill_outcomes.py streaming fix) before the release."
+    with_ids = metrics.score_extraction(
+        src,
+        ["Review & merge PR #199 (skill_outcomes.py streaming tool_result fix) before release"],
+        baseline_count=1,
+    )
+    without = metrics.score_extraction(
+        src,
+        ["Review and merge the streaming tool-result fix before the release"],
+        baseline_count=1,
+    )
+    assert with_ids.score == pytest.approx(1.0)
+    assert with_ids.coverage == pytest.approx(1.0)
+    assert without.score < with_ids.score          # id retention now moves the score
+    assert without.coverage == pytest.approx(0.0)
+    assert "MISSING source ids" in without.asi      # ASI pressures the LM to add them back
+    assert "ok, self-contained" not in without.asi  # no longer mislabels the id-less output
 
 
 # ── volume anchor (anti-Goodhart) ────────────────────────────────────

@@ -18,8 +18,14 @@ corpus is needed:
 | over-compressed (`text < 40` chars) | fewer is better | ✅ |
 | over-long (`text > 120`, schema cap) | fewer is better | ✅ |
 | hallucinated ids (id in text, absent from source) | none is better | ✅ |
-| retained ids (source ids that survive into the text) | more is better (small, capped) | ✅ |
+| **id coverage** (fraction of the source's artifact ids retained across the extracted texts) | higher is better — a **score factor**, not a clamped bonus | ✅ |
 | extraction volume vs the baseline's count | match the baseline | ✅ (baseline as anchor) |
+
+Score shape: `mean(per_text_quality) × (1 − count_penalty) × coverage_factor`, where
+`coverage_factor = 0.6 + 0.4 × coverage`. Dropping every source id costs ~40% of the
+score, so an id-preserving extraction scores strictly higher than a generic paraphrase
+(an earlier per-text retained-id *bonus* was erased by the `[0,1]` clamp and didn't —
+chainlink #404 review).
 
 **Out of scope (needs gold → Path B):** precision/recall — whether the *right*
 set of commitments was extracted. A higher score here means "more self-contained,"
@@ -32,7 +38,9 @@ A text-only optimizer will try to game any scalar. Built-in counters:
 - **length cap** — blocks "stuff everything into one text."
 - **count anchored to the baseline's per-example count** — blocks both
   "extract nothing → no bad texts → perfect" and "extract everything → max id coverage."
-- **retained-id bonus is small and capped** — can't dominate the score.
+- **id coverage is a multiplicative factor**, not a clamped bonus — so GEPA can't
+  delete every artifact ref while keeping length/count/no-hallucination and still tie the
+  id-preserving output. Dropping the source ids measurably lowers the score.
 
 These are necessary but not sufficient. The decision record also reports the raw
 rubric rates (over-compression, hallucination, avg length) so a reviewer can
