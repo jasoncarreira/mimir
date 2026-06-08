@@ -17,3 +17,17 @@ What I noticed: ...
 What works: ...
 Trigger: <when this applies>
 ```
+
+## 2026-05-11 — frame-check before design work
+What I noticed: Design and implementation requests often smuggle a
+premise: that the requested feature belongs in the target subsystem, or
+that the named problem is the right problem to solve. Answering inside
+that frame can produce polished wrong-direction work.
+What works: Run the `core/05-non-goals.md` frame check out loud before
+committing to the design: "Before I implement: is X the right thing?
+Does Y actually want X?" Then either confirm and proceed, or surface the
+doubt before spending effort. This is the procedural counterpart to the
+non-goal; it makes frame-checking an action, not just a value.
+Trigger: Any request shaped like "how should we implement X", "let's add
+X to subsystem Y", "evaluate/review/decide on X", or any design task
+where a premise is plausible but not obviously true.

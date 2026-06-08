@@ -52,6 +52,15 @@ def test_core_memory_non_goals_default_contains_frame_check() -> None:
     assert "Before I implement: is X the right thing?" in text
 
 
+def test_core_memory_learned_behaviors_default_contains_frame_check_procedure() -> None:
+    text = core_template_text("40-learned-behaviors.md")
+
+    assert "frame-check before design work" in text
+    assert "procedural counterpart to the\nnon-goal" in text
+    assert "Does Y actually want X?" in text
+    assert "how should we implement X" in text
+
+
 def test_backward_compatible_default_constants_read_template_files() -> None:
     assert DEFAULT_IDENTITY_MD == core_template_text("00-identity.md")
     assert DEFAULT_NON_GOALS == core_template_text("05-non-goals.md")
