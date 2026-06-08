@@ -247,6 +247,33 @@ def test_world_state_same_valid_from_value_change_keeps_new_current(conn):
     assert fact.is_current is True
 
 
+def test_get_current_value_is_deterministic_with_dual_current_rows(conn):
+    """chainlink #397: if structural drift leaves two current rows for one
+    (subject, predicate), get_current_value should choose deterministically rather
+    than returning whichever row SQLite happens to fetch first. Newer valid_from
+    wins."""
+    now = "2024-01-01T00:00:00Z"
+    for val, vf, tid in (
+        ("Boston", "2023-01-01", "t1"),
+        ("SF", "2023-02-01", "t2"),
+        ("NYC", "2023-03-01", "t3"),
+    ):
+        conn.execute(
+            "INSERT INTO world_state "
+            "(subject, predicate, value, valid_from, valid_until, "
+            " is_current, source_triple_id, updated_at) "
+            "VALUES (?, ?, ?, ?, NULL, 1, ?, ?)",
+            ("Alice", "lives_in", val, vf, tid, now),
+        )
+    conn.commit()
+
+    fact = get_current_value(conn, "Alice", "lives_in")
+
+    assert fact is not None
+    assert fact.value == "NYC"
+    assert fact.valid_from == "2023-03-01"
+
+
 def test_detect_contradictions_finds_dual_current_values(conn):
     """chainlink #303: the query aliased GROUP_CONCAT ``AS values`` — a
     SQLite reserved word — so it raised sqlite3.OperationalError on every
