@@ -45,18 +45,20 @@ def test_core_memory_templates_are_bundled_files() -> None:
 
 def test_core_memory_non_goals_default_contains_frame_check() -> None:
     text = core_template_text("05-non-goals.md")
+    normalized = " ".join(text.split())
 
     assert "Don't accept the source frame uncritically" in text
     assert "Sycophancy is the soft version" in text
-    assert "unexamined frame\nacceptance" in text
+    assert "unexamined frame acceptance" in normalized
     assert "Before I implement: is X the right thing?" in text
 
 
 def test_core_memory_learned_behaviors_default_contains_frame_check_procedure() -> None:
     text = core_template_text("40-learned-behaviors.md")
+    normalized = " ".join(text.split())
 
     assert "frame-check before design work" in text
-    assert "procedural counterpart to the\nnon-goal" in text
+    assert "procedural counterpart to the non-goal" in normalized
     assert "Does Y actually want X?" in text
     assert "how should we implement X" in text
 
