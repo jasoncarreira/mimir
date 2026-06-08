@@ -49,7 +49,7 @@ from pathlib import Path
 from mimir._atomic import atomic_write_json
 from mimir.redaction import redact_text
 from mimir.skill_defs import home_builtin_skills_dir, home_skills_dir
-from mimir.skill_md import frontmatter_yaml, parse_env_block, parse_frontmatter
+from mimir.skill_md import frontmatter_list_field, parse_env_block, parse_frontmatter
 
 # Source root for optional-skills, relative to this file.
 #: ``mimir/skill_install.py`` lives at ``mimir/skill_install.py`` and the
@@ -605,18 +605,13 @@ def required_extras(home: Path) -> list[str]:
             if not skill_md.is_file():
                 continue
             try:
-                meta = frontmatter_yaml(skill_md.read_text(encoding="utf-8"))
+                text = skill_md.read_text(encoding="utf-8")
             except OSError:
                 continue
-            raw = meta.get("requires_extras")
-            if isinstance(raw, str):
-                raw = [raw]
-            if isinstance(raw, (list, tuple)):
-                extras.update(
-                    item.strip()
-                    for item in raw
-                    if isinstance(item, str) and item.strip()
-                )
+            # Parse ONLY the requires_extras field — not the whole frontmatter
+            # block — so a skill whose (unquoted) description carries a bare
+            # ``: `` doesn't make its declared extra silently vanish (#406 review).
+            extras.update(frontmatter_list_field(text, "requires_extras"))
     return sorted(extras)
 
 

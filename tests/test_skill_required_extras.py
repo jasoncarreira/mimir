@@ -7,7 +7,7 @@ import tomllib
 from pathlib import Path
 
 from mimir.skill_install import cmd_required_extras, required_extras
-from mimir.skill_md import frontmatter_yaml
+from mimir.skill_md import frontmatter_list_field
 
 
 def _write_skill(skills_dir: Path, name: str, frontmatter: str) -> None:
@@ -16,31 +16,46 @@ def _write_skill(skills_dir: Path, name: str, frontmatter: str) -> None:
     (d / "SKILL.md").write_text(frontmatter, encoding="utf-8")
 
 
-# ── frontmatter_yaml ─────────────────────────────────────────────────
+# ── frontmatter_list_field ───────────────────────────────────────────
 
 
-def test_frontmatter_yaml_inline_list():
-    fm = frontmatter_yaml("---\nname: x\nrequires_extras: [gepa, foo]\n---\nbody\n")
-    assert fm["name"] == "x"
-    assert fm["requires_extras"] == ["gepa", "foo"]
+def test_list_field_inline():
+    text = "---\nname: x\nrequires_extras: [gepa, foo]\n---\nbody\n"
+    assert frontmatter_list_field(text, "requires_extras") == ["gepa", "foo"]
 
 
-def test_frontmatter_yaml_block_list():
+def test_list_field_block():
     text = "---\nname: x\nrequires_extras:\n  - gepa\n  - foo\n---\nbody\n"
-    assert frontmatter_yaml(text)["requires_extras"] == ["gepa", "foo"]
+    assert frontmatter_list_field(text, "requires_extras") == ["gepa", "foo"]
 
 
-def test_frontmatter_yaml_no_frontmatter_returns_empty():
-    assert frontmatter_yaml("no frontmatter here") == {}
+def test_list_field_scalar_normalized():
+    text = "---\nname: x\nrequires_extras: gepa\n---\n"
+    assert frontmatter_list_field(text, "requires_extras") == ["gepa"]
 
 
-def test_frontmatter_yaml_unterminated_returns_empty():
-    assert frontmatter_yaml("---\nname: x\nnever closes\n") == {}
+def test_list_field_absent():
+    assert frontmatter_list_field("---\nname: x\n---\n", "requires_extras") == []
 
 
-def test_frontmatter_yaml_malformed_does_not_raise():
-    # invalid YAML inside the block — must degrade to {} (runs at boot).
-    assert frontmatter_yaml("---\nfoo: [unclosed\n---\n") == {}
+def test_list_field_no_frontmatter():
+    assert frontmatter_list_field("no frontmatter", "requires_extras") == []
+
+
+def test_list_field_unterminated():
+    assert frontmatter_list_field("---\nname: x\nnever closes\n", "requires_extras") == []
+
+
+def test_list_field_ignores_bare_colon_description():
+    """#406 review: an unquoted description with a bare ``: `` is valid under
+    the flat frontmatter contract but breaks whole-block yaml. Parsing only the
+    target field must still surface requires_extras."""
+    text = (
+        "---\nname: x\n"
+        "description: Use when: this description has a bare colon\n"
+        "requires_extras: [gepa, foo]\n---\nbody\n"
+    )
+    assert frontmatter_list_field(text, "requires_extras") == ["gepa", "foo"]
 
 
 # ── required_extras() ────────────────────────────────────────────────
@@ -54,8 +69,16 @@ def test_required_extras_unions_and_sorts(tmp_path: Path):
     assert required_extras(tmp_path) == ["foo", "gepa"]
 
 
-def test_required_extras_string_value_normalized(tmp_path: Path):
-    _write_skill(tmp_path / "skills", "s", "---\nname: s\nrequires_extras: gepa\n---\n")
+def test_required_extras_survives_bare_colon_description(tmp_path: Path):
+    """Regression for the #406 review repro: a skill whose unquoted description
+    contains a bare ``: `` must still contribute its requires_extras."""
+    _write_skill(
+        tmp_path / "skills",
+        "colon",
+        "---\nname: colon\n"
+        "description: Use when: this description has a bare colon\n"
+        "requires_extras: [gepa]\n---\nbody\n",
+    )
     assert required_extras(tmp_path) == ["gepa"]
 
 
@@ -68,10 +91,9 @@ def test_required_extras_no_skill_dirs(tmp_path: Path):
     assert required_extras(tmp_path) == []
 
 
-def test_required_extras_skips_malformed_skill(tmp_path: Path):
-    skills = tmp_path / "skills"
-    _write_skill(skills, "good", "---\nname: good\nrequires_extras: [gepa]\n---\n")
-    _write_skill(skills, "bad", "---\nfoo: [unclosed\n---\n")
+def test_required_extras_skips_skill_without_skill_md(tmp_path: Path):
+    (tmp_path / "skills" / "draft").mkdir(parents=True)
+    _write_skill(tmp_path / "skills", "good", "---\nname: good\nrequires_extras: [gepa]\n---\n")
     assert required_extras(tmp_path) == ["gepa"]
 
 
@@ -121,10 +143,7 @@ def test_bundled_skills_requires_extras_are_real_pyproject_extras():
         if not root.is_dir():
             continue
         for skill_md in sorted(root.glob("*/SKILL.md")):
-            raw = frontmatter_yaml(skill_md.read_text(encoding="utf-8")).get("requires_extras")
-            if isinstance(raw, str):
-                raw = [raw]
-            for extra in raw or []:
+            for extra in frontmatter_list_field(skill_md.read_text(encoding="utf-8"), "requires_extras"):
                 if extra not in declared:
                     offenders.setdefault(skill_md.parent.name, []).append(extra)
     assert not offenders, f"requires_extras not declared in pyproject extras: {offenders}"
@@ -134,7 +153,7 @@ def test_gepa_skill_declares_gepa_extra():
     """gepa is the first consumer of requires_extras (chainlink #406)."""
     repo = Path(__file__).parent.parent
     skill_md = repo / "mimir" / "optional-skills" / "gepa" / "SKILL.md"
-    assert frontmatter_yaml(skill_md.read_text(encoding="utf-8")).get("requires_extras") == ["gepa"]
+    assert frontmatter_list_field(skill_md.read_text(encoding="utf-8"), "requires_extras") == ["gepa"]
 
 
 # ── scaffold start.sh folds in the resolver ──────────────────────────
