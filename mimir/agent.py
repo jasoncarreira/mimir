@@ -326,7 +326,7 @@ def _resolve_model(
                 "mimir-agent extra — install it directly:\n"
                 "  pip install \"langchain-claude-code @ git+"
                 "https://github.com/jasoncarreira/langchain-claude-code"
-                "@c03f075c8b84fb0c718de1aabdd6493f5d191786\"\n"
+                "@c723d702dfac1ff6e2b22b8bde661cb17a17b0de\"\n"
                 "Restored as an extra once upstream patches "
                 "(see issue #268) merge + a release is cut."
             ) from exc

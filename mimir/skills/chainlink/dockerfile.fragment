@@ -13,6 +13,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
  && . $HOME/.cargo/env \
  && CARGO_BUILD_JOBS=1 cargo install \
         --git https://github.com/dollspace-gay/chainlink.git \
+        --tag chainlink-1.6.0 \
         --root /usr/local \
         chainlink-tracker \
  && rustup self uninstall -y \
