@@ -25,10 +25,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 
 from . import metrics
-from .adapter import COMPONENT_SYSTEM, CommitmentsAdapter, load_corpus, make_extract_fn
+from .adapter import (
+    COMPONENT_SYSTEM,
+    CommitmentsAdapter,
+    load_corpus,
+    load_turns_corpus,
+    make_extract_fn,
+)
 
 
 def _counts(extract_fn, system_prompt, examples) -> dict[str, int]:
@@ -70,6 +77,20 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--model", default=None, help="Override the extractor (task) model name.")
     ap.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home to read REAL saga_session_end turns from "
+             "(<home>/logs/turns.jsonl). Defaults to $MIMIR_HOME. Real session "
+             "text is read at run time and NEVER committed.",
+    )
+    ap.add_argument(
+        "--synthetic", action="store_true",
+        help="Force the committed synthetic fixture instead of in-home real turns.",
+    )
+    ap.add_argument(
+        "--limit", type=int, default=40,
+        help="Max real turns to sample (most recent). Default 40.",
+    )
+    ap.add_argument(
         "--out", type=Path, default=Path(__file__).parent / "pilot_output",
         help="Directory for the candidate prompt + decision-record report.",
     )
@@ -78,10 +99,26 @@ def main(argv=None) -> int:
     from mimir.commitments.extractor import EXTRACTION_SYSTEM
 
     extract_fn = make_extract_fn(model=args.model)
-    train = load_corpus(split="train")
-    holdout = load_corpus(split="holdout")
+
+    # Corpus source: REAL in-home saga_session_end turns by default (privacy:
+    # never committed), synthetic committed fixture only as a fallback/offline.
+    home = args.home or (Path(os.environ["MIMIR_HOME"]) if os.environ.get("MIMIR_HOME") else None)
+    use_real = (not args.synthetic) and home is not None and (home / "logs" / "turns.jsonl").is_file()
+    if use_real:
+        def _load(split):
+            return load_turns_corpus(home, split=split, limit=args.limit)
+        src = f"REAL in-home saga_session_end turns ({home}/logs/turns.jsonl, limit {args.limit})"
+    else:
+        def _load(split):
+            return load_corpus(split=split)
+        why = "--synthetic set" if args.synthetic else "no --home/$MIMIR_HOME turns.jsonl found"
+        src = f"SYNTHETIC committed fixture ({why})"
+
+    train = _load("train")
+    holdout = _load("holdout")
     all_ex = train + holdout
 
+    print(f"[pilot] corpus source: {src}")
     print(f"[pilot] corpus: {len(train)} train, {len(holdout)} holdout")
     print("[pilot] computing baseline extraction counts (volume anchor)...")
     baseline_counts = _counts(extract_fn, EXTRACTION_SYSTEM, all_ex)

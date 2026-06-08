@@ -38,18 +38,38 @@ These are necessary but not sufficient. The decision record also reports the raw
 rubric rates (over-compression, hallucination, avg length) so a reviewer can
 confirm a score gain reflects real self-containment, not a gamed metric.
 
+## Data & privacy — what's committed vs. what isn't
+
+- **Committed (this repo):** the *code* + `synthetic_corpus.jsonl`, a small **hand-built**
+  fixture for unit tests and offline demo. It contains no real session content.
+- **NOT committed (read at run time):** the **real** corpus. `run_pilot` defaults to reading
+  `saga_session_end` turns straight from the agent's own home (`$MIMIR_HOME/logs/turns.jsonl`)
+  via `load_turns_corpus`. Those outputs are real session text — Discord content, names/emails
+  (PII), operational detail — so they **must never** be written into this (or any) git repo.
+  The agent home is bind-mounted and git-ignored from the framework repo; the real turns stay
+  on the box.
+
+If you ever want a *frozen* real corpus for reproducibility, it belongs in the agent's
+**private** state, not here.
+
 ## How to run (on a deployment with a model + the `gepa` extra, e.g. mimirbot)
 
 ```bash
 # 1. Verify the evaluator FIRST (cheap; the GEPA skill's gate). Eyeball the ASI.
+#    Defaults to REAL in-home saga_session_end turns ($MIMIR_HOME/logs/turns.jsonl).
 uv run python -m evals.commitments_extraction.run_pilot --baseline
 
 # 2. Run a bounded optimization pass (each metric call = one extractor model run).
 uv run python -m evals.commitments_extraction.run_pilot --max-metric-calls 60
+
+# Offline / no home: force the committed synthetic fixture.
+uv run python -m evals.commitments_extraction.run_pilot --baseline --synthetic
 ```
 
-The optimize pass writes `pilot_output/candidate_system.txt` + `pilot_output/report.json`
-(git-ignored) and prints a baseline-vs-candidate decision record on the holdout.
+`--home PATH` points at a specific agent home; `--limit N` caps how many (most-recent) real
+turns are sampled (default 40). The optimize pass writes `pilot_output/candidate_system.txt`
++ `pilot_output/report.json` (git-ignored) and prints a baseline-vs-candidate decision record
+on the holdout.
 
 ## Adoption gate (non-negotiable)
 
@@ -62,15 +82,18 @@ reviewed PR that:
 
 ## Caveats
 
-- **Curated corpus.** `corpus.jsonl` is a small, hand-built set of session-summary-like
-  inputs designed to exercise the rubric — a proof-of-mechanism, not a production eval.
-  Scaling to real sampled sessions (and/or gold labels) is the Path-B follow-up.
+- **Synthetic fixture ≠ eval corpus.** `synthetic_corpus.jsonl` is a hand-built set that only
+  exercises the rubric for tests/offline. The *real* evaluation runs on in-home
+  `saga_session_end` turns (see Data & privacy). Gold labels (for precision/recall) remain a
+  Path-B follow-up; `$MIMIR_HOME/.mimir/commitments.jsonl` (the real extracted commitments)
+  could seed weak references there — also in-home, never committed.
 - **Model drift.** The v4 spec's absolute numbers are on `claude-haiku-4-5`; this pilot
   runs the extractor on whatever model the deployment is configured with (codex-plus on
   mimirbot), so the baseline is re-measured here, not read from the spec.
 
 ## Files
 - `metrics.py` — reference-free scorer + ASI (the heart; unit-tested).
-- `corpus.jsonl` — frozen curated examples (train/holdout split).
-- `adapter.py` — gepa adapter wiring the extractor model path → metrics.
-- `run_pilot.py` — `--baseline` and optimize CLI.
+- `synthetic_corpus.jsonl` — committed synthetic fixture (tests/offline only).
+- `adapter.py` — `load_corpus` (fixture), `load_turns_corpus` (real in-home turns), and the
+  gepa adapter wiring the extractor model path → metrics.
+- `run_pilot.py` — `--baseline` / optimize CLI (real in-home turns by default; `--synthetic` to override).

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -174,3 +175,57 @@ def test_make_extract_fn_returns_async_callable():
     # No model call — just that the factory builds an awaitable-returning fn.
     fn = adapter.make_extract_fn()
     assert asyncio.iscoroutinefunction(fn)
+
+
+# ── load_turns_corpus (real in-home turns; never committed) ──────────
+
+
+def _write_turns(home, rows):
+    logs = home / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "turns.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows), encoding="utf-8"
+    )
+
+
+def test_load_turns_corpus_filters_trigger_and_length(tmp_path):
+    long_out = "Worked on PR #1 today. " * 8  # > 100 chars
+    _write_turns(
+        tmp_path,
+        [
+            {"turn_id": "t1", "trigger": "saga_session_end", "output": long_out},
+            {"turn_id": "t2", "trigger": "user_message", "output": long_out},  # wrong trigger
+            {"turn_id": "t3", "trigger": "saga_session_end", "output": "too short"},  # < 100
+            {"turn_id": "t4", "trigger": "saga_session_end", "output": long_out},
+            {"turn_id": "t5", "trigger": "saga_session_end"},  # no output
+        ],
+    )
+    ex = adapter.load_turns_corpus(tmp_path)
+    assert {e.id for e in ex} == {"t1", "t4"}
+    assert all(e.source_text == long_out for e in ex)
+    assert all("never committed" in e.notes for e in ex)
+
+
+def test_load_turns_corpus_bucketing_stable_and_splits_partition(tmp_path):
+    out = "x" * 150
+    _write_turns(
+        tmp_path,
+        [{"turn_id": f"id{i}", "trigger": "saga_session_end", "output": out} for i in range(20)],
+    )
+    a = {e.id: e.split for e in adapter.load_turns_corpus(tmp_path)}
+    b = {e.id: e.split for e in adapter.load_turns_corpus(tmp_path)}
+    assert a == b  # deterministic, process-stable
+    train = adapter.load_turns_corpus(tmp_path, split="train")
+    holdout = adapter.load_turns_corpus(tmp_path, split="holdout")
+    assert {e.id for e in train}.isdisjoint({e.id for e in holdout})
+    assert len(train) + len(holdout) == 20
+
+
+def test_load_turns_corpus_limit_takes_most_recent(tmp_path):
+    out = "y" * 150
+    _write_turns(
+        tmp_path,
+        [{"turn_id": f"r{i}", "trigger": "saga_session_end", "output": out} for i in range(10)],
+    )
+    ex = adapter.load_turns_corpus(tmp_path, limit=3)
+    assert {e.id for e in ex} == {"r7", "r8", "r9"}

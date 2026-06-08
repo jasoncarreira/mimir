@@ -17,6 +17,7 @@ metrics can be exercised without the optional ``gepa`` extra installed.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,7 +25,11 @@ from typing import Awaitable, Callable
 
 from . import metrics
 
-CORPUS_PATH = Path(__file__).parent / "corpus.jsonl"
+#: Committed SYNTHETIC fixture — for unit tests + offline demo. NOT the real
+#: eval corpus. Real evaluation reads in-home session turns via
+#: :func:`load_turns_corpus`, which are never committed (privacy: real session
+#: text carries Discord content / PII / operational detail).
+SYNTHETIC_CORPUS_PATH = Path(__file__).parent / "synthetic_corpus.jsonl"
 
 #: The single component gepa evolves. seed_candidate = {COMPONENT_SYSTEM: EXTRACTION_SYSTEM}.
 COMPONENT_SYSTEM = "system"
@@ -38,8 +43,12 @@ class Example:
     notes: str = ""
 
 
-def load_corpus(path: Path = CORPUS_PATH, *, split: str | None = None) -> list[Example]:
-    """Load the frozen pilot corpus, optionally filtered to a split."""
+def load_corpus(path: Path = SYNTHETIC_CORPUS_PATH, *, split: str | None = None) -> list[Example]:
+    """Load the committed SYNTHETIC fixture, optionally filtered to a split.
+
+    For tests and offline demo. The real evaluation uses
+    :func:`load_turns_corpus` against the agent's in-home turn log.
+    """
     out: list[Example] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
         raw = raw.strip()
@@ -54,6 +63,75 @@ def load_corpus(path: Path = CORPUS_PATH, *, split: str | None = None) -> list[E
                 split=d.get("split", ""),
                 source_text=d["source_text"],
                 notes=d.get("notes", ""),
+            )
+        )
+    return out
+
+
+# Min source length to bother extracting — mirrors the extractor's MIN_OUTPUT_LEN
+# and the v4 eval recipe ("output >= 100 chars").
+_MIN_SOURCE_CHARS = 100
+
+
+def _holdout_bucket(turn_id: str, holdout_every: int) -> bool:
+    """Deterministic, process-stable holdout assignment (no PYTHONHASHSEED
+    dependence, no RNG) — same turn always lands in the same split."""
+    digest = hashlib.sha1(turn_id.encode("utf-8")).hexdigest()
+    return int(digest, 16) % holdout_every == 0
+
+
+def load_turns_corpus(
+    home: Path,
+    *,
+    split: str | None = None,
+    limit: int | None = None,
+    holdout_every: int = 4,
+) -> list[Example]:
+    """Load REAL session-end syntheses from the agent's in-home turn log.
+
+    Reads ``<home>/logs/turns.jsonl``, keeps ``trigger == "saga_session_end"``
+    turns whose ``output`` is >= 100 chars (the extractor's actual input, and
+    the v4 eval recipe), and returns them as examples. Splits are assigned by a
+    stable hash of ``turn_id`` (~1/``holdout_every`` to holdout).
+
+    **Privacy:** these examples contain real session content (Discord text, PII,
+    operational detail). They are read at run time on the deployment and MUST
+    NOT be committed to the framework repo. ``home`` is the agent's bind-mounted
+    home, which is git-ignored from this repo.
+    """
+    turns_path = home / "logs" / "turns.jsonl"
+    rows: list[dict] = []
+    for raw in turns_path.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            d = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if d.get("trigger") != "saga_session_end":
+            continue
+        output = d.get("output")
+        if not isinstance(output, str) or len(output) < _MIN_SOURCE_CHARS:
+            continue
+        rows.append(d)
+
+    # Most-recent `limit` (turns.jsonl is chronological).
+    if limit is not None and limit >= 0:
+        rows = rows[-limit:]
+
+    out: list[Example] = []
+    for d in rows:
+        tid = str(d.get("turn_id") or d.get("saga_session_id") or len(out))
+        sp = "holdout" if _holdout_bucket(tid, holdout_every) else "train"
+        if split is not None and sp != split:
+            continue
+        out.append(
+            Example(
+                id=tid,
+                split=sp,
+                source_text=d["output"],
+                notes="real saga_session_end turn (in-home; never committed)",
             )
         )
     return out
