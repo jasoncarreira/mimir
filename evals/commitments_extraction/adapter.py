@@ -180,6 +180,11 @@ class CommitmentsAdapter:
     count, anchoring the per-example volume penalty (see ``run_pilot``).
     """
 
+    # GEPA 0.1.x's Protocol declares this as a class attribute; duck-typed
+    # adapters still need the concrete attr or reflective mutation probes it
+    # with ``self.adapter.propose_new_texts`` and raises AttributeError.
+    propose_new_texts = None
+
     def __init__(
         self,
         examples: list[Example],

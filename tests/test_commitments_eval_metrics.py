@@ -168,6 +168,7 @@ def test_adapter_evaluate_and_reflective_dataset():
         return canned[source]
 
     ad = adapter.CommitmentsAdapter(examples, {"a": 1, "b": 0}, stub_extract)
+    assert ad.propose_new_texts is None
     batch = examples
     result = ad.evaluate(batch, {adapter.COMPONENT_SYSTEM: "SYS"}, capture_traces=True)
 
