@@ -80,8 +80,14 @@ async def test_bash_async_spawns_and_returns_job_id(fake_registry: ShellJobRegis
     out = await shell_async.bash_async.ainvoke({"command": "sleep 5"})
     assert "Spawned job" in out
     assert "job-1" in out
-    # Verify the spawn was routed via ``bash -lc``.
-    assert fake_registry._spawned_log[0]["argv"] == ["bash", "-lc", "sleep 5"]  # type: ignore[attr-defined]
+    # Routed via ``bash -lc`` with the venv-bin PATH export prepended so the
+    # job can find ``mimir`` / the venv ``python`` (login shell resets PATH).
+    argv = fake_registry._spawned_log[0]["argv"]  # type: ignore[attr-defined]
+    assert argv[:2] == ["bash", "-lc"]
+    assert "export PATH=" in argv[2]
+    assert argv[2].endswith("\nsleep 5")  # original command preserved verbatim
+    # The recorded command (for display) stays the clean original.
+    assert fake_registry._spawned_log[0]["command"] == "sleep 5"  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

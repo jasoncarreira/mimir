@@ -787,15 +787,21 @@ def cmd_list(args) -> int:
 
 # ─── Drift detection (mimir skills update) ──────────────────────────
 
-#: Paths excluded from drift comparison on both sides (same as
-#: the ignore pattern used in ``install()``).
-_DRIFT_IGNORE: frozenset[str] = frozenset({"__pycache__", ".pytest_cache"})
+#: Paths excluded from drift comparison on both sides. ``__pycache__`` /
+#: ``.pytest_cache`` are build artifacts; ``.pre-update-backup`` is created by
+#: ``apply_skill_update`` itself (a pre-overwrite snapshot inside the skill
+#: dir) — without excluding it, the backup files show up as ``extra`` and the
+#: detector flags its own backups as drift (a false positive).
+_DRIFT_IGNORE: frozenset[str] = frozenset(
+    {"__pycache__", ".pytest_cache", ".pre-update-backup"}
+)
 
 
 def _file_hashes(root: Path) -> dict[str, str]:
     """Return ``relative-path-str → sha256-hex`` for every file under
     *root*, recursively.  Skips any path whose components include a
-    name in ``_DRIFT_IGNORE`` (``__pycache__``, ``.pytest_cache``).
+    name in ``_DRIFT_IGNORE`` (``__pycache__``, ``.pytest_cache``,
+    ``.pre-update-backup``).
     """
     hashes: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
@@ -1206,6 +1212,33 @@ def _print_drift_report(result: SkillDriftResult, *, show_diff: bool = False) ->
         print(f"  (source: {result.source_path})")
 
 
+#: How many ``.pre-update-backup/<timestamp>/`` snapshots to retain per skill.
+#: Backups are a rollback convenience (source is in git), so a small window is
+#: plenty; pruning the rest keeps them from accumulating unbounded.
+_KEEP_PRE_UPDATE_BACKUPS = 3
+
+
+def _prune_old_backups(installed_path: Path, keep: int = _KEEP_PRE_UPDATE_BACKUPS) -> None:
+    """Remove all but the most recent ``keep`` ``.pre-update-backup/<ts>``
+    snapshots under ``installed_path``. Best-effort — backups are not
+    load-bearing, so failures are swallowed."""
+    backup_base = installed_path / ".pre-update-backup"
+    if not backup_base.is_dir():
+        return
+    snaps = sorted(
+        (d for d in backup_base.iterdir() if d.is_dir()),
+        key=lambda d: d.name,  # ISO-ish UTC timestamps sort chronologically
+    )
+    stale = snaps[:-keep] if keep > 0 else snaps
+    for d in stale:
+        shutil.rmtree(d, ignore_errors=True)
+    try:
+        if not any(backup_base.iterdir()):
+            backup_base.rmdir()
+    except OSError:
+        pass
+
+
 def apply_skill_update(
     result: SkillDriftResult,
     *,
@@ -1330,6 +1363,10 @@ def apply_skill_update(
             f"  {result.name}: {len(failed)} file(s) could not be updated: "
             f"{', '.join(failed)}"
         )
+
+    # Keep the pre-update backups bounded — they're rollback convenience, and
+    # without pruning they accumulate one snapshot per update forever.
+    _prune_old_backups(result.installed_path)
 
     pollers_hint: str | None = None
     if "pollers.json" in updated:

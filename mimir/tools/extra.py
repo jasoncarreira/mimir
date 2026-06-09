@@ -298,8 +298,9 @@ def shell_exec(command: str) -> str:
     if not command or not command.strip():
         return "shell_exec failed: command is required"
     try:
+        from ._shell_env import login_shell_command
         proc = subprocess.run(  # noqa: S603 — shell exec by design; trusted container (#226), guard middleware screens the command
-            ["bash", "-lc", command],
+            ["bash", "-lc", login_shell_command(command)],
             capture_output=True,
             text=True,
             timeout=_SHELL_STATE["timeout_s"],

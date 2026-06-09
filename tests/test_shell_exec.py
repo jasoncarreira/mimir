@@ -104,3 +104,38 @@ def test_shell_exec_surfaces_bash_syntax_error():
     result = shell_exec.invoke({"command": "echo \"unterminated"})
     assert "exit=0" not in result  # bash reports the syntax error
     assert "shell-parse error" not in result  # the shlex path is gone
+
+
+# ─── venv-bin on PATH (login_shell_command) ──────────────────────────
+
+
+def test_login_shell_command_prepends_venv_bin():
+    """The agent's shell runs via ``bash -lc`` (login shell resets PATH).
+    login_shell_command prepends the venv bin — where ``mimir`` and the venv
+    ``python`` live — via an export that runs after the profile, so ``mimir``
+    is reachable regardless of how the server was launched."""
+    import os
+    import sys
+
+    from mimir.tools._shell_env import login_shell_command
+
+    cmd = "mimir reflection introspection-report --days 7"
+    wrapped = login_shell_command(cmd)
+    venv_bin = os.path.dirname(sys.executable)
+
+    assert wrapped.startswith("export PATH=")
+    assert venv_bin in wrapped
+    # The original command is preserved verbatim at the tail.
+    assert wrapped.endswith("\n" + cmd)
+
+
+def test_shell_exec_puts_venv_bin_on_path():
+    """End-to-end: the venv bin (where the `mimir` console script lives) is on
+    PATH in the shell_exec subprocess, even though `bash -lc` resets PATH from
+    the login profile."""
+    import os
+    import sys
+
+    venv_bin = os.path.dirname(sys.executable)
+    out = shell_exec.invoke({"command": 'echo "PATHCHECK:$PATH"'})
+    assert venv_bin in out
