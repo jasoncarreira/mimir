@@ -48,7 +48,7 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 
-from .bridges._directives import parse_directives, ReactDirective
+from .bridges._directives import parse_directives, ReactDirective, resolve_react_target
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .event_logger import log_event, log_event_sync, safe_log_event
@@ -434,24 +434,6 @@ def _extract_atom_ids_from_tool_results(messages: list[Any]) -> list[str]:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _resolve_react_target(
-    directive_message_id: str | None,
-    sent_message_id: str | None,
-    last_assistant_message_id: str | None,
-) -> str | None:
-    """Pick the message a ``<react>`` directive should attach to (#394).
-
-    Precedence: the directive's explicit ``message_id`` → the message just
-    sent this turn → the last assistant message in the channel. A
-    directives-only reply (empty clean text) sends nothing, so the per-turn
-    ``sent`` id is None; without the last-assistant fallback a bare react
-    resolved to None and called ``bridge.react(channel, None, emoji)``.
-    Returns None only when there is genuinely no target, in which case the
-    caller must skip the react rather than react on None.
-    """
-    return directive_message_id or sent_message_id or last_assistant_message_id
 
 
 # Window for the saga contextual-rewrite context. Matches
@@ -1988,7 +1970,7 @@ class Agent:
                             # to None and call bridge.react(channel, None, emoji).
                             # Fall back to the last assistant message; skip the
                             # react entirely when there's still no target.
-                            _target = _resolve_react_target(
+                            _target = resolve_react_target(
                                 _directive.message_id,
                                 sent_result.message_id if sent_result else None,
                                 getattr(ctx, "last_assistant_message_id", None),

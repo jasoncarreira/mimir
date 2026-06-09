@@ -8,6 +8,7 @@ from mimir.bridges._directives import (
     has_incomplete_actions_tag,
     has_unclosed_actions_block,
     parse_directives,
+    resolve_react_target,
     strip_actions_blocks,
 )
 
@@ -450,3 +451,29 @@ async def test_send_message_records_bridge_name_as_source(tmp_path):
         reset_current_channel_id(cid_token)
         set_channel_registry(None)
         set_global_buffer(prev_buf)  # type: ignore[arg-type]
+
+
+def test_resolve_react_target_precedence():
+    """chainlink #394: <react> target precedence is explicit id → message
+    sent this dispatch → last assistant message; None only when none exist."""
+    # Explicit directive id wins over everything.
+    assert resolve_react_target("explicit", "sent", "last") == "explicit"
+    # Falls back to the message sent this dispatch.
+    assert resolve_react_target(None, "sent", "last") == "sent"
+    # Directives-only reply (nothing sent) -> last assistant message.
+    assert resolve_react_target(None, None, "last") == "last"
+    # No target at all -> None, so the caller must skip the react instead of
+    # calling bridge.react(channel, None, emoji).
+    assert resolve_react_target(None, None, None) is None
+
+
+def test_resolve_react_target_streaming_two_arg_call():
+    """The streaming plan-flush path has no last-assistant id in hand, so it
+    calls with two args (last_assistant defaults to None). A bare react with
+    nothing sent resolves to None -> caller skips."""
+    # Explicit id still wins.
+    assert resolve_react_target("m-99", None) == "m-99"
+    # Plan was flushed -> target the sent message.
+    assert resolve_react_target(None, "flushed") == "flushed"
+    # Actions-only plan (nothing sent, no explicit id) -> None -> skip.
+    assert resolve_react_target(None, None) is None

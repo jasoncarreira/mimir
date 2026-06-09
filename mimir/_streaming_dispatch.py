@@ -305,7 +305,11 @@ class StreamingAutoDispatcher:
         # blocking the flush; the agent fallback at end of turn has
         # the same fallback shape.
         try:
-            from .bridges._directives import parse_directives, ReactDirective
+            from .bridges._directives import (
+                parse_directives,
+                ReactDirective,
+                resolve_react_target,
+            )
             parsed = parse_directives(plan_text)
             clean_plan = parsed.clean_text or ""
             directives = list(parsed.directives)
@@ -355,9 +359,21 @@ class StreamingAutoDispatcher:
         # implemented anywhere.
         for d in directives:
             if isinstance(d, ReactDirective):
-                target = d.message_id or (
-                    getattr(result, "message_id", None) if result else None
+                # chainlink #394: an actions-only streamed plan sends no text
+                # (``result`` is None), so a bare <react> with no explicit
+                # message_id has no target. The streaming dispatcher holds no
+                # channel history for a last-assistant fallback, so skip the
+                # react rather than call bridge.react(channel, None, emoji).
+                target = resolve_react_target(
+                    d.message_id,
+                    getattr(result, "message_id", None) if result else None,
                 )
+                if target is None:
+                    log.debug(
+                        "streaming react directive skipped: no target message "
+                        "for emoji %r", d.emoji,
+                    )
+                    continue
                 try:
                     await self._bridge.react(
                         self._channel_id, target, d.emoji,
