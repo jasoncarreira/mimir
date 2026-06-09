@@ -44,41 +44,38 @@ If something genuinely needs operator attention, route through the
 operator alert channel; otherwise no user-visible message."""
 
 
-_DEFAULT_CONVENTIONS = """## Replying to user messages
+_DEFAULT_CONVENTIONS = """## Replying to messages
 
-For chat channels (Discord, Slack, web), your final assistant text is
-**auto-delivered** to the channel that sent the message. Just reply
-naturally — the runtime parses any ``<actions>`` block out, sends the
-remaining text to the user, and dispatches the directives. You do not
-need to explicitly call the ``send_message`` tool for normal replies.
+Your final assistant text is NOT delivered to anyone — it is recorded as
+your reasoning for the turn. **To say something to a channel you MUST call
+the ``send_message`` tool.** Nothing you write outside a ``send_message``
+call reaches the user.
 
-When auto-dispatch applies:
-- ``user_message``, ``react_received``, and ``shell_job_complete``
-  triggers on a registered chat bridge → final text is delivered.
-  ``shell_job_complete`` is a spawn-completion wake-up — the spawn
-  was kicked off from the operator's chat, so the wake-up reply
-  goes back to the same channel.
-- ``scheduled_tick`` (heartbeats, cron-fired turns) → final text is
-  NOT auto-delivered. Heartbeats are explicitly silent; if you want
-  to surface something to the operator, use the ``send_message`` tool
-  on the operator alert channel.
-- If you call ``send_message`` explicitly during the turn → the
-  auto-dispatch is suppressed (the explicit call is the canonical
-  delivery; auto-dispatch only kicks in when you didn't call it).
+- ``send_message(text=...)`` with no ``channel_id`` replies in the channel
+  this turn came from — the normal case for a user message.
+- You can call ``send_message`` **multiple times in one turn**: a multi-part
+  reply, or a progress note before a long tool sequence and then the result.
+  It does not count against the tool-call budget, so you can always reply
+  even after other tools are capped.
+- If an interactive turn produces a reply as text but never calls
+  ``send_message``, the user gets silence and the runtime emits a negative
+  feedback signal. Don't write a reply you never send. (Choosing to stay
+  silent — no reply text — is fine.)
 
-When to call ``send_message`` explicitly anyway:
-- Cross-channel sends (different ``channel_id`` than the inbound).
-- You want fine-grained chunking control (multiple separate Discord
-  messages with different reactions).
-- You want to send something *and then* keep working in the same turn
-  without that subsequent work landing in the user's view.
+Non-interactive turns — heartbeats / ``scheduled_tick``, pollers,
+``saga_session_end`` synthesis, ``upgrade`` maintenance — have no channel to
+default to, so ``send_message`` with no ``channel_id`` errors on them. When
+such a turn genuinely needs to surface something, pass an explicit
+``channel_id`` (e.g. the operator alert channel). Heartbeats are otherwise
+silent.
 
 ## ``<actions>`` directives
 
-Inside your reply text (auto-dispatch) or inside the ``send_message``
-text body, you may embed an ``<actions>`` block to bundle reactions
-and file sends into the same delivery. The runtime strips the block
-from the user-visible text, then dispatches each directive in order.
+Inside the ``text`` body you pass to ``send_message`` you may embed an
+``<actions>`` block to bundle a reaction or file send into the same
+delivery. The runtime strips the block from the visible text, sends the
+rest, then dispatches each directive in order. For example, the ``text``
+you pass might be:
 
 ```
 Got it, here's the chart you asked for.
@@ -90,22 +87,20 @@ Got it, here's the chart you asked for.
 ```
 
 - ``<react emoji="..." [message="<id>"] />`` — react with an emoji.
-  Defaults to the message just delivered in this turn (or the most
-  recent assistant message when the reply is directives-only). To
-  ack the inbound user message instead, pass ``message="<id>"``
-  using the ``msg_id`` from the Current-message header (or the
-  ``id=<...>`` field on Recent-activity lines).
+  Defaults to the message you just sent. To ack the inbound user message
+  instead, pass ``message="<id>"`` using the ``msg_id`` from the
+  Current-message header (or the ``id=<...>`` field on Recent-activity
+  lines).
 - ``<send-file path="..." [caption="..."] [kind="image|file|audio"]
   [cleanup="true"] />`` — attach a file. ``path`` resolves under
   ``MIMIR_HOME/attachments/outbound/``; absolute paths must already be
   inside that dir. ``..`` and symlink escapes are rejected.
   ``cleanup="true"`` deletes the file after a successful send.
 
-Per-directive failures show up in the next turn's prompt feedback
-block; the main reply still goes out. Discord wants unicode glyphs
-for reactions (``thumbsup`` shortcode does NOT work — use ``👍`` or
-``thumbsup`` resolves via the alias table); Slack accepts the alias
-form (``thumbsup`` without colons)."""
+Per-directive failures show up in the next turn's prompt feedback block;
+the send still goes out. Discord wants unicode glyphs / alias names for
+reactions (``👍``, or ``thumbsup`` via the alias table); Slack accepts the
+alias form (``thumbsup`` without colons)."""
 
 
 # VSM: algedonic (out) — operator alert channel. When MIMIR_OPERATOR_ALERT_CHANNEL

@@ -88,11 +88,10 @@ def _utc_now_iso() -> str:
 #
 # Single ``MessageBuffer`` per process (created by ``server.py`` at
 # startup). Outbound paths that don't have a direct handle to the Agent
-# instance — the ``send_message`` tool (``mimir/tools/registry.py``),
-# the streaming dispatcher (``mimir/_streaming_dispatch.py``), and the
-# bridge-level send — look up the buffer here so they can append to
-# the conversational record without needing buffer plumbed through
-# every call path.
+# instance — chiefly the ``send_message`` tool (``mimir/tools/registry.py``),
+# which is the sole delivery path as of 0.3.0 — look up the buffer here so
+# they can append to the conversational record without needing buffer
+# plumbed through every call path.
 #
 # Was lost in PR #181 (deepagents migration) — the SDK-era code
 # inlined ``buffer.append`` in the agent's pre/post hooks; the

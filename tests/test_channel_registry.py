@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 
 from mimir.bridges.base import Bridge, SendResult
-from mimir.channel_registry import ChannelRegistry, UnknownChannelError
+from mimir.channel_registry import (
+    ChannelRegistry,
+    INTERACTIVE_TRIGGERS,
+    UnknownChannelError,
+    is_interactive_turn,
+)
 
 
 @dataclass
@@ -116,3 +121,50 @@ async def test_connect_disconnect_iterate_all():
     await reg.disconnect_all()
     assert a.connected == 1 and b.connected == 1
     assert a.disconnected == 1 and b.disconnected == 1
+
+
+# ── is_interactive_turn (0.3.0) ──────────────────────────────────────
+
+
+def _interactive_reg() -> ChannelRegistry:
+    reg = ChannelRegistry()
+    reg.register(_bridge("disc", ("discord-", "dm-discord-")))
+    return reg
+
+
+def test_is_interactive_user_message_on_bridge():
+    assert is_interactive_turn("discord-123", "user_message", _interactive_reg()) is True
+
+
+def test_is_interactive_shell_job_complete_on_bridge():
+    # shell_job_complete is interactive when it lands on a bridge channel
+    assert is_interactive_turn("discord-9", "shell_job_complete", _interactive_reg()) is True
+
+
+@pytest.mark.parametrize(
+    "trigger", ["scheduled_tick", "poller", "saga_session_end", "upgrade"]
+)
+def test_automated_triggers_not_interactive_even_on_bridge(trigger):
+    # Trigger gating applies even when the channel has a registered bridge
+    # (e.g. a saga_session_end synthesis turn on a real discord channel).
+    assert is_interactive_turn("discord-123", trigger, _interactive_reg()) is False
+
+
+def test_no_bridge_channel_not_interactive():
+    reg = _interactive_reg()
+    assert is_interactive_turn("scheduler:heartbeat", "user_message", reg) is False
+    assert is_interactive_turn("poller:gmail", "poller", reg) is False
+
+
+def test_none_inputs_not_interactive():
+    reg = _interactive_reg()
+    assert is_interactive_turn(None, "user_message", reg) is False
+    assert is_interactive_turn("discord-1", None, reg) is False
+    assert is_interactive_turn("discord-1", "user_message", None) is False
+
+
+def test_interactive_triggers_allowlist_membership():
+    assert "user_message" in INTERACTIVE_TRIGGERS
+    assert "shell_job_complete" in INTERACTIVE_TRIGGERS
+    assert "scheduled_tick" not in INTERACTIVE_TRIGGERS
+    assert "saga_session_end" not in INTERACTIVE_TRIGGERS

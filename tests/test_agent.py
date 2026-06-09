@@ -57,15 +57,15 @@ class _FakeAgent:
     async def astream(self, state: dict[str, Any], *, config: dict[str, Any], stream_mode: str = "values"):
         """Yield one cumulative-state chunk (matches stream_mode='values'
         semantics). Real LangGraph emits one chunk per node; for tests
-        a single final yield is sufficient — the streaming state machine
-        in mimir._streaming_dispatch handles single-chunk inputs cleanly."""
+        a single final yield is sufficient — the turn loop derives
+        events/output from the final cumulative message list."""
         self.invocations.append({"state": state, "config": config})
         yield {"messages": list(state.get("messages") or []) + self._response_messages}
 
 
 class _BridgeStub:
-    """Captures send + cancel_typing calls so tests can assert on
-    the end-of-turn dispatch path's three branches."""
+    """Captures send / typing / cancel calls so tests can assert on the
+    0.3.0 turn-end path: no auto-dispatch, typing held start→end."""
 
     name = "stub"
     prefixes = ("ch-",)
@@ -73,6 +73,7 @@ class _BridgeStub:
     def __init__(self) -> None:
         self.sends: list[tuple[str, str, bool]] = []
         self.cancels: list[str] = []
+        self.typing_starts: list[str] = []
 
     async def send(self, channel_id: str, text: str, *,
                    final: bool = True, attachment_paths=None):
@@ -89,7 +90,7 @@ class _BridgeStub:
         self.cancels.append(channel_id)
 
     async def send_typing_indicator(self, channel_id: str) -> None:
-        pass
+        self.typing_starts.append(channel_id)
 
     async def fetch_history(self, *a, **kw):
         return []
@@ -656,27 +657,16 @@ async def test_run_turn_immediate_end_failure_does_not_crash_turn(tmp_path: Path
     assert fake_sessions.end_now_calls == ["scheduler:heartbeat"]
 
 
-async def test_run_turn_cancels_typing_when_plan_streamed_but_result_empty(
+async def test_run_turn_typing_fires_at_start_and_cancels_at_end(
     tmp_path: Path,
 ):
-    """Edge case from review: if streamed_plan=True but result_text()
-    is empty (model called tools then said nothing), the typing
-    indicator is held by ``final=False`` and would dangle until the
-    bridge's auto-expire kicks in. The end-of-turn path must call
-    ``bridge.cancel_typing`` to release it explicitly.
-    """
+    """0.3.0: on an interactive turn the typing indicator fires at turn
+    START (so the user sees the message was received) and is released only
+    at turn END — never auto-dispatching the model's text."""
     from mimir.channel_registry import ChannelRegistry
 
-    # AIMessage sequence: plan text → tool_call → nothing (empty AIMessage)
-    # → ensures streaming flushes a plan but result_text() is empty.
     fake_agent = _FakeAgent(response_messages=[
-        AIMessage(
-            content="planning...",
-            tool_calls=[
-                {"name": "memory_query", "args": {"query": "x"}, "id": "t1"},
-            ],
-        ),
-        AIMessage(content=""),  # no final result text
+        AIMessage(content="here is my reply"),
     ])
     bridge = _BridgeStub()
     registry = ChannelRegistry()
@@ -688,17 +678,13 @@ async def test_run_turn_cancels_typing_when_plan_streamed_but_result_empty(
     event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
     record = await agent.run_turn(event)
 
-    # The plan was streamed mid-turn (final=False) but no result text
-    # followed — so cancel_typing fires to release the indicator.
-    plan_sends = [s for s in bridge.sends if s[2] is False]
-    final_sends = [s for s in bridge.sends if s[2] is True]
-    assert len(plan_sends) == 1
-    assert "planning" in plan_sends[0][1]
-    # No end-of-turn send (no result text to ship).
-    assert final_sends == []
-    # But typing indicator was released.
+    # Typing fired at start, released at end.
+    assert bridge.typing_starts == ["ch-1"]
     assert bridge.cancels == ["ch-1"]
-    # Turn record still wrote cleanly.
+    # No auto-dispatch: the turn loop never ships text via bridge.send.
+    assert bridge.sends == []
+    # The model's final text is captured as reasoning in the turn record.
+    assert "here is my reply" in record.output
     assert record.error is None
 
 
@@ -892,46 +878,24 @@ async def test_run_turn_appends_inbound_to_message_buffer(tmp_path: Path):
     )
 
 
-async def test_run_turn_appends_outbound_via_fallback_bridge_send(tmp_path: Path):
-    """When the end-of-turn fallback ``bridge.send`` fires, the sent
-    text must be appended to the chat-history buffer as an
-    ``assistant_message`` so the agent's next turn sees its own reply
-    in Recent activity. Mirrors what the SDK-era post-hook did before
-    PR #181."""
+async def test_run_turn_interactive_no_send_message_emits_no_reply_signal(
+    tmp_path: Path,
+):
+    """0.3.0: an interactive turn that produced final text but never called
+    send_message ships NOTHING (auto-dispatch is gone) and emits a negative
+    ``interactive_turn_no_send_message`` feedback signal. The text is kept
+    as reasoning in the turn record, not as a sent assistant_message."""
+    import json
+    from mimir.channel_registry import ChannelRegistry
 
-    class _CapturingBridge:
-        name = "fake"
-        def __init__(self) -> None:
-            self.sends: list[tuple[str, str, bool]] = []
-
-        async def send_typing_indicator(self, *a, **kw):
-            return None
-
-        async def cancel_typing(self, *a, **kw):
-            return None
-
-        async def send(self, channel_id, text, attachment_paths=None, *, final=True):
-            self.sends.append((channel_id, text, final))
-            class _R:
-                sent = True
-                message_id = "msg-out-42"
-            return _R()
-
-    class _Channels:
-        def __init__(self, bridge):
-            self._bridge = bridge
-
-        def find(self, channel_id):
-            return self._bridge
-
-    bridge = _CapturingBridge()
     fake_agent = _FakeAgent(response_messages=[
-        AIMessage(content="here is my reply"),
+        AIMessage(content="I worked out the answer but never sent it"),
     ])
-    agent = _build_agent(
-        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
-    )
-    agent._channels = _Channels(bridge)  # type: ignore[attr-defined]
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
 
     event = AgentEvent(
         trigger="user_message", channel_id="ch-1",
@@ -939,20 +903,73 @@ async def test_run_turn_appends_outbound_via_fallback_bridge_send(tmp_path: Path
     )
     record = await agent.run_turn(event)
     assert record.error is None
-    # Bridge actually sent the reply (via the agent fallback path,
-    # since this fake agent doesn't trigger streaming).
-    assert ("ch-1", "here is my reply", True) in bridge.sends
+    # No auto-dispatch: nothing shipped, nothing buffered as a sent message.
+    assert bridge.sends == []
+    assert [m for m in agent._buffer._all if m.kind == "assistant_message"] == []
+    # The unsent text is captured as reasoning in the turn record.
+    assert "never sent it" in record.output
 
-    # The outbound must be in the buffer.
-    msgs = list(agent._buffer._all)
-    outbound = [m for m in msgs if m.kind == "assistant_message"]
-    assert len(outbound) == 1, (
-        f"expected 1 assistant_message; got "
-        f"{[(m.kind, m.content[:30]) for m in msgs]}"
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    no_reply = [e for e in evs if e.get("type") == "interactive_turn_no_send_message"]
+    assert len(no_reply) == 1, (
+        f"expected the no-reply signal; got types {[e.get('type') for e in evs]}"
     )
-    assert outbound[0].content == "here is my reply"
-    assert outbound[0].channel_id == "ch-1"
-    assert outbound[0].msg_id == "msg-out-42"
+    assert no_reply[0].get("channel_id") == "ch-1"
+    assert no_reply[0].get("output_chars", 0) > 0
+
+
+async def test_run_turn_send_message_call_suppresses_no_reply_signal(
+    tmp_path: Path,
+):
+    """When the turn DID call send_message (a tool_call in the events), the
+    forgot-to-send signal must NOT fire even if there's also final text."""
+    import json
+    from mimir.channel_registry import ChannelRegistry
+
+    fake_agent = _FakeAgent(response_messages=[
+        AIMessage(content="done", tool_calls=[
+            {"name": "send_message", "args": {"text": "hello!"}, "id": "s1"},
+        ]),
+    ])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    await agent.run_turn(event)
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    assert [e for e in evs if e.get("type") == "interactive_turn_no_send_message"] == []
+
+
+async def test_run_turn_non_interactive_no_signal_no_typing(tmp_path: Path):
+    """A non-interactive turn (scheduled_tick) on a bridge channel produces
+    no typing indicator and no forgot-to-send signal — trigger gating applies
+    even when the channel has a bridge."""
+    import json
+    from mimir.channel_registry import ChannelRegistry
+
+    fake_agent = _FakeAgent(response_messages=[
+        AIMessage(content="heartbeat ran; nothing to surface"),
+    ])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+
+    event = AgentEvent(trigger="scheduled_tick", channel_id="ch-1", content="tick")
+    await agent.run_turn(event)
+
+    assert bridge.typing_starts == []  # no typing on a non-interactive turn
+    assert bridge.sends == []
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    assert [e for e in evs if e.get("type") == "interactive_turn_no_send_message"] == []
 
 
 async def test_inbound_buffer_append_skips_internal_wake_triggers(tmp_path: Path):
@@ -1013,58 +1030,6 @@ async def test_inbound_buffer_append_falls_back_to_author_for_display(
     assert len(msgs) == 1
     assert msgs[0].author == "discord-99"
     assert msgs[0].author_display == "discord-99"
-
-
-async def test_outbound_buffer_append_runs_even_when_bridge_send_fails(
-    tmp_path: Path,
-):
-    """Pre-#181's ``_auto_dispatch_or_record``: "Always writes to
-    chat_history regardless of dispatch outcome — so Recent activity
-    reflects what the agent said even when delivery failed (the
-    agent self-corrects when it sees a stale conversation that
-    doesn't match what it thought it sent)."
-
-    Verify the append fires even when ``bridge.send`` raises.
-    """
-
-    class _ExplodingBridge:
-        name = "fake"
-        async def send_typing_indicator(self, *a, **kw):
-            return None
-        async def cancel_typing(self, *a, **kw):
-            return None
-        async def send(self, *a, **kw):
-            raise RuntimeError("network down")
-
-    class _Channels:
-        def __init__(self, bridge):
-            self._bridge = bridge
-        def find(self, channel_id):
-            return self._bridge
-
-    bridge = _ExplodingBridge()
-    fake_agent = _FakeAgent(response_messages=[
-        AIMessage(content="reply that won't reach the user"),
-    ])
-    agent = _build_agent(
-        tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
-    )
-    agent._channels = _Channels(bridge)  # type: ignore[attr-defined]
-
-    event = AgentEvent(
-        trigger="user_message", channel_id="ch-1",
-        content="hi", author="jason", source="discord",
-    )
-    record = await agent.run_turn(event)
-    # run_turn doesn't fail just because bridge.send did
-    assert record.error is None
-    # ...and the outbound IS in the buffer for the agent to reconcile.
-    msgs = list(agent._buffer._all)
-    outbound = [m for m in msgs if m.kind == "assistant_message"]
-    assert len(outbound) == 1
-    assert outbound[0].content == "reply that won't reach the user"
-    # msg_id is None when send failed (no SendResult to read from)
-    assert outbound[0].msg_id is None
 
 
 async def test_send_message_tool_appends_outbound_via_global_buffer(tmp_path: Path):

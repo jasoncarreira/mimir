@@ -43,12 +43,24 @@ log = logging.getLogger(__name__)
 
 from langchain_core.runnables import RunnableConfig
 
-from ..bridges._directives import parse_directives, ReactDirective
+from ..bridges._directives import parse_directives, ReactDirective, resolve_react_target
 
 # Per-task ContextVar for channel_id — isolated across concurrent asyncio
 # Tasks so concurrent turns on different channels don't race (S2-1 fix).
 _current_channel_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "mimir_current_channel_id", default=None
+)
+
+# Per-task ContextVar: is the active turn an interactive (user-facing) one?
+# Set by the dispatcher at turn start, paired with the channel id. Governs
+# whether ``send_message`` may DEFAULT to the turn's channel: on a non-
+# interactive turn (heartbeat / poller / synthesis / upgrade) there is no
+# user to default a reply to, so a channel-less send_message errors and the
+# agent must pass an explicit channel_id. Default ``True`` is permissive for
+# non-agent callers (tests / bench / direct invocation) — the dispatcher is
+# authoritative and always sets the real value for production turns.
+_current_turn_interactive_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "mimir_current_turn_interactive", default=True
 )
 
 
@@ -131,6 +143,41 @@ def reset_current_channel_id(token: contextvars.Token) -> None:
     _current_channel_id_var.reset(token)
 
 
+def set_current_turn_interactive(interactive: bool) -> contextvars.Token:
+    """Set whether the active turn is interactive (user-facing). Paired with
+    ``set_current_channel_id`` at turn start; reset in a finally block.
+    Governs ``send_message``'s default-channel behavior (see the ContextVar
+    docstring)."""
+    return _current_turn_interactive_var.set(interactive)
+
+
+def reset_current_turn_interactive(token: contextvars.Token) -> None:
+    """Restore the prior interactivity flag using the Token from
+    set_current_turn_interactive."""
+    _current_turn_interactive_var.reset(token)
+
+
+# All tool-name spellings that mean "the agent explicitly delivered a
+# message": native langchain @tool, claude-code MCP bridge, legacy MCP
+# server. Used by the dispatcher's forgot-to-send guard to tell whether an
+# interactive turn actually replied. (Moved here from the retired
+# _streaming_dispatch module.)
+SEND_MESSAGE_TOOL_NAMES = frozenset({
+    "send_message",
+    "mcp__langchain-tools__send_message",
+    "mcp__mimir__send_message",
+})
+
+
+def is_send_message_tool(name: str | None) -> bool:
+    """True iff ``name`` is any spelling of the ``send_message`` tool.
+    Tolerant suffix match so a future bridge rename that keeps the trailing
+    ``send_message`` token still counts."""
+    if not name:
+        return False
+    return name in SEND_MESSAGE_TOOL_NAMES or name.endswith("__send_message")
+
+
 # ────────────────────────────────────────────────────────────────────
 # Channel tools (mimir/channeltools.py)
 # ────────────────────────────────────────────────────────────────────
@@ -156,9 +203,21 @@ async def send_message(
         return "send_message failed: no channel registry configured"
     if not text or not text.strip():
         return "send_message failed: text is required"
+    explicit_channel = bool((channel_id or "").strip())
     cid = _channel_from_config_or_state(channel_id, config)
     if not cid:
         return "send_message failed: no channel_id and no current channel"
+    # Non-interactive turns (heartbeat / poller / synthesis / upgrade) have no
+    # user to default a reply to. A channel-less send_message on such a turn is
+    # almost always a mistake (the agent talking to itself), so refuse it and
+    # require an explicit channel_id. An explicit channel_id always works —
+    # that's how a heartbeat reaches the operator alert channel.
+    if not explicit_channel and not _current_turn_interactive_var.get():
+        return (
+            "send_message failed: non-interactive turn — there is no channel to "
+            "default to. Pass an explicit channel_id (e.g. the operator alert "
+            "channel) if this turn genuinely needs to send a message."
+        )
 
     # Loop-detection circuit breaker (SPEC §7.2.4). The per-turn
     # LoopDetector lives on the active TurnContext; agent.run_turn
@@ -268,9 +327,20 @@ async def send_message(
 
     for _directive in parsed.directives:
         if isinstance(_directive, ReactDirective):
-            _target = _directive.message_id or (
-                result.message_id if result else None
+            # chainlink #394: resolve the target via the shared helper and
+            # skip on None rather than calling bridge.react(cid, None, emoji).
+            # The just-sent message is the natural target; a directives-only
+            # send_message (empty clean_text → result None) has no target.
+            _target = resolve_react_target(
+                _directive.message_id,
+                result.message_id if result else None,
             )
+            if _target is None:
+                log.debug(
+                    "send_message react directive skipped: no target message "
+                    "for emoji %r", _directive.emoji,
+                )
+                continue
             try:
                 await bridge.react(cid, _target, _directive.emoji)
             except Exception:

@@ -19,6 +19,42 @@ from .bridges.base import Bridge, SendResult
 log = logging.getLogger(__name__)
 
 
+# Triggers that represent a live, user-facing exchange the agent can reply
+# into by default. Allowlist (not denylist) so any NEW automated/synthetic
+# trigger defaults to NON-interactive — a fail-safe: a future cron/poller-
+# style trigger can't accidentally auto-default a user-facing send.
+# ``shell_job_complete`` is interactive only when it lands on a bridge
+# channel (it reports back to wherever the spawn was launched from); the
+# bridge-presence check in ``is_interactive_turn`` enforces that.
+INTERACTIVE_TRIGGERS: frozenset[str] = frozenset(
+    {"user_message", "shell_job_complete"}
+)
+
+
+def is_interactive_turn(
+    channel_id: str | None,
+    trigger: str | None,
+    registry: "ChannelRegistry | None",
+) -> bool:
+    """True when this turn is a live user-facing exchange the agent can
+    reply into by default — the channel is served by a registered bridge
+    AND the trigger is one of :data:`INTERACTIVE_TRIGGERS`.
+
+    Non-interactive turns (``scheduled_tick`` heartbeats, ``poller`` batches,
+    ``saga_session_end`` synthesis, ``upgrade`` maintenance, and anything on
+    a non-bridge ``scheduler:`` / ``poller:`` channel) return ``False``:
+    there is no user to default a reply to, so ``send_message`` must be given
+    an explicit ``channel_id`` (e.g. the operator alert channel).
+    """
+    if not channel_id or not trigger:
+        return False
+    if trigger not in INTERACTIVE_TRIGGERS:
+        return False
+    if registry is None:
+        return False
+    return registry.find(channel_id) is not None
+
+
 class UnknownChannelError(LookupError):
     def __init__(self, channel_id: str) -> None:
         super().__init__(

@@ -35,10 +35,12 @@ from mimir.tools.registry import (
     reload_pollers,
     remove_schedule,
     reset_current_channel_id,
+    reset_current_turn_interactive,
     send_message,
     set_channel_registry,
     set_commitments_store,
     set_current_channel_id,
+    set_current_turn_interactive,
     set_dispatcher,
     set_scheduler,
 )
@@ -857,3 +859,74 @@ class TestCommitmentList:
         out = await commitment_list.ainvoke({})
         assert "commitment_list failed" in out
         assert "boom" in out
+
+
+# ────────────────────────────────────────────────────────────────────
+# send_message interactivity guard (0.3.0)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestSendMessageInteractivityGuard:
+    """0.3.0: a channel-less send_message defaults to the turn's channel only
+    on interactive turns; on non-interactive turns it errors and requires an
+    explicit channel_id. Explicit channel always works."""
+
+    @pytest.mark.asyncio
+    async def test_non_interactive_no_channel_errors(self) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        cid_tok = set_current_channel_id("chan-1")
+        int_tok = set_current_turn_interactive(False)
+        try:
+            out = await send_message.ainvoke({"text": "hi"})
+        finally:
+            reset_current_turn_interactive(int_tok)
+            reset_current_channel_id(cid_tok)
+        assert "non-interactive" in out
+        assert bridge.send_calls == []  # nothing was sent
+
+    @pytest.mark.asyncio
+    async def test_non_interactive_explicit_channel_works(self) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        int_tok = set_current_turn_interactive(False)
+        try:
+            out = await send_message.ainvoke({"text": "hi", "channel_id": "chan-1"})
+        finally:
+            reset_current_turn_interactive(int_tok)
+        assert "send_message ok" in out
+        assert bridge.send_calls == [{"cid": "chan-1", "text": "hi"}]
+
+    @pytest.mark.asyncio
+    async def test_interactive_no_channel_defaults_and_sends(self) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        cid_tok = set_current_channel_id("chan-1")
+        int_tok = set_current_turn_interactive(True)
+        try:
+            out = await send_message.ainvoke({"text": "hi"})
+        finally:
+            reset_current_turn_interactive(int_tok)
+            reset_current_channel_id(cid_tok)
+        assert "send_message ok" in out
+        assert bridge.send_calls == [{"cid": "chan-1", "text": "hi"}]
+
+    @pytest.mark.asyncio
+    async def test_directives_only_send_skips_targetless_react(self) -> None:
+        """A send_message whose text is only an <actions> react (empty clean
+        text → nothing sent → no message id) must SKIP the react rather than
+        call bridge.react(cid, None, emoji) (chainlink #394)."""
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        int_tok = set_current_turn_interactive(True)
+        try:
+            out = await send_message.ainvoke({
+                "text": '<actions><react emoji="thumbsup" /></actions>',
+                "channel_id": "chan-1",
+            })
+        finally:
+            reset_current_turn_interactive(int_tok)
+        # No text was sent and the targetless react was skipped (not None).
+        assert bridge.send_calls == []
+        assert bridge.react_calls == []
+        assert "send_message ok" in out

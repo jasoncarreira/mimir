@@ -74,6 +74,11 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "predictions_pending_review": ("negative", "predictions_pending"),
     "send_message_unknown_channel": ("negative", "unknown_channel"),
     "auto_dispatch_failed": ("negative", "auto_dispatch_failed"),
+    # 0.3.0: interactive turn produced final text but never called the
+    # send_message tool — the reply is stuck as reasoning and the user got
+    # nothing. Surfaces in the next turn's feedback panel so the agent
+    # self-corrects (and reflection can catch a recurring pattern).
+    "interactive_turn_no_send_message": ("negative", "no_reply"),
     # Poller framework — health signals emitted by skill-side poller
     # subprocesses (via the ``"signal": "<event_type>"`` JSONL shape;
     # see ``mimir/pollers.py`` output contract). These surface
