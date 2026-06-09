@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from evals.commitments_extraction import adapter, metrics
+from evals.commitments_extraction import adapter, metrics, run_pilot
 
 
 # ── artifact_ids ─────────────────────────────────────────────────────
@@ -256,3 +256,74 @@ def test_load_turns_corpus_limit_takes_most_recent(tmp_path):
     )
     ex = adapter.load_turns_corpus(tmp_path, limit=3)
     assert {e.id for e in ex} == {"r7", "r8", "r9"}
+
+
+# ── #407 targeted-pilot helpers ─────────────────────────────────────
+
+
+def test_load_turns_corpus_can_focus_artifact_rich_examples(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    rows = [
+        {
+            "turn_id": "plain",
+            "trigger": "saga_session_end",
+            "output": "Plain long session summary with no artifact identifiers. " * 4,
+        },
+        {
+            "turn_id": "one",
+            "trigger": "saga_session_end",
+            "output": "Discussed PR #123 and the follow-up in extractor.py. " * 4,
+        },
+        {
+            "turn_id": "many",
+            "trigger": "saga_session_end",
+            "output": "Discussed PR #1, PR #2, chainlink #3, and metrics.py. " * 4,
+        },
+    ]
+    (logs / "turns.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+
+    focused = adapter.load_turns_corpus(tmp_path, focus_artifact_rich=True, limit=2)
+
+    assert [ex.id for ex in focused] == ["many", "one"]
+
+
+def test_prioritize_low_id_coverage_orders_missing_id_examples_first():
+    examples = [
+        adapter.Example(id="no-ids", split="train", source_text="No refs here."),
+        adapter.Example(id="covered", split="train", source_text="Merge PR #1 and update docs.md."),
+        adapter.Example(id="missing", split="train", source_text="Merge PR #2 and update code.py."),
+    ]
+    evals = [
+        metrics.score_extraction(examples[0].source_text, ["No refs here but enough text"], baseline_count=1),
+        metrics.score_extraction(
+            examples[1].source_text,
+            ["Merge PR #1 and update docs.md once CI is green"],
+            baseline_count=1,
+        ),
+        metrics.score_extraction(
+            examples[2].source_text,
+            ["Merge the code update once CI is green and review is in"],
+            baseline_count=1,
+        ),
+    ]
+
+    ordered = run_pilot._prioritize_low_id_coverage(examples, evals)
+
+    assert [ex.id for ex in ordered] == ["missing", "covered", "no-ids"]
+
+
+def test_report_marks_seed_retained_as_no_go_without_candidate_delta():
+    report = run_pilot._report(200, {"mean_score": 0.7}, seed_retained=True)
+
+    assert report["seed_retained"] is True
+    assert report["candidate_holdout"] is None
+    assert report["delta_mean_score"] is None
+    assert report["recommendation"].startswith("no-go")
+
+
+def test_seed_retained_compares_system_component():
+    seed = {adapter.COMPONENT_SYSTEM: "baseline"}
+
+    assert run_pilot._seed_retained(seed, {adapter.COMPONENT_SYSTEM: "baseline"})
+    assert not run_pilot._seed_retained(seed, {adapter.COMPONENT_SYSTEM: "candidate"})
