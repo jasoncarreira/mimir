@@ -1853,26 +1853,25 @@ class Agent:
         # buffer as a sent message. (Typing is released in run_turn's finally.)
         #
         # Forgot-to-send guard: an interactive turn that produced final text
-        # but never called send_message means the reply is stuck as reasoning
-        # and the user got nothing. Emit a negative algedonic signal so the
-        # next turn's feedback panel surfaces it (feedback.classify maps
+        # but never DELIVERED a reply means the text is stuck as reasoning and
+        # the user got nothing. Key off ctx.send_message_count (incremented
+        # only on a confirmed bridge send) — NOT the presence of a send_message
+        # tool call, which can be refused (non-interactive / loop hard-stop /
+        # no bridge) or soft-fail and deliver nothing. Emit a negative signal
+        # so the next turn's feedback panel surfaces it (feedback.classify maps
         # ``interactive_turn_no_send_message`` to a negative ``no_reply``).
-        if turn_is_interactive and (output or "").strip():
-            from .tools.registry import is_send_message_tool
-            sent_this_turn = any(
-                isinstance(e, dict)
-                and e.get("type") == "tool_call"
-                and is_send_message_tool(e.get("name"))
-                for e in events
+        if (
+            turn_is_interactive
+            and (output or "").strip()
+            and getattr(ctx, "send_message_count", 0) == 0
+        ):
+            await safe_log_event(
+                "interactive_turn_no_send_message",
+                channel_id=event.channel_id,
+                turn_id=turn_id,
+                trigger=event.trigger,
+                output_chars=len((output or "").strip()),
             )
-            if not sent_this_turn:
-                await safe_log_event(
-                    "interactive_turn_no_send_message",
-                    channel_id=event.channel_id,
-                    turn_id=turn_id,
-                    trigger=event.trigger,
-                    output_chars=len((output or "").strip()),
-                )
 
         await log_event(
             "turn_finished",

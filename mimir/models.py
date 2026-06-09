@@ -90,17 +90,12 @@ class TurnContext:
     # Origin source of the inbound event (carried from AgentEvent.source so
     # outbound assistant replies on the same channel inherit it).
     channel_source: str | None = None
-    # Number of successful send_message calls in this turn. Each send fires
-    # an SAGA mark_contributions pass with that send's text; the agent-level
-    # post_message_hook only fires (as a fallback) when this is 0 — i.e.
-    # for turns that produced a reply via SDK output instead of send_message.
+    # Number of successful send_message deliveries in this turn (incremented
+    # only after the bridge confirms ``SendResult.sent``). The forgot-to-send
+    # guard emits ``interactive_turn_no_send_message`` when an interactive turn
+    # produced final text but this is still 0 — i.e. the reply never went out
+    # (0.3.0: send_message is the sole delivery path).
     send_message_count: int = 0
-    # Number of send_message *attempts* — successful or failed. The
-    # outbound chat_history fallback gate uses this (not send_message_count)
-    # so a failed dispatch (unknown channel, bridge error) doesn't get the
-    # SDK's final assistant text persisted as if the user had received it.
-    # Failure is visible in events.jsonl; nothing else needs to record it.
-    send_message_attempts: int = 0
     # Channel-layer state (Phase 6.3) — populated by the agent at run_turn start.
     loop_detector: object | None = None
     last_assistant_message_id: str | None = None

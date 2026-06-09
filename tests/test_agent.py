@@ -919,19 +919,31 @@ async def test_run_turn_interactive_no_send_message_emits_no_reply_signal(
     assert no_reply[0].get("output_chars", 0) > 0
 
 
-async def test_run_turn_send_message_call_suppresses_no_reply_signal(
+async def test_run_turn_successful_send_suppresses_no_reply_signal(
     tmp_path: Path,
 ):
-    """When the turn DID call send_message (a tool_call in the events), the
-    forgot-to-send signal must NOT fire even if there's also final text."""
+    """When the turn actually DELIVERED a reply (send_message_count > 0), the
+    forgot-to-send signal must NOT fire even with final text. The guard keys
+    off confirmed delivery, NOT the mere presence of a send_message tool call
+    (which can be refused / soft-fail and deliver nothing)."""
     import json
     from mimir.channel_registry import ChannelRegistry
 
-    fake_agent = _FakeAgent(response_messages=[
-        AIMessage(content="done", tool_calls=[
-            {"name": "send_message", "args": {"text": "hello!"}, "id": "s1"},
-        ]),
-    ])
+    class _DeliveringAgent(_FakeAgent):
+        """Simulate a confirmed send by bumping send_message_count on the
+        active turn context — exactly what the real tool does after the
+        bridge reports SendResult.sent=True."""
+        async def astream(self, state, *, config, stream_mode="values"):
+            from mimir._context import get_current_turn
+            _ctx = get_current_turn()
+            if _ctx is not None:
+                _ctx.send_message_count += 1
+            async for chunk in super().astream(
+                state, config=config, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    fake_agent = _DeliveringAgent(response_messages=[AIMessage(content="done")])
     bridge = _BridgeStub()
     registry = ChannelRegistry()
     registry.register(bridge)  # type: ignore[arg-type]

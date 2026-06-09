@@ -157,27 +157,6 @@ def reset_current_turn_interactive(token: contextvars.Token) -> None:
     _current_turn_interactive_var.reset(token)
 
 
-# All tool-name spellings that mean "the agent explicitly delivered a
-# message": native langchain @tool, claude-code MCP bridge, legacy MCP
-# server. Used by the dispatcher's forgot-to-send guard to tell whether an
-# interactive turn actually replied. (Moved here from the retired
-# _streaming_dispatch module.)
-SEND_MESSAGE_TOOL_NAMES = frozenset({
-    "send_message",
-    "mcp__langchain-tools__send_message",
-    "mcp__mimir__send_message",
-})
-
-
-def is_send_message_tool(name: str | None) -> bool:
-    """True iff ``name`` is any spelling of the ``send_message`` tool.
-    Tolerant suffix match so a future bridge rename that keeps the trailing
-    ``send_message`` token still counts."""
-    if not name:
-        return False
-    return name in SEND_MESSAGE_TOOL_NAMES or name.endswith("__send_message")
-
-
 # ────────────────────────────────────────────────────────────────────
 # Channel tools (mimir/channeltools.py)
 # ────────────────────────────────────────────────────────────────────
@@ -270,9 +249,43 @@ async def send_message(
     result = None
     if clean_text:
         try:
-            result = await bridge.send(cid, clean_text)
+            # final=False keeps the typing indicator held — it is released
+            # once, at turn end (run_turn's finally), so it persists across
+            # multiple send_message calls in a turn. final=True (the default)
+            # would cancel typing on the FIRST send (see DiscordBridge.send).
+            result = await bridge.send(cid, clean_text, final=False)
         except Exception as exc:
             return f"send_message failed: {exc}"
+
+        # Soft delivery failure: bridges return SendResult(sent=False, error=…)
+        # for recoverable failures (disconnected client, bad channel) instead
+        # of raising. With auto-dispatch gone this is the sole reply path, so a
+        # soft failure must NOT look delivered — don't log send_message_sent,
+        # don't append to history, and surface the failure to the model.
+        if not getattr(result, "sent", True):
+            _err = getattr(result, "error", None)
+            try:
+                await _log_event(
+                    "send_message_failed",
+                    channel_id=cid,
+                    error=(str(_err)[:200] if _err else None),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return (
+                "send_message failed: bridge reported the message was not "
+                f"delivered (channel={cid}" + (f"; {_err}" if _err else "") + ")"
+            )
+
+        # Successful delivery — record it on the turn context so the
+        # forgot-to-send guard knows a reply actually went out. An
+        # attempted-but-refused / soft-failed send must NOT suppress the
+        # no-reply signal, so only a confirmed send increments this.
+        if ctx is not None:
+            try:
+                ctx.send_message_count += 1
+            except Exception:  # noqa: BLE001
+                pass
 
         # S2-2: log a send_message_sent event with a normalized content hash
         # so FeedbackLog._detect_cross_turn_send_loops can detect 24h floods

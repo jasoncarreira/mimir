@@ -237,6 +237,14 @@ def test_classify_gave_up_suffix_is_negative():
     assert classify(123) is None
 
 
+def test_send_message_failed_classified_negative():
+    from mimir.feedback import classify
+
+    # 0.3.0: a soft delivery failure on the sole reply path is a negative
+    # signal (replaces the removed auto_dispatch_failed).
+    assert classify("send_message_failed") == ("negative", "send_failed")
+
+
 def test_background_task_failed_surfaces_as_negative(tmp_path: Path):
     from mimir.feedback import classify
 

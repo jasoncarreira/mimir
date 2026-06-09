@@ -77,6 +77,13 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f"SAGA consolidation failed: {_sanitize_field(ev.get('error') or '(no detail)')}"
     if rule_kind == "saga_decay_error":
         return f"SAGA decay failed: {_sanitize_field(ev.get('error') or '(no detail)')}"
+    if rule_kind == "send_failed":
+        ch = ev.get("channel_id") or "?"
+        err = _sanitize_field(ev.get("error") or "(no detail)")
+        return (
+            f"send_message to {ch} was not delivered: {err}. Your reply did "
+            f"not reach the channel — retry or surface the failure."
+        )
     if rule_kind == "saga_forget_error":
         dry = ev.get("dry_run")
         suffix = " (dry_run)" if dry else ""

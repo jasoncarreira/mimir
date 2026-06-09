@@ -72,17 +72,16 @@ silent.
 ## ``<actions>`` directives
 
 Inside the ``text`` body you pass to ``send_message`` you may embed an
-``<actions>`` block to bundle a reaction or file send into the same
-delivery. The runtime strips the block from the visible text, sends the
-rest, then dispatches each directive in order. For example, the ``text``
-you pass might be:
+``<actions>`` block to bundle a reaction into the same delivery. The
+runtime strips the block from the visible text, sends the rest, then
+dispatches each directive in order. For example, the ``text`` you pass
+might be:
 
 ```
 Got it, here's the chart you asked for.
 
 <actions>
   <react emoji="thumbsup" />
-  <send-file path="charts/q3.png" caption="Q3 numbers" />
 </actions>
 ```
 
@@ -91,11 +90,6 @@ Got it, here's the chart you asked for.
   instead, pass ``message="<id>"`` using the ``msg_id`` from the
   Current-message header (or the ``id=<...>`` field on Recent-activity
   lines).
-- ``<send-file path="..." [caption="..."] [kind="image|file|audio"]
-  [cleanup="true"] />`` — attach a file. ``path`` resolves under
-  ``MIMIR_HOME/attachments/outbound/``; absolute paths must already be
-  inside that dir. ``..`` and symlink escapes are rejected.
-  ``cleanup="true"`` deletes the file after a successful send.
 
 Per-directive failures show up in the next turn's prompt feedback block;
 the send still goes out. Discord wants unicode glyphs / alias names for
