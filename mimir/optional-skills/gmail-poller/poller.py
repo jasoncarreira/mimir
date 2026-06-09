@@ -368,9 +368,11 @@ def _format_event(msg: dict, account: Account) -> dict | None:
     Returns None if the message lacks an ``id`` (we have nothing to
     cursor on — safer to skip than emit an un-deduplicable event).
 
-    The emitted ``prompt`` is the account's resolved prompt body when
-    one was supplied (per-account file or inline), else the built-in
-    default template.
+    The emitted ``prompt`` always begins with the per-message detail
+    block (from / subject / snippet / URL / message_id). When the account
+    supplies a custom prompt body (per-account file or inline), it is
+    appended after the detail as triage instructions — it augments the
+    detail, it does not replace it.
     """
     msg_id = msg.get("id") or msg.get("messageId") or msg.get("message_id")
     if not msg_id:
