@@ -288,6 +288,31 @@ def test_load_turns_corpus_can_focus_artifact_rich_examples(tmp_path):
     assert [ex.id for ex in focused] == ["many", "one"]
 
 
+def test_load_turns_corpus_artifact_rich_tiebreaks_recent_first(tmp_path):
+    out = "Discussed PR #1 and docs.md in a long enough summary. " * 4
+    _write_turns(
+        tmp_path,
+        [
+            {
+                "turn_id": "old",
+                "trigger": "saga_session_end",
+                "output": out,
+                "ts": "2026-06-01T00:00:00Z",
+            },
+            {
+                "turn_id": "new",
+                "trigger": "saga_session_end",
+                "output": out,
+                "ts": "2026-06-02T00:00:00Z",
+            },
+        ],
+    )
+
+    focused = adapter.load_turns_corpus(tmp_path, focus_artifact_rich=True, limit=2)
+
+    assert [ex.id for ex in focused] == ["new", "old"]
+
+
 def test_prioritize_low_id_coverage_orders_missing_id_examples_first():
     examples = [
         adapter.Example(id="no-ids", split="train", source_text="No refs here."),
@@ -320,6 +345,18 @@ def test_report_marks_seed_retained_as_no_go_without_candidate_delta():
     assert report["candidate_holdout"] is None
     assert report["delta_mean_score"] is None
     assert report["recommendation"].startswith("no-go")
+
+
+def test_write_seed_retained_record_removes_stale_candidate(tmp_path):
+    stale = tmp_path / "candidate_system.txt"
+    stale.write_text("old candidate", encoding="utf-8")
+
+    report = run_pilot._write_seed_retained_record(tmp_path, 200, {"mean_score": 0.7})
+
+    assert report["seed_retained"] is True
+    assert not stale.exists()
+    written = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert written["candidate_holdout"] is None
 
 
 def test_seed_retained_compares_system_component():

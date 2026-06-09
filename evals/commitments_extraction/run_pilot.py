@@ -28,6 +28,7 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 
 from . import metrics
@@ -120,6 +121,15 @@ def _report(max_metric_calls, base_agg, cand_agg=None, *, seed_retained: bool = 
     return report
 
 
+def _write_seed_retained_record(out: Path, max_metric_calls: int, base_agg: dict) -> dict:
+    """Write an unambiguous no-go record and remove any stale candidate prompt."""
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "candidate_system.txt").unlink(missing_ok=True)
+    report = _report(max_metric_calls, base_agg, seed_retained=True)
+    (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="GEPA pilot: commitments-extraction self-containment (chainlink #404)"
@@ -155,13 +165,22 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--focus-low-id-coverage",
         action="store_true",
-        help="After baseline scoring, order train examples by low artifact-id coverage for #407.",
+        help=(
+            "After baseline scoring, order train examples by low artifact-id coverage for #407. "
+            "Adds an extra train-split baseline scoring pass outside --max-metric-calls."
+        ),
     )
     ap.add_argument(
         "--out", type=Path, default=Path(__file__).parent / "pilot_output",
         help="Directory for the candidate prompt + decision-record report.",
     )
     args = ap.parse_args(argv)
+    if args.synthetic and args.focus_artifact_rich:
+        print(
+            "[pilot] warning: --focus-artifact-rich only applies to real-turn corpora; "
+            "ignored with --synthetic.",
+            file=sys.stderr,
+        )
 
     from mimir.commitments.extractor import EXTRACTION_SYSTEM
 
@@ -236,8 +255,7 @@ def main(argv=None) -> int:
 
     args.out.mkdir(parents=True, exist_ok=True)
     if _seed_retained(seed, best):
-        report = _report(args.max_metric_calls, base_agg, seed_retained=True)
-        (args.out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        report = _write_seed_retained_record(args.out, args.max_metric_calls, base_agg)
 
         print("\n=== DECISION RECORD (holdout) ===")
         print(json.dumps(report, indent=2))

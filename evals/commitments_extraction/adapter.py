@@ -124,14 +124,18 @@ def load_turns_corpus(
         rows.append(d)
 
     if focus_artifact_rich:
-        rows = sorted(
-            rows,
-            key=lambda d: (
-                len(metrics.artifact_ids(str(d.get("output") or ""))) == 0,
-                -len(metrics.artifact_ids(str(d.get("output") or ""))),
-                str(d.get("ts") or d.get("started_at") or ""),
-            ),
+        ranked = [
+            (d, metrics.artifact_ids(str(d.get("output") or "")))
+            for d in rows
+        ]
+        # Stable two-pass sort: recent-first for equal artifact counts, then
+        # artifact-rich first. Precomputing ids avoids double extraction per row.
+        ranked.sort(
+            key=lambda item: str(item[0].get("ts") or item[0].get("started_at") or ""),
+            reverse=True,
         )
+        ranked.sort(key=lambda item: (len(item[1]) == 0, -len(item[1])))
+        rows = [d for d, _ids in ranked]
 
     # Most-recent `limit` by default (turns.jsonl is chronological). In focused
     # mode the sort above makes this the most artifact-rich slice instead.
