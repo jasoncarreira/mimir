@@ -20,6 +20,8 @@ from mimir.skill_install import (
     OptionalSkill,
     SkillDriftResult,
     SkillEnvSpec,
+    _KEEP_PRE_UPDATE_BACKUPS,
+    _prune_old_backups,
     accept_skill_drift,
     clear_accepted_skill_drift,
     apply_skill_update,
@@ -1956,3 +1958,78 @@ def test_run_smoke_test_uses_minimal_env_not_host_secrets(tmp_path, monkeypatch)
     assert "should-not-leak" not in snippet
     # The skill's own declared/configured var (from .env) IS visible.
     assert "SKILLVAR=present" in snippet
+
+
+# ─── .pre-update-backup drift + pruning ──────────────────────────────
+
+
+def test_drift_ignores_pre_update_backup(fake_optional_root: Path, fake_home: Path):
+    """``apply_skill_update`` writes ``.pre-update-backup/<ts>/`` INSIDE the
+    installed skill dir. The drift detector must ignore it — otherwise the
+    backup files surface as ``extra`` and the detector flags its own backups
+    as drift (the false positive mimirbot hit after the 0.3.0 update)."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    backup = (
+        fake_home / "skills" / "fake-skill"
+        / ".pre-update-backup" / "20260609T190809Z"
+    )
+    backup.mkdir(parents=True)
+    (backup / "SKILL.md").write_text("old backed-up content\n")
+    (backup / "pollers.json").write_text("{}\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+    assert r.is_clean, f"backup leaked into drift: extra={r.extra} differs={r.differs}"
+    assert r.extra == []
+    assert not r.has_unaccepted_drift
+
+
+def test_prune_old_backups_keeps_most_recent(tmp_path: Path):
+    skill = tmp_path / "skill"
+    base = skill / ".pre-update-backup"
+    stamps = [
+        "20260101T000000Z", "20260102T000000Z", "20260103T000000Z",
+        "20260104T000000Z", "20260105T000000Z",
+    ]
+    for s in stamps:
+        d = base / s
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text("snapshot\n")
+
+    _prune_old_backups(skill)  # default keep=3
+
+    remaining = sorted(d.name for d in base.iterdir() if d.is_dir())
+    assert remaining == stamps[-_KEEP_PRE_UPDATE_BACKUPS:]  # newest 3 retained
+
+
+def test_prune_old_backups_noop_without_backup_dir(tmp_path: Path):
+    # No .pre-update-backup dir → no error, nothing created.
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    _prune_old_backups(skill)
+    assert not (skill / ".pre-update-backup").exists()
+
+
+def test_apply_update_prunes_backups_after_overwrite(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """An end-to-end apply that creates a fresh backup also prunes old ones."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    skill_dir = fake_home / "skills" / "fake-skill"
+    # Seed 4 stale backups (> keep=3).
+    for s in ("20260101T000000Z", "20260102T000000Z", "20260103T000000Z", "20260104T000000Z"):
+        (skill_dir / ".pre-update-backup" / s).mkdir(parents=True)
+    # Make source differ so apply overwrites SKILL.md (→ writes a new backup).
+    (fake_optional_root / "fake-skill" / "SKILL.md").write_text(
+        "---\nname: fake-skill\ndescription: changed.\n---\n# fake-skill\nNEW\n"
+    )
+    result = next(
+        r for r in detect_skill_drift(fake_home, fake_optional_root)
+        if r.name == "fake-skill"
+    )
+    apply_skill_update(result)
+
+    backups = sorted(
+        d.name for d in (skill_dir / ".pre-update-backup").iterdir() if d.is_dir()
+    )
+    assert len(backups) == _KEEP_PRE_UPDATE_BACKUPS  # pruned to the cap

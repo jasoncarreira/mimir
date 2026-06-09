@@ -306,9 +306,10 @@ async def bash_async(
                 )
 
     try:
+        from ._shell_env import login_shell_command
         job = _REGISTRY.spawn(
-            command,
-            argv=["bash", "-lc", command],
+            command,  # original (clean) command recorded for display
+            argv=["bash", "-lc", login_shell_command(command)],
             channel_id=channel_id,
             on_complete=_ON_COMPLETE,
         )
