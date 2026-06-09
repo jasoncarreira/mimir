@@ -1853,17 +1853,19 @@ class Agent:
         # buffer as a sent message. (Typing is released in run_turn's finally.)
         #
         # Forgot-to-send guard: an interactive turn that produced final text
-        # but never DELIVERED a reply means the text is stuck as reasoning and
-        # the user got nothing. Key off ctx.send_message_count (incremented
-        # only on a confirmed bridge send) — NOT the presence of a send_message
-        # tool call, which can be refused (non-interactive / loop hard-stop /
-        # no bridge) or soft-fail and deliver nothing. Emit a negative signal
-        # so the next turn's feedback panel surfaces it (feedback.classify maps
+        # but never DELIVERED a response means the text is stuck as reasoning
+        # and the user got nothing. Key off confirmed delivery — a successful
+        # send_message OR a successful react (a react-only acknowledgment is a
+        # valid reply, so it must NOT be flagged) — NOT the presence of a tool
+        # call, which can be refused (non-interactive / loop hard-stop / no
+        # bridge) or soft-fail and deliver nothing. Emit a negative signal so
+        # the next turn's feedback panel surfaces it (feedback.classify maps
         # ``interactive_turn_no_send_message`` to a negative ``no_reply``).
         if (
             turn_is_interactive
             and (output or "").strip()
             and getattr(ctx, "send_message_count", 0) == 0
+            and getattr(ctx, "react_count", 0) == 0
         ):
             await safe_log_event(
                 "interactive_turn_no_send_message",

@@ -438,6 +438,16 @@ async def react(
             f"react failed: bridge declined "
             f"(channel={cid}, message_id={message_id}, emoji={emoji})"
         )
+    # A successful react is a valid interactive response (an acknowledgment) —
+    # record it on the turn so the forgot-to-send guard doesn't flag a
+    # react-only reply as "no reply" (0.3.2).
+    from .._context import get_current_turn
+    _ctx = get_current_turn()
+    if _ctx is not None:
+        try:
+            _ctx.react_count += 1
+        except Exception:  # noqa: BLE001
+            pass
     return f"react ok: channel={cid} emoji={emoji} message_id={message_id}"
 
 

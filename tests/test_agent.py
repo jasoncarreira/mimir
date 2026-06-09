@@ -958,6 +958,41 @@ async def test_run_turn_successful_send_suppresses_no_reply_signal(
     assert [e for e in evs if e.get("type") == "interactive_turn_no_send_message"] == []
 
 
+async def test_run_turn_react_only_suppresses_no_reply_signal(tmp_path: Path):
+    """0.3.2: a react-only reply (the react tool, no send_message) is a valid
+    interactive response (an acknowledgment), so the forgot-to-send guard must
+    NOT fire — keying off ctx.react_count, not just send_message_count."""
+    import json
+    from mimir.channel_registry import ChannelRegistry
+
+    class _ReactingAgent(_FakeAgent):
+        """Simulate a confirmed react by bumping react_count on the active turn
+        context — exactly what the real react tool does on a successful react."""
+        async def astream(self, state, *, config, stream_mode="values"):
+            from mimir._context import get_current_turn
+            _ctx = get_current_turn()
+            if _ctx is not None:
+                _ctx.react_count += 1
+            async for chunk in super().astream(
+                state, config=config, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    fake_agent = _ReactingAgent(response_messages=[AIMessage(content="absorbed it 👍")])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    await agent.run_turn(event)
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    assert [e for e in evs if e.get("type") == "interactive_turn_no_send_message"] == []
+
+
 async def test_run_turn_non_interactive_no_signal_no_typing(tmp_path: Path):
     """A non-interactive turn (scheduled_tick) on a bridge channel produces
     no typing indicator and no forgot-to-send signal — trigger gating applies

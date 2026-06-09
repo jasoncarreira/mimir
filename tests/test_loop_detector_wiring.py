@@ -25,7 +25,7 @@ from mimir._context import reset_current_turn, set_current_turn
 from mimir.loop_detector import LoopDetector
 from mimir.models import TurnContext
 from mimir.tools import registry as tool_registry
-from mimir.tools.registry import send_message
+from mimir.tools.registry import react, send_message
 
 
 class _FakeBridge:
@@ -243,3 +243,24 @@ async def test_distinct_text_resets_streak(
     assert "ok" in out.lower()
     # We never hit HARD_STOP.
     assert not any(k == "send_message_loop_hard_stop" for k, _ in captured_events)
+
+
+# ─── react bumps react_count (0.3.2 — react counts as a reply) ───────
+
+
+@pytest.mark.asyncio
+async def test_react_increments_react_count_on_turn(
+    fake_bridge: _FakeBridge,
+) -> None:
+    """A successful react bumps ctx.react_count so the forgot-to-send guard
+    treats a react-only acknowledgment as a delivered response (0.3.2)."""
+    detector = LoopDetector(soft_limit=5, hard_limit=10, similarity_threshold=0.9)
+    ctx = _ctx(detector)
+    _set_channel("ch-1")
+    token = set_current_turn(ctx)
+    try:
+        out = await react.ainvoke({"emoji": "👍", "message_id": "m-1"})
+    finally:
+        reset_current_turn(token)
+    assert "react ok" in out.lower()
+    assert ctx.react_count == 1

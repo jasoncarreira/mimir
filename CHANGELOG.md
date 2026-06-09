@@ -6,6 +6,19 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-06-09
+
+### Fixed
+
+- **The forgot-to-send guard no longer flags react-only replies.** A `react`
+  (an emoji acknowledgment) is a valid interactive response, but
+  `interactive_turn_no_send_message` only counted `send_message`, so a turn
+  that responded with just a reaction was falsely flagged as "no reply"
+  (observed live on muninn). The `react` tool now bumps a `react_count` on the
+  turn context (on a confirmed react), and the guard fires only when an
+  interactive turn produced text and delivered **neither** a `send_message`
+  **nor** a `react`.
+
 ## [0.3.1] — 2026-06-09
 
 Follow-up to the 0.3.0 explicit-delivery switch.
