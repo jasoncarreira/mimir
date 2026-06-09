@@ -268,7 +268,7 @@ Channel bridges (Slack, Discord, Bluesky, Web UI, Bench) are NOT separate proces
 │      └─ spawn_claude_code MCP tool for out-of-process delegation│
 │ 6. saga post-message hook     # SagaStore.feedback(atom_ids,    │
 │                               # output, feedback=pos/neg)        │
-│ 7. persist TurnRecord; emit channel output via bridge.send       │
+│ 7. persist TurnRecord (delivery is explicit send_message; step 5)│
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -310,7 +310,7 @@ Mimir's parallelism model post-deepagents migration:
 
 **(3) Cross-channel concurrency.** Different channels' worker tasks run concurrently (§4.5). The dispatcher serializes turns within one channel but runs them in parallel across channels.
 
-**Streaming.** `agent.astream(stream_mode="values")` yields the full LangGraph state snapshot after each graph step. The `StreamingAutoDispatcher` observes each new `AIMessage` as it accumulates and flushes "plan" text to the channel at the first tool_call boundary (so the user sees intent before tool results arrive). Tool calls execute between graph steps; the next model generation begins only after all tool results from the current step are available.
+**Streaming.** `agent.astream(stream_mode="values")` yields the full LangGraph state snapshot after each graph step. The turn loop drains the stream to drive the graph to completion, then derives the turn's events/output from the final message list. There is no mid-turn auto-flush to the channel: as of 0.3.0 the agent delivers only by calling the `send_message` tool (§7.1), so the model's final text is captured as reasoning and nothing reaches the user until an explicit `send_message`. Tool calls execute between graph steps; the next model generation begins only after all tool results from the current step are available.
 
 ### 4.5 Concurrent request handling
 

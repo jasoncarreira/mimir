@@ -35,10 +35,12 @@ from mimir.tools.registry import (
     reload_pollers,
     remove_schedule,
     reset_current_channel_id,
+    reset_current_turn_interactive,
     send_message,
     set_channel_registry,
     set_commitments_store,
     set_current_channel_id,
+    set_current_turn_interactive,
     set_dispatcher,
     set_scheduler,
 )
@@ -63,8 +65,10 @@ def _reset_state():
 
 
 class _SendResult:
-    def __init__(self, message_id: str) -> None:
+    def __init__(self, message_id: str, sent: bool = True) -> None:
         self.message_id = message_id
+        self.sent = sent
+        self.error: str | None = None
 
 
 class _StubBridge:
@@ -72,6 +76,7 @@ class _StubBridge:
 
     def __init__(self) -> None:
         self.send_calls: list[dict] = []
+        self.send_finals: list[bool] = []
         self.react_calls: list[dict] = []
         self.history_calls: list[dict] = []
         self.raise_on: str | None = None
@@ -80,12 +85,16 @@ class _StubBridge:
         # don't honor the bool contract; set False to exercise the
         # declined-reaction path.
         self.react_returns: bool | None = None
+        # Control SendResult.sent — set False to exercise the soft
+        # delivery-failure path (bridge returns sent=False, no raise).
+        self.send_sent: bool = True
 
-    async def send(self, cid: str, text: str):
+    async def send(self, cid: str, text: str, *, final: bool = True):
         if self.raise_on == "send":
             raise RuntimeError("send boom")
         self.send_calls.append({"cid": cid, "text": text})
-        return _SendResult(message_id="msg-42")
+        self.send_finals.append(final)
+        return _SendResult(message_id="msg-42", sent=self.send_sent)
 
     async def react(self, cid: str, message_id: str | None, emoji: str):
         if self.raise_on == "react":
@@ -103,7 +112,7 @@ class _StubBridge:
 class _StubBridgeNoHistory:
     """Bridge without fetch_history to verify graceful missing-attr error."""
 
-    async def send(self, cid: str, text: str):
+    async def send(self, cid: str, text: str, *, final: bool = True):
         return _SendResult(message_id="msg-1")
 
     async def react(self, cid: str, message_id: str | None, emoji: str):
@@ -857,3 +866,115 @@ class TestCommitmentList:
         out = await commitment_list.ainvoke({})
         assert "commitment_list failed" in out
         assert "boom" in out
+
+
+# ────────────────────────────────────────────────────────────────────
+# send_message interactivity guard (0.3.0)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestSendMessageInteractivityGuard:
+    """0.3.0: a channel-less send_message defaults to the turn's channel only
+    on interactive turns; on non-interactive turns it errors and requires an
+    explicit channel_id. Explicit channel always works."""
+
+    @pytest.mark.asyncio
+    async def test_non_interactive_no_channel_errors(self) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        cid_tok = set_current_channel_id("chan-1")
+        int_tok = set_current_turn_interactive(False)
+        try:
+            out = await send_message.ainvoke({"text": "hi"})
+        finally:
+            reset_current_turn_interactive(int_tok)
+            reset_current_channel_id(cid_tok)
+        assert "non-interactive" in out
+        assert bridge.send_calls == []  # nothing was sent
+
+    @pytest.mark.asyncio
+    async def test_non_interactive_explicit_channel_works(self) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        int_tok = set_current_turn_interactive(False)
+        try:
+            out = await send_message.ainvoke({"text": "hi", "channel_id": "chan-1"})
+        finally:
+            reset_current_turn_interactive(int_tok)
+        assert "send_message ok" in out
+        assert bridge.send_calls == [{"cid": "chan-1", "text": "hi"}]
+
+    @pytest.mark.asyncio
+    async def test_interactive_no_channel_defaults_and_sends(self) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        cid_tok = set_current_channel_id("chan-1")
+        int_tok = set_current_turn_interactive(True)
+        try:
+            out = await send_message.ainvoke({"text": "hi"})
+        finally:
+            reset_current_turn_interactive(int_tok)
+            reset_current_channel_id(cid_tok)
+        assert "send_message ok" in out
+        assert bridge.send_calls == [{"cid": "chan-1", "text": "hi"}]
+
+    @pytest.mark.asyncio
+    async def test_directives_only_send_skips_targetless_react(self) -> None:
+        """A send_message whose text is only an <actions> react (empty clean
+        text → nothing sent → no message id) must SKIP the react rather than
+        call bridge.react(cid, None, emoji) (chainlink #394)."""
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        int_tok = set_current_turn_interactive(True)
+        try:
+            out = await send_message.ainvoke({
+                "text": '<actions><react emoji="thumbsup" /></actions>',
+                "channel_id": "chan-1",
+            })
+        finally:
+            reset_current_turn_interactive(int_tok)
+        # No text was sent and the targetless react was skipped (not None).
+        assert bridge.send_calls == []
+        assert bridge.react_calls == []
+        assert "send_message ok" in out
+
+
+# ────────────────────────────────────────────────────────────────────
+# send_message delivery semantics (0.3.0)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestSendMessageDelivery:
+    """send_message uses final=False (typing stays held to turn end), and a
+    soft bridge failure (SendResult.sent=False) surfaces as a failure rather
+    than silently looking delivered (auto-dispatch removed → sole reply path)."""
+
+    @pytest.mark.asyncio
+    async def test_send_uses_final_false_to_hold_typing(self) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        out = await send_message.ainvoke({"text": "hi", "channel_id": "chan-1"})
+        assert "send_message ok" in out
+        # final=False so the bridge does NOT cancel typing per-send; run_turn
+        # releases it once at turn end (persists across multi-part replies).
+        assert bridge.send_finals == [False]
+
+    @pytest.mark.asyncio
+    async def test_soft_failure_surfaces_and_is_not_recorded(self, tmp_path) -> None:
+        from mimir.history import MessageBuffer, set_global_buffer
+
+        bridge = _StubBridge()
+        bridge.send_sent = False  # bridge reports a soft delivery failure
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        buf = MessageBuffer(history_path=tmp_path / "chat_history.jsonl")
+        set_global_buffer(buf)
+        try:
+            out = await send_message.ainvoke({"text": "hi", "channel_id": "chan-1"})
+        finally:
+            set_global_buffer(None)
+        # The model is told it failed (not "ok"), so it can react/retry.
+        assert "failed" in out and "not delivered" in out
+        # The send WAS attempted...
+        assert bridge.send_calls == [{"cid": "chan-1", "text": "hi"}]
+        # ...but a soft failure is NOT recorded as a delivered assistant message.
+        assert [m for m in buf._all if m.kind == "assistant_message"] == []

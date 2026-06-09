@@ -6,6 +6,52 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-06-09
+
+**BREAKING — explicit message delivery.** The agent's final turn text is no
+longer auto-delivered to the channel. To say anything to a channel the agent
+MUST call the `send_message` tool. This makes delivery an explicit,
+inspectable action and removes the "the agent thought out loud and it got
+shipped" failure mode; the unsent final text is captured as reasoning.
+
+### Changed
+
+- **No auto-dispatch.** The end-of-turn auto-send and the mid-turn streaming
+  plan-flush are both removed (the `_streaming_dispatch` module is retired).
+  The model's final text is captured as reasoning in the turn record (`output`
+  + a reasoning event) and is NOT sent to the channel or recorded as a sent
+  message. `send_message` is the sole delivery path and may be called multiple
+  times per turn (multi-part replies, progress notes).
+- **`send_message` channel defaulting is gated by interactivity.** A
+  channel-less `send_message` defaults to the turn's channel only on an
+  interactive turn (`user_message` / `shell_job_complete` on a registered
+  bridge). On a non-interactive turn — heartbeat / `scheduled_tick`, poller,
+  `saga_session_end` synthesis, `upgrade` maintenance — it errors and requires
+  an explicit `channel_id` (e.g. the operator alert channel). Explicit-channel
+  sends are unchanged, so heartbeat→operator-alert still works.
+- **Typing indicator** fires at turn start on interactive turns and is
+  released only at turn end, so it persists across multiple `send_message`
+  calls instead of being tied to a per-send flush.
+- Reply conventions (`prompts.py`) and `core/06-action-boundaries.md` rewritten
+  to require `send_message`; `<actions>` directives (`<react>` / `<send-file>`)
+  now ride inside the `send_message` text body.
+
+### Added
+
+- `interactive_turn_no_send_message` algedonic signal — an interactive turn
+  that produced final text but never called `send_message` emits a negative
+  feedback signal (the reply was stuck as reasoning, the user got nothing),
+  surfaced in the next turn's feedback panel so the agent self-corrects.
+- `channel_registry.is_interactive_turn` / `INTERACTIVE_TRIGGERS` — the shared
+  interactivity gate used by both the `send_message` tool and the dispatcher.
+
+### Migration
+
+Agents reply via `send_message` now; the bundled prompt + core-memory defaults
+teach this and the algedonic signal reinforces it. `send_message` remains
+exempt from the per-turn tool-call budget, so the agent can always reply even
+after other tools are capped.
+
 ## [0.2.18] — 2026-06-08
 
 GEPA prompt-optimization lands as an opt-in capability (skill + extra + first

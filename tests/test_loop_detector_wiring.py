@@ -35,7 +35,7 @@ class _FakeBridge:
         self.sent: list[tuple[str, str]] = []
         self._counter = 0
 
-    async def send(self, channel_id: str, text: str) -> str:
+    async def send(self, channel_id: str, text: str, *, final: bool = True) -> str:
         self.sent.append((channel_id, text))
         self._counter += 1
         return f"msg-{self._counter}"

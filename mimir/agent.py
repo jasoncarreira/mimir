@@ -48,8 +48,7 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 
-from .bridges._directives import parse_directives, ReactDirective, resolve_react_target
-from .channel_registry import ChannelRegistry
+from .channel_registry import ChannelRegistry, is_interactive_turn
 from .config import Config
 from .event_logger import log_event, log_event_sync, safe_log_event
 from .feedback import FeedbackLog
@@ -910,40 +909,6 @@ class Agent:
         turn's later replies. Wired in server.py via ``set_on_inject``."""
         await self._append_inbound_to_buffer(event)
 
-    async def _append_outbound_to_buffer(
-        self,
-        channel_id: str,
-        content: str,
-        *,
-        msg_id: str | None = None,
-        source: str | None = None,
-    ) -> None:
-        """Append an outbound assistant message to the buffer. Called
-        from every ``bridge.send`` site (agent-fallback, ``send_message``
-        tool, streaming dispatcher) so the agent sees its own prior
-        replies in ``## Recent activity`` on the next turn.
-
-        Called whether or not delivery succeeded — pre-#181's
-        ``_auto_dispatch_or_record`` recorded outbound regardless of
-        dispatch outcome so the agent self-corrects when a stale
-        conversation doesn't match what it thought it sent.
-        """
-        if not channel_id or not content:
-            return
-        try:
-            msg = self._buffer.make_message(
-                channel_id=channel_id,
-                kind="assistant_message",
-                content=content,
-                msg_id=msg_id,
-                source=source,
-            )
-            await self._buffer.append(msg)
-        except Exception:  # noqa: BLE001
-            log.exception(
-                "outbound buffer append failed for channel=%r", channel_id,
-            )
-
     def _current_system_prompt(self, *, emit_health_events: bool = False) -> str:
         """Render the system prompt for the current turn.
 
@@ -1192,21 +1157,25 @@ class Agent:
             saga_session_id = sess.saga_session_id
             self._sessions.increment_turn_count(event.channel_id)
 
-        # Typing indicator at turn start — Discord/Slack bridges expose
-        # ``send_typing_indicator`` so the user sees "mimir is typing…"
-        # while a multi-second LLM call runs. Pre-fix the indicator
-        # only fired on the post-turn ``bridge.send``; long turns
-        # appeared hung. Bridges that don't implement the method
-        # (Bluesky / Bench / WebChat) are silently skipped.
+        # Typing indicator: fire at turn START on interactive turns so the
+        # user sees "mimir is typing…" the moment their message lands and for
+        # the whole turn (0.3.0 removed auto-dispatch, so this is the only
+        # received-it signal until the agent calls send_message). It is
+        # released in the finally (turn END) — NOT on send_message — so it
+        # persists across multi-part replies. Bridges without the method
+        # (Bench / WebChat) are silently skipped.
+        _typing_bridge = None
         if (
             self._channels is not None
             and event.channel_id
-            and event.trigger == "user_message"
+            and is_interactive_turn(event.channel_id, event.trigger, self._channels)
         ):
-            bridge = self._channels.find(event.channel_id)
-            if bridge is not None and hasattr(bridge, "send_typing_indicator"):
+            _typing_bridge = self._channels.find(event.channel_id)
+            if _typing_bridge is not None and hasattr(
+                _typing_bridge, "send_typing_indicator"
+            ):
                 try:
-                    await bridge.send_typing_indicator(event.channel_id)
+                    await _typing_bridge.send_typing_indicator(event.channel_id)
                 except Exception as exc:  # noqa: BLE001
                     log.debug("typing indicator failed: %s", exc)
 
@@ -1243,14 +1212,12 @@ class Agent:
             # this off the TurnContext and refuse tool calls past
             # the cap. 0 disables (matches main's contract).
             tool_call_budget=self._config.tool_call_budget,
-            # Source of the inbound channel (e.g. "discord", "slack").
-            # Carried through to _append_outbound_to_buffer so the
-            # agent's own replies get source="discord" (etc.) in
-            # chat_history.jsonl and pass the recent_sources allowlist
-            # filter in recent_for_channel. Without this the field
-            # defaults to None and all assistant messages are silently
-            # excluded from the ## Recent activity prompt block.
-            # (chainlink #270)
+            # Source of the inbound channel (e.g. "discord", "slack"),
+            # recorded on the turn context for observability. The outbound
+            # buffer-append now lives only in the send_message tool, which
+            # tags the message with ``bridge.name`` so it passes the
+            # recent_sources allowlist in recent_for_channel (chainlink #270);
+            # this field is no longer the source of that tag.
             channel_source=event.source,
         )
         # WikiBacklinksHook pre-snapshot — capture mtimes of every
@@ -1281,8 +1248,17 @@ class Agent:
         from .tools.registry import (
             set_current_channel_id as _set_cid,
             reset_current_channel_id as _reset_cid,
+            set_current_turn_interactive as _set_interactive,
+            reset_current_turn_interactive as _reset_interactive,
         )
         cid_token = _set_cid(event.channel_id)
+        # Pair the interactivity flag with the channel id: send_message uses it
+        # to decide whether a channel-less call may default to this turn's
+        # channel (interactive) or must be given an explicit channel (non-
+        # interactive heartbeat / poller / synthesis / upgrade turns).
+        interactive_token = _set_interactive(
+            is_interactive_turn(event.channel_id, event.trigger, self._channels)
+        )
         try:
             return await self._run_turn_body(
                 event, ctx, ctx_token, turn_id, session_id, saga_session_id,
@@ -1324,7 +1300,16 @@ class Agent:
                 leftover_injections = mid_turn_injection.deactivate(event.channel_id)
                 if leftover_injections and self._dispatcher is not None:
                     self._dispatcher.requeue_front(leftover_injections)
+            # Release the typing indicator at turn end (held from turn start
+            # across any send_message calls). In the finally so it fires on
+            # success, error, and cancellation alike.
+            if _typing_bridge is not None and hasattr(_typing_bridge, "cancel_typing"):
+                try:
+                    await _typing_bridge.cancel_typing(event.channel_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("cancel_typing failed: %s", exc)
             reset_current_turn(ctx_token)
+            _reset_interactive(interactive_token)
             _reset_cid(cid_token)
 
     async def _run_turn_body(
@@ -1434,31 +1419,14 @@ class Agent:
         # Build / reuse the agent singleton.
         agent = await self._build_agent_if_needed()
 
-        # Streaming auto-dispatcher (181-O / chainlink #5): observes
-        # AIMessages as they stream in and flushes the "plan" text to
-        # the channel at the first tool_call boundary. Bench / no-
-        # bridge channels skip; explicit ``send_message`` tool calls
-        # disable streaming entirely. The result text is flushed at
-        # end of turn via the existing bridge.send path below — when
-        # streaming was active we use ``dispatcher.result_text()``
-        # instead of the canonical ``output`` so intermediate text
-        # between tool calls is correctly suppressed from the user.
-        bridge_for_streaming = None
-        if self._channels is not None and event.channel_id:
-            bridge_for_streaming = self._channels.find(event.channel_id)
-        from ._streaming_dispatch import StreamingAutoDispatcher
-        streaming = StreamingAutoDispatcher(
-            channel_id=event.channel_id or "",
-            bridge=bridge_for_streaming,
-            # Mid-turn plan flushes append to the chat-history buffer
-            # so the agent sees its own streamed reply in the next
-            # turn's Recent activity (just like the end-of-turn send).
-            outbound_appender=self._append_outbound_to_buffer,
-            channel_source=ctx.channel_source,
-            eligible=(
-                event.channel_id is not None
-                and event.trigger == "user_message"
-            ),
+        # 0.3.0: auto-dispatch removed. The model's final text is NOT shipped
+        # to the channel — the agent must call the ``send_message`` tool to
+        # reply (and may call it multiple times per turn). The unsent final
+        # text is captured as reasoning in the turn record.
+        # ``turn_is_interactive`` feeds the forgot-to-send guard at turn end;
+        # the typing indicator is started/cancelled in ``run_turn``.
+        turn_is_interactive = is_interactive_turn(
+            event.channel_id, event.trigger, self._channels
         )
 
         timeout = self._config.turn_timeout_seconds
@@ -1491,10 +1459,12 @@ class Agent:
             async with _timeout_ctx:
                 # ``stream_mode="values"`` yields the full state snapshot
                 # after each graph step; ``state.get("messages", [])`` is
-                # the canonical message list. Feed each NEW AIMessage
-                # through the streaming state machine so mid-turn plan
-                # flushes happen at the first tool_call boundary —
-                # NOT at end of turn.
+                # the canonical message list. We drain the stream to drive the
+                # graph to completion, then derive events/output from the final
+                # message list. (Pre-0.3.0 this loop also fed each new
+                # AIMessage through a streaming auto-dispatcher that flushed
+                # plan text mid-turn; auto-dispatch is gone — the agent now
+                # delivers via the send_message tool.)
                 invoke_config = {
                     "configurable": {
                         "thread_id": saga_session_id or session_id,
@@ -1508,30 +1478,12 @@ class Agent:
                         "channel_id": event.channel_id,
                     },
                 }
-                # Track the count of AIMessages we've already streamed
-                # into the state machine. ``stream_mode="values"``
-                # re-emits the cumulative messages list on every step,
-                # so without slice-past-observed we'd feed the same
-                # AIMessages in multiple times. The state machine's
-                # ``observed_count`` is bumped per-call, so we feed
-                # only the new AIMessages each iteration.
-                ai_observed = 0
                 async for chunk in agent.astream(
                     {"messages": [HumanMessage(content=turn_prompt)]},
                     config=invoke_config,
                     stream_mode="values",
                 ):
                     messages = list(chunk.get("messages", []))
-                    if streaming.enabled:
-                        # Walk messages, ignore any non-AIMessage, slice
-                        # past the ones already observed.
-                        ai_count = 0
-                        for msg in messages:
-                            if isinstance(msg, AIMessage):
-                                ai_count += 1
-                                if ai_count > ai_observed:
-                                    await streaming.observe(msg)
-                        ai_observed = ai_count
                 events, output = extract_turn_events(messages)
         except asyncio.TimeoutError:
             error = f"TurnTimeout: turn exceeded {timeout}s wall-clock limit"
@@ -1894,114 +1846,32 @@ class Agent:
         await self._post_turn_index_rebuild()
         await self._post_turn_git_commit(ctx)
 
-        # End-of-turn bridge dispatch. Three cases:
-        #   1. Streaming was active AND a plan was already flushed
-        #      mid-turn (``streamed_plan=True``): send the result text
-        #      via ``dispatcher.result_text()`` — intermediate text
-        #      between tool calls is correctly suppressed from the
-        #      user, captured only as reasoning in turns.jsonl.
-        #   2. Streaming was disabled by an explicit ``send_message``
-        #      tool call (the canonical-delivery path): skip the
-        #      end-of-turn send entirely; the model already shipped.
-        #   3. Otherwise (no tool calls, or streaming disabled because
-        #      bench/no-bridge): single canonical ``output`` flush —
-        #      matches pre-181-O behavior.
-        # ``upgrade`` turns are startup-created maintenance turns, but they
-        # target the WebChat/Bench-style synthetic channel and need their final
-        # text persisted just like a user-message turn so submit/abandon errors
-        # are visible instead of disappearing into turns.jsonl.
+        # 0.3.0: no auto-dispatch. The agent delivers via the send_message
+        # tool only; the model's final text is captured as reasoning (it's
+        # already in the TurnRecord ``output`` + a reasoning event) and is
+        # intentionally NOT shipped to the channel or appended to the chat
+        # buffer as a sent message. (Typing is released in run_turn's finally.)
+        #
+        # Forgot-to-send guard: an interactive turn that produced final text
+        # but never DELIVERED a reply means the text is stuck as reasoning and
+        # the user got nothing. Key off ctx.send_message_count (incremented
+        # only on a confirmed bridge send) — NOT the presence of a send_message
+        # tool call, which can be refused (non-interactive / loop hard-stop /
+        # no bridge) or soft-fail and deliver nothing. Emit a negative signal
+        # so the next turn's feedback panel surfaces it (feedback.classify maps
+        # ``interactive_turn_no_send_message`` to a negative ``no_reply``).
         if (
-            self._channels is not None
-            and event.channel_id
-            and event.trigger in {"user_message", "upgrade"}
+            turn_is_interactive
+            and (output or "").strip()
+            and getattr(ctx, "send_message_count", 0) == 0
         ):
-            bridge = self._channels.find(event.channel_id)
-            if bridge is not None and hasattr(bridge, "send"):
-                # Pick the right text + decide whether to send at all.
-                send_text: str | None = None
-                if streaming.disabled_by_explicit_send:
-                    send_text = None  # already delivered via tool call
-                elif streaming.streamed_plan:
-                    candidate = streaming.result_text()
-                    send_text = candidate if candidate else None
-                elif output:
-                    send_text = output
-                if send_text:
-                    parsed = parse_directives(send_text)
-                    clean = parsed.clean_text
-                    sent_result = None
-                    if clean:
-                        try:
-                            # chainlink #389: bound the external send so a hung
-                            # bridge HTTP call can't hold the worker forever. The
-                            # existing handler catches the resulting TimeoutError.
-                            sent_result = await asyncio.wait_for(
-                                bridge.send(event.channel_id, clean),
-                                timeout=self._config.post_turn_timeout_seconds,
-                            )
-                        except Exception as exc:
-                            log.warning("bridge.send failed: %s", exc)
-                            # Gap 5 fix: emit algedonic negative so the
-                            # per-turn block surfaces auto-dispatch failures.
-                            await safe_log_event(
-                                "auto_dispatch_failed",
-                                channel_id=event.channel_id,
-                                error=str(exc),
-                                session_id=session_id,
-                            )
-                        # Append to chat-history buffer regardless of
-                        # send outcome — pre-#181's _auto_dispatch_or_record
-                        # explicitly recorded outbound even on bridge
-                        # failure so the agent self-corrects when a
-                        # stale conversation doesn't match what it
-                        # thought it sent (matches what was attempted,
-                        # not what was confirmed delivered).
-                        await self._append_outbound_to_buffer(
-                            event.channel_id,
-                            clean,
-                            msg_id=getattr(sent_result, "message_id", None),
-                            source=ctx.channel_source,
-                        )
-                    for _directive in parsed.directives:
-                        if isinstance(_directive, ReactDirective):
-                            # chainlink #394: a directives-only reply (empty
-                            # clean text) leaves sent_result None, so a bare
-                            # react with no explicit message_id used to resolve
-                            # to None and call bridge.react(channel, None, emoji).
-                            # Fall back to the last assistant message; skip the
-                            # react entirely when there's still no target.
-                            _target = resolve_react_target(
-                                _directive.message_id,
-                                sent_result.message_id if sent_result else None,
-                                getattr(ctx, "last_assistant_message_id", None),
-                            )
-                            if _target is None:
-                                log.debug(
-                                    "bridge.react (directive) skipped: no target "
-                                    "message for emoji %r", _directive.emoji,
-                                )
-                                continue
-                            try:
-                                await bridge.react(
-                                    event.channel_id, _target, _directive.emoji
-                                )
-                            except Exception as exc:
-                                log.debug("bridge.react (directive) failed: %s", exc)
-                elif streaming.streamed_plan:
-                    # Edge case: a plan was flushed mid-turn with
-                    # final=False (typing indicator held), but the
-                    # model produced no result text after the last
-                    # tool call. Without an end-of-turn send the
-                    # indicator dangles in "still working" forever
-                    # (~9s on Discord, then auto-expires; longer on
-                    # Slack). Release it explicitly via the bridge's
-                    # cancel_typing API. Failures swallowed — typing
-                    # state is observability, not load-bearing.
-                    if hasattr(bridge, "cancel_typing"):
-                        try:
-                            await bridge.cancel_typing(event.channel_id)
-                        except Exception as exc:
-                            log.debug("bridge.cancel_typing failed: %s", exc)
+            await safe_log_event(
+                "interactive_turn_no_send_message",
+                channel_id=event.channel_id,
+                turn_id=turn_id,
+                trigger=event.trigger,
+                output_chars=len((output or "").strip()),
+            )
 
         await log_event(
             "turn_finished",

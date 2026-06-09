@@ -43,12 +43,24 @@ log = logging.getLogger(__name__)
 
 from langchain_core.runnables import RunnableConfig
 
-from ..bridges._directives import parse_directives, ReactDirective
+from ..bridges._directives import parse_directives, ReactDirective, resolve_react_target
 
 # Per-task ContextVar for channel_id — isolated across concurrent asyncio
 # Tasks so concurrent turns on different channels don't race (S2-1 fix).
 _current_channel_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "mimir_current_channel_id", default=None
+)
+
+# Per-task ContextVar: is the active turn an interactive (user-facing) one?
+# Set by the dispatcher at turn start, paired with the channel id. Governs
+# whether ``send_message`` may DEFAULT to the turn's channel: on a non-
+# interactive turn (heartbeat / poller / synthesis / upgrade) there is no
+# user to default a reply to, so a channel-less send_message errors and the
+# agent must pass an explicit channel_id. Default ``True`` is permissive for
+# non-agent callers (tests / bench / direct invocation) — the dispatcher is
+# authoritative and always sets the real value for production turns.
+_current_turn_interactive_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "mimir_current_turn_interactive", default=True
 )
 
 
@@ -131,6 +143,20 @@ def reset_current_channel_id(token: contextvars.Token) -> None:
     _current_channel_id_var.reset(token)
 
 
+def set_current_turn_interactive(interactive: bool) -> contextvars.Token:
+    """Set whether the active turn is interactive (user-facing). Paired with
+    ``set_current_channel_id`` at turn start; reset in a finally block.
+    Governs ``send_message``'s default-channel behavior (see the ContextVar
+    docstring)."""
+    return _current_turn_interactive_var.set(interactive)
+
+
+def reset_current_turn_interactive(token: contextvars.Token) -> None:
+    """Restore the prior interactivity flag using the Token from
+    set_current_turn_interactive."""
+    _current_turn_interactive_var.reset(token)
+
+
 # ────────────────────────────────────────────────────────────────────
 # Channel tools (mimir/channeltools.py)
 # ────────────────────────────────────────────────────────────────────
@@ -156,9 +182,21 @@ async def send_message(
         return "send_message failed: no channel registry configured"
     if not text or not text.strip():
         return "send_message failed: text is required"
+    explicit_channel = bool((channel_id or "").strip())
     cid = _channel_from_config_or_state(channel_id, config)
     if not cid:
         return "send_message failed: no channel_id and no current channel"
+    # Non-interactive turns (heartbeat / poller / synthesis / upgrade) have no
+    # user to default a reply to. A channel-less send_message on such a turn is
+    # almost always a mistake (the agent talking to itself), so refuse it and
+    # require an explicit channel_id. An explicit channel_id always works —
+    # that's how a heartbeat reaches the operator alert channel.
+    if not explicit_channel and not _current_turn_interactive_var.get():
+        return (
+            "send_message failed: non-interactive turn — there is no channel to "
+            "default to. Pass an explicit channel_id (e.g. the operator alert "
+            "channel) if this turn genuinely needs to send a message."
+        )
 
     # Loop-detection circuit breaker (SPEC §7.2.4). The per-turn
     # LoopDetector lives on the active TurnContext; agent.run_turn
@@ -211,9 +249,43 @@ async def send_message(
     result = None
     if clean_text:
         try:
-            result = await bridge.send(cid, clean_text)
+            # final=False keeps the typing indicator held — it is released
+            # once, at turn end (run_turn's finally), so it persists across
+            # multiple send_message calls in a turn. final=True (the default)
+            # would cancel typing on the FIRST send (see DiscordBridge.send).
+            result = await bridge.send(cid, clean_text, final=False)
         except Exception as exc:
             return f"send_message failed: {exc}"
+
+        # Soft delivery failure: bridges return SendResult(sent=False, error=…)
+        # for recoverable failures (disconnected client, bad channel) instead
+        # of raising. With auto-dispatch gone this is the sole reply path, so a
+        # soft failure must NOT look delivered — don't log send_message_sent,
+        # don't append to history, and surface the failure to the model.
+        if not getattr(result, "sent", True):
+            _err = getattr(result, "error", None)
+            try:
+                await _log_event(
+                    "send_message_failed",
+                    channel_id=cid,
+                    error=(str(_err)[:200] if _err else None),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return (
+                "send_message failed: bridge reported the message was not "
+                f"delivered (channel={cid}" + (f"; {_err}" if _err else "") + ")"
+            )
+
+        # Successful delivery — record it on the turn context so the
+        # forgot-to-send guard knows a reply actually went out. An
+        # attempted-but-refused / soft-failed send must NOT suppress the
+        # no-reply signal, so only a confirmed send increments this.
+        if ctx is not None:
+            try:
+                ctx.send_message_count += 1
+            except Exception:  # noqa: BLE001
+                pass
 
         # S2-2: log a send_message_sent event with a normalized content hash
         # so FeedbackLog._detect_cross_turn_send_loops can detect 24h floods
@@ -268,9 +340,20 @@ async def send_message(
 
     for _directive in parsed.directives:
         if isinstance(_directive, ReactDirective):
-            _target = _directive.message_id or (
-                result.message_id if result else None
+            # chainlink #394: resolve the target via the shared helper and
+            # skip on None rather than calling bridge.react(cid, None, emoji).
+            # The just-sent message is the natural target; a directives-only
+            # send_message (empty clean_text → result None) has no target.
+            _target = resolve_react_target(
+                _directive.message_id,
+                result.message_id if result else None,
             )
+            if _target is None:
+                log.debug(
+                    "send_message react directive skipped: no target message "
+                    "for emoji %r", _directive.emoji,
+                )
+                continue
             try:
                 await bridge.react(cid, _target, _directive.emoji)
             except Exception:

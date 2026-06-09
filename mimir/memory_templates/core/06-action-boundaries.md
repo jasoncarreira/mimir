@@ -43,11 +43,20 @@ here or in ``30-reflection-policy.md``, fall back to
 
 ## Send / outbound
 
-- ``send_message`` to the inbound channel — **autonomous**.
-- ``send_message`` cross-channel — **autonomous for the
-  surface-attention pattern** (e.g., heartbeat surfacing an
-  alert via the operator-alert channel); **escalate-first for
-  everything else**.
+Delivery is explicit — there is no auto-dispatch. Your final turn
+text is reasoning, not a message; **to reach a channel you call
+``send_message``** (callable multiple times per turn, and never
+counted against the tool-call budget).
+
+- ``send_message`` to the inbound channel (no ``channel_id``) —
+  **autonomous**. The normal reply path on an interactive turn.
+- ``send_message`` cross-channel (explicit ``channel_id``) —
+  **autonomous for the surface-attention pattern** (e.g., a
+  heartbeat surfacing an alert via the operator-alert channel);
+  **escalate-first for everything else**. Non-interactive turns
+  (heartbeat / poller / synthesis / upgrade) have no default
+  channel, so a channel-less ``send_message`` errors there — pass
+  an explicit ``channel_id``.
 - Off-platform notifications (push, email, SMS) —
   **escalate-first**. Escalation by definition; what qualifies
   needs prior operator consent.

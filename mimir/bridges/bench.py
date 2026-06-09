@@ -59,11 +59,11 @@ class BenchBridge(Bridge):
         *,
         final: bool = True,
     ) -> SendResult:
-        # chainlink #5: bench has no typing-indicator affordance, so
-        # ``final`` is informational only. Streaming auto-dispatch is
-        # disabled on bench channels anyway (the bench harness reads
-        # the SDK's final text directly), so this kwarg should never
-        # arrive with final=False in practice.
+        # bench has no typing-indicator affordance, so ``final`` is
+        # informational only and ignored. As of 0.3.0 there is no
+        # streaming/auto-dispatch at all — bench.send is reached only via the
+        # send_message tool, and the bench harness reads the agent's answer
+        # from TurnRecord.output (turns.jsonl), not from this stdout line.
         del final
         message_id = uuid.uuid4().hex[:12]
         line = (
