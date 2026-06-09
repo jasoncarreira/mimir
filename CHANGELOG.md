@@ -6,6 +6,54 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.18] — 2026-06-08
+
+GEPA prompt-optimization lands as an opt-in capability (skill + extra + first
+pilot), the skill-extras gap that pruned deps on restart is closed, plus two
+saga/proposal correctness fixes and a core-memory default.
+
+### Added
+
+- **GEPA prompt optimization** — an opt-in framework for evaluator-backed
+  optimization of bounded textual artifacts:
+  - a bundled `gepa` skill (shipped as an **optional** skill) with explicit
+    fit/anti-fit gates, an ASI-rich evaluator requirement, and a mandatory
+    PR/proposal adoption gate — it never auto-replaces a production prompt
+    (#611, moved to `optional-skills/` in #614);
+  - an opt-in `gepa` extra plus `mimir.gepa_support`, which routes gepa's
+    `reflection_lm` through mimir's already-configured ChatModel (codex-plus /
+    minimax / anthropic) — no separate LiteLLM/OpenAI key (#614);
+  - the first pilot harness (`evals/commitments_extraction/`, repo-root, not
+    shipped in the wheel): reference-free self-containment metrics + ASI, a gepa
+    adapter over the real extractor model path, and a `--baseline`/optimize
+    runner that reads real in-home turns and never auto-applies a candidate
+    (#616, #617).
+- **Skill-declared `requires_extras`** + `mimir skills required-extras`:
+  workspace-mode `start.sh` derives its `uv sync` extras from the installed
+  skills, so an optional skill's dependency (e.g. `gepa`) isn't pruned on
+  restart. CI validates that every declared extra is a real pyproject extra (#615).
+- **Frame-checking non-goal** in the bundled core-memory defaults —
+  `memory/core/05-non-goals.md` ("don't accept the source frame uncritically"),
+  with a matching learned-behaviors procedure (#613).
+
+### Fixed
+
+- **Protected-surface proposals fail closed on leftover git conflict markers.**
+  `finalize_proposal` refuses to submit `memory/core/` or `prompts/` content
+  still containing a `<<<<<<<` / `=======` / `>>>>>>>` marker (the separator
+  matched as a standalone 7-`=` line to avoid false-positives on setext rules),
+  keeping the worktree open for re-resolution (#609).
+- **Deterministic world-state lookup.** `saga.get_current_value` now orders by
+  `valid_from DESC, rowid DESC LIMIT 1`, so a transient dual-`is_current` row
+  resolves to the newest fact instead of an arbitrary one (#610).
+
+### Changed
+
+- **External tool pins bumped** — claude-code CLI `2.1.168`, codex CLI
+  `0.137.0`, gogcli `v0.9.0` + Go `1.26.4`, chainlink `chainlink-1.6.0`
+  (retiring the floating git HEAD), and the `langchain-claude-code` fork ref.
+  Every pin verified to resolve upstream (#612).
+
 ## [0.2.17] — 2026-06-07
 
 ### Fixed
