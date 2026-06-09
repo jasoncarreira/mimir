@@ -355,3 +355,47 @@ def test_write_conflict_markers_stay_on_their_own_lines(tmp_path: Path) -> None:
     assert lines[0] == "<<<<<<< home"
     assert "=======" in lines
     assert lines[-1] == ">>>>>>> mimir-defaults"
+
+
+def test_upgrade_template_instructs_operator_notification() -> None:
+    """The shipped upgrade-reconciliation prompt must tell the agent to notify
+    the operator (send_message on the operator alert channel) after submitting,
+    so the propose-only PR doesn't sit unreviewed (0.3.1)."""
+    from pathlib import Path as _P
+
+    import mimir
+
+    tmpl = _P(mimir.__file__).parent / "prompt_templates" / "upgrade.md"
+    text = tmpl.read_text(encoding="utf-8")
+    assert "send_message" in text
+    assert "operator alert" in text.lower()
+    # explicit channel_id, since the upgrade turn is non-interactive
+    assert "channel_id" in text
+
+
+@pytest.mark.asyncio
+async def test_upgrade_fallback_prompt_instructs_operator_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When neither a home nor a bundled upgrade template is available, the
+    inline fallback prompt must also carry the operator-notify instruction."""
+    home = tmp_path / "home"
+    home.mkdir()
+    # No home template; force the bundled lookup empty → inline fallback.
+    monkeypatch.setattr(du, "bundled_prompt_defaults", lambda: {})
+    wt = home / "scratch" / "proposals" / "upgrade" / "upgrade_defaults"
+    result = du.DefaultsUpgradeResult(
+        ok=True,
+        action="proposal_opened",
+        version="1.2.0",
+        proposal=du.OpenResult(ok=True, branch="upgrade/defaults", worktree=wt),
+    )
+    events = []
+
+    async def fake_enqueue(event):
+        events.append(event)
+        return True
+
+    assert await du.enqueue_upgrade_reconciliation_turn(home, result, fake_enqueue) is True
+    assert "send_message" in events[0].content
+    assert "operator alert" in events[0].content.lower()
