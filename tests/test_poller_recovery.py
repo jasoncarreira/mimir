@@ -223,6 +223,44 @@ def test_reconcile_missing_events_file_is_safe(tmp_path: Path):
     ) == []
 
 
+# ── out-of-order outcome scan (chainlink #316) ───────────────────────
+
+
+def test_read_outcomes_out_of_order_newer_record_not_missed(tmp_path: Path):
+    """chainlink #316: writers stamp the timestamp before taking the append
+    lock, so a record with a *later* timestamp can be appended *before* one
+    with an *earlier* timestamp. ``tail_jsonl_records`` yields newest-appended
+    first, so it reaches the earlier-stamped record first — and the old early
+    ``break`` on the first record at/under the cutoff dropped the out-of-order
+    newer record sitting just behind it. The grace-window scan recovers it."""
+    events = tmp_path / "events.jsonl"
+    cutoff = _ts(100)
+    # Append the NEW record (later ts, > cutoff) FIRST, then the OLD record
+    # (earlier ts, < cutoff but within the 5s grace) SECOND — so tail reads
+    # the OLD one first and the old code would break before the NEW one.
+    _write_outcome(events, type_="turn_completed", channel_id="poller:gmail",
+                   source_id="new", ts=_ts(98))
+    _write_outcome(events, type_="turn_completed", channel_id="poller:gmail",
+                   source_id="old", ts=_ts(101))
+    out = poller_recovery._read_outcomes_since(events, "poller:gmail", cutoff)
+    # New (out-of-order) record recovered; old one at/under cutoff still skipped.
+    assert [r["source_id"] for r in out] == ["new"]
+
+
+def test_read_outcomes_terminates_past_grace_window(tmp_path: Path):
+    """A record older than the cutoff by more than the grace window stops the
+    scan (and is excluded), so this stays O(new events), not O(whole log)."""
+    events = tmp_path / "events.jsonl"
+    cutoff = _ts(100)
+    # Realistic ordering: oldest appended first, newest last.
+    _write_outcome(events, type_="turn_completed", channel_id="poller:gmail",
+                   source_id="ancient", ts=_ts(500))   # << cutoff - grace
+    _write_outcome(events, type_="turn_completed", channel_id="poller:gmail",
+                   source_id="new", ts=_ts(98))         # > cutoff
+    out = poller_recovery._read_outcomes_since(events, "poller:gmail", cutoff)
+    assert [r["source_id"] for r in out] == ["new"]
+
+
 # ── back-pressure + GC (chainlink #305 / #310) ───────────────────────
 
 

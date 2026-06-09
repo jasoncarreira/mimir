@@ -174,6 +174,27 @@ def parse_directives(text: str) -> ParseResult:
     return ParseResult(clean_text=cleaned, directives=tuple(directives))
 
 
+def resolve_react_target(
+    directive_message_id: str | None,
+    sent_message_id: str | None,
+    last_assistant_message_id: str | None = None,
+) -> str | None:
+    """Pick the message a :class:`ReactDirective` should attach to (#394).
+
+    Precedence matches ``ReactDirective``'s documented contract: the
+    directive's explicit ``message_id`` → the message just sent in the same
+    dispatch → the most recent assistant message in the channel.
+
+    Returns None only when none of those exist — a directives-only reply
+    (empty clean text) sends nothing, so the per-dispatch ``sent`` id is
+    None, and a caller with no last-assistant id available (e.g. the
+    streaming plan-flush path, which has no channel history in hand) gets
+    None here. Callers MUST skip the react on None rather than calling
+    ``bridge.react(channel, None, emoji)``.
+    """
+    return directive_message_id or sent_message_id or last_assistant_message_id
+
+
 def has_unclosed_actions_block(text: str) -> bool:
     """Streaming helper. True when the most recent ``<actions>`` opening
     tag has no matching ``</actions>`` close yet — caller can hide the
@@ -216,6 +237,7 @@ __all__ = [
     "Directive",
     "ParseResult",
     "parse_directives",
+    "resolve_react_target",
     "has_unclosed_actions_block",
     "has_incomplete_actions_tag",
     "strip_actions_blocks",

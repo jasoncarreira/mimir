@@ -2341,3 +2341,20 @@ async def test_rearm_quota_recovery_on_start_from_pause_file(tmp_path: Path):
         assert sched._scheduler.get_job(_QUOTA_RECOVERY_JOB_ID) is not None
     finally:
         sched.stop()
+
+
+def test_minimax_poll_job_default_model_matches_poller_default():
+    """chainlink #398: the scheduler's default ``model_name`` must match the
+    poller's live Token-Plan bucket (``DEFAULT_MODEL_NAME``). A stale
+    ``"MiniMax-M*"`` default made a direct caller relying on it spam
+    ``minimax_usage_failed`` at the ``model_match`` stage every tick."""
+    import inspect
+
+    from mimir.minimax_usage_poller import DEFAULT_MODEL_NAME
+
+    default = (
+        inspect.signature(Scheduler.add_minimax_usage_poll_job)
+        .parameters["model_name"]
+        .default
+    )
+    assert default == DEFAULT_MODEL_NAME == "general"

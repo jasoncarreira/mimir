@@ -368,9 +368,11 @@ def _format_event(msg: dict, account: Account) -> dict | None:
     Returns None if the message lacks an ``id`` (we have nothing to
     cursor on — safer to skip than emit an un-deduplicable event).
 
-    The emitted ``prompt`` is the account's resolved prompt body when
-    one was supplied (per-account file or inline), else the built-in
-    default template.
+    The emitted ``prompt`` always begins with the per-message detail
+    block (from / subject / snippet / URL / message_id). When the account
+    supplies a custom prompt body (per-account file or inline), it is
+    appended after the detail as triage instructions — it augments the
+    detail, it does not replace it.
     """
     msg_id = msg.get("id") or msg.get("messageId") or msg.get("message_id")
     if not msg_id:
@@ -394,12 +396,17 @@ def _format_event(msg: dict, account: Account) -> dict | None:
         f"https://mail.google.com/mail/u/0/#inbox/{thread_id}"
     )
 
-    # Account-supplied prompt overrides the default; if absent (legacy
-    # mode or no prompt-file/prompt configured), fall back to the
-    # original built-in template.
-    prompt = account.prompt_body or _default_prompt(
-        sender, subject, snippet, web_url, msg_id,
-    )
+    # The per-message detail block (from / subject / snippet / URL /
+    # message_id) is ALWAYS included so the agent sees what each email is.
+    # A custom account prompt body is triage *instructions* — it augments,
+    # it does not replace, the detail. (Chronic bug: ``prompt =
+    # account.prompt_body or _default_prompt(...)`` meant a configured
+    # prompt_body dropped the per-message fields from the prompt body — they
+    # rode along only as event extras, which ``_render_batch`` never renders,
+    # so a batch showed N copies of the account instructions with no idea
+    # which emails arrived.)
+    detail = _default_prompt(sender, subject, snippet, web_url, msg_id)
+    prompt = f"{detail}\n\n{account.prompt_body}" if account.prompt_body else detail
     return {
         "poller": POLLER_NAME,
         "prompt": prompt,
