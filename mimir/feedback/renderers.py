@@ -77,15 +77,6 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f"SAGA consolidation failed: {_sanitize_field(ev.get('error') or '(no detail)')}"
     if rule_kind == "saga_decay_error":
         return f"SAGA decay failed: {_sanitize_field(ev.get('error') or '(no detail)')}"
-    if rule_kind == "auto_dispatch_failed":
-        bridge = ev.get("bridge") or "?"
-        ch = ev.get("channel_id") or "?"
-        err = _sanitize_field(ev.get("error") or "(no detail)")
-        return (
-            f"auto-dispatch reply failed via {bridge} on {ch}: {err}. "
-            f"Your text was generated but not delivered. "
-            f"Consider calling send_message explicitly next time."
-        )
     if rule_kind == "saga_forget_error":
         dry = ev.get("dry_run")
         suffix = " (dry_run)" if dry else ""

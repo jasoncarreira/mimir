@@ -73,7 +73,6 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "introspection_report_error": ("negative", "introspection_error"),
     "predictions_pending_review": ("negative", "predictions_pending"),
     "send_message_unknown_channel": ("negative", "unknown_channel"),
-    "auto_dispatch_failed": ("negative", "auto_dispatch_failed"),
     # 0.3.0: interactive turn produced final text but never called the
     # send_message tool — the reply is stuck as reasoning and the user got
     # nothing. Surfaces in the next turn's feedback panel so the agent

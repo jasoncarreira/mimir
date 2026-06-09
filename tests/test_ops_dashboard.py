@@ -89,12 +89,12 @@ def test_build_dashboard_payload_skips_malformed_lines(tmp_path: Path):
     with log.open("w") as f:
         f.write('{"timestamp":"' + _ts() + '","type":"event_queued","trigger":"user_message","channel_id":"c1"}\n')
         f.write("not-json-at-all\n")
-        f.write('{"timestamp":"' + _ts() + '","type":"auto_dispatch_ok"}\n')
+        f.write('{"timestamp":"' + _ts() + '","type":"send_message_sent"}\n')
 
     payload = build_dashboard_payload(log, days=7)
     assert payload["summary"]["total_events"] == 2
     assert payload["summary"]["events_queued"] == 1
-    assert payload["summary"]["auto_dispatch_ok"] == 1
+    assert payload["summary"]["messages_sent"] == 1
 
 
 def test_build_dashboard_payload_respects_cutoff(tmp_path: Path):
@@ -123,7 +123,7 @@ def test_compute_stats_summary_counts(tmp_path: Path):
     _write_events(log, [
         {"timestamp": _ts(0.1), "type": "event_queued", "trigger": "user_message", "channel_id": "c1"},
         {"timestamp": _ts(0.1), "type": "event_queued", "trigger": "scheduled_tick", "channel_id": "c1"},
-        {"timestamp": _ts(0.1), "type": "auto_dispatch_ok"},
+        {"timestamp": _ts(0.1), "type": "send_message_sent"},
         {"timestamp": _ts(0.1), "type": "subagent_started", "task_id": "t1"},
         {"timestamp": _ts(0.1), "type": "subagent_notification", "task_id": "t1"},
         {"timestamp": _ts(0.1), "type": "client_pool_drained"},
@@ -133,7 +133,7 @@ def test_compute_stats_summary_counts(tmp_path: Path):
     s = payload["summary"]
     assert s["total_events"] == 7
     assert s["events_queued"] == 2
-    assert s["auto_dispatch_ok"] == 1
+    assert s["messages_sent"] == 1
     assert s["subagents_started"] == 1
     assert s["subagents_completed"] == 1
     assert s["client_pool_drains"] == 1
@@ -209,7 +209,7 @@ def test_compute_stats_failure_detection_by_suffix(tmp_path: Path):
         {"timestamp": _ts(0.1), "type": "oauth_quota_anomalous", "detail": "100% jump"},
         {"timestamp": _ts(0.1), "type": "event_admission_rejected"},
         {"timestamp": _ts(0.1), "type": "shell_job_complete_enqueue_failed", "error": "dispatcher down"},
-        {"timestamp": _ts(0.1), "type": "auto_dispatch_ok"},  # not a failure
+        {"timestamp": _ts(0.1), "type": "send_message_sent"},  # not a failure
         {"timestamp": _ts(0.1), "type": "event_queued", "trigger": "user_message"},  # not a failure
     ])
     payload = build_dashboard_payload(log, days=1)
@@ -220,7 +220,7 @@ def test_compute_stats_failure_detection_by_suffix(tmp_path: Path):
     assert "oauth_quota_anomalous" in fbk
     assert "event_admission_rejected" in fbk
     assert "shell_job_complete_enqueue_failed" in fbk
-    assert "auto_dispatch_ok" not in fbk
+    assert "send_message_sent" not in fbk
     assert "event_queued" not in fbk
 
 
@@ -320,7 +320,7 @@ def test_compute_stats_timeseries_per_day(tmp_path: Path):
     _write_events(log, [
         # 2 events 3 days ago, 1 event today.
         {"timestamp": _ts(3.0), "type": "event_queued", "trigger": "user_message"},
-        {"timestamp": _ts(3.0), "type": "auto_dispatch_ok"},
+        {"timestamp": _ts(3.0), "type": "send_message_sent"},
         {"timestamp": _ts(0.0), "type": "event_queued", "trigger": "user_message"},
     ])
     payload = build_dashboard_payload(log, days=7)
