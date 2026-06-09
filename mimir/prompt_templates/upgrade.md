@@ -22,6 +22,7 @@ Your job:
    - remove the conflict markers before submission.
 4. If the clean merge is already acceptable, do not churn the files just to touch them.
 5. Submit the proposal with `submit_proposal(title, rationale, lane='upgrade')` so the operator gets a PR. Approval is still the merge.
+6. Notify the operator so the PR doesn't sit unreviewed: call `send_message` on the operator alert channel — pass an explicit `channel_id` (this is a non-interactive turn, so a channel-less `send_message` errors) — with the PR URL `submit_proposal` returned and a one-line summary of what you reconciled. If no operator alert channel is configured, skip this step.
 
 Suggested title: `Upgrade mimir defaults to {version}`
 

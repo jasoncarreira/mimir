@@ -550,7 +550,11 @@ async def enqueue_upgrade_reconciliation_turn(
             "# Upgrade defaults reconciliation\n\n"
             "Review the open upgrade-lane proposal worktree, reconcile any "
             "memory/core and prompts changes, resolve conflict markers, then "
-            "submit_proposal with lane='upgrade'."
+            "submit_proposal with lane='upgrade'. After submitting, notify the "
+            "operator so the PR doesn't sit unreviewed: send_message on the "
+            "operator alert channel (pass an explicit channel_id — this is a "
+            "non-interactive turn) with the PR URL and a one-line summary. "
+            "Skip the notification if no operator alert channel is configured."
         )
     worktree = result.proposal.worktree
     branch = result.proposal.branch

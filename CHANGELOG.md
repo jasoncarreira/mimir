@@ -6,6 +6,21 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-06-09
+
+Follow-up to the 0.3.0 explicit-delivery switch.
+
+### Fixed
+
+- **Upgrade reconciliation now notifies the operator.** The version-triggered
+  upgrade-reconciliation turn opens a propose-only PR (`submit_proposal`), but
+  it ran on a non-interactive channel and never surfaced the PR — so the
+  reconciliation could sit unreviewed (mimirbot's 0.3.0 reconciliation PR did
+  exactly this). The upgrade prompt (`prompt_templates/upgrade.md` + the inline
+  fallback) now instructs the agent to `send_message` the operator-alert
+  channel (explicit `channel_id`, since the turn is non-interactive) with the
+  PR URL after submitting.
+
 ## [0.3.0] — 2026-06-09
 
 **BREAKING — explicit message delivery.** The agent's final turn text is no
