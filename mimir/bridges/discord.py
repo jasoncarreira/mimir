@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,6 +74,7 @@ _FATAL_DISCORD_EXCEPTIONS: tuple[type[BaseException], ...] = tuple(
 # any logger-side failure shows up under the right name.
 from ._supervisor import should_emit_retry_algedonic as _should_emit_retry_algedonic
 from ._supervisor import safe_log_event as _shared_safe_log_event
+from ._supervisor import reset_backoff_if_session_was_healthy as _reset_backoff_if_healthy
 
 
 async def _safe_log_event(event_kind: str, **fields: Any) -> None:
@@ -373,6 +375,7 @@ class DiscordBridge(Bridge):
         attempt = 0
         backoff = self._RECONNECT_BACKOFF_INITIAL_SECONDS
         while True:
+            started_at = time.monotonic()
             try:
                 # ``client.start`` returns when the gateway disconnects
                 # cleanly OR raises on transient/fatal failure. discord.py
@@ -419,6 +422,10 @@ class DiscordBridge(Bridge):
                 # mode that motivated this) lands here. ``ConnectionClosed``
                 # covers post-handshake gateway disconnects that
                 # discord.py's resume protocol couldn't fix.
+                attempt, backoff = _reset_backoff_if_healthy(
+                    time.monotonic() - started_at, attempt, backoff,
+                    initial_backoff=self._RECONNECT_BACKOFF_INITIAL_SECONDS,
+                )
                 attempt += 1
                 log.warning(
                     "DiscordBridge: transient failure (%s) on attempt %d; "
@@ -441,6 +448,10 @@ class DiscordBridge(Bridge):
                 # as transient — Discord-down looks the same to the bot
                 # whether it's a discord-py exception or a deeper aiohttp
                 # one. Surface but retry.
+                attempt, backoff = _reset_backoff_if_healthy(
+                    time.monotonic() - started_at, attempt, backoff,
+                    initial_backoff=self._RECONNECT_BACKOFF_INITIAL_SECONDS,
+                )
                 attempt += 1
                 log.warning(
                     "DiscordBridge: unexpected exception (%s) on attempt %d; "

@@ -234,8 +234,9 @@ class TestIntermediateTextSegments:
 
 
 class _FakeSendResult:
-    def __init__(self, sent: bool = True) -> None:
+    def __init__(self, sent: bool = True, message_id: str | None = "flush-msg") -> None:
         self.sent = sent
+        self.message_id = message_id
         self.error: str | None = None
 
 
@@ -378,18 +379,21 @@ async def test_dispatcher_strips_actions_markup_before_bridge_send() -> None:
     assert "<actions>" not in sent_text
     assert "<react" not in sent_text
     assert "Got it" in sent_text
-    # The directive WAS dispatched against the just-sent plan flush.
-    assert bridge.reacts == [("ch-1", None, "👀")]
+    # The directive WAS dispatched against the just-sent plan flush — the
+    # react targets that message's id (chainlink #394), not a None target.
+    assert bridge.reacts == [("ch-1", "flush-msg", "👀")]
     assert d.streamed_plan is True
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_actions_only_plan_no_bridge_send_but_directives_fire() -> None:
+async def test_dispatcher_actions_only_plan_skips_targetless_react() -> None:
     """Edge case: plan is directives-only. After stripping ``<actions>``
-    there's nothing left to send to the bridge — but the directives
-    must still dispatch (e.g. an ack-react with no accompanying text).
-    Pre-#181 invariant: ``cleaned_plan.strip()`` empty → no send,
-    but directives are still forwarded."""
+    there's nothing left to send, so ``result`` is None. A bare <react>
+    with no explicit message_id therefore has no target — and the streaming
+    dispatcher holds no channel history for a last-assistant fallback — so
+    the react is SKIPPED rather than firing on a None target (chainlink
+    #394; this path previously called ``bridge.react(channel, None, emoji)``).
+    """
     bridge = _ReactingBridge()
     d = StreamingAutoDispatcher(channel_id="ch-1", bridge=bridge)
     directives_only = '<actions><react emoji="✅" /></actions>'
@@ -399,10 +403,26 @@ async def test_dispatcher_actions_only_plan_no_bridge_send_but_directives_fire()
     ))
     # No bridge send (nothing left after stripping).
     assert bridge.sends == []
-    # But the react fired.
-    assert bridge.reacts == [("ch-1", None, "✅")]
+    # And no react — there's no message to attach it to, so skip rather than
+    # react on a None target.
+    assert bridge.reacts == []
     # streamed_plan stays False — we never confirmed a send.
     assert d.streamed_plan is False
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_actions_only_react_with_explicit_message_id_fires() -> None:
+    """The skip only applies when there is genuinely no target: a
+    directives-only plan whose <react> carries an explicit message_id still
+    fires, so the #394 guard doesn't suppress legitimately-targeted reacts."""
+    bridge = _ReactingBridge()
+    d = StreamingAutoDispatcher(channel_id="ch-1", bridge=bridge)
+    await d.observe(_ai('<actions><react emoji="✅" message="m-99" /></actions>'))
+    await d.observe(_ai(
+        "", tool_calls=[{"name": "memory_query", "args": {}, "id": "t1"}],
+    ))
+    assert bridge.sends == []
+    assert bridge.reacts == [("ch-1", "m-99", "✅")]
 
 
 @pytest.mark.asyncio

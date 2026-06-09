@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from mimir.bridges._supervisor import (
+    HEALTHY_SESSION_RESET_SECONDS,
+    reset_backoff_if_session_was_healthy,
     safe_log_event,
     should_emit_retry_algedonic,
 )
@@ -38,6 +40,52 @@ class TestShouldEmitRetryAlgedonic:
     @pytest.mark.parametrize("attempt", [11, 12, 15, 19, 21, 99])
     def test_silent_between_multiples_of_ten(self, attempt: int) -> None:
         assert should_emit_retry_algedonic(attempt) is False
+
+
+class TestResetBackoffIfSessionWasHealthy:
+    """chainlink #396: the supervisors init attempt/backoff once above the
+    ``while True`` loop and only ever ramp them up. After early connect
+    failures push backoff toward the 5-min cap and the bridge *then* runs
+    healthily for hours, the next gateway drop must retry fast — not resume
+    from the elevated backoff. A session counts as healthy once it ran for
+    at least the reset threshold (handshake failures fail within seconds)."""
+
+    def test_resets_after_healthy_session(self) -> None:
+        # Ran well past the threshold with a ramped-up attempt/backoff.
+        assert reset_backoff_if_session_was_healthy(
+            HEALTHY_SESSION_RESET_SECONDS + 1.0,
+            attempt=12, backoff=300.0, initial_backoff=5.0,
+        ) == (0, 5.0)
+
+    def test_resets_exactly_at_threshold(self) -> None:
+        assert reset_backoff_if_session_was_healthy(
+            HEALTHY_SESSION_RESET_SECONDS,
+            attempt=7, backoff=160.0, initial_backoff=5.0,
+        ) == (0, 5.0)
+
+    def test_no_reset_during_retry_storm(self) -> None:
+        # A fast-failing handshake (well under the threshold) keeps the
+        # ramped backoff so a real outage still backs off as before.
+        assert reset_backoff_if_session_was_healthy(
+            2.0, attempt=12, backoff=300.0, initial_backoff=5.0,
+        ) == (12, 300.0)
+
+    def test_zero_elapsed_never_resets(self) -> None:
+        assert reset_backoff_if_session_was_healthy(
+            0.0, attempt=1, backoff=10.0, initial_backoff=5.0,
+        ) == (1, 10.0)
+
+    def test_custom_threshold(self) -> None:
+        # Below custom threshold -> unchanged.
+        assert reset_backoff_if_session_was_healthy(
+            5.0, attempt=3, backoff=40.0, initial_backoff=5.0,
+            healthy_after_seconds=10.0,
+        ) == (3, 40.0)
+        # At/above custom threshold -> reset.
+        assert reset_backoff_if_session_was_healthy(
+            10.0, attempt=3, backoff=40.0, initial_backoff=5.0,
+            healthy_after_seconds=10.0,
+        ) == (0, 5.0)
 
 
 class TestSafeLogEvent:

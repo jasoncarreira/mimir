@@ -48,7 +48,7 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 
-from .bridges._directives import parse_directives, ReactDirective
+from .bridges._directives import parse_directives, ReactDirective, resolve_react_target
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .event_logger import log_event, log_event_sync, safe_log_event
@@ -1964,9 +1964,23 @@ class Agent:
                         )
                     for _directive in parsed.directives:
                         if isinstance(_directive, ReactDirective):
-                            _target = _directive.message_id or (
-                                sent_result.message_id if sent_result else None
+                            # chainlink #394: a directives-only reply (empty
+                            # clean text) leaves sent_result None, so a bare
+                            # react with no explicit message_id used to resolve
+                            # to None and call bridge.react(channel, None, emoji).
+                            # Fall back to the last assistant message; skip the
+                            # react entirely when there's still no target.
+                            _target = resolve_react_target(
+                                _directive.message_id,
+                                sent_result.message_id if sent_result else None,
+                                getattr(ctx, "last_assistant_message_id", None),
                             )
+                            if _target is None:
+                                log.debug(
+                                    "bridge.react (directive) skipped: no target "
+                                    "message for emoji %r", _directive.emoji,
+                                )
+                                continue
                             try:
                                 await bridge.react(
                                     event.channel_id, _target, _directive.emoji
