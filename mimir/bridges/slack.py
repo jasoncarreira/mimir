@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +55,7 @@ log = logging.getLogger(__name__)
 # bridge label so any logger-side failure shows up under the right name.
 from ._supervisor import should_emit_retry_algedonic as _should_emit_retry_algedonic
 from ._supervisor import safe_log_event as _shared_safe_log_event
+from ._supervisor import reset_backoff_if_session_was_healthy as _reset_backoff_if_healthy
 
 
 async def _safe_log_event(event_kind: str, **fields: Any) -> None:
@@ -357,6 +359,7 @@ class SlackBridge(Bridge):
             # connect-time 503'd, this re-runs every retry until it
             # succeeds.
             await self._refresh_bot_user_id()
+            started_at = time.monotonic()
             try:
                 assert self._handler is not None
                 await self._handler.start_async()
@@ -403,6 +406,10 @@ class SlackBridge(Bridge):
                         name=f"mimir-slack-log-{event_kind}",
                     )
                     raise
+                attempt, backoff = _reset_backoff_if_healthy(
+                    time.monotonic() - started_at, attempt, backoff,
+                    initial_backoff=self._RECONNECT_BACKOFF_INITIAL_SECONDS,
+                )
                 attempt += 1
                 log.warning(
                     "SlackBridge: transient SlackApiError (%s) on attempt %d; "
@@ -424,6 +431,10 @@ class SlackBridge(Bridge):
                 # Unexpected exception (network errors from aiohttp,
                 # WebSocket disconnect storms, slack_sdk internals).
                 # Treat as transient — same posture as Discord supervisor.
+                attempt, backoff = _reset_backoff_if_healthy(
+                    time.monotonic() - started_at, attempt, backoff,
+                    initial_backoff=self._RECONNECT_BACKOFF_INITIAL_SECONDS,
+                )
                 attempt += 1
                 log.warning(
                     "SlackBridge: unexpected exception (%s) on attempt %d; "

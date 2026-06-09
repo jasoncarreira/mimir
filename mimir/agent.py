@@ -436,6 +436,24 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _resolve_react_target(
+    directive_message_id: str | None,
+    sent_message_id: str | None,
+    last_assistant_message_id: str | None,
+) -> str | None:
+    """Pick the message a ``<react>`` directive should attach to (#394).
+
+    Precedence: the directive's explicit ``message_id`` → the message just
+    sent this turn → the last assistant message in the channel. A
+    directives-only reply (empty clean text) sends nothing, so the per-turn
+    ``sent`` id is None; without the last-assistant fallback a bare react
+    resolved to None and called ``bridge.react(channel, None, emoji)``.
+    Returns None only when there is genuinely no target, in which case the
+    caller must skip the react rather than react on None.
+    """
+    return directive_message_id or sent_message_id or last_assistant_message_id
+
+
 # Window for the saga contextual-rewrite context. Matches
 # ``mimir.saga.query_rewrite._MAX_CONTEXT_MESSAGES`` so the rewriter's
 # last-10-msgs trim doesn't waste effort on entries we'd ship and
@@ -1964,9 +1982,23 @@ class Agent:
                         )
                     for _directive in parsed.directives:
                         if isinstance(_directive, ReactDirective):
-                            _target = _directive.message_id or (
-                                sent_result.message_id if sent_result else None
+                            # chainlink #394: a directives-only reply (empty
+                            # clean text) leaves sent_result None, so a bare
+                            # react with no explicit message_id used to resolve
+                            # to None and call bridge.react(channel, None, emoji).
+                            # Fall back to the last assistant message; skip the
+                            # react entirely when there's still no target.
+                            _target = _resolve_react_target(
+                                _directive.message_id,
+                                sent_result.message_id if sent_result else None,
+                                getattr(ctx, "last_assistant_message_id", None),
                             )
+                            if _target is None:
+                                log.debug(
+                                    "bridge.react (directive) skipped: no target "
+                                    "message for emoji %r", _directive.emoji,
+                                )
+                                continue
                             try:
                                 await bridge.react(
                                     event.channel_id, _target, _directive.emoji

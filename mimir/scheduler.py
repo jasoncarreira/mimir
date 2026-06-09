@@ -1821,7 +1821,7 @@ class Scheduler:
         cron_expr: str,
         api_key: str,
         *,
-        model_name: str = "MiniMax-M*",
+        model_name: str = "general",
         job_id: str = "minimax-usage-poll",
     ) -> bool:
         """Register the Minimax plan-window usage poller. Returns
@@ -1829,9 +1829,13 @@ class Scheduler:
         no yaml override), matching ``add_oauth_usage_poll_job``'s
         opt-out shape.
 
-        ``model_name`` defaults to ``"MiniMax-M*"`` — the chat-models
-        bucket. Override for deployments on the speech / music / image
-        plans (each has its own per-plan quota in the response).
+        ``model_name`` defaults to ``"general"`` — the live Token-Plan
+        usage bucket, matching ``minimax_usage_poller.DEFAULT_MODEL_NAME``
+        and ``config.minimax_usage_model_name``. (chainlink #398: the
+        legacy ``"MiniMax-M*"`` Coding-Plan glob was stale — a direct
+        caller relying on the default got ``minimax_usage_failed`` at the
+        ``model_match`` stage every tick. The configured server path was
+        safe because it passes the config default explicitly.)
         """
         from .minimax_usage_poller import MinimaxPollerConfig, poll_once
 

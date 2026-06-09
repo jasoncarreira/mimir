@@ -47,7 +47,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -74,6 +74,14 @@ DEFAULT_MAX_RECOVERY_ATTEMPTS = 3
 DEFAULT_STASH_TTL_HOURS = 48.0
 
 _TURN_OUTCOME_TYPES = ("turn_completed", "turn_failed")
+
+# chainlink #316: writers stamp the event timestamp BEFORE acquiring the
+# append lock, so a record can land slightly out of append order relative to
+# its timestamp. The disorder is bounded by the lock-hold window (sub-ms in
+# practice); this grace margin is the slack ``_read_outcomes_since`` keeps
+# scanning past the cutoff so an out-of-order newer record just behind an
+# older one isn't missed by an early break.
+_OUTCOME_SCAN_GRACE_SECONDS = 5.0
 
 # Re-enqueue callback shape, matching ``run_poller``'s ``enqueue`` param.
 EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
@@ -199,27 +207,38 @@ def _read_outcomes_since(
     """Turn-outcome records (``turn_completed`` / ``turn_failed``) for
     ``channel_id`` strictly newer than ``since_iso``, returned oldest-first.
 
-    ``tail_jsonl_records`` yields newest-first; we stop as soon as we cross
-    the cutoff (everything older is already processed) so this stays O(new
+    ``tail_jsonl_records`` yields newest-first; we stop once we cross the
+    cutoff *by more than the disorder grace window* so this stays O(new
     events) rather than O(whole log).
 
-    NOTE (chainlink #316): this assumes events.jsonl is timestamp-ordered.
-    Writers stamp the time before taking the append lock, so a record can
-    in principle land slightly out of order near the cutoff and be missed
-    by the early ``break``. In practice the window is sub-millisecond and
-    the stash GC bounds any leak; a fully order-independent scan is tracked
-    separately.
+    chainlink #316: writers stamp the timestamp before taking the append
+    lock, so a record can land slightly out of order near the cutoff. The
+    old code ``break``-ed on the first record at/under ``since_iso``, which
+    could drop an out-of-order newer record sitting just behind an older
+    one. We now keep scanning until a record is older than ``since_iso``
+    by more than ``_OUTCOME_SCAN_GRACE_SECONDS`` (skip-not-break inside the
+    window), so bounded disorder no longer leaks turns.
     """
     if not events_path.exists():
         return []
+    since_dt = _parse_iso(since_iso) if since_iso else None
+    cutoff_floor = (
+        since_dt - timedelta(seconds=_OUTCOME_SCAN_GRACE_SECONDS)
+        if since_dt is not None
+        else None
+    )
     out: list[dict] = []
     try:
         for rec in tail_jsonl_records(events_path):
             ts = rec.get("timestamp")
             if not isinstance(ts, str):
                 continue
+            if cutoff_floor is not None:
+                rec_dt = _parse_iso(ts)
+                if rec_dt is not None and rec_dt < cutoff_floor:
+                    break  # older than the cutoff by > the disorder window
             if since_iso and ts <= since_iso:
-                break  # reverse-chrono: the rest is already reconciled
+                continue  # at/under cutoff but within grace: not new, skip it
             if rec.get("type") not in _TURN_OUTCOME_TYPES:
                 continue
             if rec.get("channel_id") != channel_id:

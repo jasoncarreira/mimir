@@ -25,6 +25,40 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
+# chainlink #396: a session must run at least this long before a drop is
+# treated as a fresh disconnect rather than a continuation of an earlier
+# retry storm. Discord/Slack handshake failures fail within seconds, so a
+# connection that stayed up this long was a genuine healthy session and the
+# next reconnect should retry fast instead of resuming from a ramped backoff.
+HEALTHY_SESSION_RESET_SECONDS = 60.0
+
+
+def reset_backoff_if_session_was_healthy(
+    elapsed_seconds: float,
+    attempt: int,
+    backoff: float,
+    *,
+    initial_backoff: float,
+    healthy_after_seconds: float = HEALTHY_SESSION_RESET_SECONDS,
+) -> tuple[int, float]:
+    """Reset the reconnect backoff after a healthy session (chainlink #396).
+
+    The supervisors initialise ``attempt``/``backoff`` once, above the
+    ``while True`` loop, and only ever ramp them up — so a run of early
+    connect failures pushes ``backoff`` toward the 5-min cap, and if the
+    bridge *then* runs healthily for hours, the next gateway drop resumes
+    from that elevated backoff instead of retrying fast.
+
+    If the just-ended session ran for at least *healthy_after_seconds* it
+    was a genuine connection (handshake failures fail within seconds), so
+    return ``(0, initial_backoff)`` to retry fast. Otherwise return the
+    counters unchanged so a real retry storm still ramps as before.
+    """
+    if elapsed_seconds >= healthy_after_seconds:
+        return 0, initial_backoff
+    return attempt, backoff
+
+
 def should_emit_retry_algedonic(attempt: int) -> bool:
     """Throttle ``*_bridge_retry`` events during sustained outages.
 

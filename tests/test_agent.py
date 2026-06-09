@@ -2028,3 +2028,19 @@ async def test_run_turn_bounds_hung_finalize_hook(tmp_path: Path, monkeypatch):
     record = await asyncio.wait_for(agent.run_turn(event), timeout=15.0)
     assert record is not None
     assert record.output == "ok"
+
+
+def test_resolve_react_target_precedence():
+    """chainlink #394: <react> target precedence is explicit id → message
+    sent this turn → last assistant message; None only when none exist."""
+    from mimir.agent import _resolve_react_target
+
+    # Explicit directive id wins over everything.
+    assert _resolve_react_target("explicit", "sent", "last") == "explicit"
+    # Falls back to the message sent this turn.
+    assert _resolve_react_target(None, "sent", "last") == "sent"
+    # Directives-only reply (nothing sent) -> last assistant message.
+    assert _resolve_react_target(None, None, "last") == "last"
+    # No target at all -> None, so the caller skips the react instead of
+    # calling bridge.react(channel, None, emoji).
+    assert _resolve_react_target(None, None, None) is None
