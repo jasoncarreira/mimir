@@ -909,40 +909,6 @@ class Agent:
         turn's later replies. Wired in server.py via ``set_on_inject``."""
         await self._append_inbound_to_buffer(event)
 
-    async def _append_outbound_to_buffer(
-        self,
-        channel_id: str,
-        content: str,
-        *,
-        msg_id: str | None = None,
-        source: str | None = None,
-    ) -> None:
-        """Append an outbound assistant message to the buffer. Called
-        from every ``bridge.send`` site (agent-fallback, ``send_message``
-        tool, streaming dispatcher) so the agent sees its own prior
-        replies in ``## Recent activity`` on the next turn.
-
-        Called whether or not delivery succeeded — pre-#181's
-        ``_auto_dispatch_or_record`` recorded outbound regardless of
-        dispatch outcome so the agent self-corrects when a stale
-        conversation doesn't match what it thought it sent.
-        """
-        if not channel_id or not content:
-            return
-        try:
-            msg = self._buffer.make_message(
-                channel_id=channel_id,
-                kind="assistant_message",
-                content=content,
-                msg_id=msg_id,
-                source=source,
-            )
-            await self._buffer.append(msg)
-        except Exception:  # noqa: BLE001
-            log.exception(
-                "outbound buffer append failed for channel=%r", channel_id,
-            )
-
     def _current_system_prompt(self, *, emit_health_events: bool = False) -> str:
         """Render the system prompt for the current turn.
 
@@ -1246,14 +1212,12 @@ class Agent:
             # this off the TurnContext and refuse tool calls past
             # the cap. 0 disables (matches main's contract).
             tool_call_budget=self._config.tool_call_budget,
-            # Source of the inbound channel (e.g. "discord", "slack").
-            # Carried through to _append_outbound_to_buffer so the
-            # agent's own replies get source="discord" (etc.) in
-            # chat_history.jsonl and pass the recent_sources allowlist
-            # filter in recent_for_channel. Without this the field
-            # defaults to None and all assistant messages are silently
-            # excluded from the ## Recent activity prompt block.
-            # (chainlink #270)
+            # Source of the inbound channel (e.g. "discord", "slack"),
+            # recorded on the turn context for observability. The outbound
+            # buffer-append now lives only in the send_message tool, which
+            # tags the message with ``bridge.name`` so it passes the
+            # recent_sources allowlist in recent_for_channel (chainlink #270);
+            # this field is no longer the source of that tag.
             channel_source=event.source,
         )
         # WikiBacklinksHook pre-snapshot — capture mtimes of every
