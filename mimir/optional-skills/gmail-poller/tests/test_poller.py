@@ -283,11 +283,15 @@ def test_config_json_multi_account_each_uses_own_prompt(
     assert len(events) == 2
     by_id = {e["message_id"]: e for e in events}
 
-    assert by_id["home-msg-1"]["prompt"] == "HOME ACCOUNT PROMPT"
+    # Each account's prompt body is present as instructions, alongside that
+    # message's per-item detail (from/subject) — not a replacement for it.
+    assert "HOME ACCOUNT PROMPT" in by_id["home-msg-1"]["prompt"]
+    assert "alice@example.com" in by_id["home-msg-1"]["prompt"]
     assert by_id["home-msg-1"]["account"] == "me@gmail.com"
     assert by_id["home-msg-1"]["account_name"] == "home"
 
-    assert by_id["work-msg-1"]["prompt"] == "WORK ACCOUNT PROMPT"
+    assert "WORK ACCOUNT PROMPT" in by_id["work-msg-1"]["prompt"]
+    assert "bob@employer.com" in by_id["work-msg-1"]["prompt"]
     assert by_id["work-msg-1"]["account"] == "me@employer.com"
     assert by_id["work-msg-1"]["account_name"] == "work"
 
@@ -307,7 +311,9 @@ def test_config_json_inline_prompt(fresh_poller, tmp_path, monkeypatch, capsys):
     rc = fresh_poller.main()
     assert rc == 0
     events = _capture_emits(capsys)
-    assert events[0]["prompt"] == "Triage agent-account email."
+    # Inline prompt is included as instructions, after the per-message detail.
+    assert "Triage agent-account email." in events[0]["prompt"]
+    assert events[0]["prompt"].startswith("[gmail] new message")
 
 
 def test_config_json_prompt_file_wins_over_inline(
@@ -333,7 +339,8 @@ def test_config_json_prompt_file_wins_over_inline(
     # Capture stdout + stderr in one readout — both share the buffer.
     captured = capsys.readouterr()
     events = [json.loads(l) for l in captured.out.splitlines() if l.strip()]
-    assert events[0]["prompt"] == "FILE WINS"
+    assert "FILE WINS" in events[0]["prompt"]
+    assert "this should be overridden" not in events[0]["prompt"]
     assert "both prompt-file and prompt" in captured.err
 
 
@@ -356,7 +363,7 @@ def test_config_json_missing_prompt_file_falls_back_to_inline(
     rc = fresh_poller.main()
     assert rc == 0
     events = _capture_emits(capsys)
-    assert events[0]["prompt"] == "inline fallback"
+    assert "inline fallback" in events[0]["prompt"]
 
 
 def test_config_json_no_prompt_fields_uses_default_template(
@@ -378,6 +385,36 @@ def test_config_json_no_prompt_fields_uses_default_template(
     events = _capture_emits(capsys)
     # Default template includes the "[gmail] new message from" prefix.
     assert events[0]["prompt"].startswith("[gmail] new message from alice@example.com")
+
+
+def test_config_json_custom_prompt_still_includes_per_message_detail(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    """Regression: a custom prompt body must NOT drop the per-message detail.
+
+    Previously ``prompt = account.prompt_body or _default_prompt(...)`` meant a
+    configured prompt *replaced* the from/subject/url, so a batch rendered as N
+    copies of the instructions with no idea which emails arrived (the fields
+    rode along only as event extras, which ``_render_batch`` never renders)."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    _write_config(tmp_path, [
+        {"name": "agent", "email": "agent@bot.ai", "prompt": "TRIAGE INSTRUCTIONS"},
+    ])
+    monkeypatch.delenv("GOG_ACCOUNT", raising=False)
+    monkeypatch.setattr(
+        fresh_poller, "_gog_search",
+        lambda account, q, m: (
+            [_msg("m1", sender="alice@example.com", subject="Invoice")]
+            if account == "agent@bot.ai" else []
+        ),
+    )
+    rc = fresh_poller.main()
+    assert rc == 0
+    prompt = _capture_emits(capsys)[0]["prompt"]
+    # Both the per-message detail AND the instructions — detail first.
+    assert "alice@example.com" in prompt and "Invoice" in prompt
+    assert "TRIAGE INSTRUCTIONS" in prompt
+    assert prompt.index("alice@example.com") < prompt.index("TRIAGE INSTRUCTIONS")
 
 
 def test_config_json_prompt_file_path_traversal_rejected(
