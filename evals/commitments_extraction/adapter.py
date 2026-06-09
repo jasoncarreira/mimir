@@ -86,6 +86,7 @@ def load_turns_corpus(
     split: str | None = None,
     limit: int | None = None,
     holdout_every: int = 4,
+    focus_artifact_rich: bool = False,
 ) -> list[Example]:
     """Load REAL session-end syntheses from the agent's in-home turn log.
 
@@ -93,6 +94,12 @@ def load_turns_corpus(
     turns whose ``output`` is >= 100 chars (the extractor's actual input, and
     the v4 eval recipe), and returns them as examples. Splits are assigned by a
     stable hash of ``turn_id`` (~1/``holdout_every`` to holdout).
+
+    When ``focus_artifact_rich`` is true, rank candidate rows with source
+    artifact ids first before applying ``limit``. This is a targeted chainlink
+    #407 mode: spend GEPA's reflective budget on examples where artifact-id
+    preservation can actually be measured, rather than on generic high-scoring
+    examples with no refs to preserve.
 
     **Privacy:** these examples contain real session content (Discord text, PII,
     operational detail). They are read at run time on the deployment and MUST
@@ -116,9 +123,24 @@ def load_turns_corpus(
             continue
         rows.append(d)
 
-    # Most-recent `limit` (turns.jsonl is chronological).
+    if focus_artifact_rich:
+        ranked = [
+            (d, metrics.artifact_ids(str(d.get("output") or "")))
+            for d in rows
+        ]
+        # Stable two-pass sort: recent-first for equal artifact counts, then
+        # artifact-rich first. Precomputing ids avoids double extraction per row.
+        ranked.sort(
+            key=lambda item: str(item[0].get("ts") or item[0].get("started_at") or ""),
+            reverse=True,
+        )
+        ranked.sort(key=lambda item: (len(item[1]) == 0, -len(item[1])))
+        rows = [d for d, _ids in ranked]
+
+    # Most-recent `limit` by default (turns.jsonl is chronological). In focused
+    # mode the sort above makes this the most artifact-rich slice instead.
     if limit is not None and limit >= 0:
-        rows = rows[-limit:]
+        rows = rows[:limit] if focus_artifact_rich else rows[-limit:]
 
     out: list[Example] = []
     for d in rows:

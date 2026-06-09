@@ -70,14 +70,26 @@ uv run python -m evals.commitments_extraction.run_pilot --baseline
 # 2. Run a bounded optimization pass (each metric call = one extractor model run).
 uv run python -m evals.commitments_extraction.run_pilot --max-metric-calls 60
 
+# #407 pass 2: focus the corpus/reflection pressure on artifact-id retention.
+uv run python -m evals.commitments_extraction.run_pilot \
+  --focus-artifact-rich --focus-low-id-coverage --limit 80 --max-metric-calls 200
+
 # Offline / no home: force the committed synthetic fixture.
 uv run python -m evals.commitments_extraction.run_pilot --baseline --synthetic
 ```
 
-`--home PATH` points at a specific agent home; `--limit N` caps how many (most-recent) real
-turns are sampled (default 40). The optimize pass writes `pilot_output/candidate_system.txt`
-+ `pilot_output/report.json` (git-ignored) and prints a baseline-vs-candidate decision record
-on the holdout.
+`--home PATH` points at a specific agent home; `--limit N` caps how many real turns are
+sampled (default 40). By default the real corpus is the most recent eligible turns.
+`--focus-artifact-rich` instead samples turns with source artifact ids first;
+`--focus-low-id-coverage` then spends one additional baseline extraction pass over the train
+split and orders train examples by the baseline extractor's measured id-coverage misses before
+GEPA reflection. Those two flags are the #407 second-pass shape:
+spend the budget on the actual gap from the first run (dropped PR#/chainlink#/path refs),
+not generic prompt rewriting. The optimize pass writes `pilot_output/candidate_system.txt`
+only when GEPA proposes a non-seed candidate, plus `pilot_output/report.json` (git-ignored),
+and prints a holdout decision record. If GEPA retains the seed prompt, the report says
+`seed_retained: true`, omits `candidate_holdout` / `delta_mean_score`, and treats the run as
+an explicit no-go rather than implying a baseline-vs-candidate comparison.
 
 ## Adoption gate (non-negotiable)
 
@@ -104,4 +116,4 @@ reviewed PR that:
 - `synthetic_corpus.jsonl` — committed synthetic fixture (tests/offline only).
 - `adapter.py` — `load_corpus` (fixture), `load_turns_corpus` (real in-home turns), and the
   gepa adapter wiring the extractor model path → metrics.
-- `run_pilot.py` — `--baseline` / optimize CLI (real in-home turns by default; `--synthetic` to override).
+- `run_pilot.py` — `--baseline` / optimize CLI (real in-home turns by default; `--synthetic` to override), including #407 artifact-rich / low-id-coverage focusing and seed-retained no-go reporting.
