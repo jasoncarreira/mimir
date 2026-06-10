@@ -1115,3 +1115,42 @@ def test_build_quota_providers_minimax_regional_host(tmp_path):
     )
     assert len(providers) == 1
     assert isinstance(providers[0], MinimaxQuotaProvider)
+
+
+# ─── raw-wall coasting demotion ────────────────────────────────────────
+
+
+def test_raw_wall_demoted_to_elevated_when_coasting():
+    """Over the wall but coasting (M clears the ELEVATED edge): the
+    wall grades ELEVATED, not TIGHT — low still yields (absolute
+    headroom is thin, turns are bursty), normal pollers keep firing
+    through the window tail. u=0.85 projecting to only 0.86 → M =
+    0.15/0.01 = 15."""
+    provider = _FakeProvider("anthropic", [
+        _w("seven_day", 0.85, 0.86),
+    ])
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.ELEVATED
+    assert "quota_saturated" in result.reason
+    assert result.burst_multiple == pytest.approx(15.0, abs=0.1)
+
+
+def test_raw_wall_stays_tight_without_pace_evidence():
+    """No projection (pegged / derived / early window) → no demotion;
+    the wall is the only signal and stays TIGHT."""
+    provider = _FakeProvider("anthropic", [
+        _w("seven_day", 0.85, None),
+    ])
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.TIGHT
+    assert "quota_saturated" in result.reason
+
+
+def test_raw_wall_stays_tight_when_pace_does_not_clear():
+    """Over the wall AND still on pace to exceed (M below the ELEVATED
+    edge) → TIGHT; demotion needs genuine coasting evidence."""
+    provider = _FakeProvider("anthropic", [
+        _w("seven_day", 0.85, 0.99),  # M = 0.15/0.14 ≈ 1.07
+    ])
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.TIGHT

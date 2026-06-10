@@ -27,9 +27,13 @@ All notable changes will land here. Format loosely follows
   same projected 80% grades CLEAR with 1 day left of a 7d window (busting
   needs ~2.75× pace) but TIGHT with 5 days left (~1.35×). Band edges are
   scaled by an early-window confidence ramp (γ = elapsed/0.25, capped at 1)
-  so a noisy first hour can't shed work. Raw utilization ≥ 0.80 stays a
-  TIGHT wall. API (pay-as-you-go) billing: cost-rate alert → TIGHT, within
-  80% of the hourly-limit or spike trip → ELEVATED.
+  so a noisy first hour can't shed work. Raw utilization ≥ 0.80 is a
+  TIGHT wall, demoted to ELEVATED when the same window's own pace shows
+  coasting (M ≥ the ELEVATED edge) — near the cap but not going to hit it
+  sheds low-priority work only; without pace evidence (pegged / derived /
+  early windows) the wall stays TIGHT. API (pay-as-you-go) billing:
+  cost-rate alert → TIGHT, within 80% of the hourly-limit or spike trip →
+  ELEVATED.
 - **429 early-recovery probe.** While a quota pause is active, an interval
   job (`MIMIR_QUOTA_RECHECK_SECONDS`, default 180s) checks whether the
   window cleared before the recorded reset: an authoritative cap, plus a
@@ -41,7 +45,8 @@ All notable changes will land here. Format loosely follows
 
 ### Changed
 
-- **BREAKING (internal API):** `HomeostaticArbiter.should_fire_heartbeat()`
+- Internal API only — no operator-facing surface changes (patch
+  release): `HomeostaticArbiter.should_fire_heartbeat()`
   is replaced by `should_fire(priority=...)` returning a `FireDecision`;
   `billing.evaluate_quota()` is replaced by `evaluate_quota_severity()`.
   The fixed on-pace suppress thresholds (0.90 5h / 0.95 7d) are superseded

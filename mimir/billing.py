@@ -635,10 +635,14 @@ def evaluate_quota_severity(
 
     - **raw wall** — ``utilization >= raw_threshold`` (looser for
       ``derived`` readings, chainlink #17) → TIGHT. Near the cap the
-      absolute headroom is small and one big turn can peg the bucket,
-      no matter how flattering the pace math looks. Also the only
-      signal for pegged buckets / derived / early windows, where
-      ``on_pace_utilization`` is None by design.
+      absolute headroom is small and one big turn can peg the bucket
+      — M can't see burst risk because a burst is precisely a
+      departure from established pace. Also the only signal for
+      pegged buckets / derived / early windows, where
+      ``on_pace_utilization`` is None by design. **Coasting
+      demotion:** when the same window's pace shows the cap won't be
+      hit (M ≥ the ELEVATED edge), the wall grades ELEVATED instead —
+      "85% used, slow pace, reset near" sheds low-priority work only.
     - **burst multiple** — M from :func:`burst_multiple`, band edges
       scaled by the early-window ramp γ (see the band-edges comment
       block above): ``M < burst_tight×γ`` → TIGHT, ``M <
@@ -667,25 +671,49 @@ def evaluate_quota_severity(
             continue
         for w in windows:
             pname = provider.provider_name
-            if w.utilization is not None:
-                w_threshold = _raw_threshold_for(w, raw_threshold)
-                if w.utilization >= w_threshold:
-                    candidates.append((
-                        Severity.TIGHT, 0, w.utilization,
-                        f"quota_saturated:{pname}:{w.key}@{w.utilization:.2f}",
-                        pname, w.key, None, None,
-                    ))
+            # Pace signal first — the raw wall consults it below.
+            m: Optional[float] = None
+            gamma: Optional[float] = None
             if (
                 w.on_pace_utilization is not None
                 and w.utilization is not None
             ):
                 m = burst_multiple(w.utilization, w.on_pace_utilization)
-                if m is None:
-                    continue
-                # elapsed_fraction = util / on_pace (P = u / ef). Both
-                # inputs are positive here per burst_multiple's guards.
-                elapsed_fraction = w.utilization / w.on_pace_utilization
-                gamma = min(1.0, elapsed_fraction / ramp_fraction)
+                if m is not None:
+                    # elapsed_fraction = util / on_pace (P = u / ef).
+                    # Both inputs are positive per burst_multiple's
+                    # guards.
+                    elapsed_fraction = w.utilization / w.on_pace_utilization
+                    gamma = min(1.0, elapsed_fraction / ramp_fraction)
+
+            if w.utilization is not None:
+                w_threshold = _raw_threshold_for(w, raw_threshold)
+                if w.utilization >= w_threshold:
+                    # Coasting demotion: when this window's own pace
+                    # shows the cap won't be hit (M clears the
+                    # ELEVATED edge — e.g. 85% used, slow pace, reset
+                    # near), the wall grades ELEVATED instead of
+                    # TIGHT: low-priority work still yields (absolute
+                    # headroom IS thin and turns are bursty — reserve
+                    # the tail for interactive work), but normal
+                    # pollers keep their feeds fresh through the
+                    # window tail. Without pace evidence (pegged /
+                    # derived / early window — projection absent by
+                    # design) the wall stays TIGHT: it's the only
+                    # signal we have.
+                    wall_severity = Severity.TIGHT
+                    if (
+                        m is not None and gamma is not None
+                        and m >= burst_elevated * gamma
+                    ):
+                        wall_severity = Severity.ELEVATED
+                    candidates.append((
+                        wall_severity, 0, w.utilization,
+                        f"quota_saturated:{pname}:{w.key}@{w.utilization:.2f}",
+                        pname, w.key, m, gamma,
+                    ))
+
+            if m is not None and gamma is not None:
                 if m < burst_tight * gamma:
                     candidates.append((
                         Severity.TIGHT, 1, -m,

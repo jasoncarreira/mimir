@@ -15,8 +15,10 @@ ELEVATED, ``normal`` at TIGHT, everything at BLOCKED. See
    window: how many times the established pace the agent would have
    to sustain for the rest of the window to hit 100%, with an
    early-window confidence ramp. Raw utilization ≥
-   ``plan_window_suppress_threshold`` (default 0.80) stays a TIGHT
-   wall. See ``mimir.billing.evaluate_quota_severity``.
+   ``plan_window_suppress_threshold`` (default 0.80) is a TIGHT
+   wall, demoted to ELEVATED when the window's own pace shows
+   coasting (M ≥ the ELEVATED edge). See
+   ``mimir.billing.evaluate_quota_severity``.
 3. ``pay-as-you-go`` (API) mode — cost-rate alert (hourly limit or
    spike vs 7d baseline) → TIGHT; within 80% of either trip →
    ELEVATED; plan-window raw saturation, when data exists, stays a
