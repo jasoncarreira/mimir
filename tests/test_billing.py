@@ -322,16 +322,16 @@ def test_evaluate_quota_burst_multiple_time_left_asymmetry():
 
 
 def test_evaluate_quota_mid_band_is_elevated():
-    """1.5 <= M < 2 (post-ramp) → ELEVATED: shed low-priority work
-    only. u=0.40 projecting to 0.85 → M = 0.60/0.45 ≈ 1.33... pick
-    u=0.40 → 0.75: M = 0.60/0.35 ≈ 1.71."""
+    """1.5 <= M < 2 (post-ramp, projection past the floor) →
+    ELEVATED: shed low-priority work only. u=0.45 projecting to
+    0.80 → M = 0.55/0.35 ≈ 1.57."""
     provider = _FakeProvider("anthropic", [
-        _w("seven_day", 0.40, 0.75),    # ef=0.533 (γ=1), M≈1.71
+        _w("seven_day", 0.45, 0.80),    # ef=0.5625 (γ=1), M≈1.57
     ])
     result = evaluate_quota_severity([provider])
     assert result.severity is Severity.ELEVATED
     assert "quota_pace_elevated" in result.reason
-    assert result.burst_multiple == pytest.approx(1.71, abs=0.01)
+    assert result.burst_multiple == pytest.approx(1.57, abs=0.01)
 
 
 def test_evaluate_quota_early_window_ramp_gives_wiggle_room():
@@ -356,7 +356,7 @@ def test_evaluate_quota_early_window_ramp_gives_wiggle_room():
 
 def test_evaluate_quota_raw_saturation_is_tight():
     provider = _FakeProvider("anthropic", [
-        _w("seven_day", 0.85, 0.50),  # raw 0.85 >= 0.80 default
+        _w("seven_day", 0.92, 0.50),  # raw 0.92 >= 0.90 wall
     ])
     result = evaluate_quota_severity([provider])
     assert result.severity is Severity.TIGHT
@@ -364,6 +364,49 @@ def test_evaluate_quota_raw_saturation_is_tight():
     assert "anthropic:seven_day" in result.reason
     assert result.provider == "anthropic"
     assert result.window_key == "seven_day"
+
+
+def test_evaluate_quota_below_wall_without_hot_pace_is_clear():
+    """85% used no longer trips the wall (0.80 → 0.90): the pace
+    bands own "heading toward the cap"; the absolute wall only
+    catches "genuinely almost out"."""
+    provider = _FakeProvider("anthropic", [
+        _w("seven_day", 0.85, None),   # no pace signal, under the wall
+    ])
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.CLEAR
+
+
+def test_evaluate_quota_wall_boundary_inclusive():
+    provider = _FakeProvider("anthropic", [
+        _w("seven_day", 0.90, None),
+    ])
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.TIGHT
+    assert "quota_saturated" in result.reason
+
+
+def test_evaluate_quota_pace_floor_gates_bands():
+    """The M bands engage only when the projection clears the 0.75
+    floor. Muninn's live case: 28% used, projected 68%, M=1.79 —
+    previously ELEVATED (heartbeats dark for days over a window
+    headed to 68%); now CLEAR. Same M past the floor still grades."""
+    below_floor = _FakeProvider("anthropic", [
+        _w("seven_day", 0.28, 0.68),   # M≈1.79, projection under floor
+    ])
+    assert evaluate_quota_severity([below_floor]).severity is Severity.CLEAR
+
+    at_floor = _FakeProvider("anthropic", [
+        _w("seven_day", 0.309, 0.75),  # M≈1.57, projection == floor (not >)
+    ])
+    assert evaluate_quota_severity([at_floor]).severity is Severity.CLEAR
+
+    past_floor = _FakeProvider("anthropic", [
+        _w("seven_day", 0.32, 0.78),   # M≈1.48, projection clears floor
+    ])
+    result = evaluate_quota_severity([past_floor])
+    assert result.severity is Severity.TIGHT
+    assert "quota_off_pace" in result.reason
 
 
 def test_evaluate_quota_off_pace_5h_is_tight():
@@ -390,7 +433,7 @@ def test_evaluate_quota_raw_takes_precedence_over_on_pace():
     """When BOTH raw and pace land in the same severity, raw wins
     (we're AT the wall vs. heading toward it)."""
     provider = _FakeProvider("anthropic", [
-        _w("seven_day", 0.85, 0.99),  # raw 85% (saturated) AND off-pace
+        _w("seven_day", 0.92, 0.99),  # raw 92% (over the wall) AND off-pace
     ])
     result = evaluate_quota_severity([provider])
     assert result.severity is Severity.TIGHT
@@ -465,8 +508,9 @@ def test_arbiter_quota_mode_off_pace_sheds_by_priority(tmp_path):
 
 
 def test_arbiter_quota_mode_elevated_sheds_low_only(tmp_path):
-    """ELEVATED (1.5 <= M < 2): low sheds, normal + high fire."""
-    provider = _FakeProvider("anthropic", [_w("seven_day", 0.40, 0.75)])
+    """ELEVATED (1.5 <= M < 2, projection past the floor): low
+    sheds, normal + high fire."""
+    provider = _FakeProvider("anthropic", [_w("seven_day", 0.45, 0.80)])
     arb = _quota_arbiter(tmp_path, [provider])
     low = arb.should_fire(priority="low", now=NOW)
     normal = arb.should_fire(priority="normal", now=NOW)
@@ -482,7 +526,7 @@ def test_arbiter_unknown_priority_treated_as_normal(tmp_path):
     """Defense-in-depth: an unrecognized priority string behaves like
     ``normal`` (parse layers already normalize, but the arbiter must
     not crash or fail-closed on garbage)."""
-    provider = _FakeProvider("anthropic", [_w("seven_day", 0.40, 0.75)])
+    provider = _FakeProvider("anthropic", [_w("seven_day", 0.45, 0.80)])
     arb = _quota_arbiter(tmp_path, [provider])
     decision = arb.should_fire(priority="urgent", now=NOW)
     # ELEVATED tolerated by normal → fires.
@@ -615,13 +659,14 @@ def test_evaluate_quota_derived_5h_at_threshold_boundary_suppresses():
     assert "five_hour@0.90" in result.reason
 
 
-def test_evaluate_quota_direct_5h_at_85_still_suppresses():
-    """Invariant: chainlink #17 doesn't loosen direct 5h thresholds.
-    Direct 5h at 0.85 still trips the 0.80 wall."""
-    provider = _FakeProvider("anthropic", [_w("five_hour", 0.85, None)])
+def test_evaluate_quota_direct_5h_at_92_trips_wall():
+    """Direct and derived walls are both 0.90 since the pace-floor
+    recalibration (the chainlink #17 looser-for-derived gap closed
+    when the direct wall moved 0.80 → 0.90)."""
+    provider = _FakeProvider("anthropic", [_w("five_hour", 0.92, None)])
     result = evaluate_quota_severity([provider])
     assert result.severity is Severity.TIGHT
-    assert "five_hour@0.85" in result.reason
+    assert "five_hour@0.92" in result.reason
 
 
 def test_evaluate_quota_derived_propagates_through_anthropic_provider(tmp_path):
@@ -1124,22 +1169,22 @@ def test_raw_wall_demoted_to_elevated_when_coasting():
     """Over the wall but coasting (M clears the ELEVATED edge): the
     wall grades ELEVATED, not TIGHT — low still yields (absolute
     headroom is thin, turns are bursty), normal pollers keep firing
-    through the window tail. u=0.85 projecting to only 0.86 → M =
-    0.15/0.01 = 15."""
+    through the window tail. u=0.92 projecting to only 0.93 → M =
+    0.08/0.01 = 8."""
     provider = _FakeProvider("anthropic", [
-        _w("seven_day", 0.85, 0.86),
+        _w("seven_day", 0.92, 0.93),
     ])
     result = evaluate_quota_severity([provider])
     assert result.severity is Severity.ELEVATED
     assert "quota_saturated" in result.reason
-    assert result.burst_multiple == pytest.approx(15.0, abs=0.1)
+    assert result.burst_multiple == pytest.approx(8.0, abs=0.1)
 
 
 def test_raw_wall_stays_tight_without_pace_evidence():
     """No projection (pegged / derived / early window) → no demotion;
     the wall is the only signal and stays TIGHT."""
     provider = _FakeProvider("anthropic", [
-        _w("seven_day", 0.85, None),
+        _w("seven_day", 0.92, None),
     ])
     result = evaluate_quota_severity([provider])
     assert result.severity is Severity.TIGHT
@@ -1150,7 +1195,7 @@ def test_raw_wall_stays_tight_when_pace_does_not_clear():
     """Over the wall AND still on pace to exceed (M below the ELEVATED
     edge) → TIGHT; demotion needs genuine coasting evidence."""
     provider = _FakeProvider("anthropic", [
-        _w("seven_day", 0.85, 0.99),  # M = 0.15/0.14 ≈ 1.07
+        _w("seven_day", 0.92, 0.99),  # M = 0.08/0.07 ≈ 1.14
     ])
     result = evaluate_quota_severity([provider])
     assert result.severity is Severity.TIGHT

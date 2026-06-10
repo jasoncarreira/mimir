@@ -6,6 +6,22 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Quota severity recalibrated: pace floor + higher wall.** The M bands
+  now engage only when the projected end-of-window utilization exceeds
+  **75%** — a window not even projected near its cap has no quota story to
+  tell, no matter how small M is. Observed live: muninn's heartbeats went
+  dark over a projected-68% week because M sat at 1.79 (ELEVATED); that
+  case now grades CLEAR. The raw-utilization wall moves **0.80 → 0.90**
+  (`plan_window_suppress_threshold` default): with pace bands carrying the
+  "heading toward the cap" signal above the floor, the absolute wall only
+  needs to catch "genuinely almost out". The canonical time-left asymmetry
+  is unchanged (projected 80% @ 1 day left → CLEAR; @ 5 days left → TIGHT),
+  and the wall move makes the direct and derived (chainlink #17) thresholds
+  equal at 0.90. The early-recovery probe's hot-window veto follows the
+  same threshold.
+
 ## [0.3.3] — 2026-06-10
 
 ### Added

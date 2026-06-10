@@ -905,7 +905,7 @@ class Scheduler:
             snaps = {k: v for k, v in snaps.items() if k in allowed}
         if not snaps:
             return
-        wall = getattr(self._arbiter, "plan_window_suppress_threshold", 0.80)
+        wall = getattr(self._arbiter, "plan_window_suppress_threshold", 0.90)
         fresh_seen = False
         for snap in snaps.values():
             if snap.utilization is None:

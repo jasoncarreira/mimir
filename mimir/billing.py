@@ -482,10 +482,22 @@ def build_quota_providers(
 # ─── suppression evaluation ────────────────────────────────────────────
 
 
-# Defaults. The raw-utilization threshold matches the existing
-# ``plan_window_suppress_threshold`` for backward compatibility (we
-# previously suppressed at raw 0.80).
-DEFAULT_RAW_SUPPRESS_THRESHOLD = 0.80
+# Defaults. The raw-utilization wall moved 0.80 → 0.90 with the pace
+# floor below: pace bands now carry the "heading toward the cap"
+# signal once the projection clears the floor, so the absolute wall
+# only needs to catch "genuinely almost out" — at 90% consumed,
+# autonomous work defers regardless of how flattering the pace looks
+# (subject to the coasting demotion).
+DEFAULT_RAW_SUPPRESS_THRESHOLD = 0.90
+
+# Pace floor: the M bands engage only when the projected end-of-window
+# utilization exceeds this. A window not even projected to reach 75%
+# of its cap has no quota story to tell — grading its pace headroom
+# just starves low-priority maintenance (observed live: muninn's
+# heartbeats went dark for days over a projected-68% week because
+# M sat at 1.79). Below the floor, severity from this window is CLEAR
+# no matter how small M is.
+DEFAULT_PACE_PROJECTION_FLOOR = 0.75
 # chainlink #17: derived 5h utilization (cost-rate-back-derived during
 # endpoint glitches) gets a looser raw-suppress threshold than direct
 # readings. The estimator rounds to 5pp + uses an empirical ~10× 5h:7d
@@ -498,6 +510,10 @@ DEFAULT_RAW_SUPPRESS_THRESHOLD = 0.80
 # (different plan tier, telemetry-confirmed re-calibration via
 # ``MIMIR_QUOTA_5H_BACKDERIVE_FACTOR``), the variance band of the
 # derived estimate shifts and this threshold may need to move with it.
+# NOTE: with the direct wall now also at 0.90 the derived/direct gap
+# has closed — kept as a named constant so the looser-for-derived
+# distinction can reopen (e.g. 0.95) if derived readings false-trip
+# the wall in practice.
 DEFAULT_RAW_SUPPRESS_DERIVED = 0.90
 
 # ─── severity bands (priority-banded suppression) ──────────────────────
@@ -625,6 +641,7 @@ def evaluate_quota_severity(
     burst_tight: float = DEFAULT_BURST_TIGHT,
     burst_elevated: float = DEFAULT_BURST_ELEVATED,
     ramp_fraction: float = DEFAULT_RAMP_FRACTION,
+    pace_floor: float = DEFAULT_PACE_PROJECTION_FLOOR,
 ) -> QuotaSeverityResult:
     """Across all configured providers, grade quota pressure into a
     :class:`Severity`. Worst window wins; within the same severity a
@@ -646,7 +663,10 @@ def evaluate_quota_severity(
     - **burst multiple** — M from :func:`burst_multiple`, band edges
       scaled by the early-window ramp γ (see the band-edges comment
       block above): ``M < burst_tight×γ`` → TIGHT, ``M <
-      burst_elevated×γ`` → ELEVATED.
+      burst_elevated×γ`` → ELEVATED. The bands engage only when the
+      projection clears ``pace_floor`` (default 0.75) — a window not
+      projected to get near its cap has no quota story to tell, no
+      matter how small M is.
 
     Returns CLEAR when no provider reports any data. Missing data is
     "we don't know" not "we're suppressed" — cold starts and poller
@@ -713,7 +733,11 @@ def evaluate_quota_severity(
                         pname, w.key, m, gamma,
                     ))
 
-            if m is not None and gamma is not None:
+            if (
+                m is not None and gamma is not None
+                and w.on_pace_utilization is not None
+                and w.on_pace_utilization > pace_floor
+            ):
                 if m < burst_tight * gamma:
                     candidates.append((
                         Severity.TIGHT, 1, -m,
