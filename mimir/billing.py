@@ -1,18 +1,20 @@
-"""Billing-mode-aware suppression for the S3-S4 homeostat (chainlink #13).
+"""Billing-mode-aware severity grading for the S3-S4 homeostat
+(chainlink #13; priority-banded suppression).
 
 Two billing modes, per-install (single mode):
 
 - ``quota`` — provider has plan windows (5h + 1-week) with hard caps
-  and zero marginal cost up to the cap. Suppression input: on-pace
-  projection across configured windows, plus the existing raw-
-  utilization "literal wall" check at ``plan_window_suppress_threshold``.
-  Cost-rate spikes are demoted to advisory (logged, not suppressing).
+  and zero marginal cost up to the cap. Severity input: the burst-
+  multiple pace bands per window (:func:`evaluate_quota_severity`),
+  plus the raw-utilization "literal wall" check at
+  ``plan_window_suppress_threshold``. Cost-rate spikes are demoted to
+  advisory (logged, not a severity input).
 
-- ``pay-as-you-go`` — provider charges per token. Suppression input:
-  current ``cost_rate_alert`` behavior (``spike_ratio`` against a
-  rolling-week baseline). Plan-window data, if present, is ignored
-  for suppression decisions in this mode (it's not the binding
-  constraint when every token costs real money — the spike check is).
+- ``pay-as-you-go`` — provider charges per token. Severity input:
+  ``cost_rate_alert`` (hourly limit / ``spike_ratio`` against a
+  rolling-week baseline) → TIGHT, near-trip → ELEVATED (graded in
+  ``mimir.budget``). Plan-window data, when present, stays a TIGHT
+  sanity wall.
 
 Auto-detect default: presence of any OAuth signal
 (``CLAUDE_CODE_OAUTH_TOKEN`` env var, or ``MIMIR_CLAUDE_OAUTH_CREDENTIALS``
@@ -37,7 +39,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Optional
 
@@ -146,7 +148,7 @@ class QuotaWindow:
     ``derived`` (chainlink #17): true when this window's utilization
     was estimated from cost data (the cost-rate-back-derived 5h
     estimator that fires when the endpoint reading is rejected as
-    anomalous by layer (a)). Causes :func:`evaluate_quota` to apply
+    anomalous by layer (a)). Causes :func:`evaluate_quota_severity` to apply
     a looser raw-suppress threshold for this window — derived values
     are approximations and shouldn't trip the wall threshold as
     aggressively as direct readings."""
@@ -482,14 +484,8 @@ def build_quota_providers(
 
 # Defaults. The raw-utilization threshold matches the existing
 # ``plan_window_suppress_threshold`` for backward compatibility (we
-# previously suppressed at raw 0.80). The on-pace thresholds are
-# looser because projections are noisier than ground truth — we want
-# to suppress when we WILL blow past quota, not flap on every tick.
-# 5h windows get a tighter threshold than 7d because there's less
-# time for the projection to be wrong.
+# previously suppressed at raw 0.80).
 DEFAULT_RAW_SUPPRESS_THRESHOLD = 0.80
-DEFAULT_ON_PACE_SUPPRESS_5H = 0.90
-DEFAULT_ON_PACE_SUPPRESS_7D = 0.95
 # chainlink #17: derived 5h utilization (cost-rate-back-derived during
 # endpoint glitches) gets a looser raw-suppress threshold than direct
 # readings. The estimator rounds to 5pp + uses an empirical ~10× 5h:7d
@@ -504,14 +500,91 @@ DEFAULT_ON_PACE_SUPPRESS_7D = 0.95
 # derived estimate shifts and this threshold may need to move with it.
 DEFAULT_RAW_SUPPRESS_DERIVED = 0.90
 
+# ─── severity bands (priority-banded suppression) ──────────────────────
+#
+# The binary suppress/fire decision is generalized into a severity
+# ladder so autonomous work can shed by priority instead of all-or-
+# nothing (heartbeats only). The QUOTA-mode signal is the **burst
+# multiple** M — how many times the established burn pace the agent
+# would have to sustain for the REST of the window to hit 100%:
+#
+#   M = (1 - util) / (pace × time_left) = ((1 - util) / util) × (elapsed / left)
+#
+# which, given the on-pace projection P = util / elapsed_fraction the
+# providers already compute, reduces to M = (1 - u) / (P - u). The same
+# projected end-of-window value means very different risk depending on
+# time remaining: projected 80% with 1 day left of a 7d window needs
+# ~2.75× the established pace to actually bust the cap (safe), while
+# projected 80% with 5 days left busts at only ~1.35× (fragile). M
+# captures that directly — utilization, pace, and time-left in one
+# number; lower M = less headroom.
+#
+# Band edges (post-ramp): M < BURST_TIGHT → TIGHT, M < BURST_ELEVATED →
+# ELEVATED, else CLEAR. Early-window wiggle: pace estimated over a
+# small elapsed fraction is noisy (one busy hour at the start of a 7d
+# window reads as a furious pace), so the edges are scaled by
+# γ = min(1, elapsed_fraction / RAMP_FRACTION) — at 10% elapsed the
+# TIGHT edge is 1.5×0.4 = 0.6, so only a genuinely extreme burn rate
+# suppresses anything early; by RAMP_FRACTION elapsed the bands apply
+# at full strength. Below ``project_window_end``'s
+# ``min_elapsed_fraction`` there is no projection at all and severity
+# falls back to raw utilization only.
+DEFAULT_BURST_TIGHT = 1.5
+DEFAULT_BURST_ELEVATED = 2.0
+DEFAULT_RAMP_FRACTION = 0.25
 
-def _on_pace_threshold(window_key: str) -> float:
-    """5h windows are tighter; 7d windows are looser. Unknown keys
-    default to the 7d threshold (conservative — projections over
-    longer horizons are less reliable, so demand more headroom)."""
-    if window_key == "five_hour":
-        return DEFAULT_ON_PACE_SUPPRESS_5H
-    return DEFAULT_ON_PACE_SUPPRESS_7D
+
+class Severity(IntEnum):
+    """Autonomy-throttle severity, worst-signal-wins. Ordered so
+    comparisons read naturally (``severity >= Severity.TIGHT``)."""
+
+    CLEAR = 0      # full speed — nothing tripped
+    ELEVATED = 1   # headroom shrinking — shed low-priority work
+    TIGHT = 2      # raw wall / on pace to exceed — shed low + normal
+    BLOCKED = 3    # recorded 429 pause — provider refusing; shed all
+
+
+# Work priorities and the worst severity each still fires under.
+# ``low`` (heartbeats by default) yields at the first sign of pressure;
+# ``high`` digs into the quota tail for near-interactive feeds; nothing
+# fires under BLOCKED (the provider is actively refusing — headroom
+# math is moot).
+PRIORITY_LEVELS = ("low", "normal", "high")
+_PRIORITY_TOLERANCE: dict[str, Severity] = {
+    "low": Severity.CLEAR,
+    "normal": Severity.ELEVATED,
+    "high": Severity.TIGHT,
+}
+
+
+def normalize_priority(raw: object, *, default: str = "normal") -> str:
+    """Coerce an operator-supplied priority value to a known level.
+    Unknown / non-string values fall back to ``default`` (callers warn
+    with their own file/entry context)."""
+    if isinstance(raw, str) and raw.strip().lower() in PRIORITY_LEVELS:
+        return raw.strip().lower()
+    return default
+
+
+def priority_tolerates(priority: str, severity: Severity) -> bool:
+    """True when work of ``priority`` should still fire under
+    ``severity``. Unknown priorities are treated as ``normal``."""
+    tolerance = _PRIORITY_TOLERANCE.get(priority, _PRIORITY_TOLERANCE["normal"])
+    return severity <= tolerance
+
+
+def burst_multiple(
+    utilization: float, on_pace_utilization: float,
+) -> float | None:
+    """The burst multiple M from current utilization + the on-pace
+    projection (see the band-edges comment block above). None when the
+    inputs carry no usable rate signal (zero utilization, projection
+    not above current — i.e. window effectively over)."""
+    if utilization <= 0.0 or on_pace_utilization <= utilization:
+        return None
+    if utilization >= 1.0:
+        return 0.0
+    return (1.0 - utilization) / (on_pace_utilization - utilization)
 
 
 def _raw_threshold_for(window: "QuotaWindow", direct_threshold: float) -> float:
@@ -525,43 +598,67 @@ def _raw_threshold_for(window: "QuotaWindow", direct_threshold: float) -> float:
 
 
 @dataclass(frozen=True)
-class QuotaSuppressionResult:
-    """Decision output of :func:`evaluate_quota`.
+class QuotaSeverityResult:
+    """Decision output of :func:`evaluate_quota_severity`.
 
-    ``reason`` follows the same shape as the existing
-    ``plan_window_saturated:<key>@<util>`` format so downstream
-    rendering / introspection counts don't have to special-case the
-    new strings:
+    ``reason`` keeps the legacy shapes for the suppressing bands
+    (``quota_saturated:<provider>:<key>@<util>`` /
+    ``quota_off_pace:<provider>:<key>@<on_pace>``) so downstream
+    rendering / introspection counts don't have to special-case;
+    ELEVATED adds ``quota_pace_elevated:<provider>:<key>@<on_pace>``.
+    ``burst_multiple`` / ``gamma`` are carried for event payloads and
+    operator triage (None when the deciding signal was raw-utilization
+    rather than pace)."""
 
-    - ``"ok"`` — no suppression
-    - ``"quota_saturated:<provider>:<key>@<util>"`` — raw utilization
-      crossed the wall threshold
-    - ``"quota_off_pace:<provider>:<key>@<on_pace>"`` — projection
-      crossed the on-pace threshold for that window size
-    """
-
-    suppress: bool
+    severity: Severity
     reason: str
     provider: Optional[str]
     window_key: Optional[str]
+    burst_multiple: Optional[float] = None
+    gamma: Optional[float] = None
 
 
-def evaluate_quota(
+def evaluate_quota_severity(
     providers: list[QuotaProvider],
     *,
     raw_threshold: float = DEFAULT_RAW_SUPPRESS_THRESHOLD,
-) -> QuotaSuppressionResult:
-    """Across all configured providers, decide whether to suppress.
+    burst_tight: float = DEFAULT_BURST_TIGHT,
+    burst_elevated: float = DEFAULT_BURST_ELEVATED,
+    ramp_fraction: float = DEFAULT_RAMP_FRACTION,
+) -> QuotaSeverityResult:
+    """Across all configured providers, grade quota pressure into a
+    :class:`Severity`. Worst window wins; within the same severity a
+    raw-utilization hit outranks a pace hit (we're AT the wall vs.
+    heading toward it), then the tighter reading wins.
 
-    Worst-case wins (most-suppressive provider/window). Raw-utilization
-    saturation takes precedence over on-pace projection — if we're
-    already at the wall, no point projecting forward.
+    Signals per window:
 
-    Returns ``suppress=False`` when no provider reports any data.
-    Missing data is "we don't know" not "we're suppressed" — cold
-    starts and poller hiccups shouldn't gate scheduled work."""
-    raw_hits: list[tuple[str, str, float]] = []  # (provider, key, util)
-    on_pace_hits: list[tuple[str, str, float]] = []  # (provider, key, on_pace)
+    - **raw wall** — ``utilization >= raw_threshold`` (looser for
+      ``derived`` readings, chainlink #17) → TIGHT. Near the cap the
+      absolute headroom is small and one big turn can peg the bucket
+      — M can't see burst risk because a burst is precisely a
+      departure from established pace. Also the only signal for
+      pegged buckets / derived / early windows, where
+      ``on_pace_utilization`` is None by design. **Coasting
+      demotion:** when the same window's pace shows the cap won't be
+      hit (M ≥ the ELEVATED edge), the wall grades ELEVATED instead —
+      "85% used, slow pace, reset near" sheds low-priority work only.
+    - **burst multiple** — M from :func:`burst_multiple`, band edges
+      scaled by the early-window ramp γ (see the band-edges comment
+      block above): ``M < burst_tight×γ`` → TIGHT, ``M <
+      burst_elevated×γ`` → ELEVATED.
+
+    Returns CLEAR when no provider reports any data. Missing data is
+    "we don't know" not "we're suppressed" — cold starts and poller
+    hiccups shouldn't gate scheduled work. BLOCKED is never produced
+    here: a recorded 429 pause is the arbiter's call (it owns the
+    pause tracker), layered above this evaluation."""
+    # Candidates: (severity, kind_rank, tightness, reason, provider,
+    # key, M, gamma). kind_rank 0 = raw (outranks pace at equal
+    # severity); tightness orders within a kind (higher = worse).
+    candidates: list[
+        tuple[Severity, int, float, str, str, str, Optional[float], Optional[float]]
+    ] = []
 
     for provider in providers:
         try:
@@ -573,36 +670,75 @@ def evaluate_quota(
             )
             continue
         for w in windows:
+            pname = provider.provider_name
+            # Pace signal first — the raw wall consults it below.
+            m: Optional[float] = None
+            gamma: Optional[float] = None
+            if (
+                w.on_pace_utilization is not None
+                and w.utilization is not None
+            ):
+                m = burst_multiple(w.utilization, w.on_pace_utilization)
+                if m is not None:
+                    # elapsed_fraction = util / on_pace (P = u / ef).
+                    # Both inputs are positive per burst_multiple's
+                    # guards.
+                    elapsed_fraction = w.utilization / w.on_pace_utilization
+                    gamma = min(1.0, elapsed_fraction / ramp_fraction)
+
             if w.utilization is not None:
                 w_threshold = _raw_threshold_for(w, raw_threshold)
                 if w.utilization >= w_threshold:
-                    raw_hits.append((provider.provider_name, w.key, w.utilization))
-            if w.on_pace_utilization is not None:
-                threshold = _on_pace_threshold(w.key)
-                if w.on_pace_utilization >= threshold:
-                    on_pace_hits.append(
-                        (provider.provider_name, w.key, w.on_pace_utilization)
-                    )
+                    # Coasting demotion: when this window's own pace
+                    # shows the cap won't be hit (M clears the
+                    # ELEVATED edge — e.g. 85% used, slow pace, reset
+                    # near), the wall grades ELEVATED instead of
+                    # TIGHT: low-priority work still yields (absolute
+                    # headroom IS thin and turns are bursty — reserve
+                    # the tail for interactive work), but normal
+                    # pollers keep their feeds fresh through the
+                    # window tail. Without pace evidence (pegged /
+                    # derived / early window — projection absent by
+                    # design) the wall stays TIGHT: it's the only
+                    # signal we have.
+                    wall_severity = Severity.TIGHT
+                    if (
+                        m is not None and gamma is not None
+                        and m >= burst_elevated * gamma
+                    ):
+                        wall_severity = Severity.ELEVATED
+                    candidates.append((
+                        wall_severity, 0, w.utilization,
+                        f"quota_saturated:{pname}:{w.key}@{w.utilization:.2f}",
+                        pname, w.key, m, gamma,
+                    ))
 
-    if raw_hits:
-        provider, key, util = max(raw_hits, key=lambda t: t[2])
-        return QuotaSuppressionResult(
-            suppress=True,
-            reason=f"quota_saturated:{provider}:{key}@{util:.2f}",
-            provider=provider,
-            window_key=key,
+            if m is not None and gamma is not None:
+                if m < burst_tight * gamma:
+                    candidates.append((
+                        Severity.TIGHT, 1, -m,
+                        f"quota_off_pace:{pname}:{w.key}@{w.on_pace_utilization:.2f}",
+                        pname, w.key, m, gamma,
+                    ))
+                elif m < burst_elevated * gamma:
+                    candidates.append((
+                        Severity.ELEVATED, 1, -m,
+                        f"quota_pace_elevated:{pname}:{w.key}@{w.on_pace_utilization:.2f}",
+                        pname, w.key, m, gamma,
+                    ))
+
+    if not candidates:
+        return QuotaSeverityResult(
+            severity=Severity.CLEAR, reason="ok",
+            provider=None, window_key=None,
         )
-    if on_pace_hits:
-        provider, key, on_pace = max(on_pace_hits, key=lambda t: t[2])
-        return QuotaSuppressionResult(
-            suppress=True,
-            reason=f"quota_off_pace:{provider}:{key}@{on_pace:.2f}",
-            provider=provider,
-            window_key=key,
-        )
-    return QuotaSuppressionResult(
-        suppress=False,
-        reason="ok",
-        provider=None,
-        window_key=None,
+    severity, _kind, _tight, reason, pname, key, m, gamma = max(
+        candidates, key=lambda c: (c[0], -c[1], c[2]),
     )
+    return QuotaSeverityResult(
+        severity=severity, reason=reason,
+        provider=pname, window_key=key,
+        burst_multiple=m, gamma=gamma,
+    )
+
+

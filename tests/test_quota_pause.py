@@ -476,3 +476,63 @@ def test_headerless_429_does_not_shorten_active_authoritative_pause(tmp_path: Pa
     reloaded = QuotaPauseTracker(path)
     assert reloaded.reset_at == auth_reset
     assert reloaded.is_paused(now=now + timedelta(minutes=1)).reason == "quota_exhausted"
+
+
+# ─── recorded_at (early-recovery probe support) ────────────────────────
+
+
+def test_pause_records_recorded_at_and_persists(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from mimir.quota_pause import QuotaPauseTracker
+
+    path = tmp_path / "quota_pause.json"
+    now = datetime.now(tz=timezone.utc)
+    tracker = QuotaPauseTracker(path)
+    tracker.pause_until(now + timedelta(hours=2), now=now)
+    assert tracker.recorded_at == now
+
+    # Round-trips through the state file.
+    reloaded = QuotaPauseTracker(path)
+    assert reloaded.recorded_at == now
+
+
+def test_recorded_at_defaults_to_wall_clock(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from mimir.quota_pause import QuotaPauseTracker
+
+    before = datetime.now(tz=timezone.utc)
+    tracker = QuotaPauseTracker(tmp_path / "quota_pause.json")
+    tracker.pause_until(before + timedelta(hours=1))
+    after = datetime.now(tz=timezone.utc)
+    assert tracker.recorded_at is not None
+    assert before <= tracker.recorded_at <= after
+
+
+def test_recorded_at_cleared_with_pause(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from mimir.quota_pause import QuotaPauseTracker
+
+    now = datetime.now(tz=timezone.utc)
+    tracker = QuotaPauseTracker(tmp_path / "quota_pause.json")
+    tracker.pause_until(now + timedelta(hours=1), now=now)
+    tracker.clear()
+    assert tracker.recorded_at is None
+
+
+def test_recorded_at_missing_in_old_state_file(tmp_path):
+    """State files written before the field existed load as None —
+    the early-recovery probe then falls back to plain reset expiry."""
+    import json
+    from datetime import datetime, timedelta, timezone
+    from mimir.quota_pause import QuotaPauseTracker
+
+    path = tmp_path / "quota_pause.json"
+    reset = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+    path.write_text(json.dumps({
+        "reset_at": reset.isoformat(),
+        "reason": "quota_exhausted",
+        "provider": "anthropic",
+    }), encoding="utf-8")
+    tracker = QuotaPauseTracker(path)
+    assert tracker.is_paused().paused is True
+    assert tracker.recorded_at is None

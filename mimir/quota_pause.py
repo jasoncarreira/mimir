@@ -118,6 +118,12 @@ class QuotaPauseTracker:
         self._reset_at: datetime | None = None
         self._reason: str | None = None
         self._provider: str | None = None
+        # When the current pause was recorded. Lets the early-recovery
+        # recheck (scheduler) distinguish quota observations made AFTER
+        # the 429 from stale pre-pause readings. None on state files
+        # written before this field existed — the recheck then falls
+        # back to plain reset-at expiry.
+        self._recorded_at: datetime | None = None
         # Transient-backoff escalation state (see _transient_backoff_seconds).
         # ``_last_transient_at`` tracks the last *header-less/transient*
         # backoff only — authoritative caps deliberately leave it untouched
@@ -144,6 +150,12 @@ class QuotaPauseTracker:
         """The provider label recorded with the current pause, if any."""
         return self._provider
 
+    @property
+    def recorded_at(self) -> datetime | None:
+        """When the current pause was recorded, if known. None for
+        pauses persisted before this field existed."""
+        return self._recorded_at
+
     # ── persistence ─────────────────────────────────────────────────
 
     def _load(self) -> None:
@@ -168,6 +180,14 @@ class QuotaPauseTracker:
                 self._reset_at = None
         self._reason = data.get("reason") or None
         self._provider = data.get("provider") or None
+        raw_recorded = data.get("recorded_at")
+        if isinstance(raw_recorded, str):
+            try:
+                self._recorded_at = datetime.fromisoformat(
+                    raw_recorded.replace("Z", "+00:00"),
+                )
+            except ValueError:
+                self._recorded_at = None
         raw_consecutive = data.get("consecutive")
         self._consecutive = raw_consecutive if isinstance(raw_consecutive, int) and raw_consecutive >= 0 else 0
         raw_last = data.get("last_transient_at")
@@ -182,6 +202,7 @@ class QuotaPauseTracker:
             "reset_at": self._reset_at.isoformat() if self._reset_at else None,
             "reason": self._reason,
             "provider": self._provider,
+            "recorded_at": self._recorded_at.isoformat() if self._recorded_at else None,
             "consecutive": self._consecutive,
             "last_transient_at": self._last_transient_at.isoformat() if self._last_transient_at else None,
         }
@@ -204,10 +225,12 @@ class QuotaPauseTracker:
         *,
         reason: str = "quota_exhausted",
         provider: str | None = None,
+        now: datetime | None = None,
     ) -> None:
         """Record that the agent should treat itself as quota-paused
         until ``reset_at``. Idempotent — overwrites any existing pause
         (the newest pause wins, since it has the freshest reset info).
+        ``now`` (tests) overrides the ``recorded_at`` stamp.
 
         Does NOT touch the transient-backoff escalation clock
         (``_consecutive`` / ``_last_transient_at``) — only
@@ -216,6 +239,7 @@ class QuotaPauseTracker:
         self._reset_at = reset_at
         self._reason = reason
         self._provider = provider
+        self._recorded_at = now or datetime.now(tz=timezone.utc)
         self._save()
 
     def record_rate_limit(
@@ -243,7 +267,7 @@ class QuotaPauseTracker:
             # header-less 429 starts at the 60s floor, not mid-escalation.
             self._consecutive = 0
             self._last_transient_at = None
-            self.pause_until(parsed_reset, reason="quota_exhausted", provider=provider)
+            self.pause_until(parsed_reset, reason="quota_exhausted", provider=provider, now=now)
             return parsed_reset, "quota_exhausted"
 
         # A header-less 429 carries no reset info, so it must NOT shorten or
@@ -275,7 +299,7 @@ class QuotaPauseTracker:
         self._consecutive = consecutive
         self._last_transient_at = now
         reset_at = now + timedelta(seconds=_transient_backoff_seconds(consecutive))
-        self.pause_until(reset_at, reason="rate_limited_backoff", provider=provider)
+        self.pause_until(reset_at, reason="rate_limited_backoff", provider=provider, now=now)
         return reset_at, "rate_limited_backoff"
 
     def _mark_recovered(self) -> None:
@@ -287,6 +311,7 @@ class QuotaPauseTracker:
         self._reset_at = None
         self._reason = None
         self._provider = None
+        self._recorded_at = None
         self._save()
 
     def clear(self) -> None:
@@ -296,6 +321,7 @@ class QuotaPauseTracker:
         self._reset_at = None
         self._reason = None
         self._provider = None
+        self._recorded_at = None
         self._consecutive = 0
         self._last_transient_at = None
         try:

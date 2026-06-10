@@ -2872,3 +2872,45 @@ async def test_run_poller_output_overflow_kills_and_fails(
     assert enq.events == []
     types = [e["type"] for e in _read_events(home)]
     assert "poller_output_overflow" in types
+
+
+# ─── priority parsing (priority-banded suppression) ───────────────────
+
+
+def test_discover_priority_defaults_to_normal(tmp_path: Path):
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "* * * * *"},
+    ])
+    [p] = discover_pollers(skills)
+    assert p.priority == "normal"
+
+
+def test_discover_priority_parsed_and_normalized(tmp_path: Path):
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "hi", "command": "echo", "cron": "* * * * *",
+         "priority": " High "},
+        {"name": "lo", "command": "echo", "cron": "* * * * *",
+         "priority": "low"},
+    ])
+    out = {p.name: p for p in discover_pollers(skills)}
+    assert out["hi"].priority == "high"
+    assert out["lo"].priority == "low"
+
+
+def test_discover_invalid_priority_warns_and_defaults(tmp_path: Path, caplog):
+    """A typo'd priority must not silently promote a poller to ride
+    through quota pressure (or demote it) — warn + default."""
+    import logging
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "* * * * *",
+         "priority": "urgent"},
+    ])
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        [p] = discover_pollers(skills)
+    assert p.priority == "normal"
+    assert any(
+        "poller_invalid_priority" in r.getMessage() for r in caplog.records
+    )

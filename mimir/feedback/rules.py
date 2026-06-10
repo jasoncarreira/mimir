@@ -69,6 +69,12 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "rate_limit_off_pace": ("negative", "rate_limit_off_pace"),
     "scheduled_tick_dropped": ("negative", "tick_dropped"),
     "scheduled_tick_suppressed": ("negative", "tick_suppressed"),
+    # Priority-banded suppression: a poller fire was shed under
+    # resource pressure (same homeostat gate as scheduled ticks, keyed
+    # by the poller's declared priority). Negative for the same reason
+    # tick_suppressed is — the agent should see its autonomous
+    # feeds going quiet and why.
+    "poller_fire_suppressed": ("negative", "poller_suppressed"),
     "heartbeat_health_degraded": ("negative", "heartbeat_health"),
     "introspection_report_error": ("negative", "introspection_error"),
     "predictions_pending_review": ("negative", "predictions_pending"),

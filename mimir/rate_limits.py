@@ -93,7 +93,7 @@ class RateLimitSnapshot:
     poller's cost-rate-back-derived 5h estimator sets this when the
     layer-(a) anomaly detector rejected an endpoint reading and we
     need a usable 5h signal during a long endpoint glitch. The
-    arbiter (mimir/billing.py:evaluate_quota) applies a higher
+    arbiter (mimir/billing.py:evaluate_quota_severity) applies a higher
     suppress threshold (90% vs 80% direct) when this is set —
     derived values are approximations and shouldn't trip the wall
     threshold as quickly as ground truth."""

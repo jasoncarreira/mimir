@@ -41,8 +41,10 @@ from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .billing import normalize_priority
 from .event_logger import log_event
 from .models import AgentEvent
 from .pollers import POLLER_CHANNEL_PREFIX, PollerConfig, discover_pollers, run_poller
@@ -117,6 +119,13 @@ class SchedulerJob:
     cron: str | None = None
     time_of_day: str | None = None
     channel_id: str | None = None
+    # Priority-banded suppression: how much resource pressure this
+    # tick rides through before the arbiter sheds it (low | normal |
+    # high). Heartbeat-style maintenance defaults to ``low`` — it
+    # yields at the first sign of pressure, preserving quota for
+    # interactive replies and higher-priority pollers. Operators
+    # override per-entry in scheduler.yaml.
+    priority: str = "low"
 
     def to_yaml_entry(self) -> dict[str, Any]:
         out: dict[str, Any] = {"name": self.name}
@@ -130,6 +139,10 @@ class SchedulerJob:
             out["cron"] = self.cron
         if self.time_of_day:
             out["time_of_day"] = self.time_of_day
+        # Only emit a non-default priority — keeps yaml uncluttered
+        # (and callable entries never fire through the arbiter gate).
+        if self.priority != "low" and not self.callable_name:
+            out["priority"] = self.priority
         # Callable entries don't carry a channel_id (they're not
         # dispatched as AgentEvents); only emit it for prompt entries
         # to keep yaml uncluttered.
@@ -148,6 +161,19 @@ class SchedulerJob:
         channel_id = raw.get("channel_id")
         if isinstance(channel_id, str) and not channel_id.strip():
             channel_id = None
+        raw_priority = raw.get("priority")
+        priority = "low"
+        if raw_priority is not None:
+            priority = normalize_priority(raw_priority, default="low")
+            if not (
+                isinstance(raw_priority, str)
+                and raw_priority.strip().lower() == priority
+            ):
+                log.warning(
+                    "scheduler job %r: priority %r invalid "
+                    "(expected low|normal|high); using %r",
+                    name, raw_priority, priority,
+                )
         if not name:
             raise ValueError("scheduler job missing 'name'")
         # Exactly one of prompt / prompt_file / callable must be set.
@@ -191,6 +217,7 @@ class SchedulerJob:
             cron=cron,
             time_of_day=time_of_day,
             channel_id=channel_id,
+            priority=priority,
         )
 
 
@@ -367,6 +394,47 @@ def _resolve_callable_cron(
 # quota-pause backoff). A single id (replace_existing) means the newest
 # pause's reset always wins and we never accumulate stale wakes.
 _QUOTA_RECOVERY_JOB_ID = "__quota_recovery__"
+
+# Early-recovery probe for 429 pauses. The one-shot recovery wake
+# trusts the RECORDED reset timestamp — but that timestamp can be
+# pessimistic or plain wrong (clamped garbage header, provider-side
+# early roll), and the upstream window sometimes clears intermittently
+# well before it. While a pause is active this interval job looks for
+# fresh post-pause quota evidence and clears the pause the moment the
+# provider looks healthy again, instead of sitting out the full
+# recorded window.
+_QUOTA_RECHECK_JOB_ID = "__quota_pause_recheck__"
+_QUOTA_RECHECK_SECONDS_DEFAULT = 180
+_QUOTA_RECHECK_SECONDS_MIN = 30
+
+
+def _quota_recheck_seconds() -> int:
+    """Probe cadence (seconds) — ``MIMIR_QUOTA_RECHECK_SECONDS``,
+    default 180, floor 30 (the probe is cheap — file read + in-memory
+    store scan — but sub-30s adds nothing: the usage pollers that
+    refresh the evidence run on multi-minute crons)."""
+    try:
+        val = int(os.environ.get(
+            "MIMIR_QUOTA_RECHECK_SECONDS",
+            str(_QUOTA_RECHECK_SECONDS_DEFAULT),
+        ))
+    except ValueError:
+        val = _QUOTA_RECHECK_SECONDS_DEFAULT
+    return max(_QUOTA_RECHECK_SECONDS_MIN, val)
+
+
+def _parse_iso_ts(raw: object) -> datetime | None:
+    """Best-effort ISO-8601 → aware datetime (UTC assumed when naive).
+    None on empty / non-string / unparseable input."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
 
 
 class Scheduler:
@@ -593,6 +661,29 @@ class Scheduler:
             registered += 1
         return {"registered": registered, "invalid": invalid}
 
+    async def _consult_arbiter(self, *, priority: str) -> Any | None:
+        """Priority-banded fire decision (``FireDecision``) from the
+        homeostat, run off the event loop. ``None`` when no arbiter is
+        configured or it raised — fail-open, a broken arbiter must not
+        silence all autonomous work.
+
+        CR#5: ``should_fire()`` may read turns.jsonl via
+        ``aggregate_usage`` / ``_partition_turns``; ``to_thread`` keeps
+        concurrent dispatcher work (other channel turns, log writers)
+        from stalling during the per-fire scan."""
+        if self._arbiter is None:
+            return None
+        try:
+            _loop = asyncio.get_running_loop()
+            return await asyncio.to_thread(
+                self._arbiter.should_fire,
+                priority=priority,
+                event_loop=_loop,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("arbiter.should_fire raised; firing anyway")
+            return None
+
     # VSM: S4 (intelligence / foresight) — generic scheduled-tick
     #      dispatch. Heartbeat (loop 4.1) and reflection (loop 4.2)
     #      both ride this; the schedule_name in extra distinguishes
@@ -636,33 +727,26 @@ class Scheduler:
             },
         )
 
-        # §12.4: ask the homeostat first. If S4 work is suppressed by
-        # plan-window saturation or a cost-rate alert, drop the tick
-        # with a structured reason so operator audit / dashboards can
+        # §12.4: ask the homeostat first. If S4 work at this entry's
+        # priority is shed under the current severity (quota pace /
+        # raw wall / cost-rate / 429 pause), drop the tick with a
+        # structured reason so operator audit / dashboards can
         # explain the gap.
-        if self._arbiter is not None:
-            try:
-                # CR#5: should_fire_heartbeat() reads turns.jsonl via
-                # aggregate_usage and _partition_turns. Move off the
-                # event loop so concurrent dispatcher work (other
-                # channel turns, log writers) isn't stalled during the
-                # per-tick scan.
-                _loop = asyncio.get_running_loop()
-                fire, reason = await asyncio.to_thread(
-                    self._arbiter.should_fire_heartbeat,
-                    event_loop=_loop,
-                )
-            except Exception:  # noqa: BLE001
-                log.exception("arbiter.should_fire_heartbeat raised; firing anyway")
-                fire, reason = True, "arbiter_error"
-            if not fire:
-                await log_event(
-                    "scheduled_tick_suppressed",
-                    schedule_name=job.name,
-                    channel_id=event.channel_id,
-                    reason=reason,
-                )
-                return
+        decision = await self._consult_arbiter(priority=job.priority)
+        if decision is not None and not decision.fire:
+            await log_event(
+                "scheduled_tick_suppressed",
+                schedule_name=job.name,
+                channel_id=event.channel_id,
+                reason=decision.reason,
+                priority=decision.priority,
+                severity=decision.severity.name,
+                **(
+                    {"burst_multiple": round(decision.burst_multiple, 3)}
+                    if decision.burst_multiple is not None else {}
+                ),
+            )
+            return
 
         await log_event("scheduled_tick", schedule_name=job.name, channel_id=event.channel_id)
         accepted = await self._enqueue(event)
@@ -707,10 +791,134 @@ class Scheduler:
             )
         except Exception:  # noqa: BLE001 — defensive; recovery degrades to next tick
             log.exception("failed to arm quota-recovery wake")
+        # Pair the one-shot wake with the intermittent early-recovery
+        # probe — the wake handles "the recorded reset was right", the
+        # probe handles "the window actually cleared sooner".
+        self.arm_quota_pause_recheck()
+
+    def arm_quota_pause_recheck(self) -> None:
+        """Register/replace the interval probe that early-clears an
+        authoritative 429 pause when fresh quota evidence shows the
+        provider recovered before the recorded reset. Idempotent;
+        disarms itself once the pause is gone. Best-effort like the
+        one-shot wake."""
+        try:
+            self._scheduler.add_job(
+                self._recheck_quota_pause,
+                trigger=IntervalTrigger(seconds=_quota_recheck_seconds()),
+                id=_QUOTA_RECHECK_JOB_ID,
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
+        except Exception:  # noqa: BLE001 — recovery degrades to the one-shot wake
+            log.exception("failed to arm quota-pause recheck")
+
+    def _disarm_quota_pause_recheck(self) -> None:
+        try:
+            self._scheduler.remove_job(_QUOTA_RECHECK_JOB_ID)
+        except Exception:  # noqa: BLE001 — already gone / scheduler shutting down
+            pass
+
+    async def _recheck_quota_pause(self) -> None:
+        """Interval-probe body. Three outcomes:
+
+        - **Pause gone** (lazy-expired right here, or cleared
+          elsewhere): emit ``quota_recovered`` if we consumed the
+          expiry transition, disarm. The catch-up heartbeat stays the
+          one-shot wake's job — both fire near the reset and a double
+          heartbeat is wasted tokens.
+        - **Still paused, early-recovery evidence**: clear the pause,
+          emit ``quota_recovered`` with ``early=true``, disarm, and
+          fire a catch-up heartbeat immediately (that immediacy is the
+          point of probing).
+        - **Still paused, no evidence**: do nothing; probe again next
+          interval.
+
+        Early-recovery evidence — deliberately conservative, all three
+        required:
+
+        1. The pause is an **authoritative cap** (``quota_exhausted``).
+           Transient header-less backoffs (``rate_limited_backoff``)
+           are short and deliberately escalating; early-clearing them
+           would defeat the backoff.
+        2. At least one rate-limit-store snapshot was **observed after
+           the pause was recorded** — i.e. the usage poller (which
+           keeps running during a pause; it's cheap HTTP, not an LLM
+           turn) has genuinely heard from the provider since the 429.
+        3. **No current snapshot sits at/over the suppress wall** —
+           the usage poller refreshes ALL windows each cycle, so a
+           fresh low 7d reading while the pegged 5h window still reads
+           0.9+ must not clear the pause; the still-hot window vetoes.
+        """
+        if self._home is None:
+            self._disarm_quota_pause_recheck()
+            return
+        from .quota_pause import QuotaPauseTracker
+        tracker = QuotaPauseTracker(self._home / ".mimir" / "quota_pause.json")
+        status = tracker.is_paused()
+        if not status.paused:
+            if status.reset_at is not None:
+                # Our is_paused() call consumed the lazy-expiry
+                # transition — emit the recovery signal that the
+                # arbiter path would otherwise have emitted.
+                await log_event(
+                    "quota_recovered",
+                    reset_at=status.reset_at.isoformat(),
+                    previous_reason=status.reason,
+                    early=False,
+                )
+            self._disarm_quota_pause_recheck()
+            return
+
+        if status.reason != "quota_exhausted":
+            return
+        recorded_at = tracker.recorded_at
+        if recorded_at is None:
+            # Pre-field state file — no way to tell fresh evidence
+            # from stale; fall back to plain reset-at expiry.
+            return
+        store = getattr(self._arbiter, "rate_limit_store", None)
+        if store is None:
+            return
+        try:
+            snaps = store.current()
+        except Exception:  # noqa: BLE001 — store read is best-effort
+            log.exception("quota recheck: rate-limit store read failed")
+            return
+        if not snaps:
+            return
+        wall = getattr(self._arbiter, "plan_window_suppress_threshold", 0.80)
+        fresh_seen = False
+        for snap in snaps.values():
+            if snap.utilization is None:
+                continue
+            if snap.utilization >= wall:
+                # A window still at/over the wall vetoes early clear.
+                return
+            observed = _parse_iso_ts(getattr(snap, "observed_at", ""))
+            if observed is not None and observed > recorded_at:
+                fresh_seen = True
+        if not fresh_seen:
+            return
+
+        tracker.clear()
+        await log_event(
+            "quota_recovered",
+            reset_at=status.reset_at.isoformat() if status.reset_at else None,
+            previous_reason=status.reason,
+            early=True,
+            evidence="fresh_quota_below_threshold",
+        )
+        self._disarm_quota_pause_recheck()
+        # Catch-up heartbeat now — through the normal arbiter gate, so
+        # a still-degraded environment (e.g. cost-rate TIGHT) can
+        # still veto the actual turn.
+        await self._fire(job=SchedulerJob(name="heartbeat", prompt_file="heartbeat.md"))
 
     async def _fire_quota_recovery(self) -> None:
         """One-shot wake body: re-run the heartbeat through the normal
-        arbiter path. ``should_fire_heartbeat`` lazy-expires the pause
+        arbiter path. ``should_fire`` lazy-expires the pause
         (emitting ``quota_recovered``) and fires if utilization allows —
         so this both clears the pause and resumes maintenance work."""
         await log_event("quota_recovery_wake_fired")
@@ -1254,6 +1462,30 @@ class Scheduler:
                 "poller_fire_dropped",
                 poller=poller_name,
                 reason="poller_not_in_registry",
+            )
+            return
+
+        # Priority-banded suppression: same homeostat gate the
+        # scheduled ticks go through, keyed by the poller's declared
+        # priority. Checked BEFORE the subprocess runs, so the
+        # poller's cursor stays frozen — after recovery the next cron
+        # tick picks up everything that accumulated (events are
+        # delayed, not lost). Without this gate a ``* * * * *``
+        # poller keeps spawning turns under quota pressure: burning
+        # the last of the window, or 429ing and refreshing the pause
+        # every minute while heartbeats dutifully back off.
+        decision = await self._consult_arbiter(priority=poller.priority)
+        if decision is not None and not decision.fire:
+            await log_event(
+                "poller_fire_suppressed",
+                poller=poller_name,
+                reason=decision.reason,
+                priority=decision.priority,
+                severity=decision.severity.name,
+                **(
+                    {"burst_multiple": round(decision.burst_multiple, 3)}
+                    if decision.burst_multiple is not None else {}
+                ),
             )
             return
 

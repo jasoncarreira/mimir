@@ -127,14 +127,15 @@ def test_partition_early_break_on_7d_cutoff(tmp_path: Path):
     assert t7d == 500  # 99999 from the 30d-old record was excluded
 
 
-# ─── should_fire_heartbeat: layered constraints ─────────────────────────
+# ─── should_fire: layered constraints ─────────────────────────
 
 
 def test_should_fire_when_no_signal(tmp_path: Path):
     arb = _arbiter(tmp_path)
-    fire, reason = arb.should_fire_heartbeat(now=NOW)
-    assert fire is True
-    assert reason == "ok"
+    decision = arb.should_fire(priority="low", now=NOW)
+    assert decision.fire is True
+    assert decision.reason == "ok"
+    assert decision.severity.name == "CLEAR"
 
 
 def test_plan_window_saturation_suppresses(tmp_path: Path):
@@ -151,10 +152,14 @@ def test_plan_window_saturation_suppresses(tmp_path: Path):
             "observed_at": NOW.isoformat(),
         },
     }
-    fire, reason = arb.should_fire_heartbeat(now=NOW)
-    assert fire is False
-    assert "plan_window_saturated" in reason
-    assert "7d_opus" in reason
+    low = arb.should_fire(priority="low", now=NOW)
+    assert low.fire is False
+    assert "plan_window_saturated" in low.reason
+    assert "7d_opus" in low.reason
+    assert low.severity.name == "TIGHT"
+    # TIGHT sheds low + normal; high rides through a raw wall.
+    assert arb.should_fire(priority="normal", now=NOW).fire is False
+    assert arb.should_fire(priority="high", now=NOW).fire is True
 
 
 def test_plan_window_below_threshold_does_not_suppress(tmp_path: Path):
@@ -168,8 +173,7 @@ def test_plan_window_below_threshold_does_not_suppress(tmp_path: Path):
             "observed_at": NOW.isoformat(),
         },
     }
-    fire, _ = arb.should_fire_heartbeat(now=NOW)
-    assert fire is True
+    assert arb.should_fire(priority="low", now=NOW).fire is True
 
 
 def test_cost_rate_alert_suppresses(tmp_path: Path):
@@ -182,9 +186,10 @@ def test_cost_rate_alert_suppresses(tmp_path: Path):
         _write_turn(turns, ts=real_now - timedelta(minutes=10),
                     trigger="user_message", cost=2.0)
     arb = _arbiter(tmp_path, cost_hourly_limit_usd=5.0)
-    fire, reason = arb.should_fire_heartbeat(now=real_now)
-    assert fire is False
-    assert "cost_rate_alert" in reason
+    decision = arb.should_fire(priority="low", now=real_now)
+    assert decision.fire is False
+    assert "cost_rate_alert" in decision.reason
+    assert decision.severity.name == "TIGHT"
 
 
 def test_partition_no_longer_suppresses_busy_days(tmp_path: Path):
@@ -199,9 +204,9 @@ def test_partition_no_longer_suppresses_busy_days(tmp_path: Path):
     _write_turn(turns, ts=NOW - timedelta(hours=1),
                 trigger="user_message", tool_calls=10)
     arb = _arbiter(tmp_path)
-    fire, reason = arb.should_fire_heartbeat(now=NOW)
-    assert fire is True
-    assert reason == "ok"
+    decision = arb.should_fire(priority="low", now=NOW)
+    assert decision.fire is True
+    assert decision.reason == "ok"
 
 
 # ─── render_self_state_block ────────────────────────────────────────────
@@ -304,9 +309,9 @@ def test_build_turn_prompt_omits_self_state_when_none():
 
 
 def test_quota_pause_suppresses_heartbeat(tmp_path: Path):
-    """When QuotaPauseTracker has an active pause, should_fire_heartbeat
-    returns (False, "quota_exhausted_pause:...") regardless of
-    utilization. SPEC §4.9 / §16 item 18."""
+    """When QuotaPauseTracker has an active pause, should_fire grades
+    BLOCKED ("quota_exhausted_pause:...") regardless of utilization or
+    priority. SPEC §4.9 / §16 item 18."""
     from datetime import datetime, timedelta, timezone
     from mimir.quota_pause import QuotaPauseTracker
 
@@ -317,12 +322,16 @@ def test_quota_pause_suppresses_heartbeat(tmp_path: Path):
     tracker.pause_until(reset_at, reason="quota_exhausted", provider="anthropic")
 
     arb = _arbiter(tmp_path)
-    fire, reason = arb.should_fire_heartbeat()
-    assert not fire
-    assert reason.startswith("quota_exhausted_pause:resets_at=")
+    decision = arb.should_fire(priority="low")
+    assert not decision.fire
+    assert decision.reason.startswith("quota_exhausted_pause:resets_at=")
+    assert decision.severity.name == "BLOCKED"
     # The reset timestamp is surfaced in the reason so operator triage
     # via events.jsonl can see when the pause clears.
-    assert reset_at.isoformat() in reason
+    assert reset_at.isoformat() in decision.reason
+    # BLOCKED sheds EVERYTHING — even high-priority pollers: the
+    # provider is actively refusing, headroom math is moot.
+    assert arb.should_fire(priority="high").fire is False
 
 
 def test_quota_pause_clears_after_reset(tmp_path: Path):
@@ -340,11 +349,11 @@ def test_quota_pause_clears_after_reset(tmp_path: Path):
     assert pause_path.is_file()
 
     arb = _arbiter(tmp_path)
-    fire, reason = arb.should_fire_heartbeat()
+    decision = arb.should_fire(priority="low")
     # Pause has expired → normal arbiter behavior. No utilization, no
     # cost rate, no other suppressors → should fire.
-    assert fire
-    assert reason == "ok"
+    assert decision.fire
+    assert decision.reason == "ok"
     # Lazy-expiry deactivates the pause (preserving the escalation
     # counter), so a fresh read sees no active pause.
     assert QuotaPauseTracker(pause_path).is_paused().paused is False
@@ -356,16 +365,16 @@ def test_no_quota_pause_file_skips_check_cleanly(tmp_path: Path):
     Confirmed by behavior: arbiter returns normal decision with no
     side effects on the .mimir dir."""
     arb = _arbiter(tmp_path)
-    fire, reason = arb.should_fire_heartbeat()
-    assert fire
-    assert reason == "ok"
+    decision = arb.should_fire(priority="low")
+    assert decision.fire
+    assert decision.reason == "ok"
     # No .mimir dir got created as a side effect — the early guard
     # prevented an unnecessary tracker.
     assert not (tmp_path / ".mimir").exists()
 
 
 def test_quota_recovered_uses_run_coroutine_threadsafe_when_loop_provided(tmp_path: Path):
-    """When ``event_loop`` is passed to ``should_fire_heartbeat``
+    """When ``event_loop`` is passed to ``should_fire``
     (the normal ``asyncio.to_thread`` path), the ``quota_recovered``
     coroutine is submitted via ``asyncio.run_coroutine_threadsafe``
     rather than ``get_running_loop()`` — which would raise RuntimeError
@@ -391,10 +400,10 @@ def test_quota_recovered_uses_run_coroutine_threadsafe_when_loop_provided(tmp_pa
         coro.close()  # avoid ResourceWarning — we're not running it
 
     with patch("asyncio.run_coroutine_threadsafe", _capture_threadsafe):
-        fire, reason = arb.should_fire_heartbeat(event_loop=object())
+        decision = arb.should_fire(priority="low", event_loop=object())
 
-    assert fire
-    assert reason == "ok"
+    assert decision.fire
+    assert decision.reason == "ok"
     assert len(submitted) == 1, (
         "run_coroutine_threadsafe should have been called exactly once "
         f"for quota_recovered; calls: {submitted}"
@@ -404,7 +413,7 @@ def test_quota_recovered_uses_run_coroutine_threadsafe_when_loop_provided(tmp_pa
 @pytest.mark.asyncio
 async def test_quota_recovered_emits_from_to_thread(tmp_path: Path):
     """End-to-end: when the scheduler's ``asyncio.to_thread`` shape runs
-    ``should_fire_heartbeat`` in a worker thread, ``quota_recovered``
+    ``should_fire`` in a worker thread, ``quota_recovered``
     actually fires on the main event loop. Chainlink #184."""
     import asyncio
     from datetime import datetime, timedelta, timezone
@@ -426,8 +435,9 @@ async def test_quota_recovered_emits_from_to_thread(tmp_path: Path):
     try:
         _loop = asyncio.get_running_loop()
         arb = _arbiter(tmp_path)
-        fire, reason = await asyncio.to_thread(
-            arb.should_fire_heartbeat,
+        decision = await asyncio.to_thread(
+            arb.should_fire,
+            priority="low",
             event_loop=_loop,
         )
         # Yield to the event loop so run_coroutine_threadsafe's task runs.
@@ -436,8 +446,67 @@ async def test_quota_recovered_emits_from_to_thread(tmp_path: Path):
     finally:
         _el_mod.log_event = original_log  # type: ignore[assignment]
 
-    assert fire
-    assert reason == "ok"
+    assert decision.fire
+    assert decision.reason == "ok"
     assert "quota_recovered" in emitted, (
         f"quota_recovered not emitted; got: {emitted}"
     )
+
+
+# ─── pay-as-you-go ELEVATED early warning ───────────────────────────────
+
+
+def test_payg_near_limit_is_elevated(tmp_path: Path):
+    """Rate within 80% of the hourly limit but not over it → ELEVATED:
+    low sheds, normal still fires (graduated band, not a binary trip)."""
+    real_now = datetime.now(tz=timezone.utc)
+    turns = tmp_path / "turns.jsonl"
+    # $4.50/hr against a $5 limit → 90% of limit, alert not tripped.
+    for _ in range(3):
+        _write_turn(turns, ts=real_now - timedelta(minutes=10),
+                    trigger="user_message", cost=1.5)
+    arb = _arbiter(tmp_path, cost_hourly_limit_usd=5.0)
+    low = arb.should_fire(priority="low", now=real_now)
+    assert low.fire is False
+    assert low.severity.name == "ELEVATED"
+    assert "cost_rate_near_limit" in low.reason
+    assert arb.should_fire(priority="normal", now=real_now).fire is True
+
+
+def test_payg_well_under_limit_is_clear(tmp_path: Path):
+    real_now = datetime.now(tz=timezone.utc)
+    turns = tmp_path / "turns.jsonl"
+    # $1/hr against a $5 limit → 20%, comfortably CLEAR.
+    _write_turn(turns, ts=real_now - timedelta(minutes=10),
+                trigger="user_message", cost=1.0)
+    arb = _arbiter(tmp_path, cost_hourly_limit_usd=5.0)
+    decision = arb.should_fire(priority="low", now=real_now)
+    assert decision.fire is True
+    assert decision.severity.name == "CLEAR"
+
+
+def test_render_self_state_includes_throttle_line_when_pressured(tmp_path: Path):
+    """The agent should see WHY autonomous work went quiet — the
+    severity + reason render into the Self-state block."""
+    real_now = datetime.now(tz=timezone.utc)
+    turns = tmp_path / "turns.jsonl"
+    for _ in range(5):
+        _write_turn(turns, ts=real_now - timedelta(minutes=10),
+                    trigger="user_message", cost=2.0)
+    arb = _arbiter(tmp_path, cost_hourly_limit_usd=5.0)
+    block = arb.render_self_state_block(now=real_now)
+    assert block is not None
+    assert "autonomy throttle: TIGHT" in block
+    assert "cost_rate_alert" in block
+    assert "low+normal scheduled work shedding" in block
+
+
+def test_render_self_state_no_throttle_line_when_clear(tmp_path: Path):
+    real_now = datetime.now(tz=timezone.utc)
+    turns = tmp_path / "turns.jsonl"
+    _write_turn(turns, ts=real_now - timedelta(minutes=10),
+                trigger="user_message", cost=0.1)
+    arb = _arbiter(tmp_path)
+    block = arb.render_self_state_block(now=real_now)
+    assert block is not None
+    assert "autonomy throttle" not in block
