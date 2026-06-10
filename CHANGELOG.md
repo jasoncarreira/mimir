@@ -6,6 +6,8 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-06-10
+
 ### Added
 
 - **Priority-banded suppression for ALL autonomous work — pollers included.**
