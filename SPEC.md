@@ -430,8 +430,9 @@ The `arbiter` (in `mimir/arbiter.py`) polls the Anthropic usage endpoint on each
 1. The agent's `run_turn` catches the exception from `agent.astream` and classifies it via `quota_pause.is_quota_exhaustion` (checks SDK exception class, HTTP 429 status, and provider-message text).
 2. `quota_pause.extract_reset_at` parses the reset time from Anthropic-specific headers (`anthropic-ratelimit-tokens-reset` etc.) or a generic `Retry-After`, falling back to a 5-hour default (matching Anthropic's 5h rolling window).
 3. The agent records the pause via `QuotaPauseTracker` (persisted at `<home>/.mimir/quota_pause.json` so a container restart mid-pause doesn't lose it) and emits a `quota_exhausted` event with the reset time, provider label, and exception details.
-4. The arbiter's `should_fire_heartbeat` consults the tracker BEFORE the utilization check — while paused, scheduled ticks are suppressed with reason `quota_exhausted_pause:resets_at=<iso>`.
+4. The arbiter's `should_fire` consults the tracker BEFORE the utilization check — while paused, severity is BLOCKED and ALL autonomous work (scheduled ticks AND poller fires, at every priority) is suppressed with reason `quota_exhausted_pause:resets_at=<iso>`.
 5. The tracker lazy-expires past its reset time. The arbiter's first read after the transition emits `quota_recovered` (positive algedonic) so the agent sees "we're back online" in its next-turn feedback block.
+6. **Early-recovery probe.** The recorded reset can be pessimistic or wrong (clamped garbage header, provider-side early roll), and a window sometimes clears intermittently well before it. While a pause is active, an interval job (`MIMIR_QUOTA_RECHECK_SECONDS`, default 180s) probes for fresh evidence: the pause is an authoritative cap (`quota_exhausted`, never a transient backoff), at least one rate-limit-store snapshot was observed AFTER the pause was recorded (the usage pollers keep running — cheap HTTP, not LLM turns), and no current window sits at/over the suppress wall (a still-pegged 5h window vetoes, even if the fresh 7d reading is low). On evidence: the pause clears immediately, `quota_recovered` fires with `early=true`, and a catch-up heartbeat runs through the normal arbiter gate. The probe disarms itself once the pause is gone; the one-shot recovery wake at `reset_at` remains the fallback.
 
 User-message turns are NOT blocked by the pause (interactive responsiveness wins over quota conservation). They'll hit the API and either succeed (window has reset) or get their own 429 — which the agent surfaces to the operator via `send_message` rather than vanishing silently.
 
@@ -801,11 +802,12 @@ Inbound message handling per bridge:
 
 Verbatim port of open-strix's `pollers.json` pattern (`open_strix/builtin_skills/pollers/SKILL.md`). Use this for read-only sources where process isolation matters: Bluesky firehose, RSS, GitHub notifications, anything that holds network state and might hang.
 
-- Each skill folder may include `pollers.json` declaring `name`, `command`, `cron`, optional `env`.
+- Each skill folder may include `pollers.json` declaring `name`, `command`, `cron`, optional `env`, optional `priority` (`low` | `normal` | `high`, default `normal` — see priority-banded suppression below).
 - Mimir's scheduler discovers them at startup and on `reload_pollers()`.
 - On each cron tick the script runs as a subprocess with `STATE_DIR` and `POLLER_NAME` set.
 - Stdout JSONL lines (`{"poller": ..., "prompt": ...}`) become events on the dispatcher.
-- 60s timeout, exits cleanly. Pollers never call an LLM. Silence = nothing to report.
+- 60s timeout, exits cleanly. Pollers never call an LLM directly. Silence = nothing to report. (Each emitted event DOES spawn an LLM turn — which is why poller fires go through the homeostat gate below.)
+- **Priority-banded suppression.** Before each fire the scheduler consults the homeostat (`HomeostaticArbiter.should_fire(priority=...)`), which grades resource pressure into CLEAR / ELEVATED / TIGHT / BLOCKED — under subscription billing from the per-window **burst multiple** M = (1−util)/(pace×time_left) with an early-window confidence ramp, under API billing from cost-rate trips, and BLOCKED from a recorded 429 pause. `low`-priority work sheds at ELEVATED, `normal` at TIGHT, `high` only at BLOCKED. A shed fire skips the subprocess (cursor frozen — events delayed, not lost) and emits `poller_fire_suppressed`. Scheduled ticks ride the same gate via `SchedulerJob.priority` (default `low`, overridable per scheduler.yaml entry).
 - Stderr → events.jsonl as `poller_stderr`. Non-zero exit → `poller_nonzero_exit`.
 
 The `pollers` skill from open-strix ports into `mimir/skills/pollers/` verbatim — same SKILL.md, same design-patterns.md.

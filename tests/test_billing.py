@@ -14,8 +14,9 @@ from mimir.billing import (
     BillingMode,
     QuotaProvider,
     QuotaWindow,
+    Severity,
     detect_billing_mode,
-    evaluate_quota,
+    evaluate_quota_severity,
 )
 from mimir.budget import HomeostaticArbiter
 from mimir.rate_limits import RateLimitSnapshot, RateLimitStore
@@ -249,7 +250,7 @@ def test_anthropic_provider_returns_known_windows_with_projection(tmp_path):
     assert seven.on_pace_utilization == pytest.approx(0.40, rel=0.01)
 
 
-# ─── evaluate_quota ────────────────────────────────────────────────────
+# ─── evaluate_quota_severity ───────────────────────────────────────────
 
 
 class _FakeProvider(QuotaProvider):
@@ -277,77 +278,132 @@ def _w(key: str, util: float | None, on_pace: float | None) -> QuotaWindow:
 
 
 def test_evaluate_quota_no_providers():
-    result = evaluate_quota([])
-    assert result.suppress is False
+    result = evaluate_quota_severity([])
+    assert result.severity is Severity.CLEAR
     assert result.reason == "ok"
 
 
-def test_evaluate_quota_empty_provider_does_not_suppress():
+def test_evaluate_quota_empty_provider_is_clear():
     provider = _FakeProvider("anthropic", [])
-    result = evaluate_quota([provider])
-    assert result.suppress is False
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.CLEAR
 
 
-def test_evaluate_quota_below_thresholds_does_not_suppress():
+def test_evaluate_quota_comfortable_pace_is_clear():
+    """Plenty of headroom in pace terms (M >= 2) → CLEAR."""
     provider = _FakeProvider("anthropic", [
-        _w("five_hour", 0.5, 0.85),    # below 0.90 on-pace 5h threshold
-        _w("seven_day", 0.4, 0.70),    # below 0.95 on-pace 7d threshold
+        _w("five_hour", 0.5, 0.60),    # M = 0.5/0.10 = 5.0
+        _w("seven_day", 0.3, 0.50),    # M = 0.7/0.20 = 3.5
     ])
-    result = evaluate_quota([provider])
-    assert result.suppress is False
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.CLEAR
     assert result.reason == "ok"
 
 
-def test_evaluate_quota_raw_saturation_suppresses():
+def test_evaluate_quota_burst_multiple_time_left_asymmetry():
+    """The load-bearing property of M: the SAME projected end-of-window
+    value (80%) grades differently depending on time remaining.
+
+    Late in a 7d window (6 of 7 days elapsed, util 68.6%) reaching
+    100% would take ~2.75× the established pace — locked in, CLEAR.
+    Earlier (2 of 7 days elapsed, util 22.9%, same projection) busts
+    at only ~1.35× pace — fragile, TIGHT."""
+    late = _FakeProvider("anthropic", [
+        _w("seven_day", 0.686, 0.80),   # ef=0.857, M≈2.75
+    ])
+    early = _FakeProvider("anthropic", [
+        _w("seven_day", 0.229, 0.80),   # ef=0.286, M≈1.35
+    ])
+    assert evaluate_quota_severity([late]).severity is Severity.CLEAR
+    result = evaluate_quota_severity([early])
+    assert result.severity is Severity.TIGHT
+    assert "quota_off_pace" in result.reason
+    assert result.burst_multiple == pytest.approx(1.35, abs=0.01)
+
+
+def test_evaluate_quota_mid_band_is_elevated():
+    """1.5 <= M < 2 (post-ramp) → ELEVATED: shed low-priority work
+    only. u=0.40 projecting to 0.85 → M = 0.60/0.45 ≈ 1.33... pick
+    u=0.40 → 0.75: M = 0.60/0.35 ≈ 1.71."""
+    provider = _FakeProvider("anthropic", [
+        _w("seven_day", 0.40, 0.75),    # ef=0.533 (γ=1), M≈1.71
+    ])
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.ELEVATED
+    assert "quota_pace_elevated" in result.reason
+    assert result.burst_multiple == pytest.approx(1.71, abs=0.01)
+
+
+def test_evaluate_quota_early_window_ramp_gives_wiggle_room():
+    """Early in a window the pace estimate is noise — the SAME M that
+    grades TIGHT mid-window must pass CLEAR when only ~11% of the
+    window has elapsed (γ = 0.11/0.25 ≈ 0.44 scales the band edges
+    down to 0.65/0.87)."""
+    early = _FakeProvider("anthropic", [
+        _w("five_hour", 0.10, 0.92),   # ef=0.109, M≈1.10 vs edges 0.65/0.87
+    ])
+    result = evaluate_quota_severity([early])
+    assert result.severity is Severity.CLEAR
+
+    # Same burn shape past the ramp (ef >= 0.25): full-strength bands.
+    mid = _FakeProvider("anthropic", [
+        _w("five_hour", 0.30, 0.95),   # ef=0.316, M≈1.08 < 1.5
+    ])
+    result = evaluate_quota_severity([mid])
+    assert result.severity is Severity.TIGHT
+    assert "quota_off_pace" in result.reason
+
+
+def test_evaluate_quota_raw_saturation_is_tight():
     provider = _FakeProvider("anthropic", [
         _w("seven_day", 0.85, 0.50),  # raw 0.85 >= 0.80 default
     ])
-    result = evaluate_quota([provider])
-    assert result.suppress is True
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.TIGHT
     assert "quota_saturated" in result.reason
     assert "anthropic:seven_day" in result.reason
     assert result.provider == "anthropic"
     assert result.window_key == "seven_day"
 
 
-def test_evaluate_quota_off_pace_5h_suppresses():
+def test_evaluate_quota_off_pace_5h_is_tight():
     provider = _FakeProvider("anthropic", [
-        _w("five_hour", 0.30, 0.95),  # raw 30%, but projects to 95% — over 0.90 on-pace 5h
+        _w("five_hour", 0.30, 0.95),  # raw 30%, M = 0.70/0.65 ≈ 1.08
     ])
-    result = evaluate_quota([provider])
-    assert result.suppress is True
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.TIGHT
     assert "quota_off_pace" in result.reason
     assert "five_hour" in result.reason
 
 
-def test_evaluate_quota_off_pace_7d_suppresses():
+def test_evaluate_quota_off_pace_7d_is_tight():
     provider = _FakeProvider("anthropic", [
-        _w("seven_day", 0.40, 0.96),  # projects to 96% — over 0.95 on-pace 7d
+        _w("seven_day", 0.40, 0.96),  # M = 0.60/0.56 ≈ 1.07
     ])
-    result = evaluate_quota([provider])
-    assert result.suppress is True
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.TIGHT
     assert "quota_off_pace" in result.reason
     assert "seven_day" in result.reason
 
 
 def test_evaluate_quota_raw_takes_precedence_over_on_pace():
-    """When BOTH raw and on-pace fire, raw wins (more authoritative)."""
+    """When BOTH raw and pace land in the same severity, raw wins
+    (we're AT the wall vs. heading toward it)."""
     provider = _FakeProvider("anthropic", [
-        _w("seven_day", 0.85, 0.99),  # raw 85% (saturated) AND on-pace 99%
+        _w("seven_day", 0.85, 0.99),  # raw 85% (saturated) AND off-pace
     ])
-    result = evaluate_quota([provider])
-    assert result.suppress is True
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.TIGHT
     assert "quota_saturated" in result.reason  # raw wins
 
 
 def test_evaluate_quota_picks_worst_across_windows():
     provider = _FakeProvider("anthropic", [
-        _w("five_hour", 0.10, 0.92),    # over 0.90 by 0.02
-        _w("seven_day", 0.40, 0.99),    # over 0.95 by 0.04 — bigger hit
+        _w("five_hour", 0.30, 0.92),    # M = 0.70/0.62 ≈ 1.13
+        _w("seven_day", 0.40, 0.99),    # M = 0.60/0.59 ≈ 1.02 — tighter
     ])
-    result = evaluate_quota([provider])
-    # Worst-on-pace wins by absolute value (we sort by raw value, not
-    # margin-over-threshold). 0.99 > 0.92 → seven_day wins.
+    result = evaluate_quota_severity([provider])
+    # Both TIGHT; the smaller burst multiple (less headroom) wins.
     assert result.window_key == "seven_day"
 
 
@@ -360,8 +416,8 @@ def test_evaluate_quota_provider_exception_continues():
         def get_windows(self) -> list[QuotaWindow]:
             raise RuntimeError("oops")
     good = _FakeProvider("anthropic", [_w("five_hour", 0.30, 0.50)])
-    result = evaluate_quota([_Broken(), good])
-    assert result.suppress is False  # only the good provider's data counted
+    result = evaluate_quota_severity([_Broken(), good])
+    assert result.severity is Severity.CLEAR  # only the good provider counted
     assert result.reason == "ok"
 
 
@@ -384,19 +440,53 @@ def _quota_arbiter(tmp_path: Path, providers, **kwargs) -> HomeostaticArbiter:
 
 
 def test_arbiter_quota_mode_no_data_fires_ok(tmp_path):
-    """No quota signal yet (cold start, poller hasn't run) → fire."""
+    """No quota signal yet (cold start, poller hasn't run) → fire at
+    every priority."""
     arb = _quota_arbiter(tmp_path, [])
-    fire, reason = arb.should_fire_heartbeat(now=NOW)
-    assert fire is True
-    assert reason == "ok"
+    for priority in ("low", "normal", "high"):
+        decision = arb.should_fire(priority=priority, now=NOW)
+        assert decision.fire is True
+        assert decision.reason == "ok"
+        assert decision.severity is Severity.CLEAR
 
 
-def test_arbiter_quota_mode_off_pace_suppresses(tmp_path):
+def test_arbiter_quota_mode_off_pace_sheds_by_priority(tmp_path):
+    """TIGHT (M ≈ 1.02): low + normal shed, high rides through."""
     provider = _FakeProvider("anthropic", [_w("seven_day", 0.40, 0.99)])
     arb = _quota_arbiter(tmp_path, [provider])
-    fire, reason = arb.should_fire_heartbeat(now=NOW)
-    assert fire is False
-    assert "quota_off_pace" in reason
+    low = arb.should_fire(priority="low", now=NOW)
+    normal = arb.should_fire(priority="normal", now=NOW)
+    high = arb.should_fire(priority="high", now=NOW)
+    assert low.fire is False and "quota_off_pace" in low.reason
+    assert normal.fire is False
+    assert high.fire is True
+    assert low.severity is Severity.TIGHT
+    assert low.burst_multiple == pytest.approx(1.02, abs=0.01)
+
+
+def test_arbiter_quota_mode_elevated_sheds_low_only(tmp_path):
+    """ELEVATED (1.5 <= M < 2): low sheds, normal + high fire."""
+    provider = _FakeProvider("anthropic", [_w("seven_day", 0.40, 0.75)])
+    arb = _quota_arbiter(tmp_path, [provider])
+    low = arb.should_fire(priority="low", now=NOW)
+    normal = arb.should_fire(priority="normal", now=NOW)
+    high = arb.should_fire(priority="high", now=NOW)
+    assert low.fire is False
+    assert low.severity is Severity.ELEVATED
+    assert "quota_pace_elevated" in low.reason
+    assert normal.fire is True
+    assert high.fire is True
+
+
+def test_arbiter_unknown_priority_treated_as_normal(tmp_path):
+    """Defense-in-depth: an unrecognized priority string behaves like
+    ``normal`` (parse layers already normalize, but the arbiter must
+    not crash or fail-closed on garbage)."""
+    provider = _FakeProvider("anthropic", [_w("seven_day", 0.40, 0.75)])
+    arb = _quota_arbiter(tmp_path, [provider])
+    decision = arb.should_fire(priority="urgent", now=NOW)
+    # ELEVATED tolerated by normal → fires.
+    assert decision.fire is True
 
 
 def test_arbiter_quota_mode_ignores_cost_rate_alert(tmp_path):
@@ -426,9 +516,9 @@ def test_arbiter_quota_mode_ignores_cost_rate_alert(tmp_path):
         quota_providers=[],
         cost_hourly_limit_usd=5.0,  # would trip in pay-go
     )
-    fire, reason = arb.should_fire_heartbeat(now=real_now)
-    assert fire is True
-    assert reason == "ok"
+    decision = arb.should_fire(priority="low", now=real_now)
+    assert decision.fire is True
+    assert decision.reason == "ok"
 
 
 def test_arbiter_pay_as_you_go_mode_unchanged_behavior(tmp_path):
@@ -456,9 +546,13 @@ def test_arbiter_pay_as_you_go_mode_unchanged_behavior(tmp_path):
         billing_mode=BillingMode.PAY_AS_YOU_GO,
         cost_hourly_limit_usd=5.0,
     )
-    fire, reason = arb.should_fire_heartbeat(now=real_now)
-    assert fire is False
-    assert "cost_rate_alert" in reason
+    low = arb.should_fire(priority="low", now=real_now)
+    assert low.fire is False
+    assert "cost_rate_alert" in low.reason
+    assert low.severity is Severity.TIGHT
+    # An alert is TIGHT, not BLOCKED — high-priority work still fires.
+    high = arb.should_fire(priority="high", now=real_now)
+    assert high.fire is True
 
 
 def test_arbiter_pay_as_you_go_default_when_unspecified(tmp_path):
@@ -494,8 +588,8 @@ def test_evaluate_quota_derived_5h_under_90_does_not_suppress():
     """Derived 5h at 0.85 — would suppress under the direct 0.80
     threshold, must NOT suppress under the derived 0.90 threshold."""
     provider = _FakeProvider("anthropic", [_w_derived("five_hour", 0.85)])
-    result = evaluate_quota([provider])
-    assert result.suppress is False, (
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.CLEAR, (
         f"derived 5h @0.85 should be under the 0.90 threshold, "
         f"got: {result.reason}"
     )
@@ -507,8 +601,8 @@ def test_evaluate_quota_derived_5h_above_90_suppresses():
     of the threshold and to keep the test from flapping on a `>` vs
     `>=` boundary edit."""
     provider = _FakeProvider("anthropic", [_w_derived("five_hour", 0.92)])
-    result = evaluate_quota([provider])
-    assert result.suppress is True
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.TIGHT
     assert "five_hour@0.92" in result.reason
 
 
@@ -516,8 +610,8 @@ def test_evaluate_quota_derived_5h_at_threshold_boundary_suppresses():
     """Locks the inclusive boundary: 0.90 (== threshold) trips. If the
     `>=` semantics ever flip to `>`, this test catches it."""
     provider = _FakeProvider("anthropic", [_w_derived("five_hour", 0.90)])
-    result = evaluate_quota([provider])
-    assert result.suppress is True
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.TIGHT
     assert "five_hour@0.90" in result.reason
 
 
@@ -525,8 +619,8 @@ def test_evaluate_quota_direct_5h_at_85_still_suppresses():
     """Invariant: chainlink #17 doesn't loosen direct 5h thresholds.
     Direct 5h at 0.85 still trips the 0.80 wall."""
     provider = _FakeProvider("anthropic", [_w("five_hour", 0.85, None)])
-    result = evaluate_quota([provider])
-    assert result.suppress is True
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.TIGHT
     assert "five_hour@0.85" in result.reason
 
 
@@ -553,9 +647,9 @@ def test_evaluate_quota_derived_propagates_through_anthropic_provider(tmp_path):
     assert five_hour_w.derived is True
     assert five_hour_w.utilization == pytest.approx(0.85)
 
-    # And evaluate_quota uses the looser threshold.
-    result = evaluate_quota([provider])
-    assert result.suppress is False, (
+    # And evaluate_quota_severity uses the looser threshold.
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.CLEAR, (
         "derived 5h @0.85 must not suppress under the 0.90 threshold"
     )
 
@@ -596,10 +690,10 @@ def test_derived_5h_skips_on_pace_projection(tmp_path):
         f"{w.on_pace_utilization!r}"
     )
 
-    # And evaluate_quota doesn't suppress (raw 0.85 < derived
+    # And evaluate_quota_severity stays CLEAR (raw 0.85 < derived
     # threshold 0.90, on-pace skipped).
-    result = evaluate_quota([provider])
-    assert result.suppress is False
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.CLEAR
 
 
 def test_direct_5h_still_projects_on_pace(tmp_path):

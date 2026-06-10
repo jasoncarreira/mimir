@@ -145,6 +145,13 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f"scheduled_tick dropped: {ev.get('reason') or '(no reason)'}"
     if rule_kind == "tick_suppressed":
         return f"scheduled_tick suppressed by arbiter: {ev.get('reason') or '(no reason)'}"
+    if rule_kind == "poller_suppressed":
+        return (
+            f"poller {ev.get('poller') or '?'} suppressed by arbiter "
+            f"(severity={ev.get('severity') or '?'}, "
+            f"priority={ev.get('priority') or '?'}): "
+            f"{ev.get('reason') or '(no reason)'}"
+        )
     if rule_kind == "heartbeat_health":
         rate = ev.get("success_rate")
         thr = ev.get("threshold")

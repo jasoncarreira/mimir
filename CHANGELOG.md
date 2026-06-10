@@ -6,6 +6,48 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **Priority-banded suppression for ALL autonomous work — pollers included.**
+  The homeostat previously made a binary fire/suppress call for heartbeats
+  only; pollers bypassed it entirely, so under quota pressure heartbeats
+  backed off while a `* * * * *` poller kept spawning turns (burning the
+  window tail, or 429ing and refreshing the pause every minute). The arbiter
+  now grades pressure into a severity ladder (CLEAR / ELEVATED / TIGHT /
+  BLOCKED) and gates each unit of work by its declared priority: `low` sheds
+  at ELEVATED, `normal` at TIGHT, `high` only at BLOCKED (recorded 429).
+  Pollers declare `priority` in `pollers.json` (default `normal`); scheduled
+  ticks declare it per scheduler.yaml entry (default `low` — heartbeats yield
+  first). Shed poller fires skip the subprocess (cursor frozen — events
+  delayed, not lost) and emit `poller_fire_suppressed`.
+- **Pace-aware subscription severity (burst multiple M).** Subscription
+  (quota) decisions are now based on projected usage with time-awareness:
+  M = (1−util)/(pace×time_left) — how many times the established pace the
+  agent would have to sustain for the rest of the window to hit 100%. The
+  same projected 80% grades CLEAR with 1 day left of a 7d window (busting
+  needs ~2.75× pace) but TIGHT with 5 days left (~1.35×). Band edges are
+  scaled by an early-window confidence ramp (γ = elapsed/0.25, capped at 1)
+  so a noisy first hour can't shed work. Raw utilization ≥ 0.80 stays a
+  TIGHT wall. API (pay-as-you-go) billing: cost-rate alert → TIGHT, within
+  80% of the hourly-limit or spike trip → ELEVATED.
+- **429 early-recovery probe.** While a quota pause is active, an interval
+  job (`MIMIR_QUOTA_RECHECK_SECONDS`, default 180s) checks whether the
+  window cleared before the recorded reset: an authoritative cap, plus a
+  rate-limit-store snapshot observed after the pause was recorded, with no
+  current window at/over the wall → pause clears immediately,
+  `quota_recovered` fires with `early=true`, and a catch-up heartbeat runs.
+  The current severity (when above CLEAR) renders into the agent's
+  Self-state block as an `autonomy throttle` line.
+
+### Changed
+
+- **BREAKING (internal API):** `HomeostaticArbiter.should_fire_heartbeat()`
+  is replaced by `should_fire(priority=...)` returning a `FireDecision`;
+  `billing.evaluate_quota()` is replaced by `evaluate_quota_severity()`.
+  The fixed on-pace suppress thresholds (0.90 5h / 0.95 7d) are superseded
+  by the M bands. `scheduled_tick_suppressed` events now carry `priority`,
+  `severity`, and (for pace decisions) `burst_multiple`.
+
 ## [0.3.2] — 2026-06-09
 
 ### Fixed

@@ -553,6 +553,30 @@ async def test_introspection_report_callback_writes_report_and_emits(tmp_path: P
     assert health["success_rate"] == 0.25
 
 
+class _StubArbiter:
+    """Arbiter stand-in for gate tests. Records the priority each
+    ``should_fire`` consult was made with and returns a fixed
+    FireDecision-shaped object."""
+
+    def __init__(self, *, fire: bool, severity_name: str = "CLEAR",
+                 reason: str = "ok"):
+        self._fire = fire
+        self._severity_name = severity_name
+        self._reason = reason
+        self.consulted_priorities: list[str] = []
+
+    def should_fire(self, *, priority: str = "normal", **_kwargs):
+        from mimir.budget import FireDecision
+        from mimir.billing import Severity
+        self.consulted_priorities.append(priority)
+        return FireDecision(
+            fire=self._fire,
+            reason=self._reason,
+            severity=Severity[self._severity_name],
+            priority=priority,
+        )
+
+
 @pytest.mark.asyncio
 async def test_fire_consults_arbiter_and_suppresses(tmp_path: Path):
     """§12.4: when the homeostat returns SUPPRESS, _fire must skip the
@@ -563,14 +587,11 @@ async def test_fire_consults_arbiter_and_suppresses(tmp_path: Path):
         enqueued.append(event)
         return True
 
-    class _SuppressingArbiter:
-        def should_fire_heartbeat(self, **_kwargs):
-            return False, "plan_window_saturated:7d_opus@0.92"
-
     sched = Scheduler(
         scheduler_yaml=tmp_path / "s.yaml",
         enqueue=fake_enqueue,
-        arbiter=_SuppressingArbiter(),
+        arbiter=_StubArbiter(fire=False, severity_name="TIGHT",
+                             reason="plan_window_saturated:7d_opus@0.92"),
     )
     job = SchedulerJob(name="morning", prompt="x", cron="0 8 * * *")
     await sched._fire(job=job)
@@ -587,14 +608,10 @@ async def test_fire_consults_arbiter_and_fires(tmp_path: Path):
         enqueued.append(event)
         return True
 
-    class _FiringArbiter:
-        def should_fire_heartbeat(self, **_kwargs):
-            return True, "ok"
-
     sched = Scheduler(
         scheduler_yaml=tmp_path / "s.yaml",
         enqueue=fake_enqueue,
-        arbiter=_FiringArbiter(),
+        arbiter=_StubArbiter(fire=True),
     )
     job = SchedulerJob(name="morning", prompt="x", cron="0 8 * * *")
     await sched._fire(job=job)
@@ -2358,3 +2375,378 @@ def test_minimax_poll_job_default_model_matches_poller_default():
         .default
     )
     assert default == DEFAULT_MODEL_NAME == "general"
+
+
+# ─── priority-banded suppression (pollers + scheduled ticks) ──────────
+
+
+def _drop_priority_poller(
+    skills_dir: Path, name: str, priority: str, cron: str = "* * * * *",
+) -> Path:
+    """_drop_pollers_skill variant with an explicit priority field."""
+    skill = skills_dir / name
+    skill.mkdir(parents=True, exist_ok=True)
+    (skill / "pollers.json").write_text(_json.dumps({
+        "pollers": [{
+            "name": name, "command": "true", "cron": cron,
+            "priority": priority,
+        }],
+    }), encoding="utf-8")
+    return skill
+
+
+def _read_event_types(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    return [
+        _json.loads(line)
+        for line in path.read_text().splitlines() if line.strip()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fire_poller_suppressed_skips_subprocess_and_emits(
+    tmp_path: Path, monkeypatch,
+):
+    """A shed poller fire must NOT run the subprocess (cursor stays
+    frozen; events delayed, not lost) and must emit
+    ``poller_fire_suppressed`` with priority + severity context."""
+    from mimir.event_logger import init_logger
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    async def noop(_e):
+        return True
+
+    arbiter = _StubArbiter(
+        fire=False, severity_name="TIGHT",
+        reason="quota_off_pace:anthropic:seven_day@0.96",
+    )
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, arbiter=arbiter,
+    )
+    skills = tmp_path / "skills"
+    _drop_priority_poller(skills, "p1", priority="normal")
+    sched.add_poller_jobs(skills)
+
+    ran: list[str] = []
+
+    async def fake_run_poller(poller, enqueue, home=None):
+        ran.append(poller.name)
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    await sched._fire_poller(poller_name="p1")
+
+    assert ran == []  # subprocess skipped
+    # The consult used the poller's declared priority.
+    assert arbiter.consulted_priorities == ["normal"]
+    events = _read_event_types(tmp_path / "events.jsonl")
+    [ev] = [e for e in events if e["type"] == "poller_fire_suppressed"]
+    assert ev["poller"] == "p1"
+    assert ev["priority"] == "normal"
+    assert ev["severity"] == "TIGHT"
+    assert "quota_off_pace" in ev["reason"]
+
+
+@pytest.mark.asyncio
+async def test_fire_poller_fires_when_arbiter_clear(
+    tmp_path: Path, monkeypatch,
+):
+    async def noop(_e):
+        return True
+
+    arbiter = _StubArbiter(fire=True)
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, arbiter=arbiter,
+    )
+    skills = tmp_path / "skills"
+    _drop_priority_poller(skills, "p1", priority="high")
+    sched.add_poller_jobs(skills)
+
+    ran: list[str] = []
+
+    async def fake_run_poller(poller, enqueue, home=None):
+        ran.append(poller.name)
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    await sched._fire_poller(poller_name="p1")
+
+    assert ran == ["p1"]
+    assert arbiter.consulted_priorities == ["high"]
+
+
+@pytest.mark.asyncio
+async def test_fire_poller_fail_open_when_arbiter_raises(
+    tmp_path: Path, monkeypatch,
+):
+    """A broken arbiter must not silence autonomous work — the poller
+    fires anyway (same fail-open contract as scheduled ticks)."""
+    async def noop(_e):
+        return True
+
+    class _BrokenArbiter:
+        def should_fire(self, **_kwargs):
+            raise RuntimeError("boom")
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=noop,
+        arbiter=_BrokenArbiter(),
+    )
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)
+
+    ran: list[str] = []
+
+    async def fake_run_poller(poller, enqueue, home=None):
+        ran.append(poller.name)
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    await sched._fire_poller(poller_name="p1")
+    assert ran == ["p1"]
+
+
+@pytest.mark.asyncio
+async def test_fire_consults_arbiter_with_job_priority(tmp_path: Path):
+    """_fire passes the SchedulerJob's declared priority (heartbeats
+    default ``low``; scheduler.yaml overrides per entry)."""
+    async def noop(_e):
+        return True
+
+    arbiter = _StubArbiter(fire=True)
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, arbiter=arbiter,
+    )
+    await sched._fire(job=SchedulerJob(name="hb", prompt="x", cron="* * * * *"))
+    await sched._fire(job=SchedulerJob(
+        name="digest", prompt="x", cron="* * * * *", priority="high",
+    ))
+    assert arbiter.consulted_priorities == ["low", "high"]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_tick_suppressed_event_carries_priority_severity(
+    tmp_path: Path,
+):
+    from mimir.event_logger import init_logger
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    async def noop(_e):
+        return True
+
+    arbiter = _StubArbiter(
+        fire=False, severity_name="ELEVATED",
+        reason="quota_pace_elevated:anthropic:seven_day@0.75",
+    )
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, arbiter=arbiter,
+    )
+    await sched._fire(job=SchedulerJob(name="hb", prompt="x", cron="* * * * *"))
+    events = _read_event_types(tmp_path / "events.jsonl")
+    [ev] = [e for e in events if e["type"] == "scheduled_tick_suppressed"]
+    assert ev["priority"] == "low"
+    assert ev["severity"] == "ELEVATED"
+
+
+def test_scheduler_job_priority_yaml_round_trip(tmp_path: Path):
+    path = tmp_path / "scheduler.yaml"
+    write_jobs(path, [
+        SchedulerJob(name="hb", prompt="x", cron="0 8 * * *"),
+        SchedulerJob(name="digest", prompt="y", cron="0 9 * * *", priority="high"),
+    ])
+    jobs = {j.name: j for j in load_jobs(path)}
+    assert jobs["hb"].priority == "low"        # default, not serialized
+    assert jobs["digest"].priority == "high"   # explicit, round-trips
+    # Default priority isn't written to yaml (uncluttered).
+    assert "priority" not in path.read_text().split("digest")[0]
+
+
+def test_scheduler_job_invalid_priority_falls_back_to_low():
+    job = SchedulerJob.from_yaml_entry({
+        "name": "hb", "prompt": "x", "cron": "0 8 * * *",
+        "priority": "urgent",
+    })
+    assert job.priority == "low"
+
+
+def test_scheduler_job_priority_case_insensitive():
+    job = SchedulerJob.from_yaml_entry({
+        "name": "hb", "prompt": "x", "cron": "0 8 * * *",
+        "priority": " High ",
+    })
+    assert job.priority == "high"
+
+
+# ─── quota-pause early-recovery probe ──────────────────────────────────
+
+
+def _paused_scheduler(tmp_path: Path, enqueued: list):
+    """Scheduler wired with a home + a real rate-limit store the probe
+    reads through a minimal arbiter stand-in."""
+    from types import SimpleNamespace
+    from mimir.rate_limits import RateLimitStore
+
+    async def fake_enqueue(event):
+        enqueued.append(event)
+        return True
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    store = RateLimitStore(path=home / ".mimir" / "rate_limits.json")
+    arbiter = SimpleNamespace(
+        rate_limit_store=store,
+        plan_window_suppress_threshold=0.80,
+    )
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue,
+        home=home, arbiter=arbiter,
+    )
+    return sched, home, store
+
+
+def _record_pause(home: Path, *, reason: str = "quota_exhausted",
+                  hours_ahead: float = 2.0):
+    from datetime import datetime, timedelta, timezone
+    from mimir.quota_pause import QuotaPauseTracker
+    tracker = QuotaPauseTracker(home / ".mimir" / "quota_pause.json")
+    now = datetime.now(tz=timezone.utc)
+    tracker.pause_until(
+        now + timedelta(hours=hours_ahead),
+        reason=reason, provider="anthropic",
+        now=now - timedelta(minutes=10),  # pause recorded 10 min ago
+    )
+    return tracker
+
+
+def _fresh_snap(store, key: str, util: float, *, minutes_ago: float = 1.0):
+    from datetime import datetime, timedelta, timezone
+    from mimir.rate_limits import RateLimitSnapshot
+    now = datetime.now(tz=timezone.utc)
+    store.record_sync(key, RateLimitSnapshot(
+        status="allowed",
+        utilization=util,
+        resets_at=int((now + timedelta(hours=4)).timestamp()),
+        observed_at=(now - timedelta(minutes=minutes_ago)).isoformat(),
+    ))
+
+
+@pytest.mark.asyncio
+async def test_quota_recheck_early_clears_on_fresh_evidence(tmp_path: Path):
+    """Authoritative pause + fresh post-pause snapshot below the wall →
+    pause cleared early, quota_recovered(early=true), catch-up
+    heartbeat enqueued."""
+    from mimir.event_logger import init_logger
+    from mimir.quota_pause import QuotaPauseTracker
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    enqueued: list = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    _record_pause(home)
+    _fresh_snap(store, "five_hour", 0.30)
+
+    await sched._recheck_quota_pause()
+
+    assert QuotaPauseTracker(
+        home / ".mimir" / "quota_pause.json").is_paused().paused is False
+    events = _read_event_types(tmp_path / "events.jsonl")
+    [rec] = [e for e in events if e["type"] == "quota_recovered"]
+    assert rec["early"] is True
+    assert rec["evidence"] == "fresh_quota_below_threshold"
+    assert len(enqueued) == 1  # catch-up heartbeat
+
+
+@pytest.mark.asyncio
+async def test_quota_recheck_hot_window_vetoes_early_clear(tmp_path: Path):
+    """The usage poller refreshes ALL windows each cycle — a fresh low
+    7d reading must not clear the pause while the pegged 5h window
+    still reads over the wall."""
+    from mimir.event_logger import init_logger
+    from mimir.quota_pause import QuotaPauseTracker
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    enqueued: list = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    _record_pause(home)
+    _fresh_snap(store, "seven_day", 0.30)
+    _fresh_snap(store, "five_hour", 0.95)  # still pegged → veto
+
+    await sched._recheck_quota_pause()
+
+    assert QuotaPauseTracker(
+        home / ".mimir" / "quota_pause.json").is_paused().paused is True
+    events = _read_event_types(tmp_path / "events.jsonl")
+    assert not [e for e in events if e["type"] == "quota_recovered"]
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_quota_recheck_ignores_transient_backoff(tmp_path: Path):
+    """Header-less-429 backoffs are short and deliberately escalating —
+    early-clearing them would defeat the backoff."""
+    from mimir.event_logger import init_logger
+    from mimir.quota_pause import QuotaPauseTracker
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    enqueued: list = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    _record_pause(home, reason="rate_limited_backoff", hours_ahead=0.05)
+    _fresh_snap(store, "five_hour", 0.10)
+
+    await sched._recheck_quota_pause()
+
+    assert QuotaPauseTracker(
+        home / ".mimir" / "quota_pause.json").is_paused().paused is True
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_quota_recheck_requires_fresh_observation(tmp_path: Path):
+    """Snapshots observed BEFORE the pause was recorded are stale
+    pre-429 readings — not evidence of recovery."""
+    from mimir.quota_pause import QuotaPauseTracker
+
+    enqueued: list = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    _record_pause(home)
+    # Observed 30 min ago; pause recorded 10 min ago → stale.
+    _fresh_snap(store, "five_hour", 0.30, minutes_ago=30.0)
+
+    await sched._recheck_quota_pause()
+
+    assert QuotaPauseTracker(
+        home / ".mimir" / "quota_pause.json").is_paused().paused is True
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_quota_recheck_expired_pause_emits_and_disarms(tmp_path: Path):
+    """A pause whose reset already passed: the probe consumes the
+    lazy-expiry transition → emits quota_recovered(early=false), no
+    catch-up heartbeat (the one-shot wake owns that)."""
+    from mimir.event_logger import init_logger
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    enqueued: list = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    _record_pause(home, hours_ahead=-0.1)  # reset 6 min ago
+
+    await sched._recheck_quota_pause()
+
+    events = _read_event_types(tmp_path / "events.jsonl")
+    [rec] = [e for e in events if e["type"] == "quota_recovered"]
+    assert rec["early"] is False
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_arm_quota_recovery_wake_also_arms_recheck(tmp_path: Path):
+    """The one-shot wake and the interval probe are armed together —
+    agent 429 hook + startup re-arm get both via one call."""
+    from datetime import datetime, timedelta, timezone
+    from mimir.scheduler import _QUOTA_RECHECK_JOB_ID
+
+    enqueued: list = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    sched.arm_quota_recovery_wake(
+        datetime.now(tz=timezone.utc) + timedelta(hours=1),
+    )
+    assert sched._scheduler.get_job(_QUOTA_RECHECK_JOB_ID) is not None

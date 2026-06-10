@@ -80,6 +80,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from .billing import normalize_priority
 from .event_logger import log_event, get_events_path
 from .models import AgentEvent
 from . import poller_recovery
@@ -354,6 +355,16 @@ class PollerConfig:
     #: reconciliation, so framework re-enqueue on top would double-fire
     #: review turns. See :mod:`mimir.poller_recovery`.
     recover_failed_turns: bool = False
+    #: ``priority`` (priority-banded suppression): how much resource
+    #: pressure this poller rides through before the scheduler sheds
+    #: it. ``low`` yields at the first sign of pressure (ELEVATED),
+    #: ``normal`` (default) sheds when quota is tight, ``high`` keeps
+    #: firing until the provider actively refuses (recorded 429).
+    #: See ``HomeostaticArbiter.should_fire`` for the fire matrix.
+    #: Suppressed fires skip the subprocess entirely, so the poller's
+    #: cursor stays frozen and catches up on the next tick after
+    #: recovery — no events are lost, only delayed.
+    priority: str = "normal"
     pass_env: tuple[str, ...] = ()
     #: ``env_required`` (chainlink #108): env var names the poller
     #: **must** have in its subprocess env to function correctly.
@@ -616,6 +627,23 @@ def discover_pollers(
             # non-bool just reads as on/off rather than erroring (low-stakes
             # flag, unlike batch_size which affects coalescing math).
             recover_failed_turns = bool(entry.get("recover_failed_turns", False))
+            # ``priority`` (priority-banded suppression): low | normal |
+            # high. Garbage values fall back to the default with a
+            # warning — a typo shouldn't silently promote a poller to
+            # ride through quota pressure (or demote it to shed early).
+            raw_priority = entry.get("priority")
+            priority = "normal"
+            if raw_priority is not None:
+                priority = normalize_priority(raw_priority)
+                if not (
+                    isinstance(raw_priority, str)
+                    and raw_priority.strip().lower() == priority
+                ):
+                    log.warning(
+                        "poller_invalid_priority: %s name=%r value=%r "
+                        "(expected low|normal|high); using %r",
+                        pollers_file, name, raw_priority, priority,
+                    )
             pollers.append(
                 PollerConfig(
                     name=name,
@@ -626,6 +654,7 @@ def discover_pollers(
                     persist_dir=persist_dir,
                     batch_size=batch_size,
                     recover_failed_turns=recover_failed_turns,
+                    priority=priority,
                     pass_env=tuple(pass_env_clean),
                     env_required=tuple(env_required_clean),
                     manifest_path=pollers_file,
