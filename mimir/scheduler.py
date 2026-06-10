@@ -46,6 +46,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .billing import normalize_priority
 from .event_logger import log_event
+from .quota_windows import provider_store_keys
 from .models import AgentEvent
 from .pollers import POLLER_CHANNEL_PREFIX, PollerConfig, discover_pollers, run_poller
 from .saga_client import SagaClient, SagaError
@@ -886,6 +887,22 @@ class Scheduler:
         except Exception:  # noqa: BLE001 — store read is best-effort
             log.exception("quota recheck: rate-limit store read failed")
             return
+        # Filter to the ACTIVE quota provider(s)' store keys (mirrors
+        # the Resource-usage view, chainlink #301). A deployment that
+        # switched providers (e.g. the Codex cutover) can have
+        # stale-but-unexpired snapshots from the prior provider in the
+        # store — without this filter a leftover hot ``minimax_*``
+        # window would veto early clear of an Anthropic pause, and a
+        # fresh foreign snapshot would count as recovery evidence for
+        # a pause it says nothing about. Fail-open: no configured
+        # providers (pay-as-you-go) or no declared keys → unfiltered.
+        allowed: set[str] = set()
+        for provider in getattr(self._arbiter, "quota_providers", None) or []:
+            allowed.update(
+                provider_store_keys(getattr(provider, "provider_name", "")),
+            )
+        if allowed:
+            snaps = {k: v for k, v in snaps.items() if k in allowed}
         if not snaps:
             return
         wall = getattr(self._arbiter, "plan_window_suppress_threshold", 0.80)

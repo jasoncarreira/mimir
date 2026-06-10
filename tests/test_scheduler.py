@@ -2750,3 +2750,76 @@ async def test_arm_quota_recovery_wake_also_arms_recheck(tmp_path: Path):
         datetime.now(tz=timezone.utc) + timedelta(hours=1),
     )
     assert sched._scheduler.get_job(_QUOTA_RECHECK_JOB_ID) is not None
+
+
+@pytest.mark.asyncio
+async def test_quota_recheck_ignores_stale_prior_provider_window(tmp_path: Path):
+    """Provider filter (review follow-up on #626): a hot
+    stale-but-unexpired window left behind by a PRIOR provider (e.g.
+    leftover ``minimax_*`` keys after a Codex/Anthropic cutover) must
+    not veto early clear when the ACTIVE provider's windows show
+    recovery."""
+    from types import SimpleNamespace
+    from mimir.event_logger import init_logger
+    from mimir.quota_pause import QuotaPauseTracker
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    enqueued: list = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    sched._arbiter.quota_providers = [SimpleNamespace(provider_name="anthropic")]
+    _record_pause(home)
+    _fresh_snap(store, "five_hour", 0.30)          # active (anthropic): recovered
+    _fresh_snap(store, "minimax_five_hour", 0.95)  # prior provider: hot, ignored
+
+    await sched._recheck_quota_pause()
+
+    assert QuotaPauseTracker(
+        home / ".mimir" / "quota_pause.json").is_paused().paused is False
+    events = _read_event_types(tmp_path / "events.jsonl")
+    [rec] = [e for e in events if e["type"] == "quota_recovered"]
+    assert rec["early"] is True
+    assert len(enqueued) == 1
+
+
+@pytest.mark.asyncio
+async def test_quota_recheck_foreign_snapshot_is_not_evidence(tmp_path: Path):
+    """The freshness side of the same filter: a fresh snapshot from a
+    NON-active provider says nothing about the paused provider's
+    window — it must not count as recovery evidence."""
+    from types import SimpleNamespace
+    from mimir.quota_pause import QuotaPauseTracker
+
+    enqueued: list = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    sched._arbiter.quota_providers = [SimpleNamespace(provider_name="anthropic")]
+    _record_pause(home)
+    _fresh_snap(store, "minimax_five_hour", 0.10)  # fresh + low, but foreign
+
+    await sched._recheck_quota_pause()
+
+    assert QuotaPauseTracker(
+        home / ".mimir" / "quota_pause.json").is_paused().paused is True
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_quota_recheck_active_provider_hot_window_still_vetoes(
+    tmp_path: Path,
+):
+    """The filter must not weaken the veto: the ACTIVE provider's own
+    hot window still blocks early clear."""
+    from types import SimpleNamespace
+    from mimir.quota_pause import QuotaPauseTracker
+
+    enqueued: list = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    sched._arbiter.quota_providers = [SimpleNamespace(provider_name="anthropic")]
+    _record_pause(home)
+    _fresh_snap(store, "seven_day", 0.30)
+    _fresh_snap(store, "five_hour", 0.95)  # active provider, pegged → veto
+
+    await sched._recheck_quota_pause()
+
+    assert QuotaPauseTracker(
+        home / ".mimir" / "quota_pause.json").is_paused().paused is True
+    assert enqueued == []
