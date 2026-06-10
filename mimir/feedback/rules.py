@@ -83,6 +83,11 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # — disconnected client, bad channel) on a send_message. With auto-dispatch
     # gone this is the sole reply path, so a non-delivery is operator-relevant.
     "send_message_failed": ("negative", "send_failed"),
+    # chainlink #408: a <react> directive inside a send_message body
+    # failed (bridge declined or raised). Previously a silent
+    # except-pass — but the prompt tells the agent directive failures
+    # surface in feedback, and a failed ack means the user saw nothing.
+    "send_message_directive_failed": ("negative", "directive_failed"),
     # 0.3.0: interactive turn produced final text but never called the
     # send_message tool — the reply is stuck as reasoning and the user got
     # nothing. Surfaces in the next turn's feedback panel so the agent
