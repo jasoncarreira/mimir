@@ -98,6 +98,16 @@ For each repo in `GITHUB_REPOS`:
   `pr_review_request_gave_up` **signal** (no turn; surfaces as a *negative
   algedonic signal* via `feedback.classify`'s `*_gave_up` rule) and goes dormant
   for that PR until you're removed and re-requested.
+- **Stale changes-requested on your own PRs** (`pr_changes_requested_stale`) —
+  state-reconciling reminder (chainlink #449), the reverse direction of the
+  above: reviews ON your PRs are otherwise edge-triggered only, so a turn that
+  reads a request-changes review without pushing fixes loses the work signal
+  when the cursor advances. Each poll, your open PRs whose latest substantive
+  review per reviewer is `CHANGES_REQUESTED` **and** whose head commit predates
+  that review fire ONE reminder per `(pr, head_sha)` — pushing fixes (head
+  newer than the review) silences it without a re-review; a new blocking
+  review newer than your new head is a new state and reminds once more. No
+  re-emit loop, no give-up signal: one reminder per stale state.
 
 Issue / PR / comment / review detection is filtered by `created_at > cursor`
 and (when set) `user.login != MIMIR_GITHUB_SELF_LOGIN`. Push + review-request
@@ -126,6 +136,8 @@ Polling 1 repo every 15 min @ 4 endpoints = ~16 calls/hr/repo. For a 5-repo watc
 ## Cursor file
 
 Persists at `<home>/state/pollers/github-activity/cursor.json` (the framework-injected `STATE_DIR`). Survives container rebuilds. First run looks back 1 hour to bound the backfill burst.
+
+The `pr_changes_requested` key maps `{repo: {pr_number: head_sha}}` — the own-PR stale states already reminded about (chainlink #449), rebuilt from the live snapshot each poll so closed/unblocked PRs drop out.
 
 The `pr_review_requests` key maps `{repo: {pr_number: attempts}}` — `attempts` counts `pr_review_requested` emits while you stayed requested (chainlink #299; a dormant PR that gave up parks at `cap + 1`). The pre-#299 bare-list format (`{repo: [pr_number, ...]}`) migrates automatically on first load.
 
