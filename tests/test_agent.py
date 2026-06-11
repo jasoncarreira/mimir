@@ -2177,3 +2177,28 @@ def test_resolve_model_claude_code_scaffold_opt_in(tmp_path, monkeypatch):
         pytest.fail(f"gate fired despite scaffolded opt-in: {exc}")
     except ImportError:
         pass  # fork not installed — expected past the gate
+
+
+def test_reflection_lm_honors_scaffold_opt_in(tmp_path, monkeypatch):
+    """chainlink #426 (review follow-up 3): every Config-based
+    _resolve_model caller must thread home= — gepa_support's
+    reflection-LM construction previously missed it, so a
+    subscription-scaffolded home worked for the main agent but the
+    reflection LM still refused the claude-code route."""
+    from types import SimpleNamespace
+    pytest.importorskip("gepa")
+    from mimir.gepa_support import reflection_lm_from_config
+
+    monkeypatch.delenv("MIMIR_ALLOW_CLAUDE_CODE", raising=False)
+    (tmp_path / ".env").write_text(
+        "MIMIR_ALLOW_CLAUDE_CODE=1\n", encoding="utf-8",
+    )
+    cfg = SimpleNamespace(
+        model_spec="claude-code:claude-sonnet-4-6", home=tmp_path,
+    )
+    try:
+        reflection_lm_from_config(cfg)
+    except RuntimeError as exc:
+        pytest.fail(f"deprecation gate fired despite scaffolded opt-in: {exc}")
+    except ImportError:
+        pass  # langchain-claude-code fork not installed — past the gate
