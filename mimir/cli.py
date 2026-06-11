@@ -93,6 +93,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .commands import memory as _memory_cmd
     mem_p = _memory_cmd.add_argparse(sub)
 
+    # `mimir worklink run <issue>` — operator-invoked Worklink executor.
+    from .commands import worklink as _worklink_cmd
+    worklink_p = _worklink_cmd.add_argparse(sub)
+
     regen_p = sub.add_parser(
         "regenerate-api-key",
         help="Rotate MIMIR_API_KEY in <home>/.env. Prints the new value.",
@@ -336,6 +340,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         if code:
             sys.exit(code)
         return
+
+    if args.command == "worklink":
+        sys.exit(_worklink_cmd.dispatch(args, worklink_p))
 
     if args.command == "stats":
         from .config import Config as _Config

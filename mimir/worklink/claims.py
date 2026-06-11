@@ -120,10 +120,42 @@ class ChainlinkClaims:
             agent_id=self.agent_id,
             claimed_at=self.clock(),
         )
-        self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
-        self._run("issue", "label", str(issue_id), "worklink:in-progress")
-        self._run("issue", "comment", str(issue_id), record.to_comment())
+        try:
+            self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
+            self._run("issue", "label", str(issue_id), "worklink:in-progress")
+            self._run("issue", "comment", str(issue_id), record.to_comment())
+        except Exception:
+            self.release_issue(issue_id)
+            raise
         return ClaimResult(True, record=record)
+
+    def release_issue(self, issue_id: int) -> None:
+        """Release the Chainlink lock for ``issue_id`` best-effort."""
+        self._run("locks", "release", str(issue_id), check=False)
+
+    def transition_issue(
+        self,
+        issue_id: int,
+        *,
+        status: str,
+        review_ready: bool,
+        reason: str | None = None,
+    ) -> None:
+        """Move Worklink labels after evidence validation."""
+        self._run("issue", "unlabel", str(issue_id), "worklink:in-progress", check=False)
+        self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
+        self._run("issue", "unlabel", str(issue_id), "worklink:review", check=False)
+        self._run("issue", "unlabel", str(issue_id), "worklink:blocked", check=False)
+        self._run("issue", "unlabel", str(issue_id), "worklink:failed", check=False)
+        if review_ready:
+            self._run("issue", "label", str(issue_id), "worklink:review")
+            return
+        if status == "blocked":
+            self._run("issue", "label", str(issue_id), "worklink:blocked")
+            return
+        self._run("issue", "label", str(issue_id), "worklink:failed")
+        if reason:
+            self._run("issue", "comment", str(issue_id), f"WORKLINK_FAILED {reason}")
 
     def next_attempt(self, comments: Iterable[str]) -> int:
         records = claim_records_from_comments(comments)
