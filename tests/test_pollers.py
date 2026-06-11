@@ -3090,3 +3090,42 @@ def test_discover_invalid_priority_warns_and_defaults(tmp_path: Path, caplog):
     assert any(
         "poller_invalid_priority" in r.getMessage() for r in caplog.records
     )
+
+
+# ─── hidden-dir manifests excluded from discovery ─────────────────────
+
+
+def test_discover_skips_pre_update_backup_manifest(tmp_path: Path):
+    """Observed live 2026-06-11: a skill update's .pre-update-backup
+    snapshot includes pollers.json; with first-wins duplicate-name
+    dedupe (#420) the backup ('.pre-…' sorts first) shadowed the live
+    manifest and the scheduler ran the OLD poller from the backup dir
+    every tick. Hidden directories are never skill roots — discovery
+    must not descend into them."""
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "github-poller", [
+        {"name": "github-activity", "command": "python3 poller.py",
+         "cron": "*/15 * * * *", "priority": "high"},
+    ])
+    backup = skills / "github-poller" / ".pre-update-backup" / "20260611T183425Z"
+    _write_pollers_json(backup, [
+        {"name": "github-activity", "command": "python3 poller.py",
+         "cron": "*/15 * * * *"},  # stale: no priority
+    ])
+    out = discover_pollers(skills)
+    assert len(out) == 1
+    [p] = out
+    assert p.skill_dir == skills / "github-poller"   # the LIVE dir
+    assert p.priority == "high"                       # the LIVE config
+
+
+def test_discover_skips_any_hidden_dir_manifest(tmp_path: Path):
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / ".scratch" / "old-skill", [
+        {"name": "ghost", "command": "echo", "cron": "* * * * *"},
+    ])
+    _write_pollers_json(skills / "real-skill", [
+        {"name": "real", "command": "echo", "cron": "* * * * *"},
+    ])
+    out = discover_pollers(skills)
+    assert [p.name for p in out] == ["real"]
