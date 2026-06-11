@@ -134,6 +134,14 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # Operators see the block in the algedonic block so a manifest typo
     # or supply-chain regression doesn't go silent.
     "poller_env_process_control_blocked": ("negative", "poller_env_process_control_blocked"),
+    # chainlink #419: a pollers.json entry's cron expression failed to
+    # validate on install/reload. A previously-installed poller keeps
+    # firing on its last-known-good cron (preserved, like the
+    # invalid-manifest path); a fresh install is skipped entirely.
+    # Negative so the operator sees the broken schedule algedonically
+    # instead of discovering it via a poller that never updated (or
+    # never started).
+    "poller_reload_invalid_cron": ("negative", "poller_invalid_cron"),
     # chainlink #108: env_required validation — emitted when a poller's
     # declared required env vars are absent from the assembled subprocess
     # env.  The poller run is skipped entirely for that tick.  Negative so

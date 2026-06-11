@@ -704,6 +704,63 @@ def test_scheduled_tick_suppressed_renders_in_feedback(tmp_path: Path):
     assert "plan_window_saturated" in block
 
 
+def test_poller_reload_invalid_cron_classified_negative():
+    """chainlink #419: the invalid-cron reload event must be in
+    _EVENT_RULES so the operator sees a broken poller schedule
+    algedonically rather than via a poller that quietly never fires."""
+    from mimir.feedback import classify
+
+    assert classify("poller_reload_invalid_cron") == (
+        "negative", "poller_invalid_cron",
+    )
+
+
+def test_poller_reload_invalid_cron_renders_preserved_variant(tmp_path: Path):
+    """Preserved case: a previously-installed poller keeps firing on
+    its last-known-good cron — the rendered line must say so, so the
+    operator doesn't think the poller went dark."""
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.5),
+            "type": "poller_reload_invalid_cron",
+            "session_id": "s",
+            "poller": "github-activity",
+            "cron": "not a cron",
+            "manifest_path": "/home/skills/gh/pollers.json",
+            "error": "ValueError: Wrong number of fields",
+            "preserved_pollers": ["github-activity"],
+        },
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "Negative" in block
+    assert "invalid cron" in block
+    assert "github-activity" in block
+    assert "previous schedule kept" in block
+
+
+def test_poller_reload_invalid_cron_renders_skipped_variant(tmp_path: Path):
+    """Fresh-install case: nothing to preserve — the line must make
+    clear the poller is NOT scheduled at all."""
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.5),
+            "type": "poller_reload_invalid_cron",
+            "session_id": "s",
+            "poller": "newcomer",
+            "cron": "61 * * * *",
+            "manifest_path": "/home/skills/new/pollers.json",
+            "error": "ValueError: ...",
+            "preserved_pollers": [],
+        },
+    ])
+    block = log.recent_block()
+    assert block is not None
+    assert "Negative" in block
+    assert "newcomer" in block
+    assert "poller not scheduled" in block
+
+
 # ---- pending_forget_candidates_count -------------------------------------
 
 
