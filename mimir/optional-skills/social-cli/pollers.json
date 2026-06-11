@@ -9,7 +9,9 @@
         "MIMIR_SOCIAL_PLATFORMS",
         "MIMIR_SOCIAL_LIMIT",
         "MIMIR_SOCIAL_USERS_DIR",
-        "SOCIAL_CLI_BIN"
+        "SOCIAL_CLI_BIN",
+        "ATPROTO_HANDLE",
+        "ATPROTO_APP_PASSWORD"
       ]
     },
     {
@@ -20,7 +22,9 @@
       "pass_env": [
         "MIMIR_SOCIAL_PLATFORMS",
         "MIMIR_SOCIAL_FEED_LIMIT",
-        "SOCIAL_CLI_BIN"
+        "SOCIAL_CLI_BIN",
+        "ATPROTO_HANDLE",
+        "ATPROTO_APP_PASSWORD"
       ]
     }
   ]
