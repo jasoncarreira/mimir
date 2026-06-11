@@ -109,7 +109,7 @@ def _orchestrator_runner(
     calls: list[Sequence[str] | str] = []
     commit_seen = False
 
-    def runner(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         nonlocal commit_seen
         calls.append(args)
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
@@ -209,7 +209,7 @@ def test_worklink_runner_backend_nonzero_transitions_failed_without_pr(tmp_path:
         isinstance(call, list) and call[:3] == ["gh", "pr", "create"]
         for call in calls
     )
-    assert ["chainlink", "issue", "label", "441", "worklink:failed"] in calls
+    assert ["chainlink", "issue", "label", "441", "worklink:ready"] in calls
     assert ["chainlink", "locks", "release", "441"] in calls
 
 
@@ -232,7 +232,7 @@ def test_worklink_runner_timeout_transitions_failed_without_pr(tmp_path: Path) -
         isinstance(call, list) and call[:3] == ["gh", "pr", "create"]
         for call in calls
     )
-    assert ["chainlink", "issue", "label", "441", "worklink:failed"] in calls
+    assert ["chainlink", "issue", "label", "441", "worklink:ready"] in calls
 
 
 def test_worklink_runner_dirty_after_commit_fails_before_push(tmp_path: Path) -> None:
@@ -257,4 +257,4 @@ def test_worklink_runner_dirty_after_commit_fails_before_push(tmp_path: Path) ->
         and call[3] == "push"
         for call in calls
     )
-    assert ["chainlink", "issue", "label", "441", "worklink:failed"] in calls
+    assert ["chainlink", "issue", "label", "441", "worklink:ready"] in calls

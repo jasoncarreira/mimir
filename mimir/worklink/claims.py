@@ -139,6 +139,7 @@ class ChainlinkClaims:
         *,
         status: str,
         review_ready: bool,
+        attempt: int | None = None,
         reason: str | None = None,
     ) -> None:
         """Move Worklink labels after evidence validation."""
@@ -150,10 +151,10 @@ class ChainlinkClaims:
         if review_ready:
             self._run("issue", "label", str(issue_id), "worklink:review")
             return
-        if status == "blocked":
+        if status == "blocked" or (attempt is not None and attempt >= self.max_attempts):
             self._run("issue", "label", str(issue_id), "worklink:blocked")
-            return
-        self._run("issue", "label", str(issue_id), "worklink:failed")
+        else:
+            self._run("issue", "label", str(issue_id), "worklink:ready")
         if reason:
             self._run("issue", "comment", str(issue_id), f"WORKLINK_FAILED {reason}")
 

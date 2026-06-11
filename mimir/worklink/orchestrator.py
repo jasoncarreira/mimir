@@ -22,7 +22,7 @@ from .claims import ChainlinkClaims
 from .evidence import EvidenceValidation, WorklinkEvidence, observe_evidence
 from .worktree import WorktreeLease, cleanup_worktree, create_worktree
 
-Runner = Callable[[Sequence[str] | str], subprocess.CompletedProcess[str]]
+Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 @dataclass(frozen=True)
@@ -266,6 +266,7 @@ class WorklinkRunner:
                 issue.issue_id,
                 status=validation.status,
                 review_ready=validation.review_ready,
+                attempt=record.attempt,
                 reason=", ".join(validation.reasons) if validation.reasons else None,
             )
             _log_event(
@@ -293,6 +294,7 @@ class WorklinkRunner:
                     issue.issue_id,
                     status="failed",
                     review_ready=False,
+                    attempt=record.attempt,
                     reason=str(exc),
                 )
             except Exception:
@@ -498,19 +500,19 @@ def _list_runner(runner: Runner) -> Callable[[Sequence[str]], subprocess.Complet
 
 
 def _runner_for_home(home: Path, chainlink_bin: str) -> Runner:
-    def run(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:
+    def run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         if isinstance(args, str):
-            return subprocess.run(args, shell=True, capture_output=True, text=True, check=False)
-        cwd = home if args and args[0] == chainlink_bin else None
-        return subprocess.run(list(args), cwd=cwd, capture_output=True, text=True, check=False)
+            return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, check=False)
+        command_cwd = cwd if cwd is not None else (home if args and args[0] == chainlink_bin else None)
+        return subprocess.run(list(args), cwd=command_cwd, capture_output=True, text=True, check=False)
 
     return run
 
 
-def _run(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:
+def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     if isinstance(args, str):
-        return subprocess.run(args, shell=True, capture_output=True, text=True, check=False)
-    return subprocess.run(list(args), capture_output=True, text=True, check=False)
+        return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, check=False)
+    return subprocess.run(list(args), cwd=cwd, capture_output=True, text=True, check=False)
 
 
 def _log_event(event_type: str, **payload: Any) -> None:
