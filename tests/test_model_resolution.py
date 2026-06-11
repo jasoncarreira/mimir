@@ -199,9 +199,14 @@ class TestResolveModelInitChat:
 
 
 class TestResolveModelClaudeCode:
-    def test_claude_code_path_returns_chat_claude_code(self) -> None:
+    def test_claude_code_path_returns_chat_claude_code(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         # claude-code path doesn't accept max_retries; just confirm we get
         # back a ChatClaudeCode instance regardless of the kwarg.
+        # chainlink #426: the route is deprecated-by-default — these tests
+        # exercise post-gate behavior, so they opt in.
+        monkeypatch.setenv("MIMIR_ALLOW_CLAUDE_CODE", "1")
         try:
             from langchain_claude_code import ChatClaudeCode
         except ImportError:
@@ -357,6 +362,7 @@ def test_effort_skipped_when_none(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_claude_code_gets_effort_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_ALLOW_CLAUDE_CODE", "1")  # chainlink #426 opt-in
     pytest.importorskip("langchain_claude_code")
     captured: dict[str, Any] = {}
 
@@ -370,6 +376,7 @@ def test_claude_code_gets_effort_when_set(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_claude_code_omits_effort_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_ALLOW_CLAUDE_CODE", "1")  # chainlink #426 opt-in
     pytest.importorskip("langchain_claude_code")
     captured: dict[str, Any] = {}
 
@@ -404,7 +411,10 @@ def test_anthropic_invalid_effort_raises() -> None:
         _resolve_model("anthropic:claude-opus-4-8", reasoning_effort="minimal")
 
 
-def test_claude_code_invalid_effort_raises() -> None:
+def test_claude_code_invalid_effort_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_ALLOW_CLAUDE_CODE", "1")  # chainlink #426 opt-in
     pytest.importorskip("langchain_claude_code")
     with pytest.raises(ValueError, match="claude-code"):
         _resolve_model("claude-code:claude-sonnet-4-6", reasoning_effort="minimal")

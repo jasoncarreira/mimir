@@ -101,6 +101,14 @@ class TurnContext:
     # treats react_count > 0 the same as a delivered send_message — otherwise
     # a react-only reply gets falsely flagged as "no reply" (0.3.2).
     react_count: int = 0
+    # Channels that received a CONFIRMED delivery this turn (send_message
+    # with SendResult.sent, or a confirmed react — tool or directive).
+    # chainlink #423: the forgot-to-send guard is channel-scoped — an
+    # interactive turn must deliver to the TRIGGERING channel; a
+    # cross-channel send (e.g. an ops-channel alert) doesn't count as
+    # replying to the user who asked. The plain counters above stay for
+    # observability; this set is what the guard reads.
+    delivered_channel_ids: set = field(default_factory=set)
     # Channel-layer state (Phase 6.3) — populated by the agent at run_turn start.
     loop_detector: object | None = None
     last_assistant_message_id: str | None = None

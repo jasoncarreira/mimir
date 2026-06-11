@@ -315,6 +315,33 @@ def _resolve_model(
     if not isinstance(spec, str):
         raise TypeError(f"unexpected model spec type: {type(spec).__name__}")
     if spec.startswith("claude-code:"):
+        # chainlink #426: the claude-code subprocess route is DEPRECATED.
+        # Its tools are bridged into the ClaudeSDKClient as in-process MCP
+        # tools and execute inside the SDK round-trip — they never
+        # traverse langgraph's tool node, so BudgetGateMiddleware and the
+        # prohibited-action screen do not run on this provider: an
+        # ungated agent. No live deployment uses it (codex-plus /
+        # anthropic-compat routes) and the subprocess-subagent direction
+        # is being retired, so rather than maintain gating code for a
+        # provider nobody exercises, the route is refused at resolve time
+        # with an explicit opt-out for operators who accept the gap.
+        if os.environ.get("MIMIR_ALLOW_CLAUDE_CODE", "").strip() not in (
+            "1", "true", "yes",
+        ):
+            raise RuntimeError(
+                "MIMIR_MODEL_SPEC=claude-code:* is deprecated and disabled: "
+                "this provider executes tools inside the Claude Code "
+                "subprocess, bypassing the per-turn tool budget and the "
+                "prohibited-action screen (chainlink #426). Use a routed "
+                "provider (anthropic:, openai:, codex-plus:) — or set "
+                "MIMIR_ALLOW_CLAUDE_CODE=1 to run it anyway, accepting an "
+                "ungated agent."
+            )
+        log.warning(
+            "claude-code provider enabled via MIMIR_ALLOW_CLAUDE_CODE — "
+            "this route is deprecated and runs WITHOUT the tool budget "
+            "or prohibited-action gating (chainlink #426)"
+        )
         try:
             from langchain_claude_code import ChatClaudeCode  # type: ignore[import-untyped]
         except ImportError as exc:
@@ -1882,14 +1909,23 @@ class Agent:
         # send_message OR a successful react (a react-only acknowledgment is a
         # valid reply, so it must NOT be flagged) — NOT the presence of a tool
         # call, which can be refused (non-interactive / loop hard-stop / no
-        # bridge) or soft-fail and deliver nothing. Emit a negative signal so
-        # the next turn's feedback panel surfaces it (feedback.classify maps
-        # ``interactive_turn_no_send_message`` to a negative ``no_reply``).
+        # bridge) or soft-fail and deliver nothing.
+        #
+        # chainlink #423: the check is CHANNEL-SCOPED — the delivery must
+        # reach the TRIGGERING channel. A turn whose only confirmed
+        # delivery is a cross-channel send (e.g. an ops-channel alert)
+        # left the asking user in silence, which is exactly what this
+        # signal exists to catch; the convention is "close the loop with
+        # whoever asked" (see prompts.py). ``delivered_elsewhere`` is
+        # carried on the event so feedback/reflection can distinguish
+        # totally-silent from answered-in-the-wrong-room. Emit a negative
+        # signal so the next turn's feedback panel surfaces it
+        # (feedback.classify maps it to a negative ``no_reply``).
+        _delivered = getattr(ctx, "delivered_channel_ids", None) or set()
         if (
             turn_is_interactive
             and (output or "").strip()
-            and getattr(ctx, "send_message_count", 0) == 0
-            and getattr(ctx, "react_count", 0) == 0
+            and event.channel_id not in _delivered
         ):
             await safe_log_event(
                 "interactive_turn_no_send_message",
@@ -1897,6 +1933,10 @@ class Agent:
                 turn_id=turn_id,
                 trigger=event.trigger,
                 output_chars=len((output or "").strip()),
+                **(
+                    {"delivered_elsewhere": sorted(_delivered)}
+                    if _delivered else {}
+                ),
             )
 
         await log_event(
