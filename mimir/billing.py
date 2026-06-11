@@ -191,6 +191,27 @@ class QuotaProvider(ABC):
 _ANTHROPIC_WINDOW_HOURS = ANTHROPIC.window_hours()
 
 
+def _is_stale_observation(observed_at: object, window_hours: float) -> bool:
+    """True when an ISO ``observed_at`` is older than ``window_hours``
+    (the window it was read from has definitionally rolled since).
+    Unparseable / missing timestamps are NOT treated as stale — they
+    carry no age signal either way, and suppressing on them would turn
+    a logging quirk into a policy decision (chainlink #424)."""
+    if not isinstance(observed_at, str) or not observed_at:
+        return False
+    import datetime as _dt
+    try:
+        ts = _dt.datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=_dt.timezone.utc)
+    age_hours = (
+        _dt.datetime.now(tz=_dt.timezone.utc) - ts
+    ).total_seconds() / 3600.0
+    return age_hours > window_hours
+
+
 class _StorageBackedQuotaProvider(QuotaProvider):
     """Shared base for providers that read :class:`RateLimitStore` with a
     fixed ``{key → window_hours}`` mapping and an optional store-key
@@ -226,6 +247,21 @@ class _StorageBackedQuotaProvider(QuotaProvider):
         for key, hours in self._window_hours.items():
             snap = snaps.get(f"{self._store_key_prefix}{key}")
             if snap is None:
+                continue
+            # Staleness guard (chainlink #424): ``RateLimitStore.current()``
+            # only expires entries past their ``resets_at`` — a snapshot
+            # with ``resets_at=None`` (derived 5h estimates by design;
+            # reset-at-less Codex headers) survives forever. Grading the
+            # raw wall from a reading older than its own window length is
+            # grading a window that has definitionally rolled since — on
+            # Codex (no independent poller; quota arrives only on
+            # responses) a stale ≥wall reading could wedge severity TIGHT
+            # with nothing left under suppression to refresh it. Treat
+            # such a reading as no-signal; entries WITH a resets_at keep
+            # the store's own expiry.
+            if snap.resets_at is None and _is_stale_observation(
+                getattr(snap, "observed_at", ""), hours,
+            ):
                 continue
             is_derived = getattr(snap, "derived", False)
             # chainlink #17: on-pace projection on a derived utilization

@@ -821,6 +821,20 @@ class Scheduler:
         except Exception:  # noqa: BLE001 — already gone / scheduler shutting down
             pass
 
+    def _disarm_quota_recovery_wake(self) -> None:
+        """Remove the one-shot wake armed at the recorded reset.
+
+        chainlink #414: after an early clear the recorded reset is
+        moot — leaving the wake armed fires a spurious
+        ``quota_recovery_wake_fired`` + a second catch-up heartbeat at
+        the stale timestamp (the sibling pause-gone branch explicitly
+        calls a double heartbeat wasted tokens). Best-effort, like
+        arming."""
+        try:
+            self._scheduler.remove_job(_QUOTA_RECOVERY_JOB_ID)
+        except Exception:  # noqa: BLE001 — already gone / never armed
+            pass
+
     async def _recheck_quota_pause(self) -> None:
         """Interval-probe body. Three outcomes:
 
@@ -928,6 +942,10 @@ class Scheduler:
             evidence="fresh_quota_below_threshold",
         )
         self._disarm_quota_pause_recheck()
+        # chainlink #414: the recorded reset is moot now — drop the
+        # one-shot wake so it doesn't fire a second catch-up heartbeat
+        # at the stale timestamp.
+        self._disarm_quota_recovery_wake()
         # Catch-up heartbeat now — through the normal arbiter gate, so
         # a still-degraded environment (e.g. cost-rate TIGHT) can
         # still veto the actual turn.
