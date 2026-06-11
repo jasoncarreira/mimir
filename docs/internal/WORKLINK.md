@@ -51,12 +51,19 @@ already provides the primitives:
 | Evidence + audit trail | `chainlink issue comment` (evidence JSON + human summary) |
 | Review loop | labels + approval-shaped comment / PR review, reconciled by a poller |
 
-**Slice 0 verifies lock atomicity empirically** (two processes racing
-`locks claim` on one issue; exactly one wins). If the implementation
-turns out not to be atomic across processes, the fallback is
-`O_CREAT|O_EXCL` claim files under `<home>/state/worklink/claims/`
-(atomic on POSIX for same-host workers) with the chainlink lock kept as
-the human-visible mirror — and an upstream issue filed.
+**Slice 0 verified lock atomicity empirically** with
+`scripts/probe_chainlink_locks.py` (chainlink #438): 20 independent
+remote-backed clone races against `chainlink locks claim <issue>` on
+chainlink `0.2.0+9909d7e-dirty` produced exactly one successful claim
+per trial, zero double-claims, and one loser failing in git rebase on
+the shared `chainlink/locks` branch. Decision: use chainlink locks as
+the primary claim mechanism; do **not** add a parallel `O_CREAT|O_EXCL`
+claim-file fallback unless a future chainlink-version probe shows a
+double-claim or non-deterministic winner. Operational caveat: `locks
+steal` is forceful — in this version a freshly-created lock is reported
+as "STALE (no recent heartbeat)" and can be stolen immediately, so the
+worklink reaper must enforce its own TTL / heartbeat evidence before
+calling `steal`; it must not trust `steal` to reject live claims.
 
 ### State machine
 
