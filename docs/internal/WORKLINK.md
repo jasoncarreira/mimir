@@ -118,8 +118,15 @@ Per-issue flow (one `run`):
    guarantee that vague parents can't reach a coding agent.
 2. **Claim** (`claims.py`). Lock + claim comment (agent id, ts,
    attempt N).
-3. **Worktree.** `git worktree add .worklink/<issue> -b issue/<issue>`
-   from fresh `main`. Never a long-lived per-worker branch.
+3. **Worktree.** `git worktree add .worklink/<issue>-<attempt> -b
+   issue/<issue>-a<attempt>` from fresh `main` — **attempt-scoped
+   names**, because failed/blocked worktrees are retained for autopsy
+   (§3 step 8): with issue-scoped names the second attempt would
+   collide with the first attempt's kept worktree AND its branch, and
+   `attempts < 3` could never actually run more than once. Each retry
+   gets a fresh path + branch; autopsy artifacts from prior attempts
+   stay untouched until the reaper prunes them. Never a long-lived
+   per-worker branch.
 4. **Render the prompt** from issue fields: description, acceptance
    criteria, review criteria, parent context, repo conventions pointer.
    Template lives at `prompts/worklink-order.md` (operator-tunable).
@@ -130,8 +137,10 @@ Per-issue flow (one `run`):
 7. **Validate + transition.** Evidence gates the label move (§4).
    Push branch, open PR (`gh` via the executor, or the backend's
    native PR creation when `Caps.native_pr_creation` and configured).
-8. **Cleanup.** Remove worktree on success; keep on `failed`/`blocked`
-   for autopsy (reaper prunes after N days). Release the lock.
+8. **Cleanup.** Remove the attempt's worktree on success; keep on
+   `failed`/`blocked` for autopsy (the reaper prunes attempt worktrees
+   and their `issue/<issue>-a<n>` branches after N days, and on issue
+   close). Release the lock.
 
 ## 4. Evidence schema (backend-independent)
 
@@ -144,8 +153,8 @@ summary):
   "issue": 412,
   "attempt": 1,
   "backend": "codex",
-  "branch": "issue/412",
-  "worktree": ".worklink/412",
+  "branch": "issue/412-a1",
+  "worktree": ".worklink/412-1",
   "started_at": "...", "finished_at": "...",
   "files_changed": ["mimir/saga/triples.py", "tests/test_memory_triples.py"],
   "diff_stat": "2 files changed, 31 insertions(+), 4 deletions(-)",
@@ -248,7 +257,7 @@ acceptance criteria.
   default `normal`, configurable — so worker launches shed under TIGHT
   with everything else. Operator-invoked `mimir worklink run` always
   proceeds.
-- **Events.** `worklink_claimed`, `worklink_evidence`, 
+- **Events.** `worklink_claimed`, `worklink_evidence`,
   `worklink_transition`, `worklink_attempts_exhausted` land in
   events.jsonl with feedback rules (attempts-exhausted negative), so
   the agent sees its delegated work's health in the algedonic block.
