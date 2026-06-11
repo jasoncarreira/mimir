@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from mimir.worklink.backends import BackendRegistry, Caps, CodexBackend, RawResult, WorkOrder, WorklinkConfig
+import mimir.worklink.backends.codex as codex_module
 
 
 class FakeProcess:
@@ -35,7 +36,16 @@ async def test_codex_backend_invokes_exec_json_with_worktree_and_prompt(monkeypa
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     backend = CodexBackend()
-    order = WorkOrder(issue_id=440, worktree=tmp_path, prompt="Do slice 1b", rules=None, timeout_s=30, env={"PATH": "/bin"})
+    transcript_root = tmp_path / "state" / "worklink" / "transcripts"
+    order = WorkOrder(
+        issue_id=440,
+        worktree=tmp_path / "worktree",
+        prompt="Do slice 1b",
+        rules=None,
+        timeout_s=30,
+        env={"PATH": "/bin"},
+        transcript_root=transcript_root,
+    )
 
     result = await backend.run(order)
 
@@ -47,16 +57,19 @@ async def test_codex_backend_invokes_exec_json_with_worktree_and_prompt(monkeypa
     )
     assert calls == [
         {
-            "args": ("codex", "exec", "--cd", str(tmp_path), "--json", "Do slice 1b"),
+            "args": ("codex", "exec", "--cd", str(order.worktree), "--json", "Do slice 1b"),
             "kwargs": {
                 "stdout": asyncio.subprocess.PIPE,
                 "stderr": asyncio.subprocess.PIPE,
-                "cwd": str(tmp_path),
+                "cwd": str(order.worktree),
                 "env": {"PATH": "/bin"},
+                "start_new_session": True,
             },
         }
     ]
     assert result.transcript_path is not None
+    assert result.transcript_path.parent == transcript_root
+    assert not result.transcript_path.is_relative_to(order.worktree)
     transcript = json.loads(result.transcript_path.read_text())
     assert transcript["backend"] == "codex"
     assert transcript["stdout"] == '{"event":"done"}\n'
@@ -81,6 +94,7 @@ async def test_codex_backend_maps_quota_and_auth_errors(monkeypatch: pytest.Monk
 @pytest.mark.asyncio
 async def test_codex_backend_enforces_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     process = FakeProcess(stdout=b"partial", stderr=b"")
+    killed: list[FakeProcess] = []
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
         return process
@@ -89,13 +103,19 @@ async def test_codex_backend_enforces_timeout(monkeypatch: pytest.MonkeyPatch, t
         awaitable.close()
         raise TimeoutError
 
+    async def fake_kill_process_group(proc: FakeProcess) -> None:
+        killed.append(proc)
+        proc.kill()
+
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
+    monkeypatch.setattr(codex_module, "_kill_process_group", fake_kill_process_group)
 
     result = await CodexBackend().run(
         WorkOrder(issue_id=440, worktree=tmp_path, prompt="x", rules=None, timeout_s=1)
     )
 
+    assert killed == [process]
     assert process.killed is True
     assert result.backend_status == "timeout"
     assert result.exit_code == -9
@@ -166,3 +186,8 @@ def test_registry_selection_has_no_codex_specific_orchestrator_branch() -> None:
     registry = BackendRegistry(config)
 
     assert registry.select(labels={"worklink"}, repo="jasoncarreira/mimir").name == "codex"
+
+
+def test_codex_status_auth_detection_does_not_match_author_text() -> None:
+    assert codex_module._status_from_output(1, "author: test@example.com", "") == "failed"
+    assert codex_module._status_from_output(1, "", "authentication required") == "auth_error"

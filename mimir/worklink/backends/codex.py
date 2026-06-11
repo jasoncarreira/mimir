@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import re
+import signal
 from typing import Any, Sequence
 
 from .base import Caps, RawResult, WorkOrder
@@ -33,7 +35,7 @@ class CodexBackend:
 
     async def run(self, order: WorkOrder) -> RawResult:
         command = self._command(order)
-        transcript_path = _transcript_path(order.worktree, order.issue_id)
+        transcript_path = _transcript_path(order.transcript_root, order.issue_id)
         env = {"PATH": os.environ.get("PATH", "")}
         env.update(order.env)
         try:
@@ -43,6 +45,7 @@ class CodexBackend:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(order.worktree),
                 env=env,
+                start_new_session=True,
             )
         except OSError as exc:
             _write_transcript(
@@ -63,7 +66,7 @@ class CodexBackend:
             )
         except TimeoutError:
             timed_out = True
-            proc.kill()
+            await _kill_process_group(proc)
             stdout_b, stderr_b = await proc.communicate()
 
         stdout = stdout_b.decode(errors="replace")
@@ -96,11 +99,16 @@ class CodexBackend:
         return f"{order.rules.rstrip()}\n\n{order.prompt}"
 
 
-def _transcript_path(worktree: Path, issue_id: int) -> Path:
+def _transcript_path(transcript_root: Path | None, issue_id: int) -> Path:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    directory = worktree / ".worklink" / "transcripts"
+    directory = transcript_root or _default_transcript_root()
     directory.mkdir(parents=True, exist_ok=True)
     return directory / f"codex-{issue_id}-{stamp}.json"
+
+
+def _default_transcript_root() -> Path:
+    home = Path(os.environ.get("MIMIR_HOME", str(Path.home())))
+    return home / "state" / "worklink" / "transcripts"
 
 
 def _write_transcript(
@@ -125,13 +133,32 @@ def _write_transcript(
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+async def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        proc.kill()
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except TimeoutError:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        await proc.wait()
+
+
 def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:
     if exit_code == 0:
         return "success"
     combined = f"{stdout}\n{stderr}".lower()
     if "rate limit" in combined or "quota" in combined or "429" in combined:
         return "quota_exhausted"
-    if "auth" in combined or "login" in combined or "unauthorized" in combined:
+    if re.search(r"\b(unauthorized|authentication|login)\b", combined):
         return "auth_error"
     return "failed"
 

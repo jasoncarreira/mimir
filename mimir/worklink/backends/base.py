@@ -31,6 +31,7 @@ class WorkOrder:
     rules: str | None
     timeout_s: int
     env: dict[str, str] = field(default_factory=dict)
+    transcript_root: Path | None = None
 
 
 @dataclass(frozen=True)
