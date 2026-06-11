@@ -14,8 +14,9 @@ ELEVATED, ``normal`` at TIGHT, everything at BLOCKED. See
 2. ``quota`` (subscription) mode — the **burst multiple** M per plan
    window: how many times the established pace the agent would have
    to sustain for the rest of the window to hit 100%, with an
-   early-window confidence ramp. Raw utilization ≥
-   ``plan_window_suppress_threshold`` (default 0.80) is a TIGHT
+   early-window confidence ramp — engaged only when the projection
+   clears the pace floor (default 0.75). Raw utilization ≥
+   ``plan_window_suppress_threshold`` (default 0.90) is a TIGHT
    wall, demoted to ELEVATED when the window's own pace shows
    coasting (M ≥ the ELEVATED edge). See
    ``mimir.billing.evaluate_quota_severity``.
@@ -169,7 +170,7 @@ class HomeostaticArbiter:
     turns_log: Path
     billing_mode: BillingMode = BillingMode.PAY_AS_YOU_GO
     quota_providers: list[QuotaProvider] = field(default_factory=list)
-    plan_window_suppress_threshold: float = 0.80
+    plan_window_suppress_threshold: float = 0.90
     cost_hourly_limit_usd: float | None = None
     cost_spike_ratio: float | None = None
     cost_spike_floor_usd: float | None = 5.0
