@@ -749,6 +749,22 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"poller {name!r} skipped — missing required env: {missing_str} "
             f"(add to pass_env + provision the var)"
         )
+    if rule_kind == "poller_invalid_cron":
+        # chainlink #419: cron failed to validate on install/reload.
+        # ``preserved_pollers`` non-empty means the previously-installed
+        # config kept firing on its last-known-good cron; empty means a
+        # fresh install was skipped. Cron strings come from the
+        # skill-authored manifest — sanitize before surfacing.
+        name = ev.get("poller") or "?"
+        cron = _sanitize_field(ev.get("cron") or "?", max_len=60)
+        preserved = ev.get("preserved_pollers") or []
+        outcome = (
+            "previous schedule kept" if preserved else "poller not scheduled"
+        )
+        return (
+            f"poller {name!r} has invalid cron {cron!r} — {outcome} "
+            f"(fix pollers.json + reload_pollers)"
+        )
     if rule_kind == "pr_merge_blocked":
         # chainlink #214: pre-merge CHANGES_REQUESTED gate refused the merge.
         # Include PR number + blocking reviewer(s) so the operator can see

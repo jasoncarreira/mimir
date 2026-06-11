@@ -1746,6 +1746,115 @@ async def test_reload_pollers_preserves_apscheduler_job_for_broken_manifest(
     )
 
 
+# ─── chainlink #419: invalid cron on reload — preserve, don't zombie ───
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_invalid_cron_preserves_previous_poller(
+    tmp_path: Path,
+):
+    """chainlink #419 acceptance: an operator edits a working poller's
+    cron to something ``from_crontab`` rejects. Pre-fix, Phase 2 had
+    already removed the job before Phase 3's validation ``continue``d
+    — the dict kept the OLD config so the poller reported live with no
+    backing job (a zombie registry entry). The cron-invalid entry must
+    take the same path as a parse-failed manifest: prior config + job
+    preserved in-place, ``poller_reload_invalid_cron`` emitted."""
+    from unittest.mock import patch
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "edited")
+    sched.add_poller_jobs(skills)
+    pre_edit_cfg = sched._pollers["edited"]
+    assert sched._scheduler.get_job("poller:edited") is not None
+
+    # Operator-typo simulation: valid JSON, invalid cron field.
+    manifest = skills / "edited" / "pollers.json"
+    manifest.write_text(_json.dumps({
+        "pollers": [{"name": "edited", "command": "true", "cron": "not a cron"}],
+    }), encoding="utf-8")
+
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(event_type: str, **kwargs):
+        captured.append((event_type, kwargs))
+
+    with patch("mimir.scheduler.log_event", new=fake_log_event):
+        n = await sched.reload_pollers()
+
+    # Registry and jobstore agree: the prior config is preserved
+    # in-place (same object — not a fresh construct from a manifest
+    # whose cron can't schedule) AND its job keeps firing on the
+    # last-known-good cron.
+    assert sched._pollers["edited"] is pre_edit_cfg
+    assert sched._scheduler.get_job("poller:edited") is not None
+    assert n["total"] == 1
+    assert n["total"] == len(sched.registered_pollers())
+
+    invalid = [
+        (et, kw) for et, kw in captured
+        if et == "poller_reload_invalid_cron"
+    ]
+    assert len(invalid) == 1
+    _et, payload = invalid[0]
+    assert payload["poller"] == "edited"
+    assert payload["cron"] == "not a cron"
+    assert payload["manifest_path"] == str(manifest)
+    assert payload["preserved_pollers"] == ["edited"]
+    assert payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_reload_pollers_invalid_cron_fresh_install_skips_and_emits(
+    tmp_path: Path,
+):
+    """Negative case for the chainlink #419 preserve path: a poller
+    that was NEVER installed and arrives with an invalid cron has
+    nothing to preserve — it must be skipped (no dict entry, no job)
+    while still surfacing the ``poller_reload_invalid_cron`` event
+    with an empty ``preserved_pollers`` list."""
+    from unittest.mock import patch
+
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "fine")
+    sched.add_poller_jobs(skills)
+
+    bad = skills / "newcomer"
+    bad.mkdir(parents=True)
+    (bad / "pollers.json").write_text(_json.dumps({
+        "pollers": [
+            {"name": "newcomer", "command": "true", "cron": "61 * * * *"},
+        ],
+    }), encoding="utf-8")
+
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_log_event(event_type: str, **kwargs):
+        captured.append((event_type, kwargs))
+
+    with patch("mimir.scheduler.log_event", new=fake_log_event):
+        n = await sched.reload_pollers()
+
+    assert "newcomer" not in sched._pollers
+    assert sched._scheduler.get_job("poller:newcomer") is None
+    assert n["total"] == 1
+    assert sched.registered_pollers() == ["fine"]
+
+    invalid = [
+        (et, kw) for et, kw in captured
+        if et == "poller_reload_invalid_cron"
+    ]
+    assert len(invalid) == 1
+    assert invalid[0][1]["poller"] == "newcomer"
+    assert invalid[0][1]["preserved_pollers"] == []
+
+
 # ─── MIMIR_SCHEDULER_TZ — configurable scheduler timezone ──────────────
 
 
@@ -2004,10 +2113,10 @@ async def test_on_job_missed_task_is_held_in_background_tasks(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_invalid_manifest_events_task_is_held_in_background_tasks(
+async def test_dispatch_poller_reload_events_task_is_held_in_background_tasks(
     tmp_path: Path,
 ):
-    """_dispatch_invalid_manifest_events uses _spawn() which holds strong refs
+    """_dispatch_poller_reload_events uses _spawn() which holds strong refs
     for each event task until completion (chainlink #118)."""
     from unittest.mock import patch
 
@@ -2028,7 +2137,9 @@ async def test_dispatch_invalid_manifest_events_task_is_held_in_background_tasks
         {"manifest_path": "/b.json", "error": "missing field"},
     ]
     with patch("mimir.scheduler.log_event", new=blocking_log_event):
-        sched._dispatch_invalid_manifest_events(events)
+        sched._dispatch_poller_reload_events(
+            "poller_reload_invalid_manifest", events,
+        )
         # Yield to let tasks start.
         await asyncio.sleep(0)
 

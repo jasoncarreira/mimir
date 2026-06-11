@@ -1129,7 +1129,8 @@ class Scheduler:
         (tests / niche call sites). See ``mimir/pollers.py`` for the
         full contract.
 
-        Any ``poller_reload_invalid_manifest`` events produced by the
+        Any ``poller_reload_invalid_manifest`` /
+        ``poller_reload_invalid_cron`` events produced by the
         underlying ``_reinstall_pollers`` call are scheduled via the
         running event loop when one is present (startup-time callers
         like ``server.py`` run this from within an awaited init
@@ -1138,7 +1139,9 @@ class Scheduler:
         ``_on_job_missed``.
         """
         self._pollers_dir = skills_dir
-        installed, invalid_events = self._reinstall_pollers()
+        installed, invalid_events, invalid_cron_events = (
+            self._reinstall_pollers()
+        )
         # Snapshot for the MCP reply (PR #141 review item #1+2).
         # ``installed`` returned here is the count of pollers
         # freshly registered in Phase 3 — at bootstrap time there
@@ -1146,7 +1149,12 @@ class Scheduler:
         # ``reload_pollers`` (below) overrides with the live total
         # to handle the preserved case correctly.
         self._last_invalid_manifest_events = list(invalid_events)
-        self._dispatch_invalid_manifest_events(invalid_events)
+        self._dispatch_poller_reload_events(
+            "poller_reload_invalid_manifest", invalid_events,
+        )
+        self._dispatch_poller_reload_events(
+            "poller_reload_invalid_cron", invalid_cron_events,
+        )
         return installed
 
     async def reload_pollers(self) -> dict:
@@ -1179,7 +1187,7 @@ class Scheduler:
             self._last_invalid_manifest_events = []
             return {"registered": 0, "replaced": 0, "removed": 0, "total": 0}
         async with self._mutate_lock:
-            _installed_fresh, invalid_events = (
+            _installed_fresh, invalid_events, invalid_cron_events = (
                 await self._reinstall_pollers_async()
             )
             # PR #141 review item #2: ``_reinstall_pollers`` returns
@@ -1217,6 +1225,10 @@ class Scheduler:
         # concurrent reloads is intentionally non-deterministic.
         for payload in invalid_events:
             await log_event("poller_reload_invalid_manifest", **payload)
+        # chainlink #419: cron-invalid entries surface algedonically
+        # too — same emission point + caveats as the manifest events.
+        for payload in invalid_cron_events:
+            await log_event("poller_reload_invalid_cron", **payload)
         return {
             "registered": _installed_fresh,
             "replaced": 0,
@@ -1224,19 +1236,21 @@ class Scheduler:
             "total": live_total,
         }
 
-    def _reinstall_pollers(self) -> tuple[int, list[dict[str, Any]]]:
+    def _reinstall_pollers(
+        self,
+    ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
         """Wipe + re-discover + re-register (sync): discovery IO then
         apply. Used by the on-loop sync bootstrap ``add_poller_jobs``.
         Async callers use ``_reinstall_pollers_async`` so the scheduler
         mutations stay on the loop thread (chainlink #259 item 16)."""
         if self._pollers_dir is None:
-            return 0, []
+            return 0, [], []
         discovered, invalid_manifests = self._discover_pollers_io()
         return self._apply_reinstall(discovered, invalid_manifests)
 
     async def _reinstall_pollers_async(
         self,
-    ) -> tuple[int, list[dict[str, Any]]]:
+    ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
         """``_reinstall_pollers`` with filesystem discovery off the loop
         (``to_thread``) and the APScheduler / ``self._pollers`` mutations
         on the loop thread. AsyncIOScheduler's jobstore is only safe to
@@ -1244,7 +1258,7 @@ class Scheduler:
         ``asyncio.to_thread`` raced the scheduler's own on-loop job
         dispatch (chainlink #259 item 16)."""
         if self._pollers_dir is None:
-            return 0, []
+            return 0, [], []
         discovered, invalid_manifests = await asyncio.to_thread(
             self._discover_pollers_io,
         )
@@ -1286,13 +1300,15 @@ class Scheduler:
         loop thread. ``discovered`` / ``invalid_manifests`` come from
         ``_discover_pollers_io`` (the only IO).
 
-        Returns ``(installed_count, invalid_manifest_events)``. The
-        second element is a list of event payloads (one per
-        ``pollers.json`` whose JSON parse failed this reload). Callers
-        in async contexts emit each as a
-        ``poller_reload_invalid_manifest`` algedonic event;
+        Returns ``(installed_count, invalid_manifest_events,
+        invalid_cron_events)``. The second element is a list of event
+        payloads (one per ``pollers.json`` whose JSON parse failed this
+        reload); the third one payload per entry whose cron failed to
+        validate (chainlink #419). Callers in async contexts emit each
+        as a ``poller_reload_invalid_manifest`` /
+        ``poller_reload_invalid_cron`` algedonic event;
         ``add_poller_jobs`` (sync) routes through
-        ``_dispatch_invalid_manifest_events``.
+        ``_dispatch_poller_reload_events``.
 
         **Per-entry pre-population, not end-of-loop swap (PR #107
         review fix).** A previous version of this function built a
@@ -1323,9 +1339,62 @@ class Scheduler:
         ``poller_reload_invalid_manifest`` algedonic event surfaces
         the failing path + parse error + preserved names so the
         operator sees the situation in events.jsonl.
+
+        **Preserve-on-invalid-cron (chainlink #419).** Cron expressions
+        are validated BEFORE Phase 2's job removal. Validation used to
+        live in Phase 3 — after the poller's job had already been
+        removed — so a ``from_crontab`` failure ``continue``d without
+        re-adding the job while the name (still in the discovered set)
+        survived the dict cleanup: the poller reported live in
+        ``registered_pollers()`` / the reload total with no backing
+        job, visible only as a stderr warning. A cron-invalid entry now
+        takes the same path as a parse-failed manifest: a
+        previously-installed poller keeps its prior config AND job
+        (last-known-good cron keeps firing), a fresh install is
+        skipped, and a ``poller_reload_invalid_cron`` algedonic event
+        surfaces it either way — the registry and the jobstore always
+        agree.
         """
-        new_names = {p.name for p in discovered}
         invalid_paths = {path for path, _err in invalid_manifests}
+
+        # Cron pre-validation (chainlink #419) — must happen before any
+        # job removal so a cron-invalid entry can preserve its existing
+        # job in place. Entries that fail drop out of the discovered
+        # set entirely; ``new_names`` below is built from the valid
+        # remainder so the Phase 2 dict cleanup can't keep a config
+        # that Phase 3 won't back with a job.
+        valid: list[tuple[PollerConfig, CronTrigger]] = []
+        cron_preserved_names: set[str] = set()
+        invalid_cron_events: list[dict[str, Any]] = []
+        for poller in discovered:
+            try:
+                trigger = CronTrigger.from_crontab(poller.cron, timezone=self._tz)
+            except (ValueError, KeyError) as exc:
+                log.warning(
+                    "poller_invalid_cron: %s — cron=%r error=%s",
+                    poller.name, poller.cron, exc,
+                )
+                preserved = poller.name in self._pollers
+                if preserved:
+                    cron_preserved_names.add(poller.name)
+                # Payload mirrors ``poller_reload_invalid_manifest``
+                # (manifest_path / error / preserved_pollers) plus the
+                # poller name + offending cron so the operator can fix
+                # the exact field without opening the manifest blind.
+                invalid_cron_events.append({
+                    "poller": poller.name,
+                    "cron": poller.cron,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "manifest_path": (
+                        str(poller.manifest_path)
+                        if poller.manifest_path is not None else None
+                    ),
+                    "preserved_pollers": [poller.name] if preserved else [],
+                })
+                continue
+            valid.append((poller, trigger))
+
+        new_names = {p.name for p, _trigger in valid}
 
         # Map of failing manifest_path → previously-installed names,
         # so we can identify which existing entries belong to a manifest
@@ -1351,38 +1420,37 @@ class Scheduler:
         # Removed before install so a fire that lands during this loop
         # against a removed poller correctly logs poller_fire_dropped
         # (the poller really IS gone). Pollers whose manifest failed
-        # to parse this reload are PRESERVED — their job stays
+        # to parse this reload (chainlink #84) or whose cron failed to
+        # validate (chainlink #419) are PRESERVED — their job stays
         # registered with the prior cron, dict entry stays put.
         for job in list(self._scheduler.get_jobs()):
             if not job.id.startswith(POLLER_CHANNEL_PREFIX):
                 continue
             # ``poller:<name>`` — strip the prefix to recover the name.
             job_poller_name = job.id[len(POLLER_CHANNEL_PREFIX):]
-            if job_poller_name in preserved_names:
+            if (
+                job_poller_name in preserved_names
+                or job_poller_name in cron_preserved_names
+            ):
                 continue
             try:
                 self._scheduler.remove_job(job.id)
             except Exception:  # noqa: BLE001 — JobLookupError, fine
                 pass
         for name in list(self._pollers):
-            if name in new_names or name in preserved_names:
+            if (
+                name in new_names
+                or name in preserved_names
+                or name in cron_preserved_names
+            ):
                 continue
             del self._pollers[name]
 
-        # Phase 3: validate cron + register. Pre-populate the dict
-        # entry BEFORE add_job so a fire landing during job
-        # registration finds the poller. Validation failure (bad cron)
-        # leaves the dict unchanged for that name.
+        # Phase 3: register the cron-validated entries. Pre-populate
+        # the dict entry BEFORE add_job so a fire landing during job
+        # registration finds the poller.
         installed = 0
-        for poller in discovered:
-            try:
-                trigger = CronTrigger.from_crontab(poller.cron, timezone=self._tz)
-            except (ValueError, KeyError) as exc:
-                log.warning(
-                    "poller_invalid_cron: %s — cron=%r error=%s",
-                    poller.name, poller.cron, exc,
-                )
-                continue
+        for poller, trigger in valid:
             # Pre-populate FIRST. add_job below registers the
             # callback; if APScheduler fires immediately, the
             # callback's lookup succeeds.
@@ -1422,18 +1490,20 @@ class Scheduler:
                     preserved_names_by_path.get(path, []),
                 ),
             })
-        return installed, invalid_events
+        return installed, invalid_events, invalid_cron_events
 
-    def _dispatch_invalid_manifest_events(
+    def _dispatch_poller_reload_events(
         self,
+        event_type: str,
         events: list[dict[str, Any]],
     ) -> None:
-        """Emit ``poller_reload_invalid_manifest`` events from a sync
-        context (``add_poller_jobs``). When a running event loop is
-        available (server.py startup is awaited init), schedule the
-        async ``log_event`` via ``create_task``. Otherwise fall back
-        to ``log.warning`` so the event isn't silently lost. Mirrors
-        the pattern in ``_on_job_missed``.
+        """Emit ``poller_reload_invalid_manifest`` /
+        ``poller_reload_invalid_cron`` events from a sync context
+        (``add_poller_jobs``). When a running event loop is available
+        (server.py startup is awaited init), schedule the async
+        ``log_event`` via ``create_task``. Otherwise fall back to
+        ``log.warning`` so the event isn't silently lost. Mirrors the
+        pattern in ``_on_job_missed``.
         """
         if not events:
             return
@@ -1442,14 +1512,15 @@ class Scheduler:
         except RuntimeError:
             for payload in events:
                 log.warning(
-                    "poller_reload_invalid_manifest (no loop): %s",
+                    "%s (no loop): %s",
+                    event_type,
                     payload,
                 )
             return
         for payload in events:
             self._spawn(
-                log_event("poller_reload_invalid_manifest", **payload),
-                name="scheduler-invalid-manifest-event",
+                log_event(event_type, **payload),
+                name="scheduler-poller-reload-event",
             )
 
     async def _fire_poller(self, *, poller_name: str) -> None:

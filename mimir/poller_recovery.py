@@ -367,6 +367,21 @@ async def reconcile_failed_turns(
                         # don't loop on it forever.
                         del inflight[source_id]
                     else:
+                        # chainlink #422: never trust the stash verbatim.
+                        # ``.recovery.json`` lives in the poller-writable
+                        # persist_dir, so a malicious skill could rewrite a
+                        # stashed event's channel/trigger/source to make
+                        # the re-fire impersonate a user message on an
+                        # arbitrary channel. Re-stamp the fields the hot
+                        # path forces on every emitted event (the
+                        # AgentEvent assembly in ``run_poller``): whatever
+                        # the file says, this fires on THIS poller's
+                        # channel, as a poller event.
+                        event.channel_id = channel_id
+                        event.trigger = "poller"
+                        event.source = "poller"
+                        if isinstance(event.extra, dict):
+                            event.extra["poller_name"] = poller_name
                         try:
                             accepted = await enqueue(event)
                         except Exception as exc:  # noqa: BLE001
@@ -387,7 +402,16 @@ async def reconcile_failed_turns(
                             summary["deferred"] += 1
                             break
         if isinstance(ts, str):
-            watermark = ts
+            # Outcomes are processed in append order, which the #316
+            # writer disorder can leave slightly out of timestamp order
+            # (chainlink #418). ``max`` so a late-appended OLDER record
+            # can't regress the watermark below an already-handled
+            # ``turn_failed`` — a regressed watermark re-reads that
+            # outcome next cycle and re-fires it, double-burning the
+            # wedge-guard attempt. Timestamps are uniform aware
+            # ``isoformat()`` strings, so lexicographic ``max`` orders
+            # them chronologically.
+            watermark = max(watermark, ts)
 
     if summary["deferred"]:
         # We stopped on back-pressure. Persist the watermark exactly where

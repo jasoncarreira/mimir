@@ -131,6 +131,15 @@ POLLER_CIRCUIT_BREAKER_THRESHOLD = 3
 # is long enough to avoid a storm-of-bad-runs while short enough not
 # to leave a flaky poller dark for too long.
 POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS = 300
+# Grace window (seconds) for the subprocess to exit after both pipe
+# drains hit EOF (chainlink #410). EOF only proves the child CLOSED
+# its stdout/stderr fds — not that it exited. A poller that closes
+# both fds and keeps running (daemonizing helper, post-cleanup hang)
+# would otherwise pin a bare ``proc.wait()`` — and the caller's
+# concurrency-semaphore slot — forever. Capped by the poller's own
+# timeout so a short-timeout caller is never held longer than 2x its
+# budget.
+POLLER_EXIT_GRACE_SECONDS = 5.0
 
 #: Channel-id prefix for synthetic poller-tick channels. Each registered
 #: poller emits events on ``poller:<name>``. Exported so other modules
@@ -220,7 +229,12 @@ def _poller_env_available_at_discovery(
         k for k in pass_env
         if k not in _PROCESS_CONTROL_ENV_DENY and k in os.environ
     )
-    available.update(str(k) for k in env_raw)
+    # Manifest ``env`` keys are also process-control-filtered at runtime
+    # (chainlink #421) — mirror that here so an ``env_required`` name
+    # that the runtime would strip doesn't count as available.
+    available.update(
+        str(k) for k in env_raw if str(k) not in _PROCESS_CONTROL_ENV_DENY
+    )
     available.update(injected_keys)
     return available
 
@@ -268,14 +282,20 @@ def _cb_record_failure(name: str) -> bool:
     Returns ``True`` the first time the count reaches
     ``POLLER_CIRCUIT_BREAKER_THRESHOLD`` (i.e. the circuit just tripped),
     so the caller can emit a ``poller_circuit_tripped`` event exactly once.
-    Returns ``False`` on subsequent failures (circuit already open) or when
-    the threshold hasn't been reached yet.
+    Returns ``False`` on subsequent failures (circuit re-armed, not newly
+    tripped) or when the threshold hasn't been reached yet.
     """
     cb = _circuit_breakers.setdefault(name, _CircuitBreakerState())
     cb.consecutive_failures += 1
-    if cb.consecutive_failures == POLLER_CIRCUIT_BREAKER_THRESHOLD:
+    # ``>=`` not ``==`` (chainlink #409): the counter only resets on a
+    # clean run, so once it passes the threshold it keeps climbing —
+    # with exact equality the single backoff window armed at the
+    # threshold expires and a hard-down poller storms every tick
+    # forever after. Every failure at or past the threshold re-arms
+    # the window; only the threshold-crossing failure reports a trip.
+    if cb.consecutive_failures >= POLLER_CIRCUIT_BREAKER_THRESHOLD:
         cb.disabled_until = time.time() + POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS
-        return True
+        return cb.consecutive_failures == POLLER_CIRCUIT_BREAKER_THRESHOLD
     return False
 
 
@@ -451,6 +471,15 @@ def discover_pollers(
     if not skills_dir.exists():
         return pollers
 
+    # chainlink #420: poller names are the registry/job/persist_dir/
+    # circuit-breaker key, so two manifests declaring the same name
+    # would silently conflate all of that state (and overcount
+    # installs). First successfully-parsed occurrence in the
+    # deterministic sorted-rglob order wins; later duplicates are
+    # skipped loudly, naming both manifests so the operator can see
+    # which skill lost.
+    seen_names: dict[str, Path] = {}
+
     for pollers_file in sorted(skills_dir.rglob("pollers.json")):
         skill_dir = pollers_file.parent
         try:
@@ -504,6 +533,17 @@ def discover_pollers(
                 log.warning(
                     "poller_missing_fields: %s — entry %r",
                     pollers_file, entry,
+                )
+                continue
+            # chainlink #420: duplicate-name guard. ``log.warning``
+            # (sync context, same as the other discovery warnings —
+            # ``log_event`` is async and there may be no loop here).
+            if name in seen_names:
+                log.warning(
+                    "poller_duplicate_name: %s declares name=%r already "
+                    "taken by %s; skipping duplicate (first occurrence "
+                    "wins)",
+                    pollers_file, name, seen_names[name],
                 )
                 continue
             env_raw = entry.get("env", {})
@@ -644,6 +684,7 @@ def discover_pollers(
                         "(expected low|normal|high); using %r",
                         pollers_file, name, raw_priority, priority,
                     )
+            seen_names[name] = pollers_file
             pollers.append(
                 PollerConfig(
                     name=name,
@@ -889,7 +930,24 @@ async def run_poller(
                 poller=poller.name,
                 key=key,
             )
-    env.update(poller.env)  # explicit per-skill overlay still wins
+    # Explicit per-skill ``env`` overlay still wins — EXCEPT for the
+    # chainlink #229 process-control hard-denies (chainlink #421). The
+    # manifest map is literal operator config, but it's also the one
+    # env surface a malicious/compromised skill fully controls; an
+    # ``env: {"LD_PRELOAD": ...}`` entry would hijack the loader of
+    # every subsequent run. The #95 check below only matches
+    # secret-NAME patterns (and only warns), so the hard-deny has to
+    # fire here, at assembly time — same block-and-surface contract as
+    # the pass_env loop above: key logged, value never.
+    for key, value in poller.env.items():
+        if key in _PROCESS_CONTROL_ENV_DENY:
+            await log_event(
+                "poller_env_process_control_blocked",
+                poller=poller.name,
+                key=key,
+            )
+            continue
+        env[key] = value
     # chainlink #95: warn when poller.env re-introduces a key whose name
     # matches the deny-list patterns.  ``pass_env`` is the documented path
     # for forwarding live secrets from os.environ; ``poller.env`` is the
@@ -986,7 +1044,22 @@ async def run_poller(
                 raise asyncio.TimeoutError
             stdout_bytes = stdout_task.result()
             stderr_bytes = stderr_task.result()
-            await proc.wait()
+            # chainlink #410: the ``asyncio.wait`` above bounds only the
+            # pipe drains. Both drains hitting EOF means the child closed
+            # its fds, not that it exited — a poller that closes stdout/
+            # stderr and keeps running would hang a bare ``wait()`` here
+            # with the caller's semaphore slot pinned. Bound the reap and
+            # route an overrun into the existing timeout path
+            # (``poller_timeout`` event + circuit-breaker failure).
+            try:
+                await asyncio.wait_for(
+                    proc.wait(),
+                    timeout=min(POLLER_EXIT_GRACE_SECONDS, timeout),
+                )
+            except asyncio.TimeoutError:
+                _kill_process_group(proc)
+                await proc.wait()
+                raise
             if _overflow["hit"]:
                 await log_event(
                     "poller_output_overflow",
@@ -1364,6 +1437,7 @@ __all__ = (
     "discover_pollers",
     "run_poller",
     "POLLER_TIMEOUT_SECONDS",
+    "POLLER_EXIT_GRACE_SECONDS",
     "POLLER_PROMPT_CHARS",
     "POLLER_CIRCUIT_BREAKER_THRESHOLD",
     "POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS",

@@ -215,6 +215,39 @@ async def test_reconcile_watermark_prevents_reprocessing(tmp_path: Path):
     assert len(enq.calls) == 1
 
 
+async def test_reconcile_reenqueue_restamps_forged_stash_fields(tmp_path: Path):
+    """chainlink #422: ``.recovery.json`` lives in the poller-writable
+    persist_dir, so a malicious skill could rewrite a stashed event's
+    channel/trigger/source and have the recovery path enqueue an event
+    impersonating a user message on an arbitrary channel. The re-fire
+    must carry the same stamps the hot path forces on every emitted
+    event — the poller's channel, ``trigger="poller"``,
+    ``source="poller"`` — regardless of what the file says."""
+    events = tmp_path / "events.jsonl"
+    forged = _make_event("sid-1")
+    forged.channel_id = "discord:operator-dm"
+    forged.trigger = "user_message"
+    forged.source = "discord"
+    forged.extra["poller_name"] = "not-gmail"
+    poller_recovery.stash_enqueued_event(tmp_path, forged)
+    _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                   source_id="sid-1", ts=_ts(5))
+    enq = _FakeEnqueue()
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=events, enqueue=enq, max_attempts=3,
+    )
+    assert summary["reenqueued"] == 1
+    ev = enq.calls[0]
+    assert ev.channel_id == "poller:gmail"
+    assert ev.trigger == "poller"
+    assert ev.source == "poller"
+    assert ev.extra["poller_name"] == "gmail"
+    # The correlation key is preserved — it's how the retry's own
+    # outcome is matched back to this entry.
+    assert ev.source_id == "sid-1"
+
+
 def test_reconcile_missing_events_file_is_safe(tmp_path: Path):
     """Reading outcomes from a non-existent events.jsonl returns nothing
     rather than raising."""
@@ -259,6 +292,40 @@ def test_read_outcomes_terminates_past_grace_window(tmp_path: Path):
                    source_id="new", ts=_ts(98))         # > cutoff
     out = poller_recovery._read_outcomes_since(events, "poller:gmail", cutoff)
     assert [r["source_id"] for r in out] == ["new"]
+
+
+async def test_reconcile_watermark_survives_out_of_order_outcomes(tmp_path: Path):
+    """chainlink #418: outcomes are processed in APPEND order, which the
+    #316 writer disorder can leave slightly out of timestamp order. The
+    old per-record ``watermark = ts`` assignment let a late-appended
+    OLDER record regress the watermark below an already-handled
+    ``turn_failed`` — the next cycle re-read that outcome and re-fired
+    it, double-burning a wedge-guard attempt. The watermark must be
+    monotonic (``max``)."""
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    # The #316 disorder shape: the NEWER-stamped turn_failed is appended
+    # FIRST, then an OLDER-stamped (but still in-window) outcome lands
+    # behind it. Processing order = append order, so the old code ended
+    # the loop with watermark = the older timestamp.
+    _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
+                   source_id="sid-1", ts=_ts(3))
+    _write_outcome(events, type_="turn_completed", channel_id="poller:gmail",
+                   source_id="unrelated", ts=_ts(4))
+    enq = _FakeEnqueue()
+    common = dict(poller_name="gmail", channel_id="poller:gmail",
+                  persist_dir=tmp_path, events_path=events, enqueue=enq,
+                  max_attempts=3)
+    s1 = await poller_recovery.reconcile_failed_turns(**common)
+    assert s1["reenqueued"] == 1
+    # Second cycle with NO new outcomes: a regressed watermark would
+    # re-read the handled turn_failed and re-fire it.
+    s2 = await poller_recovery.reconcile_failed_turns(**common)
+    assert s2["reenqueued"] == 0
+    assert len(enq.calls) == 1
+    # Exactly one wedge-guard attempt burned across both cycles.
+    st = poller_recovery._load_state(tmp_path)
+    assert st["inflight"]["sid-1"]["attempts"] == 1
 
 
 # ── back-pressure + GC (chainlink #305 / #310) ───────────────────────

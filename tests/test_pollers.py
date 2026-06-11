@@ -16,6 +16,7 @@ import json
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -281,6 +282,56 @@ def test_discover_walks_nested_skill_dirs(tmp_path: Path):
     out = discover_pollers(skills)
     names = sorted(p.name for p in out)
     assert names == ["a-poll", "b-poll"]
+
+
+def test_discover_duplicate_poller_name_first_wins(tmp_path: Path, caplog):
+    """chainlink #420: two skills declaring the same poller name would
+    silently collide — the registry, APScheduler job id, persist_dir,
+    channel, and circuit-breaker are all keyed by name, so last-write-
+    wins conflated their state and overcounted installs. The first
+    occurrence in deterministic sorted-rglob order must win; the later
+    duplicate is skipped with a warning naming both manifests."""
+    import logging
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "a-skill", [
+        {"name": "dup", "command": "echo a", "cron": "* * * * *"},
+    ])
+    _write_pollers_json(skills / "b-skill", [
+        {"name": "dup", "command": "echo b", "cron": "*/5 * * * *"},
+    ])
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        out = discover_pollers(skills)
+    # Exactly one config survives — the sorted-first manifest's.
+    assert len(out) == 1
+    assert out[0].skill_dir == skills / "a-skill"
+    assert out[0].command == "echo a"
+    # The warning names both manifests so the operator can see which
+    # skill lost the collision.
+    dup_warnings = [
+        r.getMessage() for r in caplog.records
+        if "poller_duplicate_name" in r.getMessage()
+    ]
+    assert len(dup_warnings) == 1
+    assert str(skills / "a-skill" / "pollers.json") in dup_warnings[0]
+    assert str(skills / "b-skill" / "pollers.json") in dup_warnings[0]
+
+
+def test_discover_duplicate_name_within_one_manifest_first_wins(tmp_path: Path, caplog):
+    """Same guard for two entries in a single manifest — the collision
+    is on the name key, not the file."""
+    import logging
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "dup", "command": "echo first", "cron": "* * * * *"},
+        {"name": "dup", "command": "echo second", "cron": "* * * * *"},
+    ])
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        out = discover_pollers(skills)
+    assert len(out) == 1
+    assert out[0].command == "echo first"
+    assert any(
+        "poller_duplicate_name" in r.getMessage() for r in caplog.records
+    )
 
 
 # ─── chainlink #91: schema_version field ─────────────────────────────
@@ -1029,6 +1080,43 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
         await asyncio.sleep(0.05)
 
     assert not child_is_still_running()
+
+
+@pytest.mark.asyncio
+async def test_run_poller_bounded_when_child_closes_pipes_but_keeps_running(
+    tmp_path: Path, home: Path,
+) -> None:
+    """chainlink #410: ``asyncio.wait`` bounds only the pipe drains.
+    A poller that CLOSES stdout/stderr (drains hit EOF inside the
+    timeout) but keeps running used to reach a bare ``proc.wait()``
+    with no bound — run_poller hung for the child's full lifetime and
+    the caller's semaphore slot stayed pinned. The post-EOF reap must
+    be grace-bounded and route into the existing timeout path."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import os, time
+os.close(1)
+os.close(2)
+time.sleep(30)
+""")
+    cfg = PollerConfig(
+        name="fd-closer", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    # Outer wait_for fails the test promptly on regression instead of
+    # hanging the suite for the child's 30s sleep. The grace window is
+    # min(POLLER_EXIT_GRACE_SECONDS, timeout), so worst case here is
+    # ~2s (drain timeout) + ~2s (exit grace) — well under the bound.
+    n = await asyncio.wait_for(
+        run_poller(cfg, enqueue=enq, timeout=2.0), timeout=15.0,
+    )
+    assert n == 0
+    assert enq.events == []
+    events = _read_events(home)
+    timeouts = [e for e in events if e["type"] == "poller_timeout"]
+    assert len(timeouts) == 1
+
 
 @pytest.mark.asyncio
 async def test_run_poller_nonexistent_command_logs_exec_error(
@@ -2216,6 +2304,52 @@ print('{"poller": "x", "prompt": "ok"}')
     assert warn_events[0].get("key") == "MIMIR_SOME_INTERNAL_KEY"
 
 
+@pytest.mark.asyncio
+async def test_run_poller_manifest_env_process_control_key_is_blocked(
+    tmp_path: Path, home: Path,
+) -> None:
+    """chainlink #421: the manifest ``env`` map is the one env surface
+    a skill fully controls, and it used to be applied unfiltered — an
+    ``env: {"LD_PRELOAD": ...}`` entry sailed past the chainlink #229
+    hard-deny (which only covered pass_env). Process-control keys must
+    be stripped from the overlay at assembly time, with the key (never
+    the value) surfaced via ``poller_env_process_control_blocked``;
+    benign literal keys keep flowing."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({
+    "poller": "x",
+    "prompt": (
+        f"ld={os.environ.get('LD_PRELOAD', 'UNSET')} "
+        f"safe={os.environ.get('SAFE_VAR', 'missing')}"
+    ),
+}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"LD_PRELOAD": "/tmp/evil.so", "SAFE_VAR": "ok"},
+        skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+
+    # The loader var never reached the subprocess; the benign literal did.
+    assert enq.events[0].content == "ld=UNSET safe=ok"
+
+    events = _read_events(home)
+    blocked = [
+        e for e in events
+        if e.get("type") == "poller_env_process_control_blocked"
+    ]
+    assert len(blocked) == 1
+    assert blocked[0]["poller"] == "x"
+    assert blocked[0]["key"] == "LD_PRELOAD"
+    # The value must never be logged.
+    assert "/tmp/evil.so" not in json.dumps(blocked[0])
+
+
 # ─── Algedonic signals from pollers ──────────────────────────────────
 
 
@@ -2644,6 +2778,48 @@ async def test_circuit_breaker_resets_after_successful_run(tmp_path, home, clear
     events = _read_events(home)
     tripped = [e for e in events if e.get("type") == "poller_circuit_tripped"]
     assert tripped == [], "no trip should have fired"
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_rearms_after_backoff_expiry(
+    tmp_path, home, clear_circuit_breakers,
+):
+    """chainlink #409: the failure counter only resets on a CLEAN run,
+    so a hard-down poller's count keeps climbing past the threshold.
+    With the old exact-equality check the single backoff armed at the
+    threshold expired and never re-armed — the poller stormed every
+    tick forever. Every failure at/past the threshold must re-open the
+    circuit."""
+    cfg = _failing_poller_cfg(tmp_path)
+    enq = _CapturingEnqueue()
+
+    # Trip the circuit, then simulate the backoff window expiring.
+    for _ in range(POLLER_CIRCUIT_BREAKER_THRESHOLD):
+        await run_poller(cfg, enqueue=enq)
+    state = _circuit_breakers[cfg.name]
+    assert state.disabled_until > time.time()
+    state.disabled_until = time.time() - 1.0
+
+    # The poller is still hard-down: this run executes (circuit no
+    # longer open), fails, and pushes the count PAST the threshold —
+    # which must re-arm the backoff window.
+    await run_poller(cfg, enqueue=enq)
+    state = _circuit_breakers[cfg.name]
+    assert state.consecutive_failures == POLLER_CIRCUIT_BREAKER_THRESHOLD + 1
+    assert state.disabled_until > time.time(), (
+        "circuit must re-open on every failure at/past the threshold "
+        "(chainlink #409) — exact-equality arming storms forever after "
+        "the first backoff expires"
+    )
+
+    # And the re-opened circuit suppresses the next run.
+    await run_poller(cfg, enqueue=enq)
+    events = _read_events(home)
+    assert any(e["type"] == "poller_circuit_open" for e in events)
+    # ``poller_circuit_tripped`` still fires exactly once — re-arming
+    # is not a new trip.
+    tripped = [e for e in events if e["type"] == "poller_circuit_tripped"]
+    assert len(tripped) == 1
 
 
 # ─── chainlink #108: env_required validation ─────────────────────────────────
