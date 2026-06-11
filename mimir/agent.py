@@ -2605,9 +2605,20 @@ class Agent:
         if auto_skill_block is not None and self._saga_store is not None:
             from . import skill_memory
             _skill_name, _skill_body = auto_skill_block
-            _conn = self._saga_store.connection()
+            # chainlink #411: route the read through the store's own
+            # serialization (run_locked_read holds _db_lock in the
+            # worker thread) rather than handing the shared
+            # check_same_thread=False connection into a bare thread —
+            # the consolidate cron / turn writers use that connection
+            # under the store's locks, and unserialized cross-thread
+            # access is segfault-class with FTS5 (#365/#386).
+            # augment_skill_body itself swallows recall errors and
+            # returns the body unaugmented.
             _augmented, _injected_ids = await asyncio.to_thread(
-                skill_memory.augment_skill_body, _conn, _skill_name, _skill_body,
+                self._saga_store.run_locked_read,
+                lambda _c: skill_memory.augment_skill_body(
+                    _c, _skill_name, _skill_body,
+                ),
             )
             auto_skill_block = (_skill_name, _augmented)
             # slice 6: record the injected learnings as this turn's cited

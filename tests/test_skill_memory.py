@@ -260,6 +260,55 @@ class TestSagaStoreConnection:
         assert recall_skill_learnings(conn, "cb")[0]["content"] == "x"
 
 
+class TestRunLockedRead:
+    """chainlink #411: skill-memory reads go through the store's own
+    serialization (``run_locked_read`` holds ``_db_lock``) instead of
+    touching the shared check_same_thread=False connection from a bare
+    worker thread."""
+
+    @pytest.mark.asyncio
+    async def test_run_locked_read_matches_direct_augment(self, store):
+        sl = await _add_learning(store, "cb", "tip", "pass --foo")
+        from mimir import skill_memory
+        direct = skill_memory.augment_skill_body(
+            store._ensure_conn(), "cb", "BODY",
+        )
+        via_store = store.run_locked_read(
+            lambda conn: skill_memory.augment_skill_body(conn, "cb", "BODY")
+        )
+        assert via_store == direct
+        assert via_store[1] == [sl["atom_id"]]
+        assert "[tip] pass --foo" in via_store[0]
+
+    @pytest.mark.asyncio
+    async def test_run_locked_read_holds_db_lock_during_fn(self, store):
+        """The shared-connection lock must be held while *fn* runs: a
+        non-blocking acquire from another thread inside *fn* must fail
+        (``_db_lock`` is an RLock, so the probe has to come from a
+        different thread)."""
+        import threading
+
+        store._ensure_conn()
+        real_lock = store._db_lock
+        observed: dict[str, bool] = {}
+
+        def _fn(conn):
+            def _probe():
+                got = real_lock.acquire(blocking=False)
+                if got:
+                    real_lock.release()
+                observed["contended"] = not got
+            t = threading.Thread(target=_probe)
+            t.start()
+            t.join()
+            return "ok"
+
+        assert store.run_locked_read(_fn) == "ok"
+        assert observed["contended"] is True, (
+            "_db_lock was not held while run_locked_read's fn executed"
+        )
+
+
 # ── activation ranking (chainlink #266 slice 6) ──────────────────────
 
 

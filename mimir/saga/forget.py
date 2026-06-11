@@ -102,10 +102,39 @@ def forget(
         conn.rollback()
         raise
 
-    # Refresh trend / evidence_count for affected observations. Each
-    # refresh_trend call manages its own transaction.
+    # Refresh trend for affected observations (each refresh_trend call
+    # manages its own transaction), then rebuild evidence_count from the
+    # SURVIVING evidence. chainlink #416: evidence_count means the
+    # number of live evidence atoms backing the observation — the
+    # "rebuilt from surviving relations" this module's docstring has
+    # always promised, matching dedup's end-of-pass sweep semantics
+    # (dedup.py). refresh_trend owns only the trend fields; the
+    # relation rows themselves are preserved on tombstone (historical
+    # record), so the rebuild joins atoms to count only edges whose
+    # target is still live.
     for obs_id in affected_obs_ids:
         refresh_trend(conn, obs_id)
+    if affected_obs_ids:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for obs_id in affected_obs_ids:
+                live_count = conn.execute(
+                    "SELECT COUNT(*) FROM atom_relations ar "
+                    "JOIN atoms t ON t.id = ar.target_id "
+                    "WHERE ar.source_id = ? "
+                    "  AND ar.relation_type = 'evidenced_by' "
+                    "  AND t.tombstoned = 0",
+                    (obs_id,),
+                ).fetchone()[0]
+                conn.execute(
+                    "UPDATE observations_metadata SET evidence_count = ? "
+                    "WHERE atom_id = ?",
+                    (live_count, obs_id),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     return ForgetResult(
         tombstoned_count=len(eligible_ids),
