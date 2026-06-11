@@ -737,6 +737,142 @@ def _check_pr_pushes(
     return count, new_heads, new_review_requests
 
 
+def _head_commit_date(repo: str, sha: str, token: str) -> str:
+    """Committer date of ``sha`` (ISO-8601), or ``""`` when the lookup
+    fails. Used by the changes-requested reconciliation to decide
+    whether commits landed after the blocking review."""
+    data = _gh_api(f"repos/{repo}/commits/{sha}", token)
+    if not isinstance(data, dict):
+        return ""
+    commit = data.get("commit") or {}
+    committer = commit.get("committer") or {}
+    return str(committer.get("date") or "")
+
+
+def _check_own_changes_requested(
+    repo: str,
+    token: str,
+    me: str,
+    prior: dict[str, str],
+) -> tuple[int, dict[str, str]]:
+    """State-reconciling reminder for the agent's OWN open PRs stuck at
+    CHANGES_REQUESTED (chainlink #449).
+
+    Reviews ON the agent's PRs are otherwise edge-triggered only
+    (``_check_pr_reviews`` emits each review once, then the cursor
+    consumes it). A turn that triages the review without pushing fixes
+    loses the work signal permanently — observed 2026-06-11: a batched
+    turn read two request-changes reviews, merged a sibling approved
+    PR, and ended; nothing ever re-fired the rework. This is the
+    reverse-direction analog of the ``requested_reviewers``
+    reconciliation above: the PR *state* (open, authored by ``me``,
+    latest review per reviewer == CHANGES_REQUESTED, no commits since
+    that review) is the authoritative "fixes still owed" signal, so it
+    is re-derived from the live snapshot each poll.
+
+    Dedupe contract: at most ONE ``pr_changes_requested_stale`` event
+    per ``(pr, head_sha)`` — ``prior`` maps ``pr_key -> head_sha`` of
+    the state already reminded about. Unlike the review-request wedge
+    guard there is no re-emit loop: one reminder per stale state, a
+    new head sha (fixes pushed, CHANGES_REQUESTED again after
+    re-review) is a NEW state and reminds once more. Cleanup is the
+    same rebuild-on-every-poll model as the sibling cursors: closed /
+    merged / no-longer-blocked PRs drop out because they are never
+    copied into the returned dict, so a fresh changes-requested cycle
+    later starts clean.
+
+    "No commits since the review" matters: right after the agent
+    pushes fixes the PR's review decision STAYS CHANGES_REQUESTED
+    until a re-review lands, so reminding on that state would nag the
+    agent for work it already did. A head commit newer than the latest
+    blocking review → not stale, nothing emitted, nothing recorded
+    (the state is re-evaluated next poll; if a reviewer then requests
+    changes again, that review is newer than the head and fires).
+
+    Empty ``me`` → skipped entirely (no self identity to match).
+    On the PR-list API failing, ``prior`` is preserved unchanged so a
+    transient failure doesn't re-fire already-reminded states.
+    """
+    if not me:
+        return 0, {}
+    data = _gh_api(
+        f"repos/{repo}/pulls?state=open&sort=created&direction=desc&per_page=100",
+        token,
+    )
+    if not isinstance(data, list):
+        return 0, dict(prior)
+    count = 0
+    new: dict[str, str] = {}
+    for pr in data:
+        if (pr.get("user") or {}).get("login") != me:
+            continue
+        number = pr.get("number")
+        head_sha = (pr.get("head") or {}).get("sha") or ""
+        if not number or not head_sha:
+            continue
+        key = str(number)
+        reviews = _gh_api(f"repos/{repo}/pulls/{number}/reviews", token)
+        if not isinstance(reviews, list):
+            # Cannot determine review state — preserve the dedupe entry
+            # so a transient failure doesn't cause a duplicate reminder.
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        # Latest substantive review per reviewer. COMMENTED/PENDING/
+        # DISMISSED don't change the blocking state; a reviewer's later
+        # APPROVED clears their earlier CHANGES_REQUESTED.
+        latest: dict[str, tuple[str, str]] = {}
+        for review in reviews:
+            login = (review.get("user") or {}).get("login") or ""
+            state = (review.get("state") or "").upper()
+            submitted = review.get("submitted_at") or ""
+            if not login or login == me or not submitted:
+                continue
+            if state not in ("APPROVED", "CHANGES_REQUESTED"):
+                continue
+            cur = latest.get(login)
+            if cur is None or submitted > cur[0]:
+                latest[login] = (submitted, state)
+        blocking = {
+            login: ts for login, (ts, st) in latest.items()
+            if st == "CHANGES_REQUESTED"
+        }
+        if not blocking:
+            continue  # not blocked — entry drops; a later CR cycle starts fresh
+        if prior.get(key) == head_sha:
+            new[key] = head_sha  # already reminded for exactly this state
+            continue
+        # Stale only when no commits landed after the newest blocking
+        # review. An unknown head-commit date (API hiccup) counts as
+        # stale — the per-sha dedupe caps the cost at one reminder.
+        newest_block_ts = max(blocking.values())
+        head_date = _head_commit_date(repo, head_sha, token)
+        if head_date and head_date >= newest_block_ts:
+            continue
+        title = pr.get("title", "")
+        url = pr.get("html_url", "")
+        reviewers = ", ".join(f"@{login}" for login in sorted(blocking))
+        prompt = (
+            f"Your PR #{number} on {repo} is stuck at CHANGES_REQUESTED: "
+            f"{title}\n"
+            f"{reviewers} requested changes and no commits have landed "
+            f"since (head {head_sha[:8]}). Address the review feedback, "
+            f"push the fixes, and re-request review.\n{url}"
+        )
+        _emit(
+            prompt,
+            event_type="pr_changes_requested_stale",
+            repo=repo,
+            number=number,
+            url=url,
+            head=head_sha,
+            reviewers=sorted(blocking),
+        )
+        count += 1
+        new[key] = head_sha
+    return count, new
+
+
 def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
     """New PR reviews (approve / changes-requested / commented).
     No ``since=`` query on reviews endpoint — walk open PRs + filter
@@ -867,6 +1003,11 @@ def main() -> None:
     # bare-list format (``{repo: [pr_key, ...]}``) on first load.
     rr_all: dict = cursor.get("pr_review_requests", {}) or {}
     new_rr_all: dict[str, dict[str, int]] = {}
+    # Changes-requested reconciliation cursor (chainlink #449):
+    # ``{repo: {pr_key: head_sha}}`` — the own-PR states already
+    # reminded about, deduped per (pr, head_sha).
+    cr_all: dict = cursor.get("pr_changes_requested", {}) or {}
+    new_cr_all: dict[str, dict[str, str]] = {}
 
     total = 0
     for repo in repos:
@@ -884,10 +1025,17 @@ def main() -> None:
         total += push_count
         new_pr_heads_all[repo] = new_repo_heads
         new_rr_all[repo] = new_repo_rr
+        repo_cr = cr_all.get(repo, {}) or {}
+        cr_count, new_repo_cr = _check_own_changes_requested(
+            repo, token, me, repo_cr,
+        )
+        total += cr_count
+        new_cr_all[repo] = new_repo_cr
 
     cursor["last_checked"] = new_cursor_ts
     cursor["pr_heads"] = new_pr_heads_all
     cursor["pr_review_requests"] = new_rr_all
+    cursor["pr_changes_requested"] = new_cr_all
     _save_cursor(cursor)
     print(
         f"Emitted {total} event(s) across {len(repos)} repo(s)",
