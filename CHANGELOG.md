@@ -6,21 +6,71 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-06-11
+
+### Fixed
+
+- **Adversarial-review hardening batch** — 17 confirmed findings across
+  four PRs (#630–#633), from a six-reviewer adversarial sweep of the
+  codebase (chainlinks #408–#425):
+  - *Delivery/lifecycle (#630):* `send_message` `<react>` directives feed
+    the same confirmed-delivery accounting as the react tool and emit
+    `send_message_directive_failed` on failure; Discord emoji aliases
+    actually resolve (`resolve_for_discord` had zero callers — the
+    documented `thumbsup` ack 400'd); `run_turn`'s setup phase runs inside
+    its cleanup `finally` (no more leaked injection entries / typing holds
+    / turn contexts on setup-phase cancellation).
+  - *Pollers (#632):* circuit breaker re-arms on every failure at/past the
+    threshold (was exact-`==` — a hard-down poller stormed forever after
+    one backoff); the post-drain `proc.wait()` is bounded (a child closing
+    its pipes but living on pinned a global semaphore slot permanently);
+    recovery watermark can't regress (`max`); invalid-cron reloads
+    preserve the prior poller + emit `poller_reload_invalid_cron`;
+    duplicate poller names are skipped loudly; the manifest `env` map is
+    process-control-filtered (`LD_PRELOAD` et al.); recovery re-enqueue
+    re-stamps event identity (forge-proof).
+  - *Saga (#631):* skill-memory injection reads through a locked store
+    seam (cross-thread sqlite access was segfault-class); `evidence_count`
+    means relation count (refresh_trend stopped clobbering it); skill-
+    memory dedup removes tombstoned FAISS vectors + `rebuild_if_needed`
+    wired (was dead code); all embeddings precompute before
+    `BEGIN IMMEDIATE` (a hung embed stalled every memory write).
+  - *Quota (#633):* transient-429 backoff decay is end-anchored (the
+    escalation ladder actually escalates — record-anchored it self-reset
+    to the 60s floor forever); early-clear disarms the one-shot recovery
+    wake (no double catch-up heartbeat); `resets_at=None` snapshots
+    staleness-guarded by window length (a stale ≥wall reading could wedge
+    severity TIGHT on Codex).
+
 ### Changed
 
-- **Quota severity recalibrated: pace floor + higher wall.** The M bands
-  now engage only when the projected end-of-window utilization exceeds
+- **Quota severity recalibrated: pace floor + higher wall (#629).** The M
+  bands engage only when the projected end-of-window utilization exceeds
   **75%** — a window not even projected near its cap has no quota story to
-  tell, no matter how small M is. Observed live: muninn's heartbeats went
-  dark over a projected-68% week because M sat at 1.79 (ELEVATED); that
-  case now grades CLEAR. The raw-utilization wall moves **0.80 → 0.90**
-  (`plan_window_suppress_threshold` default): with pace bands carrying the
-  "heading toward the cap" signal above the floor, the absolute wall only
-  needs to catch "genuinely almost out". The canonical time-left asymmetry
-  is unchanged (projected 80% @ 1 day left → CLEAR; @ 5 days left → TIGHT),
-  and the wall move makes the direct and derived (chainlink #17) thresholds
-  equal at 0.90. The early-recovery probe's hot-window veto follows the
-  same threshold.
+  tell, no matter how small M is (observed live: muninn's heartbeats went
+  dark over a projected-68% week). The raw-utilization wall moves
+  **0.80 → 0.90**; the canonical time-left asymmetry is unchanged; direct
+  and derived thresholds now coincide at 0.90; the early-recovery probe's
+  hot-window veto follows the same threshold.
+- **The forgot-to-send guard is channel-scoped (#634).** A confirmed
+  delivery must reach the *triggering* channel — a cross-channel-only send
+  (e.g. an ops alert) no longer suppresses the `no_reply` signal for the
+  user who asked; the event carries `delivered_elsewhere`, and the prompt
+  conventions teach "close the loop with whoever asked" (a react counts).
+- **The `claude-code:` model route is deprecated (#634).** Its tools
+  execute inside the Claude Code subprocess, bypassing the per-turn tool
+  budget and prohibited-action screen. `_resolve_model` refuses it unless
+  opted in via `MIMIR_ALLOW_CLAUDE_CODE=1` (env, or the `<home>/.env`
+  scaffold line that `mimir setup --subscription` now writes for
+  claude-code routes — informed consent at setup time, threaded through
+  every Config-based resolution path).
+
+### Added
+
+- **WORKLINK design spec (#635)** — `docs/internal/WORKLINK.md`:
+  chainlink worker orchestration (planner/executor split, observed
+  evidence, pluggable toolchain backends). Spec only; implementation
+  tracked as chainlink #380 subissues.
 
 ## [0.3.3] — 2026-06-10
 
