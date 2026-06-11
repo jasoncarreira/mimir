@@ -2934,3 +2934,32 @@ async def test_quota_recheck_active_provider_hot_window_still_vetoes(
     assert QuotaPauseTracker(
         home / ".mimir" / "quota_pause.json").is_paused().paused is True
     assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_quota_recheck_early_clear_disarms_recovery_wake(tmp_path: Path):
+    """chainlink #414: an early clear makes the recorded reset moot —
+    the one-shot recovery wake must be disarmed alongside the recheck
+    probe, or it fires a second catch-up heartbeat at the stale
+    timestamp."""
+    from datetime import datetime, timedelta, timezone
+    from mimir.event_logger import init_logger
+    from mimir.scheduler import _QUOTA_RECOVERY_JOB_ID, _QUOTA_RECHECK_JOB_ID
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    enqueued: list = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    _record_pause(home)
+    _fresh_snap(store, "five_hour", 0.30)
+    # Arm both jobs the way the agent's 429 hook does.
+    sched.arm_quota_recovery_wake(
+        datetime.now(tz=timezone.utc) + timedelta(hours=2),
+    )
+    assert sched._scheduler.get_job(_QUOTA_RECOVERY_JOB_ID) is not None
+
+    await sched._recheck_quota_pause()
+
+    # Early clear happened (heartbeat enqueued) and BOTH jobs are gone.
+    assert len(enqueued) == 1
+    assert sched._scheduler.get_job(_QUOTA_RECOVERY_JOB_ID) is None
+    assert sched._scheduler.get_job(_QUOTA_RECHECK_JOB_ID) is None

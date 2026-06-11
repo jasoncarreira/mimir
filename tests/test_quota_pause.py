@@ -536,3 +536,49 @@ def test_recorded_at_missing_in_old_state_file(tmp_path):
     tracker = QuotaPauseTracker(path)
     assert tracker.is_paused().paused is True
     assert tracker.recorded_at is None
+
+
+def test_transient_escalation_sustains_past_long_rungs(tmp_path):
+    """chainlink #413: escalation is decay-anchored to the previous
+    backoff's END, so a header-less cap that keeps 429ing right after
+    each backoff expires climbs the full ladder (60s → 4m → 16m → 64m →
+    … capped at one window) instead of resetting to the floor once a
+    rung outgrows the 30m decay window. Pre-fix, the n=3 rung (64m) made
+    `now - record_time > 30m` always true and the ladder restarted at
+    60s forever."""
+    from datetime import datetime, timedelta, timezone
+    from mimir.quota_pause import (
+        QuotaPauseTracker,
+        _TRANSIENT_MAX_SECONDS,
+    )
+
+    path = tmp_path / "qp.json"
+    exc = Exception("HTTP 429: Rate limit exceeded")
+    now = datetime.now(tz=timezone.utc)
+    observed: list[float] = []
+    for _ in range(7):
+        reset_at, reason = QuotaPauseTracker(path).record_rate_limit(exc, now=now)
+        assert reason == "rate_limited_backoff"
+        observed.append((reset_at - now).total_seconds())
+        # The cap is still on: the next 429 lands 1 minute after the
+        # backoff expires — within the decay window of the END.
+        now = reset_at + timedelta(seconds=60)
+    assert observed[:4] == [60, 240, 960, 3840]
+    # …and the ladder reaches (and holds at) the one-window cap.
+    assert observed[-1] == _TRANSIENT_MAX_SECONDS
+
+
+def test_transient_escalation_still_decays_after_quiet(tmp_path):
+    """The decay contract is unchanged in spirit: >30m of quiet AFTER a
+    backoff expires resets to the 60s floor."""
+    from datetime import datetime, timedelta, timezone
+    from mimir.quota_pause import QuotaPauseTracker
+
+    path = tmp_path / "qp.json"
+    exc = Exception("HTTP 429: Rate limit exceeded")
+    now = datetime.now(tz=timezone.utc)
+    reset1, _ = QuotaPauseTracker(path).record_rate_limit(exc, now=now)
+    # Next 429 lands 31 minutes after the backoff EXPIRED.
+    later = reset1 + timedelta(minutes=31)
+    reset2, _ = QuotaPauseTracker(path).record_rate_limit(exc, now=later)
+    assert (reset2 - later).total_seconds() == 60

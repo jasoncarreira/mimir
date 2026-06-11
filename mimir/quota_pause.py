@@ -66,9 +66,11 @@ _MAX_RESET_WINDOW_DAYS = 7
 # reset hint). Treat it as transient: a SHORT backoff that escalates on
 # repeat so a real, header-less cap eventually backs off to the window
 # length instead of being hammered. The escalation decays — if no 429
-# has landed for ``_TRANSIENT_DECAY_SECONDS`` the counter resets, so
-# isolated blips hours apart each get the cheap 60s treatment rather
-# than accumulating.
+# has landed within ``_TRANSIENT_DECAY_SECONDS`` of the previous
+# backoff EXPIRING (end-anchored, chainlink #413 — record-anchored, the
+# longer ladder rungs outlasted the decay window and escalation could
+# never be sustained), the counter resets, so isolated blips hours
+# apart each get the cheap 60s treatment rather than accumulating.
 _TRANSIENT_BASE_SECONDS = 60
 _TRANSIENT_FACTOR = 4
 _TRANSIENT_MAX_SECONDS = _DEFAULT_PAUSE_HOURS * 3600  # cap at one window
@@ -285,10 +287,25 @@ class QuotaPauseTracker:
         ):
             return self._reset_at, "quota_exhausted"
 
-        # Header-less 429 → transient backoff. Escalate only when the
-        # previous *transient* backoff was recent; an authoritative pause
-        # (or >30 min of quiet) leaves _last_transient_at None/stale, so
-        # this starts fresh at the floor.
+        # Header-less 429 → transient backoff. Escalate only when this
+        # 429 arrives within the decay window of the previous transient
+        # backoff's END; an authoritative pause (or >30 min of quiet
+        # after the backoff expired) leaves _last_transient_at
+        # None/stale, so this starts fresh at the floor.
+        #
+        # chainlink #413: the stamp is the backoff's END (its reset_at),
+        # NOT the record time. Measured from record time the ladder
+        # self-defeated: scheduled work is fully suppressed during the
+        # pause, so the next header-less 429 necessarily lands AFTER the
+        # backoff expires — and the n=3 backoff (64m) is longer than the
+        # decay window (30m), so `now - record_time > decay` always held
+        # and the escalation reset to the 60s floor every cycle,
+        # hammering a real header-less cap in a 60s/4m/16m/64m loop
+        # forever. End-anchored, a 429 right after expiry (the cap is
+        # still on) escalates toward _TRANSIENT_MAX_SECONDS as the
+        # module docstring always promised; a mid-pause 429 (user turns
+        # still run while paused) yields a negative delta and escalates
+        # too, which is correct — the burst is plainly still on.
         if (
             self._last_transient_at is not None
             and (now - self._last_transient_at).total_seconds() <= _TRANSIENT_DECAY_SECONDS
@@ -297,8 +314,8 @@ class QuotaPauseTracker:
         else:
             consecutive = 0
         self._consecutive = consecutive
-        self._last_transient_at = now
         reset_at = now + timedelta(seconds=_transient_backoff_seconds(consecutive))
+        self._last_transient_at = reset_at
         self.pause_until(reset_at, reason="rate_limited_backoff", provider=provider, now=now)
         return reset_at, "rate_limited_backoff"
 

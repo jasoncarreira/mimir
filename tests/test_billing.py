@@ -678,10 +678,13 @@ def test_evaluate_quota_derived_propagates_through_anthropic_provider(tmp_path):
     import asyncio
 
     store = RateLimitStore(path=tmp_path / "rl.json")
+    # observed_at must be FRESH: a resets_at-less snapshot older than its
+    # window length is skipped by the #424 staleness guard.
+    _now_iso = datetime.now(tz=timezone.utc).isoformat()
     snap = RateLimitSnapshot(
         status="allowed_warning",
         utilization=0.85,
-        observed_at="2026-05-09T00:00:00+00:00",
+        observed_at=_now_iso,
         derived=True,
     )
     asyncio.run(store.record("five_hour", snap))
@@ -1199,3 +1202,57 @@ def test_raw_wall_stays_tight_when_pace_does_not_clear():
     ])
     result = evaluate_quota_severity([provider])
     assert result.severity is Severity.TIGHT
+
+
+# ─── staleness guard on resets_at-less snapshots (chainlink #424) ──────
+
+
+def test_get_windows_skips_stale_resetless_snapshot(tmp_path):
+    """A snapshot with resets_at=None older than its own window length
+    is no-signal: the window it was read from has definitionally rolled.
+    Without this, a stale derived 0.90+ reading wedged severity TIGHT on
+    Codex (no independent poller to refresh under suppression)."""
+    import asyncio
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    stale = (datetime.now(tz=timezone.utc) - timedelta(hours=6)).isoformat()
+    asyncio.run(store.record("five_hour", RateLimitSnapshot(
+        status="allowed_warning",
+        utilization=0.95,           # over every wall — but 6h old for a 5h window
+        observed_at=stale,
+        derived=True,               # derived snapshots carry resets_at=None by design
+    )))
+    provider = AnthropicQuotaProvider(store)
+    assert provider.get_windows() == []
+    result = evaluate_quota_severity([provider])
+    assert result.severity is Severity.CLEAR
+
+
+def test_get_windows_keeps_fresh_resetless_snapshot(tmp_path):
+    import asyncio
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    fresh = (datetime.now(tz=timezone.utc) - timedelta(hours=1)).isoformat()
+    asyncio.run(store.record("five_hour", RateLimitSnapshot(
+        status="allowed_warning",
+        utilization=0.95,
+        observed_at=fresh,
+        derived=True,
+    )))
+    provider = AnthropicQuotaProvider(store)
+    [w] = provider.get_windows()
+    assert w.utilization == pytest.approx(0.95)
+    assert evaluate_quota_severity([provider]).severity is Severity.TIGHT
+
+
+def test_get_windows_unparseable_observed_at_not_treated_stale(tmp_path):
+    """Missing/garbage observed_at carries no age signal — keep the
+    window rather than letting a logging quirk drop the wall."""
+    import asyncio
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    asyncio.run(store.record("five_hour", RateLimitSnapshot(
+        status="allowed_warning",
+        utilization=0.95,
+        observed_at="not-a-timestamp",
+        derived=True,
+    )))
+    provider = AnthropicQuotaProvider(store)
+    assert len(provider.get_windows()) == 1
