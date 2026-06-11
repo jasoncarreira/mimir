@@ -6,6 +6,50 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-06-11
+
+### Added
+
+- **Worklink slice 1 — the chainlink worker rail** (`mimir/worklink/`,
+  spec: `docs/internal/WORKLINK.md`, chainlink #380 subissues #438–#441;
+  built largely by mimir itself through the normal PR/review loop):
+  - Race-safe chainlink claiming with attempt caps + TTL reaper (the
+    slice-0 probe verified `chainlink locks` atomicity: 20/20 races,
+    zero double-claims; `locks steal` is forceful, so the reaper
+    enforces its own staleness evidence) (#637, #638).
+  - Attempt-scoped worktree lifecycle and **observed** evidence: the
+    executor itself diffs `base...HEAD` + untracked files and runs the
+    test command anchored to the attempt worktree — backend
+    self-reports are never trusted; `completed` with an empty diff
+    demotes to `failed` (#638, #641).
+  - Pluggable `ToolBackend` protocol (capability declarations incl.
+    `tool_category` + `quota_pool`) with a codex adapter:
+    process-group timeout kill, transcripts under
+    `<home>/state/worklink/transcripts/`, config-driven selection via
+    `worklink.yaml` (#639).
+  - `mimir worklink run <issue> [--backend X] [--dry-run]` — the
+    operator vertical: validate leaf → claim → worktree → backend →
+    observed evidence → gated label transitions (failure with retries
+    returns to `worklink:ready`) → push + PR → cleanup (#641).
+- **github-poller: state-based reconciliation for own PRs stuck at
+  CHANGES_REQUESTED** (`pr_changes_requested_stale`, chainlink #449):
+  a turn that consumes a review event without pushing fixes gets one
+  deduped reminder per `(pr, head_sha)` — validated in production the
+  same day (#640).
+
+### Fixed
+
+- **Poller discovery no longer descends into hidden directories**
+  (#642): `skill_install`'s `.pre-update-backup` snapshot includes
+  `pollers.json`, and with first-wins duplicate-name dedupe the backup
+  shadowed the freshly-updated live manifest — the scheduler ran the
+  OLD poller from the backup dir every tick (found live on mimirbot).
+- **social-cli pollers pass ATPROTO credentials via `pass_env`**
+  (#643): the subprocess depended on a hand-seeded `STATE_DIR/.env`;
+  an operator app-password rotation in `compose.env` never reached it,
+  producing a 3-day Bluesky failed-login storm surfacing as
+  rate-limiting. `compose.env` is now the source of truth.
+
 ## [0.3.4] — 2026-06-11
 
 ### Fixed
