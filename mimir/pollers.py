@@ -481,6 +481,28 @@ def discover_pollers(
     seen_names: dict[str, Path] = {}
 
     for pollers_file in sorted(skills_dir.rglob("pollers.json")):
+        # Skip manifests under hidden directories (observed live
+        # 2026-06-11): ``skill_install`` keeps full pre-update snapshots
+        # at ``<skill>/.pre-update-backup/<ts>/`` — INCLUDING the
+        # snapshot's pollers.json — and ``rglob`` walks into them. With
+        # the #420 first-wins duplicate-name guard, the backup manifest
+        # (``.pre-…`` sorts before the skill's own ``pollers.json``)
+        # SHADOWED the freshly-updated live manifest: the scheduler
+        # registered the BACKUP directory as skill_dir and ran the old
+        # poller.py every tick, while the duplicate warning sat only in
+        # container stderr. (Pre-#420 last-wins silently picked the live
+        # one, masking the hazard.) Hidden directories are never valid
+        # skill roots — backups, scratch, VCS internals — so exclude
+        # them from discovery wholesale.
+        try:
+            _rel_dirs = pollers_file.relative_to(skills_dir).parts[:-1]
+        except ValueError:  # pragma: no cover — rglob yields children only
+            _rel_dirs = ()
+        if any(part.startswith(".") for part in _rel_dirs):
+            log.info(
+                "poller_manifest_hidden_dir_skipped: %s", pollers_file,
+            )
+            continue
         skill_dir = pollers_file.parent
         try:
             raw = json.loads(pollers_file.read_text(encoding="utf-8"))
