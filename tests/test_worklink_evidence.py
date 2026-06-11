@@ -106,7 +106,7 @@ def test_observe_evidence_uses_executor_diff_and_test_results(tmp_path: Path) ->
         started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
         base_ref="main",
         backend_status="completed",
-        test_command="python -c 'import sys; sys.exit(0)'",
+        test_command="test -f a.txt",
     )
 
     assert result.review_ready is True

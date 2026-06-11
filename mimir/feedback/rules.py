@@ -31,6 +31,10 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "tool_call_denied": ("negative", "tool_denied"),
     "tool_error": ("negative", "tool_error"),
     "background_task_failed": ("negative", "background_task_failed"),
+    "worklink_claimed": ("positive", "worklink_claimed"),
+    "worklink_evidence": ("positive", "worklink_evidence"),
+    "worklink_transition": ("positive", "worklink_transition"),
+    "worklink_attempts_exhausted": ("negative", "worklink_attempts_exhausted"),
     "tool_call_budget_warning": ("negative", "tool_budget"),
     # Gap 4 fix: budget_gate.py emits these two names, not the legacy
     # "tool_call_budget_warning". All three are aliased to the same

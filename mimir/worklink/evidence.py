@@ -56,7 +56,7 @@ class EvidenceValidation:
     evidence: WorklinkEvidence
 
 
-Run = Callable[[Sequence[str] | str], subprocess.CompletedProcess[str]]
+Run = Callable[..., subprocess.CompletedProcess[str]]
 
 
 def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
@@ -140,7 +140,7 @@ def observe_evidence(
 
     tests: TestResult | None = None
     if test_command:
-        test = runner(test_command)
+        test = runner(test_command, cwd=worktree)
         tests = TestResult(test_command, test.returncode, _summarize(test))
         commands.append(CommandResult(test_command, test.returncode, _summarize(test)))
 
@@ -174,12 +174,12 @@ def _common_status(status: str) -> str:
     return "failed"
 
 
-def _run(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:
+def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     if isinstance(args, str):
         # Operator-configured test commands are trusted input, equivalent to
         # poller.command; backend-generated text is never routed here.
-        return subprocess.run(args, shell=True, capture_output=True, text=True, check=False)
-    return subprocess.run(list(args), capture_output=True, text=True, check=False)
+        return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, check=False)
+    return subprocess.run(list(args), cwd=cwd, capture_output=True, text=True, check=False)
 
 
 def _merge_paths(*groups: list[str]) -> list[str]:

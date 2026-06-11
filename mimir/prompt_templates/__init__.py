@@ -19,6 +19,7 @@ Currently seeded:
   audit workflow.
 - ``upgrade.md`` — version-triggered prompts/core defaults reconciliation
   turn for startup-opened upgrade-lane proposals.
+- ``worklink-order.md`` — operator-run Worklink backend order template.
 
 The intent: a fresh ``mimir setup`` produces a deployment that already
 has a reasonable autonomous-work cadence wired up. Operators delete
