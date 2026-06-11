@@ -978,3 +978,106 @@ class TestSendMessageDelivery:
         assert bridge.send_calls == [{"cid": "chan-1", "text": "hi"}]
         # ...but a soft failure is NOT recorded as a delivered assistant message.
         assert [m for m in buf._all if m.kind == "assistant_message"] == []
+
+
+# ────────────────────────────────────────────────────────────────────
+# directive-react delivery accounting (chainlink #408)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestDirectiveReactAccounting:
+    """A <react> directive inside a send_message body is a real delivery:
+    a confirmed directive react increments ctx.react_count (so the
+    forgot-to-send guard doesn't false-flag an actions-only ack), and a
+    declined/raising directive react emits send_message_directive_failed
+    instead of vanishing into an except-pass."""
+
+    def _turn_ctx(self):
+        from mimir.models import TurnContext
+        from mimir._context import set_current_turn, reset_current_turn
+        ctx = TurnContext(
+            turn_id="t1", session_id="s1", trigger="user_message",
+            channel_id="chan-1", started_at=0.0, agent_id="test",
+        )
+        tok = set_current_turn(ctx)
+        return ctx, tok, reset_current_turn
+
+    @pytest.mark.asyncio
+    async def test_actions_only_send_with_target_counts_as_reply(self) -> None:
+        bridge = _StubBridge()
+        bridge.react_returns = True
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        ctx, tok, reset = self._turn_ctx()
+        int_tok = set_current_turn_interactive(True)
+        try:
+            out = await send_message.ainvoke({
+                "text": '<actions><react emoji="👍" message="m-7" /></actions>',
+                "channel_id": "chan-1",
+            })
+        finally:
+            reset_current_turn_interactive(int_tok)
+            reset(tok)
+        assert "send_message ok" in out
+        assert bridge.react_calls == [
+            {"cid": "chan-1", "message_id": "m-7", "emoji": "👍"},
+        ]
+        assert ctx.send_message_count == 0  # no text was sent
+        assert ctx.react_count == 1         # the delivered react counts
+
+    @pytest.mark.asyncio
+    async def test_declined_directive_react_does_not_count_and_emits(
+        self, tmp_path,
+    ) -> None:
+        from mimir.event_logger import init_logger
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        bridge.react_returns = False  # bridge declined
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        ctx, tok, reset = self._turn_ctx()
+        int_tok = set_current_turn_interactive(True)
+        try:
+            await send_message.ainvoke({
+                "text": '<actions><react emoji="👍" message="m-7" /></actions>',
+                "channel_id": "chan-1",
+            })
+        finally:
+            reset_current_turn_interactive(int_tok)
+            reset(tok)
+        assert ctx.react_count == 0
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        ]
+        [ev] = [e for e in events if e["type"] == "send_message_directive_failed"]
+        assert ev["directive"] == "react"
+        assert ev["error"] == "bridge declined"
+
+    @pytest.mark.asyncio
+    async def test_raising_directive_react_emits_and_send_still_ok(
+        self, tmp_path,
+    ) -> None:
+        from mimir.event_logger import init_logger
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        bridge.raise_on = "react"
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        ctx, tok, reset = self._turn_ctx()
+        int_tok = set_current_turn_interactive(True)
+        try:
+            out = await send_message.ainvoke({
+                "text": 'hi there <splitter>\n<actions><react emoji="👍" /></actions>'.replace(" <splitter>", ""),
+                "channel_id": "chan-1",
+            })
+        finally:
+            reset_current_turn_interactive(int_tok)
+            reset(tok)
+        # The text part delivered (counts), the react raised (doesn't).
+        assert "send_message ok" in out
+        assert ctx.send_message_count == 1
+        assert ctx.react_count == 0
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        ]
+        [ev] = [e for e in events if e["type"] == "send_message_directive_failed"]
+        assert "react boom" in ev["error"]

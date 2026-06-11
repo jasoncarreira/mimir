@@ -354,10 +354,43 @@ async def send_message(
                     "for emoji %r", _directive.emoji,
                 )
                 continue
+            # chainlink #408: a directive react is a real delivery — it
+            # feeds the same accounting as the standalone ``react`` tool
+            # (0.3.2's react_count fix covered only the tool; an
+            # actions-only body increments NO send count, so a delivered
+            # ack still tripped the forgot-to-send guard), and its
+            # failures surface algedonically (the prompt promises
+            # per-directive failures show up in the feedback block —
+            # false while this was a bare except-pass).
+            _ok: object = False
             try:
-                await bridge.react(cid, _target, _directive.emoji)
-            except Exception:
-                pass  # non-fatal; directive failures don't abort the send
+                _ok = await bridge.react(cid, _target, _directive.emoji)
+            except Exception as _exc:  # noqa: BLE001 — non-fatal; don't abort the send
+                await _log_event(
+                    "send_message_directive_failed",
+                    channel_id=cid,
+                    directive="react",
+                    emoji=_directive.emoji,
+                    message_id=_target,
+                    error=f"{type(_exc).__name__}: {_exc}"[:200],
+                )
+            else:
+                if _ok is False:
+                    await _log_event(
+                        "send_message_directive_failed",
+                        channel_id=cid,
+                        directive="react",
+                        emoji=_directive.emoji,
+                        message_id=_target,
+                        error="bridge declined",
+                    )
+            # Confirmed-delivery gate mirrors the react tool: only a
+            # non-False return counts toward the turn's reply accounting.
+            if _ok is not False and ctx is not None:
+                try:
+                    ctx.react_count += 1
+                except Exception:  # noqa: BLE001
+                    pass
         # SendFileDirective: not yet implemented via this path
 
     # chainlink #259: surface the bare message_id, not the SendResult repr,

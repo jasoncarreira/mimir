@@ -2040,3 +2040,41 @@ async def test_run_turn_bounds_hung_finalize_hook(tmp_path: Path, monkeypatch):
     record = await asyncio.wait_for(agent.run_turn(event), timeout=15.0)
     assert record is not None
     assert record.output == "ok"
+
+
+async def test_run_turn_setup_phase_exception_releases_cleanup(tmp_path: Path):
+    """chainlink #415: the setup phase (session touch, wiki snapshot,
+    contextvar arming) runs INSIDE run_turn's cleanup try. A setup-phase
+    exception must deactivate the mid-turn-injection registry entry
+    (requeuing anything already injected) and leave no leaked turn
+    context — previously the window between register_inflight and the
+    model-loop try escaped the finally entirely."""
+    from mimir import mid_turn_injection
+    from mimir._context import get_current_turn
+    from mimir.channel_registry import ChannelRegistry
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="unreached")])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+
+    # Blow up mid-setup — after injection arming + typing start, before
+    # the model loop (the previously-uncovered window).
+    def _boom():
+        raise RuntimeError("setup boom")
+    agent._snapshot_wiki_mtimes = _boom  # type: ignore[assignment]
+
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1",
+        content="hi", author="jason", source="discord",
+    )
+    with pytest.raises(RuntimeError, match="setup boom"):
+        await agent.run_turn(event)
+
+    # The injection-registry entry was deactivated (a fresh inject sees
+    # no active turn rather than queueing into a stale entry).
+    assert mid_turn_injection.inject_message("ch-1", event) == "no_active_turn"
+    # No leaked turn context (token reset despite the mid-setup raise).
+    assert get_current_turn() is None

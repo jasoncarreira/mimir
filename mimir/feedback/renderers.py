@@ -145,6 +145,13 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return f"scheduled_tick dropped: {ev.get('reason') or '(no reason)'}"
     if rule_kind == "tick_suppressed":
         return f"scheduled_tick suppressed by arbiter: {ev.get('reason') or '(no reason)'}"
+    if rule_kind == "directive_failed":
+        return (
+            f"send_message <{ev.get('directive') or '?'}> directive failed "
+            f"(emoji={ev.get('emoji') or '?'}, "
+            f"message={ev.get('message_id') or '?'}): "
+            f"{ev.get('error') or '(no detail)'}"
+        )
     if rule_kind == "poller_suppressed":
         return (
             f"poller {ev.get('poller') or '?'} suppressed by arbiter "

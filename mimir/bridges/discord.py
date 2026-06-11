@@ -36,6 +36,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
 
 from ..background_tasks import spawn_background
 from ..models import AgentEvent
+from ._emoji import resolve_for_discord
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
 from .base import Bridge, SendResult
@@ -737,7 +738,14 @@ class DiscordBridge(Bridge):
             if not hasattr(channel, "fetch_message"):
                 return False
             message = await channel.fetch_message(mid_int)
-            await message.add_reaction(emoji)
+            # Alias → glyph resolution (chainlink #412): the prompt
+            # documents alias-name acks (``thumbsup`` / ``:thumbsup:``),
+            # but Discord's API only accepts unicode glyphs or custom-
+            # emoji literals — a raw alias 400s as Unknown Emoji. The
+            # resolver landed in ee0e9b9 but its consuming stage was
+            # never wired; Slack has its own ``_normalize_emoji``
+            # equivalent on its react path.
+            await message.add_reaction(resolve_for_discord(emoji))
             return True
         except discord.DiscordException as exc:
             log.warning("DiscordBridge.react failed: %s", exc)

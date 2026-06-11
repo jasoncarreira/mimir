@@ -1181,3 +1181,31 @@ def test_fatal_discord_exceptions_built_correctly():
     # The info map should have a (event_kind, log_msg) tuple per class.
     assert _FATAL_DISCORD_EXCEPTION_INFO[discord.LoginFailure][0] == "discord_bridge_login_failure"
     assert _FATAL_DISCORD_EXCEPTION_INFO[discord.PrivilegedIntentsRequired][0] == "discord_bridge_intents_failure"
+
+
+@pytest.mark.asyncio
+async def test_react_resolves_alias_to_glyph(bridge_with_fake_client):
+    """chainlink #412: the prompt documents alias-name acks (``thumbsup`` /
+    ``:thumbsup:``), but Discord's API only accepts unicode glyphs — the
+    resolver existed (ee0e9b9) with no caller, so alias reacts 400'd. The
+    bridge now resolves aliases before add_reaction; raw glyphs and custom
+    emoji literals pass through untouched."""
+    bridge, _, _ = bridge_with_fake_client
+    seen: list[str] = []
+    channel = bridge._client._channels[1]
+
+    async def fetch_message(mid):
+        msg = SimpleNamespace(id=mid)
+
+        async def add_reaction(emoji):
+            seen.append(emoji)
+        msg.add_reaction = add_reaction
+        return msg
+
+    channel.fetch_message = fetch_message
+
+    assert await bridge.react("discord-1", "1000", "thumbsup") is True
+    assert await bridge.react("discord-1", "1000", ":rocket:") is True
+    assert await bridge.react("discord-1", "1000", "👀") is True
+    assert await bridge.react("discord-1", "1000", "<:custom:12345>") is True
+    assert seen == ["👍", "\U0001F680", "👀", "<:custom:12345>"]

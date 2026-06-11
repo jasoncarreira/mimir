@@ -1132,140 +1132,158 @@ class Agent:
         # the registry in lockstep closes the setup blind window where a
         # follow-up user_message saw dispatcher._in_flight but inject_message()
         # returned no_active_turn and fell into the FIFO. The model-loop finally
-        # still owns deactivate(); setup-phase exceptions explicitly deactivate
-        # below so early arming cannot leak a stale active entry.
+        # still owns deactivate(); the setup phase runs inside run_turn's own
+        # try (chainlink #415) so its finally deactivates + requeues on any
+        # setup-phase exception or cancellation — early arming cannot leak a
+        # stale active entry.
         injection_registered = False
         if event.channel_id and event.trigger == "user_message":
             mid_turn_injection.register_inflight(event.channel_id)
             injection_registered = True
-        # Capture the asyncio loop once so shell-job waiter threads
-        # can schedule their completion handlers back onto it via
-        # ``asyncio.run_coroutine_threadsafe``.
-        if self._loop is None:
-            try:
-                self._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
-
-        # Session attach — same as the SDK path.
-        session_id = event.channel_id or "default"
-        saga_session_id: str | None = None
-        if event.trigger == "saga_session_end":
-            saga_session_id = (event.extra or {}).get("saga_session_id")
-        elif self._sessions is not None:
-            sess = await self._sessions.touch(event.channel_id)
-            saga_session_id = sess.saga_session_id
-            self._sessions.increment_turn_count(event.channel_id)
-
-        # Typing indicator: fire at turn START on interactive turns so the
-        # user sees "mimir is typing…" the moment their message lands and for
-        # the whole turn (0.3.0 removed auto-dispatch, so this is the only
-        # received-it signal until the agent calls send_message). It is
-        # released in the finally (turn END) — NOT on send_message — so it
-        # persists across multi-part replies. Bridges without the method
-        # (Bench / WebChat) are silently skipped.
+        # chainlink #415: cleanup obligations accrue across the setup phase
+        # (typing-indicator hold, _active_turns registration, channel /
+        # interactivity contextvar tokens) — so the setup MUST run inside
+        # the same try whose finally releases them. It previously sat
+        # outside: a cancellation at the session-touch lock (hard
+        # shutdown) or an unexpected setup failure leaked the active
+        # injection-registry entry (silently dropping any already-injected
+        # messages on the next turn's overwrite), poisoned
+        # get_only_active_turn()'s len==1 heuristic for the life of the
+        # process, and left the typing-hold task running. Names are
+        # pre-bound so the finally releases exactly what was created.
         _typing_bridge = None
-        if (
-            self._channels is not None
-            and event.channel_id
-            and is_interactive_turn(event.channel_id, event.trigger, self._channels)
-        ):
-            _typing_bridge = self._channels.find(event.channel_id)
-            if _typing_bridge is not None and hasattr(
-                _typing_bridge, "send_typing_indicator"
-            ):
-                try:
-                    await _typing_bridge.send_typing_indicator(event.channel_id)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("typing indicator failed: %s", exc)
-
-        # Set up TurnContext so RecordingSagaClient can populate
-        # ctx.saga_calls. Without this all saga calls — pre-message
-        # query, post-message feedback — were lost from the turn
-        # record. The context is reset in the finally block.
-        from .models import TurnContext as _TurnContext
-        from ._context import set_current_turn, reset_current_turn
-        from .loop_detector import LoopDetector
-        ctx = _TurnContext(
-            turn_id=turn_id,
-            session_id=session_id,
-            trigger=event.trigger,
-            channel_id=event.channel_id,
-            started_at=t_total_start,
-            agent_id=self._config.agent_id,
-            saga_session_id=saga_session_id,
-            # Per-turn send-loop circuit breaker (SPEC §7.2.4). Attached
-            # to the TurnContext so send_message can reach it via
-            # ``_context.get_current_turn()`` without a separate
-            # parameter-passing path. Soft/hard limits + similarity
-            # threshold come from Config (mimir/config.py default 5/10/0.9).
-            # Pre-181-J the detector wasn't constructed at all; the
-            # circuit breaker was disarmed and the agent could ship
-            # near-duplicate sends indefinitely.
-            loop_detector=LoopDetector(
-                soft_limit=self._config.send_loop_soft_limit,
-                hard_limit=self._config.send_loop_hard_limit,
-                similarity_threshold=self._config.send_loop_similarity,
-            ),
-            # Tool-call budget (181-N). The langchain @tool wrappers
-            # installed by ``apply_budget_gate`` in registry.py read
-            # this off the TurnContext and refuse tool calls past
-            # the cap. 0 disables (matches main's contract).
-            tool_call_budget=self._config.tool_call_budget,
-            # Source of the inbound channel (e.g. "discord", "slack"),
-            # recorded on the turn context for observability. The outbound
-            # buffer-append now lives only in the send_message tool, which
-            # tags the message with ``bridge.name`` so it passes the
-            # recent_sources allowlist in recent_for_channel (chainlink #270);
-            # this field is no longer the source of that tag.
-            channel_source=event.source,
-        )
-        # WikiBacklinksHook pre-snapshot — capture mtimes of every
-        # state/wiki/ content page BEFORE the model loop runs so the
-        # finalize step can tell if any wiki page was edited this turn.
-        # Stored on ctx (NOT on self) so concurrent turns on different
-        # channels don't share state — multi-channel-correctness
-        # invariant from the SDK build. Empty dict when the wiki dir
-        # doesn't exist; finalize early-returns in that case.
-        ctx.wiki_mtime_snapshot = self._snapshot_wiki_mtimes()
-
-        ctx_token = set_current_turn(ctx)
-        # Populate the module-global current_channel_id as a fallback
-        # for the claude-code path. ChatClaudeCode dispatches tools
-        # via the ClaudeSDKClient subprocess; the SDK round-trips back
-        # through ``_langchain_claude_code_patches`` which calls
-        # ``tool._arun(**args, config=RunnableConfig())`` — a fresh
-        # empty config. The RunnableConfig route added in 181-B
-        # therefore can't see ``configurable["channel_id"]`` on that
-        # path, and send_message / react / fetch_channel_history would
-        # fail with "no channel_id and no current channel" when the
-        # model omits the arg. Setting _STATE here closes the gap; the
-        # helper still prefers configurable when present, so direct
-        # LangGraph tool dispatch (anthropic/openai providers) keeps
-        # the race-free route. The dispatcher serializes turns per-
-        # channel, so the cross-channel race Mimir originally flagged
-        # is constrained to the moment between set and reset here.
-        from .tools.registry import (
-            set_current_channel_id as _set_cid,
-            reset_current_channel_id as _reset_cid,
-            set_current_turn_interactive as _set_interactive,
-            reset_current_turn_interactive as _reset_interactive,
-        )
-        cid_token = _set_cid(event.channel_id)
-        # Pair the interactivity flag with the channel id: send_message uses it
-        # to decide whether a channel-less call may default to this turn's
-        # channel (interactive) or must be given an explicit channel (non-
-        # interactive heartbeat / poller / synthesis / upgrade turns).
-        interactive_token = _set_interactive(
-            is_interactive_turn(event.channel_id, event.trigger, self._channels)
-        )
+        ctx = None
+        ctx_token = None
+        cid_token = None
+        interactive_token = None
         try:
+            # Capture the asyncio loop once so shell-job waiter threads
+            # can schedule their completion handlers back onto it via
+            # ``asyncio.run_coroutine_threadsafe``.
+            if self._loop is None:
+                try:
+                    self._loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+
+            # Session attach — same as the SDK path.
+            session_id = event.channel_id or "default"
+            saga_session_id: str | None = None
+            if event.trigger == "saga_session_end":
+                saga_session_id = (event.extra or {}).get("saga_session_id")
+            elif self._sessions is not None:
+                sess = await self._sessions.touch(event.channel_id)
+                saga_session_id = sess.saga_session_id
+                self._sessions.increment_turn_count(event.channel_id)
+
+            # Typing indicator: fire at turn START on interactive turns so the
+            # user sees "mimir is typing…" the moment their message lands and for
+            # the whole turn (0.3.0 removed auto-dispatch, so this is the only
+            # received-it signal until the agent calls send_message). It is
+            # released in the finally (turn END) — NOT on send_message — so it
+            # persists across multi-part replies. Bridges without the method
+            # (Bench / WebChat) are silently skipped.
+            _typing_bridge = None
+            if (
+                self._channels is not None
+                and event.channel_id
+                and is_interactive_turn(event.channel_id, event.trigger, self._channels)
+            ):
+                _typing_bridge = self._channels.find(event.channel_id)
+                if _typing_bridge is not None and hasattr(
+                    _typing_bridge, "send_typing_indicator"
+                ):
+                    try:
+                        await _typing_bridge.send_typing_indicator(event.channel_id)
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("typing indicator failed: %s", exc)
+
+            # Set up TurnContext so RecordingSagaClient can populate
+            # ctx.saga_calls. Without this all saga calls — pre-message
+            # query, post-message feedback — were lost from the turn
+            # record. The context is reset in the finally block.
+            from .models import TurnContext as _TurnContext
+            from ._context import set_current_turn, reset_current_turn
+            from .loop_detector import LoopDetector
+            ctx = _TurnContext(
+                turn_id=turn_id,
+                session_id=session_id,
+                trigger=event.trigger,
+                channel_id=event.channel_id,
+                started_at=t_total_start,
+                agent_id=self._config.agent_id,
+                saga_session_id=saga_session_id,
+                # Per-turn send-loop circuit breaker (SPEC §7.2.4). Attached
+                # to the TurnContext so send_message can reach it via
+                # ``_context.get_current_turn()`` without a separate
+                # parameter-passing path. Soft/hard limits + similarity
+                # threshold come from Config (mimir/config.py default 5/10/0.9).
+                # Pre-181-J the detector wasn't constructed at all; the
+                # circuit breaker was disarmed and the agent could ship
+                # near-duplicate sends indefinitely.
+                loop_detector=LoopDetector(
+                    soft_limit=self._config.send_loop_soft_limit,
+                    hard_limit=self._config.send_loop_hard_limit,
+                    similarity_threshold=self._config.send_loop_similarity,
+                ),
+                # Tool-call budget (181-N). The langchain @tool wrappers
+                # installed by ``apply_budget_gate`` in registry.py read
+                # this off the TurnContext and refuse tool calls past
+                # the cap. 0 disables (matches main's contract).
+                tool_call_budget=self._config.tool_call_budget,
+                # Source of the inbound channel (e.g. "discord", "slack"),
+                # recorded on the turn context for observability. The outbound
+                # buffer-append now lives only in the send_message tool, which
+                # tags the message with ``bridge.name`` so it passes the
+                # recent_sources allowlist in recent_for_channel (chainlink #270);
+                # this field is no longer the source of that tag.
+                channel_source=event.source,
+            )
+            # WikiBacklinksHook pre-snapshot — capture mtimes of every
+            # state/wiki/ content page BEFORE the model loop runs so the
+            # finalize step can tell if any wiki page was edited this turn.
+            # Stored on ctx (NOT on self) so concurrent turns on different
+            # channels don't share state — multi-channel-correctness
+            # invariant from the SDK build. Empty dict when the wiki dir
+            # doesn't exist; finalize early-returns in that case.
+            ctx.wiki_mtime_snapshot = self._snapshot_wiki_mtimes()
+
+            ctx_token = set_current_turn(ctx)
+            # Populate the module-global current_channel_id as a fallback
+            # for the claude-code path. ChatClaudeCode dispatches tools
+            # via the ClaudeSDKClient subprocess; the SDK round-trips back
+            # through ``_langchain_claude_code_patches`` which calls
+            # ``tool._arun(**args, config=RunnableConfig())`` — a fresh
+            # empty config. The RunnableConfig route added in 181-B
+            # therefore can't see ``configurable["channel_id"]`` on that
+            # path, and send_message / react / fetch_channel_history would
+            # fail with "no channel_id and no current channel" when the
+            # model omits the arg. Setting _STATE here closes the gap; the
+            # helper still prefers configurable when present, so direct
+            # LangGraph tool dispatch (anthropic/openai providers) keeps
+            # the race-free route. The dispatcher serializes turns per-
+            # channel, so the cross-channel race Mimir originally flagged
+            # is constrained to the moment between set and reset here.
+            from .tools.registry import (
+                set_current_channel_id as _set_cid,
+                reset_current_channel_id as _reset_cid,
+                set_current_turn_interactive as _set_interactive,
+                reset_current_turn_interactive as _reset_interactive,
+            )
+            cid_token = _set_cid(event.channel_id)
+            # Pair the interactivity flag with the channel id: send_message uses it
+            # to decide whether a channel-less call may default to this turn's
+            # channel (interactive) or must be given an explicit channel (non-
+            # interactive heartbeat / poller / synthesis / upgrade turns).
+            interactive_token = _set_interactive(
+                is_interactive_turn(event.channel_id, event.trigger, self._channels)
+            )
             return await self._run_turn_body(
                 event, ctx, ctx_token, turn_id, session_id, saga_session_id,
                 t_total_start,
             )
         except Exception as exc:
-            # chainlink #306: _run_turn_body's model-loop try/except emits
+            # chainlink #306 (+ #415): _run_turn_body's model-loop try/except emits
             # turn_failed/turn_completed only AFTER the early phase (prompt
             # build, agent construction, model resolution). A crash in that
             # early phase would otherwise propagate here with NO terminal
@@ -1308,9 +1326,15 @@ class Agent:
                     await _typing_bridge.cancel_typing(event.channel_id)
                 except Exception as exc:  # noqa: BLE001
                     log.debug("cancel_typing failed: %s", exc)
-            reset_current_turn(ctx_token)
-            _reset_interactive(interactive_token)
-            _reset_cid(cid_token)
+            # Token guards: a setup-phase exception may land here before a
+            # given token (or its importing module) was bound — release
+            # only what was actually created.
+            if ctx_token is not None:
+                reset_current_turn(ctx_token)
+            if interactive_token is not None:
+                _reset_interactive(interactive_token)
+            if cid_token is not None:
+                _reset_cid(cid_token)
 
     async def _run_turn_body(
         self,
