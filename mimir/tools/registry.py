@@ -284,6 +284,7 @@ async def send_message(
         if ctx is not None:
             try:
                 ctx.send_message_count += 1
+                ctx.delivered_channel_ids.add(cid)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -389,6 +390,7 @@ async def send_message(
             if _ok is not False and ctx is not None:
                 try:
                     ctx.react_count += 1
+                    ctx.delivered_channel_ids.add(cid)
                 except Exception:  # noqa: BLE001
                     pass
         # SendFileDirective: not yet implemented via this path
@@ -479,6 +481,7 @@ async def react(
     if _ctx is not None:
         try:
             _ctx.react_count += 1
+            _ctx.delivered_channel_ids.add(cid)
         except Exception:  # noqa: BLE001
             pass
     return f"react ok: channel={cid} emoji={emoji} message_id={message_id}"

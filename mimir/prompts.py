@@ -61,6 +61,13 @@ call reaches the user.
   ``send_message``, the user gets silence and the runtime emits a negative
   feedback signal. Don't write a reply you never send. (Choosing to stay
   silent — no reply text — is fine.)
+- **Close the loop with whoever asked.** The delivery check is scoped to
+  the channel the turn came from: if your response to a user's message is
+  an action elsewhere (a send to another channel, a PR, a file change),
+  also send a short ack/result on the asking channel — a cross-channel
+  send alone still leaves the asker in silence and trips the same
+  negative signal. A react on the asking channel counts as closing the
+  loop.
 
 Non-interactive turns — heartbeats / ``scheduled_tick``, pollers,
 ``saga_session_end`` synthesis, ``upgrade`` maintenance — have no channel to

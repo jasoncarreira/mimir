@@ -90,5 +90,11 @@ def reflection_lm_from_config(config: Any | None = None) -> Callable[[str], str]
         max_retries=getattr(cfg, "model_max_retries", 6),
         max_tokens=getattr(cfg, "model_max_tokens", 0),
         reasoning_effort=getattr(cfg, "model_reasoning_effort", ""),
+        # chainlink #426: every Config-based resolution must thread home
+        # so the deprecation gate can honor the scaffolded opt-in in
+        # <home>/.env (same as Agent's call site) — without it a
+        # subscription-scaffolded home worked for the main agent but
+        # GEPA/reflection LM construction still refused the route.
+        home=getattr(cfg, "home", None),
     )
     return chat_model_as_reflection_lm(model)

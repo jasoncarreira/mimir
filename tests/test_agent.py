@@ -938,6 +938,9 @@ async def test_run_turn_successful_send_suppresses_no_reply_signal(
             _ctx = get_current_turn()
             if _ctx is not None:
                 _ctx.send_message_count += 1
+                # chainlink #423: the guard is channel-scoped — the real
+                # tool records the delivery channel alongside the count.
+                _ctx.delivered_channel_ids.add("ch-1")
             async for chunk in super().astream(
                 state, config=config, stream_mode=stream_mode,
             ):
@@ -973,6 +976,7 @@ async def test_run_turn_react_only_suppresses_no_reply_signal(tmp_path: Path):
             _ctx = get_current_turn()
             if _ctx is not None:
                 _ctx.react_count += 1
+                _ctx.delivered_channel_ids.add("ch-1")
             async for chunk in super().astream(
                 state, config=config, stream_mode=stream_mode,
             ):
@@ -2078,3 +2082,123 @@ async def test_run_turn_setup_phase_exception_releases_cleanup(tmp_path: Path):
     assert mid_turn_injection.inject_message("ch-1", event) == "no_active_turn"
     # No leaked turn context (token reset despite the mid-setup raise).
     assert get_current_turn() is None
+
+
+async def test_run_turn_cross_channel_only_delivery_still_flags(tmp_path: Path):
+    """chainlink #423: the forgot-to-send guard is channel-scoped. A turn
+    whose only confirmed delivery went to a DIFFERENT channel (e.g. an
+    ops-channel alert) left the asking user in silence — the signal fires,
+    carrying delivered_elsewhere so feedback can distinguish
+    answered-in-the-wrong-room from totally silent."""
+    import json
+    from mimir.channel_registry import ChannelRegistry
+
+    class _CrossChannelAgent(_FakeAgent):
+        async def astream(self, state, *, config, stream_mode="values"):
+            from mimir._context import get_current_turn
+            _ctx = get_current_turn()
+            if _ctx is not None:
+                _ctx.send_message_count += 1
+                _ctx.delivered_channel_ids.add("ops-channel")  # not ch-1
+            async for chunk in super().astream(
+                state, config=config, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    fake_agent = _CrossChannelAgent(response_messages=[AIMessage(content="alerted ops")])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    await agent.run_turn(event)
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    [sig] = [e for e in evs if e.get("type") == "interactive_turn_no_send_message"]
+    assert sig["channel_id"] == "ch-1"
+    assert sig["delivered_elsewhere"] == ["ops-channel"]
+
+
+def test_resolve_model_claude_code_deprecated_by_default(monkeypatch):
+    """chainlink #426: the claude-code subprocess route bypasses the tool
+    budget + prohibited-action gating, is unused by live deployments, and
+    is deprecated — _resolve_model refuses it unless the operator opts in
+    via MIMIR_ALLOW_CLAUDE_CODE."""
+    from mimir.agent import _resolve_model
+
+    monkeypatch.delenv("MIMIR_ALLOW_CLAUDE_CODE", raising=False)
+    with pytest.raises(RuntimeError, match="deprecated"):
+        _resolve_model("claude-code:claude-sonnet-4-6")
+
+
+def test_resolve_model_claude_code_override_passes_gate(monkeypatch):
+    """With the opt-in set, the gate steps aside — resolution proceeds to
+    the normal import path (ImportError in envs without the fork, never
+    the deprecation RuntimeError)."""
+    from mimir.agent import _resolve_model
+
+    monkeypatch.setenv("MIMIR_ALLOW_CLAUDE_CODE", "1")
+    try:
+        _resolve_model("claude-code:claude-sonnet-4-6")
+    except RuntimeError as exc:
+        pytest.fail(f"gate fired despite override: {exc}")
+    except ImportError:
+        pass  # fork not installed in this env — expected past the gate
+
+
+def test_resolve_model_claude_code_scaffold_opt_in(tmp_path, monkeypatch):
+    """chainlink #426 (review follow-up): Config.from_env reads os.environ
+    only, so 'mimir setup --subscription' writing MIMIR_ALLOW_CLAUDE_CODE=1
+    into <home>/.env never reaches a bare 'mimir run' through env. The gate
+    consumes the scaffold line directly — setup-written operator intent for
+    this home — so the supported Max quickstart works without a shell
+    export. Env absent + no scaffold still refuses."""
+    from mimir.agent import _resolve_model
+
+    monkeypatch.delenv("MIMIR_ALLOW_CLAUDE_CODE", raising=False)
+
+    # No scaffold → still refused.
+    with pytest.raises(RuntimeError, match="deprecated"):
+        _resolve_model("claude-code:claude-sonnet-4-6", home=tmp_path)
+
+    # Scaffolded opt-in (what setup writes for claude-code routes) → gate
+    # steps aside; resolution proceeds to the import path.
+    (tmp_path / ".env").write_text(
+        "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6\n"
+        "MIMIR_ALLOW_CLAUDE_CODE=1\n",
+        encoding="utf-8",
+    )
+    try:
+        _resolve_model("claude-code:claude-sonnet-4-6", home=tmp_path)
+    except RuntimeError as exc:
+        pytest.fail(f"gate fired despite scaffolded opt-in: {exc}")
+    except ImportError:
+        pass  # fork not installed — expected past the gate
+
+
+def test_reflection_lm_honors_scaffold_opt_in(tmp_path, monkeypatch):
+    """chainlink #426 (review follow-up 3): every Config-based
+    _resolve_model caller must thread home= — gepa_support's
+    reflection-LM construction previously missed it, so a
+    subscription-scaffolded home worked for the main agent but the
+    reflection LM still refused the claude-code route."""
+    from types import SimpleNamespace
+    pytest.importorskip("gepa")
+    from mimir.gepa_support import reflection_lm_from_config
+
+    monkeypatch.delenv("MIMIR_ALLOW_CLAUDE_CODE", raising=False)
+    (tmp_path / ".env").write_text(
+        "MIMIR_ALLOW_CLAUDE_CODE=1\n", encoding="utf-8",
+    )
+    cfg = SimpleNamespace(
+        model_spec="claude-code:claude-sonnet-4-6", home=tmp_path,
+    )
+    try:
+        reflection_lm_from_config(cfg)
+    except RuntimeError as exc:
+        pytest.fail(f"deprecation gate fired despite scaffolded opt-in: {exc}")
+    except ImportError:
+        pass  # langchain-claude-code fork not installed — past the gate
