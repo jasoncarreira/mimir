@@ -278,6 +278,7 @@ def _resolve_model(
     max_tokens: int = 0,
     reasoning_effort: str = "",
     rate_limit_callback: Callable[[Any], None] | None = None,
+    home: Path | None = None,
 ) -> BaseChatModel:
     """Translate a mimir-friendly model spec into a constructed BaseChatModel.
 
@@ -325,8 +326,33 @@ def _resolve_model(
         # is being retired, so rather than maintain gating code for a
         # provider nobody exercises, the route is refused at resolve time
         # with an explicit opt-out for operators who accept the gap.
-        if os.environ.get("MIMIR_ALLOW_CLAUDE_CODE", "").strip() not in (
-            "1", "true", "yes",
+        # The opt-in is honored from os.environ OR the home scaffold
+        # (``<home>/.env``). Config.from_env reads os.environ only —
+        # the runtime contract since #510/#297 — so ``mimir setup
+        # --subscription`` writing the allow flag into ``.env`` would
+        # never reach a bare ``mimir run`` through env alone, and the
+        # supported Max quickstart would crash at first resolution
+        # (caught in #634 review). The scaffold line IS durable
+        # operator intent for this home (setup writes it only when the
+        # operator explicitly chose a claude-code route), so the gate
+        # consumes it directly — narrowly scoped to this one key; the
+        # general env contract is unchanged.
+        def _scaffold_allows() -> bool:
+            if home is None:
+                return False
+            try:
+                from .skill_install import _read_env_file
+                value = _read_env_file(home / ".env").get(
+                    "MIMIR_ALLOW_CLAUDE_CODE", "",
+                )
+            except Exception:  # noqa: BLE001 — unreadable scaffold = no opt-in
+                return False
+            return value.strip() in ("1", "true", "yes")
+
+        if (
+            os.environ.get("MIMIR_ALLOW_CLAUDE_CODE", "").strip()
+            not in ("1", "true", "yes")
+            and not _scaffold_allows()
         ):
             raise RuntimeError(
                 "MIMIR_MODEL_SPEC=claude-code:* is deprecated and disabled: "
@@ -1096,6 +1122,10 @@ class Agent:
                         self._config, "model_reasoning_effort", ""
                     ),
                     rate_limit_callback=codex_plus_callback,
+                    # chainlink #426: lets the deprecation gate honor the
+                    # scaffolded opt-in in <home>/.env (setup-written
+                    # operator intent) — see the gate comment.
+                    home=getattr(self._config, "home", None),
                 )
 
             if self._agent_tools is None:

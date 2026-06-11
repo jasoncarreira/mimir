@@ -2147,3 +2147,33 @@ def test_resolve_model_claude_code_override_passes_gate(monkeypatch):
         pytest.fail(f"gate fired despite override: {exc}")
     except ImportError:
         pass  # fork not installed in this env — expected past the gate
+
+
+def test_resolve_model_claude_code_scaffold_opt_in(tmp_path, monkeypatch):
+    """chainlink #426 (review follow-up): Config.from_env reads os.environ
+    only, so 'mimir setup --subscription' writing MIMIR_ALLOW_CLAUDE_CODE=1
+    into <home>/.env never reaches a bare 'mimir run' through env. The gate
+    consumes the scaffold line directly — setup-written operator intent for
+    this home — so the supported Max quickstart works without a shell
+    export. Env absent + no scaffold still refuses."""
+    from mimir.agent import _resolve_model
+
+    monkeypatch.delenv("MIMIR_ALLOW_CLAUDE_CODE", raising=False)
+
+    # No scaffold → still refused.
+    with pytest.raises(RuntimeError, match="deprecated"):
+        _resolve_model("claude-code:claude-sonnet-4-6", home=tmp_path)
+
+    # Scaffolded opt-in (what setup writes for claude-code routes) → gate
+    # steps aside; resolution proceeds to the import path.
+    (tmp_path / ".env").write_text(
+        "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6\n"
+        "MIMIR_ALLOW_CLAUDE_CODE=1\n",
+        encoding="utf-8",
+    )
+    try:
+        _resolve_model("claude-code:claude-sonnet-4-6", home=tmp_path)
+    except RuntimeError as exc:
+        pytest.fail(f"gate fired despite scaffolded opt-in: {exc}")
+    except ImportError:
+        pass  # fork not installed — expected past the gate
