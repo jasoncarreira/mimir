@@ -23,6 +23,7 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
 
     assert lease.path == tmp_path / ".worklink" / "439-2"
     assert lease.branch == "issue/439-a2"
+    assert lease.base_ref == "main"
     assert calls == [["git", "-C", str(tmp_path), "worktree", "add", "-b", "issue/439-a2", str(lease.path), "main"]]
 
 
@@ -33,7 +34,7 @@ def test_cleanup_removes_only_successful_worktrees(tmp_path: Path) -> None:
         calls.append(list(args))
         return completed(args)
 
-    lease = WorktreeLease(439, 1, tmp_path, tmp_path / ".worklink" / "439-1", "issue/439-a1")
+    lease = WorktreeLease(439, 1, tmp_path, tmp_path / ".worklink" / "439-1", "issue/439-a1", "main")
 
     assert cleanup_worktree(lease, outcome="failed", runner=runner) is False
     assert calls == []
@@ -67,4 +68,7 @@ def test_prune_attempt_worktrees_is_conservative(tmp_path: Path) -> None:
     pruned = prune_attempt_worktrees(tmp_path, older_than=timedelta(days=3), now=now, runner=runner)
 
     assert pruned == [old]
-    assert calls == [["git", "-C", str(tmp_path), "worktree", "remove", "--force", str(old)]]
+    assert calls == [
+        ["git", "-C", str(tmp_path), "worktree", "remove", "--force", str(old)],
+        ["git", "-C", str(tmp_path), "branch", "-D", "issue/439-a1"],
+    ]

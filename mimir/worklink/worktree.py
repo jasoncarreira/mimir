@@ -23,6 +23,7 @@ class WorktreeLease:
     repo: Path
     path: Path
     branch: str
+    base_ref: str
 
 
 def create_worktree(
@@ -41,7 +42,7 @@ def create_worktree(
     result = runner(["git", "-C", str(repo), "worktree", "add", "-b", branch, str(path), base])
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout).strip() or "git worktree add failed")
-    return WorktreeLease(issue_id=issue_id, attempt=attempt, repo=repo, path=path, branch=branch)
+    return WorktreeLease(issue_id=issue_id, attempt=attempt, repo=repo, path=path, branch=branch, base_ref=base)
 
 
 def cleanup_worktree(lease: WorktreeLease, *, outcome: str, runner: Runner = _default_runner) -> bool:
@@ -82,10 +83,19 @@ def prune_attempt_worktrees(
             # If git no longer knows about it, remove the stale directory so the
             # next attempt will not collide forever.
             shutil.rmtree(child, ignore_errors=True)
+        branch = _attempt_branch_name(child.name)
+        if branch:
+            runner(["git", "-C", str(repo), "branch", "-D", branch])
         pruned.append(child)
     return pruned
 
 
 def _attempt_dir_name(name: str) -> bool:
+    return _attempt_branch_name(name) is not None
+
+
+def _attempt_branch_name(name: str) -> str | None:
     left, sep, right = name.partition("-")
-    return bool(sep) and left.isdigit() and right.isdigit()
+    if not (sep and left.isdigit() and right.isdigit()):
+        return None
+    return f"issue/{left}-a{right}"

@@ -104,6 +104,7 @@ def test_observe_evidence_uses_executor_diff_and_test_results(tmp_path: Path) ->
         branch="issue/439-a1",
         worktree=repo,
         started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
+        base_ref="main",
         backend_status="completed",
         test_command="python -c 'import sys; sys.exit(0)'",
     )
@@ -112,3 +113,60 @@ def test_observe_evidence_uses_executor_diff_and_test_results(tmp_path: Path) ->
     assert result.evidence.files_changed == ["a.txt"]
     assert result.evidence.tests is not None
     assert result.evidence.tests.exit_code == 0
+
+
+def test_observe_evidence_sees_untracked_files(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "seed.txt").write_text("seed\n")
+    subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+    (repo / "new_module.py").write_text("print('new')\n")
+
+    result = observe_evidence(
+        issue=439,
+        attempt=1,
+        backend="codex",
+        branch="issue/439-a1",
+        worktree=repo,
+        started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
+        base_ref="main",
+        backend_status="completed",
+        test_command="python -c 'import sys; sys.exit(0)'",
+    )
+
+    assert result.review_ready is True
+    assert result.evidence.files_changed == ["new_module.py"]
+
+
+def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "seed.txt").write_text("seed\n")
+    subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+    subprocess.run(["git", "switch", "-q", "-c", "issue/439-a1"], cwd=repo, check=True)
+    (repo / "new_test.py").write_text("def test_new():\n    assert True\n")
+    subprocess.run(["git", "add", "new_test.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "backend work"], cwd=repo, check=True)
+
+    result = observe_evidence(
+        issue=439,
+        attempt=1,
+        backend="codex",
+        branch="issue/439-a1",
+        worktree=repo,
+        started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
+        base_ref="main",
+        backend_status="completed",
+        test_command="python -c 'import sys; sys.exit(0)'",
+    )
+
+    assert result.review_ready is True
+    assert result.evidence.files_changed == ["new_test.py"]

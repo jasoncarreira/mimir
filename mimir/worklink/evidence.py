@@ -116,6 +116,7 @@ def observe_evidence(
     branch: str,
     worktree: Path,
     started_at: datetime,
+    base_ref: str,
     backend_status: str,
     test_command: str | None,
     transcript: str | None = None,
@@ -124,12 +125,17 @@ def observe_evidence(
 ) -> EvidenceValidation:
     """Build evidence by observing the worktree after a backend run."""
     runner = runner or _run
-    files = runner(["git", "-C", str(worktree), "diff", "--name-only", "HEAD"])
-    stat = runner(["git", "-C", str(worktree), "diff", "--stat", "HEAD"])
-    files_changed = [line for line in files.stdout.splitlines() if line.strip()]
+    committed = runner(["git", "-C", str(worktree), "diff", "--name-only", f"{base_ref}...HEAD"])
+    stat = runner(["git", "-C", str(worktree), "diff", "--stat", f"{base_ref}...HEAD"])
+    status = runner(["git", "-C", str(worktree), "status", "--porcelain=v1", "--untracked-files=all"])
+    files_changed = _merge_paths(
+        [line for line in committed.stdout.splitlines() if line.strip()],
+        _paths_from_status(status.stdout),
+    )
     commands: list[CommandResult] = [
-        CommandResult("git diff --name-only HEAD", files.returncode, _summarize(files)),
-        CommandResult("git diff --stat HEAD", stat.returncode, stat.stdout.strip()),
+        CommandResult(f"git diff --name-only {base_ref}...HEAD", committed.returncode, _summarize(committed)),
+        CommandResult(f"git diff --stat {base_ref}...HEAD", stat.returncode, stat.stdout.strip()),
+        CommandResult("git status --porcelain=v1 --untracked-files=all", status.returncode, _summarize(status)),
     ]
 
     tests: TestResult | None = None
@@ -154,7 +160,7 @@ def observe_evidence(
         status=_common_status(backend_status),
         blocked_reason=None,
         transcript=transcript,
-        diff_observed=files.returncode == 0 and stat.returncode == 0,
+        diff_observed=committed.returncode == 0 and stat.returncode == 0 and status.returncode == 0,
     )
     return validate_evidence(evidence)
 
@@ -170,8 +176,34 @@ def _common_status(status: str) -> str:
 
 def _run(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:
     if isinstance(args, str):
+        # Operator-configured test commands are trusted input, equivalent to
+        # poller.command; backend-generated text is never routed here.
         return subprocess.run(args, shell=True, capture_output=True, text=True, check=False)
     return subprocess.run(list(args), capture_output=True, text=True, check=False)
+
+
+def _merge_paths(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for path in group:
+            if path and path not in seen:
+                seen.add(path)
+                merged.append(path)
+    return merged
+
+
+def _paths_from_status(output: str) -> list[str]:
+    paths: list[str] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:] if len(line) > 3 else ""
+        if " -> " in path:
+            path = path.rsplit(" -> ", 1)[1]
+        if path:
+            paths.append(path.strip())
+    return paths
 
 
 def _summarize(result: subprocess.CompletedProcess[str]) -> str:
