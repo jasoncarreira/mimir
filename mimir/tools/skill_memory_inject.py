@@ -60,22 +60,26 @@ def _skill_from_path(path: str) -> str | None:
     return skill or None
 
 
-def _resolve_conn() -> Any | None:
-    """Best-effort sqlite conn from the installed SagaStore.
+def _resolve_client() -> Any | None:
+    """Best-effort handle to the installed SagaStore.
 
     ``set_memory_client`` receives the raw concrete ``SagaStore`` (the
     peeling in ``agent._try_inject_memory_client`` unwraps any recording/
-    proxy layers), so ``client.connection()`` (added in slice 2) hands
-    back the live connection directly. ``None`` if memory isn't wired."""
+    proxy layers). chainlink #411: we hand back the *store* — not its raw
+    connection — so ``_compute_augmented`` can run the recall through
+    ``run_locked_read``, the store's own serialization, instead of
+    touching the shared ``check_same_thread=False`` connection from a
+    bare worker thread (the cross-thread access SagaStore's threading
+    contract forbids; #365/#386). ``None`` if memory isn't wired or the
+    client doesn't expose the helper."""
     try:
         from .memory import _MEMORY_STATE
         client = _MEMORY_STATE.get("client")
         if client is None:
             return None
-        conn_fn = getattr(client, "connection", None)
-        if conn_fn is None:
+        if getattr(client, "run_locked_read", None) is None:
             return None
-        return conn_fn()
+        return client
     except Exception:  # noqa: BLE001 — injection is best-effort
         return None
 
@@ -92,21 +96,24 @@ def _is_success_text(result: Any) -> bool:
 
 
 def _compute_augmented(
-    file_path: str, content: Any, conn: Any,
+    file_path: str, content: Any, client: Any,
 ) -> tuple[str | None, list[str]]:
     """Return ``(augmented_content_or_None, injected_atom_ids)``.
 
     ``None`` for the content leaves the read unchanged. The atom IDs are
     the injected learnings, recorded onto the turn (slice 6) so the
-    session-boundary synthesis turn can curate feedback on them. Pure/sync
-    so the async path can offload it to a thread (the SQL in
-    ``augment_skill_body`` shouldn't run on the event loop)."""
+    session-boundary synthesis turn can curate feedback on them. Sync
+    so the async path can offload it to a thread; the SQL runs inside
+    ``client.run_locked_read`` so the shared connection is never touched
+    cross-thread without the store's lock (chainlink #411)."""
     skill = _skill_from_path(file_path)
-    if skill is None or conn is None or not isinstance(content, str):
+    if skill is None or client is None or not isinstance(content, str):
         return None, []
     try:
         from .. import skill_memory
-        augmented, ids = skill_memory.augment_skill_body(conn, skill, content)
+        augmented, ids = client.run_locked_read(
+            lambda conn: skill_memory.augment_skill_body(conn, skill, content)
+        )
     except Exception:  # noqa: BLE001 — never break a file read
         return None, []
     if augmented == content:
@@ -150,7 +157,7 @@ class SkillMemoryInjectionMiddleware(AgentMiddleware):
         if _tool_name(request) != _READ_FILE_TOOL or not _is_success_text(result):
             return result
         augmented, ids = _compute_augmented(
-            _file_path_arg(request), result.content, _resolve_conn(),
+            _file_path_arg(request), result.content, _resolve_client(),
         )
         if augmented is not None:
             result.content = augmented
@@ -167,7 +174,7 @@ class SkillMemoryInjectionMiddleware(AgentMiddleware):
             return result
         augmented, ids = await asyncio.to_thread(
             _compute_augmented,
-            _file_path_arg(request), result.content, _resolve_conn(),
+            _file_path_arg(request), result.content, _resolve_client(),
         )
         if augmented is not None:
             result.content = augmented

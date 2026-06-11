@@ -729,3 +729,167 @@ async def test_consolidate_restructure_tombstones_orphan_on_rollback(
         "orphaned observation must be tombstoned after the relations rollback "
         "(#391) — found a live unbacked observation"
     )
+
+
+# ─── chainlink #425: skill-memory index sync + rebuild_if_needed wiring ──
+
+
+@pytest.mark.asyncio
+async def test_consolidate_skill_memories_removes_tombstoned_from_faiss_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """chainlink #425: the per-skill dedup pass must mirror dedup tombstones
+    into ``VectorIndex.remove`` — the #390 fix was applied to consolidate()
+    but not consolidate_skill_memories(), so a skill's merged learnings kept
+    their vectors live and consumed top_k slots."""
+    from mimir.saga.client import SagaStore
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "t.saga.db", embedding_dim=4)
+    for i in range(2):  # distinct content, identical embedding → dedup cluster
+        await store.store(
+            content=f"gotcha number {i}",
+            source_type="skill_learning",
+            metadata={"skill": "cb", "kind": "tip"},
+        )
+    conn = store._ensure_conn()
+    index = store._ensure_index(conn)
+    assert index is not None and len(index._id_to_pos) == 2
+
+    result = await store.consolidate_skill_memories()
+
+    tombstoned = result["skills"]["cb"]["duplicates_tombstoned"]
+    assert tombstoned, "per-skill dedup should have tombstoned the duplicate"
+    for atom_id in tombstoned:
+        # Removed from the index: gone from id_to_pos, or its position is marked.
+        if atom_id in index._id_to_pos:
+            assert index._id_to_pos[atom_id] in index._removed, (
+                f"dedup-tombstoned skill-learning {atom_id} still active in "
+                "FAISS — #425 (the #390 regression, per-skill pass)"
+            )
+
+
+@pytest.mark.asyncio
+async def test_forget_triggers_index_rebuild_past_removal_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """chainlink #425: ``rebuild_if_needed`` (>10% soft-removed → full
+    rebuild) had zero callers. forget() must invoke it at end-of-pass so
+    a removal batch past the threshold collapses into a fresh index
+    (no lingering soft-removed positions)."""
+    from mimir.saga.client import SagaStore
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "t.saga.db", embedding_dim=4)
+    atom_ids = []
+    for i in range(4):
+        r = await store.store(content=f"fact number {i}", stream="semantic")
+        atom_ids.append(r["atom_id"])
+    # Protect 3 of 4 from the min_retrievals criterion below.
+    await store.outcome(atom_ids[:3], feedback="positive")
+    conn = store._ensure_conn()
+    index = store._ensure_index(conn)
+    assert index is not None and len(index._id_to_pos) == 4
+
+    result = await store.forget(dry_run=False, min_retrievals=1)
+
+    assert result["tombstoned_count"] == 1
+    # 1/4 = 25% > 10% → the end-of-forget backstop rebuilt from disk:
+    # soft-removed set cleared, only the 3 live atoms indexed.
+    assert not index._removed, (
+        "soft-removed positions survived forget() — rebuild_if_needed "
+        "was not invoked (#425)"
+    )
+    assert len(index._id_to_pos) == 3
+    assert atom_ids[3] not in index._id_to_pos
+
+
+@pytest.mark.asyncio
+async def test_consolidate_triggers_index_rebuild_past_removal_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """chainlink #425: consolidate() must run the same end-of-cycle rebuild
+    backstop — a dedup pass that tombstones >10% of indexed vectors leaves a
+    freshly-rebuilt index, not an accumulating soft-removed set."""
+    from mimir.saga.client import SagaStore
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "t.saga.db", embedding_dim=4)
+    for i in range(2):  # identical embedding → one dedup cluster
+        await store.store(content=f"fact number {i}", stream="semantic")
+    conn = store._ensure_conn()
+    index = store._ensure_index(conn)
+    assert index is not None and len(index._id_to_pos) == 2
+
+    result = await store.consolidate(dedup_first=True, min_cluster_size=99)
+
+    tombstoned = result["dedup"]["duplicates_tombstoned"]
+    assert tombstoned, "dedup should have tombstoned the duplicate"
+    # 1/2 = 50% > 10% → rebuilt: tombstoned atom fully gone, no soft marks.
+    assert not index._removed
+    for atom_id in tombstoned:
+        assert atom_id not in index._id_to_pos
+    assert len(index._id_to_pos) == 1
+
+
+# ─── chainlink #417: no embedding I/O inside consolidate transactions ──
+
+
+@pytest.mark.asyncio
+async def test_consolidate_never_embeds_inside_a_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """chainlink #417: _restructure held BEGIN IMMEDIATE + the global write
+    lock across per-triple network embedding calls (store_triples embedded
+    inside the relations transaction). All embeddings must be precomputed
+    before the transaction — the embed fn must never run while the shared
+    connection is mid-transaction — and the restructure output (observation
+    + embedded triples) must be unchanged."""
+    from mimir.saga import client as client_mod
+    from mimir.saga.client import SagaStore
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "t.saga.db", embedding_dim=4)
+    for i in range(3):  # identical embedding → one thematic cluster
+        await store.store(content=f"observation seed {i}", stream="semantic")
+    conn = store._ensure_conn()
+
+    real_embed = client_mod._embed_text_sync
+    in_txn_calls: list[bool] = []
+
+    def _recording_embed(text):
+        in_txn_calls.append(conn.in_transaction)
+        return real_embed(text)
+
+    monkeypatch.setattr(client_mod, "_embed_text_sync", _recording_embed)
+
+    async def _stub_synth(cluster, *, prior_block="", vocab_block=""):
+        return {
+            "content": "synthesized observation",
+            "topics": [],
+            "triples": [
+                {"subject": "Alice", "predicate": "likes", "object": "tea"},
+            ],
+            "contradictions": [],
+        }
+
+    store._rich_synth_fn = _stub_synth
+    result = await store.consolidate(dedup_first=False, min_cluster_size=2)
+
+    # Output unchanged: one observation, one embedded triple.
+    assert result["observations_created"] == 1
+    assert result["triples_stored"] == 1
+    triple_row = conn.execute(
+        "SELECT subject, embedding, embedding_dim FROM triples"
+    ).fetchone()
+    assert triple_row is not None and triple_row[0] == "Alice"
+    assert triple_row[1] is not None and triple_row[2] == 4, (
+        "triple must still get its precomputed embedding"
+    )
+
+    # The invariant: embedding ran (observation + triple) and NEVER while
+    # the shared connection was inside a transaction.
+    assert in_txn_calls, "embed fn should have been called during consolidate"
+    assert not any(in_txn_calls), (
+        "embedding I/O ran inside an open transaction — #417 regression"
+    )

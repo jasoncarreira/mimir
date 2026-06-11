@@ -157,7 +157,14 @@ def test_falling_off_activity_classifies_as_weakening():
 
 
 def test_refresh_trend_persists_to_observations_metadata(conn):
-    """Computing trend writes to observations_metadata + updates on re-run."""
+    """Computing trend writes to observations_metadata + updates on re-run.
+
+    chainlink #416: evidence_count means the RELATION count (evidence
+    atoms backing the observation), not the access-event count. With no
+    evidenced_by edges, the row refresh_trend seeds carries 0 — the
+    pre-fix behavior of writing ``len(access events)`` (4 here) was the
+    clobber bug.
+    """
     r = store(conn, "test observation", embed_fn=_fake_embed,
               memory_type="observation")
     # Add some access events. mark_access doesn't commit — caller does.
@@ -176,7 +183,50 @@ def test_refresh_trend_persists_to_observations_metadata(conn):
     ).fetchone()
     assert row is not None
     assert row[0] == result.trend
-    assert row[1] >= 4  # store + 3 retrievals
+    assert row[1] == 0  # no evidenced_by relations — NOT the event count
+
+
+def test_refresh_trend_preserves_consolidate_inserted_evidence_count(conn):
+    """chainlink #416 regression: the exact consolidate→refresh_trend
+    sequence. consolidate inserts ``evidence_count=len(evidence_ids)``,
+    commits, then calls refresh_trend — which pre-fix UPDATEd
+    evidence_count to ``len(access-event timestamps)``, destroying the
+    real count (every fresh observation collapsed to 1, its own 'store'
+    event). refresh_trend must leave the inserted relation count alone.
+    """
+    raw_ids = [
+        store(conn, f"evidence raw {i}", embed_fn=_fake_embed).atom_id
+        for i in range(3)
+    ]
+    obs = store(conn, "consolidated observation", embed_fn=_fake_embed,
+                memory_type="observation").atom_id
+    now = datetime.now(timezone.utc).isoformat()
+    # Mirror consolidate's restructure: evidenced_by edges + metadata
+    # row with evidence_count = len(evidence_ids).
+    conn.executemany(
+        "INSERT INTO atom_relations (source_id, target_id, "
+        "relation_type, confidence, created_at) "
+        "VALUES (?, ?, 'evidenced_by', 1.0, ?)",
+        [(obs, rid, now) for rid in raw_ids],
+    )
+    conn.execute(
+        "INSERT INTO observations_metadata "
+        "(atom_id, evidence_count, trend, last_evidence_at, "
+        "consolidated_at) VALUES (?, ?, 'strengthening', ?, ?)",
+        (obs, len(raw_ids), now, now),
+    )
+    conn.commit()
+
+    refresh_trend(conn, obs)  # the very next step in consolidate
+
+    count = conn.execute(
+        "SELECT evidence_count FROM observations_metadata WHERE atom_id = ?",
+        (obs,),
+    ).fetchone()[0]
+    assert count == 3, (
+        f"refresh_trend clobbered evidence_count to {count}; the inserted "
+        "relation count (3) must survive the trend refresh (#416)"
+    )
 
 
 # ────────────────────────────────────────────────────────────────────

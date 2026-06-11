@@ -178,6 +178,18 @@ def refresh_trend(
     Idempotent — running on the same observation twice produces the
     same result (modulo time progression). Used by reflect() on
     newly-created observations and by a periodic refresh job.
+
+    chainlink #416: this function owns the TREND fields only
+    (``trend``, ``last_evidence_at``, plus the ``consolidated_at``
+    backfill on a missing row). ``evidence_count`` means the number of
+    evidence atoms backing the observation (``evidenced_by``
+    relations) — written by consolidate at insert time, rebuilt by
+    dedup's end-of-pass sweep and by forget(). The pre-fix UPDATE
+    branch here overwrote it with ``len(access events)``, so the
+    consolidate→refresh_trend sequence destroyed the real count
+    (every fresh observation collapsed to 1 — its own 'store' event)
+    and ``pick_canonical``'s ev_count tiebreaker ranked on the
+    corrupted value.
     """
     rows = conn.execute(
         "SELECT ts FROM access_events WHERE atom_id = ? ORDER BY ts",
@@ -198,11 +210,23 @@ def refresh_trend(
     try:
         conn.execute("BEGIN IMMEDIATE")
         if existing is None:
+            # Missing row (periodic refresh on an observation whose
+            # metadata was never written): seed evidence_count from the
+            # live evidenced_by relations — the relation-count semantics
+            # (#416), never the access-event count.
+            live_evidence = conn.execute(
+                "SELECT COUNT(*) FROM atom_relations ar "
+                "JOIN atoms t ON t.id = ar.target_id "
+                "WHERE ar.source_id = ? "
+                "  AND ar.relation_type = 'evidenced_by' "
+                "  AND t.tombstoned = 0",
+                (observation_id,),
+            ).fetchone()[0]
             conn.execute(
                 "INSERT INTO observations_metadata "
                 "(atom_id, evidence_count, trend, last_evidence_at, "
                 "consolidated_at) VALUES (?, ?, ?, ?, ?)",
-                (observation_id, len(timestamps), result.trend,
+                (observation_id, live_evidence, result.trend,
                  last_evidence_at,
                  # consolidated_at filled by reflect when the observation
                  # is first created; if missing on a periodic refresh,
@@ -210,11 +234,13 @@ def refresh_trend(
                  timestamps[0] if timestamps else (now or _utc_now()).isoformat()),
             )
         else:
+            # evidence_count deliberately untouched (#416) — consolidate
+            # inserted the real relation count and this refresh must not
+            # clobber it with an event count.
             conn.execute(
                 "UPDATE observations_metadata SET trend = ?, "
-                "evidence_count = ?, last_evidence_at = ? WHERE atom_id = ?",
-                (result.trend, len(timestamps), last_evidence_at,
-                 observation_id),
+                "last_evidence_at = ? WHERE atom_id = ?",
+                (result.trend, last_evidence_at, observation_id),
             )
         conn.commit()
     except Exception:

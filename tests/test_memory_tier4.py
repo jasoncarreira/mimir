@@ -119,15 +119,21 @@ def test_forget_refreshes_observation_metadata(conn):
     ).fetchone()
     assert obs_state[0] == 0
 
-    # Observation metadata was refreshed — but evidence_count is
-    # rebuilt from refresh_trend, which counts access_events, not
-    # evidenced_by rows directly. Trend should be present.
+    # Observation metadata was refreshed. chainlink #416:
+    # evidence_count is rebuilt from the SURVIVING evidenced_by
+    # relations (one of two raws forgotten → 1), and the trend label
+    # is recomputed by refresh_trend.
     md = conn.execute(
-        "SELECT trend FROM observations_metadata WHERE atom_id = ?",
+        "SELECT trend, evidence_count FROM observations_metadata "
+        "WHERE atom_id = ?",
         (obs,)
     ).fetchone()
     assert md is not None
     assert md[0] in ("stable", "strengthening", "weakening", "stale")
+    assert md[1] == 1, (
+        f"evidence_count should be rebuilt to the surviving evidence "
+        f"count (1), got {md[1]}"
+    )
 
 
 def test_forget_empty_list_is_no_op(conn):

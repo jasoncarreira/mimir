@@ -377,8 +377,32 @@ class SagaStore:
         layer (saga does not import up into ``mimir.*``). Callers that use
         this connection from worker threads must provide their own
         serialization; SagaStore's public methods do so via ``_db_lock``.
+        Worker-thread callers should prefer :meth:`run_locked_read`,
+        which provides that serialization for them (chainlink #411).
         """
         return self._ensure_conn()
+
+    def run_locked_read(self, fn):
+        """Run ``fn(conn)`` against the shared sqlite3 connection under
+        ``_db_lock``. Returns ``fn``'s result.
+
+        chainlink #411: the safe seam for upper-layer reads (the #266
+        skill-memory load injection) that previously took ``connection()``
+        and queried it from a bare worker thread while the consolidate
+        cron / turn writers used the same ``check_same_thread=False``
+        connection under the store's locks — exactly the cross-thread
+        access the threading contract above forbids (#365/#386:
+        segfault-class with FTS5). ``_db_lock`` is a ``threading.RLock``,
+        so async callers offload via
+        ``asyncio.to_thread(store.run_locked_read, fn)`` — the same
+        worker-thread-holds-the-lock pattern as ``_db_locked`` (which
+        consolidate()'s shared-conn reads use). Saga can't import up into
+        ``mimir.*``, so the callable comes from the caller; keep ``fn`` a
+        pure read (or a self-contained short transaction) — it holds the
+        shared-connection lock for its whole duration.
+        """
+        with self._db_lock:
+            return fn(self._ensure_conn())
 
     def _ensure_conn(self) -> sqlite3.Connection:
         if self._conn is not None:
@@ -512,6 +536,26 @@ class SagaStore:
             self._ensure_index(conn)
         else:
             self._index.build_from_db(conn)
+
+    def _rebuild_index_if_needed(self, conn: sqlite3.Connection) -> None:
+        """Invoke the documented >10%-soft-removed FAISS rebuild backstop.
+
+        chainlink #425: ``VectorIndex.rebuild_if_needed`` existed but had
+        zero callers, so the long-standing comments promising it "kicks
+        in" were aspirational — soft removals accumulated forever and
+        every search over-fetched past them. Called at the natural
+        end-of-cycle points (``consolidate()`` / ``forget()``) where the
+        index and connection are both in hand and a batch of removals
+        may just have landed. Caller must hold ``_db_lock`` (the rebuild
+        reads atoms/embeddings on the shared connection); ``_index_lock``
+        is taken here, matching the established db-lock→index-lock
+        ordering in query()/store(). Cost: a no-op compare below the 10%
+        threshold; one bulk ``build_from_db`` above it.
+        """
+        if self._index is None or not self._index.built:
+            return
+        with self._index_lock:
+            self._index.rebuild_if_needed(conn)
 
     def _ensure_sessions_index(self, conn: sqlite3.Connection) -> VectorIndex | None:
         """Lazily build the sessions FAISS index from sessions.embedding.
@@ -1140,6 +1184,13 @@ class SagaStore:
             )
 
         if len(raws) < min_cluster_size:
+            # chainlink #425: end-of-cycle FAISS backstop applies on this
+            # early exit too — the dedup pass above may have soft-removed
+            # vectors even when too few candidates remain for synthesis.
+            if not dry_run:
+                await self._db_locked(
+                    lambda: self._rebuild_index_if_needed(conn)
+                )
             return {
                 "clusters_formed": 0,
                 "observations_emitted": [],
@@ -1208,6 +1259,57 @@ class SagaStore:
             *[_synth(c, pb) for c, pb in zip(eligible, prior_blocks)]
         )
 
+        # 2b. chainlink #417: precompute ALL embeddings (each observation's
+        # text + each extracted triple's embed input) BEFORE _restructure
+        # takes the write lock and opens BEGIN IMMEDIATE. store.py's
+        # invariant — embedding is network I/O and must run before the
+        # transaction — applied to the consolidate path: pre-fix,
+        # ``store_triples(.., embed_fn=_embed_text_sync)`` embedded
+        # per-triple INSIDE the relations transaction (and the
+        # observation's own embed ran while the global write lock was
+        # held), so one hung provider call stalled every memory write in
+        # the process. After this block, _restructure does SQLite work
+        # only. Observation-embed failures propagate (same crash-the-pass
+        # semantics as the pre-fix in-transaction failure); triple-embed
+        # failures are tolerated per-triple, mirroring store_triples'
+        # own warn-and-store-unembedded fallback.
+        from .triples import _triple_text
+
+        def _precompute_embeddings():
+            obs_embeds: list[tuple[bytes, str, str, int] | None] = []
+            triple_vecs: dict[str, tuple[bytes, str, str, int]] = {}
+            for result in results:
+                content = (result.get("content") or "").strip()
+                if not content:
+                    obs_embeds.append(None)
+                    continue
+                obs_embeds.append(_embed_text_sync(content))
+                for t in result.get("triples", []):
+                    try:
+                        text = _triple_text(
+                            t["subject"], t["predicate"], t["object"],
+                        )
+                        if text in triple_vecs:
+                            continue
+                        triple_vecs[text] = _embed_text_sync(text)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("triple embed precompute failed: %s", exc)
+            return obs_embeds, triple_vecs
+
+        obs_embeds, triple_vecs = await asyncio.to_thread(_precompute_embeddings)
+
+        def _lookup_triple_embed(text: str) -> tuple[bytes, str, str, int]:
+            """Pure dict lookup over the precomputed vectors — never does
+            I/O, so it's safe to hand to store_triples inside the
+            transaction. Raising on a miss (embed failed above) routes
+            store_triples to its existing store-unembedded fallback."""
+            vec = triple_vecs.get(text)
+            if vec is None:
+                raise RuntimeError(
+                    f"no precomputed embedding for triple text {text!r}"
+                )
+            return vec
+
         # 3. Per-cluster restructure: store observation, link evidence,
         # emit access events. Each cluster runs its own short transaction
         # so an LLM failure on one doesn't block the others. Done in a
@@ -1225,7 +1327,7 @@ class SagaStore:
             superseded: list[tuple[str, str]] = []
             triples_stored = 0
             contradicts_stored = 0
-            for cluster, result in zip(eligible, results):
+            for cluster, result, obs_emb in zip(eligible, results, obs_embeds):
                 content = result.get("content", "")
                 topics = result.get("topics", [])
                 triples = result.get("triples", [])
@@ -1244,7 +1346,12 @@ class SagaStore:
 
                 store_result = _store_atom(
                     conn, content,
+                    # chainlink #417: embedding was precomputed above,
+                    # before the write lock / transactions; embed_fn is
+                    # the unused fallback (store never calls it when
+                    # precomputed_embedding is supplied).
                     embed_fn=_embed_text_sync,
+                    precomputed_embedding=obs_emb,
                     memory_type="observation",
                     stream="semantic",
                     topics=topics,
@@ -1305,7 +1412,9 @@ class SagaStore:
                         added = store_triples(
                             conn, triples,
                             source_atom_id=observation_id,
-                            embed_fn=_embed_text_sync,
+                            # chainlink #417: precomputed-vector lookup —
+                            # no network I/O inside this transaction.
+                            embed_fn=_lookup_triple_embed,
                         )
                         triples_stored += len(added)
                     # Contradiction edges: map LLM-emitted 1-based atom
@@ -1406,6 +1515,10 @@ class SagaStore:
         emitted, superseded, n_triples, n_contra, n_supersedes_contra = (
             await self._write_locked(_restructure)
         )
+        # chainlink #425: end-of-cycle FAISS backstop — when soft removals
+        # (dedup tombstones mirrored out of the index above) exceed 10% of
+        # positions, run the full rebuild ``rebuild_if_needed`` promises.
+        await self._db_locked(lambda: self._rebuild_index_if_needed(conn))
         return {
             "candidates_scanned": len(raws),
             "clusters_found": len(clusters),
@@ -1504,6 +1617,28 @@ class SagaStore:
                     skill_scope=skill,
                 )
             res = await self._write_locked(_do_dedup)
+            # chainlink #425: mirror the #390 fix here — the general
+            # consolidate() removes dedup-tombstoned raws from the FAISS
+            # index, but this per-skill pass didn't, so a skill's merged
+            # learnings kept their vectors live and consumed top_k slots
+            # (the exact #390 regression). Best-effort: a missed removal
+            # degrades gracefully (WHERE tombstoned=0 still masks the row).
+            if (
+                not dry_run
+                and res.duplicates_tombstoned
+                and self._index is not None
+                and self._index.built
+            ):
+                with self._index_lock:
+                    for atom_id in res.duplicates_tombstoned:
+                        try:
+                            self._index.remove(atom_id)
+                        except Exception:  # noqa: BLE001
+                            log.warning(
+                                "FAISS index remove failed for dedup-tombstoned "
+                                "skill-learning atom_id=%r", atom_id,
+                                exc_info=True,
+                            )
             summary["skills"][skill] = {
                 "candidates_scanned": res.candidates_scanned,
                 "clusters_formed": res.clusters_formed,
@@ -1527,11 +1662,10 @@ class SagaStore:
         # so without explicit removal here the index accumulates
         # orphaned positions: retrieval still works (the SQL-side
         # ``WHERE tombstoned = 0`` filter in ``recall.py`` masks them
-        # out), but index fragmentation grows until
-        # ``VectorIndex.rebuild_if_needed`` (>10% removed) kicks in.
-        # That's a long time on low-churn deployments — meanwhile
-        # over-fetches climb and FAISS top_k starts missing the real
-        # top results past the removal noise.
+        # out), but over-fetches climb past the removal noise. The
+        # end-of-pass ``_rebuild_index_if_needed`` call (chainlink #425)
+        # collapses the accumulated soft removals into a fresh index
+        # once they exceed 10% of positions.
         #
         # PR #342 fixed the silent-drop on ``agent_id`` +
         # ``min_retrievals``. ``contribution_threshold`` +
@@ -1590,6 +1724,10 @@ class SagaStore:
                                 "FAISS index remove failed for atom_id=%r",
                                 atom_id, exc_info=True,
                             )
+            # chainlink #425: end-of-cycle FAISS backstop. _do runs under
+            # _write_locked (so _db_lock is held, as the helper requires).
+            if not result.dry_run:
+                self._rebuild_index_if_needed(conn)
             return {
                 "tombstoned_count": result.tombstoned_count,
                 "preview_ids": result.tombstoned_ids if dry_run else [],
