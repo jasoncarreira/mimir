@@ -840,60 +840,147 @@ def _drift_hash_for_file(path: Path, rel: str) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _parse_pollers_manifest(path: Path) -> tuple[dict, list] | None:
+    """Return ``(payload, pollers)`` when *path* is a parseable pollers manifest."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    pollers = payload.get("pollers")
+    if not isinstance(pollers, list):
+        return None
+    return payload, pollers
+
+
+def _match_poller(pollers: list, idx: int, name: object) -> dict | None:
+    """Find a poller entry by ``name`` with index fallback for unnamed entries."""
+    if isinstance(name, str):
+        for candidate in pollers:
+            if isinstance(candidate, dict) and candidate.get("name") == name:
+                return candidate
+    if idx < len(pollers) and isinstance(pollers[idx], dict):
+        return pollers[idx]
+    return None
+
+
+def _find_latest_pollers_baseline(installed_path: Path) -> Path | None:
+    """Return the newest saved bundled baseline for an installed poller skill.
+
+    Newer updates write the source manifest they applied to
+    ``.pre-update-backup/<ts>/.source/pollers.json``. Older snapshots only have
+    ``pollers.json`` (the pre-overwrite installed manifest), so use that as a
+    best-effort baseline when it is all we have.
+    """
+    backup_base = installed_path / ".pre-update-backup"
+    if not backup_base.is_dir():
+        return None
+    snapshots = sorted(
+        (d for d in backup_base.iterdir() if d.is_dir()),
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    for snap in snapshots:
+        candidate = snap / ".source" / "pollers.json"
+        if candidate.is_file():
+            return candidate
+    for snap in snapshots:
+        candidate = snap / "pollers.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _write_applied_source_baseline(backup_dir: Path, rel: str, src_file: Path) -> None:
+    """Store the bundled file applied by this update for future three-way merges."""
+    baseline_path = backup_dir / ".source" / rel
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_file, baseline_path)
+
+
+def _append_skill_update_event(home: Path, event_type: str, **fields) -> None:
+    """Best-effort append to events.jsonl for standalone skills-update CLI runs."""
+    record = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "type": event_type,
+        **fields,
+    }
+    try:
+        log_path = home / "logs" / "events.jsonl"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
+    except OSError:
+        pass
+
+
 def _merge_operator_tuned_pollers_json(
-    src_file: Path, dst_file: Path,
-) -> tuple[str | None, list[str]]:
-    """Return source pollers.json with installed operator-tunable keys overlaid.
+    src_file: Path,
+    dst_file: Path,
+    *,
+    old_src_file: Path | None = None,
+) -> tuple[str | None, list[str], list[str]]:
+    """Return source pollers.json with operator-changed tunable keys overlaid.
 
     The merge is keyed by poller ``name``. Entries without names fall back to
-    same-list-index matching. Returns ``(None, [])`` when either manifest cannot
-    be parsed as a poller manifest, signaling callers to use a normal copy.
+    same-list-index matching. When an old bundled manifest is available,
+    this is a three-way merge: preserve an installed tunable key only when it
+    differs from the old bundled value, so upstream changes to untouched
+    tunables apply normally. Without an old bundled manifest, fall back to the
+    conservative two-way overlay (preserve installed tunables).
+
+    Returns ``(None, [], [])`` when the new source or installed manifest cannot
+    be parsed as a poller manifest, signaling callers to use a normal copy. The
+    third item lists two-way fallback preservations that also differ from the
+    new bundled value and therefore deserve explicit review.
     """
-    try:
-        source_payload = json.loads(src_file.read_text(encoding="utf-8"))
-        installed_payload = json.loads(dst_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None, []
-    if not isinstance(source_payload, dict) or not isinstance(installed_payload, dict):
-        return None, []
-    source_pollers = source_payload.get("pollers")
-    installed_pollers = installed_payload.get("pollers")
-    if not isinstance(source_pollers, list) or not isinstance(installed_pollers, list):
-        return None, []
+    parsed_source = _parse_pollers_manifest(src_file)
+    parsed_installed = _parse_pollers_manifest(dst_file)
+    if parsed_source is None or parsed_installed is None:
+        return None, [], []
+    source_payload, _source_pollers = parsed_source
+    _, installed_pollers = parsed_installed
+
+    old_source_pollers: list | None = None
+    if old_src_file is not None:
+        parsed_old_source = _parse_pollers_manifest(old_src_file)
+        if parsed_old_source is not None:
+            _, old_source_pollers = parsed_old_source
 
     merged = copy.deepcopy(source_payload)
     merged_pollers = merged.get("pollers")
     if not isinstance(merged_pollers, list):
-        return None, []
+        return None, [], []
 
-    installed_by_name = {
-        p.get("name"): p
-        for p in installed_pollers
-        if isinstance(p, dict) and isinstance(p.get("name"), str)
-    }
     preserved: list[str] = []
+    upstream_divergences: list[str] = []
     for idx, poller in enumerate(merged_pollers):
         if not isinstance(poller, dict):
             continue
-        installed = None
         name = poller.get("name")
-        if isinstance(name, str):
-            installed = installed_by_name.get(name)
-        if (
-            installed is None
-            and idx < len(installed_pollers)
-            and isinstance(installed_pollers[idx], dict)
-        ):
-            installed = installed_pollers[idx]
+        installed = _match_poller(installed_pollers, idx, name)
         if not isinstance(installed, dict):
             continue
+        old_source = (
+            _match_poller(old_source_pollers, idx, name)
+            if old_source_pollers is not None else None
+        )
         display = name if isinstance(name, str) else f"#{idx}"
         for key in sorted(_POLLER_OPERATOR_TUNABLE_KEYS):
-            if key in installed:
+            if key not in installed:
+                continue
+            preserve = True
+            if old_source_pollers is not None:
+                old_value = old_source.get(key) if isinstance(old_source, dict) else None
+                preserve = installed.get(key) != old_value
+            if preserve:
+                if old_source_pollers is None and installed.get(key) != poller.get(key):
+                    upstream_divergences.append(f"{display}.{key}")
                 poller[key] = copy.deepcopy(installed[key])
                 preserved.append(f"{display}.{key}")
 
-    return json.dumps(merged, indent=2, sort_keys=False) + "\n", preserved
+    return json.dumps(merged, indent=2, sort_keys=False) + "\n", preserved, upstream_divergences
 
 
 def _file_hashes(root: Path) -> dict[str, str]:
@@ -1415,6 +1502,14 @@ def apply_skill_update(
         src_file = result.source_path / rel
         dst_file = result.installed_path / rel
 
+        # For poller manifests, capture any pre-existing baseline before this
+        # update creates its own backup; the current backup is the installed
+        # value, not the old bundled value we need for a three-way merge.
+        pollers_old_src_file = (
+            _find_latest_pollers_baseline(result.installed_path)
+            if rel == "pollers.json" and dst_file.is_file() else None
+        )
+
         # For files that differ, write a backup before overwriting so no data
         # is silently lost.  If the backup fails, skip the overwrite entirely
         # and record as failed — never proceed with a destructive write without
@@ -1436,16 +1531,36 @@ def apply_skill_update(
         try:
             dst_file.parent.mkdir(parents=True, exist_ok=True)
             if rel == "pollers.json" and dst_file.is_file():
-                merged_text, preserved = _merge_operator_tuned_pollers_json(src_file, dst_file)
+                old_src_file = pollers_old_src_file
+                merged_text, preserved, upstream_divergences = _merge_operator_tuned_pollers_json(
+                    src_file, dst_file, old_src_file=old_src_file,
+                )
                 if merged_text is not None:
                     dst_file.write_text(merged_text, encoding="utf-8")
+                    if backup_root is not None:
+                        _write_applied_source_baseline(backup_root, rel, src_file)
                     if preserved:
+                        basis = "three-way" if old_src_file is not None else "two-way"
                         print(
                             f"  {result.name}: preserved operator-tuned pollers.json "
-                            f"keys: {', '.join(preserved)}"
+                            f"keys ({basis} merge): {', '.join(preserved)}"
+                        )
+                    if upstream_divergences:
+                        print(
+                            f"  warning: {result.name}: kept installed poller tuning that "
+                            f"differs from the bundled update: "
+                            f"{', '.join(upstream_divergences)} — review"
+                        )
+                        _append_skill_update_event(
+                            result.installed_path.parent.parent,
+                            "poller_tuning_upstream_divergence",
+                            skill=result.name,
+                            keys=upstream_divergences,
                         )
                 else:
                     shutil.copy2(src_file, dst_file)
+                    if backup_root is not None:
+                        _write_applied_source_baseline(backup_root, rel, src_file)
             else:
                 shutil.copy2(src_file, dst_file)
             updated.append(rel)

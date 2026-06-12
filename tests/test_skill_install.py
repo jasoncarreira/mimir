@@ -1103,10 +1103,10 @@ def test_apply_copies_added_file(
     assert (fake_home / "skills" / "fake-skill" / "helper.py").read_text() == "# new\n"
 
 
-def test_apply_pollers_json_preserves_operator_tuned_keys(
+def test_apply_pollers_json_preserves_operator_tuned_keys_two_way_without_backup(
     fake_optional_root: Path, fake_home: Path, capsys,
 ):
-    """--apply must not silently reset deployment-local poller tuning."""
+    """Without an old bundled manifest, fall back to conservative two-way preservation."""
     install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
     installed_pollers = fake_home / "skills" / "fake-poller" / "pollers.json"
     installed_pollers.write_text(json.dumps({
@@ -1122,7 +1122,7 @@ def test_apply_pollers_json_preserves_operator_tuned_keys(
         }]
     }))
     # Upstream release changes a source-owned key. The update should apply that
-    # change while preserving operator-owned deployment tuning.
+    # change while preserving installed deployment tuning when no baseline exists.
     (fake_optional_root / "fake-poller" / "pollers.json").write_text(json.dumps({
         "pollers": [{
             "name": "fake",
@@ -1150,8 +1150,83 @@ def test_apply_pollers_json_preserves_operator_tuned_keys(
     assert poller["env"] == {"LOCAL_ONLY": "1"}
     assert poller["pass_env"] == ["GITHUB_TOKEN", "MIMIR_HOME"]
     out = capsys.readouterr().out
-    assert "preserved operator-tuned pollers.json keys" in out
+    assert "preserved operator-tuned pollers.json keys (two-way merge)" in out
+    assert "differs from the bundled update" in out
     assert "fake.priority" in out
+    assert "fake.pass_env" in out
+    event_lines = (fake_home / "logs" / "events.jsonl").read_text().splitlines()
+    events = [json.loads(line) for line in event_lines]
+    assert len(events) == 1
+    assert events[0]["type"] == "poller_tuning_upstream_divergence"
+    assert events[0]["skill"] == "fake-poller"
+    assert events[0]["keys"] == [
+        "fake.batch_size", "fake.env", "fake.pass_env", "fake.priority",
+        "fake.recover_failed_turns",
+    ]
+
+
+def test_apply_pollers_json_three_way_merge_applies_upstream_tunable_changes(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """Three-way merge preserves only tunables changed from the old bundle."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    skill_dir = fake_home / "skills" / "fake-poller"
+    installed_pollers = skill_dir / "pollers.json"
+    old_bundled = json.loads(installed_pollers.read_text())
+    old_bundled["pollers"][0].update({
+        "priority": "normal",
+        "batch_size": 10,
+        "pass_env": ["GITHUB_TOKEN"],
+    })
+    installed_pollers.write_text(json.dumps(old_bundled))
+
+    # A previous update snapshot gives --apply a baseline for which installed
+    # tunables were operator edits versus untouched old bundled values.
+    backup_dir = skill_dir / ".pre-update-backup" / "20260612T201000Z" / ".source"
+    backup_dir.mkdir(parents=True)
+    (backup_dir / "pollers.json").write_text(json.dumps(old_bundled))
+
+    installed_payload = json.loads(installed_pollers.read_text())
+    installed_payload["pollers"][0].update({
+        "priority": "high",  # operator changed: preserve
+        "batch_size": 10,  # untouched: accept upstream change below
+        "pass_env": ["GITHUB_TOKEN"],  # untouched: accept upstream additions below
+    })
+    installed_pollers.write_text(json.dumps(installed_payload))
+
+    new_bundled = json.loads(installed_pollers.read_text())
+    new_bundled["pollers"][0].update({
+        "command": "python3 new_poller.py",
+        "priority": "normal",
+        "batch_size": 5,
+        "pass_env": ["GITHUB_TOKEN", "ATPROTO_HANDLE", "ATPROTO_APP_PASSWORD"],
+    })
+    (fake_optional_root / "fake-poller" / "pollers.json").write_text(
+        json.dumps(new_bundled)
+    )
+
+    r = detect_skill_drift(fake_home, fake_optional_root, name="fake-poller")[0]
+    assert r.differs == ["pollers.json"]
+
+    updated, failed, hint = apply_skill_update(r)
+
+    assert updated == ["pollers.json"]
+    assert failed == []
+    assert hint is not None
+    data = json.loads(installed_pollers.read_text())
+    poller = data["pollers"][0]
+    assert poller["command"] == "python3 new_poller.py"
+    assert poller["priority"] == "high"
+    assert poller["batch_size"] == 5
+    assert poller["pass_env"] == [
+        "GITHUB_TOKEN", "ATPROTO_HANDLE", "ATPROTO_APP_PASSWORD",
+    ]
+    out = capsys.readouterr().out
+    assert "preserved operator-tuned pollers.json keys (three-way merge)" in out
+    assert "fake.priority" in out
+    assert "fake.batch_size" not in out
+    assert "fake.pass_env" not in out
+    assert not (fake_home / "logs" / "events.jsonl").exists()
 
 
 def test_apply_skips_extra_without_force(
