@@ -147,11 +147,13 @@ class WorklinkRunner:
         validate_leaf(issue)
         config = WorklinkConfig.load(self.home / "worklink.yaml")
         registry = self.registry or BackendRegistry(config)
+        repo_slug = _repo_slug(self.repo)
         backend = (
             registry.get(backend_name)
             if backend_name
-            else registry.select(labels=issue.labels, repo=_repo_slug(self.repo))
+            else registry.select(labels=issue.labels, repo=repo_slug)
         )
+        compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
         selected_name = backend.name
         test_cmd = (
             test_command
@@ -228,7 +230,7 @@ class WorklinkRunner:
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             started = datetime.now(UTC)
-            raw = await backend.run(order)
+            raw = await backend.run(order, compute=compute)
             validation = observe_evidence(
                 issue=issue.issue_id,
                 attempt=record.attempt,

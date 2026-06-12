@@ -7,8 +7,10 @@ from typing import Any
 
 import pytest
 
-from mimir.worklink.backends import BackendRegistry, Caps, CodexBackend, RawResult, WorkOrder, WorklinkConfig
+from mimir.worklink.backends import BackendRegistry, Caps, CodexBackend, ComputeResult, LocalSubprocessComputeBackend, RawResult, WorkOrder, WorklinkConfig
+from mimir.worklink.compute import WorkSpec
 import mimir.worklink.backends.codex as codex_module
+import mimir.worklink.compute as compute_module
 
 
 class FakeProcess:
@@ -116,7 +118,7 @@ async def test_codex_backend_enforces_timeout(monkeypatch: pytest.MonkeyPatch, t
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
-    monkeypatch.setattr(codex_module, "_kill_process_group", fake_kill_process_group)
+    monkeypatch.setattr(compute_module, "_kill_process_group", fake_kill_process_group)
 
     result = await CodexBackend().run(
         WorkOrder(
@@ -155,12 +157,14 @@ def test_worklink_config_routes_first_match_and_defaults(tmp_path: Path) -> None
         """
 defaults:
   backend: codex
+  compute_backend: local_subprocess
   timeout_s: 45
   backend_by_category:
     renderer: mermaid
 routes:
   - label: render
     backend: mermaid
+    compute_backend: local_subprocess
   - repo: jasoncarreira/mimir
     backend: codex
 backends:
@@ -182,6 +186,8 @@ backends:
     assert isinstance(codex, CodexBackend)
     assert codex.bin == "/opt/bin/codex"
     assert codex.extra_args == ("exec", "--json", "--sandbox", "workspace-write")
+    assert config.defaults.compute_backend == "local_subprocess"
+    assert isinstance(registry.select_compute(), LocalSubprocessComputeBackend)
 
 
 def test_codex_command_includes_rules_in_prompt(tmp_path: Path) -> None:
@@ -200,6 +206,81 @@ def test_registry_selection_has_no_codex_specific_orchestrator_branch() -> None:
     registry = BackendRegistry(config)
 
     assert registry.select(labels={"worklink"}, repo="jasoncarreira/mimir").name == "codex"
+
+
+@pytest.mark.asyncio
+async def test_codex_backend_can_run_via_injected_compute(tmp_path: Path) -> None:
+    seen: list[WorkSpec] = []
+
+    class FakeCompute:
+        name = "fake_compute"
+
+        async def run(self, spec: WorkSpec) -> ComputeResult:
+            seen.append(spec)
+            return ComputeResult(exit_code=0, stdout='{"event":"done"}\n', stderr='')
+
+    order = WorkOrder(
+        issue_id=455,
+        worktree=tmp_path / "worktree",
+        prompt="Do work",
+        rules=None,
+        timeout_s=17,
+        env={"MIMIR_HOME": "/tmp/home"},
+        transcript_root=tmp_path / "transcripts",
+    )
+
+    result = await CodexBackend().run(order, compute=FakeCompute())
+
+    assert result.backend_status == "success"
+    assert seen == [
+        WorkSpec(
+            argv=["codex", "exec", "--cd", str(order.worktree), "--json", "Do work"],
+            cwd=order.worktree,
+            env={"MIMIR_HOME": "/tmp/home"},
+            timeout_s=17,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeProcess(returncode=0, stdout=b"ok", stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    result = await LocalSubprocessComputeBackend().run(
+        WorkSpec(
+            argv=["tool", "arg"],
+            cwd=tmp_path,
+            env={"PATH": "/custom/bin", "X": "1"},
+            timeout_s=5,
+        )
+    )
+
+    assert result == ComputeResult(
+        exit_code=0,
+        stdout="ok",
+        stderr="",
+        handle=result.handle,
+    )
+    assert calls == [
+        {
+            "args": ("tool", "arg"),
+            "kwargs": {
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+                "cwd": str(tmp_path),
+                "env": {"PATH": "/custom/bin", "X": "1"},
+                "start_new_session": True,
+            },
+        }
+    ]
 
 
 def test_codex_status_auth_detection_does_not_match_author_text() -> None:

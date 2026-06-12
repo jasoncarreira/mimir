@@ -5,7 +5,20 @@ may edit a per-issue worktree, but claiming, worktree lifecycle, and evidence
 validation live here as plain Python.
 """
 
-from .backends import BackendRegistry, Caps, CodexBackend, RawResult, ToolBackend, WorkOrder, WorklinkConfig
+from .backends import (
+    BackendRegistry,
+    Caps,
+    CodexBackend,
+    ComputeBackend,
+    ComputeResult,
+    LaunchHandle,
+    LocalSubprocessComputeBackend,
+    RawResult,
+    ToolBackend,
+    WorkOrder,
+    WorkSpec,
+    WorklinkConfig,
+)
 from .claims import ClaimRecord, ClaimResult, ChainlinkClaims
 from .evidence import CommandResult, EvidenceValidation, TestResult, WorklinkEvidence
 from .worktree import WorktreeLease
@@ -18,11 +31,16 @@ __all__ = [
     "ClaimRecord",
     "ClaimResult",
     "CommandResult",
+    "LocalSubprocessComputeBackend",
+    "LaunchHandle",
+    "ComputeResult",
+    "ComputeBackend",
     "EvidenceValidation",
     "TestResult",
     "RawResult",
     "ToolBackend",
     "WorkOrder",
+    "WorkSpec",
     "WorklinkConfig",
     "WorklinkEvidence",
     "WorktreeLease",

@@ -9,8 +9,9 @@ import pytest
 import asyncio
 
 from mimir.event_logger import _reset_logger_for_tests, init_logger
-from mimir.worklink.backends import Caps, RawResult, WorkOrder
-from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig
+from mimir.worklink.backends import Caps, ComputeResult, RawResult, WorkOrder
+from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
+from mimir.worklink.compute import WorkSpec
 from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
@@ -18,6 +19,17 @@ from mimir.worklink.orchestrator import (
     render_decomposition_prompt,
     validate_leaf,
 )
+
+
+class FakeCompute:
+    name = "fake_compute"
+
+    def __init__(self) -> None:
+        self.specs: list[WorkSpec] = []
+
+    async def run(self, spec: WorkSpec) -> ComputeResult:
+        self.specs.append(spec)
+        return ComputeResult(exit_code=0, stdout="ok", stderr="")
 
 
 class FakeBackend:
@@ -31,7 +43,7 @@ class FakeBackend:
     def capabilities(self) -> Caps:
         return Caps("fake", False, False, False, True, None)
 
-    async def run(self, order: WorkOrder) -> RawResult:
+    async def run(self, order: WorkOrder, *, compute: object | None = None) -> RawResult:
         self.orders.append(order)
         if self.write_change:
             (order.worktree / "changed.txt").write_text("hello\n", encoding="utf-8")
@@ -41,6 +53,73 @@ class FakeBackend:
             self.status,
             None,
         )
+
+
+def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    compute = FakeCompute()
+    calls: list[Sequence[str] | str] = []
+
+    def runner(
+        args: Sequence[str] | str, **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            return cp(args, stdout=ISSUE_JSON)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "close"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "label"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "unlabel"]:
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
+            worktree.mkdir(parents=True)
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"]:
+            if "--cached" in args and "--quiet" in args:
+                return cp(args, returncode=1)
+            return cp(args, stdout=" changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "status"]:
+            return cp(args)
+        if args == "echo ok":
+            return cp(args, stdout="ok\n")
+        if isinstance(args, list) and args[:3] == ["gh", "pr", "create"]:
+            return cp(args, stdout="https://github.com/jasoncarreira/mimir/pull/999\n")
+        return cp(args)
+
+    class ComputeAwareBackend(FakeBackend):
+        async def run(self, order: WorkOrder, *, compute: object | None = None) -> RawResult:
+            self.orders.append(order)
+            assert compute is not None
+            result = await compute.run(WorkSpec(["fake-tool"], order.worktree, order.env, order.timeout_s))
+            (order.worktree / "changed.txt").write_text(result.stdout + "\n", encoding="utf-8")
+            return RawResult(result.exit_code, order.transcript_root / "fake.json", "success", None)
+
+    backend = ComputeAwareBackend(status="success")
+    registry = BackendRegistry(WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute")))
+    registry.register(backend)
+    registry.register_compute(compute)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake"
+        )
+    )
+
+    assert result.status == "completed", (result.reason, calls)
+    assert compute.specs
+    assert compute.specs[0].argv == ["fake-tool"]
+    assert compute.specs[0].cwd == worktree
+    assert compute.specs[0].env["MIMIR_HOME"] == str(tmp_path)
 
 
 def cp(
@@ -118,6 +197,16 @@ def _orchestrator_runner(
             return cp(args, stdout=ISSUE_JSON)
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
             return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "close"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "label"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "unlabel"]:
+            return cp(args)
         if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
             return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
         if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
@@ -180,13 +269,23 @@ def test_worklink_rereads_issue_comments_before_claiming(tmp_path: Path) -> None
             return cp(args, stdout=ISSUE_JSON if show_count == 1 else issue_with_prior_claim)
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
             return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "close"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "label"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "unlabel"]:
+            return cp(args)
         if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
             return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
         if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
             worktree.mkdir(parents=True)
             return cp(args)
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"]:
-            return cp(args)
+            return cp(args, stdout=" changed.txt\n")
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "status"]:
             return cp(args)
         if args == "echo ok":

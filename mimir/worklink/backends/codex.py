@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
-import os
 from pathlib import Path
 import re
-import signal
 from typing import Any, Sequence
 
+from ..compute import ComputeBackend, LocalSubprocessComputeBackend, WorkSpec
 from .base import Caps, RawResult, WorkOrder
 
 
@@ -33,57 +31,49 @@ class CodexBackend:
             quota_pool="codex-subscription",
         )
 
-    async def run(self, order: WorkOrder) -> RawResult:
-        command = self._command(order)
+    async def run(
+        self,
+        order: WorkOrder,
+        *,
+        compute: ComputeBackend | None = None,
+    ) -> RawResult:
+        spec = self.work_spec(order)
         transcript_path = _transcript_path(order.transcript_root, order.issue_id)
-        env = {"PATH": os.environ.get("PATH", "")}
-        env.update(order.env)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(order.worktree),
-                env=env,
-                start_new_session=True,
-            )
-        except OSError as exc:
+        result = await (compute or LocalSubprocessComputeBackend()).run(spec)
+        if result.launch_error:
             _write_transcript(
                 transcript_path,
-                command=command,
+                command=list(spec.argv),
                 exit_code=None,
                 status="backend_error",
-                stdout="",
-                stderr=str(exc),
+                stdout=result.stdout,
+                stderr=result.stderr,
                 timed_out=False,
             )
-            return RawResult(-1, transcript_path, "backend_error", str(exc))
+            return RawResult(-1, transcript_path, "backend_error", result.launch_error)
 
-        timed_out = False
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=order.timeout_s
-            )
-        except TimeoutError:
-            timed_out = True
-            await _kill_process_group(proc)
-            stdout_b, stderr_b = await proc.communicate()
-
-        stdout = stdout_b.decode(errors="replace")
-        stderr = stderr_b.decode(errors="replace")
-        exit_code = proc.returncode if proc.returncode is not None else -1
-        status = "timeout" if timed_out else _status_from_output(exit_code, stdout, stderr)
-        error = _error_from_status(status, stdout, stderr)
+        status = "timeout" if result.timed_out else _status_from_output(
+            result.exit_code, result.stdout, result.stderr
+        )
+        error = _error_from_status(status, result.stdout, result.stderr)
         _write_transcript(
             transcript_path,
-            command=command,
-            exit_code=exit_code,
+            command=list(spec.argv),
+            exit_code=result.exit_code,
             status=status,
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=timed_out,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            timed_out=result.timed_out,
         )
-        return RawResult(exit_code, transcript_path, status, error)
+        return RawResult(result.exit_code, transcript_path, status, error)
+
+    def work_spec(self, order: WorkOrder) -> WorkSpec:
+        return WorkSpec(
+            argv=self._command(order),
+            cwd=order.worktree,
+            env=order.env,
+            timeout_s=order.timeout_s,
+        )
 
     def _command(self, order: WorkOrder) -> list[str]:
         args = list(self.extra_args) or ["exec", "--json"]
@@ -107,6 +97,8 @@ def _transcript_path(transcript_root: Path | None, issue_id: int) -> Path:
 
 
 def _default_transcript_root() -> Path:
+    import os
+
     home = Path(os.environ.get("MIMIR_HOME", str(Path.home())))
     return home / "state" / "worklink" / "transcripts"
 
@@ -131,25 +123,6 @@ def _write_transcript(
         "stderr": stderr,
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-
-
-async def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
-    try:
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except OSError:
-        proc.kill()
-        return
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=5)
-    except TimeoutError:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        await proc.wait()
 
 
 def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:

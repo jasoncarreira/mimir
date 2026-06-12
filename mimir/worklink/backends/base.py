@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from ..compute import ComputeBackend, WorkSpec
+
 
 @dataclass(frozen=True)
 class Caps:
@@ -47,4 +49,8 @@ class ToolBackend(Protocol):
 
     def capabilities(self) -> Caps: ...
 
-    async def run(self, order: WorkOrder) -> RawResult: ...
+    def work_spec(self, order: WorkOrder) -> WorkSpec: ...
+
+    async def run(
+        self, order: WorkOrder, *, compute: ComputeBackend | None = None
+    ) -> RawResult: ...

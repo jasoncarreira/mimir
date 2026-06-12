@@ -137,11 +137,8 @@ mimir/worklink/
     base.py         # ToolBackend protocol, Caps, WorkOrder, RawResult
     codex.py        # first adapter
     claude_cli.py   # second adapter (mechanical addition)
-  compute/          # ComputeBackend launchers — WHERE work runs (planned, #454)
-    base.py         # ComputeBackend protocol, WorkSpec, LaunchHandle
-    local.py        # local-subprocess (today's behavior; accept-the-risk fallback)
-    docker.py       # docker-sibling via broker
-    ecs.py          # ecs-runtask (AWS)
+  compute.py       # ComputeBackend protocol + local-subprocess substrate
+  # future compute launchers: docker-sibling broker, ecs-runtask worker
 ```
 
 **Packaging (decided 2026-06-12).** The executor above (`mimir/worklink/`) and
@@ -264,6 +261,7 @@ class WorkOrder:
     rules: str | None         # backend-appropriate rules/system content
     timeout_s: int
     env: dict[str, str]       # explicit allowlist, assembled like poller env
+    transcript_root: Path | None
 
 @dataclass(frozen=True)
 class RawResult:
@@ -275,13 +273,15 @@ class RawResult:
 class ToolBackend(Protocol):
     name: str
     def capabilities(self) -> Caps: ...
-    async def run(self, order: WorkOrder) -> RawResult: ...
+    def work_spec(self, order: WorkOrder) -> WorkSpec: ...
+    async def run(
+        self, order: WorkOrder, *, compute: ComputeBackend | None = None
+    ) -> RawResult: ...
 ```
 
-Adapters own **only** CLI session mechanics: how to start/reuse a
-session, pass prompt/rules, detect completion or failure, collect the
-transcript, and map backend-specific errors into the common status
-terms. Everything else — claiming, worktrees, evidence, transitions —
+Adapters own **only** CLI session mechanics: how to turn a
+`WorkOrder` into a `WorkSpec`, pass prompt/rules, collect the transcript,
+and map backend-specific output/errors into the common status terms. Everything else — claiming, worktrees, evidence, transitions —
 is orchestrator code shared by every backend. Adding a backend is one
 file implementing the protocol plus a registry entry; it must never
 require touching the orchestrator.
@@ -341,29 +341,38 @@ Four facts shape it:
 ```python
 @dataclass(frozen=True)
 class WorkSpec:
-    issue_id: int; attempt: int
-    repo_url: str; base_ref: str; branch: str   # git handoff, not a local path
-    prompt: str; rules: str | None
-    test_command: str; backend: str; timeout_s: int
-    creds_ref: dict[str, str]                    # substrate-resolved, value-blind
-    env: dict[str, str]                          # explicit allowlist
+    argv: Sequence[str]          # local-subprocess command line for the first seam
+    cwd: Path                    # current local worktree; future remote specs use refs
+    env: Mapping[str, str]
+    timeout_s: int
+
+@dataclass(frozen=True)
+class LaunchHandle:
+    substrate: str
+    identifier: str
+
+@dataclass(frozen=True)
+class ComputeResult:
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    launch_error: str | None = None
+    handle: LaunchHandle | None = None
 
 class ComputeBackend(Protocol):
     name: str
-    def capabilities(self) -> ComputeCaps: ...
-    async def launch(self, spec: WorkSpec) -> LaunchHandle: ...
-    async def wait(self, h: LaunchHandle, timeout_s: int) -> ComputeResult: ...
-    async def cancel(self, h: LaunchHandle) -> None: ...
-    async def cleanup(self, h: LaunchHandle) -> None: ...
+    async def run(self, spec: WorkSpec) -> ComputeResult: ...
 ```
 
 **Operator decision (2026-06-12):** `local-subprocess` (today's behavior — the
 backend runs as a local subprocess with full container filesystem access)
-remains available as an explicit **accept-the-risk fallback**. The isolated
+remains the default for manual slice-1 compatibility and is the explicit
+**accept-the-risk fallback** once isolated substrates exist. The isolated
 worker (`docker-sibling` / `ecs-runtask`) is the recommended path for
 unsandboxed or autonomous use; operators may opt back into `local-subprocess`
-and accept the documented blast radius. Not the default — the safe path is easy,
-the risky path stays possible.
+and accept the documented blast radius. The safe path should be easy, while the
+risky path stays possible for bounded operator-invoked runs.
 
 ### Backend trust model
 
@@ -461,6 +470,7 @@ Minimal current config shape:
 ```yaml
 defaults:
   backend: codex
+  compute_backend: local_subprocess
   timeout_s: 1800
   priority: normal
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
