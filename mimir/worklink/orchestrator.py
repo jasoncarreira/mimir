@@ -15,12 +15,18 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import warnings
 from typing import Any, Callable, Mapping, Sequence
 
 from .backends import BackendRegistry, RawResult, ToolBackend, WorkOrder, WorklinkConfig
 from .claims import ChainlinkClaims
 from .evidence import EvidenceValidation, WorklinkEvidence, observe_evidence
-from .planning import missing_leaf_template_parts, suggested_test_command
+from .planning import (
+    missing_leaf_template_parts,
+    render_decompose_prompt,
+    suggested_test_command,
+    uses_strict_leaf_validation,
+)
 from .worktree import WorktreeLease, cleanup_worktree, create_worktree
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -34,6 +40,7 @@ class IssueContext:
     labels: set[str]
     parent_id: int | None = None
     comments: tuple[str, ...] = ()
+    created_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -83,13 +90,24 @@ class ChainlinkIssueReader:
             labels={str(label) for label in payload.get("labels") or ()},
             parent_id=int(payload["parent_id"]) if payload.get("parent_id") is not None else None,
             comments=tuple(comment for comment in comments if comment),
+            created_at=_parse_chainlink_datetime(payload.get("created_at")),
         )
 
 
 def validate_leaf(issue: IssueContext) -> None:
     missing = missing_leaf_template_parts(issue.description)
-    if missing:
-        raise LeafValidationError("issue missing planner template: " + ", ".join(missing))
+    if not missing:
+        return
+    message = "issue missing planner template: " + ", ".join(missing)
+    if uses_strict_leaf_validation(issue.created_at):
+        raise LeafValidationError(message)
+    warnings.warn(message + " (legacy pre-contract leaf; continuing)", RuntimeWarning, stacklevel=2)
+    _log_event(
+        "worklink_legacy_template_warning",
+        issue_id=issue.issue_id,
+        missing=missing,
+        created_at=issue.created_at.isoformat() if issue.created_at else None,
+    )
 
 
 def render_work_order(
@@ -338,6 +356,26 @@ def run_worklink(
     )
 
 
+def render_decomposition_prompt(
+    *,
+    template_path: Path,
+    parent_id: int,
+    title: str,
+    labels: str,
+    priority: str,
+    description: str,
+) -> str:
+    template = template_path.read_text(encoding="utf-8")
+    return render_decompose_prompt(
+        template,
+        parent_id=parent_id,
+        title=title,
+        labels=labels,
+        priority=priority,
+        description=description,
+    )
+
+
 def _template_path(home: Path) -> Path:
     custom = home / "prompts" / "worklink-order.md"
     if custom.exists():
@@ -484,6 +522,19 @@ def _evidence_json(evidence: WorklinkEvidence) -> dict[str, Any]:
     data["commands"] = [asdict(command) for command in evidence.commands]
     data["tests"] = asdict(evidence.tests) if evidence.tests else None
     return data
+
+
+def _parse_chainlink_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _comment_text(value: Any) -> str:

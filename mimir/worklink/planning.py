@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 
 LEAF_TEMPLATE_MARKDOWN = """Acceptance criteria:
 - [ ] <observable, testable outcome>
@@ -25,6 +26,21 @@ _REQUIRED_SECTIONS = (
     "- Suggested test command:",
 )
 
+# Slice 2 tightened the executor/planner contract. Earlier Chainlink issues were
+# not authored with the Worklink-notes sections, so strict refusal would orphan
+# already queued leaves. New issues are strict; pre-contract issues are
+# advisory-warned so they can drain or be migrated in normal planning work.
+STRICT_VALIDATION_CREATED_AFTER = datetime(2026, 6, 12, tzinfo=UTC)
+
+
+def render_decompose_prompt(template: str, **values: object) -> str:
+    """Render the planner prompt with the canonical leaf template injected."""
+
+    rendered = template.replace("{leaf_template}", LEAF_TEMPLATE_MARKDOWN)
+    if not values:
+        return rendered
+    return rendered.format(**values)
+
 
 def missing_leaf_template_parts(description: str) -> list[str]:
     """Return planner-template parts absent from a candidate Worklink leaf."""
@@ -36,6 +52,16 @@ def missing_leaf_template_parts(description: str) -> list[str]:
     if not re.search(r"(?m)^- \[[ xX]\] ", description):
         missing.append("acceptance checklist item")
     return missing
+
+
+def uses_strict_leaf_validation(created_at: datetime | None) -> bool:
+    """Return whether missing planner-template parts are fatal for a leaf."""
+
+    if created_at is None:
+        return True
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    return created_at >= STRICT_VALIDATION_CREATED_AFTER
 
 
 def suggested_test_command(description: str) -> str | None:

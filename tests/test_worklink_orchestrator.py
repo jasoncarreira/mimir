@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -14,6 +15,7 @@ from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
     WorklinkRunner,
+    render_decomposition_prompt,
     validate_leaf,
 )
 
@@ -329,10 +331,10 @@ STRICT_ISSUE_JSON = '''{
 }'''
 
 
-def test_validate_leaf_requires_worklink_notes_template() -> None:
+def test_validate_leaf_requires_worklink_notes_template_for_new_issues() -> None:
     issue = IssueContext(
         443,
-        "old loose leaf",
+        "new loose leaf",
         "Acceptance criteria:\n- [ ] do it\n\nReview criteria: reviewer checks it",
         {"worklink"},
     )
@@ -341,18 +343,50 @@ def test_validate_leaf_requires_worklink_notes_template() -> None:
         validate_leaf(issue)
 
 
-def test_planner_prompt_and_skill_embed_single_leaf_template() -> None:
+def test_validate_leaf_warns_for_legacy_leaves_without_orphaning_them() -> None:
+    issue = IssueContext(
+        445,
+        "legacy queued leaf",
+        "Acceptance criteria:\n- [ ] do it\n\nReview criteria: reviewer checks it",
+        {"worklink"},
+        created_at=datetime(2026, 6, 11, tzinfo=UTC),
+    )
+
+    with pytest.warns(RuntimeWarning, match="legacy pre-contract leaf"):
+        validate_leaf(issue)
+
+
+def test_planner_prompt_renders_single_leaf_template_constant() -> None:
+    from mimir.prompt_templates import bundled_defaults
     from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
 
     root = Path(__file__).parent.parent
-    prompt = (root / "mimir" / "prompt_templates" / "decompose.md").read_text(
-        encoding="utf-8"
+    prompt_path = root / "mimir" / "prompt_templates" / "decompose.md"
+    prompt = prompt_path.read_text(encoding="utf-8")
+    rendered = render_decomposition_prompt(
+        template_path=prompt_path,
+        parent_id=380,
+        title="parent",
+        labels="worklink",
+        priority="normal",
+        description="parent body",
     )
+
+    assert "{leaf_template}" in prompt
+    assert LEAF_TEMPLATE_MARKDOWN not in prompt
+    assert LEAF_TEMPLATE_MARKDOWN in rendered
+    assert LEAF_TEMPLATE_MARKDOWN in bundled_defaults()["decompose.md"]
+    assert "{leaf_template}" not in bundled_defaults()["decompose.md"]
+
+
+def test_skill_embeds_single_leaf_template_constant() -> None:
+    from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
+
+    root = Path(__file__).parent.parent
     skill = (root / "mimir" / "skills" / "chainlink-orchestrator" / "SKILL.md").read_text(
         encoding="utf-8"
     )
 
-    assert LEAF_TEMPLATE_MARKDOWN in prompt
     assert LEAF_TEMPLATE_MARKDOWN in skill
 
 
@@ -382,3 +416,13 @@ def test_worklink_uses_planner_suggested_test_command_by_default(
     out = capsys.readouterr().out
     assert result.dry_run is True
     assert "uv run pytest -q tests/test_worklink_orchestrator.py" in out
+
+
+def test_decompose_prompt_teaches_chainlink_block_argument_order() -> None:
+    prompt = (Path(__file__).parent.parent / "mimir" / "prompt_templates" / "decompose.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "chainlink issue block <ID-that-is-blocked> <BLOCKER>" in prompt
+    assert "blocked issue id comes first" in prompt
+    assert "chainlink issue block <blocker> <blocked>" not in prompt

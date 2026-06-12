@@ -27,7 +27,7 @@ template.
 - Parent work is split into reviewable leaf subissues.
 - Each Worklink-ready leaf has the exact template the executor validates:
   `Acceptance criteria`, checklist items, `Review criteria`, and `Worklink notes`.
-- Dependency edges are represented with `chainlink issue block <blocker> <blocked>`.
+- Dependency edges are represented with `chainlink issue block <ID-that-is-blocked> <BLOCKER>`; the blocked issue id comes first, then the blocker.
 - Only leaves with independently testable criteria receive the `worklink:ready`
   label.
 
@@ -41,14 +41,14 @@ or label vague placeholders as ready.
 3. Identify the smallest reviewable leaves. Each leaf should have one coherent
    change, an observable outcome, and a focused validation command/evidence.
 4. Create each leaf with `chainlink issue subissue <parent-id> --description "$DESC"`.
-5. Add dependency edges with `chainlink issue block <blocker> <blocked>`.
+5. Add dependency edges with `chainlink issue block <ID-that-is-blocked> <BLOCKER>` (blocked issue first, blocker second; do not transpose them).
 6. Label only executable leaves with `worklink:ready`.
 7. Leave a parent comment summarizing leaf ids, dependency edges, ready leaves,
    and not-ready leaves.
 
 ## Required leaf template
 
-Use this exact structure. The executor refuses issues that do not carry it. The canonical copy is `mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN`; tests assert this skill and the planner prompt stay in sync with that constant.
+Use this exact structure. The executor refuses new issues that do not carry it. The canonical copy is `mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN`; the planner prompt renders that constant and tests assert this skill stays in sync with it.
 
 ```markdown
 Acceptance criteria:

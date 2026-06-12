@@ -102,7 +102,7 @@ Chainlink mutations. Use the bundled `chainlink-orchestrator` skill and the
 operator-tunable `prompts/decompose.md` prompt to turn a parent issue into leaf
 subissues. The canonical leaf-description template is
 `mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN`; the planner prompt and skill
-include that exact text, and executor tests assert they stay in sync.
+render that exact text from the constant, and executor tests assert they stay in sync.
 
 A leaf may receive `worklink:ready` only when it includes:
 
@@ -112,10 +112,16 @@ A leaf may receive `worklink:ready` only when it includes:
   `Suggested test command`.
 
 `mimir worklink run` refuses leaves missing that template before claiming, so a
-vague parent or half-planned subissue cannot reach a backend agent. When a
-planner needs ordering, it records it with `chainlink issue block <blocker>
-<blocked>`; readiness comes from Chainlink's ready queue plus `worklink:ready`,
-not from prose alone.
+vague parent or half-planned subissue cannot reach a backend agent. Backcompat:
+issues created before slice 2's template hardening are advisory-warned and still
+allowed, but newly created issues are strict. Existing queued Worklink leaves
+#445 and #446 were migrated in the tracker to include the new sections;
+non-Worklink candidates #447 and #448 remain pre-contract advisory-warned if
+routed without migration, and a planner should add the template before marking
+them ready. When a planner needs ordering, it records it with
+`chainlink issue block <ID-that-is-blocked> <BLOCKER>`; the blocked issue id
+comes first, then the blocker. Readiness comes from Chainlink's ready queue plus
+`worklink:ready`, not from prose alone.
 
 ## 3. Executor anatomy (`mimir/worklink/`)
 
@@ -162,10 +168,11 @@ Per-issue flow (one `run`):
 4. **Render the prompt** from issue fields: description, acceptance
    criteria, review criteria, parent context, repo conventions pointer.
    Template lives at `prompts/worklink-order.md` (operator-tunable). The
-   planner-side decomposition prompt lives at `prompts/decompose.md`; both
-   planner prompt and `chainlink-orchestrator` skill embed the single
-   `mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN` contract so the executor
-   validates the same template the planner emits.
+   planner-side decomposition prompt lives at `prompts/decompose.md`; its
+   `{leaf_template}` slot is rendered from the single
+   `mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN` contract, which the
+   `chainlink-orchestrator` skill also embeds, so the executor validates the
+   same template the planner emits.
 5. **Spawn the backend** (adapter `run(WorkOrder)`) under a timeout.
 6. **Observe evidence** (`evidence.py`): the executor itself runs
    `git -C <worktree> diff --stat`/`status`, runs the declared test
@@ -301,6 +308,11 @@ polling or in-turn `worklink_run` dispatch for Codex, choose one of:
    mounts; or
 3. explicitly accept unsandboxed autonomous backend runs as an operator
    policy decision and document the added blast radius.
+
+
+The planner-supplied `Suggested test command` is executable shell input
+(`shell=True`) from Chainlink issue descriptions, within the same
+operator/agent-private trust boundary as poller commands.
 
 Prompt content originates from chainlink issues (operator/planner-authored),
 not arbitrary external text; the planner must not paste untrusted web/PR

@@ -16,24 +16,14 @@ Planner rules:
 - Create leaf subissues with `chainlink issue subissue {parent_id} ...`.
 - Each leaf must use the exact template below in its description.
 - Add `worklink:ready` only when all acceptance criteria are independently testable.
-- Use `chainlink issue block <blocker> <blocked>` for ordering dependencies.
+- Use `chainlink issue block <ID-that-is-blocked> <BLOCKER>` for ordering dependencies. Reminder: the blocked issue id comes first, then the blocker; do not transpose this order.
 - Do not mark vague research/design placeholders as `worklink:ready`; keep them as normal subissues or add `needs-decomposition`.
 - Keep leaves reviewable: one coherent implementation slice per issue.
 
 Required leaf description template (single source for executor validation):
 
 ```markdown
-Acceptance criteria:
-- [ ] <observable, testable outcome>
-- [ ] <focused validation command or evidence requirement>
-
-Review criteria:
-- <what a reviewer/operator should verify before approval>
-
-Worklink notes:
-- Scope: <files/subsystems expected to change, or "docs only">
-- Out of scope: <nearby work not included in this leaf>
-- Suggested test command: <command the executor should run>
+{leaf_template}
 ```
 
 After creating subissues and dependency edges, summarize:

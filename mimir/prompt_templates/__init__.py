@@ -33,6 +33,8 @@ import logging
 import shutil
 from pathlib import Path
 
+from ..worklink.planning import render_decompose_prompt
+
 log = logging.getLogger(__name__)
 
 _TEMPLATES_ROOT = Path(__file__).parent
@@ -49,10 +51,16 @@ def _template_names() -> list[str]:
     )
 
 
+def _render_template(name: str, text: str) -> str:
+    if name == "decompose.md":
+        return render_decompose_prompt(text)
+    return text
+
+
 def bundled_defaults() -> dict[str, str]:
     """Bundled prompt defaults keyed by basename."""
     return {
-        name: (_TEMPLATES_ROOT / name).read_text(encoding="utf-8")
+        name: _render_template(name, (_TEMPLATES_ROOT / name).read_text(encoding="utf-8"))
         for name in _template_names()
     }
 
@@ -79,7 +87,8 @@ def seed_prompts(home: Path) -> dict[str, str]:
             out[name] = "present"
             continue
         try:
-            shutil.copy2(src, dst)
+            text = _render_template(name, src.read_text(encoding="utf-8"))
+            dst.write_text(text, encoding="utf-8")
             out[name] = "created"
             log.info("seeded default prompt: %s", dst)
         except OSError as exc:
