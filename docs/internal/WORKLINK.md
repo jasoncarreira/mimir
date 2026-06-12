@@ -7,7 +7,7 @@ deterministic machinery connects them.
 
 Status: Slice 1 vertical implemented: manual `mimir worklink run` can claim a
 ready leaf, spawn Codex, observe evidence, push a branch, and open a review PR.
-Later slices still need planner/poller/tool autonomy and additional backends.
+Slice 2 adds the planner/decomposer contract (prompt + skill + executor refusal). Later slices still need poller/tool autonomy and additional backends.
 Owner issue: chainlink #380; leaf issues are subissues of #380.
 
 ## 1. Roles
@@ -94,6 +94,29 @@ Rules:
   a reaper (`locks steal` + issue back to ready + comment naming the
   stale agent).
 
+
+## 2.5 Planner contract (slice 2)
+
+The planner/decomposer is an LLM turn, but its output is still constrained to
+Chainlink mutations. Use the bundled `chainlink-orchestrator` skill and the
+operator-tunable `prompts/decompose.md` prompt to turn a parent issue into leaf
+subissues. The canonical leaf-description template is
+`mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN`; the planner prompt and skill
+include that exact text, and executor tests assert they stay in sync.
+
+A leaf may receive `worklink:ready` only when it includes:
+
+- `Acceptance criteria:` with checklist items,
+- `Review criteria:`,
+- `Worklink notes:` containing `Scope`, `Out of scope`, and
+  `Suggested test command`.
+
+`mimir worklink run` refuses leaves missing that template before claiming, so a
+vague parent or half-planned subissue cannot reach a backend agent. When a
+planner needs ordering, it records it with `chainlink issue block <blocker>
+<blocked>`; readiness comes from Chainlink's ready queue plus `worklink:ready`,
+not from prose alone.
+
 ## 3. Executor anatomy (`mimir/worklink/`)
 
 ```
@@ -138,7 +161,11 @@ Per-issue flow (one `run`):
    per-worker branch.
 4. **Render the prompt** from issue fields: description, acceptance
    criteria, review criteria, parent context, repo conventions pointer.
-   Template lives at `prompts/worklink-order.md` (operator-tunable).
+   Template lives at `prompts/worklink-order.md` (operator-tunable). The
+   planner-side decomposition prompt lives at `prompts/decompose.md`; both
+   planner prompt and `chainlink-orchestrator` skill embed the single
+   `mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN` contract so the executor
+   validates the same template the planner emits.
 5. **Spawn the backend** (adapter `run(WorkOrder)`) under a timeout.
 6. **Observe evidence** (`evidence.py`): the executor itself runs
    `git -C <worktree> diff --stat`/`status`, runs the declared test

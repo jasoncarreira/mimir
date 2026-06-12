@@ -53,7 +53,7 @@ def cp(
 ISSUE_JSON = '''{
   "id": 441,
   "title": "worklink slice",
-  "description": "Acceptance criteria:\\n- [ ] do it\\n\\nReview criteria: reviewer checks it",
+  "description": "Acceptance criteria:\\n- [ ] do it\\n- [ ] echo ok\\n\\nReview criteria:\\n- reviewer checks it\\n\\nWorklink notes:\\n- Scope: test fixture\\n- Out of scope: unrelated work\\n- Suggested test command: echo ok",
   "labels": ["worklink"],
   "parent_id": 380,
   "comments": []
@@ -318,3 +318,67 @@ def test_worklink_runner_dirty_after_commit_fails_before_push(tmp_path: Path) ->
         for call in calls
     )
     assert ["chainlink", "issue", "label", "441", "worklink:ready"] in calls
+
+STRICT_ISSUE_JSON = '''{
+  "id": 443,
+  "title": "strict worklink leaf",
+  "description": "Acceptance criteria:\\n- [ ] implement it\\n- [ ] uv run pytest -q tests/test_worklink_orchestrator.py\\n\\nReview criteria:\\n- reviewer verifies scope\\n\\nWorklink notes:\\n- Scope: mimir/worklink\\n- Out of scope: docs-only cleanup\\n- Suggested test command: uv run pytest -q tests/test_worklink_orchestrator.py",
+  "labels": ["worklink", "worklink:ready"],
+  "parent_id": 380,
+  "comments": []
+}'''
+
+
+def test_validate_leaf_requires_worklink_notes_template() -> None:
+    issue = IssueContext(
+        443,
+        "old loose leaf",
+        "Acceptance criteria:\n- [ ] do it\n\nReview criteria: reviewer checks it",
+        {"worklink"},
+    )
+
+    with pytest.raises(LeafValidationError, match="Worklink notes"):
+        validate_leaf(issue)
+
+
+def test_planner_prompt_and_skill_embed_single_leaf_template() -> None:
+    from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
+
+    root = Path(__file__).parent.parent
+    prompt = (root / "mimir" / "prompt_templates" / "decompose.md").read_text(
+        encoding="utf-8"
+    )
+    skill = (root / "mimir" / "skills" / "chainlink-orchestrator" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert LEAF_TEMPLATE_MARKDOWN in prompt
+    assert LEAF_TEMPLATE_MARKDOWN in skill
+
+
+def test_worklink_uses_planner_suggested_test_command_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[Sequence[str] | str] = []
+
+    def runner(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "443"]:
+            return cp(args, stdout=STRICT_ISSUE_JSON)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(tmp_path / "repo"), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        return cp(args)
+
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(
+            home=tmp_path, repo=tmp_path / "repo", runner=runner, registry=registry
+        ).run(443, backend_name="fake", dry_run=True)
+    )
+
+    out = capsys.readouterr().out
+    assert result.dry_run is True
+    assert "uv run pytest -q tests/test_worklink_orchestrator.py" in out

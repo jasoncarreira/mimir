@@ -20,6 +20,7 @@ from typing import Any, Callable, Mapping, Sequence
 from .backends import BackendRegistry, RawResult, ToolBackend, WorkOrder, WorklinkConfig
 from .claims import ChainlinkClaims
 from .evidence import EvidenceValidation, WorklinkEvidence, observe_evidence
+from .planning import missing_leaf_template_parts, suggested_test_command
 from .worktree import WorktreeLease, cleanup_worktree, create_worktree
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -86,14 +87,7 @@ class ChainlinkIssueReader:
 
 
 def validate_leaf(issue: IssueContext) -> None:
-    text = issue.description.lower()
-    missing: list[str] = []
-    if "acceptance criteria" not in text:
-        missing.append("Acceptance criteria checklist")
-    if "- [ ]" not in issue.description and "- [x]" not in issue.description:
-        missing.append("checklist items")
-    if "review criteria" not in text:
-        missing.append("Review criteria block")
+    missing = missing_leaf_template_parts(issue.description)
     if missing:
         raise LeafValidationError("issue missing planner template: " + ", ".join(missing))
 
@@ -141,7 +135,11 @@ class WorklinkRunner:
             else registry.select(labels=issue.labels, repo=_repo_slug(self.repo))
         )
         selected_name = backend.name
-        test_cmd = test_command if test_command is not None else config.defaults.test_command
+        test_cmd = (
+            test_command
+            if test_command is not None
+            else suggested_test_command(issue.description) or config.defaults.test_command
+        )
         template_path = _template_path(self.home)
 
         # Dry-run validates the issue and renders the exact prompt without claiming
