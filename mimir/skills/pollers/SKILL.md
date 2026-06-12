@@ -188,6 +188,34 @@ if __name__ == "__main__":
 | `recover_failed_turns` | no | Opt into framework recovery of turns whose triggered turn **failed** (chainlink #262). When `true`, the framework stashes each enqueued event by `source_id`, then each cycle reads `turn_failed` / `turn_completed` outcomes to **re-enqueue** (capped) the ones whose turn died — emitting a one-shot `poller_turn_gave_up` signal when the cap is hit. Closes the "poll advanced the cursor but the triggered review/processing turn died" drop (#299) for pollers with no live state to reconcile against (gmail, github issue/comment turns). Default `false`. Leave **off** for pollers that recover another way — github-poller reconciles against `requested_reviewers`, so framework re-enqueue on top would double-fire turns. |
 | `priority` | no | `low` \| `normal` (default) \| `high` — how much resource pressure this poller rides through before the scheduler sheds its fires. The homeostat grades quota/cost pressure into a severity ladder (CLEAR / ELEVATED / TIGHT / BLOCKED): `low` sheds at ELEVATED, `normal` at TIGHT, `high` keeps firing until the provider actively refuses (recorded 429 → BLOCKED sheds everything). A suppressed fire **skips the subprocess entirely** — the cursor stays frozen, so events are delayed, not lost; the next tick after recovery catches up. Each shed fire emits `poller_fire_suppressed` with priority, severity, and the deciding reason. Use `high` for near-interactive feeds the operator actively waits on, `low` for nice-to-have ambient monitoring. |
 
+## Operator overrides (`<home>/pollers-overrides.yaml`)
+
+Skill-shipped `pollers.json` files are code; per-deployment tuning is config —
+and the two used to share a file, so `mimir skills update --apply` could
+silently reset operator tuning (observed live: a `priority: high` reverted by
+an update). The overrides file separates them for good. It lives in the agent
+HOME (never the skill dir), so updates can't touch it and drift detection
+never sees it — the same pattern as `scheduler.yaml` overriding callable crons.
+
+```yaml
+# <home>/pollers-overrides.yaml — poller name → overridden fields
+github-activity:
+  cron: "*/5 * * * *"     # poll faster than the shipped */15
+  priority: high           # ride through quota pressure (see priority docs)
+some-feed:
+  batch_size: 10
+  recover_failed_turns: true
+```
+
+Overridable fields: `cron`, `priority`, `batch_size`, `recover_failed_turns`,
+`env`, `pass_env` — the same set treated as deployment tuning elsewhere.
+Anything else (notably `command`) is refused with a warning: overrides tune
+behavior, they don't redefine what runs. Field-level fail-safety: an invalid
+value (typo'd cron, unknown priority) warns and keeps the manifest value —
+an override mistake degrades to shipped behavior, never to a dead poller.
+Unknown poller names warn so a rename/uninstall can't silently orphan tuning.
+Applied at discovery time (startup + `reload_pollers`).
+
 **On `batch_size`**: the poller script always emits per-item JSONL lines (clean contract). The framework collects all items, then emits `ceil(N/batch_size)` AgentEvents, each carrying a rendered prompt summarizing up to `batch_size` items + per-item metadata in `extra.items`. Single-item batches (default) render the prompt verbatim — no header. Multi-item batches render with a header (`<poller-name> reported N items` plus a `(batch X of Y)` suffix on multi-batch fires) and a numbered list of per-item prompts.
 
 ### 3. Register the pollers

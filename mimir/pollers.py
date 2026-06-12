@@ -432,11 +432,192 @@ class PollerConfig:
         return self.persist_dir if self.persist_dir is not None else self.skill_dir
 
 
+#: Per-poller fields an operator may override from
+#: ``<home>/pollers-overrides.yaml`` — the same set skill updates treat
+#: as deployment tuning. The overrides file lives in the HOME, not the
+#: skill directory: skill updates can never touch it, drift detection
+#: never sees it, and a rotation/retune survives any reinstall. Mirrors
+#: the ``scheduler.yaml`` pattern for callable crons (operator config
+#: overrides shipped defaults at load time).
+POLLER_OVERRIDE_KEYS = frozenset(
+    {"cron", "priority", "batch_size", "recover_failed_turns", "env", "pass_env"}
+)
+
+#: Recognized string spellings for boolean overrides. YAML 1.1 already maps
+#: bare ``yes``/``no``/``on``/``off``/``true``/``false`` to real bools, but a
+#: *quoted* value (``recover_failed_turns: "false"``) arrives as a string —
+#: and ``bool("false")`` is ``True``. So coerce strictly rather than by Python
+#: truthiness, or an operator turning a flag OFF could silently turn it ON.
+_OVERRIDE_BOOL_TRUE = frozenset({"true", "yes", "on", "1"})
+_OVERRIDE_BOOL_FALSE = frozenset({"false", "no", "off", "0"})
+
+
+def _parse_override_bool(value: object) -> bool | None:
+    """Strict bool coercion for an override value, or ``None`` if unparseable.
+
+    ``None`` means "not a recognizable bool" — the caller keeps the manifest
+    value and warns, never falling back to Python truthiness (which would make
+    the quoted-``"false"`` YAML footgun read as ``True``).
+    """
+    if isinstance(value, bool):  # must precede the int check — bool ⊂ int
+        return value
+    if isinstance(value, int):
+        return bool(value) if value in (0, 1) else None
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in _OVERRIDE_BOOL_TRUE:
+            return True
+        if s in _OVERRIDE_BOOL_FALSE:
+            return False
+    return None
+
+
+def load_poller_overrides(path: Path | None) -> dict[str, dict]:
+    """Parse ``pollers-overrides.yaml`` → ``{poller_name: {field: value}}``.
+
+    Best-effort and fail-safe: a missing file is a no-op, a malformed
+    file logs one warning and applies nothing (the manifests keep
+    working), and unknown FIELDS inside an entry are dropped with a
+    warning so a typo can't smuggle arbitrary keys into PollerConfig.
+    Sync context (discovery runs before the event loop) → ``log.warning``,
+    same as the other discovery diagnostics.
+    """
+    if path is None or not path.is_file():
+        return {}
+    try:
+        import yaml
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — config parse must never abort discovery
+        log.warning("poller_overrides_invalid: %s — %s; ignoring file", path, exc)
+        return {}
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        log.warning(
+            "poller_overrides_invalid: %s — root must be a mapping of "
+            "poller name → overrides; ignoring file", path,
+        )
+        return {}
+    out: dict[str, dict] = {}
+    for name, entry in raw.items():
+        if not isinstance(entry, dict):
+            log.warning(
+                "poller_overrides_invalid_entry: %s — %r must map to a "
+                "dict of fields; skipping", path, name,
+            )
+            continue
+        kept = {}
+        for key, value in entry.items():
+            if key not in POLLER_OVERRIDE_KEYS:
+                log.warning(
+                    "poller_overrides_unknown_field: %s — %s.%s is not "
+                    "overridable (allowed: %s); dropping",
+                    path, name, key, ", ".join(sorted(POLLER_OVERRIDE_KEYS)),
+                )
+                continue
+            kept[str(key)] = value
+        if kept:
+            out[str(name)] = kept
+    return out
+
+
+def _apply_poller_overrides(
+    poller: "PollerConfig", overrides: dict, *, source: Path,
+) -> "PollerConfig":
+    """Return ``poller`` with validated operator overrides applied.
+
+    Field-level fail-safety: each invalid value warns and keeps the
+    manifest value rather than dropping the poller — an override typo
+    must degrade to shipped behavior, never to a dead poller. Cron is
+    validated here (lazy APScheduler import) because the scheduler's
+    invalid-cron preservation path (#419) protects RELOADS, not first
+    installs — an unvalidated bad override cron on a fresh start would
+    skip the poller entirely.
+    """
+    import dataclasses
+
+    updates: dict = {}
+    if "cron" in overrides:
+        cron = str(overrides["cron"]).strip()
+        try:
+            from apscheduler.triggers.cron import CronTrigger
+            CronTrigger.from_crontab(cron)
+            updates["cron"] = cron
+        except Exception as exc:  # noqa: BLE001 — keep manifest cron on any parse failure
+            log.warning(
+                "poller_overrides_invalid_cron: %s — %s.cron=%r (%s); "
+                "keeping manifest cron %r",
+                source, poller.name, cron, exc, poller.cron,
+            )
+    if "priority" in overrides:
+        raw_p = overrides["priority"]
+        norm = normalize_priority(raw_p, default=poller.priority)
+        if not (isinstance(raw_p, str) and raw_p.strip().lower() == norm):
+            log.warning(
+                "poller_overrides_invalid_priority: %s — %s.priority=%r "
+                "(expected low|normal|high); keeping %r",
+                source, poller.name, raw_p, norm,
+            )
+        updates["priority"] = norm
+    if "batch_size" in overrides:
+        try:
+            bs = int(overrides["batch_size"])
+            if bs >= 1:
+                updates["batch_size"] = bs
+            else:
+                raise ValueError(bs)
+        except (TypeError, ValueError):
+            log.warning(
+                "poller_overrides_invalid_batch_size: %s — %s.batch_size=%r; "
+                "keeping %d", source, poller.name,
+                overrides["batch_size"], poller.batch_size,
+            )
+    if "recover_failed_turns" in overrides:
+        parsed = _parse_override_bool(overrides["recover_failed_turns"])
+        if parsed is None:
+            log.warning(
+                "poller_overrides_invalid_recover_failed_turns: %s — "
+                "%s.recover_failed_turns=%r (expected a bool: "
+                "true/false/yes/no/1/0); keeping %r",
+                source, poller.name, overrides["recover_failed_turns"],
+                poller.recover_failed_turns,
+            )
+        else:
+            updates["recover_failed_turns"] = parsed
+    if "env" in overrides:
+        env_o = overrides["env"]
+        if isinstance(env_o, dict):
+            updates["env"] = {str(k): str(v) for k, v in env_o.items()}
+        else:
+            log.warning(
+                "poller_overrides_invalid_env: %s — %s.env must be a "
+                "mapping; keeping manifest env", source, poller.name,
+            )
+    if "pass_env" in overrides:
+        pe = overrides["pass_env"]
+        if isinstance(pe, list) and all(isinstance(x, str) for x in pe):
+            updates["pass_env"] = tuple(x.strip() for x in pe if x.strip())
+        else:
+            log.warning(
+                "poller_overrides_invalid_pass_env: %s — %s.pass_env must "
+                "be a list of strings; keeping manifest pass_env",
+                source, poller.name,
+            )
+    if not updates:
+        return poller
+    log.info(
+        "poller_overrides_applied: %s — %s: %s",
+        source, poller.name, ", ".join(sorted(updates)),
+    )
+    return dataclasses.replace(poller, **updates)
+
+
 def discover_pollers(
     skills_dir: Path,
     *,
     state_root: Path | None = None,
     invalid_manifests: list[tuple[Path, str]] | None = None,
+    overrides_path: Path | None = None,
 ) -> list[PollerConfig]:
     """Walk ``skills_dir/**/pollers.json`` and parse out poller configs.
 
@@ -723,6 +904,24 @@ def discover_pollers(
                     manifest_path=pollers_file,
                 ),
             )
+
+    # Operator overrides (``<home>/pollers-overrides.yaml``): applied
+    # AFTER manifest parse + duplicate-name dedupe so the override keys
+    # win over whatever the skill shipped. Unknown poller names warn —
+    # a renamed/uninstalled poller shouldn't silently orphan its tuning.
+    overrides = load_poller_overrides(overrides_path)
+    if overrides:
+        by_name = {p.name for p in pollers}
+        for name in sorted(set(overrides) - by_name):
+            log.warning(
+                "poller_overrides_unknown_poller: %s — %r has no installed "
+                "poller; overrides not applied", overrides_path, name,
+            )
+        pollers = [
+            _apply_poller_overrides(p, overrides[p.name], source=overrides_path)
+            if p.name in overrides else p
+            for p in pollers
+        ]
     return pollers
 
 
