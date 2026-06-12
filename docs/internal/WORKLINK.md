@@ -247,15 +247,37 @@ and is configured for `native_pr_creation`).
 
 ### Backend trust model
 
-The backend agent runs with full write access to its **worktree** and
-whatever its own CLI permissions grant. The executor constrains the
-blast radius: per-issue worktree (not the live checkout), explicit env
-allowlist (no ambient secrets beyond what the backend needs — the
-poller env-assembly discipline applies), branch push + PR (never push
-to main), and review-gated close. Prompt content originates from
-chainlink issues (operator/planner-authored), not arbitrary external
-text; the planner must not paste untrusted web/PR content verbatim into
-acceptance criteria.
+The executor always isolates **git state** by running each backend in a
+per-issue worktree, pushing only an issue/attempt branch, and requiring
+normal PR review before merge. It also uses an explicit environment
+allowlist, so backend subprocesses do not inherit arbitrary ambient
+secrets by default. Those are the durable safety rails.
+
+That is **not the same as filesystem sandboxing**. In the current agent
+container, the Codex CLI only works with `--sandbox danger-full-access`;
+the default bwrap sandbox fails before useful work starts. Therefore a
+Codex-backed Worklink run has full container filesystem access from the
+backend process. The worktree cwd limits where the backend is asked to
+work, but it does not prevent reads or writes elsewhere in `/workspace`
+or `/mimir-home` if the backend agent/tool chooses to do them. Treat
+worktree isolation as an audit/review boundary, not a security boundary.
+
+This is acceptable for **operator-invoked** slice-1 runs on bounded issues
+because the output still lands as a review PR and the executor observes
+diff/tests itself. It is not acceptable as a silent autonomous-dispatch
+boundary without a fresh risk decision. Before slice 3 turns on ready-queue
+polling or in-turn `worklink_run` dispatch for Codex, choose one of:
+
+1. make a real sandbox profile work in-container, scoped to the worktree
+   plus transcript/evidence roots;
+2. run backends in a sibling/containerized worker with only the intended
+   mounts; or
+3. explicitly accept unsandboxed autonomous backend runs as an operator
+   policy decision and document the added blast radius.
+
+Prompt content originates from chainlink issues (operator/planner-authored),
+not arbitrary external text; the planner must not paste untrusted web/PR
+content verbatim into acceptance criteria.
 
 ## 6. Mimir integrations
 
@@ -299,7 +321,9 @@ leaf issues with explicit acceptance criteria and review criteria.
   those to the backend, and the evidence gate only checks observed mechanics.
 - Configure backend quirks in `<home>/worklink.yaml`. In the current production
   container Codex requires `--sandbox danger-full-access`; the default bwrap
-  sandbox can fail before any code runs.
+  sandbox can fail before any code runs. That means the backend is **not
+  filesystem sandboxed**; see §5's trust model before using Worklink on
+  sensitive issues or enabling slice-3 autonomous dispatch.
 
 Minimal current config shape:
 
@@ -468,6 +492,7 @@ tool_pins:
 |---|---|
 | Chainlink locks not atomic cross-process | Slice 0 probe; O_EXCL fallback; upstream issue |
 | Backend session brittleness | Start operator-invoked (slice 1); autonomy only after dry-run |
+| Unsandboxed backend filesystem access | Current Codex route uses `--sandbox danger-full-access`; treat worktree isolation as audit/review only, and require a fresh sandbox/container/policy decision before slice-3 autonomous dispatch |
 | Evidence gaming by the backend agent | Orchestrator observes diff/tests itself; empty-diff demotion |
 | Worktree cost under concurrency | Worktrees are per-issue and short-lived; cap concurrent claims (default 2) |
 | Shared quota exhaustion | `quota_pool` + arbiter gating; operator runs bypass |
