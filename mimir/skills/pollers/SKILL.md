@@ -194,6 +194,8 @@ if __name__ == "__main__":
 
 After creating or updating `pollers.json`, call the `reload_pollers` tool. This re-scans `<home>/skills/**/pollers.json` and registers any new pollers with the scheduler. Removed pollers (skill uninstalled, manifest deleted) get dropped on the same call.
 
+**Skill updates preserve operator tuning.** Optional poller skills are updated with `mimir skills update --apply`, but installed `pollers.json` is both a bundled manifest and a deployment-local tuning surface. The update path treats these per-poller keys as operator-owned and preserves them from the installed manifest when applying a new bundled manifest: `priority`, `batch_size`, `recover_failed_turns`, `env`, and `pass_env`. Drift detection also ignores differences limited to those keys, so an intentionally high-priority GitHub poller does not show up as stale forever. Source-owned fields such as `command`, `cron`, `env_required`, and script files still update normally. If you change preserved keys intentionally, call `reload_pollers` (or restart) afterward.
+
 ```
 reload_pollers()
 # → "reload_pollers ok: 2 poller(s) registered — github-activity, bluesky-mentions"

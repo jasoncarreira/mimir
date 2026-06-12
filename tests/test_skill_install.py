@@ -11,6 +11,7 @@ a non-zero exit cleanly), and the drift-detection logic
 from __future__ import annotations
 
 from argparse import ArgumentParser, Namespace
+import json
 from pathlib import Path
 
 import pytest
@@ -676,6 +677,32 @@ def test_drift_pycache_excluded(fake_optional_root: Path, fake_home: Path):
 
 
 
+def test_pollers_json_operator_tuning_does_not_count_as_drift(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """Deployment-local pollers.json tuning should not make optional skills look stale."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    installed_pollers = fake_home / "skills" / "fake-poller" / "pollers.json"
+    installed_pollers.write_text(
+        json.dumps({
+            "pollers": [{
+                "name": "fake",
+                "command": "true",
+                "cron": "*/5 * * * *",
+                "priority": "high",
+                "batch_size": 25,
+                "recover_failed_turns": True,
+                "env": {"LOCAL_ONLY": "1"},
+                "pass_env": ["GITHUB_TOKEN", "MIMIR_HOME"],
+            }]
+        })
+    )
+
+    r = detect_skill_drift(fake_home, fake_optional_root, name="fake-poller")[0]
+
+    assert r.is_clean, f"Expected operator-only tuning to be ignored; got: {r}"
+
+
 def test_accept_skill_drift_records_hashes_and_marks_accepted(
     fake_optional_root: Path, fake_home: Path,
 ):
@@ -1074,6 +1101,57 @@ def test_apply_copies_added_file(
     assert "helper.py" in updated
     assert failed == []
     assert (fake_home / "skills" / "fake-skill" / "helper.py").read_text() == "# new\n"
+
+
+def test_apply_pollers_json_preserves_operator_tuned_keys(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """--apply must not silently reset deployment-local poller tuning."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    installed_pollers = fake_home / "skills" / "fake-poller" / "pollers.json"
+    installed_pollers.write_text(json.dumps({
+        "pollers": [{
+            "name": "fake",
+            "command": "true",
+            "cron": "*/5 * * * *",
+            "priority": "high",
+            "batch_size": 25,
+            "recover_failed_turns": True,
+            "env": {"LOCAL_ONLY": "1"},
+            "pass_env": ["GITHUB_TOKEN", "MIMIR_HOME"],
+        }]
+    }))
+    # Upstream release changes a source-owned key. The update should apply that
+    # change while preserving operator-owned deployment tuning.
+    (fake_optional_root / "fake-poller" / "pollers.json").write_text(json.dumps({
+        "pollers": [{
+            "name": "fake",
+            "command": "python3 new_poller.py",
+            "cron": "*/5 * * * *",
+            "batch_size": 5,
+            "pass_env": ["GITHUB_TOKEN"],
+        }]
+    }))
+
+    r = detect_skill_drift(fake_home, fake_optional_root, name="fake-poller")[0]
+    assert r.differs == ["pollers.json"]
+
+    updated, failed, hint = apply_skill_update(r)
+
+    assert updated == ["pollers.json"]
+    assert failed == []
+    assert hint is not None
+    data = json.loads(installed_pollers.read_text())
+    poller = data["pollers"][0]
+    assert poller["command"] == "python3 new_poller.py"
+    assert poller["priority"] == "high"
+    assert poller["batch_size"] == 25
+    assert poller["recover_failed_turns"] is True
+    assert poller["env"] == {"LOCAL_ONLY": "1"}
+    assert poller["pass_env"] == ["GITHUB_TOKEN", "MIMIR_HOME"]
+    out = capsys.readouterr().out
+    assert "preserved operator-tuned pollers.json keys" in out
+    assert "fake.priority" in out
 
 
 def test_apply_skips_extra_without_force(

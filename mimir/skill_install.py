@@ -34,6 +34,7 @@ custom edits.
 
 from __future__ import annotations
 
+import copy
 import datetime
 import hashlib
 import json
@@ -796,6 +797,104 @@ _DRIFT_IGNORE: frozenset[str] = frozenset(
     {"__pycache__", ".pytest_cache", ".pre-update-backup"}
 )
 
+#: Fields inside each ``pollers.json`` poller entry that are deployment-local
+#: operator tuning rather than skill source code. Skill updates merge these
+#: fields from the installed manifest onto the updated bundled manifest so
+#: ``mimir skills update --apply`` cannot silently reset local priority / env
+#: policy. Drift detection also ignores differences limited to these fields.
+_POLLER_OPERATOR_TUNABLE_KEYS: frozenset[str] = frozenset(
+    {"priority", "batch_size", "recover_failed_turns", "env", "pass_env"}
+)
+
+
+def _normalized_pollers_manifest_bytes(path: Path) -> bytes | None:
+    """Canonical pollers.json bytes for drift comparison.
+
+    Returns ``None`` when the file is not parseable as the expected manifest
+    shape, in which case callers should fall back to raw bytes.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    normalized = copy.deepcopy(payload)
+    pollers = normalized.get("pollers")
+    if not isinstance(pollers, list):
+        return None
+    for poller in pollers:
+        if isinstance(poller, dict):
+            for key in _POLLER_OPERATOR_TUNABLE_KEYS:
+                poller.pop(key, None)
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _drift_hash_for_file(path: Path, rel: str) -> str:
+    """Return the content hash used by optional-skill drift detection."""
+    data: bytes | None = None
+    if rel == "pollers.json":
+        data = _normalized_pollers_manifest_bytes(path)
+    if data is None:
+        data = path.read_bytes()
+    return hashlib.sha256(data).hexdigest()
+
+
+def _merge_operator_tuned_pollers_json(
+    src_file: Path, dst_file: Path,
+) -> tuple[str | None, list[str]]:
+    """Return source pollers.json with installed operator-tunable keys overlaid.
+
+    The merge is keyed by poller ``name``. Entries without names fall back to
+    same-list-index matching. Returns ``(None, [])`` when either manifest cannot
+    be parsed as a poller manifest, signaling callers to use a normal copy.
+    """
+    try:
+        source_payload = json.loads(src_file.read_text(encoding="utf-8"))
+        installed_payload = json.loads(dst_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None, []
+    if not isinstance(source_payload, dict) or not isinstance(installed_payload, dict):
+        return None, []
+    source_pollers = source_payload.get("pollers")
+    installed_pollers = installed_payload.get("pollers")
+    if not isinstance(source_pollers, list) or not isinstance(installed_pollers, list):
+        return None, []
+
+    merged = copy.deepcopy(source_payload)
+    merged_pollers = merged.get("pollers")
+    if not isinstance(merged_pollers, list):
+        return None, []
+
+    installed_by_name = {
+        p.get("name"): p
+        for p in installed_pollers
+        if isinstance(p, dict) and isinstance(p.get("name"), str)
+    }
+    preserved: list[str] = []
+    for idx, poller in enumerate(merged_pollers):
+        if not isinstance(poller, dict):
+            continue
+        installed = None
+        name = poller.get("name")
+        if isinstance(name, str):
+            installed = installed_by_name.get(name)
+        if (
+            installed is None
+            and idx < len(installed_pollers)
+            and isinstance(installed_pollers[idx], dict)
+        ):
+            installed = installed_pollers[idx]
+        if not isinstance(installed, dict):
+            continue
+        display = name if isinstance(name, str) else f"#{idx}"
+        for key in sorted(_POLLER_OPERATOR_TUNABLE_KEYS):
+            if key in installed:
+                poller[key] = copy.deepcopy(installed[key])
+                preserved.append(f"{display}.{key}")
+
+    return json.dumps(merged, indent=2, sort_keys=False) + "\n", preserved
+
 
 def _file_hashes(root: Path) -> dict[str, str]:
     """Return ``relative-path-str → sha256-hex`` for every file under
@@ -811,7 +910,7 @@ def _file_hashes(root: Path) -> dict[str, str]:
         # Drop any path that passes through an ignored directory.
         if any(part in _DRIFT_IGNORE for part in rel.parts):
             continue
-        hashes[str(rel)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        hashes[str(rel)] = _drift_hash_for_file(path, str(rel))
     return hashes
 
 
@@ -1336,7 +1435,19 @@ def apply_skill_update(
 
         try:
             dst_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_file, dst_file)
+            if rel == "pollers.json" and dst_file.is_file():
+                merged_text, preserved = _merge_operator_tuned_pollers_json(src_file, dst_file)
+                if merged_text is not None:
+                    dst_file.write_text(merged_text, encoding="utf-8")
+                    if preserved:
+                        print(
+                            f"  {result.name}: preserved operator-tuned pollers.json "
+                            f"keys: {', '.join(preserved)}"
+                        )
+                else:
+                    shutil.copy2(src_file, dst_file)
+            else:
+                shutil.copy2(src_file, dst_file)
             updated.append(rel)
         except (OSError, IOError) as exc:
             print(f"  error: failed to copy {rel}: {exc}")
