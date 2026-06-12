@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -14,6 +15,7 @@ from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
     WorklinkRunner,
+    render_decomposition_prompt,
     validate_leaf,
 )
 
@@ -53,7 +55,7 @@ def cp(
 ISSUE_JSON = '''{
   "id": 441,
   "title": "worklink slice",
-  "description": "Acceptance criteria:\\n- [ ] do it\\n\\nReview criteria: reviewer checks it",
+  "description": "Acceptance criteria:\\n- [ ] do it\\n- [ ] echo ok\\n\\nReview criteria:\\n- reviewer checks it\\n\\nWorklink notes:\\n- Scope: test fixture\\n- Out of scope: unrelated work\\n- Suggested test command: echo ok",
   "labels": ["worklink"],
   "parent_id": 380,
   "comments": []
@@ -318,3 +320,109 @@ def test_worklink_runner_dirty_after_commit_fails_before_push(tmp_path: Path) ->
         for call in calls
     )
     assert ["chainlink", "issue", "label", "441", "worklink:ready"] in calls
+
+STRICT_ISSUE_JSON = '''{
+  "id": 443,
+  "title": "strict worklink leaf",
+  "description": "Acceptance criteria:\\n- [ ] implement it\\n- [ ] uv run pytest -q tests/test_worklink_orchestrator.py\\n\\nReview criteria:\\n- reviewer verifies scope\\n\\nWorklink notes:\\n- Scope: mimir/worklink\\n- Out of scope: docs-only cleanup\\n- Suggested test command: uv run pytest -q tests/test_worklink_orchestrator.py",
+  "labels": ["worklink", "worklink:ready"],
+  "parent_id": 380,
+  "comments": []
+}'''
+
+
+def test_validate_leaf_requires_worklink_notes_template_for_new_issues() -> None:
+    issue = IssueContext(
+        443,
+        "new loose leaf",
+        "Acceptance criteria:\n- [ ] do it\n\nReview criteria: reviewer checks it",
+        {"worklink"},
+    )
+
+    with pytest.raises(LeafValidationError, match="Worklink notes"):
+        validate_leaf(issue)
+
+
+def test_validate_leaf_warns_for_legacy_leaves_without_orphaning_them() -> None:
+    issue = IssueContext(
+        445,
+        "legacy queued leaf",
+        "Acceptance criteria:\n- [ ] do it\n\nReview criteria: reviewer checks it",
+        {"worklink"},
+        created_at=datetime(2026, 6, 11, tzinfo=UTC),
+    )
+
+    with pytest.warns(RuntimeWarning, match="legacy pre-contract leaf"):
+        validate_leaf(issue)
+
+
+def test_planner_prompt_renders_single_leaf_template_constant() -> None:
+    from mimir.prompt_templates import bundled_defaults
+    from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
+
+    root = Path(__file__).parent.parent
+    prompt_path = root / "mimir" / "prompt_templates" / "decompose.md"
+    prompt = prompt_path.read_text(encoding="utf-8")
+    rendered = render_decomposition_prompt(
+        template_path=prompt_path,
+        parent_id=380,
+        title="parent",
+        labels="worklink",
+        priority="normal",
+        description="parent body",
+    )
+
+    assert "{leaf_template}" in prompt
+    assert LEAF_TEMPLATE_MARKDOWN not in prompt
+    assert LEAF_TEMPLATE_MARKDOWN in rendered
+    assert LEAF_TEMPLATE_MARKDOWN in bundled_defaults()["decompose.md"]
+    assert "{leaf_template}" not in bundled_defaults()["decompose.md"]
+
+
+def test_skill_embeds_single_leaf_template_constant() -> None:
+    from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
+
+    root = Path(__file__).parent.parent
+    skill = (root / "mimir" / "skills" / "chainlink-orchestrator" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert LEAF_TEMPLATE_MARKDOWN in skill
+
+
+def test_worklink_uses_planner_suggested_test_command_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[Sequence[str] | str] = []
+
+    def runner(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "443"]:
+            return cp(args, stdout=STRICT_ISSUE_JSON)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(tmp_path / "repo"), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        return cp(args)
+
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(
+            home=tmp_path, repo=tmp_path / "repo", runner=runner, registry=registry
+        ).run(443, backend_name="fake", dry_run=True)
+    )
+
+    out = capsys.readouterr().out
+    assert result.dry_run is True
+    assert "uv run pytest -q tests/test_worklink_orchestrator.py" in out
+
+
+def test_decompose_prompt_teaches_chainlink_block_argument_order() -> None:
+    prompt = (Path(__file__).parent.parent / "mimir" / "prompt_templates" / "decompose.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "chainlink issue block <ID-that-is-blocked> <BLOCKER>" in prompt
+    assert "blocked issue id comes first" in prompt
+    assert "chainlink issue block <blocker> <blocked>" not in prompt

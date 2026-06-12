@@ -38,6 +38,7 @@ CRITICAL_RUNTIME_DATA = (
     "mimir/prompt_templates/commitments-review.md",
     "mimir/prompt_templates/upgrade.md",  # version-triggered defaults reconciliation
     "mimir/prompt_templates/worklink-order.md",  # Worklink operator-run prompt
+    "mimir/prompt_templates/decompose.md",  # Worklink planner/decomposer prompt
     "mimir/memory_templates/core/00-identity.md",  # setup core-memory defaults
     "mimir/memory_templates/core/05-non-goals.md",
     "mimir/memory_templates/core/06-action-boundaries.md",
@@ -49,6 +50,7 @@ CRITICAL_RUNTIME_DATA = (
     "mimir/skills/tmux/scripts/find-sessions.sh",  # tmux skill support scripts
     "mimir/skills/tmux/scripts/wait-for-text.sh",
     "mimir/skills/chainlink/dockerfile.fragment",  # chainlink scaffold fragment
+    "mimir/skills/chainlink-orchestrator/SKILL.md",  # Worklink planner skill
 )
 
 
