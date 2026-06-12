@@ -108,7 +108,27 @@ mimir/worklink/
     base.py         # ToolBackend protocol, Caps, WorkOrder, RawResult
     codex.py        # first adapter
     claude_cli.py   # second adapter (mechanical addition)
+  compute/          # ComputeBackend launchers — WHERE work runs (planned, #454)
+    base.py         # ComputeBackend protocol, WorkSpec, LaunchHandle
+    local.py        # local-subprocess (today's behavior; accept-the-risk fallback)
+    docker.py       # docker-sibling via broker
+    ecs.py          # ecs-runtask (AWS)
 ```
+
+**Packaging (decided 2026-06-12).** The executor above (`mimir/worklink/`) and
+the `mimir worklink run` CLI stay in **core** — it is the security-critical,
+integration-coupled engine (it imports `event_logger`; slice-3 dispatch consults
+`HomeostaticArbiter.should_fire()`), and the safety claim that *state transitions
+never depend on a model following instructions* is strongest with claim/evidence/
+transition as core Python behind a hard CLI/tool boundary. The two model-touching
+surfaces ship as **one opt-in skill** (`chainlink-orchestrator`): the planner
+(slice 2) and the ready-queue poller (slice 3). The skill's poller **invokes
+`mimir worklink run` as a subprocess and never reimplements the state machine**;
+SKILL.md tells the agent to dispatch via the CLI/tool, not to hand-run claim/
+evidence/transition. This buys opt-in per-home enablement (mimirbot yes, muninn
+no) and an auto-registering poller via `skill_install.py` without model-mediating
+the deterministic core. The slice-3 `worklink_run` *tool* stays core regardless
+(tools have no skill-contributed mechanism).
 
 Entry points:
 
@@ -245,6 +265,72 @@ a per-category default. The executor consults `Caps` rather than
 assuming (e.g. it opens the PR itself unless the backend both declares
 and is configured for `native_pr_creation`).
 
+### Execution substrate (the orthogonal `ComputeBackend` axis)
+
+`ToolBackend` answers **what** builds (codex / claude / cursor). A second,
+orthogonal axis answers **where** it runs: `ComputeBackend` ∈
+{`local-subprocess`, `docker-sibling`, `ecs-runtask`, `k8s-job`}. This is the
+portable, design-level home of the "containerized worker" idea, generalized so
+the same Worklink runs on OrbStack today and AWS ECS/Fargate later. Full
+design: chainlink #454.
+
+Four facts shape it:
+
+- **"Spawn a container" is not a portable primitive.** The Docker family
+  (OrbStack, Docker Desktop, plain Docker, ECS-on-EC2) exposes a daemon socket;
+  ECS Fargate and Kubernetes do not — they have job APIs (`RunTask`, k8s `Job`).
+  A socket implementation covers the Docker family but is impossible on Fargate.
+  (The seccomp/userns profile below likewise does not port to Fargate.) So the
+  abstraction is required, not `docker run` baked into the orchestrator.
+- **Git handoff is the portable common denominator.** The orchestrator today
+  assumes a *local* worktree it creates, a *local* backend subprocess, and
+  *local* `git diff`/test observation — a remote worker breaks all three.
+  Instead of shipping a worktree, ship a git ref: the `WorkSpec` carries
+  `{repo_url, base_ref, branch, prompt, test_command, creds_ref, …}`; the worker
+  clones, checks out, runs the backend, runs tests, **pushes the branch**, and
+  emits `evidence.json`. Bind-mounting a worktree is a Docker-only optimization
+  (and the sibling-mount footgun: `-v /path` resolves on the *daemon* host, not
+  the parent container's namespace).
+- **Observe-don't-trust survives.** The orchestrator can no longer diff a local
+  worktree, so it **fetches the pushed branch and re-derives** diff/tests from
+  `base..head` itself. The worker's `evidence.json` is a hint; the orchestrator's
+  re-derivation from the immutable pushed commit is the gate. Empty-diff demotion
+  and tests-exit-0 carry over unchanged. The worker payload
+  (clone→checkout→backend→tests→push→evidence) is identical across substrates;
+  only the launcher differs (Docker reuses the agent image, AWS publishes to ECR).
+- **The Docker socket is root-equivalent** on the host VM, so the `docker-sibling`
+  launcher is a **broker**: a tiny service *outside* the agent container owns the
+  socket and accepts only one narrow request ("run worklink job N on branch B"),
+  building the spec itself (worktree-only, no extra caps). On ECS the equivalent
+  is a scoped IAM task role permitted to `RunTask` only the worklink task def.
+
+```python
+@dataclass(frozen=True)
+class WorkSpec:
+    issue_id: int; attempt: int
+    repo_url: str; base_ref: str; branch: str   # git handoff, not a local path
+    prompt: str; rules: str | None
+    test_command: str; backend: str; timeout_s: int
+    creds_ref: dict[str, str]                    # substrate-resolved, value-blind
+    env: dict[str, str]                          # explicit allowlist
+
+class ComputeBackend(Protocol):
+    name: str
+    def capabilities(self) -> ComputeCaps: ...
+    async def launch(self, spec: WorkSpec) -> LaunchHandle: ...
+    async def wait(self, h: LaunchHandle, timeout_s: int) -> ComputeResult: ...
+    async def cancel(self, h: LaunchHandle) -> None: ...
+    async def cleanup(self, h: LaunchHandle) -> None: ...
+```
+
+**Operator decision (2026-06-12):** `local-subprocess` (today's behavior — the
+backend runs as a local subprocess with full container filesystem access)
+remains available as an explicit **accept-the-risk fallback**. The isolated
+worker (`docker-sibling` / `ecs-runtask`) is the recommended path for
+unsandboxed or autonomous use; operators may opt back into `local-subprocess`
+and accept the documented blast radius. Not the default — the safe path is easy,
+the risky path stays possible.
+
 ### Backend trust model
 
 The executor always isolates **git state** by running each backend in a
@@ -266,14 +352,20 @@ This is acceptable for **operator-invoked** slice-1 runs on bounded issues
 because the output still lands as a review PR and the executor observes
 diff/tests itself. It is not acceptable as a silent autonomous-dispatch
 boundary without a fresh risk decision. Before slice 3 turns on ready-queue
-polling or in-turn `worklink_run` dispatch for Codex, choose one of:
+polling or in-turn `worklink_run` dispatch for Codex, pick an isolation
+posture — the options are now concrete (chainlink #452 / #454):
 
-1. make a real sandbox profile work in-container, scoped to the worktree
-   plus transcript/evidence roots;
-2. run backends in a sibling/containerized worker with only the intended
-   mounts; or
-3. explicitly accept unsandboxed autonomous backend runs as an operator
-   policy decision and document the added blast radius.
+1. **In-container sandbox (verified).** A one-line seccomp profile permitting
+   user namespaces (`docs/internal/seccomp-userns.json`) lets Codex's own bwrap
+   `--sandbox workspace-write` confine writes to the worktree and deny network —
+   verified model-free on the agent image (#452). Trade-off: userns widens the
+   container's kernel attack surface. Does **not** port to ECS Fargate.
+2. **Out-of-container worker** via the `ComputeBackend` axis above
+   (`docker-sibling` through a broker, or `ecs-runtask`) — chainlink #454. The
+   portable path; the only isolation that survives a move to AWS.
+3. **Accept-the-risk** `local-subprocess` (today's behavior) as an explicit,
+   documented operator policy decision — recorded 2026-06-12 as a permitted
+   fallback, not the default.
 
 Prompt content originates from chainlink issues (operator/planner-authored),
 not arbitrary external text; the planner must not paste untrusted web/PR
@@ -436,6 +528,7 @@ Current slice-1 recovery is manual:
 ```yaml
 defaults:
   backend: codex
+  compute: local-subprocess # WHERE the backend runs: local-subprocess | docker-sibling | ecs-runtask
   timeout_s: 1800
   priority: normal          # arbiter priority for autonomous dispatch
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
@@ -446,12 +539,22 @@ routes:                     # first match wins
   - repo: "jasoncarreira/mimir"
     backend: codex
 
-backends:
+backends:                   # ToolBackend adapters — WHAT builds
   codex:
     bin: codex
     args: ["exec", "--json"]
   claude_cli:
     bin: claude
+
+compute_backends:           # ComputeBackend launchers — WHERE it runs (#454)
+  local-subprocess: {}      # today's behavior; accept-the-risk fallback
+  docker-sibling:
+    broker_url: "unix:///run/worklink-broker.sock"   # broker owns the docker socket, not the agent
+    image: mimirbot-mimirbot
+  ecs-runtask:
+    cluster: worklink
+    task_definition: worklink-worker
+    subnets: ["subnet-…"]
 
 tool_pins:
   - name: codex
@@ -480,7 +583,10 @@ tool_pins:
 3. **Slice 2 — planner.** `prompts/decompose.md` +
    `chainlink-orchestrator` skill + executor template-refusal test.
 4. **Slice 3 — autonomy.** Ready-queue poller, multi-claim concurrency,
-   TTL reaper, arbiter gating, `worklink_run` tool.
+   TTL reaper, arbiter gating, `worklink_run` tool. Gated on an isolation
+   posture (see the trust model) — the `ComputeBackend` axis (#454) and/or the
+   verified in-container seccomp profile (#452). Autonomous `local-subprocess`
+   requires the explicit accept-the-risk opt-in.
 5. **Slice 4 — second adapter.** `claude_cli`, proving mechanical
    addition.
 6. **Slice 5 — tool pins.** Inventory + drift poller + bump-issue
@@ -492,7 +598,7 @@ tool_pins:
 |---|---|
 | Chainlink locks not atomic cross-process | Slice 0 probe; O_EXCL fallback; upstream issue |
 | Backend session brittleness | Start operator-invoked (slice 1); autonomy only after dry-run |
-| Unsandboxed backend filesystem access | Current Codex route uses `--sandbox danger-full-access`; treat worktree isolation as audit/review only, and require a fresh sandbox/container/policy decision before slice-3 autonomous dispatch |
+| Unsandboxed backend filesystem access | Verified in-container seccomp/userns profile confines bwrap `workspace-write` (#452, `docs/internal/seccomp-userns.json`), or out-of-container `ComputeBackend` isolation (#454); `local-subprocess` (today's `--sandbox danger-full-access`) is the explicit accept-the-risk fallback, gated before slice-3 autonomous dispatch |
 | Evidence gaming by the backend agent | Orchestrator observes diff/tests itself; empty-diff demotion |
 | Worktree cost under concurrency | Worktrees are per-issue and short-lived; cap concurrent claims (default 2) |
 | Shared quota exhaustion | `quota_pool` + arbiter gating; operator runs bypass |
