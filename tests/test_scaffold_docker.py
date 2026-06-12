@@ -302,12 +302,27 @@ def test_render_dockerfile_empty_fragments():
 
 def test_render_dockerfile_has_base_layer():
     """Sanity: regardless of fragments, the base image + tooling are
-    present (git, gh, uv, pinned claude-code, pinned mermaid)."""
+    present (git, gh, uv, pinned mermaid). Claude Code is optional."""
     out = render_dockerfile([])
     assert "FROM python:3.11-slim" in out
-    assert "@anthropic-ai/claude-code@2.1.168" in out
     assert "@mermaid-js/mermaid-cli@11.15.0" in out
     assert "astral.sh/uv/install.sh" in out
+
+
+def test_render_dockerfile_gates_claude_code_cli_on_build_arg():
+    """The Claude Code npm CLI should not ride along in every image.
+
+    It is only needed when the legacy subprocess provider is enabled, so
+    generated Dockerfiles install it under the same MIMIR_ENABLE_CLAUDE_CODE
+    gate as the Python provider. Mermaid remains unconditional.
+    """
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode)
+        assert "RUN npm install -g @mermaid-js/mermaid-cli@11.15.0" in out, mode
+        assert "RUN npm install -g @anthropic-ai/claude-code" not in out, mode
+        assert 'if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \\' in out, mode
+        assert "npm install -g @anthropic-ai/claude-code@2.1.168" in out, mode
+        assert "@anthropic-ai/claude-code@2.1.168 @mermaid-js/mermaid-cli" not in out, mode
 
 
 # ── codex CLI install (chainlink #293) ─────────────────────────────
