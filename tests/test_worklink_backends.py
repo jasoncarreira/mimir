@@ -83,7 +83,14 @@ async def test_codex_backend_maps_quota_and_auth_errors(monkeypatch: pytest.Monk
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
 
     result = await CodexBackend().run(
-        WorkOrder(issue_id=440, worktree=tmp_path, prompt="x", rules=None, timeout_s=30)
+        WorkOrder(
+            issue_id=440,
+            worktree=tmp_path,
+            prompt="x",
+            rules=None,
+            timeout_s=30,
+            transcript_root=tmp_path / "transcripts",
+        )
     )
 
     assert result.exit_code == 1
@@ -112,7 +119,14 @@ async def test_codex_backend_enforces_timeout(monkeypatch: pytest.MonkeyPatch, t
     monkeypatch.setattr(codex_module, "_kill_process_group", fake_kill_process_group)
 
     result = await CodexBackend().run(
-        WorkOrder(issue_id=440, worktree=tmp_path, prompt="x", rules=None, timeout_s=1)
+        WorkOrder(
+            issue_id=440,
+            worktree=tmp_path,
+            prompt="x",
+            rules=None,
+            timeout_s=1,
+            transcript_root=tmp_path / "transcripts",
+        )
     )
 
     assert killed == [process]
