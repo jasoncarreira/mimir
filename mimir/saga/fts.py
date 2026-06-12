@@ -34,6 +34,8 @@ from __future__ import annotations
 import re
 import sqlite3
 
+from ._like import escape_like_pattern
+
 
 # Same stopword list saga uses — empirically tuned for English
 # conversational text. Don't grow this without bench evidence; over-
@@ -220,13 +222,15 @@ def _fts_fallback(
     if not terms:
         return []
 
-    like_clauses = " AND ".join(["LOWER(a.content) LIKE ?"] * len(terms))
+    like_clauses = " AND ".join(
+        ["LOWER(a.content) LIKE ? ESCAPE '\\'"] * len(terms)
+    )
     where = [like_clauses, "a.tombstoned = 0", "a.agent_id = ?"]
     if memory_type:
         where.append("a.memory_type = ?")
     where_sql = " AND ".join(where)
 
-    params: list = [f"%{t}%" for t in terms] + [agent_id]
+    params: list = [f"%{escape_like_pattern(t)}%" for t in terms] + [agent_id]
     if memory_type:
         params.append(memory_type)
     params.append(top_k)

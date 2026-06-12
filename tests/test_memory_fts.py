@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.saga.fts import fts5_query, fts_search
+from mimir.saga.fts import _fts_fallback, fts5_query, fts_search
 
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"
@@ -200,3 +200,36 @@ def test_fts_search_respects_top_k(conn):
         _insert_atom(conn, f"a{i}", f"Alice mentions concise topic {i}")
     results = fts_search(conn, "alice concise", top_k=3)
     assert len(results) <= 3
+
+
+def test_fts_fallback_escapes_like_percent(conn):
+    _insert_atom(conn, "literal", "Alice saved budget marker 100%")
+    _insert_atom(conn, "wildcard", "Alice saved budget marker 100x")
+
+    results = _fts_fallback(
+        conn, "100%", top_k=10, memory_type=None, agent_id="default"
+    )
+
+    assert [aid for aid, _ in results] == ["literal"]
+
+
+def test_fts_fallback_escapes_like_underscore(conn):
+    _insert_atom(conn, "literal", "Alice uses code abc_def")
+    _insert_atom(conn, "wildcard", "Alice uses code abcXdef")
+
+    results = _fts_fallback(
+        conn, "abc_def", top_k=10, memory_type=None, agent_id="default"
+    )
+
+    assert [aid for aid, _ in results] == ["literal"]
+
+
+def test_fts_fallback_percent_only_term_does_not_match_everything(conn):
+    _insert_atom(conn, "plain", "Alice prefers concise replies")
+    _insert_atom(conn, "literal", "Alice wrote three percent signs %%%")
+
+    results = _fts_fallback(
+        conn, "%%%", top_k=10, memory_type=None, agent_id="default"
+    )
+
+    assert [aid for aid, _ in results] == ["literal"]
