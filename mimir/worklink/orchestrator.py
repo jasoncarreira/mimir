@@ -169,6 +169,9 @@ class WorklinkRunner:
             agent_id=self.agent_id,
             runner=_list_runner(runner),
         )
+        # Re-read immediately before claiming so retries in a long-lived caller do
+        # not use stale comments and collide with prior attempt-scoped branches.
+        issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
         claim = claims.claim_issue(issue.issue_id, issue.comments)
         if claim.attempts_exhausted:
             _log_event("worklink_attempts_exhausted", issue_id=issue.issue_id)
@@ -489,7 +492,7 @@ def _comment_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, Mapping):
-        for key in ("body", "text", "comment"):
+        for key in ("content", "body", "text", "comment"):
             if key in value:
                 return str(value[key])
     return ""

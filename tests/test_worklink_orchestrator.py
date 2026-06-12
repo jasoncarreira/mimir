@@ -156,6 +156,66 @@ def _orchestrator_runner(
 
     return calls, runner
 
+
+def test_worklink_rereads_issue_comments_before_claiming(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-2"
+    calls: list[Sequence[str] | str] = []
+
+    issue_with_prior_claim = ISSUE_JSON.replace(
+        '"comments": []',
+        '"comments": [{"content": "WORKLINK_CLAIM {\\"agent_id\\": \\"mimir-worklink\\", \\"attempt\\": 1, \\"claimed_at\\": \\"2026-06-12T12:04:29+00:00\\", \\"heartbeat_at\\": null, \\"issue_id\\": 441}"}]',
+    )
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        show_count = sum(
+            1
+            for call in calls
+            if isinstance(call, list) and call[:4] == ["chainlink", "issue", "show", "441"]
+        )
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            return cp(args, stdout=ISSUE_JSON if show_count == 1 else issue_with_prior_claim)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
+            worktree.mkdir(parents=True)
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"]:
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "status"]:
+            return cp(args)
+        if args == "echo ok":
+            return cp(args, stdout="ok\n")
+        return cp(args)
+
+    backend = FakeBackend(status="success", write_change=False)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.attempt == 2
+    assert result.branch == "issue/441-a2"
+    assert [
+        "git",
+        "-C",
+        str(repo),
+        "worktree",
+        "add",
+        "-b",
+        "issue/441-a2",
+        str(worktree),
+        "main",
+    ] in calls
+
+
 def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"

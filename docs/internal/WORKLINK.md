@@ -5,8 +5,10 @@ decomposition and execution. Chainlink is the coordination surface and
 source of truth; mimir plans; pluggable coding/maintenance CLIs build;
 deterministic machinery connects them.
 
-Status: SPEC (pre-implementation). Owner issue: chainlink #380; leaf
-issues are subissues of #380.
+Status: Slice 1 vertical implemented: manual `mimir worklink run` can claim a
+ready leaf, spawn Codex, observe evidence, push a branch, and open a review PR.
+Later slices still need planner/poller/tool autonomy and additional backends.
+Owner issue: chainlink #380; leaf issues are subissues of #380.
 
 ## 1. Roles
 
@@ -278,7 +280,134 @@ acceptance criteria.
   command is the evidence). Version-drift checks are a tool-class
   concern, not a coding-CLI special case.
 
-## 7. Configuration (`<home>/worklink.yaml`)
+## 7. Operator runbook
+
+Slice 1 is intentionally operator-invoked. The executor is deterministic
+plumbing around an external coding CLI; use it for small, well-scoped ready
+leaf issues with explicit acceptance criteria and review criteria.
+
+### Prerequisites
+
+- Run from the target git repository (`/workspace/mimir` for mimir source
+  work) and point `--home` at the agent home that owns Chainlink and Worklink
+  state (`/mimir-home` in production).
+- The Chainlink tracker must have an agent identity for the executor. If lock
+  claims fail with a missing-agent/identity error, initialize it once from the
+  Chainlink repo: `cd /mimir-home && chainlink agent init mimir-worklink`.
+- The issue should be an unblocked leaf, not a vague parent. Worklink expects
+  concrete acceptance criteria plus review criteria; the prompt renderer passes
+  those to the backend, and the evidence gate only checks observed mechanics.
+- Configure backend quirks in `<home>/worklink.yaml`. In the current production
+  container Codex requires `--sandbox danger-full-access`; the default bwrap
+  sandbox can fail before any code runs.
+
+Minimal current config shape:
+
+```yaml
+defaults:
+  backend: codex
+  timeout_s: 1800
+  priority: normal
+  test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
+
+backends:
+  codex:
+    bin: codex
+    args: ["exec", "--json", "--sandbox", "danger-full-access"]
+```
+
+### Dry run
+
+Before a first real run on a new issue shape, render the work order without
+claiming or spawning the backend:
+
+```bash
+cd /workspace/mimir
+uv run mimir worklink run <issue-id> --home /mimir-home --dry-run
+```
+
+A dry run is a prompt/config validation step only. It does not create a claim,
+worktree, evidence bundle, branch, or PR.
+
+### Real run
+
+```bash
+cd /workspace/mimir
+uv run mimir worklink run <issue-id> \
+  --home /mimir-home \
+  --test-command 'env -u MIMIR_MODEL_SPEC uv run pytest -q <focused-tests> --tb=short'
+```
+
+Expected success output is shaped like:
+
+```text
+worklink #433 attempt 1: completed review-ready PR https://github.com/.../pull/645
+evidence: /mimir-home/state/worklink/evidence/433-1.json
+```
+
+On success Worklink should leave the Chainlink issue labeled
+`worklink:review`, write an evidence bundle under
+`<home>/state/worklink/evidence/`, write a backend transcript under
+`<home>/state/worklink/transcripts/`, push `issue/<id>-a<attempt>`, and open a
+GitHub PR. The normal review/merge path still applies; Worklink does not make
+its own PR trustworthy.
+
+### Evidence inspection
+
+Evidence is executor-observed, not backend self-report. Inspect it directly:
+
+```bash
+jq . /mimir-home/state/worklink/evidence/<issue>-<attempt>.json
+```
+
+The load-bearing fields are:
+
+- `status`: `completed`, `failed`, or `blocked`.
+- `files_changed` and `diff_stat`: collected with git by the executor.
+- `commands`: observed command summaries, including diff/status checks.
+- `tests`: the exact test command, exit code, and captured summary.
+- `transcript`: path to the backend JSON transcript outside the worktree.
+- `pr_url`: review PR if the evidence gate passed.
+
+Do not treat a backend's prose as evidence when these fields disagree. Empty
+diff with a nominal backend success is demoted to failure.
+
+### Recovery and cleanup
+
+Current slice-1 recovery is manual:
+
+- **Backend/sandbox failure before useful diff:** read the transcript path in
+  the evidence bundle or `<home>/state/worklink/transcripts/`, adjust
+  `<home>/worklink.yaml`, and rerun only if the Chainlink comments/attempt
+  state indicate the next attempt will use a fresh attempt number.
+- **Claim lock left behind:** inspect with `cd /mimir-home && chainlink locks
+  check <issue-id>` and release the executor's own known-stale lock with
+  `chainlink locks release <issue-id>`. Use `locks steal` only after independent
+  TTL/heartbeat evidence; Chainlink can report a fresh lock as stale when no
+  heartbeat has been written yet.
+- **Retained failed worktree/branch:** failed or blocked attempts are retained
+  for autopsy under `.worklink/<issue>-<attempt>` with branch
+  `issue/<issue>-a<attempt>`. Remove them only after evidence has been copied
+  or is no longer needed. Successful attempts are cleaned up automatically.
+- **Attempt/branch collision:** if reruns reuse `attempt=1` and collide with
+  `issue/<id>-a1`, do not keep retrying. The current parser likely missed prior
+  structured claim comments; file/fix the parser gap before trusting retries.
+- **Stale async wake-up:** shell completion logs can report an earlier failed
+  run after a later completed run. Compare Chainlink labels, the newest evidence
+  bundle, PR state, and current branch state before rerunning.
+
+### Closeout checklist for a Worklink leaf
+
+1. Chainlink target issue has a `WORKLINK_EVIDENCE` comment and
+   `worklink:review` label.
+2. Evidence JSON validates the changed files, diff stat, test command, and exit
+   code.
+3. GitHub PR is open, mergeable, and green.
+4. Normal review/merge has happened; only then close the original leaf issue.
+5. Any manual intervention or rail gap found during the run is captured either
+   in the slice postmortem or as a follow-up Chainlink issue.
+
+## 8. Configuration (`<home>/worklink.yaml`)
 
 ```yaml
 defaults:
@@ -315,7 +444,7 @@ tool_pins:
     smoke: "mmdc --version"
 ```
 
-## 8. Rollout slices (= the #380 subissues)
+## 9. Rollout slices (= the #380 subissues)
 
 1. **Slice 0 — lock probe.** Empirically verify `chainlink locks claim`
    atomicity across processes; decide claim mechanism; document in this
@@ -333,7 +462,7 @@ tool_pins:
 6. **Slice 5 — tool pins.** Inventory + drift poller + bump-issue
    filing.
 
-## 9. Risks
+## 10. Risks
 
 | Risk | Mitigation |
 |---|---|
