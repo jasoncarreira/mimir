@@ -35,9 +35,9 @@ FROM python:3.11-slim AS base
 #     mimir-agent extra (PyPI rejects direct git URLs), so it ships
 #     as an EXTRA build step that builds add explicitly (see the
 #     ``MIMIR_ENABLE_CLAUDE_CODE`` block below).
-#   - nodejs + npm + @anthropic-ai/claude-code@2.1.168: the Claude Code CLI
-#     binary, needed when the deployment routes through the
-#     subprocess provider (Max OAuth path).
+#   - nodejs + npm: Node runtime/tooling. The Claude Code CLI is installed
+#     only when ``MIMIR_ENABLE_CLAUDE_CODE=1`` (same gate as the Python
+#     subprocess provider below).
 #   - poppler-utils, tesseract-ocr, tesseract-ocr-eng: PDF-ingest
 #     toolchain used by mimir's reading-queue pipeline. Tesseract's
 #     control file declares ``Depends: tesseract-ocr-eng |
@@ -45,12 +45,15 @@ FROM python:3.11-slim AS base
 #     alone — orientation detection only). Pinning ``eng`` explicitly
 #     removes that ambiguity.
 ENV NODE_VERSION=20
+ARG MIMIR_ENABLE_CLAUDE_CODE=0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg git \
         poppler-utils tesseract-ocr tesseract-ocr-eng \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @anthropic-ai/claude-code@2.1.168 \
+    && if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \
+        npm install -g @anthropic-ai/claude-code@2.1.168 ; \
+    fi \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -100,7 +103,6 @@ RUN pip install --no-cache-dir --upgrade pip \
 # Optional: install the Claude Code subprocess provider. Set
 # ``--build-arg MIMIR_ENABLE_CLAUDE_CODE=1`` to enable. Pinned to a
 # specific fork SHA; bump when upstream patches merge (issue #268).
-ARG MIMIR_ENABLE_CLAUDE_CODE=0
 ARG LANGCHAIN_CLAUDE_CODE_REF=c723d702dfac1ff6e2b22b8bde661cb17a17b0de
 RUN if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \
         pip install --no-cache-dir \

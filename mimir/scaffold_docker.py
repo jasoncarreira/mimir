@@ -270,9 +270,9 @@ FROM python:3.11-slim
 # Base system tooling — same set mimirbot has been running with since
 # 2026-05: git for the source clone + agent dev loop, gh for PR
 # creation, build-essential for any C extensions, ca-certificates for
-# HTTPS clones, poppler-utils for Claude Code's PDF Read, Node 20
-# (claude-agent-sdk + mermaid-cli are pinned npm packages), jq for JSONL
-# log parsing across many skill bodies + the introspection recipes.
+# HTTPS clones, poppler-utils for PDF ingest, Node 20 (needed for
+# optional Claude Code CLI plus mermaid-cli), jq for JSONL log parsing
+# across many skill bodies + the introspection recipes.
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends \\
         git \\
@@ -292,9 +292,10 @@ RUN apt-get update \\
  && apt-get install -y --no-install-recommends gh nodejs \\
  && rm -rf /var/lib/apt/lists/*
 
-# Claude Code CLI (claude-agent-sdk shells out to this binary) +
-# pinned mermaid CLI (used by mermaid-diagrams skill).
-RUN npm install -g @anthropic-ai/claude-code@2.1.168 @mermaid-js/mermaid-cli@11.15.0
+# Pinned mermaid CLI (used by mermaid-diagrams skill).
+RUN npm install -g @mermaid-js/mermaid-cli@11.15.0
+
+__CLAUDE_CODE_INSTALL__
 
 __CODEX_INSTALL__
 
@@ -365,7 +366,7 @@ FROM python:3.11-slim
 # Base system tooling — git for any local commits the agent makes,
 # gh for PR / issue automation, build-essential for C extensions
 # pulled by deps, poppler-utils + jq because skill bodies use them,
-# Node 20 for claude-code + mermaid CLIs.
+# Node 20 for the optional claude-code CLI + mermaid CLI.
 #
 # git is also required when MIMIR_ENABLE_CLAUDE_CODE=1 below —
 # ``langchain-claude-code`` is a git-pinned fork (PyPI direct-URL
@@ -390,9 +391,10 @@ RUN apt-get update \\
  && apt-get install -y --no-install-recommends gh nodejs \\
  && rm -rf /var/lib/apt/lists/*
 
-# Claude Code CLI subprocess transport + mermaid CLI for the
-# mermaid-diagrams skill. Both ship via pinned npm package versions.
-RUN npm install -g @anthropic-ai/claude-code@2.1.168 @mermaid-js/mermaid-cli@11.15.0
+# Pinned mermaid CLI (used by mermaid-diagrams skill).
+RUN npm install -g @mermaid-js/mermaid-cli@11.15.0
+
+__CLAUDE_CODE_INSTALL__
 
 __CODEX_INSTALL__
 
@@ -451,7 +453,6 @@ RUN pip install --no-cache-dir --upgrade pip \\
 # ``MIMIR_ENABLE_CLAUDE_CODE=1`` at build to include. Bump
 # ``LANGCHAIN_CLAUDE_CODE_REF`` when upstream rolls (tracked at
 # mimir-repo issue #268).
-ARG MIMIR_ENABLE_CLAUDE_CODE=0
 ARG LANGCHAIN_CLAUDE_CODE_REF=c723d702dfac1ff6e2b22b8bde661cb17a17b0de
 RUN if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \\
         pip install --no-cache-dir \\
@@ -474,13 +475,31 @@ ENTRYPOINT ["/usr/local/bin/start.sh"]
 """
 
 
+def _claude_code_install_block() -> str:
+    """Dockerfile block installing the Claude Code CLI when enabled.
+
+    The npm CLI is needed only for the legacy Claude Code subprocess
+    provider. Gate it on the same build arg as the git-pinned
+    ``langchain-claude-code`` Python provider so Codex/OpenAI/Anthropic
+    API deployments don't carry an unused CLI binary.
+    """
+    return (
+        "# Claude Code CLI — optional subprocess-provider transport.\n"
+        "# Same gate as the langchain-claude-code Python provider below.\n"
+        "ARG MIMIR_ENABLE_CLAUDE_CODE=0\n"
+        "RUN if [ \"$MIMIR_ENABLE_CLAUDE_CODE\" = \"1\" ]; then \\\n"
+        "        npm install -g @anthropic-ai/claude-code@2.1.168 ; \\\n"
+        "    fi"
+    )
+
+
 def _codex_install_block(install_codex: bool) -> str:
     """Dockerfile line installing the codex CLI, or a placeholder comment.
 
     Installed for codex-subscription deployments (the ``codex-plus``
     extra) so ``spawn_codex`` can shell out to ``codex exec`` and Codex
     Plus auth (``~/.codex/auth.json``) is usable. Same npm-global pattern
-    as the bundled claude-code CLI.
+    as the optional claude-code CLI.
     """
     if not install_codex:
         return "# (codex CLI not installed — no codex-plus extra selected)"
@@ -529,6 +548,7 @@ def render_dockerfile(
     # Shared userdel/groupdel block — inlined here so the workspace
     # and pypi templates can't drift on the defensive cleanup logic.
     base = base.replace("__USERDEL_BLOCK__", _USERDEL_BLOCK)
+    base = base.replace("__CLAUDE_CODE_INSTALL__", _claude_code_install_block())
     base = base.replace("__CODEX_INSTALL__", _codex_install_block(install_codex))
     if not fragments:
         body = "# (no skills installed yet ship a dockerfile.fragment)"
