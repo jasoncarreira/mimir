@@ -3129,3 +3129,100 @@ def test_discover_skips_any_hidden_dir_manifest(tmp_path: Path):
     ])
     out = discover_pollers(skills)
     assert [p.name for p in out] == ["real"]
+
+
+# ─── operator overrides (<home>/pollers-overrides.yaml) ───────────────
+
+
+def _write_overrides(path: Path, content: str) -> Path:
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def test_overrides_apply_cron_and_priority(tmp_path: Path):
+    """The operator overrides file wins over the skill-shipped manifest
+    for tunable keys — and lives outside the skill dir, so updates and
+    drift detection can never touch it."""
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "0 * * * *"},
+    ])
+    ov = _write_overrides(tmp_path / "pollers-overrides.yaml", (
+        "p:\n  cron: '*/5 * * * *'\n  priority: high\n  batch_size: 7\n"
+    ))
+    [p] = discover_pollers(skills, overrides_path=ov)
+    assert p.cron == "*/5 * * * *"
+    assert p.priority == "high"
+    assert p.batch_size == 7
+    # Non-overridden fields keep manifest values.
+    assert p.command == "echo"
+
+
+def test_overrides_invalid_cron_keeps_manifest_cron(tmp_path: Path, caplog):
+    """A typo'd override cron must degrade to shipped behavior, never to
+    a dead poller — the scheduler's #419 preservation only protects
+    reloads, not first installs."""
+    import logging
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "0 * * * *"},
+    ])
+    ov = _write_overrides(tmp_path / "pollers-overrides.yaml", (
+        "p:\n  cron: 'not a cron'\n  priority: high\n"
+    ))
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        [p] = discover_pollers(skills, overrides_path=ov)
+    assert p.cron == "0 * * * *"          # manifest kept
+    assert p.priority == "high"            # valid field still applied
+    assert any("poller_overrides_invalid_cron" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_overrides_unknown_poller_and_field_warn(tmp_path: Path, caplog):
+    import logging
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "0 * * * *"},
+    ])
+    ov = _write_overrides(tmp_path / "pollers-overrides.yaml", (
+        "ghost:\n  cron: '*/5 * * * *'\n"
+        "p:\n  command: 'rm -rf /'\n"   # command is NOT overridable
+    ))
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        [p] = discover_pollers(skills, overrides_path=ov)
+    assert p.command == "echo"
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("poller_overrides_unknown_poller" in m for m in msgs)
+    assert any("poller_overrides_unknown_field" in m for m in msgs)
+
+
+def test_overrides_absent_or_malformed_are_noops(tmp_path: Path, caplog):
+    import logging
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "0 * * * *"},
+    ])
+    # Absent file.
+    [p] = discover_pollers(skills, overrides_path=tmp_path / "nope.yaml")
+    assert p.cron == "0 * * * *"
+    # Malformed file.
+    ov = _write_overrides(tmp_path / "pollers-overrides.yaml", "- just\n- a list\n")
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        [p] = discover_pollers(skills, overrides_path=ov)
+    assert p.cron == "0 * * * *"
+    assert any("poller_overrides_invalid" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_overrides_env_and_pass_env(tmp_path: Path):
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "0 * * * *",
+         "pass_env": ["OLD_KEY"]},
+    ])
+    ov = _write_overrides(tmp_path / "pollers-overrides.yaml", (
+        "p:\n  env:\n    FOO: bar\n  pass_env: [NEW_KEY, OTHER]\n"
+    ))
+    [p] = discover_pollers(skills, overrides_path=ov)
+    assert p.env == {"FOO": "bar"}
+    assert p.pass_env == ("NEW_KEY", "OTHER")

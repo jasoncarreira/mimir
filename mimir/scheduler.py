@@ -1304,6 +1304,13 @@ class Scheduler:
                 self._pollers_dir,
                 state_root=state_root,
                 invalid_manifests=invalid_manifests,
+                # Operator tuning surface (<home>/pollers-overrides.yaml):
+                # cron/priority/batch_size/... overrides that skill updates
+                # can never clobber. None when no home (tests/bench).
+                overrides_path=(
+                    self._home / "pollers-overrides.yaml"
+                    if self._home is not None else None
+                ),
             )
         )
         return discovered, invalid_manifests
