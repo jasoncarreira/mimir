@@ -443,6 +443,34 @@ POLLER_OVERRIDE_KEYS = frozenset(
     {"cron", "priority", "batch_size", "recover_failed_turns", "env", "pass_env"}
 )
 
+#: Recognized string spellings for boolean overrides. YAML 1.1 already maps
+#: bare ``yes``/``no``/``on``/``off``/``true``/``false`` to real bools, but a
+#: *quoted* value (``recover_failed_turns: "false"``) arrives as a string —
+#: and ``bool("false")`` is ``True``. So coerce strictly rather than by Python
+#: truthiness, or an operator turning a flag OFF could silently turn it ON.
+_OVERRIDE_BOOL_TRUE = frozenset({"true", "yes", "on", "1"})
+_OVERRIDE_BOOL_FALSE = frozenset({"false", "no", "off", "0"})
+
+
+def _parse_override_bool(value: object) -> bool | None:
+    """Strict bool coercion for an override value, or ``None`` if unparseable.
+
+    ``None`` means "not a recognizable bool" — the caller keeps the manifest
+    value and warns, never falling back to Python truthiness (which would make
+    the quoted-``"false"`` YAML footgun read as ``True``).
+    """
+    if isinstance(value, bool):  # must precede the int check — bool ⊂ int
+        return value
+    if isinstance(value, int):
+        return bool(value) if value in (0, 1) else None
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in _OVERRIDE_BOOL_TRUE:
+            return True
+        if s in _OVERRIDE_BOOL_FALSE:
+            return False
+    return None
+
 
 def load_poller_overrides(path: Path | None) -> dict[str, dict]:
     """Parse ``pollers-overrides.yaml`` → ``{poller_name: {field: value}}``.
@@ -545,7 +573,17 @@ def _apply_poller_overrides(
                 overrides["batch_size"], poller.batch_size,
             )
     if "recover_failed_turns" in overrides:
-        updates["recover_failed_turns"] = bool(overrides["recover_failed_turns"])
+        parsed = _parse_override_bool(overrides["recover_failed_turns"])
+        if parsed is None:
+            log.warning(
+                "poller_overrides_invalid_recover_failed_turns: %s — "
+                "%s.recover_failed_turns=%r (expected a bool: "
+                "true/false/yes/no/1/0); keeping %r",
+                source, poller.name, overrides["recover_failed_turns"],
+                poller.recover_failed_turns,
+            )
+        else:
+            updates["recover_failed_turns"] = parsed
     if "env" in overrides:
         env_o = overrides["env"]
         if isinstance(env_o, dict):

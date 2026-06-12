@@ -3226,3 +3226,57 @@ def test_overrides_env_and_pass_env(tmp_path: Path):
     [p] = discover_pollers(skills, overrides_path=ov)
     assert p.env == {"FOO": "bar"}
     assert p.pass_env == ("NEW_KEY", "OTHER")
+
+
+def test_overrides_recover_failed_turns_quoted_false_is_false(tmp_path: Path):
+    """Regression (#651 review): a *quoted* YAML ``"false"`` arrives as the
+    string ``"false"``, and ``bool("false")`` is ``True``. An operator turning
+    recovery OFF must not silently turn it ON — that would double-fire review
+    turns on pollers like github-poller. Manifest is ON; override is quoted
+    false; result must be OFF."""
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "0 * * * *",
+         "recover_failed_turns": True},
+    ])
+    ov = _write_overrides(tmp_path / "pollers-overrides.yaml",
+                          'p:\n  recover_failed_turns: "false"\n')
+    [p] = discover_pollers(skills, overrides_path=ov)
+    assert p.recover_failed_turns is False
+
+
+@pytest.mark.parametrize("literal,expected", [
+    ("true", True), ("false", False),          # bare YAML bools
+    ('"true"', True), ('"false"', False),      # quoted strings (the footgun)
+    ("'yes'", True), ("'no'", False),
+    ("'on'", True), ("'off'", False),
+    ("1", True), ("0", False),                 # int
+    ("'1'", True), ("'0'", False),             # quoted int
+])
+def test_overrides_recover_failed_turns_spellings(tmp_path: Path, literal, expected):
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "0 * * * *"},
+    ])
+    ov = _write_overrides(tmp_path / "pollers-overrides.yaml",
+                          f"p:\n  recover_failed_turns: {literal}\n")
+    [p] = discover_pollers(skills, overrides_path=ov)
+    assert p.recover_failed_turns is expected
+
+
+def test_overrides_recover_failed_turns_invalid_keeps_manifest(tmp_path: Path, caplog):
+    """An unrecognized bool spelling warns and keeps the manifest value,
+    rather than falling back to Python truthiness."""
+    import logging
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "0 * * * *",
+         "recover_failed_turns": True},
+    ])
+    ov = _write_overrides(tmp_path / "pollers-overrides.yaml",
+                          "p:\n  recover_failed_turns: maybe\n")
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        [p] = discover_pollers(skills, overrides_path=ov)
+    assert p.recover_failed_turns is True
+    assert any("poller_overrides_invalid_recover_failed_turns" in r.getMessage()
+               for r in caplog.records)
