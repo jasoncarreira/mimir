@@ -392,9 +392,6 @@ Current slice-1 recovery is manual:
 - **Attempt/branch collision:** if reruns reuse `attempt=1` and collide with
   `issue/<id>-a1`, do not keep retrying. The current parser likely missed prior
   structured claim comments; file/fix the parser gap before trusting retries.
-  Known slice-1 gap: issue comments are read before the new claim comment is
-  appended, so multiple failures inside one orchestrator run or manual retry
-  paths can reuse an attempt number unless the issue is re-read first.
 - **Stale async wake-up:** shell completion logs can report an earlier failed
   run after a later completed run. Compare Chainlink labels, the newest evidence
   bundle, PR state, and current branch state before rerunning.
