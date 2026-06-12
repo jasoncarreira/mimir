@@ -452,6 +452,31 @@ def test_retrieve_by_entity_substring(conn):
     assert not any(r["subject"] == "Bob" for r in results)
 
 
+def test_retrieve_by_entity_escapes_like_percent(conn):
+    _seed_atom(conn, "obs1", "obs")
+    store_triples(conn, [
+        {"subject": "Alice", "predicate": "prefers", "object": "concise"},
+        {"subject": "Discount%", "predicate": "means", "object": "literal"},
+        {"subject": "Bob", "predicate": "enjoys", "object": "verbose"},
+    ], source_atom_id="obs1")
+
+    results = retrieve_by_entity(conn, "%")
+
+    assert [r["subject"] for r in results] == ["Discount%"]
+
+
+def test_retrieve_by_entity_escapes_like_underscore(conn):
+    _seed_atom(conn, "obs1", "obs")
+    store_triples(conn, [
+        {"subject": "A_B", "predicate": "means", "object": "literal"},
+        {"subject": "AxB", "predicate": "means", "object": "wildcard_only"},
+    ], source_atom_id="obs1")
+
+    results = retrieve_by_entity(conn, "A_B")
+
+    assert [r["subject"] for r in results] == ["A_B"]
+
+
 # ─── Contradiction resolution ────────────────────────────────────────
 
 

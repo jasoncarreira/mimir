@@ -43,6 +43,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
+from ._like import escape_like_pattern
+
 
 logger = logging.getLogger("mimir.saga.triples")
 
@@ -581,12 +583,12 @@ def retrieve_by_entity(
     """Substring match on subject or object. Used for direct entity
     probes ("what did the user say about Alice?") where the query
     *names* the entity and we can skip the embedding path."""
-    pat = f"%{entity}%"
+    pat = f"%{escape_like_pattern(entity)}%"
     rows = conn.execute(
         "SELECT id, subject, predicate, object, source_atom_id, "
         "valid_from, valid_until "
         "FROM triples WHERE tombstoned = 0 "
-        "AND (subject LIKE ? OR object LIKE ?) "
+        "AND (subject LIKE ? ESCAPE '\\' OR object LIKE ? ESCAPE '\\') "
         "LIMIT ?",
         (pat, pat, top_k),
     ).fetchall()
