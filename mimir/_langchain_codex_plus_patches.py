@@ -13,7 +13,7 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -22,6 +22,114 @@ _STREAMING_RETRY_MARKER = "_mimir_codex_plus_transient_retry_patched"
 _SYNC_RETRY_MARKER = "_mimir_codex_plus_sync_transient_retry_patched"
 _DEFAULT_MAX_ATTEMPTS = 3
 _DEFAULT_BASE_DELAY_SECONDS = 0.5
+
+
+class TolerantSSEDecoder:
+    """OpenAI-compatible SSE decoder that tolerates malformed UTF-8 lines.
+
+    The OpenAI SDK's decoder calls ``raw_line.decode("utf-8")`` with
+    strict error handling. Production Codex Plus heartbeats have occasionally
+    failed with bare ``UnicodeDecodeError`` records after minutes of model work;
+    the error shape matches this decoder boundary, and the original turn logs
+    lacked tracebacks. Treat SSE as a transport/display boundary and decode
+    malformed lines with replacement so one bad byte cannot crash the turn.
+    """
+
+    _data: list[str]
+    _event: str | None
+    _retry: int | None
+    _last_event_id: str | None
+    _server_sent_event_cls: Any = None
+
+    def __init__(self) -> None:
+        self._event = None
+        self._data = []
+        self._last_event_id = None
+        self._retry = None
+
+    @staticmethod
+    def _decode_line(raw_line: bytes) -> str:
+        return raw_line.decode("utf-8", errors="replace")
+
+    def iter_bytes(self, iterator: Iterator[bytes]) -> Iterator[Any]:
+        for chunk in self._iter_chunks(iterator):
+            for raw_line in chunk.splitlines():
+                sse = self.decode(self._decode_line(raw_line))
+                if sse:
+                    yield sse
+
+    def _iter_chunks(self, iterator: Iterator[bytes]) -> Iterator[bytes]:
+        data = b""
+        for chunk in iterator:
+            for line in chunk.splitlines(keepends=True):
+                data += line
+                if data.endswith((b"\r\r", b"\n\n", b"\r\n\r\n")):
+                    yield data
+                    data = b""
+        if data:
+            yield data
+
+    async def aiter_bytes(self, iterator: AsyncIterator[bytes]) -> AsyncIterator[Any]:
+        async for chunk in self._aiter_chunks(iterator):
+            for raw_line in chunk.splitlines():
+                sse = self.decode(self._decode_line(raw_line))
+                if sse:
+                    yield sse
+
+    async def _aiter_chunks(self, iterator: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        data = b""
+        async for chunk in iterator:
+            for line in chunk.splitlines(keepends=True):
+                data += line
+                if data.endswith((b"\r\r", b"\n\n", b"\r\n\r\n")):
+                    yield data
+                    data = b""
+        if data:
+            yield data
+
+    def decode(self, line: str) -> Any | None:
+        if not line:
+            if (
+                not self._event
+                and not self._data
+                and not self._last_event_id
+                and self._retry is None
+            ):
+                return None
+            event_cls = self._server_sent_event_cls
+            if event_cls is None:  # pragma: no cover - patch normally sets it
+                from openai._streaming import ServerSentEvent as event_cls
+            sse = event_cls(
+                event=self._event,
+                data="\n".join(self._data),
+                id=self._last_event_id,
+                retry=self._retry,
+            )
+            self._event = None
+            self._data = []
+            self._retry = None
+            return sse
+
+        if line.startswith(":"):
+            return None
+
+        fieldname, _, value = line.partition(":")
+        if value.startswith(" "):
+            value = value[1:]
+
+        if fieldname == "event":
+            self._event = value
+        elif fieldname == "data":
+            self._data.append(value)
+        elif fieldname == "id":
+            if "\0" not in value:
+                self._last_event_id = value
+        elif fieldname == "retry":
+            try:
+                self._retry = int(value)
+            except (TypeError, ValueError):
+                pass
+        return None
 
 
 def _retry_attempts() -> int:
@@ -101,8 +209,21 @@ def install_codex_plus_transient_retry_patch(ChatCodexPlus: type[Any] | None = N
         from langchain_codex_plus import ChatCodexPlus as _ChatCodexPlus  # type: ignore[import-untyped]
         ChatCodexPlus = _ChatCodexPlus
 
+    _patch_openai_sse_decoder()
     _patch_astream(ChatCodexPlus)
     _patch_generate(ChatCodexPlus)
+
+
+def _patch_openai_sse_decoder() -> None:
+    try:
+        import openai._streaming as openai_streaming  # type: ignore[import-untyped]
+    except ImportError:  # pragma: no cover - openai is present with codex-plus
+        return
+    if getattr(openai_streaming.SSEDecoder, "_mimir_utf8_replace_patched", False):
+        return
+    TolerantSSEDecoder._server_sent_event_cls = openai_streaming.ServerSentEvent
+    openai_streaming.SSEDecoder = TolerantSSEDecoder
+    setattr(openai_streaming.SSEDecoder, "_mimir_utf8_replace_patched", True)
 
 
 def _patch_astream(ChatCodexPlus: type[Any]) -> None:
@@ -171,5 +292,6 @@ def _patch_generate(ChatCodexPlus: type[Any]) -> None:
 
 
 __all__ = [
+    "TolerantSSEDecoder",
     "install_codex_plus_transient_retry_patch",
 ]
