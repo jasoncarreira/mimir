@@ -17,6 +17,66 @@ from typing import Callable, Mapping, Protocol, Sequence
 from .backends import ToolPin
 
 
+DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
+    ToolPin(
+        name="codex",
+        category="coding-cli",
+        pin="0.137.0",
+        smoke="codex --version && env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_backends.py",
+        source="npm",
+        package="@openai/codex",
+        install="scaffold Dockerfiles when the codex-plus extra is selected",
+        risk="High: Worklink's first coding backend; changes can affect prompt execution, sandbox flags, transcript shape, and quota consumption.",
+    ),
+    ToolPin(
+        name="chainlink",
+        category="issue-cli",
+        pin="chainlink-1.6.0",
+        smoke="chainlink --version && chainlink issue ready",
+        source="github-release",
+        repo="dollspace-gay/chainlink",
+        install="chainlink bundled-skill dockerfile.fragment",
+        risk="High: Worklink coordination depends on issue, lock, comment, and dependency semantics staying compatible.",
+    ),
+    ToolPin(
+        name="mermaid-cli",
+        category="renderer",
+        pin="11.15.0",
+        smoke="mmdc --version",
+        source="npm",
+        package="@mermaid-js/mermaid-cli",
+        install="scaffold Dockerfiles; used by the mermaid-diagrams skill rather than Worklink execution",
+        risk="Low: renderer drift is usually isolated to diagram generation and Chromium dependencies.",
+    ),
+    ToolPin(
+        name="claude-code",
+        category="coding-cli",
+        pin="2.1.168",
+        smoke="claude --version",
+        source="npm",
+        package="@anthropic-ai/claude-code",
+        install="root/scaffold Dockerfiles only when MIMIR_ENABLE_CLAUDE_CODE=1",
+        risk="Medium: optional second coding backend; real smoke requires deployments with the Claude CLI installed.",
+    ),
+    ToolPin(
+        name="gogcli",
+        category="integration-cli",
+        pin="v0.9.0",
+        smoke="gog --version",
+        source="github-release",
+        repo="steipete/gogcli",
+        install="gmail-poller optional-skill dockerfile.fragment",
+        risk="Medium: Google Workspace helper CLI; drift can break Gmail/Calendar polling independently of Worklink coding backends.",
+    ),
+)
+
+
+def default_tool_pins() -> tuple[ToolPin, ...]:
+    """Return the source-controlled initial Worklink external executable inventory."""
+
+    return DEFAULT_TOOL_PINS
+
+
 @dataclass(frozen=True)
 class UpstreamVersion:
     """Resolved upstream version for one configured tool pin."""
@@ -122,9 +182,10 @@ def render_bump_issue_body(drift: ToolPinDrift) -> str:
 
     pin = drift.pin
     changelog = drift.changelog or "No changelog metadata was returned by the resolver."
-    risk = drift.risk or "Review upstream release notes and keep the bump scoped to this tool pin."
+    risk = drift.risk or pin.risk or "Review upstream release notes and keep the bump scoped to this tool pin."
     package = pin.package or pin.repo or pin.name
     source = pin.source or pin.category
+    install = pin.install or "Configured in worklink.yaml/tool_pins."
     return f"""Dedupe-Key: {drift.dedupe_key}
 
 Bump configured Worklink tool pin `{pin.name}` for category `{pin.category}` from `{pin.pin}` to `{drift.current}`.
@@ -134,6 +195,7 @@ Upstream:
 - Package/repo: `{package}`
 - Current configured pin: `{pin.pin}`
 - Latest resolved pin: `{drift.current}`
+- Install surface: {install}
 
 Changelog / release notes:
 {changelog}
@@ -148,6 +210,7 @@ Acceptance criteria:
 
 Review criteria:
 - Verify the upstream version is still current at review time and the smoke output covers `{pin.name}`.
+- Confirm the category/risk surface is still `{pin.category}`; do not treat renderer/helper CLI bumps as equivalent to coding-backend bumps.
 
 Worklink notes:
 - Scope: Worklink tool-pin configuration for `{pin.name}` only.

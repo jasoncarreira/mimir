@@ -33,6 +33,8 @@ class ToolPin:
     source: str | None = None
     package: str | None = None
     repo: str | None = None
+    install: str | None = None
+    risk: str | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,8 @@ def _parse_tool_pin(value: Any, *, index: int) -> ToolPin:
         source=str(value["source"]) if "source" in value else None,
         package=str(value["package"]) if "package" in value else None,
         repo=str(value["repo"]) if "repo" in value else None,
+        install=str(value["install"]) if "install" in value else None,
+        risk=str(value["risk"]) if "risk" in value else None,
     )
 
 

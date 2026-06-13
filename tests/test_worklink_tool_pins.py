@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import subprocess
 from typing import Any
 
@@ -11,6 +12,7 @@ from mimir.worklink.tool_pins import (
     ChainlinkBumpFiler,
     ToolPinDrift,
     UpstreamVersion,
+    default_tool_pins,
     inventory_tool_pins,
     render_bump_issue_body,
     render_bump_issue_title,
@@ -32,6 +34,43 @@ class FakeResolver:
 class FailingResolver:
     def resolve(self, pin: ToolPin) -> UpstreamVersion:
         raise RuntimeError("upstream unavailable")
+
+
+def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -> None:
+    pins = {pin.name: pin for pin in default_tool_pins()}
+
+    assert set(pins) == {"codex", "chainlink", "mermaid-cli", "claude-code", "gogcli"}
+    assert pins["codex"].category == "coding-cli"
+    assert pins["claude-code"].category == "coding-cli"
+    assert pins["chainlink"].category == "issue-cli"
+    assert pins["mermaid-cli"].category == "renderer"
+    assert pins["gogcli"].category == "integration-cli"
+    for pin in pins.values():
+        assert pin.pin
+        assert pin.smoke
+        assert pin.source
+        assert pin.install
+        assert pin.risk
+
+
+def test_default_tool_pin_inventory_matches_shipped_install_literals() -> None:
+    pins = {pin.name: pin for pin in default_tool_pins()}
+    root = Path(__file__).resolve().parents[1]
+    install_text = "\n".join(
+        (root / relpath).read_text(encoding="utf-8")
+        for relpath in (
+            "Dockerfile",
+            "mimir/scaffold_docker.py",
+            "mimir/skills/chainlink/dockerfile.fragment",
+            "mimir/optional-skills/gmail-poller/dockerfile.fragment",
+        )
+    )
+
+    assert f"@openai/codex@{pins['codex'].pin}" in install_text
+    assert f"--tag {pins['chainlink'].pin}" in install_text
+    assert f"@mermaid-js/mermaid-cli@{pins['mermaid-cli'].pin}" in install_text
+    assert f"@anthropic-ai/claude-code@{pins['claude-code'].pin}" in install_text
+    assert f"github.com/steipete/gogcli/cmd/gog@{pins['gogcli'].pin}" in install_text
 
 
 def test_inventory_tool_pins_reports_drift_without_mutating_or_smoking() -> None:
@@ -95,6 +134,8 @@ def test_render_bump_issue_body_is_worklink_ready_and_uses_smoke_as_suggested_te
     assert "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.137.0->0.138.0" in body
     assert "- release notes here" in body
     assert "low risk" in body
+    assert "Install surface:" in body
+    assert "Confirm the category/risk surface is still `coding-cli`" in body
     assert "Acceptance criteria:" in body
     assert "Review criteria:" in body
     assert "Worklink notes:" in body
