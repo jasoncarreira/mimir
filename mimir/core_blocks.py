@@ -9,9 +9,12 @@ in the auto-generated INDEX.md files).
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # ── Health-check thresholds ──────────────────────────────────────────────────
 # Fires ``core_prompt_degraded`` (negative algedonic event) when either check
@@ -89,6 +92,66 @@ class CoreBlock:
     is_auto_description: bool
 
 
+def read_text_lossy(path: Path) -> str:
+    """Read a UTF-8 text file, tolerating stray non-UTF-8 bytes.
+
+    Prompt-assembly readers (core blocks, memory index) feed home-authored
+    ``.md`` straight into the system prompt every turn. A single non-UTF-8 byte
+    — e.g. a ``§`` (0xA7) from a cp1252-saved paste, or a mid-write artifact —
+    used to raise ``UnicodeDecodeError``, which is a ``ValueError``, **not** an
+    ``OSError``; the callers' ``except OSError`` missed it and the whole turn
+    crashed during prompt assembly, before any tool ran (chainlink #470).
+
+    Decode strict; on failure, log which file/byte and fall back to replacement
+    decoding so one bad byte mangles a single character instead of dropping the
+    file or killing the turn. Genuine ``OSError`` (vanished/unreadable file)
+    still propagates to the caller's existing guard.
+    """
+    data = path.read_bytes()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        bad_byte = data[exc.start] if exc.start < len(data) else 0
+        log.warning(
+            "non-UTF-8 bytes in %s (byte 0x%02x at position %d); "
+            "decoding with replacement",
+            path, bad_byte, exc.start,
+        )
+        _report_non_utf8(path, bad_byte, exc.start)
+        return data.decode("utf-8", errors="replace")
+
+
+#: Paths already reported this process. ``read_text_lossy`` runs during prompt
+#: assembly every turn, so a persistent bad file would otherwise emit the
+#: algedonic signal every turn — dedupe to one emit per distinct file (re-armed
+#: on restart; a fixed file simply stops emitting).
+_NON_UTF8_REPORTED: set[str] = set()
+
+
+def _report_non_utf8(path: Path, bad_byte: int, position: int) -> None:
+    """Emit a one-shot ``non_utf8_home_file`` algedonic signal so the agent
+    cleans the offending file (re-save as UTF-8 / drop the stray byte).
+
+    Best-effort: the event logger raises if uninitialized (CLI ``index`` builds,
+    unit tests), so signalling must never break the read it's reporting on.
+    """
+    key = str(path)
+    if key in _NON_UTF8_REPORTED:
+        return
+    _NON_UTF8_REPORTED.add(key)
+    try:
+        from .event_logger import log_event_sync
+
+        log_event_sync(
+            "non_utf8_home_file",
+            path=key,
+            byte=f"0x{bad_byte:02x}",
+            position=position,
+        )
+    except Exception:  # noqa: BLE001 — signalling is best-effort; never break the read
+        pass
+
+
 def load_core(home: Path) -> list[CoreBlock]:
     """Load every ``memory/core/*.md`` in lexicographic (= numeric prefix) order."""
     core_dir = home / "memory" / "core"
@@ -97,7 +160,7 @@ def load_core(home: Path) -> list[CoreBlock]:
     blocks: list[CoreBlock] = []
     for path in sorted(core_dir.glob("*.md")):
         try:
-            text = path.read_text(encoding="utf-8")
+            text = read_text_lossy(path)
         except OSError:
             continue
         desc, is_auto = describe_file(text)
@@ -167,7 +230,7 @@ def load_channel_memory(home: Path, channel_id: str) -> str | None:
     parts: list[str] = []
     for path in sorted(channel_dir.glob("*.md")):
         try:
-            text = path.read_text(encoding="utf-8").rstrip()
+            text = read_text_lossy(path).rstrip()
         except OSError:
             continue
         if text:

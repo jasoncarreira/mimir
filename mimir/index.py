@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from .core_blocks import describe_file
+from .core_blocks import describe_file, read_text_lossy
 
 log = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ def _build_entries(root: Path, files: list[Path]) -> list[IndexEntry]:
     entries: list[IndexEntry] = []
     for path in files:
         try:
-            text = path.read_text(encoding="utf-8")
+            text = read_text_lossy(path)
         except OSError:
             continue
         desc, is_auto = describe_file(text)
@@ -251,7 +251,7 @@ def build_wiki_index(home: Path) -> str:
         entries: list[IndexEntry] = []
         for path in files:
             try:
-                text = path.read_text(encoding="utf-8")
+                text = read_text_lossy(path)
             except OSError:
                 continue
             desc, is_auto = describe_file(text)
@@ -353,7 +353,7 @@ class IndexGenerator:
         existing: str = ""
         if catalog_path.is_file():
             try:
-                existing = catalog_path.read_text(encoding="utf-8")
+                existing = read_text_lossy(catalog_path)
             except OSError:
                 pass  # treat missing/unreadable as empty → always write
         if fresh == existing:
@@ -393,7 +393,7 @@ class IndexGenerator:
         path = self._home / "memory" / "INDEX.md"
         if path.is_file():
             try:
-                return path.read_text(encoding="utf-8")
+                return read_text_lossy(path)
             except OSError:
                 pass
         return build_memory_index(self._home)
