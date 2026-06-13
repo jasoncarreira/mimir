@@ -287,9 +287,12 @@ def test_worklink_config_allows_missing_or_empty_tool_pins(tmp_path: Path) -> No
     missing_path.write_text("defaults:\n  backend: codex\n")
     empty_path = tmp_path / "empty.yaml"
     empty_path.write_text("tool_pins: []\n")
+    null_path = tmp_path / "null.yaml"
+    null_path.write_text("tool_pins:\n")
 
     assert WorklinkConfig.load(missing_path).tool_pins == ()
     assert WorklinkConfig.load(empty_path).tool_pins == ()
+    assert WorklinkConfig.load(null_path).tool_pins == ()
 
 
 def test_worklink_config_rejects_invalid_tool_pins(tmp_path: Path) -> None:

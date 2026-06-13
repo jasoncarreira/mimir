@@ -81,7 +81,7 @@ class WorklinkConfig:
             compute_backend=str(defaults_data.get("compute_backend", "local_subprocess")),
         )
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
-        tool_pins = _parse_tool_pins(data.get("tool_pins", []))
+        tool_pins = _parse_tool_pins(data.get("tool_pins") or [])
         backends = data.get("backends") or {}
         if not isinstance(backends, dict):
             raise ValueError("worklink backends must be a mapping")
