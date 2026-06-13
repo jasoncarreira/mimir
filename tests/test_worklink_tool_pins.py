@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import json
+import subprocess
+from typing import Any
+
+import pytest
+
+from mimir.worklink.backends import ToolPin
+from mimir.worklink.tool_pins import (
+    ChainlinkBumpFiler,
+    ToolPinDrift,
+    UpstreamVersion,
+    inventory_tool_pins,
+    render_bump_issue_body,
+    render_bump_issue_title,
+)
+
+
+class FakeResolver:
+    def __init__(self, current: str, *, changelog: str | None = None, risk: str | None = None) -> None:
+        self.current = current
+        self.changelog = changelog
+        self.risk = risk
+        self.calls: list[ToolPin] = []
+
+    def resolve(self, pin: ToolPin) -> UpstreamVersion:
+        self.calls.append(pin)
+        return UpstreamVersion(current=self.current, changelog=self.changelog, risk=self.risk)
+
+
+class FailingResolver:
+    def resolve(self, pin: ToolPin) -> UpstreamVersion:
+        raise RuntimeError("upstream unavailable")
+
+
+def test_inventory_tool_pins_reports_drift_without_mutating_or_smoking() -> None:
+    pin = ToolPin(
+        name="codex",
+        category="coding-cli",
+        pin="0.137.0",
+        smoke="codex --version",
+        source="npm",
+        package="@openai/codex",
+    )
+    resolver = FakeResolver("0.138.0", changelog="- fixed worker mode", risk="medium")
+
+    inventory = inventory_tool_pins([pin], {"npm": resolver})
+
+    assert resolver.calls == [pin]
+    assert inventory.diagnostics == ()
+    assert inventory.drift == (
+        ToolPinDrift(pin=pin, current="0.138.0", changelog="- fixed worker mode", risk="medium"),
+    )
+    assert inventory.drift[0].dedupe_key == "worklink-tool-pin:coding-cli:codex:0.137.0->0.138.0"
+
+
+def test_inventory_tool_pins_skips_matching_manual_unknown_and_failed_resolvers() -> None:
+    matching = ToolPin("mermaid", "renderer", "11.15.0", "mmdc --version", source="npm")
+    manual = ToolPin("bespoke", "coding-cli", "local", "bespoke --version", source="manual")
+    unknown = ToolPin("other", "coding-cli", "1.0.0", "other --version", source="github")
+    failing = ToolPin("chainlink", "issue-cli", "1.6.0", "chainlink --version", source="cargo")
+
+    inventory = inventory_tool_pins(
+        [matching, manual, unknown, failing],
+        {"npm": FakeResolver("11.15.0"), "cargo": FailingResolver()},
+    )
+
+    assert inventory.drift == ()
+    assert [(diag.name, diag.reason) for diag in inventory.diagnostics] == [
+        ("bespoke", "manual pin has no upstream resolver"),
+        ("other", "no resolver for source/category: github"),
+        ("chainlink", "resolver failed: upstream unavailable"),
+    ]
+
+
+def test_render_bump_issue_body_is_worklink_ready_and_uses_smoke_as_suggested_test() -> None:
+    drift = ToolPinDrift(
+        pin=ToolPin(
+            name="codex",
+            category="coding-cli",
+            pin="0.137.0",
+            smoke="codex --version && uv run pytest -q tests/test_worklink_backends.py",
+            source="npm",
+            package="@openai/codex",
+        ),
+        current="0.138.0",
+        changelog="- release notes here",
+        risk="low risk",
+    )
+
+    assert render_bump_issue_title(drift) == "Bump Worklink codex pin to 0.138.0"
+    body = render_bump_issue_body(drift)
+
+    assert "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.137.0->0.138.0" in body
+    assert "- release notes here" in body
+    assert "low risk" in body
+    assert "Acceptance criteria:" in body
+    assert "Review criteria:" in body
+    assert "Worklink notes:" in body
+    assert "- Suggested test command: codex --version && uv run pytest -q tests/test_worklink_backends.py" in body
+
+
+def test_chainlink_bump_filer_reuses_existing_issue_by_dedupe_key() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        stdout = json.dumps([
+            {
+                "id": 777,
+                "title": "Bump Worklink codex pin",
+                "description": "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.137.0->0.138.0",
+            }
+        ])
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+
+    drift = ToolPinDrift(
+        pin=ToolPin("codex", "coding-cli", "0.137.0", "codex --version", source="npm"),
+        current="0.138.0",
+    )
+
+    assert ChainlinkBumpFiler(runner=runner).file(drift) == 777
+    assert calls == [["chainlink", "issue", "search", drift.dedupe_key, "--json"]]
+
+
+def test_chainlink_bump_filer_creates_low_priority_issue_when_no_duplicate() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if args[:3] == ["chainlink", "issue", "search"]:
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        return subprocess.CompletedProcess(args, 0, "Created issue #778\n", "")
+
+    drift = ToolPinDrift(
+        pin=ToolPin("codex", "coding-cli", "0.137.0", "codex --version", source="npm"),
+        current="0.138.0",
+    )
+
+    assert ChainlinkBumpFiler(runner=runner).file(drift) == 778
+    assert calls[1][:4] == ["chainlink", "issue", "create", "Bump Worklink codex pin to 0.138.0"]
+    assert "--priority" in calls[1]
+    assert "low" in calls[1]
+    assert "--label" in calls[1]
+    assert "tool-pin" in calls[1]
+
+
+def test_chainlink_bump_filer_raises_on_create_failure() -> None:
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["chainlink", "issue", "search"]:
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        return subprocess.CompletedProcess(args, 1, "", "boom")
+
+    drift = ToolPinDrift(
+        pin=ToolPin("codex", "coding-cli", "0.137.0", "codex --version", source="npm"),
+        current="0.138.0",
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        ChainlinkBumpFiler(runner=runner).file(drift)
