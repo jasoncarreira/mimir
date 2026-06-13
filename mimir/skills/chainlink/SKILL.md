@@ -201,10 +201,12 @@ below for the full workflow.
 ### Block / unblock relations
 
 ```bash
-chainlink issue block 42 17     # 42 blocks 17 (don't work on 17 yet)
-chainlink issue unblock 42 17
+chainlink issue block 17 42     # 17 is blocked by 42 (don't work on 17 yet)
+chainlink issue unblock 17 42
 ```
 
+The live CLI argument order is `chainlink issue block <ID> <BLOCKER>`:
+`<ID>` is the issue that should wait, and `<BLOCKER>` is the prerequisite.
 Once issue 42 closes, issue 17 automatically appears in `chainlink issue
 ready`. `issue show 17` still lists 42 in its "Blocked by" output as
 historical record — trust `ready` for "is this actionable?", trust
@@ -242,8 +244,8 @@ work split between a planning session and one or more implementing sessions.
 2. **Decompose** into subissues. Each subissue gets a non-empty
    `--description` with its own acceptance criteria — sized so a future
    session can pick it up without re-reading the parent.
-3. **Add dependency edges** via `chainlink issue block <a> <b>` if `<a>`
-   must complete before `<b>` is actionable.
+3. **Add dependency edges** via `chainlink issue block <blocked> <blocker>`
+   when `<blocked>` must wait for `<blocker>` to complete.
 4. **Mark parent in-progress** via `chainlink issue label <parent> in-progress`.
 
 Acceptance for the planning session: parent has subissues, every subissue has
