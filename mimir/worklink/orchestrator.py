@@ -12,13 +12,13 @@ import asyncio
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import json
-import os
 from pathlib import Path
 import subprocess
 import warnings
 from typing import Any, Callable, Mapping, Sequence
 
-from .backends import BackendRegistry, RawResult, ToolBackend, WorkOrder, WorklinkConfig
+from .backends import BackendRegistry, WorkOrder, WorklinkConfig
+from .compute import ComputeLaunchError, ComputeResult
 from .claims import ChainlinkClaims
 from .evidence import EvidenceValidation, WorklinkEvidence, observe_evidence
 from .planning import (
@@ -147,11 +147,14 @@ class WorklinkRunner:
         validate_leaf(issue)
         config = WorklinkConfig.load(self.home / "worklink.yaml")
         registry = self.registry or BackendRegistry(config)
+        repo_url = _repo_remote_url(self.repo, runner=runner)
+        repo_slug = _repo_slug_from_url(repo_url)
         backend = (
             registry.get(backend_name)
             if backend_name
-            else registry.select(labels=issue.labels, repo=_repo_slug(self.repo))
+            else registry.select(labels=issue.labels, repo=repo_slug)
         )
+        compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
         selected_name = backend.name
         test_cmd = (
             test_command
@@ -228,7 +231,29 @@ class WorklinkRunner:
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             started = datetime.now(UTC)
-            raw = await backend.run(order)
+            spec = backend.work_spec(
+                order,
+                attempt=record.attempt,
+                repo_url=repo_url,
+                base_ref=lease.base_ref,
+                branch=lease.branch,
+                test_command=test_cmd,
+            )
+            handle = None
+            try:
+                handle = await compute.launch(spec)
+                compute_result = await compute.wait(handle, spec.timeout_s)
+            except ComputeLaunchError as exc:
+                compute_result = ComputeResult(
+                    exit_code=-1,
+                    stdout="",
+                    stderr=str(exc),
+                    launch_error=str(exc),
+                )
+            finally:
+                if handle is not None:
+                    await compute.cleanup(handle)
+            raw = await backend.interpret(order, compute_result)
             validation = observe_evidence(
                 issue=issue.issue_id,
                 attempt=record.attempt,
@@ -484,12 +509,21 @@ def _open_pr(
     return result.stdout.strip().splitlines()[-1]
 
 
-def _repo_slug(repo: Path, *, runner: Runner | None = None) -> str | None:
+def _repo_remote_url(repo: Path, *, runner: Runner | None = None) -> str | None:
     run = runner or _run
     result = run(["git", "-C", str(repo), "config", "--get", "remote.origin.url"])
     if result.returncode != 0:
         return None
-    url = result.stdout.strip()
+    return result.stdout.strip() or None
+
+
+def _repo_slug(repo: Path, *, runner: Runner | None = None) -> str | None:
+    return _repo_slug_from_url(_repo_remote_url(repo, runner=runner))
+
+
+def _repo_slug_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
     if url.startswith("git@github.com:"):
         return url.removeprefix("git@github.com:").removesuffix(".git")
     if "github.com/" in url:

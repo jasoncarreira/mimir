@@ -7,8 +7,19 @@ from typing import Any
 
 import pytest
 
-from mimir.worklink.backends import BackendRegistry, Caps, CodexBackend, RawResult, WorkOrder, WorklinkConfig
+from mimir.worklink.backends import (
+    BackendRegistry,
+    Caps,
+    CodexBackend,
+    ComputeResult,
+    LocalSubprocessComputeBackend,
+    RawResult,
+    WorkOrder,
+    WorklinkConfig,
+)
+from mimir.worklink.compute import ComputeCaps, WorkSpec
 import mimir.worklink.backends.codex as codex_module
+import mimir.worklink.compute as compute_module
 
 
 class FakeProcess:
@@ -27,7 +38,9 @@ class FakeProcess:
 
 
 @pytest.mark.asyncio
-async def test_codex_backend_invokes_exec_json_with_worktree_and_prompt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_codex_backend_invokes_exec_json_with_worktree_and_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     calls: list[dict[str, Any]] = []
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
@@ -47,7 +60,19 @@ async def test_codex_backend_invokes_exec_json_with_worktree_and_prompt(monkeypa
         transcript_root=transcript_root,
     )
 
-    result = await backend.run(order)
+    spec = backend.work_spec(
+        order,
+        attempt=1,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="issue/440-a1",
+        test_command="echo ok",
+    )
+    compute = LocalSubprocessComputeBackend()
+    handle = await compute.launch(spec)
+    compute_result = await compute.wait(handle, spec.timeout_s)
+    await compute.cleanup(handle)
+    result = await backend.interpret(order, compute_result)
 
     assert result == RawResult(
         exit_code=0,
@@ -76,22 +101,34 @@ async def test_codex_backend_invokes_exec_json_with_worktree_and_prompt(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_codex_backend_maps_quota_and_auth_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_codex_backend_maps_quota_and_auth_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
         return FakeProcess(returncode=1, stdout=b"", stderr=b"HTTP 429 quota exhausted")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-
-    result = await CodexBackend().run(
-        WorkOrder(
-            issue_id=440,
-            worktree=tmp_path,
-            prompt="x",
-            rules=None,
-            timeout_s=30,
-            transcript_root=tmp_path / "transcripts",
-        )
+    order = WorkOrder(
+        issue_id=440,
+        worktree=tmp_path,
+        prompt="x",
+        rules=None,
+        timeout_s=30,
+        transcript_root=tmp_path / "transcripts",
     )
+    spec = CodexBackend().work_spec(
+        order,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/440-a1",
+        test_command="echo ok",
+    )
+    compute = LocalSubprocessComputeBackend()
+    handle = await compute.launch(spec)
+    compute_result = await compute.wait(handle, spec.timeout_s)
+    await compute.cleanup(handle)
+    result = await CodexBackend().interpret(order, compute_result)
 
     assert result.exit_code == 1
     assert result.backend_status == "quota_exhausted"
@@ -99,7 +136,9 @@ async def test_codex_backend_maps_quota_and_auth_errors(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
-async def test_codex_backend_enforces_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_codex_backend_enforces_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     process = FakeProcess(stdout=b"partial", stderr=b"")
     killed: list[FakeProcess] = []
 
@@ -116,18 +155,28 @@ async def test_codex_backend_enforces_timeout(monkeypatch: pytest.MonkeyPatch, t
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
-    monkeypatch.setattr(codex_module, "_kill_process_group", fake_kill_process_group)
-
-    result = await CodexBackend().run(
-        WorkOrder(
-            issue_id=440,
-            worktree=tmp_path,
-            prompt="x",
-            rules=None,
-            timeout_s=1,
-            transcript_root=tmp_path / "transcripts",
-        )
+    monkeypatch.setattr(compute_module, "_kill_process_group", fake_kill_process_group)
+    order = WorkOrder(
+        issue_id=440,
+        worktree=tmp_path,
+        prompt="x",
+        rules=None,
+        timeout_s=1,
+        transcript_root=tmp_path / "transcripts",
     )
+    spec = CodexBackend().work_spec(
+        order,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/440-a1",
+        test_command="echo ok",
+    )
+    compute = LocalSubprocessComputeBackend()
+    handle = await compute.launch(spec)
+    compute_result = await compute.wait(handle, spec.timeout_s)
+    await compute.cleanup(handle)
+    result = await CodexBackend().interpret(order, compute_result)
 
     assert killed == [process]
     assert process.killed is True
@@ -155,12 +204,14 @@ def test_worklink_config_routes_first_match_and_defaults(tmp_path: Path) -> None
         """
 defaults:
   backend: codex
+  compute_backend: local_subprocess
   timeout_s: 45
   backend_by_category:
     renderer: mermaid
 routes:
   - label: render
     backend: mermaid
+    compute_backend: local_subprocess
   - repo: jasoncarreira/mimir
     backend: codex
 backends:
@@ -182,24 +233,134 @@ backends:
     assert isinstance(codex, CodexBackend)
     assert codex.bin == "/opt/bin/codex"
     assert codex.extra_args == ("exec", "--json", "--sandbox", "workspace-write")
+    assert config.defaults.compute_backend == "local_subprocess"
+    assert isinstance(registry.select_compute(), LocalSubprocessComputeBackend)
 
 
-def test_codex_command_includes_rules_in_prompt(tmp_path: Path) -> None:
+def test_codex_work_spec_includes_rules_in_local_argv(tmp_path: Path) -> None:
     backend = CodexBackend()
-    command = backend._command(
-        WorkOrder(issue_id=440, worktree=tmp_path, prompt="Do work", rules="Follow policy", timeout_s=30)
+    spec = backend.work_spec(
+        WorkOrder(issue_id=440, worktree=tmp_path, prompt="Do work", rules="Follow policy", timeout_s=30),
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/440-a1",
+        test_command="echo ok",
     )
 
-    assert command == ["codex", "exec", "--cd", str(tmp_path), "--json", "Follow policy\n\nDo work"]
+    assert spec.local_argv == (
+        "codex",
+        "exec",
+        "--cd",
+        str(tmp_path),
+        "--json",
+        "Follow policy\n\nDo work",
+    )
 
 
 def test_registry_selection_has_no_codex_specific_orchestrator_branch() -> None:
-    config = WorklinkConfig(
-        routes=(),
-    )
+    config = WorklinkConfig(routes=())
     registry = BackendRegistry(config)
 
     assert registry.select(labels={"worklink"}, repo="jasoncarreira/mimir").name == "codex"
+
+
+def test_codex_backend_builds_portable_git_handoff_work_spec(tmp_path: Path) -> None:
+    order = WorkOrder(
+        issue_id=455,
+        worktree=tmp_path / "worktree",
+        prompt="Do work",
+        rules=None,
+        timeout_s=17,
+        env={"MIMIR_HOME": "/tmp/home"},
+        transcript_root=tmp_path / "transcripts",
+    )
+
+    spec = CodexBackend().work_spec(
+        order,
+        attempt=2,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="origin/main",
+        branch="issue/455-a2",
+        test_command="echo ok",
+    )
+
+    assert spec == WorkSpec(
+        issue_id=455,
+        attempt=2,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="origin/main",
+        branch="issue/455-a2",
+        prompt="Do work",
+        rules=None,
+        test_command="echo ok",
+        backend="codex",
+        timeout_s=17,
+        env={"MIMIR_HOME": "/tmp/home"},
+        backend_config={"bin": "codex", "args": ["exec", "--json"]},
+        local_worktree=order.worktree,
+        local_argv=("codex", "exec", "--cd", str(order.worktree), "--json", "Do work"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeProcess(returncode=0, stdout=b"ok", stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    backend = LocalSubprocessComputeBackend()
+
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="echo ok",
+        backend="other_tool",
+        timeout_s=5,
+        env={"PATH": "/custom/bin", "X": "1"},
+        backend_config={"bin": "other", "args": ["ignored"]},
+        local_worktree=tmp_path,
+        local_argv=("tool", "arg", "--cd", str(tmp_path), "prompt"),
+    )
+    handle = await backend.launch(spec)
+    result = await backend.wait(handle, 5)
+    await backend.cleanup(handle)
+
+    assert backend.capabilities() == ComputeCaps(
+        shared_filesystem=True,
+        network_isolated=False,
+        handle_cancel=True,
+        persistent_after_disconnect=False,
+    )
+    assert result == ComputeResult(
+        exit_code=0,
+        stdout="ok",
+        stderr="",
+        handle=result.handle,
+        command=("tool", "arg", "--cd", str(tmp_path), "prompt"),
+    )
+    assert calls == [
+        {
+            "args": ("tool", "arg", "--cd", str(tmp_path), "prompt"),
+            "kwargs": {
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+                "cwd": str(tmp_path),
+                "env": {"PATH": "/custom/bin", "X": "1"},
+                "start_new_session": True,
+            },
+        }
+    ]
 
 
 def test_codex_status_auth_detection_does_not_match_author_text() -> None:

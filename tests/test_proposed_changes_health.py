@@ -312,7 +312,15 @@ async def test_scheduled_check_silent_when_under_threshold(tmp_path: Path):
             ## 2026-05-23 — recent one
             body
         """)
-        await run_scheduled_backlog_check(tmp_path)
+        # Patch datetime so this stays under-threshold after the fixture date ages.
+        import mimir.reflection.proposed_changes_health as mod
+        original_compute = mod.compute_backlog_health
+        now = datetime(2026, 5, 24, tzinfo=timezone.utc)
+        mod.compute_backlog_health = lambda home, **kw: original_compute(home, now=now, **kw)
+        try:
+            await run_scheduled_backlog_check(tmp_path)
+        finally:
+            mod.compute_backlog_health = original_compute
         # No proposed_changes_backlog event should appear.
         if events_path.is_file():
             events = [

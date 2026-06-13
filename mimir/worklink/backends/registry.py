@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 import yaml
 
+from ..compute import ComputeBackend, LocalSubprocessComputeBackend
 from .base import ToolBackend
 from .codex import CodexBackend
 
@@ -19,6 +20,7 @@ class WorklinkDefaults:
     priority: str = "normal"
     test_command: str = "env -u MIMIR_MODEL_SPEC uv run pytest -q"
     backend_by_category: Mapping[str, str] = field(default_factory=dict)
+    compute_backend: str = "local_subprocess"
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,7 @@ class WorklinkRoute:
     label: str | None = None
     repo: str | None = None
     tool_category: str | None = None
+    compute_backend: str | None = None
 
     def matches(self, *, labels: set[str], repo: str | None, tool_category: str | None) -> bool:
         if self.label is not None and self.label not in labels:
@@ -63,12 +66,26 @@ class WorklinkConfig:
             priority=str(defaults_data.get("priority", "normal")),
             test_command=str(defaults_data.get("test_command", "env -u MIMIR_MODEL_SPEC uv run pytest -q")),
             backend_by_category={str(key): str(value) for key, value in category_defaults.items()},
+            compute_backend=str(defaults_data.get("compute_backend", "local_subprocess")),
         )
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
         backends = data.get("backends") or {}
         if not isinstance(backends, dict):
             raise ValueError("worklink backends must be a mapping")
         return cls(defaults=defaults, routes=routes, backend_settings=backends)
+
+    def select_compute_backend_name(
+        self,
+        *,
+        labels: set[str] | None = None,
+        repo: str | None = None,
+        tool_category: str | None = None,
+    ) -> str:
+        label_set = labels or set()
+        for route in self.routes:
+            if route.matches(labels=label_set, repo=repo, tool_category=tool_category):
+                return route.compute_backend or self.defaults.compute_backend
+        return self.defaults.compute_backend
 
     def select_backend_name(
         self,
@@ -97,6 +114,7 @@ def _parse_route(value: Any) -> WorklinkRoute:
         label=str(value["label"]) if "label" in value else None,
         repo=str(value["repo"]) if "repo" in value else None,
         tool_category=str(value["tool_category"]) if "tool_category" in value else None,
+        compute_backend=str(value["compute_backend"]) if "compute_backend" in value else None,
     )
 
 
@@ -106,15 +124,40 @@ class BackendRegistry:
         self._backends: dict[str, ToolBackend] = {
             "codex": self._build_codex(self.config.backend_settings.get("codex", {})),
         }
+        self._compute_backends: dict[str, ComputeBackend] = {
+            "local_subprocess": LocalSubprocessComputeBackend(),
+        }
 
     def register(self, backend: ToolBackend) -> None:
         self._backends[backend.name] = backend
+
+    def register_compute(self, backend: ComputeBackend) -> None:
+        self._compute_backends[backend.name] = backend
 
     def get(self, name: str) -> ToolBackend:
         try:
             return self._backends[name]
         except KeyError as exc:
             raise KeyError(f"unknown Worklink backend: {name}") from exc
+
+    def get_compute(self, name: str) -> ComputeBackend:
+        try:
+            return self._compute_backends[name]
+        except KeyError as exc:
+            raise KeyError(f"unknown Worklink compute backend: {name}") from exc
+
+    def select_compute(
+        self,
+        *,
+        labels: set[str] | None = None,
+        repo: str | None = None,
+        tool_category: str | None = None,
+    ) -> ComputeBackend:
+        return self.get_compute(
+            self.config.select_compute_backend_name(
+                labels=labels, repo=repo, tool_category=tool_category
+            )
+        )
 
     def select(
         self,
