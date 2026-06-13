@@ -13,6 +13,7 @@ from mimir.event_logger import _reset_logger_for_tests, init_logger
 from mimir.worklink.backends import Caps, ComputeCaps, ComputeResult, RawResult, WorkOrder
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.compute import WorkSpec
+from mimir.worklink.evidence import BLOCKED_SENTINEL
 from mimir.worklink.worker import WorkerPayload, run_worker_payload
 from mimir.worklink.orchestrator import (
     IssueContext,
@@ -98,6 +99,19 @@ class FakeBackend:
             None,
         )
 
+
+
+class BlockedSentinelBackend(FakeBackend):
+    """Backend that concludes it cannot proceed and writes the blocked sentinel."""
+
+    async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+        self.orders.append(order)
+        (order.worktree / BLOCKED_SENTINEL).write_text(
+            "Acceptance criteria contradict issue #438; needs planner review.\n",
+            encoding="utf-8",
+        )
+        # Report success to prove the observed sentinel overrides a self-reported status.
+        return RawResult(0, order.transcript_root / "fake.json", "success", None)
 
 
 class WorkerFakeBackend(FakeBackend):
@@ -827,6 +841,39 @@ def test_worklink_runner_backend_nonzero_transitions_failed_without_pr(tmp_path:
     )
     assert ["chainlink", "issue", "label", "441", "worklink:ready"] in calls
     assert ["chainlink", "locks", "release", "441"] in calls
+
+
+def test_worklink_runner_backend_blocked_sentinel_routes_to_blocked(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+    backend = BlockedSentinelBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.review_ready is False
+    assert result.pr_url is None
+    # Blocked is terminal-pending-human on attempt 1 of 3: no retry, no PR.
+    assert ["chainlink", "issue", "label", "441", "worklink:blocked"] in calls
+    assert ["chainlink", "issue", "label", "441", "worklink:ready"] not in calls
+    assert not any(
+        isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls
+    )
+    assert ["chainlink", "locks", "release", "441"] in calls
+    # The human who picks up worklink:blocked must see why it stopped.
+    assert any(
+        isinstance(call, list)
+        and call[:3] == ["chainlink", "issue", "comment"]
+        and "needs planner review" in call[-1]
+        for call in calls
+    )
 
 
 def test_worklink_runner_timeout_transitions_failed_without_pr(tmp_path: Path) -> None:

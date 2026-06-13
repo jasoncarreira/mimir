@@ -245,6 +245,30 @@ self-reported):
 - `blocked` requires a non-empty `blocked_reason`; it is a first-class
   outcome, not a failure.
 
+### Signalling `blocked` (the `.worklink-blocked` sentinel)
+
+A backend cannot *self-report* `blocked` for the same reason it cannot
+self-report success: a transcript claim is not observed evidence. Instead the
+backend signals "I cannot proceed" by writing a file named
+**`.worklink-blocked`** in the repository root; its contents become
+`blocked_reason`. The executor reads that file (`observe_evidence`), so a
+blocked outcome rests on observed evidence on the same footing as the diff and
+test signals.
+
+- The sentinel **overrides** any backend status — a backend that writes
+  `.worklink-blocked` and also reports "success" is still `blocked`.
+- An empty / whitespace-only sentinel is ignored (no signal).
+- The sentinel filename is stripped from `files_changed`: it is a control
+  signal, never a deliverable, and is never committed (the review-ready commit
+  path does not run for a blocked outcome).
+- `blocked` routes to `worklink:blocked` (terminal-pending-human) and does
+  **not** spend a retry attempt — distinct from `failed`, which returns the
+  leaf to `worklink:ready` until attempts are exhausted. The reason is surfaced
+  to the human on the issue (the evidence comment carries a `Blocked:` line).
+
+The work-order prompt (`prompt_templates/worklink-order.md`) instructs backends
+on when and how to write the sentinel.
+
 ## 5. Pluggable backends
 
 ### Protocol

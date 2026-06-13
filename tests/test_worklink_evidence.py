@@ -5,7 +5,13 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
-from mimir.worklink.evidence import TestResult, WorklinkEvidence, observe_evidence, validate_evidence
+from mimir.worklink.evidence import (
+    BLOCKED_SENTINEL,
+    TestResult,
+    WorklinkEvidence,
+    observe_evidence,
+    validate_evidence,
+)
 
 
 def base_evidence(**overrides: object) -> WorklinkEvidence:
@@ -60,6 +66,16 @@ def test_blocked_requires_reason() -> None:
 
     assert result.status == "failed"
     assert "blocked_missing_reason" in result.reasons
+
+
+def test_blocked_with_reason_stays_blocked_and_not_review_ready() -> None:
+    result = validate_evidence(
+        base_evidence(status="blocked", blocked_reason="acceptance criteria contradict #438")
+    )
+
+    assert result.status == "blocked"
+    assert result.review_ready is False
+    assert result.evidence.blocked_reason == "acceptance criteria contradict #438"
 
 
 def test_completed_requires_tests_or_skipped_reason() -> None:
@@ -170,3 +186,70 @@ def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> None:
 
     assert result.review_ready is True
     assert result.evidence.files_changed == ["new_test.py"]
+
+
+def _seed_repo(repo: Path) -> None:
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "seed.txt").write_text("seed\n")
+    subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+
+
+def test_observe_evidence_detects_blocked_sentinel(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _seed_repo(repo)
+    # The backend partially edited a file, then concluded it cannot proceed and
+    # wrote the blocked sentinel. The "completed" backend_status must not win.
+    (repo / "partial.py").write_text("# half-done\n")
+    (repo / BLOCKED_SENTINEL).write_text(
+        "Acceptance criteria contradict issue #438; needs planner review.\n"
+    )
+
+    result = observe_evidence(
+        issue=439,
+        attempt=1,
+        backend="codex",
+        branch="issue/439-a1",
+        worktree=repo,
+        started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
+        base_ref="main",
+        backend_status="completed",
+        test_command="python -c 'import sys; sys.exit(0)'",
+    )
+
+    assert result.status == "blocked"
+    assert result.review_ready is False
+    assert result.evidence.blocked_reason == (
+        "Acceptance criteria contradict issue #438; needs planner review."
+    )
+    # The sentinel is a control signal, never a deliverable in the changed set.
+    assert BLOCKED_SENTINEL not in result.evidence.files_changed
+    assert "partial.py" in result.evidence.files_changed
+
+
+def test_observe_evidence_ignores_empty_blocked_sentinel(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _seed_repo(repo)
+    (repo / "new_module.py").write_text("print('ok')\n")
+    (repo / BLOCKED_SENTINEL).write_text("   \n")  # whitespace only == no signal
+
+    result = observe_evidence(
+        issue=439,
+        attempt=1,
+        backend="codex",
+        branch="issue/439-a1",
+        worktree=repo,
+        started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
+        base_ref="main",
+        backend_status="completed",
+        test_command="python -c 'import sys; sys.exit(0)'",
+    )
+
+    assert result.status == "completed"
+    assert result.review_ready is True
+    assert result.evidence.blocked_reason is None
+    assert BLOCKED_SENTINEL not in result.evidence.files_changed
+    assert result.evidence.files_changed == ["new_module.py"]

@@ -9,6 +9,15 @@ import subprocess
 from typing import Callable, Sequence
 
 
+# Filename a backend writes into the worktree root to signal it cannot proceed.
+# The file's contents become the human-facing ``blocked_reason``. The executor
+# reads the file rather than trusting a transcript claim, so a "blocked" outcome
+# rests on observed evidence, the same footing as the diff/test signals.
+BLOCKED_SENTINEL = ".worklink-blocked"
+
+_BLOCKED_REASON_LIMIT = 2000
+
+
 @dataclass(frozen=True)
 class CommandResult:
     cmd: str
@@ -259,12 +268,21 @@ def _observe_evidence_from_ref(
     path_groups = [[line for line in committed.stdout.splitlines() if line.strip()]]
     if status is not None:
         path_groups.append(_paths_from_status(status.stdout))
-    files_changed = _merge_paths(*path_groups)
+    # The blocked sentinel is a control signal, not a deliverable: keep it out of
+    # the changed-file set so it never reads as work product.
+    files_changed = [p for p in _merge_paths(*path_groups) if p != BLOCKED_SENTINEL]
+    blocked_reason = _read_blocked_sentinel(worktree)
+    resolved_status = "blocked" if blocked_reason else _common_status(backend_status)
     commands: list[CommandResult] = list(pre_commands or [])
     commands.extend([
         CommandResult(f"git diff --name-only {range_ref}", committed.returncode, _summarize(committed)),
         CommandResult(f"git diff --stat {range_ref}", stat.returncode, stat.stdout.strip()),
     ])
+    if blocked_reason is not None:
+        sentinel_summary = (
+            blocked_reason if len(blocked_reason) <= 500 else blocked_reason[:497] + "..."
+        )
+        commands.append(CommandResult(f"read {BLOCKED_SENTINEL}", 0, sentinel_summary))
     if status is not None:
         commands.append(
             CommandResult(
@@ -304,8 +322,8 @@ def _observe_evidence_from_ref(
         commands=commands,
         tests=tests,
         pr_url=pr_url,
-        status=_common_status(backend_status),
-        blocked_reason=None,
+        status=resolved_status,
+        blocked_reason=blocked_reason,
         transcript=transcript,
         diff_observed=pre_observed
         and committed.returncode == 0
@@ -322,6 +340,27 @@ def _common_status(status: str) -> str:
     if normalized in {"blocked", "needs_human"}:
         return "blocked"
     return "failed"
+
+
+def _read_blocked_sentinel(worktree: Path) -> str | None:
+    """Return the blocked reason a backend wrote into the worktree, if any.
+
+    Reads ``<worktree>/.worklink-blocked`` tolerantly (a backend may emit
+    non-UTF-8 bytes) and returns the stripped, length-capped reason. Returns
+    ``None`` when the file is absent or contains only whitespace.
+    """
+    sentinel = worktree / BLOCKED_SENTINEL
+    try:
+        raw = sentinel.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        # Absent sentinel (the common case) or any unreadable path == no signal.
+        return None
+    reason = raw.strip()
+    if not reason:
+        return None
+    if len(reason) > _BLOCKED_REASON_LIMIT:
+        reason = reason[: _BLOCKED_REASON_LIMIT - 3] + "..."
+    return reason
 
 
 def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:

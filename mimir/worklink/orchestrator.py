@@ -470,8 +470,11 @@ def _comment_evidence(
         f"files={len(evidence.files_changed)} evidence={evidence_path}"
     )
     reasons = f"\nReasons: {', '.join(validation.reasons)}" if validation.reasons else ""
+    blocked = ""
+    if validation.status == "blocked" and evidence.blocked_reason:
+        blocked = f"\nBlocked: {evidence.blocked_reason}"
     claims._run(  # noqa: SLF001 - Chainlink wrapper owns quoting/checks.
-        "issue", "comment", str(evidence.issue), summary + reasons
+        "issue", "comment", str(evidence.issue), summary + reasons + blocked
     )
 
 
