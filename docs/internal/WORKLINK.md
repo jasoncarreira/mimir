@@ -473,14 +473,30 @@ content verbatim into acceptance criteria.
   events.jsonl with feedback rules (attempts-exhausted negative), so
   the agent sees its delegated work's health in the algedonic block.
 - **Tool-pin inventory (external-toolchain drift).** `worklink.yaml`
-  carries `tool_pins:` — every pinned external executable (codex,
-  chainlink, mermaid-cli, helper CLIs) with category, pin
-  (version/SHA), and a smoke command. A low-priority maintenance
-  poller inventories pins vs upstream and **files chainlink bump
-  issues** with changelog/risk notes; those flow through this same
-  pipeline (planner refines → executor bumps in a worktree → the smoke
-  command is the evidence). Version-drift checks are a tool-class
-  concern, not a coding-CLI special case.
+  may carry deployment-specific `tool_pins:`, but the source-controlled
+  seed inventory lives in `mimir.worklink.tool_pins.DEFAULT_TOOL_PINS`.
+  The seed covers pinned external executables that affect agent/worklink
+  operation: codex, chainlink, mermaid-cli, optional claude-code, and
+  gmail-poller's gogcli helper. Each entry records category, upstream
+  lookup source, current pin, install surface, smoke command, and risk
+  notes; guard tests compare those pins against Dockerfile/scaffold/
+  skill-fragment literals so the inventory cannot silently drift from
+  shipped installs. A low-priority maintenance poller inventories pins
+  vs upstream and **files chainlink bump issues** with changelog/risk
+  notes; those flow through this same pipeline (planner refines →
+  executor bumps in a worktree → the smoke command is the evidence).
+  Version-drift checks are a tool-class concern, not a coding-CLI
+  special case.
+
+  Initial seed inventory:
+
+  | Tool | Category | Source lookup | Current pin | Install surface | Smoke command | Risk surface |
+  |------|----------|---------------|-------------|-----------------|---------------|--------------|
+  | codex | `coding-cli` | npm package `@openai/codex` | `0.137.0` | scaffold Dockerfiles when `codex-plus` is selected | `codex --version && env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_backends.py` | High: first Worklink coding backend; CLI drift can affect prompt execution, sandbox flags, transcript shape, and quota use. |
+  | chainlink | `issue-cli` | GitHub release/tag `dollspace-gay/chainlink` | `chainlink-1.6.0` | bundled Chainlink skill `dockerfile.fragment` | `chainlink --version && chainlink issue ready` | High: Worklink coordination depends on issue, lock, comment, and dependency semantics. |
+  | mermaid-cli | `renderer` | npm package `@mermaid-js/mermaid-cli` | `11.15.0` | scaffold Dockerfiles | `mmdc --version` | Low: renderer/Chromium drift affects diagram generation, not coding execution. |
+  | claude-code | `coding-cli` | npm package `@anthropic-ai/claude-code` | `2.1.168` | root/scaffold Dockerfiles when `MIMIR_ENABLE_CLAUDE_CODE=1` | `claude --version` | Medium: optional second coding backend; real smoke requires a deployment with `claude` installed. |
+  | gogcli | `integration-cli` | GitHub release/tag `steipete/gogcli` | `v0.9.0` | gmail-poller optional-skill `dockerfile.fragment` | `gog --version` | Medium: Gmail/Calendar helper drift can break polling independent of Worklink coding backends. |
 
 ## 7. Operator runbook
 

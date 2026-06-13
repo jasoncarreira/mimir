@@ -378,6 +378,8 @@ tool_pins:
     smoke: "codex --version"
     source: npm
     package: "@openai/codex"
+    install: "scaffold Dockerfiles"
+    risk: "high"
   - name: chainlink
     category: tracker
     pin: "chainlink-1.6.0"
@@ -397,6 +399,8 @@ tool_pins:
             smoke="codex --version",
             source="npm",
             package="@openai/codex",
+            install="scaffold Dockerfiles",
+            risk="high",
         ),
         ToolPin(
             name="chainlink",
