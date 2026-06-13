@@ -12,7 +12,7 @@ from ..compute import (
 from .base import Caps, RawResult, ToolBackend, WorkOrder
 from .claude_cli import ClaudeCliBackend
 from .codex import CodexBackend
-from .registry import BackendRegistry, WorklinkConfig, WorklinkDefaults, WorklinkRoute
+from .registry import BackendRegistry, ToolPin, WorklinkConfig, WorklinkDefaults, WorklinkRoute
 
 __all__ = [
     "BackendRegistry",
@@ -27,6 +27,7 @@ __all__ = [
     "LocalSubprocessComputeBackend",
     "RawResult",
     "ToolBackend",
+    "ToolPin",
     "WorkOrder",
     "WorkSpec",
     "WorklinkConfig",

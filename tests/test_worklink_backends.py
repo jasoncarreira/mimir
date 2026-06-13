@@ -15,6 +15,7 @@ from mimir.worklink.backends import (
     ComputeResult,
     LocalSubprocessComputeBackend,
     RawResult,
+    ToolPin,
     WorkOrder,
     WorklinkConfig,
 )
@@ -362,6 +363,83 @@ backends:
     assert claude_cli.extra_args == ("-p", "--output-format", "json", "--allowedTools", "Bash")
     assert config.defaults.compute_backend == "local_subprocess"
     assert isinstance(registry.select_compute(), LocalSubprocessComputeBackend)
+
+    assert config.tool_pins == ()
+
+
+def test_worklink_config_parses_tool_pins(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+tool_pins:
+  - name: codex
+    category: coding-cli
+    pin: "0.137.0"
+    smoke: "codex --version"
+    source: npm
+    package: "@openai/codex"
+  - name: chainlink
+    category: tracker
+    pin: "chainlink-1.6.0"
+    smoke: "chainlink --help"
+    source: github-release
+    repo: dollspace-gay/chainlink
+""".strip()
+    )
+
+    config = WorklinkConfig.load(config_path)
+
+    assert config.tool_pins == (
+        ToolPin(
+            name="codex",
+            category="coding-cli",
+            pin="0.137.0",
+            smoke="codex --version",
+            source="npm",
+            package="@openai/codex",
+        ),
+        ToolPin(
+            name="chainlink",
+            category="tracker",
+            pin="chainlink-1.6.0",
+            smoke="chainlink --help",
+            source="github-release",
+            repo="dollspace-gay/chainlink",
+        ),
+    )
+
+
+def test_worklink_config_allows_missing_or_empty_tool_pins(tmp_path: Path) -> None:
+    missing_path = tmp_path / "missing.yaml"
+    missing_path.write_text("defaults:\n  backend: codex\n")
+    empty_path = tmp_path / "empty.yaml"
+    empty_path.write_text("tool_pins: []\n")
+    null_path = tmp_path / "null.yaml"
+    null_path.write_text("tool_pins:\n")
+
+    assert WorklinkConfig.load(missing_path).tool_pins == ()
+    assert WorklinkConfig.load(empty_path).tool_pins == ()
+    assert WorklinkConfig.load(null_path).tool_pins == ()
+
+
+def test_worklink_config_rejects_invalid_tool_pins(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+tool_pins:
+  - name: codex
+    category: coding-cli
+    pin: "0.137.0"
+""".strip()
+    )
+
+    with pytest.raises(ValueError, match=r"worklink tool_pins\[0\] missing required field"):
+        WorklinkConfig.load(config_path)
+
+    config_path.write_text("tool_pins: not-a-list\n")
+    with pytest.raises(ValueError, match="worklink tool_pins must be a list"):
+        WorklinkConfig.load(config_path)
+
 
 
 def test_codex_work_spec_includes_rules_in_local_argv(tmp_path: Path) -> None:

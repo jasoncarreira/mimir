@@ -655,14 +655,18 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454)
     subnets: ["subnet-…"]
 
 tool_pins:
-  - name: codex
-    category: coding-cli
-    pin: "0.99.0"
-    smoke: "codex --version"
+  - name: codex                  # required: stable local tool name
+    category: coding-cli         # required: coding-cli | renderer | tracker | helper
+    pin: "0.99.0"                # required: version, tag, or SHA currently expected
+    smoke: "codex --version"     # required: command used as bump evidence
+    source: npm                  # optional lookup strategy for drift checks
+    package: "@openai/codex"     # optional upstream package/repo identifier
   - name: chainlink
     category: tracker
     pin: "git+dollspace-gay/chainlink@<sha>"
     smoke: "chainlink --help"
+    source: github-release
+    repo: dollspace-gay/chainlink
   - name: mermaid-cli
     category: renderer
     pin: "11.x"
