@@ -435,6 +435,14 @@ The planner-supplied `Suggested test command` is executable shell input
 (`shell=True`) from Chainlink issue descriptions, within the same
 operator/agent-private trust boundary as poller commands.
 
+For non-shared-filesystem compute substrates, controller-side evidence
+re-derivation is intentionally diff-only for now: the orchestrator fetches refs
+and runs `git diff`, but it must **not** check out the worker branch and run
+`test_command` on the controller. Test re-derivation for remote workers needs a
+fresh sandboxed compute job in the same substrate; until that exists, remote
+evidence marks tests `observed=false`, so the gate fails closed instead of
+executing backend-authored branch code on the controller.
+
 Prompt content originates from chainlink issues (operator/planner-authored),
 not arbitrary external text; the planner must not paste untrusted web/PR
 content verbatim into acceptance criteria.

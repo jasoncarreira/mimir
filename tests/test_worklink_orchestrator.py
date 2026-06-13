@@ -24,12 +24,13 @@ from mimir.worklink.orchestrator import (
 class FakeCompute:
     name = "fake_compute"
 
-    def __init__(self) -> None:
+    def __init__(self, *, shared_filesystem: bool = False) -> None:
+        self.shared_filesystem = shared_filesystem
         self.specs: list[WorkSpec] = []
         self.cleaned: list[WorkSpec] = []
 
     def capabilities(self) -> ComputeCaps:
-        return ComputeCaps(False, False, True, False)
+        return ComputeCaps(self.shared_filesystem, False, True, False)
 
     async def launch(self, spec: WorkSpec) -> WorkSpec:
         self.specs.append(spec)
@@ -99,7 +100,7 @@ class FakeBackend:
 def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo / ".worklink" / "441-1"
-    compute = FakeCompute()
+    compute = FakeCompute(shared_filesystem=True)
     calls: list[Sequence[str] | str] = []
 
     def runner(
@@ -424,7 +425,7 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
 
 
 
-def test_remote_compute_gate_rederives_evidence_from_pushed_branch(tmp_path: Path) -> None:
+def test_remote_compute_gate_rederives_diff_but_does_not_run_tests_on_controller(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo / ".worklink" / "441-1"
     compute = FakeCompute()
@@ -470,14 +471,14 @@ def test_remote_compute_gate_rederives_evidence_from_pushed_branch(tmp_path: Pat
         ):
             return cp(args, stdout=" remote.txt | 1 +\n")
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "checkout"]:
-            return cp(args)
+            raise AssertionError("remote gate must not checkout untrusted branch on controller")
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"]:
             # A remote substrate must not be gated on the placeholder local worktree.
             return cp(args, stdout="")
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "status"]:
             return cp(args)
         if args == "echo ok":
-            return cp(args, stdout="ok\n")
+            raise AssertionError("remote gate must not run branch tests on controller")
         if isinstance(args, list) and args[:3] == ["gh", "pr", "create"]:
             return cp(args, stdout="https://github.com/jasoncarreira/mimir/pull/1000\n")
         return cp(args)
@@ -493,9 +494,9 @@ def test_remote_compute_gate_rederives_evidence_from_pushed_branch(tmp_path: Pat
         )
     )
 
-    assert result.status == "completed"
-    assert result.review_ready is True
-    assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/1000"
+    assert result.status == "failed"
+    assert result.review_ready is False
+    assert result.pr_url is None
     assert ["git", "-C", str(worktree), "fetch", "origin", "+main:refs/remotes/origin/main"] in calls
     assert [
         "git",
@@ -505,7 +506,7 @@ def test_remote_compute_gate_rederives_evidence_from_pushed_branch(tmp_path: Pat
         "origin",
         "+issue/441-a1:refs/remotes/origin/issue/441-a1",
     ] in calls
-    assert ["git", "-C", str(worktree), "checkout", "--detach", "origin/issue/441-a1"] in calls
+    assert ["git", "-C", str(worktree), "checkout", "--detach", "origin/issue/441-a1"] not in calls
     assert not any(
         isinstance(call, list) and call[:4] == ["git", "-C", str(worktree), "add"]
         for call in calls
@@ -521,6 +522,8 @@ def test_remote_compute_gate_rederives_evidence_from_pushed_branch(tmp_path: Pat
     )
     assert "remote.txt" in evidence
     assert "origin/main...origin/issue/441-a1" in evidence
+    assert '"observed": false' in evidence
+    assert "remote test re-run requires sandboxed compute" in evidence
 
 
 def test_remote_compute_fetch_failure_blocks_review_gate(tmp_path: Path) -> None:

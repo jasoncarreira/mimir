@@ -192,12 +192,12 @@ def observe_remote_evidence(
         base_ref=f"origin/{base_ref}",
         head_ref=head_ref,
         backend_status=backend_status,
-        test_command=test_command,
+        test_command=None,
         transcript=transcript,
         pr_url=pr_url,
         runner=runner,
         include_worktree_status=False,
-        checkout_ref=head_ref,
+        checkout_ref=None,
         pre_commands=[
             CommandResult(
                 f"git fetch origin {base_ref}", fetch_base.returncode, _summarize(fetch_base)
@@ -208,6 +208,17 @@ def observe_remote_evidence(
         ],
         pre_observed=fetch_base.returncode == 0 and fetch_branch.returncode == 0,
     )
+    if test_command:
+        evidence = replace(
+            validation.evidence,
+            tests=TestResult(
+                test_command,
+                None,
+                "remote test re-run requires sandboxed compute",
+                observed=False,
+            ),
+        )
+        return validate_evidence(evidence)
     return validation
 
 
