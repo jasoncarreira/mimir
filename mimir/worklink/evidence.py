@@ -123,26 +123,173 @@ def observe_evidence(
     pr_url: str | None = None,
     runner: Run | None = None,
 ) -> EvidenceValidation:
-    """Build evidence by observing the worktree after a backend run."""
-    runner = runner or _run
-    committed = runner(["git", "-C", str(worktree), "diff", "--name-only", f"{base_ref}...HEAD"])
-    stat = runner(["git", "-C", str(worktree), "diff", "--stat", f"{base_ref}...HEAD"])
-    status = runner(["git", "-C", str(worktree), "status", "--porcelain=v1", "--untracked-files=all"])
-    files_changed = _merge_paths(
-        [line for line in committed.stdout.splitlines() if line.strip()],
-        _paths_from_status(status.stdout),
+    """Build evidence by observing a worktree after a backend run."""
+    return _observe_evidence_from_ref(
+        issue=issue,
+        attempt=attempt,
+        backend=backend,
+        branch=branch,
+        worktree=worktree,
+        started_at=started_at,
+        base_ref=base_ref,
+        head_ref="HEAD",
+        backend_status=backend_status,
+        test_command=test_command,
+        transcript=transcript,
+        pr_url=pr_url,
+        runner=runner,
+        include_worktree_status=True,
     )
-    commands: list[CommandResult] = [
-        CommandResult(f"git diff --name-only {base_ref}...HEAD", committed.returncode, _summarize(committed)),
-        CommandResult(f"git diff --stat {base_ref}...HEAD", stat.returncode, stat.stdout.strip()),
-        CommandResult("git status --porcelain=v1 --untracked-files=all", status.returncode, _summarize(status)),
-    ]
+
+
+def observe_remote_evidence(
+    *,
+    issue: int,
+    attempt: int,
+    backend: str,
+    branch: str,
+    worktree: Path,
+    started_at: datetime,
+    base_ref: str,
+    backend_status: str,
+    test_command: str | None,
+    transcript: str | None = None,
+    pr_url: str | None = None,
+    runner: Run | None = None,
+) -> EvidenceValidation:
+    """Build evidence from fetched refs after a remote compute run.
+
+    Remote workers are untrusted for transition gating.  The orchestrator
+    fetches both refs into a fresh/local observation worktree and derives diff
+    and test evidence from ``origin/<base_ref>..origin/<branch>`` instead of
+    trusting worker-reported evidence JSON or a shared filesystem worktree.
+    """
+    runner = runner or _run
+    fetch_base = runner([
+        "git",
+        "-C",
+        str(worktree),
+        "fetch",
+        "origin",
+        f"+{base_ref}:refs/remotes/origin/{base_ref}",
+    ])
+    fetch_branch = runner([
+        "git",
+        "-C",
+        str(worktree),
+        "fetch",
+        "origin",
+        f"+{branch}:refs/remotes/origin/{branch}",
+    ])
+    head_ref = f"origin/{branch}"
+    validation = _observe_evidence_from_ref(
+        issue=issue,
+        attempt=attempt,
+        backend=backend,
+        branch=branch,
+        worktree=worktree,
+        started_at=started_at,
+        base_ref=f"origin/{base_ref}",
+        head_ref=head_ref,
+        backend_status=backend_status,
+        test_command=None,
+        transcript=transcript,
+        pr_url=pr_url,
+        runner=runner,
+        include_worktree_status=False,
+        checkout_ref=None,
+        pre_commands=[
+            CommandResult(
+                f"git fetch origin {base_ref}", fetch_base.returncode, _summarize(fetch_base)
+            ),
+            CommandResult(
+                f"git fetch origin {branch}", fetch_branch.returncode, _summarize(fetch_branch)
+            ),
+        ],
+        pre_observed=fetch_base.returncode == 0 and fetch_branch.returncode == 0,
+    )
+    if test_command:
+        evidence = replace(
+            validation.evidence,
+            tests=TestResult(
+                test_command,
+                None,
+                "remote test re-run requires sandboxed compute",
+                observed=False,
+            ),
+        )
+        return validate_evidence(evidence)
+    return validation
+
+
+def _observe_evidence_from_ref(
+    *,
+    issue: int,
+    attempt: int,
+    backend: str,
+    branch: str,
+    worktree: Path,
+    started_at: datetime,
+    base_ref: str,
+    head_ref: str,
+    backend_status: str,
+    test_command: str | None,
+    transcript: str | None,
+    pr_url: str | None,
+    runner: Run | None,
+    include_worktree_status: bool,
+    checkout_ref: str | None = None,
+    pre_commands: list[CommandResult] | None = None,
+    pre_observed: bool = True,
+) -> EvidenceValidation:
+    runner = runner or _run
+    range_ref = f"{base_ref}...{head_ref}"
+    committed = runner(["git", "-C", str(worktree), "diff", "--name-only", range_ref])
+    stat = runner(["git", "-C", str(worktree), "diff", "--stat", range_ref])
+    status = None
+    if include_worktree_status:
+        status = runner([
+            "git",
+            "-C",
+            str(worktree),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ])
+    path_groups = [[line for line in committed.stdout.splitlines() if line.strip()]]
+    if status is not None:
+        path_groups.append(_paths_from_status(status.stdout))
+    files_changed = _merge_paths(*path_groups)
+    commands: list[CommandResult] = list(pre_commands or [])
+    commands.extend([
+        CommandResult(f"git diff --name-only {range_ref}", committed.returncode, _summarize(committed)),
+        CommandResult(f"git diff --stat {range_ref}", stat.returncode, stat.stdout.strip()),
+    ])
+    if status is not None:
+        commands.append(
+            CommandResult(
+                "git status --porcelain=v1 --untracked-files=all",
+                status.returncode,
+                _summarize(status),
+            )
+        )
 
     tests: TestResult | None = None
+    checkout = None
+    if checkout_ref:
+        checkout = runner(["git", "-C", str(worktree), "checkout", "--detach", checkout_ref])
+        commands.append(
+            CommandResult(
+                f"git checkout --detach {checkout_ref}", checkout.returncode, _summarize(checkout)
+            )
+        )
     if test_command:
-        test = runner(test_command, cwd=worktree)
-        tests = TestResult(test_command, test.returncode, _summarize(test))
-        commands.append(CommandResult(test_command, test.returncode, _summarize(test)))
+        if checkout is not None and checkout.returncode != 0:
+            tests = TestResult(test_command, None, "checkout failed before test", observed=False)
+        else:
+            test = runner(test_command, cwd=worktree)
+            tests = TestResult(test_command, test.returncode, _summarize(test))
+            commands.append(CommandResult(test_command, test.returncode, _summarize(test)))
 
     evidence = WorklinkEvidence(
         issue=issue,
@@ -160,7 +307,10 @@ def observe_evidence(
         status=_common_status(backend_status),
         blocked_reason=None,
         transcript=transcript,
-        diff_observed=committed.returncode == 0 and stat.returncode == 0 and status.returncode == 0,
+        diff_observed=pre_observed
+        and committed.returncode == 0
+        and stat.returncode == 0
+        and (status is None or status.returncode == 0),
     )
     return validate_evidence(evidence)
 

@@ -26,12 +26,13 @@ from mimir.worklink.orchestrator import (
 class FakeCompute:
     name = "fake_compute"
 
-    def __init__(self) -> None:
+    def __init__(self, *, shared_filesystem: bool = False) -> None:
+        self.shared_filesystem = shared_filesystem
         self.specs: list[WorkSpec] = []
         self.cleaned: list[WorkSpec] = []
 
     def capabilities(self) -> ComputeCaps:
-        return ComputeCaps(False, False, True, False)
+        return ComputeCaps(self.shared_filesystem, False, True, False)
 
     async def launch(self, spec: WorkSpec) -> WorkSpec:
         self.specs.append(spec)
@@ -320,7 +321,7 @@ def test_worker_asks_backend_to_localize_tool_argv(tmp_path: Path) -> None:
 def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo / ".worklink" / "441-1"
-    compute = FakeCompute()
+    compute = FakeCompute(shared_filesystem=True)
     calls: list[Sequence[str] | str] = []
 
     def runner(
@@ -643,6 +644,166 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
 
 
+
+
+def test_remote_compute_gate_rederives_diff_but_does_not_run_tests_on_controller(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    compute = FakeCompute()
+    calls: list[Sequence[str] | str] = []
+
+    def runner(
+        args: Sequence[str] | str, *, cwd: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            return cp(args, stdout=ISSUE_JSON)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "close"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "label"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "unlabel"]:
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
+            worktree.mkdir(parents=True)
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "fetch"]:
+            return cp(args)
+        if (
+            isinstance(args, list)
+            and args[:4] == ["git", "-C", str(worktree), "diff"]
+            and "origin/main...origin/issue/441-a1" in args
+            and "--name-only" in args
+        ):
+            return cp(args, stdout="remote.txt\n")
+        if (
+            isinstance(args, list)
+            and args[:4] == ["git", "-C", str(worktree), "diff"]
+            and "origin/main...origin/issue/441-a1" in args
+            and "--stat" in args
+        ):
+            return cp(args, stdout=" remote.txt | 1 +\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "checkout"]:
+            raise AssertionError("remote gate must not checkout untrusted branch on controller")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"]:
+            # A remote substrate must not be gated on the placeholder local worktree.
+            return cp(args, stdout="")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "status"]:
+            return cp(args)
+        if args == "echo ok":
+            raise AssertionError("remote gate must not run branch tests on controller")
+        if isinstance(args, list) and args[:3] == ["gh", "pr", "create"]:
+            return cp(args, stdout="https://github.com/jasoncarreira/mimir/pull/1000\n")
+        return cp(args)
+
+    backend = FakeBackend(status="success", write_change=False)
+    registry = BackendRegistry(WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute")))
+    registry.register(backend)
+    registry.register_compute(compute)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.review_ready is False
+    assert result.pr_url is None
+    assert ["git", "-C", str(worktree), "fetch", "origin", "+main:refs/remotes/origin/main"] in calls
+    assert [
+        "git",
+        "-C",
+        str(worktree),
+        "fetch",
+        "origin",
+        "+issue/441-a1:refs/remotes/origin/issue/441-a1",
+    ] in calls
+    assert ["git", "-C", str(worktree), "checkout", "--detach", "origin/issue/441-a1"] not in calls
+    assert not any(
+        isinstance(call, list) and call[:4] == ["git", "-C", str(worktree), "add"]
+        for call in calls
+    )
+    assert not any(
+        isinstance(call, list)
+        and call[:3] == ["git", "-C", str(repo)]
+        and call[3] == "push"
+        for call in calls
+    )
+    evidence = (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text(
+        encoding="utf-8"
+    )
+    assert "remote.txt" in evidence
+    assert "origin/main...origin/issue/441-a1" in evidence
+    assert '"observed": false' in evidence
+    assert "remote test re-run requires sandboxed compute" in evidence
+
+
+def test_remote_compute_fetch_failure_blocks_review_gate(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    compute = FakeCompute()
+    calls: list[Sequence[str] | str] = []
+
+    def runner(
+        args: Sequence[str] | str, *, cwd: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            return cp(args, stdout=ISSUE_JSON)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "close"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "label"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "unlabel"]:
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
+            worktree.mkdir(parents=True)
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "fetch"]:
+            return cp(args, returncode=1, stderr="missing ref\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"]:
+            return cp(args, stdout="remote.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "checkout"]:
+            return cp(args)
+        if args == "echo ok":
+            return cp(args, stdout="ok\n")
+        return cp(args)
+
+    backend = FakeBackend(status="success", write_change=False)
+    registry = BackendRegistry(WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute")))
+    registry.register(backend)
+    registry.register_compute(compute)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.review_ready is False
+    assert not any(isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls)
+    evidence = (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text(
+        encoding="utf-8"
+    )
+    assert "diff_not_observed" in evidence or "missing ref" in evidence
 
 def test_worklink_runner_backend_nonzero_transitions_failed_without_pr(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
