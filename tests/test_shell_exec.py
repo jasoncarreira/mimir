@@ -64,6 +64,20 @@ def test_shell_exec_still_blocks_empty_command():
     assert "command is required" in result
 
 
+def test_shell_exec_tolerates_non_utf8_stdout():
+    """Binary-ish command output must not crash the whole agent turn.
+
+    Heartbeat #470 failures surfaced as bare UnicodeDecodeError records when
+    shell commands encountered non-UTF-8 local artifacts (for example grep/find
+    probes that crossed binary files). Decode lossy display output with
+    replacement instead of letting subprocess text mode raise.
+    """
+    result = shell_exec.invoke({"command": "printf '\\247'"})
+
+    assert "exit=0" in result
+    assert "�" in result
+
+
 def test_shell_exec_expands_shell_syntax():
     """shell-wrapper fix: shell_exec runs via bash -lc, so shell syntax is
     honored — env vars expand (this test used to pin the OPPOSITE under the

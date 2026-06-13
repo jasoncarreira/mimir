@@ -39,6 +39,7 @@ import logging
 import os
 import re
 import time
+import traceback
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1361,6 +1362,11 @@ class Agent:
                         turn_id=turn_id,
                         trigger=event.trigger,
                         error=f"{type(exc).__name__}: {exc}"[:240],
+                        traceback="".join(
+                            traceback.format_exception(
+                                type(exc), exc, exc.__traceback__, limit=12,
+                            )
+                        )[-4000:],
                         phase="pre_model_loop",
                         **_turn_outcome_identity(event),
                     )
@@ -1523,6 +1529,7 @@ class Agent:
             _timeout_ctx = contextlib.nullcontext()
 
         error: str | None = None
+        exception_traceback: str | None = None
         messages: list[Any] = []
         output = ""
         # chainlink #376 (PR 3/4): (event, fold_monotonic) for each message
@@ -1576,6 +1583,9 @@ class Agent:
             await log_event("turn_timeout", channel_id=event.channel_id, timeout_s=timeout)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
+            exception_traceback = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__, limit=16)
+            )
             events = []
             log.exception("agent.astream failed: %s", exc)
             # Mid-turn quota exhaustion handling (SPEC §4.9 / §16 item 18).
@@ -1689,6 +1699,10 @@ class Agent:
                 turn_id=turn_id,
                 trigger=event.trigger,
                 error=error[:240],
+                **(
+                    {"traceback": exception_traceback[-4000:]}
+                    if exception_traceback else {}
+                ),
                 **_turn_outcome_identity(event),
             )
         elif event.trigger == "poller":

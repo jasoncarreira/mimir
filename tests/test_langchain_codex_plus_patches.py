@@ -64,7 +64,6 @@ async def test_codex_plus_astream_does_not_retry_after_yield(
 
     assert FakeChatCodexPlus.calls == 1
 
-
 def test_codex_plus_generate_retries_transient(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MIMIR_CODEX_PLUS_TRANSIENT_RETRY_ATTEMPTS", "3")
     monkeypatch.setenv("MIMIR_CODEX_PLUS_TRANSIENT_RETRY_BASE_DELAY", "0")
@@ -85,7 +84,6 @@ def test_codex_plus_generate_retries_transient(monkeypatch: pytest.MonkeyPatch) 
 
     assert FakeChatCodexPlus()._generate([]) == "ok"
     assert FakeChatCodexPlus.calls == 2
-
 
 def test_codex_plus_patch_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MIMIR_CODEX_PLUS_TRANSIENT_RETRY_ATTEMPTS", "2")

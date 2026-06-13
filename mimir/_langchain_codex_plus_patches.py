@@ -5,6 +5,11 @@ small, defensive patches that protect production turns until the provider can
 ship the behavior itself. The functions are intentionally import-light: nothing
 here imports ``langchain_codex_plus`` or ``httpx`` at module import time, so
 operators not using the Codex Plus extra don't pay for it.
+
+Keep patches at the boundary ``langchain-codex-plus`` actually uses. For
+example, the Codex Plus streaming path consumes httpx ``iter_lines`` /
+``aiter_lines`` and never instantiates OpenAI SDK ``SSEDecoder``; do not patch
+that SDK decoder here as a proxy for Codex Plus transport failures.
 """
 
 from __future__ import annotations

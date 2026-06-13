@@ -14,6 +14,7 @@ deepagents graph is constructed. We're verifying the
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -1699,6 +1700,33 @@ async def test_run_turn_emits_missed_submission_for_unsubmitted_poller_review(
     )
     assert missed[0]["expected"] == 1
     assert missed[0]["submitted"] == 0
+
+
+async def test_run_turn_failed_event_includes_traceback_for_model_loop_errors(
+    tmp_path: Path,
+):
+    class ExplodingAgent:
+        async def astream(self, state, *, config, stream_mode="values"):
+            raise UnicodeDecodeError("utf-8", b"bad \xa7", 4, 5, "invalid start byte")
+            yield  # pragma: no cover - makes this an async generator
+
+    agent = _build_agent(
+        tmp_path, fake_agent=ExplodingAgent(), fake_saga=None,
+        session_manager=_FakeSessionManager(),
+    )
+
+    record = await agent.run_turn(
+        AgentEvent(trigger="scheduled_tick", channel_id="scheduler:heartbeat", content="x")
+    )
+
+    assert record.error and record.error.startswith("UnicodeDecodeError:")
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    failed = [e for e in evs if e.get("type") == "turn_failed"]
+    assert len(failed) == 1
+    assert failed[0]["trigger"] == "scheduled_tick"
+    assert "UnicodeDecodeError" in failed[0]["traceback"]
+    assert "tests/test_agent.py" in failed[0]["traceback"]
 
 
 async def test_early_phase_poller_crash_still_emits_turn_failed(

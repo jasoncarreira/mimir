@@ -302,7 +302,6 @@ def shell_exec(command: str) -> str:
         proc = subprocess.run(  # noqa: S603 — shell exec by design; trusted container (#226), guard middleware screens the command
             ["bash", "-lc", login_shell_command(command)],
             capture_output=True,
-            text=True,
             timeout=_SHELL_STATE["timeout_s"],
             cwd=_SHELL_STATE["cwd"],
         )
@@ -312,8 +311,10 @@ def shell_exec(command: str) -> str:
         return f"shell_exec failed: bash not found: {exc}"
 
     parts = [f"exit={proc.returncode}"]
-    if proc.stdout:
-        parts.append(f"stdout:\n{proc.stdout[:4000]}")
-    if proc.stderr:
-        parts.append(f"stderr:\n{proc.stderr[:2000]}")
+    stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
+    stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
+    if stdout:
+        parts.append(f"stdout:\n{stdout[:4000]}")
+    if stderr:
+        parts.append(f"stderr:\n{stderr[:2000]}")
     return "\n\n".join(parts)
