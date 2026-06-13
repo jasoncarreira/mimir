@@ -1,0 +1,13 @@
+{
+  "pollers": [
+    {
+      "name": "worklink-tool-pins",
+      "command": "python3 poller.py",
+      "cron": "0 8 * * 0",
+      "priority": "low",
+      "pass_env": [
+        "MIMIR_HOME"
+      ]
+    }
+  ]
+}
