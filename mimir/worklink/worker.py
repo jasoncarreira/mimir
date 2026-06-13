@@ -75,7 +75,6 @@ async def run_worker_payload(
     spec = payload.spec
     repo = _prepare_repo(payload, runner=runner)
     backend = registry.get(spec.backend)
-    local_spec = _localize_spec_for_repo(spec, repo)
     order = WorkOrder(
         issue_id=spec.issue_id,
         worktree=repo,
@@ -84,6 +83,14 @@ async def run_worker_payload(
         timeout_s=spec.timeout_s,
         env={**dict(payload.safe_env), **dict(spec.env)},
         transcript_root=payload.transcript_root,
+    )
+    local_spec = backend.work_spec(
+        order,
+        attempt=spec.attempt,
+        repo_url=spec.repo_url,
+        base_ref=spec.base_ref,
+        branch=spec.branch,
+        test_command=spec.test_command,
     )
     started = datetime.now(UTC)
     compute = LocalSubprocessComputeBackend()
@@ -98,6 +105,18 @@ async def run_worker_payload(
             if handle is not None:
                 await compute.cleanup(handle)
         raw = await backend.interpret(order, compute_result)
+        if _backend_completed(raw.backend_status):
+            _check(runner(["git", "-C", str(repo), "add", "-A"]), "git add")
+            commit = runner([
+                "git",
+                "-C",
+                str(repo),
+                "commit",
+                "-m",
+                f"worklink: issue #{spec.issue_id}",
+            ])
+            if commit.returncode != 0 and "nothing to commit" not in (commit.stdout + commit.stderr).lower():
+                raise RuntimeError((commit.stderr or commit.stdout).strip() or "git commit failed")
         validation = observe_evidence(
             issue=spec.issue_id,
             attempt=spec.attempt,
@@ -113,32 +132,7 @@ async def run_worker_payload(
         )
         _write_worker_evidence(payload.evidence_path, validation)
         if validation.review_ready:
-            _check(runner(["git", "-C", str(repo), "add", "-A"]), "git add")
-            commit = runner([
-                "git",
-                "-C",
-                str(repo),
-                "commit",
-                "-m",
-                f"worklink: issue #{spec.issue_id}",
-            ])
-            if commit.returncode != 0 and "nothing to commit" not in (commit.stdout + commit.stderr).lower():
-                raise RuntimeError((commit.stderr or commit.stdout).strip() or "git commit failed")
             _check(runner(["git", "-C", str(repo), "push", "origin", f"HEAD:{spec.branch}"]), "git push")
-            validation = observe_evidence(
-                issue=spec.issue_id,
-                attempt=spec.attempt,
-                backend=spec.backend,
-                branch=spec.branch,
-                worktree=repo,
-                started_at=started,
-                base_ref=spec.base_ref,
-                backend_status=raw.backend_status,
-                test_command=spec.test_command,
-                transcript=str(raw.transcript_path) if raw.transcript_path else None,
-                runner=runner,
-            )
-            _write_worker_evidence(payload.evidence_path, validation)
         return validation
     except Exception as exc:
         failed = _failed_worker_evidence(payload, repo, started, str(exc), runner=runner)
@@ -181,31 +175,8 @@ def _is_simple_branch(base_ref: str) -> bool:
     return "/" not in base_ref and all(ch.isalnum() or ch in "._-" for ch in base_ref)
 
 
-def _localize_spec_for_repo(spec: WorkSpec, repo: Path) -> WorkSpec:
-    from dataclasses import replace
-
-    argv = spec.local_argv
-    if argv:
-        argv = _rewrite_local_argv(argv, repo, spec)
-    return replace(spec, local_worktree=repo, local_argv=argv)
-
-
-def _rewrite_local_argv(argv: Sequence[str], repo: Path, spec: WorkSpec) -> tuple[str, ...]:
-    rendered_prompt = spec.prompt if spec.rules is None else f"{spec.rules.rstrip()}\n\n{spec.prompt}"
-    rewritten: list[str] = []
-    skip_next = False
-    for index, arg in enumerate(argv):
-        if skip_next:
-            skip_next = False
-            continue
-        if arg == "--cd" and index + 1 < len(argv):
-            rewritten.extend(["--cd", str(repo)])
-            skip_next = True
-        elif index == len(argv) - 1:
-            rewritten.append(rendered_prompt)
-        else:
-            rewritten.append(str(arg))
-    return tuple(rewritten)
+def _backend_completed(status: str) -> bool:
+    return status.lower().strip() in {"completed", "success", "succeeded", "ok"}
 
 
 def _failed_worker_evidence(
