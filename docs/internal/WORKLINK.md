@@ -319,11 +319,14 @@ Four facts shape it:
   assumes a *local* worktree it creates, a *local* backend subprocess, and
   *local* `git diff`/test observation — a remote worker breaks all three.
   Instead of shipping a worktree, ship a git ref: the `WorkSpec` carries
-  `{repo_url, base_ref, branch, prompt, test_command, creds_ref, …}`; the worker
-  clones, checks out, runs the backend, runs tests, **pushes the branch**, and
-  emits `evidence.json`. Bind-mounting a worktree is a Docker-only optimization
-  (and the sibling-mount footgun: `-v /path` resolves on the *daemon* host, not
-  the parent container's namespace).
+  `{repo_url, base_ref, branch, prompt, test_command, creds_ref, …}`. The
+  bundled worker entrypoint (`python -m mimir.worklink.worker` or
+  `mimir worklink worker <payload.json>`) accepts a `WorkerPayload`, clones or
+  fetches the repo, checks out the base ref, creates/resets the attempt branch,
+  runs the selected `ToolBackend`, runs tests, **pushes the branch**, and emits
+  `evidence.json`. Bind-mounting a worktree is a Docker-only optimization (and
+  the sibling-mount footgun: `-v /path` resolves on the *daemon* host, not the
+  parent container's namespace).
 - **Observe-don't-trust survives.** The orchestrator can no longer diff a local
   worktree, so it **fetches the pushed branch and re-derives** diff/tests from
   `base..head` itself. The worker's `evidence.json` is a hint; the orchestrator's
@@ -348,6 +351,15 @@ class WorkSpec:
     env: dict[str, str]                          # explicit allowlist
     backend_config: dict[str, Any]               # tool-specific settings
     local_worktree: Path | None                  # local-subprocess compatibility only
+    local_argv: tuple[str, ...] | None            # local-subprocess compatibility only
+
+@dataclass(frozen=True)
+class WorkerPayload:
+    spec: WorkSpec
+    repo_dir: Path                                # worker-local clone directory
+    evidence_path: Path                           # where evidence.json is written
+    transcript_root: Path | None = None           # outside worktree when possible
+    safe_env: dict[str, str] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class LaunchHandle:

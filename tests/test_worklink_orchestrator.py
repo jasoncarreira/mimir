@@ -12,6 +12,7 @@ from mimir.event_logger import _reset_logger_for_tests, init_logger
 from mimir.worklink.backends import Caps, ComputeCaps, ComputeResult, RawResult, WorkOrder
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.compute import WorkSpec
+from mimir.worklink.worker import WorkerPayload, run_worker_payload
 from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
@@ -95,6 +96,103 @@ class FakeBackend:
             None,
         )
 
+
+
+class WorkerFakeBackend(FakeBackend):
+    def work_spec(
+        self,
+        order: WorkOrder,
+        *,
+        attempt: int,
+        repo_url: str,
+        base_ref: str,
+        branch: str,
+        test_command: str,
+    ) -> WorkSpec:
+        return WorkSpec(
+            issue_id=order.issue_id,
+            attempt=attempt,
+            repo_url=repo_url,
+            base_ref=base_ref,
+            branch=branch,
+            prompt=order.prompt,
+            rules=order.rules,
+            test_command=test_command,
+            backend=self.name,
+            timeout_s=order.timeout_s,
+            env=order.env,
+            local_worktree=order.worktree,
+            local_argv=("fake-tool", "--cd", str(order.worktree), order.prompt),
+        )
+
+
+def test_worker_payload_clone_branch_fake_backend_pushes_and_writes_evidence(tmp_path: Path) -> None:
+    repo = tmp_path / "worker-repo"
+    evidence_path = tmp_path / "out" / "evidence.json"
+    calls: list[Sequence[str] | str] = []
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:2] == ["git", "clone"]:
+            repo.mkdir(parents=True)
+            (repo / ".git").mkdir()
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "fetch"]:
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "checkout"]:
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--name-only" in args:
+            return cp(args, stdout="changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--stat" in args:
+            return cp(args, stdout=" changed.txt | 1 +\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "status"]:
+            return cp(args, stdout="?? changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "add"]:
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "commit"]:
+            return cp(args, stdout="[issue/456-a1 abc123] worklink\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "push"]:
+            return cp(args)
+        if args == "echo ok":
+            return cp(args, stdout="ok\n")
+        return cp(args)
+
+    backend = WorkerFakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    spec = backend.work_spec(
+        WorkOrder(
+            issue_id=456,
+            worktree=tmp_path / "origin-local-worktree-is-ignored",
+            prompt="Do worker handoff",
+            rules=None,
+            timeout_s=30,
+            env={"MIMIR_HOME": str(tmp_path / "home")},
+            transcript_root=tmp_path / "transcripts",
+        ),
+        attempt=1,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="origin/main",
+        branch="issue/456-a1",
+        test_command="echo ok",
+    )
+    payload = WorkerPayload(
+        spec=spec,
+        repo_dir=repo,
+        evidence_path=evidence_path,
+        transcript_root=tmp_path / "transcripts",
+        safe_env={"PATH": "/bin"},
+    )
+
+    validation = asyncio.run(run_worker_payload(payload, registry=registry, runner=runner))
+
+    assert validation.status == "completed"
+    assert validation.review_ready is True
+    assert evidence_path.is_file()
+    assert ["git", "clone", "git@github.com:jasoncarreira/mimir.git", str(repo)] in calls
+    assert ["git", "-C", str(repo), "checkout", "-B", "issue/456-a1", "origin/main"] in calls
+    assert ["git", "-C", str(repo), "push", "origin", "HEAD:issue/456-a1"] in calls
+    assert backend.orders[0].worktree == repo
 
 def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path: Path) -> None:
     repo = tmp_path / "repo"

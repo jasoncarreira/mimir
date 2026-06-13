@@ -53,3 +53,36 @@ def test_worklink_run_cli_dispatches_operator_vertical(
         }
     ]
     assert "worklink #441 attempt 1: completed review-ready" in capsys.readouterr().out
+
+
+def test_worklink_worker_cli_dispatches_payload_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[object] = []
+    payload = tmp_path / "payload.json"
+    payload.write_text("{}", encoding="utf-8")
+
+    class FakeValidation:
+        status = "completed"
+        review_ready = True
+        reasons = ()
+
+    import mimir.commands.worklink as worklink_cmd
+
+    def fake_payload_from_json(data: object) -> object:
+        calls.append(("payload", data))
+        return {"payload": data}
+
+    async def fake_run_worker_payload(payload_obj: object) -> FakeValidation:
+        calls.append(("run", payload_obj))
+        return FakeValidation()
+
+    monkeypatch.setattr(worklink_cmd, "payload_from_json", fake_payload_from_json)
+    monkeypatch.setattr(worklink_cmd, "run_worker_payload", fake_run_worker_payload)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "worker", str(payload)])
+
+    assert exc.value.code == 0
+    assert calls == [("payload", {}), ("run", {"payload": {}})]
+    assert "worklink worker: completed review-ready" in capsys.readouterr().out

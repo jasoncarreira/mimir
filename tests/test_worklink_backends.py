@@ -18,6 +18,7 @@ from mimir.worklink.backends import (
     WorklinkConfig,
 )
 from mimir.worklink.compute import ComputeCaps, WorkSpec
+from mimir.worklink.worker import WorkerPayload, payload_from_json, payload_to_json
 import mimir.worklink.backends.codex as codex_module
 import mimir.worklink.compute as compute_module
 
@@ -366,3 +367,38 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
 def test_codex_status_auth_detection_does_not_match_author_text() -> None:
     assert codex_module._status_from_output(1, "author: test@example.com", "") == "failed"
     assert codex_module._status_from_output(1, "", "authentication required") == "auth_error"
+
+
+def test_worker_payload_round_trips_portable_work_spec(tmp_path: Path) -> None:
+    spec = WorkSpec(
+        issue_id=456,
+        attempt=2,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="origin/main",
+        branch="issue/456-a2",
+        prompt="Do the worker slice",
+        rules="Follow policy",
+        test_command="echo ok",
+        backend="codex",
+        timeout_s=30,
+        creds_ref={"github": "worklink-github"},
+        env={"MIMIR_HOME": "/home/worklink"},
+        backend_config={"bin": "codex", "args": ["exec", "--json"]},
+        local_worktree=tmp_path / "ignored-local",
+        local_argv=("codex", "exec", "--cd", str(tmp_path / "ignored-local"), "--json", "Do the worker slice"),
+    )
+    payload = WorkerPayload(
+        spec=spec,
+        repo_dir=tmp_path / "repo",
+        evidence_path=tmp_path / "evidence.json",
+        transcript_root=tmp_path / "transcripts",
+        safe_env={"PATH": "/bin"},
+    )
+
+    restored = payload_from_json(payload_to_json(payload))
+
+    assert restored.spec == spec
+    assert restored.repo_dir == (tmp_path / "repo").resolve()
+    assert restored.evidence_path == (tmp_path / "evidence.json").resolve()
+    assert restored.transcript_root == (tmp_path / "transcripts").resolve()
+    assert restored.safe_env == {"PATH": "/bin"}
