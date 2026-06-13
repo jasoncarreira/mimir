@@ -10,6 +10,7 @@ import pytest
 from mimir.worklink.backends import (
     BackendRegistry,
     Caps,
+    ClaudeCliBackend,
     CodexBackend,
     ComputeResult,
     LocalSubprocessComputeBackend,
@@ -198,6 +199,124 @@ def test_codex_capabilities_declare_quota_pool_and_worktree_safety() -> None:
     )
 
 
+
+@pytest.mark.asyncio
+async def test_claude_cli_backend_invokes_print_json_in_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeProcess(returncode=0, stdout=b'{"type":"result"}\n', stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    backend = ClaudeCliBackend()
+    transcript_root = tmp_path / "state" / "worklink" / "transcripts"
+    order = WorkOrder(
+        issue_id=445,
+        worktree=tmp_path / "worktree",
+        prompt="Do the backend slice",
+        rules="Follow Worklink policy",
+        timeout_s=30,
+        env={"PATH": "/bin"},
+        transcript_root=transcript_root,
+    )
+
+    spec = backend.work_spec(
+        order,
+        attempt=1,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="issue/445-a1",
+        test_command="echo ok",
+    )
+    compute = LocalSubprocessComputeBackend()
+    handle = await compute.launch(spec)
+    compute_result = await compute.wait(handle, spec.timeout_s)
+    await compute.cleanup(handle)
+    result = await backend.interpret(order, compute_result)
+
+    assert result == RawResult(
+        exit_code=0,
+        transcript_path=result.transcript_path,
+        backend_status="success",
+        error=None,
+    )
+    assert calls == [
+        {
+            "args": (
+                "claude",
+                "-p",
+                "--output-format",
+                "json",
+                "Follow Worklink policy\n\nDo the backend slice",
+            ),
+            "kwargs": {
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+                "cwd": str(order.worktree),
+                "env": {"PATH": "/bin"},
+                "start_new_session": True,
+            },
+        }
+    ]
+    assert result.transcript_path is not None
+    assert result.transcript_path.parent == transcript_root
+    assert not result.transcript_path.is_relative_to(order.worktree)
+    transcript = json.loads(result.transcript_path.read_text())
+    assert transcript["backend"] == "claude_cli"
+    assert transcript["stdout"] == '{"type":"result"}\n'
+
+
+def test_claude_cli_capabilities_declare_separate_quota_pool() -> None:
+    assert ClaudeCliBackend().capabilities() == Caps(
+        tool_category="coding-cli",
+        persistent_sessions=False,
+        json_output=True,
+        native_pr_creation=False,
+        worktree_safe=True,
+        quota_pool="anthropic-max-plan",
+    )
+
+
+def test_claude_cli_work_spec_builds_portable_git_handoff(tmp_path: Path) -> None:
+    order = WorkOrder(
+        issue_id=445,
+        worktree=tmp_path / "worktree",
+        prompt="Do work",
+        rules=None,
+        timeout_s=17,
+        env={"MIMIR_HOME": "/tmp/home"},
+        transcript_root=tmp_path / "transcripts",
+    )
+
+    spec = ClaudeCliBackend().work_spec(
+        order,
+        attempt=2,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="origin/main",
+        branch="issue/445-a2",
+        test_command="echo ok",
+    )
+
+    assert spec == WorkSpec(
+        issue_id=445,
+        attempt=2,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="origin/main",
+        branch="issue/445-a2",
+        prompt="Do work",
+        rules=None,
+        test_command="echo ok",
+        backend="claude_cli",
+        timeout_s=17,
+        env={"MIMIR_HOME": "/tmp/home"},
+        backend_config={"bin": "claude", "args": ["-p", "--output-format", "json"]},
+        local_worktree=order.worktree,
+        local_argv=("claude", "-p", "--output-format", "json", "Do work"),
+    )
+
 def test_worklink_config_routes_first_match_and_defaults(tmp_path: Path) -> None:
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(
@@ -218,6 +337,9 @@ backends:
   codex:
     bin: /opt/bin/codex
     args: [exec, --json, --sandbox, workspace-write]
+  claude_cli:
+    bin: /opt/bin/claude
+    args: [-p, --output-format, json, --allowedTools, Bash]
 """.strip()
     )
 
@@ -233,6 +355,10 @@ backends:
     assert isinstance(codex, CodexBackend)
     assert codex.bin == "/opt/bin/codex"
     assert codex.extra_args == ("exec", "--json", "--sandbox", "workspace-write")
+    claude_cli = registry.get("claude_cli")
+    assert isinstance(claude_cli, ClaudeCliBackend)
+    assert claude_cli.bin == "/opt/bin/claude"
+    assert claude_cli.extra_args == ("-p", "--output-format", "json", "--allowedTools", "Bash")
     assert config.defaults.compute_backend == "local_subprocess"
     assert isinstance(registry.select_compute(), LocalSubprocessComputeBackend)
 
@@ -263,6 +389,7 @@ def test_registry_selection_has_no_codex_specific_orchestrator_branch() -> None:
     registry = BackendRegistry(config)
 
     assert registry.select(labels={"worklink"}, repo="jasoncarreira/mimir").name == "codex"
+    assert registry.get("claude_cli").name == "claude_cli"
 
 
 def test_codex_backend_builds_portable_git_handoff_work_spec(tmp_path: Path) -> None:

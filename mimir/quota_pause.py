@@ -465,9 +465,11 @@ def extract_reset_at(exc: BaseException) -> tuple[datetime | None, str | None]:
                 continue
             try:
                 reset = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-                return _clamp_reset_at(reset, now), "anthropic"
             except ValueError:
                 continue
+            if reset.tzinfo is None:
+                reset = reset.replace(tzinfo=timezone.utc)
+            return _clamp_reset_at(reset, now), "anthropic"
         # Generic Retry-After (seconds).
         retry_after = (
             headers.get("retry-after") if hasattr(headers, "get") else None

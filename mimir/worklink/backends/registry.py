@@ -10,6 +10,7 @@ import yaml
 
 from ..compute import ComputeBackend, LocalSubprocessComputeBackend
 from .base import ToolBackend
+from .claude_cli import ClaudeCliBackend
 from .codex import CodexBackend
 
 
@@ -123,6 +124,9 @@ class BackendRegistry:
         self.config = config or WorklinkConfig()
         self._backends: dict[str, ToolBackend] = {
             "codex": self._build_codex(self.config.backend_settings.get("codex", {})),
+            "claude_cli": self._build_claude_cli(
+                self.config.backend_settings.get("claude_cli", {})
+            ),
         }
         self._compute_backends: dict[str, ComputeBackend] = {
             "local_subprocess": LocalSubprocessComputeBackend(),
@@ -177,3 +181,11 @@ class BackendRegistry:
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ValueError("worklink codex args must be a list of strings")
         return CodexBackend(bin=bin_name, extra_args=tuple(args))
+
+    @staticmethod
+    def _build_claude_cli(settings: Mapping[str, Any]) -> ClaudeCliBackend:
+        bin_name = str(settings.get("bin", "claude"))
+        args = settings.get("args", ["-p", "--output-format", "json"])
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise ValueError("worklink claude_cli args must be a list of strings")
+        return ClaudeCliBackend(bin=bin_name, extra_args=tuple(args))
