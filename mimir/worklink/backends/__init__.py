@@ -10,12 +10,14 @@ from ..compute import (
     WorkSpec,
 )
 from .base import Caps, RawResult, ToolBackend, WorkOrder
+from .claude_cli import ClaudeCliBackend
 from .codex import CodexBackend
 from .registry import BackendRegistry, WorklinkConfig, WorklinkDefaults, WorklinkRoute
 
 __all__ = [
     "BackendRegistry",
     "Caps",
+    "ClaudeCliBackend",
     "CodexBackend",
     "ComputeBackend",
     "ComputeCaps",

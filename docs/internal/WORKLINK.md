@@ -290,7 +290,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `codex` (first) | `codex exec --cd <worktree> --json <prompt>` | Already installed in the agent containers; JSON output; shares the ChatGPT-account quota pool with codex-routed agents |
-| `claude_cli` (second) | `claude -p <prompt> --output-format json` in worktree cwd | Proves the interface is mechanical; separate Max-plan pool |
+| `claude_cli` (second) | `claude -p <prompt> --output-format json` in worktree cwd | Implemented as a protocol-parity adapter; proves the interface is mechanical; separate Max-plan pool. Requires a deployment image with the `claude` CLI installed before real runs. |
 | `cursor` / others | per their headless CLIs | Added on demand |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
@@ -493,7 +493,16 @@ backends:
   codex:
     bin: codex
     args: ["exec", "--json", "--sandbox", "danger-full-access"]
+  claude_cli:
+    bin: claude
+    args: ["-p", "--output-format", "json"]
 ```
+
+`claude_cli` is registered by default but is only runnable in deployments that
+actually install the `claude` binary. The current production container may omit
+it when Claude Code CLI installation is disabled; in that state the adapter can
+be selected/configured and unit-tested, but a real Worklink smoke run must wait
+for an image with `claude` on `PATH`.
 
 ### Dry run
 
