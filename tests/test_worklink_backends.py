@@ -19,6 +19,7 @@ from mimir.worklink.backends import (
     WorkOrder,
     WorklinkConfig,
 )
+from mimir.worklink.backends.base import blocked_reason_from_output
 from mimir.worklink.compute import ComputeCaps, WorkSpec
 from mimir.worklink.worker import WorkerPayload, payload_from_json, payload_to_json
 import mimir.worklink.backends.codex as codex_module
@@ -599,6 +600,23 @@ def test_coding_backends_parse_structured_worklink_blocked_marker(tmp_path: Path
     assert codex_raw.error == "design requires raw docker.sock access"
     assert claude_raw.backend_status == "blocked"
     assert claude_raw.blocked_reason == "design requires raw docker.sock access"
+
+
+def test_blocked_reason_from_output_takes_final_marker_not_prompt_echo() -> None:
+    # No marker → no block.
+    assert blocked_reason_from_output("did the work\n", "") is None
+    # A bare marker is parsed.
+    assert blocked_reason_from_output("WORKLINK_BLOCKED: real reason", "") == "real reason"
+    # Whitespace-only reason is not a signal.
+    assert blocked_reason_from_output("WORKLINK_BLOCKED:    \n", "") is None
+    # A backend that echoes the prompt's marker line early must not override the
+    # real, final decision: the last matching line wins.
+    echoed = (
+        "WORKLINK_BLOCKED: <one-line reason>\n"  # echoed instruction placeholder
+        "...did some analysis...\n"
+        "WORKLINK_BLOCKED: acceptance criteria contradict #438\n"
+    )
+    assert blocked_reason_from_output(echoed, "") == "acceptance criteria contradict #438"
 
 
 def test_codex_status_auth_detection_does_not_match_author_text() -> None:

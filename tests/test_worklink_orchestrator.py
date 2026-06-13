@@ -469,6 +469,8 @@ def test_dry_run_prints_rendered_work_order_without_mutations(
     assert result.dry_run is True
     assert "worklink slice" in out
     assert "Acceptance criteria" in out
+    # The work order teaches backends how to signal a design-level block.
+    assert "WORKLINK_BLOCKED:" in out
     assert not any(isinstance(call, list) and call[:2] == ["chainlink", "locks"] for call in calls)
     assert backend.orders == []
 
@@ -682,7 +684,7 @@ def test_backend_blocked_result_routes_leaf_to_blocked_with_reason(tmp_path: Pat
         "issue",
         "comment",
         "441",
-        "WORKLINK_FAILED planner gave contradictory acceptance criteria",
+        "WORKLINK_BLOCKED planner gave contradictory acceptance criteria",
     ] in calls
     assert not any(isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls)
     evidence = (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text(

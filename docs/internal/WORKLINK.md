@@ -38,11 +38,15 @@ Why the split is load-bearing:
   with the real exit code.
 - **Planner/design flaws are routed as blocked, not retried blindly.** If
   the backend discovers contradictory acceptance criteria, missing
-  prerequisites, or another issue that needs planner/human rework, it can
-  emit a line `WORKLINK_BLOCKED: <reason>` on stdout or stderr. The
-  adapter maps that to evidence status `blocked`, preserves the reason,
-  and the executor labels the leaf `worklink:blocked` instead of opening a
-  PR or burning attempts as a generic failure.
+  prerequisites, or another issue that needs planner/human rework, it
+  emits a line `WORKLINK_BLOCKED: <reason>` as the **final line** of its
+  output (the work-order prompt instructs this). The adapter maps that to
+  evidence status `blocked`, preserves the reason, and the executor labels
+  the leaf `worklink:blocked` (reason posted under `WORKLINK_BLOCKED`)
+  instead of opening a PR or burning attempts as a generic failure. The
+  parser takes the *last* marker line, so a backend that echoes the
+  prompt's instruction earlier does not false-trigger over its real
+  decision.
 - **Mimir's turn loop stays free.** A 20-minute backend run is a
   side subprocess (like a poller), not a turn holding a channel slot.
 

@@ -137,6 +137,30 @@ def test_transition_failed_attempt_with_retries_returns_to_ready() -> None:
     )
 
 
+def test_transition_blocked_comment_uses_blocked_prefix() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, max_attempts=3)
+
+    # A backend-signalled block on attempt 1: labels worklink:blocked and the
+    # reason posts under WORKLINK_BLOCKED, not the misleading WORKLINK_FAILED.
+    claims.transition_issue(
+        2, status="blocked", review_ready=False, attempt=1, reason="acceptance criteria contradict #438"
+    )
+
+    assert ["chainlink", "issue", "label", "2", "worklink:blocked"] in calls
+    assert ["chainlink", "issue", "label", "2", "worklink:ready"] not in calls
+    assert any(
+        call[:3] == ["chainlink", "issue", "comment"]
+        and call[-1] == "WORKLINK_BLOCKED acceptance criteria contradict #438"
+        for call in calls
+    )
+
+
 def test_transition_failed_exhausted_attempt_blocks() -> None:
     calls: list[list[str]] = []
 
