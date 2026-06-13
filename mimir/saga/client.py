@@ -1821,8 +1821,17 @@ class SagaStore:
                     ).fetchall():
                         if not emb_blob:
                             continue
+                        # #432: a stored embedding from a different-dim provider
+                        # (after a provider switch) must not be unpacked at the
+                        # QUERY dim — ``emb_blob[:dim*4]`` would silently truncate
+                        # a larger vector into a clean-but-meaningless similarity,
+                        # precisely when the FAISS path is empty due to dim
+                        # filtering. Require an exact byte-length match (mirrors
+                        # the dim guard in store.py's cosine path).
+                        if len(emb_blob) != dim * 4:
+                            continue
                         try:
-                            e_arr = _struct.unpack(f"{dim}f", emb_blob[: dim * 4])
+                            e_arr = _struct.unpack(f"{dim}f", emb_blob)
                             dot = sum(a * b for a, b in zip(query_emb, e_arr))
                             e_norm = math.sqrt(sum(x * x for x in e_arr)) + 1e-9
                             sim_map[sess_id] = dot / (q_norm * e_norm)
