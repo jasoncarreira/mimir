@@ -117,7 +117,39 @@ def read_text_lossy(path: Path) -> str:
             "decoding with replacement",
             path, bad_byte, exc.start,
         )
+        _report_non_utf8(path, bad_byte, exc.start)
         return data.decode("utf-8", errors="replace")
+
+
+#: Paths already reported this process. ``read_text_lossy`` runs during prompt
+#: assembly every turn, so a persistent bad file would otherwise emit the
+#: algedonic signal every turn — dedupe to one emit per distinct file (re-armed
+#: on restart; a fixed file simply stops emitting).
+_NON_UTF8_REPORTED: set[str] = set()
+
+
+def _report_non_utf8(path: Path, bad_byte: int, position: int) -> None:
+    """Emit a one-shot ``non_utf8_home_file`` algedonic signal so the agent
+    cleans the offending file (re-save as UTF-8 / drop the stray byte).
+
+    Best-effort: the event logger raises if uninitialized (CLI ``index`` builds,
+    unit tests), so signalling must never break the read it's reporting on.
+    """
+    key = str(path)
+    if key in _NON_UTF8_REPORTED:
+        return
+    _NON_UTF8_REPORTED.add(key)
+    try:
+        from .event_logger import log_event_sync
+
+        log_event_sync(
+            "non_utf8_home_file",
+            path=key,
+            byte=f"0x{bad_byte:02x}",
+            position=position,
+        )
+    except Exception:  # noqa: BLE001 — signalling is best-effort; never break the read
+        pass
 
 
 def load_core(home: Path) -> list[CoreBlock]:

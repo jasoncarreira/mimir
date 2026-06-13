@@ -246,6 +246,11 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # values, or filing rules. Negative so the algedonic block makes the
     # degradation visible every turn until the operator can restore the files.
     "core_prompt_degraded": ("negative", "core_prompt_degraded"),
+    # A home file read into the system prompt (core block / memory index) has a
+    # non-UTF-8 byte. read_text_lossy keeps the turn alive by replacement-decoding,
+    # but the stray byte (mojibake / cp1252 paste / mid-write artifact) silently
+    # degrades the prompt — surface it so the agent cleans the file. chainlink #470.
+    "non_utf8_home_file": ("negative", "non_utf8_home_file"),
     # SPEC §16 items follow-up from the 2026-05-23 VSM eval. The weekly
     # viability report (mimir/viability_metrics.py) emits one event per
     # threshold-crossing it detects. Each is a distinct collapse /

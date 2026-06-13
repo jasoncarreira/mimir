@@ -104,6 +104,39 @@ def test_load_core_survives_non_utf8_block(tmp_path: Path, caplog):
     assert any("non-UTF-8" in r.getMessage() for r in caplog.records)
 
 
+def test_read_text_lossy_emits_actionable_event_once(tmp_path: Path):
+    """A non-UTF-8 read emits a deduped ``non_utf8_home_file`` algedonic event
+    so the agent is prompted to clean the file — once per file per process
+    (read_text_lossy runs every turn during prompt assembly). chainlink #470."""
+    import json
+
+    import mimir.core_blocks as cb
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    events = tmp_path / "events.jsonl"
+    init_logger(events, session_id="t-470")
+    try:
+        cb._NON_UTF8_REPORTED.clear()
+        p = tmp_path / "core-bad.md"
+        # 0xa7 lands at byte 52 — the exact position from the #470 incident.
+        p.write_bytes(b"# bad\n" + b"x" * 46 + b"\xa7 tail")
+        cb.read_text_lossy(p)
+        cb.read_text_lossy(p)  # second read must NOT re-emit (dedupe)
+    finally:
+        _reset_logger_for_tests()
+
+    lines = [
+        json.loads(line)
+        for line in events.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    emits = [e for e in lines if e.get("type") == "non_utf8_home_file"]
+    assert len(emits) == 1
+    assert emits[0]["path"] == str(p)
+    assert emits[0]["byte"] == "0xa7"
+    assert emits[0]["position"] == 52
+
+
 def test_render_core_section_separates_blocks(tmp_path: Path):
     core = tmp_path / "memory" / "core"
     core.mkdir(parents=True)
