@@ -24,6 +24,17 @@ class WorklinkDefaults:
 
 
 @dataclass(frozen=True)
+class ToolPin:
+    name: str
+    category: str
+    pin: str
+    smoke: str
+    source: str | None = None
+    package: str | None = None
+    repo: str | None = None
+
+
+@dataclass(frozen=True)
 class WorklinkRoute:
     backend: str
     label: str | None = None
@@ -46,6 +57,7 @@ class WorklinkConfig:
     defaults: WorklinkDefaults = field(default_factory=WorklinkDefaults)
     routes: tuple[WorklinkRoute, ...] = ()
     backend_settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    tool_pins: tuple[ToolPin, ...] = ()
 
     @classmethod
     def load(cls, path: Path) -> "WorklinkConfig":
@@ -69,10 +81,11 @@ class WorklinkConfig:
             compute_backend=str(defaults_data.get("compute_backend", "local_subprocess")),
         )
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
+        tool_pins = _parse_tool_pins(data.get("tool_pins", []))
         backends = data.get("backends") or {}
         if not isinstance(backends, dict):
             raise ValueError("worklink backends must be a mapping")
-        return cls(defaults=defaults, routes=routes, backend_settings=backends)
+        return cls(defaults=defaults, routes=routes, backend_settings=backends, tool_pins=tool_pins)
 
     def select_compute_backend_name(
         self,
@@ -101,6 +114,29 @@ class WorklinkConfig:
         if tool_category and tool_category in self.defaults.backend_by_category:
             return self.defaults.backend_by_category[tool_category]
         return self.defaults.backend
+
+
+def _parse_tool_pins(value: Any) -> tuple[ToolPin, ...]:
+    if not isinstance(value, list):
+        raise ValueError("worklink tool_pins must be a list")
+    return tuple(_parse_tool_pin(item, index=index) for index, item in enumerate(value))
+
+
+def _parse_tool_pin(value: Any, *, index: int) -> ToolPin:
+    if not isinstance(value, dict):
+        raise ValueError(f"worklink tool_pins[{index}] must be a mapping")
+    missing = [field for field in ("name", "category", "pin", "smoke") if field not in value]
+    if missing:
+        raise ValueError(f"worklink tool_pins[{index}] missing required field(s): {', '.join(missing)}")
+    return ToolPin(
+        name=str(value["name"]),
+        category=str(value["category"]),
+        pin=str(value["pin"]),
+        smoke=str(value["smoke"]),
+        source=str(value["source"]) if "source" in value else None,
+        package=str(value["package"]) if "package" in value else None,
+        repo=str(value["repo"]) if "repo" in value else None,
+    )
 
 
 def _parse_route(value: Any) -> WorklinkRoute:
