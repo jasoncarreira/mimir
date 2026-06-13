@@ -66,6 +66,21 @@ def test_build_memory_index_includes_core_with_tag(tmp_path: Path):
     assert "- INDEX.md" not in body
 
 
+def test_build_memory_index_survives_non_utf8_file(tmp_path: Path):
+    """Regression #470: a memory *.md with a stray non-UTF-8 byte must not
+    crash index building (it feeds the system prompt; UnicodeDecodeError is a
+    ValueError, not OSError, so the old guard missed it and the turn died
+    pre-tool)."""
+    _seed_memory(tmp_path)
+    # 0xa7 = '§' in cp1252 — the #470 byte. Lands among files the index reads.
+    (tmp_path / "memory" / "core" / "10-bad.md").write_bytes(
+        b"<!-- desc: bad -->\n# bad\n\xa7 stray cp1252 byte"
+    )
+    body = build_memory_index(tmp_path)  # must not raise
+    assert "core/00-persona.md" in body  # clean entries still indexed
+    assert "core/10-bad.md" in body  # the bad file is indexed, not dropped/crashed
+
+
 def test_files_without_desc_are_marked_auto(tmp_path: Path):
     (tmp_path / "memory").mkdir()
     (tmp_path / "memory" / "without-desc.md").write_text("# Title\nThis is the body.")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from mimir.core_blocks import (
@@ -11,6 +12,7 @@ from mimir.core_blocks import (
     first_sentence_fallback,
     load_channel_memory,
     load_core,
+    read_text_lossy,
     render_core_section,
 )
 
@@ -64,6 +66,42 @@ def test_load_core_orders_lexicographically(tmp_path: Path):
 
 def test_load_core_returns_empty_when_dir_missing(tmp_path: Path):
     assert load_core(tmp_path) == []
+
+
+def test_read_text_lossy_replaces_non_utf8_and_logs(tmp_path: Path, caplog):
+    """A stray non-UTF-8 byte is replacement-decoded (not raised) and logged
+    with the file + position — chainlink #470."""
+    p = tmp_path / "bad.md"
+    # 0xa7 = '§' in cp1252; the exact byte/shape from the #470 heartbeat crash.
+    p.write_bytes(b"# Heading\n\nclean prose then a stray \xa7 byte\n")
+    with caplog.at_level(logging.WARNING, logger="mimir.core_blocks"):
+        text = read_text_lossy(p)
+    assert "�" in text  # replacement char in place of the bad byte
+    assert "Heading" in text  # surrounding content preserved
+    assert any("non-UTF-8" in r.getMessage() for r in caplog.records)
+
+
+def test_read_text_lossy_strict_path_is_exact(tmp_path: Path):
+    p = tmp_path / "ok.md"
+    p.write_text("# ok\n\nclean — café ☕", encoding="utf-8")
+    assert read_text_lossy(p) == "# ok\n\nclean — café ☕"
+
+
+def test_load_core_survives_non_utf8_block(tmp_path: Path, caplog):
+    """Regression #470: a core/*.md with a stray non-UTF-8 byte must NOT crash
+    prompt assembly. UnicodeDecodeError is a ValueError, not OSError, so the old
+    `except OSError` missed it and the whole turn died pre-tool. Both blocks load;
+    the bad one is replacement-decoded, not dropped."""
+    core = tmp_path / "memory" / "core"
+    core.mkdir(parents=True)
+    (core / "00-persona.md").write_text(
+        "<!-- desc: persona -->\n# persona\nclean", encoding="utf-8"
+    )
+    (core / "10-bad.md").write_bytes(b"<!-- desc: bad -->\n# bad\n\xa7 stray cp1252 byte")
+    with caplog.at_level(logging.WARNING, logger="mimir.core_blocks"):
+        blocks = load_core(tmp_path)
+    assert len(blocks) == 2
+    assert any("non-UTF-8" in r.getMessage() for r in caplog.records)
 
 
 def test_render_core_section_separates_blocks(tmp_path: Path):
