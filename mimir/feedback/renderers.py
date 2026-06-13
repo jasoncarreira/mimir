@@ -635,6 +635,16 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "proposed_changes_backlog_error":
         msg = _sanitize_field(ev.get("error") or "(no detail)")
         return f"proposed-changes backlog check failed: {msg}"
+    if rule_kind == "non_utf8_home_file":
+        path = _sanitize_field(str(ev.get("path") or "?"))
+        byte = _sanitize_field(str(ev.get("byte") or "?"))
+        pos = ev.get("position")
+        pos_str = str(pos) if isinstance(pos, int) else "?"
+        return (
+            f"non-UTF-8 byte in {path} ({byte} at position {pos_str}) — read with "
+            f"replacement so the turn survives, but it degrades the prompt; "
+            f"re-save the file as UTF-8 or remove the stray byte"
+        )
     if rule_kind == "mimir_update_available":
         current = ev.get("current") or "?"
         latest = ev.get("latest") or "?"

@@ -45,6 +45,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .billing import normalize_priority
+from .core_blocks import read_text_lossy
 from .event_logger import log_event
 from .quota_windows import provider_store_keys
 from .models import AgentEvent
@@ -734,7 +735,14 @@ class Scheduler:
             resolved = _resolve_prompt_file(self._home, job.prompt_file)
             if resolved is not None and resolved.is_file():
                 try:
-                    content = resolved.read_text(encoding="utf-8").strip()
+                    # Tolerant read (#470): a stray non-UTF-8 byte in a
+                    # scheduled-tick prompt_file (e.g. heartbeat.md) must not
+                    # crash the tick. This read is scheduled-tick-only (reactive
+                    # turns bypass it), which is why such a byte showed up as a
+                    # heartbeat-specific UnicodeDecodeError. read_text_lossy
+                    # replacement-decodes + emits the non_utf8_home_file signal;
+                    # genuine OSError still falls back to the inline prompt.
+                    content = read_text_lossy(resolved).strip()
                 except OSError as exc:
                     log.warning(
                         "scheduler %r: prompt_file %s read failed (%s); "

@@ -237,6 +237,22 @@ def test_classify_gave_up_suffix_is_negative():
     assert classify(123) is None
 
 
+def test_non_utf8_home_file_is_negative_and_renders_actionably():
+    """chainlink #470: a non-UTF-8 home file surfaces as a negative algedonic
+    signal that names the file + byte and tells the agent to clean it."""
+    from mimir.feedback import classify
+    from mimir.feedback.renderers import _render_event_line
+
+    assert classify("non_utf8_home_file") == ("negative", "non_utf8_home_file")
+    line = _render_event_line(
+        "non_utf8_home_file",
+        {"path": "memory/core/10-x.md", "byte": "0xa7", "position": 52},
+    )
+    assert "memory/core/10-x.md" in line
+    assert "0xa7" in line
+    assert "UTF-8" in line
+
+
 def test_send_message_failed_classified_negative():
     from mimir.feedback import classify
 
