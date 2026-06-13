@@ -93,6 +93,57 @@ async def test_add_job_persists_to_yaml_and_replaces_by_name(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_llm_tick_registers_with_generous_misfire_grace(tmp_path: Path):
+    """Regression #468: LLM-tick jobs must carry their configured misfire
+    grace, not APScheduler's 1s library default — a brief top-of-hour event
+    loop stall must not silently drop the whole interval (the hourly
+    heartbeat wedge)."""
+    from mimir.scheduler import SCHEDULER_CHANNEL_PREFIX
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    await sched.add_job(
+        SchedulerJob(name="heartbeat", prompt_file="heartbeat.md", cron="0 * * * *")
+    )
+    apjob = sched._scheduler.get_job(f"{SCHEDULER_CHANNEL_PREFIX}heartbeat")
+    assert apjob is not None
+    assert apjob.misfire_grace_time == 3600
+
+    # Per-entry override flows through to the registered APScheduler job.
+    await sched.add_job(
+        SchedulerJob(name="fast", prompt="x", cron="* * * * *", misfire_grace_time=90)
+    )
+    fast = sched._scheduler.get_job(f"{SCHEDULER_CHANNEL_PREFIX}fast")
+    assert fast is not None
+    assert fast.misfire_grace_time == 90
+
+
+def test_misfire_grace_time_yaml_round_trip_and_validation(tmp_path: Path, caplog):
+    import logging
+
+    # Default (3600) is not emitted — keeps yaml uncluttered.
+    default_job = SchedulerJob(name="h", prompt="x", cron="0 * * * *")
+    assert "misfire_grace_time" not in default_job.to_yaml_entry()
+
+    # Non-default is emitted and parses back.
+    entry = SchedulerJob(
+        name="h", prompt="x", cron="0 * * * *", misfire_grace_time=120
+    ).to_yaml_entry()
+    assert entry["misfire_grace_time"] == 120
+    assert SchedulerJob.from_yaml_entry(entry).misfire_grace_time == 120
+
+    # Invalid value warns and falls back to 3600 (never a 1s-equivalent footgun).
+    with caplog.at_level(logging.WARNING, logger="mimir.scheduler"):
+        bad = SchedulerJob.from_yaml_entry(
+            {"name": "h", "prompt": "x", "cron": "0 * * * *", "misfire_grace_time": "nope"}
+        )
+    assert bad.misfire_grace_time == 3600
+    assert any("misfire_grace_time" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_add_job_validates_trigger(tmp_path: Path):
     sched = Scheduler(
         scheduler_yaml=tmp_path / "s.yaml", enqueue=lambda e: asyncio.sleep(0, result=True)

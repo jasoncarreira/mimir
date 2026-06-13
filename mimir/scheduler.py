@@ -127,6 +127,14 @@ class SchedulerJob:
     # interactive replies and higher-priority pollers. Operators
     # override per-entry in scheduler.yaml.
     priority: str = "low"
+    # APScheduler misfire grace (seconds). Intentionally generous: these are
+    # coalesced maintenance ticks (heartbeat hourly, reflection, …), so running
+    # a bit late beats dropping the tick. Must NOT inherit APScheduler's 1s
+    # library default — at the top of the hour an LLM-tick collides with the
+    # co-scheduled job burst plus a brief event-loop stall, slips past a 1s
+    # window, and the whole interval is silently skipped (chainlink #468).
+    # Mirrors the per-job grace _CallableDef already carries; per-entry override.
+    misfire_grace_time: int = 3600
 
     def to_yaml_entry(self) -> dict[str, Any]:
         out: dict[str, Any] = {"name": self.name}
@@ -149,6 +157,9 @@ class SchedulerJob:
         # to keep yaml uncluttered.
         if not self.callable_name:
             out["channel_id"] = self.channel_id
+        # Only emit a non-default grace — keeps yaml uncluttered.
+        if self.misfire_grace_time != 3600:
+            out["misfire_grace_time"] = self.misfire_grace_time
         return out
 
     @classmethod
@@ -175,6 +186,20 @@ class SchedulerJob:
                     "(expected low|normal|high); using %r",
                     name, raw_priority, priority,
                 )
+        misfire_grace_time = 3600
+        raw_grace = raw.get("misfire_grace_time")
+        if raw_grace is not None:
+            try:
+                misfire_grace_time = int(raw_grace)
+                if misfire_grace_time < 1:
+                    raise ValueError(misfire_grace_time)
+            except (TypeError, ValueError):
+                log.warning(
+                    "scheduler job %r: misfire_grace_time %r invalid "
+                    "(expected positive int seconds); using 3600",
+                    name, raw_grace,
+                )
+                misfire_grace_time = 3600
         if not name:
             raise ValueError("scheduler job missing 'name'")
         # Exactly one of prompt / prompt_file / callable must be set.
@@ -219,6 +244,7 @@ class SchedulerJob:
             time_of_day=time_of_day,
             channel_id=channel_id,
             priority=priority,
+            misfire_grace_time=misfire_grace_time,
         )
 
 
@@ -658,6 +684,11 @@ class Scheduler:
                 replace_existing=True,
                 coalesce=True,
                 max_instances=1,
+                # Without this the LLM-tick jobs inherit APScheduler's 1s
+                # default grace and get silently skipped on a brief top-of-hour
+                # loop stall (chainlink #468). 3600s + coalesce → run once, late
+                # if needed, rather than drop the interval.
+                misfire_grace_time=job.misfire_grace_time,
             )
             registered += 1
         return {"registered": registered, "invalid": invalid}
