@@ -2841,6 +2841,32 @@ async def test_quota_recheck_hot_window_vetoes_early_clear(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_quota_recheck_requires_fresh_evidence_from_every_window(tmp_path: Path):
+    """#430: a fresh below-wall reading from ONE window must not early-clear
+    while another active window's below-wall reading is STALE (pre-pause). The
+    stale window carries no current evidence — the provider may still be at that
+    cap — so a fresh low 7d must not clear on its own while the 5h is unrefreshed."""
+    from mimir.event_logger import init_logger
+    from mimir.quota_pause import QuotaPauseTracker
+    init_logger(tmp_path / "events.jsonl", session_id="test-session")
+
+    enqueued: list = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+    _record_pause(home)  # recorded 10 min ago
+    _fresh_snap(store, "seven_day", 0.30, minutes_ago=1)     # fresh, below wall
+    _fresh_snap(store, "five_hour", 0.50, minutes_ago=15)    # STALE (pre-pause), below wall
+
+    await sched._recheck_quota_pause()
+
+    # The stale 5h blocks early-clear even though 7d is fresh + low.
+    assert QuotaPauseTracker(
+        home / ".mimir" / "quota_pause.json").is_paused().paused is True
+    events = _read_event_types(tmp_path / "events.jsonl")
+    assert not [e for e in events if e["type"] == "quota_recovered"]
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
 async def test_quota_recheck_ignores_transient_backoff(tmp_path: Path):
     """Header-less-429 backoffs are short and deliberately escalating —
     early-clearing them would defeat the backoff."""

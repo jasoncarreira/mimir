@@ -951,17 +951,27 @@ class Scheduler:
         if not snaps:
             return
         wall = getattr(self._arbiter, "plan_window_suppress_threshold", 0.90)
-        fresh_seen = False
+        fresh_below_wall = False
         for snap in snaps.values():
             if snap.utilization is None:
                 continue
             if snap.utilization >= wall:
-                # A window still at/over the wall vetoes early clear.
+                # A window at/over the wall vetoes early clear (stale or fresh
+                # — treating an at-cap reading as binding is the safe side).
                 return
             observed = _parse_iso_ts(getattr(snap, "observed_at", ""))
-            if observed is not None and observed > recorded_at:
-                fresh_seen = True
-        if not fresh_seen:
+            if observed is None or observed <= recorded_at:
+                # #430: a STALE below-wall window is not current evidence — the
+                # binding window (e.g. 5h) may still be at the cap at the
+                # provider while a fresh reading from a DIFFERENT window (e.g.
+                # 7d) sits low. Don't let that fresh window supply the recovery
+                # evidence on its own; require every active window to have a
+                # fresh below-wall reading. Conservative + bounded: the reset-at
+                # expiry still clears normally, and the pause re-records on the
+                # next 429 if the provider is still refusing.
+                return
+            fresh_below_wall = True
+        if not fresh_below_wall:
             return
 
         tracker.clear()

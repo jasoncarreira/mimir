@@ -84,6 +84,37 @@ async def test_search_sessions_basic_result_shape(store):
 
 
 @pytest.mark.asyncio
+async def test_search_sessions_skips_mismatched_dim_embedding(store, tmp_path, monkeypatch):
+    """#432: after a provider switch, a stored session embedding can be a
+    different dim than the query. The Python cosine fallback must SKIP it, not
+    unpack ``emb_blob[:dim*4]`` into a clean-but-meaningless similarity."""
+    import sqlite3
+    import struct
+
+    # Force the Python cosine fallback (bypass the sessions FAISS index).
+    monkeypatch.setattr(type(store), "_ensure_sessions_index", lambda self, conn: None)
+
+    await store.end_session("sess-good", "Python asyncio patterns", channel_id="ch")
+    await store.end_session("sess-bad", "Cooking pasta and risotto", channel_id="ch")
+    # Simulate a provider switch: sess-bad's stored embedding is now 8-dim
+    # (32 bytes), mismatched against the 4-dim query.
+    con = sqlite3.connect(tmp_path / "test.saga.db")
+    con.execute(
+        "UPDATE sessions SET embedding = ? WHERE id = ?",
+        (struct.pack("8f", *[0.5] * 8), "sess-bad"),
+    )
+    con.commit()
+    con.close()
+
+    results = await store.search_sessions("programming patterns", alpha=1.0)
+    by_id = {r["session_id"]: r for r in results}
+    # The mismatched-dim session is skipped → similarity 0, not garbage.
+    assert by_id["sess-bad"]["similarity_score"] == 0.0
+    # The matching-dim session still scores via the fallback.
+    assert by_id["sess-good"]["similarity_score"] > 0.0
+
+
+@pytest.mark.asyncio
 async def test_search_sessions_recency_ordering(store):
     """With alpha=0 (recency-only), the more-recent session ranks higher."""
     await store.end_session("sess-recent", "Topics A", channel_id="ch-x")
