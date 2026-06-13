@@ -153,6 +153,26 @@ def test_extract_reset_at_from_anthropic_headers():
     assert provider == "anthropic"
 
 
+def test_extract_reset_at_from_naive_anthropic_header_assumes_utc():
+    """Anthropic reset headers can be tz-naive; normalize before clamping.
+
+    Regression for chainlink #429: the header path used to pass a naive
+    datetime into ``_clamp_reset_at`` where comparing with aware ``now`` raised
+    TypeError, causing the quota pause to be skipped.
+    """
+    target = (datetime.now(tz=timezone.utc) + timedelta(hours=3)).replace(
+        microsecond=0, tzinfo=None
+    )
+    response = _FakeResponse({
+        "anthropic-ratelimit-tokens-reset": target.isoformat(),
+    })
+    exc = Exception("rate limit hit")
+    exc.response = response  # type: ignore[attr-defined]
+    reset, provider = extract_reset_at(exc)
+    assert reset == target.replace(tzinfo=timezone.utc)
+    assert provider == "anthropic"
+
+
 def test_extract_reset_at_from_retry_after_seconds():
     """Generic 429 from a non-Anthropic upstream: Retry-After in
     seconds → reset = now + seconds."""
