@@ -225,6 +225,37 @@ async def test_fire_reads_prompt_file_when_set(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_fire_survives_non_utf8_prompt_file(tmp_path: Path):
+    """Regression #470: a stray non-UTF-8 byte in a scheduled-tick prompt_file
+    (e.g. heartbeat.md) must not crash the tick. This read is scheduler-only
+    (reactive turns bypass it), which is why it surfaced as a heartbeat-specific
+    UnicodeDecodeError. It should replacement-decode and still fire."""
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    home = tmp_path / "home"
+    (home / "prompts").mkdir(parents=True)
+    # 0xa7 = '§' (cp1252) at byte 52 — the #470 byte/shape.
+    (home / "prompts" / "heartbeat.md").write_bytes(
+        b"Run the heartbeat skill before anything else; backlog second \xa7 done\n"
+    )
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=home)
+    job = SchedulerJob(
+        name="heartbeat", prompt="fallback inline", prompt_file="heartbeat.md", cron="0 * * * *",
+    )
+    await sched._fire(job=job)  # must not raise
+
+    assert len(enqueued) == 1
+    e = enqueued[0]
+    assert "Run the heartbeat skill" in e.content  # body used, not the inline fallback
+    assert "fallback inline" not in e.content
+    assert "�" in e.content  # the bad byte became a replacement char, not a crash
+
+
+@pytest.mark.asyncio
 async def test_fire_falls_back_to_inline_when_prompt_file_missing(tmp_path: Path):
     """A missing prompt_file logs a warning and falls back to the
     inline prompt — never crashes the cron firing."""
