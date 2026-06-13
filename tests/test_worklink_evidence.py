@@ -62,6 +62,51 @@ def test_blocked_requires_reason() -> None:
     assert "blocked_missing_reason" in result.reasons
 
 
+def test_blocked_reason_does_not_require_diff_or_tests() -> None:
+    result = validate_evidence(
+        base_evidence(
+            status="blocked",
+            blocked_reason="planner contradiction",
+            files_changed=[],
+            tests=None,
+            diff_observed=False,
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.review_ready is False
+    assert result.reasons == ()
+
+
+def test_observe_evidence_carries_backend_blocked_reason(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "a.txt").write_text("old\n")
+    subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+
+    result = observe_evidence(
+        issue=466,
+        attempt=1,
+        backend="codex",
+        branch="issue/466-a1",
+        worktree=repo,
+        started_at=datetime(2026, 6, 13, 12, tzinfo=UTC),
+        base_ref="main",
+        backend_status="blocked",
+        blocked_reason="Acceptance criteria conflict with review criteria",
+        test_command=None,
+    )
+
+    assert result.status == "blocked"
+    assert result.review_ready is False
+    assert result.reasons == ()
+    assert result.evidence.blocked_reason == "Acceptance criteria conflict with review criteria"
+
+
 def test_completed_requires_tests_or_skipped_reason() -> None:
     result = validate_evidence(base_evidence(tests=None))
 

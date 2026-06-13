@@ -10,7 +10,7 @@ import re
 from typing import Sequence
 
 from ..compute import ComputeResult, WorkSpec
-from .base import Caps, RawResult, WorkOrder
+from .base import Caps, RawResult, WorkOrder, blocked_reason_from_output
 
 
 @dataclass(frozen=True)
@@ -76,10 +76,13 @@ class CodexBackend:
             )
             return RawResult(-1, transcript_path, "backend_error", result.launch_error)
 
-        status = "timeout" if result.timed_out else _status_from_output(
-            result.exit_code, result.stdout, result.stderr
+        blocked_reason = blocked_reason_from_output(result.stdout, result.stderr)
+        status = "blocked" if blocked_reason else (
+            "timeout" if result.timed_out else _status_from_output(
+                result.exit_code, result.stdout, result.stderr
+            )
         )
-        error = _error_from_status(status, result.stdout, result.stderr)
+        error = blocked_reason or _error_from_status(status, result.stdout, result.stderr)
         _write_transcript(
             transcript_path,
             command=list(result.command),
@@ -89,7 +92,7 @@ class CodexBackend:
             stderr=result.stderr,
             timed_out=result.timed_out,
         )
-        return RawResult(result.exit_code, transcript_path, status, error)
+        return RawResult(result.exit_code, transcript_path, status, error, blocked_reason)
 
 
 
