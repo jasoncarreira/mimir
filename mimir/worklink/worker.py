@@ -128,6 +128,7 @@ async def run_worker_payload(
             backend_status=raw.backend_status,
             test_command=spec.test_command,
             transcript=str(raw.transcript_path) if raw.transcript_path else None,
+            blocked_reason=raw.blocked_reason,
             runner=runner,
         )
         _write_worker_evidence(payload.evidence_path, validation)

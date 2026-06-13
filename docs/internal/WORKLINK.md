@@ -36,6 +36,13 @@ Why the split is load-bearing:
   `git diff` and the test command itself after the backend exits. A
   backend that claims success over a failing suite produces evidence
   with the real exit code.
+- **Planner/design flaws are routed as blocked, not retried blindly.** If
+  the backend discovers contradictory acceptance criteria, missing
+  prerequisites, or another issue that needs planner/human rework, it can
+  emit a line `WORKLINK_BLOCKED: <reason>` on stdout or stderr. The
+  adapter maps that to evidence status `blocked`, preserves the reason,
+  and the executor labels the leaf `worklink:blocked` instead of opening a
+  PR or burning attempts as a generic failure.
 - **Mimir's turn loop stays free.** A 20-minute backend run is a
   side subprocess (like a poller), not a turn holding a channel slot.
 
@@ -75,7 +82,7 @@ Labels on the leaf issue (chainlink `status` stays open/closed):
 needs-decomposition ──planner──▶ worklink:ready
 worklink:ready ──executor claim (lock)──▶ worklink:in-progress
 worklink:in-progress ──evidence ok──▶ worklink:review     (+ PR opened)
-worklink:in-progress ──blocked_reason──▶ worklink:blocked  (human unblocks → ready)
+worklink:in-progress ──backend emits WORKLINK_BLOCKED / blocked_reason──▶ worklink:blocked  (human unblocks → ready)
 worklink:in-progress ──failure──▶ worklink:ready           (attempts < 3)
                                   worklink:blocked          (attempts == 3, reason=attempts_exhausted)
 worklink:review ──approval-shaped event (PR approved/merged or approval comment)──▶ closed
@@ -659,6 +666,10 @@ backends:                   # ToolBackend adapters — WHAT builds
     args: ["exec", "--json"]
   claude_cli:
     bin: claude
+
+# Backend blocked path: coding CLIs can deliberately route planner/human issues
+# back to Chainlink by printing `WORKLINK_BLOCKED: <one-line reason>`. This is
+# for design contradictions or missing prerequisites, not transient tool errors.
 
 compute_backends:           # ComputeBackend launchers — WHERE it runs (#454)
   local-subprocess: {}      # today's behavior; accept-the-risk fallback

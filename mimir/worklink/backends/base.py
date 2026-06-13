@@ -36,12 +36,41 @@ class WorkOrder:
     transcript_root: Path | None = None
 
 
+BLOCKED_MARKER = "WORKLINK_BLOCKED:"
+
+
+def blocked_reason_from_output(stdout: str, stderr: str) -> str | None:
+    """Extract a backend-requested Worklink blocked reason from output.
+
+    Backend CLIs are model-driven and may discover a planner/design flaw that
+    deterministic Worklink cannot repair.  They can route that case back to the
+    planner by emitting a line like ``WORKLINK_BLOCKED: <reason>`` to stdout or
+    stderr.  The reason is intentionally plain text and bounded to one line so it
+    can be copied into Chainlink evidence comments safely.
+    """
+    for line in f"{stdout}\n{stderr}".splitlines():
+        if line.startswith(BLOCKED_MARKER):
+            reason = line[len(BLOCKED_MARKER) :].strip()
+            return _clean_blocked_reason(reason)
+    return None
+
+
+def _clean_blocked_reason(reason: str) -> str | None:
+    # Keep the Chainlink label/comment payload bounded and one-line even if a
+    # backend emits a paragraph after the marker.
+    reason = reason.strip().replace("\x00", "")
+    if not reason:
+        return None
+    return reason[:500]
+
+
 @dataclass(frozen=True)
 class RawResult:
     exit_code: int
     transcript_path: Path | None
     backend_status: str
     error: str | None
+    blocked_reason: str | None = None
 
 
 class ToolBackend(Protocol):

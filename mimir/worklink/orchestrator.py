@@ -273,6 +273,7 @@ class WorklinkRunner:
                     backend_status=raw.backend_status,
                     test_command=test_cmd,
                     transcript=str(raw.transcript_path) if raw.transcript_path else None,
+                    blocked_reason=raw.blocked_reason,
                     runner=runner,
                 )
                 evidence_path = _write_evidence(self.home, validation.evidence)
@@ -294,6 +295,7 @@ class WorklinkRunner:
                     backend_status=raw.backend_status,
                     test_command=test_cmd,
                     transcript=str(raw.transcript_path) if raw.transcript_path else None,
+                    blocked_reason=raw.blocked_reason,
                     runner=runner,
                 )
                 evidence_path = _write_evidence(self.home, validation.evidence)
@@ -315,6 +317,7 @@ class WorklinkRunner:
                             backend_status=raw.backend_status,
                             test_command=test_cmd,
                             transcript=str(raw.transcript_path) if raw.transcript_path else None,
+                            blocked_reason=raw.blocked_reason,
                             runner=runner,
                         )
                     evidence_path = _write_evidence(self.home, validation.evidence)
@@ -339,7 +342,9 @@ class WorklinkRunner:
                 status=validation.status,
                 review_ready=validation.review_ready,
                 attempt=record.attempt,
-                reason=", ".join(validation.reasons) if validation.reasons else None,
+                reason=validation.evidence.blocked_reason
+                if validation.status == "blocked"
+                else (", ".join(validation.reasons) if validation.reasons else None),
             )
             _log_event(
                 "worklink_transition",

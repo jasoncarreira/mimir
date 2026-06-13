@@ -646,6 +646,52 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
 
 
 
+
+
+def test_backend_blocked_result_routes_leaf_to_blocked_with_reason(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+
+    class BlockingBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            self.orders.append(order)
+            return RawResult(
+                1,
+                order.transcript_root / "fake.json",
+                "blocked",
+                "planner gave contradictory acceptance criteria",
+                "planner gave contradictory acceptance criteria",
+            )
+
+    backend = BlockingBackend(write_change=False)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.review_ready is False
+    assert ["chainlink", "issue", "label", "441", "worklink:blocked"] in calls
+    assert [
+        "chainlink",
+        "issue",
+        "comment",
+        "441",
+        "WORKLINK_FAILED planner gave contradictory acceptance criteria",
+    ] in calls
+    assert not any(isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls)
+    evidence = (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text(
+        encoding="utf-8"
+    )
+    assert '"status": "blocked"' in evidence
+    assert "planner gave contradictory acceptance criteria" in evidence
+
+
 def test_remote_compute_gate_rederives_diff_but_does_not_run_tests_on_controller(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo / ".worklink" / "441-1"

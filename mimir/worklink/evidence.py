@@ -77,6 +77,9 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
         reasons.append("blocked_missing_reason")
         status = "failed"
 
+    if status == "blocked":
+        return EvidenceValidation(status="blocked", review_ready=False, reasons=tuple(reasons), evidence=evidence)
+
     if status == "completed" and not evidence.files_changed:
         reasons.append("completed_empty_diff")
         status = "failed"
@@ -87,8 +90,8 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
 
     tests_ok = False
     if evidence.tests is None:
-        reasons.append("tests_missing")
         if status == "completed":
+            reasons.append("tests_missing")
             status = "failed"
     elif not evidence.tests.observed:
         reasons.append("tests_not_observed")
@@ -121,6 +124,7 @@ def observe_evidence(
     test_command: str | None,
     transcript: str | None = None,
     pr_url: str | None = None,
+    blocked_reason: str | None = None,
     runner: Run | None = None,
 ) -> EvidenceValidation:
     """Build evidence by observing a worktree after a backend run."""
@@ -137,6 +141,7 @@ def observe_evidence(
         test_command=test_command,
         transcript=transcript,
         pr_url=pr_url,
+        blocked_reason=blocked_reason,
         runner=runner,
         include_worktree_status=True,
     )
@@ -155,6 +160,7 @@ def observe_remote_evidence(
     test_command: str | None,
     transcript: str | None = None,
     pr_url: str | None = None,
+    blocked_reason: str | None = None,
     runner: Run | None = None,
 ) -> EvidenceValidation:
     """Build evidence from fetched refs after a remote compute run.
@@ -195,6 +201,7 @@ def observe_remote_evidence(
         test_command=None,
         transcript=transcript,
         pr_url=pr_url,
+        blocked_reason=blocked_reason,
         runner=runner,
         include_worktree_status=False,
         checkout_ref=None,
@@ -236,6 +243,7 @@ def _observe_evidence_from_ref(
     test_command: str | None,
     transcript: str | None,
     pr_url: str | None,
+    blocked_reason: str | None,
     runner: Run | None,
     include_worktree_status: bool,
     checkout_ref: str | None = None,
@@ -305,7 +313,7 @@ def _observe_evidence_from_ref(
         tests=tests,
         pr_url=pr_url,
         status=_common_status(backend_status),
-        blocked_reason=None,
+        blocked_reason=blocked_reason,
         transcript=transcript,
         diff_observed=pre_observed
         and committed.returncode == 0

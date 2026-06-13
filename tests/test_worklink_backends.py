@@ -573,6 +573,34 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
     ]
 
 
+
+
+def test_coding_backends_parse_structured_worklink_blocked_marker(tmp_path: Path) -> None:
+    result = ComputeResult(
+        exit_code=1,
+        stdout="I cannot implement this safely.\nWORKLINK_BLOCKED: design requires raw docker.sock access",
+        stderr="",
+        command=("codex",),
+    )
+    order = WorkOrder(
+        issue_id=466,
+        worktree=tmp_path,
+        prompt="do it",
+        rules=None,
+        timeout_s=30,
+        transcript_root=tmp_path / "transcripts",
+    )
+
+    codex_raw = asyncio.run(CodexBackend().interpret(order, result))
+    claude_raw = asyncio.run(ClaudeCliBackend().interpret(order, result))
+
+    assert codex_raw.backend_status == "blocked"
+    assert codex_raw.blocked_reason == "design requires raw docker.sock access"
+    assert codex_raw.error == "design requires raw docker.sock access"
+    assert claude_raw.backend_status == "blocked"
+    assert claude_raw.blocked_reason == "design requires raw docker.sock access"
+
+
 def test_codex_status_auth_detection_does_not_match_author_text() -> None:
     assert codex_module._status_from_output(1, "author: test@example.com", "") == "failed"
     assert codex_module._status_from_output(1, "", "authentication required") == "auth_error"
