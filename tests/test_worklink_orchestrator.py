@@ -9,7 +9,7 @@ import pytest
 import asyncio
 
 from mimir.event_logger import _reset_logger_for_tests, init_logger
-from mimir.worklink.backends import Caps, ComputeResult, RawResult, WorkOrder
+from mimir.worklink.backends import Caps, ComputeCaps, ComputeResult, RawResult, WorkOrder
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.compute import WorkSpec
 from mimir.worklink.orchestrator import (
@@ -26,6 +26,10 @@ class FakeCompute:
 
     def __init__(self) -> None:
         self.specs: list[WorkSpec] = []
+        self.cleaned: list[WorkSpec] = []
+
+    def capabilities(self) -> ComputeCaps:
+        return ComputeCaps(False, False, True, False)
 
     async def launch(self, spec: WorkSpec) -> WorkSpec:
         self.specs.append(spec)
@@ -34,11 +38,14 @@ class FakeCompute:
     async def wait(self, handle: WorkSpec, timeout_s: int) -> ComputeResult:
         return ComputeResult(exit_code=0, stdout="ok", stderr="")
 
+    async def logs(self, handle: WorkSpec) -> str:
+        return ""
+
     async def cancel(self, handle: WorkSpec) -> None:
         return None
 
     async def cleanup(self, handle: WorkSpec) -> None:
-        return None
+        self.cleaned.append(handle)
 
 
 class FakeBackend:
@@ -52,7 +59,32 @@ class FakeBackend:
     def capabilities(self) -> Caps:
         return Caps("fake", False, False, False, True, None)
 
-    async def run(self, order: WorkOrder, *, compute: object | None = None) -> RawResult:
+    def work_spec(
+        self,
+        order: WorkOrder,
+        *,
+        attempt: int,
+        repo_url: str,
+        base_ref: str,
+        branch: str,
+        test_command: str,
+    ) -> WorkSpec:
+        return WorkSpec(
+            issue_id=order.issue_id,
+            attempt=attempt,
+            repo_url=repo_url,
+            base_ref=base_ref,
+            branch=branch,
+            prompt=order.prompt,
+            rules=order.rules,
+            test_command=test_command,
+            backend=self.name,
+            timeout_s=order.timeout_s,
+            env=order.env,
+            local_worktree=order.worktree,
+        )
+
+    async def interpret(self, order: WorkOrder, result: object) -> RawResult:
         self.orders.append(order)
         if self.write_change:
             (order.worktree / "changed.txt").write_text("hello\n", encoding="utf-8")
@@ -106,29 +138,38 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
         return cp(args)
 
     class ComputeAwareBackend(FakeBackend):
-        async def run(self, order: WorkOrder, *, compute: object | None = None) -> RawResult:
-            self.orders.append(order)
-            assert compute is not None
-            spec = WorkSpec(
+        def work_spec(
+            self,
+            order: WorkOrder,
+            *,
+            attempt: int,
+            repo_url: str,
+            base_ref: str,
+            branch: str,
+            test_command: str,
+        ) -> WorkSpec:
+            return WorkSpec(
                 issue_id=order.issue_id,
-                attempt=order.attempt,
-                repo_url=order.repo_url,
-                base_ref=order.base_ref,
-                branch=order.branch,
+                attempt=attempt,
+                repo_url=repo_url,
+                base_ref=base_ref,
+                branch=branch,
                 prompt=order.prompt,
                 rules=order.rules,
-                test_command=order.test_command,
+                test_command=test_command,
                 backend=self.name,
                 timeout_s=order.timeout_s,
                 env=order.env,
-                local_argv=["fake-tool"],
+                backend_config={"bin": "fake-tool", "args": []},
                 local_worktree=order.worktree,
             )
-            handle = await compute.launch(spec)
-            result = await compute.wait(handle, spec.timeout_s)
-            await compute.cleanup(handle)
+
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            self.orders.append(order)
+            assert isinstance(result, ComputeResult)
             (order.worktree / "changed.txt").write_text(result.stdout + "\n", encoding="utf-8")
             return RawResult(result.exit_code, order.transcript_root / "fake.json", "success", None)
+
 
     backend = ComputeAwareBackend(status="success")
     registry = BackendRegistry(WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute")))
@@ -143,14 +184,15 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
 
     assert result.status == "completed", (result.reason, calls)
     assert compute.specs
-    assert compute.specs[0].local_argv == ["fake-tool"]
-    assert compute.specs[0].local_worktree == worktree
     assert compute.specs[0].issue_id == 441
     assert compute.specs[0].attempt == 1
-    assert compute.specs[0].base_ref == "main"
     assert compute.specs[0].branch == "issue/441-a1"
+    assert compute.specs[0].repo_url == "git@github.com:jasoncarreira/mimir.git"
+    assert compute.specs[0].base_ref == "main"
     assert compute.specs[0].test_command == "echo ok"
+    assert compute.specs[0].local_worktree == worktree
     assert compute.specs[0].env["MIMIR_HOME"] == str(tmp_path)
+    assert compute.cleaned == [compute.specs[0]]
 
 
 def cp(

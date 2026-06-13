@@ -137,7 +137,7 @@ mimir/worklink/
     base.py         # ToolBackend protocol, Caps, WorkOrder, RawResult
     codex.py        # first adapter
     claude_cli.py   # second adapter (mechanical addition)
-  compute.py       # ComputeBackend protocol + local-subprocess substrate
+  compute.py       # ComputeBackend protocol, WorkSpec, LaunchHandle, local-subprocess
   # future compute launchers: docker-sibling broker, ecs-runtask worker
 ```
 
@@ -273,15 +273,14 @@ class RawResult:
 class ToolBackend(Protocol):
     name: str
     def capabilities(self) -> Caps: ...
-    def work_spec(self, order: WorkOrder) -> WorkSpec: ...
-    async def run(
-        self, order: WorkOrder, *, compute: ComputeBackend | None = None
-    ) -> RawResult: ...
+    def work_spec(self, order: WorkOrder, *, attempt: int, repo_url: str,
+                  base_ref: str, branch: str, test_command: str) -> WorkSpec: ...
+    async def interpret(self, order: WorkOrder, result: ComputeResult) -> RawResult: ...
 ```
 
 Adapters own **only** CLI session mechanics: how to turn a
-`WorkOrder` into a `WorkSpec`, pass prompt/rules, collect the transcript,
-and map backend-specific output/errors into the common status terms. Everything else — claiming, worktrees, evidence, transitions —
+`WorkOrder` into a portable git-handoff `WorkSpec`, pass prompt/rules,
+and map backend-specific output/errors into the common status terms. Everything else — claiming, worktrees, compute launch/wait/cancel/cleanup, evidence, transitions —
 is orchestrator code shared by every backend. Adding a backend is one
 file implementing the protocol plus a registry entry; it must never
 require touching the orchestrator.
@@ -342,19 +341,18 @@ Four facts shape it:
 @dataclass(frozen=True)
 class WorkSpec:
     issue_id: int; attempt: int
-    repo_url: str | None; base_ref: str; branch: str
+    repo_url: str; base_ref: str; branch: str   # git handoff, not a local path
     prompt: str; rules: str | None
     test_command: str; backend: str; timeout_s: int
-    creds_ref: Mapping[str, str] = field(default_factory=dict)
-    env: Mapping[str, str] = field(default_factory=dict)
-    # Local-subprocess compatibility hints only; remote substrates use git handoff.
-    local_argv: Sequence[str] = ()
-    local_worktree: Path | None = None
+    creds_ref: dict[str, str]                    # substrate-resolved, value-blind
+    env: dict[str, str]                          # explicit allowlist
+    backend_config: dict[str, Any]               # tool-specific settings
+    local_worktree: Path | None                  # local-subprocess compatibility only
 
 @dataclass(frozen=True)
 class LaunchHandle:
     substrate: str
-    identifier: str
+    identifier: str                              # pid / container id / ECS task ARN
 
 @dataclass(frozen=True)
 class ComputeResult:
@@ -364,19 +362,27 @@ class ComputeResult:
     timed_out: bool = False
     launch_error: str | None = None
     handle: LaunchHandle | None = None
+    command: tuple[str, ...] = ()                # local-subprocess audit trail
 
 class ComputeBackend(Protocol):
     name: str
+    def capabilities(self) -> ComputeCaps: ...
     async def launch(self, spec: WorkSpec) -> LaunchHandle: ...
     async def wait(self, h: LaunchHandle, timeout_s: int) -> ComputeResult: ...
+    async def logs(self, h: LaunchHandle) -> str: ...
     async def cancel(self, h: LaunchHandle) -> None: ...
     async def cleanup(self, h: LaunchHandle) -> None: ...
 ```
 
+**Slice #455 implementation note.** The first implemented substrate is
+`local-subprocess`, so it necessarily uses `local_worktree` to preserve today's
+manual in-container behavior. The same `WorkSpec` still carries the git
+coordinates and handle-based protocol required by #454; Docker/ECS slices should
+ignore `local_worktree` and use the git handoff fields.
+
 **Operator decision (2026-06-12):** `local-subprocess` (today's behavior — the
 backend runs as a local subprocess with full container filesystem access)
-remains the default for manual slice-1 compatibility and is the explicit
-**accept-the-risk fallback** once isolated substrates exist. The isolated
+remains available as an explicit **accept-the-risk fallback**. The isolated
 worker (`docker-sibling` / `ecs-runtask`) is the recommended path for
 unsandboxed or autonomous use; operators may opt back into `local-subprocess`
 and accept the documented blast radius. The safe path should be easy, while the

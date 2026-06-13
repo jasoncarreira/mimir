@@ -2,6 +2,8 @@
 
 from ..compute import (
     ComputeBackend,
+    ComputeCaps,
+    ComputeLaunchError,
     ComputeResult,
     LaunchHandle,
     LocalSubprocessComputeBackend,
@@ -16,6 +18,8 @@ __all__ = [
     "Caps",
     "CodexBackend",
     "ComputeBackend",
+    "ComputeCaps",
+    "ComputeLaunchError",
     "ComputeResult",
     "LaunchHandle",
     "LocalSubprocessComputeBackend",

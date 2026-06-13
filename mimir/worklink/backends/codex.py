@@ -9,13 +9,13 @@ from pathlib import Path
 import re
 from typing import Any, Sequence
 
-from ..compute import ComputeBackend, LocalSubprocessComputeBackend, WorkSpec
+from ..compute import ComputeResult, WorkSpec
 from .base import Caps, RawResult, WorkOrder
 
 
 @dataclass(frozen=True)
 class CodexBackend:
-    """Adapter for ``codex exec`` in an isolated Worklink worktree."""
+    """Adapter for ``codex exec`` Worklink jobs."""
 
     bin: str = "codex"
     extra_args: Sequence[str] = field(default_factory=tuple)
@@ -31,24 +31,40 @@ class CodexBackend:
             quota_pool="codex-subscription",
         )
 
-    async def run(
+    def work_spec(
         self,
         order: WorkOrder,
         *,
-        compute: ComputeBackend | None = None,
-    ) -> RawResult:
-        spec = self.work_spec(order)
+        attempt: int,
+        repo_url: str,
+        base_ref: str,
+        branch: str,
+        test_command: str,
+    ) -> WorkSpec:
+        return WorkSpec(
+            issue_id=order.issue_id,
+            attempt=attempt,
+            repo_url=repo_url,
+            base_ref=base_ref,
+            branch=branch,
+            prompt=order.prompt,
+            rules=order.rules,
+            test_command=test_command,
+            backend=self.name,
+            timeout_s=order.timeout_s,
+            env=order.env,
+            backend_config={"bin": self.bin, "args": list(self.extra_args) or ["exec", "--json"]},
+            local_worktree=order.worktree,
+        )
+
+    async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+        if not isinstance(result, ComputeResult):
+            raise TypeError("CodexBackend.interpret expects ComputeResult")
         transcript_path = _transcript_path(order.transcript_root, order.issue_id)
-        compute_backend = compute or LocalSubprocessComputeBackend()
-        handle = await compute_backend.launch(spec)
-        try:
-            result = await compute_backend.wait(handle, spec.timeout_s)
-        finally:
-            await compute_backend.cleanup(handle)
         if result.launch_error:
             _write_transcript(
                 transcript_path,
-                command=list(spec.local_argv),
+                command=list(result.command),
                 exit_code=None,
                 status="backend_error",
                 stdout=result.stdout,
@@ -63,7 +79,7 @@ class CodexBackend:
         error = _error_from_status(status, result.stdout, result.stderr)
         _write_transcript(
             transcript_path,
-            command=list(spec.local_argv),
+            command=list(result.command),
             exit_code=result.exit_code,
             status=status,
             stdout=result.stdout,
@@ -72,36 +88,20 @@ class CodexBackend:
         )
         return RawResult(result.exit_code, transcript_path, status, error)
 
-    def work_spec(self, order: WorkOrder) -> WorkSpec:
-        return WorkSpec(
-            issue_id=order.issue_id,
-            attempt=order.attempt,
-            repo_url=order.repo_url,
-            base_ref=order.base_ref,
-            branch=order.branch,
-            prompt=order.prompt,
-            rules=order.rules,
-            test_command=order.test_command,
-            backend=self.name,
-            timeout_s=order.timeout_s,
-            creds_ref=order.creds_ref,
-            env=order.env,
-            local_argv=self._command(order),
-            local_worktree=order.worktree,
-        )
-
     def _command(self, order: WorkOrder) -> list[str]:
-        args = list(self.extra_args) or ["exec", "--json"]
-        prompt = self._prompt(order)
+        spec = self.work_spec(
+            order,
+            attempt=0,
+            repo_url="",
+            base_ref="",
+            branch="",
+            test_command="",
+        )
+        args = list(spec.backend_config["args"])
+        prompt = spec.prompt if spec.rules is None else f"{spec.rules.rstrip()}\n\n{spec.prompt}"
         if args and args[0] == "exec":
             return [self.bin, "exec", "--cd", str(order.worktree), *args[1:], prompt]
         return [self.bin, *args, "--cd", str(order.worktree), prompt]
-
-    @staticmethod
-    def _prompt(order: WorkOrder) -> str:
-        if not order.rules:
-            return order.prompt
-        return f"{order.rules.rstrip()}\n\n{order.prompt}"
 
 
 def _transcript_path(transcript_root: Path | None, issue_id: int) -> Path:
@@ -114,7 +114,7 @@ def _transcript_path(transcript_root: Path | None, issue_id: int) -> Path:
 def _default_transcript_root() -> Path:
     import os
 
-    home = Path(os.environ.get("MIMIR_HOME", str(Path.home())))
+    home = Path(os.environ.get("MIMIR_HOME", ".")).resolve()
     return home / "state" / "worklink" / "transcripts"
 
 
@@ -128,25 +128,27 @@ def _write_transcript(
     stderr: str,
     timed_out: bool,
 ) -> None:
-    payload: dict[str, Any] = {
+    payload = {
         "backend": "codex",
         "command": list(command),
         "exit_code": exit_code,
-        "backend_status": status,
-        "timed_out": timed_out,
+        "status": status,
         "stdout": stdout,
         "stderr": stderr,
+        "timed_out": timed_out,
+        "recorded_at": datetime.now(UTC).isoformat(),
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:
+    combined = f"{stdout}\n{stderr}".lower()
     if exit_code == 0:
         return "success"
-    combined = f"{stdout}\n{stderr}".lower()
-    if "rate limit" in combined or "quota" in combined or "429" in combined:
+    if "429" in combined or "quota" in combined or "rate limit" in combined:
         return "quota_exhausted"
-    if re.search(r"\b(unauthorized|authentication|login)\b", combined):
+    auth_text = stderr.lower()
+    if re.search(r"\b(auth|authentication|oauth|login|credential|api key|permission)\b", auth_text):
         return "auth_error"
     return "failed"
 
@@ -154,7 +156,8 @@ def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:
 def _error_from_status(status: str, stdout: str, stderr: str) -> str | None:
     if status == "success":
         return None
-    detail = (stderr or stdout).strip()
+    detail = (stderr.strip() or stdout.strip()).splitlines()
+    message = detail[-1] if detail else status
     if status == "timeout":
-        return "codex execution timed out" + (f": {detail}" if detail else "")
-    return detail or status
+        return f"codex execution timed out: {message}"
+    return message

@@ -18,6 +18,7 @@ import warnings
 from typing import Any, Callable, Mapping, Sequence
 
 from .backends import BackendRegistry, WorkOrder, WorklinkConfig
+from .compute import ComputeLaunchError, ComputeResult
 from .claims import ChainlinkClaims
 from .evidence import EvidenceValidation, WorklinkEvidence, observe_evidence
 from .planning import (
@@ -178,10 +179,6 @@ class WorklinkRunner:
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
-                repo_url=repo_url,
-                base_ref="main",
-                branch=f"issue/{issue.issue_id}-DRYRUN",
-                test_command=test_cmd,
             )
             print(_format_work_order(order, backend=selected_name))
             return WorklinkRunResult(issue.issue_id, None, "dry_run", dry_run=True)
@@ -232,14 +229,31 @@ class WorklinkRunner:
                 timeout_s=config.defaults.timeout_s,
                 env={"MIMIR_HOME": str(self.home)},
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
+            )
+            started = datetime.now(UTC)
+            spec = backend.work_spec(
+                order,
                 attempt=record.attempt,
                 repo_url=repo_url,
                 base_ref=lease.base_ref,
                 branch=lease.branch,
                 test_command=test_cmd,
             )
-            started = datetime.now(UTC)
-            raw = await backend.run(order, compute=compute)
+            handle = None
+            try:
+                handle = await compute.launch(spec)
+                compute_result = await compute.wait(handle, spec.timeout_s)
+            except ComputeLaunchError as exc:
+                compute_result = ComputeResult(
+                    exit_code=-1,
+                    stdout="",
+                    stderr=str(exc),
+                    launch_error=str(exc),
+                )
+            finally:
+                if handle is not None:
+                    await compute.cleanup(handle)
+            raw = await backend.interpret(order, compute_result)
             validation = observe_evidence(
                 issue=issue.issue_id,
                 attempt=record.attempt,
