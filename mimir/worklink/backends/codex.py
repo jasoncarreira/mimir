@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import json
 from pathlib import Path
 import re
-from typing import Any, Sequence
+from typing import Sequence
 
 from ..compute import ComputeResult, WorkSpec
 from .base import Caps, RawResult, WorkOrder
@@ -41,6 +41,8 @@ class CodexBackend:
         branch: str,
         test_command: str,
     ) -> WorkSpec:
+        prompt = _prompt_for_order(order)
+        args = list(self.extra_args) or ["exec", "--json"]
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
@@ -53,8 +55,9 @@ class CodexBackend:
             backend=self.name,
             timeout_s=order.timeout_s,
             env=order.env,
-            backend_config={"bin": self.bin, "args": list(self.extra_args) or ["exec", "--json"]},
+            backend_config={"bin": self.bin, "args": args},
             local_worktree=order.worktree,
+            local_argv=_local_argv(self.bin, args, order.worktree, prompt),
         )
 
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
@@ -88,20 +91,16 @@ class CodexBackend:
         )
         return RawResult(result.exit_code, transcript_path, status, error)
 
-    def _command(self, order: WorkOrder) -> list[str]:
-        spec = self.work_spec(
-            order,
-            attempt=0,
-            repo_url="",
-            base_ref="",
-            branch="",
-            test_command="",
-        )
-        args = list(spec.backend_config["args"])
-        prompt = spec.prompt if spec.rules is None else f"{spec.rules.rstrip()}\n\n{spec.prompt}"
-        if args and args[0] == "exec":
-            return [self.bin, "exec", "--cd", str(order.worktree), *args[1:], prompt]
-        return [self.bin, *args, "--cd", str(order.worktree), prompt]
+
+
+def _prompt_for_order(order: WorkOrder) -> str:
+    return order.prompt if order.rules is None else f"{order.rules.rstrip()}\n\n{order.prompt}"
+
+
+def _local_argv(bin_name: str, args: Sequence[str], worktree: Path, prompt: str) -> tuple[str, ...]:
+    if args and args[0] == "exec":
+        return (bin_name, "exec", "--cd", str(worktree), *args[1:], prompt)
+    return (bin_name, *args, "--cd", str(worktree), prompt)
 
 
 def _transcript_path(transcript_root: Path | None, issue_id: int) -> Path:

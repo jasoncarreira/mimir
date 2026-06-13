@@ -237,13 +237,25 @@ backends:
     assert isinstance(registry.select_compute(), LocalSubprocessComputeBackend)
 
 
-def test_codex_command_includes_rules_in_prompt(tmp_path: Path) -> None:
+def test_codex_work_spec_includes_rules_in_local_argv(tmp_path: Path) -> None:
     backend = CodexBackend()
-    command = backend._command(
-        WorkOrder(issue_id=440, worktree=tmp_path, prompt="Do work", rules="Follow policy", timeout_s=30)
+    spec = backend.work_spec(
+        WorkOrder(issue_id=440, worktree=tmp_path, prompt="Do work", rules="Follow policy", timeout_s=30),
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/440-a1",
+        test_command="echo ok",
     )
 
-    assert command == ["codex", "exec", "--cd", str(tmp_path), "--json", "Follow policy\n\nDo work"]
+    assert spec.local_argv == (
+        "codex",
+        "exec",
+        "--cd",
+        str(tmp_path),
+        "--json",
+        "Follow policy\n\nDo work",
+    )
 
 
 def test_registry_selection_has_no_codex_specific_orchestrator_branch() -> None:
@@ -287,6 +299,7 @@ def test_codex_backend_builds_portable_git_handoff_work_spec(tmp_path: Path) -> 
         env={"MIMIR_HOME": "/tmp/home"},
         backend_config={"bin": "codex", "args": ["exec", "--json"]},
         local_worktree=order.worktree,
+        local_argv=("codex", "exec", "--cd", str(order.worktree), "--json", "Do work"),
     )
 
 
@@ -312,11 +325,12 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
         prompt="prompt",
         rules=None,
         test_command="echo ok",
-        backend="codex",
+        backend="other_tool",
         timeout_s=5,
         env={"PATH": "/custom/bin", "X": "1"},
-        backend_config={"bin": "tool", "args": ["arg"]},
+        backend_config={"bin": "other", "args": ["ignored"]},
         local_worktree=tmp_path,
+        local_argv=("tool", "arg", "--cd", str(tmp_path), "prompt"),
     )
     handle = await backend.launch(spec)
     result = await backend.wait(handle, 5)

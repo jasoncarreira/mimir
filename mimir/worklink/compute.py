@@ -34,9 +34,10 @@ class WorkSpec:
 
     The durable handoff is git-shaped: a worker can clone ``repo_url``, check out
     ``base_ref``/``branch``, run ``backend`` with ``prompt``/``rules``, execute
-    ``test_command``, and push evidence. ``local_worktree`` is a compatibility
-    pointer used only by the ``local_subprocess`` fallback for today's manual
-    in-container runs; remote substrates ignore it and use the git fields.
+    ``test_command``, and push evidence. ``local_worktree`` and
+    ``local_argv`` are compatibility pointers used only by the
+    ``local_subprocess`` fallback for today's manual in-container runs; remote
+    substrates ignore them and use the git fields.
     """
 
     issue_id: int
@@ -53,6 +54,7 @@ class WorkSpec:
     env: Mapping[str, str] = field(default_factory=dict)
     backend_config: Mapping[str, Any] = field(default_factory=dict)
     local_worktree: Path | None = None
+    local_argv: Sequence[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -116,7 +118,13 @@ class LocalSubprocessComputeBackend:
     async def launch(self, spec: WorkSpec) -> LaunchHandle:
         if spec.local_worktree is None:
             raise ComputeLaunchError("local_subprocess requires spec.local_worktree")
-        command = tuple(_command_for_spec(spec))
+        if spec.local_argv is None:
+            raise ComputeLaunchError("local_subprocess requires spec.local_argv")
+        if isinstance(spec.local_argv, (str, bytes)):
+            raise ComputeLaunchError("local_subprocess spec.local_argv must be a sequence")
+        command = tuple(str(arg) for arg in spec.local_argv)
+        if not command:
+            raise ComputeLaunchError("local_subprocess spec.local_argv must not be empty")
         env = {"PATH": os.environ.get("PATH", "")}
         env.update(spec.env)
         try:
@@ -202,18 +210,3 @@ async def _kill_process_group(proc: object) -> None:
             return
         await wait()
 
-
-def _command_for_spec(spec: WorkSpec) -> list[str]:
-    if spec.backend != "codex":
-        raise ComputeLaunchError(f"local_subprocess does not know backend {spec.backend!r}")
-    if spec.local_worktree is None:
-        raise ComputeLaunchError("codex local subprocess requires local_worktree")
-    bin_name = str(spec.backend_config.get("bin", "codex"))
-    raw_args = spec.backend_config.get("args", ["exec", "--json"])
-    if not isinstance(raw_args, Sequence) or isinstance(raw_args, (str, bytes)):
-        raise ComputeLaunchError("codex backend_config args must be a sequence")
-    args = [str(arg) for arg in raw_args]
-    prompt = spec.prompt if spec.rules is None else f"{spec.rules.rstrip()}\n\n{spec.prompt}"
-    if args and args[0] == "exec":
-        return [bin_name, "exec", "--cd", str(spec.local_worktree), *args[1:], prompt]
-    return [bin_name, *args, "--cd", str(spec.local_worktree), prompt]
