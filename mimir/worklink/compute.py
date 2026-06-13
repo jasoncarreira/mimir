@@ -1,10 +1,11 @@
 """Compute substrates for Worklink tool backends.
 
-Tool backends decide *what* command to run and how to interpret its output.
-Compute backends decide *where/how* that command runs.  The first substrate is
-local subprocess execution, preserving Worklink's original in-container
-behavior; later substrates can launch the same work spec in a container or a
-remote worker without changing tool-specific adapters.
+Tool backends decide *what* tool should do the work. Compute backends decide
+*where/how* that work runs.  The WorkSpec is intentionally at work-unit
+altitude (issue/attempt + git handoff + prompt/test coordinates), not merely a
+local ``argv``/``cwd`` pair; local subprocess execution carries optional local
+hints only to preserve today's in-container behavior while remote substrates use
+the git coordinates.
 """
 
 from __future__ import annotations
@@ -19,12 +20,24 @@ from typing import Mapping, Protocol, Sequence
 
 @dataclass(frozen=True)
 class WorkSpec:
-    """Concrete process request produced by a Worklink tool backend."""
+    """Portable Worklink work unit handed to a compute substrate."""
 
-    argv: Sequence[str]
-    cwd: Path
-    env: Mapping[str, str] = field(default_factory=dict)
+    issue_id: int
+    attempt: int
+    repo_url: str | None
+    base_ref: str
+    branch: str
+    prompt: str
+    rules: str | None
+    test_command: str
+    backend: str
     timeout_s: int = 1800
+    creds_ref: Mapping[str, str] = field(default_factory=dict)
+    env: Mapping[str, str] = field(default_factory=dict)
+    # Compatibility hints for the explicit local-subprocess fallback. Remote
+    # substrates must use the git-handoff fields above instead of these paths.
+    local_argv: Sequence[str] = field(default_factory=tuple)
+    local_worktree: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -50,44 +63,70 @@ class ComputeResult:
 class ComputeBackend(Protocol):
     name: str
 
-    async def run(self, spec: WorkSpec) -> ComputeResult: ...
+    async def launch(self, spec: WorkSpec) -> LaunchHandle: ...
+
+    async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult: ...
+
+    async def cancel(self, handle: LaunchHandle) -> None: ...
+
+    async def cleanup(self, handle: LaunchHandle) -> None: ...
 
 
-@dataclass(frozen=True)
+@dataclass
 class LocalSubprocessComputeBackend:
     """Run a WorkSpec as a local subprocess in the current container."""
 
     name: str = "local_subprocess"
 
-    async def run(self, spec: WorkSpec) -> ComputeResult:
+    def __post_init__(self) -> None:
+        self._processes: dict[str, asyncio.subprocess.Process] = {}
+        self._launch_errors: dict[str, str] = {}
+        self._specs: dict[str, WorkSpec] = {}
+        self._next_error_id = 0
+
+    async def launch(self, spec: WorkSpec) -> LaunchHandle:
+        if not spec.local_argv or spec.local_worktree is None:
+            raise ValueError("local_subprocess requires local_argv and local_worktree hints")
         env = {"PATH": os.environ.get("PATH", "")}
         env.update(spec.env)
         try:
             proc = await asyncio.create_subprocess_exec(
-                *spec.argv,
+                *spec.local_argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(spec.cwd),
+                cwd=str(spec.local_worktree),
                 env=env,
                 start_new_session=True,
             )
         except OSError as exc:
+            self._next_error_id += 1
+            identifier = f"launch-error-{self._next_error_id}"
+            self._launch_errors[identifier] = str(exc)
+            self._specs[identifier] = spec
+            return LaunchHandle(self.name, identifier)
+
+        identifier = str(getattr(proc, "pid", "unknown"))
+        self._processes[identifier] = proc
+        self._specs[identifier] = spec
+        return LaunchHandle(self.name, identifier)
+
+    async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+        if handle.identifier in self._launch_errors:
+            error = self._launch_errors[handle.identifier]
             return ComputeResult(
                 exit_code=-1,
                 stdout="",
-                stderr=str(exc),
-                launch_error=str(exc),
+                stderr=error,
+                launch_error=error,
+                handle=handle,
             )
-
-        handle = LaunchHandle(self.name, str(getattr(proc, "pid", "unknown")))
+        proc = self._processes[handle.identifier]
         timed_out = False
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=spec.timeout_s
-            )
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except TimeoutError:
             timed_out = True
-            await _kill_process_group(proc)
+            await self.cancel(handle)
             stdout_b, stderr_b = await proc.communicate()
 
         stdout = stdout_b.decode(errors="replace")
@@ -100,6 +139,26 @@ class LocalSubprocessComputeBackend:
             timed_out=timed_out,
             handle=handle,
         )
+
+    async def cancel(self, handle: LaunchHandle) -> None:
+        proc = self._processes.get(handle.identifier)
+        if proc is None:
+            return
+        await _kill_process_group(proc)
+
+    async def cleanup(self, handle: LaunchHandle) -> None:
+        self._processes.pop(handle.identifier, None)
+        self._launch_errors.pop(handle.identifier, None)
+        self._specs.pop(handle.identifier, None)
+
+    async def run(self, spec: WorkSpec) -> ComputeResult:
+        """Compatibility helper for callers that do not need handle control."""
+
+        handle = await self.launch(spec)
+        try:
+            return await self.wait(handle, spec.timeout_s)
+        finally:
+            await self.cleanup(handle)
 
 
 async def _kill_process_group(proc: object) -> None:

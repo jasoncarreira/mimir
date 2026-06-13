@@ -39,11 +39,16 @@ class CodexBackend:
     ) -> RawResult:
         spec = self.work_spec(order)
         transcript_path = _transcript_path(order.transcript_root, order.issue_id)
-        result = await (compute or LocalSubprocessComputeBackend()).run(spec)
+        compute_backend = compute or LocalSubprocessComputeBackend()
+        handle = await compute_backend.launch(spec)
+        try:
+            result = await compute_backend.wait(handle, spec.timeout_s)
+        finally:
+            await compute_backend.cleanup(handle)
         if result.launch_error:
             _write_transcript(
                 transcript_path,
-                command=list(spec.argv),
+                command=list(spec.local_argv),
                 exit_code=None,
                 status="backend_error",
                 stdout=result.stdout,
@@ -58,7 +63,7 @@ class CodexBackend:
         error = _error_from_status(status, result.stdout, result.stderr)
         _write_transcript(
             transcript_path,
-            command=list(spec.argv),
+            command=list(spec.local_argv),
             exit_code=result.exit_code,
             status=status,
             stdout=result.stdout,
@@ -69,10 +74,20 @@ class CodexBackend:
 
     def work_spec(self, order: WorkOrder) -> WorkSpec:
         return WorkSpec(
-            argv=self._command(order),
-            cwd=order.worktree,
-            env=order.env,
+            issue_id=order.issue_id,
+            attempt=order.attempt,
+            repo_url=order.repo_url,
+            base_ref=order.base_ref,
+            branch=order.branch,
+            prompt=order.prompt,
+            rules=order.rules,
+            test_command=order.test_command,
+            backend=self.name,
             timeout_s=order.timeout_s,
+            creds_ref=order.creds_ref,
+            env=order.env,
+            local_argv=self._command(order),
+            local_worktree=order.worktree,
         )
 
     def _command(self, order: WorkOrder) -> list[str]:

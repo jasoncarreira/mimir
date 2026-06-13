@@ -34,6 +34,12 @@ class WorkOrder:
     timeout_s: int
     env: dict[str, str] = field(default_factory=dict)
     transcript_root: Path | None = None
+    attempt: int = 0
+    repo_url: str | None = None
+    base_ref: str = "main"
+    branch: str = ""
+    test_command: str = ""
+    creds_ref: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

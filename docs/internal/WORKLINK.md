@@ -341,10 +341,15 @@ Four facts shape it:
 ```python
 @dataclass(frozen=True)
 class WorkSpec:
-    argv: Sequence[str]          # local-subprocess command line for the first seam
-    cwd: Path                    # current local worktree; future remote specs use refs
-    env: Mapping[str, str]
-    timeout_s: int
+    issue_id: int; attempt: int
+    repo_url: str | None; base_ref: str; branch: str
+    prompt: str; rules: str | None
+    test_command: str; backend: str; timeout_s: int
+    creds_ref: Mapping[str, str] = field(default_factory=dict)
+    env: Mapping[str, str] = field(default_factory=dict)
+    # Local-subprocess compatibility hints only; remote substrates use git handoff.
+    local_argv: Sequence[str] = ()
+    local_worktree: Path | None = None
 
 @dataclass(frozen=True)
 class LaunchHandle:
@@ -362,7 +367,10 @@ class ComputeResult:
 
 class ComputeBackend(Protocol):
     name: str
-    async def run(self, spec: WorkSpec) -> ComputeResult: ...
+    async def launch(self, spec: WorkSpec) -> LaunchHandle: ...
+    async def wait(self, h: LaunchHandle, timeout_s: int) -> ComputeResult: ...
+    async def cancel(self, h: LaunchHandle) -> None: ...
+    async def cleanup(self, h: LaunchHandle) -> None: ...
 ```
 
 **Operator decision (2026-06-12):** `local-subprocess` (today's behavior — the

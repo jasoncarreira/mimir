@@ -27,9 +27,18 @@ class FakeCompute:
     def __init__(self) -> None:
         self.specs: list[WorkSpec] = []
 
-    async def run(self, spec: WorkSpec) -> ComputeResult:
+    async def launch(self, spec: WorkSpec) -> WorkSpec:
         self.specs.append(spec)
+        return spec
+
+    async def wait(self, handle: WorkSpec, timeout_s: int) -> ComputeResult:
         return ComputeResult(exit_code=0, stdout="ok", stderr="")
+
+    async def cancel(self, handle: WorkSpec) -> None:
+        return None
+
+    async def cleanup(self, handle: WorkSpec) -> None:
+        return None
 
 
 class FakeBackend:
@@ -100,7 +109,24 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
         async def run(self, order: WorkOrder, *, compute: object | None = None) -> RawResult:
             self.orders.append(order)
             assert compute is not None
-            result = await compute.run(WorkSpec(["fake-tool"], order.worktree, order.env, order.timeout_s))
+            spec = WorkSpec(
+                issue_id=order.issue_id,
+                attempt=order.attempt,
+                repo_url=order.repo_url,
+                base_ref=order.base_ref,
+                branch=order.branch,
+                prompt=order.prompt,
+                rules=order.rules,
+                test_command=order.test_command,
+                backend=self.name,
+                timeout_s=order.timeout_s,
+                env=order.env,
+                local_argv=["fake-tool"],
+                local_worktree=order.worktree,
+            )
+            handle = await compute.launch(spec)
+            result = await compute.wait(handle, spec.timeout_s)
+            await compute.cleanup(handle)
             (order.worktree / "changed.txt").write_text(result.stdout + "\n", encoding="utf-8")
             return RawResult(result.exit_code, order.transcript_root / "fake.json", "success", None)
 
@@ -117,8 +143,13 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
 
     assert result.status == "completed", (result.reason, calls)
     assert compute.specs
-    assert compute.specs[0].argv == ["fake-tool"]
-    assert compute.specs[0].cwd == worktree
+    assert compute.specs[0].local_argv == ["fake-tool"]
+    assert compute.specs[0].local_worktree == worktree
+    assert compute.specs[0].issue_id == 441
+    assert compute.specs[0].attempt == 1
+    assert compute.specs[0].base_ref == "main"
+    assert compute.specs[0].branch == "issue/441-a1"
+    assert compute.specs[0].test_command == "echo ok"
     assert compute.specs[0].env["MIMIR_HOME"] == str(tmp_path)
 
 

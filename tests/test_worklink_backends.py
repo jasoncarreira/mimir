@@ -215,9 +215,18 @@ async def test_codex_backend_can_run_via_injected_compute(tmp_path: Path) -> Non
     class FakeCompute:
         name = "fake_compute"
 
-        async def run(self, spec: WorkSpec) -> ComputeResult:
+        async def launch(self, spec: WorkSpec):
             seen.append(spec)
+            return spec
+
+        async def wait(self, handle: WorkSpec, timeout_s: int) -> ComputeResult:
             return ComputeResult(exit_code=0, stdout='{"event":"done"}\n', stderr='')
+
+        async def cancel(self, handle: WorkSpec) -> None:
+            return None
+
+        async def cleanup(self, handle: WorkSpec) -> None:
+            return None
 
     order = WorkOrder(
         issue_id=455,
@@ -234,10 +243,19 @@ async def test_codex_backend_can_run_via_injected_compute(tmp_path: Path) -> Non
     assert result.backend_status == "success"
     assert seen == [
         WorkSpec(
-            argv=["codex", "exec", "--cd", str(order.worktree), "--json", "Do work"],
-            cwd=order.worktree,
-            env={"MIMIR_HOME": "/tmp/home"},
+            issue_id=455,
+            attempt=0,
+            repo_url=None,
+            base_ref="main",
+            branch="",
+            prompt="Do work",
+            rules=None,
+            test_command="",
+            backend="codex",
             timeout_s=17,
+            env={"MIMIR_HOME": "/tmp/home"},
+            local_argv=["codex", "exec", "--cd", str(order.worktree), "--json", "Do work"],
+            local_worktree=order.worktree,
         )
     ]
 
@@ -256,10 +274,19 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
 
     result = await LocalSubprocessComputeBackend().run(
         WorkSpec(
-            argv=["tool", "arg"],
-            cwd=tmp_path,
-            env={"PATH": "/custom/bin", "X": "1"},
+            issue_id=1,
+            attempt=1,
+            repo_url=None,
+            base_ref="main",
+            branch="issue/1-a1",
+            prompt="",
+            rules=None,
+            test_command="",
+            backend="tool",
             timeout_s=5,
+            env={"PATH": "/custom/bin", "X": "1"},
+            local_argv=["tool", "arg"],
+            local_worktree=tmp_path,
         )
     )
 
