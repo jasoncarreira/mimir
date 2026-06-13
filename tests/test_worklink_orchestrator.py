@@ -638,7 +638,12 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").is_file()
     assert ["git", "-C", str(worktree), "commit", "-m", "worklink: issue #441"] in calls
     assert ["chainlink", "locks", "release", "441"] in calls
-    assert any(isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls)
+    # Default base: worktree cut from main, PR targets main explicitly.
+    assert [
+        "git", "-C", str(repo), "worktree", "add", "-b", "issue/441-a1", str(worktree), "main"
+    ] in calls
+    pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
+    assert pr_calls and pr_calls[0][pr_calls[0].index("--base") + 1] == "main"
     body = events.read_text(encoding="utf-8")
     assert "worklink_claimed" in body
     assert "worklink_evidence" in body
@@ -646,6 +651,62 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
 
 
+def test_worklink_runner_cuts_worktree_and_pr_from_configured_base(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    # worklink.yaml in the home points Worklink at a long-running feature branch.
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  base_branch: integration/worklink\n"
+    )
+    calls, runner = _orchestrator_runner(repo, worktree)
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    # Worktree is cut from the configured base, not main.
+    assert [
+        "git", "-C", str(repo), "worktree", "add", "-b", "issue/441-a1", str(worktree),
+        "integration/worklink",
+    ] in calls
+    # And the PR targets that base (the feature-branch / stacking model).
+    pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
+    assert pr_calls
+    assert pr_calls[0][pr_calls[0].index("--base") + 1] == "integration/worklink"
+
+
+def test_worklink_run_base_override_beats_config(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    # Config says one base; the per-run override must win for both worktree + PR.
+    (tmp_path / "worklink.yaml").write_text("defaults:\n  base_branch: develop\n")
+    calls, runner = _orchestrator_runner(repo, worktree)
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok", base_branch="release/2.0"
+        )
+    )
+
+    assert result.status == "completed"
+    assert [
+        "git", "-C", str(repo), "worktree", "add", "-b", "issue/441-a1", str(worktree), "release/2.0"
+    ] in calls
+    assert not any(
+        isinstance(c, list) and c[:5] == ["git", "-C", str(repo), "worktree", "add"] and c[-1] == "develop"
+        for c in calls
+    )
+    pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
+    assert pr_calls and pr_calls[0][pr_calls[0].index("--base") + 1] == "release/2.0"
 
 
 

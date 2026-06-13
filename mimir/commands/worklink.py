@@ -41,6 +41,14 @@ def add_argparse(
     run_p.add_argument(
         "--test-command", default=None, help="Override the configured evidence test command."
     )
+    run_p.add_argument(
+        "--base",
+        default=None,
+        help=(
+            "Base branch to cut the worktree from and target the PR at "
+            "(overrides worklink.yaml defaults.base_branch; default: main)."
+        ),
+    )
 
     worker_p = worklink_sub.add_parser("worker", help="Run one portable Worklink worker payload.")
     worker_p.add_argument("payload", type=Path, help="Path to worker payload JSON.")
@@ -85,6 +93,7 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             backend=args.backend,
             dry_run=args.dry_run,
             test_command=args.test_command,
+            base_branch=args.base,
         )
     except LeafValidationError as exc:
         print(f"error: {exc}", file=sys.stderr)
