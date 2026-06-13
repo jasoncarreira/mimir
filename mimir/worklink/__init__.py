@@ -24,6 +24,17 @@ from .backends import (
 )
 from .claims import ClaimRecord, ClaimResult, ChainlinkClaims
 from .evidence import CommandResult, EvidenceValidation, TestResult, WorklinkEvidence
+from .tool_pins import (
+    ChainlinkBumpFiler,
+    ToolPinDiagnostic,
+    ToolPinDrift,
+    ToolPinInventory,
+    ToolPinResolver,
+    UpstreamVersion,
+    inventory_tool_pins,
+    render_bump_issue_body,
+    render_bump_issue_title,
+)
 from .worktree import WorktreeLease
 
 __all__ = [
@@ -43,11 +54,20 @@ __all__ = [
     "EvidenceValidation",
     "TestResult",
     "RawResult",
+    "ChainlinkBumpFiler",
     "ToolBackend",
     "ToolPin",
+    "ToolPinDiagnostic",
+    "ToolPinDrift",
+    "ToolPinInventory",
+    "ToolPinResolver",
     "WorkOrder",
     "WorkSpec",
     "WorklinkConfig",
     "WorklinkEvidence",
     "WorktreeLease",
+    "UpstreamVersion",
+    "inventory_tool_pins",
+    "render_bump_issue_body",
+    "render_bump_issue_title",
 ]
