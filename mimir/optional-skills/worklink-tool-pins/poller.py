@@ -1,32 +1,87 @@
 #!/usr/bin/env python3
 """Worklink tool-pin drift poller.
 
-Loads ``<home>/worklink.yaml``, inventories configured ``tool_pins`` against
-upstream version sources, and files/reuses low-priority Chainlink bump issues
-when drift is detected. Healthy paths are silent: missing config, no pins, or no
-drift all exit 0 with no stdout.
+This file is intentionally standalone: optional pollers are launched as
+``python3 poller.py`` in a scrubbed subprocess environment, not inside mimir's
+venv/import path. Keep this script stdlib-only and do not import ``mimir.*``.
+
+Loads the ``tool_pins`` section from ``<home>/worklink.yaml``, inventories the
+configured pins against upstream version sources, and files/reuses low-priority
+Chainlink bump issues when drift is detected. Healthy paths are silent: missing
+config, no pins, or no drift all exit 0 with no stdout.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import ast
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import Sequence
-
-from mimir.worklink.backends import ToolPin, WorklinkConfig
-from mimir.worklink.tool_pins import (
-    ChainlinkBumpFiler,
-    ToolPinDrift,
-    ToolPinResolver,
-    UpstreamVersion,
-    inventory_tool_pins,
-)
+from typing import Callable, Mapping, Protocol, Sequence
 
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-tool-pins")
 DEFAULT_HOME = Path("/mimir-home")
+
+
+@dataclass(frozen=True)
+class ToolPin:
+    name: str
+    category: str
+    pin: str
+    smoke: str
+    source: str | None = None
+    package: str | None = None
+    repo: str | None = None
+
+
+@dataclass(frozen=True)
+class UpstreamVersion:
+    """Resolved upstream version for one configured tool pin."""
+
+    current: str
+    changelog: str | None = None
+    risk: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolPinDiagnostic:
+    """Non-fatal inventory diagnostic for skipped pins/resolver failures."""
+
+    name: str
+    category: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ToolPinDrift:
+    """A configured tool pin differs from its upstream version."""
+
+    pin: ToolPin
+    current: str
+    changelog: str | None = None
+    risk: str | None = None
+
+    @property
+    def dedupe_key(self) -> str:
+        return f"worklink-tool-pin:{self.pin.category}:{self.pin.name}:{self.pin.pin}->{self.current}"
+
+
+@dataclass(frozen=True)
+class ToolPinInventory:
+    """Result of a tool-pin inventory pass."""
+
+    drift: tuple[ToolPinDrift, ...]
+    diagnostics: tuple[ToolPinDiagnostic, ...] = ()
+
+
+class ToolPinResolver(Protocol):
+    def resolve(self, pin: ToolPin) -> UpstreamVersion: ...
+
+
+Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 def _log(message: str) -> None:
@@ -96,6 +151,144 @@ class GitHubReleaseResolver:
         )
 
 
+def inventory_tool_pins(
+    pins: Sequence[ToolPin],
+    resolvers: Mapping[str, ToolPinResolver],
+) -> ToolPinInventory:
+    """Compare configured pins against upstream resolvers without side effects."""
+
+    drift: list[ToolPinDrift] = []
+    diagnostics: list[ToolPinDiagnostic] = []
+    for pin in pins:
+        resolver_key = pin.source or pin.category
+        if not resolver_key or resolver_key in {"manual", "local"}:
+            diagnostics.append(_diagnostic(pin, "manual pin has no upstream resolver"))
+            continue
+        resolver = resolvers.get(resolver_key) or resolvers.get(pin.category)
+        if resolver is None:
+            diagnostics.append(_diagnostic(pin, f"no resolver for source/category: {resolver_key}"))
+            continue
+        try:
+            upstream = resolver.resolve(pin)
+        except Exception as exc:  # noqa: BLE001 - poller path must skip, not crash.
+            diagnostics.append(_diagnostic(pin, f"resolver failed: {exc}"))
+            continue
+        if upstream.current == pin.pin:
+            continue
+        drift.append(
+            ToolPinDrift(
+                pin=pin,
+                current=upstream.current,
+                changelog=upstream.changelog,
+                risk=upstream.risk,
+            )
+        )
+    return ToolPinInventory(drift=tuple(drift), diagnostics=tuple(diagnostics))
+
+
+def render_bump_issue_title(drift: ToolPinDrift) -> str:
+    """Render a low-priority Chainlink title for a tool-pin bump."""
+
+    return f"Bump Worklink {drift.pin.name} pin to {drift.current}"
+
+
+def render_bump_issue_body(drift: ToolPinDrift) -> str:
+    """Render a Worklink-ready Chainlink bump issue body."""
+
+    pin = drift.pin
+    changelog = drift.changelog or "No changelog metadata was returned by the resolver."
+    risk = drift.risk or "Review upstream release notes and keep the bump scoped to this tool pin."
+    package = pin.package or pin.repo or pin.name
+    source = pin.source or pin.category
+    return f"""Dedupe-Key: {drift.dedupe_key}
+
+Bump configured Worklink tool pin `{pin.name}` for category `{pin.category}` from `{pin.pin}` to `{drift.current}`.
+
+Upstream:
+- Source: `{source}`
+- Package/repo: `{package}`
+- Current configured pin: `{pin.pin}`
+- Latest resolved pin: `{drift.current}`
+
+Changelog / release notes:
+{changelog}
+
+Risk notes:
+{risk}
+
+Acceptance criteria:
+- [ ] Update the configured `{pin.name}` Worklink tool pin from `{pin.pin}` to `{drift.current}`.
+- [ ] Keep the change scoped to the pin bump and any required lockfile/generated metadata.
+- [ ] Run the configured smoke command successfully.
+
+Review criteria:
+- Verify the upstream version is still current at review time and the smoke output covers `{pin.name}`.
+
+Worklink notes:
+- Scope: Worklink tool-pin configuration for `{pin.name}` only.
+- Out of scope: unrelated tool upgrades, backend behavior changes, or poller policy changes.
+- Suggested test command: {pin.smoke}
+"""
+
+
+class ChainlinkBumpFiler:
+    """Create Chainlink bump issues with dedupe-key protection."""
+
+    def __init__(self, *, chainlink_bin: str = "chainlink", runner: Runner | None = None) -> None:
+        self.chainlink_bin = chainlink_bin
+        self.runner = runner or _run
+
+    def existing_issue_id(self, dedupe_key: str) -> int | None:
+        result = self.runner([self.chainlink_bin, "issue", "search", dedupe_key, "--json"])
+        if result.returncode != 0:
+            return None
+        try:
+            issues = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(issues, list):
+            return None
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            haystack = "\n".join(
+                str(issue.get(field) or "")
+                for field in ("title", "description", "body")
+            )
+            if dedupe_key in haystack:
+                issue_id = issue.get("id") or issue.get("number")
+                try:
+                    return int(issue_id)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def file(self, drift: ToolPinDrift) -> int | None:
+        existing = self.existing_issue_id(drift.dedupe_key)
+        if existing is not None:
+            return existing
+        result = self.runner(
+            [
+                self.chainlink_bin,
+                "issue",
+                "create",
+                render_bump_issue_title(drift),
+                "--description",
+                render_bump_issue_body(drift),
+                "--priority",
+                "low",
+                "--label",
+                "worklink",
+                "--label",
+                "tool-pin",
+            ]
+        )
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout).strip() or "chainlink issue create failed"
+            raise RuntimeError(message)
+        return _created_issue_id(result.stdout)
+
+
 def _home() -> Path:
     return Path(os.environ.get("MIMIR_HOME") or DEFAULT_HOME)
 
@@ -130,10 +323,153 @@ def _resolvers() -> dict[str, ToolPinResolver]:
     }
 
 
-def _load_config(path: Path) -> WorklinkConfig | None:
+def _load_config(path: Path) -> tuple[ToolPin, ...] | None:
     if not path.exists():
         return None
-    return WorklinkConfig.load(path)
+    return _parse_tool_pins_section(path.read_text(encoding="utf-8"))
+
+
+def _parse_tool_pins_section(text: str) -> tuple[ToolPin, ...]:
+    """Parse the documented top-level ``tool_pins`` list using stdlib only.
+
+    This is not a general YAML parser. It supports the Worklink tool-pin shape
+    documented by this skill: a top-level ``tool_pins:`` key whose value is a
+    list of scalar mappings. Poller subprocesses cannot assume PyYAML or mimir's
+    import path are available, so the standalone parser is the production path.
+    """
+
+    block = _tool_pins_block(text)
+    if block is None:
+        return ()
+    items: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for raw in block:
+        line = _strip_inline_comment(raw).strip()
+        if not line:
+            continue
+        if line.startswith("- ") or line == "-":
+            if current is not None:
+                items.append(current)
+            current = {}
+            rest = line[1:].strip()
+            if rest:
+                key, value = _split_key_value(rest)
+                current[key] = _parse_scalar(value)
+            continue
+        if current is None:
+            raise ValueError("worklink tool_pins must be a list of mappings")
+        key, value = _split_key_value(line)
+        current[key] = _parse_scalar(value)
+    if current is not None:
+        items.append(current)
+    return tuple(_tool_pin_from_mapping(item, index=index) for index, item in enumerate(items))
+
+
+def _tool_pins_block(text: str) -> list[str] | None:
+    lines = text.splitlines()
+    for index, raw in enumerate(lines):
+        stripped = _strip_inline_comment(raw).strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("tool_pins:"):
+            continue
+        key, value = _split_key_value(stripped)
+        if key != "tool_pins":
+            continue
+        if value.strip() in {"", "|"}:
+            base_indent = _indent(raw)
+            block: list[str] = []
+            for candidate in lines[index + 1 :]:
+                candidate_stripped = _strip_inline_comment(candidate).strip()
+                if candidate_stripped and _indent(candidate) <= base_indent:
+                    break
+                block.append(candidate)
+            return block
+        if value.strip() == "[]":
+            return []
+        raise ValueError("worklink tool_pins must be a list")
+    return None
+
+
+def _tool_pin_from_mapping(data: Mapping[str, str], *, index: int) -> ToolPin:
+    missing = [field for field in ("name", "category", "pin", "smoke") if field not in data]
+    if missing:
+        raise ValueError(f"worklink tool_pins[{index}] missing required field(s): {', '.join(missing)}")
+    return ToolPin(
+        name=str(data["name"]),
+        category=str(data["category"]),
+        pin=str(data["pin"]),
+        smoke=str(data["smoke"]),
+        source=str(data["source"]) if "source" in data else None,
+        package=str(data["package"]) if "package" in data else None,
+        repo=str(data["repo"]) if "repo" in data else None,
+    )
+
+
+def _split_key_value(text: str) -> tuple[str, str]:
+    if ":" not in text:
+        raise ValueError(f"expected key/value mapping entry: {text}")
+    key, value = text.split(":", 1)
+    key = key.strip()
+    if not key:
+        raise ValueError(f"empty key in mapping entry: {text}")
+    return key, value.strip()
+
+
+def _parse_scalar(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    if value[0] in {'"', "'"}:
+        try:
+            parsed = ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            return value.strip('"\'')
+        return str(parsed)
+    return value
+
+
+def _strip_inline_comment(text: str) -> str:
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote == '"':
+            escaped = True
+            continue
+        if char in {'"', "'"}:
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+            continue
+        if char == "#" and quote is None and (index == 0 or text[index - 1].isspace()):
+            return text[:index]
+    return text
+
+
+def _indent(text: str) -> int:
+    return len(text) - len(text.lstrip(" "))
+
+
+def _diagnostic(pin: ToolPin, reason: str) -> ToolPinDiagnostic:
+    return ToolPinDiagnostic(name=pin.name, category=pin.category, reason=reason)
+
+
+def _created_issue_id(stdout: str) -> int | None:
+    for token in stdout.replace("#", " #").split():
+        if token.startswith("#"):
+            try:
+                return int(token[1:])
+            except ValueError:
+                continue
+    return None
+
+
+def _run(args: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, text=True, capture_output=True, check=False, **kwargs)
 
 
 def _event_for_drift(drift: ToolPinDrift, issue_id: int | None) -> dict:
@@ -158,14 +494,14 @@ def main() -> int:
     home = _home()
     config_path = _worklink_config_path(home)
     try:
-        config = _load_config(config_path)
+        tool_pins = _load_config(config_path)
     except Exception as exc:  # noqa: BLE001 - bad local config is a poller runtime error.
         _log(f"failed to load {config_path}: {exc}")
         return 1
-    if config is None or not config.tool_pins:
+    if not tool_pins:
         return 0
 
-    inventory = inventory_tool_pins(config.tool_pins, _resolvers())
+    inventory = inventory_tool_pins(tool_pins, _resolvers())
     for diagnostic in inventory.diagnostics:
         _log(f"tool-pin diagnostic {diagnostic.category}/{diagnostic.name}: {diagnostic.reason}")
     if not inventory.drift:

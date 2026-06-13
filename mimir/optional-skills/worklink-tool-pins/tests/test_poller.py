@@ -34,15 +34,14 @@ def _write_config(home: Path, body: str) -> Path:
 
 
 class FakeNpmResolver:
-    def __init__(self, current: str) -> None:
+    def __init__(self, current: str, poller_module=None) -> None:
         self.current = current
+        self.poller_module = poller_module
         self.calls = []
 
     def resolve(self, pin):
-        from mimir.worklink.tool_pins import UpstreamVersion
-
         self.calls.append(pin)
-        return UpstreamVersion(current=self.current, changelog="fake changelog", risk="fake risk")
+        return self.poller_module.UpstreamVersion(current=self.current, changelog="fake changelog", risk="fake risk")
 
 
 class FailingResolver:
@@ -69,7 +68,7 @@ def test_no_drift_exits_zero_silently(fresh_poller, monkeypatch, capsys):
             package: "@openai/codex"
         """,
     )
-    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.137.0")})
+    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.137.0", fresh_poller)})
 
     assert fresh_poller.main() == 0
     assert _events(capsys) == []
@@ -89,7 +88,7 @@ def test_detected_drift_files_issue_and_emits_jsonl(fresh_poller, monkeypatch, c
             package: "@openai/codex"
         """,
     )
-    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.138.0")})
+    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.138.0", fresh_poller)})
 
     calls: list[list[str]] = []
 
@@ -138,7 +137,7 @@ def test_reuses_existing_issue_by_dedupe_key(fresh_poller, monkeypatch, capsys):
             source: npm
         """,
     )
-    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.138.0")})
+    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.138.0", fresh_poller)})
 
     calls: list[list[str]] = []
 
@@ -190,6 +189,35 @@ def test_lookup_failure_is_diagnostic_not_emit_or_nonzero(fresh_poller, monkeypa
     assert "resolver failed: lookup unavailable" in captured.err
 
 
+def test_production_subprocess_imports_without_mimir_or_pyyaml(tmp_path: Path):
+    skill_dir = Path(__file__).resolve().parent.parent
+    home = tmp_path / "home"
+    _write_config(
+        home,
+        """
+        tool_pins:
+          - name: codex
+            category: coding-cli
+            pin: "0.137.0"
+            smoke: "codex --version"
+            source: manual
+        """,
+    )
+
+    result = subprocess.run(
+        ["python3", "poller.py"],
+        cwd=skill_dir,
+        env={"PATH": "/usr/local/bin:/usr/bin:/bin", "MIMIR_HOME": str(home)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert "manual pin has no upstream resolver" in result.stderr
+
+
 def test_resolvers_do_not_run_smoke_commands(monkeypatch, fresh_poller):
     calls: list[list[str]] = []
 
@@ -204,10 +232,8 @@ def test_resolvers_do_not_run_smoke_commands(monkeypatch, fresh_poller):
     npm = fresh_poller.NpmVersionResolver(runner=run)
     gh = fresh_poller.GitHubReleaseResolver(runner=run)
 
-    from mimir.worklink.backends import ToolPin
-
-    assert npm.resolve(ToolPin("codex", "coding-cli", "0.137.0", "SHOULD_NOT_RUN", source="npm", package="@openai/codex")).current == "0.138.0"
-    assert gh.resolve(ToolPin("chainlink", "tracker", "v1.0.0", "SHOULD_NOT_RUN", source="github-release", repo="owner/repo")).current == "v1.2.3"
+    assert npm.resolve(fresh_poller.ToolPin("codex", "coding-cli", "0.137.0", "SHOULD_NOT_RUN", source="npm", package="@openai/codex")).current == "0.138.0"
+    assert gh.resolve(fresh_poller.ToolPin("chainlink", "tracker", "v1.0.0", "SHOULD_NOT_RUN", source="github-release", repo="owner/repo")).current == "v1.2.3"
     assert calls == [
         ["npm", "view", "@openai/codex", "version"],
         ["gh", "release", "view", "--repo", "owner/repo", "--json", "tagName", "url"],

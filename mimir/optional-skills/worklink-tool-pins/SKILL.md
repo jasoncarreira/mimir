@@ -18,7 +18,10 @@ from the configured pin.
 
 ## What it does
 
-- Loads `<home>/worklink.yaml` using Worklink's normal config parser.
+- Loads the documented `tool_pins:` section from `<home>/worklink.yaml`
+  with a standalone stdlib parser. Poller subprocesses run outside
+  mimir's venv/import path, so this skill intentionally does not import
+  `mimir.*` or PyYAML at runtime.
 - Inventories configured `tool_pins:` against supported upstream
   sources (`npm` and GitHub release sources).
 - Files or reuses low-priority Chainlink issues carrying the stable
@@ -72,3 +75,8 @@ Supported `source` values:
 Pins with `source: manual` / `local`, missing resolvers, or resolver
 failures are skipped as diagnostics on stderr; they do not make the
 poller non-zero.
+
+The parser is intentionally narrow rather than a full YAML interpreter:
+it supports the documented top-level `tool_pins:` list of scalar
+mappings. If the Worklink config format grows nested tool-pin fields,
+update this poller parser and its subprocess smoke test in the same PR.
