@@ -236,6 +236,7 @@ Mimir ships ready-built poller skills under ``mimir/optional-skills/`` — opt-i
 | Skill | Watches |
 |---|---|
 | `github-poller` | New issues, PRs, comments, PR reviews, and inline diff comments on configured GitHub repos |
+| `worklink-tool-pins` | Worklink `tool_pins:` version drift; files/reuses low-priority Chainlink bump issues, never auto-bumps |
 
 To install one:
 
