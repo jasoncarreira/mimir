@@ -191,12 +191,18 @@ Per-issue flow (one `run`):
    `chainlink-orchestrator` skill also embeds, so the executor validates the
    same template the planner emits.
 5. **Spawn the backend** (adapter `run(WorkOrder)`) under a timeout.
-6. **Observe evidence** (`evidence.py`): the executor itself runs
-   `git -C <worktree> diff --stat`/`status`, runs the declared test
-   command capturing exit code, collects the transcript pointer.
+6. **Observe evidence** (`evidence.py`): for shared-filesystem compute,
+   the executor itself runs `git -C <worktree> diff --stat`/`status`, runs
+   the declared test command, and captures the transcript pointer; for
+   non-shared/remote compute, the executor fetches `origin/<base>` and
+   `origin/<attempt-branch>`, checks out the fetched attempt ref, then
+   re-derives diff/test evidence locally. Worker-reported evidence is a
+   hint/transcript, not the transition gate.
 7. **Validate + transition.** Evidence gates the label move (§4).
-   Push branch, open PR (`gh` via the executor, or the backend's
-   native PR creation when `Caps.native_pr_creation` and configured).
+   Local shared-filesystem runs push the committed branch before PR creation;
+   remote runs expect the worker to have pushed the branch and the executor
+   opens the PR only after fetched-ref evidence passes. Native PR creation can
+   become another backend cap later, but it must not bypass executor evidence.
 8. **Cleanup.** Remove the attempt's worktree on success; keep on
    `failed`/`blocked` for autopsy (the reaper prunes attempt worktrees
    and their `issue/<issue>-a<n>` branches after N days, and on issue

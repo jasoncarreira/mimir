@@ -20,7 +20,12 @@ from typing import Any, Callable, Mapping, Sequence
 from .backends import BackendRegistry, WorkOrder, WorklinkConfig
 from .compute import ComputeLaunchError, ComputeResult
 from .claims import ChainlinkClaims
-from .evidence import EvidenceValidation, WorklinkEvidence, observe_evidence
+from .evidence import (
+    EvidenceValidation,
+    WorklinkEvidence,
+    observe_evidence,
+    observe_remote_evidence,
+)
 from .planning import (
     missing_leaf_template_parts,
     render_decompose_prompt,
@@ -254,49 +259,72 @@ class WorklinkRunner:
                 if handle is not None:
                     await compute.cleanup(handle)
             raw = await backend.interpret(order, compute_result)
-            validation = observe_evidence(
-                issue=issue.issue_id,
-                attempt=record.attempt,
-                backend=selected_name,
-                branch=lease.branch,
-                worktree=lease.path,
-                started_at=started,
-                base_ref=lease.base_ref,
-                backend_status=raw.backend_status,
-                test_command=test_cmd,
-                transcript=str(raw.transcript_path) if raw.transcript_path else None,
-                runner=runner,
-            )
-            evidence_path = _write_evidence(self.home, validation.evidence)
+            remote_gate = not compute.capabilities().shared_filesystem
             pr_url = None
-            if validation.review_ready:
-                _commit_worktree_changes(lease.path, issue, runner=runner)
-                try:
-                    _ensure_clean_worktree(lease.path, runner=runner)
-                except WorklinkError as exc:
-                    validation = _failed_validation(validation, str(exc))
-                else:
-                    validation = observe_evidence(
-                        issue=issue.issue_id,
-                        attempt=record.attempt,
-                        backend=selected_name,
-                        branch=lease.branch,
-                        worktree=lease.path,
-                        started_at=started,
-                        base_ref=lease.base_ref,
-                        backend_status=raw.backend_status,
-                        test_command=test_cmd,
-                        transcript=str(raw.transcript_path) if raw.transcript_path else None,
-                        runner=runner,
-                    )
-                evidence_path = _write_evidence(self.home, validation.evidence)
-            if validation.review_ready:
-                _git_push(self.repo, lease.branch, runner=runner)
-                pr_url = _open_pr(
-                    self.repo, issue, lease.branch, validation.evidence, runner=runner
+            if remote_gate:
+                validation = observe_remote_evidence(
+                    issue=issue.issue_id,
+                    attempt=record.attempt,
+                    backend=selected_name,
+                    branch=lease.branch,
+                    worktree=lease.path,
+                    started_at=started,
+                    base_ref=lease.base_ref,
+                    backend_status=raw.backend_status,
+                    test_command=test_cmd,
+                    transcript=str(raw.transcript_path) if raw.transcript_path else None,
+                    runner=runner,
                 )
-                validation = _with_pr_url(validation, pr_url)
                 evidence_path = _write_evidence(self.home, validation.evidence)
+                if validation.review_ready:
+                    pr_url = _open_pr(
+                        self.repo, issue, lease.branch, validation.evidence, runner=runner
+                    )
+                    validation = _with_pr_url(validation, pr_url)
+                    evidence_path = _write_evidence(self.home, validation.evidence)
+            else:
+                validation = observe_evidence(
+                    issue=issue.issue_id,
+                    attempt=record.attempt,
+                    backend=selected_name,
+                    branch=lease.branch,
+                    worktree=lease.path,
+                    started_at=started,
+                    base_ref=lease.base_ref,
+                    backend_status=raw.backend_status,
+                    test_command=test_cmd,
+                    transcript=str(raw.transcript_path) if raw.transcript_path else None,
+                    runner=runner,
+                )
+                evidence_path = _write_evidence(self.home, validation.evidence)
+                if validation.review_ready:
+                    _commit_worktree_changes(lease.path, issue, runner=runner)
+                    try:
+                        _ensure_clean_worktree(lease.path, runner=runner)
+                    except WorklinkError as exc:
+                        validation = _failed_validation(validation, str(exc))
+                    else:
+                        validation = observe_evidence(
+                            issue=issue.issue_id,
+                            attempt=record.attempt,
+                            backend=selected_name,
+                            branch=lease.branch,
+                            worktree=lease.path,
+                            started_at=started,
+                            base_ref=lease.base_ref,
+                            backend_status=raw.backend_status,
+                            test_command=test_cmd,
+                            transcript=str(raw.transcript_path) if raw.transcript_path else None,
+                            runner=runner,
+                        )
+                    evidence_path = _write_evidence(self.home, validation.evidence)
+                if validation.review_ready:
+                    _git_push(self.repo, lease.branch, runner=runner)
+                    pr_url = _open_pr(
+                        self.repo, issue, lease.branch, validation.evidence, runner=runner
+                    )
+                    validation = _with_pr_url(validation, pr_url)
+                    evidence_path = _write_evidence(self.home, validation.evidence)
             _comment_evidence(claims, validation.evidence, validation, evidence_path)
             _log_event(
                 "worklink_evidence",
