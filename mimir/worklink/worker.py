@@ -161,7 +161,12 @@ def _prepare_repo(payload: WorkerPayload, *, runner: Any) -> Path:
     else:
         _check(runner(["git", "clone", spec.repo_url, str(repo)]), "git clone")
         _check(runner(["git", "-C", str(repo), "fetch", "origin", remote_ref]), "git fetch")
-    if _is_simple_branch(spec.base_ref):
+    if not spec.base_ref.startswith("origin/"):
+        # Materialize the fetched base under a local ref so both the checkout
+        # below and the later `base...HEAD` diff can name it. Git allows slashes
+        # in branch names, so this works for simple ("main") and long-running
+        # feature ("integration/worklink") bases alike. origin/-prefixed bases
+        # are skipped: they resolve via the remote-tracking ref instead.
         _check(runner(["git", "-C", str(repo), "branch", "-f", spec.base_ref, "FETCH_HEAD"]), "git branch")
     checkout_ref = f"origin/{remote_ref}" if spec.base_ref.startswith("origin/") else spec.base_ref
     _check(runner(["git", "-C", str(repo), "checkout", "-B", spec.branch, checkout_ref]), "git checkout")
@@ -170,10 +175,6 @@ def _prepare_repo(payload: WorkerPayload, *, runner: Any) -> Path:
 
 def _remote_ref(base_ref: str) -> str:
     return base_ref.removeprefix("origin/")
-
-
-def _is_simple_branch(base_ref: str) -> bool:
-    return "/" not in base_ref and all(ch.isalnum() or ch in "._-" for ch in base_ref)
 
 
 def _backend_completed(status: str) -> bool:
