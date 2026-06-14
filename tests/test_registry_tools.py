@@ -22,6 +22,7 @@ from typing import Any, Optional
 import pytest
 
 from mimir.commitments.models import CommitmentStatus
+from mimir.scheduler import SchedulerJob
 from mimir.tools.registry import (
     _STATE,
     _channel_from_config_or_state,
@@ -142,18 +143,18 @@ class _StubScheduler:
         self.raise_on: str | None = None
         self._removed: bool = True  # default: job found and removed
 
-    async def add_job(self, *, name: str, cron: str, prompt: str, channel_id):
+    async def add_job(self, job: SchedulerJob) -> SchedulerJob:
         if self.raise_on == "add":
             raise RuntimeError("add boom")
-        self.add_calls.append({"name": name, "cron": cron})
-
-        class _FakeJob:
-            pass
-
-        j = _FakeJob()
-        j.name = name
-        j.cron = cron
-        return j
+        self.add_calls.append(
+            {
+                "name": job.name,
+                "cron": job.cron,
+                "prompt": job.prompt,
+                "channel_id": job.channel_id,
+            }
+        )
+        return job
 
     async def remove_job(self, name: str) -> bool:
         if self.raise_on == "remove":
@@ -568,12 +569,22 @@ class TestAddSchedule:
         sched = _StubScheduler()
         _STATE["scheduler"] = sched
         out = await add_schedule.ainvoke(
-            {"name": "morning", "cron": "0 9 * * *", "prompt": "Good morning"}
+            {
+                "name": "morning",
+                "cron": "0 9 * * *",
+                "prompt": "Good morning",
+                "channel_id": "chan-1",
+            }
         )
         assert "add_schedule ok:" in out
         assert "name=morning" in out
         assert "cron=0 9 * * *" in out
         assert len(sched.add_calls) == 1
+        call = sched.add_calls[0]
+        assert call["name"] == "morning"
+        assert call["cron"] == "0 9 * * *"
+        assert call["prompt"] == "Good morning"
+        assert call["channel_id"] == "chan-1"
 
 
 class TestRemoveSchedule:
