@@ -31,6 +31,8 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "tool_call_denied": ("negative", "tool_denied"),
     "tool_error": ("negative", "tool_error"),
     "background_task_failed": ("negative", "background_task_failed"),
+    "scheduler_loop_lag": ("negative", "scheduler_loop_lag"),
+    "scheduler_loop_lag_monitor_failed": ("negative", "scheduler_loop_lag_monitor_failed"),
     "worklink_claimed": ("positive", "worklink_claimed"),
     "worklink_evidence": ("positive", "worklink_evidence"),
     "worklink_transition": ("positive", "worklink_transition"),
@@ -603,6 +605,8 @@ _ESCALATION_THRESHOLDS: dict[str, int] = {
     # Core prompt degraded: 2+ means the first signal didn't get resolved;
     # the agent may have been running on a stripped-down prompt for hours.
     "core_prompt_degraded": 2,
+    "scheduler_loop_lag": 3,
+    "scheduler_loop_lag_monitor_failed": 1,
     # Bind-mount stale: 3+ transient stales (or 2 persistent) means the
     # VirtioFS issue is recurring, not a one-off.
     "bind_mount_stale": 3,
