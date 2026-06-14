@@ -44,6 +44,7 @@ log = logging.getLogger(__name__)
 from langchain_core.runnables import RunnableConfig
 
 from ..bridges._directives import parse_directives, ReactDirective, resolve_react_target
+from ..scheduler import SchedulerJob
 
 # Per-task ContextVar for channel_id — isolated across concurrent asyncio
 # Tasks so concurrent turns on different channels don't race (S2-1 fix).
@@ -742,9 +743,10 @@ async def add_schedule(
     if scheduler is None:
         return "add_schedule failed: no scheduler configured"
     try:
-        job = await scheduler.add_job(
+        job = SchedulerJob(
             name=name, cron=cron, prompt=prompt, channel_id=channel_id,
         )
+        job = await scheduler.add_job(job)
     except Exception as exc:
         return f"add_schedule failed: {exc}"
     return f"add_schedule ok: name={job.name} cron={job.cron}"
