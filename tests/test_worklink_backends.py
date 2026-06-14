@@ -21,7 +21,7 @@ from mimir.worklink.backends import (
     WorklinkConfig,
 )
 from mimir.worklink.backends.base import blocked_reason_from_output
-from mimir.worklink.compute import ComputeCaps, WorkSpec
+from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, WorkSpec
 from mimir.worklink.worker import WorkerPayload, payload_from_json, payload_to_json
 import mimir.worklink.backends.codex as codex_module
 import mimir.worklink.compute as compute_module
@@ -419,6 +419,26 @@ compute_backends:
         persistent_after_disconnect=True,
     )
     assert isinstance(registry.select_compute(labels={"local-ok"}), LocalSubprocessComputeBackend)
+
+
+def test_docker_sibling_compute_backend_fails_closed_at_launch() -> None:
+    backend = DockerSiblingComputeBackend(broker_url="unix:///x.sock", image="i")
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="echo ok",
+        backend="codex",
+        timeout_s=5,
+    )
+
+    assert backend.capabilities().shared_filesystem is False
+    with pytest.raises(ComputeLaunchError, match="broker client is not implemented"):
+        asyncio.run(backend.launch(spec))
 
 
 def test_worklink_config_accepts_legacy_compute_alias_for_docker_sibling(tmp_path: Path) -> None:
