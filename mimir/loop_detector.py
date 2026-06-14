@@ -76,6 +76,27 @@ class LoopDetector:
         # default_factory produces an unbounded deque; bind it to window_size.
         self._history = deque(self._history, maxlen=self.window_size)
 
+    def snapshot(self) -> tuple[int, bool, tuple[str, ...]]:
+        """Capture mutable state before a speculative ``check``.
+
+        ``send_message`` runs the breaker before bridge delivery so it can
+        refuse hard loops early, but bridge lookup / delivery can still fail.
+        A failed delivery must not poison the next deliverable send, so callers
+        snapshot before ``check`` and restore if the message was not delivered.
+        """
+        return (
+            self._streak,
+            self._warning_reaction_emitted,
+            tuple(self._history),
+        )
+
+    def restore(self, state: tuple[int, bool, tuple[str, ...]]) -> None:
+        """Restore a state captured by ``snapshot``."""
+        streak, warning_emitted, history = state
+        self._streak = streak
+        self._warning_reaction_emitted = warning_emitted
+        self._history = deque(history, maxlen=self.window_size)
+
     def check(self, text: str) -> BreakerDecision:
         normalized = _normalize(text)
 

@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from mimir._context import reset_current_turn, set_current_turn
+from mimir.bridges.base import SendResult
 from mimir.loop_detector import LoopDetector
 from mimir.models import TurnContext
 from mimir.tools import registry as tool_registry
@@ -34,11 +35,19 @@ class _FakeBridge:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
         self._counter = 0
+        self.send_results: list[SendResult | BaseException] = []
 
-    async def send(self, channel_id: str, text: str, *, final: bool = True) -> str:
+    async def send(
+        self, channel_id: str, text: str, *, final: bool = True,
+    ) -> SendResult:
         self.sent.append((channel_id, text))
+        if self.send_results:
+            result = self.send_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
         self._counter += 1
-        return f"msg-{self._counter}"
+        return SendResult(sent=True, message_id=f"msg-{self._counter}", chunks=1)
 
     async def react(self, channel_id: str, message_id: str | None, emoji: str) -> None:
         pass
@@ -199,6 +208,89 @@ async def test_soft_warn_logs_once_and_still_sends(
     # Exactly one warning event fires per turn.
     warns = [kw for k, kw in captured_events if k == "send_message_loop_warning"]
     assert len(warns) == 1
+
+
+@pytest.mark.asyncio
+async def test_undelivered_send_does_not_advance_loop_detector_streak(
+    fake_bridge: _FakeBridge,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Soft bridge failures are not deliveries, so they must not count
+    toward the near-duplicate streak that can later hard-stop sends."""
+    detector = LoopDetector(soft_limit=2, hard_limit=3, similarity_threshold=0.9)
+    fake_bridge.send_results = [
+        SendResult(sent=False, error="bridge offline"),
+        SendResult(sent=False, error="bridge offline"),
+        SendResult(sent=True, message_id="msg-ok", chunks=1),
+    ]
+    ctx = _ctx(detector)
+    _set_channel("ch-1")
+    token = set_current_turn(ctx)
+    try:
+        out1 = await send_message.ainvoke({"text": "retry me"})
+        out2 = await send_message.ainvoke({"text": "retry me"})
+        out3 = await send_message.ainvoke({"text": "retry me"})
+    finally:
+        reset_current_turn(token)
+
+    assert "not delivered" in out1
+    assert "not delivered" in out2
+    assert "ok" in out3.lower()
+    assert len(fake_bridge.sent) == 3
+    assert not any(k == "send_message_loop_hard_stop" for k, _ in captured_events)
+
+
+@pytest.mark.asyncio
+async def test_raised_send_does_not_advance_loop_detector_streak(
+    fake_bridge: _FakeBridge,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Bridge exceptions before delivery are also rolled back so the first
+    later deliverable duplicate is not refused."""
+    detector = LoopDetector(soft_limit=2, hard_limit=3, similarity_threshold=0.9)
+    fake_bridge.send_results = [
+        RuntimeError("send boom"),
+        RuntimeError("send boom"),
+        SendResult(sent=True, message_id="msg-ok", chunks=1),
+    ]
+    ctx = _ctx(detector)
+    _set_channel("ch-1")
+    token = set_current_turn(ctx)
+    try:
+        out1 = await send_message.ainvoke({"text": "retry me"})
+        out2 = await send_message.ainvoke({"text": "retry me"})
+        out3 = await send_message.ainvoke({"text": "retry me"})
+    finally:
+        reset_current_turn(token)
+
+    assert "send boom" in out1
+    assert "send boom" in out2
+    assert "ok" in out3.lower()
+    assert len(fake_bridge.sent) == 3
+    assert not any(k == "send_message_loop_hard_stop" for k, _ in captured_events)
+
+
+@pytest.mark.asyncio
+async def test_directive_only_without_target_does_not_advance_loop_detector(
+    fake_bridge: _FakeBridge,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """A skipped actions-only directive has no delivery, so it also rolls
+    back the speculative duplicate check."""
+    detector = LoopDetector(soft_limit=2, hard_limit=3, similarity_threshold=0.9)
+    ctx = _ctx(detector)
+    _set_channel("ch-1")
+    token = set_current_turn(ctx)
+    try:
+        await send_message.ainvoke({"text": '<actions><react emoji="👍" /></actions>'})
+        await send_message.ainvoke({"text": '<actions><react emoji="👍" /></actions>'})
+        out = await send_message.ainvoke({"text": "first real send"})
+    finally:
+        reset_current_turn(token)
+
+    assert "ok" in out.lower()
+    assert fake_bridge.sent == [("ch-1", "first real send")]
+    assert not any(k == "send_message_loop_hard_stop" for k, _ in captured_events)
 
 
 # ─── No detector on the context — back-compat ─────────────────────
