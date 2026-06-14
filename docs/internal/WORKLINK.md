@@ -547,7 +547,7 @@ Minimal current config shape:
 ```yaml
 defaults:
   backend: codex
-  compute_backend: local_subprocess
+  compute_backend: local_subprocess  # accept-the-risk fallback; docker-sibling below is selectable once configured
   timeout_s: 1800
   priority: normal
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
@@ -560,6 +560,12 @@ backends:
   claude_cli:
     bin: claude
     args: ["-p", "--output-format", "json"]
+
+compute_backends:
+  docker-sibling:
+    broker_url: "unix:///run/worklink-broker.sock"
+    image: mimirbot-mimirbot
+    policy: {}
 ```
 
 `claude_cli` is registered by default but is only runnable in deployments that
@@ -664,7 +670,7 @@ Current slice-1 recovery is manual:
 ```yaml
 defaults:
   backend: codex
-  compute: local-subprocess # WHERE the backend runs: local-subprocess | docker-sibling | ecs-runtask
+  compute_backend: local_subprocess # WHERE the backend runs: local_subprocess | docker-sibling | ecs-runtask
   timeout_s: 1800
   priority: normal          # arbiter priority for autonomous dispatch
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
@@ -691,10 +697,14 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454)
   docker-sibling:
     broker_url: "unix:///run/worklink-broker.sock"   # broker owns the docker socket, not the agent
     image: mimirbot-mimirbot
-  ecs-runtask:
-    cluster: worklink
-    task_definition: worklink-worker
-    subnets: ["subnet-…"]
+    policy: {}             # optional broker policy map; actual enforcement arrives with broker slices
+  # ecs-runtask is a future #459 substrate; uncomment only once that launcher exists.
+  # ecs-runtask:
+  #   cluster: worklink
+  #   task_definition: worklink-worker
+  #   subnets: ["subnet-…"]
+
+`compute_backend` also accepts the legacy spelling `compute`; backend names are normalized so `docker-sibling` in YAML selects Python registry key `docker_sibling`. Invalid or unknown DockerSibling fields fail closed during config load instead of falling back to local execution. This slice only wires config/registry selection; the broker client/server live in later slices.
 
 tool_pins:
   - name: codex                  # required: stable local tool name

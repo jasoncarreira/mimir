@@ -13,6 +13,7 @@ from mimir.worklink.backends import (
     ClaudeCliBackend,
     CodexBackend,
     ComputeResult,
+    DockerSiblingComputeBackend,
     LocalSubprocessComputeBackend,
     RawResult,
     ToolPin,
@@ -20,7 +21,7 @@ from mimir.worklink.backends import (
     WorklinkConfig,
 )
 from mimir.worklink.backends.base import blocked_reason_from_output
-from mimir.worklink.compute import ComputeCaps, WorkSpec
+from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, WorkSpec
 from mimir.worklink.worker import WorkerPayload, payload_from_json, payload_to_json
 import mimir.worklink.backends.codex as codex_module
 import mimir.worklink.compute as compute_module
@@ -320,6 +321,7 @@ def test_claude_cli_work_spec_builds_portable_git_handoff(tmp_path: Path) -> Non
         local_argv=("claude", "-p", "--output-format", "json", "Do work"),
     )
 
+
 def test_worklink_config_routes_first_match_and_defaults(tmp_path: Path) -> None:
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(
@@ -351,7 +353,12 @@ backends:
     assert config.defaults.timeout_s == 45
     assert config.select_backend_name(labels={"render"}, repo="jasoncarreira/mimir") == "mermaid"
     assert config.select_backend_name(labels={"worklink"}, repo="jasoncarreira/mimir") == "codex"
-    assert config.select_backend_name(labels={"worklink"}, repo="elsewhere/repo", tool_category="renderer") == "mermaid"
+    assert (
+        config.select_backend_name(
+            labels={"worklink"}, repo="elsewhere/repo", tool_category="renderer"
+        )
+        == "mermaid"
+    )
     assert config.select_backend_name(labels={"worklink"}, repo="elsewhere/repo") == "codex"
     registry = BackendRegistry(config)
     codex = registry.get("codex")
@@ -368,6 +375,131 @@ backends:
     assert config.defaults.base_branch == "main"
 
     assert config.tool_pins == ()
+
+
+def test_worklink_config_builds_docker_sibling_compute_backend(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  backend: codex
+  compute_backend: docker-sibling
+routes:
+  - label: local-ok
+    backend: codex
+    compute_backend: local_subprocess
+compute_backends:
+  docker-sibling:
+    broker_url: "unix:///run/worklink-broker.sock"
+    image: mimirbot-mimirbot
+    policy:
+      network: none
+""".strip()
+    )
+
+    config = WorklinkConfig.load(config_path)
+    registry = BackendRegistry(config)
+
+    assert config.defaults.compute_backend == "docker_sibling"
+    assert config.compute_backend_settings["docker_sibling"] == {
+        "broker_url": "unix:///run/worklink-broker.sock",
+        "image": "mimirbot-mimirbot",
+        "policy": {"network": "none"},
+    }
+    backend = registry.select_compute(labels={"worklink"})
+    assert isinstance(backend, DockerSiblingComputeBackend)
+    assert backend.name == "docker_sibling"
+    assert backend.broker_url == "unix:///run/worklink-broker.sock"
+    assert backend.image == "mimirbot-mimirbot"
+    assert backend.policy == {"network": "none"}
+    assert backend.capabilities() == ComputeCaps(
+        shared_filesystem=False,
+        network_isolated=True,
+        handle_cancel=True,
+        persistent_after_disconnect=True,
+    )
+    assert isinstance(registry.select_compute(labels={"local-ok"}), LocalSubprocessComputeBackend)
+
+
+def test_docker_sibling_compute_backend_fails_closed_at_launch() -> None:
+    backend = DockerSiblingComputeBackend(broker_url="unix:///x.sock", image="i")
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="echo ok",
+        backend="codex",
+        timeout_s=5,
+    )
+
+    assert backend.capabilities().shared_filesystem is False
+    with pytest.raises(ComputeLaunchError, match="broker client is not implemented"):
+        asyncio.run(backend.launch(spec))
+
+
+def test_worklink_config_accepts_legacy_compute_alias_for_docker_sibling(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  backend: codex
+  compute: docker-sibling
+compute_backends:
+  docker_sibling:
+    broker_endpoint: "https://broker.example.invalid"
+    image: mimirbot-mimirbot
+""".strip()
+    )
+
+    registry = BackendRegistry(WorklinkConfig.load(config_path))
+
+    backend = registry.select_compute()
+    assert isinstance(backend, DockerSiblingComputeBackend)
+    assert backend.broker_url == "https://broker.example.invalid"
+
+
+def test_worklink_config_rejects_malformed_docker_sibling_compute_backend(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  compute_backend: docker-sibling
+compute_backends:
+  docker-sibling:
+    broker_url: "file:///tmp/socket"
+    image: mimirbot-mimirbot
+""".strip()
+    )
+    with pytest.raises(ValueError, match="broker_url must use"):
+        BackendRegistry(WorklinkConfig.load(config_path))
+
+    config_path.write_text(
+        """
+defaults:
+  compute_backend: docker-sibling
+compute_backends:
+  docker-sibling:
+    broker_url: "unix:///run/worklink-broker.sock"
+    image: mimirbot-mimirbot
+    docker_socket: /var/run/docker.sock
+""".strip()
+    )
+    with pytest.raises(ValueError, match="unknown setting"):
+        BackendRegistry(WorklinkConfig.load(config_path))
+
+    config_path.write_text("compute_backends:\n  docker-sibling: []\n")
+    with pytest.raises(
+        ValueError, match="worklink compute_backends.docker-sibling must be a mapping"
+    ):
+        WorklinkConfig.load(config_path)
+
+    config_path.write_text("defaults:\n  compute_backend: docker-sibling\n")
+    with pytest.raises(ValueError, match="requires compute_backends.docker-sibling config"):
+        BackendRegistry(WorklinkConfig.load(config_path)).select_compute()
 
 
 def test_worklink_config_loads_base_branch(tmp_path: Path) -> None:
