@@ -670,6 +670,7 @@ def test_worklink_rereads_issue_comments_before_claiming(tmp_path: Path) -> None
         str(repo),
         "worktree",
         "add",
+        "--no-track",
         "-b",
         "issue/441-a2",
         str(worktree),
@@ -703,7 +704,7 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert ["chainlink", "locks", "release", "441"] in calls
     # Default base: worktree cut from main, PR targets main explicitly.
     assert [
-        "git", "-C", str(repo), "worktree", "add", "-b", "issue/441-a1", str(worktree), "main"
+        "git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "issue/441-a1", str(worktree), "main"
     ] in calls
     pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
     assert pr_calls and pr_calls[0][pr_calls[0].index("--base") + 1] == "main"
@@ -735,7 +736,7 @@ def test_worklink_runner_cuts_worktree_and_pr_from_configured_base(tmp_path: Pat
     assert result.status == "completed"
     # Worktree is cut from the configured base, not main.
     assert [
-        "git", "-C", str(repo), "worktree", "add", "-b", "issue/441-a1", str(worktree),
+        "git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "issue/441-a1", str(worktree),
         "integration/worklink",
     ] in calls
     # And the PR targets that base (the feature-branch / stacking model).
@@ -762,7 +763,7 @@ def test_worklink_run_base_override_beats_config(tmp_path: Path) -> None:
 
     assert result.status == "completed"
     assert [
-        "git", "-C", str(repo), "worktree", "add", "-b", "issue/441-a1", str(worktree), "release/2.0"
+        "git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "issue/441-a1", str(worktree), "release/2.0"
     ] in calls
     assert not any(
         isinstance(c, list) and c[:5] == ["git", "-C", str(repo), "worktree", "add"] and c[-1] == "develop"

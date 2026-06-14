@@ -24,7 +24,11 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
     assert lease.path == tmp_path / ".worklink" / "439-2"
     assert lease.branch == "issue/439-a2"
     assert lease.base_ref == "main"
-    assert calls == [["git", "-C", str(tmp_path), "worktree", "add", "-b", "issue/439-a2", str(lease.path), "main"]]
+    assert lease.local_base == "main"
+    assert calls == [
+        ["git", "-C", str(tmp_path), "rev-parse", "--verify", "--quiet", "refs/heads/main"],
+        ["git", "-C", str(tmp_path), "worktree", "add", "--no-track", "-b", "issue/439-a2", str(lease.path), "main"],
+    ]
 
 
 def test_cleanup_removes_only_successful_worktrees(tmp_path: Path) -> None:
@@ -72,3 +76,44 @@ def test_prune_attempt_worktrees_is_conservative(tmp_path: Path) -> None:
         ["git", "-C", str(tmp_path), "worktree", "remove", "--force", str(old)],
         ["git", "-C", str(tmp_path), "branch", "-D", "issue/439-a1"],
     ]
+
+
+def _git(cwd: Path, *args: str) -> str:
+    out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True)
+    return out.stdout.strip()
+
+
+def test_create_worktree_real_git_slash_named_remote_base(tmp_path: Path) -> None:
+    # Regression for #467: a feature base that exists only as a remote-tracking
+    # branch (origin/integration/worklink) must still yield the attempt-scoped
+    # branch. With a bare `worktree add -b ... <base>`, git's DWIM ignores -b and
+    # checks out the base branch instead. Verified here with real git.
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    work = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(origin), str(work)], check=True)
+    _git(work, "config", "user.email", "t@e.com")
+    _git(work, "config", "user.name", "t")
+    _git(work, "commit", "-q", "--allow-empty", "-m", "main commit")
+    _git(work, "push", "-q", "origin", "HEAD:main")
+    _git(work, "checkout", "-q", "-b", "integration/worklink")
+    _git(work, "commit", "-q", "--allow-empty", "-m", "feature commit")
+    _git(work, "push", "-q", "origin", "integration/worklink")
+
+    # Fresh clone: integration/worklink exists only as origin/integration/worklink.
+    repo = tmp_path / "fresh"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@e.com")
+    _git(repo, "config", "user.name", "t")
+
+    lease = create_worktree(repo, issue_id=441, attempt=1, base="integration/worklink")
+
+    assert lease.branch == "issue/441-a1"
+    assert lease.base_ref == "integration/worklink"
+    assert lease.local_base == "origin/integration/worklink"
+    # The worktree must be on the attempt branch, NOT the base branch (the DWIM bug).
+    assert _git(lease.path, "branch", "--show-current") == "issue/441-a1"
+    assert _git(lease.path, "rev-parse", "HEAD") == _git(repo, "rev-parse", "origin/integration/worklink")
+    # No stray local branch named after the base was created by DWIM.
+    local_branches = _git(repo, "branch", "--format=%(refname:short)").split()
+    assert "integration/worklink" not in local_branches

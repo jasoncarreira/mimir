@@ -24,6 +24,11 @@ class WorktreeLease:
     path: Path
     branch: str
     base_ref: str
+    # ``base_ref`` is the operator-facing base name (PR target, worker fetch).
+    # ``local_base`` is the locally-resolvable start point / diff floor it
+    # resolved to (a local branch, ``origin/<base>``, or the name as-is) — see
+    # ``_resolve_local_base``.
+    local_base: str = ""
 
 
 def create_worktree(
@@ -39,10 +44,44 @@ def create_worktree(
     path = repo / worklink_dir / f"{issue_id}-{attempt}"
     branch = f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
-    result = runner(["git", "-C", str(repo), "worktree", "add", "-b", branch, str(path), base])
+    start_point = _resolve_local_base(repo, base, runner=runner)
+    # ``--no-track`` + an explicit, locally-resolvable start point: without them
+    # ``git worktree add -b <branch> <path> <base>`` DWIMs a remote-only base
+    # name (e.g. a slash-named feature branch that exists only as
+    # ``origin/<base>``) into a tracking checkout — silently ignoring ``-b`` and
+    # leaving the worktree on the base branch instead of the attempt branch.
+    result = runner([
+        "git", "-C", str(repo), "worktree", "add", "--no-track", "-b", branch, str(path), start_point
+    ])
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout).strip() or "git worktree add failed")
-    return WorktreeLease(issue_id=issue_id, attempt=attempt, repo=repo, path=path, branch=branch, base_ref=base)
+    return WorktreeLease(
+        issue_id=issue_id,
+        attempt=attempt,
+        repo=repo,
+        path=path,
+        branch=branch,
+        base_ref=base,
+        local_base=start_point,
+    )
+
+
+def _resolve_local_base(repo: Path, base: str, *, runner: Runner) -> str:
+    """Resolve ``base`` to a locally-resolvable start point / diff floor.
+
+    Prefers an existing local branch, then the remote-tracking ``origin/<base>``,
+    else returns ``base`` unchanged (already ``origin/``-prefixed, a SHA, or a
+    tag — let git resolve it). Returning an explicit ref defeats
+    ``git worktree add``'s DWIM for remote-only base names.
+    """
+    if base.startswith("origin/"):
+        return base
+    candidates = ((f"refs/heads/{base}", base), (f"refs/remotes/origin/{base}", f"origin/{base}"))
+    for ref, resolved in candidates:
+        check = runner(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ref])
+        if check.returncode == 0:
+            return resolved
+    return base
 
 
 def cleanup_worktree(lease: WorktreeLease, *, outcome: str, runner: Runner = _default_runner) -> bool:
