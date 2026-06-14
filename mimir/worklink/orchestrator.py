@@ -146,6 +146,7 @@ class WorklinkRunner:
         backend_name: str | None = None,
         dry_run: bool = False,
         test_command: str | None = None,
+        base_branch: str | None = None,
     ) -> WorklinkRunResult:
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
@@ -167,6 +168,8 @@ class WorklinkRunner:
             else suggested_test_command(issue.description) or config.defaults.test_command
         )
         template_path = _template_path(self.home)
+        # Per-run override beats worklink.yaml, which beats the built-in "main".
+        base = base_branch or config.defaults.base_branch
 
         # Dry-run validates the issue and renders the exact prompt without claiming
         # or mutating Chainlink/git state.
@@ -186,6 +189,7 @@ class WorklinkRunner:
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             print(_format_work_order(order, backend=selected_name))
+            print(f"\nBase branch: {base} (worktree cut from it; PR targets it)")
             return WorklinkRunResult(issue.issue_id, None, "dry_run", dry_run=True)
 
         claims = ChainlinkClaims(
@@ -218,6 +222,7 @@ class WorklinkRunner:
                 self.repo,
                 issue_id=issue.issue_id,
                 attempt=record.attempt,
+                base=base,
                 runner=_list_runner(runner),
             )
             prompt = render_work_order(
@@ -279,7 +284,12 @@ class WorklinkRunner:
                 evidence_path = _write_evidence(self.home, validation.evidence)
                 if validation.review_ready:
                     pr_url = _open_pr(
-                        self.repo, issue, lease.branch, validation.evidence, runner=runner
+                        self.repo,
+                        issue,
+                        lease.branch,
+                        validation.evidence,
+                        base=lease.base_ref,
+                        runner=runner,
                     )
                     validation = _with_pr_url(validation, pr_url)
                     evidence_path = _write_evidence(self.home, validation.evidence)
@@ -291,7 +301,7 @@ class WorklinkRunner:
                     branch=lease.branch,
                     worktree=lease.path,
                     started_at=started,
-                    base_ref=lease.base_ref,
+                    base_ref=lease.local_base or lease.base_ref,
                     backend_status=raw.backend_status,
                     test_command=test_cmd,
                     transcript=str(raw.transcript_path) if raw.transcript_path else None,
@@ -313,7 +323,7 @@ class WorklinkRunner:
                             branch=lease.branch,
                             worktree=lease.path,
                             started_at=started,
-                            base_ref=lease.base_ref,
+                            base_ref=lease.local_base or lease.base_ref,
                             backend_status=raw.backend_status,
                             test_command=test_cmd,
                             transcript=str(raw.transcript_path) if raw.transcript_path else None,
@@ -324,7 +334,12 @@ class WorklinkRunner:
                 if validation.review_ready:
                     _git_push(self.repo, lease.branch, runner=runner)
                     pr_url = _open_pr(
-                        self.repo, issue, lease.branch, validation.evidence, runner=runner
+                        self.repo,
+                        issue,
+                        lease.branch,
+                        validation.evidence,
+                        base=lease.base_ref,
+                        runner=runner,
                     )
                     validation = _with_pr_url(validation, pr_url)
                     evidence_path = _write_evidence(self.home, validation.evidence)
@@ -403,6 +418,7 @@ def run_worklink(
     backend: str | None = None,
     dry_run: bool = False,
     test_command: str | None = None,
+    base_branch: str | None = None,
 ) -> WorklinkRunResult:
     return asyncio.run(
         WorklinkRunner(home=home, repo=repo).run(
@@ -410,6 +426,7 @@ def run_worklink(
             backend_name=backend,
             dry_run=dry_run,
             test_command=test_command,
+            base_branch=base_branch,
         )
     )
 
@@ -516,11 +533,18 @@ def _git_push(repo: Path, branch: str, *, runner: Runner) -> None:
 
 
 def _open_pr(
-    repo: Path, issue: IssueContext, branch: str, evidence: WorklinkEvidence, *, runner: Runner
+    repo: Path,
+    issue: IssueContext,
+    branch: str,
+    evidence: WorklinkEvidence,
+    *,
+    base: str,
+    runner: Runner,
 ) -> str:
     body = (
         f"Closes chainlink #{issue.issue_id}.\n\n"
         f"Worklink evidence:\n"
+        f"- Base: `{base}`\n"
         f"- Branch: `{branch}`\n"
         f"- Files changed: {len(evidence.files_changed)}\n"
         "- Tests: "
@@ -528,7 +552,7 @@ def _open_pr(
         f"{evidence.tests.exit_code if evidence.tests else 'missing'}\n"
         f"- Transcript: `{evidence.transcript or '(none)'}`\n"
     )
-    command = ["gh", "pr", "create", "--head", branch]
+    command = ["gh", "pr", "create", "--base", base, "--head", branch]
     repo_slug = _repo_slug(repo, runner=runner)
     if repo_slug:
         command.extend(["--repo", repo_slug])

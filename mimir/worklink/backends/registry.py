@@ -22,6 +22,10 @@ class WorklinkDefaults:
     test_command: str = "env -u MIMIR_MODEL_SPEC uv run pytest -q"
     backend_by_category: Mapping[str, str] = field(default_factory=dict)
     compute_backend: str = "local_subprocess"
+    # Branch that attempt worktrees are cut from and that leaf PRs target. Point
+    # it at a long-running integration/feature branch to stack Worklink leaves
+    # there instead of opening every PR straight against main.
+    base_branch: str = "main"
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,7 @@ class WorklinkConfig:
             test_command=str(defaults_data.get("test_command", "env -u MIMIR_MODEL_SPEC uv run pytest -q")),
             backend_by_category={str(key): str(value) for key, value in category_defaults.items()},
             compute_backend=str(defaults_data.get("compute_backend", "local_subprocess")),
+            base_branch=str(defaults_data.get("base_branch", "main")),
         )
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
         tool_pins = _parse_tool_pins(data.get("tool_pins") or [])

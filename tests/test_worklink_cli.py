@@ -50,9 +50,40 @@ def test_worklink_run_cli_dispatches_operator_vertical(
             "backend": "fake",
             "dry_run": False,
             "test_command": None,
+            "base_branch": None,
         }
     ]
     assert "worklink #441 attempt 1: completed review-ready" in capsys.readouterr().out
+
+
+def test_worklink_run_cli_forwards_base_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_run_worklink(**kwargs: object) -> WorklinkRunResult:
+        calls.append(kwargs)
+        return WorklinkRunResult(issue_id=441, attempt=1, status="completed")
+
+    import mimir.commands.worklink as worklink_cmd
+
+    monkeypatch.setattr(worklink_cmd, "run_worklink", fake_run_worklink)
+
+    with pytest.raises(SystemExit) as exc:
+        main([
+            "worklink",
+            "run",
+            "441",
+            "--home",
+            str(tmp_path / "home"),
+            "--repo",
+            str(tmp_path / "repo"),
+            "--base",
+            "integration/worklink",
+        ])
+
+    assert exc.value.code == 0
+    assert calls and calls[0]["base_branch"] == "integration/worklink"
 
 
 def test_worklink_worker_cli_dispatches_payload_runner(

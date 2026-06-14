@@ -364,8 +364,24 @@ backends:
     assert claude_cli.extra_args == ("-p", "--output-format", "json", "--allowedTools", "Bash")
     assert config.defaults.compute_backend == "local_subprocess"
     assert isinstance(registry.select_compute(), LocalSubprocessComputeBackend)
+    # Unset base_branch falls back to the built-in default.
+    assert config.defaults.base_branch == "main"
 
     assert config.tool_pins == ()
+
+
+def test_worklink_config_loads_base_branch(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text("defaults:\n  base_branch: integration/worklink\n")
+
+    config = WorklinkConfig.load(config_path)
+
+    assert config.defaults.base_branch == "integration/worklink"
+
+    # Absent file and absent key both default to main.
+    assert WorklinkConfig.load(tmp_path / "missing.yaml").defaults.base_branch == "main"
+    (tmp_path / "nobase.yaml").write_text("defaults:\n  backend: codex\n")
+    assert WorklinkConfig.load(tmp_path / "nobase.yaml").defaults.base_branch == "main"
 
 
 def test_worklink_config_parses_tool_pins(tmp_path: Path) -> None:

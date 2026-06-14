@@ -185,8 +185,18 @@ Per-issue flow (one `run`):
 2. **Claim** (`claims.py`). Lock + claim comment (agent id, ts,
    attempt N).
 3. **Worktree.** `git worktree add .worklink/<issue>-<attempt> -b
-   issue/<issue>-a<attempt>` from fresh `main` — **attempt-scoped
-   names**, because failed/blocked worktrees are retained for autopsy
+   issue/<issue>-a<attempt>` from the **configured base branch**
+   (`defaults.base_branch` in `worklink.yaml`, default `main`; a `mimir
+   worklink run --base <branch>` flag overrides per run). The same base is the
+   diff floor (`base...head`) and the PR target (`gh pr create --base
+   <base>`), so pointing it at a long-running integration/feature branch
+   stacks every leaf PR there instead of straight onto main (the
+   **feature-branch model**) — without any other change. The base is a single
+   configured branch for the whole run; **dependency-aware bases** (auto-cutting
+   a dependent leaf from its blocker's branch, resolved from the Chainlink
+   `block` graph) are a deliberate follow-up — they need blocker-branch
+   existence/merge ordering and rebase-on-blocker-merge handling. Names are
+   **attempt-scoped**, because failed/blocked worktrees are retained for autopsy
    (§3 step 8): with issue-scoped names the second attempt would
    collide with the first attempt's kept worktree AND its branch, and
    `attempts < 3` could never actually run more than once. Each retry
@@ -541,6 +551,7 @@ defaults:
   timeout_s: 1800
   priority: normal
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
+  base_branch: main          # worktrees cut from + PRs target this branch
 
 backends:
   codex:

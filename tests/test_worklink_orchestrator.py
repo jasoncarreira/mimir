@@ -243,6 +243,69 @@ def test_worker_payload_clone_branch_fake_backend_pushes_and_writes_evidence(tmp
     assert backend.orders[0].worktree == repo
 
 
+def test_worker_prepares_slash_named_feature_base(tmp_path: Path) -> None:
+    # Regression for #467: a long-running feature base such as
+    # `integration/worklink` must be materialized as a local ref and checked out
+    # from it — previously slash names were never given a local branch and the
+    # checkout failed, so the remote worker could not use the feature-branch model.
+    repo = tmp_path / "worker-repo"
+    evidence_path = tmp_path / "out" / "evidence.json"
+    calls: list[Sequence[str] | str] = []
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:2] == ["git", "clone"]:
+            repo.mkdir(parents=True)
+            (repo / ".git").mkdir()
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--name-only" in args:
+            return cp(args, stdout="changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--stat" in args:
+            return cp(args, stdout=" changed.txt | 1 +\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "status"]:
+            return cp(args, stdout="?? changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "commit"]:
+            return cp(args, stdout="[issue/456-a1 abc123] worklink\n")
+        if args == "echo ok":
+            return cp(args, stdout="ok\n")
+        return cp(args)
+
+    backend = WorkerFakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    spec = backend.work_spec(
+        WorkOrder(
+            issue_id=456,
+            worktree=tmp_path / "ignored",
+            prompt="Do worker handoff",
+            rules=None,
+            timeout_s=30,
+            env={"MIMIR_HOME": str(tmp_path / "home")},
+            transcript_root=tmp_path / "transcripts",
+        ),
+        attempt=1,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="integration/worklink",
+        branch="issue/456-a1",
+        test_command="echo ok",
+    )
+    payload = WorkerPayload(
+        spec=spec,
+        repo_dir=repo,
+        evidence_path=evidence_path,
+        transcript_root=tmp_path / "transcripts",
+        safe_env={"PATH": "/bin"},
+    )
+
+    validation = asyncio.run(run_worker_payload(payload, registry=registry, runner=runner))
+
+    assert validation.status == "completed"
+    # The slash base is fetched, materialized as a local ref, and checked out from it.
+    assert ["git", "-C", str(repo), "fetch", "origin", "integration/worklink"] in calls
+    assert ["git", "-C", str(repo), "branch", "-f", "integration/worklink", "FETCH_HEAD"] in calls
+    assert ["git", "-C", str(repo), "checkout", "-B", "issue/456-a1", "integration/worklink"] in calls
+
+
 def test_worker_asks_backend_to_localize_tool_argv(tmp_path: Path) -> None:
     repo = tmp_path / "worker-repo"
     evidence_path = tmp_path / "out" / "evidence.json"
@@ -607,6 +670,7 @@ def test_worklink_rereads_issue_comments_before_claiming(tmp_path: Path) -> None
         str(repo),
         "worktree",
         "add",
+        "--no-track",
         "-b",
         "issue/441-a2",
         str(worktree),
@@ -638,7 +702,12 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").is_file()
     assert ["git", "-C", str(worktree), "commit", "-m", "worklink: issue #441"] in calls
     assert ["chainlink", "locks", "release", "441"] in calls
-    assert any(isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls)
+    # Default base: worktree cut from main, PR targets main explicitly.
+    assert [
+        "git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "issue/441-a1", str(worktree), "main"
+    ] in calls
+    pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
+    assert pr_calls and pr_calls[0][pr_calls[0].index("--base") + 1] == "main"
     body = events.read_text(encoding="utf-8")
     assert "worklink_claimed" in body
     assert "worklink_evidence" in body
@@ -646,6 +715,62 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
 
 
+def test_worklink_runner_cuts_worktree_and_pr_from_configured_base(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    # worklink.yaml in the home points Worklink at a long-running feature branch.
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  base_branch: integration/worklink\n"
+    )
+    calls, runner = _orchestrator_runner(repo, worktree)
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    # Worktree is cut from the configured base, not main.
+    assert [
+        "git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "issue/441-a1", str(worktree),
+        "integration/worklink",
+    ] in calls
+    # And the PR targets that base (the feature-branch / stacking model).
+    pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
+    assert pr_calls
+    assert pr_calls[0][pr_calls[0].index("--base") + 1] == "integration/worklink"
+
+
+def test_worklink_run_base_override_beats_config(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    # Config says one base; the per-run override must win for both worktree + PR.
+    (tmp_path / "worklink.yaml").write_text("defaults:\n  base_branch: develop\n")
+    calls, runner = _orchestrator_runner(repo, worktree)
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok", base_branch="release/2.0"
+        )
+    )
+
+    assert result.status == "completed"
+    assert [
+        "git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "issue/441-a1", str(worktree), "release/2.0"
+    ] in calls
+    assert not any(
+        isinstance(c, list) and c[:5] == ["git", "-C", str(repo), "worktree", "add"] and c[-1] == "develop"
+        for c in calls
+    )
+    pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
+    assert pr_calls and pr_calls[0][pr_calls[0].index("--base") + 1] == "release/2.0"
 
 
 
