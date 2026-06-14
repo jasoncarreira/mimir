@@ -8,7 +8,11 @@ from typing import Any, Mapping
 
 import yaml
 
-from ..compute import ComputeBackend, LocalSubprocessComputeBackend
+from ..compute import (
+    ComputeBackend,
+    DockerSiblingComputeBackend,
+    LocalSubprocessComputeBackend,
+)
 from .base import ToolBackend
 from .claude_cli import ClaudeCliBackend
 from .codex import CodexBackend
@@ -64,6 +68,7 @@ class WorklinkConfig:
     defaults: WorklinkDefaults = field(default_factory=WorklinkDefaults)
     routes: tuple[WorklinkRoute, ...] = ()
     backend_settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    compute_backend_settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     tool_pins: tuple[ToolPin, ...] = ()
 
     @classmethod
@@ -76,16 +81,26 @@ class WorklinkConfig:
         defaults_data = data.get("defaults") or {}
         if not isinstance(defaults_data, dict):
             raise ValueError("worklink defaults must be a mapping")
-        category_defaults = defaults_data.get("backend_by_category") or defaults_data.get("category_defaults") or {}
+        category_defaults = defaults_data.get("backend_by_category") or defaults_data.get(
+            "category_defaults"
+        ) or {}
         if not isinstance(category_defaults, dict):
             raise ValueError("worklink category defaults must be a mapping")
         defaults = WorklinkDefaults(
             backend=str(defaults_data.get("backend", "codex")),
             timeout_s=int(defaults_data.get("timeout_s", 1800)),
             priority=str(defaults_data.get("priority", "normal")),
-            test_command=str(defaults_data.get("test_command", "env -u MIMIR_MODEL_SPEC uv run pytest -q")),
+            test_command=str(
+                defaults_data.get("test_command", "env -u MIMIR_MODEL_SPEC uv run pytest -q")
+            ),
             backend_by_category={str(key): str(value) for key, value in category_defaults.items()},
-            compute_backend=str(defaults_data.get("compute_backend", "local_subprocess")),
+            compute_backend=_normalize_compute_backend_name(
+                str(
+                    defaults_data.get(
+                        "compute_backend", defaults_data.get("compute", "local_subprocess")
+                    )
+                )
+            ),
             base_branch=str(defaults_data.get("base_branch", "main")),
         )
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
@@ -93,7 +108,22 @@ class WorklinkConfig:
         backends = data.get("backends") or {}
         if not isinstance(backends, dict):
             raise ValueError("worklink backends must be a mapping")
-        return cls(defaults=defaults, routes=routes, backend_settings=backends, tool_pins=tool_pins)
+        compute_backends = data.get("compute_backends") or {}
+        if not isinstance(compute_backends, dict):
+            raise ValueError("worklink compute_backends must be a mapping")
+        normalized_compute_backends = {
+            _normalize_compute_backend_name(str(name)): _expect_mapping(
+                settings, f"worklink compute_backends.{name}"
+            )
+            for name, settings in compute_backends.items()
+        }
+        return cls(
+            defaults=defaults,
+            routes=routes,
+            backend_settings=backends,
+            compute_backend_settings=normalized_compute_backends,
+            tool_pins=tool_pins,
+        )
 
     def select_compute_backend_name(
         self,
@@ -124,6 +154,18 @@ class WorklinkConfig:
         return self.defaults.backend
 
 
+def _normalize_compute_backend_name(name: str) -> str:
+    return name.strip().replace("-", "_")
+
+
+def _expect_mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a mapping")
+    return value
+
+
 def _parse_tool_pins(value: Any) -> tuple[ToolPin, ...]:
     if not isinstance(value, list):
         raise ValueError("worklink tool_pins must be a list")
@@ -135,7 +177,9 @@ def _parse_tool_pin(value: Any, *, index: int) -> ToolPin:
         raise ValueError(f"worklink tool_pins[{index}] must be a mapping")
     missing = [field for field in ("name", "category", "pin", "smoke") if field not in value]
     if missing:
-        raise ValueError(f"worklink tool_pins[{index}] missing required field(s): {', '.join(missing)}")
+        raise ValueError(
+            f"worklink tool_pins[{index}] missing required field(s): {', '.join(missing)}"
+        )
     return ToolPin(
         name=str(value["name"]),
         category=str(value["category"]),
@@ -160,7 +204,11 @@ def _parse_route(value: Any) -> WorklinkRoute:
         label=str(value["label"]) if "label" in value else None,
         repo=str(value["repo"]) if "repo" in value else None,
         tool_category=str(value["tool_category"]) if "tool_category" in value else None,
-        compute_backend=str(value["compute_backend"]) if "compute_backend" in value else None,
+        compute_backend=(
+            _normalize_compute_backend_name(str(value["compute_backend"]))
+            if "compute_backend" in value
+            else None
+        ),
     )
 
 
@@ -176,6 +224,8 @@ class BackendRegistry:
         self._compute_backends: dict[str, ComputeBackend] = {
             "local_subprocess": LocalSubprocessComputeBackend(),
         }
+        for name, settings in self.config.compute_backend_settings.items():
+            self._compute_backends[name] = self._build_compute_backend(name, settings)
 
     def register(self, backend: ToolBackend) -> None:
         self._backends[backend.name] = backend
@@ -190,8 +240,9 @@ class BackendRegistry:
             raise KeyError(f"unknown Worklink backend: {name}") from exc
 
     def get_compute(self, name: str) -> ComputeBackend:
+        normalized = _normalize_compute_backend_name(name)
         try:
-            return self._compute_backends[name]
+            return self._compute_backends[normalized]
         except KeyError as exc:
             raise KeyError(f"unknown Worklink compute backend: {name}") from exc
 
@@ -202,11 +253,18 @@ class BackendRegistry:
         repo: str | None = None,
         tool_category: str | None = None,
     ) -> ComputeBackend:
-        return self.get_compute(
-            self.config.select_compute_backend_name(
-                labels=labels, repo=repo, tool_category=tool_category
-            )
+        name = self.config.select_compute_backend_name(
+            labels=labels, repo=repo, tool_category=tool_category
         )
+        try:
+            return self.get_compute(name)
+        except KeyError:
+            if _normalize_compute_backend_name(name) == "docker_sibling":
+                raise ValueError(
+                    "worklink docker-sibling compute backend requires "
+                    "compute_backends.docker-sibling config"
+                ) from None
+            raise
 
     def select(
         self,
@@ -218,6 +276,30 @@ class BackendRegistry:
         return self.get(
             self.config.select_backend_name(labels=labels, repo=repo, tool_category=tool_category)
         )
+
+    @staticmethod
+    def _build_compute_backend(name: str, settings: Mapping[str, Any]) -> ComputeBackend:
+        if name == "local_subprocess":
+            if settings:
+                raise ValueError(
+                    "worklink local-subprocess compute backend does not accept settings"
+                )
+            return LocalSubprocessComputeBackend()
+        if name == "docker_sibling":
+            allowed = {"broker_url", "broker_endpoint", "image", "policy"}
+            unknown = sorted(set(settings) - allowed)
+            if unknown:
+                raise ValueError(
+                    "worklink docker-sibling compute backend unknown setting(s): "
+                    + ", ".join(unknown)
+                )
+            broker_url = str(settings.get("broker_url", settings.get("broker_endpoint", "")))
+            image = str(settings.get("image", ""))
+            policy = settings.get("policy") or {}
+            if not isinstance(policy, Mapping):
+                raise ValueError("worklink docker-sibling policy must be a mapping")
+            return DockerSiblingComputeBackend(broker_url=broker_url, image=image, policy=policy)
+        raise ValueError(f"unknown Worklink compute backend config: {name}")
 
     @staticmethod
     def _build_codex(settings: Mapping[str, Any]) -> CodexBackend:
