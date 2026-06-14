@@ -568,6 +568,15 @@ compute_backends:
     policy: {}
 ```
 
+The agent-side `docker-sibling` backend is a broker **client**, not a Docker
+launcher. Its contract is deliberately narrow: `POST /jobs` submits `{image,
+policy, worker_payload}`, `POST /jobs/<id>/wait` returns bounded compute result
+fields, `GET /jobs/<id>/logs` returns text/JSON logs, `POST /jobs/<id>/cancel`
+cancels, and `DELETE /jobs/<id>` cleans up. The submitted worker payload is the
+same JSON schema consumed by `mimir worklink worker <payload.json>`; do not add a
+second Docker-only work schema. The client supports `unix://`, `http://`, and
+`https://` broker URLs and contains no direct docker CLI or docker.sock access.
+
 `claude_cli` is registered by default but is only runnable in deployments that
 actually install the `claude` binary. The current production container may omit
 it when Claude Code CLI installation is disabled; in that state the adapter can
@@ -704,7 +713,7 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454)
   #   task_definition: worklink-worker
   #   subnets: ["subnet-…"]
 
-`compute_backend` also accepts the legacy spelling `compute`; backend names are normalized so `docker-sibling` in YAML selects Python registry key `docker_sibling`. Invalid or unknown DockerSibling fields fail closed during config load instead of falling back to local execution. This slice only wires config/registry selection; the broker client/server live in later slices.
+`compute_backend` also accepts the legacy spelling `compute`; backend names are normalized so `docker-sibling` in YAML selects Python registry key `docker_sibling`. Invalid or unknown DockerSibling fields fail closed during config load instead of falling back to local execution. The agent-side broker client is implemented, but the broker process/policy layer is a later slice; until that broker is running, selecting `docker-sibling` will fail at launch rather than silently falling back to local execution.
 
 tool_pins:
   - name: codex                  # required: stable local tool name

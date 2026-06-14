@@ -421,24 +421,148 @@ compute_backends:
     assert isinstance(registry.select_compute(labels={"local-ok"}), LocalSubprocessComputeBackend)
 
 
-def test_docker_sibling_compute_backend_fails_closed_at_launch() -> None:
-    backend = DockerSiblingComputeBackend(broker_url="unix:///x.sock", image="i")
-    spec = WorkSpec(
-        issue_id=1,
-        attempt=1,
-        repo_url="repo",
+class FakeDockerSiblingTransport:
+    def __init__(self) -> None:
+        self.submitted: list[dict[str, Any]] = []
+        self.waits: list[tuple[str, int]] = []
+        self.logs_requested: list[str] = []
+        self.cancelled: list[str] = []
+        self.cleaned: list[str] = []
+        self.wait_response: dict[str, Any] = {
+            "status": "completed",
+            "exit_code": 0,
+            "stdout": "done",
+            "stderr": "",
+        }
+
+    async def submit_job(self, payload: dict[str, Any], *, timeout_s: int) -> dict[str, Any]:
+        self.submitted.append({"payload": payload, "timeout_s": timeout_s})
+        return {"job_id": "job-123"}
+
+    async def wait_job(self, job_id: str, *, timeout_s: int) -> dict[str, Any]:
+        self.waits.append((job_id, timeout_s))
+        return self.wait_response
+
+    async def job_logs(self, job_id: str) -> str:
+        self.logs_requested.append(job_id)
+        return "broker logs"
+
+    async def cancel_job(self, job_id: str) -> None:
+        self.cancelled.append(job_id)
+
+    async def cleanup_job(self, job_id: str) -> None:
+        self.cleaned.append(job_id)
+
+
+def _portable_spec() -> WorkSpec:
+    return WorkSpec(
+        issue_id=472,
+        attempt=2,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
         base_ref="main",
-        branch="issue/1-a1",
+        branch="issue/472-a2",
         prompt="prompt",
         rules=None,
         test_command="echo ok",
         backend="codex",
         timeout_s=5,
+        env={"MIMIR_HOME": "/home/mimir"},
+        backend_config={"bin": "codex", "args": ["exec", "--json"]},
     )
 
-    assert backend.capabilities().shared_filesystem is False
-    with pytest.raises(ComputeLaunchError, match="broker client is not implemented"):
-        asyncio.run(backend.launch(spec))
+
+@pytest.mark.asyncio
+async def test_docker_sibling_compute_backend_uses_broker_contract_not_docker() -> None:
+    transport = FakeDockerSiblingTransport()
+    backend = DockerSiblingComputeBackend(
+        broker_url="unix:///run/worklink-broker.sock",
+        image="mimirbot-mimirbot",
+        policy={"network": "none"},
+        transport=transport,
+    )
+
+    handle = await backend.launch(_portable_spec())
+    result = await backend.wait(handle, timeout_s=7)
+    logs = await backend.logs(handle)
+    await backend.cancel(handle)
+    await backend.cleanup(handle)
+
+    assert handle.substrate == "docker_sibling"
+    assert handle.identifier == "job-123"
+    assert result == ComputeResult(
+        exit_code=0,
+        stdout="done",
+        stderr="",
+        handle=handle,
+        command=("worklink-broker", "unix:///run/worklink-broker.sock", "wait", "job-123"),
+    )
+    assert logs == "broker logs"
+    assert transport.waits == [("job-123", 7)]
+    assert transport.logs_requested == ["job-123"]
+    assert transport.cancelled == ["job-123"]
+    assert transport.cleaned == ["job-123"]
+    submitted = transport.submitted[0]
+    assert submitted["timeout_s"] == 5
+    assert submitted["payload"]["image"] == "mimirbot-mimirbot"
+    assert submitted["payload"]["policy"] == {"network": "none"}
+    worker_payload = submitted["payload"]["worker_payload"]
+    assert worker_payload["repo_dir"] == "/work/repo"
+    assert worker_payload["evidence_path"] == "/work/evidence/evidence.json"
+    assert worker_payload["transcript_root"] == "/work/transcripts"
+    assert worker_payload["spec"]["branch"] == "issue/472-a2"
+    assert worker_payload["spec"]["backend_config"] == {"bin": "codex", "args": ["exec", "--json"]}
+
+
+@pytest.mark.asyncio
+async def test_docker_sibling_compute_backend_maps_transport_failures_to_results() -> None:
+    class FailingWaitTransport(FakeDockerSiblingTransport):
+        async def wait_job(self, job_id: str, *, timeout_s: int) -> dict[str, Any]:
+            raise RuntimeError("broker unavailable")
+
+    backend = DockerSiblingComputeBackend(
+        broker_url="https://broker.example.invalid",
+        image="mimirbot-mimirbot",
+        transport=FailingWaitTransport(),
+    )
+
+    handle = await backend.launch(_portable_spec())
+    result = await backend.wait(handle, timeout_s=7)
+
+    assert result.exit_code == -1
+    assert result.launch_error == "docker-sibling broker wait failed: broker unavailable"
+    assert result.handle == handle
+
+
+@pytest.mark.asyncio
+async def test_docker_sibling_compute_backend_cleanup_is_best_effort() -> None:
+    class FailingCleanupTransport(FakeDockerSiblingTransport):
+        async def cleanup_job(self, job_id: str) -> None:
+            raise RuntimeError("cleanup failed")
+
+    backend = DockerSiblingComputeBackend(
+        broker_url="https://broker.example.invalid",
+        image="mimirbot-mimirbot",
+        transport=FailingCleanupTransport(),
+    )
+
+    handle = await backend.launch(_portable_spec())
+    await backend.cleanup(handle)
+
+
+@pytest.mark.asyncio
+async def test_docker_sibling_compute_backend_requires_broker_job_id() -> None:
+    class MissingJobIdTransport(FakeDockerSiblingTransport):
+        async def submit_job(self, payload: dict[str, Any], *, timeout_s: int) -> dict[str, Any]:
+            return {}
+
+    backend = DockerSiblingComputeBackend(
+        broker_url="https://broker.example.invalid",
+        image="mimirbot-mimirbot",
+        transport=MissingJobIdTransport(),
+    )
+
+    with pytest.raises(ComputeLaunchError, match="missing job_id"):
+        await backend.launch(_portable_spec())
 
 
 def test_worklink_config_accepts_legacy_compute_alias_for_docker_sibling(tmp_path: Path) -> None:
