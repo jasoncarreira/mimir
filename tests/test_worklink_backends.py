@@ -649,7 +649,7 @@ def test_worklink_config_parses_tool_pins(tmp_path: Path) -> None:
 tool_pins:
   - name: codex
     category: coding-cli
-    pin: "0.137.0"
+    pin: "0.139.0"
     smoke: "codex --version"
     source: npm
     package: "@openai/codex"
@@ -670,7 +670,7 @@ tool_pins:
         ToolPin(
             name="codex",
             category="coding-cli",
-            pin="0.137.0",
+            pin="0.139.0",
             smoke="codex --version",
             source="npm",
             package="@openai/codex",
@@ -708,7 +708,7 @@ def test_worklink_config_rejects_invalid_tool_pins(tmp_path: Path) -> None:
 tool_pins:
   - name: codex
     category: coding-cli
-    pin: "0.137.0"
+    pin: "0.139.0"
 """.strip()
     )
 
