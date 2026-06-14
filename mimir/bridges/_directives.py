@@ -82,12 +82,11 @@ class ParseResult:
 # ─── Regex tokens ───────────────────────────────────────────────────
 
 
-# Line-anchored open/close: the agent's convention is one block per line
-# (or multi-line block whose tags sit alone on their lines). Inline prose
-# mentions in code spans (single backticks) or markdown formatting don't
-# start at column 0, so they're skipped — fixes the "agent documents the
-# directive syntax in code-quotes and the parser greedily eats prose
-# between the stray open and the real trailing close" failure mode.
+# Line-anchored complete block: the agent's convention is one block per
+# line (or a multi-line block whose tags sit alone on their lines).
+# Closing remains line-anchored so inline prose mentions in code spans
+# don't get greedily paired with a real trailing close and strip the
+# explanation between them.
 _ACTIONS_BLOCK_RE = re.compile(
     r"^[ \t]*<actions\b[^>]*>([\s\S]*?)</actions>[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
@@ -95,6 +94,11 @@ _ACTIONS_BLOCK_RE = re.compile(
 
 # Matches a self-closing <react ... /> or <send-file ... />. The
 # whitespace around `/>` is tolerated to be lenient on LLM output.
+_ACTIONS_ANY_BLOCK_RE = re.compile(
+    r"<actions\b[^>]*>([\s\S]*?)</actions>",
+    re.IGNORECASE,
+)
+
 _DIRECTIVE_TOKEN_RE = re.compile(
     r"""<(react|send-file)\b([^>]*?)/\s*>""",
     re.VERBOSE | re.IGNORECASE,
@@ -147,6 +151,36 @@ def _parse_block_children(block: str) -> list[Directive]:
 # ─── Public API ─────────────────────────────────────────────────────
 
 
+def _block_contains_only_known_directives(block: str) -> bool:
+    """True when a non-anchored actions block is safe to consume.
+
+    The line-anchored parser remains deliberately permissive for normal
+    agent output. For inline blocks we only consume directive-only
+    payloads, so an explanatory inline-code mention of ``<actions>``
+    cannot be greedily paired with a later close tag and delete prose.
+    """
+    if not _parse_block_children(block):
+        return False
+    return _DIRECTIVE_TOKEN_RE.sub("", block).strip() == ""
+
+
+def _strip_unclosed_actions_tail(text: str) -> str:
+    lower = text.lower()
+    last_open = lower.rfind("<actions")
+    if last_open < 0 or lower.rfind("</actions>") > last_open:
+        return text
+
+    tail = lower[last_open:]
+    line_start = lower.rfind("\n", 0, last_open) + 1
+    prefix = text[line_start:last_open]
+    is_line_anchored = prefix.strip() == ""
+    has_directive_child = "<react" in tail or "<send-file" in tail
+    if not (is_line_anchored or has_directive_child):
+        return text
+
+    return text[:last_open]
+
+
 def parse_directives(text: str) -> ParseResult:
     """Extract every ``<actions>...</actions>`` block from ``text``,
     parse the directives inside each, and return a cleaned text plus
@@ -157,17 +191,36 @@ def parse_directives(text: str) -> ParseResult:
     tags outside ``<actions>`` are NOT parsed — keeping the wrapper
     requirement makes parsing deterministic and gives the agent a clear
     visual marker that it's emitting actions vs. just describing them.
+    Malformed line-anchored or directive-bearing blocks are stripped from
+    the visible text rather than delivering raw XML to the user.
     """
     if "<actions" not in text.lower():
         return ParseResult(clean_text=text, directives=())
 
     directives: list[Directive] = []
 
-    def _replace(m: re.Match[str]) -> str:
+    def _replace_anchored(m: re.Match[str]) -> str:
         directives.extend(_parse_block_children(m.group(1)))
         return ""
 
-    cleaned = _ACTIONS_BLOCK_RE.sub(_replace, text)
+    cleaned = _ACTIONS_BLOCK_RE.sub(_replace_anchored, text)
+
+    def _replace_inline(m: re.Match[str]) -> str:
+        # Do not consume examples written as inline markdown code. The
+        # fallback inline parser exists for real malformed sends, not for
+        # documentation like `<actions><react emoji="x" /></actions>`.
+        if (m.start() > 0 and cleaned[m.start() - 1] == "`") or (
+            m.end() < len(cleaned) and cleaned[m.end()] == "`"
+        ):
+            return m.group(0)
+        block = m.group(1)
+        if not _block_contains_only_known_directives(block):
+            return m.group(0)
+        directives.extend(_parse_block_children(block))
+        return ""
+
+    cleaned = _ACTIONS_ANY_BLOCK_RE.sub(_replace_inline, cleaned)
+    cleaned = _strip_unclosed_actions_tail(cleaned)
     # Collapse trailing whitespace/blank lines left behind by stripped
     # blocks — agent-emitted blocks often sit on their own line(s).
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
@@ -223,12 +276,10 @@ def has_incomplete_actions_tag(text: str) -> bool:
 
 def strip_actions_blocks(text: str) -> str:
     """Cleaned-text-only variant of ``parse_directives`` — returns the
-    text with every complete ``<actions>`` block removed. Useful in
-    streaming / display paths that don't care about the directives
-    themselves (e.g., logging, transcript mirroring)."""
-    cleaned = _ACTIONS_BLOCK_RE.sub("", text)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return cleaned
+    text with action blocks removed. Useful in streaming / display paths
+    that don't care about the directives themselves (e.g., logging,
+    transcript mirroring)."""
+    return parse_directives(text).clean_text
 
 
 __all__ = [

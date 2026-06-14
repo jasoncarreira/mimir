@@ -168,6 +168,40 @@ def test_block_with_indented_open_tag():
     assert result.directives[0].emoji == "eyes"  # type: ignore[attr-defined]
 
 
+def test_inline_directive_only_block_is_parsed():
+    result = parse_directives(
+        'ACK <actions><react emoji="thumbsup" message="m1" /></actions>'
+    )
+
+    assert result.clean_text == "ACK"
+    assert len(result.directives) == 1
+    assert result.directives[0].emoji == "thumbsup"  # type: ignore[attr-defined]
+    assert result.directives[0].message_id == "m1"  # type: ignore[attr-defined]
+
+
+def test_inline_code_directive_example_is_not_parsed():
+    raw = 'Document `<actions><react emoji="thumbsup" /></actions>` literally.'
+    result = parse_directives(raw)
+
+    assert result.clean_text == raw
+    assert result.directives == ()
+
+
+def test_unclosed_line_anchored_block_is_stripped():
+    raw = 'ACK\n<actions><react emoji="thumbsup"'
+    result = parse_directives(raw)
+
+    assert result.clean_text == "ACK"
+    assert result.directives == ()
+
+
+def test_unclosed_directive_bearing_inline_block_is_stripped():
+    raw = 'ACK <actions><react emoji="thumbsup"'
+    result = parse_directives(raw)
+
+    assert result.clean_text == "ACK"
+    assert result.directives == ()
+
 def test_inline_mention_without_trailing_block():
     """A bare inline mention with no trailing block just stays in the
     cleaned text — same as the no-actions-here passthrough."""
@@ -234,14 +268,13 @@ def test_self_closing_with_extra_whitespace():
     assert len(result.directives) == 1
 
 
-def test_unclosed_block_returns_text_unchanged():
-    """Unmatched <actions> with no close → no directives parsed; text
-    returned with the unclosed marker still present (the streaming
-    helpers detect this case for display)."""
-    raw = "starting up <actions><react emoji=\"x\" "
+def test_explanatory_unclosed_inline_block_returns_text_unchanged():
+    """A prose mention of <actions> with no directive child still stays
+    visible; only malformed directive-bearing blocks are stripped."""
+    raw = "starting up <actions> someday"
     result = parse_directives(raw)
     assert result.directives == ()
-    assert "<actions>" in result.clean_text
+    assert result.clean_text == raw
 
 
 def test_strip_actions_blocks_only():
