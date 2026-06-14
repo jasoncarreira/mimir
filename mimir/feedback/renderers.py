@@ -57,6 +57,15 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         name = _sanitize_field(ev.get("name") or "?")
         error = _sanitize_field(ev.get("error") or "(no detail)")
         return f"background task {name!r} failed: {error}"
+    if rule_kind == "scheduler_loop_lag":
+        lag = ev.get("lag_s")
+        threshold = ev.get("threshold_s")
+        lag_s = f"{lag:.3f}s" if isinstance(lag, (int, float)) else "?"
+        threshold_s = f"{threshold:.3f}s" if isinstance(threshold, (int, float)) else "?"
+        return f"scheduler event loop lag: {lag_s} over threshold {threshold_s}"
+    if rule_kind == "scheduler_loop_lag_monitor_failed":
+        error = _sanitize_field(ev.get("error") or "(no detail)")
+        return f"scheduler loop-lag monitor failed: {error}"
     if rule_kind == "loop_stop":
         return f"send_message_loop_hard_stop after {ev.get('count', '?')}"
     if rule_kind == "loop_warn":
