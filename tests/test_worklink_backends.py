@@ -19,6 +19,7 @@ from mimir.worklink.backends import (
     WorkOrder,
     WorklinkConfig,
 )
+from mimir.worklink.backends.base import blocked_reason_from_output
 from mimir.worklink.compute import ComputeCaps, WorkSpec
 from mimir.worklink.worker import WorkerPayload, payload_from_json, payload_to_json
 import mimir.worklink.backends.codex as codex_module
@@ -599,6 +600,32 @@ def test_coding_backends_parse_structured_worklink_blocked_marker(tmp_path: Path
     assert codex_raw.error == "design requires raw docker.sock access"
     assert claude_raw.backend_status == "blocked"
     assert claude_raw.blocked_reason == "design requires raw docker.sock access"
+
+
+def test_blocked_reason_from_output_requires_final_line_marker() -> None:
+    # No marker → no block.
+    assert blocked_reason_from_output("did the work\n", "") is None
+    # Marker as the final non-empty line (trailing blank lines tolerated) → reason.
+    assert blocked_reason_from_output("WORKLINK_BLOCKED: real reason\n\n", "") == "real reason"
+    # Whitespace-only reason is not a signal.
+    assert blocked_reason_from_output("WORKLINK_BLOCKED:    \n", "") is None
+    # Marker on stderr's final line is honored too.
+    assert blocked_reason_from_output("", "boom\nWORKLINK_BLOCKED: env missing") == "env missing"
+    # Regression (#671 review): a backend that echoes the prompt's marker line
+    # near the top and then COMPLETES NORMALLY must not be mislabeled blocked —
+    # the real final line is its success output, not the echoed marker.
+    echo_then_success = (
+        "WORKLINK_BLOCKED: <one-line reason>\n"  # echoed instruction placeholder
+        "I completed the work successfully\n"
+    )
+    assert blocked_reason_from_output(echo_then_success, "") is None
+    # But an early echo followed by a real FINAL marker is a genuine block.
+    echo_then_block = (
+        "WORKLINK_BLOCKED: <one-line reason>\n"
+        "...did some analysis...\n"
+        "WORKLINK_BLOCKED: acceptance criteria contradict #438\n"
+    )
+    assert blocked_reason_from_output(echo_then_block, "") == "acceptance criteria contradict #438"
 
 
 def test_codex_status_auth_detection_does_not_match_author_text() -> None:

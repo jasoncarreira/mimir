@@ -156,7 +156,8 @@ class ChainlinkClaims:
         else:
             self._run("issue", "label", str(issue_id), "worklink:ready")
         if reason:
-            self._run("issue", "comment", str(issue_id), f"WORKLINK_FAILED {reason}")
+            prefix = "WORKLINK_BLOCKED" if status == "blocked" else "WORKLINK_FAILED"
+            self._run("issue", "comment", str(issue_id), f"{prefix} {reason}")
 
     def next_attempt(self, comments: Iterable[str]) -> int:
         records = claim_records_from_comments(comments)
