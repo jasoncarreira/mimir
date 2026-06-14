@@ -100,3 +100,43 @@ def test_onnx_provider_direct_unaffected(
     provider = get_provider()
     assert isinstance(provider, ONNXProvider)
     assert provider.model_name == "BAAI/bge-small-en-v1.5"
+
+
+def test_fallback_overrides_dimensions_to_match_onnx_model(
+    monkeypatch: pytest.MonkeyPatch, fake_cfg,
+) -> None:
+    """Fallback must override ``dimensions`` to the ONNX model's native
+    dim, not the API provider's. Reviewer repro: with
+    ``model = "voyage-4-lite" + dimensions = 1024`` and no API key,
+    pre-fix returned a provider with 1024-d ``dimensions()`` but
+    384-d vectors, crashing ``struct.pack(f"{dim}f", *vec)`` callers."""
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    fake_cfg(embedding={
+        "provider": "voyage",
+        "model": "voyage-4-lite",
+        "dimensions": 1024,
+        "api_key_env": "VOYAGE_API_KEY",
+    })
+
+    from mimir.saga.embeddings import get_provider
+
+    provider = get_provider()
+    assert provider.dimensions() == 384
+
+
+def test_onnx_provider_direct_honors_configured_dimensions(
+    monkeypatch: pytest.MonkeyPatch, fake_cfg,
+) -> None:
+    """Non-fallback path: ``provider = "onnx"`` honors the operator's
+    ``dimensions`` config (e.g. for a different onnx model)."""
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    fake_cfg(embedding={
+        "provider": "onnx",
+        "dimensions": 768,
+        "api_key_env": "VOYAGE_API_KEY",
+    })
+
+    from mimir.saga.embeddings import get_provider
+
+    provider = get_provider()
+    assert provider.dimensions() == 768

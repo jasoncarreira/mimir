@@ -179,14 +179,17 @@ class ONNXProvider(EmbeddingProvider):
     wrapper swap.
     """
 
-    def __init__(self, model_name: Optional[str] = None):
-        # Override for the API-key-fallback path: the configured model
-        # is typically an API model name that fastembed rejects.
+    def __init__(self, model_name: Optional[str] = None, dimensions: Optional[int] = None):
+        # Overrides for the API-key-fallback path: the configured
+        # model is typically an API model name that fastembed rejects,
+        # and its ``[embedding] dimensions`` value won't match the
+        # ONNX model's native dim.
         self.model_name = (
             model_name
             if model_name is not None
             else _cfg('embedding', 'model', 'BAAI/bge-small-en-v1.5')
         )
+        self._dimensions_override = dimensions
         self.max_chars = _cfg('embedding', 'max_input_chars', 2000)
         self._model = None
 
@@ -234,6 +237,8 @@ class ONNXProvider(EmbeddingProvider):
         return [v.tolist() for v in vecs]
 
     def dimensions(self) -> int:
+        if self._dimensions_override is not None:
+            return self._dimensions_override
         return _cfg('embedding', 'dimensions', 384)
 
 
@@ -389,8 +394,12 @@ def get_provider() -> EmbeddingProvider:
         }
         # When falling back from an API-keyed provider to onnx, force
         # the onnx default model: the configured model is typically
-        # the API model name and fastembed would reject it.
+        # the API model name and fastembed would reject it. Also
+        # override dimensions — the API provider's dim (e.g. 1024 for
+        # voyage) doesn't match the ONNX model's native dim, and
+        # callers pack vectors at the reported dim.
         _onnx_model_override: Optional[str] = None
+        _onnx_dimensions_override: Optional[int] = None
         if provider_name in _API_KEYED_PROVIDERS:
             api_key_env = _cfg(
                 'embedding', 'api_key_env',
@@ -405,6 +414,7 @@ def get_provider() -> EmbeddingProvider:
                 )
                 provider_name = "onnx"
                 _onnx_model_override = "BAAI/bge-small-en-v1.5"
+                _onnx_dimensions_override = 384
 
         provider_cls = _PROVIDERS.get(provider_name)
         if provider_cls is None:
@@ -413,7 +423,10 @@ def get_provider() -> EmbeddingProvider:
                 f"Available: {', '.join(_PROVIDERS.keys())}"
             )
         if _onnx_model_override is not None and provider_cls is ONNXProvider:
-            _provider_instance = provider_cls(model_name=_onnx_model_override)
+            _provider_instance = provider_cls(
+                model_name=_onnx_model_override,
+                dimensions=_onnx_dimensions_override,
+            )
         else:
             _provider_instance = provider_cls()
     return _provider_instance
