@@ -210,10 +210,34 @@ async def send_message(
     from ..loop_detector import BreakerVerdict
 
     detector = None
+    detector_state = None
+    decision = None
+    undelivered_decision = None
     ctx = get_current_turn()
     if ctx is not None:
         detector = getattr(ctx, "loop_detector", None)
+
+    bridge = channels.find(cid)
+    if bridge is None:
+        return f"send_message failed: no bridge for channel {cid!r}"
+
     if detector is not None:
+        undelivered_decision = detector.check_undelivered_backstop(text)
+        if undelivered_decision is not None:
+            await _log_event(
+                "send_message_loop_hard_stop",
+                channel_id=cid,
+                streak=undelivered_decision.streak,
+                similarity=round(undelivered_decision.similarity, 4),
+                undelivered=True,
+            )
+            return (
+                "send_message hard stop: repeated near-duplicate "
+                "undelivered-send loop. This send is refused before another "
+                "delivery attempt. Reflect on the delivery failure before "
+                "trying again."
+            )
+        detector_state = detector.snapshot()
         decision = detector.check(text)
         if decision.verdict == BreakerVerdict.HARD_STOP:
             await _log_event(
@@ -228,18 +252,6 @@ async def send_message(
                 "approach before sending again — try a completely "
                 "different tactic or finish the turn."
             )
-        if decision.verdict == BreakerVerdict.SOFT_WARN:
-            if detector.mark_warning_emitted():
-                await _log_event(
-                    "send_message_loop_warning",
-                    channel_id=cid,
-                    streak=decision.streak,
-                    similarity=round(decision.similarity, 4),
-                )
-
-    bridge = channels.find(cid)
-    if bridge is None:
-        return f"send_message failed: no bridge for channel {cid!r}"
 
     # Strip <actions>...</actions> directive blocks from the outbound
     # text and dispatch parsed directives (react, send-file) after send.
@@ -247,6 +259,8 @@ async def send_message(
     clean_text = parsed.clean_text
 
     result = None
+    delivered_by_text = False
+    delivered_by_directive = False
     if clean_text:
         try:
             # final=False keeps the typing indicator held — it is released
@@ -255,6 +269,23 @@ async def send_message(
             # would cancel typing on the FIRST send (see DiscordBridge.send).
             result = await bridge.send(cid, clean_text, final=False)
         except Exception as exc:
+            if detector is not None and detector_state is not None:
+                detector.restore(detector_state)
+                undelivered_decision = detector.record_undelivered_attempt(text)
+                if undelivered_decision.verdict == BreakerVerdict.HARD_STOP:
+                    await _log_event(
+                        "send_message_loop_hard_stop",
+                        channel_id=cid,
+                        streak=undelivered_decision.streak,
+                        similarity=round(undelivered_decision.similarity, 4),
+                        undelivered=True,
+                    )
+                    return (
+                        "send_message hard stop: repeated near-duplicate "
+                        "undelivered-send loop. This send failed before "
+                        "delivery and further identical retries are refused. "
+                        "Reflect on the delivery failure before trying again."
+                    )
             return f"send_message failed: {exc}"
 
         # Soft delivery failure: bridges return SendResult(sent=False, error=…)
@@ -263,6 +294,23 @@ async def send_message(
         # soft failure must NOT look delivered — don't log send_message_sent,
         # don't append to history, and surface the failure to the model.
         if not getattr(result, "sent", True):
+            if detector is not None and detector_state is not None:
+                detector.restore(detector_state)
+                undelivered_decision = detector.record_undelivered_attempt(text)
+                if undelivered_decision.verdict == BreakerVerdict.HARD_STOP:
+                    await _log_event(
+                        "send_message_loop_hard_stop",
+                        channel_id=cid,
+                        streak=undelivered_decision.streak,
+                        similarity=round(undelivered_decision.similarity, 4),
+                        undelivered=True,
+                    )
+                    return (
+                        "send_message hard stop: repeated near-duplicate "
+                        "undelivered-send loop. This send failed before "
+                        "delivery and further identical retries are refused. "
+                        "Reflect on the delivery failure before trying again."
+                    )
             _err = getattr(result, "error", None)
             try:
                 await _log_event(
@@ -277,6 +325,8 @@ async def send_message(
                 f"delivered (channel={cid}" + (f"; {_err}" if _err else "") + ")"
             )
 
+        delivered_by_text = True
+
         # Successful delivery — record it on the turn context so the
         # forgot-to-send guard knows a reply actually went out. An
         # attempted-but-refused / soft-failed send must NOT suppress the
@@ -287,6 +337,8 @@ async def send_message(
                 ctx.delivered_channel_ids.add(cid)
             except Exception:  # noqa: BLE001
                 pass
+        if detector is not None:
+            detector.clear_undelivered_attempts()
 
         # S2-2: log a send_message_sent event with a normalized content hash
         # so FeedbackLog._detect_cross_turn_send_loops can detect 24h floods
@@ -387,13 +439,52 @@ async def send_message(
                     )
             # Confirmed-delivery gate mirrors the react tool: only a
             # non-False return counts toward the turn's reply accounting.
-            if _ok is not False and ctx is not None:
-                try:
-                    ctx.react_count += 1
-                    ctx.delivered_channel_ids.add(cid)
-                except Exception:  # noqa: BLE001
-                    pass
+            if _ok is not False:
+                delivered_by_directive = True
+                if ctx is not None:
+                    try:
+                        ctx.react_count += 1
+                        ctx.delivered_channel_ids.add(cid)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if detector is not None:
+                    detector.clear_undelivered_attempts()
         # SendFileDirective: not yet implemented via this path
+
+    if (
+        detector is not None
+        and detector_state is not None
+        and not delivered_by_text
+        and not delivered_by_directive
+    ):
+        detector.restore(detector_state)
+        undelivered_decision = detector.record_undelivered_attempt(text)
+        if undelivered_decision.verdict == BreakerVerdict.HARD_STOP:
+            await _log_event(
+                "send_message_loop_hard_stop",
+                channel_id=cid,
+                streak=undelivered_decision.streak,
+                similarity=round(undelivered_decision.similarity, 4),
+                undelivered=True,
+            )
+            return (
+                "send_message hard stop: repeated near-duplicate "
+                "undelivered-send loop. This send failed before delivery and "
+                "further identical retries are refused. Reflect on the "
+                "delivery failure before trying again."
+            )
+    elif (
+        detector is not None
+        and decision is not None
+        and decision.verdict == BreakerVerdict.SOFT_WARN
+        and detector.mark_warning_emitted()
+    ):
+        await _log_event(
+            "send_message_loop_warning",
+            channel_id=cid,
+            streak=decision.streak,
+            similarity=round(decision.similarity, 4),
+        )
 
     # chainlink #259: surface the bare message_id, not the SendResult repr,
     # so downstream parses/greps (e.g. a later react(message_id=...)) work.
