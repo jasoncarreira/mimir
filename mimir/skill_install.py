@@ -1298,12 +1298,19 @@ def apply_skill_update(
     # the installed skill directory.  Created lazily on first use.
     backup_root: Path | None = None
 
-    def _ensure_backup_root() -> Path:
+    def _ensure_backup_root() -> Path | None:
         nonlocal backup_root
         if backup_root is None:
             ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             backup_root = result.installed_path / ".pre-update-backup" / ts
-            backup_root.mkdir(parents=True, exist_ok=True)
+            try:
+                backup_root.mkdir(parents=True, exist_ok=True)
+            except (OSError, IOError) as exc:
+                print(
+                    f"  error: could not create backup directory {backup_root}: "
+                    f"{exc}"
+                )
+                backup_root = None
         return backup_root
 
     # Overwrite changed files and copy new files from source. Accepted
@@ -1322,6 +1329,12 @@ def apply_skill_update(
         # a functioning safety net.
         if rel in result.differs and dst_file.is_file():
             backup_dir = _ensure_backup_root()
+            if backup_dir is None:
+                print(
+                    f"  error: could not back up {rel} before overwrite — skipping"
+                )
+                failed.append(rel)
+                continue
             backup_path = backup_dir / rel
             try:
                 backup_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1342,11 +1355,29 @@ def apply_skill_update(
             print(f"  error: failed to copy {rel}: {exc}")
             failed.append(rel)
 
-    # Extra files (local additions or source deletions).
+    # Extra files (local additions or source deletions). Under --force, removals
+    # are destructive too, so snapshot each file before unlinking it.  This keeps
+    # source-deleted files recoverable just like changed files are.
     for rel in result.extra:
         if force:
             extra_file = result.installed_path / rel
+            backup_dir = _ensure_backup_root()
+            if backup_dir is None:
+                print(
+                    f"  error: could not back up extra file {rel} before "
+                    "removal — skipping"
+                )
+                failed.append(rel)
+                continue
+            backup_path = backup_dir / rel
             try:
+                if extra_file.is_file():
+                    backup_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(extra_file, backup_path)
+                    print(
+                        f"  Note: backed up extra file {rel} → "
+                        f"{backup_path} before removal"
+                    )
                 extra_file.unlink(missing_ok=True)
                 updated.append(rel)
             except (OSError, IOError) as exc:

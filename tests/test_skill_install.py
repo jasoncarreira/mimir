@@ -1035,6 +1035,37 @@ def test_apply_differs_file_creates_backup(
     assert installed_md.read_text() == src_text
 
 
+
+def test_apply_skips_differing_file_when_backup_root_fails(
+    fake_optional_root: Path, fake_home: Path, monkeypatch, capsys,
+):
+    """Backup-root failures are reported as per-file failures, not uncaught."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    installed_md = fake_home / "skills" / "fake-skill" / "SKILL.md"
+    installed_md.write_text("---\nname: fake-skill\ndescription: hand-edited\n---\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+
+    original_mkdir = Path.mkdir
+
+    def _failing_mkdir(self, *args, **kwargs):
+        if ".pre-update-backup" in str(self):
+            raise OSError("permission denied (simulated)")
+        return original_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", _failing_mkdir)
+
+    updated, failed, _ = apply_skill_update(r)
+
+    assert updated == []
+    assert failed == ["SKILL.md"]
+    assert installed_md.read_text() == "---\nname: fake-skill\ndescription: hand-edited\n---\n"
+    out = capsys.readouterr().out
+    assert "could not create backup directory" in out
+    assert "could not back up SKILL.md before overwrite" in out
+
+
 def test_apply_added_file_does_not_create_backup(
     fake_optional_root: Path, fake_home: Path, capsys,
 ):
@@ -1114,6 +1145,63 @@ def test_apply_removes_extra_with_force(
     assert "local-note.md" in updated
     assert failed == []
     assert not extra_file.exists()  # removed
+
+
+def test_apply_removes_extra_with_force_after_backup(
+    fake_optional_root: Path, fake_home: Path, capsys,
+):
+    """--apply --force snapshots extra files before deleting them."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    extra_file = fake_home / "skills" / "fake-skill" / "notes" / "local-note.md"
+    extra_file.parent.mkdir()
+    extra_file.write_text("my notes\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+
+    updated, failed, _ = apply_skill_update(r, force=True)
+
+    assert "notes/local-note.md" in updated
+    assert failed == []
+    assert not extra_file.exists()
+    backup_parent = fake_home / "skills" / "fake-skill" / ".pre-update-backup"
+    ts_dirs = list(backup_parent.iterdir())
+    assert len(ts_dirs) == 1
+    backup_file = ts_dirs[0] / "notes" / "local-note.md"
+    assert backup_file.read_text() == "my notes\n"
+    out = capsys.readouterr().out
+    assert "backed up extra file" in out
+    assert "notes/local-note.md" in out
+
+
+def test_apply_skips_extra_removal_when_backup_root_fails(
+    fake_optional_root: Path, fake_home: Path, monkeypatch, capsys,
+):
+    """A backup-root failure must not destroy extra files under --force."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    extra_file = fake_home / "skills" / "fake-skill" / "local-note.md"
+    extra_file.write_text("my notes\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-skill")
+
+    original_mkdir = Path.mkdir
+
+    def _failing_mkdir(self, *args, **kwargs):
+        if ".pre-update-backup" in str(self):
+            raise OSError("permission denied (simulated)")
+        return original_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", _failing_mkdir)
+
+    updated, failed, _ = apply_skill_update(r, force=True)
+
+    assert updated == []
+    assert failed == ["local-note.md"]
+    assert extra_file.read_text() == "my notes\n"
+    out = capsys.readouterr().out
+    assert "could not create backup directory" in out
+    assert "could not back up extra file local-note.md before removal" in out
 
 
 def test_apply_emits_pollers_hint(

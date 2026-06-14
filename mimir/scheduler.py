@@ -492,6 +492,7 @@ class Scheduler:
         self._arbiter = arbiter
         self._mutate_lock = asyncio.Lock()
         self._started = False
+        self._loop_lag_task: asyncio.Task[Any] | None = None
         # Used to resolve ``SchedulerJob.prompt_file`` against
         # ``<home>/prompts/<file>`` at fire time. Optional for tests
         # and bench harnesses that construct Scheduler without a home.
@@ -2462,13 +2463,68 @@ class Scheduler:
         if not self._started:
             self._scheduler.start()
             self._started = True
+            self._start_loop_lag_monitor()
             # Re-arm a quota-recovery wake if we restarted mid-pause
             # (the in-memory wake is lost on restart; the pause file
             # survives). Must run after start() so the job registers
             # against a running scheduler.
             self.rearm_quota_recovery_on_start()
 
+    def _start_loop_lag_monitor(self) -> None:
+        """Emit an algedonic event when the scheduler loop is blocked.
+
+        APScheduler itself runs on the asyncio event loop, so any synchronous
+        CPU/file/JSON work that stalls the loop can delay job dispatch before
+        the scheduler has a chance to record a normal job-missed event.  This
+        monitor is intentionally tiny: sleep at a fixed cadence, compare the
+        monotonic clock against the expected wake time, and log only when the
+        lag clears the threshold.
+        """
+        if self._loop_lag_task is not None and not self._loop_lag_task.done():
+            return
+        self._loop_lag_task = self._spawn(
+            self._monitor_loop_lag(),
+            name="scheduler-loop-lag-monitor",
+        )
+
+    async def _monitor_loop_lag(
+        self,
+        *,
+        interval_s: float = 1.0,
+        threshold_s: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    ) -> None:
+        next_wake = clock() + interval_s
+        try:
+            while True:
+                await sleeper(interval_s)
+                now = clock()
+                lag_s = now - next_wake
+                # Anchor the next expected wake to *now*, not the old target,
+                # so a single long stall produces one bounded event instead of
+                # a catch-up burst of gradually shrinking lag reports.
+                next_wake = now + interval_s
+                if lag_s <= threshold_s:
+                    continue
+                await log_event(
+                    "scheduler_loop_lag",
+                    lag_s=round(lag_s, 3),
+                    threshold_s=threshold_s,
+                    interval_s=interval_s,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — observability must not kill scheduler
+            await log_event(
+                "scheduler_loop_lag_monitor_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
     def stop(self) -> None:
+        if self._loop_lag_task is not None:
+            self._loop_lag_task.cancel()
+            self._loop_lag_task = None
         if self._started:
             self._scheduler.shutdown(wait=False)
             self._started = False

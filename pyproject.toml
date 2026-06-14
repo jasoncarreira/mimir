@@ -138,6 +138,7 @@ dev = [
     # in dev so CI exercises the reflection_lm wiring against the real
     # library; tests still ``importorskip`` it so a non-dev env stays green.
     "gepa>=0.1.1,<0.2",
+    "botocore>=1.35",
 ]
 
 # For dev work on the Claude Code subprocess path, install ``[dev]``
@@ -257,4 +258,5 @@ dev = [
     "langchain-codex-plus>=0.0.3,<0.1",
     "mcp>=1.27",
     "faiss-cpu>=1.13",
+    "botocore>=1.35",
 ]

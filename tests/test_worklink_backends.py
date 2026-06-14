@@ -16,7 +16,6 @@ from mimir.worklink.backends import (
     DockerSiblingComputeBackend,
     EcsRunTaskComputeBackend,
     EcsRunTaskConfig,
-    EcsSecretReference,
     LocalSubprocessComputeBackend,
     RawResult,
     ToolPin,
@@ -324,6 +323,7 @@ def test_claude_cli_work_spec_builds_portable_git_handoff(tmp_path: Path) -> Non
         local_argv=("claude", "-p", "--output-format", "json", "Do work"),
     )
 
+
 def test_worklink_config_routes_first_match_and_defaults(tmp_path: Path) -> None:
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(
@@ -355,7 +355,12 @@ backends:
     assert config.defaults.timeout_s == 45
     assert config.select_backend_name(labels={"render"}, repo="jasoncarreira/mimir") == "mermaid"
     assert config.select_backend_name(labels={"worklink"}, repo="jasoncarreira/mimir") == "codex"
-    assert config.select_backend_name(labels={"worklink"}, repo="elsewhere/repo", tool_category="renderer") == "mermaid"
+    assert (
+        config.select_backend_name(
+            labels={"worklink"}, repo="elsewhere/repo", tool_category="renderer"
+        )
+        == "mermaid"
+    )
     assert config.select_backend_name(labels={"worklink"}, repo="elsewhere/repo") == "codex"
     registry = BackendRegistry(config)
     codex = registry.get("codex")
@@ -372,6 +377,255 @@ backends:
     assert config.defaults.base_branch == "main"
 
     assert config.tool_pins == ()
+
+
+def test_worklink_config_builds_docker_sibling_compute_backend(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  backend: codex
+  compute_backend: docker-sibling
+routes:
+  - label: local-ok
+    backend: codex
+    compute_backend: local_subprocess
+compute_backends:
+  docker-sibling:
+    broker_url: "unix:///run/worklink-broker.sock"
+    image: mimirbot-mimirbot
+    policy:
+      network: none
+""".strip()
+    )
+
+    config = WorklinkConfig.load(config_path)
+    registry = BackendRegistry(config)
+
+    assert config.defaults.compute_backend == "docker_sibling"
+    assert config.compute_backend_settings["docker_sibling"] == {
+        "broker_url": "unix:///run/worklink-broker.sock",
+        "image": "mimirbot-mimirbot",
+        "policy": {"network": "none"},
+    }
+    backend = registry.select_compute(labels={"worklink"})
+    assert isinstance(backend, DockerSiblingComputeBackend)
+    assert backend.name == "docker_sibling"
+    assert backend.broker_url == "unix:///run/worklink-broker.sock"
+    assert backend.image == "mimirbot-mimirbot"
+    assert backend.policy == {"network": "none"}
+    assert backend.capabilities() == ComputeCaps(
+        shared_filesystem=False,
+        network_isolated=True,
+        handle_cancel=True,
+        persistent_after_disconnect=True,
+    )
+    assert isinstance(registry.select_compute(labels={"local-ok"}), LocalSubprocessComputeBackend)
+
+
+class FakeDockerSiblingTransport:
+    def __init__(self) -> None:
+        self.submitted: list[dict[str, Any]] = []
+        self.waits: list[tuple[str, int]] = []
+        self.logs_requested: list[str] = []
+        self.cancelled: list[str] = []
+        self.cleaned: list[str] = []
+        self.wait_response: dict[str, Any] = {
+            "status": "completed",
+            "exit_code": 0,
+            "stdout": "done",
+            "stderr": "",
+        }
+
+    async def submit_job(self, payload: dict[str, Any], *, timeout_s: int) -> dict[str, Any]:
+        self.submitted.append({"payload": payload, "timeout_s": timeout_s})
+        return {"job_id": "job-123"}
+
+    async def wait_job(self, job_id: str, *, timeout_s: int) -> dict[str, Any]:
+        self.waits.append((job_id, timeout_s))
+        return self.wait_response
+
+    async def job_logs(self, job_id: str) -> str:
+        self.logs_requested.append(job_id)
+        return "broker logs"
+
+    async def cancel_job(self, job_id: str) -> None:
+        self.cancelled.append(job_id)
+
+    async def cleanup_job(self, job_id: str) -> None:
+        self.cleaned.append(job_id)
+
+
+def _portable_spec() -> WorkSpec:
+    return WorkSpec(
+        issue_id=472,
+        attempt=2,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="issue/472-a2",
+        prompt="prompt",
+        rules=None,
+        test_command="echo ok",
+        backend="codex",
+        timeout_s=5,
+        env={"MIMIR_HOME": "/home/mimir"},
+        backend_config={"bin": "codex", "args": ["exec", "--json"]},
+    )
+
+
+@pytest.mark.asyncio
+async def test_docker_sibling_compute_backend_uses_broker_contract_not_docker() -> None:
+    transport = FakeDockerSiblingTransport()
+    backend = DockerSiblingComputeBackend(
+        broker_url="unix:///run/worklink-broker.sock",
+        image="mimirbot-mimirbot",
+        policy={"network": "none"},
+        transport=transport,
+    )
+
+    handle = await backend.launch(_portable_spec())
+    result = await backend.wait(handle, timeout_s=7)
+    logs = await backend.logs(handle)
+    await backend.cancel(handle)
+    await backend.cleanup(handle)
+
+    assert handle.substrate == "docker_sibling"
+    assert handle.identifier == "job-123"
+    assert result == ComputeResult(
+        exit_code=0,
+        stdout="done",
+        stderr="",
+        handle=handle,
+        command=("worklink-broker", "unix:///run/worklink-broker.sock", "wait", "job-123"),
+    )
+    assert logs == "broker logs"
+    assert transport.waits == [("job-123", 7)]
+    assert transport.logs_requested == ["job-123"]
+    assert transport.cancelled == ["job-123"]
+    assert transport.cleaned == ["job-123"]
+    submitted = transport.submitted[0]
+    assert submitted["timeout_s"] == 5
+    assert submitted["payload"]["image"] == "mimirbot-mimirbot"
+    assert submitted["payload"]["policy"] == {"network": "none"}
+    worker_payload = submitted["payload"]["worker_payload"]
+    assert worker_payload["repo_dir"] == "/work/repo"
+    assert worker_payload["evidence_path"] == "/work/evidence/evidence.json"
+    assert worker_payload["transcript_root"] == "/work/transcripts"
+    assert worker_payload["spec"]["branch"] == "issue/472-a2"
+    assert worker_payload["spec"]["backend_config"] == {"bin": "codex", "args": ["exec", "--json"]}
+
+
+@pytest.mark.asyncio
+async def test_docker_sibling_compute_backend_maps_transport_failures_to_results() -> None:
+    class FailingWaitTransport(FakeDockerSiblingTransport):
+        async def wait_job(self, job_id: str, *, timeout_s: int) -> dict[str, Any]:
+            raise RuntimeError("broker unavailable")
+
+    backend = DockerSiblingComputeBackend(
+        broker_url="https://broker.example.invalid",
+        image="mimirbot-mimirbot",
+        transport=FailingWaitTransport(),
+    )
+
+    handle = await backend.launch(_portable_spec())
+    result = await backend.wait(handle, timeout_s=7)
+
+    assert result.exit_code == -1
+    assert result.launch_error == "docker-sibling broker wait failed: broker unavailable"
+    assert result.handle == handle
+
+
+@pytest.mark.asyncio
+async def test_docker_sibling_compute_backend_cleanup_is_best_effort() -> None:
+    class FailingCleanupTransport(FakeDockerSiblingTransport):
+        async def cleanup_job(self, job_id: str) -> None:
+            raise RuntimeError("cleanup failed")
+
+    backend = DockerSiblingComputeBackend(
+        broker_url="https://broker.example.invalid",
+        image="mimirbot-mimirbot",
+        transport=FailingCleanupTransport(),
+    )
+
+    handle = await backend.launch(_portable_spec())
+    await backend.cleanup(handle)
+
+
+@pytest.mark.asyncio
+async def test_docker_sibling_compute_backend_requires_broker_job_id() -> None:
+    class MissingJobIdTransport(FakeDockerSiblingTransport):
+        async def submit_job(self, payload: dict[str, Any], *, timeout_s: int) -> dict[str, Any]:
+            return {}
+
+    backend = DockerSiblingComputeBackend(
+        broker_url="https://broker.example.invalid",
+        image="mimirbot-mimirbot",
+        transport=MissingJobIdTransport(),
+    )
+
+    with pytest.raises(ComputeLaunchError, match="missing job_id"):
+        await backend.launch(_portable_spec())
+
+
+def test_worklink_config_accepts_legacy_compute_alias_for_docker_sibling(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  backend: codex
+  compute: docker-sibling
+compute_backends:
+  docker_sibling:
+    broker_endpoint: "https://broker.example.invalid"
+    image: mimirbot-mimirbot
+""".strip()
+    )
+
+    registry = BackendRegistry(WorklinkConfig.load(config_path))
+
+    backend = registry.select_compute()
+    assert isinstance(backend, DockerSiblingComputeBackend)
+    assert backend.broker_url == "https://broker.example.invalid"
+
+
+def test_worklink_config_rejects_malformed_docker_sibling_compute_backend(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  compute_backend: docker-sibling
+compute_backends:
+  docker-sibling:
+    broker_url: "file:///tmp/socket"
+    image: mimirbot-mimirbot
+""".strip()
+    )
+    with pytest.raises(ValueError, match="broker_url must use"):
+        BackendRegistry(WorklinkConfig.load(config_path))
+
+    config_path.write_text(
+        """
+defaults:
+  compute_backend: docker-sibling
+compute_backends:
+  docker-sibling:
+    broker_url: "unix:///run/worklink-broker.sock"
+    image: mimirbot-mimirbot
+    docker_socket: /var/run/docker.sock
+""".strip()
+    )
+    with pytest.raises(ValueError, match="unknown setting"):
+        BackendRegistry(WorklinkConfig.load(config_path))
+
+    config_path.write_text("compute_backends:\n  docker-sibling: []\n")
+    with pytest.raises(
+        ValueError, match="worklink compute_backends.docker-sibling must be a mapping"
+    ):
+        WorklinkConfig.load(config_path)
+
+    config_path.write_text("defaults:\n  compute_backend: docker-sibling\n")
+    with pytest.raises(ValueError, match="requires compute_backends.docker-sibling config"):
+        BackendRegistry(WorklinkConfig.load(config_path)).select_compute()
 
 
 def test_worklink_config_loads_base_branch(tmp_path: Path) -> None:
@@ -700,7 +954,6 @@ def test_ecs_runtask_backend_builds_value_blind_runtask_request() -> None:
         task_role_arn="arn:aws:iam::123:role/worklink-task",
         execution_role_arn="arn:aws:iam::123:role/worklink-exec",
         safe_env={"MIMIR_HOME": "/worklink/home"},
-        secrets=(EcsSecretReference("GITHUB_TOKEN", "arn:aws:ssm:us-east-1:123:parameter/worklink/github-token"),),
         tags={"component": "worklink"},
     )
     spec = WorkSpec(
@@ -714,7 +967,7 @@ def test_ecs_runtask_backend_builds_value_blind_runtask_request() -> None:
         test_command="uv run pytest -q tests/test_worklink_backends.py",
         backend="codex",
         timeout_s=900,
-        creds_ref={"github": "ssm:/worklink/github-token"},
+        creds_ref={"github": "task-definition-env:GITHUB_TOKEN"},
         env={"WORKLINK_MODE": "test"},
         backend_config={"bin": "codex", "args": ["exec", "--json"]},
     )
@@ -738,12 +991,11 @@ def test_ecs_runtask_backend_builds_value_blind_runtask_request() -> None:
     container = overrides["containerOverrides"][0]
     assert container["name"] == "worker"
     assert container["command"][:3] == ["mimir", "worklink", "worker"]
-    assert container["secrets"] == [
-        {"name": "GITHUB_TOKEN", "valueFrom": "arn:aws:ssm:us-east-1:123:parameter/worklink/github-token"}
-    ]
+    assert "secrets" not in container
     rendered = json.dumps(request.params, sort_keys=True)
     assert "ghp_" not in rendered
-    assert "github-token" in rendered
+    assert "github-token" not in rendered
+    assert "ssm:" not in rendered
     payload = json.loads(container["command"][4])
     assert payload == request.payload
     assert payload["spec"]["branch"] == "issue/459-a3"
@@ -753,6 +1005,45 @@ def test_ecs_runtask_backend_builds_value_blind_runtask_request() -> None:
     assert env["MIMIR_HOME"] == "/worklink/home"
     assert env["WORKLINK_MODE"] == "test"
     assert "WORKLINK_PAYLOAD_JSON" not in env
+
+
+def test_ecs_runtask_request_validates_against_botocore_param_model() -> None:
+    botocore_session = pytest.importorskip("botocore.session")
+    botocore_validate = pytest.importorskip("botocore.validate")
+    config = EcsRunTaskConfig(
+        cluster="worklink",
+        task_definition="worklink-worker:7",
+        container_name="worker",
+        subnets=("subnet-a",),
+        security_groups=("sg-worklink",),
+        task_role_arn="arn:aws:iam::123:role/worklink-task",
+        execution_role_arn="arn:aws:iam::123:role/worklink-exec",
+        safe_env={"MIMIR_HOME": "/worklink/home"},
+    )
+    spec = WorkSpec(
+        issue_id=459,
+        attempt=3,
+        repo_url="https://github.com/jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="issue/459-a3",
+        prompt="Implement ECS launcher",
+        rules=None,
+        test_command="uv run pytest -q tests/test_worklink_backends.py",
+        backend="codex",
+        timeout_s=900,
+        creds_ref={"github": "task-definition-env:GITHUB_TOKEN"},
+        env={"WORKLINK_MODE": "test"},
+        backend_config={"bin": "codex", "args": ["exec", "--json"]},
+    )
+    request = EcsRunTaskComputeBackend(config).build_request(spec)
+
+    service_model = botocore_session.get_session().get_service_model("ecs")
+    run_task_model = service_model.operation_model("RunTask")
+    validation = botocore_validate.ParamValidator().validate(
+        dict(request.params), run_task_model.input_shape
+    )
+
+    assert not validation.has_errors(), validation.generate_report()
 
 
 @pytest.mark.asyncio
@@ -816,76 +1107,25 @@ async def test_ecs_runtask_backend_launch_wait_and_cancel_with_fake_client() -> 
     assert client.stopped is True
 
 
-
-def test_worklink_config_builds_docker_sibling_compute_backend(tmp_path: Path) -> None:
-    config_path = tmp_path / "worklink.yaml"
-    config_path.write_text(
-        """
-defaults:
-  compute_backend: docker-sibling
-  backend: codex
-backends:
-  codex: {}
-compute_backends:
-  docker-sibling:
-    broker_url: unix:///run/worklink-broker.sock
-    image: mimirbot-mimirbot
-    policy:
-      network: restricted
-""",
-        encoding="utf-8",
-    )
-
-    config = WorklinkConfig.load(config_path)
-    registry = BackendRegistry(config)
-    backend = registry.select_compute()
-
-    assert config.defaults.compute_backend == "docker_sibling"
-    assert isinstance(backend, DockerSiblingComputeBackend)
-    assert backend.broker_url == "unix:///run/worklink-broker.sock"
-    assert backend.image == "mimirbot-mimirbot"
-    assert backend.policy == {"network": "restricted"}
-
-
-def test_worklink_config_rejects_unknown_docker_sibling_setting(tmp_path: Path) -> None:
+def test_worklink_config_rejects_ecs_runtask_runtime_secrets(tmp_path: Path) -> None:
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(
         """
 compute_backends:
-  docker-sibling:
-    broker_url: unix:///run/worklink-broker.sock
-    image: mimirbot-mimirbot
-    typo: true
-""",
+  ecs-runtask:
+    cluster: worklink
+    task_definition: worklink-worker
+    container_name: worker
+    subnets: [subnet-a]
+    secrets:
+      - name: GITHUB_TOKEN
+        value_from: arn:aws:secretsmanager:us-east-1:123:secret:github
+""".strip(),
         encoding="utf-8",
     )
 
-    config = WorklinkConfig.load(config_path)
-    with pytest.raises(ValueError, match="unknown setting"):
-        BackendRegistry(config)
-
-
-@pytest.mark.asyncio
-async def test_docker_sibling_fails_closed_until_broker_client_exists() -> None:
-    backend = DockerSiblingComputeBackend(
-        broker_url="unix:///run/worklink-broker.sock", image="mimirbot-mimirbot"
-    )
-
-    with pytest.raises(ComputeLaunchError, match="not implemented yet"):
-        await backend.launch(
-            WorkSpec(
-                issue_id=459,
-                attempt=1,
-                repo_url="git@github.com:jasoncarreira/mimir.git",
-                base_ref="main",
-                branch="issue/459-a1",
-                prompt="x",
-                rules=None,
-                test_command="echo ok",
-                backend="codex",
-                timeout_s=30,
-            )
-        )
+    with pytest.raises(ValueError, match="unknown setting.*secrets"):
+        BackendRegistry(WorklinkConfig.load(config_path))
 
 
 def test_worklink_config_registers_ecs_runtask_compute_backend(tmp_path: Path) -> None:
@@ -903,10 +1143,8 @@ compute_backends:
     security_groups: [sg-worklink]
     safe_env:
       MIMIR_HOME: /worklink/home
-    secrets:
-      - name: GITHUB_TOKEN
-        value_from: arn:aws:secretsmanager:us-east-1:123:secret:github
-""".strip()
+""".strip(),
+        encoding="utf-8",
     )
 
     registry = BackendRegistry(WorklinkConfig.load(config_path))
@@ -917,6 +1155,3 @@ compute_backends:
     assert backend.config.subnets == ("subnet-a",)
     assert backend.config.security_groups == ("sg-worklink",)
     assert backend.config.safe_env == {"MIMIR_HOME": "/worklink/home"}
-    assert backend.config.secrets == (
-        EcsSecretReference("GITHUB_TOKEN", "arn:aws:secretsmanager:us-east-1:123:secret:github"),
-    )

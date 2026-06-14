@@ -2238,6 +2238,83 @@ async def test_dispatch_poller_reload_events_task_is_held_in_background_tasks(
     assert len(logged) == 2
 
 
+@pytest.mark.asyncio
+async def test_scheduler_loop_lag_monitor_logs_blocking_delay(tmp_path: Path, monkeypatch):
+    logged: list[tuple[str, dict]] = []
+    ticks = iter([0.0, 0.11, 0.34])
+
+    async def fake_sleep(_delay: float) -> None:
+        await asyncio.sleep(0)
+
+    def fake_monotonic() -> float:
+        return next(ticks)
+
+    async def fake_log_event(event_type: str, **payload):
+        logged.append((event_type, payload))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("mimir.scheduler.log_event", fake_log_event)
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    with pytest.raises(asyncio.CancelledError):
+        await sched._monitor_loop_lag(
+            interval_s=0.1,
+            threshold_s=0.05,
+            clock=fake_monotonic,
+            sleeper=fake_sleep,
+        )
+
+    assert logged == [
+        (
+            "scheduler_loop_lag",
+            {"lag_s": 0.13, "threshold_s": 0.05, "interval_s": 0.1},
+        )
+    ]
+
+
+def test_scheduler_start_and_stop_manage_loop_lag_monitor(tmp_path: Path, monkeypatch):
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    started = []
+
+    class FakeTask:
+        def __init__(self):
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+
+    task = FakeTask()
+
+    def fake_scheduler_start():
+        started.append("scheduler")
+
+    monkeypatch.setattr(sched._scheduler, "start", fake_scheduler_start)
+    monkeypatch.setattr(sched._scheduler, "shutdown", lambda wait=False: None)
+    monkeypatch.setattr(sched, "rearm_quota_recovery_on_start", lambda: None)
+    monkeypatch.setattr(sched, "_spawn", lambda coro, *, name=None: (coro.close(), task)[1])
+
+    sched.start()
+
+    assert started == ["scheduler"]
+    assert sched._started is True
+    assert sched._loop_lag_task is task
+
+    sched.stop()
+
+    assert task.cancelled is True
+    assert sched._loop_lag_task is None
+
+
 # ─── chainlink #234: _resolve_prompt_file symlink hardening ─────────
 
 

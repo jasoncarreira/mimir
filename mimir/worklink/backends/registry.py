@@ -13,7 +13,6 @@ from ..compute import (
     DockerSiblingComputeBackend,
     EcsRunTaskComputeBackend,
     EcsRunTaskConfig,
-    EcsSecretReference,
     LocalSubprocessComputeBackend,
 )
 from .base import ToolBackend
@@ -306,8 +305,32 @@ class BackendRegistry:
             return BackendRegistry._build_ecs_runtask(settings)
         raise ValueError(f"unknown Worklink compute backend config: {name}")
 
+
     @staticmethod
     def _build_ecs_runtask(settings: Mapping[str, Any]) -> EcsRunTaskComputeBackend:
+        allowed = {
+            "cluster",
+            "task_definition",
+            "container_name",
+            "subnets",
+            "security_groups",
+            "assign_public_ip",
+            "launch_type",
+            "platform_version",
+            "task_role_arn",
+            "execution_role_arn",
+            "worker_repo_dir",
+            "worker_evidence_path",
+            "worker_transcript_root",
+            "safe_env",
+            "tags",
+        }
+        unknown = sorted(set(settings) - allowed)
+        if unknown:
+            raise ValueError(
+                "worklink ecs_runtask compute backend unknown setting(s): "
+                + ", ".join(unknown)
+            )
         missing = [
             field
             for field in ("cluster", "task_definition", "container_name", "subnets")
@@ -327,9 +350,6 @@ class BackendRegistry:
         tags = settings.get("tags") or {}
         if not isinstance(tags, dict):
             raise ValueError("worklink ecs_runtask tags must be a mapping")
-        secrets = settings.get("secrets") or []
-        if not isinstance(secrets, list):
-            raise ValueError("worklink ecs_runtask secrets must be a list")
         config = EcsRunTaskConfig(
             cluster=str(settings["cluster"]),
             task_definition=str(settings["task_definition"]),
@@ -338,21 +358,27 @@ class BackendRegistry:
             security_groups=security_groups,
             assign_public_ip=bool(settings.get("assign_public_ip", False)),
             launch_type=str(settings.get("launch_type", "FARGATE")),
-            platform_version=(str(settings["platform_version"]) if "platform_version" in settings else None),
+            platform_version=(
+                str(settings["platform_version"]) if "platform_version" in settings else None
+            ),
             task_role_arn=(str(settings["task_role_arn"]) if "task_role_arn" in settings else None),
-            execution_role_arn=(str(settings["execution_role_arn"]) if "execution_role_arn" in settings else None),
+            execution_role_arn=(
+                str(settings["execution_role_arn"]) if "execution_role_arn" in settings else None
+            ),
             worker_repo_dir=str(settings.get("worker_repo_dir", "/worklink/repo")),
-            worker_evidence_path=str(settings.get("worker_evidence_path", "/worklink/evidence/evidence.json")),
+            worker_evidence_path=str(
+                settings.get("worker_evidence_path", "/worklink/evidence/evidence.json")
+            ),
             worker_transcript_root=(
                 str(settings["worker_transcript_root"])
                 if "worker_transcript_root" in settings
                 else "/worklink/transcripts"
             ),
             safe_env={str(key): str(value) for key, value in safe_env.items()},
-            secrets=tuple(_parse_ecs_secret(secret, index=index) for index, secret in enumerate(secrets)),
             tags={str(key): str(value) for key, value in tags.items()},
         )
         return EcsRunTaskComputeBackend(config)
+
 
     @staticmethod
     def _build_codex(settings: Mapping[str, Any]) -> CodexBackend:
@@ -377,14 +403,3 @@ def _string_tuple(value: Any, *, field_name: str) -> tuple[str, ...]:
     if not all(isinstance(item, str) for item in value):
         raise ValueError(f"{field_name} must be a list of strings")
     return tuple(value)
-
-
-def _parse_ecs_secret(value: Any, *, index: int) -> EcsSecretReference:
-    if not isinstance(value, dict):
-        raise ValueError(f"worklink ecs_runtask secrets[{index}] must be a mapping")
-    missing = [field for field in ("name", "value_from") if field not in value]
-    if missing:
-        raise ValueError(
-            f"worklink ecs_runtask secrets[{index}] missing required field(s): {', '.join(missing)}"
-        )
-    return EcsSecretReference(name=str(value["name"]), value_from=str(value["value_from"]))

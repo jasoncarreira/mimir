@@ -148,8 +148,8 @@ mimir/worklink/
     base.py         # ToolBackend protocol, Caps, WorkOrder, RawResult
     codex.py        # first adapter
     claude_cli.py   # second adapter (mechanical addition)
-  compute.py       # ComputeBackend protocol, WorkSpec, LaunchHandle, local_subprocess
-  # future compute launchers: docker_sibling broker, ecs_runtask worker
+  compute.py       # ComputeBackend protocol, WorkSpec, LaunchHandle, local-subprocess
+  # future compute launchers: docker-sibling broker, ecs-runtask worker
 ```
 
 **Packaging (decided 2026-06-12).** The executor above (`mimir/worklink/`) and
@@ -329,7 +329,7 @@ and is configured for `native_pr_creation`).
 
 `ToolBackend` answers **what** builds (codex / claude / cursor). A second,
 orthogonal axis answers **where** it runs: `ComputeBackend` ∈
-{`local_subprocess`, `docker_sibling`, `ecs_runtask`, `k8s-job`}. This is the
+{`local-subprocess`, `docker-sibling`, `ecs-runtask`, `k8s-job`}. This is the
 portable, design-level home of the "containerized worker" idea, generalized so
 the same Worklink runs on OrbStack today and AWS ECS/Fargate later. Full
 design: chainlink #454.
@@ -361,45 +361,11 @@ Four facts shape it:
   and tests-exit-0 carry over unchanged. The worker payload
   (clone→checkout→backend→tests→push→evidence) is identical across substrates;
   only the launcher differs (Docker reuses the agent image, AWS publishes to ECR).
-- **The Docker socket is root-equivalent** on the host VM, so the `docker_sibling`
+- **The Docker socket is root-equivalent** on the host VM, so the `docker-sibling`
   launcher is a **broker**: a tiny service *outside* the agent container owns the
   socket and accepts only one narrow request ("run worklink job N on branch B"),
   building the spec itself (worktree-only, no extra caps). On ECS the equivalent
   is a scoped IAM task role permitted to `RunTask` only the worklink task def.
-
-### ECS RunTask launcher
-
-`ecs_runtask` is the AWS/Fargate proof that the `ComputeBackend` seam is not
-Docker-specific. It maps the git-handoff `WorkSpec` into an ECS `RunTask`
-request for a predeclared Worklink worker task definition / ECR image. The
-container command is `mimir worklink worker --payload-json <payload>` so the
-remote task does not need a pre-mounted payload file; the request builder is
-unit-testable without live AWS credentials, and a live smoke run is optional
-until credentials/config exist in an operator deployment.
-
-Secrets are value-blind. The config accepts only ECS container `secrets` entries
-(`name` + SSM Parameter Store or Secrets Manager `valueFrom`) and explicit
-non-secret environment allowlists; raw token values must not appear in Worklink
-config, task overrides, logs, transcripts, or evidence. The worker payload is
-work-order metadata (repo/ref/branch/prompt/test command/backend config), not a
-credential carrier.
-
-Minimal IAM shape:
-
-- the launcher principal may call `ecs:RunTask` only for the Worklink task
-  definition and cluster, `iam:PassRole` only for the declared Worklink task /
-  execution roles, `ecs:DescribeTasks` for launched task ARNs, and
-  `ecs:StopTask` for cancellation;
-- CloudWatch log reads are optional diagnostic access (`logs:GetLogEvents` /
-  `logs:FilterLogEvents`) and should be scoped to the Worklink log group;
-- the task role receives the value-blind secret refs it needs (for example a
-  GitHub token parameter) and the minimum network access needed to fetch/push the
-  repo and run the selected tool backend.
-
-Fargate constraints are explicit: there is no custom seccomp/userns profile and
-no Docker socket; isolation comes from one task per worker, AWS's task boundary,
-scoped IAM roles, value-blind secrets, and the orchestrator's fetched-ref
-re-derivation before PR state transitions.
 
 ```python
 @dataclass(frozen=True)
@@ -411,8 +377,8 @@ class WorkSpec:
     creds_ref: dict[str, str]                    # substrate-resolved, value-blind
     env: dict[str, str]                          # explicit allowlist
     backend_config: dict[str, Any]               # tool-specific settings
-    local_worktree: Path | None                  # local_subprocess compatibility only
-    local_argv: tuple[str, ...] | None            # local_subprocess compatibility only
+    local_worktree: Path | None                  # local-subprocess compatibility only
+    local_argv: tuple[str, ...] | None            # local-subprocess compatibility only
 
 @dataclass(frozen=True)
 class WorkerPayload:
@@ -435,7 +401,7 @@ class ComputeResult:
     timed_out: bool = False
     launch_error: str | None = None
     handle: LaunchHandle | None = None
-    command: tuple[str, ...] = ()                # local_subprocess audit trail
+    command: tuple[str, ...] = ()                # local-subprocess audit trail
 
 class ComputeBackend(Protocol):
     name: str
@@ -448,16 +414,16 @@ class ComputeBackend(Protocol):
 ```
 
 **Slice #455 implementation note.** The first implemented substrate is
-`local_subprocess`, so it necessarily uses `local_worktree` to preserve today's
+`local-subprocess`, so it necessarily uses `local_worktree` to preserve today's
 manual in-container behavior. The same `WorkSpec` still carries the git
 coordinates and handle-based protocol required by #454; Docker/ECS slices should
 ignore `local_worktree` and use the git handoff fields.
 
-**Operator decision (2026-06-12):** `local_subprocess` (today's behavior — the
+**Operator decision (2026-06-12):** `local-subprocess` (today's behavior — the
 backend runs as a local subprocess with full container filesystem access)
 remains available as an explicit **accept-the-risk fallback**. The isolated
-worker (`docker_sibling` / `ecs_runtask`) is the recommended path for
-unsandboxed or autonomous use; operators may opt back into `local_subprocess`
+worker (`docker-sibling` / `ecs-runtask`) is the recommended path for
+unsandboxed or autonomous use; operators may opt back into `local-subprocess`
 and accept the documented blast radius. The safe path should be easy, while the
 risky path stays possible for bounded operator-invoked runs.
 
@@ -491,9 +457,9 @@ posture — the options are now concrete (chainlink #452 / #454):
    verified model-free on the agent image (#452). Trade-off: userns widens the
    container's kernel attack surface. Does **not** port to ECS Fargate.
 2. **Out-of-container worker** via the `ComputeBackend` axis above
-   (`docker_sibling` through a broker, or `ecs_runtask`) — chainlink #454. The
+   (`docker-sibling` through a broker, or `ecs-runtask`) — chainlink #454. The
    portable path; the only isolation that survives a move to AWS.
-3. **Accept-the-risk** `local_subprocess` (today's behavior) as an explicit,
+3. **Accept-the-risk** `local-subprocess` (today's behavior) as an explicit,
    documented operator policy decision — recorded 2026-06-12 as a permitted
    fallback, not the default.
 
@@ -581,7 +547,7 @@ Minimal current config shape:
 ```yaml
 defaults:
   backend: codex
-  compute_backend: local_subprocess
+  compute_backend: local_subprocess  # accept-the-risk fallback; docker-sibling below is selectable once configured
   timeout_s: 1800
   priority: normal
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
@@ -594,7 +560,22 @@ backends:
   claude_cli:
     bin: claude
     args: ["-p", "--output-format", "json"]
+
+compute_backends:
+  docker-sibling:
+    broker_url: "unix:///run/worklink-broker.sock"
+    image: mimirbot-mimirbot
+    policy: {}
 ```
+
+The agent-side `docker-sibling` backend is a broker **client**, not a Docker
+launcher. Its contract is deliberately narrow: `POST /jobs` submits `{image,
+policy, worker_payload}`, `POST /jobs/<id>/wait` returns bounded compute result
+fields, `GET /jobs/<id>/logs` returns text/JSON logs, `POST /jobs/<id>/cancel`
+cancels, and `DELETE /jobs/<id>` cleans up. The submitted worker payload is the
+same JSON schema consumed by `mimir worklink worker <payload.json>`; do not add a
+second Docker-only work schema. The client supports `unix://`, `http://`, and
+`https://` broker URLs and contains no direct docker CLI or docker.sock access.
 
 `claude_cli` is registered by default but is only runnable in deployments that
 actually install the `claude` binary. The current production container may omit
@@ -698,7 +679,7 @@ Current slice-1 recovery is manual:
 ```yaml
 defaults:
   backend: codex
-  compute_backend: local_subprocess # WHERE it runs: local_subprocess | docker-sibling | ecs-runtask
+  compute_backend: local_subprocess # WHERE the backend runs: local_subprocess | docker-sibling | ecs-runtask
   timeout_s: 1800
   priority: normal          # arbiter priority for autonomous dispatch
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
@@ -709,7 +690,7 @@ routes:                     # first match wins
   - repo: "jasoncarreira/mimir"
     backend: codex
 
-backends:                   # ToolBackend adapters — WHAT tool builds the diff
+backends:                   # ToolBackend adapters — WHAT builds
   codex:
     bin: codex
     args: ["exec", "--json"]
@@ -734,9 +715,11 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454)
     security_groups: ["sg-…"]
     task_role_arn: arn:aws:iam::<acct>:role/worklink-task
     execution_role_arn: arn:aws:iam::<acct>:role/worklink-execution
-    secrets:
-      - name: GITHUB_TOKEN
-        value_from: arn:aws:ssm:<region>:<acct>:parameter/worklink/github-token
+    # ECS secrets are not RunTask overrides. Declare SSM Parameter Store or
+    # Secrets Manager `valueFrom` references on the task definition's container
+    # definition, and grant the task/execution roles permission to read them.
+    # Worklink's generated RunTask request carries only worker metadata, safe
+    # environment values, role overrides, network config, and tags.
 
 `compute_backend` also accepts the legacy spelling `compute`; backend names are
 normalized so `docker-sibling`/`docker_sibling` and `ecs-runtask`/`ecs_runtask`
@@ -776,7 +759,7 @@ tool_pins:
 4. **Slice 3 — autonomy.** Ready-queue poller, multi-claim concurrency,
    TTL reaper, arbiter gating, `worklink_run` tool. Gated on an isolation
    posture (see the trust model) — the `ComputeBackend` axis (#454) and/or the
-   verified in-container seccomp profile (#452). Autonomous `local_subprocess`
+   verified in-container seccomp profile (#452). Autonomous `local-subprocess`
    requires the explicit accept-the-risk opt-in.
 5. **Slice 4 — second adapter.** `claude_cli`, proving mechanical
    addition.
@@ -789,7 +772,7 @@ tool_pins:
 |---|---|
 | Chainlink locks not atomic cross-process | Slice 0 probe; O_EXCL fallback; upstream issue |
 | Backend session brittleness | Start operator-invoked (slice 1); autonomy only after dry-run |
-| Unsandboxed backend filesystem access | Verified in-container seccomp/userns profile confines bwrap `workspace-write` (#452, `docs/internal/seccomp-userns.json`), or out-of-container `ComputeBackend` isolation (#454); `local_subprocess` (today's `--sandbox danger-full-access`) is the explicit accept-the-risk fallback, gated before slice-3 autonomous dispatch |
+| Unsandboxed backend filesystem access | Verified in-container seccomp/userns profile confines bwrap `workspace-write` (#452, `docs/internal/seccomp-userns.json`), or out-of-container `ComputeBackend` isolation (#454); `local-subprocess` (today's `--sandbox danger-full-access`) is the explicit accept-the-risk fallback, gated before slice-3 autonomous dispatch |
 | Evidence gaming by the backend agent | Orchestrator observes diff/tests itself; empty-diff demotion |
 | Worktree cost under concurrency | Worktrees are per-issue and short-lived; cap concurrent claims (default 2) |
 | Shared quota exhaustion | `quota_pool` + arbiter gating; operator runs bypass |

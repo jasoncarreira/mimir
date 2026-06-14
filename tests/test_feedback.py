@@ -253,6 +253,37 @@ def test_non_utf8_home_file_is_negative_and_renders_actionably():
     assert "UTF-8" in line
 
 
+def test_scheduler_loop_lag_surfaces_as_negative(tmp_path: Path):
+    from mimir.feedback import classify
+
+    assert classify("scheduler_loop_lag") == ("negative", "scheduler_loop_lag")
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "timestamp": _ts(0.1),
+                "type": "scheduler_loop_lag",
+                "lag_s": 1.234,
+                "threshold_s": 1.0,
+            }
+        ],
+    )
+
+    block = log.recent_block()
+
+    assert block is not None
+    assert "scheduler event loop lag: 1.234s over threshold 1.000s" in block
+
+
+def test_scheduler_loop_lag_monitor_failure_surfaces_as_negative():
+    from mimir.feedback import classify
+
+    assert classify("scheduler_loop_lag_monitor_failed") == (
+        "negative",
+        "scheduler_loop_lag_monitor_failed",
+    )
+
+
 def test_send_message_failed_classified_negative():
     from mimir.feedback import classify
 
