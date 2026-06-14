@@ -14,6 +14,8 @@ from mimir.worklink.backends import (
     CodexBackend,
     ComputeResult,
     DockerSiblingComputeBackend,
+    EcsRunTaskComputeBackend,
+    EcsRunTaskConfig,
     LocalSubprocessComputeBackend,
     RawResult,
     ToolPin,
@@ -21,7 +23,7 @@ from mimir.worklink.backends import (
     WorklinkConfig,
 )
 from mimir.worklink.backends.base import blocked_reason_from_output
-from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, WorkSpec
+from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, LaunchHandle, WorkSpec
 from mimir.worklink.worker import WorkerPayload, payload_from_json, payload_to_json
 import mimir.worklink.backends.codex as codex_module
 import mimir.worklink.compute as compute_module
@@ -938,3 +940,218 @@ def test_worker_payload_round_trips_portable_work_spec(tmp_path: Path) -> None:
     assert restored.evidence_path == (tmp_path / "evidence.json").resolve()
     assert restored.transcript_root == (tmp_path / "transcripts").resolve()
     assert restored.safe_env == {"PATH": "/bin"}
+
+
+
+def test_ecs_runtask_backend_builds_value_blind_runtask_request() -> None:
+    config = EcsRunTaskConfig(
+        cluster="worklink",
+        task_definition="worklink-worker:7",
+        container_name="worker",
+        subnets=("subnet-a", "subnet-b"),
+        security_groups=("sg-worklink",),
+        platform_version="1.4.0",
+        task_role_arn="arn:aws:iam::123:role/worklink-task",
+        execution_role_arn="arn:aws:iam::123:role/worklink-exec",
+        safe_env={"MIMIR_HOME": "/worklink/home"},
+        tags={"component": "worklink"},
+    )
+    spec = WorkSpec(
+        issue_id=459,
+        attempt=3,
+        repo_url="https://github.com/jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="issue/459-a3",
+        prompt="Implement ECS launcher",
+        rules=None,
+        test_command="uv run pytest -q tests/test_worklink_backends.py",
+        backend="codex",
+        timeout_s=900,
+        creds_ref={"github": "task-definition-env:GITHUB_TOKEN"},
+        env={"WORKLINK_MODE": "test"},
+        backend_config={"bin": "codex", "args": ["exec", "--json"]},
+    )
+
+    request = EcsRunTaskComputeBackend(config).build_request(spec)
+
+    assert request.params["cluster"] == "worklink"
+    assert request.params["taskDefinition"] == "worklink-worker:7"
+    assert request.params["launchType"] == "FARGATE"
+    assert request.params["platformVersion"] == "1.4.0"
+    assert request.params["networkConfiguration"] == {
+        "awsvpcConfiguration": {
+            "subnets": ["subnet-a", "subnet-b"],
+            "assignPublicIp": "DISABLED",
+            "securityGroups": ["sg-worklink"],
+        }
+    }
+    overrides = request.params["overrides"]
+    assert overrides["taskRoleArn"] == "arn:aws:iam::123:role/worklink-task"
+    assert overrides["executionRoleArn"] == "arn:aws:iam::123:role/worklink-exec"
+    container = overrides["containerOverrides"][0]
+    assert container["name"] == "worker"
+    assert container["command"][:3] == ["mimir", "worklink", "worker"]
+    assert "secrets" not in container
+    rendered = json.dumps(request.params, sort_keys=True)
+    assert "ghp_" not in rendered
+    assert "github-token" not in rendered
+    assert "ssm:" not in rendered
+    payload = json.loads(container["command"][4])
+    assert payload == request.payload
+    assert payload["spec"]["branch"] == "issue/459-a3"
+    assert payload["spec"]["local_worktree"] is None
+    assert payload["spec"]["local_argv"] is None
+    env = {item["name"]: item["value"] for item in container["environment"]}
+    assert env["MIMIR_HOME"] == "/worklink/home"
+    assert env["WORKLINK_MODE"] == "test"
+    assert "WORKLINK_PAYLOAD_JSON" not in env
+
+
+def test_ecs_runtask_request_validates_against_botocore_param_model() -> None:
+    botocore_session = pytest.importorskip("botocore.session")
+    botocore_validate = pytest.importorskip("botocore.validate")
+    config = EcsRunTaskConfig(
+        cluster="worklink",
+        task_definition="worklink-worker:7",
+        container_name="worker",
+        subnets=("subnet-a",),
+        security_groups=("sg-worklink",),
+        task_role_arn="arn:aws:iam::123:role/worklink-task",
+        execution_role_arn="arn:aws:iam::123:role/worklink-exec",
+        safe_env={"MIMIR_HOME": "/worklink/home"},
+    )
+    spec = WorkSpec(
+        issue_id=459,
+        attempt=3,
+        repo_url="https://github.com/jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="issue/459-a3",
+        prompt="Implement ECS launcher",
+        rules=None,
+        test_command="uv run pytest -q tests/test_worklink_backends.py",
+        backend="codex",
+        timeout_s=900,
+        creds_ref={"github": "task-definition-env:GITHUB_TOKEN"},
+        env={"WORKLINK_MODE": "test"},
+        backend_config={"bin": "codex", "args": ["exec", "--json"]},
+    )
+    request = EcsRunTaskComputeBackend(config).build_request(spec)
+
+    service_model = botocore_session.get_session().get_service_model("ecs")
+    run_task_model = service_model.operation_model("RunTask")
+    validation = botocore_validate.ParamValidator().validate(
+        dict(request.params), run_task_model.input_shape
+    )
+
+    assert not validation.has_errors(), validation.generate_report()
+
+
+@pytest.mark.asyncio
+async def test_ecs_runtask_backend_launch_wait_and_cancel_with_fake_client() -> None:
+    class FakeEcsClient:
+        def __init__(self) -> None:
+            self.run_kwargs: dict[str, Any] | None = None
+            self.stopped = False
+
+        def run_task(self, **kwargs: Any) -> dict[str, Any]:
+            self.run_kwargs = kwargs
+            return {"tasks": [{"taskArn": "arn:aws:ecs:task/worklink/abc"}]}
+
+        def describe_tasks(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "tasks": [
+                    {
+                        "taskArn": kwargs["tasks"][0],
+                        "lastStatus": "STOPPED",
+                        "stoppedReason": "Essential container exited",
+                        "containers": [{"name": "worker", "exitCode": 0}],
+                    }
+                ]
+            }
+
+        def stop_task(self, **kwargs: Any) -> dict[str, Any]:
+            self.stopped = True
+            return {"task": {"taskArn": kwargs["task"]}}
+
+    client = FakeEcsClient()
+    backend = EcsRunTaskComputeBackend(
+        EcsRunTaskConfig(
+            cluster="worklink",
+            task_definition="worklink-worker",
+            container_name="worker",
+            subnets=("subnet-a",),
+        ),
+        client=client,
+    )
+    spec = WorkSpec(
+        issue_id=459,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/459-a1",
+        prompt="x",
+        rules=None,
+        test_command="echo ok",
+        backend="codex",
+        timeout_s=30,
+    )
+
+    handle = await backend.launch(spec)
+    result = await backend.wait(handle, timeout_s=30)
+    await backend.cancel(handle)
+
+    assert handle == LaunchHandle("ecs_runtask", "arn:aws:ecs:task/worklink/abc")
+    assert result.exit_code == 0
+    assert result.stderr == "Essential container exited"
+    assert client.run_kwargs is not None
+    assert client.stopped is True
+
+
+def test_worklink_config_rejects_ecs_runtask_runtime_secrets(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+compute_backends:
+  ecs-runtask:
+    cluster: worklink
+    task_definition: worklink-worker
+    container_name: worker
+    subnets: [subnet-a]
+    secrets:
+      - name: GITHUB_TOKEN
+        value_from: arn:aws:secretsmanager:us-east-1:123:secret:github
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unknown setting.*secrets"):
+        BackendRegistry(WorklinkConfig.load(config_path))
+
+
+def test_worklink_config_registers_ecs_runtask_compute_backend(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  compute_backend: ecs-runtask
+compute_backends:
+  ecs-runtask:
+    cluster: worklink
+    task_definition: worklink-worker
+    container_name: worker
+    subnets: [subnet-a]
+    security_groups: [sg-worklink]
+    safe_env:
+      MIMIR_HOME: /worklink/home
+""".strip(),
+        encoding="utf-8",
+    )
+
+    registry = BackendRegistry(WorklinkConfig.load(config_path))
+    backend = registry.select_compute()
+
+    assert isinstance(backend, EcsRunTaskComputeBackend)
+    assert backend.config.cluster == "worklink"
+    assert backend.config.subnets == ("subnet-a",)
+    assert backend.config.security_groups == ("sg-worklink",)
+    assert backend.config.safe_env == {"MIMIR_HOME": "/worklink/home"}

@@ -51,7 +51,12 @@ def add_argparse(
     )
 
     worker_p = worklink_sub.add_parser("worker", help="Run one portable Worklink worker payload.")
-    worker_p.add_argument("payload", type=Path, help="Path to worker payload JSON.")
+    worker_p.add_argument("payload", type=Path, nargs="?", help="Path to worker payload JSON.")
+    worker_p.add_argument(
+        "--payload-json",
+        default=None,
+        help="Inline worker payload JSON (used by remote compute substrates).",
+    )
 
     return worklink_p
 
@@ -61,7 +66,14 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         parser.print_help()
         return 1
     if args.worklink_action == "worker":
-        payload = payload_from_json(json.loads(args.payload.read_text(encoding="utf-8")))
+        if args.payload_json is not None:
+            payload_data = json.loads(args.payload_json)
+        elif args.payload is not None:
+            payload_data = json.loads(args.payload.read_text(encoding="utf-8"))
+        else:
+            print("error: worklink worker requires payload path or --payload-json", file=sys.stderr)
+            return 2
+        payload = payload_from_json(payload_data)
         validation = asyncio.run(run_worker_payload(payload))
         suffix = " review-ready" if validation.review_ready else ""
         print(f"worklink worker: {validation.status}{suffix}")

@@ -11,6 +11,8 @@ import yaml
 from ..compute import (
     ComputeBackend,
     DockerSiblingComputeBackend,
+    EcsRunTaskComputeBackend,
+    EcsRunTaskConfig,
     LocalSubprocessComputeBackend,
 )
 from .base import ToolBackend
@@ -299,7 +301,84 @@ class BackendRegistry:
             if not isinstance(policy, Mapping):
                 raise ValueError("worklink docker-sibling policy must be a mapping")
             return DockerSiblingComputeBackend(broker_url=broker_url, image=image, policy=policy)
+        if name == "ecs_runtask":
+            return BackendRegistry._build_ecs_runtask(settings)
         raise ValueError(f"unknown Worklink compute backend config: {name}")
+
+
+    @staticmethod
+    def _build_ecs_runtask(settings: Mapping[str, Any]) -> EcsRunTaskComputeBackend:
+        allowed = {
+            "cluster",
+            "task_definition",
+            "container_name",
+            "subnets",
+            "security_groups",
+            "assign_public_ip",
+            "launch_type",
+            "platform_version",
+            "task_role_arn",
+            "execution_role_arn",
+            "worker_repo_dir",
+            "worker_evidence_path",
+            "worker_transcript_root",
+            "safe_env",
+            "tags",
+        }
+        unknown = sorted(set(settings) - allowed)
+        if unknown:
+            raise ValueError(
+                "worklink ecs_runtask compute backend unknown setting(s): "
+                + ", ".join(unknown)
+            )
+        missing = [
+            field
+            for field in ("cluster", "task_definition", "container_name", "subnets")
+            if field not in settings
+        ]
+        if missing:
+            raise ValueError(f"worklink ecs_runtask missing required field(s): {', '.join(missing)}")
+        subnets = _string_tuple(settings.get("subnets"), field_name="worklink ecs_runtask subnets")
+        if not subnets:
+            raise ValueError("worklink ecs_runtask subnets must not be empty")
+        security_groups = _string_tuple(
+            settings.get("security_groups", ()), field_name="worklink ecs_runtask security_groups"
+        )
+        safe_env = settings.get("safe_env") or {}
+        if not isinstance(safe_env, dict):
+            raise ValueError("worklink ecs_runtask safe_env must be a mapping")
+        tags = settings.get("tags") or {}
+        if not isinstance(tags, dict):
+            raise ValueError("worklink ecs_runtask tags must be a mapping")
+        config = EcsRunTaskConfig(
+            cluster=str(settings["cluster"]),
+            task_definition=str(settings["task_definition"]),
+            container_name=str(settings["container_name"]),
+            subnets=subnets,
+            security_groups=security_groups,
+            assign_public_ip=bool(settings.get("assign_public_ip", False)),
+            launch_type=str(settings.get("launch_type", "FARGATE")),
+            platform_version=(
+                str(settings["platform_version"]) if "platform_version" in settings else None
+            ),
+            task_role_arn=(str(settings["task_role_arn"]) if "task_role_arn" in settings else None),
+            execution_role_arn=(
+                str(settings["execution_role_arn"]) if "execution_role_arn" in settings else None
+            ),
+            worker_repo_dir=str(settings.get("worker_repo_dir", "/worklink/repo")),
+            worker_evidence_path=str(
+                settings.get("worker_evidence_path", "/worklink/evidence/evidence.json")
+            ),
+            worker_transcript_root=(
+                str(settings["worker_transcript_root"])
+                if "worker_transcript_root" in settings
+                else "/worklink/transcripts"
+            ),
+            safe_env={str(key): str(value) for key, value in safe_env.items()},
+            tags={str(key): str(value) for key, value in tags.items()},
+        )
+        return EcsRunTaskComputeBackend(config)
+
 
     @staticmethod
     def _build_codex(settings: Mapping[str, Any]) -> CodexBackend:
@@ -316,3 +395,11 @@ class BackendRegistry:
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ValueError("worklink claude_cli args must be a list of strings")
         return ClaudeCliBackend(bin=bin_name, extra_args=tuple(args))
+
+
+def _string_tuple(value: Any, *, field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        raise ValueError(f"{field_name} must be a list of strings")
+    if not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{field_name} must be a list of strings")
+    return tuple(value)

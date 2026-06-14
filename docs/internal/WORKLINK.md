@@ -707,13 +707,24 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454)
     broker_url: "unix:///run/worklink-broker.sock"   # broker owns the docker socket, not the agent
     image: mimirbot-mimirbot
     policy: {}             # optional broker policy map; actual enforcement arrives with broker slices
-  # ecs-runtask is a future #459 substrate; uncomment only once that launcher exists.
-  # ecs-runtask:
-  #   cluster: worklink
-  #   task_definition: worklink-worker
-  #   subnets: ["subnet-…"]
+  ecs-runtask:
+    cluster: worklink
+    task_definition: worklink-worker
+    container_name: worker
+    subnets: ["subnet-…"]
+    security_groups: ["sg-…"]
+    task_role_arn: arn:aws:iam::<acct>:role/worklink-task
+    execution_role_arn: arn:aws:iam::<acct>:role/worklink-execution
+    # ECS secrets are not RunTask overrides. Declare SSM Parameter Store or
+    # Secrets Manager `valueFrom` references on the task definition's container
+    # definition, and grant the task/execution roles permission to read them.
+    # Worklink's generated RunTask request carries only worker metadata, safe
+    # environment values, role overrides, network config, and tags.
 
-`compute_backend` also accepts the legacy spelling `compute`; backend names are normalized so `docker-sibling` in YAML selects Python registry key `docker_sibling`. Invalid or unknown DockerSibling fields fail closed during config load instead of falling back to local execution. The agent-side broker client is implemented, but the broker process/policy layer is a later slice; until that broker is running, selecting `docker-sibling` will fail at launch rather than silently falling back to local execution.
+`compute_backend` also accepts the legacy spelling `compute`; backend names are
+normalized so `docker-sibling`/`docker_sibling` and `ecs-runtask`/`ecs_runtask`
+select the same Python registry keys. Invalid or unknown compute-backend fields
+fail closed during config load instead of falling back to local execution.
 
 tool_pins:
   - name: codex                  # required: stable local tool name
