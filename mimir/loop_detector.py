@@ -69,6 +69,12 @@ class LoopDetector:
     # Internal state — bumped by ``check``.
     _streak: int = 0
     _warning_reaction_emitted: bool = False
+    # Delivery-failure backstop state. This intentionally lives outside
+    # ``snapshot``/``restore``: undelivered attempts roll back the delivered-send
+    # streak/history, but repeated identical undelivered attempts still need a
+    # separate bound so a bridge failure cannot loop forever.
+    _undelivered_streak: int = 0
+    _last_undelivered_text: str | None = None
     # Last window_size normalized texts; bounded deque created in __post_init__.
     _history: deque = field(default_factory=deque)
 
@@ -125,6 +131,59 @@ class LoopDetector:
         else:
             verdict = BreakerVerdict.OK
         return BreakerDecision(verdict=verdict, streak=streak, similarity=ratio)
+
+    def check_undelivered_backstop(self, text: str) -> BreakerDecision | None:
+        """Refuse another identical retry after prior undelivered hard-stop.
+
+        The Nth failed attempt is allowed to reach the bridge so a transient
+        failure can still recover; if it also fails, ``record_undelivered_attempt``
+        returns HARD_STOP. Later identical attempts are refused before delivery.
+        """
+        normalized = _normalize(text)
+        if (
+            normalized
+            and normalized == self._last_undelivered_text
+            and self._undelivered_streak >= self.hard_limit
+        ):
+            return BreakerDecision(
+                verdict=BreakerVerdict.HARD_STOP,
+                streak=self._undelivered_streak,
+                similarity=1.0,
+            )
+        return None
+
+    def record_undelivered_attempt(self, text: str) -> BreakerDecision:
+        """Track repeated identical attempts that failed before delivery.
+
+        Callers use this after restoring the delivered-send state for a bridge
+        exception / ``sent=False`` result / directive-only no-op. It preserves
+        PR #676's core behavior (undelivered sends don't poison the delivered
+        streak/history) while still bounding pathological retry loops when the
+        agent keeps trying the same failed send.
+        """
+        normalized = _normalize(text)
+        if normalized and normalized == self._last_undelivered_text:
+            streak = self._undelivered_streak + 1
+        else:
+            streak = 1
+        self._last_undelivered_text = normalized
+        self._undelivered_streak = streak
+
+        if streak >= self.hard_limit:
+            verdict = BreakerVerdict.HARD_STOP
+        elif streak >= self.soft_limit:
+            verdict = BreakerVerdict.SOFT_WARN
+        else:
+            verdict = BreakerVerdict.OK
+        # Identical comparison by construction; first attempt has no prior
+        # undelivered attempt to compare against.
+        similarity = 1.0 if streak > 1 else 0.0
+        return BreakerDecision(verdict=verdict, streak=streak, similarity=similarity)
+
+    def clear_undelivered_attempts(self) -> None:
+        """Reset the failure backstop after a delivered-send check starts."""
+        self._undelivered_streak = 0
+        self._last_undelivered_text = None
 
     def mark_warning_emitted(self) -> bool:
         """Returns True the first time it's called for this turn (caller emits

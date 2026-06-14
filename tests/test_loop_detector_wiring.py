@@ -241,6 +241,43 @@ async def test_undelivered_send_does_not_advance_loop_detector_streak(
 
 
 @pytest.mark.asyncio
+async def test_repeated_undelivered_sends_trip_separate_hard_stop_backstop(
+    fake_bridge: _FakeBridge,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Rolling back delivered-send history must not make delivery-failure
+    retry loops unbounded: identical undelivered attempts still hard-stop."""
+    detector = LoopDetector(soft_limit=2, hard_limit=3, similarity_threshold=0.9)
+    fake_bridge.send_results = [
+        SendResult(sent=False, error="bridge offline"),
+        SendResult(sent=False, error="bridge offline"),
+        SendResult(sent=False, error="bridge offline"),
+        SendResult(sent=False, error="bridge offline"),
+    ]
+    ctx = _ctx(detector)
+    _set_channel("ch-1")
+    token = set_current_turn(ctx)
+    try:
+        out1 = await send_message.ainvoke({"text": "retry me"})
+        out2 = await send_message.ainvoke({"text": "retry me"})
+        out3 = await send_message.ainvoke({"text": "retry me"})
+        out4 = await send_message.ainvoke({"text": "retry me"})
+    finally:
+        reset_current_turn(token)
+
+    assert "not delivered" in out1
+    assert "not delivered" in out2
+    assert "hard stop" in out3.lower()
+    assert "hard stop" in out4.lower()
+    # The third attempt reached the bridge and established the hard stop; the
+    # fourth identical retry was refused before another bridge call.
+    assert len(fake_bridge.sent) == 3
+    hard_stops = [kw for k, kw in captured_events if k == "send_message_loop_hard_stop"]
+    assert hard_stops
+    assert all(kw.get("undelivered") is True for kw in hard_stops)
+
+
+@pytest.mark.asyncio
 async def test_raised_send_does_not_advance_loop_detector_streak(
     fake_bridge: _FakeBridge,
     captured_events: list[tuple[str, dict]],

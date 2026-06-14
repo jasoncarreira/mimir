@@ -212,6 +212,7 @@ async def send_message(
     detector = None
     detector_state = None
     decision = None
+    undelivered_decision = None
     ctx = get_current_turn()
     if ctx is not None:
         detector = getattr(ctx, "loop_detector", None)
@@ -221,6 +222,21 @@ async def send_message(
         return f"send_message failed: no bridge for channel {cid!r}"
 
     if detector is not None:
+        undelivered_decision = detector.check_undelivered_backstop(text)
+        if undelivered_decision is not None:
+            await _log_event(
+                "send_message_loop_hard_stop",
+                channel_id=cid,
+                streak=undelivered_decision.streak,
+                similarity=round(undelivered_decision.similarity, 4),
+                undelivered=True,
+            )
+            return (
+                "send_message hard stop: repeated near-duplicate "
+                "undelivered-send loop. This send is refused before another "
+                "delivery attempt. Reflect on the delivery failure before "
+                "trying again."
+            )
         detector_state = detector.snapshot()
         decision = detector.check(text)
         if decision.verdict == BreakerVerdict.HARD_STOP:
@@ -255,6 +271,21 @@ async def send_message(
         except Exception as exc:
             if detector is not None and detector_state is not None:
                 detector.restore(detector_state)
+                undelivered_decision = detector.record_undelivered_attempt(text)
+                if undelivered_decision.verdict == BreakerVerdict.HARD_STOP:
+                    await _log_event(
+                        "send_message_loop_hard_stop",
+                        channel_id=cid,
+                        streak=undelivered_decision.streak,
+                        similarity=round(undelivered_decision.similarity, 4),
+                        undelivered=True,
+                    )
+                    return (
+                        "send_message hard stop: repeated near-duplicate "
+                        "undelivered-send loop. This send failed before "
+                        "delivery and further identical retries are refused. "
+                        "Reflect on the delivery failure before trying again."
+                    )
             return f"send_message failed: {exc}"
 
         # Soft delivery failure: bridges return SendResult(sent=False, error=…)
@@ -265,6 +296,21 @@ async def send_message(
         if not getattr(result, "sent", True):
             if detector is not None and detector_state is not None:
                 detector.restore(detector_state)
+                undelivered_decision = detector.record_undelivered_attempt(text)
+                if undelivered_decision.verdict == BreakerVerdict.HARD_STOP:
+                    await _log_event(
+                        "send_message_loop_hard_stop",
+                        channel_id=cid,
+                        streak=undelivered_decision.streak,
+                        similarity=round(undelivered_decision.similarity, 4),
+                        undelivered=True,
+                    )
+                    return (
+                        "send_message hard stop: repeated near-duplicate "
+                        "undelivered-send loop. This send failed before "
+                        "delivery and further identical retries are refused. "
+                        "Reflect on the delivery failure before trying again."
+                    )
             _err = getattr(result, "error", None)
             try:
                 await _log_event(
@@ -291,6 +337,8 @@ async def send_message(
                 ctx.delivered_channel_ids.add(cid)
             except Exception:  # noqa: BLE001
                 pass
+        if detector is not None:
+            detector.clear_undelivered_attempts()
 
         # S2-2: log a send_message_sent event with a normalized content hash
         # so FeedbackLog._detect_cross_turn_send_loops can detect 24h floods
@@ -399,6 +447,8 @@ async def send_message(
                         ctx.delivered_channel_ids.add(cid)
                     except Exception:  # noqa: BLE001
                         pass
+                if detector is not None:
+                    detector.clear_undelivered_attempts()
         # SendFileDirective: not yet implemented via this path
 
     if (
@@ -408,6 +458,21 @@ async def send_message(
         and not delivered_by_directive
     ):
         detector.restore(detector_state)
+        undelivered_decision = detector.record_undelivered_attempt(text)
+        if undelivered_decision.verdict == BreakerVerdict.HARD_STOP:
+            await _log_event(
+                "send_message_loop_hard_stop",
+                channel_id=cid,
+                streak=undelivered_decision.streak,
+                similarity=round(undelivered_decision.similarity, 4),
+                undelivered=True,
+            )
+            return (
+                "send_message hard stop: repeated near-duplicate "
+                "undelivered-send loop. This send failed before delivery and "
+                "further identical retries are refused. Reflect on the "
+                "delivery failure before trying again."
+            )
     elif (
         detector is not None
         and decision is not None
