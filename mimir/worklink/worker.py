@@ -143,9 +143,16 @@ async def run_worker_payload(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a portable Worklink worker payload.")
-    parser.add_argument("payload", type=Path, help="Path to worker payload JSON.")
+    parser.add_argument("payload", type=Path, nargs="?", help="Path to worker payload JSON.")
+    parser.add_argument("--payload-json", default=None, help="Inline worker payload JSON.")
     args = parser.parse_args(argv)
-    payload = payload_from_json(json.loads(args.payload.read_text(encoding="utf-8")))
+    if args.payload_json is not None:
+        payload_data = json.loads(args.payload_json)
+    elif args.payload is not None:
+        payload_data = json.loads(args.payload.read_text(encoding="utf-8"))
+    else:
+        parser.error("payload path or --payload-json is required")
+    payload = payload_from_json(payload_data)
     validation = asyncio.run(run_worker_payload(payload))
     print(json.dumps({"status": validation.status, "review_ready": validation.review_ready, "reasons": list(validation.reasons)}))
     return 0 if validation.status in {"completed", "failed", "blocked"} else 1
