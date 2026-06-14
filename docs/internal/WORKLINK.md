@@ -44,9 +44,9 @@ Why the split is load-bearing:
   evidence status `blocked`, preserves the reason, and the executor labels
   the leaf `worklink:blocked` (reason posted under `WORKLINK_BLOCKED`)
   instead of opening a PR or burning attempts as a generic failure. The
-  parser takes the *last* marker line, so a backend that echoes the
-  prompt's instruction earlier does not false-trigger over its real
-  decision.
+  marker counts only as the **final non-empty line** of stdout/stderr, so a
+  backend that echoes the prompt's instruction earlier and then completes
+  normally is not mislabeled blocked.
 - **Mimir's turn loop stays free.** A 20-minute backend run is a
   side subprocess (like a poller), not a turn holding a channel slot.
 

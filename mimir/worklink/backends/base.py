@@ -48,17 +48,30 @@ def blocked_reason_from_output(stdout: str, stderr: str) -> str | None:
     stderr.  The reason is intentionally plain text and bounded to one line so it
     can be copied into Chainlink evidence comments safely.
 
-    The work-order prompt instructs backends to emit the marker as the *final*
-    line of their output, so we take the **last** matching line. That way a
-    backend that echoes the prompt's instruction (which mentions the marker
-    inline) earlier in its output does not false-trigger a block over the real,
-    final decision.
+    The marker is honored only when it is the **final non-empty line** of stdout
+    or stderr — exactly the convention the work-order prompt enforces ("emit it
+    as the final line and stop"). Enforcing the final-line rule (not merely
+    last-match-anywhere) means a backend that echoes the prompt's marker
+    instruction near the top and then *completes normally* is not mislabeled
+    blocked: the real final line is its success output, not the echoed marker.
     """
-    reason: str | None = None
-    for line in f"{stdout}\n{stderr}".splitlines():
-        if line.startswith(BLOCKED_MARKER):
-            reason = _clean_blocked_reason(line[len(BLOCKED_MARKER) :].strip())
-    return reason
+    for stream in (stdout, stderr):
+        last = _last_nonempty_line(stream)
+        if last is None:
+            continue
+        stripped = last.strip()
+        if stripped.startswith(BLOCKED_MARKER):
+            reason = _clean_blocked_reason(stripped[len(BLOCKED_MARKER) :].strip())
+            if reason:
+                return reason
+    return None
+
+
+def _last_nonempty_line(text: str) -> str | None:
+    for line in reversed(text.splitlines()):
+        if line.strip():
+            return line
+    return None
 
 
 def _clean_blocked_reason(reason: str) -> str | None:
