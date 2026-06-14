@@ -698,7 +698,7 @@ Current slice-1 recovery is manual:
 ```yaml
 defaults:
   backend: codex
-  compute_backend: local_subprocess # WHERE it runs: local_subprocess | docker_sibling | ecs_runtask
+  compute_backend: local_subprocess # WHERE it runs: local_subprocess | docker-sibling | ecs-runtask
   timeout_s: 1800
   priority: normal          # arbiter priority for autonomous dispatch
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
@@ -709,16 +709,24 @@ routes:                     # first match wins
   - repo: "jasoncarreira/mimir"
     backend: codex
 
-backends:                   # ToolBackend adapters + ComputeBackend settings
+backends:                   # ToolBackend adapters — WHAT tool builds the diff
   codex:
     bin: codex
     args: ["exec", "--json"]
   claude_cli:
     bin: claude
-  # local_subprocess is built in and needs no settings; docker_sibling is a
-  # future broker-backed ComputeBackend. ecs_runtask is the first remote worker
-  # request-builder slice.
-  ecs_runtask:
+
+# Backend blocked path: coding CLIs can deliberately route planner/human issues
+# back to Chainlink by printing `WORKLINK_BLOCKED: <one-line reason>`. This is
+# for design contradictions or missing prerequisites, not transient tool errors.
+
+compute_backends:           # ComputeBackend launchers — WHERE it runs (#454)
+  local-subprocess: {}      # today's behavior; accept-the-risk fallback
+  docker-sibling:
+    broker_url: "unix:///run/worklink-broker.sock"   # broker owns the docker socket, not the agent
+    image: mimirbot-mimirbot
+    policy: {}             # optional broker policy map; actual enforcement arrives with broker slices
+  ecs-runtask:
     cluster: worklink
     task_definition: worklink-worker
     container_name: worker
@@ -730,9 +738,10 @@ backends:                   # ToolBackend adapters + ComputeBackend settings
       - name: GITHUB_TOKEN
         value_from: arn:aws:ssm:<region>:<acct>:parameter/worklink/github-token
 
-# Backend blocked path: coding CLIs can deliberately route planner/human issues
-# back to Chainlink by printing `WORKLINK_BLOCKED: <one-line reason>`. This is
-# for design contradictions or missing prerequisites, not transient tool errors.
+`compute_backend` also accepts the legacy spelling `compute`; backend names are
+normalized so `docker-sibling`/`docker_sibling` and `ecs-runtask`/`ecs_runtask`
+select the same Python registry keys. Invalid or unknown compute-backend fields
+fail closed during config load instead of falling back to local execution.
 
 tool_pins:
   - name: codex                  # required: stable local tool name

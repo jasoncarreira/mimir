@@ -13,6 +13,7 @@ from mimir.worklink.backends import (
     ClaudeCliBackend,
     CodexBackend,
     ComputeResult,
+    DockerSiblingComputeBackend,
     EcsRunTaskComputeBackend,
     EcsRunTaskConfig,
     EcsSecretReference,
@@ -23,7 +24,7 @@ from mimir.worklink.backends import (
     WorklinkConfig,
 )
 from mimir.worklink.backends.base import blocked_reason_from_output
-from mimir.worklink.compute import ComputeCaps, LaunchHandle, WorkSpec
+from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, LaunchHandle, WorkSpec
 from mimir.worklink.worker import WorkerPayload, payload_from_json, payload_to_json
 import mimir.worklink.backends.codex as codex_module
 import mimir.worklink.compute as compute_module
@@ -815,14 +816,86 @@ async def test_ecs_runtask_backend_launch_wait_and_cancel_with_fake_client() -> 
     assert client.stopped is True
 
 
+
+def test_worklink_config_builds_docker_sibling_compute_backend(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  compute_backend: docker-sibling
+  backend: codex
+backends:
+  codex: {}
+compute_backends:
+  docker-sibling:
+    broker_url: unix:///run/worklink-broker.sock
+    image: mimirbot-mimirbot
+    policy:
+      network: restricted
+""",
+        encoding="utf-8",
+    )
+
+    config = WorklinkConfig.load(config_path)
+    registry = BackendRegistry(config)
+    backend = registry.select_compute()
+
+    assert config.defaults.compute_backend == "docker_sibling"
+    assert isinstance(backend, DockerSiblingComputeBackend)
+    assert backend.broker_url == "unix:///run/worklink-broker.sock"
+    assert backend.image == "mimirbot-mimirbot"
+    assert backend.policy == {"network": "restricted"}
+
+
+def test_worklink_config_rejects_unknown_docker_sibling_setting(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+compute_backends:
+  docker-sibling:
+    broker_url: unix:///run/worklink-broker.sock
+    image: mimirbot-mimirbot
+    typo: true
+""",
+        encoding="utf-8",
+    )
+
+    config = WorklinkConfig.load(config_path)
+    with pytest.raises(ValueError, match="unknown setting"):
+        BackendRegistry(config)
+
+
+@pytest.mark.asyncio
+async def test_docker_sibling_fails_closed_until_broker_client_exists() -> None:
+    backend = DockerSiblingComputeBackend(
+        broker_url="unix:///run/worklink-broker.sock", image="mimirbot-mimirbot"
+    )
+
+    with pytest.raises(ComputeLaunchError, match="not implemented yet"):
+        await backend.launch(
+            WorkSpec(
+                issue_id=459,
+                attempt=1,
+                repo_url="git@github.com:jasoncarreira/mimir.git",
+                base_ref="main",
+                branch="issue/459-a1",
+                prompt="x",
+                rules=None,
+                test_command="echo ok",
+                backend="codex",
+                timeout_s=30,
+            )
+        )
+
+
 def test_worklink_config_registers_ecs_runtask_compute_backend(tmp_path: Path) -> None:
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(
         """
 defaults:
-  compute_backend: ecs_runtask
-backends:
-  ecs_runtask:
+  compute_backend: ecs-runtask
+compute_backends:
+  ecs-runtask:
     cluster: worklink
     task_definition: worklink-worker
     container_name: worker

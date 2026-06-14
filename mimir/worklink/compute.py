@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import signal
 from typing import Any, Mapping, Protocol, Sequence
+from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,59 @@ class ComputeBackend(Protocol):
 
     async def cleanup(self, handle: LaunchHandle) -> None: ...
 
+
+
+@dataclass(frozen=True)
+class DockerSiblingComputeBackend:
+    """Configured Docker-sibling substrate placeholder.
+
+    This slice only makes Docker-sibling selectable through typed Worklink
+    config.  The broker client/process arrives in later slices; launching now
+    fails closed instead of silently falling back to local execution.
+    """
+
+    broker_url: str
+    image: str
+    policy: Mapping[str, Any] = field(default_factory=dict)
+    name: str = "docker_sibling"
+
+    def __post_init__(self) -> None:
+        if not self.broker_url:
+            raise ValueError("worklink docker-sibling compute backend requires broker_url")
+        parsed = urlparse(self.broker_url)
+        if parsed.scheme not in {"unix", "http", "https"}:
+            raise ValueError(
+                "worklink docker-sibling broker_url must use unix://, http://, or https://"
+            )
+        if not self.image:
+            raise ValueError("worklink docker-sibling compute backend requires image")
+        if not isinstance(self.policy, Mapping):
+            raise ValueError("worklink docker-sibling policy must be a mapping")
+
+    def capabilities(self) -> ComputeCaps:
+        return ComputeCaps(
+            shared_filesystem=False,
+            network_isolated=True,
+            handle_cancel=True,
+            persistent_after_disconnect=True,
+        )
+
+    async def launch(self, spec: WorkSpec) -> LaunchHandle:
+        raise ComputeLaunchError(
+            "docker_sibling compute backend broker client is not implemented yet"
+        )
+
+    async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+        raise KeyError(f"unknown {self.name} handle: {handle.identifier}")
+
+    async def logs(self, handle: LaunchHandle) -> str:
+        raise KeyError(f"unknown {self.name} handle: {handle.identifier}")
+
+    async def cancel(self, handle: LaunchHandle) -> None:
+        raise KeyError(f"unknown {self.name} handle: {handle.identifier}")
+
+    async def cleanup(self, handle: LaunchHandle) -> None:
+        return None
 
 
 @dataclass(frozen=True)
