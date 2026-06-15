@@ -67,6 +67,20 @@ async def _handle_event(request: web.Request) -> web.Response:
     if not channel_id:
         return web.json_response({"error": "channel_id required"}, status=400)
 
+    # #487: type-check structured fields, don't coerce. A truthy non-dict
+    # ``extra`` (or non-list ``attachment_names``) survives ``or {}``/``or []``
+    # and later ``event.extra.get(...)`` raises AttributeError → an unguarded
+    # 500 in enqueue or a silently-dropped turn on the worker path. Reachable by
+    # any client when MIMIR_API_KEY is unset. Reject with 400 instead.
+    extra = body.get("extra")
+    if extra is not None and not isinstance(extra, dict):
+        return web.json_response({"error": "extra must be an object"}, status=400)
+    attachment_names = body.get("attachment_names")
+    if attachment_names is not None and not isinstance(attachment_names, list):
+        return web.json_response(
+            {"error": "attachment_names must be an array"}, status=400,
+        )
+
     event = AgentEvent(
         trigger=body.get("trigger", "user_message"),
         channel_id=channel_id,
@@ -75,8 +89,8 @@ async def _handle_event(request: web.Request) -> web.Response:
         author_id=body.get("author_id"),
         source_id=body.get("source_id"),
         source=body.get("source"),
-        attachment_names=body.get("attachment_names") or [],
-        extra=body.get("extra") or {},
+        attachment_names=attachment_names or [],
+        extra=extra or {},
     )
 
     dispatcher: Dispatcher = request.app["dispatcher"]

@@ -147,6 +147,11 @@ class WebChatBridge(Bridge):
         channel_id = (body.get("channel_id") or DEFAULT_CHANNEL).strip()
         if not channel_id.startswith("web-"):
             channel_id = "web-" + channel_id
+        # #487: type-check, don't coerce — a truthy non-dict ``extra`` survives
+        # ``or {}`` and later ``event.extra.get(...)`` raises.
+        extra = body.get("extra")
+        if extra is not None and not isinstance(extra, dict):
+            return web.json_response({"error": "extra must be an object"}, status=400)
         event = AgentEvent(
             trigger="user_message",
             channel_id=channel_id,
@@ -155,7 +160,7 @@ class WebChatBridge(Bridge):
             author_id=body.get("author_id"),
             source_id=body.get("msg_id") or uuid.uuid4().hex[:12],
             source="web",
-            extra=body.get("extra") or {},
+            extra=extra or {},
         )
         accepted = await self.enqueue(event)
         if not accepted:
