@@ -114,8 +114,21 @@ class ChainlinkClaims:
         self.clock = clock or (lambda: datetime.now(UTC))
         self.max_attempts = max_attempts
 
-    def claim_issue(self, issue_id: int, comments: Iterable[str] = ()) -> ClaimResult:
-        """Claim ``issue_id`` if the attempts cap has not been exhausted."""
+    def claim_issue(
+        self,
+        issue_id: int,
+        comments: Iterable[str] = (),
+        *,
+        max_active_locks: int | None = None,
+    ) -> ClaimResult:
+        """Claim ``issue_id`` if attempts and optional global cap allow it.
+
+        ``max_active_locks`` is the autonomous-dispatch hard bound. The issue
+        lock is acquired first, then the active lock count is checked while this
+        claim is already reserved; if admitting this reservation would exceed
+        the cap, the lock is released before any label/comment mutation or
+        backend compute launch.
+        """
         attempt = self.next_attempt(comments)
         if attempt > self.max_attempts:
             self._attempts_exhausted(issue_id, attempt - 1)
@@ -124,6 +137,22 @@ class ChainlinkClaims:
         lock = self._run("locks", "claim", str(issue_id), check=False)
         if lock.returncode != 0:
             return ClaimResult(False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed")
+
+        if max_active_locks is not None:
+            try:
+                active = self.active_worklink_lock_count()
+            except Exception:
+                self.release_issue(issue_id)
+                raise
+            if active > max_active_locks:
+                self.release_issue(issue_id)
+                return ClaimResult(
+                    False,
+                    reason=(
+                        f"concurrency cap reached ({active - 1}/{max_active_locks} active "
+                        "claims before this reservation)"
+                    ),
+                )
 
         record = ClaimRecord(
             issue_id=issue_id,
@@ -255,7 +284,7 @@ class ChainlinkClaims:
 
         Use for *discovery* (ready-queue scan, reaper sweep) where a missing
         list just means "do less this cycle". The concurrency CAP must NOT use
-        this — see :meth:`active_claim_count`, which fails closed instead.
+        this — see :meth:`active_worklink_lock_count`, which fails closed instead.
         """
         try:
             return self._list_issue_ids(label, status=status)
@@ -263,10 +292,38 @@ class ChainlinkClaims:
             return []
 
     def active_claim_count(self) -> int:
-        """Number of ``worklink:in-progress`` issues — the live worker count the
-        concurrency cap gates against. RAISES if the count can't be read, so the
-        cap fails **closed**: never admit a worker whose peers we can't bound."""
+        """Number of ``worklink:in-progress`` issues.
+
+        Kept for discovery/telemetry compatibility. The autonomous concurrency
+        cap uses :meth:`active_worklink_lock_count` instead: labels are applied
+        after process start, while locks are the atomic reservation surface.
+        """
         return len(self._list_issue_ids("worklink:in-progress"))
+
+    def active_worklink_lock_count(self) -> int:
+        """Number of active Chainlink locks — the autonomous hard-cap surface.
+
+        RAISES if the lock table can't be read or parsed, so the cap fails
+        closed. Chainlink locks are the atomic reservation mechanism; counting
+        them avoids the label-based check-then-act window where a worker has
+        been admitted but has not yet applied ``worklink:in-progress``.
+        """
+        result = self._run("locks", "list", "--json", check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                (result.stderr or result.stdout).strip()
+                or f"chainlink locks list --json failed (rc={result.returncode})"
+            )
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("chainlink locks list --json returned invalid JSON") from exc
+        locks = data.get("locks", data if isinstance(data, list) else {})
+        if isinstance(locks, dict):
+            return len(locks)
+        if isinstance(locks, list):
+            return len(locks)
+        raise RuntimeError("chainlink locks list --json returned unexpected shape")
 
     def _issue_comments(self, issue_id: int) -> list[str]:
         result = self._run("issue", "show", str(issue_id), "--json", check=False)
@@ -281,7 +338,7 @@ class ChainlinkClaims:
             if isinstance(item, str):
                 out.append(item)
             elif isinstance(item, dict):
-                text = item.get("text") or item.get("body") or ""
+                text = item.get("content") or item.get("text") or item.get("body") or ""
                 if text:
                     out.append(str(text))
         return out

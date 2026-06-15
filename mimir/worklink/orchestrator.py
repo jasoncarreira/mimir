@@ -199,7 +199,7 @@ class WorklinkRunner:
         # any claim/mutation, so the posture can't be bypassed by a caller. The
         # operator CLI passes autonomous=False and is never gated.
         if autonomous:
-            allowed, reason = config.autonomous_compute_allowed(compute.name)
+            allowed, reason = config.autonomous_compute_allowed(compute.name, compute.capabilities())
             if not allowed:
                 _log_event(
                     "worklink_autonomous_refused",
@@ -216,7 +216,11 @@ class WorklinkRunner:
         # Re-read immediately before claiming so retries in a long-lived caller do
         # not use stale comments and collide with prior attempt-scoped branches.
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
-        claim = claims.claim_issue(issue.issue_id, issue.comments)
+        claim = claims.claim_issue(
+            issue.issue_id,
+            issue.comments,
+            max_active_locks=config.defaults.max_concurrent if autonomous else None,
+        )
         if claim.attempts_exhausted:
             _log_event("worklink_attempts_exhausted", issue_id=issue.issue_id)
             return WorklinkRunResult(issue.issue_id, None, "blocked", reason="attempts_exhausted")

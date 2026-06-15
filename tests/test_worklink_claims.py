@@ -53,6 +53,30 @@ def test_claim_issue_records_attempt_and_labels_transition() -> None:
     assert comment_calls and "WORKLINK_CLAIM" in comment_calls[0][-1]
 
 
+def test_claim_issue_enforces_max_active_locks_after_reservation() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        args = list(args)
+        calls.append(args)
+        if args[1:4] == ["locks", "list", "--json"]:
+            # The new issue lock is already reserved; cap=1 means this would be
+            # the second active worker, so claim_issue must release it before
+            # mutating labels/comments.
+            return subprocess.CompletedProcess(args, 0, stdout='{"locks":{"old":{},"new":{}}}', stderr="")
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+    result = claims.claim_issue(8, max_active_locks=1)
+
+    assert result.claimed is False
+    assert result.reason and "concurrency cap reached" in result.reason
+    assert ["chainlink", "locks", "claim", "8"] in calls
+    assert ["chainlink", "locks", "release", "8"] in calls
+    assert not any(call[:3] == ["chainlink", "issue", "label"] for call in calls)
+    assert not any(call[:3] == ["chainlink", "issue", "comment"] for call in calls)
+
+
 def test_claim_issue_blocks_when_attempts_exhausted() -> None:
     calls: list[list[str]] = []
 
