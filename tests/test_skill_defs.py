@@ -4,11 +4,42 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from mimir.skill_defs import (
     _bundled_skill_names,
     installed_skill_names,
+    reject_escaping_symlinks,
     seed_skills,
 )
+
+
+# ─── #500: escaping-symlink guard ──────────────────────────────────────
+
+
+def test_reject_escaping_symlinks_raises_on_escape(tmp_path: Path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "leak.txt").symlink_to(outside)
+    with pytest.raises(ValueError, match="symlink escaping"):
+        reject_escaping_symlinks(bundle)
+
+
+def test_reject_escaping_symlinks_allows_in_bundle_link(tmp_path: Path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "real.txt").write_text("ok")
+    (bundle / "alias.txt").symlink_to("real.txt")  # relative, stays inside
+    reject_escaping_symlinks(bundle)  # no raise
+
+
+def test_reject_escaping_symlinks_noop_without_symlinks(tmp_path: Path):
+    bundle = tmp_path / "bundle"
+    (bundle / "sub").mkdir(parents=True)
+    (bundle / "sub" / "f.txt").write_text("x")
+    reject_escaping_symlinks(bundle)  # no raise
 
 
 def test_bundled_skills_include_expected_set():
