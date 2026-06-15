@@ -175,12 +175,12 @@ class MidTurnInjectionMiddleware(AgentMiddleware):
 ### 3. Injection API
 
 ```python
-def inject_message(channel_id: str, content: str) -> Literal["injected", "no_active_turn"]:
+def inject_message(channel_id: str, event: AgentEvent) -> str:
     with _LOCK:
         inflight = _REGISTRY.get(channel_id)
         if inflight is None or not inflight.active:
             return "no_active_turn"
-        inflight.queue.append(content)
+        inflight.queue.append(event)
         return "injected"
 ```
 

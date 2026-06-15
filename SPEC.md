@@ -52,14 +52,14 @@ The name is from Norse myth — Mímir, the keeper of memory and counsel.
 │   ├── shell_jobs.py             # background bash jobs — bash_async / bash_job_output
 │   ├── pollers.py                # poller subprocess runner + manifest loader (§7.2.2)
 │   ├── history.py                # per-channel message history (§5.4)
-│   ├── feedback.py               # saga feedback / mark_contributions hook
+│   ├── feedback/                 # algedonic signal surfacing (subpackage; see feedback/__init__.py)
 │   ├── dispatcher.py             # per-channel queue + S2 coordination
 │   ├── loop_detector.py          # send_message dedup / loop guard (S2)
 │   ├── skill_catalog.py          # skills catalog builder (mimir skills catalog)
 │   ├── skill_defs.py             # skill registration and tool definitions
 │   ├── billing.py                # plan-window billing helpers
-│   ├── budget.py                 # per-session tool-call budget gate
-│   ├── rate_limits.py            # homeostatic arbiter — suppresses ticks on quota overrun
+│   ├── budget.py                 # §12.4 homeostatic arbiter — grades severity, suppresses ticks/pollers
+│   ├── rate_limits.py            # rate-limit store (observed plan-window utilization)
 │   ├── health_probe.py           # bind-mount VirtioFS health probe (1/min cron)
 │   ├── channel_registry.py       # prefix → bridge dispatch (§7.2.3)
 │   ├── commitments/              # commitments extraction + tracking
@@ -78,11 +78,10 @@ The name is from Norse myth — Mímir, the keeper of memory and counsel.
 │   ├── turn_viewer.html          # vanilla-JS single-file viewer (open-strix port)
 │   ├── config.py                 # env + config loading
 │   ├── session_manager.py        # per-channel saga session lifecycle (§5.6)
-│   ├── prompts/
-│   │   └── saga_session_end.md   # synthesis-turn template (§5.6); overridable
-│   │                             # via MIMIR_PROMPTS_DIR.
-│   │                             # `saga_session_end_lean.md` sibling
-│   │                             # is the lean variant for narrow contexts.
+│   ├── templates.py              # bundled synthesis-turn templates (§5.6) as string
+│   │                             # constants (SAGA_SESSION_END_DEFAULT + the lean
+│   │                             # variant); operator override via MIMIR_PROMPTS_DIR.
+│   ├── prompt_templates/         # bundled operator-facing prompt templates (.md)
 │   └── skills/                   # bundled skills (operator-installed overrides — see §8)
 │       └── (skill overrides take priority over .mimir_builtin_skills/)
 ├── saga/                         # v0.5 §1 — vendored workspace member.
@@ -236,7 +235,7 @@ One primary Python process inside the container (no supervisord):
 
 **SAGA** runs **in-process** as `SagaStore` (the only mode since the external-saga HTTP path was retired). `make_saga_client()` instantiates `SagaStore` directly (SQLite, same process, no HTTP loop).
 
-Channel bridges (Slack, Discord, Bluesky, Web UI, Bench) are NOT separate processes — they run inside the mimir process as asyncio coroutines, sharing the per-channel dispatcher (§4.5) and the global concurrency cap. Subprocess pollers (§7.2.2) are the only out-of-process channel components, and they're inbound-only.
+Channel bridges (Slack, Discord, Web, Bench) are NOT separate processes — they run inside the mimir process as asyncio coroutines, sharing the per-channel dispatcher (§4.5) and the global concurrency cap. Subprocess pollers (§7.2.2) are the only out-of-process channel components, and they're inbound-only.
 
 ### 4.2 Agent loop
 
@@ -613,12 +612,12 @@ store_session_boundary(
 Flow:
 
 1. Read `<home>/logs/turns.jsonl` and extract every record where `saga_session_id == this_session.saga_session_id`. Every TurnRecord carries this field (§10.2), populated from `TurnContext.saga_session_id` at turn start, so filtering is exact — no timestamp-window heuristics, no risk of off-by-one against rapid neighboring sessions.
-2. Enqueue a synthesis turn with `trigger="saga_session_end"`, `channel_id=channel_id`, empty inbound text, and the turn window embedded in the turn prompt under `## Turns from this session`. The template lives at `mimir/prompts/saga_session_end.md` (overridable via `MIMIR_PROMPTS_DIR`).
+2. Enqueue a synthesis turn with `trigger="saga_session_end"`, `channel_id=channel_id`, empty inbound text, and the turn window embedded in the turn prompt under `## Turns from this session`. The template lives at `mimir/templates.py` (the `SAGA_SESSION_END_DEFAULT` constant) (overridable via `MIMIR_PROMPTS_DIR`).
 3. Pre-message SAGA hook is **skipped** for `trigger="saga_session_end"`. Post-message `mark_contributions` is also skipped — the "response" is tool calls, not a user-facing reply.
 4. The agent does three things in this turn (see prompt below): captures session memories to disk, upvotes/downvotes useful SAGA atoms, and calls `saga_end_session(...)` with the synthesized boundary fields.
 5. After the synthesis turn finishes (regardless of which step errored), the session manager drops the in-memory session and logs `saga_session_ended` with `duration_s`, `turn_count`, `synthesis_ok`, `feedback_count`, `memory_writes`.
 
-Synthesis prompt template (`mimir/prompts/saga_session_end.md`):
+Synthesis prompt template (`mimir/templates.py` (the `SAGA_SESSION_END_DEFAULT` constant)):
 
 ```markdown
 The SAGA session for channel {channel_id} has been idle for {idle_minutes}
@@ -786,8 +785,7 @@ class Bridge(ABC):
 |---|---|---|---|---|
 | Slack | `slack-bolt` (socket mode) | `app.message` handler | `chat.postMessage` | `reactions.add` |
 | Discord | `discord.py` (port from open-strix) | `on_message` callback | `channel.send(chunk)` | `message.add_reaction` |
-| Bluesky | `atproto` | DM convo poll | `chat.bsky.convo.sendMessage` | log no-op (no native) |
-| Web UI | aiohttp + SSE | POST `/chat` | SSE push | event-log marker |
+| Web | aiohttp + SSE | POST `/chat` | SSE push | event-log marker |
 | Bench | n/a | POST `/event` from adapter | print to stdout | reactions.jsonl |
 
 Bridges run as asyncio tasks inside the mimir process — no extra container, no IPC. Open-strix's Discord bridge (`open_strix/discord.py`, ~670 LOC including chunking, attachments, history refresh) is the reference implementation. Each bridge is opt-in via env (`SLACK_BOT_TOKEN`, `DISCORD_TOKEN`, `BSKY_HANDLE`+`BSKY_APP_PASSWORD`, `MIMIR_WEB_PORT`). A bridge that fails to connect logs to events.jsonl as `bridge_error` and the process keeps running with the remaining bridges.
@@ -822,8 +820,7 @@ A single tool — `reload_pollers()` — exposed by the pollers skill, re-scans 
 |---|---|---|
 | `slack-`, `dm-slack-` | SlackBridge | Public channel vs. DM |
 | `discord-`, `dm-discord-` | DiscordBridge | |
-| `bsky-`, `dm-bsky-` | BlueskyBridge | Thread vs. DM convo |
-| `web-` | WebUIBridge | Local web UI |
+| `web-` | WebChatBridge | Local web chat (`/chat` + SSE) |
 | `bench-` | BenchBridge | Benchmark adapter stdout |
 
 `send_message` and `react` look up the bridge by `channel_id` prefix and delegate. Unknown prefix → `error` event in events.jsonl + tool returns `"send_message failed: no bridge registered for prefix '<x>-'"`. Adding a new channel source = drop a new module under `mimir/bridges/` and register a prefix; the tool surface stays the same.
@@ -1427,14 +1424,14 @@ Caveats: `--dataset-path` must be explicit (default resolves incorrectly — see
 | Env var | Default | Meaning |
 |---|---|---|
 | `MIMIR_HOME` | `/home` | Agent home dir |
-| `MIMIR_MODEL` | `claude-opus-4-7` | Model for the main loop |
+| `MIMIR_MODEL_SPEC` | `claude-code:claude-sonnet-4-6` | Main agent-loop model + provider (forms: `claude-code:`, `anthropic:`, `openai:`) |
 | `MIMIR_CONTEXT_1M` | `true` | Pass Anthropic's `context-1m-2025-08-07` beta to the SDK (lifts Claude 4.x Opus / Sonnet from 200k → 1M context cap). Set `false` if your account/model doesn't accept the beta. |
 | `MIMIR_EFFORT` | `high` | Effort param |
 | `MIMIR_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed model |
 | `MIMIR_INDEX_DB` | `$MIMIR_HOME/.mimir/index.db` | SQLite path |
 | `MIMIR_SAGA_SESSION_IDLE_MINUTES` | `10` | Per-channel SAGA session idle timeout (§5.6); session-end fires after this much silence on a channel |
 | `MIMIR_SAGA_CONSOLIDATE_CRON` | `0 4 * * *` | Cron expression for periodic `POST /v1/consolidate`; empty string disables (§5.6) |
-| `MIMIR_PROMPTS_DIR` | `mimir/prompts/` (bundled) | Override path for prompt templates; mimir falls back to bundled defaults if a file isn't found (§5.6) |
+| `MIMIR_PROMPTS_DIR` | (unset) | Operator override dir for prompt templates; mimir falls back to the bundled defaults in `templates.py` / `prompt_templates/` when unset or a file isn't found (§5.6) |
 | `MIMIR_TURNS_ARCHIVE_DIR` | (unset) | If set, `reset()` archives turns.jsonl + events.jsonl here before truncate |
 | `MIMIR_MAX_TURNS` | `5000` | Retention cap for turns.jsonl (hard ceiling 50000) |
 | `MIMIR_MAX_EVENTS` | `75000` | Retention cap for events.jsonl (hard ceiling 750000) |
@@ -1450,7 +1447,7 @@ Caveats: `--dataset-path` must be explicit (default resolves incorrectly — see
 | `DISCORD_TOKEN` | (unset) | Enables DiscordBridge (§7.2.1) when set |
 | `SLACK_BOT_TOKEN` | (unset) | Enables SlackBridge; requires `SLACK_APP_TOKEN` for socket mode |
 | `SLACK_APP_TOKEN` | (unset) | Slack socket-mode app-level token |
-| `BSKY_HANDLE` | (unset) | Bluesky handle; with `BSKY_APP_PASSWORD` enables BlueskyBridge |
+| `BSKY_HANDLE` | (unset) | Bluesky handle; consumed by the `social-cli` optional skill poller (there is no in-process Bluesky bridge) |
 | `BSKY_APP_PASSWORD` | (unset) | Bluesky app password |
 | `MIMIR_SEND_LOOP_SOFT_LIMIT` | `5` | `send_message` near-duplicate warning threshold (§7.2.4) |
 | `MIMIR_SEND_LOOP_HARD_LIMIT` | `10` | `send_message` hard-stop threshold |
@@ -1477,7 +1474,7 @@ The benchmark adapter sets these before launching the container. `effort` and `t
 
 When run against Claude (Opus 4.7 via OAuth or API key), all features work natively — adaptive thinking, `spawn_claude_code` subagents, 1M context beta.
 
-Channel-specific config (Bluesky/Slack) is live (both bridges implemented post-Phase 6.3); deferred config is mainly around per-channel rate-limit granularity and Bluesky reply threading.
+Slack and Discord bridge config is live (both implemented). Bluesky is handled by the `social-cli` optional skill poller, not an in-process bridge. Deferred config is mainly per-channel rate-limit granularity.
 
 ---
 
@@ -1515,7 +1512,7 @@ Channel-specific config (Bluesky/Slack) is live (both bridges implemented post-P
 - Pre-message hook: query SAGA, format hits into turn prompt, stash atom IDs.
 - Post-message hook: call `mark_contributions` with the union of pre-injected and mid-turn-queried atom IDs.
 - **Per-channel SAGA session manager (§5.6)** — `mimir/session_manager.py` with `touch(channel_id)`, idle timer. Hook into the dispatcher (§4.5) so every inbound event touches the session before enqueueing.
-- **Session-end synthesis turn** — on idle, dispatcher enqueues a turn with `trigger="saga_session_end"`, the channel's turn window from turns.jsonl in the prompt, and `mimir/prompts/saga_session_end.md` as the template. Pre/post SAGA hooks skip on this trigger.
+- **Session-end synthesis turn** — on idle, dispatcher enqueues a turn with `trigger="saga_session_end"`, the channel's turn window from turns.jsonl in the prompt, and `mimir/templates.py` (the `SAGA_SESSION_END_DEFAULT` constant) as the template. Pre/post SAGA hooks skip on this trigger.
 - `saga_end_session` tool that POSTs `/v1/sessions/end` (`store_session_boundary` server-side).
 - Weekly consolidation cron (`MIMIR_SAGA_CONSOLIDATE_CRON`) wired into `mimir/scheduler.py` as a non-LLM job — direct POST `/v1/consolidate`.
 - Turn logger writes `saga_session_id` and `saga_atom_ids` to every TurnRecord (§10.2) so the synthesis turn can filter the window exactly.
@@ -1537,7 +1534,7 @@ Channel-specific config (Bluesky/Slack) is live (both bridges implemented post-P
 - `BenchBridge` (stdout for the benchmark adapter) — minimum viable, unblocks Phase 7.
 - `WebUIBridge` (aiohttp routes for `/chat`, SSE push) — primary manual-testing surface.
 - `DiscordBridge` ported from `open_strix/discord.py` — proof-of-concept for the in-process bridge pattern (chunking, attachments, history refresh).
-- `SlackBridge` and `BlueskyBridge` — registered but stubbed (`raise NotImplementedError` on send/react with `bridge_stub` events.jsonl entry); real implementations as a stretch.
+- `SlackBridge` and `DiscordBridge` are fully implemented (socket-mode / `discord.py`). There is no Bluesky bridge — Bluesky posting runs through the `social-cli` optional skill poller.
 - `send_message` + `react` channel-aware dispatch through the registry.
 - Loop-detection circuit breaker — verbatim port from `open_strix/tools.py:282-453`.
 - `pollers` skill ported verbatim into `mimir/skills/pollers/` (subprocess pollers from §7.2.2). Scheduler discovers `pollers.json`.
@@ -1580,7 +1577,7 @@ Total: ~15.5 working days for a first benchmarkable build (Phase 4 expanded by 0
 
 ## 16. Open questions / deferred decisions
 
-1. **Slack and Bluesky bridge implementations.** Slack and Discord bridges are live (production). Bluesky bridge is implemented. Per-channel rate-limit granularity (beyond the within-turn circuit breaker at §7.2.4) is still deferred.
+1. **Bridge implementations.** Slack, Discord, and Web bridges are live (production). Bluesky is the `social-cli` optional skill poller (no in-process bridge). Per-channel rate-limit granularity (beyond the within-turn circuit breaker at §7.2.4) is still deferred.
 2. **Embedder upgrade path.** Likely target: `text-embedding-3-large` or a stronger open model. Decision deferred; v1 ships fastembed bge-small. Voyage AI embeddings explored as alternative (see `memory/issues/voyage-embedding-input-type-required.md`).
 3. **SAGA auto-store cadence.** SAGA's own atom extractor decides when to store from message content; mimir doesn't impose a separate cadence. Revisit if extraction is too noisy.
 4. **Subagent recursion.** [Resolved: changed post-deepagents migration] The `Agent` SDK tool is no longer the subagent mechanism. `spawn_claude_code` (§4.3) spawns an out-of-process Claude Code subprocess — recursion is possible (a subagent can itself call `spawn_claude_code`) but budget-gated. The original SDK-level "cannot spawn subagents" restriction no longer applies.

@@ -222,9 +222,9 @@ exit 0
 
 Hook is shipped in the container image (`docker/post-create.sh` copies
 it to `.git/hooks/` after `git init`), so it can't be bypassed by an
-agent that loses access to the source. A failed hook surfaces as an
-algedonic `git_commit_secret_scan_blocked` event with the matched
-pattern — the next turn sees it and self-corrects.
+agent that loses access to the source. A failed hook surfaces as a
+`git_commit_failed` event (`stage=commit`) whose stderr carries the matched
+pattern — the next turn sees it via the algedonic feedback block and self-corrects.
 
 ## Post-turn commit hook contract
 
@@ -323,8 +323,8 @@ Contract guarantees:
   to the next turn's prompt as a negative signal. Local commits stand;
   the next successful debounced push catches up.
 - **Pre-commit hook refusal is logged + continues.** We log
-  `git_commit_secret_scan_blocked` and the change stays staged for
-  operator inspection. We do NOT schedule a push for a refused commit.
+  `git_commit_failed` (`stage=commit`, the hook's stderr in the reason) and the
+  change stays staged for operator inspection. We do NOT schedule a push for a refused commit.
 - **All git invocations go through `_git()`,** which wraps
   `subprocess.run` with `cwd=/mimir-home`, `timeout=10` per call (push
   uses a different outer timeout), and returns stdout/stderr structured.
@@ -533,7 +533,7 @@ One-shot operator script:
 | 4 | Corrupted `.git` directory | `git fsck` fails on commit | Algedonic `git_repo_corrupted`; agent stops auto-commit, surfaces to operator. Recovery: re-clone from remote into a side dir, swap. |
 | 5 | Network outage during pull-on-start | `git fetch` fails on container start | `mimir setup` proceeds without pull (volume is authoritative locally); first successful turn-end push reconciles. |
 | 6 | Network outage during commit-on-turn | `git push` times out (30s) | Logged `git_push_failed`. Local commit stands; next successful push catches up. |
-| 7 | Pre-commit hook false-positive (legitimate content matches a secret pattern) | `git_commit_secret_scan_blocked` algedonic | Agent reads the matched pattern from the event, surfaces to operator. Operator either tunes the pattern or commits manually with `--no-verify` after audit. |
+| 7 | Pre-commit hook false-positive (legitimate content matches a secret pattern) | `git_commit_failed` (`stage=commit`) algedonic | Agent reads the matched pattern from the event's stderr, surfaces to operator. Operator either tunes the pattern or commits manually with `--no-verify` after audit. |
 | 8 | Volume corruption (overlay2 disk-full, ext4 fsck failure) | Volume mount fails on container start | Out of scope for git layer; same recovery story as today (recreate volume, restore from host snapshot). |
 | 9 | Operator-side force-push rewrites history | `git pull --ff-only` rejects on next start | `git_pull_blocked` algedonic. Operator manually resolves: either reset the container's local branch to match remote, or push container's commits. |
 | 10 | Auto-commit produces noise (1000 trivial commits/day) | Repo growth + log review | v1: accept the noise as audit value. v2: introduce empty-diff suppression already (`git status --porcelain` empty-check), add commit-coalescing if >5 commits within 60s. |

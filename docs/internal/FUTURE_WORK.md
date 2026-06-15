@@ -2,9 +2,11 @@
 
 **Status:** living document
 **Owner:** jcarreira
-**Last updated:** 2026-04-26
+**Last updated:** 2026-06-15
 
 This is the backlog: improvements identified during design, build, and benchmarking that aren't blocking the current architecture but should be addressed before serious production deployment or as the system scales.
+
+> **Shipped-since-last-refresh (2026-06-15):** several items below have landed and are listed here only for their rationale (per the Maintenance note, §11). Treat these as **done**, not future: **§2.2** git audit/rollback (`mimir/git_tracking.py`), **§12.1** feedforward `## Upcoming` (`mimir/upcoming.py`), **§12.2** applied-proposals audit (`mimir/reflection/applied_audit.py` + scheduler job), **§12.3** skill-outcome tracking (`mimir/skill_outcomes.py`), **§12.4** S3–S4 homeostat (`mimir/budget.py`), **§12.5** subagent VSM frontmatter (`mimir/subagent_defs.py::parse_vsm_config`), **§12.6a/b** VSM loop tags + `mimir loops` (`mimir/loop_inventory.py`, `mimir/loops_cmd.py`). Verify against current code before treating any *other* item as unimplemented.
 
 Items are organized by area, not priority. Where an item has a likely sequence with another, the dependency is noted.
 
