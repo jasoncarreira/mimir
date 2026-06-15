@@ -53,6 +53,17 @@ def _retry_with_backoff(fn, max_retries=3, base_delay=1.0):
 class EmbeddingProvider:
     """Base class for embedding providers."""
 
+    #: Logical provider label for embedding-row provenance (#493). Set per
+    #: subclass so callers read the TRUE provider off the live instance —
+    #: which, after the keyless fallback, may differ from configured.
+    provider_name: str = "unknown"
+
+    @property
+    def model_id(self) -> str:
+        """Logical model name for provenance. Subclasses store it as
+        ``model`` (API providers) or ``model_name`` (local/onnx)."""
+        return getattr(self, "model", None) or getattr(self, "model_name", None) or "unknown"
+
     def embed(self, text: str, input_type: str = "passage") -> list[float]:
         raise NotImplementedError
 
@@ -82,6 +93,8 @@ class OpenAIProvider(EmbeddingProvider):
     ``"query"`` / ``"passage"`` (a historical holdover). The mapping is
     one-way: ``passage → document``, ``query → query``.
     """
+
+    provider_name = "openai"
 
     def __init__(self):
         self.url = _cfg('embedding', 'url', 'https://api.openai.com/v1/embeddings')
@@ -137,6 +150,8 @@ class OpenAIProvider(EmbeddingProvider):
 class LocalProvider(EmbeddingProvider):
     """Local sentence-transformers provider. No API key needed."""
 
+    provider_name = "local"
+
     def __init__(self):
         self.model_name = _cfg('embedding', 'model', 'all-MiniLM-L6-v2')
         self.max_chars = _cfg('embedding', 'max_input_chars', 2000)
@@ -178,6 +193,8 @@ class ONNXProvider(EmbeddingProvider):
     custom mean-pool. Functionally equivalent; this is just a runtime
     wrapper swap.
     """
+
+    provider_name = "onnx"
 
     def __init__(self, model_name: Optional[str] = None, dimensions: Optional[int] = None):
         # Overrides for the API-key-fallback path: the configured
@@ -259,6 +276,8 @@ class VoyageProvider(OpenAIProvider):
     block in saga.toml. The defaults exist so a minimal config
     (``provider = "voyage"`` alone) just works.
     """
+
+    provider_name = "voyage"
 
     def __init__(self):
         # Reuse OpenAIProvider's __init__ via super(), then patch the

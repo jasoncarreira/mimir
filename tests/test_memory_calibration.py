@@ -198,3 +198,36 @@ def test_re_embed_target_provider_override(tmp_path: Path,
     ).fetchone()[0]
     assert provider == "onnx"
     conn.close()
+
+
+def test_re_embed_stamps_live_provider_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#695 (extends #493): the bulk re-embed must stamp provider/model from the
+    LIVE provider, not config — a configured-voyage run that fell back to ONNX
+    must not write provider='voyage' / model='voyage-4-lite' rows over the ONNX
+    vectors it actually produced."""
+    stub = _StubProvider(dim=3)
+    stub.provider_name = "onnx"  # live provider after the keyless fallback
+    stub.model_id = "BAAI/bge-small-en-v1.5"
+    monkeypatch.setattr("mimir.saga.calibration.get_provider", lambda: stub)
+
+    def _cfg(section, key, default=None):
+        return {
+            ("embedding", "max_input_chars"): 2000,
+            ("embedding", "provider"): "voyage",       # configured (not live)
+            ("embedding", "model"): "voyage-4-lite",
+        }.get((section, key), default)
+
+    monkeypatch.setattr("mimir.saga.calibration.get_config", lambda: _cfg)
+
+    db = tmp_path / "saga.db"
+    _seed_db(db, [("atom1", "alpha content", 0)])
+    from mimir.saga.calibration import re_embed
+    re_embed(db, dry_run=False)
+
+    conn = sqlite3.connect(str(db))
+    row = conn.execute("SELECT provider, model FROM embeddings").fetchone()
+    conn.close()
+    # Live provider/model, NOT the configured voyage values.
+    assert row == ("onnx", "BAAI/bge-small-en-v1.5")
