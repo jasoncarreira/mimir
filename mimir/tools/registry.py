@@ -102,6 +102,11 @@ _STATE: dict[str, Any] = {
     "scheduler": None,
     "commitments_store": None,
     "spawn_config": None,
+    # Slice-3 Worklink autonomy (#444): the HomeostaticArbiter so the in-turn
+    # ``worklink_run`` tool can shed autonomous dispatch under TIGHT. Injected by
+    # server.py from ``agent._arbiter``; the operator CLI path never sets it, so
+    # ``mimir worklink run`` is uncapped/un-gated by design.
+    "arbiter": None,
     # chainlink #392: the old "current_channel_id" key was dead — the per-turn
     # channel lives in the _current_channel_id_var ContextVar (set via
     # set_current_channel_id). Removed so nothing reads a never-written key.
@@ -126,6 +131,12 @@ def set_commitments_store(store: Any) -> None:
 
 def set_spawn_config(config: Any) -> None:
     _STATE["spawn_config"] = config
+
+
+def set_arbiter(arbiter: Any) -> None:
+    """Inject the HomeostaticArbiter so ``worklink_run`` can gate autonomous
+    dispatch (#444). Set by server.py from the agent's arbiter."""
+    _STATE["arbiter"] = arbiter
 
 
 def set_current_channel_id(channel_id: str | None) -> contextvars.Token:
@@ -1421,6 +1432,103 @@ async def request_mimir_update(
 # Convenience: assemble all tools for the deepagent factory
 # ────────────────────────────────────────────────────────────────────
 
+@tool
+async def worklink_run(
+    issue_id: int,
+    backend: Optional[str] = None,
+    config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
+) -> str:
+    """Dispatch a Worklink job for a ready Chainlink leaf issue, from this turn.
+
+    Claims the issue, runs the configured coding backend in an isolated git
+    worktree, validates observed evidence (diff + tests), and transitions the
+    issue label — all via the deterministic core executor (the same path as
+    ``mimir worklink run``; this tool never re-implements claim/evidence).
+
+    Autonomous-dispatch guards apply here but NOT to the operator CLI:
+      * Sheds under resource pressure — if the HomeostaticArbiter says the
+        worklink priority can't fire (e.g. severity TIGHT), the dispatch is
+        refused and you should try later. Use ``mimir worklink run`` to force.
+      * Respects the concurrent-claim cap (``defaults.max_concurrent`` in
+        worklink.yaml, default 2) across all in-flight Worklink workers.
+
+    Note: a leaf run is synchronous and can take minutes — pick small,
+    well-scoped ready leaves. Per-issue exclusivity is guaranteed by the
+    Chainlink lock, so this never collides with another worker on the same issue.
+
+    Args:
+        issue_id: Chainlink issue id — must be a worklink-ready leaf.
+        backend: Optional backend-name override (else worklink.yaml routing).
+    """
+    home_env = os.environ.get("MIMIR_HOME")
+    if not home_env:
+        return "worklink_run failed: MIMIR_HOME not set"
+    home = Path(home_env)
+
+    from ..worklink.autonomy import check_concurrency, worklink_priority, worklink_repo
+
+    # Honor the documented WORKLINK_REPO (MIMIR_WORKLINK_REPO compat); never
+    # silently run the executor against the server process cwd.
+    repo = Path(worklink_repo())
+
+    # 1) Arbiter gate (cheap, in-process): shed autonomous dispatch under
+    #    pressure. The CLI path never injects an arbiter, so it bypasses this.
+    arbiter = _STATE.get("arbiter")
+    if arbiter is not None:
+        try:
+            priority = worklink_priority(home)
+        except Exception:
+            priority = "normal"
+        try:
+            decision = arbiter.should_fire(priority=priority)
+        except Exception as exc:  # never let arbiter errors block dispatch silently
+            log.warning("worklink_run arbiter check failed: %s", exc)
+            decision = None
+        if decision is not None and not decision.fire:
+            return (
+                f"worklink_run shed: resource pressure {decision.severity.name} "
+                f"(priority={decision.priority}) — {decision.reason}. "
+                "Try again later, or run `mimir worklink run` to force."
+            )
+
+    # 2) Concurrency cap (chainlink query): bound total in-flight workers.
+    try:
+        cc = check_concurrency(home)
+    except Exception as exc:
+        return f"worklink_run failed: concurrency check error: {exc}"
+    if not cc.allowed:
+        return f"worklink_run skipped: {cc.reason} — try again when a slot frees."
+
+    # 3) Dispatch via the deterministic core executor. ``run_worklink`` is
+    #    synchronous (and opens its own event loop), so run it off the agent's
+    #    loop in a worker thread.
+    from ..worklink.orchestrator import run_worklink
+
+    try:
+        result = await asyncio.to_thread(
+            run_worklink,
+            home=home,
+            repo=repo,
+            issue_id=int(issue_id),
+            backend=backend,
+        )
+    except Exception as exc:
+        return f"worklink_run failed: {exc}"
+
+    parts = [f"worklink_run #{result.issue_id}: {result.status}"]
+    if result.attempt is not None:
+        parts.append(f"attempt={result.attempt}")
+    if result.review_ready:
+        parts.append("review-ready")
+    if result.pr_url:
+        parts.append(f"PR {result.pr_url}")
+    if result.evidence_path:
+        parts.append(f"evidence={result.evidence_path}")
+    if result.reason:
+        parts.append(f"reason={result.reason}")
+    return " ".join(parts)
+
+
 def all_mimir_tools() -> list:
     """Return the full mimir tool surface for create_deep_agent.
 
@@ -1489,6 +1597,9 @@ def all_mimir_tools() -> list:
         # Commitments
         commitment_complete, commitment_snooze,
         commitment_dismiss, commitment_list,
+        # Worklink in-turn dispatch (#444). Core tool (no skill mechanism);
+        # arbiter- + cap-gated autonomous dispatch to the deterministic executor.
+        worklink_run,
         # Mimir-package self-update (operator-approved, applied on
         # next restart). See mimir/update_on_start.py.
         request_mimir_update,

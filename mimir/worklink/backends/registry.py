@@ -32,6 +32,14 @@ class WorklinkDefaults:
     # it at a long-running integration/feature branch to stack Worklink leaves
     # there instead of opening every PR straight against main.
     base_branch: str = "main"
+    # Slice-3 autonomy. ``max_concurrent`` caps how many leaves may be
+    # claimed (``worklink:in-progress``) at once across autonomous dispatch
+    # (poller + tool); the operator CLI is not capped. ``reaper_ttl_s`` is
+    # how long a claim may sit without a heartbeat before the TTL reaper
+    # steals it back to ready/blocked — kept well above ``timeout_s`` so a
+    # legitimately-running worker is never reaped out from under itself.
+    max_concurrent: int = 2
+    reaper_ttl_s: int = 7200
 
 
 @dataclass(frozen=True)
@@ -104,6 +112,8 @@ class WorklinkConfig:
                 )
             ),
             base_branch=str(defaults_data.get("base_branch", "main")),
+            max_concurrent=int(defaults_data.get("max_concurrent", 2)),
+            reaper_ttl_s=int(defaults_data.get("reaper_ttl_s", 7200)),
         )
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
         tool_pins = _parse_tool_pins(data.get("tool_pins") or [])

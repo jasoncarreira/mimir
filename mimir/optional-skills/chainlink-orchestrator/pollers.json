@@ -1,0 +1,20 @@
+{
+  "pollers": [
+    {
+      "name": "worklink-ready-queue",
+      "command": "python3 poller.py",
+      "cron": "*/10 * * * *",
+      "priority": "normal",
+      "env_required": [
+        "WORKLINK_REPO"
+      ],
+      "pass_env": [
+        "MIMIR_HOME",
+        "CHAINLINK_BIN",
+        "WORKLINK_RUN_BIN",
+        "WORKLINK_REPO",
+        "WORKLINK_MAX_CONCURRENT"
+      ]
+    }
+  ]
+}

@@ -109,7 +109,8 @@ Rules:
 ## 2.5 Planner contract (slice 2)
 
 The planner/decomposer is an LLM turn, but its output is still constrained to
-Chainlink mutations. Use the bundled `chainlink-orchestrator` skill and the
+Chainlink mutations. Use the opt-in `chainlink-orchestrator` skill (install with
+`mimir skills install chainlink-orchestrator`) and the
 operator-tunable `prompts/decompose.md` prompt to turn a parent issue into leaf
 subissues. The canonical leaf-description template is
 `mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN`; the planner prompt and skill
@@ -779,7 +780,9 @@ defaults:
   backend: codex
   compute_backend: local_subprocess # WHERE the backend runs: local_subprocess | docker-sibling | ecs-runtask
   timeout_s: 1800
-  priority: normal          # arbiter priority for autonomous dispatch
+  priority: normal          # arbiter priority for autonomous dispatch (low|normal|high)
+  max_concurrent: 2         # cap on concurrent autonomous claims (poller + tool); CLI uncapped
+  reaper_ttl_s: 7200        # claim age (no heartbeat) before the TTL reaper steals it back
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
 
 routes:                     # first match wins
@@ -855,11 +858,18 @@ tool_pins:
    issue (an adversarial-review LOW is a good guinea pig).
 3. **Slice 2 — planner.** `prompts/decompose.md` +
    `chainlink-orchestrator` skill + executor template-refusal test.
-4. **Slice 3 — autonomy.** Ready-queue poller, multi-claim concurrency,
-   TTL reaper, arbiter gating, `worklink_run` tool. Gated on an isolation
-   posture (see the trust model) — the `ComputeBackend` axis (#454) and/or the
-   verified in-container seccomp profile (#452). Autonomous `local-subprocess`
-   requires the explicit accept-the-risk opt-in.
+4. **Slice 3 — autonomy (#444, shipped).** Ready-queue poller
+   (`chainlink-orchestrator` skill `pollers.json`/`poller.py`, `priority: normal`
+   so the scheduler sheds it under TIGHT; dispatches detached `mimir worklink
+   run` up to `defaults.max_concurrent`, default 2), `worklink_run` core tool
+   (arbiter-gated via `HomeostaticArbiter.should_fire` + cap; operator CLI
+   bypasses both), and a TTL reaper scheduler callable (`worklink-reaper`,
+   opt-in via `MIMIR_WORKLINK_REAPER_CRON`) that recovers stale claims using
+   `defaults.reaper_ttl_s`. Per-issue exclusivity stays guaranteed by the
+   Chainlink lock. Gated on an isolation posture (see the trust model) — the
+   `ComputeBackend` axis (#454) and/or the verified in-container seccomp profile
+   (#452). Autonomous `local-subprocess` requires the explicit accept-the-risk
+   opt-in.
 5. **Slice 4 — second adapter.** `claude_cli`, proving mechanical
    addition.
 6. **Slice 5 — tool pins.** Inventory + drift poller + bump-issue

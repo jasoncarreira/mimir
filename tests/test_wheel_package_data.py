@@ -50,7 +50,9 @@ CRITICAL_RUNTIME_DATA = (
     "mimir/skills/tmux/scripts/find-sessions.sh",  # tmux skill support scripts
     "mimir/skills/tmux/scripts/wait-for-text.sh",
     "mimir/skills/chainlink/dockerfile.fragment",  # chainlink scaffold fragment
-    "mimir/skills/chainlink-orchestrator/SKILL.md",  # Worklink planner skill
+    "mimir/optional-skills/chainlink-orchestrator/SKILL.md",  # Worklink planner skill (opt-in)
+    "mimir/optional-skills/chainlink-orchestrator/poller.py",  # ready-queue poller (#444)
+    "mimir/optional-skills/chainlink-orchestrator/pollers.json",
 )
 
 

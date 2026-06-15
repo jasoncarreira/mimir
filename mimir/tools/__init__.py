@@ -36,6 +36,7 @@ from .registry import (
     reload_pollers,
     remove_schedule,
     send_message,
+    set_arbiter,
     set_channel_registry,
     set_commitments_store,
     set_current_channel_id,
@@ -44,6 +45,7 @@ from .registry import (
     set_spawn_config,
     spawn_claude_code,
     spawn_codex,
+    worklink_run,
 )
 from .web import (
     fetch_url,
@@ -124,6 +126,9 @@ __all__ = [
     "set_commitments_store",
     "set_spawn_config",
     "set_current_channel_id",
+    "set_arbiter",
+    # Worklink in-turn dispatch (#444)
+    "worklink_run",
     # Aggregate
     "all_mimir_tools",
 ]

@@ -1110,7 +1110,7 @@ def test_skill_embeds_single_leaf_template_constant() -> None:
     from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
 
     root = Path(__file__).parent.parent
-    skill = (root / "mimir" / "skills" / "chainlink-orchestrator" / "SKILL.md").read_text(
+    skill = (root / "mimir" / "optional-skills" / "chainlink-orchestrator" / "SKILL.md").read_text(
         encoding="utf-8"
     )
 
