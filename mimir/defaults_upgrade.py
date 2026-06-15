@@ -32,6 +32,7 @@ from .proposals import (
     finalize_proposal,
     list_open_proposals,
     open_proposal,
+    _ensure_scratch_ignored,
 )
 
 log = logging.getLogger(__name__)
@@ -158,8 +159,13 @@ def _prepare_vendor_worktree(home: Path, branch: str) -> tuple[Path | None, str 
 
     The vendor rewrite happens in ``scratch/defaults-vendor`` rather than the
     live home checkout so the operation never deletes or dirties runtime state
-    files while constructing the defaults-only tree.
+    files while constructing the defaults-only tree. Ensure ``scratch/`` is
+    ignored before creating the worktree so a later home-level ``git add -A``
+    cannot capture the embedded repository even if startup ordering changes.
     """
+    ignore_err = _ensure_scratch_ignored(home)
+    if ignore_err:
+        return None, ignore_err
     _git(["worktree", "prune"], cwd=home)
     wt = home / VENDOR_WORKTREE_REL
     if wt.exists():
