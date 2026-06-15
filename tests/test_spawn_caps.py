@@ -14,6 +14,9 @@ import pytest
 from mimir.tools.registry import (
     _SPAWN_DEPTH_ENV,
     _SPAWN_GUARD,
+    _spawn_acquire_rate_slot,
+    _spawn_guard_init,
+    _spawn_release_rate_slot,
     _spawn_reset_for_tests,
     set_spawn_config,
     spawn_claude_code,
@@ -198,6 +201,39 @@ async def test_rate_cap_refuses_after_threshold(
     msg = await spawn_claude_code.ainvoke({"prompt": "call-4"})
     assert "per-hour cap" in msg
     assert "3/h" in msg
+
+
+@pytest.mark.asyncio
+async def test_rate_slot_release_removes_this_spawn_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Abort cleanup must release the slot reserved by this spawn, not
+    blindly pop the newest slot that may belong to a concurrent spawn."""
+    set_spawn_config({"default_cwd": tmp_path})
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_PER_HOUR", "10")
+
+    from mimir.tools import registry
+
+    ticks = iter([1000.0, 1001.0])
+
+    def _fake_monotonic() -> float:
+        return next(ticks, 1001.0)
+
+    monkeypatch.setattr(registry.time, "monotonic", _fake_monotonic)
+
+    guard = _spawn_guard_init()
+    token_a, err_a = await _spawn_acquire_rate_slot(guard)
+    token_b, err_b = await _spawn_acquire_rate_slot(guard)
+
+    assert err_a is None
+    assert err_b is None
+    assert list(_SPAWN_GUARD.recent) == [1000.0, 1001.0]
+
+    await _spawn_release_rate_slot(guard, token_a)
+    assert list(_SPAWN_GUARD.recent) == [1001.0]
+
+    await _spawn_release_rate_slot(guard, token_b)
+    assert list(_SPAWN_GUARD.recent) == []
 
 
 # ─── concurrency semaphore ──────────────────────────────────────────────
