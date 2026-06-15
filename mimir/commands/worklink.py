@@ -52,6 +52,18 @@ def add_argparse(
             "(overrides worklink.yaml defaults.base_branch; default: main)."
         ),
     )
+    run_p.add_argument(
+        "--autonomous",
+        action="store_true",
+        help=(
+            "Mark this an autonomous dispatch (set by the ready-queue poller). "
+            "Enforces the compute-backend autonomy policy: refuses the "
+            "unsandboxed local_subprocess substrate unless "
+            "defaults.allow_autonomous_local_subprocess is set. Omit for "
+            "operator-invoked runs — they always proceed (accept-the-risk; the "
+            "local_subprocess backend runs with full container filesystem access)."
+        ),
+    )
 
     worker_p = worklink_sub.add_parser("worker", help="Run one portable Worklink worker payload.")
     worker_p.add_argument("payload", type=Path, nargs="?", help="Path to worker payload JSON.")
@@ -148,6 +160,7 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             dry_run=args.dry_run,
             test_command=args.test_command,
             base_branch=args.base,
+            autonomous=args.autonomous,
         )
     except LeafValidationError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -158,6 +171,12 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     if result.dry_run:
         return 0
+    if result.status == "refused":
+        # Autonomy policy declined this run (e.g. unsandboxed compute without
+        # opt-in). Not a failure of the work — surface the reason and exit 1 so
+        # an autonomous caller treats it as "did not run".
+        print(f"worklink #{result.issue_id}: refused — {result.reason}", file=sys.stderr)
+        return 1
     print(
         f"worklink #{result.issue_id} attempt {result.attempt}: {result.status}"
         + (" review-ready" if result.review_ready else "")

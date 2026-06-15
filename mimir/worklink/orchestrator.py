@@ -147,6 +147,7 @@ class WorklinkRunner:
         dry_run: bool = False,
         test_command: str | None = None,
         base_branch: str | None = None,
+        autonomous: bool = False,
     ) -> WorklinkRunResult:
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
@@ -191,6 +192,21 @@ class WorklinkRunner:
             print(_format_work_order(order, backend=selected_name))
             print(f"\nBase branch: {base} (worktree cut from it; PR targets it)")
             return WorklinkRunResult(issue.issue_id, None, "dry_run", dry_run=True)
+
+        # Autonomy safety gate (#460): autonomous dispatch (poller / worklink_run
+        # tool, which pass autonomous=True) refuses an unsandboxed compute
+        # substrate unless the operator opted in. Decided here in core, before
+        # any claim/mutation, so the posture can't be bypassed by a caller. The
+        # operator CLI passes autonomous=False and is never gated.
+        if autonomous:
+            allowed, reason = config.autonomous_compute_allowed(compute.name)
+            if not allowed:
+                _log_event(
+                    "worklink_autonomous_refused",
+                    issue_id=issue.issue_id,
+                    compute_backend=compute.name,
+                )
+                return WorklinkRunResult(issue.issue_id, None, "refused", reason=reason)
 
         claims = ChainlinkClaims(
             chainlink_bin=self.chainlink_bin,
@@ -419,6 +435,7 @@ def run_worklink(
     dry_run: bool = False,
     test_command: str | None = None,
     base_branch: str | None = None,
+    autonomous: bool = False,
 ) -> WorklinkRunResult:
     return asyncio.run(
         WorklinkRunner(home=home, repo=repo).run(
@@ -427,6 +444,7 @@ def run_worklink(
             dry_run=dry_run,
             test_command=test_command,
             base_branch=base_branch,
+            autonomous=autonomous,
         )
     )
 
