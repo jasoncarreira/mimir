@@ -1959,6 +1959,51 @@ class Scheduler:
             coalesce=True,
         )
 
+    # ---- Worklink TTL reaper cron (slice-3 autonomy, #444) -----------
+
+    def add_worklink_reaper_job(
+        self,
+        home: Path,
+        cron_expr: str = "",
+        *,
+        job_id: str = "worklink-reaper",
+    ) -> bool:
+        """Register the Worklink stale-claim TTL reaper.
+
+        Recovers leaves whose worker died: any ``worklink:in-progress`` claim
+        with no heartbeat past ``defaults.reaper_ttl_s`` is stolen back to
+        ``worklink:ready`` (or ``worklink:blocked`` once attempts are spent) so
+        the ready queue can re-dispatch it. Delegates discovery + staleness to
+        the tested :func:`mimir.worklink.autonomy.reap_stale_claims_for_home`,
+        which runs ``chainlink`` subprocesses — so the body hops to a worker
+        thread to keep the event loop free.
+
+        Default cron is **empty** → no job is installed unless an operator opts
+        in (``MIMIR_WORKLINK_REAPER_CRON`` env or a ``callable: worklink-reaper``
+        scheduler.yaml entry). Worklink is opt-in per home; non-Worklink
+        deployments install nothing.
+        """
+        from .worklink.autonomy import reap_stale_claims_for_home
+
+        async def _fire() -> None:
+            reaped = await asyncio.to_thread(reap_stale_claims_for_home, home)
+            if reaped:
+                await log_event(
+                    "worklink_claims_reaped",
+                    count=len(reaped),
+                    issue_ids=[record.issue_id for record in reaped],
+                )
+
+        return self.register_callable(
+            name=job_id,
+            fn=_fire,
+            default_cron=cron_expr,
+            job_id=job_id,
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # ---- Index-integrity cron ----------------------------------------
 
     def add_index_integrity_job(

@@ -475,6 +475,11 @@ def build_app(config: Config) -> web.Application:
     _agent_tools.set_channel_registry(channels)
     _agent_tools.set_dispatcher(dispatcher)
     _agent_tools.set_scheduler(scheduler)
+    # Worklink slice-3 (#444): give the in-turn ``worklink_run`` tool the
+    # HomeostaticArbiter so autonomous dispatch sheds under resource pressure
+    # (TIGHT). The operator CLI never sets this, so ``mimir worklink run``
+    # stays un-gated by design.
+    _agent_tools.set_arbiter(agent._arbiter)
     # Register the process's MessageBuffer globally so the
     # ``send_message`` tool can append outbound replies. Restored
     # after PR #181 (deepagents migration) lost the inline
@@ -785,6 +790,18 @@ def build_app(config: Config) -> web.Application:
             scheduler.add_index_integrity_job(home=config.home)
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc), job="index-integrity")
+
+        # Register the Worklink stale-claim TTL reaper (#444). Opt-in:
+        # MIMIR_WORKLINK_REAPER_CRON empty -> no job installed (non-Worklink
+        # homes register nothing). Recovers leaves whose worker died back to
+        # the ready queue. Detection/recovery-only; bad cron logs and continues.
+        try:
+            scheduler.add_worklink_reaper_job(
+                home=config.home,
+                cron_expr=os.environ.get("MIMIR_WORKLINK_REAPER_CRON", ""),
+            )
+        except ValueError as exc:
+            await log_event("scheduler_invalid_cron", error=str(exc), job="worklink-reaper")
 
         # Register the weekly viability report (SPEC §16 follow-up
         # from the 2026-05-23 VSM eval — collapse detection + curation

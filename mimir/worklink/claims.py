@@ -85,6 +85,17 @@ def claim_records_from_comments(comments: Iterable[str]) -> list[ClaimRecord]:
     return records
 
 
+def _claim_is_newer(candidate: ClaimRecord, current: ClaimRecord) -> bool:
+    """True when ``candidate`` supersedes ``current`` for the same issue:
+    a higher attempt, or the same attempt with a later claim/heartbeat
+    anchor (the record the reaper should judge for staleness)."""
+    if candidate.attempt != current.attempt:
+        return candidate.attempt > current.attempt
+    cand_anchor = candidate.heartbeat_at or candidate.claimed_at
+    cur_anchor = current.heartbeat_at or current.claimed_at
+    return cand_anchor > cur_anchor
+
+
 class ChainlinkClaims:
     """Small wrapper around the Chainlink CLI claim/label/comment protocol."""
 
@@ -203,6 +214,75 @@ class ChainlinkClaims:
             )
             reaped.append(record)
         return reaped
+
+    # ---- Discovery / concurrency (slice-3 autonomy) ------------------
+
+    def issue_ids_with_label(self, label: str, *, status: str = "open") -> list[int]:
+        """Return open issue ids carrying ``label`` (best-effort; [] on error).
+
+        Used for ready-queue discovery (``worklink:ready``) and the
+        concurrent-claim cap (``worklink:in-progress``).
+        """
+        result = self._run(
+            "issue", "list", "--label", label, "--status", status, "--json",
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+        try:
+            data = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            return []
+        issues = data if isinstance(data, list) else data.get("issues", [])
+        ids: list[int] = []
+        for item in issues:
+            if not isinstance(item, dict):
+                continue
+            raw = item.get("id", item.get("number"))
+            try:
+                ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        return ids
+
+    def active_claim_count(self) -> int:
+        """Count issues currently labeled ``worklink:in-progress`` — the
+        live worker count the concurrency cap is enforced against."""
+        return len(self.issue_ids_with_label("worklink:in-progress"))
+
+    def _issue_comments(self, issue_id: int) -> list[str]:
+        result = self._run("issue", "show", str(issue_id), "--json", check=False)
+        if result.returncode != 0:
+            return []
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return []
+        out: list[str] = []
+        for item in payload.get("comments") or ():
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("body") or ""
+                if text:
+                    out.append(str(text))
+        return out
+
+    def reap_home(self, *, ttl: timedelta) -> list[ClaimRecord]:
+        """Discover ``worklink:in-progress`` issues, gather the latest claim
+        record per issue from their comments, and reap any stale ones.
+
+        This is the entry point the scheduler's TTL-reaper callable uses:
+        it owns the discovery so :meth:`reap_stale_claims` stays a pure,
+        records-in transform that's trivial to unit-test.
+        """
+        latest: dict[int, ClaimRecord] = {}
+        for issue_id in self.issue_ids_with_label("worklink:in-progress"):
+            for record in claim_records_from_comments(self._issue_comments(issue_id)):
+                current = latest.get(record.issue_id)
+                if current is None or _claim_is_newer(record, current):
+                    latest[record.issue_id] = record
+        return self.reap_stale_claims(latest.values(), ttl=ttl)
 
     def _attempts_exhausted(self, issue_id: int, attempts: int) -> None:
         self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)

@@ -1,0 +1,369 @@
+"""Worklink slice-3 autonomy (chainlink #444).
+
+Covers the two review criteria explicitly:
+  * a TIGHT severity window provably stops autonomous worker launches, and
+  * no path lets two workers hold the same issue (cap + lock-fail);
+plus the concurrency cap, the TTL reaper's stale-claim recovery, and the
+ready-queue poller's discovery/dispatch (cap-respecting, detached).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Sequence
+
+import pytest
+
+from mimir.worklink import autonomy
+from mimir.worklink.claims import CLAIM_PREFIX, ChainlinkClaims, ClaimRecord
+
+
+def cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+class FakeChainlink:
+    """Records chainlink invocations and answers from canned tables."""
+
+    def __init__(
+        self,
+        *,
+        in_progress: list[int] | None = None,
+        ready: list[int] | None = None,
+        comments: dict[int, list[str]] | None = None,
+        fail_steal: set[int] | None = None,
+    ) -> None:
+        self.in_progress = in_progress or []
+        self.ready = ready or []
+        self.comments = comments or {}
+        self.fail_steal = fail_steal or set()
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        args = list(args)
+        self.calls.append(args)
+        # drop the leading binary token
+        tail = args[1:]
+        if tail[:2] == ["issue", "list"]:
+            label = tail[tail.index("--label") + 1] if "--label" in tail else ""
+            ids = self.in_progress if label == "worklink:in-progress" else self.ready if label == "worklink:ready" else []
+            return cp(stdout=json.dumps([{"id": i} for i in ids]))
+        if tail[:2] == ["issue", "show"]:
+            issue_id = int(tail[2])
+            payload = {"id": issue_id, "comments": list(self.comments.get(issue_id, []))}
+            return cp(stdout=json.dumps(payload))
+        if tail[:2] == ["locks", "steal"]:
+            issue_id = int(tail[2])
+            return cp(returncode=1 if issue_id in self.fail_steal else 0)
+        # locks release/label/unlabel/comment all succeed
+        return cp()
+
+    def names(self) -> list[str]:
+        return [" ".join(c[1:4]) for c in self.calls]
+
+
+def _claim_comment(issue_id: int, *, attempt: int, age: timedelta, agent: str = "mimir-worklink") -> str:
+    claimed = datetime.now(UTC) - age
+    rec = ClaimRecord(issue_id=issue_id, attempt=attempt, agent_id=agent, claimed_at=claimed)
+    return rec.to_comment()
+
+
+# ── claims.py: discovery + cap count ────────────────────────────────
+
+
+def test_active_claim_count_reads_in_progress_label() -> None:
+    fake = FakeChainlink(in_progress=[10, 11, 12])
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    assert claims.active_claim_count() == 3
+    assert claims.issue_ids_with_label("worklink:ready") == []
+
+
+def test_issue_ids_with_label_tolerates_bad_json() -> None:
+    claims = ChainlinkClaims(agent_id="t", runner=lambda a: cp(stdout="not json"))
+    assert claims.issue_ids_with_label("worklink:ready") == []
+
+
+# ── claims.py: TTL reaper recovery ──────────────────────────────────
+
+
+def test_reap_home_recovers_stale_claim_to_ready() -> None:
+    fake = FakeChainlink(
+        in_progress=[50],
+        comments={50: [_claim_comment(50, attempt=1, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake, max_attempts=3)
+    reaped = claims.reap_home(ttl=timedelta(hours=2))
+    assert [r.issue_id for r in reaped] == [50]
+    names = fake.names()
+    assert "locks steal 50" in names
+    assert "locks release 50" in names
+    assert "issue label 50" in names  # relabelled
+    # back to ready (retries remain), not blocked
+    assert any(c[1:] == ["issue", "label", "50", "worklink:ready"] for c in fake.calls)
+    assert not any(c[1:] == ["issue", "label", "50", "worklink:blocked"] for c in fake.calls)
+
+
+def test_reap_home_blocks_when_attempts_exhausted() -> None:
+    fake = FakeChainlink(
+        in_progress=[51],
+        comments={51: [_claim_comment(51, attempt=3, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake, max_attempts=3)
+    reaped = claims.reap_home(ttl=timedelta(hours=2))
+    assert [r.issue_id for r in reaped] == [51]
+    assert any(c[1:] == ["issue", "label", "51", "worklink:blocked"] for c in fake.calls)
+
+
+def test_reap_home_leaves_fresh_claim_untouched() -> None:
+    fake = FakeChainlink(
+        in_progress=[52],
+        comments={52: [_claim_comment(52, attempt=1, age=timedelta(minutes=5))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert "locks steal 52" not in fake.names()
+
+
+def test_reap_home_uses_latest_record_per_issue() -> None:
+    # Two claim comments for the same issue; the latest (attempt 2, fresh) wins,
+    # so the stale attempt-1 record must NOT trigger a reap.
+    fake = FakeChainlink(
+        in_progress=[53],
+        comments={53: [
+            _claim_comment(53, attempt=1, age=timedelta(hours=5)),
+            _claim_comment(53, attempt=2, age=timedelta(minutes=1)),
+        ]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+
+
+# ── claims.py: per-issue exclusivity (lock fail → not claimed) ──────
+
+
+def test_claim_issue_refuses_when_lock_unavailable() -> None:
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["locks", "claim"]:
+            return cp(returncode=1, stderr="locked by other")
+        return cp()
+
+    claims = ChainlinkClaims(agent_id="t", runner=runner)
+    result = claims.claim_issue(99, comments=[])
+    assert result.claimed is False  # a second worker can never hold the same issue
+
+
+# ── autonomy.py: concurrency cap + config ───────────────────────────
+
+
+def _write_worklink_yaml(home: Path, *, max_concurrent: int = 2, priority: str = "normal", reaper_ttl_s: int = 7200) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "worklink.yaml").write_text(
+        "defaults:\n"
+        f"  priority: {priority}\n"
+        f"  max_concurrent: {max_concurrent}\n"
+        f"  reaper_ttl_s: {reaper_ttl_s}\n",
+        encoding="utf-8",
+    )
+
+
+def test_check_concurrency_allows_below_cap(tmp_path: Path) -> None:
+    _write_worklink_yaml(tmp_path, max_concurrent=2)
+    claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(in_progress=[1]))
+    check = autonomy.check_concurrency(tmp_path, claims=claims)
+    assert check.allowed and check.active == 1 and check.cap == 2
+
+
+def test_check_concurrency_blocks_at_cap(tmp_path: Path) -> None:
+    _write_worklink_yaml(tmp_path, max_concurrent=2)
+    claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(in_progress=[1, 2]))
+    check = autonomy.check_concurrency(tmp_path, claims=claims)
+    assert not check.allowed and check.active == 2 and "cap reached" in check.reason
+
+
+def test_worklink_priority_from_config(tmp_path: Path) -> None:
+    _write_worklink_yaml(tmp_path, priority="high")
+    assert autonomy.worklink_priority(tmp_path) == "high"
+
+
+def test_reap_for_home_uses_config_ttl(tmp_path: Path) -> None:
+    # reaper_ttl_s = 1h; a 3h-old claim is stale and gets reaped.
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
+    fake = FakeChainlink(
+        in_progress=[60],
+        comments={60: [_claim_comment(60, attempt=1, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
+    assert [r.issue_id for r in reaped] == [60]
+
+
+# ── worklink_run tool: arbiter shed (TIGHT) + cap + dispatch ────────
+
+
+class _FakeDecision:
+    def __init__(self, fire: bool, severity_name: str = "TIGHT", priority: str = "normal") -> None:
+        self.fire = fire
+        self.priority = priority
+        self.reason = "test"
+        self.severity = type("Sev", (), {"name": severity_name})()
+
+
+class _FakeArbiter:
+    def __init__(self, fire: bool) -> None:
+        self._fire = fire
+        self.calls: list[str] = []
+
+    def should_fire(self, *, priority: str = "normal", **_: object):
+        self.calls.append(priority)
+        return _FakeDecision(self._fire, priority=priority)
+
+
+@pytest.fixture
+def _tool_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _write_worklink_yaml(tmp_path)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    from mimir.tools import registry
+
+    dispatched: list[int] = []
+
+    def fake_run_worklink(*, home, repo, issue_id, backend=None, **_):
+        dispatched.append(issue_id)
+        return type("R", (), {
+            "issue_id": issue_id, "attempt": 1, "status": "completed",
+            "review_ready": True, "pr_url": None, "evidence_path": None, "reason": None,
+        })()
+
+    import mimir.worklink.orchestrator as orch
+    monkeypatch.setattr(orch, "run_worklink", fake_run_worklink, raising=True)
+    # keep concurrency below cap by default (0 active)
+    monkeypatch.setattr(autonomy, "check_concurrency", lambda home, **_: autonomy.ConcurrencyCheck(True, 0, 2))
+    yield registry, dispatched
+    registry.set_arbiter(None)
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_sheds_under_tight(_tool_env) -> None:
+    registry, dispatched = _tool_env
+    arbiter = _FakeArbiter(fire=False)  # severity TIGHT → should_fire False
+    registry.set_arbiter(arbiter)
+    out = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "shed" in out and "TIGHT" in out
+    assert dispatched == []          # provably no launch under TIGHT
+    assert arbiter.calls == ["normal"]
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_dispatches_when_clear(_tool_env) -> None:
+    registry, dispatched = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+    out = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "443" in out and "completed" in out
+    assert dispatched == [443]
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_skips_at_cap(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    registry, dispatched = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+    monkeypatch.setattr(autonomy, "check_concurrency", lambda home, **_: autonomy.ConcurrencyCheck(False, 2, 2))
+    out = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "skipped" in out
+    assert dispatched == []
+
+
+# ── ready-queue poller: discovery + cap-bounded detached dispatch ───
+
+
+POLLER = Path(__file__).resolve().parent.parent / "mimir" / "optional-skills" / "chainlink-orchestrator" / "poller.py"
+
+
+def _fake_chainlink_script(tmp: Path, *, ready: list[int], in_progress: list[int]) -> Path:
+    """A tiny stand-in chainlink that answers `issue list --label … --json`."""
+    script = tmp / "chainlink"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "a = sys.argv[1:]\n"
+        f"ready = {ready!r}\n"
+        f"inprog = {in_progress!r}\n"
+        "if a[:2] == ['issue','list']:\n"
+        "    label = a[a.index('--label')+1] if '--label' in a else ''\n"
+        "    ids = inprog if label=='worklink:in-progress' else ready if label=='worklink:ready' else []\n"
+        "    print(json.dumps([{'id': i} for i in ids]))\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _fake_run_bin(tmp: Path) -> Path:
+    """A run-bin that records each `worklink run <id>` dispatch to a file."""
+    record = tmp / "dispatched.txt"
+    script = tmp / "fakemimir"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"open({str(record)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
+    env = {k: v for k, v in os.environ.items() if k not in {
+        "WORKLINK_REPO", "WORKLINK_RUN_BIN", "WORKLINK_MAX_CONCURRENT", "CHAINLINK_BIN",
+    }}
+    env.update(env_extra)
+    proc = subprocess.run(
+        [sys.executable, str(POLLER)], cwd=str(tmp), env=env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    chainlink = _fake_chainlink_script(tmp_path, ready=[201, 202, 203], in_progress=[100])
+    runbin = _fake_run_bin(tmp_path)
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(home),
+        "WORKLINK_MAX_CONCURRENT": "2",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+    # cap 2, 1 already active → exactly 1 free slot → 1 dispatch
+    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert len(dispatched) == 1
+    assert dispatched[0]["issue_id"] == 201  # lowest id first
+    scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
+    assert scan["ready_count"] == 3 and scan["active"] == 1 and scan["dispatched"] == 1
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_no_dispatch_when_cap_reached(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    chainlink = _fake_chainlink_script(tmp_path, ready=[201], in_progress=[100, 101])
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_REPO": str(home),
+        "WORKLINK_MAX_CONCURRENT": "2",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+    assert not [e for e in events if e.get("signal") == "worklink_dispatched"]
+    scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
+    assert scan["slots"] == 0

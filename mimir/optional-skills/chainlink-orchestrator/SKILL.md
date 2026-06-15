@@ -1,6 +1,21 @@
 ---
 name: chainlink-orchestrator
-description: Plan Worklink-ready Chainlink issue trees. Use when decomposing a parent issue into testable Worklink leaf subissues with acceptance criteria, dependency edges, and ready labels; the planner mutates Chainlink only and never executes implementation work.
+description: "The two model-touching halves of Worklink, shipped as one opt-in skill. (1) Planner: decompose a parent Chainlink issue into testable worklink:ready leaf subissues (mutates Chainlink only, never executes). (2) Ready-queue poller: discovers worklink:ready leaves and dispatches them by invoking `mimir worklink run` as a detached subprocess, up to the concurrent-claim cap — it never reimplements claim/evidence/transition. Opt-in (mimirbot yes, muninn no): `mimir skills install chainlink-orchestrator`, then set the env below to enable autonomous dispatch."
+env:
+  required:
+    - name: WORKLINK_REPO
+      description: "Absolute path to the git repo the backend works in (e.g. /workspace/mimir). The ready-queue poller skips dispatch until this is set; the planner half does not need it."
+      example: "/workspace/mimir"
+  optional:
+    - name: WORKLINK_RUN_BIN
+      description: "Command (shlex-split) the poller invokes for dispatch. Default `mimir`; set to `uv run mimir` or an absolute venv path if bare `mimir` isn't on PATH."
+      example: "uv run mimir"
+    - name: WORKLINK_MAX_CONCURRENT
+      description: "Total concurrent Worklink claims the poller allows. Default 2; keep in sync with defaults.max_concurrent in worklink.yaml."
+      example: "2"
+    - name: MIMIR_WORKLINK_REAPER_CRON
+      description: "Cron for the core TTL reaper that recovers stale claims (set in the agent env, not here). Empty = reaper disabled."
+      example: "*/30 * * * *"
 ---
 
 <!-- desc: Planner workflow for decomposing parent Chainlink issues into Worklink-ready leaf issues with a single executor-validation template. -->
@@ -101,3 +116,33 @@ chainlink issue subissue <parent-id> --description "$(cat /tmp/worklink-leaf.md)
 If adding `worklink:ready` fails because the label does not exist, create or use
 whatever project label convention the parent already established; do not proceed
 silently with an unlabeled executable leaf.
+
+## Ready-queue poller (slice 3 — autonomous dispatch)
+
+`pollers.json` + `poller.py` in this skill are the autonomous execution half.
+Once installed and configured (see frontmatter env), the scheduler runs the
+`worklink-ready-queue` poller on its cron (default every 10 min). Each fire:
+
+1. Lists `worklink:ready` leaves and counts `worklink:in-progress` claims.
+2. Computes free slots = `WORKLINK_MAX_CONCURRENT` − active (default cap 2).
+3. Launches `mimir worklink run <id>` **detached** for up to that many leaves,
+   then returns immediately (a run can take minutes; the poller's own 60s budget
+   would otherwise kill it). The detached run does the claim/evidence/transition
+   in the deterministic core executor.
+
+Safety properties (do not bypass these in the poller):
+- **Per-issue exclusivity** is guaranteed by `chainlink locks claim` *inside*
+  the run, not by the poller — a duplicate launch for the same id simply fails
+  to claim and exits.
+- **Shedding under pressure**: the poller declares `priority: normal` in
+  `pollers.json`, so the scheduler's arbiter suppresses the whole fire under
+  TIGHT (and worse). The in-turn `worklink_run` tool consults the arbiter
+  directly; the operator CLI (`mimir worklink run`) bypasses both — it always
+  proceeds.
+- **Stale recovery**: a worker that dies leaves a claim; the core TTL reaper
+  (`MIMIR_WORKLINK_REAPER_CRON`) steals it back to `worklink:ready` (or
+  `worklink:blocked` once attempts are spent).
+
+The poller never decides *what* is implementable — only the planner half (and
+the `worklink:ready` label it applies) does. The poller dispatches what's
+already marked ready.
