@@ -9,7 +9,7 @@ A memory-centric agent harness built on [deepagents](https://github.com/langchai
 mimir wraps an LLM agent loop with the surrounding apparatus a long-running
 agent needs to operate over time, across channels, and across sessions:
 persistent memory (the in-process `mimir.saga` backend), a tool-and-skill registry, scheduled
-ticks for autonomous work, message bridges (Discord / Slack / Bluesky / web /
+ticks for autonomous work, message bridges (Discord / Slack / web /
 benchmark stdout), and a feedback-loop / homeostat layer that keeps the
 agent regulated as it accumulates state.
 
@@ -29,10 +29,11 @@ The name is from Norse myth — Mímir, the keeper of memory and counsel.
 - **Scheduled work.** Cron-backed scheduler fires per-channel ticks
   (heartbeat, reflection, custom). The §12.4 homeostat suppresses
   ticks when the plan window saturates or cost-rate trips.
-- **Multi-channel bridges.** Discord, Slack, Bluesky, web chat,
+- **Multi-channel bridges.** Discord, Slack, web chat, and
   benchmark stdout. The agent has one identity across channels;
   `state/identities.yaml` resolves platform aliases to canonical
-  names.
+  names. (Social posting — e.g. Bluesky — is the `social-cli`
+  optional skill, not a bridge.)
 - **Reflection + double-loop learning.** Weekly reflection skill
   audits behavior + memory architecture, drafts proposals into
   `state/proposed-changes.md`, and (via the §12.2 applied-proposals
