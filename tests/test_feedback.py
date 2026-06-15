@@ -224,8 +224,16 @@ def test_classify_gave_up_suffix_is_negative():
     from mimir.feedback import classify, _EVENT_RULES
 
     # Suffix convention: the motivating case + the generalization to any poller.
-    assert classify("pr_review_request_gave_up") == ("negative", "gave_up")
-    assert classify("some_other_poller_gave_up") == ("negative", "gave_up")
+    # The concrete event type is the rule-kind so unrelated give-up causes do
+    # not share one arousal/escalation count bucket (chainlink #321).
+    assert classify("pr_review_request_gave_up") == (
+        "negative",
+        "pr_review_request_gave_up",
+    )
+    assert classify("some_other_poller_gave_up") == (
+        "negative",
+        "some_other_poller_gave_up",
+    )
     # Exact-match canonical rules are returned unchanged.
     assert classify("tool_call_denied") == _EVENT_RULES["tool_call_denied"]
     assert classify("algedonic_escalation") == _EVENT_RULES["algedonic_escalation"]
@@ -341,6 +349,50 @@ def test_pr_review_request_gave_up_surfaces_as_negative(tmp_path: Path):
     # repo+number target is preferred over the raw url.
     assert "jasoncarreira/mimir#511" in block
     assert "[poller:github-poller]" in block
+
+
+def test_distinct_gave_up_event_types_keep_separate_counts(tmp_path: Path):
+    """chainlink #321: suffix-classified give-up events render with the
+    existing friendly wording, but their ×N counts stay per event type rather
+    than sharing one generic ``gave_up`` bucket."""
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "timestamp": _ts(0.30),
+                "type": "poller_turn_gave_up",
+                "attempts": 3,
+                "detail": "poller:alpha",
+            },
+            {
+                "timestamp": _ts(0.20),
+                "type": "poller_turn_gave_up",
+                "attempts": 3,
+                "detail": "poller:beta",
+            },
+            {
+                "timestamp": _ts(0.10),
+                "type": "pr_review_request_gave_up",
+                "attempts": 3,
+                "repo": "jasoncarreira/mimir",
+                "number": 511,
+            },
+        ],
+    )
+
+    negatives, positives = log.recent()
+
+    assert positives == []
+    by_kind = {sig.kind: sig for sig in negatives}
+    assert by_kind["pr_review_request_gave_up"].count == 1
+    assert by_kind["poller_turn_gave_up"].count == 2
+    block = render_feedback_block(negatives, positives)
+    assert block is not None
+    assert "poller gave up on pr review request after 3 attempts" in block
+    assert "poller gave up on poller turn after 3 attempts" in block
+    assert "jasoncarreira/mimir#511" in block
+    assert "poller:beta (×2 in 24h)" in block
+    assert "pr review request after 3 attempts — jasoncarreira/mimir#511 (×3" not in block
 
 
 # ---- Channel scoping (no scoping — feedback is global) ------------------

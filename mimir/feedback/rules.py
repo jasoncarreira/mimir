@@ -386,7 +386,7 @@ def classify(evtype: object) -> tuple[Polarity, str] | None:
 
     1. Exact match in :data:`_EVENT_RULES` (the canonical table).
     2. Suffix convention — any event type ending in ``_gave_up`` is a
-       NEGATIVE ``gave_up`` signal, even without its own table entry.
+       NEGATIVE signal whose rule-kind is the concrete event type.
 
     Tier 2 lets a poller that exhausts its retry budget surface in the
     agent's algedonic block without a per-poller rule. github-poller's
@@ -396,10 +396,13 @@ def classify(evtype: object) -> tuple[Polarity, str] | None:
 
     All three feedback read-paths — algedonic ``recent()``, Alg-2 run
     detection, Alg-3 escalation counts — route their event→rule lookup
-    through here, so the convention is honoured uniformly. A ``gave_up``
-    kind isn't in any valence group, so (like the other ``poller_*``
-    negatives) it surfaces as a standalone negative algedonic signal
-    rather than as part of a paired pos/neg run.
+    through here, so the convention is honoured uniformly. Returning the
+    concrete event type (rather than a shared ``gave_up`` kind) keeps the
+    algedonic ``×N`` count and escalation bookkeeping from conflating
+    unrelated give-up causes. These concrete ``*_gave_up`` kinds are not in
+    any valence group, so (like the other ``poller_*`` negatives) they
+    surface as standalone negative algedonic signals rather than as part of
+    a paired pos/neg run.
     """
     if not isinstance(evtype, str):
         return None
@@ -407,7 +410,7 @@ def classify(evtype: object) -> tuple[Polarity, str] | None:
     if rule is not None:
         return rule
     if evtype.endswith("_gave_up"):
-        return ("negative", "gave_up")
+        return ("negative", evtype)
     return None
 
 
