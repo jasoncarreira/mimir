@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import json
 import subprocess
 from typing import Sequence
 
@@ -77,6 +78,21 @@ def test_claim_issue_enforces_max_active_locks_after_reservation() -> None:
     assert not any(call[:3] == ["chainlink", "issue", "comment"] for call in calls)
 
 
+def test_list_issue_ids_falls_back_when_id_is_null() -> None:
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["issue", "list"]:
+            return subprocess.CompletedProcess(
+                list(args),
+                0,
+                stdout=json.dumps([{"id": None, "number": 81}, {"id": "82"}]),
+                stderr="",
+            )
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="t", runner=runner)
+    assert claims.issue_ids_with_label("worklink:ready") == [81, 82]
+
+
 def test_claim_issue_blocks_when_attempts_exhausted() -> None:
     calls: list[list[str]] = []
 
@@ -104,6 +120,13 @@ def test_reaper_enforces_own_ttl_before_steal() -> None:
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
+        if list(args)[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                list(args),
+                0,
+                stdout=json.dumps({"locks": {"2": {"issue_id": 2}}}),
+                stderr="",
+            )
         return completed(args)
 
     now = datetime(2026, 6, 11, 5, tzinfo=UTC)
@@ -127,6 +150,13 @@ def test_reaper_blocks_after_max_attempts() -> None:
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
+        if list(args)[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                list(args),
+                0,
+                stdout=json.dumps({"locks": {"2": {"issue_id": 2}}}),
+                stderr="",
+            )
         return completed(args)
 
     now = datetime(2026, 6, 11, 5, tzinfo=UTC)

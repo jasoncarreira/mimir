@@ -96,6 +96,26 @@ def _claim_is_newer(candidate: ClaimRecord, current: ClaimRecord) -> bool:
     return cand_anchor > cur_anchor
 
 
+def _lock_issue_id(lock: dict[str, Any]) -> int | None:
+    for key in ("issue_id", "id", "issue"):
+        raw = lock.get(key)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _lock_owner(lock: dict[str, Any]) -> str | None:
+    for key in ("agent_id", "owner", "holder", "holder_id", "claimant"):
+        raw = lock.get(key)
+        if raw not in (None, ""):
+            return str(raw)
+    return None
+
+
 class ChainlinkClaims:
     """Small wrapper around the Chainlink CLI claim/label/comment protocol."""
 
@@ -217,8 +237,13 @@ class ChainlinkClaims:
         for record in records:
             if not record.is_stale(now, ttl):
                 continue
+            if not self._lock_still_held_by(record):
+                continue
             steal = self._run("locks", "steal", str(record.issue_id), check=False)
             if steal.returncode != 0:
+                continue
+            if not self._issue_has_label(record.issue_id, "worklink:in-progress"):
+                self._run("locks", "release", str(record.issue_id), check=False)
                 continue
             self._run("locks", "release", str(record.issue_id), check=False)
             self._run("issue", "unlabel", str(record.issue_id), "worklink:in-progress", check=False)
@@ -243,6 +268,76 @@ class ChainlinkClaims:
             )
             reaped.append(record)
         return reaped
+
+
+    def _issue_has_label(self, issue_id: int, label: str) -> bool:
+        """Best-effort current-label check for reaper race avoidance.
+
+        Reaper discovery is necessarily two-step (list in-progress, then inspect
+        comments). A worker can transition the issue to review/blocked between
+        discovery and ``locks steal``. When ``issue show --json`` exposes labels,
+        refuse to relabel anything no longer in-progress. If the label shape is
+        unavailable, preserve the prior behavior rather than disabling reaping.
+        """
+        result = self._run("issue", "show", str(issue_id), "--json", check=False)
+        if result.returncode != 0:
+            return True
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return True
+        raw_labels = data.get("labels")
+        if raw_labels is None:
+            return True
+        labels: set[str] = set()
+        if isinstance(raw_labels, list):
+            for item in raw_labels:
+                if isinstance(item, str):
+                    labels.add(item)
+                elif isinstance(item, dict):
+                    name = item.get("name") or item.get("label")
+                    if name:
+                        labels.add(str(name))
+        elif isinstance(raw_labels, dict):
+            labels.update(str(name) for name in raw_labels)
+        return label in labels
+
+    def _lock_still_held_by(self, record: ClaimRecord) -> bool:
+        """Best-effort race guard before TTL reaping.
+
+        If the original worker already released the lock during its normal
+        transition, do not steal/relabel the issue back to ready. When the lock
+        table exposes an owner/agent field, require it to match the claim record;
+        when the shape is too old to identify owners, retain the prior behavior
+        rather than disabling reaping entirely.
+        """
+        result = self._run("locks", "list", "--json", check=False)
+        if result.returncode != 0:
+            return False
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return False
+        locks = data.get("locks", data if isinstance(data, list) else {})
+        lock: Any | None = None
+        if isinstance(locks, dict):
+            lock = locks.get(str(record.issue_id))
+            if lock is None:
+                for value in locks.values():
+                    if isinstance(value, dict) and _lock_issue_id(value) == record.issue_id:
+                        lock = value
+                        break
+        elif isinstance(locks, list):
+            for value in locks:
+                if isinstance(value, dict) and _lock_issue_id(value) == record.issue_id:
+                    lock = value
+                    break
+        if lock is None:
+            return False
+        if not isinstance(lock, dict):
+            return True
+        owner = _lock_owner(lock)
+        return owner is None or owner == record.agent_id
 
     # ---- Discovery / concurrency (slice-3 autonomy) ------------------
 
@@ -272,7 +367,9 @@ class ChainlinkClaims:
         for item in issues:
             if not isinstance(item, dict):
                 continue
-            raw = item.get("id", item.get("number"))
+            raw = item.get("id")
+            if raw is None:
+                raw = item.get("number")
             try:
                 ids.append(int(raw))
             except (TypeError, ValueError):

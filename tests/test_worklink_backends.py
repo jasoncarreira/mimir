@@ -379,6 +379,20 @@ backends:
     assert config.tool_pins == ()
 
 
+def test_worklink_config_malformed_autonomy_ints_fall_back(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  max_concurrent: definitely-not-an-int
+  reaper_ttl_s: -5
+""",
+        encoding="utf-8",
+    )
+    defaults = WorklinkConfig.load(config_path).defaults
+    assert defaults.max_concurrent == 2
+    assert defaults.reaper_ttl_s == 7200
+
 def test_worklink_config_builds_docker_sibling_compute_backend(tmp_path: Path) -> None:
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(
