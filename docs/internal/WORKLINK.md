@@ -595,13 +595,85 @@ max_timeout_s: 1800
 Run it on a Unix socket the agent can reach:
 
 ```bash
-uv run mimir worklink docker-broker   --policy /etc/mimir/worklink-docker-broker.yaml   --socket /run/worklink-broker.sock
+uv run mimir worklink docker-broker \
+  --policy /etc/mimir/worklink-docker-broker.yaml \
+  --socket /run/worklink-broker.sock
 ```
 
 The broker builds `docker run --rm --name <job> --network <policy.network> ...
 <allowed-image> mimir worklink worker --payload-json <payload>` from policy and
 the worker payload. Tests inject fake process primitives; no broker test requires
-a live Docker daemon. Real Docker/OrbStack smoke remains the follow-up slice.
+a live Docker daemon.
+
+#### DockerSibling smoke / runbook
+
+The real Docker/OrbStack-family smoke is deliberately opt-in. It exercises the
+complete boundary rather than just unit-level broker calls:
+
+1. Start the broker outside the agent container, where Docker/OrbStack and the
+   Docker socket are available:
+
+   ```bash
+   uv run mimir worklink docker-broker \
+     --policy /etc/mimir/worklink-docker-broker.yaml \
+     --socket /run/worklink-broker.sock
+   ```
+
+2. Pick a sacrificial Worklink-ready Chainlink leaf whose acceptance criteria are
+   intentionally tiny. The run may push `issue/<id>-a<attempt>` and open a PR, so
+   do not point it at an issue with ambiguous or high-risk scope.
+
+3. From `/workspace/mimir`, run the opt-in smoke:
+
+   ```bash
+   MIMIR_WORKLINK_DOCKER_SMOKE=1 \
+   WORKLINK_DOCKER_BROKER_URL=unix:///run/worklink-broker.sock \
+   WORKLINK_DOCKER_IMAGE=mimir-worklink:latest \
+   env -u MIMIR_MODEL_SPEC \
+     uv run python scripts/worklink_docker_sibling_smoke.py <chainlink-issue-id>
+   ```
+
+   Override `--test-command`, `--base`, `--backend`, or `--broker-url` when the
+   smoke issue needs a narrower validation command or the broker is exposed over
+   HTTP(S). Without `MIMIR_WORKLINK_DOCKER_SMOKE=1`, the script refuses to run.
+
+4. Expected success output:
+
+   ```text
+   worklink docker-sibling smoke issue=<id> attempt=<n> status=completed review_ready=True
+   pr: https://github.com/jasoncarreira/mimir/pull/<n>
+   evidence: /mimir-home/state/worklink/evidence/<id>-<attempt>.json
+   ```
+
+5. Inspect the evidence file before treating the smoke as passed. It should show
+   the controller re-derived evidence from remote refs, including commands like
+   `git fetch origin main`, `git fetch origin issue/<id>-a<attempt>`, and
+   `git diff --name-only origin/main...origin/issue/<id>-a<attempt>`. The worker's
+   own evidence file is only a handoff artifact; the orchestrator's remote
+   evidence gate is the trust boundary.
+
+Cleanup is bounded on both sides. The orchestrator calls broker cleanup after
+`wait`, and the broker uses `docker run --rm` plus a best-effort `docker rm -f
+<job>`. Worklink state intentionally remains for audit: Chainlink comments/labels,
+`/mimir-home/state/worklink/evidence/<id>-<attempt>.json`, transcripts under
+`/mimir-home/state/worklink/transcripts/`, and any opened PR/attempt branch.
+Broker logs are available through `GET /jobs/<id>/logs` while the broker still has
+the job in memory; after cleanup, inspect the broker process logs and the
+orchestrator evidence/transcript files instead.
+
+If the broker/socket/image is unavailable, fall back to `compute_backend:
+local_subprocess` for manual operator-run Worklink. That fallback is useful for
+local development but is not a DockerSibling smoke: it runs inside the agent
+container and does not prove the broker/client/worker-container/remote-evidence
+boundary.
+
+Security caveats remain after a successful smoke: DockerSibling reduces the
+agent container's direct privilege by keeping docker.sock in the broker process,
+but the broker is still privileged relative to the host and the selected worker
+image still runs model-generated code. Keep policy static/operator-owned, keep
+`network: none` unless a specific issue requires otherwise, allowlist env vars
+narrowly, and do not treat this as the final sandbox gate for autonomous Worklink
+(#452/#460 remain the autonomy/security decision surface).
 
 `claude_cli` is registered by default but is only runnable in deployments that
 actually install the `claude` binary. The current production container may omit
