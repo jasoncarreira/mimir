@@ -83,6 +83,27 @@ class AuditRow:
 # ─── Parsing proposed-changes.md ────────────────────────────────────────
 
 
+#: proposed-changes.md ``## `` headings that are real section boundaries:
+#: the three top-level buckets, plus date-prefixed proposal headings
+#: (``## 2026-05-27 — …``). Everything else at ``## `` level is body.
+_PROPOSAL_BUCKETS = {"pending", "applied", "rejected"}
+_DATE_HEADING_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\b")
+
+
+def _is_section_boundary(heading_text: str) -> bool:
+    """True when a ``## `` heading is a real proposed-changes.md boundary —
+    a bucket name or a date-prefixed proposal heading (#497).
+
+    LLM-authored proposal bodies routinely contain prose subheadings at
+    ``## `` level (e.g. ``## Risks``). Treating those as boundaries made
+    ``mark_applied`` / ``mark_reject`` move only up to the subheading —
+    stranding the remainder in Pending and creating a phantom, un-date-parseable
+    ``## Risks`` entry that inflated backlog-health counts. Folding non-boundary
+    headings into the current section closes that."""
+    h = heading_text.strip()
+    return h.lower() in _PROPOSAL_BUCKETS or bool(_DATE_HEADING_RE.match(h))
+
+
 def _split_md_sections(body: str) -> list[tuple[str, str]]:
     """Return [(heading_text_without_##, section_body), ...] keeping
     everything in document order. Section body excludes the heading.
@@ -91,6 +112,11 @@ def _split_md_sections(body: str) -> list[tuple[str, str]]:
     treated as part of the surrounding section body, not as new section
     boundaries. Proposal bodies routinely contain fenced samples whose
     own headings would otherwise mis-split the entry — chainlink #114.
+
+    Boundary-aware (#497): only bucket headings and date-prefixed proposal
+    headings start a new section (see ``_is_section_boundary``); other ``## ``
+    lines (prose subheadings inside an LLM-authored proposal body) stay with
+    the current section.
     """
     out: list[tuple[str, str]] = []
     cur_head: str | None = None
@@ -106,7 +132,11 @@ def _split_md_sections(body: str) -> list[tuple[str, str]]:
             if cur_head is not None:
                 cur_buf.append(line)
             continue
-        if not in_fence and stripped.startswith("## "):
+        if (
+            not in_fence
+            and stripped.startswith("## ")
+            and _is_section_boundary(stripped[3:])
+        ):
             if cur_head is not None:
                 out.append((cur_head, "\n".join(cur_buf).rstrip()))
             cur_head = stripped[3:].strip()
