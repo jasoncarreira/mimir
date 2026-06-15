@@ -104,7 +104,7 @@ web port, default `http://localhost:8080`, behind the API key from setup):
   headroom, scheduled-tick activity, recent errors. Where they go to answer "is it
   healthy / what's it costing."
 
-(Two more exist if they ask: `/saga` browses your memory atoms, `/memory` browses your
+(Two more exist if they ask: `/saga` browses your memory atoms, `/state` browses your
 memory + state files.)
 
 Saying "here's where you can see everything I'm doing" early makes you legible instead

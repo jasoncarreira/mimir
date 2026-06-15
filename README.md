@@ -144,7 +144,7 @@ on first visit and remembers it:
   headroom, scheduled-tick activity, recent errors, and pending `mimir-agent`
   updates.
 - **`/saga` — memory viewer.** Browse saga's memory atoms.
-- **`/memory` — file browser.** Browse `memory/` and `state/`.
+- **`/state` — file browser.** Browse `memory/` and `state/`.
 
 Each HTML page has a JSON twin (`/api/turns`, `/api/ops`, `/api/saga`,
 `/api/memory`) for scripting. All are auth-gated; expose the port publicly only

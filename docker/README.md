@@ -132,7 +132,7 @@ on first load:
 - **`/turns`** — live turn viewer (inbound trigger, tools run, replies; auto-refreshes).
 - **`/ops`** — health + usage dashboard (token/cost rate, plan-window headroom,
   scheduled-tick activity, errors, pending updates).
-- **`/saga`** — saga memory-atom viewer. **`/memory`** — `memory/` + `state/` file browser.
+- **`/saga`** — saga memory-atom viewer. **`/state`** — `memory/` + `state/` file browser.
 
 All routes are auth-gated by `MIMIR_API_KEY`. Only publish port 8080 beyond
 localhost with that key set (see Security notes below).
