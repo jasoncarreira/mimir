@@ -93,6 +93,48 @@ def test_mark_applied_moves_section_and_appends_log(tmp_path: Path):
     assert records[0]["predicted_effect"] == "Drift indicators would drop."
 
 
+def test_inner_heading_in_proposal_body_not_split(tmp_path: Path):
+    """#497: a ``## `` prose subheading inside an LLM-authored proposal body
+    (e.g. ``## Risks``) is NOT a section boundary. Pre-fix it became a phantom
+    Pending entry and mark_applied moved only the head, stranding the rest."""
+    pc = tmp_path / "state" / "proposed-changes.md"
+    _seed_proposed_changes(pc, """
+        # Proposed Changes
+
+        ## Pending
+
+        ## 2026-04-12 — split persona block
+        Source: reflection 2026-04-12
+        Proposal: Split memory/core/00-persona.md.
+
+        ## Risks
+        Could fragment the persona voice.
+
+        ## Applied
+
+        ## Rejected
+    """)
+    log = tmp_path / "state" / "applied-proposals.jsonl"
+
+    # Exactly ONE pending proposal — the ``## Risks`` subheading is body, not a
+    # phantom entry that would inflate backlog-health counts.
+    pending = _list_pending_proposals(pc)
+    assert len(pending) == 1
+    assert "split persona block" in pending[0][1]
+
+    mark_applied(pc, log, "split persona", now=NOW)
+    new_body = pc.read_text()
+    pending_idx = new_body.find("## Pending")
+    applied_idx = new_body.find("## Applied")
+    rejected_idx = new_body.find("## Rejected")
+    split_idx = new_body.find("split persona block")
+    risks_idx = new_body.find("## Risks")
+    # The WHOLE proposal — including its inner ``## Risks`` — moved to Applied;
+    # nothing stranded in Pending.
+    assert applied_idx < split_idx < rejected_idx
+    assert applied_idx < risks_idx < rejected_idx
+
+
 def test_mark_applied_raises_when_no_match(tmp_path: Path):
     pc = tmp_path / "state" / "proposed-changes.md"
     _seed_proposed_changes(pc, """
