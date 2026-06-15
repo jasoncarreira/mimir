@@ -48,7 +48,11 @@ from pathlib import Path
 
 from mimir._atomic import atomic_write_json
 from mimir.redaction import redact_text
-from mimir.skill_defs import home_builtin_skills_dir, home_skills_dir
+from mimir.skill_defs import (
+    home_builtin_skills_dir,
+    home_skills_dir,
+    reject_escaping_symlinks,
+)
 from mimir.skill_md import frontmatter_list_field, parse_env_block, parse_frontmatter
 
 # Source root for optional-skills, relative to this file.
@@ -244,6 +248,11 @@ def install(
             f"Run `mimir skills list-optional` to see installable skills."
         )
 
+    # #500: reject a bundle whose symlinks escape it BEFORE any destructive
+    # action (the rmtree below), so host files can't be smuggled into the
+    # skills catalog and read into the model prompt.
+    reject_escaping_symlinks(src)
+
     dest_root = home_skills_dir(home)
     dest_root.mkdir(parents=True, exist_ok=True)
     dest = dest_root / name
@@ -278,7 +287,9 @@ def install(
     def _ignore(_dirname, names):
         return [n for n in names if n in ("__pycache__", ".pytest_cache")]
 
-    shutil.copytree(src, dest, ignore=_ignore)
+    # symlinks=True preserves in-bundle links instead of dereferencing their
+    # contents at copy time (#500); escaping links were already rejected above.
+    shutil.copytree(src, dest, ignore=_ignore, symlinks=True)
 
     return InstallResult(
         name=name,

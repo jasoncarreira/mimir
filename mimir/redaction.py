@@ -36,6 +36,19 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # env var dumps, JSON pretty-prints with bareword keys). The value alphabet
     # stops at common delimiters so the regex doesn't eat the rest of the line.
     re.compile(r"(?i)(token=|api[_-]?key=|password=|passwd=|secret=)([^\s\"',&]+)"),
+    # AWS access-key IDs (chainlink #499 — sync with templates/git/pre-commit).
+    # The long-lived ``AKIA`` and STS-temp ``ASIA`` prefixes + 16 upper/digit
+    # chars are a high-confidence shape; mask the whole value.
+    re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
+    # ``AWS_SECRET_ACCESS_KEY=…`` / ``AWS_ACCESS_KEY_ID=…`` env-dump forms. The
+    # secret-access-key *value* has no fixed shape, so it can only be caught via
+    # its variable name (the bare ``secret=``/``api_key=`` group above misses
+    # ``..._ACCESS_KEY=`` — no ``api`` prefix, no bare ``secret=``).
+    re.compile(r"(?i)(aws_[a-z0-9_]*key(?:_id)?\s*=)([^\s\"',&]+)"),
+    # JSON OAuth-token value forms (``"refresh_token": "…"`` etc.) the sibling
+    # pre-commit hook already catches; keep the redactor in sync so a token in a
+    # subprocess stderr / event payload doesn't land cleartext in events.jsonl.
+    re.compile(r'(?i)("(?:access_token|refresh_token|client_secret)"\s*:\s*")([^"]{6,})'),
     # Discord bot tokens — JWT-shaped with ``MTk…`` / ``MzU…`` prefix for many
     # of them. Use the well-documented 24+.6+27 segment shape.
     re.compile(r"\b[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}\b"),

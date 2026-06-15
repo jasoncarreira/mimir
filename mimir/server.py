@@ -530,6 +530,7 @@ def build_app(config: Config) -> web.Application:
                     token=config.discord_token,
                     enqueue=dispatcher.enqueue,
                     attachments_dir=attachments_inbound,
+                    attachments_max_bytes=config.attachments_max_bytes,
                 )
             )
         except ImportError as exc:
@@ -552,6 +553,7 @@ def build_app(config: Config) -> web.Application:
                     app_token=config.slack_app_token,
                     enqueue=dispatcher.enqueue,
                     attachments_dir=attachments_inbound,
+                    attachments_max_bytes=config.attachments_max_bytes,
                 )
             )
         except ImportError as exc:

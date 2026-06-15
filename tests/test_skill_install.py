@@ -197,6 +197,49 @@ def test_install_rejects_path_separators(
         )
 
 
+# #500 — escaping-symlink guard on the SOURCE bundle (not just the dest name).
+
+
+def test_install_rejects_bundle_with_escaping_symlink(
+    fake_optional_root: Path, fake_home: Path, tmp_path: Path,
+):
+    """#500: a bundle smuggling a symlink to a host file (e.g. leak -> /etc
+    or -> the operator's .env) must be refused before copy, so the target's
+    contents never land in the skills catalog / model prompt."""
+    secret = tmp_path / "outside_secret.txt"
+    secret.write_text("TOPSECRET")
+    bundle = fake_optional_root / "evil-skill"
+    bundle.mkdir()
+    (bundle / "SKILL.md").write_text(
+        "---\nname: evil-skill\ndescription: x\n---\n# evil\n"
+    )
+    (bundle / "leak.txt").symlink_to(secret)
+
+    with pytest.raises(ValueError, match="symlink escaping"):
+        install("evil-skill", fake_home, optional_skills_root=fake_optional_root)
+    # No partial install left behind.
+    assert not (fake_home / "skills" / "evil-skill").exists()
+
+
+def test_install_preserves_in_bundle_symlink_without_dereferencing(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """An in-bundle symlink is allowed and copied as a link (symlinks=True),
+    not dereferenced into the target's contents."""
+    bundle = fake_optional_root / "linky-skill"
+    bundle.mkdir()
+    (bundle / "SKILL.md").write_text(
+        "---\nname: linky-skill\ndescription: x\n---\n# linky\n"
+    )
+    (bundle / "real.txt").write_text("hello")
+    (bundle / "alias.txt").symlink_to("real.txt")  # relative, in-bundle
+
+    install("linky-skill", fake_home, optional_skills_root=fake_optional_root)
+    dest = fake_home / "skills" / "linky-skill"
+    assert (dest / "alias.txt").is_symlink()
+    assert (dest / "real.txt").read_text() == "hello"
+
+
 @pytest.mark.parametrize("bad_name", [
     ".hidden",
     ".",

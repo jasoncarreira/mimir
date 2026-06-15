@@ -48,10 +48,35 @@ independent of each other.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+
+def reject_escaping_symlinks(src: Path) -> None:
+    """Raise ``ValueError`` if any symlink under ``src`` resolves outside
+    ``src`` (#500).
+
+    Skill copy uses ``copytree(symlinks=True)`` to preserve links rather than
+    dereference their contents at copy time, but a later skills-catalog read
+    would still follow an escaping link (e.g. a bundle smuggling ``leak.txt ->
+    /etc/passwd`` or ``-> <home>/.env``), pulling host-file contents into the
+    model prompt. Reject such a bundle outright before copying. Links that stay
+    within the bundle are allowed."""
+    src_resolved = src.resolve()
+    for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
+        for entry in (*dirnames, *filenames):
+            path = Path(dirpath) / entry
+            if not path.is_symlink():
+                continue
+            target = path.resolve()
+            if not target.is_relative_to(src_resolved):
+                raise ValueError(
+                    f"skill bundle {src.name!r} contains a symlink escaping the "
+                    f"bundle ({path} -> {target}); refusing install"
+                )
 
 #: Directory under the agent's home where bundled skills get refreshed
 #: every startup. Read-only by convention; gitignored in deployments.
@@ -216,13 +241,17 @@ def refresh_builtin_skills(home: Path) -> dict[str, str]:
             shutil.rmtree(tmp, ignore_errors=True)
 
         try:
-            shutil.copytree(src, tmp)
+            # Defense-in-depth (#500): bundled skills are trusted, but reject
+            # any escaping symlink and preserve safe links instead of
+            # dereferencing their contents.
+            reject_escaping_symlinks(src)
+            shutil.copytree(src, tmp, symlinks=True)
             # Atomic-replace: remove old, rename tmp into place.
             if dst.exists():
                 shutil.rmtree(dst, ignore_errors=True)
             tmp.rename(dst)
             out[name] = "refreshed"
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             log.warning(
                 "refresh_builtin_skills: failed to copy %s: %s", name, exc,
             )
