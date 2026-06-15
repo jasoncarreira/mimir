@@ -1673,6 +1673,27 @@ class Scheduler:
             await self._poller_semaphore.acquire()
 
         try:
+            # #488: re-consult the arbiter AFTER the (possibly long) semaphore
+            # wait. Under many per-minute pollers contending for the slots, the
+            # pre-acquire decision can be arbitrarily stale — a 429 during the
+            # wait flips the arbiter to shed-all, and firing anyway would do real
+            # upstream calls during a hard pause, defeating the priority-banded
+            # suppression in exactly the contended load it exists for.
+            recheck = await self._consult_arbiter(priority=poller.priority)
+            if recheck is not None and not recheck.fire:
+                await log_event(
+                    "poller_fire_suppressed",
+                    poller=poller_name,
+                    reason=recheck.reason,
+                    priority=recheck.priority,
+                    severity=recheck.severity.name,
+                    stage="post_acquire",
+                    **(
+                        {"burst_multiple": round(recheck.burst_multiple, 3)}
+                        if recheck.burst_multiple is not None else {}
+                    ),
+                )
+                return
             await run_poller(poller, enqueue=self._enqueue, home=self._home)
         finally:
             self._poller_semaphore.release()

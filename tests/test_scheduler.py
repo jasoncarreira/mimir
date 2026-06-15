@@ -1625,6 +1625,70 @@ async def test_fire_poller_passes_scheduler_home_to_run_poller(
 
 
 @pytest.mark.asyncio
+async def test_fire_poller_resheds_after_acquiring_semaphore(
+    tmp_path: Path, monkeypatch,
+):
+    """#488: a poller that clears the pre-acquire arbiter check but is shed
+    after the (possibly long) semaphore wait must NOT run — _fire_poller
+    re-consults the arbiter post-acquire so a 429-during-wait pause is honored.
+    """
+    import json
+
+    from mimir.budget import FireDecision, Severity
+
+    async def noop(_e):
+        return True
+
+    class FlipArbiter:
+        """CLEAR pre-acquire (fire), then shed-all post-acquire (a 429 landed
+        while the poller was waiting for a slot)."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def should_fire(self, *, priority, event_loop=None):
+            self.calls += 1
+            if self.calls == 1:
+                return FireDecision(
+                    fire=True, reason="ok", severity=Severity.CLEAR, priority=priority,
+                )
+            return FireDecision(
+                fire=False, reason="quota_exhausted_pause",
+                severity=Severity.BLOCKED, priority=priority,
+            )
+
+    arb = FlipArbiter()
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, arbiter=arb)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)
+
+    ran = False
+
+    async def fake_run_poller(poller, enqueue, home=None):
+        nonlocal ran
+        ran = True
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+
+    await sched._fire_poller(poller_name="p1")
+
+    assert ran is False, "poller ran despite a post-acquire shed"
+    assert arb.calls == 2, "arbiter must be consulted pre- AND post-acquire"
+    assert not sched._poller_semaphore.locked()  # slot released, not leaked
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    supp = [
+        e for e in events
+        if e.get("type") == "poller_fire_suppressed" and e.get("stage") == "post_acquire"
+    ]
+    assert supp, "expected a post_acquire poller_fire_suppressed event"
+
+
+@pytest.mark.asyncio
 async def test_reinstall_pollers_pre_populates_dict_before_add_job(
     tmp_path: Path, monkeypatch
 ):
@@ -2802,7 +2866,10 @@ async def test_fire_poller_fires_when_arbiter_clear(
     await sched._fire_poller(poller_name="p1")
 
     assert ran == ["p1"]
-    assert arbiter.consulted_priorities == ["high"]
+    # #488: a firing poller is consulted twice — once before the semaphore wait
+    # and once after acquiring the slot (the re-check that honors a shed during
+    # the wait). Both clear here, so it runs.
+    assert arbiter.consulted_priorities == ["high", "high"]
 
 
 @pytest.mark.asyncio
