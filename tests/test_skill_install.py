@@ -134,6 +134,43 @@ def test_install_copies_directory(fake_optional_root: Path, fake_home: Path):
     assert result.pollers_registered_hint is True
 
 
+def test_install_cleans_up_partial_copy_on_failure(
+    fake_optional_root: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """#501: a mid-copy failure must NOT leave half-populated debris at the
+    destination (which would then block a --force-less retry with a misleading
+    'custom edits' FileExistsError). The transactional copy builds in a .tmp
+    dir, so a failure cleans up and leaves the real dest untouched."""
+    import shutil as _shutil
+
+    real_copytree = _shutil.copytree
+    calls = {"n": 0}
+
+    def flaky_copytree(src, dst, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Partially populate the target, then fail mid-copy.
+            Path(dst).mkdir(parents=True, exist_ok=True)
+            (Path(dst) / "SKILL.md").write_text("partial")
+            raise OSError("simulated ENOSPC mid-copy")
+        return real_copytree(src, dst, *a, **k)
+
+    monkeypatch.setattr("mimir.skill_install.shutil.copytree", flaky_copytree)
+
+    dest = fake_home / "skills" / "fake-poller"
+    with pytest.raises(OSError):
+        install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    # No debris at the real dest, and the .tmp staging dir is cleaned up.
+    assert not dest.exists()
+    assert not (fake_home / "skills" / "fake-poller.tmp").exists()
+
+    # Retry WITHOUT --force now succeeds (no debris-induced FileExistsError).
+    result = install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    assert (dest / "SKILL.md").is_file()
+    assert (dest / "poller.py").is_file()
+    assert result.overwrote is False
+
+
 def test_install_pollers_hint_false_for_non_poller(
     fake_optional_root: Path, fake_home: Path,
 ):
