@@ -564,8 +564,9 @@ backends:
 compute_backends:
   docker-sibling:
     broker_url: "unix:///run/worklink-broker.sock"
-    image: mimirbot-mimirbot
-    policy: {}
+    image: mimir-worklink:latest
+    policy:
+      network: none
 ```
 
 The agent-side `docker-sibling` backend is a broker **client**, not a Docker
@@ -576,6 +577,31 @@ cancels, and `DELETE /jobs/<id>` cleans up. The submitted worker payload is the
 same JSON schema consumed by `mimir worklink worker <payload.json>`; do not add a
 second Docker-only work schema. The client supports `unix://`, `http://`, and
 `https://` broker URLs and contains no direct docker CLI or docker.sock access.
+
+The broker process is started separately, outside the agent container, with the
+Docker socket mounted only there. Its policy file is static operator-owned
+configuration; the agent cannot submit raw Docker flags, host mounts,
+`--privileged`, arbitrary env, or arbitrary network mode:
+
+```yaml
+allowed_images: [mimir-worklink:latest]
+network: none          # only none/bridge are accepted; host is intentionally refused
+env_allowlist: [GITHUB_TOKEN, MIMIR_HOME]
+default_env:
+  GITHUB_TOKEN: "${GITHUB_TOKEN}"
+max_timeout_s: 1800
+```
+
+Run it on a Unix socket the agent can reach:
+
+```bash
+uv run mimir worklink docker-broker   --policy /etc/mimir/worklink-docker-broker.yaml   --socket /run/worklink-broker.sock
+```
+
+The broker builds `docker run --rm --name <job> --network <policy.network> ...
+<allowed-image> mimir worklink worker --payload-json <payload>` from policy and
+the worker payload. Tests inject fake process primitives; no broker test requires
+a live Docker daemon. Real Docker/OrbStack smoke remains the follow-up slice.
 
 `claude_cli` is registered by default but is only runnable in deployments that
 actually install the `claude` binary. The current production container may omit
@@ -705,8 +731,9 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454)
   local-subprocess: {}      # today's behavior; accept-the-risk fallback
   docker-sibling:
     broker_url: "unix:///run/worklink-broker.sock"   # broker owns the docker socket, not the agent
-    image: mimirbot-mimirbot
-    policy: {}             # optional broker policy map; actual enforcement arrives with broker slices
+    image: mimir-worklink:latest
+    policy:
+      network: none       # broker enforces static image/network/env/timeout policy
   ecs-runtask:
     cluster: worklink
     task_definition: worklink-worker
