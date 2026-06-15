@@ -44,7 +44,7 @@ FROM python:3.11-slim AS base
 #     tesseract-ocr-osd`` (an OR-relation APT can satisfy with osd
 #     alone — orientation detection only). Pinning ``eng`` explicitly
 #     removes that ambiguity.
-ENV NODE_VERSION=20
+ENV NODE_VERSION=22
 ARG MIMIR_ENABLE_CLAUDE_CODE=0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg git \
