@@ -207,6 +207,39 @@ async def test_commit_and_schedule_push(
     assert push_failures[0]["turn_id"] == "t1"
 
 
+@pytest.mark.asyncio
+async def test_commit_holds_per_home_lock_during_stage_and_commit(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#482: the ``git add -A`` / ``commit`` critical section runs under the
+    per-home lock, so concurrent turns sharing the repo can't race the index."""
+    _short_debounce(monkeypatch, 0.01)
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("hello\n")
+
+    lock = git_tracking._get_lock(home_repo)
+    orig_git = git_tracking._git
+    locked_during: dict[str, bool] = {}
+
+    async def spy_git(*args: str, **kwargs: Any) -> Any:
+        sub = args[0] if args else ""
+        if sub in ("add", "commit"):
+            locked_during[sub] = lock.locked()
+        return await orig_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_git", spy_git)
+    await git_tracking.commit_turn_changes(
+        turn_id="t-lock", trigger="user_message", home=home_repo, enabled=True,
+    )
+    # The stage + commit ran while the per-home lock was held...
+    assert locked_during.get("add") is True
+    assert locked_during.get("commit") is True
+    # ...and the lock is released afterward (no leak; the push runs unlocked).
+    assert lock.locked() is False
+    if git_tracking._pending_push_task is not None:
+        git_tracking._pending_push_task.cancel()
+
+
 # ─── pull --rebase before push (#340) ───────────────────────────────
 
 

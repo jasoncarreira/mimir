@@ -296,19 +296,40 @@ async def commit_turn_changes(
     await _ensure_main_upstream_invariant(home=home, turn_id=turn_id)
     await _cleanup_resolved_proposal_branches(home=home, turn_id=turn_id)
 
+    # Stage + commit under the per-home lock: up to ``max_concurrent_turns``
+    # turns share this one repo, so an unlocked ``git add -A`` / ``commit`` lets
+    # them race the git index — mis-attributing or dropping commits and tripping
+    # ``.git/index.lock`` (#482). The push is scheduled OUTSIDE the lock
+    # (``_get_lock`` is non-reentrant and ``_schedule_debounced_push`` takes it).
+    async with _get_lock(home):
+        committed = await _stage_and_commit(
+            turn_id=turn_id, trigger=trigger, home=home,
+        )
+    if not committed:
+        return
+
+    # 4. Schedule a debounced push. Subsequent calls within the
+    #    debounce window cancel the pending task and reschedule, so
+    #    a burst of N commits in <60s becomes 1 push.
+    await _schedule_debounced_push(turn_id=turn_id, home=home)
+
+
+async def _stage_and_commit(*, turn_id: str, trigger: str, home: Path) -> bool:
+    """Stage (-A) + commit this turn's tracked changes; return True when a commit
+    landed (caller schedules the push), False on no-op/failure.
+
+    MUST run under ``_get_lock(home)`` — concurrent turns sharing the home repo
+    otherwise race the git index (#482)."""
     # 1. Fast check — anything to commit? Most turns hit this branch.
     try:
         result = await _git("status", "--porcelain", cwd=home)
     except (GitError, asyncio.TimeoutError, OSError) as exc:
         await log_event(
-            "git_commit_failed",
-            stage="status",
-            turn_id=turn_id,
-            error=_short_err(exc),
+            "git_commit_failed", stage="status", turn_id=turn_id, error=_short_err(exc),
         )
-        return
+        return False
     if not result.stdout.strip():
-        return  # no-op fast path; do NOT schedule a push.
+        return False  # no-op fast path; do NOT schedule a push.
 
     porcelain = result.stdout
 
@@ -317,12 +338,9 @@ async def commit_turn_changes(
         await _git("add", "-A", cwd=home)
     except (GitError, asyncio.TimeoutError, OSError) as exc:
         await log_event(
-            "git_commit_failed",
-            stage="add",
-            turn_id=turn_id,
-            error=_short_err(exc),
+            "git_commit_failed", stage="add", turn_id=turn_id, error=_short_err(exc),
         )
-        return
+        return False
 
     # chainlink #353: before committing, surface any prose note under a tracked
     # root that git is silently ignoring — ``git add -A`` drops it with no
@@ -339,15 +357,10 @@ async def commit_turn_changes(
     try:
         await _git("commit", "-m", msg, cwd=home)
     except GitError as exc:
-        # "nothing to commit" is a soft no-op, not a failure. It happens
-        # when everything staged got gitignored between status and add, or
-        # when the only ``git status`` changes are embedded-repo gitlinks
-        # that ``git add -A`` won't stage (e.g. a nested git repo the agent
-        # left in a scratch dir under the tracked home). git prints that
-        # message — and "no changes added to commit" / "working tree
-        # clean" — to STDOUT, so check both streams. Checking stderr alone
-        # (empty for this case) emitted a spurious git_commit_failed every
-        # turn (chainlink #299 follow-up).
+        # "nothing to commit" / "no changes added" / "working tree clean" is a
+        # soft no-op (everything staged got gitignored, or only embedded-repo
+        # gitlinks changed). git prints it to STDOUT, so check both streams —
+        # stderr alone is empty for this case (chainlink #299 follow-up).
         combined = f"{exc.stdout or ''}\n{exc.stderr or ''}"
         if any(
             phrase in combined
@@ -357,27 +370,17 @@ async def commit_turn_changes(
                 "working tree clean",
             )
         ):
-            return
+            return False
         await log_event(
-            "git_commit_failed",
-            stage="commit",
-            turn_id=turn_id,
-            error=_short_err(exc),
+            "git_commit_failed", stage="commit", turn_id=turn_id, error=_short_err(exc),
         )
-        return
+        return False
     except (asyncio.TimeoutError, OSError) as exc:
         await log_event(
-            "git_commit_failed",
-            stage="commit",
-            turn_id=turn_id,
-            error=_short_err(exc),
+            "git_commit_failed", stage="commit", turn_id=turn_id, error=_short_err(exc),
         )
-        return
-
-    # 4. Schedule a debounced push. Subsequent calls within the
-    #    debounce window cancel the pending task and reschedule, so
-    #    a burst of N commits in <60s becomes 1 push.
-    await _schedule_debounced_push(turn_id=turn_id, home=home)
+        return False
+    return True
 
 
 # chainlink #353: prose-note extensions whose presence under a TRACKED root
@@ -474,7 +477,14 @@ async def _debounced_push(*, turn_id: str, home: Path) -> None:
         return
     key = _home_key(home)
     branch = await _current_branch(home)
-    if not await _sync_remote_before_push(home=home, turn_id=turn_id, branch=branch):
+    # The remote sync does pull --rebase + a reset/add/commit reconcile — index
+    # and HEAD mutations that must not interleave with a live-turn commit (#482).
+    # Serialize under the per-home lock; this is the debounced background path
+    # (off the interactive hot path), so briefly holding it across the rebase is
+    # acceptable. The network push below stays unlocked (it doesn't touch the index).
+    async with _get_lock(home):
+        synced = await _sync_remote_before_push(home=home, turn_id=turn_id, branch=branch)
+    if not synced:
         async with _get_lock(home):
             _schedule_push_retry_locked(key=key, home=home, turn_id=turn_id)
         return
