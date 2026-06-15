@@ -178,24 +178,33 @@ class _StubCommitmentsStore:
         self.dismiss_calls: list[dict] = []
         self._items: list = []
         self.raise_on: str | None = None
+        # The real store returns a bool (False when _can_apply rejects: unknown
+        # id / already terminal). Set reject=True to exercise that path (#485).
+        self.reject: bool = False
 
     async def complete(self, commitment_id: str, *, message_id=None):
         if self.raise_on == "complete":
             raise RuntimeError("complete boom")
+        if self.reject:
+            return False
         self.complete_calls.append({"id": commitment_id, "message_id": message_id})
-        return "done"
+        return True
 
     async def snooze(self, commitment_id: str, *, until_unix: float, reason=None):
         if self.raise_on == "snooze":
             raise RuntimeError("snooze boom")
+        if self.reject:
+            return False
         self.snooze_calls.append({"id": commitment_id, "until_unix": until_unix})
-        return "snoozed"
+        return True
 
     async def dismiss(self, commitment_id: str, *, reason=None):
         if self.raise_on == "dismiss":
             raise RuntimeError("dismiss boom")
+        if self.reject:
+            return False
         self.dismiss_calls.append({"id": commitment_id, "reason": reason})
-        return "dismissed"
+        return True
 
     def list(self):
         if self.raise_on == "list":
@@ -677,7 +686,16 @@ class TestCommitmentComplete:
         out = await commitment_complete.ainvoke({"commitment_id": "c-42"})
         assert "commitment_complete ok:" in out
         assert "id=c-42" in out
-        assert "result=done" in out
+
+    @pytest.mark.asyncio
+    async def test_rejected_transition_returns_failed(self) -> None:
+        # Store returns False (unknown id / already terminal) → must NOT report ok (#485).
+        store = _StubCommitmentsStore()
+        store.reject = True
+        set_commitments_store(store)
+        out = await commitment_complete.ainvoke({"commitment_id": "c-42"})
+        assert "commitment_complete failed" in out
+        assert "ok" not in out
 
 
 class TestCommitmentSnooze:
@@ -709,6 +727,17 @@ class TestCommitmentSnooze:
         assert "id=c-7" in out
         assert "until=2030-06-01T10:00:00Z" in out
 
+    @pytest.mark.asyncio
+    async def test_rejected_transition_returns_failed(self) -> None:
+        store = _StubCommitmentsStore()
+        store.reject = True
+        set_commitments_store(store)
+        out = await commitment_snooze.ainvoke(
+            {"commitment_id": "c-7", "until_iso": "2030-06-01T10:00:00Z"}
+        )
+        assert "commitment_snooze failed" in out
+        assert "ok" not in out
+
 
 class TestCommitmentDismiss:
     @pytest.mark.asyncio
@@ -727,6 +756,15 @@ class TestCommitmentDismiss:
         assert "commitment_dismiss ok:" in out
         assert store.dismiss_calls[0]["id"] == "c-5"
         assert store.dismiss_calls[0]["reason"] == "no longer relevant"
+
+    @pytest.mark.asyncio
+    async def test_rejected_transition_returns_failed(self) -> None:
+        store = _StubCommitmentsStore()
+        store.reject = True
+        set_commitments_store(store)
+        out = await commitment_dismiss.ainvoke({"commitment_id": "c-5"})
+        assert "commitment_dismiss failed" in out
+        assert "ok" not in out
 
 
 class TestCommitmentList:
