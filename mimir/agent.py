@@ -2457,11 +2457,18 @@ class Agent:
             )
             return None
 
-    def _assemble_self_state_block(self) -> str | None:
+    def _assemble_self_state_block(
+        self, *, event_loop: "asyncio.AbstractEventLoop | None" = None,
+    ) -> str | None:
         """v0.5+ §12.4: render the ``## Self-state`` block — homeostat
-        view + uncommitted-files line + per-turn skill telemetry."""
+        view + uncommitted-files line + per-turn skill telemetry.
+
+        ``event_loop`` is threaded to the arbiter so a lazy-expiry
+        ``quota_recovered`` emit isn't dropped on this worker thread (#489)."""
         try:
-            arbiter_body = self._arbiter.render_self_state_block()
+            arbiter_body = self._arbiter.render_self_state_block(
+                event_loop=event_loop,
+            )
         except Exception:  # noqa: BLE001
             log.exception(
                 "_assemble_self_state_block (arbiter) failed; skipping",
@@ -2656,8 +2663,12 @@ class Agent:
         commitments_block = self._assemble_commitments_block(
             channel_id=event.channel_id,
         )
+        # Thread the running loop into the worker thread so the arbiter's
+        # lazy-expiry quota_recovered emit can bridge back via
+        # run_coroutine_threadsafe instead of being dropped (#489).
         self_state_block = await asyncio.to_thread(
             self._assemble_self_state_block,
+            event_loop=asyncio.get_running_loop(),
         )
         # Auto-surface the relevant SKILL.md when this turn is on a
         # ``poller:<name>`` channel — the agent gets the skill's

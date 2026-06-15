@@ -577,3 +577,21 @@ def test_render_self_state_no_throttle_line_when_clear(tmp_path: Path):
     block = arb.render_self_state_block(now=real_now)
     assert block is not None
     assert "autonomy throttle" not in block
+
+
+def test_render_threads_event_loop_to_assess(tmp_path: Path):
+    """#489: render_self_state_block runs under asyncio.to_thread, so it must
+    forward the caller's event_loop to assess() — otherwise a lazy-expiry
+    quota_recovered emit is dropped on the worker thread (no running loop)."""
+    arb = _arbiter(tmp_path)
+    captured = {}
+    real_assess = arb.assess
+
+    def _spy(*, now=None, event_loop=None):
+        captured["event_loop"] = event_loop
+        return real_assess(now=now, event_loop=event_loop)
+
+    arb.assess = _spy  # type: ignore[method-assign]
+    sentinel = object()
+    arb.render_self_state_block(now=NOW, event_loop=sentinel)
+    assert captured["event_loop"] is sentinel

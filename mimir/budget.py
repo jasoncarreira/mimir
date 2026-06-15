@@ -493,11 +493,21 @@ class HomeostaticArbiter:
         )
 
     def render_self_state_block(
-        self, *, now: datetime | None = None,
+        self,
+        *,
+        now: datetime | None = None,
+        event_loop: "asyncio.AbstractEventLoop | None" = None,
     ) -> str | None:
         """Format the snapshot as a ``## Self-state`` body. Returns
         None when nothing is worth surfacing (no plan data, no usage,
-        no tool-call history) — don't print an empty header."""
+        no tool-call history) — don't print an empty header.
+
+        ``event_loop``: the caller's running loop, threaded through to
+        ``assess()`` (#489). This method runs under ``asyncio.to_thread``
+        when building the turn prompt, so without the loop the lazy-expiry
+        ``quota_recovered`` emit would be discarded (``get_running_loop()``
+        raises on the worker thread) even though the pause is cleared —
+        silently swallowing the recovery signal."""
         snap = self.snapshot(now=now)
 
         lines: list[str] = []
@@ -525,7 +535,7 @@ class HomeostaticArbiter:
         # gating on so the agent can see WHY its pollers/heartbeats
         # went quiet (and modulate its own optional work to match).
         try:
-            assessment = self.assess(now=now)
+            assessment = self.assess(now=now, event_loop=event_loop)
         except Exception:  # noqa: BLE001
             log.exception("severity assess failed; skipping throttle line")
             assessment = None
