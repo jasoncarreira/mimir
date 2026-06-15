@@ -1771,7 +1771,7 @@ class Agent:
         permission_denials: list = []
         if self._backend is not None and hasattr(self._backend, "drain_denials"):
             try:
-                permission_denials = self._backend.drain_denials()
+                permission_denials = self._backend.drain_denials(turn_id=turn_id)
             except Exception as exc:  # noqa: BLE001
                 log.debug("backend.drain_denials failed: %s", exc)
         # Gap 3 fix: emit one algedonic negative per denied write/edit/upload
