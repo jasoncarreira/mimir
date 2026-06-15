@@ -170,6 +170,33 @@ def get_only_active_turn() -> "TurnContext | None":
     return None
 
 
+def active_turn_snapshots(*, now: float | None = None) -> list[dict[str, Any]]:
+    """Return bounded diagnostic metadata for currently active turns.
+
+    Used by scheduler loop-lag observability: when the event loop resumes
+    after a stall, this gives enough attribution context to distinguish
+    "no turn was active" from "these channel/trigger turns were in flight"
+    without serializing prompts, messages, tool args, or other user content.
+    """
+    import time
+
+    observed_at = time.monotonic() if now is None else now
+    snapshots: list[dict[str, Any]] = []
+    for ctx in _active_turns.values():
+        item: dict[str, Any] = {
+            "turn_id": ctx.turn_id,
+            "trigger": ctx.trigger,
+            "channel_id": ctx.channel_id,
+            "age_s": round(max(0.0, observed_at - ctx.started_at), 3),
+            "tool_call_count": ctx.tool_call_count,
+        }
+        if ctx.agent_id is not None:
+            item["agent_id"] = ctx.agent_id
+        snapshots.append(item)
+    snapshots.sort(key=lambda item: item.get("age_s", 0), reverse=True)
+    return snapshots
+
+
 def resolve_active_ctx(args: dict[str, Any]) -> tuple["TurnContext | None", str]:
     """Standard three-level lookup chain for MCP tool handlers running
     on a forked task that can't see ``_current_turn``.
