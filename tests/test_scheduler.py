@@ -2335,7 +2335,13 @@ async def test_scheduler_loop_lag_monitor_logs_blocking_delay(tmp_path: Path, mo
     assert logged == [
         (
             "scheduler_loop_lag",
-            {"lag_s": 0.13, "threshold_s": 0.05, "interval_s": 0.1},
+            {
+                "lag_s": 0.13,
+                "threshold_s": 0.05,
+                "interval_s": 0.1,
+                "active_turn_count": 0,
+                "active_turns": [],
+            },
         )
     ]
 

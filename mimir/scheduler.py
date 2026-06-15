@@ -47,6 +47,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .billing import normalize_priority
 from .core_blocks import read_text_lossy
 from .event_logger import log_event
+from ._context import active_turn_snapshots
 from .quota_windows import provider_store_keys
 from .models import AgentEvent
 from .pollers import POLLER_CHANNEL_PREFIX, PollerConfig, discover_pollers, run_poller
@@ -2576,11 +2577,14 @@ class Scheduler:
                 next_wake = now + interval_s
                 if lag_s <= threshold_s:
                     continue
+                active_turns = active_turn_snapshots(now=now)
                 await log_event(
                     "scheduler_loop_lag",
                     lag_s=round(lag_s, 3),
                     threshold_s=threshold_s,
                     interval_s=interval_s,
+                    active_turn_count=len(active_turns),
+                    active_turns=active_turns[:8],
                 )
         except asyncio.CancelledError:
             raise

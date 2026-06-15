@@ -17,6 +17,7 @@ import pytest
 
 from mimir._context import (
     _active_turns,
+    active_turn_snapshots,
     get_only_active_turn,
     get_turn_by_saga_session_id,
     reset_current_turn,
@@ -136,6 +137,40 @@ def test_get_only_active_turn_returns_none_when_multiple_active():
     token_b = set_current_turn(ctx_b)
     try:
         assert get_only_active_turn() is None
+    finally:
+        reset_current_turn(token_b)
+        reset_current_turn(token_a)
+
+
+def test_active_turn_snapshots_returns_bounded_diagnostic_metadata():
+    ctx_a = _make_ctx("t-a", "saga-channel-a-100")
+    ctx_a.started_at = 10.0
+    ctx_a.tool_call_count = 3
+    ctx_a.agent_id = "mimir-test"
+    ctx_b = _make_ctx("t-b", "saga-channel-b-200")
+    ctx_b.started_at = 18.0
+    ctx_b.trigger = "scheduled_tick"
+    ctx_b.channel_id = "scheduler:heartbeat"
+    token_a = set_current_turn(ctx_a)
+    token_b = set_current_turn(ctx_b)
+    try:
+        assert active_turn_snapshots(now=20.0) == [
+            {
+                "turn_id": "t-a",
+                "trigger": "user_message",
+                "channel_id": "c1",
+                "age_s": 10.0,
+                "tool_call_count": 3,
+                "agent_id": "mimir-test",
+            },
+            {
+                "turn_id": "t-b",
+                "trigger": "scheduled_tick",
+                "channel_id": "scheduler:heartbeat",
+                "age_s": 2.0,
+                "tool_call_count": 0,
+            },
+        ]
     finally:
         reset_current_turn(token_b)
         reset_current_turn(token_a)
