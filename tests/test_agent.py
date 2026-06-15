@@ -1253,7 +1253,8 @@ async def test_run_turn_emits_tool_call_denied_per_denial(tmp_path: Path):
 
     # Inject a fake backend with two pre-populated denials.
     class _FakeBackend:
-        def drain_denials(self):
+        def drain_denials(self, turn_id=None):
+            assert turn_id is not None
             return [
                 {"op": "write", "file_path": "/etc/passwd", "writable_dirs": []},
                 {"op": "edit", "file_path": "/proc/sys/x", "writable_dirs": []},

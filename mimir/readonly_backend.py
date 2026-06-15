@@ -159,32 +159,51 @@ class WriteGuardBackend:
         self._prompts_root: Path = (self._root / "prompts").resolve()
         self._enforce_core_memory_readonly: bool = enforce_core_memory_readonly
         # Recorded denials, one per blocked Write/Edit/upload. The agent
-        # drains this list at end-of-turn (``drain_denials()``) into
-        # TurnRecord.permission_denials so the audit trail is visible
-        # in the turn viewer instead of silently empty.
+        # drains entries for its own turn at end-of-turn
+        # (``drain_denials(turn_id=...)``) into TurnRecord.permission_denials
+        # so the audit trail is visible in the turn viewer instead of
+        # silently empty. Entries carry the active turn id because the backend
+        # is process-global and cross-channel turns can run concurrently.
         self._denials: list[dict[str, Any]] = []
 
-    def drain_denials(self) -> list[dict[str, Any]]:
+    def drain_denials(self, turn_id: str | None = None) -> list[dict[str, Any]]:
         """Return + clear recorded permission denials.
 
-        Called by Agent.run_turn after each turn so the next turn
-        starts with a fresh slate. Concurrent turns sharing the same
-        backend would race here; mimir's dispatcher serializes
-        turns per channel and the backend is process-global, so the
-        practical race window is narrow but real for cross-channel
-        turns. Acceptable for an audit trail (we'd rather log all
-        denials with possible attribution drift than lose some).
+        ``turn_id=None`` preserves the historical behavior: drain everything,
+        useful for tests and non-turn callers. Agent.run_turn passes its
+        concrete turn id so concurrent cross-channel turns sharing the
+        process-global backend cannot drain and misattribute each other's
+        write-guard denials.
         """
-        snapshot = list(self._denials)
-        self._denials.clear()
-        return snapshot
+        if turn_id is None:
+            snapshot = list(self._denials)
+            self._denials.clear()
+            return snapshot
+
+        matched: list[dict[str, Any]] = []
+        remaining: list[dict[str, Any]] = []
+        for denial in self._denials:
+            if denial.get("turn_id") == turn_id:
+                matched.append(denial)
+            else:
+                remaining.append(denial)
+        self._denials = remaining
+        return matched
 
     def _record_denial(self, op: str, file_path: str) -> None:
-        self._denials.append({
+        denial: dict[str, Any] = {
             "op": op,
             "file_path": file_path,
             "writable_dirs": list(self._writable_labels),
-        })
+        }
+        # Lazy import to avoid a module cycle. A missing context is valid for
+        # setup/tests/non-turn callables; in-turn denials get scoped so the
+        # process-global backend can be drained safely by concurrent turns.
+        from ._context import get_current_turn
+        ctx = get_current_turn()
+        if ctx is not None:
+            denial["turn_id"] = ctx.turn_id
+        self._denials.append(denial)
 
     def __getattr__(self, name: str) -> Any:
         # Default-deny passthrough: only explicit reads forward.

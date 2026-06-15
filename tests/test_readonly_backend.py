@@ -196,6 +196,46 @@ class TestWriteGuardBackend:
         # Drain clears, so the next call returns nothing.
         assert b.drain_denials() == []
 
+
+    def test_drain_denials_can_scope_by_turn_id(self, home: Path) -> None:
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        from mimir._context import reset_current_turn, set_current_turn
+        from mimir.models import TurnContext
+
+        ctx1 = TurnContext(
+            turn_id="t-one",
+            session_id="s-one",
+            trigger="user_message",
+            channel_id="discord-1",
+            started_at=0.0,
+        )
+        tok1 = set_current_turn(ctx1)
+        try:
+            b.write(file_path="/logs/one.txt", content="no")
+        finally:
+            reset_current_turn(tok1)
+
+        ctx2 = TurnContext(
+            turn_id="t-two",
+            session_id="s-two",
+            trigger="user_message",
+            channel_id="discord-2",
+            started_at=0.0,
+        )
+        tok2 = set_current_turn(ctx2)
+        try:
+            b.edit(file_path="/logs/two.txt", old_string="x", new_string="y")
+        finally:
+            reset_current_turn(tok2)
+
+        one = b.drain_denials(turn_id="t-one")
+        assert [d["file_path"] for d in one] == ["/logs/one.txt"]
+        assert b.drain_denials(turn_id="t-one") == []
+
+        two = b.drain_denials(turn_id="t-two")
+        assert [d["file_path"] for d in two] == ["/logs/two.txt"]
+        assert b.drain_denials() == []
+
     def test_denials_not_recorded_on_allowed_writes(self, home: Path) -> None:
         b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
         b.write(file_path="/state/ok.txt", content="hi")
@@ -262,13 +302,11 @@ class TestCoreMemoryReflectionGate:
         return tmp_path
 
     @staticmethod
-    def _make_turn_ctx(trigger: str, channel_id: str):
-        """Build a minimal TurnContext for the gate check. The backend
-        only reads ``.trigger`` and ``.channel_id``, so a partial dataclass
-        construction is fine."""
+    def _make_turn_ctx(trigger: str, channel_id: str, turn_id: str = "t-test"):
+        """Build a minimal TurnContext for the gate check."""
         from mimir.models import TurnContext
         return TurnContext(
-            turn_id="t-test",
+            turn_id=turn_id,
             session_id="s-test",
             trigger=trigger,
             channel_id=channel_id,
