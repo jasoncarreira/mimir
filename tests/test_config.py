@@ -242,6 +242,22 @@ class TestConfigFromEnv:
         cfg = Config.from_env()
         assert cfg.web_port == 9090
 
+    def test_attachments_max_bytes_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """#495: a sane 25MiB inbound-attachment cap by default, so the bridge
+        size gate is armed (it's a no-op when None)."""
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_ATTACHMENTS_MAX_BYTES", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.attachments_max_bytes == 25 * 1024 * 1024
+
+    def test_attachments_max_bytes_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_ATTACHMENTS_MAX_BYTES", str(500 * 1024 * 1024))
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.attachments_max_bytes == 500 * 1024 * 1024
+
     def test_model_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._base(monkeypatch)
         monkeypatch.delenv("MIMIR_MODEL", raising=False)

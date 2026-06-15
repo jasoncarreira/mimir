@@ -479,6 +479,11 @@ class Config:
     slack_app_token: str
     bsky_handle: str
     bsky_app_password: str
+    # Per-file cap on inbound chat attachments the agent downloads to disk
+    # (#494/#495). Without it the bridge size gate is disabled and any chat
+    # participant can fill the agent's disk with max-size uploads. Override
+    # via ``MIMIR_ATTACHMENTS_MAX_BYTES`` (e.g. larger for Slack's ~1GB).
+    attachments_max_bytes: int
 
     # Identity reconciliation (FUTURE_WORK §6.1). Defaults true — operators
     # who want strict per-platform isolation (compliance, regulated workflows)
@@ -796,6 +801,9 @@ class Config:
             slack_app_token=_env("SLACK_APP_TOKEN"),
             bsky_handle=_env("BSKY_HANDLE"),
             bsky_app_password=_env("BSKY_APP_PASSWORD"),
+            attachments_max_bytes=_env_int(
+                "MIMIR_ATTACHMENTS_MAX_BYTES", 25 * 1024 * 1024,
+            ),
 
             cross_platform_pull=_env_bool("MIMIR_CROSS_PLATFORM_PULL", True),
 
