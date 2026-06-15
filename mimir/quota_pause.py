@@ -34,10 +34,16 @@ restart mid-pause doesn't lose the pause and immediately retry.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
 from dataclasses import dataclass
+
+try:
+    import fcntl  # POSIX advisory file locks (Linux/macOS)
+except ImportError:  # pragma: no cover - non-POSIX (Windows): lock degrades to no-op
+    fcntl = None  # type: ignore[assignment]
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -170,6 +176,12 @@ class QuotaPauseTracker:
             return
         if not isinstance(data, dict):
             return
+        # Reset the timestamp fields first so a reload (e.g. under the
+        # record_rate_limit lock) fully reflects the file — an absent field
+        # means "cleared", not "keep the stale in-memory value" (#484).
+        self._reset_at = None
+        self._recorded_at = None
+        self._last_transient_at = None
         raw_reset = data.get("reset_at")
         if isinstance(raw_reset, str):
             try:
@@ -244,6 +256,32 @@ class QuotaPauseTracker:
         self._recorded_at = now or datetime.now(tz=timezone.utc)
         self._save()
 
+    @contextlib.contextmanager
+    def _exclusive_lock(self):
+        """Cross-process exclusive lock around the pause-file read-modify-write,
+        so concurrent 429s from parallel turns (each with its own tracker
+        instance/process) can't lost-update an authoritative cap (#484).
+        Best-effort: degrades to no locking where fcntl or the lock file is
+        unavailable rather than failing the 429 handler."""
+        if fcntl is None:
+            yield
+            return
+        lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(lock_path, "w")
+        except OSError:
+            yield
+            return
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                fh.close()
+
     def record_rate_limit(
         self, exc: BaseException, *, now: datetime | None = None,
     ) -> tuple[datetime, str]:
@@ -263,6 +301,17 @@ class QuotaPauseTracker:
           of quiet (or an authoritative pause clearing it) so isolated
           blips reset to the 60s floor."""
         now = now or datetime.now(tz=timezone.utc)
+        # Serialize the read-modify-write across processes and reload fresh, so a
+        # header-less 429 can't clobber a live authoritative cap recorded by a
+        # concurrent turn down to the 60s transient floor — the guard below must
+        # test the current on-disk state, not this instance's snapshot (#484).
+        with self._exclusive_lock():
+            self._load()
+            return self._record_rate_limit_locked(exc, now=now)
+
+    def _record_rate_limit_locked(
+        self, exc: BaseException, *, now: datetime,
+    ) -> tuple[datetime, str]:
         parsed_reset, provider = extract_reset_at(exc)
         if parsed_reset is not None:
             # Authoritative cap — clear the transient clock so a later
