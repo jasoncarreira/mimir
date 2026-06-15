@@ -121,7 +121,7 @@ class WorklinkConfig:
             base_branch=str(defaults_data.get("base_branch", "main")),
             max_concurrent=int(defaults_data.get("max_concurrent", 2)),
             reaper_ttl_s=int(defaults_data.get("reaper_ttl_s", 7200)),
-            allow_autonomous_local_subprocess=bool(
+            allow_autonomous_local_subprocess=_coerce_safety_bool(
                 defaults_data.get("allow_autonomous_local_subprocess", False)
             ),
         )
@@ -214,6 +214,33 @@ def _expect_mapping(value: Any, label: str) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a mapping")
     return value
+
+
+_TRUE_TOKENS = frozenset({"true", "1", "yes", "on"})
+_FALSE_TOKENS = frozenset({"false", "0", "no", "off", ""})
+
+
+def _coerce_safety_bool(value: Any, *, default: bool = False) -> bool:
+    """Fail-closed bool coercion for safety knobs (e.g.
+    ``allow_autonomous_local_subprocess``).
+
+    Plain ``bool(value)`` is unsafe here: ``bool("false") is True`` and any
+    non-empty string would silently enable the unsafe path. So accept real YAML
+    booleans, 0/1 ints, and an explicit recognised true/false token set; anything
+    unrecognised (a typo, an arbitrary string) returns ``default`` — i.e. stays
+    OFF — rather than enabling the gate.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):  # YAML 0/1 (bool already handled above)
+        return value != 0
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _TRUE_TOKENS:
+            return True
+        if token in _FALSE_TOKENS:
+            return False
+    return default
 
 
 def _parse_tool_pins(value: Any) -> tuple[ToolPin, ...]:

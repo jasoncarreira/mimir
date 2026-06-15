@@ -19,6 +19,8 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
+import pytest
+
 from mimir.worklink import BackendRegistry, Caps, ComputeCaps, WorklinkConfig
 from mimir.worklink.backends.registry import WorklinkDefaults
 from mimir.worklink.orchestrator import WorklinkRunner
@@ -146,3 +148,36 @@ def test_autonomous_isolated_substrate_allowed(tmp_path: Path) -> None:
     result, claimed = _run(tmp_path, autonomous=True, compute_name="docker_sibling")
     assert claimed
     assert result.status != "refused"
+
+
+# ── fail-closed parsing of the safety knob ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("true", True),       # real YAML bool
+        ("false", False),
+        ('"true"', True),     # quoted string alias
+        ('"false"', False),   # the bug: bool("false") was True → must be False
+        ('"1"', True),
+        ('"0"', False),
+        ('"off"', False),
+        ("maybe", False),     # arbitrary/invalid string → fail closed (OFF)
+        ('"enabled"', False),
+    ],
+)
+def test_allow_autonomous_local_subprocess_parses_fail_closed(
+    tmp_path: Path, raw: str, expected: bool
+) -> None:
+    (tmp_path / "worklink.yaml").write_text(
+        f"defaults:\n  allow_autonomous_local_subprocess: {raw}\n", encoding="utf-8"
+    )
+    cfg = WorklinkConfig.load(tmp_path / "worklink.yaml")
+    assert cfg.defaults.allow_autonomous_local_subprocess is expected
+
+
+def test_allow_autonomous_local_subprocess_defaults_off(tmp_path: Path) -> None:
+    (tmp_path / "worklink.yaml").write_text("defaults:\n  priority: normal\n", encoding="utf-8")
+    cfg = WorklinkConfig.load(tmp_path / "worklink.yaml")
+    assert cfg.defaults.allow_autonomous_local_subprocess is False
