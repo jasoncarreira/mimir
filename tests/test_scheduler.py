@@ -2674,6 +2674,67 @@ def _read_event_types(path: Path) -> list[dict]:
     ]
 
 
+def test_worklink_reaper_empty_cron_does_not_install_job(tmp_path: Path):
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched.add_worklink_reaper_job(tmp_path, cron_expr="") is False
+    assert sched._scheduler.get_job("worklink-reaper") is None
+    assert "worklink-reaper" in sched.registered_callables()
+
+
+@pytest.mark.asyncio
+async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    async def noop(_e):
+        return True
+
+    class Rec:
+        def __init__(self, issue_id: int) -> None:
+            self.issue_id = issue_id
+
+    calls: list[Path] = []
+
+    def fake_reap(home: Path):
+        calls.append(home)
+        return [Rec(476), Rec(477)]
+
+    monkeypatch.setattr("mimir.worklink.autonomy.reap_stale_claims_for_home", fake_reap)
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched.add_worklink_reaper_job(tmp_path, cron_expr="* * * * *") is True
+    job = sched._scheduler.get_job("worklink-reaper")
+    assert job is not None
+
+    await job.func()
+
+    assert calls == [tmp_path]
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    [ev] = [e for e in events if e["type"] == "worklink_claims_reaped"]
+    assert ev["count"] == 2
+    assert ev["issue_ids"] == [476, 477]
+
+
+@pytest.mark.asyncio
+async def test_worklink_reaper_job_silent_when_nothing_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    async def noop(_e):
+        return True
+
+    monkeypatch.setattr("mimir.worklink.autonomy.reap_stale_claims_for_home", lambda home: [])
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched.add_worklink_reaper_job(tmp_path, cron_expr="* * * * *") is True
+    job = sched._scheduler.get_job("worklink-reaper")
+    assert job is not None
+
+    await job.func()
+
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    assert not [e for e in events if e["type"] == "worklink_claims_reaped"]
+
+
 @pytest.mark.asyncio
 async def test_fire_poller_suppressed_skips_subprocess_and_emits(
     tmp_path: Path, monkeypatch,

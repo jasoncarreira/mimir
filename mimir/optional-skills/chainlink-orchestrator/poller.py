@@ -56,6 +56,32 @@ def _chainlink_bin() -> str:
     return os.environ.get("CHAINLINK_BIN") or "chainlink"
 
 
+def _active_lock_count(home: Path) -> int | None:
+    """Active Chainlink lock count, or ``None`` if unreadable.
+
+    Locks are Worklink's atomic reservation surface. Counting labels here is a
+    TOCTOU bug: detached workers apply ``worklink:in-progress`` only after cold
+    start, so a second autonomous dispatcher can over-admit before labels show.
+    """
+    try:
+        proc = subprocess.run(
+            [_chainlink_bin(), "locks", "list", "--json"],
+            cwd=str(home), capture_output=True, text=True, check=False, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    locks = data.get("locks", data if isinstance(data, list) else {})
+    if isinstance(locks, (dict, list)):
+        return len(locks)
+    return None
+
+
 def _issue_ids_with_label(home: Path, label: str) -> list[int] | None:
     """Issue ids carrying ``label``, or ``None`` if the query failed.
 
@@ -96,17 +122,16 @@ def main() -> int:
     home = Path(home_env)
 
     ready_ids = _issue_ids_with_label(home, READY_LABEL)
-    active_ids = _issue_ids_with_label(home, IN_PROGRESS_LABEL)
-    # Fail closed: if we can't read either the ready queue or the active-claim
+    active = _active_lock_count(home)
+    # Fail closed: if we can't read either the ready queue or the active lock
     # count, do not dispatch (an undercounted cap could over-admit workers).
-    if ready_ids is None or active_ids is None:
+    if ready_ids is None or active is None:
         _emit({
             "signal": "worklink_poller_degraded",
-            "reason": "chainlink issue list failed; skipping dispatch this cycle",
+            "reason": "chainlink ready/lock read failed; skipping dispatch this cycle",
         })
         return 0
     ready = sorted(set(ready_ids))
-    active = len(active_ids)
     try:
         cap = int(os.environ.get("WORKLINK_MAX_CONCURRENT", "2"))
     except ValueError:

@@ -87,6 +87,62 @@ def test_worklink_run_cli_forwards_base_flag(
     assert calls and calls[0]["base_branch"] == "integration/worklink"
 
 
+def test_worklink_run_cli_forwards_autonomous_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_run_worklink(**kwargs: object) -> WorklinkRunResult:
+        calls.append(kwargs)
+        return WorklinkRunResult(issue_id=441, attempt=1, status="completed")
+
+    import mimir.commands.worklink as worklink_cmd
+
+    monkeypatch.setattr(worklink_cmd, "run_worklink", fake_run_worklink)
+
+    with pytest.raises(SystemExit) as exc:
+        main([
+            "worklink",
+            "run",
+            "441",
+            "--home",
+            str(tmp_path / "home"),
+            "--repo",
+            str(tmp_path / "repo"),
+            "--autonomous",
+        ])
+
+    assert exc.value.code == 0
+    assert calls and calls[0]["autonomous"] is True
+
+
+def test_worklink_run_cli_autonomous_refused_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_run_worklink(**kwargs: object) -> WorklinkRunResult:
+        return WorklinkRunResult(issue_id=441, attempt=None, status="refused", reason="unsafe compute")
+
+    import mimir.commands.worklink as worklink_cmd
+
+    monkeypatch.setattr(worklink_cmd, "run_worklink", fake_run_worklink)
+
+    with pytest.raises(SystemExit) as exc:
+        main([
+            "worklink",
+            "run",
+            "441",
+            "--home",
+            str(tmp_path / "home"),
+            "--repo",
+            str(tmp_path / "repo"),
+            "--autonomous",
+        ])
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "refused" in captured.err and "unsafe compute" in captured.err
+
+
 def test_worklink_worker_cli_dispatches_payload_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

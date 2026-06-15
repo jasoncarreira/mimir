@@ -47,14 +47,28 @@ class _FakeBackend:
 
 
 class _FakeCompute:
-    def __init__(self, name: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        shared_filesystem: bool = True,
+        network_isolated: bool = False,
+    ) -> None:
         self.name = name
+        self.shared_filesystem = shared_filesystem
+        self.network_isolated = network_isolated
 
     def capabilities(self) -> ComputeCaps:
-        return ComputeCaps(True, False, True, False)
+        return ComputeCaps(self.shared_filesystem, self.network_isolated, True, False)
 
 
-def _registry(*, compute_name: str = "local_subprocess", allow_local: bool = False) -> BackendRegistry:
+def _registry(
+    *,
+    compute_name: str = "local_subprocess",
+    allow_local: bool = False,
+    shared_filesystem: bool = True,
+    network_isolated: bool = False,
+) -> BackendRegistry:
     cfg = WorklinkConfig(defaults=WorklinkDefaults(
         backend="fake",
         compute_backend=compute_name,
@@ -62,12 +76,23 @@ def _registry(*, compute_name: str = "local_subprocess", allow_local: bool = Fal
     ))
     reg = BackendRegistry(cfg)
     reg.register(_FakeBackend("fake"))
-    reg.register_compute(_FakeCompute(compute_name))
+    reg.register_compute(_FakeCompute(
+        compute_name,
+        shared_filesystem=shared_filesystem,
+        network_isolated=network_isolated,
+    ))
     return reg
 
 
-def _run(tmp_path: Path, *, autonomous: bool, compute_name: str = "local_subprocess",
-         allow_local: bool = False):
+def _run(
+    tmp_path: Path,
+    *,
+    autonomous: bool,
+    compute_name: str = "local_subprocess",
+    allow_local: bool = False,
+    shared_filesystem: bool = True,
+    network_isolated: bool = False,
+):
     repo = tmp_path / "repo"
     repo.mkdir(parents=True, exist_ok=True)
     # The gate reads the authoritative <home>/worklink.yaml (not the injected
@@ -90,7 +115,12 @@ def _run(tmp_path: Path, *, autonomous: bool, compute_name: str = "local_subproc
             return cp(args, returncode=1)  # fail claim → a run past the gate stops here
         return cp(args)
 
-    registry = _registry(compute_name=compute_name, allow_local=allow_local)
+    registry = _registry(
+        compute_name=compute_name,
+        allow_local=allow_local,
+        shared_filesystem=shared_filesystem,
+        network_isolated=network_isolated,
+    )
     result = asyncio.run(
         WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
             441, autonomous=autonomous,
@@ -117,8 +147,27 @@ def test_policy_allows_local_subprocess_when_opted_in() -> None:
 
 def test_policy_allows_isolated_substrates() -> None:
     cfg = WorklinkConfig(defaults=WorklinkDefaults(allow_autonomous_local_subprocess=False))
-    assert cfg.autonomous_compute_allowed("docker_sibling") == (True, None)
-    assert cfg.autonomous_compute_allowed("ecs_runtask") == (True, None)
+    isolated = ComputeCaps(
+        shared_filesystem=False,
+        network_isolated=True,
+        handle_cancel=True,
+        persistent_after_disconnect=False,
+    )
+    assert cfg.autonomous_compute_allowed("docker_sibling", isolated) == (True, None)
+    assert cfg.autonomous_compute_allowed("ecs_runtask", isolated) == (True, None)
+
+
+def test_policy_refuses_differently_named_unsandboxed_backend() -> None:
+    cfg = WorklinkConfig(defaults=WorklinkDefaults(allow_autonomous_local_subprocess=False))
+    caps = ComputeCaps(
+        shared_filesystem=True,
+        network_isolated=False,
+        handle_cancel=True,
+        persistent_after_disconnect=False,
+    )
+    allowed, reason = cfg.autonomous_compute_allowed("custom_alias", caps)
+    assert allowed is False
+    assert reason and "shared filesystem" in reason
 
 
 # ── orchestrator gate ───────────────────────────────────────────────
@@ -145,7 +194,13 @@ def test_autonomous_local_subprocess_allowed_when_opted_in(tmp_path: Path) -> No
 
 
 def test_autonomous_isolated_substrate_allowed(tmp_path: Path) -> None:
-    result, claimed = _run(tmp_path, autonomous=True, compute_name="docker_sibling")
+    result, claimed = _run(
+        tmp_path,
+        autonomous=True,
+        compute_name="docker_sibling",
+        shared_filesystem=False,
+        network_isolated=True,
+    )
     assert claimed
     assert result.status != "refused"
 
@@ -165,6 +220,8 @@ def test_autonomous_isolated_substrate_allowed(tmp_path: Path) -> None:
         ('"off"', False),
         ("maybe", False),     # arbitrary/invalid string → fail closed (OFF)
         ('"enabled"', False),
+        ("2", False),
+        ("-1", False),
     ],
 )
 def test_allow_autonomous_local_subprocess_parses_fail_closed(

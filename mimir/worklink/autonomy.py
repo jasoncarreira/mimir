@@ -109,14 +109,16 @@ def check_concurrency(
 ) -> ConcurrencyCheck:
     """Whether autonomous dispatch may start one more leaf right now.
 
-    ``allowed`` is ``active < cap``. Per-issue exclusivity is a separate,
-    stronger guarantee enforced by ``chainlink locks claim`` inside
-    :meth:`ChainlinkClaims.claim_issue` — this cap only bounds the *total*
-    number of concurrent autonomous workers.
+    ``allowed`` is ``active < cap`` where ``active`` is the active Chainlink
+    lock count. Per-issue exclusivity and the final hard-cap reservation are
+    both enforced by ``chainlink locks claim`` inside
+    :meth:`ChainlinkClaims.claim_issue`; this preflight is advisory/fail-closed
+    so callers can skip work before entering the executor when the cap is
+    already full.
     """
     cap = worklink_defaults(home).max_concurrent
     cl = claims or make_claims(home, agent_id=agent_id)
-    active = cl.active_claim_count()
+    active = cl.active_worklink_lock_count()
     return ConcurrencyCheck(allowed=active < cap, active=active, cap=cap)
 
 
@@ -131,6 +133,12 @@ def reap_stale_claims_for_home(
     Reads ``reaper_ttl_s`` from worklink.yaml and delegates discovery +
     staleness to :meth:`ChainlinkClaims.reap_home`.
     """
-    ttl = timedelta(seconds=worklink_defaults(home).reaper_ttl_s)
+    defaults = worklink_defaults(home)
+    if defaults.reaper_ttl_s <= defaults.timeout_s:
+        raise RuntimeError(
+            "worklink reaper_ttl_s must be greater than timeout_s so the TTL "
+            "reaper cannot steal a legitimately running worker"
+        )
+    ttl = timedelta(seconds=defaults.reaper_ttl_s)
     cl = claims or make_claims(home, agent_id=agent_id)
     return cl.reap_home(ttl=ttl)

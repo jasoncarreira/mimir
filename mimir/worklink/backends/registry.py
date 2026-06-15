@@ -10,6 +10,7 @@ import yaml
 
 from ..compute import (
     ComputeBackend,
+    ComputeCaps,
     DockerSiblingComputeBackend,
     EcsRunTaskComputeBackend,
     EcsRunTaskConfig,
@@ -179,25 +180,31 @@ class WorklinkConfig:
     #: access (no isolation). Autonomous dispatch refuses these without opt-in.
     UNSANDBOXED_COMPUTE: tuple[str, ...] = ("local_subprocess",)
 
-    def autonomous_compute_allowed(self, compute_backend_name: str) -> tuple[bool, str | None]:
-        """Whether autonomous dispatch may use ``compute_backend_name`` (#460).
+    def autonomous_compute_allowed(
+        self,
+        compute_backend_name: str,
+        caps: ComputeCaps | None = None,
+    ) -> tuple[bool, str | None]:
+        """Whether autonomous dispatch may use a compute substrate (#460/#479).
 
-        Refuses an unsandboxed substrate (``local_subprocess``) unless the
-        operator opted in via ``defaults.allow_autonomous_local_subprocess``.
-        Isolated substrates (``docker_sibling`` / ``ecs_runtask`` / anything
-        else) are always allowed. The operator CLI does not consult this — it
-        always runs, with the documented blast-radius warning.
+        The safety invariant is capability-based: autonomous dispatch refuses a
+        substrate with shared filesystem access or without network isolation
+        unless the operator explicitly opts in to local-subprocess blast radius.
+        The historical name list remains a secondary guard for aliases of the
+        known local backend, but it is not the primary policy surface.
         """
-        if (
-            compute_backend_name in self.UNSANDBOXED_COMPUTE
-            and not self.defaults.allow_autonomous_local_subprocess
-        ):
+        normalized = _normalize_compute_backend_name(compute_backend_name)
+        unsafe_by_name = normalized in self.UNSANDBOXED_COMPUTE
+        unsafe_by_caps = caps is not None and (caps.shared_filesystem or not caps.network_isolated)
+        if (unsafe_by_name or unsafe_by_caps) and not self.defaults.allow_autonomous_local_subprocess:
+            reason = "shared filesystem access" if caps and caps.shared_filesystem else "no network isolation"
+            if unsafe_by_name and caps is None:
+                reason = "known unsandboxed compute backend"
             return False, (
                 f"autonomous Worklink dispatch refuses the unsandboxed "
-                f"'{compute_backend_name}' compute backend (full container "
-                f"filesystem access). Route this issue to an isolated "
-                f"ComputeBackend (docker_sibling / ecs_runtask), or set "
-                f"defaults.allow_autonomous_local_subprocess: true in "
+                f"'{compute_backend_name}' compute backend ({reason}). Route this "
+                f"issue to an isolated ComputeBackend (docker_sibling / ecs_runtask), "
+                f"or set defaults.allow_autonomous_local_subprocess: true in "
                 f"worklink.yaml to accept the blast radius for autonomous runs. "
                 f"The operator CLI `mimir worklink run` is unaffected."
             )
@@ -232,8 +239,10 @@ def _coerce_safety_bool(value: Any, *, default: bool = False) -> bool:
     """
     if isinstance(value, bool):
         return value
-    if isinstance(value, int):  # YAML 0/1 (bool already handled above)
-        return value != 0
+    if isinstance(value, int):  # YAML 0/1 only (bool already handled above)
+        if value in (0, 1):
+            return bool(value)
+        return default
     if isinstance(value, str):
         token = value.strip().lower()
         if token in _TRUE_TOKENS:
