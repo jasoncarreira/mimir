@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from mimir.jsonl_snapshot import JsonlSnapshot, iter_snapshot_or_tail
+from mimir.jsonl_snapshot import (
+    JsonlSnapshot,
+    iter_snapshot_or_tail,
+    iter_window_records,
+)
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -202,6 +206,42 @@ def test_iter_snapshot_or_tail_handles_missing_file(tmp_path: Path):
     snap = JsonlSnapshot(missing)
     assert list(iter_snapshot_or_tail(snap, missing)) == []
     assert list(iter_snapshot_or_tail(None, missing)) == []
+
+
+# ─── iter_window_records (#498) ──────────────────────────────────────
+
+
+def test_iter_window_records_falls_back_to_file_when_saturated(tmp_path: Path):
+    """#498: a saturated snapshot would truncate a time-windowed scan at the
+    cap (undercounting the window). iter_window_records streams the full file
+    tail instead, so the scan reaches its cutoff."""
+    path = tmp_path / "events.jsonl"
+    _write_jsonl(path, [{"i": i} for i in range(20)])
+
+    snap = JsonlSnapshot(path, max_records=5)
+    assert snap.records() and snap.saturated  # cap hit → saturated
+
+    out = list(iter_window_records(snap, path))
+    # All 20 (newest-first) via the file fallback — not just the capped 5.
+    assert [r["i"] for r in out] == list(range(19, -1, -1))
+
+
+def test_iter_window_records_uses_snapshot_when_not_saturated(tmp_path: Path):
+    """Unsaturated → use the cheap cached snapshot (no file re-read needed)."""
+    path = tmp_path / "events.jsonl"
+    _write_jsonl(path, [{"i": 1}, {"i": 2}])
+    snap = JsonlSnapshot(path, max_records=100)
+    assert not snap.saturated or snap.records()  # not saturated
+
+    out = list(iter_window_records(snap, path))
+    assert [r["i"] for r in out] == [2, 1]
+
+
+def test_iter_window_records_falls_back_when_no_snapshot(tmp_path: Path):
+    path = tmp_path / "events.jsonl"
+    _write_jsonl(path, [{"i": 1}, {"i": 2}])
+    out = list(iter_window_records(None, path))
+    assert [r["i"] for r in out] == [2, 1]
 
 
 # ─── Concurrency ─────────────────────────────────────────────────────

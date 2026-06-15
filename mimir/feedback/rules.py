@@ -10,7 +10,7 @@ from typing import Literal
 
 from ._models import Polarity, ValenceGroup
 from .._jsonl_tail import tail_jsonl_records
-from ..jsonl_snapshot import JsonlSnapshot, iter_snapshot_or_tail
+from ..jsonl_snapshot import JsonlSnapshot, iter_window_records
 
 log = logging.getLogger(__name__)
 
@@ -805,7 +805,7 @@ def _count_kinds_in_window(
     cutoff_iso: str,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
-    for ev in iter_snapshot_or_tail(snapshot, events_path):
+    for ev in iter_window_records(snapshot, events_path):  # #498: complete window
         ts = ev.get("timestamp")
         if not isinstance(ts, str) or ts < cutoff_iso:
             if isinstance(ts, str):
@@ -832,7 +832,7 @@ def _escalated_kinds_in_window(
     dedup so each kind emits at most one escalation event per window.
     """
     escalated: set[str] = set()
-    for ev in iter_snapshot_or_tail(snapshot, events_path):
+    for ev in iter_window_records(snapshot, events_path):  # #498: complete window
         ts = ev.get("timestamp")
         if not isinstance(ts, str) or ts < cutoff_iso:
             if isinstance(ts, str):
