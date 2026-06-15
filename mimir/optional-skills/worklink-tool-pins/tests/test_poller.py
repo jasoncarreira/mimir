@@ -62,13 +62,13 @@ def test_no_drift_exits_zero_silently(fresh_poller, monkeypatch, capsys):
         tool_pins:
           - name: codex
             category: coding-cli
-            pin: "0.137.0"
+            pin: "0.139.0"
             smoke: "codex --version"
             source: npm
             package: "@openai/codex"
         """,
     )
-    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.137.0", fresh_poller)})
+    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.139.0", fresh_poller)})
 
     assert fresh_poller.main() == 0
     assert _events(capsys) == []
@@ -82,13 +82,13 @@ def test_detected_drift_files_issue_and_emits_jsonl(fresh_poller, monkeypatch, c
         tool_pins:
           - name: codex
             category: coding-cli
-            pin: "0.137.0"
+            pin: "0.139.0"
             smoke: "codex --version && echo smoke"
             source: npm
             package: "@openai/codex"
         """,
     )
-    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.138.0", fresh_poller)})
+    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.140.0", fresh_poller)})
 
     calls: list[list[str]] = []
 
@@ -114,7 +114,7 @@ def test_detected_drift_files_issue_and_emits_jsonl(fresh_poller, monkeypatch, c
     assert events[0]["poller"] == "worklink-tool-pins"
     assert events[0]["event_type"] == "worklink_tool_pin_drift"
     assert events[0]["issue_id"] == 900
-    assert events[0]["dedupe_key"] == "worklink-tool-pin:coding-cli:codex:0.137.0->0.138.0"
+    assert events[0]["dedupe_key"] == "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0"
     assert "Chainlink bump issue: #900" in events[0]["prompt"]
 
     create = calls[1]
@@ -132,12 +132,12 @@ def test_reuses_existing_issue_by_dedupe_key(fresh_poller, monkeypatch, capsys):
         tool_pins:
           - name: codex
             category: coding-cli
-            pin: "0.137.0"
+            pin: "0.139.0"
             smoke: "codex --version"
             source: npm
         """,
     )
-    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.138.0", fresh_poller)})
+    monkeypatch.setattr(fresh_poller, "_resolvers", lambda: {"npm": FakeNpmResolver("0.140.0", fresh_poller)})
 
     calls: list[list[str]] = []
 
@@ -152,7 +152,7 @@ def test_reuses_existing_issue_by_dedupe_key(fresh_poller, monkeypatch, capsys):
                     [
                         {
                             "id": 901,
-                            "description": "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.137.0->0.138.0",
+                            "description": "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
                         }
                     ]
                 ),
@@ -176,7 +176,7 @@ def test_lookup_failure_is_diagnostic_not_emit_or_nonzero(fresh_poller, monkeypa
         tool_pins:
           - name: codex
             category: coding-cli
-            pin: "0.137.0"
+            pin: "0.139.0"
             smoke: "codex --version"
             source: npm
         """,
@@ -198,7 +198,7 @@ def test_production_subprocess_imports_without_mimir_or_pyyaml(tmp_path: Path):
         tool_pins:
           - name: codex
             category: coding-cli
-            pin: "0.137.0"
+            pin: "0.139.0"
             smoke: "codex --version"
             source: manual
         """,
@@ -224,7 +224,7 @@ def test_resolvers_do_not_run_smoke_commands(monkeypatch, fresh_poller):
     def run(args, **kwargs):
         calls.append(args)
         if args[:3] == ["npm", "view", "@openai/codex"]:
-            return subprocess.CompletedProcess(args, 0, "0.138.0\n", "")
+            return subprocess.CompletedProcess(args, 0, "0.140.0\n", "")
         if args[:4] == ["gh", "release", "view", "--repo"]:
             return subprocess.CompletedProcess(args, 0, json.dumps({"tagName": "v1.2.3", "url": "https://example.test"}), "")
         raise AssertionError(f"unexpected command: {args}")
@@ -232,7 +232,7 @@ def test_resolvers_do_not_run_smoke_commands(monkeypatch, fresh_poller):
     npm = fresh_poller.NpmVersionResolver(runner=run)
     gh = fresh_poller.GitHubReleaseResolver(runner=run)
 
-    assert npm.resolve(fresh_poller.ToolPin("codex", "coding-cli", "0.137.0", "SHOULD_NOT_RUN", source="npm", package="@openai/codex")).current == "0.138.0"
+    assert npm.resolve(fresh_poller.ToolPin("codex", "coding-cli", "0.139.0", "SHOULD_NOT_RUN", source="npm", package="@openai/codex")).current == "0.140.0"
     assert gh.resolve(fresh_poller.ToolPin("chainlink", "tracker", "v1.0.0", "SHOULD_NOT_RUN", source="github-release", repo="owner/repo")).current == "v1.2.3"
     assert calls == [
         ["npm", "view", "@openai/codex", "version"],

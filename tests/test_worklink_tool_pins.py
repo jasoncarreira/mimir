@@ -77,21 +77,21 @@ def test_inventory_tool_pins_reports_drift_without_mutating_or_smoking() -> None
     pin = ToolPin(
         name="codex",
         category="coding-cli",
-        pin="0.137.0",
+        pin="0.139.0",
         smoke="codex --version",
         source="npm",
         package="@openai/codex",
     )
-    resolver = FakeResolver("0.138.0", changelog="- fixed worker mode", risk="medium")
+    resolver = FakeResolver("0.140.0", changelog="- fixed worker mode", risk="medium")
 
     inventory = inventory_tool_pins([pin], {"npm": resolver})
 
     assert resolver.calls == [pin]
     assert inventory.diagnostics == ()
     assert inventory.drift == (
-        ToolPinDrift(pin=pin, current="0.138.0", changelog="- fixed worker mode", risk="medium"),
+        ToolPinDrift(pin=pin, current="0.140.0", changelog="- fixed worker mode", risk="medium"),
     )
-    assert inventory.drift[0].dedupe_key == "worklink-tool-pin:coding-cli:codex:0.137.0->0.138.0"
+    assert inventory.drift[0].dedupe_key == "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0"
 
 
 def test_inventory_tool_pins_skips_matching_manual_unknown_and_failed_resolvers() -> None:
@@ -118,20 +118,20 @@ def test_render_bump_issue_body_is_worklink_ready_and_uses_smoke_as_suggested_te
         pin=ToolPin(
             name="codex",
             category="coding-cli",
-            pin="0.137.0",
+            pin="0.139.0",
             smoke="codex --version && uv run pytest -q tests/test_worklink_backends.py",
             source="npm",
             package="@openai/codex",
         ),
-        current="0.138.0",
+        current="0.140.0",
         changelog="- release notes here",
         risk="low risk",
     )
 
-    assert render_bump_issue_title(drift) == "Bump Worklink codex pin to 0.138.0"
+    assert render_bump_issue_title(drift) == "Bump Worklink codex pin to 0.140.0"
     body = render_bump_issue_body(drift)
 
-    assert "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.137.0->0.138.0" in body
+    assert "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0" in body
     assert "- release notes here" in body
     assert "low risk" in body
     assert "Install surface:" in body
@@ -151,14 +151,14 @@ def test_chainlink_bump_filer_reuses_existing_issue_by_dedupe_key() -> None:
             {
                 "id": 777,
                 "title": "Bump Worklink codex pin",
-                "description": "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.137.0->0.138.0",
+                "description": "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0",
             }
         ])
         return subprocess.CompletedProcess(args, 0, stdout, "")
 
     drift = ToolPinDrift(
-        pin=ToolPin("codex", "coding-cli", "0.137.0", "codex --version", source="npm"),
-        current="0.138.0",
+        pin=ToolPin("codex", "coding-cli", "0.139.0", "codex --version", source="npm"),
+        current="0.140.0",
     )
 
     assert ChainlinkBumpFiler(runner=runner).file(drift) == 777
@@ -175,12 +175,12 @@ def test_chainlink_bump_filer_creates_low_priority_issue_when_no_duplicate() -> 
         return subprocess.CompletedProcess(args, 0, "Created issue #778\n", "")
 
     drift = ToolPinDrift(
-        pin=ToolPin("codex", "coding-cli", "0.137.0", "codex --version", source="npm"),
-        current="0.138.0",
+        pin=ToolPin("codex", "coding-cli", "0.139.0", "codex --version", source="npm"),
+        current="0.140.0",
     )
 
     assert ChainlinkBumpFiler(runner=runner).file(drift) == 778
-    assert calls[1][:4] == ["chainlink", "issue", "create", "Bump Worklink codex pin to 0.138.0"]
+    assert calls[1][:4] == ["chainlink", "issue", "create", "Bump Worklink codex pin to 0.140.0"]
     assert "--priority" in calls[1]
     assert "low" in calls[1]
     assert "--label" in calls[1]
@@ -194,8 +194,8 @@ def test_chainlink_bump_filer_raises_on_create_failure() -> None:
         return subprocess.CompletedProcess(args, 1, "", "boom")
 
     drift = ToolPinDrift(
-        pin=ToolPin("codex", "coding-cli", "0.137.0", "codex --version", source="npm"),
-        current="0.138.0",
+        pin=ToolPin("codex", "coding-cli", "0.139.0", "codex --version", source="npm"),
+        current="0.140.0",
     )
 
     with pytest.raises(RuntimeError, match="boom"):
