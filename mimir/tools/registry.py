@@ -999,9 +999,14 @@ def _spawn_reset_for_tests() -> None:
     _SPAWN_GUARD.recent.clear()
 
 
-async def _spawn_acquire_rate_slot(guard: _SpawnGuard) -> str | None:
-    """Check + reserve a per-hour spawn slot. Returns ``None`` if a
-    slot was reserved, or an error string if the cap is exhausted.
+async def _spawn_acquire_rate_slot(guard: _SpawnGuard) -> tuple[float | None, str | None]:
+    """Check + reserve a per-hour spawn slot.
+
+    Returns ``(token, None)`` if a slot was reserved, where ``token`` is
+    the exact timestamp appended to the sliding window, or
+    ``(None, error)`` if the cap is exhausted. The token lets abort
+    paths remove their own reservation rather than blindly popping the
+    newest entry, which can belong to a concurrent spawn.
 
     The window is a sliding 3600-second wall-clock window over
     ``time.monotonic()`` timestamps. The check + append are inside
@@ -1017,29 +1022,34 @@ async def _spawn_acquire_rate_slot(guard: _SpawnGuard) -> str | None:
         if len(guard.recent) >= guard.max_per_hour:
             oldest_age = int(now - guard.recent[0])
             return (
+                None,
                 f"spawn_claude_code refused: per-hour cap "
                 f"({guard.max_per_hour}/h) reached — oldest entry "
                 f"{oldest_age}s ago. Raise MIMIR_SPAWN_MAX_PER_HOUR "
-                f"or wait for the window to roll forward."
+                f"or wait for the window to roll forward.",
             )
         guard.recent.append(now)
-    return None
+    return now, None
 
 
-def _spawn_release_rate_slot(guard: _SpawnGuard) -> None:
-    """Release the most-recent spawn slot — called on the refusal
-    paths AFTER the rate slot was reserved but BEFORE the concurrency
-    semaphore acquired (currently only the depth check is between
-    those, but the structure keeps the cleanup explicit). The
-    rate window is sliding, so the only correct behavior on
-    abort is to remove the entry we just appended."""
+async def _spawn_release_rate_slot(guard: _SpawnGuard, token: float | None) -> None:
+    """Release this spawn's reserved rate slot on abort.
+
+    The rate window is shared by concurrent spawn calls, so abort cleanup
+    must remove the exact token returned by ``_spawn_acquire_rate_slot``
+    under the same lock. A blind ``pop()`` can remove a later concurrent
+    spawn's reservation instead.
+    """
+    if token is None:
+        return
     assert guard.rate_lock is not None
-    # No lock needed for a single pop — deque is thread-safe for
-    # append/pop and we're the only writer holding context here.
-    try:
-        guard.recent.pop()
-    except IndexError:
-        pass
+    async with guard.rate_lock:
+        try:
+            guard.recent.remove(token)
+        except ValueError:
+            # The token may already have aged out during an unusually long
+            # wait; either way, there is no live reservation to release.
+            pass
 
 
 def _run_claude_subprocess(
@@ -1154,7 +1164,7 @@ async def spawn_claude_code(
 
     # Per-hour rate cap. Reserves a slot inside the rate_lock so two
     # concurrent spawns can't both pass the check.
-    rate_err = await _spawn_acquire_rate_slot(guard)
+    rate_token, rate_err = await _spawn_acquire_rate_slot(guard)
     if rate_err is not None:
         return rate_err
 
@@ -1197,7 +1207,7 @@ async def spawn_claude_code(
         # rate-slot we reserved doesn't reflect real work that
         # consumed budget. Release it so the per-hour window is
         # accurate for the operator.
-        _spawn_release_rate_slot(guard)
+        await _spawn_release_rate_slot(guard, rate_token)
         raise
     if returncode != 0:
         return (
@@ -1273,7 +1283,7 @@ async def spawn_codex(
             f"The parent agent is already at this nesting level — "
             f"deeper spawns would risk a fork-bomb / unbounded budget."
         )
-    rate_err = await _spawn_acquire_rate_slot(guard)
+    rate_token, rate_err = await _spawn_acquire_rate_slot(guard)
     if rate_err is not None:
         # The shared helper names spawn_claude_code; retarget for this tool.
         return rate_err.replace("spawn_claude_code", "spawn_codex")
@@ -1311,7 +1321,7 @@ async def spawn_codex(
             except FileNotFoundError:
                 return "spawn_codex failed: 'codex' CLI not on PATH"
     except BaseException:
-        _spawn_release_rate_slot(guard)
+        await _spawn_release_rate_slot(guard, rate_token)
         raise
     if returncode != 0:
         return f"spawn_codex failed: exit={returncode} stderr={stderr[:500]}"
