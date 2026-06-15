@@ -712,7 +712,18 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        home = Path(_env("MIMIR_HOME") or Path.cwd()).resolve()
+        raw_home = _env("MIMIR_HOME")
+        if not raw_home:
+            # `mimir run` gates on this and refuses to start; this fallback
+            # only reaches direct from_env callers (tests, one-off ops
+            # commands). Warn loudly so a misconfigured direct launch is
+            # visible rather than silently homing on the process cwd — a
+            # cwd-home is what makes the agent chase paths that don't exist.
+            log.warning(
+                "MIMIR_HOME is not set; falling back to the current directory "
+                "(%s). Set MIMIR_HOME to an explicit agent home.", Path.cwd(),
+            )
+        home = Path(raw_home or Path.cwd()).resolve()
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
         # Resolve once — used by both ``billing_mode`` (to detect QUOTA

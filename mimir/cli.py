@@ -78,7 +78,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     run_p = sub.add_parser("run", help="Run the mimir server (default).")
     run_p.add_argument(
         "--home", type=Path, default=None,
-        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+        help="Agent home (overrides MIMIR_HOME). Required: `run` refuses to "
+             "start if neither --home nor MIMIR_HOME is set.",
     )
 
     # `mimir identities {list,add,remove,resolve}` — delegate to commands.identities
@@ -518,6 +519,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         home_arg = getattr(args, "home", None)
         if home_arg is not None:
             os.environ["MIMIR_HOME"] = str(Path(home_arg).resolve())
+        # The agent home must be EXPLICIT. Refuse to start with neither
+        # ``--home`` nor ``MIMIR_HOME`` rather than silently defaulting to the
+        # process cwd: a cwd-home scatters state/skills/memory wherever the
+        # process happened to launch and makes the agent chase container-shaped
+        # paths that don't exist on the box (the classic non-Docker failure).
+        if not os.environ.get("MIMIR_HOME"):
+            print(
+                "error: MIMIR_HOME is not set.\n"
+                "  The agent home must be explicit. Either:\n"
+                "    mimir run --home /path/to/agent-home\n"
+                "  or export MIMIR_HOME=/path/to/agent-home before `mimir run`.\n"
+                "  (Refusing to default to the current directory.)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         # Defer import — server pulls in aiohttp/SDK; keep `mimir setup`
         # snappy and importable in environments where the runtime isn't
         # fully wired up yet.
