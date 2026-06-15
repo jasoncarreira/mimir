@@ -2065,7 +2065,7 @@ class Scheduler:
             try:
                 from datetime import datetime, timezone as _tz
                 from .reflection.introspection_report import (
-                    aggregate, render_markdown, maybe_emit_health_event,
+                    aggregate, render_markdown, health_degraded_fields,
                 )
                 turns_log = home / "logs" / "turns.jsonl"
                 events_log = home / "logs" / "events.jsonl"
@@ -2080,9 +2080,12 @@ class Scheduler:
 
                 emitted = False
                 if emit_algedonic:
-                    emitted = maybe_emit_health_event(
-                        report, events_log, threshold=health_threshold,
-                    )
+                    fields = health_degraded_fields(report, threshold=health_threshold)
+                    if fields is not None:
+                        # Emit through the shared EventLogger (serialized with
+                        # live-turn writes + trim) rather than a raw append (#486).
+                        await log_event("heartbeat_health_degraded", **fields)
+                        emitted = True
 
                 await log_event(
                     "introspection_report_ok",

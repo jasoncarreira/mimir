@@ -743,25 +743,19 @@ def render_markdown(report: Report) -> str:
 # ─── Algedonic emit ────────────────────────────────────────────────────
 
 
-def maybe_emit_health_event(
-    report: Report,
-    events_log: Path,
-    *,
-    threshold: float,
-) -> bool:
-    """When pipeline success rate is below ``threshold``, append a
-    ``heartbeat_health_degraded`` event to events.jsonl. Returns True
-    when emitted. No-op when:
-      - heartbeat fired==0 in window (no signal to interpret)
-      - success_rate >= threshold
-    """
+def health_degraded_fields(report: Report, *, threshold: float) -> dict | None:
+    """Pure decision: the ``heartbeat_health_degraded`` event fields when the
+    pipeline success rate is below ``threshold``, else ``None``.
+
+    Returns only the payload fields (no ``type``/``session_id``/``timestamp`` —
+    the EventLogger stamps those). No signal when ``success_rate`` is ``None``
+    (heartbeat fired==0 in window) or >= threshold. Callers emit via the shared
+    logger (``log_event`` / ``log_event_sync``) so the write is serialized —
+    never a raw append, which races the EventLogger's trim (#486)."""
     rate = report.heartbeat.success_rate
     if rate is None or rate >= threshold:
-        return False
-    payload = {
-        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-        "type": "heartbeat_health_degraded",
-        "session_id": "introspection-report",
+        return None
+    return {
         "success_rate": round(rate, 4),
         "threshold": threshold,
         "fired": report.heartbeat.fired,
@@ -769,6 +763,31 @@ def maybe_emit_health_event(
         "suppressed": report.heartbeat.suppressed,
         "dropped": report.heartbeat.dropped,
         "window_days": report.days,
+    }
+
+
+def maybe_emit_health_event(
+    report: Report,
+    events_log: Path,
+    *,
+    threshold: float,
+) -> bool:
+    """Standalone-CLI helper: append a ``heartbeat_health_degraded`` event to
+    ``events_log`` when degraded. Returns True when emitted.
+
+    Used only by the ``mimir`` introspection CLI, which runs as its own process
+    with no concurrent EventLogger — so the direct append is race-free there.
+    The in-process scheduler path must NOT use this; it emits via
+    :func:`health_degraded_fields` + ``log_event`` to share the EventLogger lock
+    (#486)."""
+    fields = health_degraded_fields(report, threshold=threshold)
+    if fields is None:
+        return False
+    payload = {
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "type": "heartbeat_health_degraded",
+        "session_id": "introspection-report",
+        **fields,
     }
     events_log.parent.mkdir(parents=True, exist_ok=True)
     with events_log.open("a", encoding="utf-8") as f:
