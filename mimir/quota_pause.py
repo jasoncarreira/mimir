@@ -168,6 +168,18 @@ class QuotaPauseTracker:
 
     def _load(self) -> None:
         if not self._path.is_file():
+            # Absent file = no pause on disk. Fully clear in-memory state so a
+            # reload under the record_rate_limit lock of a since-cleared file
+            # (another process called clear()) doesn't keep reporting a stale
+            # authoritative cap via the don't-shorten guard (#692 review).
+            # An unreadable/corrupt file below is left as-is on purpose — a
+            # transient read error shouldn't drop a live pause.
+            self._reset_at = None
+            self._reason = None
+            self._provider = None
+            self._recorded_at = None
+            self._consecutive = 0
+            self._last_transient_at = None
             return
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))

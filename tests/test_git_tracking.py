@@ -240,6 +240,44 @@ async def test_commit_holds_per_home_lock_during_stage_and_commit(
         git_tracking._pending_push_task.cancel()
 
 
+@pytest.mark.asyncio
+async def test_retry_push_holds_per_home_lock_during_remote_sync(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#692 review: the retry push path runs ``_sync_remote_before_push`` (pull
+    --rebase + reset/add/commit reconcile) under the per-home lock too, so a
+    retry waking mid-turn can't race a live-turn commit's index/HEAD writes."""
+    lock = git_tracking._get_lock(home_repo)
+    locked_during_sync: dict[str, bool] = {}
+
+    async def spy_sync(*, home: Path, turn_id: str, branch: str | None) -> bool:
+        locked_during_sync["held"] = lock.locked()
+        return True
+
+    async def fake_has_origin(home: Path) -> bool:
+        return True
+
+    orig_git = git_tracking._git
+
+    async def spy_git(*args: str, **kwargs: Any) -> Any:
+        if args and args[0] == "push":
+            return ""  # no-op the network push (no real remote in this test)
+        return await orig_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_sync_remote_before_push", spy_sync)
+    monkeypatch.setattr(git_tracking, "_has_origin_remote", fake_has_origin)
+    monkeypatch.setattr(git_tracking, "_git", spy_git)
+
+    await git_tracking._retry_push(
+        home=home_repo, delay=0.0, attempt=0, turn_id="t-retry",
+    )
+
+    # The remote sync ran while the per-home lock was held...
+    assert locked_during_sync.get("held") is True
+    # ...and the lock is released afterward.
+    assert lock.locked() is False
+
+
 # ─── pull --rebase before push (#340) ───────────────────────────────
 
 

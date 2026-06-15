@@ -57,10 +57,12 @@ from .billing import (
     BillingMode,
     QuotaProvider,
     Severity,
+    _is_stale_observation,
     evaluate_quota_severity,
     priority_tolerates,
 )
 from .feedback import pending_forget_candidates_count
+from .quota_windows import store_window_hours
 from .rate_limits import RateLimitSnapshot, RateLimitStore
 from .usage_stats import (
     CostRateAlert,
@@ -81,6 +83,11 @@ _background_tasks: set[asyncio.Task[Any]] = set()
 # Pay-as-you-go ELEVATED early warning: within this fraction of a
 # configured cost-rate trip (hourly limit or spike threshold).
 _NEAR_TRIP_FRACTION = 0.8
+
+# Store key → window hours, for the no-reset staleness guard in
+# ``snapshot()``. Static mapping; computed once at import (mirrors
+# ``rate_limits._WINDOW_HOURS``).
+_STORE_WINDOW_HOURS: dict[str, float] = store_window_hours()
 
 
 @dataclass
@@ -187,6 +194,20 @@ class HomeostaticArbiter:
         worst_resets_at: int | None = None
         for key, snap in self.rate_limit_store.current().items():
             if snap.utilization is None:
+                continue
+            # Staleness guard, mirroring _StorageBackedQuotaProvider.get_windows
+            # (chainlink #424): current() keeps resets_at=None entries forever,
+            # so a no-reset reading older than its own window has definitionally
+            # rolled. Trusting it pins this raw wall — which both the QUOTA
+            # backstop (#483) and the PAYG sanity wall read — at a saturated
+            # value with nothing left under suppression to refresh the store.
+            # Entries WITH a resets_at keep the store's own expiry.
+            window_hours = _STORE_WINDOW_HOURS.get(key)
+            if (
+                snap.resets_at is None
+                and window_hours is not None
+                and _is_stale_observation(snap.observed_at, window_hours)
+            ):
                 continue
             if worst_util is None or snap.utilization > worst_util:
                 worst_util = snap.utilization

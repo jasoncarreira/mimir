@@ -850,7 +850,14 @@ async def _retry_push(*, home: Path, delay: float, attempt: int, turn_id: str) -
     # Try the pull/reconcile + push.
     error_reason = None
     error_returncode = None
-    if not await _sync_remote_before_push(home=home, turn_id=turn_id, branch=branch):
+    # Same index/HEAD race as the debounced path (#482): _sync_remote_before_push
+    # runs pull --rebase + a reset/add/commit reconcile that must not interleave
+    # with a live-turn commit's staging. The retry fires off a background timer, so
+    # it can wake mid-turn — serialize it under the per-home lock too. The network
+    # push below stays unlocked (it doesn't touch the index).
+    async with _get_lock(home):
+        synced = await _sync_remote_before_push(home=home, turn_id=turn_id, branch=branch)
+    if not synced:
         error_reason = "pull_blocked"
     else:
         try:
