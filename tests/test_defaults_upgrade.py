@@ -93,6 +93,34 @@ def test_first_run_initializes_vendor_baseline_only(home: Path, monkeypatch: pyt
     assert _git("status", "--porcelain", cwd=home).stdout.strip() == ""
 
 
+
+def test_vendor_worktree_self_heals_missing_scratch_ignore(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defaults-vendor worktrees must not rely on startup call ordering.
+
+    Older homes may have the broad allowlist-style .gitignore without the
+    explicit scratch/ line. Vendor branch preparation should repair that before
+    it creates scratch/defaults-vendor.
+    """
+    gitignore = home / ".gitignore"
+    gitignore.write_text(
+        "*\n!*/\n!memory/**\n!prompts/**\n!state/**\n!.gitignore\n",
+        encoding="utf-8",
+    )
+    _git("add", ".gitignore", cwd=home)
+    _git("commit", "-q", "-m", "simulate old gitignore", cwd=home)
+    _git("push", "-q", cwd=home)
+    _defaults(monkeypatch, identity="identity v1\n", heartbeat="heartbeat v1\n")
+
+    result = du.check_and_open_defaults_upgrade(home, version="1.0.0")
+
+    assert result.ok and result.action == "baseline_initialized"
+    assert "scratch/" in gitignore.read_text(encoding="utf-8")
+    status = _git("status", "--porcelain", cwd=home).stdout.splitlines()
+    assert status == [" M .gitignore"]
+
+
 def test_same_version_is_noop(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _defaults(monkeypatch, identity="identity v1\n", heartbeat="heartbeat v1\n")
     assert du.check_and_open_defaults_upgrade(home, version="1.0.0").action == "baseline_initialized"
