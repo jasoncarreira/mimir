@@ -19,7 +19,9 @@ Arbiter shedding under resource pressure is handled by the scheduler BEFORE
 this poller fires (it carries ``priority`` in pollers.json), so the body here
 stays pure discovery + dispatch.
 
-Standalone: stdlib only, no mimir imports (runs in a scrubbed subprocess).
+Imports the Worklink config loader from mimir so the autonomous cap uses the same
+parser/defaulting as the CLI/tool path. The poller runs under the mimir venv via
+``sys.executable``.
 
 Env (passed via pollers.json):
   MIMIR_HOME              Chainlink repo + agent home (required).
@@ -40,6 +42,8 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
 READY_LABEL = "worklink:ready"
@@ -118,56 +122,30 @@ def _issue_ids_with_label(home: Path, label: str) -> list[int] | None:
 
 
 
-def _positive_int(value: object, *, default: int) -> int:
-    if isinstance(value, bool):
-        return default
-    try:
-        parsed = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
-
-
-def _read_defaults_scalar(path: Path, key: str) -> str | None:
-    in_defaults = False
-    defaults_indent = 0
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.split("#", 1)[0].rstrip()
-        if not line.strip():
-            continue
-        indent = len(line) - len(line.lstrip())
-        stripped = line.strip()
-        if stripped == "defaults:":
-            in_defaults = True
-            defaults_indent = indent
-            continue
-        if in_defaults and indent <= defaults_indent:
-            in_defaults = False
-        if in_defaults and stripped.startswith(f"{key}:"):
-            return stripped.split(":", 1)[1].strip().strip('"\'')
-    return None
-
-
 def _configured_cap(home: Path) -> int:
-    """Autonomous concurrency cap: worklink.yaml is canonical.
+    """Autonomous concurrency cap: ``worklink.yaml`` is canonical.
 
-    ``WORKLINK_MAX_CONCURRENT`` remains a legacy override for deployments that
-    have not moved the knob into ``worklink.yaml`` yet. Malformed values fall
-    back to the safe default rather than crashing the poller.
+    Read through ``WorklinkConfig`` instead of a poller-local YAML subset parser
+    so the detached ready-queue poller honors the same syntax, defaults, and
+    malformed-value fallback as the in-turn ``worklink_run`` path.
+
+    ``WORKLINK_MAX_CONCURRENT`` remains a legacy override only when no
+    ``worklink.yaml`` is present.
     """
-    default = 2
     config = home / "worklink.yaml"
     if config.exists():
         try:
-            configured = _read_defaults_scalar(config, "max_concurrent")
-        except OSError:
-            configured = None
-        if configured is not None:
-            return _positive_int(configured, default=default)
+            return WorklinkConfig.load(config).defaults.max_concurrent
+        except (OSError, ValueError):
+            return WorklinkDefaults.max_concurrent
     legacy = os.environ.get("WORKLINK_MAX_CONCURRENT")
     if legacy is not None:
-        return _positive_int(legacy, default=default)
-    return default
+        try:
+            parsed = int(legacy)
+        except ValueError:
+            return WorklinkDefaults.max_concurrent
+        return parsed if parsed > 0 else WorklinkDefaults.max_concurrent
+    return WorklinkDefaults.max_concurrent
 
 
 def main() -> int:

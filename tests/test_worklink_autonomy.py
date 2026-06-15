@@ -549,6 +549,28 @@ def test_poller_reads_cap_from_worklink_yaml(tmp_path: Path) -> None:
     ] == [10, 11]
 
 
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_reads_flow_style_cap_through_worklink_config(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "worklink.yaml").write_text('defaults: {max_concurrent: "3"}\n', encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(_fake_chainlink_script(tmp_path, ready=[10, 11, 12], active_locks=[10])),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "1",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+    # WorklinkConfig parses flow-style YAML and takes precedence over the legacy
+    # env cap: cap 3, 1 active lock → 2 free slots.
+    assert [
+        r.get("issue_id") for r in events if r.get("signal") == "worklink_dispatched"
+    ] == [10, 11]
+
+
 def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
