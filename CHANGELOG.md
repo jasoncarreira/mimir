@@ -56,6 +56,8 @@ longer hard-codes container paths).
   assuming `/mimir-home`.
 - **Coding-CLI pins bumped** (#679) and the `claude-code` CLI install
   is gated in the scaffold Dockerfile (#650).
+- **Docker images ship Node 22 LTS** (was 20) — both the scaffold
+  generator and the top-level PyPI `Dockerfile` (#703).
 
 ### Fixed
 
@@ -93,7 +95,7 @@ longer hard-codes container paths).
     `UnicodeDecodeError` turn-failure hardening (#662).
   - LLM-tick jobs no longer inherit the 1s misfire grace that silently
     skipped the heartbeat (#660); the scheduler surfaces event-loop lag
-    (#675).
+    (#675) and attributes it to the active turn hogging the loop (#702).
   - `SchedulerJob` is constructed before `Scheduler.add_job` (#682);
     mid-turn injection snapshots finalize atomically (#688); denied
     writes are scoped by turn (#686); an aborted spawn releases its
@@ -107,7 +109,12 @@ longer hard-codes container paths).
     model is used in the API-key embedding fallback (#681).
 - **Docs:** chainlink block argument order (#654); codex sandbox
   boundary clarified (#648); ComputeBackend execution-substrate axis +
-  verified sandbox profile documented (#652).
+  verified sandbox profile documented (#652); the web UI's turn viewer
+  + ops pages are highlighted across the onboarding skill, README, and
+  docker docs (#704); a non-Docker setup/troubleshooting guide
+  (`docs/mimir-nondocker-guide.md`) was added (#701); and the SPEC +
+  `docs/internal/*` design docs were refreshed against the current code
+  (#705).
 
 ## [0.3.5] — 2026-06-11
 
