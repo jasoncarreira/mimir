@@ -281,3 +281,39 @@ async def test_concurrency_semaphore_serializes(
     )
     assert all("refused" not in r.lower() for r in results)
     assert peak <= 2, f"max_concurrent=2 was violated (peak={peak})"
+
+
+# ─── #494: minimal spawned-CLI env (no secret bleed) ───────────────────
+
+
+def test_minimal_child_env_strips_unrelated_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#494: a spawned CLI gets infra + only its provider's creds + the
+    incremented spawn depth — never the parent's unrelated secrets."""
+    from mimir.tools.registry import _minimal_child_env
+
+    # Unrelated secrets that must NOT reach the child.
+    for k in ("DISCORD_TOKEN", "DATABASE_URL", "TAVILY_API_KEY", "GITHUB_TOKEN"):
+        monkeypatch.setenv(k, f"{k}-secret")
+    # Provider creds + infra.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-xyz")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-xyz")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", "/home/mimir")
+
+    claude_env = _minimal_child_env(depth=3, cred_prefixes=("ANTHROPIC_", "CLAUDE_"))
+    assert claude_env["PATH"] == "/usr/bin"
+    assert claude_env["HOME"] == "/home/mimir"
+    assert claude_env[_SPAWN_DEPTH_ENV] == "3"
+    assert claude_env["ANTHROPIC_API_KEY"] == "sk-ant-xyz"
+    assert "OPENAI_API_KEY" not in claude_env  # other provider's cred dropped
+    for leaked in ("DISCORD_TOKEN", "DATABASE_URL", "TAVILY_API_KEY", "GITHUB_TOKEN"):
+        assert leaked not in claude_env
+
+    codex_env = _minimal_child_env(depth=1, cred_prefixes=("OPENAI_", "CODEX_"))
+    assert codex_env["OPENAI_API_KEY"] == "sk-openai-xyz"
+    assert codex_env["HOME"] == "/home/mimir"  # codex finds ~/.codex/auth.json via HOME
+    assert codex_env[_SPAWN_DEPTH_ENV] == "1"
+    assert "ANTHROPIC_API_KEY" not in codex_env
+    assert "DISCORD_TOKEN" not in codex_env

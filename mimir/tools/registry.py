@@ -943,6 +943,42 @@ _SPAWN_MAX_DEPTH_DEFAULT = 2
 # ``parent_depth + 1`` when spawning.
 _SPAWN_DEPTH_ENV = "MIMIR_SPAWN_DEPTH"
 
+# Minimal-env allowlist for spawned CLI subprocesses (#494). The child
+# runs an independently-prompted agent with shell + web; handing it the
+# parent's full ``os.environ`` would expose every unrelated secret
+# (Discord/Slack tokens, DB URLs, TAVILY/GitHub keys) to a second model
+# that can read its own env and exfiltrate. So we build the child env
+# from an allowlist: infrastructure vars the CLI needs to find binaries,
+# config, and a home, plus only the provider credentials that specific
+# CLI uses. New secrets added to the parent env are excluded by default.
+_CHILD_ENV_INFRA = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM",
+    "TMPDIR", "TMP", "TEMP", "TZ", "PWD", "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE", "SSL_CERT_DIR",
+)
+# Prefixes for benign locale/desktop vars passed through wholesale.
+_CHILD_ENV_INFRA_PREFIXES = ("LC_", "XDG_")
+
+
+def _minimal_child_env(*, depth: int, cred_prefixes: tuple[str, ...]) -> dict[str, str]:
+    """Build a spawned-CLI env from an allowlist (#494): infra vars +
+    ``cred_prefixes``-matching credentials + ``MIMIR_SPAWN_DEPTH``.
+
+    Everything else in the parent ``os.environ`` (unrelated secrets) is
+    dropped. ``cred_prefixes`` is the set of provider-credential prefixes
+    the target CLI legitimately needs (e.g. ``("ANTHROPIC_", "CLAUDE_")``
+    for claude, ``("OPENAI_", "CODEX_")`` for codex)."""
+    env: dict[str, str] = {}
+    for key in _CHILD_ENV_INFRA:
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
+    for key, val in os.environ.items():
+        if key.startswith(_CHILD_ENV_INFRA_PREFIXES) or key.startswith(cred_prefixes):
+            env[key] = val
+    env[_SPAWN_DEPTH_ENV] = str(depth)
+    return env
+
 
 def _env_int_floor1(name: str, default: int) -> int:
     """Read an int env var, defaulting if missing/invalid. Floors at 1
@@ -1194,11 +1230,11 @@ async def spawn_claude_code(
         argv += ["--model", model]
     argv += ["--", prompt]
 
-    # Propagate ``MIMIR_SPAWN_DEPTH=current+1`` to the child so its
-    # own ``spawn_claude_code`` calls see the deeper level. The rest
-    # of the env is inherited verbatim.
-    child_env = dict(os.environ)
-    child_env[_SPAWN_DEPTH_ENV] = str(current_depth + 1)
+    # Minimal env (#494): infra + Anthropic/Claude creds + the
+    # incremented spawn depth. Unrelated secrets are NOT inherited.
+    child_env = _minimal_child_env(
+        depth=current_depth + 1, cred_prefixes=("ANTHROPIC_", "CLAUDE_"),
+    )
 
     assert guard.sem is not None
     try:
@@ -1313,8 +1349,12 @@ async def spawn_codex(
     # ``--`` separator so a prompt starting with ``-`` isn't parsed as a flag.
     argv += ["--", prompt]
 
-    child_env = dict(os.environ)
-    child_env[_SPAWN_DEPTH_ENV] = str(current_depth + 1)
+    # Minimal env (#494): infra + OpenAI/Codex creds + the incremented
+    # spawn depth. codex also reads ~/.codex/auth.json via HOME (passed
+    # through). Unrelated secrets are NOT inherited.
+    child_env = _minimal_child_env(
+        depth=current_depth + 1, cred_prefixes=("OPENAI_", "CODEX_"),
+    )
 
     assert guard.sem is not None
     try:
