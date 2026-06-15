@@ -16,6 +16,7 @@ from mimir.reflection.introspection_report import (
     HeartbeatPipeline,
     Report,
     aggregate,
+    health_degraded_fields,
     maybe_emit_health_event,
     render_markdown,
 )
@@ -335,6 +336,28 @@ def test_no_emit_when_no_signal(tmp_path: Path):
     rep = Report(days=7, generated_at=NOW)
     emitted = maybe_emit_health_event(rep, events, threshold=0.80)
     assert emitted is False
+
+
+# ─── health_degraded_fields (pure decision, #486) ──────────────────────
+
+
+def test_health_degraded_fields_below_threshold():
+    rep = Report(days=7, generated_at=NOW, heartbeat=HeartbeatPipeline(fired=10, successful=5))
+    fields = health_degraded_fields(rep, threshold=0.80)
+    assert fields is not None
+    assert fields["success_rate"] == 0.5
+    assert fields["fired"] == 10 and fields["window_days"] == 7
+    # pure: no type/session_id/timestamp (the EventLogger stamps those)
+    assert "type" not in fields and "session_id" not in fields and "timestamp" not in fields
+
+
+def test_health_degraded_fields_none_above_threshold_or_no_signal():
+    assert health_degraded_fields(
+        Report(days=7, generated_at=NOW, heartbeat=HeartbeatPipeline(fired=10, successful=9)),
+        threshold=0.80,
+    ) is None
+    # no signal: heartbeat fired==0
+    assert health_degraded_fields(Report(days=7, generated_at=NOW), threshold=0.80) is None
 
 
 # ─── render ────────────────────────────────────────────────────────────

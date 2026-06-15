@@ -817,7 +817,9 @@ async def commitment_complete(commitment_id: str, message_id: Optional[str] = No
         result = await store.complete(commitment_id, message_id=message_id)
     except Exception as exc:
         return f"commitment_complete failed: {exc}"
-    return f"commitment_complete ok: id={commitment_id} result={result}"
+    if not result:
+        return f"commitment_complete failed: {commitment_id} not found or already terminal"
+    return f"commitment_complete ok: id={commitment_id}"
 
 
 @tool
@@ -842,6 +844,8 @@ async def commitment_snooze(
         result = await store.snooze(commitment_id, until_unix=until_unix, reason=reason)
     except Exception as exc:
         return f"commitment_snooze failed: {exc}"
+    if not result:
+        return f"commitment_snooze failed: {commitment_id} not found or already terminal"
     return f"commitment_snooze ok: id={commitment_id} until={until_iso}"
 
 
@@ -860,6 +864,8 @@ async def commitment_dismiss(commitment_id: str, reason: Optional[str] = None) -
         result = await store.dismiss(commitment_id, reason=reason)
     except Exception as exc:
         return f"commitment_dismiss failed: {exc}"
+    if not result:
+        return f"commitment_dismiss failed: {commitment_id} not found or already terminal"
     return f"commitment_dismiss ok: id={commitment_id}"
 
 

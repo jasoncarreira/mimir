@@ -328,6 +328,56 @@ def test_record_rate_limit_authoritative_reset_uses_it(tmp_path: Path):
     assert abs((reset_at - reset).total_seconds()) < 2
 
 
+def test_record_rate_limit_reloads_and_keeps_concurrent_authoritative_cap(tmp_path: Path):
+    """#484: a header-less 429 recorded by a tracker constructed BEFORE a
+    concurrent turn wrote an authoritative cap must not clobber that cap down to
+    the 60s transient. The lock + fresh reload makes the don't-shorten guard
+    test the current on-disk cap, not the stale construction-time snapshot."""
+    path = tmp_path / "qp.json"
+    now = datetime.now(tz=timezone.utc)
+    # Instance B constructed first — empty in-memory snapshot (no cap).
+    tracker_b = QuotaPauseTracker(path)
+    # Instance A (a concurrent turn) then records a 5h authoritative cap to disk.
+    cap_reset = (now + timedelta(hours=5)).replace(microsecond=0)
+    QuotaPauseTracker(path).pause_until(
+        cap_reset, reason="quota_exhausted", provider="anthropic", now=now,
+    )
+    # B records a header-less 429: pre-fix it clobbered the cap to 60s; with the
+    # reload B sees A's cap and reports it untouched.
+    reset_at, reason = tracker_b.record_rate_limit(
+        Exception("HTTP 429: Rate limit exceeded"), now=now,
+    )
+    assert reason == "quota_exhausted"
+    assert (reset_at - now).total_seconds() > 4 * 3600  # the 5h cap, not 60s
+    assert QuotaPauseTracker(path).reset_at == cap_reset
+
+
+def test_record_rate_limit_clears_stale_cap_when_pause_file_removed(tmp_path: Path):
+    """#692 review: a tracker holding a stale authoritative cap in memory must
+    not keep reporting it after another process cleared the pause file. _load()
+    now clears in-memory state on an absent file, so the don't-shorten guard
+    sees no live cap and a header-less 429 records a fresh transient backoff."""
+    path = tmp_path / "qp.json"
+    now = datetime.now(tz=timezone.utc)
+    cap_reset = (now + timedelta(hours=5)).replace(microsecond=0)
+    # Instance B loads a live authoritative cap into memory.
+    QuotaPauseTracker(path).pause_until(
+        cap_reset, reason="quota_exhausted", provider="anthropic", now=now,
+    )
+    tracker_b = QuotaPauseTracker(path)
+    assert tracker_b.reset_at == cap_reset  # holds the cap in memory
+    # Another process clears the pause (deletes the file) out from under B.
+    QuotaPauseTracker(path).clear()
+    assert not path.exists()
+    # B's header-less 429: pre-fix _load() early-returned and B reported the
+    # stale 5h cap; post-fix _load() clears, so it's a fresh transient backoff.
+    reset_at, reason = tracker_b.record_rate_limit(
+        Exception("HTTP 429: Rate limit exceeded"), now=now,
+    )
+    assert reason == "rate_limited_backoff"
+    assert (reset_at - now).total_seconds() <= 120  # transient floor, not 5h
+
+
 def test_record_rate_limit_headerless_uses_short_backoff(tmp_path: Path):
     """A header-less 429 (Codex's bare 'HTTP 429: Rate limit exceeded')
     → a short 60s backoff, NOT a 5h window pause."""
