@@ -802,7 +802,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
                 f"from {authors} — resolve before merge"
             )
         return f"pr_merge blocked: PR #{pr_num} has CHANGES_REQUESTED review"
-    if rule_kind == "gave_up":
+    if rule_kind == "gave_up" or rule_kind.endswith("_gave_up"):
         # A poller abandoned a retried action after exhausting its budget
         # (chainlink #299). The concrete event type names what was given up
         # on (``pr_review_request_gave_up`` → "pr review request"); the event
@@ -810,7 +810,10 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         # ``detail``). Render a one-liner for the agent's negative algedonic
         # block, sanitizing any GitHub-sourced target (chainlink #224) and
         # degrading gracefully when fields are absent — emitters vary by poller.
-        et = ev.get("type")
+        # New suffix-classified events use their concrete event type as the
+        # rule-kind so per-kind counts do not merge unrelated give-up causes;
+        # the legacy ``gave_up`` branch remains for any direct caller/tests.
+        et = ev.get("type") if isinstance(ev.get("type"), str) else rule_kind
         what = "a retried action"
         if isinstance(et, str) and et.endswith("_gave_up"):
             stripped = et[: -len("_gave_up")].replace("_", " ").strip()
