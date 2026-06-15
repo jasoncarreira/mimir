@@ -370,6 +370,41 @@ def test_regenerate_api_key_cli_errors_when_no_env(
     assert "no .env" in capsys.readouterr().err
 
 
+def test_run_refuses_without_explicit_home(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+):
+    """`mimir run` must refuse to start (exit 1) when neither --home nor
+    MIMIR_HOME is set, rather than silently homing on the cwd."""
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    with pytest.raises(SystemExit) as exc_info:
+        main(["run"])
+    assert exc_info.value.code == 1
+    assert "MIMIR_HOME is not set" in capsys.readouterr().err
+
+
+def test_run_proceeds_with_home_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """--home sets MIMIR_HOME and the server starts (mocked)."""
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    called: dict[str, bool] = {}
+    monkeypatch.setattr("mimir.server.main", lambda: called.setdefault("ran", True))
+    main(["run", "--home", str(tmp_path)])
+    assert called.get("ran") is True
+    assert os.environ["MIMIR_HOME"] == str(tmp_path.resolve())
+
+
+def test_run_proceeds_with_mimir_home_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """An explicit MIMIR_HOME (no --home) is accepted."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    called: dict[str, bool] = {}
+    monkeypatch.setattr("mimir.server.main", lambda: called.setdefault("ran", True))
+    main(["run"])
+    assert called.get("ran") is True
+
+
 def test_stats_cli_reports_no_turns_for_empty_home(
     tmp_path: Path, capsys: pytest.CaptureFixture,
 ):

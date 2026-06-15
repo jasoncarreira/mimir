@@ -324,7 +324,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             if isinstance(recent, (int, float)) and isinstance(cap, (int, float))
             else "auto-restart triggered"
         )
-        home = ev.get("home") or "/mimir-home"
+        home = ev.get("home") or "the agent home"
         return (
             f"Bind mount stale-inode detected ({home}); "
             f"auto-restart triggered ({count_str})"

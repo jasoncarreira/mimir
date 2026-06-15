@@ -23,7 +23,6 @@ import sys
 from typing import Callable, Mapping, Protocol, Sequence
 
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-tool-pins")
-DEFAULT_HOME = Path("/mimir-home")
 
 
 @dataclass(frozen=True)
@@ -289,8 +288,12 @@ class ChainlinkBumpFiler:
         return _created_issue_id(result.stdout)
 
 
-def _home() -> Path:
-    return Path(os.environ.get("MIMIR_HOME") or DEFAULT_HOME)
+def _home() -> Path | None:
+    """Agent home from ``MIMIR_HOME``. ``None`` when unset — the poller then
+    refuses to run rather than guessing a container path like ``/mimir-home``
+    that doesn't exist off-Docker (matches the chainlink-orchestrator poller)."""
+    raw = os.environ.get("MIMIR_HOME")
+    return Path(raw) if raw else None
 
 
 def _worklink_config_path(home: Path) -> Path:
@@ -492,6 +495,9 @@ def _event_for_drift(drift: ToolPinDrift, issue_id: int | None) -> dict:
 
 def main() -> int:
     home = _home()
+    if home is None:
+        _emit({"signal": "worklink_tool_pins_misconfigured", "reason": "MIMIR_HOME unset"})
+        return 0
     config_path = _worklink_config_path(home)
     try:
         tool_pins = _load_config(config_path)
