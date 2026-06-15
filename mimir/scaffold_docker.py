@@ -270,7 +270,7 @@ FROM python:3.11-slim
 # Base system tooling — same set mimirbot has been running with since
 # 2026-05: git for the source clone + agent dev loop, gh for PR
 # creation, build-essential for any C extensions, ca-certificates for
-# HTTPS clones, poppler-utils for PDF ingest, Node 20 (needed for
+# HTTPS clones, poppler-utils for PDF ingest, Node 22 (needed for
 # optional Claude Code CLI plus mermaid-cli), jq for JSONL log parsing
 # across many skill bodies + the introspection recipes.
 RUN apt-get update \\
@@ -288,7 +288,7 @@ RUN apt-get update \\
  && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \\
  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \\
         > /etc/apt/sources.list.d/github-cli.list \\
- && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \\
+ && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \\
  && apt-get install -y --no-install-recommends gh nodejs \\
  && rm -rf /var/lib/apt/lists/*
 
@@ -366,7 +366,7 @@ FROM python:3.11-slim
 # Base system tooling — git for any local commits the agent makes,
 # gh for PR / issue automation, build-essential for C extensions
 # pulled by deps, poppler-utils + jq because skill bodies use them,
-# Node 20 for the optional claude-code CLI + mermaid CLI.
+# Node 22 for the optional claude-code CLI + mermaid CLI.
 #
 # git is also required when MIMIR_ENABLE_CLAUDE_CODE=1 below —
 # ``langchain-claude-code`` is a git-pinned fork (PyPI direct-URL
@@ -387,7 +387,7 @@ RUN apt-get update \\
  && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \\
  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \\
         > /etc/apt/sources.list.d/github-cli.list \\
- && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \\
+ && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \\
  && apt-get install -y --no-install-recommends gh nodejs \\
  && rm -rf /var/lib/apt/lists/*
 
