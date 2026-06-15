@@ -674,8 +674,10 @@ async def test_leftover_injection_reroutes_ahead_of_later_queued_event(tmp_path:
 
     # Turn ends: deactivate yields the unfolded leftovers; agent.py's finally
     # re-routes them to the FRONT (ahead of "later").
-    leftovers = _mti.deactivate("c1")
+    leftovers, folded, deferred = _mti.deactivate("c1")
     assert [e.content for e in leftovers] == ["inject1", "inject2"]
+    assert folded == []
+    assert deferred == []
     assert disp.requeue_front(leftovers) == 2
     assert disp._queues["c1"].qsize() == 3     # leftovers ahead of the react
 

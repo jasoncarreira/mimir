@@ -85,22 +85,52 @@ def register_inflight(channel_id: str | None) -> None:
         _REGISTRY[channel_id] = _Inflight()
 
 
-def deactivate(channel_id: str | None) -> list["AgentEvent"]:
-    """Mark the turn done and drop the registry entry (``run_turn`` finally).
+def deactivate(
+    channel_id: str | None,
+) -> tuple[
+    list["AgentEvent"],
+    list[tuple["AgentEvent", float]],
+    list[tuple["AgentEvent", str]],
+]:
+    """Atomically mark the turn done and drop its registry entry.
 
-    Returns any events still queued — accepted by :func:`inject_message` but not
-    folded (they arrived after the turn's final ``before_model`` boundary, e.g.
-    while the model was generating its final response). ``run_turn`` re-enqueues
-    these so the follow-up becomes its own next turn rather than vanishing.
+    Returns ``(leftovers, folded, deferred)`` under the same lock that pops the
+    entry. ``leftovers`` are queued-but-not-folded events accepted after the
+    final ``before_model`` boundary; ``folded`` and ``deferred`` are the durable
+    visibility snapshots that ``run_turn`` records/re-enqueues. Taking all three
+    snapshots atomically prevents a worker-thread ``before_model`` drain from
+    moving events from ``queue`` to ``folded`` between separate
+    ``folded_records()``/``deferred_records()`` reads and deactivation.
     """
     if not channel_id:
-        return []
+        return [], [], []
     with _LOCK:
         inflight = _REGISTRY.pop(channel_id, None)
         if inflight is None:
-            return []
+            return [], [], []
         inflight.active = False
-        return list(inflight.queue)
+        return _snapshot_inflight(inflight)
+
+
+def _snapshot_inflight(
+    inflight: _Inflight,
+) -> tuple[
+    list["AgentEvent"],
+    list[tuple["AgentEvent", float]],
+    list[tuple["AgentEvent", str]],
+]:
+    """Return copied ``(leftovers, folded, deferred)`` for an in-flight turn.
+
+    Caller must hold ``_LOCK``.
+    """
+    leftovers = list(inflight.queue)
+    folded = list(inflight.folded)
+    deferred = [
+        (e, inflight.deferred[e.source_id])
+        for e, _t in inflight.folded
+        if e.source_id in inflight.deferred
+    ]
+    return leftovers, folded, deferred
 
 
 def inject_startup_messages(channel_id: str | None, events: list["AgentEvent"]) -> int:
