@@ -518,7 +518,7 @@ Mimir uses open-strix's message-buffer model verbatim, with one extension (cross
 }
 ```
 
-`<channel_id>` follows the bridge prefix scheme from §7.2.3: `slack-<id>` / `dm-slack-<user_id>`, `discord-<id>` / `dm-discord-<user_id>`, `bsky-<thread_uri>` / `dm-bsky-<convo_id>`, `web-<conv_id>`, `bench-<task_id>`. The benchmark adapter uses one synthetic `bench-` channel per task.
+`<channel_id>` follows the bridge prefix scheme from §7.2.3: `slack-<id>` / `dm-slack-<user_id>`, `discord-<id>` / `dm-discord-<user_id>`, `web-<conv_id>`, `bench-<task_id>`. The benchmark adapter uses one synthetic `bench-` channel per task. (Bluesky has no in-process bridge prefix — social posting runs through the `social-cli` optional skill poller.)
 
 #### In-memory deques
 
@@ -788,7 +788,7 @@ class Bridge(ABC):
 | Web | aiohttp + SSE | POST `/chat` | SSE push | event-log marker |
 | Bench | n/a | POST `/event` from adapter | print to stdout | reactions.jsonl |
 
-Bridges run as asyncio tasks inside the mimir process — no extra container, no IPC. Open-strix's Discord bridge (`open_strix/discord.py`, ~670 LOC including chunking, attachments, history refresh) is the reference implementation. Each bridge is opt-in via env (`SLACK_BOT_TOKEN`, `DISCORD_TOKEN`, `BSKY_HANDLE`+`BSKY_APP_PASSWORD`, `MIMIR_WEB_PORT`). A bridge that fails to connect logs to events.jsonl as `bridge_error` and the process keeps running with the remaining bridges.
+Bridges run as asyncio tasks inside the mimir process — no extra container, no IPC. Open-strix's Discord bridge (`open_strix/discord.py`, ~670 LOC including chunking, attachments, history refresh) is the reference implementation. Each bridge is opt-in via env (`SLACK_BOT_TOKEN`, `DISCORD_TOKEN`, `MIMIR_WEB_PORT`). A bridge that fails to connect logs to events.jsonl as `bridge_error` and the process keeps running with the remaining bridges. (`BSKY_HANDLE`/`BSKY_APP_PASSWORD` are not bridge config — they're consumed by the `social-cli` optional skill poller; there is no in-process Bluesky bridge.)
 
 Inbound message handling per bridge:
 1. Build a normalized `AgentEvent(source, channel_id, author, author_id, content, attachment_names, source_id)`.
@@ -1532,7 +1532,7 @@ Slack and Discord bridge config is live (both implemented). Bluesky is handled b
 ### Phase 6.3 — channel layer (2 days)
 - `Bridge` ABC + `ChannelRegistry` (§7.2.3).
 - `BenchBridge` (stdout for the benchmark adapter) — minimum viable, unblocks Phase 7.
-- `WebUIBridge` (aiohttp routes for `/chat`, SSE push) — primary manual-testing surface.
+- `WebChatBridge` (aiohttp routes for `/chat`, SSE push) — primary manual-testing surface.
 - `DiscordBridge` ported from `open_strix/discord.py` — proof-of-concept for the in-process bridge pattern (chunking, attachments, history refresh).
 - `SlackBridge` and `DiscordBridge` are fully implemented (socket-mode / `discord.py`). There is no Bluesky bridge — Bluesky posting runs through the `social-cli` optional skill poller.
 - `send_message` + `react` channel-aware dispatch through the registry.

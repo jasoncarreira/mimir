@@ -201,7 +201,7 @@ no_queued_predecessor = queue is None or queue.qsize() == 0
 if (self._injection_enabled(channel_id)
         and channel_id in self._in_flight
         and no_queued_predecessor):
-    if inject_message(channel_id, event.content) == "injected":   # AgentEvent.content
+    if inject_message(channel_id, event) == "injected":   # whole AgentEvent — preserves metadata/attachments
         return True                       # folded into the running turn
     # else: turn finished during the race → fall through to normal enqueue
 return await self._normal_enqueue(event)
@@ -343,7 +343,7 @@ return await self._normal_enqueue(event)
    empty queue, FIFO fold-in, AND that the hook reads the configured `channel_id`
    from `get_config()`. *No dispatcher change yet — feature dormant.*
 2. **Dispatcher routing + opt-in** — `_injection_enabled`, the
-   in-flight-AND-empty-queue → `inject_message(channel_id, event.content)` →
+   in-flight-AND-empty-queue → `inject_message(channel_id, event)` →
    fallback path, `MIMIR_MIDTURN_INJECTION_CHANNELS`. Tests for the routing race
    (inject vs `no_active_turn` fallback), the **ordering guard** (a queued
    predecessor must NOT be bypassed), and the poller/scheduler exclusion.
