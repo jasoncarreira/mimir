@@ -162,6 +162,31 @@ def test_plan_window_saturation_suppresses(tmp_path: Path):
     assert arb.should_fire(priority="high", now=NOW).fire is True
 
 
+def test_quota_mode_raw_wall_backstop_with_empty_provider(tmp_path: Path):
+    """#483: in QUOTA mode a stub/cold provider yields CLEAR, but the raw
+    plan-window wall from the rate-limit store must still backstop to TIGHT —
+    otherwise the throttle runs wide open with no signal."""
+    from mimir.billing import BillingMode
+
+    arb = _arbiter(tmp_path, billing_mode=BillingMode.QUOTA, quota_providers=[])
+    future = int((datetime.now(tz=timezone.utc) + timedelta(days=14)).timestamp())
+    arb.rate_limit_store._load = lambda: {  # type: ignore[method-assign]
+        "7d_opus": {
+            "status": "allowed_warning",
+            "utilization": 0.92,
+            "resets_at": future,
+            "observed_at": NOW.isoformat(),
+        },
+    }
+    low = arb.should_fire(priority="low", now=NOW)
+    assert low.fire is False
+    assert low.severity.name == "TIGHT"
+    assert "plan_window_saturated" in low.reason
+    # Empty provider + no store saturation stays CLEAR (no false positive).
+    arb2 = _arbiter(tmp_path, billing_mode=BillingMode.QUOTA, quota_providers=[])
+    assert arb2.should_fire(priority="low", now=NOW).severity.name == "CLEAR"
+
+
 def test_plan_window_below_threshold_does_not_suppress(tmp_path: Path):
     arb = _arbiter(tmp_path, plan_window_suppress_threshold=0.80)
     future = int((datetime.now(tz=timezone.utc) + timedelta(days=14)).timestamp())
