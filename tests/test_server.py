@@ -433,6 +433,31 @@ class TestHandleEvent:
         assert "channel_id" in body.get("error", "")
 
     @pytest.mark.asyncio
+    async def test_non_dict_extra_returns_400(self) -> None:
+        """#487: a truthy non-dict ``extra`` is rejected with 400, not coerced
+        (coercion let it reach ``event.extra.get(...)`` → AttributeError/500)."""
+        app, _ = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={"channel_id": "ch", "extra": "oops"},
+            )
+        assert resp.status == 400
+        app["dispatcher"].enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_list_attachment_names_returns_400(self) -> None:
+        """#487: a non-list ``attachment_names`` is rejected with 400."""
+        app, _ = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={"channel_id": "ch", "attachment_names": "a.txt"},
+            )
+        assert resp.status == 400
+        app["dispatcher"].enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_dispatcher_rejects_returns_503(self) -> None:
         """When the dispatcher's queue is full it returns False → 503."""
         app, _ = _event_app(enqueue_returns=False)
