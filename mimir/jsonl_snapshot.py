@@ -202,3 +202,32 @@ def iter_snapshot_or_tail(
         return
     for rec in tail_jsonl_records(path):
         yield rec
+
+
+def iter_window_records(
+    snapshot: "JsonlSnapshot | None", path: Path,
+) -> Iterator[dict]:
+    """Iterate newest-first records for a TIME-WINDOWED scan (one that breaks
+    at a cutoff older than the newest record).
+
+    Like :func:`iter_snapshot_or_tail`, but when the snapshot is **saturated**
+    — its cached tail hit ``max_records`` and may not reach the scan's cutoff —
+    stream directly from the file instead (#498). Otherwise a windowed
+    count / dedup pass silently truncates at the cap: kind counts undercount
+    (a threshold-crossing kind never escalates) and prior-escalation dedup
+    misses entries beyond the tail (escalation re-fires). The direct stream
+    still stops at the caller's cutoff, so it reads only back to the window
+    edge, not the whole file.
+
+    Do NOT use this for non-windowed scans that only need the newest records
+    (those are unaffected by saturation — the cap keeps the newest)."""
+    if snapshot is not None:
+        records = snapshot.records()  # refreshes the cache + .saturated
+        if not snapshot.saturated:
+            for rec in list(records):
+                yield rec
+            return
+    # No snapshot, or a saturated one — stream the full file tail so the
+    # windowed scan reaches its cutoff.
+    for rec in tail_jsonl_records(path):
+        yield rec

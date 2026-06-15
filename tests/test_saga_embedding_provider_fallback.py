@@ -140,3 +140,76 @@ def test_onnx_provider_direct_honors_configured_dimensions(
 
     provider = get_provider()
     assert provider.dimensions() == 768
+
+
+# ─── #493: provenance read off the LIVE provider, not config ───────────
+
+
+def test_provider_provenance_reflects_onnx_fallback(
+    monkeypatch: pytest.MonkeyPatch, fake_cfg,
+) -> None:
+    """#493: after the keyless fallback, the live provider reports onnx / the
+    BGE model — so embedding rows aren't mislabeled voyage/voyage-4-lite."""
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    fake_cfg(embedding={
+        "provider": "voyage",
+        "model": "voyage-4-lite",
+        "api_key_env": "VOYAGE_API_KEY",
+    })
+
+    from mimir.saga.embeddings import get_provider
+
+    provider = get_provider()
+    assert provider.provider_name == "onnx"
+    assert provider.model_id == "BAAI/bge-small-en-v1.5"
+
+
+def test_provider_provenance_voyage_when_keyed(
+    monkeypatch: pytest.MonkeyPatch, fake_cfg,
+) -> None:
+    """#493: with the key set, provenance reports voyage / the configured model."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key-not-real")
+    fake_cfg(embedding={
+        "provider": "voyage",
+        "model": "voyage-4-lite",
+        "api_key_env": "VOYAGE_API_KEY",
+    })
+
+    from mimir.saga.embeddings import get_provider
+
+    provider = get_provider()
+    assert provider.provider_name == "voyage"
+    assert provider.model_id == "voyage-4-lite"
+
+
+def test_embed_text_sync_stamps_live_provider_not_config(
+    monkeypatch: pytest.MonkeyPatch, fake_cfg,
+) -> None:
+    """#493: _embed_text_sync records provider/model from the live provider
+    instance — a configured voyage that fell back to onnx must NOT stamp rows
+    voyage/voyage-4-lite over the BGE vectors."""
+    fake_cfg(embedding={
+        "provider": "voyage",
+        "model": "voyage-4-lite",
+        "max_input_chars": 2000,
+    })
+
+    class _FakeOnnx:
+        provider_name = "onnx"
+        model_id = "BAAI/bge-small-en-v1.5"
+
+        def embed(self, text, input_type="passage"):
+            return [0.1, 0.2, 0.3]
+
+        def dimensions(self):
+            return 3
+
+    import mimir.saga.embeddings as emb
+    monkeypatch.setattr(emb, "get_provider", lambda: _FakeOnnx())
+
+    from mimir.saga.client import _embed_text_sync
+
+    _vec, provider_name, model, dim = _embed_text_sync("hello world")
+    assert provider_name == "onnx"
+    assert model == "BAAI/bge-small-en-v1.5"
+    assert dim == 3

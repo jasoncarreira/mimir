@@ -195,6 +195,33 @@ def test_fts_search_filters_by_agent_id(conn):
     assert ids == ["a1"]
 
 
+def test_fts_search_includes_shared_atoms(conn):
+    """#491: shared-agent atoms must be reachable via FTS. recall.py hydration
+    accepts (agent_id OR 'shared') and the vector index covers all agents, so
+    excluding 'shared' here under-ranked shared memories in RRF and missed
+    exact-keyword hits on them."""
+    _insert_atom(conn, "own", "Alice prefers concise replies", agent_id="agent_a")
+    _insert_atom(conn, "shr", "Alice loves concise summaries", agent_id="shared")
+    _insert_atom(conn, "other", "Alice writes concise notes", agent_id="agent_b")
+    results = fts_search(conn, "alice concise", top_k=10, agent_id="agent_a")
+    ids = {aid for aid, _ in results}
+    assert "own" in ids and "shr" in ids  # own + shared surfaced
+    assert "other" not in ids  # a different agent's private atom still excluded
+
+
+def test_fts_fallback_includes_shared_atoms(conn):
+    """#491: the LIKE fallback path applies the same (agent_id OR 'shared')."""
+    _insert_atom(conn, "own", "Alice prefers concise replies", agent_id="agent_a")
+    _insert_atom(conn, "shr", "Alice loves concise summaries", agent_id="shared")
+    _insert_atom(conn, "other", "Alice writes concise notes", agent_id="agent_b")
+    results = _fts_fallback(
+        conn, "alice concise", top_k=10, memory_type=None, agent_id="agent_a",
+    )
+    ids = {aid for aid, _ in results}
+    assert "own" in ids and "shr" in ids
+    assert "other" not in ids
+
+
 def test_fts_search_respects_top_k(conn):
     for i in range(5):
         _insert_atom(conn, f"a{i}", f"Alice mentions concise topic {i}")

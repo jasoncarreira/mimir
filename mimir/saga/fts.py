@@ -174,7 +174,12 @@ def fts_search(
     expanded = expand_query_for_keyword(query, synonyms)
     fts_q = fts5_query(expanded)
 
-    where = ["a.tombstoned = 0", "a.agent_id = ?"]
+    # #491: include 'shared' atoms. recall.py hydration accepts (agent_id OR
+    # 'shared') and VectorIndex.build_from_db covers all agents, so filtering
+    # exact agent_id here structurally drops shared memories from the FTS
+    # keyword list feeding RRF — they under-rank and exact-keyword hits on a
+    # shared atom silently miss. The agent_id value stays parameterized.
+    where = ["a.tombstoned = 0", "a.agent_id IN (?, 'shared')"]
     params: list = [fts_q, agent_id]
     if memory_type:
         where.append("a.memory_type = ?")
@@ -225,7 +230,7 @@ def _fts_fallback(
     like_clauses = " AND ".join(
         ["LOWER(a.content) LIKE ? ESCAPE '\\'"] * len(terms)
     )
-    where = [like_clauses, "a.tombstoned = 0", "a.agent_id = ?"]
+    where = [like_clauses, "a.tombstoned = 0", "a.agent_id IN (?, 'shared')"]  # #491
     if memory_type:
         where.append("a.memory_type = ?")
     where_sql = " AND ".join(where)

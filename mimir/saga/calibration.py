@@ -98,6 +98,16 @@ def re_embed(
 
         provider = get_provider()
         dim = provider.dimensions()
+        # #695 (extends #493): stamp provenance from the LIVE provider, not
+        # config / target_provider_name. The keyless fallback can swap a
+        # configured voyage provider for ONNX, and these embeddings rows must
+        # reflect the vectors actually written — otherwise this bulk re-embed /
+        # migration path leaves the same misleading provider='voyage' /
+        # model='voyage-4-lite' rows over ONNX/BGE vectors that
+        # _embed_text_sync now avoids. Falls back to the configured names for
+        # providers that don't expose the provenance attributes.
+        row_provider_name = getattr(provider, "provider_name", None) or provider_name
+        row_model_name = getattr(provider, "model_id", None) or model_name
         updated = 0
         now_iso = datetime.now(tz=timezone.utc).isoformat()
 
@@ -136,7 +146,7 @@ def re_embed(
                         "  dim = excluded.dim, "
                         "  vec = excluded.vec, "
                         "  embedded_at = excluded.embedded_at",
-                        (atom_id, provider_name, model_name, dim,
+                        (atom_id, row_provider_name, row_model_name, dim,
                          vec_bytes, now_iso),
                     )
                     updated += 1

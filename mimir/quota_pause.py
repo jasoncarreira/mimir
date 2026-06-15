@@ -415,19 +415,37 @@ class QuotaPauseTracker:
         if self._reset_at is None:
             return PauseStatus(paused=False, reset_at=None, reason=None)
         when = now or datetime.now(tz=timezone.utc)
-        if when >= self._reset_at:
-            # Lazy expiry. Caller (the arbiter) is responsible for
-            # the ``quota_recovered`` algedonic emit since this is a
-            # sync method.
+        if when < self._reset_at:
+            return PauseStatus(
+                paused=True, reset_at=self._reset_at, reason=self._reason,
+            )
+        # Lazy-expiry transition. Caller (the arbiter) is responsible for the
+        # ``quota_recovered`` algedonic emit since this is a sync method.
+        #
+        # #489: consume it atomically. The arbiter's _check_quota_pause, the
+        # scheduler recovery recheck, and _fire_quota_recovery each build their
+        # OWN tracker over this same file; without coordination, two could both
+        # observe the transition and emit duplicate quota_recovered (double
+        # catch-up heartbeat). Take the cross-process lock and reload fresh, so
+        # exactly one observer clears-and-signals; the rest see the cleared
+        # state (reset_at=None) and emit nothing. Only the rare expiry read
+        # pays the lock — the fast paths above stay lock-free.
+        with self._exclusive_lock():
+            self._load()
+            if self._reset_at is None:
+                # Another observer already consumed the recovery.
+                return PauseStatus(paused=False, reset_at=None, reason=None)
+            if when < self._reset_at:
+                # A newer pause landed since our snapshot — still paused.
+                return PauseStatus(
+                    paused=True, reset_at=self._reset_at, reason=self._reason,
+                )
             saved_reset = self._reset_at
             saved_reason = self._reason
             self._mark_recovered()
             return PauseStatus(
                 paused=False, reset_at=saved_reset, reason=saved_reason,
             )
-        return PauseStatus(
-            paused=True, reset_at=self._reset_at, reason=self._reason,
-        )
 
 
 # ── exception → reset-at extraction ─────────────────────────────────
@@ -473,11 +491,18 @@ def _codex_window_reset(rate_limits: Any, now: datetime) -> datetime | None:
     ``reset_at`` (unix ts) / ``reset_after_seconds``)."""
     best_used = -1.0
     best_when: datetime | None = None
+    # #490: a window can carry a usable reset hint but no parseable
+    # used_percent (undocumented/best-effort headers). Scoring that 0.0 made
+    # it fail the >=90 gate, so a genuine cap 429 was misread as a header-less
+    # transient and hammered with the 60s/4m/16m ladder. Track the earliest
+    # reset from any percent-less window and respect it when no near-cap window
+    # gives a more confident signal.
+    unknown_pct_when: datetime | None = None
     for win in (getattr(rate_limits, "primary", None), getattr(rate_limits, "secondary", None)):
         if win is None:
             continue
-        used = getattr(win, "used_percent", None)
-        used = float(used) if isinstance(used, (int, float)) else 0.0
+        raw_used = getattr(win, "used_percent", None)
+        used = float(raw_used) if isinstance(raw_used, (int, float)) else None
         reset_at = getattr(win, "reset_at", None)
         reset_after = getattr(win, "reset_after_seconds", None)
         when: datetime | None = None
@@ -488,10 +513,23 @@ def _codex_window_reset(rate_limits: Any, now: datetime) -> datetime | None:
                 when = None
         elif isinstance(reset_after, (int, float)):
             when = now + timedelta(seconds=int(reset_after))
-        if when is not None and used > best_used:
+        if when is None:
+            continue
+        if used is None:
+            # Reset hint but no parseable percent — candidate authoritative.
+            if unknown_pct_when is None or when < unknown_pct_when:
+                unknown_pct_when = when
+        elif used > best_used:
             best_used, best_when = used, when
+    # A window we can see is near its cap is the most confident signal.
     if best_when is not None and best_used >= _CODEX_CAP_THRESHOLD:
         return best_when
+    # No near-cap window, but one shipped a reset without a usable percent:
+    # respect it rather than downgrading a real cap to the transient floor.
+    # (A window with a PARSEABLE low percent stays transient — that's the
+    # genuine "429 while utilization is low" burst case.)
+    if unknown_pct_when is not None:
+        return unknown_pct_when
     return None
 
 

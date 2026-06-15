@@ -11,7 +11,7 @@ from typing import Literal
 from ._models import Polarity, ValenceGroup, Run, AnnotatedRun, FeedbackSignal
 from .rules import _VALENCE_GROUPS, classify
 from .._jsonl_tail import tail_jsonl_records
-from ..jsonl_snapshot import JsonlSnapshot, iter_snapshot_or_tail
+from ..jsonl_snapshot import JsonlSnapshot, iter_window_records
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ def _compute_group_runs(
 
     # Collect all rule-matched events in the window (iter is tail-first).
     window_events: list[tuple[str, str]] = []  # (ts, kind)
-    for ev in iter_snapshot_or_tail(snapshot, events_path):
+    for ev in iter_window_records(snapshot, events_path):  # #498: complete window
         ts = ev.get("timestamp")
         if not isinstance(ts, str) or ts < cutoff_iso:
             if isinstance(ts, str):

@@ -69,8 +69,14 @@ def _embed_text_sync(text: str) -> tuple[bytes, str, str, int]:
     provider = get_provider()
     vec = provider.embed(text[:cfg("embedding", "max_input_chars", 2000)],
                           input_type="passage")
-    provider_name = cfg("embedding", "provider", "unknown")
-    model = cfg("embedding", "model", "unknown")
+    # #493: read provenance off the LIVE provider, not config. The #681 keyless
+    # fallback can swap a configured voyage provider for ONNX (BGE 384); config
+    # would stamp those rows provider=voyage / model=voyage-4-lite over BGE
+    # vectors, misleading any future re-embed-on-provider-change or analytics.
+    provider_name = getattr(provider, "provider_name", None) or cfg(
+        "embedding", "provider", "unknown")
+    model = getattr(provider, "model_id", None) or cfg(
+        "embedding", "model", "unknown")
     dim = provider.dimensions()
     vec_bytes = struct.pack(f"{dim}f", *vec)
     return vec_bytes, provider_name, model, dim
@@ -477,6 +483,27 @@ class SagaStore:
             migrations=self.MIGRATIONS,
             detector=self._detect_schema_version,
         )
+
+    def _add_atom_to_index_locked(
+        self, conn: sqlite3.Connection, atom_id: str,
+    ) -> None:
+        """Incrementally add ``atom_id``'s stored vector to the FAISS index,
+        holding ``_index_lock`` (#492). No-op when the index isn't built.
+
+        The lock matters: a concurrent ``query()``-driven lazy build/rebuild can
+        reassign ``self._index`` between the built-check and the add, so an
+        unlocked check-then-act could add into a discarded index (lost add) —
+        inconsistent with every other index-mutation site, which all lock.
+        ``_index_lock`` is an RLock, so callers already holding it nest safely.
+        """
+        with self._index_lock:
+            if self._index is not None and self._index.built:
+                row = conn.execute(
+                    "SELECT vec FROM embeddings WHERE atom_id = ?",
+                    (atom_id,),
+                ).fetchone()
+                if row is not None and row[0] is not None:
+                    self._index.add(atom_id, row[0])
 
     def _ensure_index(self, conn: sqlite3.Connection) -> VectorIndex | None:
         """Lazily build the FAISS index on first retrieval. After build,
@@ -1485,15 +1512,9 @@ class SagaStore:
                 # manages its own BEGIN/COMMIT).
                 refresh_trend(conn, observation_id)
 
-                # Incrementally add the new observation to the FAISS
-                # index so the next query can surface it.
-                if self._index is not None and self._index.built:
-                    row = conn.execute(
-                        "SELECT vec FROM embeddings WHERE atom_id = ?",
-                        (observation_id,),
-                    ).fetchone()
-                    if row is not None and row[0] is not None:
-                        self._index.add(observation_id, row[0])
+                # Incrementally add the new observation to the FAISS index
+                # so the next query can surface it (#492: under _index_lock).
+                self._add_atom_to_index_locked(conn, observation_id)
 
                 emitted.append(observation_id)
                 for old_id in old_obs:
