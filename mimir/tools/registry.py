@@ -1511,6 +1511,7 @@ async def worklink_run(
             repo=repo,
             issue_id=int(issue_id),
             backend=backend,
+            autonomous=True,  # in-turn dispatch is autonomous → policy-gated (#460)
         )
     except Exception as exc:
         return f"worklink_run failed: {exc}"

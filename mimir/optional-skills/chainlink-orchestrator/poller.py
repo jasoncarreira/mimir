@@ -138,7 +138,8 @@ def main() -> int:
 
     dispatched = 0
     for issue_id in ready[:slots]:
-        argv = [*run_bin, "worklink", "run", str(issue_id), "--home", str(home), "--repo", repo]
+        argv = [*run_bin, "worklink", "run", str(issue_id),
+                "--home", str(home), "--repo", repo, "--autonomous"]
         log_path = state_dir / f"run-{issue_id}.log"
         try:
             log_fh = log_path.open("ab")

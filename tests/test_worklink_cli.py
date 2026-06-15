@@ -51,6 +51,7 @@ def test_worklink_run_cli_dispatches_operator_vertical(
             "dry_run": False,
             "test_command": None,
             "base_branch": None,
+            "autonomous": False,
         }
     ]
     assert "worklink #441 attempt 1: completed review-ready" in capsys.readouterr().out

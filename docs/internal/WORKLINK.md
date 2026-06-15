@@ -520,6 +520,41 @@ content verbatim into acceptance criteria.
   | claude-code | `coding-cli` | npm package `@anthropic-ai/claude-code` | `2.1.168` | root/scaffold Dockerfiles when `MIMIR_ENABLE_CLAUDE_CODE=1` | `claude --version` | Medium: optional second coding backend; real smoke requires a deployment with `claude` installed. |
   | gogcli | `integration-cli` | GitHub release/tag `steipete/gogcli` | `v0.9.0` | gmail-poller optional-skill `dockerfile.fragment` | `gog --version` | Medium: Gmail/Calendar helper drift can break polling independent of Worklink coding backends. |
 
+## 6.5 Compute-backend autonomy policy (#460)
+
+Worklink composes on two orthogonal axes: the **ToolBackend** (*what* builds —
+`codex`, `claude_cli`; chosen by `backends:` + `routes[].backend`) and the
+**ComputeBackend** (*where* it runs — `local_subprocess`, `docker_sibling`,
+`ecs_runtask`; chosen by `defaults.compute` + `routes[].compute_backend`). They
+mix freely: codex-on-local, codex-on-docker, a future claude-on-ecs — a route
+matches first, otherwise the defaults apply.
+
+`local_subprocess` runs the backend **unsandboxed**, with full
+container-filesystem access (codex needs `--sandbox danger-full-access` in the
+current image). That is an **explicit accept-the-risk fallback**, not the
+recommended autonomous path. Isolation comes from an isolated substrate
+(`docker_sibling` broker / `ecs_runtask`) per environment; the seccomp/userns
+profile is an optional Docker-family-only operator hardening, never a default
+(it doesn't port to ECS).
+
+**Policy (enforced in the core executor, `WorklinkConfig.autonomous_compute_allowed`):**
+
+- **Autonomous dispatch** — the ready-queue poller (which invokes `mimir
+  worklink run --autonomous`) and the in-turn `worklink_run` tool (which passes
+  `autonomous=True`) — **refuses** an unsandboxed substrate. With
+  `defaults.compute: local_subprocess` and
+  `defaults.allow_autonomous_local_subprocess: false` (the default), the run
+  returns `refused` *before claiming* and the issue is left untouched.
+  Autonomous use **prefers** an isolated ComputeBackend; route Worklink-ready
+  leaves to `docker_sibling`/`ecs_runtask`, or set
+  `allow_autonomous_local_subprocess: true` to accept the blast radius for
+  autonomous runs too.
+- **Operator-invoked `mimir worklink run`** (no `--autonomous`) is **never
+  gated** — it always proceeds. The blast radius is real: on `local_subprocess`
+  the backend can read/write the whole container filesystem, so reserve manual
+  unsandboxed runs for issues you've scoped and trust. The gate lives in core
+  Python ahead of the claim, so no model-facing caller can bypass it.
+
 ## 7. Operator runbook
 
 Slice 1 is intentionally operator-invoked. The executor is deterministic
@@ -783,6 +818,9 @@ defaults:
   priority: normal          # arbiter priority for autonomous dispatch (low|normal|high)
   max_concurrent: 2         # cap on concurrent autonomous claims (poller + tool); CLI uncapped
   reaper_ttl_s: 7200        # claim age (no heartbeat) before the TTL reaper steals it back
+  allow_autonomous_local_subprocess: false  # autonomy policy (#460): autonomous dispatch
+                            # refuses the unsandboxed local_subprocess substrate unless this
+                            # is true. The operator CLI is never gated. See §6.5.
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
 
 routes:                     # first match wins

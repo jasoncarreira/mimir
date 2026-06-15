@@ -40,6 +40,13 @@ class WorklinkDefaults:
     # legitimately-running worker is never reaped out from under itself.
     max_concurrent: int = 2
     reaper_ttl_s: int = 7200
+    # Autonomy safety posture (#460). local_subprocess runs the backend with
+    # full container-filesystem access (no sandbox) — fine for an operator who
+    # accepts the blast radius, unsafe as an autonomous default. Autonomous
+    # dispatch (poller / worklink_run tool) REFUSES local_subprocess unless this
+    # is flipped true; it always prefers an isolated ComputeBackend
+    # (docker_sibling / ecs_runtask). The operator CLI is never gated by this.
+    allow_autonomous_local_subprocess: bool = False
 
 
 @dataclass(frozen=True)
@@ -114,6 +121,9 @@ class WorklinkConfig:
             base_branch=str(defaults_data.get("base_branch", "main")),
             max_concurrent=int(defaults_data.get("max_concurrent", 2)),
             reaper_ttl_s=int(defaults_data.get("reaper_ttl_s", 7200)),
+            allow_autonomous_local_subprocess=bool(
+                defaults_data.get("allow_autonomous_local_subprocess", False)
+            ),
         )
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
         tool_pins = _parse_tool_pins(data.get("tool_pins") or [])
@@ -164,6 +174,34 @@ class WorklinkConfig:
         if tool_category and tool_category in self.defaults.backend_by_category:
             return self.defaults.backend_by_category[tool_category]
         return self.defaults.backend
+
+    #: Compute substrates that run the backend with full container-filesystem
+    #: access (no isolation). Autonomous dispatch refuses these without opt-in.
+    UNSANDBOXED_COMPUTE: tuple[str, ...] = ("local_subprocess",)
+
+    def autonomous_compute_allowed(self, compute_backend_name: str) -> tuple[bool, str | None]:
+        """Whether autonomous dispatch may use ``compute_backend_name`` (#460).
+
+        Refuses an unsandboxed substrate (``local_subprocess``) unless the
+        operator opted in via ``defaults.allow_autonomous_local_subprocess``.
+        Isolated substrates (``docker_sibling`` / ``ecs_runtask`` / anything
+        else) are always allowed. The operator CLI does not consult this — it
+        always runs, with the documented blast-radius warning.
+        """
+        if (
+            compute_backend_name in self.UNSANDBOXED_COMPUTE
+            and not self.defaults.allow_autonomous_local_subprocess
+        ):
+            return False, (
+                f"autonomous Worklink dispatch refuses the unsandboxed "
+                f"'{compute_backend_name}' compute backend (full container "
+                f"filesystem access). Route this issue to an isolated "
+                f"ComputeBackend (docker_sibling / ecs_runtask), or set "
+                f"defaults.allow_autonomous_local_subprocess: true in "
+                f"worklink.yaml to accept the blast radius for autonomous runs. "
+                f"The operator CLI `mimir worklink run` is unaffected."
+            )
+        return True, None
 
 
 def _normalize_compute_backend_name(name: str) -> str:
