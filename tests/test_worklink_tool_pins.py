@@ -200,3 +200,49 @@ def test_chainlink_bump_filer_raises_on_create_failure() -> None:
 
     with pytest.raises(RuntimeError, match="boom"):
         ChainlinkBumpFiler(runner=runner).file(drift)
+
+
+def _load_tool_pins_poller():
+    import importlib.util
+    import sys
+
+    poller_path = (
+        Path(__file__).resolve().parent.parent
+        / "mimir" / "optional-skills" / "worklink-tool-pins" / "poller.py"
+    )
+    spec = importlib.util.spec_from_file_location("wtp_poller_under_test", poller_path)
+    mod = importlib.util.module_from_spec(spec)
+    # Register before exec so the poller's @dataclass __module__ lookup resolves.
+    sys.modules[spec.name] = mod
+    try:
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
+    return mod
+
+
+def test_poller_home_requires_mimir_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """#portability: the tool-pins poller must not default to a hard-coded
+    container path. Without MIMIR_HOME, _home() is None and main() emits a
+    misconfigured signal instead of scanning a nonexistent /mimir-home."""
+    import contextlib
+    import io
+
+    mod = _load_tool_pins_poller()
+    assert not hasattr(mod, "DEFAULT_HOME")  # the /mimir-home default is gone
+
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    assert mod._home() is None
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mod.main()
+    assert rc == 0
+    emitted = json.loads(buf.getvalue().strip())
+    assert emitted["signal"] == "worklink_tool_pins_misconfigured"
+    assert emitted["reason"] == "MIMIR_HOME unset"
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    assert mod._home() == tmp_path

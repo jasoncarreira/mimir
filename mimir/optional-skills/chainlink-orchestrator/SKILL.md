@@ -4,8 +4,8 @@ description: "The two model-touching halves of Worklink, shipped as one opt-in s
 env:
   required:
     - name: WORKLINK_REPO
-      description: "Absolute path to the git repo the backend works in (e.g. /workspace/mimir). The ready-queue poller skips dispatch until this is set; the planner half does not need it."
-      example: "/workspace/mimir"
+      description: "Absolute path to the git repo the backend works in (e.g. /path/to/your/repo). The ready-queue poller skips dispatch until this is set; the planner half does not need it."
+      example: "/path/to/your/repo"
   optional:
     - name: WORKLINK_RUN_BIN
       description: "Command (shlex-split) the poller invokes for dispatch. Default `mimir`; set to `uv run mimir` or an absolute venv path if bare `mimir` isn't on PATH."
@@ -33,8 +33,8 @@ it is **not** allowed to execute the implementation.
 when the parent is too broad for one backend run or lacks testable acceptance
 criteria.
 
-**Requires:** Run from the Chainlink repo (`/mimir-home` for operator-tracked
-issues). Read the parent issue and relevant spec/doc first. Use the bundled
+**Requires:** Run from the Chainlink repo (your agent home / `$MIMIR_HOME` for
+operator-tracked issues). Read the parent issue and relevant spec/doc first. Use the bundled
 planner prompt at `mimir/prompt_templates/decompose.md` as the canonical leaf
 template.
 

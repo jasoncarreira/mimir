@@ -4,8 +4,8 @@ description: "Optional low-priority poller that inventories Worklink tool pins f
 env:
   optional:
     - name: MIMIR_HOME
-      description: "Agent home containing worklink.yaml and the Chainlink tracker. Passed explicitly by pollers.json; defaults to /mimir-home."
-      example: "/mimir-home"
+      description: "Agent home containing worklink.yaml and the Chainlink tracker. Supplied by the framework when it launches the poller; the poller refuses to run (emits worklink_tool_pins_misconfigured) if unset — no container-path fallback."
+      example: "/path/to/agent-home"
 ---
 
 # worklink-tool-pins — Worklink external-tool drift poller
