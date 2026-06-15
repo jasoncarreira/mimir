@@ -84,8 +84,22 @@ def test_active_claim_count_reads_in_progress_label() -> None:
 
 
 def test_issue_ids_with_label_tolerates_bad_json() -> None:
+    # Best-effort DISCOVERY path: a garbled list just means "nothing this cycle".
     claims = ChainlinkClaims(agent_id="t", runner=lambda a: cp(stdout="not json"))
     assert claims.issue_ids_with_label("worklink:ready") == []
+
+
+def test_active_claim_count_raises_on_list_failure() -> None:
+    # STRICT cap path: a failed query must NOT read as "0 active" (fail closed).
+    claims = ChainlinkClaims(agent_id="t", runner=lambda a: cp(returncode=1, stderr="boom"))
+    with pytest.raises(RuntimeError):
+        claims.active_claim_count()
+
+
+def test_active_claim_count_raises_on_bad_json() -> None:
+    claims = ChainlinkClaims(agent_id="t", runner=lambda a: cp(stdout="not json"))
+    with pytest.raises(RuntimeError):
+        claims.active_claim_count()
 
 
 # ── claims.py: TTL reaper recovery ──────────────────────────────────
@@ -226,14 +240,17 @@ class _FakeArbiter:
 @pytest.fixture
 def _tool_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _write_worklink_yaml(tmp_path)
+    repo_dir = tmp_path / "src"  # distinct from cwd so we can prove WORKLINK_REPO is honored
+    repo_dir.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo_dir))
+    monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
     from mimir.tools import registry
 
-    dispatched: list[int] = []
+    dispatched: list[dict] = []
 
     def fake_run_worklink(*, home, repo, issue_id, backend=None, **_):
-        dispatched.append(issue_id)
+        dispatched.append({"issue_id": issue_id, "repo": str(repo), "home": str(home)})
         return type("R", (), {
             "issue_id": issue_id, "attempt": 1, "status": "completed",
             "review_ready": True, "pr_url": None, "evidence_path": None, "reason": None,
@@ -243,13 +260,13 @@ def _tool_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(orch, "run_worklink", fake_run_worklink, raising=True)
     # keep concurrency below cap by default (0 active)
     monkeypatch.setattr(autonomy, "check_concurrency", lambda home, **_: autonomy.ConcurrencyCheck(True, 0, 2))
-    yield registry, dispatched
+    yield registry, dispatched, repo_dir
     registry.set_arbiter(None)
 
 
 @pytest.mark.asyncio
 async def test_worklink_run_sheds_under_tight(_tool_env) -> None:
-    registry, dispatched = _tool_env
+    registry, dispatched, _repo = _tool_env
     arbiter = _FakeArbiter(fire=False)  # severity TIGHT → should_fire False
     registry.set_arbiter(arbiter)
     out = await registry.worklink_run.ainvoke({"issue_id": 443})
@@ -259,21 +276,37 @@ async def test_worklink_run_sheds_under_tight(_tool_env) -> None:
 
 
 @pytest.mark.asyncio
-async def test_worklink_run_dispatches_when_clear(_tool_env) -> None:
-    registry, dispatched = _tool_env
+async def test_worklink_run_dispatches_when_clear_using_worklink_repo(_tool_env) -> None:
+    registry, dispatched, repo_dir = _tool_env
     registry.set_arbiter(_FakeArbiter(fire=True))
     out = await registry.worklink_run.ainvoke({"issue_id": 443})
     assert "443" in out and "completed" in out
-    assert dispatched == [443]
+    assert [d["issue_id"] for d in dispatched] == [443]
+    # the executor runs against WORKLINK_REPO, not the server process cwd
+    assert dispatched[0]["repo"] == str(repo_dir)
 
 
 @pytest.mark.asyncio
 async def test_worklink_run_skips_at_cap(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
-    registry, dispatched = _tool_env
+    registry, dispatched, _repo = _tool_env
     registry.set_arbiter(_FakeArbiter(fire=True))
     monkeypatch.setattr(autonomy, "check_concurrency", lambda home, **_: autonomy.ConcurrencyCheck(False, 2, 2))
     out = await registry.worklink_run.ainvoke({"issue_id": 443})
     assert "skipped" in out
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_fails_closed_when_cap_unreadable(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    registry, dispatched, _repo = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+
+    def boom(home, **_):
+        raise RuntimeError("chainlink unreachable")
+
+    monkeypatch.setattr(autonomy, "check_concurrency", boom)
+    out = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "concurrency check error" in out  # fail closed: surfaced, not dispatched
     assert dispatched == []
 
 
@@ -367,3 +400,22 @@ def test_poller_no_dispatch_when_cap_reached(tmp_path: Path) -> None:
     assert not [e for e in events if e.get("signal") == "worklink_dispatched"]
     scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
     assert scan["slots"] == 0
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_fails_closed_when_chainlink_errors(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    # a chainlink shim that always errors → poller can't read the queue
+    script = tmp_path / "chainlink"
+    script.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n", encoding="utf-8")
+    script.chmod(0o755)
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(script),
+        "WORKLINK_REPO": str(home),
+        "WORKLINK_MAX_CONCURRENT": "2",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+    assert any(e.get("signal") == "worklink_poller_degraded" for e in events)
+    assert not [e for e in events if e.get("signal") == "worklink_dispatched"]

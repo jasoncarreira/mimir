@@ -1361,9 +1361,12 @@ async def worklink_run(
     if not home_env:
         return "worklink_run failed: MIMIR_HOME not set"
     home = Path(home_env)
-    repo = Path(os.environ.get("MIMIR_WORKLINK_REPO") or os.getcwd())
 
-    from ..worklink.autonomy import check_concurrency, worklink_priority
+    from ..worklink.autonomy import check_concurrency, worklink_priority, worklink_repo
+
+    # Honor the documented WORKLINK_REPO (MIMIR_WORKLINK_REPO compat); never
+    # silently run the executor against the server process cwd.
+    repo = Path(worklink_repo())
 
     # 1) Arbiter gate (cheap, in-process): shed autonomous dispatch under
     #    pressure. The CLI path never injects an arbiter, so it bypasses this.

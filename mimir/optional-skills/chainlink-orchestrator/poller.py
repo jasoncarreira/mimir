@@ -56,20 +56,26 @@ def _chainlink_bin() -> str:
     return os.environ.get("CHAINLINK_BIN") or "chainlink"
 
 
-def _issue_ids_with_label(home: Path, label: str) -> list[int]:
+def _issue_ids_with_label(home: Path, label: str) -> list[int] | None:
+    """Issue ids carrying ``label``, or ``None`` if the query failed.
+
+    ``None`` (subprocess error / non-zero exit / invalid JSON) is distinct from
+    ``[]`` (no matches): the caller treats a failed read as a reason to NOT
+    dispatch, so the cap can't be undercounted into admitting extra workers.
+    """
     try:
         proc = subprocess.run(
             [_chainlink_bin(), "issue", "list", "--label", label, "--status", "open", "--json"],
             cwd=str(home), capture_output=True, text=True, check=False, timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
-        return []
+        return None
     if proc.returncode != 0:
-        return []
+        return None
     try:
         data = json.loads(proc.stdout or "[]")
     except json.JSONDecodeError:
-        return []
+        return None
     issues = data if isinstance(data, list) else data.get("issues", [])
     ids: list[int] = []
     for item in issues:
@@ -89,8 +95,18 @@ def main() -> int:
         return 0
     home = Path(home_env)
 
-    ready = sorted(set(_issue_ids_with_label(home, READY_LABEL)))
-    active = len(_issue_ids_with_label(home, IN_PROGRESS_LABEL))
+    ready_ids = _issue_ids_with_label(home, READY_LABEL)
+    active_ids = _issue_ids_with_label(home, IN_PROGRESS_LABEL)
+    # Fail closed: if we can't read either the ready queue or the active-claim
+    # count, do not dispatch (an undercounted cap could over-admit workers).
+    if ready_ids is None or active_ids is None:
+        _emit({
+            "signal": "worklink_poller_degraded",
+            "reason": "chainlink issue list failed; skipping dispatch this cycle",
+        })
+        return 0
+    ready = sorted(set(ready_ids))
+    active = len(active_ids)
     try:
         cap = int(os.environ.get("WORKLINK_MAX_CONCURRENT", "2"))
     except ValueError:

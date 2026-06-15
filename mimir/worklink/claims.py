@@ -217,22 +217,27 @@ class ChainlinkClaims:
 
     # ---- Discovery / concurrency (slice-3 autonomy) ------------------
 
-    def issue_ids_with_label(self, label: str, *, status: str = "open") -> list[int]:
-        """Return open issue ids carrying ``label`` (best-effort; [] on error).
+    def _list_issue_ids(self, label: str, *, status: str = "open") -> list[int]:
+        """Query issue ids carrying ``label``; RAISE on a failed/garbled query.
 
-        Used for ready-queue discovery (``worklink:ready``) and the
-        concurrent-claim cap (``worklink:in-progress``).
+        The strict path behind the safety cap: it must distinguish "no active
+        claims" from "couldn't read active claims" so the cap can fail closed.
         """
         result = self._run(
             "issue", "list", "--label", label, "--status", status, "--json",
             check=False,
         )
         if result.returncode != 0:
-            return []
+            raise RuntimeError(
+                (result.stderr or result.stdout).strip()
+                or f"chainlink issue list --label {label} failed (rc={result.returncode})"
+            )
         try:
             data = json.loads(result.stdout or "[]")
-        except json.JSONDecodeError:
-            return []
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"chainlink issue list --label {label} returned invalid JSON"
+            ) from exc
         issues = data if isinstance(data, list) else data.get("issues", [])
         ids: list[int] = []
         for item in issues:
@@ -245,10 +250,23 @@ class ChainlinkClaims:
                 continue
         return ids
 
+    def issue_ids_with_label(self, label: str, *, status: str = "open") -> list[int]:
+        """Best-effort id list for ``label`` ([] on any query failure).
+
+        Use for *discovery* (ready-queue scan, reaper sweep) where a missing
+        list just means "do less this cycle". The concurrency CAP must NOT use
+        this — see :meth:`active_claim_count`, which fails closed instead.
+        """
+        try:
+            return self._list_issue_ids(label, status=status)
+        except RuntimeError:
+            return []
+
     def active_claim_count(self) -> int:
-        """Count issues currently labeled ``worklink:in-progress`` — the
-        live worker count the concurrency cap is enforced against."""
-        return len(self.issue_ids_with_label("worklink:in-progress"))
+        """Number of ``worklink:in-progress`` issues — the live worker count the
+        concurrency cap gates against. RAISES if the count can't be read, so the
+        cap fails **closed**: never admit a worker whose peers we can't bound."""
+        return len(self._list_issue_ids("worklink:in-progress"))
 
     def _issue_comments(self, issue_id: int) -> list[str]:
         result = self._run("issue", "show", str(issue_id), "--json", check=False)
