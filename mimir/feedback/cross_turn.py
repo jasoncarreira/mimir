@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ._models import FeedbackSignal
-from ..jsonl_snapshot import JsonlSnapshot, iter_snapshot_or_tail
+from ..jsonl_snapshot import JsonlSnapshot, iter_window_records
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ def _detect_cross_turn_send_loops(
     send_counts: dict[tuple[str, str], int] = {}
     already_flagged: set[tuple[str, str]] = set()
 
-    for ev in iter_snapshot_or_tail(snapshot, events_path):
+    for ev in iter_window_records(snapshot, events_path):  # #498: complete window
         ts = ev.get("timestamp")
         if not isinstance(ts, str) or ts < cutoff_iso:
             if isinstance(ts, str):

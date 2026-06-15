@@ -34,7 +34,11 @@ from pathlib import Path
 from typing import Literal
 
 from .._jsonl_tail import tail_jsonl_records
-from ..jsonl_snapshot import JsonlSnapshot, iter_snapshot_or_tail
+from ..jsonl_snapshot import (
+    JsonlSnapshot,
+    iter_snapshot_or_tail,
+    iter_window_records,
+)
 
 # --- Sub-module imports + backward-compat re-exports ---
 from ._models import (  # noqa: F401
@@ -216,7 +220,7 @@ class FeedbackLog:
         seen_content: dict[str, set[str]] = {"negative": set(), "positive": set()}
 
         # 1) events.jsonl — known event-type rules.
-        for ev in iter_snapshot_or_tail(self.events_snapshot, self.events_path):
+        for ev in iter_window_records(self.events_snapshot, self.events_path):  # #498
             ts = ev.get("timestamp")
             if not isinstance(ts, str) or ts < cutoff_iso:
                 # tail-first scan: as soon as a record predates the window
@@ -264,19 +268,24 @@ class FeedbackLog:
                 if kind in seen_first_only:
                     continue
                 seen_first_only.add(kind)
-            target = negatives if polarity == "negative" else positives
-            if len(target) >= limit:
-                continue
             content = _render_event_line(kind, ev)
-            # Content-level dedup: if a prior (more recent) event
-            # already produced this exact line text in this polarity
-            # bucket, skip — see ``seen_content`` comment above for
-            # rationale. Render cost is low and we're in tail-first
-            # iteration, so the *kept* item is always the most recent.
+            # Content-level dedup: if a prior (more recent) event already
+            # produced this exact line text in this polarity bucket, skip —
+            # see ``seen_content`` comment above. Render cost is low and we're
+            # in tail-first iteration, so the *kept* item is the most recent.
+            #
+            # #496: record content BEFORE the display-capacity gate below, so
+            # the dedup set stays complete even when the bucket is full. Keeps
+            # the turns.jsonl pass (and any future emit path) from re-emitting
+            # a line identical to an in-window event we saw but had no room to
+            # display. Output is unchanged — only the dedup set is more complete.
             polarity_bucket = seen_content[polarity]
             if content in polarity_bucket:
                 continue
             polarity_bucket.add(content)
+            target = negatives if polarity == "negative" else positives
+            if len(target) >= limit:
+                continue
             target.append(
                 FeedbackSignal(
                     ts=ts,
@@ -317,7 +326,7 @@ class FeedbackLog:
         # 2) turns.jsonl — error / result_is_error are turn-level negatives
         # the events stream might not capture.
         if len(negatives) < limit:
-            for rec in iter_snapshot_or_tail(self.turns_snapshot, self.turns_path):
+            for rec in iter_window_records(self.turns_snapshot, self.turns_path):  # #498
                 ts = rec.get("ts")
                 if not isinstance(ts, str) or ts < cutoff_iso:
                     if isinstance(ts, str):
