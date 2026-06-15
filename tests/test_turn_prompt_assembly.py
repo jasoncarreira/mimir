@@ -380,7 +380,7 @@ async def test_agent_build_turn_prompt_threads_all_helper_outputs(
     )
     monkeypatch.setattr(
         agent, "_assemble_self_state_block",
-        lambda: "SELFSTATE_SENTINEL",
+        lambda **_kw: "SELFSTATE_SENTINEL",
     )
 
     async def _fake_session_summaries(*, channel_id):
@@ -485,7 +485,7 @@ async def test_agent_build_turn_prompt_omits_blocks_for_none_helpers(
     monkeypatch.setattr(agent, "_assemble_usage_block", lambda: (None, []))
     monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda: None)
     monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id: None)
-    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda: None)
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda **_kw: None)
 
     async def _none_summaries(*, channel_id):
         return None

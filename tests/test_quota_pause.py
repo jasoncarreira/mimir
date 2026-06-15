@@ -9,14 +9,25 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from types import SimpleNamespace
+
 from mimir.quota_pause import (
     PauseStatus,
     QuotaPauseTracker,
     _MAX_RESET_WINDOW_DAYS,
     _clamp_reset_at,
+    _codex_window_reset,
     extract_reset_at,
     is_quota_exhaustion,
 )
+
+
+def _codex_win(*, used_percent, reset_at=None, reset_after_seconds=None):
+    return SimpleNamespace(
+        used_percent=used_percent,
+        reset_at=reset_at,
+        reset_after_seconds=reset_after_seconds,
+    )
 
 
 # ── tracker round-trip ─────────────────────────────────────────────
@@ -652,3 +663,96 @@ def test_transient_escalation_still_decays_after_quiet(tmp_path):
     later = reset1 + timedelta(minutes=31)
     reset2, _ = QuotaPauseTracker(path).record_rate_limit(exc, now=later)
     assert (reset2 - later).total_seconds() == 60
+
+
+# ── #490: Codex window reset authoritative even without a parseable percent ──
+
+
+def test_codex_window_reset_authoritative_when_percent_missing():
+    """#490: a window carrying a reset hint but no/non-numeric used_percent is
+    a genuine cap (best-effort headers) — respect its reset, don't downgrade to
+    the 60s transient floor."""
+    now = datetime.now(tz=timezone.utc)
+    reset_ts = int((now + timedelta(hours=1)).timestamp())
+    rl = SimpleNamespace(
+        primary=_codex_win(used_percent=None, reset_at=reset_ts), secondary=None,
+    )
+    when = _codex_window_reset(rl, now)
+    assert when is not None
+    assert abs((when - (now + timedelta(hours=1))).total_seconds()) <= 1
+
+    # Non-numeric percent (e.g. "n/a") is treated the same as missing.
+    rl2 = SimpleNamespace(
+        primary=_codex_win(used_percent="n/a", reset_at=reset_ts), secondary=None,
+    )
+    assert _codex_window_reset(rl2, now) is not None
+
+
+def test_codex_window_reset_none_when_parseable_low_utilization():
+    """#490 must not over-correct: a window with a PARSEABLE low percent is the
+    genuine '429 while utilization is low' burst → stays transient (None)."""
+    now = datetime.now(tz=timezone.utc)
+    reset_ts = int((now + timedelta(hours=1)).timestamp())
+    rl = SimpleNamespace(
+        primary=_codex_win(used_percent=50.0, reset_at=reset_ts), secondary=None,
+    )
+    assert _codex_window_reset(rl, now) is None
+
+
+def test_codex_window_reset_authoritative_when_near_cap():
+    """Near-cap parseable window stays authoritative (unchanged behavior)."""
+    now = datetime.now(tz=timezone.utc)
+    reset_ts = int((now + timedelta(hours=2)).timestamp())
+    rl = SimpleNamespace(
+        primary=_codex_win(used_percent=96.0, reset_at=reset_ts), secondary=None,
+    )
+    assert _codex_window_reset(rl, now) is not None
+
+
+def test_codex_cap_with_reset_but_no_percent_extracts_authoritative():
+    """#490 end-to-end through extract_reset_at: a percent-less cap 429 yields a
+    (reset, 'codex-plus') instead of (None, None) → caller respects the window."""
+    now = datetime.now(tz=timezone.utc)
+    reset_ts = int((now + timedelta(hours=1)).timestamp())
+
+    class _CodexErr(Exception):
+        pass
+
+    exc = _CodexErr("HTTP 429")
+    exc.rate_limits = SimpleNamespace(  # type: ignore[attr-defined]
+        primary=_codex_win(used_percent=None, reset_at=reset_ts), secondary=None,
+    )
+    reset, provider = extract_reset_at(exc)
+    assert reset is not None
+    assert provider == "codex-plus"
+
+
+# ── #489: lazy-expiry recovery consumed exactly once across instances ──
+
+
+def test_lazy_expiry_recovery_consumed_once_across_instances(tmp_path: Path):
+    """#489: when two trackers over the same file both observe the lazy-expiry
+    transition, only ONE returns the recovery (paused=False, reset_at set); the
+    other reloads the cleared state — so the arbiter / scheduler-recheck /
+    recovery paths can't each emit a duplicate quota_recovered."""
+    path = tmp_path / "qp.json"
+    now = datetime.now(tz=timezone.utc)
+    reset = now + timedelta(seconds=60)
+    QuotaPauseTracker(path).pause_until(
+        reset, reason="quota_exhausted", provider="anthropic", now=now,
+    )
+
+    # Two instances each load the still-active (soon-to-expire) pause.
+    tracker_a = QuotaPauseTracker(path)
+    tracker_b = QuotaPauseTracker(path)
+
+    after = now + timedelta(seconds=120)  # past the reset
+    status_a = tracker_a.is_paused(now=after)
+    status_b = tracker_b.is_paused(now=after)
+
+    recovered = [
+        s for s in (status_a, status_b)
+        if not s.paused and s.reset_at is not None
+    ]
+    assert len(recovered) == 1, "recovery transition must be observed exactly once"
+    assert not status_a.paused and not status_b.paused
