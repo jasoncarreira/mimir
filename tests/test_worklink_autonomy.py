@@ -38,12 +38,14 @@ class FakeChainlink:
         comments: dict[int, list[str]] | None = None,
         fail_steal: set[int] | None = None,
         active_locks: list[int] | None = None,
+        lock_agents: dict[int, str] | None = None,
     ) -> None:
         self.in_progress = in_progress or []
         self.ready = ready or []
         self.comments = comments or {}
         self.fail_steal = fail_steal or set()
         self.active_locks = active_locks if active_locks is not None else list(self.in_progress)
+        self.lock_agents = lock_agents or {}
         self.calls: list[list[str]] = []
 
     def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -57,10 +59,17 @@ class FakeChainlink:
             return cp(stdout=json.dumps([{"id": i} for i in ids]))
         if tail[:2] == ["issue", "show"]:
             issue_id = int(tail[2])
-            payload = {"id": issue_id, "comments": list(self.comments.get(issue_id, []))}
+            payload = {"id": issue_id, "comments": list(self.comments.get(issue_id, [])), "labels": ["worklink:in-progress"] if issue_id in self.in_progress else []}
             return cp(stdout=json.dumps(payload))
         if tail[:2] == ["locks", "list"]:
-            return cp(stdout=json.dumps({"version": 1, "locks": {str(i): {"issue_id": i} for i in self.active_locks}}))
+            locks = {
+                str(i): {
+                    "issue_id": i,
+                    **({"agent_id": self.lock_agents[i]} if i in self.lock_agents else {}),
+                }
+                for i in self.active_locks
+            }
+            return cp(stdout=json.dumps({"version": 1, "locks": locks}))
         if tail[:2] == ["locks", "steal"]:
             issue_id = int(tail[2])
             return cp(returncode=1 if issue_id in self.fail_steal else 0)
@@ -155,6 +164,43 @@ def test_reap_home_blocks_when_attempts_exhausted() -> None:
     assert any(c[1:] == ["issue", "label", "51", "worklink:blocked"] for c in fake.calls)
 
 
+def test_reap_home_skips_when_lock_was_already_released() -> None:
+    fake = FakeChainlink(
+        in_progress=[54],
+        active_locks=[],
+        comments={54: [_claim_comment(54, attempt=1, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert "locks steal 54" not in fake.names()
+
+
+def test_reap_home_skips_when_issue_already_transitioned() -> None:
+    fake = FakeChainlink(
+        in_progress=[],
+        active_locks=[56],
+        comments={56: [_claim_comment(56, attempt=1, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    assert claims.reap_stale_claims(
+        [ClaimRecord(56, 1, "mimir-worklink", datetime.now(UTC) - timedelta(hours=3))],
+        ttl=timedelta(hours=2),
+    ) == []
+    assert not any(c[1:] == ["issue", "label", "56", "worklink:ready"] for c in fake.calls)
+
+
+def test_reap_home_skips_when_lock_owner_changed() -> None:
+    fake = FakeChainlink(
+        in_progress=[55],
+        active_locks=[55],
+        lock_agents={55: "other-agent"},
+        comments={55: [_claim_comment(55, attempt=1, age=timedelta(hours=3), agent="old-agent")]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert "locks steal 55" not in fake.names()
+
+
 def test_reap_home_leaves_fresh_claim_untouched() -> None:
     fake = FakeChainlink(
         in_progress=[52],
@@ -227,6 +273,21 @@ def test_check_concurrency_blocks_at_cap(tmp_path: Path) -> None:
     claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(active_locks=[1, 2]))
     check = autonomy.check_concurrency(tmp_path, claims=claims)
     assert not check.allowed and check.active == 2 and "cap reached" in check.reason
+
+
+def test_worklink_repo_requires_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
+    with pytest.raises(RuntimeError, match="WORKLINK_REPO is required"):
+        autonomy.worklink_repo()
+
+
+def test_worklink_repo_accepts_backcompat_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.setenv("MIMIR_WORKLINK_REPO", str(tmp_path))
+    assert autonomy.worklink_repo() == str(tmp_path)
 
 
 def test_worklink_priority_from_config(tmp_path: Path) -> None:
@@ -350,6 +411,19 @@ async def test_worklink_run_tool_propagates_refused_result(_tool_env, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_worklink_run_fails_when_worklink_repo_unset(
+    _tool_env, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, dispatched, _repo = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
+    out = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "WORKLINK_REPO is required" in out
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
 async def test_worklink_run_skips_at_cap(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
     registry, dispatched, _repo = _tool_env
     registry.set_arbiter(_FakeArbiter(fire=True))
@@ -447,6 +521,56 @@ def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_reads_cap_from_worklink_yaml(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "worklink.yaml").write_text("defaults:\n  max_concurrent: 3\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state = tmp_path / "state"
+    chainlink = _fake_chainlink_script(tmp_path, ready=[10, 11, 12], active_locks=[10])
+    run_bin = _fake_run_bin(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, str(POLLER)],
+        env={
+            **os.environ,
+            "MIMIR_HOME": str(home),
+            "WORKLINK_REPO": str(repo),
+            "STATE_DIR": str(state),
+            "CHAINLINK_BIN": str(chainlink),
+            "WORKLINK_RUN_BIN": str(run_bin),
+        },
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert proc.returncode == 0
+    records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    assert [
+        r.get("issue_id") for r in records if r.get("signal") == "worklink_dispatched"
+    ] == [10, 11]
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_reads_flow_style_cap_through_worklink_config(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "worklink.yaml").write_text('defaults: {max_concurrent: "3"}\n', encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(_fake_chainlink_script(tmp_path, ready=[10, 11, 12], active_locks=[10])),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "1",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+    # WorklinkConfig parses flow-style YAML and takes precedence over the legacy
+    # env cap: cap 3, 1 active lock → 2 free slots.
+    assert [
+        r.get("issue_id") for r in events if r.get("signal") == "worklink_dispatched"
+    ] == [10, 11]
+
+
 def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()

@@ -11,7 +11,7 @@ env:
       description: "Command (shlex-split) the poller invokes for dispatch. Default `mimir`; set to `uv run mimir` or an absolute venv path if bare `mimir` isn't on PATH."
       example: "uv run mimir"
     - name: WORKLINK_MAX_CONCURRENT
-      description: "Total concurrent Worklink claims the poller allows. Default 2; keep in sync with defaults.max_concurrent in worklink.yaml."
+      description: "Legacy fallback for total concurrent Worklink claims when worklink.yaml defaults.max_concurrent is absent. Default 2."
       example: "2"
     - name: MIMIR_WORKLINK_REAPER_CRON
       description: "Cron for the core TTL reaper that recovers stale claims (set in the agent env, not here). Empty = reaper disabled."
@@ -124,7 +124,7 @@ Once installed and configured (see frontmatter env), the scheduler runs the
 `worklink-ready-queue` poller on its cron (default every 10 min). Each fire:
 
 1. Lists `worklink:ready` leaves and counts `worklink:in-progress` claims.
-2. Computes free slots = `WORKLINK_MAX_CONCURRENT` − active (default cap 2).
+2. Computes free slots from `worklink.yaml` `defaults.max_concurrent` minus active claims. Default cap is 2; `WORKLINK_MAX_CONCURRENT` is only a legacy fallback when the YAML key is absent.
 3. Launches `mimir worklink run <id>` **detached** for up to that many leaves,
    then returns immediately (a run can take minutes; the poller's own 60s budget
    would otherwise kill it). The detached run does the claim/evidence/transition

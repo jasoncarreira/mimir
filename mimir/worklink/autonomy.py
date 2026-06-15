@@ -68,16 +68,15 @@ def worklink_repo() -> str:
     """Resolve the git repo the backend works in, consistently with the
     ready-queue poller / opt-in skill, which expose ``WORKLINK_REPO``.
 
-    ``MIMIR_WORKLINK_REPO`` is accepted as a back-compat alias. Falls back to
-    the process cwd only when neither is set (operator-CLI-style invocation from
-    inside the repo). The in-turn ``worklink_run`` tool MUST use this rather
-    than cwd so a standard install runs the executor against the configured repo.
+    ``MIMIR_WORKLINK_REPO`` is accepted as a back-compat alias. Autonomous
+    dispatch must be explicit: falling back to the server process cwd can run
+    Worklink against an unintended checkout. The operator CLI has its own
+    ``--repo`` defaulting behavior and does not use this helper.
     """
-    return (
-        os.environ.get("WORKLINK_REPO")
-        or os.environ.get("MIMIR_WORKLINK_REPO")
-        or os.getcwd()
-    )
+    repo = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    if not repo:
+        raise RuntimeError("WORKLINK_REPO is required for autonomous Worklink dispatch")
+    return repo
 
 
 def make_claims(home: Path, *, agent_id: str = DEFAULT_AGENT_ID) -> ChainlinkClaims:

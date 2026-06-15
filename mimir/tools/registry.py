@@ -1515,7 +1515,10 @@ async def worklink_run(
 
     # Honor the documented WORKLINK_REPO (MIMIR_WORKLINK_REPO compat); never
     # silently run the executor against the server process cwd.
-    repo = Path(worklink_repo())
+    try:
+        repo = Path(worklink_repo())
+    except Exception as exc:
+        return f"worklink_run failed: {exc}"
 
     # 1) Arbiter gate (cheap, in-process): shed autonomous dispatch under
     #    pressure. The CLI path never injects an arbiter, so it bypasses this.

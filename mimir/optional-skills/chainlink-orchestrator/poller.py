@@ -19,7 +19,9 @@ Arbiter shedding under resource pressure is handled by the scheduler BEFORE
 this poller fires (it carries ``priority`` in pollers.json), so the body here
 stays pure discovery + dispatch.
 
-Standalone: stdlib only, no mimir imports (runs in a scrubbed subprocess).
+Imports the Worklink config loader from mimir so the autonomous cap uses the same
+parser/defaulting as the CLI/tool path. The poller runs under the mimir venv via
+``sys.executable``.
 
 Env (passed via pollers.json):
   MIMIR_HOME              Chainlink repo + agent home (required).
@@ -28,8 +30,8 @@ Env (passed via pollers.json):
                           (default: "mimir"); e.g. "uv run mimir" or an
                           absolute venv path if bare ``mimir`` isn't on PATH.
   WORKLINK_REPO           git repo the backend works in (required to dispatch).
-  WORKLINK_MAX_CONCURRENT total concurrent claims allowed (default: 2; keep in
-                          sync with defaults.max_concurrent in worklink.yaml).
+  WORKLINK_MAX_CONCURRENT legacy override for total concurrent claims;
+                          worklink.yaml defaults.max_concurrent is canonical.
 """
 
 from __future__ import annotations
@@ -40,6 +42,8 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
 READY_LABEL = "worklink:ready"
@@ -107,11 +111,41 @@ def _issue_ids_with_label(home: Path, label: str) -> list[int] | None:
     for item in issues:
         if not isinstance(item, dict):
             continue
+        raw = item.get("id")
+        if raw is None:
+            raw = item.get("number")
         try:
-            ids.append(int(item.get("id", item.get("number"))))
+            ids.append(int(raw))
         except (TypeError, ValueError):
             continue
     return ids
+
+
+
+def _configured_cap(home: Path) -> int:
+    """Autonomous concurrency cap: ``worklink.yaml`` is canonical.
+
+    Read through ``WorklinkConfig`` instead of a poller-local YAML subset parser
+    so the detached ready-queue poller honors the same syntax, defaults, and
+    malformed-value fallback as the in-turn ``worklink_run`` path.
+
+    ``WORKLINK_MAX_CONCURRENT`` remains a legacy override only when no
+    ``worklink.yaml`` is present.
+    """
+    config = home / "worklink.yaml"
+    if config.exists():
+        try:
+            return WorklinkConfig.load(config).defaults.max_concurrent
+        except (OSError, ValueError):
+            return WorklinkDefaults.max_concurrent
+    legacy = os.environ.get("WORKLINK_MAX_CONCURRENT")
+    if legacy is not None:
+        try:
+            parsed = int(legacy)
+        except ValueError:
+            return WorklinkDefaults.max_concurrent
+        return parsed if parsed > 0 else WorklinkDefaults.max_concurrent
+    return WorklinkDefaults.max_concurrent
 
 
 def main() -> int:
@@ -132,10 +166,7 @@ def main() -> int:
         })
         return 0
     ready = sorted(set(ready_ids))
-    try:
-        cap = int(os.environ.get("WORKLINK_MAX_CONCURRENT", "2"))
-    except ValueError:
-        cap = 2
+    cap = _configured_cap(home)
     slots = max(0, cap - active)
 
     if not ready or slots == 0:

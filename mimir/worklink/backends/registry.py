@@ -120,8 +120,14 @@ class WorklinkConfig:
                 )
             ),
             base_branch=str(defaults_data.get("base_branch", "main")),
-            max_concurrent=int(defaults_data.get("max_concurrent", 2)),
-            reaper_ttl_s=int(defaults_data.get("reaper_ttl_s", 7200)),
+            max_concurrent=_positive_int(
+                defaults_data.get("max_concurrent"),
+                default=WorklinkDefaults.max_concurrent,
+            ),
+            reaper_ttl_s=_positive_int(
+                defaults_data.get("reaper_ttl_s"),
+                default=WorklinkDefaults.reaper_ttl_s,
+            ),
             allow_autonomous_local_subprocess=_coerce_safety_bool(
                 defaults_data.get("allow_autonomous_local_subprocess", False)
             ),
@@ -209,6 +215,24 @@ class WorklinkConfig:
                 f"The operator CLI `mimir worklink run` is unaffected."
             )
         return True, None
+
+
+def _positive_int(value: Any, *, default: int) -> int:
+    """Coerce positive integer config with safe defaults.
+
+    Worklink autonomy config is read by scheduler/poller loops; a malformed
+    scalar should not crash the loop forever. Fall back to the dataclass default
+    for non-int, bool, or non-positive values.
+    """
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed <= 0:
+        return default
+    return parsed
 
 
 def _normalize_compute_backend_name(name: str) -> str:
