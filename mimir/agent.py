@@ -1378,7 +1378,9 @@ class Agent:
                 # _run_turn_body normally deactivates once the model loop starts.
                 # This covers pre-body cancellations/exceptions that bypass that
                 # finally without relying on register_inflight's next-turn overwrite.
-                leftover_injections = mid_turn_injection.deactivate(event.channel_id)
+                leftover_injections, _folded, _deferred = mid_turn_injection.deactivate(
+                    event.channel_id
+                )
                 if leftover_injections and self._dispatcher is not None:
                     self._dispatcher.requeue_front(leftover_injections)
             # Release the typing indicator at turn end (held from turn start
@@ -1640,16 +1642,18 @@ class Agent:
             # queue (ahead of those later events) rather than appending via
             # enqueue() — preserving within-channel arrival order (PR 2; mimir's
             # #591 + #593 review notes).
-            # PR 3/4: snapshot what this turn folded (with fold times) BEFORE
-            # deactivate pops the registry entry, so the record build below can
-            # carry it with a t_ms. ``folded`` (consumed) and ``leftovers`` (never
-            # folded) are disjoint — leftovers re-route as the next turn; folded
-            # ones belong to this turn's durable record.
-            folded_records = mid_turn_injection.folded_records(event.channel_id)
-            # chainlink #384: read deferred records BEFORE deactivate pops the
-            # entry (same reason as folded_records).
-            deferred_records = mid_turn_injection.deferred_records(event.channel_id)
-            leftover_injections = mid_turn_injection.deactivate(event.channel_id)
+            # PR 3/4 + chainlink #435: atomically snapshot what this turn folded
+            # (with fold times), what it deferred, and what was accepted but never
+            # folded before popping the registry entry. A sync before_model hook can
+            # run in an executor thread; separate folded_records()/deferred_records()
+            # reads before deactivate could miss a drain that lands between those
+            # reads and the pop. deactivate() returns all three snapshots under one
+            # lock, so queue/folded/deferred cannot change between observe+finalize.
+            (
+                leftover_injections,
+                folded_records,
+                deferred_records,
+            ) = mid_turn_injection.deactivate(event.channel_id)
             if leftover_injections and self._dispatcher is not None:
                 await log_event(
                     "mid_turn_injection_leftover",

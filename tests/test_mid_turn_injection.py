@@ -48,7 +48,7 @@ def test_inject_message_no_active_turn_when_unregistered():
 
 def test_deactivate_rejects_later_inject():
     mti.register_inflight("ch1")
-    assert mti.deactivate("ch1") == []
+    assert mti.deactivate("ch1") == ([], [], [])
     # After the turn ends, a late inject must be rejected (the routing race the
     # dispatcher relies on).
     assert mti.inject_message("ch1", _ev("late")) == "no_active_turn"
@@ -57,9 +57,11 @@ def test_deactivate_rejects_later_inject():
 def test_deactivate_returns_unfolded_leftover_events():
     mti.register_inflight("ch1")
     mti.inject_message("ch1", _ev("never folded"))
-    leftovers = mti.deactivate("ch1")
+    leftovers, folded, deferred = mti.deactivate("ch1")
     # Whole events come back so run_turn can re-enqueue them faithfully.
     assert [e.content for e in leftovers] == ["never folded"]
+    assert folded == []
+    assert deferred == []
     assert all(isinstance(e, AgentEvent) for e in leftovers)
 
 
@@ -72,7 +74,7 @@ def test_register_overwrites_stale_entry():
 
 def test_none_channel_is_a_safe_noop():
     mti.register_inflight(None)
-    assert mti.deactivate(None) == []
+    assert mti.deactivate(None) == ([], [], [])
     assert mti._drain(None) == []
 
 
@@ -98,8 +100,27 @@ def test_folded_records_excludes_unfolded_leftovers():
     mti._drain("ch1")                       # first boundary folds folded-1
     mti.inject_message("ch1", _ev("leftover"))  # arrives after the last boundary
     assert [e.content for e, _t in mti.folded_records("ch1")] == ["folded-1"]
-    # The unfolded one comes back from deactivate as a leftover, not folded.
-    assert [e.content for e in mti.deactivate("ch1")] == ["leftover"]
+    # Deactivate returns the folded snapshot and the unfolded leftover together.
+    leftovers, folded, deferred = mti.deactivate("ch1")
+    assert [e.content for e in leftovers] == ["leftover"]
+    assert [e.content for e, _t in folded] == ["folded-1"]
+    assert deferred == []
+
+
+def test_deactivate_returns_folded_snapshot_even_after_stale_prior_read():
+    """A worker-thread drain can land after a caller's earlier folded_records()
+    read but before turn-finalization. deactivate() is the final atomic snapshot,
+    so those newly folded records must not disappear."""
+    mti.register_inflight("ch1")
+    mti.inject_message("ch1", _ev("folded-after-read"))
+    assert mti.folded_records("ch1") == []  # stale pre-drain snapshot
+
+    mti._drain("ch1")
+    leftovers, folded, deferred = mti.deactivate("ch1")
+
+    assert leftovers == []
+    assert [e.content for e, _t in folded] == ["folded-after-read"]
+    assert deferred == []
 
 
 def test_folded_records_empty_without_active_turn():
