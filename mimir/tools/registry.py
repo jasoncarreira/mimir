@@ -840,6 +840,12 @@ async def commitment_snooze(
         return "commitment_snooze failed: no commitments store"
     try:
         dt = datetime.fromisoformat(until_iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            # Naive ISO (no Z/offset — the tool's arg spec doesn't forbid it)
+            # is UTC, matching the commitments CLI _parse_iso + the extractor.
+            # Without this, dt.timestamp() reads the SERVER's local tz and the
+            # snooze lands hours off on a non-UTC host (#503).
+            dt = dt.replace(tzinfo=timezone.utc)
         until_unix = dt.timestamp()
         result = await store.snooze(commitment_id, until_unix=until_unix, reason=reason)
     except Exception as exc:

@@ -738,6 +738,26 @@ class TestCommitmentSnooze:
         assert "commitment_snooze failed" in out
         assert "ok" not in out
 
+    @pytest.mark.asyncio
+    async def test_naive_iso_interpreted_as_utc(self) -> None:
+        """#503: a naive ISO (no Z/offset) must be treated as UTC, not the
+        server's local tz — otherwise the snooze lands hours off on a non-UTC
+        host. The recorded until_unix must equal the UTC interpretation
+        regardless of the host timezone."""
+        from datetime import datetime, timezone
+
+        store = _StubCommitmentsStore()
+        set_commitments_store(store)
+        out = await commitment_snooze.ainvoke(
+            {"commitment_id": "c-9", "until_iso": "2030-06-01T10:00:00"}  # naive
+        )
+        assert "commitment_snooze ok:" in out
+        expected = datetime(2030, 6, 1, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+        assert store.snooze_calls[-1]["until_unix"] == expected
+        # And it equals the explicit-Z form (host-tz-independent).
+        z_form = datetime.fromisoformat("2030-06-01T10:00:00+00:00").timestamp()
+        assert store.snooze_calls[-1]["until_unix"] == z_form
+
 
 class TestCommitmentDismiss:
     @pytest.mark.asyncio
