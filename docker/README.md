@@ -123,6 +123,20 @@ model. Lose `mimir-home` and you've lost the agent's memory. Lose
 `mimir-claude` and you'll need to re-authenticate Claude Code (option
 A only).
 
+## Web UI (port 8080)
+
+The `-p 8080:8080` above exposes mimir's operator web UI (and the `/event`
+ingest endpoint). Visit `http://localhost:8080` — it prompts for `MIMIR_API_KEY`
+on first load:
+
+- **`/turns`** — live turn viewer (inbound trigger, tools run, replies; auto-refreshes).
+- **`/ops`** — health + usage dashboard (token/cost rate, plan-window headroom,
+  scheduled-tick activity, errors, pending updates).
+- **`/saga`** — saga memory-atom viewer. **`/memory`** — `memory/` + `state/` file browser.
+
+All routes are auth-gated by `MIMIR_API_KEY`. Only publish port 8080 beyond
+localhost with that key set (see Security notes below).
+
 ## docker-compose example
 
 ```yaml

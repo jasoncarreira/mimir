@@ -130,6 +130,25 @@ saturated plan window doesn't blow through your quota.
 
 See `.env.example` for every environment variable mimir reads.
 
+## Web UI
+
+Once running, mimir serves an operator web UI on `MIMIR_WEB_PORT` (default
+`http://localhost:8080`), gated by `MIMIR_API_KEY` — the page prompts for the key
+on first visit and remembers it:
+
+- **`/turns` — turn viewer.** A live, auto-refreshing feed of every turn: the
+  inbound trigger, the tools the agent ran, and what it said back. The first
+  place to watch the agent work or debug a turn.
+- **`/ops` — ops dashboard.** Live health + usage: token/cost rate, plan-window
+  headroom, scheduled-tick activity, recent errors, and pending `mimir-agent`
+  updates.
+- **`/saga` — memory viewer.** Browse saga's memory atoms.
+- **`/memory` — file browser.** Browse `memory/` and `state/`.
+
+Each HTML page has a JSON twin (`/api/turns`, `/api/ops`, `/api/saga`,
+`/api/memory`) for scripting. All are auth-gated; expose the port publicly only
+with `MIMIR_API_KEY` set.
+
 ## Alternative providers (Minimax, Kimi, …)
 
 `MIMIR_MODEL_SPEC` picks the model and provider. Forms:
