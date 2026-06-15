@@ -270,26 +270,40 @@ def install(
             f"{dest_root_resolved}; refusing install"
         )
 
-    overwrote = False
-    if dest.exists():
-        if not force:
-            raise FileExistsError(
-                f"{dest} already exists. Pass --force to overwrite "
-                f"(removes the existing directory recursively). Any "
-                f"custom edits you made under it are lost."
-            )
-        shutil.rmtree(dest)
-        overwrote = True
+    overwrote = dest.exists()
+    if overwrote and not force:
+        raise FileExistsError(
+            f"{dest} already exists. Pass --force to overwrite "
+            f"(removes the existing directory recursively). Any "
+            f"custom edits you made under it are lost."
+        )
 
-    # ``copytree`` from src → dest. Exclude __pycache__ + .pytest_cache;
-    # everything else (SKILL.md, pollers.json, Python sources, tests,
-    # templates) gets carried over.
+    # Exclude __pycache__ + .pytest_cache; everything else (SKILL.md,
+    # pollers.json, Python sources, tests, templates) gets carried over.
     def _ignore(_dirname, names):
         return [n for n in names if n in ("__pycache__", ".pytest_cache")]
 
-    # symlinks=True preserves in-bundle links instead of dereferencing their
-    # contents at copy time (#500); escaping links were already rejected above.
-    shutil.copytree(src, dest, ignore=_ignore, symlinks=True)
+    # Transactional copy (#501): build in a sibling ``.tmp`` dir, then
+    # atomic-rename into place. A mid-copy failure (broken symlink /
+    # permission / ENOSPC) otherwise left dest/ half-populated (e.g. a poller
+    # skill missing poller.py), and the next --force-less retry then failed
+    # with a FileExistsError whose message misleadingly blamed the operator's
+    # "custom edits" — when it was the tool's own debris. Clean up the .tmp and
+    # re-raise on failure; dest is never touched until the copy fully succeeds.
+    # Mirrors refresh_builtin_skills. symlinks=True preserves in-bundle links
+    # instead of dereferencing their contents (#500); escaping links were
+    # rejected above.
+    tmp = dest_root / f"{name}.tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        shutil.copytree(src, tmp, ignore=_ignore, symlinks=True)
+        if dest.exists():
+            shutil.rmtree(dest)
+        tmp.rename(dest)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
 
     return InstallResult(
         name=name,

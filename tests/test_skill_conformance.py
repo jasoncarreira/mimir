@@ -181,9 +181,21 @@ def test_parse_frontmatter_folded_block_rejects_unindented_continuation() -> Non
 
 
 
-# ─── strict-YAML frontmatter guard (chainlink #386-review follow-on) ───
-
-import yaml as _yaml
+# ─── runtime-loader conformance (#502) ────────────────────────────────
+#
+# Parse each SKILL.md with the SAME function the runtime uses — deepagents'
+# ``_parse_skill_metadata`` — so green CI GUARANTEES the skill is actually
+# loadable, not just well-formed by mimir's lenient tooling. The prior gate
+# used ``text.split('---', 2)``, which diverges from deepagents' frontmatter
+# regex (``^---\s*\n(.*?)\n---\s*\n``): a SKILL.md ending exactly at the closing
+# ``---`` with no trailing newline PASSED the old check but is dropped at
+# runtime (the invisible-skill failure this test exists to prevent), and a
+# ``---`` inside a frontmatter value made split() truncate and wrongly FAIL a
+# valid skill. Calling the runtime parser removes the drift entirely; if
+# deepagents moves the loader, the import breaks loudly so the gate is updated.
+from deepagents.middleware.skills import (  # noqa: E402
+    _parse_skill_metadata as _da_parse_skill_metadata,
+)
 
 _OPTIONAL_SKILLS_ROOT = Path(__file__).parent.parent / "mimir" / "optional-skills"
 
@@ -200,27 +212,24 @@ def _all_bundled_skill_mds() -> list[Path]:
 @pytest.mark.parametrize(
     "skill_md", _all_bundled_skill_mds(), ids=lambda p: f"{p.parent.parent.name}/{p.parent.name}"
 )
-def test_skill_frontmatter_is_valid_yaml(skill_md: Path) -> None:
-    """Every bundled SKILL.md (skills/ AND optional-skills/) must have frontmatter
-    that parses with the STRICT YAML loader the runtime uses.
-
-    The pre-existing conformance test only scanned ``mimir/skills/`` and used the
-    lenient ``parse_frontmatter``, so it missed five skills whose ``description:``
-    contained an unquoted colon-space (e.g. ``Opt-in: copy ...``). YAML reads that
-    as a nested mapping ("mapping values are not allowed here"), and BOTH the
-    deepagents SkillsMiddleware and ``skill_outcomes`` then skip the skill
-    entirely — silently dropping it from the agent. This guards that class.
-    """
-    parts = skill_md.read_text().split("---", 2)
-    assert len(parts) >= 3, f"{skill_md}: missing '---' frontmatter delimiters"
-    try:
-        meta = _yaml.safe_load(parts[1])
-    except _yaml.YAMLError as exc:
-        pytest.fail(
-            f"{skill_md}: frontmatter is not valid YAML ({type(exc).__name__}: {exc}). "
-            f"A common cause is an unquoted colon-space in 'description:' — quote the "
-            f"value (double-quotes) so the skill isn't silently skipped at load."
-        )
-    assert isinstance(meta, dict), f"{skill_md}: frontmatter is not a mapping"
-    assert (meta.get("name") or "").strip(), f"{skill_md}: missing 'name'"
-    assert (meta.get("description") or "").strip(), f"{skill_md}: missing 'description'"
+def test_skill_md_is_runtime_loadable(skill_md: Path) -> None:
+    """#502: every bundled SKILL.md (skills/ AND optional-skills/) must parse
+    with deepagents' own runtime loader, so a green gate means it actually
+    loads — not silently dropped. Also enforces name==folder across BOTH roots
+    (the folder name is the canonical skill identifier)."""
+    folder = skill_md.parent.name
+    meta = _da_parse_skill_metadata(skill_md.read_text(), str(skill_md), folder)
+    assert meta is not None, (
+        f"{skill_md}: deepagents' runtime loader would SKIP this skill — it would "
+        f"be invisible at runtime despite passing mimir's lenient tooling. Common "
+        f"causes: the closing '---' has no trailing newline (frontmatter regex "
+        f"needs '\\n---\\n'), an unquoted colon-space in 'description:', frontmatter "
+        f"that isn't a mapping, or a missing name/description."
+    )
+    # SkillMetadata is a TypedDict (a dict at runtime); tolerate an object
+    # form too in case a future deepagents returns a dataclass.
+    meta_name = meta.get("name") if isinstance(meta, dict) else getattr(meta, "name", "")
+    assert (meta_name or "").strip() == folder, (
+        f"{skill_md}: frontmatter name '{meta_name}' must match folder '{folder}'. "
+        f"The folder name is the canonical identifier — rename one to match."
+    )
