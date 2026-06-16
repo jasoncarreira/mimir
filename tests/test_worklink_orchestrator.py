@@ -1153,3 +1153,54 @@ def test_decompose_prompt_teaches_chainlink_block_argument_order() -> None:
     assert "chainlink issue block <ID-that-is-blocked> <BLOCKER>" in prompt
     assert "blocked issue id comes first" in prompt
     assert "chainlink issue block <blocker> <blocked>" not in prompt
+
+
+def test_planner_suggested_test_command_strips_markdown_backticks() -> None:
+    from mimir.worklink.planning import suggested_test_command
+
+    description = """Acceptance criteria:
+- [ ] Focused validation passes.
+
+Worklink notes:
+- Suggested test command: `cd /workspace/mimir && pytest -q tests/test_identities.py`
+"""
+
+    assert (
+        suggested_test_command(description)
+        == "cd /workspace/mimir && pytest -q tests/test_identities.py"
+    )
+
+
+def test_worklink_prompt_does_not_wrap_suggested_test_command_in_backticks(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[Sequence[str] | str] = []
+
+    issue_json = STRICT_ISSUE_JSON.replace(
+        "- Suggested test command: uv run pytest -q tests/test_worklink_orchestrator.py",
+        "- Suggested test command: `cd /workspace/mimir && pytest -q tests/test_identities.py`",
+    )
+
+    def runner(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "443"]:
+            return cp(args, stdout=issue_json)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(tmp_path / "repo"), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        return cp(args)
+
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(
+            home=tmp_path, repo=tmp_path / "repo", runner=runner, registry=registry
+        ).run(443, backend_name="fake", dry_run=True)
+    )
+
+    out = capsys.readouterr().out
+    assert result.dry_run is True
+    assert "orchestrator will independently run this command without Markdown delimiters" in out
+    assert "  cd /workspace/mimir && pytest -q tests/test_identities.py" in out
+    assert "``cd /workspace/mimir" not in out

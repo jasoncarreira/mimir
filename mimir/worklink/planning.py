@@ -64,13 +64,22 @@ def uses_strict_leaf_validation(created_at: datetime | None) -> bool:
     return created_at >= STRICT_VALIDATION_CREATED_AFTER
 
 
+def _strip_markdown_command_delimiters(value: str) -> str:
+    """Remove common Markdown wrappers from a single-line command."""
+
+    value = value.strip()
+    if len(value) >= 2 and value.startswith("`") and value.endswith("`"):
+        value = value.strip("`").strip()
+    return value
+
+
 def suggested_test_command(description: str) -> str | None:
     """Extract the Worklink planner's suggested test command, if present."""
 
     match = re.search(r"(?im)^- Suggested test command:\s*(.+?)\s*$", description)
     if not match:
         return None
-    value = match.group(1).strip()
-    if not value or value in {"<command the executor should run>", "n/a", "none"}:
+    value = _strip_markdown_command_delimiters(match.group(1))
+    if not value or value.casefold() in {"<command the executor should run>", "n/a", "none"}:
         return None
     return value
