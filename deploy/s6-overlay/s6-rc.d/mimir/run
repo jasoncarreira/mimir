@@ -1,0 +1,7 @@
+#!/command/with-contenv sh
+# The agent. s6 supervises it: if it exits (crash / OOM / a watchdog SIGKILL),
+# s6 restarts THIS service in place — no full-container restart needed. Each
+# restart re-runs `mimir run`, so the clean-shutdown marker fires its
+# unclean-restart notice on the way back up. Drops to the unprivileged `mimir`
+# user (/init runs as root to set up /run, services drop down).
+exec s6-setuidgid mimir mimir run --home "${MIMIR_HOME:-/home/mimir/agent}"

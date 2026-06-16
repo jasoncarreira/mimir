@@ -1254,3 +1254,19 @@ def test_feedback_emit_without_json_values_stores_strings(
     records = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
     # Without --json-values, "42" stays a string
     assert records[0]["pr"] == "42"
+
+
+def test_notify_restart_cli_dispatches(monkeypatch):
+    """`mimir notify-restart` wires --unit/--detail through to
+    notify_service_event and runs it (systemd OnFailure= hook path)."""
+    import mimir.liveness as liveness
+
+    recorded: dict = {}
+
+    async def fake_notify(*, unit=None, detail=None, _post=None):
+        recorded["unit"] = unit
+        recorded["detail"] = detail
+
+    monkeypatch.setattr(liveness, "notify_service_event", fake_notify)
+    main(["notify-restart", "--unit", "mimir.service", "--detail", "exit 137"])
+    assert recorded == {"unit": "mimir.service", "detail": "exit 137"}

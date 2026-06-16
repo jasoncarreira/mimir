@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import signal
+import time
 from pathlib import Path
 from typing import Any
 
@@ -120,7 +121,12 @@ def _safe_str_eq(a: str, b: str) -> bool:
 #
 # Method-keyed (PR #104 review fix): if a future ``POST /turns`` is
 # ever added (e.g. for a server-side form), it inherits NO exemption.
+#
+# ``GET /`` is exempt too: it's a bare convenience redirect to /turns
+# (``_handle_root``) that carries no data of its own — and its target is
+# itself an exempt HTML shell whose data APIs require auth.
 _AUTH_EXEMPT: frozenset[tuple[str, str]] = frozenset({
+    ("GET", "/"),
     ("GET", "/health"),
     ("GET", "/turns"),
     ("GET", "/ops"),
@@ -213,6 +219,16 @@ class _MaskApiKeyInAccessLog(logging.Filter):
 
 async def _handle_health(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
+
+
+async def _handle_root(request: web.Request) -> web.Response:
+    """Redirect the bare web root to the turn viewer.
+
+    The root has no content of its own; ``/turns`` is the default operator
+    landing page. 302 (Found), not 301 — so we can repoint this or add a real
+    landing page later without fighting browsers that cached a permanent
+    redirect. Auth-exempt (see ``_AUTH_EXEMPT``): it leaks nothing."""
+    raise web.HTTPFound("/turns")
 
 
 # chainlink #233: bound for caller-supplied max_clusters on the
@@ -683,6 +699,7 @@ def build_app(config: Config) -> web.Application:
             "port beyond localhost."
         )
 
+    app.router.add_get("/", _handle_root)
     app.router.add_post("/event", _handle_event)
     app.router.add_get("/health", _handle_health)
     app.router.add_post("/api/memory/consolidate", _handle_consolidate)
@@ -1219,8 +1236,77 @@ def build_app(config: Config) -> web.Application:
             name="mimir-startup-indexer-sweep",
         )
 
+        # Clean-shutdown / unclean-restart detection (chainlink #507). A
+        # complementary, sidecar-free signal to the out-of-process watchdog:
+        # mark_session_running writes a clean=false marker now; _on_cleanup
+        # flips it to clean=true on a graceful (SIGTERM-initiated) stop. If the
+        # prior marker is still clean=false at this boot, the last run died
+        # without cleanup — crash, OOM-kill, hard restart, or a wedge that got
+        # killed. Log it (so it surfaces in the algedonic feedback block) and
+        # push an out-of-band notice on the same sinks as the watchdog. First
+        # boot (no marker) and a clean prior stop both no-op.
+        from .liveness import (
+            UNCLEAN_NOTIFY_WINDOW,
+            detect_unclean_restart,
+            mark_session_running,
+            notify_unclean_restart,
+        )
+        _now = time.time()
+        _prior_session = detect_unclean_restart(config.home)
+        # Coalesce notices across a crash-loop: notify only if we haven't
+        # already paged within UNCLEAN_NOTIFY_WINDOW. The event is logged every
+        # time regardless; only the out-of-band notify is rate-limited.
+        _notify = False
+        _carry_ts: float | None = None
+        if _prior_session is not None:
+            _last = _prior_session.get("last_unclean_notify_ts")
+            _within = isinstance(_last, (int, float)) and (_now - _last) < UNCLEAN_NOTIFY_WINDOW
+            _notify = not _within
+            _carry_ts = _now if _notify else _last
+        mark_session_running(
+            config.home, started_at=_now, last_unclean_notify_ts=_carry_ts,
+        )
+        if _prior_session is not None:
+            await log_event(
+                "liveness_unclean_restart",
+                prior_started_iso=_prior_session.get("started_iso"),
+                prior_pid=_prior_session.get("pid"),
+                notified=_notify,
+            )
+            if _notify:
+                # Background — the notify POSTs to ntfy/webhook (up to 8s) and
+                # must not block startup.
+                spawn_background(
+                    _STARTUP_BACKGROUND_TASKS,
+                    notify_unclean_restart(config.home, prior=_prior_session),
+                    name="mimir-unclean-restart-notify",
+                )
+
+        # Liveness beat (chainlink #507): periodically rewrite
+        # .mimir/liveness.json so the out-of-process ``mimir watchdog`` can
+        # detect a dead/wedged agent. As an event-loop task it also stops on
+        # a wedge — the watchdog keys on the beat's *absence*, not on errors.
+        if config.liveness_beat_seconds > 0:
+            from .liveness import liveness_beat_loop
+            spawn_background(
+                _STARTUP_BACKGROUND_TASKS,
+                liveness_beat_loop(
+                    config.home,
+                    interval=config.liveness_beat_seconds,
+                    started_at=time.time(),
+                ),
+                name="mimir-liveness-beat",
+            )
+
     async def _on_cleanup(app: web.Application) -> None:
         await log_event("shutdown", reason="cleanup")
+        # Mark this stop as clean BEFORE draining: reaching _on_cleanup means
+        # we received SIGTERM/SIGINT and are tearing down in order — an
+        # intended stop — even if a later drain step is slow. A hard kill
+        # never gets here, so its marker stays clean=false (→ unclean-restart
+        # notice on next boot). chainlink #507.
+        from .liveness import mark_clean_shutdown
+        mark_clean_shutdown(config.home)
         await dispatcher.drain()
         scheduler.stop()
         await sessions.shutdown()

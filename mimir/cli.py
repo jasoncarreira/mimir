@@ -314,6 +314,58 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Overwrite --dest if it exists",
     )
 
+    # chainlink #507: out-of-process dead-man's-switch. Run as a compose
+    # sidecar or cron — it alerts (ntfy / webhook) when the agent's liveness
+    # beat goes stale, which the agent itself can't do once it's dead/wedged.
+    watchdog_p = sub.add_parser(
+        "watchdog",
+        help=(
+            "Out-of-process liveness watchdog: alert via ntfy / webhook when "
+            "the agent's liveness beat goes stale. Run as a sidecar or cron."
+        ),
+    )
+    watchdog_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (default: MIMIR_HOME or cwd).",
+    )
+    watchdog_p.add_argument(
+        "--interval", type=float, default=60.0,
+        help="Seconds between checks in loop mode (default 60).",
+    )
+    watchdog_p.add_argument(
+        "--stale-after", type=float, default=180.0,
+        help="Beat age (seconds) that counts as down (default 180).",
+    )
+    watchdog_p.add_argument(
+        "--once", action="store_true",
+        help="Check once and exit (for cron); exit code 1 if the agent is down.",
+    )
+    watchdog_p.add_argument(
+        "--restart-on-stale", action="store_true",
+        help="When the beat goes stale, kill the agent (by its beat PID) so the "
+             "supervisor (s6 / Docker restart) restarts it. In-container wedge "
+             "recovery. One attempt per outage.",
+    )
+    watchdog_p.add_argument(
+        "--restart-grace", type=float, default=10.0,
+        help="Seconds between SIGTERM and SIGKILL when restarting (default 10).",
+    )
+
+    # ``mimir notify-restart`` — push a one-shot 'service failed/restarting'
+    # alert via ntfy / webhook. Designed for a systemd ``OnFailure=`` hook
+    # (see deploy/systemd/): self-contained, no live agent or event logger
+    # needed, so it works precisely when the agent is down.
+    notify_restart_p = sub.add_parser(
+        "notify-restart",
+        help="Push an out-of-band 'service failed/restarting' alert (systemd OnFailure= hook).",
+    )
+    notify_restart_p.add_argument(
+        "--unit", default=None, help="systemd unit name, for the message (e.g. %%n).",
+    )
+    notify_restart_p.add_argument(
+        "--detail", default=None, help="Optional extra context line for the alert.",
+    )
+
     # -----------------------------------------------------------------------
     # Dispatch
     # -----------------------------------------------------------------------
@@ -344,6 +396,30 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.command == "worklink":
         sys.exit(_worklink_cmd.dispatch(args, worklink_p))
+
+    if args.command == "watchdog":
+        import asyncio
+        from .liveness import run_watchdog
+        home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
+        down = asyncio.run(
+            run_watchdog(
+                Path(home_arg).resolve(),
+                interval=args.interval,
+                stale_after=args.stale_after,
+                once=args.once,
+                restart_on_stale=args.restart_on_stale,
+                restart_grace=args.restart_grace,
+            )
+        )
+        if args.once and down:
+            sys.exit(1)
+        return
+
+    if args.command == "notify-restart":
+        import asyncio
+        from .liveness import notify_service_event
+        asyncio.run(notify_service_event(unit=args.unit, detail=args.detail))
+        return
 
     if args.command == "stats":
         from .config import Config as _Config

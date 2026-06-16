@@ -47,7 +47,7 @@ FROM python:3.11-slim AS base
 ENV NODE_VERSION=22
 ARG MIMIR_ENABLE_CLAUDE_CODE=0
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg git tini \
+        ca-certificates curl gnupg git xz-utils \
         poppler-utils tesseract-ocr tesseract-ocr-eng \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
@@ -56,6 +56,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fi \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# s6-overlay (PID 1 + process supervisor). Supersedes tini — it does the same
+# zombie-reaping + signal-forwarding AND supervises multiple services: here the
+# agent plus an in-container liveness watcher (deploy/s6-overlay/,
+# docs/watchdog.md). If the agent crashes or the watcher SIGKILLs a wedge, s6
+# restarts that service in place — no full-container restart. TARGETARCH is set
+# by BuildKit (amd64 / arm64 → s6's x86_64 / aarch64 tarball names).
+ARG S6_OVERLAY_VERSION=3.2.0.2
+ARG TARGETARCH
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) S6_ARCH=x86_64 ;; \
+        arm64) S6_ARCH=aarch64 ;; \
+        *)     S6_ARCH=x86_64 ;; \
+    esac; \
+    base="https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}"; \
+    curl -fsSL "${base}/s6-overlay-noarch.tar.xz"      -o /tmp/s6-noarch.tar.xz; \
+    curl -fsSL "${base}/s6-overlay-${S6_ARCH}.tar.xz"  -o /tmp/s6-arch.tar.xz; \
+    tar -C / -Jxpf /tmp/s6-noarch.tar.xz; \
+    tar -C / -Jxpf /tmp/s6-arch.tar.xz; \
+    rm -f /tmp/s6-noarch.tar.xz /tmp/s6-arch.tar.xz
 
 # Non-root user. The mimir process needs to own its venv so the
 # pending-update flag flow (``mimir/update_on_start.py``) can
@@ -153,5 +174,24 @@ EXPOSE 8080
 #   /home/mimir/.cache  — fastembed model cache
 VOLUME ["/home/mimir/agent", "/home/mimir/.claude", "/home/mimir/.cache"]
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["mimir", "run", "--home", "/home/mimir/agent"]
+# Container liveness probe → the in-process /health endpoint, which returns
+# {"ok": true} only while the event loop is responsive — so a *timeout* here
+# catches a wedged loop, not just a dead process. /health is auth-exempt, so
+# no API key is needed. start-period covers cold boot + fastembed warm-up.
+#
+# NOTE: `restart: unless-stopped` does NOT act on health status — Docker only
+# restarts on process *exit*, never on `unhealthy`. To turn an `unhealthy`
+# result into a restart, run an autoheal sidecar (e.g. willfarrell/autoheal)
+# or a Swarm / k8s liveness probe. See docs/watchdog.md.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${MIMIR_WEB_PORT:-8080}/health" || exit 1
+
+# s6 service definitions: the agent + the in-container liveness watcher, both
+# supervised by s6. COPY/chmod run as root (the prior mimir-user build steps are
+# done); /init must start as root to set up /run, then each service drops to the
+# `mimir` user via s6-setuidgid (see the run scripts). No CMD — the s6 ``user``
+# bundle defines what runs.
+USER root
+COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+RUN chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/watchdog/run
+ENTRYPOINT ["/init"]

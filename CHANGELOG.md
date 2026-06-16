@@ -6,6 +6,55 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **Liveness watchdog — out-of-process dead-man's-switch** (chainlink #507).
+  The agent writes a liveness beat to `.mimir/liveness.json` every
+  `MIMIR_LIVENESS_BEAT_SECONDS` (default 60; an event-loop task, so it also
+  stops on a *wedge*), and a new `mimir watchdog` command — run as a compose
+  sidecar or host cron, i.e. *outside* the agent process — alerts out-of-band
+  when the beat goes stale. Closes the one gap that survives even with `ntfy`:
+  a hard failure (OOM/SIGKILL/hung loop/dead container) can't self-report.
+  Sinks are pluggable, not ntfy-locked: `NTFY_TOPIC` and/or a generic
+  `MIMIR_WATCHDOG_WEBHOOK_URL` (Slack-incoming-webhook / PagerDuty / custom
+  shape). Loop mode gates the first alarm on having seen the agent alive (no
+  cold-start false alarm) and pushes a recovery notice. `--once` (cron) is
+  **exit-code-only** — it returns `1` when down and posts nothing, leaving
+  paging to the cron monitor (a fresh process per tick can't dedupe). Runbook:
+  `docs/watchdog.md`.
+- **Clean-shutdown marker → unclean-restart notice** (chainlink #507). A
+  sidecar-free complement to the watchdog: the agent writes a `clean: false`
+  marker to `.mimir/session.json` at startup and flips it to `clean: true` on a
+  graceful (SIGTERM-initiated) shutdown. If the next boot still sees
+  `clean: false`, the previous run was killed/crashed/OOM'd (or wedged then
+  killed) — the agent logs a `liveness_unclean_restart` event and pushes an
+  out-of-band notice on the same sinks as the watchdog. First boot and a clean
+  prior stop both no-op.
+- **`HEALTHCHECK` → `/health` in the container image.** The scaffold
+  `Dockerfile` now defines a Docker healthcheck that polls the in-process
+  `/health` endpoint (a timeout catches a *wedged* loop, not just a dead
+  process). Note: `restart: unless-stopped` does **not** act on health status —
+  pair with an autoheal sidecar or a host/Swarm probe to restart on
+  `unhealthy`. See `docs/watchdog.md`.
+- **systemd unit templates for non-Docker / local deployments** — `mimir run`
+  under systemd with `Restart=on-failure` and an `OnFailure=` hook that runs
+  the new `mimir notify-restart` command (a self-contained ntfy/webhook push,
+  no live agent needed). Templates in `deploy/systemd/`; runbook in
+  `docs/systemd.md` (incl. the macOS/launchd note).
+- **In-container liveness watcher via s6-overlay.** The scaffold image now runs
+  s6-overlay as PID 1 (superseding tini) supervising two services: the agent and
+  `mimir watchdog --restart-on-stale`. On a stale beat the watcher alerts **and**
+  kills the agent (SIGTERM→SIGKILL by its beat PID) so s6 restarts it — the
+  recovery path for a wedge, which neither s6 nor Docker `restart:` catch on
+  their own (the process is still alive). Same-container, no docker socket. New
+  `--restart-on-stale` / `--restart-grace` flags on `mimir watchdog`; tune the
+  threshold with `MIMIR_WATCHDOG_STALE_AFTER` (default 300s). s6 service defs in
+  `deploy/s6-overlay/`. The unclean-restart notice is now coalesced within a
+  120s window so a crash-loop doesn't page on every boot (the event is still
+  logged each time).
+- **`GET /` redirects to `/turns`** — the bare web root now sends browsers to
+  the turn viewer (302) instead of 404ing.
+
 ## [0.4.1] — 2026-06-16
 
 ### Added

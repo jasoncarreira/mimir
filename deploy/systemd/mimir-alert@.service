@@ -1,0 +1,19 @@
+# mimir failure notifier — templated oneshot fired by `OnFailure=` on the
+# main unit. systemd passes the failed unit's name as the template instance
+# (%i), e.g. `mimir-alert@mimir.service`.
+#
+# `mimir notify-restart` pushes a one-shot alert to ntfy / webhook (the same
+# sinks as `mimir watchdog`). It is self-contained — no live agent, no event
+# logger — so it succeeds even though the thing that failed is the agent.
+#
+# Needs NTFY_TOPIC and/or MIMIR_WATCHDOG_WEBHOOK_URL in the environment (same
+# EnvironmentFile as the main unit), or it has nowhere to send and no-ops.
+
+[Unit]
+Description=mimir failure notifier for %i
+
+[Service]
+Type=oneshot
+User=mimir
+EnvironmentFile=-/home/mimir/agent/.env
+ExecStart=/usr/local/bin/mimir notify-restart --unit %i
