@@ -108,6 +108,21 @@ Earlier versions of mimir tracked an `allowed-tools` frontmatter field listing t
 
 The skill body still describes which tools the procedure uses in prose; that documentation is the supported pattern today. Use `success_criteria` to *measure* whether the canonical tool actually fired.
 
+## Skills that send a message to a specific channel
+
+If your skill calls `send_message`, be deliberate about `channel_id` — getting it wrong fails at runtime, not authoring time.
+
+- **Replying in context? Omit `channel_id`.** It defaults to the current turn's channel (`send_message(text=...)`). This is the right choice for almost every skill — don't name a channel you don't need to.
+- **Targeting a *different* channel? The id must be prefix-qualified, not a raw platform id.** The registered bridge dispatches by prefix:
+  - `discord-<channel_id>` / `dm-discord-<channel_id>`
+  - `slack-<channel_id>` / `dm-slack-<user_id>`
+  - `web-<conv_id>`, `bench-<task_id>`
+
+  Concrete: a Discord channel whose raw id is `123456789012345678` is addressed as **`discord-123456789012345678`** (a DM to Slack user `U05ABC` as `dm-slack-U05ABC`). Passing the **bare** number `123456789012345678` has **no registered bridge** and raises `UnknownChannelError` (`mimir/channel_registry.py`). The canonical prefix scheme is SPEC §7.2.3.
+- **Never hardcode a channel id in the SKILL.md.** Channel ids are deployment-specific — a literal baked into the skill body will work in your head and fail on someone else's deployment. Source them from runtime instead:
+  - The operator alert channel is named in the system prompt's *Operator config* section (`MIMIR_OPERATOR_ALERT_CHANNEL`). The `alert` builtin skill is the reference example.
+  - Other targets come from the current turn (omit `channel_id`), the identities registry, or operator-set skill config — not a literal in the body.
+
 ## Developer-facing sibling docs (`DESIGN.md` and friends)
 
 When a skill has content that's useful to *developers* (impl cross-refs,
@@ -185,7 +200,7 @@ For short skills (< 100 lines total), keep all content in SKILL.md.
 2. Write frontmatter with `name` and a high-signal `description`. Optionally add a `success_criteria` block if the skill has a clear declarative completion signal (a Bash command pattern, a Write to a specific path, etc.) — see `mimir/skills/weather/SKILL.md` for a minimal example.
 3. Add the `<!-- desc: -->` first-body-line comment (agent-facing voice, dense).
 4. Add concise execution steps in the SKILL body.
-5. Include concrete paths/commands the agent should run.
+5. Include concrete paths/commands the agent should run. If the skill calls `send_message`, follow "Skills that send a message to a specific channel" above — omit `channel_id` to reply in context, and never hardcode a channel id.
 6. Keep scope narrow; split broad domains into multiple skills.
 7. Prefer deterministic instructions over generic advice.
 8. **Quality gate — read the skill as an outsider.** Before writing tests, re-read the complete SKILL.md as if you were a different agent seeing it for the first time. Ask: Is the trigger unambiguous? Would the procedure produce consistent output across different runs? Are the steps concrete enough to follow without context? Fix gaps now — tests lock in behavior, so verify quality *before* tests encode it.
