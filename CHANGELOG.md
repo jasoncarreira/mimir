@@ -112,9 +112,10 @@ longer hard-codes container paths).
   verified sandbox profile documented (#652); the web UI's turn viewer
   + ops pages are highlighted across the onboarding skill, README, and
   docker docs (#704); a non-Docker setup/troubleshooting guide
-  (`docs/mimir-nondocker-guide.md`) was added (#701); and the SPEC +
+  (`docs/mimir-nondocker-guide.md`) was added (#701); the SPEC +
   `docs/internal/*` design docs were refreshed against the current code
-  (#705).
+  (#705); and the skill-creator skill now documents channel addressing
+  for message-sending skills — prefix-qualified ids, no hardcoding (#707).
 
 ## [0.3.5] — 2026-06-11
 
