@@ -1167,7 +1167,14 @@ class Agent:
                 # Dormant until the dispatcher feeds the queue (PR 2) — a no-op
                 # (empty queue) on every turn today.
                 from .mid_turn_injection import MidTurnInjectionMiddleware
+                # chainlink #511: per-turn model-iteration ceiling. Counts
+                # before_model boundaries and asks for a final summary once at
+                # the budget — a graceful stop the tool-call budget alone can't
+                # provide for low-tool loops. First in the tuple so the count +
+                # one-shot wrap-up land before the other before_model hooks.
+                from .tools.iteration_gate import IterationGateMiddleware
                 self._agent_middleware = (
+                    IterationGateMiddleware(),
                     BudgetGateMiddleware(),
                     SkillMemoryInjectionMiddleware(),
                     MidTurnInjectionMiddleware(),
@@ -1294,6 +1301,10 @@ class Agent:
                 # this off the TurnContext and refuse tool calls past
                 # the cap. 0 disables (matches main's contract).
                 tool_call_budget=self._config.tool_call_budget,
+                # Per-turn model-iteration ceiling (chainlink #511). Read off
+                # the TurnContext by IterationGateMiddleware.before_model. 0
+                # disables.
+                iteration_budget=self._config.max_turn_iterations,
                 # Source of the inbound channel (e.g. "discord", "slack"),
                 # recorded on the turn context for observability. The outbound
                 # buffer-append now lives only in the send_message tool, which
@@ -1441,6 +1452,47 @@ class Agent:
         await post_job_failure_notice(
             self._channels, deliver, label=str(label), error=error[:240],
         )
+
+    async def _notify_iteration_hard_stop(
+        self, event: AgentEvent, budget: int, ctx: Any,
+    ) -> None:
+        """chainlink #511: tell the channel a turn was force-stopped at the
+        iteration ceiling (the model never delivered). Target = the deliver:
+        channel (#508) if set, else the triggering channel for an interactive
+        turn; nothing for a silent tick. Best-effort; never raises."""
+        target = resolve_deliver_channel(
+            (event.extra or {}).get("deliver"),
+            getattr(self._config, "operator_alert_channel", ""),
+        )
+        if not target and is_interactive_turn(
+            event.channel_id, event.trigger, self._channels,
+        ):
+            target = event.channel_id
+        if not target or self._channels is None:
+            return
+        try:
+            result = await self._channels.send(
+                target,
+                f"⚠️ I hit this turn's iteration limit ({budget} model steps) "
+                f"and stopped before finishing. Re-ask if you need me to "
+                f"continue — narrowing the scope helps.",
+            )
+        except Exception:  # noqa: BLE001 — never mask the turn outcome
+            log.exception("iteration hard-stop channel notice failed")
+            return
+        # Only record delivery on a CONFIRMED send. ChannelRegistry.send returns
+        # a SendResult; a bridge soft failure returns SendResult(sent=False)
+        # WITHOUT raising — recording that as delivered would suppress the
+        # forgot-to-send guard (#423) even though nothing reached the channel
+        # (the exact accounting bug this path is meant to avoid). Mirrors the
+        # send_message tool, which also gates reply accounting on result.sent.
+        # (PR #718 review.)
+        if getattr(result, "sent", False):
+            try:
+                ctx.delivered_channel_ids.add(target)
+                ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
+            except Exception:  # noqa: BLE001 — bookkeeping must not break the turn
+                log.debug("hard-stop delivery bookkeeping failed", exc_info=True)
 
     async def _run_turn_body(
         self,
@@ -1727,6 +1779,14 @@ class Agent:
                     count=len(deferred_events),
                 )
                 self._dispatcher.requeue_front(deferred_events)
+
+        # chainlink #511: if the per-turn iteration ceiling force-stopped this
+        # turn, the model never got to deliver — notify the channel rather than
+        # truncating silently. (The 90%/100% events already recorded the cap.)
+        if getattr(ctx, "iteration_hard_stopped", False):
+            await self._notify_iteration_hard_stop(
+                event, getattr(ctx, "iteration_budget", 0), ctx,
+            )
 
         # Algedonic: surface EVERY turn failure as an event so a dropped
         # turn — a transient model 503, a timeout, quota exhaustion, or a

@@ -434,6 +434,15 @@ class Config:
     # 0 disables the cap entirely.
     tool_call_budget: int
 
+    # chainlink #511: per-turn model-iteration ceiling (3-tier belt-and-
+    # suspenders alongside tool_call_budget + the homeostat). The
+    # IterationGate nudges at 75% / 90% and hard-stops (force-ends the turn +
+    # notifies the channel) at 100%. Default 200 is set ABOVE the observed
+    # ceiling of real turns (mimirbot p99≈91, max 154 over ~4.5k turns) so it
+    # only catches a genuine runaway — not Hermes' 90, which would clip ~1% of
+    # legitimate heavy turns. 0 disables the cap entirely.
+    max_turn_iterations: int
+
     # Additional file-op roots beyond ``home``. File-op tools (Read,
     # Glob, Grep, Edit, Write, MultiEdit, NotebookEdit) accept paths
     # inside any of these. Useful for deployments where the agent
@@ -805,6 +814,7 @@ class Config:
             send_loop_hard_limit=_env_int("MIMIR_SEND_LOOP_HARD_LIMIT", 10),
             send_loop_similarity=_env_float("MIMIR_SEND_LOOP_SIMILARITY", 0.9),
             tool_call_budget=_env_int("MIMIR_TOOL_CALL_BUDGET", 120),
+            max_turn_iterations=_env_int("MIMIR_MAX_TURN_ITERATIONS", 200),
             file_op_extra_roots=[
                 Path(p)
                 for p in (_env("MIMIR_FILE_OP_ROOTS", "") or "").split(":")
