@@ -472,6 +472,51 @@ def build_app(config: Config) -> web.Application:
     # inject time so they thread chronologically with the turn's mid-flight replies.
     dispatcher.set_on_inject(agent.on_message_injected)
 
+    # First-contact DM-channel capture: the first time a user messages us on a
+    # bridge, resolve their DM channel from that bridge and cache it in
+    # identities.yaml so the agent can DM them by name later (and so it shows
+    # up in the channel registry + identity context). Fire-and-forget via the
+    # dispatcher's per-event observer — never blocks or fails a turn. The lock
+    # serializes the read-modify-write so two simultaneous first-contacts can't
+    # clobber each other's captured DM channel.
+    _dm_capture_lock = asyncio.Lock()
+
+    async def _capture_dm_channel(event: AgentEvent) -> None:
+        try:
+            author = (event.author or "").strip()
+            author_id = (event.author_id or "").strip()
+            platform = (event.source or "").strip()
+            if not (author and author_id and platform in ("slack", "discord")):
+                return
+            # Cheap in-memory gate — first-contact only; no API call once cached.
+            if identity_resolver.dm_channel(author, platform):
+                return
+            bridge = channels.find(event.channel_id)
+            if bridge is None:
+                return
+            dm_id = await bridge.resolve_dm_channel(author_id)
+            if not dm_id:
+                return
+            from .identities_populator import capture_dm_channel
+            async with _dm_capture_lock:
+                wrote = await asyncio.to_thread(
+                    capture_dm_channel, config.home, author, platform, dm_id
+                )
+                if wrote:
+                    await asyncio.to_thread(identity_resolver.reload)
+            if wrote:
+                await log_event(
+                    "dm_channel_captured",
+                    channel_id=event.channel_id,
+                    author=author,
+                    platform=platform,
+                    dm_channel=dm_id,
+                )
+        except Exception:  # noqa: BLE001 — best-effort; never disrupt inbound
+            log.debug("dm-channel capture failed", exc_info=True)
+
+    dispatcher.set_on_event(_capture_dm_channel)
+
     # Wire dep-injection setters on the production tool surface so
     # langchain @tool functions can reach the same singletons the SDK
     # tool builders received as args. Each setter is idempotent and
@@ -487,6 +532,7 @@ def build_app(config: Config) -> web.Application:
     _agent_tools.set_index_generator(indexes)
     _agent_tools.set_turns_log_path(config.turns_log)
     _agent_tools.set_channel_registry(channels)
+    _agent_tools.set_identity_resolver(identity_resolver)
     _agent_tools.set_dispatcher(dispatcher)
     _agent_tools.set_scheduler(scheduler)
     # Worklink slice-3 (#444): give the in-turn ``worklink_run`` tool the

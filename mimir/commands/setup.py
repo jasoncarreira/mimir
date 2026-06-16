@@ -128,8 +128,11 @@ DEFAULT_ENV_TEMPLATE = dedent(
     # ---- Operator config -------------------------------------------------
     # Channel the agent uses for high-priority signals to you that don't fit
     # the current conversation (critical errors, urgent heartbeat findings,
-    # dispatch failures). Leave blank to disable. Use a normal channel_id —
-    # typically your DM with the bot, e.g. dm-slack-U05XXXX or dm-discord-NNN.
+    # dispatch failures). Leave blank to disable. Use a DM *conversation*
+    # channel_id (NOT a user id) — typically your DM with the bot, e.g.
+    # dm-slack-D05XXXX (the IM id) or dm-discord-NNN (the DM channel snowflake).
+    # Tip: DM the bot once, then check the captured id via the agent's
+    # list_channels tool or your dm_channels entry in state/identities.yaml.
     MIMIR_OPERATOR_ALERT_CHANNEL=
     """
 )

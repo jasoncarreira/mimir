@@ -664,6 +664,20 @@ class SlackBridge(Bridge):
 
     # ---- inbound wiring -----------------------------------------------
 
+    async def resolve_dm_channel(self, author_id: str) -> str | None:
+        """Open the IM with a Slack user id → its mimir channel id
+        (``dm-slack-<D…>``). Opens the IM conversation but sends no
+        message; best-effort."""
+        if self._app is None:
+            return None
+        try:
+            resp = await self._app.client.conversations_open(users=author_id)
+            ch = (resp.get("channel") or {}).get("id") if resp else None
+            return f"dm-slack-{ch}" if ch else None
+        except Exception as exc:  # noqa: BLE001 — best-effort; SlackApiError et al.
+            log.warning("resolve_dm_channel failed for user %s: %s", author_id, exc)
+            return None
+
     async def _user_info_cached(self, user_id: str) -> dict[str, str | None] | None:
         """Fetch (or return cached) Slack user profile.
 

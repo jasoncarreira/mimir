@@ -98,6 +98,7 @@ from langchain_core.tools import InjectedToolArg, tool
 
 _STATE: dict[str, Any] = {
     "channel_registry": None,
+    "identity_resolver": None,
     "dispatcher": None,
     "scheduler": None,
     "commitments_store": None,
@@ -115,6 +116,12 @@ _STATE: dict[str, Any] = {
 
 def set_channel_registry(registry: Any) -> None:
     _STATE["channel_registry"] = registry
+
+
+def set_identity_resolver(resolver: Any) -> None:
+    """Inject the IdentityResolver so ``list_channels`` can surface
+    operator-curated channels + captured DM channels. Set by server.py."""
+    _STATE["identity_resolver"] = resolver
 
 
 def set_dispatcher(dispatcher: Any) -> None:
@@ -620,6 +627,69 @@ async def fetch_channel_history(
     except Exception as exc:
         return f"fetch_channel_history failed: {exc}"
     return json.dumps(history, indent=2, ensure_ascii=False, default=str)
+
+
+@tool
+async def list_channels(platform: Optional[str] = None) -> str:
+    """List the channels you know about — use this to find where to send,
+    especially to DM a person by name. Read-only.
+
+    Args:
+        platform: Optional bridge filter — e.g. ``"slack"`` or ``"discord"``.
+            When set, returns only that bridge's channels/DMs/prefixes
+            (matching ids ``<platform>-…`` and ``dm-<platform>-…``). Omit
+            for everything.
+
+    Returns JSON with:
+      - ``channels``: operator-curated channels (channel_id, display_name, kind, notes).
+      - ``dms``: per-person DM channels (person, display_name, platform, channel_id),
+        auto-captured the first time each person messaged you on a bridge.
+      - ``live_prefixes``: the channel-id prefixes the connected bridges serve
+        (e.g. ``discord-`` / ``dm-slack-``). A ``channel_id`` must carry one of
+        these or ``send_message`` raises UnknownChannelError.
+
+    To DM a person, send to their ``dms[].channel_id`` (a prefix-qualified id
+    like ``dm-slack-D…``) — never their user id.
+    """
+    resolver = _STATE["identity_resolver"]
+    channels = _STATE["channel_registry"]
+    plat = (platform or "").strip().lower() or None
+
+    def _belongs(channel_id: str) -> bool:
+        if plat is None:
+            return True
+        return channel_id.startswith(f"{plat}-") or channel_id.startswith(f"dm-{plat}-")
+
+    out: dict[str, Any] = {"channels": [], "dms": [], "live_prefixes": []}
+    if plat is not None:
+        out["platform"] = plat
+    if resolver is not None:
+        for ch in resolver.all_channels():
+            if not _belongs(ch.canonical):
+                continue
+            out["channels"].append(
+                {
+                    "channel_id": ch.canonical,
+                    "display_name": ch.display_name,
+                    "kind": ch.kind,
+                    "notes": ch.notes,
+                }
+            )
+        for ident in resolver.all_identities():
+            for dm_platform, cid in (ident.dm_channels or {}).items():
+                if plat is not None and dm_platform.strip().lower() != plat:
+                    continue
+                out["dms"].append(
+                    {
+                        "person": ident.canonical,
+                        "display_name": ident.display_name,
+                        "platform": dm_platform,
+                        "channel_id": cid,
+                    }
+                )
+    if channels is not None and hasattr(channels, "prefixes"):
+        out["live_prefixes"] = [p for p in channels.prefixes() if _belongs(p)]
+    return json.dumps(out, indent=2, ensure_ascii=False, default=str)
 
 
 @tool
@@ -1644,7 +1714,7 @@ def all_mimir_tools() -> list:
         # tools query the per-process ShellJobRegistry.
         bash_async, bash_jobs_list, bash_job_output,
         # Channel ops
-        send_message, react, fetch_channel_history,
+        send_message, react, fetch_channel_history, list_channels,
         # Mid-turn injection escape hatch (chainlink #384): punt a folded
         # follow-up to its own turn instead of answering it in this one.
         defer_injected_message,

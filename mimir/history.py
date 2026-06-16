@@ -593,5 +593,13 @@ def render_identity_context(
         aliases = getattr(identity, "aliases", None) or []
         if aliases:
             parts.append(f" · aliases: {', '.join(aliases)}")
+        # Captured DM channels — so the agent can DM this person directly
+        # (send_message to the channel_id, NOT the user id).
+        dm_channels = getattr(identity, "dm_channels", None) or {}
+        if dm_channels:
+            dm_str = ", ".join(
+                f"{platform}: {cid}" for platform, cid in sorted(dm_channels.items())
+            )
+            parts.append(f" · DM: {dm_str}")
         lines.append("".join(parts))
     return "\n".join(lines)

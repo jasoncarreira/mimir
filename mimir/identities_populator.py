@@ -125,6 +125,95 @@ def _strip_value(v: Any) -> Any:
     return v.strip() if isinstance(v, str) else v
 
 
+def capture_dm_channel(
+    home: Path, author: str, platform: str, dm_channel_id: str
+) -> bool:
+    """Record a user's DM channel into ``state/identities.yaml`` on first
+    contact. Mirrors ``merge_into_yaml``'s match-by-alias + fill-blank
+    posture so it's safe to run live alongside the operator-scheduled
+    populator.
+
+    Args:
+        home: mimir home; YAML lives at ``<home>/state/identities.yaml``.
+        author: the platform-prefixed inbound id (e.g. ``slack-U05ABC``,
+            ``discord-456789``) — the same value as ``AgentEvent.author``.
+        platform: ``"slack"`` / ``"discord"`` (the ``dm_channels`` key).
+        dm_channel_id: the mimir DM channel id (``dm-slack-D…`` /
+            ``dm-discord-…``) resolved from the bridge.
+
+    Finds the person whose ``aliases`` include ``author`` (or creates a
+    new entry keyed by ``author``), then sets ``dm_channels[platform]``
+    only if it isn't already set — an existing value (operator- or
+    previously-captured) is never overwritten. Atomic, header-preserving
+    write; a no-op (no mtime bump) when nothing changed. Returns True iff
+    it wrote. Best-effort: callers should not fail a turn on a False/raise.
+    """
+    author = (author or "").strip()
+    platform = (platform or "").strip()
+    dm_channel_id = (dm_channel_id or "").strip()
+    if not (author and platform and dm_channel_id):
+        return False
+
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+
+    existing_people = doc.get("people")
+    if not isinstance(existing_people, list):
+        existing_people = []
+
+    match: dict[str, Any] | None = None
+    for entry in existing_people:
+        if not isinstance(entry, dict):
+            continue
+        if any(
+            isinstance(a, str) and a.strip() == author
+            for a in (entry.get("aliases") or [])
+        ):
+            match = entry
+            break
+
+    changed = False
+    if match is None:
+        # Brand-new person — canonical defaults to the inbound id, same as
+        # the populator does for an unknown alias (operator can merge later).
+        match = {"canonical": author, "aliases": [author]}
+        existing_people.append(match)
+        changed = True
+
+    dm = match.get("dm_channels")
+    if not isinstance(dm, dict):
+        dm = {}
+    if not dm.get(platform):
+        dm[platform] = dm_channel_id
+        match["dm_channels"] = dm
+        changed = True
+    elif dm.get(platform) != dm_channel_id:
+        # Already captured a different DM channel for this platform — leave
+        # it (stable per user; operator authority). Log the drift only.
+        log.info(
+            "capture_dm_channel: %s already has %s DM %r; not overwriting with %r",
+            match.get("canonical", author),
+            platform,
+            dm.get(platform),
+            dm_channel_id,
+        )
+
+    if not changed:
+        return False
+
+    doc["people"] = existing_people
+    yaml_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = yaml_path.with_suffix(yaml_path.suffix + ".tmp")
+    body = yaml.safe_dump(doc, sort_keys=False, allow_unicode=True, width=1_000)
+    tmp.write_text(header + body, encoding="utf-8")
+    tmp.replace(yaml_path)
+    log.info(
+        "captured DM channel for %s on %s: %s",
+        match.get("canonical", author), platform, dm_channel_id,
+    )
+    return True
+
+
 def merge_into_yaml(
     home: Path,
     *,

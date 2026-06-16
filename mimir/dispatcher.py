@@ -27,6 +27,10 @@ log = logging.getLogger(__name__)
 
 TurnRunner = Callable[[AgentEvent], Awaitable[object]]
 InjectCallback = Callable[[AgentEvent], Awaitable[None]]
+# Best-effort observer fired (fire-and-forget) for each enqueued inbound
+# event — used for first-contact DM-channel capture (server.py). Must not
+# raise into enqueue and must not block it.
+EventObserver = Callable[[AgentEvent], Awaitable[None]]
 
 
 class _ChannelQueue(asyncio.Queue):
@@ -75,6 +79,11 @@ class Dispatcher:
         # interleaved with the turn's mid-flight replies) instead of at turn end.
         # None until wired (server.py); injection still works without it.
         self._on_inject: InjectCallback | None = None
+        # Best-effort per-event observer (DM-channel capture). Fire-and-forget;
+        # tasks tracked in ``_bg_tasks`` so they aren't GC'd mid-flight
+        # (the asyncio strong-ref gotcha, chainlink #118).
+        self._on_event: EventObserver | None = None
+        self._bg_tasks: set[asyncio.Task] = set()
         self._queues: dict[str, asyncio.Queue[AgentEvent]] = {}
         self._workers: dict[str, asyncio.Task] = {}
         self._semaphore = asyncio.Semaphore(config.max_concurrent_turns)
@@ -117,6 +126,12 @@ class Dispatcher:
         records it in chat history at its true arrival time."""
         self._on_inject = on_inject
 
+    def set_on_event(self, on_event: "EventObserver") -> None:
+        """Late-bind a best-effort per-event observer (DM-channel capture).
+        Fired fire-and-forget for each enqueued ``user_message`` — never
+        blocks or fails admission."""
+        self._on_event = on_event
+
     def _injection_enabled(self, channel_id: str) -> bool:
         """True iff ``channel_id`` opts into mid-turn message injection
         (chainlink #376). Prefix allow-list from
@@ -133,6 +148,13 @@ class Dispatcher:
         """Returns True if accepted, False if the per-channel queue is full."""
         if self._closed:
             return False
+
+        # First-contact DM-channel capture (best-effort, fire-and-forget):
+        # observe inbound user messages without blocking or risking admission.
+        if self._on_event is not None and event.trigger == "user_message":
+            task = asyncio.create_task(self._on_event(event))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
 
         channel_id = event.channel_id
 
