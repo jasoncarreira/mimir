@@ -111,7 +111,7 @@ Rules:
 The planner/decomposer is an LLM turn, but its output is still constrained to
 Chainlink mutations. Use the opt-in `chainlink-orchestrator` skill (install with
 `mimir skills install chainlink-orchestrator`) and the
-operator-tunable `prompts/decompose.md` prompt to turn a parent issue into leaf
+operator-tunable `mimir/prompt_templates/decompose.md` prompt to turn a parent issue into leaf
 subissues. The canonical leaf-description template is
 `mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN`; the planner prompt and skill
 render that exact text from the constant, and executor tests assert they stay in sync.
@@ -206,8 +206,8 @@ Per-issue flow (one `run`):
    per-worker branch.
 4. **Render the prompt** from issue fields: description, acceptance
    criteria, review criteria, parent context, repo conventions pointer.
-   Template lives at `prompts/worklink-order.md` (operator-tunable). The
-   planner-side decomposition prompt lives at `prompts/decompose.md`; its
+   Template lives at `mimir/prompt_templates/worklink-order.md` (operator-tunable). The
+   planner-side decomposition prompt lives at `mimir/prompt_templates/decompose.md`; its
    `{leaf_template}` slot is rendered from the single
    `mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN` contract, which the
    `chainlink-orchestrator` skill also embeds, so the executor validates the
@@ -285,7 +285,7 @@ class Caps:
 class WorkOrder:
     issue_id: int
     worktree: Path
-    prompt: str               # rendered from prompts/worklink-order.md
+    prompt: str               # rendered from mimir/prompt_templates/worklink-order.md
     rules: str | None         # backend-appropriate rules/system content
     timeout_s: int
     env: dict[str, str]       # explicit allowlist, assembled like poller env
@@ -514,10 +514,10 @@ content verbatim into acceptance criteria.
 
   | Tool | Category | Source lookup | Current pin | Install surface | Smoke command | Risk surface |
   |------|----------|---------------|-------------|-----------------|---------------|--------------|
-  | codex | `coding-cli` | npm package `@openai/codex` | `0.137.0` | scaffold Dockerfiles when `codex-plus` is selected | `codex --version && env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_backends.py` | High: first Worklink coding backend; CLI drift can affect prompt execution, sandbox flags, transcript shape, and quota use. |
+  | codex | `coding-cli` | npm package `@openai/codex` | `0.139.0` | scaffold Dockerfiles when `codex-plus` is selected | `codex --version && env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_backends.py` | High: first Worklink coding backend; CLI drift can affect prompt execution, sandbox flags, transcript shape, and quota use. |
   | chainlink | `issue-cli` | GitHub release/tag `dollspace-gay/chainlink` | `chainlink-1.6.0` | bundled Chainlink skill `dockerfile.fragment` | `chainlink --version && chainlink issue ready` | High: Worklink coordination depends on issue, lock, comment, and dependency semantics. |
   | mermaid-cli | `renderer` | npm package `@mermaid-js/mermaid-cli` | `11.15.0` | scaffold Dockerfiles | `mmdc --version` | Low: renderer/Chromium drift affects diagram generation, not coding execution. |
-  | claude-code | `coding-cli` | npm package `@anthropic-ai/claude-code` | `2.1.168` | root/scaffold Dockerfiles when `MIMIR_ENABLE_CLAUDE_CODE=1` | `claude --version` | Medium: optional second coding backend; real smoke requires a deployment with `claude` installed. |
+  | claude-code | `coding-cli` | npm package `@anthropic-ai/claude-code` | `2.1.177` | root/scaffold Dockerfiles when `MIMIR_ENABLE_CLAUDE_CODE=1` | `claude --version` | Medium: optional second coding backend; real smoke requires a deployment with `claude` installed. |
   | gogcli | `integration-cli` | GitHub release/tag `steipete/gogcli` | `v0.9.0` | gmail-poller optional-skill `dockerfile.fragment` | `gog --version` | Medium: Gmail/Calendar helper drift can break polling independent of Worklink coding backends. |
 
 ## 6.5 Compute-backend autonomy policy (#460)
@@ -824,8 +824,8 @@ defaults:
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
 
 routes:                     # first match wins
-  - label: "render"
-    backend: mermaid        # tool_category: renderer
+  - label: "docs"
+    backend: claude_cli     # the other registered backend
   - repo: "jasoncarreira/mimir"
     backend: codex
 
@@ -894,7 +894,7 @@ tool_pins:
    <issue>`: validate-leaf → claim → worktree → codex adapter →
    observed evidence → transitions → PR. Dry-run on one non-critical
    issue (an adversarial-review LOW is a good guinea pig).
-3. **Slice 2 — planner.** `prompts/decompose.md` +
+3. **Slice 2 — planner.** `mimir/prompt_templates/decompose.md` +
    `chainlink-orchestrator` skill + executor template-refusal test.
 4. **Slice 3 — autonomy (#444, shipped).** Ready-queue poller
    (`chainlink-orchestrator` skill `pollers.json`/`poller.py`, `priority: normal`
