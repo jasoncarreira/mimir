@@ -29,6 +29,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -57,6 +58,12 @@ _RECOVERED_KEY = "agent-liveness-recovered"
 _RESTART_KEY = "agent-unclean-restart"
 _SERVICE_KEY = "mimir-service-failure"
 _CATEGORY = "agent-liveness"
+
+# Suppress repeat unclean-restart notices within this window. A crash-looping
+# agent (s6 / Docker restarting it every few seconds) would otherwise page on
+# every boot. The event is still LOGGED each time; only the out-of-band notify
+# is coalesced. Carried forward in the session marker across restarts.
+UNCLEAN_NOTIFY_WINDOW = 120.0
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> bool:
@@ -233,17 +240,26 @@ def read_session_marker(home: Path) -> dict[str, Any] | None:
 
 
 def mark_session_running(
-    home: Path, *, started_at: float, ts: float | None = None,
+    home: Path, *, started_at: float, last_unclean_notify_ts: float | None = None,
+    ts: float | None = None,
 ) -> None:
-    """Record that a session is live and has NOT shut down cleanly yet."""
+    """Record that a session is live and has NOT shut down cleanly yet.
+
+    ``last_unclean_notify_ts`` carries the timestamp of the most recent
+    unclean-restart *notification* forward across restarts, so a crash-loop
+    can coalesce notices (see ``UNCLEAN_NOTIFY_WINDOW``) instead of paging on
+    every boot."""
     now = time.time() if ts is None else ts
-    _atomic_write_json(session_marker_path(home), {
+    payload: dict[str, Any] = {
         "started_at": started_at,
         "started_iso": _iso(started_at),
         "pid": os.getpid(),
         "clean": False,
         "updated_iso": _iso(now),
-    })
+    }
+    if last_unclean_notify_ts is not None:
+        payload["last_unclean_notify_ts"] = last_unclean_notify_ts
+    _atomic_write_json(session_marker_path(home), payload)
 
 
 def mark_clean_shutdown(home: Path, *, ts: float | None = None) -> None:
@@ -320,14 +336,84 @@ async def notify_service_event(
     )
 
 
+def _proc_is_mimir(pid: int) -> bool:
+    """Best-effort guard against killing a recycled PID: confirm the target is
+    a mimir process via ``/proc`` (Linux — where the watcher runs, inside the
+    agent's container). If ``/proc`` is unavailable (non-Linux dev box), assume
+    yes rather than block a legitimate kill."""
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return True  # can't check → don't stand in the way of recovery
+    return b"mimir" in cmdline
+
+
+async def _kill_agent(
+    home: Path,
+    *,
+    grace: float,
+    _kill: Callable[[int, int], None] | None = None,
+    _sleep: Callable[[float], Awaitable[None]] | None = None,
+    _check: Callable[[int], bool] | None = None,
+) -> bool:
+    """Turn a wedge into an *exit* so the supervisor (s6 / Docker ``restart:``)
+    restarts the agent — a wedged-but-alive process never exits on its own.
+
+    Reads the agent PID from the beat file (``write_beat`` records it), sends
+    SIGTERM, waits ``grace`` seconds, then SIGKILL if it's still alive (a truly
+    wedged loop can't run its own SIGTERM handler, so the SIGKILL is the path
+    that usually fires). Same-container only (shared PID namespace); needs no
+    docker socket. Returns True if a kill was issued. ``_kill`` / ``_sleep`` /
+    ``_check`` are test seams."""
+    kill = _kill or os.kill
+    sleep = _sleep or asyncio.sleep
+    check = _check or _proc_is_mimir
+    beat = read_beat(home)
+    pid = beat.get("pid") if isinstance(beat, dict) else None
+    if not isinstance(pid, int) or pid <= 1:
+        log.warning(
+            "watchdog --restart-on-stale: no valid agent PID in the beat — "
+            "can't target a restart (pid=%r)", pid,
+        )
+        return False
+    if not check(pid):
+        log.warning(
+            "watchdog --restart-on-stale: PID %s is not a live mimir process "
+            "(recycled?) — skipping kill", pid,
+        )
+        return False
+    try:
+        kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False  # already gone — the supervisor will pick it up
+    except OSError as exc:
+        log.warning("watchdog --restart-on-stale: SIGTERM to %s failed: %s", pid, exc)
+        return False
+    await sleep(grace)
+    try:
+        kill(pid, 0)  # probe: alive?
+    except ProcessLookupError:
+        return True  # SIGTERM took it down cleanly
+    except OSError:
+        pass  # e.g. EPERM → treat as still alive, escalate
+    try:
+        kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    return True
+
+
 async def run_watchdog(
     home: Path,
     *,
     interval: float = 60.0,
     stale_after: float = 180.0,
     once: bool = False,
+    restart_on_stale: bool = False,
+    restart_grace: float = 10.0,
     _post: Callable[..., Awaitable[None]] | None = None,
     _sleep: Callable[[float], Awaitable[None]] | None = None,
+    _kill: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Out-of-process dead-man's-switch loop.
 
@@ -339,8 +425,15 @@ async def run_watchdog(
     pushes a back-up notice. ``--once`` (cron mode) skips the transition
     gate and simply reports/alerts on the current state.
 
+    With ``restart_on_stale=True`` it also *acts*: once per outage it kills the
+    agent (``_kill_agent``) so the supervisor (s6 / Docker ``restart:``)
+    restarts it — the in-container recovery path for a wedge, which neither the
+    restart policy nor s6 supervision catch on their own (the process is still
+    alive). Alert and restart are independent: you get the alarm whether or not
+    a restart is wired.
+
     Returns the last ``down`` value (useful for ``--once``). ``_post`` /
-    ``_sleep`` are injection seams for tests.
+    ``_sleep`` / ``_kill`` are injection seams for tests.
     """
     post = _post or _default_alert
     sleep = _sleep or asyncio.sleep
@@ -351,6 +444,7 @@ async def run_watchdog(
         )
     seen_alive = False
     alerted = False
+    restart_done = False  # one restart attempt per outage (reset on recovery)
     down = False
 
     while True:
@@ -359,6 +453,7 @@ async def run_watchdog(
 
         if not down:
             seen_alive = True
+            restart_done = False  # healthy again → arm for the next outage
             if alerted:
                 await post(
                     category=_CATEGORY,
@@ -369,20 +464,33 @@ async def run_watchdog(
                     tags=["white_check_mark"],
                 )
                 alerted = False
-        elif (seen_alive or once) and not alerted:
-            age_str = "no beat file" if age is None else f"{age:.0f}s stale"
-            await post(
-                category=_CATEGORY,
-                title="🔴 mimir liveness beat stale — agent may be down",
-                body=(
-                    f"No fresh liveness beat ({age_str}; threshold {stale_after:.0f}s). "
-                    f"The agent process may be dead, OOM-killed, or wedged. home={home}"
-                ),
-                dedupe_key=_DOWN_KEY,
-                priority=5,
-                tags=["rotating_light"],
-            )
-            alerted = True
+        elif seen_alive or once:
+            if not alerted:
+                age_str = "no beat file" if age is None else f"{age:.0f}s stale"
+                await post(
+                    category=_CATEGORY,
+                    title="🔴 mimir liveness beat stale — agent may be down",
+                    body=(
+                        f"No fresh liveness beat ({age_str}; threshold {stale_after:.0f}s). "
+                        f"The agent process may be dead, OOM-killed, or wedged. home={home}"
+                    ),
+                    dedupe_key=_DOWN_KEY,
+                    priority=5,
+                    tags=["rotating_light"],
+                )
+                alerted = True
+            # Recovery action: kill the wedged agent so the supervisor restarts
+            # it. One attempt per outage — if it doesn't take, we don't hammer;
+            # the down-alarm keeps the operator informed. A fresh beat resets.
+            if restart_on_stale and not restart_done:
+                killed = await _kill_agent(
+                    home, grace=restart_grace, _kill=_kill, _sleep=sleep,
+                )
+                restart_done = True
+                if killed:
+                    log.warning(
+                        "watchdog: killed stale agent; supervisor will restart it",
+                    )
 
         if once:
             return down

@@ -1,0 +1,13 @@
+#!/command/with-contenv sh
+# In-container liveness watcher (a separate PROCESS from the agent, so a wedged
+# event loop — even one holding the GIL — can't freeze it). Reads the agent's
+# liveness beat; on a stale beat it alerts (ntfy/webhook) AND, with
+# --restart-on-stale, kills the agent by its beat PID so s6 restarts it — the
+# recovery path for a wedge, which neither s6 supervision nor Docker `restart:`
+# catch on their own (the process is still alive). Tune the staleness threshold
+# with MIMIR_WATCHDOG_STALE_AFTER (default 300s = 5 missed 60s beats; high
+# enough not to false-kill a legitimately busy agent).
+exec s6-setuidgid mimir mimir watchdog \
+    --home "${MIMIR_HOME:-/home/mimir/agent}" \
+    --restart-on-stale \
+    --stale-after "${MIMIR_WATCHDOG_STALE_AFTER:-300}"

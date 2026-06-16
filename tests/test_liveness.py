@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import signal
 import time
 from pathlib import Path
 
 import pytest
 
 from mimir.liveness import (
+    _kill_agent,
     beat_age_seconds,
     detect_unclean_restart,
     liveness_path,
@@ -22,6 +24,10 @@ from mimir.liveness import (
     watchdog_has_sink,
     write_beat,
 )
+
+
+async def _anoop(*_a, **_k):
+    return None
 
 
 def _home(tmp_path: Path) -> Path:
@@ -234,6 +240,28 @@ def test_detect_then_remark_clears_for_next_cycle(tmp_path: Path) -> None:
     assert detect_unclean_restart(home) is None        # session 3 boot is clean
 
 
+def test_unclean_notify_ts_carries_forward(tmp_path: Path) -> None:
+    """The session marker carries last_unclean_notify_ts across restarts so a
+    crash-loop can coalesce notices (the storm-guard the server applies)."""
+    from mimir.liveness import UNCLEAN_NOTIFY_WINDOW
+    home = _home(tmp_path)
+    # Boot 1 → crash. No notify ts yet, so a boot-2 detection would notify.
+    mark_session_running(home, started_at=1000.0)
+    prior = detect_unclean_restart(home)
+    assert prior is not None and prior.get("last_unclean_notify_ts") is None
+    # Boot 2 notifies (records ts=2000) and crashes again.
+    mark_session_running(home, started_at=2000.0, last_unclean_notify_ts=2000.0)
+    # Boot 3, 30s later: within window → suppress, carry the original ts.
+    prior = detect_unclean_restart(home)
+    last = prior.get("last_unclean_notify_ts")
+    assert last == 2000.0 and (2030.0 - last) < UNCLEAN_NOTIFY_WINDOW
+    mark_session_running(home, started_at=2030.0, last_unclean_notify_ts=last)
+    # Boot 4, well past the window → would notify again.
+    prior = detect_unclean_restart(home)
+    assert prior.get("last_unclean_notify_ts") == 2000.0
+    assert (2000.0 + UNCLEAN_NOTIFY_WINDOW + 10 - 2000.0) >= UNCLEAN_NOTIFY_WINDOW
+
+
 def test_garbage_marker_is_not_unclean(tmp_path: Path) -> None:
     home = _home(tmp_path)
     from mimir.liveness import session_marker_path
@@ -258,6 +286,76 @@ async def test_notify_unclean_restart_shape(tmp_path: Path) -> None:
     assert "♻️" in calls[0]["title"]
     assert calls[0]["dedupe_key"] == "agent-unclean-restart"
     assert "42" in calls[0]["body"]
+
+
+# ── --restart-on-stale: kill action ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_kill_agent_sigterm_then_sigkill(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    write_beat(home)  # records os.getpid() as the beat pid (> 1)
+    sigs: list[int] = []
+
+    def fake_kill(pid, sig):
+        sigs.append(sig)  # never raises → probe reads 'alive' → escalates
+
+    killed = await _kill_agent(
+        home, grace=0, _kill=fake_kill, _sleep=_anoop, _check=lambda pid: True,
+    )
+    assert killed is True
+    assert signal.SIGTERM in sigs and signal.SIGKILL in sigs
+
+
+@pytest.mark.asyncio
+async def test_kill_agent_no_beat_pid_is_noop(tmp_path: Path) -> None:
+    home = _home(tmp_path)  # no beat → no pid to target
+    sigs: list[int] = []
+    res = await _kill_agent(
+        home, grace=0, _kill=lambda p, s: sigs.append(s), _sleep=_anoop,
+        _check=lambda pid: True,
+    )
+    assert res is False
+    assert sigs == []
+
+
+@pytest.mark.asyncio
+async def test_kill_agent_skips_recycled_pid(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    write_beat(home)
+    sigs: list[int] = []
+    res = await _kill_agent(
+        home, grace=0, _kill=lambda p, s: sigs.append(s), _sleep=_anoop,
+        _check=lambda pid: False,  # /proc says it's not a mimir process
+    )
+    assert res is False
+    assert sigs == []
+
+
+@pytest.mark.asyncio
+async def test_watchdog_restart_on_stale_invokes_kill(tmp_path: Path, monkeypatch) -> None:
+    import mimir.liveness as liveness
+    monkeypatch.setattr(liveness, "_proc_is_mimir", lambda pid: True)
+    home = _home(tmp_path)
+    write_beat(home, ts=time.time() - 9999)  # stale, but pid present
+    sigs: list[int] = []
+    down = await run_watchdog(
+        home, once=True, stale_after=60, restart_on_stale=True,
+        _post=_anoop, _sleep=_anoop, _kill=lambda pid, sig: sigs.append(sig),
+    )
+    assert down is True
+    assert signal.SIGTERM in sigs
+
+
+@pytest.mark.asyncio
+async def test_watchdog_no_restart_when_fresh(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    write_beat(home)  # fresh
+    sigs: list[int] = []
+    await run_watchdog(
+        home, once=True, stale_after=60, restart_on_stale=True,
+        _post=_anoop, _sleep=_anoop, _kill=lambda pid, sig: sigs.append(sig),
+    )
+    assert sigs == []
 
 
 @pytest.mark.asyncio

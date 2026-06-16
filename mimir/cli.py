@@ -340,6 +340,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--once", action="store_true",
         help="Check once and exit (for cron); exit code 1 if the agent is down.",
     )
+    watchdog_p.add_argument(
+        "--restart-on-stale", action="store_true",
+        help="When the beat goes stale, kill the agent (by its beat PID) so the "
+             "supervisor (s6 / Docker restart) restarts it. In-container wedge "
+             "recovery. One attempt per outage.",
+    )
+    watchdog_p.add_argument(
+        "--restart-grace", type=float, default=10.0,
+        help="Seconds between SIGTERM and SIGKILL when restarting (default 10).",
+    )
 
     # ``mimir notify-restart`` — push a one-shot 'service failed/restarting'
     # alert via ntfy / webhook. Designed for a systemd ``OnFailure=`` hook
@@ -397,6 +407,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 interval=args.interval,
                 stale_after=args.stale_after,
                 once=args.once,
+                restart_on_stale=args.restart_on_stale,
+                restart_grace=args.restart_grace,
             )
         )
         if args.once and down:

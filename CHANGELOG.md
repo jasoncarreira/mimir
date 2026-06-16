@@ -39,6 +39,17 @@ All notable changes will land here. Format loosely follows
   the new `mimir notify-restart` command (a self-contained ntfy/webhook push,
   no live agent needed). Templates in `deploy/systemd/`; runbook in
   `docs/systemd.md` (incl. the macOS/launchd note).
+- **In-container liveness watcher via s6-overlay.** The scaffold image now runs
+  s6-overlay as PID 1 (superseding tini) supervising two services: the agent and
+  `mimir watchdog --restart-on-stale`. On a stale beat the watcher alerts **and**
+  kills the agent (SIGTERM→SIGKILL by its beat PID) so s6 restarts it — the
+  recovery path for a wedge, which neither s6 nor Docker `restart:` catch on
+  their own (the process is still alive). Same-container, no docker socket. New
+  `--restart-on-stale` / `--restart-grace` flags on `mimir watchdog`; tune the
+  threshold with `MIMIR_WATCHDOG_STALE_AFTER` (default 300s). s6 service defs in
+  `deploy/s6-overlay/`. The unclean-restart notice is now coalesced within a
+  120s window so a crash-loop doesn't page on every boot (the event is still
+  logged each time).
 - **`GET /` redirects to `/turns`** — the bare web root now sends browsers to
   the turn viewer (302) instead of 404ing.
 

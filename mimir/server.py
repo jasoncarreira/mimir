@@ -1246,25 +1246,41 @@ def build_app(config: Config) -> web.Application:
         # push an out-of-band notice on the same sinks as the watchdog. First
         # boot (no marker) and a clean prior stop both no-op.
         from .liveness import (
+            UNCLEAN_NOTIFY_WINDOW,
             detect_unclean_restart,
             mark_session_running,
             notify_unclean_restart,
         )
+        _now = time.time()
         _prior_session = detect_unclean_restart(config.home)
-        mark_session_running(config.home, started_at=time.time())
+        # Coalesce notices across a crash-loop: notify only if we haven't
+        # already paged within UNCLEAN_NOTIFY_WINDOW. The event is logged every
+        # time regardless; only the out-of-band notify is rate-limited.
+        _notify = False
+        _carry_ts: float | None = None
+        if _prior_session is not None:
+            _last = _prior_session.get("last_unclean_notify_ts")
+            _within = isinstance(_last, (int, float)) and (_now - _last) < UNCLEAN_NOTIFY_WINDOW
+            _notify = not _within
+            _carry_ts = _now if _notify else _last
+        mark_session_running(
+            config.home, started_at=_now, last_unclean_notify_ts=_carry_ts,
+        )
         if _prior_session is not None:
             await log_event(
                 "liveness_unclean_restart",
                 prior_started_iso=_prior_session.get("started_iso"),
                 prior_pid=_prior_session.get("pid"),
+                notified=_notify,
             )
-            # Background — the notify POSTs to ntfy/webhook (up to 8s) and must
-            # not block startup.
-            spawn_background(
-                _STARTUP_BACKGROUND_TASKS,
-                notify_unclean_restart(config.home, prior=_prior_session),
-                name="mimir-unclean-restart-notify",
-            )
+            if _notify:
+                # Background — the notify POSTs to ntfy/webhook (up to 8s) and
+                # must not block startup.
+                spawn_background(
+                    _STARTUP_BACKGROUND_TASKS,
+                    notify_unclean_restart(config.home, prior=_prior_session),
+                    name="mimir-unclean-restart-notify",
+                )
 
         # Liveness beat (chainlink #507): periodically rewrite
         # state/liveness.json so the out-of-process ``mimir watchdog`` can

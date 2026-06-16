@@ -22,6 +22,7 @@ uptime monitor can poll.
 
 ```
 mimir watchdog [--home DIR] [--interval 60] [--stale-after 180] [--once]
+               [--restart-on-stale] [--restart-grace 10]
 ```
 
 - **Loop mode** (default): checks every `--interval`s; alerts once when the
@@ -29,6 +30,13 @@ mimir watchdog [--home DIR] [--interval 60] [--stale-after 180] [--once]
   watcher started before the agent doesn't false-alarm), and pushes a recovery
   notice when the beat returns.
 - **`--once`** (cron mode): one check, exit code `1` if the agent is down.
+- **`--restart-on-stale`**: in addition to alerting, *act* — kill the agent (by
+  the PID in its beat; SIGTERM, then SIGKILL after `--restart-grace`) so the
+  supervisor restarts it. This is the **wedge-recovery** path: a wedged-but-alive
+  process never exits, so neither s6 supervision nor Docker `restart:` would
+  restart it on their own. One attempt per outage; a fresh beat re-arms it.
+  Same-container only (shared PID namespace; no docker socket needed) — meant
+  for the in-container s6 watcher below.
 
 ### Sinks (configure at least one — or it can't alert anyone)
 
@@ -43,12 +51,28 @@ The watcher is **not** ntfy-locked. It fans out to whichever of these is set:
 Both can be set; both fire. With neither set, the watcher logs a warning and
 keeps watching (useless, but harmless).
 
-## Wiring it (must be out-of-process)
+## Wiring it
 
-A watcher *inside* the agent container won't survive the container dying — run
-it as a **separate** service or on the host.
+The watcher must be a separate **process** (so a wedged event loop — even one
+holding the GIL — can't freeze it). Where that process runs decides which
+failures it catches:
 
-### A. Compose sidecar (separate service, shares the home volume)
+### A. In-container s6 sidecar (the scaffold default) — wedge recovery
+
+The scaffold image runs s6-overlay as PID 1 supervising **two** services: the
+agent (`mimir run`) and the watcher (`mimir watchdog --restart-on-stale`). See
+`deploy/s6-overlay/`. On a stale beat the watcher alerts *and* kills the agent;
+s6 restarts that service in place. Tune the threshold with
+`MIMIR_WATCHDOG_STALE_AFTER` (default 300s — high enough not to false-kill a
+legitimately busy agent).
+
+This is the right tool for a **wedge** (and fast process-crash restart). What it
+*can't* do is alert when the whole **container** dies — it dies with it. That
+case is covered instead by Docker `restart:` bringing the container back + the
+clean-shutdown marker paging on reboot (see below); only "dead and never comes
+back" (host/daemon down) escapes, which is option D.
+
+### B. Compose sidecar (separate service, shares the home volume)
 
 ```yaml
 services:
@@ -66,7 +90,7 @@ services:
     depends_on: [mimir]
 ```
 
-### B. Host cron / launchd (outside docker entirely)
+### C. Host cron / launchd (outside docker entirely)
 
 ```cron
 */2 * * * * NTFY_TOPIC=jcarreira_mimirbot mimir watchdog --home /path/to/home --once --stale-after 180
@@ -75,7 +99,7 @@ services:
 `--once` exits non-zero when down, so it also composes with a monitoring cron
 that pages on a failing command.
 
-### C. Hosted uptime monitor on `/health`
+### D. Hosted uptime monitor on `/health`
 
 Point an external uptime monitor (UptimeRobot, Healthchecks.io dead-man timer,
 etc.) at the agent's `:8080/health`. If the loop wedges or the process dies,
@@ -117,4 +141,4 @@ different failure domain:
   `restart:` policy fires.
 
 Whole-host failure is the one case nothing on-box can catch — that's the
-hosted-monitor-on-`/health` layer (option C above).
+hosted-monitor-on-`/health` layer (option D above).
