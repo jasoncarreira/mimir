@@ -8,6 +8,18 @@ All notable changes will land here. Format loosely follows
 
 ### Added
 
+- **Per-turn model-iteration ceiling** (chainlink #511). A configurable, 3-tier
+  cap (`MIMIR_MAX_TURN_ITERATIONS`, default **200**; 0 disables) on how many
+  model iterations a turn runs, enforced by a new `IterationGateMiddleware`:
+  **75%** a gentle wrap-up nudge (no event), **90%** an urgent nudge +
+  `iteration_budget_warning`, **100%** a hard stop — it force-ends the turn
+  (`jump_to: end`), logs `iteration_budget_reached`, and notifies the channel
+  (the triggering channel for an interactive turn, or the `deliver:` channel
+  for a poller/tick) so the truncation isn't silent. Belt-and-suspenders
+  alongside the per-turn tool-call budget + the homeostat — it catches a
+  low-tool loop that would spin under the tool cap. Default 200 is set above the
+  observed ceiling of real turns (mimirbot p99≈91 / max 154 over ~4.5k turns)
+  so it only fires on a genuine runaway.
 - **Graceful-drain restart** (chainlink #510). On `SIGTERM`/`SIGINT` the
   dispatcher stops accepting new events and waits up to
   `MIMIR_DRAIN_TIMEOUT_SECONDS` (default 30) for in-flight turns to finish

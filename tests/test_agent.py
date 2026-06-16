@@ -2306,3 +2306,64 @@ async def test_no_deliver_notice_when_unset_on_early_crash(
     with pytest.raises(RuntimeError):
         await agent.run_turn(event)
     assert chans.sent == []
+
+
+# ─── chainlink #511: iteration hard-stop channel notice ──────────────
+
+
+class _FindSendChannels:
+    """channels stub with find (for is_interactive_turn) + send (recording)."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str]] = []
+
+    def find(self, channel_id):  # every channel has a bridge
+        return object()
+
+    async def send(self, channel_id, text, attachment_paths=None, *, final=True):
+        self.sent.append((channel_id, text))
+
+
+async def test_iteration_hard_stop_notifies_interactive_channel(tmp_path: Path):
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="x")]),
+        fake_saga=_FakeSaga(query_hits=[]),
+    )
+    ch = _FindSendChannels()
+    agent._channels = ch  # type: ignore[attr-defined]
+    event = AgentEvent(trigger="user_message", channel_id="discord-1", content="hi")
+    await agent._notify_iteration_hard_stop(event, 200)
+    assert len(ch.sent) == 1
+    assert ch.sent[0][0] == "discord-1"
+    assert "iteration limit (200" in ch.sent[0][1]
+
+
+async def test_iteration_hard_stop_prefers_deliver_channel(tmp_path: Path):
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="x")]),
+        fake_saga=_FakeSaga(query_hits=[]),
+    )
+    ch = _FindSendChannels()
+    agent._channels = ch  # type: ignore[attr-defined]
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:gh", content="x",
+        extra={"deliver": "slack-ops"},
+    )
+    await agent._notify_iteration_hard_stop(event, 200)
+    assert ch.sent and ch.sent[0][0] == "slack-ops"
+
+
+async def test_iteration_hard_stop_no_channel_no_send(tmp_path: Path):
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="x")]),
+        fake_saga=_FakeSaga(query_hits=[]),
+    )
+    ch = _FindSendChannels()
+    agent._channels = ch  # type: ignore[attr-defined]
+    # poller turn, no deliver:, non-interactive → nothing to notify
+    event = AgentEvent(trigger="poller", channel_id="poller:gh", content="x")
+    await agent._notify_iteration_hard_stop(event, 200)
+    assert ch.sent == []

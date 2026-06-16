@@ -87,6 +87,19 @@ class TurnContext:
     # flag means the warning fires exactly once per turn at the first
     # crossing.
     _tool_call_soft_warning_emitted: bool = False
+    # chainlink #511: per-turn model-iteration ceiling — 3-tier, belt-and-
+    # suspenders alongside the tool-call budget + homeostat.
+    # ``IterationGateMiddleware`` counts model iterations (before_model) and
+    # escalates: 75% gentle wrap-up nudge (no event), 90% urgent nudge (+event),
+    # 100% hard stop (force-end the turn + event). Each one-shot flag fires its
+    # tier exactly once. ``iteration_hard_stopped`` tells ``run_turn`` to send a
+    # cap notice to the channel (the model never got to deliver). 0 = disabled.
+    iteration_count: int = 0
+    iteration_budget: int = 0
+    _iteration_warn_75_emitted: bool = False
+    _iteration_warn_90_emitted: bool = False
+    _iteration_cap_emitted: bool = False
+    iteration_hard_stopped: bool = False
     # Origin source of the inbound event (carried from AgentEvent.source so
     # outbound assistant replies on the same channel inherit it).
     channel_source: str | None = None
