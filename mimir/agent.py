@@ -1453,7 +1453,9 @@ class Agent:
             self._channels, deliver, label=str(label), error=error[:240],
         )
 
-    async def _notify_iteration_hard_stop(self, event: AgentEvent, budget: int) -> None:
+    async def _notify_iteration_hard_stop(
+        self, event: AgentEvent, budget: int, ctx: Any,
+    ) -> None:
         """chainlink #511: tell the channel a turn was force-stopped at the
         iteration ceiling (the model never delivered). Target = the deliver:
         channel (#508) if set, else the triggering channel for an interactive
@@ -1477,6 +1479,15 @@ class Agent:
             )
         except Exception:  # noqa: BLE001 — never mask the turn outcome
             log.exception("iteration hard-stop channel notice failed")
+            return
+        # Record the confirmed delivery so the forgot-to-send guard (#423)
+        # doesn't fire a false ``interactive_turn_no_send_message`` — this
+        # notice IS the turn's delivery to ``target``. (PR #718 review.)
+        try:
+            ctx.delivered_channel_ids.add(target)
+            ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
+        except Exception:  # noqa: BLE001 — bookkeeping must not break the turn
+            log.debug("hard-stop delivery bookkeeping failed", exc_info=True)
 
     async def _run_turn_body(
         self,
@@ -1769,7 +1780,7 @@ class Agent:
         # truncating silently. (The 90%/100% events already recorded the cap.)
         if getattr(ctx, "iteration_hard_stopped", False):
             await self._notify_iteration_hard_stop(
-                event, getattr(ctx, "iteration_budget", 0),
+                event, getattr(ctx, "iteration_budget", 0), ctx,
             )
 
         # Algedonic: surface EVERY turn failure as an event so a dropped

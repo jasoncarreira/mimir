@@ -27,7 +27,7 @@ from mimir.agent import Agent
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
-from mimir.models import AgentEvent
+from mimir.models import AgentEvent, TurnContext
 from mimir.turn_logger import TurnLogger
 
 
@@ -2333,10 +2333,18 @@ async def test_iteration_hard_stop_notifies_interactive_channel(tmp_path: Path):
     ch = _FindSendChannels()
     agent._channels = ch  # type: ignore[attr-defined]
     event = AgentEvent(trigger="user_message", channel_id="discord-1", content="hi")
-    await agent._notify_iteration_hard_stop(event, 200)
+    ctx = TurnContext(
+        turn_id="t", session_id="discord-1", trigger="user_message",
+        channel_id="discord-1", started_at=0.0,
+    )
+    await agent._notify_iteration_hard_stop(event, 200, ctx)
     assert len(ch.sent) == 1
     assert ch.sent[0][0] == "discord-1"
     assert "iteration limit (200" in ch.sent[0][1]
+    # PR #718 regression: the notice records its delivery so the forgot-to-send
+    # guard (#423) won't false-fire interactive_turn_no_send_message.
+    assert "discord-1" in ctx.delivered_channel_ids
+    assert ctx.send_message_count == 1
 
 
 async def test_iteration_hard_stop_prefers_deliver_channel(tmp_path: Path):
@@ -2351,8 +2359,13 @@ async def test_iteration_hard_stop_prefers_deliver_channel(tmp_path: Path):
         trigger="poller", channel_id="poller:gh", content="x",
         extra={"deliver": "slack-ops"},
     )
-    await agent._notify_iteration_hard_stop(event, 200)
+    ctx = TurnContext(
+        turn_id="t", session_id="poller:gh", trigger="poller",
+        channel_id="poller:gh", started_at=0.0,
+    )
+    await agent._notify_iteration_hard_stop(event, 200, ctx)
     assert ch.sent and ch.sent[0][0] == "slack-ops"
+    assert "slack-ops" in ctx.delivered_channel_ids
 
 
 async def test_iteration_hard_stop_no_channel_no_send(tmp_path: Path):
@@ -2365,5 +2378,10 @@ async def test_iteration_hard_stop_no_channel_no_send(tmp_path: Path):
     agent._channels = ch  # type: ignore[attr-defined]
     # poller turn, no deliver:, non-interactive → nothing to notify
     event = AgentEvent(trigger="poller", channel_id="poller:gh", content="x")
-    await agent._notify_iteration_hard_stop(event, 200)
+    ctx = TurnContext(
+        turn_id="t", session_id="poller:gh", trigger="poller",
+        channel_id="poller:gh", started_at=0.0,
+    )
+    await agent._notify_iteration_hard_stop(event, 200, ctx)
     assert ch.sent == []
+    assert ctx.delivered_channel_ids == set()
