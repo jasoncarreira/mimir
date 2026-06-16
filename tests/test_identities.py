@@ -315,6 +315,9 @@ def test_access_metadata_is_loaded_per_canonical_and_shared_by_aliases(tmp_path:
     assert r.access_metadata("slack-U123") == expected
     assert r.access_metadata("discord-456") == expected
     assert r.access_metadata("alice") == expected
+    assert r.identity("slack-U123") is not None
+    assert r.identity("slack-U123").canonical == "alice"
+    assert r.identity("slack-UNKNOWN") is None
     assert r.access_dict("discord-456") == {"roles": ["user", "admin"]}
     assert r.is_authorized("discord-456") is True
     assert r.is_admin("discord-456") is True

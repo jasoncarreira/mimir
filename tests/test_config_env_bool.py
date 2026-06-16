@@ -26,6 +26,7 @@ _DEFAULT_TRUE_FIELDS = [
 # Fields where the production default is False.
 _DEFAULT_FALSE_FIELDS = [
     ("MIMIR_ALLOW_UNAUTHENTICATED", "allow_unauthenticated"),
+    ("MIMIR_ACCESS_CONTROL_ENFORCED", "access_control_enforced"),
 ]
 
 _ALL_BOOL_FIELDS = _DEFAULT_TRUE_FIELDS + _DEFAULT_FALSE_FIELDS
