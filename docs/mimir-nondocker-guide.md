@@ -30,6 +30,22 @@ Why it matters:
 - **The path must be on a LOCAL filesystem.** Do **not** put `MIMIR_HOME` under
   iCloud Drive, Dropbox, OneDrive, or a network mount (NFS/SMB) — see §3.
 
+### First contact — the agent onboards itself
+
+On a **brand-new** home, `mimir setup` seeds an `init` block into core memory
+that points the agent at its **onboarding** skill. You don't hand-configure the
+agent — just start talking to it on whatever bridge you've enabled, and it runs
+onboarding: conversational setup that writes its own persona / communication /
+schedule blocks from what it learns. It deletes the `init` block when done
+(and `setup` won't re-seed it afterward), so onboarding doesn't re-trigger.
+
+If a fresh agent feels "blank" — generic persona, not doing autonomous work —
+check that `memory/core/01-init.md` exists (fresh home) and that you've actually
+messaged it; onboarding is conversation-driven, not a background job. On a home
+created by an **older** build (before this was seeded), there's no `init` block —
+either create one (a short core block telling the agent to load the onboarding
+skill) or just ask the agent to onboard.
+
 ---
 
 ## 2. Embeddings — the biggest source of weird errors

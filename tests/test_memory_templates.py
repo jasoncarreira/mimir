@@ -18,9 +18,13 @@ from mimir.memory_templates import (
     DEFAULT_NON_GOALS,
     DEFAULT_REFLECTION_POLICY,
     DEFAULT_VSM_TERMS,
+    INIT_BLOCK_NAME,
+    INIT_BLOCK_TEXT,
     core_template_text,
     seed_core_memory,
+    seed_init_block,
 )
+from mimir.cli import setup_home
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CORE_TEMPLATE_ROOT = REPO_ROOT / "mimir" / "memory_templates" / "core"
@@ -97,3 +101,59 @@ def test_seed_core_memory_preserves_existing_files(tmp_path: Path) -> None:
     assert status["00-identity.md"] == "present"
     assert custom.read_text(encoding="utf-8") == "<!-- desc: custom -->\n# Custom Identity\n"
     assert status["06-action-boundaries.md"] == "created"
+
+
+def test_init_block_is_not_a_regular_core_template() -> None:
+    # The onboarding bootstrap must stay OUT of the write-if-missing core
+    # loop, or it would be recreated after the onboarding skill deletes it.
+    assert INIT_BLOCK_NAME not in CORE_TEMPLATE_NAMES
+    # Not a bundled core/ file → not picked up by seed_core_memory's scan.
+    assert not (CORE_TEMPLATE_ROOT / INIT_BLOCK_NAME).exists()
+
+
+def test_seed_init_block_creates_on_fresh_home(tmp_path: Path) -> None:
+    home = tmp_path / "agent"
+
+    assert seed_init_block(home) == "created"
+
+    block = home / "memory" / "core" / INIT_BLOCK_NAME
+    body = block.read_text(encoding="utf-8")
+    assert body == INIT_BLOCK_TEXT
+    # First line is the desc comment INDEX.md scrapes; body routes to the
+    # onboarding skill and removes itself via the proposal flow (core memory
+    # is read-only mid-turn — not a direct delete).
+    assert body.splitlines()[0].startswith("<!-- desc:")
+    assert "onboarding" in body.lower()
+    assert "proposal" in body.lower()
+    assert INIT_BLOCK_NAME in body
+
+
+def test_seed_init_block_preserves_existing(tmp_path: Path) -> None:
+    home = tmp_path / "agent"
+    block = home / "memory" / "core" / INIT_BLOCK_NAME
+    block.parent.mkdir(parents=True)
+    block.write_text("<!-- desc: custom -->\n# Init (edited)\n", encoding="utf-8")
+
+    assert seed_init_block(home) == "present"
+    assert block.read_text(encoding="utf-8") == "<!-- desc: custom -->\n# Init (edited)\n"
+
+
+def test_setup_seeds_init_block_on_fresh_home_only(tmp_path: Path) -> None:
+    """The core invariant: a fresh home gets the onboarding bootstrap, but
+    once the agent deletes it (onboarding complete) a later ``setup`` must
+    NOT recreate it — otherwise onboarding would re-trigger forever."""
+    home = tmp_path / "agent"
+    status = setup_home(home)
+    block = home / "memory" / "core" / INIT_BLOCK_NAME
+
+    # Fresh home → seeded + reported in the status.
+    assert block.is_file()
+    assert f"memory/core/{INIT_BLOCK_NAME}" in status["files_created"]
+
+    # Simulate onboarding completing: the agent deletes the block.
+    block.unlink()
+
+    # Re-run setup on the now-established home (the other core blocks remain).
+    status2 = setup_home(home)
+    assert not block.exists(), "init block must not be recreated after deletion"
+    assert f"memory/core/{INIT_BLOCK_NAME}" not in status2["files_created"]

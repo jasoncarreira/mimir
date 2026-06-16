@@ -28,7 +28,9 @@ from ..memory_templates import (
     DEFAULT_NON_GOALS,
     DEFAULT_REFLECTION_POLICY,
     DEFAULT_VSM_TERMS,
+    INIT_BLOCK_NAME,
     seed_core_memory,
+    seed_init_block,
 )
 
 log = logging.getLogger(__name__)
@@ -707,6 +709,14 @@ def setup_home(
         )
     home.mkdir(parents=True, exist_ok=True)
 
+    # First-ever setup? Decide BEFORE the mkdir loop below creates
+    # ``memory/core``. A fresh home (no core blocks yet) gets the
+    # onboarding bootstrap (init block) seeded after the core templates;
+    # an established home never does — the onboarding skill deletes the
+    # block when it's done, and re-seeding it would re-trigger onboarding.
+    _core_dir = home / "memory" / "core"
+    fresh_home = not _core_dir.is_dir() or not any(_core_dir.glob("*.md"))
+
     created_dirs: list[str] = []
     for sub in (
         "logs",
@@ -810,6 +820,12 @@ def setup_home(
     for _cname, _cstatus in seed_core_memory(home).items():
         if _cstatus == "created":
             files_created.append(f"memory/core/{_cname}")
+    # Onboarding bootstrap — only on a brand-new home (see fresh_home
+    # above). Drives the agent to the onboarding skill on first contact;
+    # it deletes the block when onboarding completes, so it self-cleans
+    # and is never re-seeded on later runs.
+    if fresh_home and seed_init_block(home) == "created":
+        files_created.append(f"memory/core/{INIT_BLOCK_NAME}")
     if _write_if_missing(home / "state" / "wiki" / "AGENTS.md", DEFAULT_WIKI_AGENTS_MD):
         files_created.append("state/wiki/AGENTS.md")
     if _write_if_missing(home / "state" / "wiki" / "index.md", DEFAULT_WIKI_INDEX_MD):
