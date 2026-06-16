@@ -47,7 +47,7 @@ FROM python:3.11-slim AS base
 ENV NODE_VERSION=22
 ARG MIMIR_ENABLE_CLAUDE_CODE=0
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg git \
+        ca-certificates curl gnupg git tini \
         poppler-utils tesseract-ocr tesseract-ocr-eng \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
@@ -153,4 +153,5 @@ EXPOSE 8080
 #   /home/mimir/.cache  — fastembed model cache
 VOLUME ["/home/mimir/agent", "/home/mimir/.claude", "/home/mimir/.cache"]
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["mimir", "run", "--home", "/home/mimir/agent"]
