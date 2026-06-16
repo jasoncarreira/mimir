@@ -14,7 +14,8 @@ import pytest
 import yaml
 
 from mimir.identities import IdentityResolver
-from mimir.identities_populator import capture_dm_channel
+from mimir import identities_populator as _pop
+from mimir.identities_populator import capture_dm_channel, merge_into_yaml
 from mimir.bridges.bench import BenchBridge
 from mimir.tools.registry import (
     list_channels,
@@ -184,3 +185,39 @@ async def test_bridge_base_resolve_dm_channel_defaults_none(tmp_path: Path) -> N
     # BenchBridge inherits the base no-op default (no DM concept).
     bench = BenchBridge(home=tmp_path)
     assert await bench.resolve_dm_channel("U1") is None
+
+
+def test_both_identities_writers_share_one_lock() -> None:
+    # The capture writer and the scheduled populator must coordinate through
+    # the SAME lock, or they lost-update identities.yaml (mimir-carreira #710).
+    assert hasattr(_pop, "_IDENTITIES_WRITE_LOCK")
+    assert hasattr(capture_dm_channel, "__wrapped__")  # decorated = lock-serialized
+    assert hasattr(merge_into_yaml, "__wrapped__")
+
+
+def test_populator_merge_preserves_captured_dm_channels(tmp_path: Path) -> None:
+    """A scheduled populate must not erase a just-captured dm_channels entry,
+    and capture must not erase populator fields — the cross-writer coordination
+    plus dm_channels being preserved through merge_into_yaml's in-place fill."""
+    home = tmp_path / "agent"
+    (home / "state").mkdir(parents=True)
+
+    # First contact captures a DM channel (creates the person entry).
+    assert capture_dm_channel(home, "slack-U05ABC", "slack", "dm-slack-D1") is True
+
+    # The daily populator later runs, matching the same person by alias and
+    # adding a cross-platform alias + display_name.
+    merge_into_yaml(
+        home,
+        people=[{"aliases": ["slack-U05ABC", "discord-456"], "display_name": "Alice"}],
+        channels=[],
+    )
+
+    person = next(
+        p for p in _read(home)["people"] if "slack-U05ABC" in (p.get("aliases") or [])
+    )
+    # Populator additions landed...
+    assert "discord-456" in person["aliases"]
+    assert person["display_name"] == "Alice"
+    # ...and the captured DM channel survived (no lost update).
+    assert person["dm_channels"]["slack"] == "dm-slack-D1"

@@ -476,11 +476,12 @@ def build_app(config: Config) -> web.Application:
     # bridge, resolve their DM channel from that bridge and cache it in
     # identities.yaml so the agent can DM them by name later (and so it shows
     # up in the channel registry + identity context). Fire-and-forget via the
-    # dispatcher's per-event observer — never blocks or fails a turn. The lock
-    # serializes the read-modify-write so two simultaneous first-contacts can't
-    # clobber each other's captured DM channel.
-    _dm_capture_lock = asyncio.Lock()
-
+    # dispatcher's per-event observer — never blocks or fails a turn.
+    #
+    # Write coordination lives in the writer: ``capture_dm_channel`` shares
+    # ``_IDENTITIES_WRITE_LOCK`` with the scheduled populator (``merge_into_yaml``)
+    # so the read-modify-write of identities.yaml is atomic across both — no
+    # per-observer lock needed here.
     async def _capture_dm_channel(event: AgentEvent) -> None:
         try:
             author = (event.author or "").strip()
@@ -498,13 +499,11 @@ def build_app(config: Config) -> web.Application:
             if not dm_id:
                 return
             from .identities_populator import capture_dm_channel
-            async with _dm_capture_lock:
-                wrote = await asyncio.to_thread(
-                    capture_dm_channel, config.home, author, platform, dm_id
-                )
-                if wrote:
-                    await asyncio.to_thread(identity_resolver.reload)
+            wrote = await asyncio.to_thread(
+                capture_dm_channel, config.home, author, platform, dm_id
+            )
             if wrote:
+                await asyncio.to_thread(identity_resolver.reload)
                 await log_event(
                     "dm_channel_captured",
                     channel_id=event.channel_id,

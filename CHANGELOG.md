@@ -29,7 +29,6 @@ All notable changes will land here. Format loosely follows
   *conversation* id (Slack `D…`, Discord DM snowflake), never the user id;
   docs (SPEC §5.4/§7.1, skill-creator, alert skill, setup `.env`) corrected
   accordingly.
->>>>>>> 46db08c (feat: capture DM channels on first contact + a list_channels tool)
 
 ## [0.4.0] — 2026-06-16
 
