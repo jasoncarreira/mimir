@@ -758,7 +758,7 @@ Tools are deliberately minimal. Memory editing is *not* a tool — the agent use
 
 ### 7.1 Channel & messaging
 - `send_message(text: str, channel_id: str | None = None, attachment_paths: list[str] | None = None)` — emit to a channel. If `channel_id` is omitted, defaults to the current turn's channel. The `ChannelRegistry` (§7.2) dispatches on the channel_id prefix to the right bridge. Subject to the loop-detection circuit breaker (§7.2.4). Returns a status string: `send_message complete (sent={bool}, chunks={n}, message_id={id})`.
-- `react(emoji: str, message_id: str | None = None, channel_id: str | None = None)` — emit a reaction. Defaults to the most recent inbound message on the current channel. Bridges that don't support native reactions (Bluesky as of v1) log a no-op to `home/logs/reactions.jsonl`.
+- `react(emoji: str, message_id: str | None = None, channel_id: str | None = None)` — emit a reaction. Defaults to the most recent inbound message on the current channel. Discord and Slack react natively; web chat broadcasts a `react` event over its SSE stream; the bench bridge (stdout has no reaction concept) logs a no-op to `home/logs/reactions.jsonl`.
 
 ### 7.2 Channel layer — bridges and pollers
 
