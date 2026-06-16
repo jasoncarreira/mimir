@@ -840,3 +840,64 @@ async def test_drain_startup_treats_force_new_turn_as_boundary(tmp_path: Path):
     q.task_done()
     q.task_done()
     await asyncio.wait_for(q.join(), timeout=1.0)
+
+
+# ─── chainlink #510: bounded graceful drain ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_cancels_slow_inflight_turn(tmp_path: Path):
+    """A turn slower than the drain timeout is cancelled so shutdown stays
+    bounded (doesn't hang past the compose stop_grace_period)."""
+    cfg = _make_config(tmp_path)
+    started = asyncio.Event()
+    finished: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        started.set()
+        await asyncio.sleep(10)  # >> the drain timeout below
+        finished.append(event.content)
+
+    disp = Dispatcher(cfg, runner)
+    await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="slow"))
+    await asyncio.wait_for(started.wait(), timeout=2)  # ensure it's in-flight
+
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    await disp.drain(timeout=0.2)
+    elapsed = loop.time() - t0
+
+    assert elapsed < 5, elapsed          # bounded by the 0.2s timeout, not 10s
+    assert finished == []                # the slow turn was cancelled
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_lets_fast_turn_finish(tmp_path: Path):
+    """A turn that finishes within the drain timeout completes (not cut off)."""
+    cfg = _make_config(tmp_path)
+    done: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        await asyncio.sleep(0.05)
+        done.append(event.content)
+
+    disp = Dispatcher(cfg, runner)
+    await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="fast"))
+    await disp.drain(timeout=5)
+    assert done == ["fast"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_rejected_after_drain(tmp_path: Path):
+    """Once draining/closed, new inbound is rejected cleanly (enqueue → False)."""
+    cfg = _make_config(tmp_path)
+
+    async def runner(event: AgentEvent) -> None:
+        return None
+
+    disp = Dispatcher(cfg, runner)
+    await disp.drain(timeout=1)
+    accepted = await disp.enqueue(
+        AgentEvent(trigger="x", channel_id="c1", content="late")
+    )
+    assert accepted is False

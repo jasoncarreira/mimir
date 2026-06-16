@@ -537,6 +537,14 @@ class Config:
     # Generous enough for a legitimate commitment-extraction LLM call.
     post_turn_timeout_seconds: int
 
+    # chainlink #510: graceful-drain bound. On SIGTERM the dispatcher stops
+    # accepting new events and waits up to this many seconds for in-flight
+    # turns to finish before cancelling them and exiting — so a deploy restart
+    # finishes live turns instead of killing them, while staying deterministic
+    # (don't hang past the compose stop_grace_period, which Docker then SIGKILLs
+    # through). Keep stop_grace_period >= this. 0 = wait unbounded.
+    drain_timeout_seconds: int
+
     # Algedonic surfacing (v0.4 §2). Window for the Recent feedback
     # signals prompt section; per-polarity cap on rendered items. 0 for
     # the limit disables the section entirely. Tune small if the prompt
@@ -831,6 +839,7 @@ class Config:
             allow_unauthenticated=_env_bool("MIMIR_ALLOW_UNAUTHENTICATED", False),
             turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", 3600),
             post_turn_timeout_seconds=_env_int("MIMIR_POST_TURN_TIMEOUT_SECONDS", 180),
+            drain_timeout_seconds=_env_int("MIMIR_DRAIN_TIMEOUT_SECONDS", 30),
 
             feedback_window_hours=_env_int("MIMIR_FEEDBACK_WINDOW_HOURS", 24),
             feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),

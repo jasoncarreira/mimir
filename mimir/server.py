@@ -1307,7 +1307,10 @@ def build_app(config: Config) -> web.Application:
         # notice on next boot). chainlink #507.
         from .liveness import mark_clean_shutdown
         mark_clean_shutdown(config.home)
-        await dispatcher.drain()
+        # chainlink #510: bounded graceful drain — finish in-flight turns up to
+        # the configured timeout, then exit. Keeps a deploy SIGTERM from killing
+        # live turns while staying within the compose stop_grace_period.
+        await dispatcher.drain(timeout=config.drain_timeout_seconds)
         scheduler.stop()
         await sessions.shutdown()
         await indexer.stop()

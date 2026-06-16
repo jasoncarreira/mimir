@@ -8,6 +8,16 @@ All notable changes will land here. Format loosely follows
 
 ### Added
 
+- **Graceful-drain restart** (chainlink #510). On `SIGTERM`/`SIGINT` the
+  dispatcher stops accepting new events and waits up to
+  `MIMIR_DRAIN_TIMEOUT_SECONDS` (default 30) for in-flight turns to finish
+  before exiting — so a deploy restart lets live turns complete instead of
+  killing them, and deploys no longer need a manual idle-check. If the drain
+  overruns, the remaining turns are cancelled and a `dispatcher_drain_timeout`
+  event is logged (the exit stays deterministic). The scaffold `compose.yml`
+  now sets `stop_grace_period: 45s` (Docker's 10s default would SIGKILL through
+  the drain); systemd's `TimeoutStopSec` covers it by default. Runbook:
+  `docs/graceful-restart.md`.
 - **Optional `deliver:` channel on pollers + scheduled ticks** (chainlink #508).
   A poller (`pollers.json` / `pollers-overrides.yaml`) or scheduled tick
   (`scheduler.yaml`) can set an optional `deliver:` channel. It's injected into
