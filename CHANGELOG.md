@@ -6,7 +6,7 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
-## [0.4.0] — 2026-06-15
+## [0.4.0] — 2026-06-16
 
 Headline: **Worklink slices 2–3** (the autonomous worker rail grows a
 planner, pluggable compute backends, and an arbiter-gated ready-queue),
