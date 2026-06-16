@@ -120,10 +120,12 @@ def test_seed_init_block_creates_on_fresh_home(tmp_path: Path) -> None:
     body = block.read_text(encoding="utf-8")
     assert body == INIT_BLOCK_TEXT
     # First line is the desc comment INDEX.md scrapes; body routes to the
-    # onboarding skill and tells the agent to delete the block when done.
+    # onboarding skill and removes itself via the proposal flow (core memory
+    # is read-only mid-turn — not a direct delete).
     assert body.splitlines()[0].startswith("<!-- desc:")
     assert "onboarding" in body.lower()
-    assert "delete this" in body.lower()
+    assert "proposal" in body.lower()
+    assert INIT_BLOCK_NAME in body
 
 
 def test_seed_init_block_preserves_existing(tmp_path: Path) -> None:

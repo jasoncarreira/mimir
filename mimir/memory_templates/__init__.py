@@ -77,16 +77,16 @@ def seed_core_memory(home: Path) -> dict[str, str]:
 
 # Onboarding bootstrap. NOT a ``core/`` template on purpose: the regular
 # seed loop above is write-if-missing, which would recreate this block on
-# every ``setup`` re-run — but the onboarding skill DELETES it when
-# onboarding completes, and recreating it would re-trigger onboarding
-# forever. So it lives here as a constant and is seeded only on a
+# every ``setup`` re-run — but onboarding removes it (via the proposal that
+# establishes the persona blocks), and recreating it would re-trigger
+# onboarding forever. So it lives here as a constant and is seeded only on a
 # brand-new home (the caller gates on first-ever setup via
 # ``seed_init_block``). It loads as ``memory/core/01-init.md`` — right
 # after identity — so it's high in the every-turn system prompt.
 INIT_BLOCK_NAME = "01-init.md"
 
 INIT_BLOCK_TEXT = """\
-<!-- desc: first-run bootstrap for a brand-new agent — load the onboarding skill, then delete this block. -->
+<!-- desc: first-run bootstrap for a brand-new agent — load the onboarding skill; removed in the proposal that establishes your persona. -->
 # Init
 
 You're a new agent and haven't been onboarded yet.
@@ -96,9 +96,13 @@ real conversations with your human to learn who they are and how you should
 operate, and from those write your `persona`, `communication`, and schedule
 blocks under `memory/core/`.
 
-When you have a persona, a schedule, and you're doing useful work, **delete this
-file** (`memory/core/01-init.md`). It's a one-time bootstrap — once it's gone,
-onboarding won't keep re-triggering.
+`memory/core/` is read-only mid-turn — core changes go through the proposal
+flow (`open_proposal` → edit → `submit_proposal`, which the operator reviews
+and merges). When you've learned enough to establish those blocks, make the
+edits **and remove this init block in that same proposal** (delete
+`memory/core/01-init.md` inside the proposal worktree — don't `rm` it
+directly). One operator approval then lands your new blocks and clears this
+bootstrap together, and onboarding stops re-triggering.
 """
 
 

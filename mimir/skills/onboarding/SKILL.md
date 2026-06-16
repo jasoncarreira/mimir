@@ -36,16 +36,29 @@ about them.
 If you're reading this because you have an `init` block, that block is your bootstrap.
 It's the core-memory file **`memory/core/01-init.md`** — `mimir setup` seeds it on a
 brand-new home (or your operator hand-creates one), and like every core block it's
-loaded into your system prompt every turn, which is what pointed you here. When
-onboarding is complete, **delete that file** (`memory/core/01-init.md`) — removing it
-is what stops onboarding from re-triggering, and `setup` won't re-seed it.
+loaded into your system prompt every turn, which is what pointed you here.
+
+**How it gets removed (this matters — `memory/core/` is read-only mid-turn).** You can't
+just delete or edit core memory in a turn; core changes go through the proposal flow
+(`open_proposal` → edit in the proposal worktree → `submit_proposal`, which your operator
+reviews and merges). So you remove this init block **as part of the same proposal that
+establishes your persona / communication / schedule blocks** — write those blocks *and*
+delete `memory/core/01-init.md` in that one proposal. Your operator's single approval
+lands the new blocks and clears the bootstrap together, and onboarding stops
+re-triggering. Don't `rm` the file directly — that bypasses the guard.
 
 It's an ordinary markdown core block (a `<!-- desc: … -->` first line, then prose) —
-**not** a YAML `value:` block. The seeded text reads roughly:
+**not** a YAML `value:` block.
 
-> You're a new agent and haven't been onboarded yet. Load the **onboarding** skill and
-> follow it… When you have a persona, a schedule, and you're doing useful work, delete
-> this file (`memory/core/01-init.md`).
+### Tell your operator how approval works — early
+
+Your operator is probably new to this too. Before you reach the point of saving what
+you've learned, **explain the proposal/approval flow to them** so the first proposal
+isn't a surprise: memory changes (your persona, schedules, and this init removal) aren't
+applied directly — you open a proposal they review and approve/merge, and *then* it takes
+effect. A plain heads-up like *"as I learn about you I'll propose updates to my memory;
+you'll get a small change to approve — that's how I save what I've learned and finish
+setting up"* turns the approval from friction into an expected, legible step.
 
 ## How Onboarding Actually Works
 
@@ -147,9 +160,10 @@ Onboarding ends when you can operate independently. Practically:
 4. **Your human is giving you more rope.** They're delegating more, correcting less,
    trusting your judgment on smaller decisions.
 
-When this feels true, **delete the `init` block.** That's it. No formal graduation
-ceremony. The human doesn't need to declare you "ready" — if you're operating well,
-onboarding just... fades into regular operation.
+When this feels true, **remove the `init` block in the proposal that lands your persona
+blocks** (see "The Init Block" above — same proposal, one operator approval). That's it.
+No formal graduation ceremony. The human doesn't need to declare you "ready" — if you're
+operating well, onboarding just... fades into regular operation.
 
 **If you're unsure whether you're done:** you probably are. The init block is training
 wheels, not a permanent fixture.
