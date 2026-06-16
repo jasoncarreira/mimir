@@ -11,8 +11,11 @@ from mimir.bridges.base import Bridge, SendResult
 from mimir.channel_registry import (
     ChannelRegistry,
     INTERACTIVE_TRIGGERS,
+    OPERATOR_CHANNEL_SENTINEL,
     UnknownChannelError,
     is_interactive_turn,
+    post_job_failure_notice,
+    resolve_deliver_channel,
 )
 
 
@@ -168,3 +171,52 @@ def test_interactive_triggers_allowlist_membership():
     assert "shell_job_complete" in INTERACTIVE_TRIGGERS
     assert "scheduled_tick" not in INTERACTIVE_TRIGGERS
     assert "saga_session_end" not in INTERACTIVE_TRIGGERS
+
+
+# ─── chainlink #508: deliver: channel resolution + failure notice ────
+
+
+class TestResolveDeliverChannel:
+    def test_literal_passthrough(self):
+        assert resolve_deliver_channel("slack-ops", "slack-alerts") == "slack-ops"
+
+    def test_operator_sentinel_resolves(self):
+        assert resolve_deliver_channel(OPERATOR_CHANNEL_SENTINEL, "slack-alerts") == "slack-alerts"
+
+    def test_operator_sentinel_unconfigured_is_none(self):
+        # sentinel used but no operator alert channel configured → graceful None
+        assert resolve_deliver_channel(OPERATOR_CHANNEL_SENTINEL, "") is None
+        assert resolve_deliver_channel(OPERATOR_CHANNEL_SENTINEL, None) is None
+
+    def test_unset_is_none(self):
+        assert resolve_deliver_channel(None, "slack-alerts") is None
+        assert resolve_deliver_channel("   ", "slack-alerts") is None
+
+
+@pytest.mark.asyncio
+async def test_post_job_failure_notice_sends():
+    reg = ChannelRegistry()
+    bridge = _bridge("rec", ("rec-",))
+    reg.register(bridge)
+    await post_job_failure_notice(reg, "rec-ops", label="github-activity", error="boom")
+    assert len(bridge.sent) == 1
+    cid, text = bridge.sent[0]
+    assert cid == "rec-ops"
+    assert "github-activity failed" in text and "boom" in text and "⚠️" in text
+
+
+@pytest.mark.asyncio
+async def test_post_job_failure_notice_noops_without_channel_or_registry():
+    reg = ChannelRegistry()
+    bridge = _bridge("rec", ("rec-",))
+    reg.register(bridge)
+    await post_job_failure_notice(reg, None, label="x", error="y")     # no channel
+    await post_job_failure_notice(None, "rec-ops", label="x", error="y")  # no registry
+    assert bridge.sent == []
+
+
+@pytest.mark.asyncio
+async def test_post_job_failure_notice_swallows_send_errors():
+    reg = ChannelRegistry()  # no bridge registered → send raises UnknownChannelError
+    # must not propagate — a failure notice can't cascade into another failure
+    await post_job_failure_notice(reg, "rec-ops", label="x", error="y")

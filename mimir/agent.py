@@ -49,7 +49,12 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 
-from .channel_registry import ChannelRegistry, is_interactive_turn
+from .channel_registry import (
+    ChannelRegistry,
+    is_interactive_turn,
+    post_job_failure_notice,
+    resolve_deliver_channel,
+)
 from .config import Config
 from .event_logger import log_event, log_event_sync, safe_log_event
 from .feedback import FeedbackLog
@@ -1709,6 +1714,24 @@ class Agent:
                 ),
                 **_turn_outcome_identity(event),
             )
+            # chainlink #508: a poller/tick turn that declared a deliver:
+            # channel couldn't surface its own result — post the mechanical
+            # failure notice there on its behalf (the only auto-send in the
+            # deliver flow). Resolves the OPERATOR_CHANNEL sentinel; no-ops
+            # when no deliver channel is set (the common case).
+            _deliver = resolve_deliver_channel(
+                (event.extra or {}).get("deliver"),
+                getattr(self._config, "operator_alert_channel", ""),
+            )
+            if _deliver:
+                _job_label = (
+                    (event.extra or {}).get("schedule_name")
+                    or (event.extra or {}).get("poller_name")
+                    or event.trigger
+                )
+                await post_job_failure_notice(
+                    self._channels, _deliver, label=str(_job_label), error=error[:240],
+                )
         elif event.trigger == "poller":
             # Success counterpart to ``turn_failed`` for poller turns
             # (chainlink #262): records that this poller item's turn was
@@ -2737,6 +2760,12 @@ class Agent:
             self._config.home,
             event.channel_id or "",
         )
+        # chainlink #508: resolve an optional deliver: channel (poller / tick),
+        # mapping the OPERATOR_CHANNEL sentinel → the operator alert channel.
+        deliver_channel = resolve_deliver_channel(
+            (event.extra or {}).get("deliver"),
+            getattr(self._config, "operator_alert_channel", ""),
+        )
         turn_prompt = build_turn_prompt(
             event,
             recent_messages=recent,
@@ -2754,5 +2783,6 @@ class Agent:
             auto_skill_block=auto_skill_block,
             saga_session_id=ctx.saga_session_id,
             channel_memory_block=channel_memory_block,
+            deliver_channel=deliver_channel,
         )
         return turn_prompt, recent

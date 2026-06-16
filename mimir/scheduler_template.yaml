@@ -39,10 +39,21 @@
 #     cron: "0 9 * * 1-5"
 #     channel_id: web-default
 #     prompt_file: morning-checkin.md   # under <home>/prompts/
+#     deliver: OPERATOR_CHANNEL          # optional — see below
 #
 # Each job needs exactly one of ``cron`` (5-field) or ``time_of_day``
 # (HH:MM, daily UTC), and exactly one of ``prompt`` (inline) or
 # ``prompt_file`` (path under <home>/prompts/).
+#
+# Optional ``deliver:`` (chainlink #508) — a channel the agent should
+# deliver this tick's surfaced output to. It's injected into the turn as
+# an instruction: the agent JUDGES whether anything is worth sending and
+# uses ``send_message`` (not an auto-dump); if the turn hard-fails, the
+# framework posts a ``⚠️`` notice there. The literal ``OPERATOR_CHANNEL``
+# resolves to ``MIMIR_OPERATOR_ALERT_CHANNEL``. Distinct from
+# ``channel_id`` (where the tick fires / its queue) — ``deliver`` is only
+# where OUTPUT goes. Unset = today's silent behavior. (Pollers take the
+# same ``deliver:`` key in pollers.json / pollers-overrides.yaml.)
 
 - name: heartbeat
   cron: "0 * * * *"

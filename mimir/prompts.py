@@ -225,6 +225,7 @@ def build_turn_prompt(
     auto_skill_block: tuple[str, str] | None = None,
     saga_session_id: str | None = None,
     channel_memory_block: str | None = None,
+    deliver_channel: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, SAGA
     atom hits, subagent completion notifications (from prior turns), event
@@ -278,6 +279,24 @@ def build_turn_prompt(
     # return None from load_channel_memory and this section is suppressed.
     if channel_memory_block:
         _add_labeled("Channel context", channel_memory_block)
+
+    # chainlink #508: optional deliver channel for poller / scheduled-tick
+    # turns. Injected as an instruction so the agent JUDGES whether anything is
+    # worth surfacing and delivers it via send_message (reusing the real send
+    # path: confirmation, chunking, loop-detection) — NOT an auto-dump. The
+    # channel is already resolved by the caller (the OPERATOR_CHANNEL sentinel →
+    # the operator alert channel). On a non-interactive turn, send_message
+    # requires an explicit channel_id — which the instruction supplies.
+    if deliver_channel:
+        _job_kind = "poller" if event.trigger == "poller" else "scheduled tick"
+        _add_labeled(
+            "Delivery",
+            f"This {_job_kind} has a delivery channel: `{deliver_channel}`. "
+            f"If anything here is worth surfacing, deliver it by calling "
+            f'`send_message(channel_id="{deliver_channel}", text=…)`. '
+            f"If there's nothing worth sending, send nothing — don't post "
+            f"filler or empty status updates.",
+        )
 
     # Algedonic channel (v0.4 §2): self-feedback signals between identities
     # and recent activity, so the agent reads its own pain/pleasure data

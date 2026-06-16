@@ -55,6 +55,51 @@ def is_interactive_turn(
     return registry.find(channel_id) is not None
 
 
+# chainlink #508: optional ``deliver:`` channel for pollers + scheduled ticks.
+# The literal ``OPERATOR_CHANNEL`` resolves to the configured operator alert
+# channel (``MIMIR_OPERATOR_ALERT_CHANNEL``) so a job can target "wherever the
+# operator listens" without hard-coding the id.
+OPERATOR_CHANNEL_SENTINEL = "OPERATOR_CHANNEL"
+
+
+def resolve_deliver_channel(
+    raw: str | None, operator_alert_channel: str | None,
+) -> str | None:
+    """Resolve a poller/tick ``deliver:`` value to a concrete channel id.
+
+    ``OPERATOR_CHANNEL`` → the configured operator alert channel; any other
+    value is returned verbatim. Returns ``None`` when unset, or when the
+    sentinel is used but no operator alert channel is configured (graceful: the
+    delivery instruction / failure notice is simply suppressed)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw == OPERATOR_CHANNEL_SENTINEL:
+        return (operator_alert_channel or "").strip() or None
+    return raw
+
+
+async def post_job_failure_notice(
+    channels: "ChannelRegistry | None",
+    deliver_channel: str | None,
+    *,
+    label: str,
+    error: str,
+) -> None:
+    """Post the mechanical ``⚠️ <job> failed`` notice to a job's ``deliver:``
+    channel (chainlink #508). This is the ONLY auto-send in the deliver flow —
+    a turn that failed can't surface its own result, so the framework reports
+    the failure on the operator's behalf. Best-effort; never raises."""
+    if channels is None or not deliver_channel:
+        return
+    try:
+        await channels.send(
+            deliver_channel, f"⚠️ {label} failed: {error}", final=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — a failure notice must not cascade
+        log.debug("post_job_failure_notice send to %s failed: %s", deliver_channel, exc)
+
+
 class UnknownChannelError(LookupError):
     def __init__(self, channel_id: str) -> None:
         super().__init__(
