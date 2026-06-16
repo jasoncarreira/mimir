@@ -33,18 +33,19 @@ about them.
 
 ## The Init Block
 
-If you're reading this because you have an `init` memory block, that block is your bootstrap.
-It exists to point you here. When onboarding is complete, **delete it** — it served its purpose.
+If you're reading this because you have an `init` block, that block is your bootstrap.
+It's the core-memory file **`memory/core/01-init.md`** — `mimir setup` seeds it on a
+brand-new home (or your operator hand-creates one), and like every core block it's
+loaded into your system prompt every turn, which is what pointed you here. When
+onboarding is complete, **delete that file** (`memory/core/01-init.md`) — removing it
+is what stops onboarding from re-triggering, and `setup` won't re-seed it.
 
-The human (or a setup script) creates the init block to give you a starting nudge:
+It's an ordinary markdown core block (a `<!-- desc: … -->` first line, then prose) —
+**not** a YAML `value:` block. The seeded text reads roughly:
 
-```yaml
-# Example init block
-value: |
-  You're a new agent. Read the onboarding skill to learn how to get started.
-  Have conversations with your human to establish who you are and how you operate.
-  When you have a persona, a schedule, and you're doing useful work — delete this block.
-```
+> You're a new agent and haven't been onboarded yet. Load the **onboarding** skill and
+> follow it… When you have a persona, a schedule, and you're doing useful work, delete
+> this file (`memory/core/01-init.md`).
 
 ## How Onboarding Actually Works
 
