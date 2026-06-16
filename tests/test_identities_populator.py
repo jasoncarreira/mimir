@@ -76,7 +76,11 @@ def test_merge_into_fresh_yaml_creates_both_sections(tmp_path: Path):
     assert counts["people_updated"] == 0
     assert counts["channels_updated"] == 0
     doc = _read_doc(tmp_path)
-    assert any(p["canonical"] == "discord-1" for p in doc["people"])
+    person = next(p for p in doc["people"] if p["canonical"] == "discord-1")
+    assert "access" not in person
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    assert resolver.is_authorized("discord-1") is False
     assert any(c["canonical"] == "discord-1500" for c in doc["channels"])
 
 
@@ -142,6 +146,40 @@ def test_merge_preserves_operator_set_display_name(tmp_path: Path):
     jason = next(p for p in doc["people"] if p["canonical"] == "jason")
     assert jason["display_name"] == "jason"
     assert jason["notes"] == "Operator-set notes"
+
+
+def test_merge_preserves_operator_authored_access_metadata(tmp_path: Path):
+    _write(
+        tmp_path,
+        """\
+        people:
+          - canonical: jason
+            aliases: [discord-100000000000000001]
+            access:
+              roles: [user, admin]
+        """,
+    )
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[
+            {
+                "aliases": ["discord-100000000000000001", "slack-U999"],
+                "display_name": "Jason",
+            }
+        ],
+        channels=[],
+    )
+    assert counts["people_updated"] == 1
+    doc = _read_doc(tmp_path)
+    jason = next(p for p in doc["people"] if p["canonical"] == "jason")
+    assert jason["access"] == {"roles": ["user", "admin"]}
+    assert "slack-U999" in jason["aliases"]
+
+    r = IdentityResolver(home=tmp_path)
+    r.reload()
+    assert r.access_dict("discord-100000000000000001") == {"roles": ["user", "admin"]}
+    assert r.access_dict("slack-U999") == {"roles": ["user", "admin"]}
+    assert r.is_authorized("slack-U999") is True
 
 
 def test_merge_fills_blank_fields_only(tmp_path: Path):
@@ -288,6 +326,7 @@ def test_merge_synthesizes_canonical_from_first_alias(tmp_path: Path):
     p = doc["people"][0]
     assert p["canonical"] == "discord-12345"
     assert p["aliases"] == ["discord-12345"]
+    assert "access" not in p
 
 
 def test_merge_skips_malformed_inputs(tmp_path: Path):

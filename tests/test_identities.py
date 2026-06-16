@@ -7,7 +7,7 @@ from textwrap import dedent
 
 import pytest
 
-from mimir.identities import IdentityResolver
+from mimir.identities import AccessMetadata, IdentityResolver
 
 
 def _write_identities(tmp_path: Path, body: str) -> IdentityResolver:
@@ -67,6 +67,30 @@ def test_resolve_falls_through_unknown(tmp_path: Path):
     assert r.resolve("slack-UNOPE") == "slack-UNOPE"
     # None stays None.
     assert r.resolve(None) is None
+
+
+def test_identity_presence_without_roles_is_not_authorized(tmp_path: Path):
+    r = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: auto-slack-user
+            aliases: [slack-UAUTO]
+          - canonical: blank-roles
+            aliases: [slack-UBLANK]
+            access: {roles: []}
+          - canonical: allowed
+            aliases: [slack-UALLOWED]
+            access: {roles: [user]}
+        """,
+    )
+
+    assert r.resolve("slack-UAUTO") == "auto-slack-user"
+    assert r.access_dict("slack-UAUTO") == {"roles": []}
+    assert r.is_authorized("slack-UAUTO") is False
+    assert r.is_authorized("slack-UBLANK") is False
+    assert r.is_authorized("slack-UALLOWED") is True
+    assert r.is_admin("slack-UALLOWED") is False
 
 
 def test_cross_platform_canonical(tmp_path: Path):
@@ -270,6 +294,66 @@ def test_email_works_as_alias(tmp_path: Path):
     )
     assert r2.resolve("email:alice@work.example.com") == "alice"
     assert r2.resolve("email:alice@personal.example.com") == "alice"
+
+
+def test_access_metadata_is_loaded_per_canonical_and_shared_by_aliases(tmp_path: Path):
+    """Authorization metadata belongs to the canonical identity, not the
+    raw Slack/Discord id that happened to arrive on a bridge event."""
+    r = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: alice
+            aliases: [slack-U123, discord-456]
+            access:
+              roles: [user, admin]
+          - canonical: bob
+            aliases: [slack-U777]
+        """,
+    )
+    expected = AccessMetadata(roles=("user", "admin"))
+    assert r.access_metadata("slack-U123") == expected
+    assert r.access_metadata("discord-456") == expected
+    assert r.access_metadata("alice") == expected
+    assert r.access_dict("discord-456") == {"roles": ["user", "admin"]}
+    assert r.is_authorized("discord-456") is True
+    assert r.is_admin("discord-456") is True
+    assert r.access_metadata("slack-U777") == AccessMetadata()
+    assert r.is_authorized("slack-U777") is False
+    assert r.access_metadata("slack-UNKNOWN") == AccessMetadata()
+    assert r.is_authorized("slack-UNKNOWN") is False
+    assert r.access_metadata(None) == AccessMetadata()
+    assert r.is_authorized(None) is False
+
+
+def test_malformed_access_metadata_falls_back_without_breaking_identity_load(
+    tmp_path: Path,
+):
+    r = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: alice
+            aliases: [slack-U123]
+            access: admin
+          - canonical: bob
+            aliases: [discord-456]
+            access:
+              roles: [admin, owner, "", 42]
+              tier: root
+          - canonical: carol
+            aliases: [slack-U999]
+            access:
+              role: admin
+        """,
+    )
+    assert r.resolve("slack-U123") == "alice"
+    assert r.access_metadata("slack-U123") == AccessMetadata()
+    assert r.resolve("discord-456") == "bob"
+    assert r.access_metadata("discord-456") == AccessMetadata()
+    assert r.access_metadata("slack-U999") == AccessMetadata(roles=("admin",))
+    assert r.is_authorized("slack-U999") is True
+    assert r.is_admin("slack-U999") is True
 
 
 # ---------------------------------------------------------------------------
