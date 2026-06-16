@@ -309,6 +309,18 @@ def test_render_dockerfile_has_base_layer():
     assert "astral.sh/uv/install.sh" in out
 
 
+def test_render_dockerfile_uses_tini_as_init():
+    """Generated containers must run through tini so orphaned subprocesses
+    adopted by PID 1 are reaped instead of accumulating as zombies.
+    """
+    from mimir.scaffold_docker import render_dockerfile
+
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode)
+        assert "tini \\" in out, mode
+        assert 'ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]' in out, mode
+
+
 def test_render_dockerfile_gates_claude_code_cli_on_build_arg():
     """The Claude Code npm CLI should not ride along in every image.
 

@@ -276,6 +276,7 @@ FROM python:3.11-slim
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends \\
         git \\
+        tini \\
         curl \\
         ca-certificates \\
         build-essential \\
@@ -344,7 +345,7 @@ RUN chmod +x /usr/local/bin/start.sh
 
 USER mimir
 
-ENTRYPOINT ["/usr/local/bin/start.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]
 """
 
 
@@ -375,6 +376,7 @@ FROM python:3.11-slim
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends \\
         git \\
+        tini \\
         curl \\
         ca-certificates \\
         build-essential \\
@@ -471,7 +473,7 @@ COPY --chown=mimir:mimir start.sh /usr/local/bin/start.sh
 # Source file must be executable in the repo (committed +x); we
 # can't chmod after copying since USER mimir doesn't own /usr/local/bin.
 
-ENTRYPOINT ["/usr/local/bin/start.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]
 """
 
 
