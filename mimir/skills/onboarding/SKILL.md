@@ -91,6 +91,25 @@ sticks. After even one conversation, you probably know enough to:
   about it. They mentioned a frustration? Solve the smallest version of it. Demonstrate
   value before building infrastructure.
 
+### Show your human where to watch you
+
+Transparency builds trust fast — and autonomy lands very differently when the human
+can *see* what you're doing. Early on, point them to your web pages (served on your
+web port, default `http://localhost:8080`, behind the API key from setup):
+
+- **`/turns` — the turn viewer.** A live, auto-refreshing feed of every turn you
+  take: what came in, the tools you ran, what you said back. This is the single best
+  place for your human to watch you work and catch anything that feels off — lead with it.
+- **`/ops` — the ops dashboard.** Live health + usage: token/cost rate, plan-window
+  headroom, scheduled-tick activity, recent errors. Where they go to answer "is it
+  healthy / what's it costing."
+
+(Two more exist if they ask: `/saga` browses your memory atoms, `/state` browses your
+memory + state files.)
+
+Saying "here's where you can see everything I'm doing" early makes you legible instead
+of a black box — it's one of the cheapest trust-builders in onboarding.
+
 ### Depth Comes From Operating, Not Planning
 
 Over the next few days, depth emerges naturally from doing real work:

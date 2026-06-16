@@ -9,7 +9,7 @@ A memory-centric agent harness built on [deepagents](https://github.com/langchai
 mimir wraps an LLM agent loop with the surrounding apparatus a long-running
 agent needs to operate over time, across channels, and across sessions:
 persistent memory (the in-process `mimir.saga` backend), a tool-and-skill registry, scheduled
-ticks for autonomous work, message bridges (Discord / Slack / Bluesky / web /
+ticks for autonomous work, message bridges (Discord / Slack / web /
 benchmark stdout), and a feedback-loop / homeostat layer that keeps the
 agent regulated as it accumulates state.
 
@@ -29,10 +29,11 @@ The name is from Norse myth — Mímir, the keeper of memory and counsel.
 - **Scheduled work.** Cron-backed scheduler fires per-channel ticks
   (heartbeat, reflection, custom). The §12.4 homeostat suppresses
   ticks when the plan window saturates or cost-rate trips.
-- **Multi-channel bridges.** Discord, Slack, Bluesky, web chat,
+- **Multi-channel bridges.** Discord, Slack, web chat, and
   benchmark stdout. The agent has one identity across channels;
   `state/identities.yaml` resolves platform aliases to canonical
-  names.
+  names. (Social posting — e.g. Bluesky — is the `social-cli`
+  optional skill, not a bridge.)
 - **Reflection + double-loop learning.** Weekly reflection skill
   audits behavior + memory architecture, drafts proposals into
   `state/proposed-changes.md`, and (via the §12.2 applied-proposals
@@ -129,6 +130,27 @@ behavioral introspection report. All gated by the homeostat so a
 saturated plan window doesn't blow through your quota.
 
 See `.env.example` for every environment variable mimir reads.
+
+## Web UI
+
+Once running, mimir serves an operator web UI on `MIMIR_WEB_PORT` (default port
+`8080`). There's no root landing page — start at a page route such as
+`http://localhost:8080/turns`; the page prompts for `MIMIR_API_KEY` on first
+visit and remembers it:
+
+- **`/turns` — turn viewer.** A live, auto-refreshing feed of every turn: the
+  inbound trigger, the tools the agent ran, and what it said back. The first
+  place to watch the agent work or debug a turn.
+- **`/ops` — ops dashboard.** Live health + usage: token/cost rate, plan-window
+  headroom, scheduled-tick activity, recent errors, and pending `mimir-agent`
+  updates.
+- **`/saga` — memory viewer.** Browse saga's memory atoms.
+- **`/state` — file browser.** Browse `memory/` and `state/`.
+
+Each HTML page has a JSON twin (`/api/turns`, `/api/ops`, `/api/saga`,
+`/api/memory`) for scripting. The data/API routes are auth-gated by
+`MIMIR_API_KEY` (the HTML shells and `/health` are exempt so the JS can load
+and prompt for the key); expose the port publicly only with `MIMIR_API_KEY` set.
 
 ## Alternative providers (Minimax, Kimi, …)
 

@@ -13,8 +13,9 @@ hosts the WebUI bridge's ``/chat``. Routes:
   GET /saga             — saga DB operator viewer (HTML)
   GET /api/saga         — JSON twin of /saga; view= selects the payload
                           shape (recent, atom, stats)
-  GET /memory           — file-based memory browser (HTML, two-pane)
-  GET /api/memory       — JSON twin of /memory; view=tree returns nested
+  GET /state            — file-based memory browser (HTML, two-pane;
+                          renamed from /memory — surfaces memory/ + state/)
+  GET /api/memory       — JSON twin of /state; view=tree returns nested
                           dir/file tree (memory/ + state/); view=file&path=...
                           returns file content (only .md files);
                           view=search&q=... returns full-text search hits;
