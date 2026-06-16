@@ -500,6 +500,12 @@ class Config:
     # without removing state/identities.yaml.
     cross_platform_pull: bool
 
+    # Access-control policy enforcement. Defaults false for backwards
+    # compatibility: the central policy can classify allow/deny outcomes, but
+    # callers should only reject unknown/non-allowlisted authors when this is
+    # explicitly enabled.
+    access_control_enforced: bool
+
     # Operator alert channel (v0.4 §6) — channel_id the agent uses for
     # high-priority signals to the operator that don't fit the current
     # conversation (critical errors, urgent heartbeat findings, dispatch
@@ -842,6 +848,7 @@ class Config:
             ),
 
             cross_platform_pull=_env_bool("MIMIR_CROSS_PLATFORM_PULL", True),
+            access_control_enforced=_env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False),
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
             api_key=_env("MIMIR_API_KEY"),

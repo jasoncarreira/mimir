@@ -514,6 +514,18 @@ class IdentityResolver:
         ident = self._identities.get(canonical)
         return ident.access if ident else AccessMetadata()
 
+    def identity(self, author: str | None) -> Identity | None:
+        """Return ``author``'s canonical identity record, if known.
+
+        Unlike ``resolve()``, unknown ids do not fall through as synthetic
+        identities. This lets policy callers distinguish an allowlisted person,
+        a known-but-unprivileged person, and a completely unknown author.
+        """
+        if author is None:
+            return None
+        canonical = self._alias_map.get(author, author)
+        return self._identities.get(canonical)
+
     def access_dict(self, author: str | None) -> dict[str, object]:
         """Dict form of :meth:`access_metadata` for JSON/tool callers."""
         return self.access_metadata(author).as_dict()
