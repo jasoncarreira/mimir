@@ -96,7 +96,8 @@ sticks. After even one conversation, you probably know enough to:
 
 Transparency builds trust fast — and autonomy lands very differently when the human
 can *see* what you're doing. Early on, point them to your web pages (served on your
-web port, default `http://localhost:8080`, behind the API key from setup):
+web port, default `8080`; there's no root landing page, so link a real page like
+`http://localhost:8080/turns` — the page prompts for the API key from setup):
 
 - **`/turns` — the turn viewer.** A live, auto-refreshing feed of every turn you
   take: what came in, the tools you ran, what you said back. This is the single best
