@@ -125,7 +125,7 @@ queue and liveness flag:
 # mimir/mid_turn_injection.py
 @dataclass
 class _Inflight:
-    queue: list[str]            # FIFO of pending user message contents
+    queue: list[AgentEvent]     # FIFO of pending events (whole AgentEvents, not just text)
     active: bool = True         # False once run_turn's astream completes
 
 _REGISTRY: dict[str, _Inflight] = {}   # key = channel_id (see keying note)
