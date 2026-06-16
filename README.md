@@ -129,6 +129,15 @@ heartbeat, weekly reflection, weekly saga consolidation, weekly
 behavioral introspection report. All gated by the homeostat so a
 saturated plan window doesn't blow through your quota.
 
+**First contact — onboarding.** On a brand-new home, `mimir setup` seeds an
+`init` block into core memory that points the agent at its **onboarding**
+skill. So you don't configure the agent by hand — just start talking to it
+(message it on whatever bridge you've enabled), and it runs onboarding:
+conversational setup that writes its own persona, communication, and schedule
+blocks from what it learns. When onboarding is done the agent deletes the
+`init` block, and it's never re-seeded — so it won't re-trigger on later
+`setup` runs.
+
 See `.env.example` for every environment variable mimir reads.
 
 ## Web UI

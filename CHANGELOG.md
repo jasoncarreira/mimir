@@ -6,6 +6,16 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **`mimir setup` seeds an onboarding `init` block on a fresh home.** A
+  brand-new home now gets `memory/core/01-init.md` pointing the agent at its
+  onboarding skill, so onboarding reliably fires on first contact instead of
+  depending on the model noticing it has no persona blocks. First-run only:
+  the onboarding skill deletes the block when done and `setup` never re-seeds
+  it (so onboarding can't re-trigger). Documented in the README quickstart +
+  the non-Docker guide.
+
 ## [0.4.0] — 2026-06-16
 
 Headline: **Worklink slices 2–3** (the autonomous worker rail grows a
