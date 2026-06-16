@@ -6,6 +6,21 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **Liveness watchdog — out-of-process dead-man's-switch** (chainlink #507).
+  The agent writes a liveness beat to `state/liveness.json` every
+  `MIMIR_LIVENESS_BEAT_SECONDS` (default 60; an event-loop task, so it also
+  stops on a *wedge*), and a new `mimir watchdog` command — run as a compose
+  sidecar or host cron, i.e. *outside* the agent process — alerts out-of-band
+  when the beat goes stale. Closes the one gap that survives even with `ntfy`:
+  a hard failure (OOM/SIGKILL/hung loop/dead container) can't self-report.
+  Sinks are pluggable, not ntfy-locked: `NTFY_TOPIC` and/or a generic
+  `MIMIR_WATCHDOG_WEBHOOK_URL` (Slack-incoming-webhook / PagerDuty / custom
+  shape). Loop mode gates the first alarm on having seen the agent alive (no
+  cold-start false alarm) and pushes a recovery notice; `--once` is for cron.
+  Runbook: `docs/watchdog.md`.
+
 ## [0.4.1] — 2026-06-16
 
 ### Added

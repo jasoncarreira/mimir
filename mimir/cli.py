@@ -314,6 +314,33 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Overwrite --dest if it exists",
     )
 
+    # chainlink #507: out-of-process dead-man's-switch. Run as a compose
+    # sidecar or cron — it alerts (ntfy / webhook) when the agent's liveness
+    # beat goes stale, which the agent itself can't do once it's dead/wedged.
+    watchdog_p = sub.add_parser(
+        "watchdog",
+        help=(
+            "Out-of-process liveness watchdog: alert via ntfy / webhook when "
+            "the agent's liveness beat goes stale. Run as a sidecar or cron."
+        ),
+    )
+    watchdog_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (default: MIMIR_HOME or cwd).",
+    )
+    watchdog_p.add_argument(
+        "--interval", type=float, default=60.0,
+        help="Seconds between checks in loop mode (default 60).",
+    )
+    watchdog_p.add_argument(
+        "--stale-after", type=float, default=180.0,
+        help="Beat age (seconds) that counts as down (default 180).",
+    )
+    watchdog_p.add_argument(
+        "--once", action="store_true",
+        help="Check once and exit (for cron); exit code 1 if the agent is down.",
+    )
+
     # -----------------------------------------------------------------------
     # Dispatch
     # -----------------------------------------------------------------------
@@ -344,6 +371,22 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.command == "worklink":
         sys.exit(_worklink_cmd.dispatch(args, worklink_p))
+
+    if args.command == "watchdog":
+        import asyncio
+        from .liveness import run_watchdog
+        home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
+        down = asyncio.run(
+            run_watchdog(
+                Path(home_arg).resolve(),
+                interval=args.interval,
+                stale_after=args.stale_after,
+                once=args.once,
+            )
+        )
+        if args.once and down:
+            sys.exit(1)
+        return
 
     if args.command == "stats":
         from .config import Config as _Config

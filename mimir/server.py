@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import signal
+import time
 from pathlib import Path
 from typing import Any
 
@@ -1218,6 +1219,22 @@ def build_app(config: Config) -> web.Application:
             indexer.sweep(),
             name="mimir-startup-indexer-sweep",
         )
+
+        # Liveness beat (chainlink #507): periodically rewrite
+        # state/liveness.json so the out-of-process ``mimir watchdog`` can
+        # detect a dead/wedged agent. As an event-loop task it also stops on
+        # a wedge — the watchdog keys on the beat's *absence*, not on errors.
+        if config.liveness_beat_seconds > 0:
+            from .liveness import liveness_beat_loop
+            spawn_background(
+                _STARTUP_BACKGROUND_TASKS,
+                liveness_beat_loop(
+                    config.home,
+                    interval=config.liveness_beat_seconds,
+                    started_at=time.time(),
+                ),
+                name="mimir-liveness-beat",
+            )
 
     async def _on_cleanup(app: web.Application) -> None:
         await log_event("shutdown", reason="cleanup")

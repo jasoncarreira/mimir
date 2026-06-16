@@ -635,6 +635,13 @@ class Config:
     health_probe_cron: str
     health_probe_max_restarts_per_hour: int
 
+    # Liveness beat (chainlink #507): a background task rewrites
+    # ``state/liveness.json`` every ``liveness_beat_seconds`` so the
+    # out-of-process ``mimir watchdog`` dead-man's-switch can detect a
+    # dead/wedged agent and alert out-of-band (ntfy / webhook). 0 disables
+    # the beat. Default 60s (watchdog default stale threshold is 180s).
+    liveness_beat_seconds: int
+
     # Identities populator (mimir/identities_populator.py): scrapes
     # connected Discord guilds + Slack workspaces into
     # ``state/identities.yaml`` so the registry stays current without
@@ -886,6 +893,7 @@ class Config:
             health_probe_max_restarts_per_hour=_env_int(
                 "MIMIR_HEALTH_PROBE_MAX_RESTARTS_PER_HOUR", 3,
             ),
+            liveness_beat_seconds=_env_int("MIMIR_LIVENESS_BEAT_SECONDS", 60),
 
             identities_populate_cron=_env(
                 "MIMIR_IDENTITIES_POPULATE_CRON", "",
