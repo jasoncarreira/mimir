@@ -2312,16 +2312,23 @@ async def test_no_deliver_notice_when_unset_on_early_crash(
 
 
 class _FindSendChannels:
-    """channels stub with find (for is_interactive_turn) + send (recording)."""
+    """channels stub with find (for is_interactive_turn) + send (recording).
 
-    def __init__(self) -> None:
+    ``send`` returns a real ``SendResult`` (like ``ChannelRegistry.send``);
+    ``succeed=False`` simulates a bridge soft failure (``sent=False``, no raise).
+    """
+
+    def __init__(self, succeed: bool = True) -> None:
         self.sent: list[tuple[str, str]] = []
+        self._succeed = succeed
 
     def find(self, channel_id):  # every channel has a bridge
         return object()
 
     async def send(self, channel_id, text, attachment_paths=None, *, final=True):
+        from mimir.bridges.base import SendResult
         self.sent.append((channel_id, text))
+        return SendResult(sent=self._succeed, message_id="m", chunks=1)
 
 
 async def test_iteration_hard_stop_notifies_interactive_channel(tmp_path: Path):
@@ -2385,3 +2392,25 @@ async def test_iteration_hard_stop_no_channel_no_send(tmp_path: Path):
     await agent._notify_iteration_hard_stop(event, 200, ctx)
     assert ch.sent == []
     assert ctx.delivered_channel_ids == set()
+
+
+async def test_iteration_hard_stop_soft_send_failure_not_recorded(tmp_path: Path):
+    """PR #718 review #2: a bridge SOFT failure (SendResult(sent=False), no
+    raise) must NOT be recorded as delivered — else the no-reply guard is
+    falsely suppressed even though nothing reached the channel."""
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="x")]),
+        fake_saga=_FakeSaga(query_hits=[]),
+    )
+    ch = _FindSendChannels(succeed=False)  # bridge soft-fails
+    agent._channels = ch  # type: ignore[attr-defined]
+    event = AgentEvent(trigger="user_message", channel_id="discord-1", content="hi")
+    ctx = TurnContext(
+        turn_id="t", session_id="discord-1", trigger="user_message",
+        channel_id="discord-1", started_at=0.0,
+    )
+    await agent._notify_iteration_hard_stop(event, 200, ctx)
+    assert len(ch.sent) == 1                       # the send was attempted
+    assert ctx.delivered_channel_ids == set()      # but NOT recorded as delivered
+    assert ctx.send_message_count == 0

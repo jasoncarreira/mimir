@@ -1471,7 +1471,7 @@ class Agent:
         if not target or self._channels is None:
             return
         try:
-            await self._channels.send(
+            result = await self._channels.send(
                 target,
                 f"⚠️ I hit this turn's iteration limit ({budget} model steps) "
                 f"and stopped before finishing. Re-ask if you need me to "
@@ -1480,14 +1480,19 @@ class Agent:
         except Exception:  # noqa: BLE001 — never mask the turn outcome
             log.exception("iteration hard-stop channel notice failed")
             return
-        # Record the confirmed delivery so the forgot-to-send guard (#423)
-        # doesn't fire a false ``interactive_turn_no_send_message`` — this
-        # notice IS the turn's delivery to ``target``. (PR #718 review.)
-        try:
-            ctx.delivered_channel_ids.add(target)
-            ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
-        except Exception:  # noqa: BLE001 — bookkeeping must not break the turn
-            log.debug("hard-stop delivery bookkeeping failed", exc_info=True)
+        # Only record delivery on a CONFIRMED send. ChannelRegistry.send returns
+        # a SendResult; a bridge soft failure returns SendResult(sent=False)
+        # WITHOUT raising — recording that as delivered would suppress the
+        # forgot-to-send guard (#423) even though nothing reached the channel
+        # (the exact accounting bug this path is meant to avoid). Mirrors the
+        # send_message tool, which also gates reply accounting on result.sent.
+        # (PR #718 review.)
+        if getattr(result, "sent", False):
+            try:
+                ctx.delivered_channel_ids.add(target)
+                ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
+            except Exception:  # noqa: BLE001 — bookkeeping must not break the turn
+                log.debug("hard-stop delivery bookkeeping failed", exc_info=True)
 
     async def _run_turn_body(
         self,
