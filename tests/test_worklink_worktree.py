@@ -5,7 +5,13 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
-from mimir.worklink.worktree import cleanup_worktree, create_worktree, prune_attempt_worktrees, WorktreeLease
+from mimir.worklink.worktree import (
+    WorktreeLease,
+    cleanup_worktree,
+    create_isolated_checkout,
+    create_worktree,
+    prune_attempt_worktrees,
+)
 
 
 def completed(args: Sequence[str], returncode: int = 0) -> subprocess.CompletedProcess[str]:
@@ -117,3 +123,46 @@ def test_create_worktree_real_git_slash_named_remote_base(tmp_path: Path) -> Non
     # No stray local branch named after the base was created by DWIM.
     local_branches = _git(repo, "branch", "--format=%(refname:short)").split()
     assert "integration/worklink" not in local_branches
+
+
+def test_create_isolated_checkout_has_real_git_dir_and_preserves_origin(tmp_path: Path) -> None:
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@e.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("base\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+
+    lease = create_isolated_checkout(repo, issue_id=517, attempt=1, base="main")
+
+    assert lease.path == repo / ".worklink" / "517-1"
+    assert lease.branch == "issue/517-a1"
+    assert lease.base_ref == "main"
+    assert lease.isolated_checkout is True
+    assert (lease.path / ".git").is_dir()
+    assert _git(lease.path, "rev-parse", "--show-toplevel") == str(lease.path)
+    assert _git(lease.path, "branch", "--show-current") == "issue/517-a1"
+    assert _git(lease.path, "remote", "get-url", "origin") == str(origin)
+    assert _git(lease.path, "rev-parse", "HEAD") == lease.local_base
+
+
+def test_cleanup_removes_successful_isolated_checkout(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    attempt = repo / ".worklink" / "517-1"
+    attempt.mkdir(parents=True)
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args, returncode=1 if args[-2:] == ["-D", "issue/517-a1"] else 0)
+
+    lease = WorktreeLease(517, 1, repo, attempt, "issue/517-a1", "main", isolated_checkout=True)
+
+    assert cleanup_worktree(lease, outcome="completed", runner=runner) is True
+    assert not attempt.exists()
+    assert calls == [["git", "-C", str(repo), "branch", "-D", "issue/517-a1"]]

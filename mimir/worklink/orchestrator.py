@@ -9,7 +9,7 @@ PR only after the evidence gate passes, then clean up and release the lock.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -32,7 +32,7 @@ from .planning import (
     suggested_test_command,
     uses_strict_leaf_validation,
 )
-from .worktree import WorktreeLease, cleanup_worktree, create_worktree
+from .worktree import WorktreeLease, cleanup_worktree, create_isolated_checkout, create_worktree
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -238,13 +238,16 @@ class WorklinkRunner:
 
         lease: WorktreeLease | None = None
         try:
-            lease = create_worktree(
+            lease = _create_backend_checkout(
                 self.repo,
                 issue_id=issue.issue_id,
                 attempt=record.attempt,
                 base=base,
+                backend_name=selected_name,
+                compute_shared_filesystem=compute.capabilities().shared_filesystem,
                 runner=_list_runner(runner),
             )
+            root_dirty_before = _dirty_paths(self.repo, runner=runner)
             prompt = render_work_order(
                 issue,
                 template_path=template_path,
@@ -328,6 +331,15 @@ class WorklinkRunner:
                     blocked_reason=raw.blocked_reason,
                     runner=runner,
                 )
+                validation = _with_outside_worktree_detection(
+                    validation,
+                    issue=issue.issue_id,
+                    attempt=record.attempt,
+                    root=self.repo,
+                    worktree=lease.path,
+                    runner=runner,
+                    root_dirty_before=root_dirty_before,
+                )
                 evidence_path = _write_evidence(self.home, validation.evidence)
                 if validation.review_ready:
                     _commit_worktree_changes(lease.path, issue, runner=runner)
@@ -349,6 +361,15 @@ class WorklinkRunner:
                             transcript=str(raw.transcript_path) if raw.transcript_path else None,
                             blocked_reason=raw.blocked_reason,
                             runner=runner,
+                        )
+                        validation = _with_outside_worktree_detection(
+                            validation,
+                            issue=issue.issue_id,
+                            attempt=record.attempt,
+                            root=self.repo,
+                            worktree=lease.path,
+                            runner=runner,
+                            root_dirty_before=root_dirty_before,
                         )
                     evidence_path = _write_evidence(self.home, validation.evidence)
                 if validation.review_ready:
@@ -538,6 +559,97 @@ def _commit_worktree_changes(worktree: Path, issue: IssueContext, *, runner: Run
         raise WorklinkError((commit.stderr or commit.stdout).strip() or "git commit failed")
 
 
+def _create_backend_checkout(
+    repo: Path,
+    *,
+    issue_id: int,
+    attempt: int,
+    base: str,
+    backend_name: str,
+    compute_shared_filesystem: bool,
+    runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
+) -> WorktreeLease:
+    if backend_name == "codex" and compute_shared_filesystem:
+        return create_isolated_checkout(
+            repo, issue_id=issue_id, attempt=attempt, base=base, runner=runner
+        )
+    return create_worktree(repo, issue_id=issue_id, attempt=attempt, base=base, runner=runner)
+
+
+def _with_outside_worktree_detection(
+    validation: EvidenceValidation,
+    *,
+    issue: int,
+    attempt: int,
+    root: Path,
+    worktree: Path,
+    runner: Runner,
+    root_dirty_before: Sequence[str] = (),
+) -> EvidenceValidation:
+    # Local shared-filesystem backends are expected to write only under the
+    # attempt checkout. If the attempt diff is empty but the parent checkout is
+    # dirty, surface the containment failure explicitly instead of only reporting
+    # ``completed_empty_diff``. This is the exact fingerprint from Worklink #512.
+    if validation.evidence.files_changed:
+        return validation
+    root_paths = _new_dirty_paths(_dirty_paths(root, runner=runner), before=root_dirty_before)
+    if not root_paths:
+        return validation
+    escaped = _paths_escape_worktree(root_paths, root=root, worktree=worktree)
+    if not escaped:
+        return validation
+
+    _log_event(
+        "worklink_backend_wrote_outside_worktree",
+        issue_id=issue,
+        attempt=attempt,
+        root=str(root),
+        worktree=str(worktree),
+        files=escaped[:50],
+    )
+    return _failed_validation(
+        validation,
+        "backend_wrote_outside_worktree: " + ", ".join(escaped[:10]),
+    )
+
+
+def _dirty_paths(repo: Path, *, runner: Runner) -> list[str]:
+    status = runner(["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all"])
+    if status.returncode != 0:
+        return []
+    return _paths_from_status(status.stdout)
+
+
+def _new_dirty_paths(paths: Sequence[str], *, before: Sequence[str]) -> list[str]:
+    old = set(before)
+    return [path for path in paths if path not in old]
+
+
+def _paths_escape_worktree(paths: Sequence[str], *, root: Path, worktree: Path) -> list[str]:
+    root_resolved = root.resolve()
+    worktree_resolved = worktree.resolve()
+    escaped: list[str] = []
+    for path in paths:
+        absolute = (root_resolved / path).resolve()
+        if absolute == worktree_resolved or absolute.is_relative_to(worktree_resolved):
+            continue
+        escaped.append(path)
+    return escaped
+
+
+def _paths_from_status(output: str) -> list[str]:
+    paths: list[str] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:] if len(line) > 3 else ""
+        if " -> " in path:
+            path = path.rsplit(" -> ", 1)[1]
+        if path:
+            paths.append(path.strip())
+    return paths
+
+
 def _ensure_clean_worktree(worktree: Path, *, runner: Runner) -> None:
     status = runner([
         "git", "-C", str(worktree), "status", "--porcelain=v1", "--untracked-files=all"
@@ -611,15 +723,11 @@ def _repo_slug_from_url(url: str | None) -> str | None:
 
 
 def _with_pr_url(validation: EvidenceValidation, pr_url: str) -> EvidenceValidation:
-    from dataclasses import replace
-
     evidence = replace(validation.evidence, pr_url=pr_url)
     return replace(validation, evidence=evidence)
 
 
 def _failed_validation(validation: EvidenceValidation, reason: str) -> EvidenceValidation:
-    from dataclasses import replace
-
     evidence = replace(validation.evidence, status="failed")
     return replace(
         validation,
