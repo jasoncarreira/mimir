@@ -6,29 +6,35 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-06-16
+
 ### Added
 
-- **`mimir setup` seeds an onboarding `init` block on a fresh home.** A
-  brand-new home now gets `memory/core/01-init.md` pointing the agent at its
+- **`mimir setup` seeds an onboarding `init` block on a fresh home** (#708) —
+  a brand-new home gets `memory/core/01-init.md` pointing the agent at its
   onboarding skill, so onboarding reliably fires on first contact instead of
   depending on the model noticing it has no persona blocks. First-run only:
-  the onboarding skill removes the block (via the proposal that establishes
-  the persona) and `setup` never re-seeds it (so onboarding can't re-trigger).
-  Documented in the README quickstart + the non-Docker guide.
-- **First-contact DM-channel capture + a `list_channels` tool.** The first
-  time a user messages on a bridge, the framework resolves their DM channel
-  (`bridge.resolve_dm_channel` → Slack `conversations.open`, Discord
+  the onboarding skill removes it (via the proposal that establishes the
+  persona) and `setup` never re-seeds it.
+- **First-contact DM-channel capture + a `list_channels` tool** (#710) — the
+  first time a user messages on a bridge, the framework resolves their DM
+  channel (`bridge.resolve_dm_channel` → Slack `conversations.open`, Discord
   `create_dm`; opens the conversation, sends nothing) and caches it under
-  that person's new `dm_channels:` map in `state/identities.yaml` (fill-blank,
-  header-preserving, never overwriting operator-set values). Captured DMs
-  surface in the per-turn "Known identities" block and via a new read-only
-  **`list_channels(platform=None)`** tool (operator-curated channels +
-  per-person captured DMs + live bridge prefixes; optional bridge filter) —
-  so the agent can DM a person by their `dm-…` channel id without the
-  operator pre-configuring it. A DM channel id is the platform's
-  *conversation* id (Slack `D…`, Discord DM snowflake), never the user id;
-  docs (SPEC §5.4/§7.1, skill-creator, alert skill, setup `.env`) corrected
+  that person's `dm_channels:` map in `state/identities.yaml` (fill-blank,
+  header-preserving). Surfaced in the per-turn "Known identities" block and
+  via a new read-only `list_channels(platform=None)` tool, so the agent can
+  DM a person by their `dm-…` channel id without operator setup. A DM channel
+  id is the platform's *conversation* id, never the user id — docs corrected
   accordingly.
+
+### Fixed
+
+- **Containers run under `tini` (PID 1) to reap zombies** (#709) — the
+  non-reaping PID 1 let orphaned `git` (and codex/hermes/openclaw) children
+  accumulate as zombies. `tini` is added to the top-level Dockerfile + both
+  scaffold modes and wraps the ENTRYPOINT. (The hand-maintained mimirbot /
+  muninn operator Dockerfiles got the same change in their own repos, since
+  they don't inherit the scaffold.)
 
 ## [0.4.0] — 2026-06-16
 
