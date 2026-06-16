@@ -9,7 +9,7 @@ All notable changes will land here. Format loosely follows
 ### Added
 
 - **Liveness watchdog — out-of-process dead-man's-switch** (chainlink #507).
-  The agent writes a liveness beat to `state/liveness.json` every
+  The agent writes a liveness beat to `.mimir/liveness.json` every
   `MIMIR_LIVENESS_BEAT_SECONDS` (default 60; an event-loop task, so it also
   stops on a *wedge*), and a new `mimir watchdog` command — run as a compose
   sidecar or host cron, i.e. *outside* the agent process — alerts out-of-band
@@ -18,11 +18,13 @@ All notable changes will land here. Format loosely follows
   Sinks are pluggable, not ntfy-locked: `NTFY_TOPIC` and/or a generic
   `MIMIR_WATCHDOG_WEBHOOK_URL` (Slack-incoming-webhook / PagerDuty / custom
   shape). Loop mode gates the first alarm on having seen the agent alive (no
-  cold-start false alarm) and pushes a recovery notice; `--once` is for cron.
-  Runbook: `docs/watchdog.md`.
+  cold-start false alarm) and pushes a recovery notice. `--once` (cron) is
+  **exit-code-only** — it returns `1` when down and posts nothing, leaving
+  paging to the cron monitor (a fresh process per tick can't dedupe). Runbook:
+  `docs/watchdog.md`.
 - **Clean-shutdown marker → unclean-restart notice** (chainlink #507). A
   sidecar-free complement to the watchdog: the agent writes a `clean: false`
-  marker to `state/session.json` at startup and flips it to `clean: true` on a
+  marker to `.mimir/session.json` at startup and flips it to `clean: true` on a
   graceful (SIGTERM-initiated) shutdown. If the next boot still sees
   `clean: false`, the previous run was killed/crashed/OOM'd (or wedged then
   killed) — the agent logs a `liveness_unclean_restart` event and pushes an

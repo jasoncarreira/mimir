@@ -11,7 +11,7 @@ boundary:
 
 | Half | Where | What |
 |---|---|---|
-| **Beat** | in the agent | a background task rewrites `state/liveness.json` every `MIMIR_LIVENESS_BEAT_SECONDS` (default 60). As an event-loop task it stops if the loop dies *or wedges*. |
+| **Beat** | in the agent | a background task rewrites `.mimir/liveness.json` every `MIMIR_LIVENESS_BEAT_SECONDS` (default 60). As an event-loop task it stops if the loop dies *or wedges*. (`.mimir/` is the gitignored runtime path — the beat must not churn the tracked home.) |
 | **Watch** | a **separate** process (`mimir watchdog`) | reads the beat's age; when it goes stale, pushes an **out-of-band** alert. Survives the agent dying because it isn't the agent. |
 
 The beat file is the primary signal — the watcher just reads the (bind-mounted)
@@ -92,12 +92,19 @@ services:
 
 ### C. Host cron / launchd (outside docker entirely)
 
+`--once` is **exit-code-only** — it checks and exits `1` when down, `0` when up,
+and posts **nothing** itself. Each cron tick is a fresh process with no memory,
+so self-paging would re-page on every tick of one sustained outage; instead the
+**cron monitor pages** (it dedupes per outage). Wire the pager yourself:
+
 ```cron
-*/2 * * * * NTFY_TOPIC=jcarreira_mimirbot mimir watchdog --home /path/to/home --once --stale-after 180
+# pipe-to-pager: cron only mails/pages when the command exits non-zero
+*/2 * * * * mimir watchdog --home /path/to/home --once --stale-after 180 || /usr/local/bin/page-me "mimir down"
 ```
 
-`--once` exits non-zero when down, so it also composes with a monitoring cron
-that pages on a failing command.
+Or hand the exit status to a dead-man monitor (healthchecks.io etc.) that pages
+once when check-ins stop. The `NTFY_TOPIC` / `MIMIR_WATCHDOG_WEBHOOK_URL` sinks
+above are for the **loop-mode** watcher (A/B), which dedupes in memory.
 
 ### D. Hosted uptime monitor on `/health`
 
@@ -124,7 +131,7 @@ different failure domain:
 
 | Mechanism | Where | Catches | Misses |
 |---|---|---|---|
-| **Clean-shutdown marker** | in the agent (next boot) | crash / OOM / hard-restart that **came back** — the agent reports it restarted uncleanly (`state/session.json`, `liveness_unclean_restart` event + out-of-band notice). No sidecar. | a death it never recovers from |
+| **Clean-shutdown marker** | in the agent (next boot) | crash / OOM / hard-restart that **came back** — the agent reports it restarted uncleanly (`.mimir/session.json`, `liveness_unclean_restart` event + out-of-band notice). No sidecar. | a death it never recovers from |
 | **`mimir watchdog`** (this doc) | separate process | the agent **absent** — dead or wedged, even when it never comes back | the whole host being down (run it off-box for that) |
 | **Docker `HEALTHCHECK` → `/health`** | the container | a wedged loop (the poll times out → `unhealthy`) | **does not restart on its own** — `restart:` reacts only to *exit* |
 | **`OnFailure=` (systemd)** | the host supervisor | the unit entering `failed` (see `docs/systemd.md`) | the host itself being down |

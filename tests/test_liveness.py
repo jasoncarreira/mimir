@@ -33,6 +33,7 @@ async def _anoop(*_a, **_k):
 def _home(tmp_path: Path) -> Path:
     home = tmp_path / "agent"
     (home / "state").mkdir(parents=True)
+    (home / ".mimir").mkdir(parents=True)  # runtime path for the beat + session marker
     return home
 
 
@@ -85,7 +86,9 @@ async def test_once_fresh_no_alert(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_once_stale_alerts(tmp_path: Path) -> None:
+async def test_once_stale_is_exit_code_only(tmp_path: Path) -> None:
+    """--once is exit-code-only: down=True but it posts NOTHING (a fresh cron
+    process can't dedupe, so paging is the cron monitor's job). PR #712 review."""
     home = _home(tmp_path)
     write_beat(home, ts=time.time() - 9999)
     calls: list[dict] = []
@@ -95,14 +98,12 @@ async def test_once_stale_alerts(tmp_path: Path) -> None:
 
     down = await run_watchdog(home, once=True, stale_after=60, _post=fake_post)
     assert down is True
-    assert len(calls) == 1
-    assert "🔴" in calls[0]["title"]
-    assert calls[0]["dedupe_key"] == "agent-liveness-down"
+    assert calls == []  # no post — the monitor pages off the exit code
 
 
 @pytest.mark.asyncio
-async def test_once_missing_beat_alerts(tmp_path: Path) -> None:
-    home = _home(tmp_path)  # state/ exists but no beat file
+async def test_once_missing_beat_is_exit_code_only(tmp_path: Path) -> None:
+    home = _home(tmp_path)  # no beat file
     calls: list[dict] = []
 
     async def fake_post(**kw):
@@ -110,7 +111,24 @@ async def test_once_missing_beat_alerts(tmp_path: Path) -> None:
 
     down = await run_watchdog(home, once=True, stale_after=60, _post=fake_post)
     assert down is True
-    assert len(calls) == 1
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_once_repeated_calls_never_post(tmp_path: Path) -> None:
+    """The reproduction from the review: N consecutive --once calls against the
+    same stale beat must produce ZERO posts (was N posts)."""
+    home = _home(tmp_path)
+    write_beat(home, ts=time.time() - 9999)
+    calls: list[dict] = []
+
+    async def fake_post(**kw):
+        calls.append(kw)
+
+    for _ in range(3):
+        down = await run_watchdog(home, once=True, stale_after=60, _post=fake_post)
+        assert down is True
+    assert calls == []
 
 
 # ── watchdog: loop transitions ─────────────────────────────────────

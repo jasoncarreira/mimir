@@ -1283,7 +1283,7 @@ def build_app(config: Config) -> web.Application:
                 )
 
         # Liveness beat (chainlink #507): periodically rewrite
-        # state/liveness.json so the out-of-process ``mimir watchdog`` can
+        # .mimir/liveness.json so the out-of-process ``mimir watchdog`` can
         # detect a dead/wedged agent. As an event-loop task it also stops on
         # a wedge — the watchdog keys on the beat's *absence*, not on errors.
         if config.liveness_beat_seconds > 0:

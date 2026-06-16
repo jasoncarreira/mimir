@@ -8,7 +8,7 @@ process. Nothing notices the **absence** of the agent.
 Two halves, deliberately split across the process boundary:
 
 * **Beat (in-agent).** ``liveness_beat_loop`` runs as a normal background
-  asyncio task and atomically rewrites ``<home>/state/liveness.json`` every
+  asyncio task and atomically rewrites ``<home>/.mimir/liveness.json`` every
   ``MIMIR_LIVENESS_BEAT_SECONDS``. Because it's an event-loop task, the beat
   also stops if the loop *wedges* — not just on a clean exit — so a hung
   agent looks the same as a dead one to the watcher (which is what we want).
@@ -83,8 +83,13 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> bool:
         return False
 
 
+# Runtime liveness files live under ``.mimir/`` (alongside saga.db) — NOT under
+# ``state/``. The home's git template tracks ``state/**`` broadly, and the beat
+# rewrites every ``MIMIR_LIVENESS_BEAT_SECONDS`` (default 60s); tracking that
+# would churn the git-tracked home every minute. ``.mimir/`` is ignored by the
+# home gitignore allowlist, so these stay untracked. (PR #712 review fix.)
 def liveness_path(home: Path) -> Path:
-    return home / "state" / LIVENESS_FILENAME
+    return home / ".mimir" / LIVENESS_FILENAME
 
 
 def write_beat(
@@ -93,7 +98,7 @@ def write_beat(
     started_at: float | None = None,
     ts: float | None = None,
 ) -> None:
-    """Atomically rewrite ``<home>/state/liveness.json`` with the current
+    """Atomically rewrite ``<home>/.mimir/liveness.json`` with the current
     timestamp. Cheap (a few bytes); tmp-file + rename so the watcher never
     reads a torn file. ``ts`` is injectable for tests."""
     now = time.time() if ts is None else ts
@@ -227,7 +232,7 @@ def watchdog_has_sink() -> bool:
 
 
 def session_marker_path(home: Path) -> Path:
-    return home / "state" / SESSION_FILENAME
+    return home / ".mimir" / SESSION_FILENAME  # ignored runtime path; see liveness_path
 
 
 def read_session_marker(home: Path) -> dict[str, Any] | None:
@@ -422,8 +427,12 @@ async def run_watchdog(
     alarm *after* it has seen the agent alive at least once — so a watchdog
     started before the agent (or a cold home with no beat yet) doesn't
     false-alarm; it detects the alive→absent transition. On recovery it
-    pushes a back-up notice. ``--once`` (cron mode) skips the transition
-    gate and simply reports/alerts on the current state.
+    pushes a back-up notice. ``--once`` (cron mode) does NOT post — it only
+    returns the exit code (``down``); paging is the cron monitor's job (e.g.
+    ``mimir watchdog --once || your-pager``, or a healthchecks.io dead-man
+    timer). A fresh ``--once`` process every tick has no memory, so self-posting
+    would re-page on every tick of one sustained outage. It still performs the
+    ``--restart-on-stale`` action if requested.
 
     With ``restart_on_stale=True`` it also *acts*: once per outage it kills the
     agent (``_kill_agent``) so the supervisor (s6 / Docker ``restart:``)
@@ -437,7 +446,7 @@ async def run_watchdog(
     """
     post = _post or _default_alert
     sleep = _sleep or asyncio.sleep
-    if _post is None and not watchdog_has_sink():
+    if not once and _post is None and not watchdog_has_sink():
         log.warning(
             "mimir watchdog has no out-of-band sink configured — set NTFY_TOPIC "
             "and/or %s, or it can't alert anyone. Watching anyway.", _WEBHOOK_ENV,
@@ -465,7 +474,12 @@ async def run_watchdog(
                 )
                 alerted = False
         elif seen_alive or once:
-            if not alerted:
+            # --once is exit-code-only: it does NOT post (paging is the cron
+            # monitor's job — a fresh process every tick has no memory and would
+            # re-page on every tick of a sustained outage). Loop mode posts,
+            # deduped by the in-memory ``alerted`` flag. The restart action below
+            # is independent of posting and runs in both modes.
+            if not once and not alerted:
                 age_str = "no beat file" if age is None else f"{age:.0f}s stale"
                 await post(
                     category=_CATEGORY,
