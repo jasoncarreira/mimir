@@ -122,6 +122,12 @@ class SchedulerJob:
     cron: str | None = None
     time_of_day: str | None = None
     channel_id: str | None = None
+    # chainlink #508: optional channel the agent should deliver this tick's
+    # surfaced output to (via send_message — judged, not auto-dumped); on a hard
+    # turn failure the framework posts a ``⚠️`` notice there. ``OPERATOR_CHANNEL``
+    # resolves to the operator alert channel. Distinct from ``channel_id`` (which
+    # is where the tick FIRES / its queue); ``deliver`` is where OUTPUT goes.
+    deliver: str | None = None
     # Priority-banded suppression: how much resource pressure this
     # tick rides through before the arbiter sheds it (low | normal |
     # high). Heartbeat-style maintenance defaults to ``low`` — it
@@ -159,6 +165,8 @@ class SchedulerJob:
         # to keep yaml uncluttered.
         if not self.callable_name:
             out["channel_id"] = self.channel_id
+            if self.deliver:  # chainlink #508 — only emit when set
+                out["deliver"] = self.deliver
         # Only emit a non-default grace — keeps yaml uncluttered.
         if self.misfire_grace_time != 3600:
             out["misfire_grace_time"] = self.misfire_grace_time
@@ -175,6 +183,7 @@ class SchedulerJob:
         channel_id = raw.get("channel_id")
         if isinstance(channel_id, str) and not channel_id.strip():
             channel_id = None
+        deliver = str(raw.get("deliver", "")).strip() or None  # chainlink #508
         raw_priority = raw.get("priority")
         priority = "low"
         if raw_priority is not None:
@@ -245,6 +254,7 @@ class SchedulerJob:
             cron=cron,
             time_of_day=time_of_day,
             channel_id=channel_id,
+            deliver=deliver,
             priority=priority,
             misfire_grace_time=misfire_grace_time,
         )
@@ -766,6 +776,7 @@ class Scheduler:
                 "schedule_name": job.name,
                 "configured_channel_id": job.channel_id,
                 **({"prompt_file": job.prompt_file} if job.prompt_file else {}),
+                **({"deliver": job.deliver} if job.deliver else {}),  # chainlink #508
             },
         )
 

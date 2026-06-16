@@ -418,6 +418,14 @@ class PollerConfig:
     #: "manifest typo'd mid-edit", and the latter silently drops a
     #: working poller.
     manifest_path: Path | None = None
+    #: ``deliver`` (chainlink #508): optional channel id the agent should
+    #: deliver this poller's surfaced output to. Injected into the triggered
+    #: turn's context as an instruction (the agent judges + uses send_message —
+    #: NOT an auto-dump); on a hard turn failure the framework posts a ``⚠️``
+    #: notice there. The literal ``OPERATOR_CHANNEL`` resolves to the operator
+    #: alert channel. Unset → today's silent behavior. Does NOT change the
+    #: event's own ``channel_id`` (the poller keeps its per-poller queue).
+    deliver: str | None = None
 
     def channel_id(self) -> str:
         """Synthetic channel for emitted events. Mirrors the
@@ -440,7 +448,8 @@ class PollerConfig:
 #: the ``scheduler.yaml`` pattern for callable crons (operator config
 #: overrides shipped defaults at load time).
 POLLER_OVERRIDE_KEYS = frozenset(
-    {"cron", "priority", "batch_size", "recover_failed_turns", "env", "pass_env"}
+    {"cron", "priority", "batch_size", "recover_failed_turns", "env", "pass_env",
+     "deliver"}
 )
 
 #: Recognized string spellings for boolean overrides. YAML 1.1 already maps
@@ -603,6 +612,16 @@ def _apply_poller_overrides(
                 "be a list of strings; keeping manifest pass_env",
                 source, poller.name,
             )
+    if "deliver" in overrides:  # chainlink #508
+        dv = overrides["deliver"]
+        if dv is None or isinstance(dv, str):
+            updates["deliver"] = (dv.strip() or None) if isinstance(dv, str) else None
+        else:
+            log.warning(
+                "poller_overrides_invalid_deliver: %s — %s.deliver must be a "
+                "string (channel id or OPERATOR_CHANNEL) or null; keeping %r",
+                source, poller.name, poller.deliver,
+            )
     if not updates:
         return poller
     log.info(
@@ -732,6 +751,7 @@ def discover_pollers(
             name = str(entry.get("name", "")).strip()
             command = str(entry.get("command", "")).strip()
             cron = str(entry.get("cron", "")).strip()
+            deliver = str(entry.get("deliver", "")).strip() or None  # chainlink #508
             if not name or not command or not cron:
                 log.warning(
                     "poller_missing_fields: %s — entry %r",
@@ -902,6 +922,7 @@ def discover_pollers(
                     pass_env=tuple(pass_env_clean),
                     env_required=tuple(env_required_clean),
                     manifest_path=pollers_file,
+                    deliver=deliver,
                 ),
             )
 
@@ -1553,6 +1574,8 @@ async def run_poller(
             "batch_count": len(batches),
             "items": [item["extras"] for item in batch],
         }
+        if poller.deliver:  # chainlink #508 — raw value; resolved at turn time
+            extra["deliver"] = poller.deliver
         event = AgentEvent(
             trigger="poller",
             channel_id=poller.channel_id(),

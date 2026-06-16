@@ -3280,3 +3280,21 @@ def test_overrides_recover_failed_turns_invalid_keeps_manifest(tmp_path: Path, c
     assert p.recover_failed_turns is True
     assert any("poller_overrides_invalid_recover_failed_turns" in r.getMessage()
                for r in caplog.records)
+
+
+# ─── chainlink #508: deliver: channel ────────────────────────────────
+
+
+def test_discover_parses_deliver_field(tmp_path: Path):
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "p", [
+        {"name": "p1", "command": "python3 a.py", "cron": "*/5 * * * *",
+         "deliver": "OPERATOR_CHANNEL"},
+        {"name": "p2", "command": "python3 b.py", "cron": "*/5 * * * *"},  # unset
+        {"name": "p3", "command": "python3 c.py", "cron": "*/5 * * * *",
+         "deliver": "slack-ops"},
+    ])
+    by_name = {p.name: p for p in discover_pollers(skills)}
+    assert by_name["p1"].deliver == "OPERATOR_CHANNEL"
+    assert by_name["p2"].deliver is None
+    assert by_name["p3"].deliver == "slack-ops"

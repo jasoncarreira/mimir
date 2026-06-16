@@ -3282,3 +3282,20 @@ async def test_quota_recheck_early_clear_disarms_recovery_wake(tmp_path: Path):
     assert len(enqueued) == 1
     assert sched._scheduler.get_job(_QUOTA_RECOVERY_JOB_ID) is None
     assert sched._scheduler.get_job(_QUOTA_RECHECK_JOB_ID) is None
+
+
+# ─── chainlink #508: deliver: channel ────────────────────────────────
+
+
+def test_scheduler_job_deliver_roundtrip():
+    job = SchedulerJob.from_yaml_entry(
+        {"name": "t", "prompt": "x", "cron": "0 * * * *", "deliver": "OPERATOR_CHANNEL"}
+    )
+    assert job.deliver == "OPERATOR_CHANNEL"
+    assert job.to_yaml_entry()["deliver"] == "OPERATOR_CHANNEL"
+
+
+def test_scheduler_job_deliver_unset_not_emitted():
+    job = SchedulerJob.from_yaml_entry({"name": "t2", "prompt": "x", "cron": "0 * * * *"})
+    assert job.deliver is None
+    assert "deliver" not in job.to_yaml_entry()

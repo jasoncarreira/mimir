@@ -621,3 +621,26 @@ def test_turn_prompt_auto_skill_block_no_frontmatter(tmp_path):
     skill_section = prompt[skill_section_start:]
     assert "name: social-cli" not in skill_section
     assert "description:" not in skill_section
+
+
+# ─── chainlink #508: deliver: channel instruction ───────────────────
+
+
+def test_build_turn_prompt_renders_deliver_section():
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(trigger="poller", channel_id="poller:gmail", content="3 new threads")
+    prompt = build_turn_prompt(event, deliver_channel="slack-ops")
+    assert "## Delivery" in prompt
+    assert "slack-ops" in prompt
+    assert "send_message" in prompt
+    assert "poller" in prompt  # trigger-aware wording
+
+
+def test_build_turn_prompt_no_deliver_section_when_unset():
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(trigger="poller", channel_id="poller:gmail", content="x")
+    assert "## Delivery" not in build_turn_prompt(event)

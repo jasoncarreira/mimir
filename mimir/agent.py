@@ -49,7 +49,12 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 
-from .channel_registry import ChannelRegistry, is_interactive_turn
+from .channel_registry import (
+    ChannelRegistry,
+    is_interactive_turn,
+    post_job_failure_notice,
+    resolve_deliver_channel,
+)
 from .config import Config
 from .event_logger import log_event, log_event_sync, safe_log_event
 from .feedback import FeedbackLog
@@ -1372,6 +1377,19 @@ class Agent:
                     )
                 except Exception:  # noqa: BLE001 — never mask the original
                     log.exception("early-phase turn_failed emit failed")
+            # chainlink #508: an early-phase crash (prompt build, agent
+            # construction, model resolution) is exactly "the agent couldn't
+            # report" — mirror the deliver: failure notice here so a poller OR
+            # scheduled-tick job with deliver: set isn't silently lost before
+            # the model loop. Gated on outcome_emitted so it never double-posts
+            # with the in-body path (which sets that flag after the loop).
+            if not getattr(ctx, "outcome_emitted", False):
+                try:
+                    await self._post_deliver_failure(
+                        event, f"{type(exc).__name__}: {exc}",
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original
+                    log.exception("early-phase deliver notice failed")
             raise
         finally:
             if injection_registered:
@@ -1400,6 +1418,29 @@ class Agent:
                 _reset_interactive(interactive_token)
             if cid_token is not None:
                 _reset_cid(cid_token)
+
+    async def _post_deliver_failure(self, event: AgentEvent, error: str) -> None:
+        """chainlink #508: best-effort ``⚠️ <job> failed`` notice to a poller/
+        tick's ``deliver:`` channel. No-ops when no deliver channel is set (the
+        common case) or it resolves to nothing. Called from BOTH terminal-
+        failure paths — the in-body ``if error:`` (model-loop failures) and the
+        outer early-failure guard (crashes before the model loop) — which are
+        disjoint via ``ctx.outcome_emitted``, so a failure notifies exactly
+        once. Never raises."""
+        deliver = resolve_deliver_channel(
+            (event.extra or {}).get("deliver"),
+            getattr(self._config, "operator_alert_channel", ""),
+        )
+        if not deliver:
+            return
+        label = (
+            (event.extra or {}).get("schedule_name")
+            or (event.extra or {}).get("poller_name")
+            or event.trigger
+        )
+        await post_job_failure_notice(
+            self._channels, deliver, label=str(label), error=error[:240],
+        )
 
     async def _run_turn_body(
         self,
@@ -1709,6 +1750,11 @@ class Agent:
                 ),
                 **_turn_outcome_identity(event),
             )
+            # chainlink #508: a poller/tick turn that declared a deliver:
+            # channel couldn't surface its own result — post the mechanical
+            # failure notice there. (Mirrored in the outer early-failure guard
+            # for crashes before the model loop; disjoint via outcome_emitted.)
+            await self._post_deliver_failure(event, error)
         elif event.trigger == "poller":
             # Success counterpart to ``turn_failed`` for poller turns
             # (chainlink #262): records that this poller item's turn was
@@ -2737,6 +2783,12 @@ class Agent:
             self._config.home,
             event.channel_id or "",
         )
+        # chainlink #508: resolve an optional deliver: channel (poller / tick),
+        # mapping the OPERATOR_CHANNEL sentinel → the operator alert channel.
+        deliver_channel = resolve_deliver_channel(
+            (event.extra or {}).get("deliver"),
+            getattr(self._config, "operator_alert_channel", ""),
+        )
         turn_prompt = build_turn_prompt(
             event,
             recent_messages=recent,
@@ -2754,5 +2806,6 @@ class Agent:
             auto_skill_block=auto_skill_block,
             saga_session_id=ctx.saga_session_id,
             channel_memory_block=channel_memory_block,
+            deliver_channel=deliver_channel,
         )
         return turn_prompt, recent

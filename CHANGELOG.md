@@ -8,6 +8,18 @@ All notable changes will land here. Format loosely follows
 
 ### Added
 
+- **Optional `deliver:` channel on pollers + scheduled ticks** (chainlink #508).
+  A poller (`pollers.json` / `pollers-overrides.yaml`) or scheduled tick
+  (`scheduler.yaml`) can set an optional `deliver:` channel. It's injected into
+  the triggered turn as an instruction — the agent **judges** whether anything
+  is worth surfacing and delivers it via `send_message` (reusing the real send
+  path; not an auto-dump). On a hard turn failure (the agent couldn't report),
+  the framework posts a `⚠️ <job> failed: <error>` notice there — the only
+  mechanical send. The literal **`OPERATOR_CHANNEL`** resolves to
+  `MIMIR_OPERATOR_ALERT_CHANNEL`. `deliver` is distinct from the event's own
+  `channel_id` (its queue) — it only routes OUTPUT. Unset = today's silent
+  behavior; the no-reply guard is unaffected (the instruction supplies the
+  explicit channel a non-interactive turn needs).
 - **Liveness watchdog — out-of-process dead-man's-switch** (chainlink #507).
   The agent writes a liveness beat to `.mimir/liveness.json` every
   `MIMIR_LIVENESS_BEAT_SECONDS` (default 60; an event-loop task, so it also

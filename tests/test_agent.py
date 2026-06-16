@@ -2231,3 +2231,78 @@ def test_reflection_lm_honors_scaffold_opt_in(tmp_path, monkeypatch):
         pytest.fail(f"deprecation gate fired despite scaffolded opt-in: {exc}")
     except ImportError:
         pass  # langchain-claude-code fork not installed — past the gate
+
+
+# ─── chainlink #508: deliver: failure notice on EARLY-phase crash ────
+
+
+class _RecordingChannels:
+    """Minimal channels stub — only ``send`` (what post_job_failure_notice
+    needs). Safe for poller turns: is_interactive_turn short-circuits on the
+    non-interactive trigger before any ``.find`` call."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str]] = []
+
+    async def send(self, channel_id, text, attachment_paths=None, *, final=True):
+        self.sent.append((channel_id, text))
+
+
+async def test_deliver_failure_notice_fires_on_early_phase_crash(
+    tmp_path: Path, monkeypatch,
+):
+    """PR #713 review blocker: a failure BEFORE the model loop (prompt build,
+    agent construction, model resolution) must still post the deliver: notice
+    via the outer terminal-failure guard — exactly the 'agent couldn't report'
+    case. And it must fire exactly ONCE (no double-post with the in-body path)."""
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="x")]),
+        fake_saga=_FakeSaga(query_hits=[]),
+    )
+    chans = _RecordingChannels()
+    agent._channels = chans  # type: ignore[attr-defined]
+
+    # Force a pre-model-loop crash (build_turn_prompt is reached before the
+    # model loop sets ctx.outcome_emitted).
+    import mimir.agent as agent_mod
+
+    def _boom(*a, **k):
+        raise RuntimeError("early boom")
+
+    monkeypatch.setattr(agent_mod, "build_turn_prompt", _boom)
+
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:px",
+        content="stuff",
+        extra={"deliver": "rec-ops", "poller_name": "px"},
+    )
+    with pytest.raises(RuntimeError):
+        await agent.run_turn(event)
+
+    notices = [(c, t) for c, t in chans.sent if c == "rec-ops"]
+    assert len(notices) == 1, chans.sent  # exactly once, no double-post
+    assert "px failed" in notices[0][1] and "⚠️" in notices[0][1]
+
+
+async def test_no_deliver_notice_when_unset_on_early_crash(
+    tmp_path: Path, monkeypatch,
+):
+    """No deliver: set → no notice even on an early crash (the common case)."""
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="x")]),
+        fake_saga=_FakeSaga(query_hits=[]),
+    )
+    chans = _RecordingChannels()
+    agent._channels = chans  # type: ignore[attr-defined]
+    import mimir.agent as agent_mod
+    monkeypatch.setattr(
+        agent_mod, "build_turn_prompt",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    event = AgentEvent(trigger="poller", channel_id="poller:px", content="x")
+    with pytest.raises(RuntimeError):
+        await agent.run_turn(event)
+    assert chans.sent == []
