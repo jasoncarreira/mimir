@@ -118,7 +118,7 @@ If your skill calls `send_message`, be deliberate about `channel_id` — getting
   - `slack-<channel_id>` / `dm-slack-<user_id>`
   - `web-<conv_id>`, `bench-<task_id>`
 
-  A bare platform id (e.g. a raw Discord channel number like `123456789012345678`) has **no registered bridge** and raises `UnknownChannelError` (`mimir/channel_registry.py`). The canonical prefix scheme is SPEC §7.2.3.
+  Concrete: a Discord channel whose raw id is `123456789012345678` is addressed as **`discord-123456789012345678`** (a DM to Slack user `U05ABC` as `dm-slack-U05ABC`). Passing the **bare** number `123456789012345678` has **no registered bridge** and raises `UnknownChannelError` (`mimir/channel_registry.py`). The canonical prefix scheme is SPEC §7.2.3.
 - **Never hardcode a channel id in the SKILL.md.** Channel ids are deployment-specific — a literal baked into the skill body will work in your head and fail on someone else's deployment. Source them from runtime instead:
   - The operator alert channel is named in the system prompt's *Operator config* section (`MIMIR_OPERATOR_ALERT_CHANNEL`). The `alert` builtin skill is the reference example.
   - Other targets come from the current turn (omit `channel_id`), the identities registry, or operator-set skill config — not a literal in the body.
