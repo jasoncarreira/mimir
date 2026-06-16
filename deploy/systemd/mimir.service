@@ -40,6 +40,10 @@ ExecStart=/usr/local/bin/mimir run --home /home/mimir/agent
 # stays stopped. RestartSec throttles a crash-loop.
 Restart=on-failure
 RestartSec=5
+# chainlink #510: graceful-drain kill grace — keep >= MIMIR_DRAIN_TIMEOUT_SECONDS
+# (default 30s) so `systemctl stop`/restart lets in-flight turns drain before
+# SIGKILL. systemd's default (90s) already covers it; only lower it in step.
+TimeoutStopSec=90
 # Cap the crash-loop: >5 failures in 60s → give up (and leave the unit in
 # `failed`, which fires OnFailure= one last time) instead of spinning forever.
 StartLimitIntervalSec=60

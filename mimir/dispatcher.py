@@ -435,17 +435,45 @@ class Dispatcher:
             await log_event("worker_cancelled", channel_id=channel_id)
             raise
 
-    async def drain(self) -> None:
-        """Wait for in-flight turns to finish. Stop accepting new events."""
+    async def drain(self, *, timeout: float | None = None) -> None:
+        """Stop accepting new events and wait for in-flight turns to finish.
+
+        ``timeout`` (seconds) bounds the wait (chainlink #510): a deploy SIGTERM
+        finishes live turns instead of killing them, but a slow/wedged turn must
+        not hang the shutdown past the compose ``stop_grace_period`` (after which
+        Docker SIGKILLs straight through the drain). On timeout we log how many
+        turns were still running and cancel them so the exit stays deterministic.
+        ``None`` / ``0`` = wait unbounded (the prior behavior; used by tests)."""
         self._closed = True
         if not self._workers:
             return
-        await log_event("dispatcher_draining", workers=len(self._workers))
-        # Wait for queues to drain naturally.
-        await asyncio.gather(
+        await log_event(
+            "dispatcher_draining", workers=len(self._workers), timeout=timeout,
+        )
+        # Wait for queues to drain naturally — bounded by ``timeout`` if given.
+        join_all = asyncio.gather(
             *(q.join() for q in self._queues.values()), return_exceptions=True
         )
-        # Cancel any worker still parked on queue.get().
+        if timeout and timeout > 0:
+            try:
+                await asyncio.wait_for(join_all, timeout=timeout)
+            except asyncio.TimeoutError:
+                await log_event(
+                    "dispatcher_drain_timeout",
+                    timeout=timeout,
+                    still_in_flight=len(self._in_flight),
+                    queued=sum(q.qsize() for q in self._queues.values()),
+                )
+                log.warning(
+                    "drain timed out after %ss — cancelling %d in-flight turn(s) "
+                    "+ %d queued event(s) to exit deterministically",
+                    timeout, len(self._in_flight),
+                    sum(q.qsize() for q in self._queues.values()),
+                )
+        else:
+            await join_all
+        # Cancel any worker still parked on queue.get() (or mid-turn after the
+        # drain timeout above).
         for task in self._workers.values():
             if not task.done():
                 task.cancel()

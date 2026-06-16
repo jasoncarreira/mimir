@@ -590,6 +590,11 @@ services:
     build: .
     container_name: {SERVICE_NAME}
     restart: unless-stopped
+    # chainlink #510: give the graceful drain time to finish in-flight turns
+    # on stop/restart before Docker SIGKILLs. Keep this >= MIMIR_DRAIN_TIMEOUT_SECONDS
+    # (default 30s); Docker's default grace is only 10s, which would cut the
+    # drain off mid-turn.
+    stop_grace_period: 45s
     env_file:
       - compose.env
     environment:
@@ -645,6 +650,11 @@ services:
     build: .
     container_name: {SERVICE_NAME}
     restart: unless-stopped
+    # chainlink #510: give the graceful drain time to finish in-flight turns
+    # on stop/restart before Docker SIGKILLs. Keep this >= MIMIR_DRAIN_TIMEOUT_SECONDS
+    # (default 30s); Docker's default grace is only 10s, which would cut the
+    # drain off mid-turn.
+    stop_grace_period: 45s
     env_file:
       - compose.env
     environment:
