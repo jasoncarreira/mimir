@@ -1,0 +1,58 @@
+# mimir agent — systemd unit (non-Docker host / local deployment).
+#
+# This is the host-service equivalent of the Docker `restart: unless-stopped`
+# policy: systemd keeps the agent running and, via OnFailure= below, pages an
+# operator when it enters the failed state — WITHOUT a watchdog sidecar.
+#
+# Install (system-wide):
+#   sudo cp deploy/systemd/mimir.service        /etc/systemd/system/
+#   sudo cp deploy/systemd/mimir-alert@.service /etc/systemd/system/
+#   # edit User=, MIMIR_HOME, ExecStart path, EnvironmentFile below to match
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mimir
+#
+# User-level (no root; runs as your login user — see docs/systemd.md):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/*.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now mimir
+#
+# See docs/systemd.md for the full runbook (and the macOS / launchd note —
+# systemd is Linux-only).
+
+[Unit]
+Description=mimir agent
+Documentation=https://github.com/jasoncarreira/mimir
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as a dedicated non-root user that owns MIMIR_HOME. (Drop User= for a
+# `--user` unit.)
+User=mimir
+Environment=MIMIR_HOME=/home/mimir/agent
+# Secrets + config: same vars you'd put in compose.env (ANTHROPIC_API_KEY,
+# NTFY_TOPIC, MIMIR_WATCHDOG_WEBHOOK_URL, MIMIR_*). Leading `-` = optional.
+EnvironmentFile=-/home/mimir/agent/.env
+ExecStart=/usr/local/bin/mimir run --home /home/mimir/agent
+
+# Auto-restart on crash. on-failure (not always) so a clean `systemctl stop`
+# stays stopped. RestartSec throttles a crash-loop.
+Restart=on-failure
+RestartSec=5
+# Cap the crash-loop: >5 failures in 60s → give up (and leave the unit in
+# `failed`, which fires OnFailure= one last time) instead of spinning forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Notify an operator when this unit enters `failed`. The alert unit is a
+# oneshot that reaches ntfy/webhook directly — no live agent needed, so it
+# works precisely when the agent is down. %n expands to this unit's name.
+OnFailure=mimir-alert@%n.service
+
+# Light hardening (optional; relax if your MIMIR_HOME lives elsewhere).
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

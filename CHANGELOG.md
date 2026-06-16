@@ -20,6 +20,27 @@ All notable changes will land here. Format loosely follows
   shape). Loop mode gates the first alarm on having seen the agent alive (no
   cold-start false alarm) and pushes a recovery notice; `--once` is for cron.
   Runbook: `docs/watchdog.md`.
+- **Clean-shutdown marker → unclean-restart notice** (chainlink #507). A
+  sidecar-free complement to the watchdog: the agent writes a `clean: false`
+  marker to `state/session.json` at startup and flips it to `clean: true` on a
+  graceful (SIGTERM-initiated) shutdown. If the next boot still sees
+  `clean: false`, the previous run was killed/crashed/OOM'd (or wedged then
+  killed) — the agent logs a `liveness_unclean_restart` event and pushes an
+  out-of-band notice on the same sinks as the watchdog. First boot and a clean
+  prior stop both no-op.
+- **`HEALTHCHECK` → `/health` in the container image.** The scaffold
+  `Dockerfile` now defines a Docker healthcheck that polls the in-process
+  `/health` endpoint (a timeout catches a *wedged* loop, not just a dead
+  process). Note: `restart: unless-stopped` does **not** act on health status —
+  pair with an autoheal sidecar or a host/Swarm probe to restart on
+  `unhealthy`. See `docs/watchdog.md`.
+- **systemd unit templates for non-Docker / local deployments** — `mimir run`
+  under systemd with `Restart=on-failure` and an `OnFailure=` hook that runs
+  the new `mimir notify-restart` command (a self-contained ntfy/webhook push,
+  no live agent needed). Templates in `deploy/systemd/`; runbook in
+  `docs/systemd.md` (incl. the macOS/launchd note).
+- **`GET /` redirects to `/turns`** — the bare web root now sends browsers to
+  the turn viewer (302) instead of 404ing.
 
 ## [0.4.1] — 2026-06-16
 

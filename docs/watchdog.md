@@ -92,3 +92,29 @@ docker kill -s KILL mimir        # hard-kill; the agent can't say goodbye
 Graceful shutdown and deliberate alerts are already covered by `ntfy` + the
 `alert` skill; the watchdog covers only the case where the agent **can't speak
 for itself**.
+
+## Complementary mechanisms
+
+The watchdog is one layer. Three others stack with it, each covering a
+different failure domain:
+
+| Mechanism | Where | Catches | Misses |
+|---|---|---|---|
+| **Clean-shutdown marker** | in the agent (next boot) | crash / OOM / hard-restart that **came back** — the agent reports it restarted uncleanly (`state/session.json`, `liveness_unclean_restart` event + out-of-band notice). No sidecar. | a death it never recovers from |
+| **`mimir watchdog`** (this doc) | separate process | the agent **absent** — dead or wedged, even when it never comes back | the whole host being down (run it off-box for that) |
+| **Docker `HEALTHCHECK` → `/health`** | the container | a wedged loop (the poll times out → `unhealthy`) | **does not restart on its own** — `restart:` reacts only to *exit* |
+| **`OnFailure=` (systemd)** | the host supervisor | the unit entering `failed` (see `docs/systemd.md`) | the host itself being down |
+
+**Restarting a wedge.** A wedged-but-alive process never *exits*, so neither
+`restart: unless-stopped` nor systemd `Restart=` will restart it. The
+`HEALTHCHECK` *detects* it; to *act* on it, add one of:
+
+- an **autoheal sidecar** (e.g. `willfarrell/autoheal`) that watches the
+  healthcheck and restarts the container on `unhealthy` — off-the-shelf, no
+  code; the natural actuator for the healthcheck above;
+- a **Swarm / k8s liveness probe** (restart-on-probe-failure is built in);
+- an in-process **loop-watchdog thread** that force-exits a stalled loop so the
+  `restart:` policy fires.
+
+Whole-host failure is the one case nothing on-box can catch — that's the
+hosted-monitor-on-`/health` layer (option C above).

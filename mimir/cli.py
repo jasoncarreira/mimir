@@ -341,6 +341,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Check once and exit (for cron); exit code 1 if the agent is down.",
     )
 
+    # ``mimir notify-restart`` — push a one-shot 'service failed/restarting'
+    # alert via ntfy / webhook. Designed for a systemd ``OnFailure=`` hook
+    # (see deploy/systemd/): self-contained, no live agent or event logger
+    # needed, so it works precisely when the agent is down.
+    notify_restart_p = sub.add_parser(
+        "notify-restart",
+        help="Push an out-of-band 'service failed/restarting' alert (systemd OnFailure= hook).",
+    )
+    notify_restart_p.add_argument(
+        "--unit", default=None, help="systemd unit name, for the message (e.g. %%n).",
+    )
+    notify_restart_p.add_argument(
+        "--detail", default=None, help="Optional extra context line for the alert.",
+    )
+
     # -----------------------------------------------------------------------
     # Dispatch
     # -----------------------------------------------------------------------
@@ -386,6 +401,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         if args.once and down:
             sys.exit(1)
+        return
+
+    if args.command == "notify-restart":
+        import asyncio
+        from .liveness import notify_service_event
+        asyncio.run(notify_service_event(unit=args.unit, detail=args.detail))
         return
 
     if args.command == "stats":

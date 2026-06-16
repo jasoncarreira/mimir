@@ -153,5 +153,17 @@ EXPOSE 8080
 #   /home/mimir/.cache  — fastembed model cache
 VOLUME ["/home/mimir/agent", "/home/mimir/.claude", "/home/mimir/.cache"]
 
+# Container liveness probe → the in-process /health endpoint, which returns
+# {"ok": true} only while the event loop is responsive — so a *timeout* here
+# catches a wedged loop, not just a dead process. /health is auth-exempt, so
+# no API key is needed. start-period covers cold boot + fastembed warm-up.
+#
+# NOTE: `restart: unless-stopped` does NOT act on health status — Docker only
+# restarts on process *exit*, never on `unhealthy`. To turn an `unhealthy`
+# result into a restart, run an autoheal sidecar (e.g. willfarrell/autoheal)
+# or a Swarm / k8s liveness probe. See docs/watchdog.md.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${MIMIR_WEB_PORT:-8080}/health" || exit 1
+
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["mimir", "run", "--home", "/home/mimir/agent"]

@@ -10,8 +10,14 @@ import pytest
 
 from mimir.liveness import (
     beat_age_seconds,
+    detect_unclean_restart,
     liveness_path,
+    mark_clean_shutdown,
+    mark_session_running,
+    notify_service_event,
+    notify_unclean_restart,
     read_beat,
+    read_session_marker,
     run_watchdog,
     watchdog_has_sink,
     write_beat,
@@ -174,3 +180,96 @@ def test_watchdog_has_sink(monkeypatch) -> None:
     monkeypatch.delenv("NTFY_TOPIC", raising=False)
     monkeypatch.setenv("MIMIR_WATCHDOG_WEBHOOK_URL", "https://hooks.example/x")
     assert watchdog_has_sink() is True
+
+
+# ── clean-shutdown marker / unclean-restart detection ──────────────
+
+def test_session_marker_roundtrip(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    mark_session_running(home, started_at=1000.0)
+    marker = read_session_marker(home)
+    assert isinstance(marker, dict)
+    assert marker["started_at"] == 1000.0
+    assert marker["clean"] is False
+    assert marker["pid"] > 0
+
+
+def test_first_boot_is_not_unclean(tmp_path: Path) -> None:
+    """No prior marker (first boot ever) → no false unclean-restart alarm."""
+    home = _home(tmp_path)
+    assert detect_unclean_restart(home) is None
+
+
+def test_clean_shutdown_then_boot_is_clean(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    mark_session_running(home, started_at=1000.0)
+    mark_clean_shutdown(home)
+    # Next boot inspects the prior marker — a graceful stop is not unclean.
+    assert detect_unclean_restart(home) is None
+    marker = read_session_marker(home)
+    assert marker["clean"] is True
+    assert "stopped_iso" in marker
+
+
+def test_crash_without_cleanup_is_unclean(tmp_path: Path) -> None:
+    """A run that wrote a clean=false marker and never flipped it (crash /
+    OOM / SIGKILL) → next boot detects the unclean restart."""
+    home = _home(tmp_path)
+    mark_session_running(home, started_at=1000.0)
+    # ... process killed; mark_clean_shutdown never ran ...
+    prior = detect_unclean_restart(home)
+    assert prior is not None
+    assert prior["clean"] is False
+    assert prior["started_at"] == 1000.0
+
+
+def test_detect_then_remark_clears_for_next_cycle(tmp_path: Path) -> None:
+    """Lifecycle: unclean prior → detect (truthy) → mark_session_running for
+    the new session resets the marker so a *subsequent* clean stop is clean."""
+    home = _home(tmp_path)
+    mark_session_running(home, started_at=1000.0)  # session 1 (crashes)
+    assert detect_unclean_restart(home) is not None  # session 2 boot sees it
+    mark_session_running(home, started_at=2000.0)    # session 2 running
+    mark_clean_shutdown(home)                          # session 2 clean stop
+    assert detect_unclean_restart(home) is None        # session 3 boot is clean
+
+
+def test_garbage_marker_is_not_unclean(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    from mimir.liveness import session_marker_path
+    session_marker_path(home).write_text("not json", encoding="utf-8")
+    # Unreadable marker reads as None → treated as first boot, not a crash.
+    assert detect_unclean_restart(home) is None
+
+
+@pytest.mark.asyncio
+async def test_notify_unclean_restart_shape(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    calls: list[dict] = []
+
+    async def fake_post(**kw):
+        calls.append(kw)
+
+    await notify_unclean_restart(
+        home, prior={"pid": 42, "started_iso": "2026-06-16T00:00:00+00:00"},
+        _post=fake_post,
+    )
+    assert len(calls) == 1
+    assert "♻️" in calls[0]["title"]
+    assert calls[0]["dedupe_key"] == "agent-unclean-restart"
+    assert "42" in calls[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_notify_service_event_shape() -> None:
+    calls: list[dict] = []
+
+    async def fake_post(**kw):
+        calls.append(kw)
+
+    await notify_service_event(unit="mimir.service", detail="exit 137", _post=fake_post)
+    assert len(calls) == 1
+    assert "🔴" in calls[0]["title"]
+    assert calls[0]["category"] == "service-restart"
+    assert "mimir.service" in calls[0]["body"]
+    assert "exit 137" in calls[0]["body"]

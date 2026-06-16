@@ -38,6 +38,7 @@ import aiohttp
 log = logging.getLogger(__name__)
 
 LIVENESS_FILENAME = "liveness.json"
+SESSION_FILENAME = "session.json"
 
 # Out-of-band sinks. The watchdog must reach the operator WITHOUT the (dead)
 # agent, so both sinks are external services: ntfy.sh (``NTFY_TOPIC``) and an
@@ -53,7 +54,26 @@ _WEBHOOK_TIMEOUT_S = 8.0
 # own window, so a sustained outage alerts at most once per window (no spam).
 _DOWN_KEY = "agent-liveness-down"
 _RECOVERED_KEY = "agent-liveness-recovered"
+_RESTART_KEY = "agent-unclean-restart"
+_SERVICE_KEY = "mimir-service-failure"
 _CATEGORY = "agent-liveness"
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> bool:
+    """Atomically write ``payload`` as JSON to ``path`` (tmp-file + rename, so
+    a concurrent reader never sees a torn file). Soft-fail: returns ``False``
+    on ``OSError`` and never raises — a state-file write must never disrupt the
+    agent (or the watchdog). The temp name is pid-scoped so two writers don't
+    clobber each other's tmp."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        log.debug("atomic json write to %s failed: %s", path, exc)
+        return False
 
 
 def liveness_path(home: Path) -> Path:
@@ -79,14 +99,7 @@ def write_beat(
     if started_at is not None:
         payload["started_at"] = started_at
         payload["uptime_s"] = round(now - started_at, 1)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError as exc:
-        # Best-effort — a beat-write failure must never disrupt the agent.
-        log.debug("liveness beat write failed: %s", exc)
+    _atomic_write_json(path, payload)
 
 
 def read_beat(home: Path) -> dict[str, Any] | None:
@@ -187,6 +200,123 @@ def watchdog_has_sink() -> bool:
     return bool(
         os.environ.get("NTFY_TOPIC", "").strip()
         or os.environ.get(_WEBHOOK_ENV, "").strip()
+    )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Clean-shutdown marker (in-process restart-notify)
+#
+# The watchdog above catches the agent dying *while nobody's home* — but it
+# needs a separate process. This second, complementary mechanism needs no
+# sidecar: the agent itself reports, on its *next boot*, that the previous run
+# died uncleanly. ``mark_session_running`` writes a ``clean: false`` marker at
+# startup; the graceful-shutdown path (``_on_cleanup``, which only runs on a
+# SIGTERM/SIGINT-initiated stop) flips it to ``clean: true``. If a boot finds
+# the prior marker still ``clean: false``, the last run was killed/crashed/OOM'd
+# (or wedged then killed) without cleanup → surface it. Catches everything that
+# *comes back* (Docker ``restart:`` brings it up, and it tells you); a host that
+# stays down is the watchdog's / an external monitor's job, not this.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def session_marker_path(home: Path) -> Path:
+    return home / "state" / SESSION_FILENAME
+
+
+def read_session_marker(home: Path) -> dict[str, Any] | None:
+    """Return the parsed session marker, or ``None`` if missing/garbage."""
+    try:
+        data = json.loads(session_marker_path(home).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def mark_session_running(
+    home: Path, *, started_at: float, ts: float | None = None,
+) -> None:
+    """Record that a session is live and has NOT shut down cleanly yet."""
+    now = time.time() if ts is None else ts
+    _atomic_write_json(session_marker_path(home), {
+        "started_at": started_at,
+        "started_iso": _iso(started_at),
+        "pid": os.getpid(),
+        "clean": False,
+        "updated_iso": _iso(now),
+    })
+
+
+def mark_clean_shutdown(home: Path, *, ts: float | None = None) -> None:
+    """Flip the current session marker to ``clean: true``. Called from the
+    graceful-shutdown path — i.e. an *intended* stop. A hard kill (OOM /
+    SIGKILL) never reaches here, so the marker stays ``clean: false`` and the
+    next boot reports an unclean restart."""
+    now = time.time() if ts is None else ts
+    marker = read_session_marker(home) or {}
+    marker["clean"] = True
+    marker["stopped_iso"] = _iso(now)
+    _atomic_write_json(session_marker_path(home), marker)
+
+
+def detect_unclean_restart(home: Path) -> dict[str, Any] | None:
+    """Inspect the prior session marker. Returns the prior marker when the
+    last run did NOT shut down cleanly; ``None`` on a clean prior stop OR a
+    first-ever boot (no marker). Call this BEFORE ``mark_session_running``
+    overwrites the marker for the new session."""
+    prior = read_session_marker(home)
+    if prior is None:
+        return None  # first boot — nothing to compare against
+    if prior.get("clean") is True:
+        return None  # previous run stopped gracefully
+    return prior
+
+
+async def notify_unclean_restart(
+    home: Path, *, prior: dict[str, Any],
+    _post: Callable[..., Awaitable[None]] | None = None,
+) -> None:
+    """Push an out-of-band notice that the agent came back after an unclean
+    shutdown. Same sinks as the watchdog (ntfy + webhook), so the in-process
+    restart-notify and the out-of-process dead-man's-switch land on one
+    channel. Soft-fail; no sink → no-op."""
+    post = _post or _default_alert
+    started = prior.get("started_iso") or "unknown"
+    pid = prior.get("pid", "?")
+    await post(
+        category=_CATEGORY,
+        title="♻️ mimir restarted after an unclean shutdown",
+        body=(
+            f"The previous run (pid {pid}, started {started}) did not shut down "
+            f"cleanly — likely a crash, OOM-kill, hard restart, or a wedge that "
+            f"was killed. The agent is back up now. home={home}"
+        ),
+        dedupe_key=_RESTART_KEY,
+        priority=4,
+        tags=["recycle", "warning"],
+    )
+
+
+async def notify_service_event(
+    *, unit: str | None = None, detail: str | None = None,
+    _post: Callable[..., Awaitable[None]] | None = None,
+) -> None:
+    """Push an out-of-band 'service failed/restarting' alert. Meant for a
+    systemd ``OnFailure=`` hook (``mimir notify-restart``), so it is
+    self-contained — it reaches ntfy / webhook directly, with no dependency on
+    a live agent process or its event logger. Soft-fail."""
+    post = _post or _default_alert
+    unit_str = unit or "mimir"
+    body = f"systemd reported a failure for unit '{unit_str}'."
+    if detail:
+        body += f" {detail}"
+    body += f" The service manager is handling restart; check `journalctl -u {unit_str}`."
+    await post(
+        category="service-restart",
+        title="🔴 mimir service failed (systemd OnFailure)",
+        body=body,
+        dedupe_key=_SERVICE_KEY,
+        priority=5,
+        tags=["rotating_light"],
     )
 
 

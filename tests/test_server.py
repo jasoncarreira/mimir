@@ -34,6 +34,7 @@ from mimir.server import (
     _safe_str_eq,
     _handle_health,
     _handle_event,
+    _handle_root,
 )
 
 
@@ -85,6 +86,9 @@ class TestAuthExemptSet:
 
     def test_state_get_is_exempt(self) -> None:
         assert ("GET", "/state") in _AUTH_EXEMPT  # renamed from /memory
+
+    def test_root_get_is_exempt(self) -> None:
+        assert ("GET", "/") in _AUTH_EXEMPT
 
     def test_event_post_is_not_exempt(self) -> None:
         assert ("POST", "/event") not in _AUTH_EXEMPT
@@ -193,6 +197,21 @@ def _health_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", _handle_health)
     return app
+
+
+def _root_app() -> web.Application:
+    """Minimal app with only the / route."""
+    app = web.Application()
+    app.router.add_get("/", _handle_root)
+    return app
+
+
+class TestRootRedirect:
+    async def test_root_redirects_to_turns(self) -> None:
+        async with TestClient(TestServer(_root_app())) as client:
+            resp = await client.get("/", allow_redirects=False)
+            assert resp.status == 302
+            assert resp.headers["Location"] == "/turns"
 
 
 class TestHandleHealth:
