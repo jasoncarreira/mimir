@@ -101,9 +101,10 @@ def _prompt_for_order(order: WorkOrder) -> str:
 
 
 def _local_argv(bin_name: str, args: Sequence[str], worktree: Path, prompt: str) -> tuple[str, ...]:
+    cd_args = ("-C", str(worktree))
     if args and args[0] == "exec":
-        return (bin_name, "exec", "--cd", str(worktree), *args[1:], prompt)
-    return (bin_name, *args, "--cd", str(worktree), prompt)
+        return (bin_name, "exec", *cd_args, *args[1:], prompt)
+    return (bin_name, *args, *cd_args, prompt)
 
 
 def _transcript_path(transcript_root: Path | None, issue_id: int) -> Path:

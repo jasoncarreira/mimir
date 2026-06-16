@@ -26,9 +26,14 @@ class WorktreeLease:
     base_ref: str
     # ``base_ref`` is the operator-facing base name (PR target, worker fetch).
     # ``local_base`` is the locally-resolvable start point / diff floor it
-    # resolved to (a local branch, ``origin/<base>``, or the name as-is) — see
-    # ``_resolve_local_base``.
+    # resolved to (a local branch, ``origin/<base>``, a SHA, or the name as-is) —
+    # see ``_resolve_local_base`` and ``create_isolated_checkout``.
     local_base: str = ""
+    # Codex can resolve linked git worktrees back to the parent checkout because
+    # their .git file points at ``<repo>/.git/worktrees/...``. Isolated checkouts
+    # have their own .git directory and are removed with ``shutil.rmtree`` rather
+    # than ``git worktree remove``.
+    isolated_checkout: bool = False
 
 
 def create_worktree(
@@ -66,6 +71,63 @@ def create_worktree(
     )
 
 
+def create_isolated_checkout(
+    repo: Path,
+    *,
+    issue_id: int,
+    attempt: int,
+    base: str = "main",
+    worklink_dir: str = ".worklink",
+    runner: Runner = _default_runner,
+) -> WorktreeLease:
+    """Create an attempt-scoped full checkout with its own ``.git`` directory.
+
+    Some coding CLIs inspect git metadata instead of honoring their process cwd.
+    A normal ``git worktree`` stores a ``.git`` file that points back into the
+    parent checkout's common git dir; Codex has been observed to treat that
+    parent as the active repository and edit it.  This checkout shape keeps the
+    same branch/diff contract while giving the backend a real repository rooted
+    at the attempt path.
+    """
+
+    path = repo / worklink_dir / f"{issue_id}-{attempt}"
+    branch = f"issue/{issue_id}-a{attempt}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise RuntimeError(f"attempt checkout already exists: {path}")
+
+    start_point = _resolve_local_base(repo, base, runner=runner)
+    start_sha = runner(["git", "-C", str(repo), "rev-parse", "--verify", start_point])
+    if start_sha.returncode != 0:
+        raise RuntimeError((start_sha.stderr or start_sha.stdout).strip() or "git rev-parse failed")
+    local_base = start_sha.stdout.strip()
+
+    clone = runner(["git", "clone", "--local", "--no-hardlinks", "--quiet", str(repo), str(path)])
+    if clone.returncode != 0:
+        raise RuntimeError((clone.stderr or clone.stdout).strip() or "git clone failed")
+
+    remote = runner(["git", "-C", str(repo), "config", "--get", "remote.origin.url"])
+    if remote.returncode == 0 and remote.stdout.strip():
+        set_remote = runner(["git", "-C", str(path), "remote", "set-url", "origin", remote.stdout.strip()])
+        if set_remote.returncode != 0:
+            raise RuntimeError((set_remote.stderr or set_remote.stdout).strip() or "git remote set-url failed")
+
+    checkout = runner(["git", "-C", str(path), "checkout", "-B", branch, local_base])
+    if checkout.returncode != 0:
+        raise RuntimeError((checkout.stderr or checkout.stdout).strip() or "git checkout failed")
+
+    return WorktreeLease(
+        issue_id=issue_id,
+        attempt=attempt,
+        repo=repo,
+        path=path,
+        branch=branch,
+        base_ref=base,
+        local_base=local_base,
+        isolated_checkout=True,
+    )
+
+
 def _resolve_local_base(repo: Path, base: str, *, runner: Runner) -> str:
     """Resolve ``base`` to a locally-resolvable start point / diff floor.
 
@@ -85,9 +147,17 @@ def _resolve_local_base(repo: Path, base: str, *, runner: Runner) -> str:
 
 
 def cleanup_worktree(lease: WorktreeLease, *, outcome: str, runner: Runner = _default_runner) -> bool:
-    """Remove successful worktrees; retain failed/blocked attempts for autopsy."""
+    """Remove successful attempt checkouts; retain failed/blocked attempts for autopsy."""
     if outcome != "completed":
         return False
+    if lease.isolated_checkout:
+        shutil.rmtree(lease.path)
+        delete = runner(["git", "-C", str(lease.repo), "branch", "-D", lease.branch])
+        # The branch may exist only inside the isolated checkout. Once the checkout
+        # is removed, branch deletion from the parent repo is best-effort cleanup.
+        if delete.returncode not in (0, 1):
+            raise RuntimeError((delete.stderr or delete.stdout).strip() or "git branch delete failed")
+        return True
     result = runner(["git", "-C", str(lease.repo), "worktree", "remove", "--force", str(lease.path)])
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout).strip() or "git worktree remove failed")

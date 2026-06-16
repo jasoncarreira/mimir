@@ -11,6 +11,7 @@ import asyncio
 
 from mimir.event_logger import _reset_logger_for_tests, init_logger
 from mimir.worklink.backends import Caps, ComputeCaps, ComputeResult, RawResult, WorkOrder
+from mimir.worklink.evidence import EvidenceValidation, WorklinkEvidence
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.compute import WorkSpec
 from mimir.worklink.worker import WorkerPayload, run_worker_payload
@@ -1153,3 +1154,71 @@ def test_decompose_prompt_teaches_chainlink_block_argument_order() -> None:
     assert "chainlink issue block <ID-that-is-blocked> <BLOCKER>" in prompt
     assert "blocked issue id comes first" in prompt
     assert "chainlink issue block <blocker> <blocked>" not in prompt
+
+
+def test_codex_local_subprocess_uses_isolated_checkout(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _create_backend_checkout
+
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[:3] == ["git", "-C", str(tmp_path)] and args[3:6] == ["rev-parse", "--verify", "main"]:
+            return subprocess.CompletedProcess(args, 0, stdout="abc123\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    lease = _create_backend_checkout(
+        tmp_path,
+        issue_id=517,
+        attempt=2,
+        base="main",
+        backend_name="codex",
+        compute_shared_filesystem=True,
+        runner=runner,
+    )
+
+    assert lease.isolated_checkout is True
+    assert any(call[:4] == ["git", "clone", "--local", "--no-hardlinks"] for call in calls)
+    assert ["git", "-C", str(lease.path), "checkout", "-B", "issue/517-a2", "abc123"] in calls
+
+
+def test_outside_worktree_detection_marks_root_leak_failed(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _with_outside_worktree_detection
+
+    validation = EvidenceValidation(
+        status="failed",
+        review_ready=False,
+        reasons=("completed_empty_diff",),
+        evidence=WorklinkEvidence(
+            issue=517,
+            attempt=1,
+            backend="codex",
+            branch="issue/517-a1",
+            worktree=str(tmp_path / ".worklink" / "517-1"),
+            started_at="2026-06-16T20:00:00+00:00",
+            finished_at="2026-06-16T20:05:00+00:00",
+            files_changed=[],
+            diff_stat="",
+            commands=[],
+            tests=None,
+            pr_url=None,
+            status="failed",
+        ),
+    )
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, stdout=" M mimir/identities.py\n?? scratch.txt\n", stderr="")
+
+    result = _with_outside_worktree_detection(
+        validation,
+        issue=517,
+        attempt=1,
+        root=tmp_path,
+        worktree=tmp_path / ".worklink" / "517-1",
+        runner=runner,
+    )
+
+    assert result.status == "failed"
+    assert result.review_ready is False
+    assert "completed_empty_diff" in result.reasons
+    assert any(reason.startswith("backend_wrote_outside_worktree:") for reason in result.reasons)

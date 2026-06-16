@@ -89,7 +89,7 @@ async def test_codex_backend_invokes_exec_json_with_worktree_and_prompt(
     )
     assert calls == [
         {
-            "args": ("codex", "exec", "--cd", str(order.worktree), "--json", "Do slice 1b"),
+            "args": ("codex", "exec", "-C", str(order.worktree), "--json", "Do slice 1b"),
             "kwargs": {
                 "stdout": asyncio.subprocess.PIPE,
                 "stderr": asyncio.subprocess.PIPE,
@@ -749,7 +749,7 @@ def test_codex_work_spec_includes_rules_in_local_argv(tmp_path: Path) -> None:
     assert spec.local_argv == (
         "codex",
         "exec",
-        "--cd",
+        "-C",
         str(tmp_path),
         "--json",
         "Follow policy\n\nDo work",
@@ -798,7 +798,7 @@ def test_codex_backend_builds_portable_git_handoff_work_spec(tmp_path: Path) -> 
         env={"MIMIR_HOME": "/tmp/home"},
         backend_config={"bin": "codex", "args": ["exec", "--json"]},
         local_worktree=order.worktree,
-        local_argv=("codex", "exec", "--cd", str(order.worktree), "--json", "Do work"),
+        local_argv=("codex", "exec", "-C", str(order.worktree), "--json", "Do work"),
     )
 
 
