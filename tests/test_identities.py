@@ -7,7 +7,7 @@ from textwrap import dedent
 
 import pytest
 
-from mimir.identities import IdentityResolver
+from mimir.identities import AccessMetadata, IdentityResolver
 
 
 def _write_identities(tmp_path: Path, body: str) -> IdentityResolver:
@@ -270,6 +270,66 @@ def test_email_works_as_alias(tmp_path: Path):
     )
     assert r2.resolve("email:alice@work.example.com") == "alice"
     assert r2.resolve("email:alice@personal.example.com") == "alice"
+
+
+def test_access_metadata_is_loaded_per_canonical_and_shared_by_aliases(tmp_path: Path):
+    """Authorization metadata belongs to the canonical identity, not the
+    raw Slack/Discord id that happened to arrive on a bridge event."""
+    r = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: alice
+            aliases: [slack-U123, discord-456]
+            access:
+              roles: [user, admin]
+              tier: admin
+          - canonical: bob
+            aliases: [slack-U777]
+        """,
+    )
+    expected = AccessMetadata(roles=("user", "admin"), tier="admin")
+    assert r.access_metadata("slack-U123") == expected
+    assert r.access_metadata("discord-456") == expected
+    assert r.access_metadata("alice") == expected
+    assert r.access_dict("discord-456") == {
+        "roles": ["user", "admin"],
+        "tier": "admin",
+    }
+    assert r.access_metadata("slack-U777") == AccessMetadata()
+    assert r.access_metadata("slack-UNKNOWN") == AccessMetadata()
+    assert r.access_metadata(None) == AccessMetadata()
+
+
+def test_malformed_access_metadata_falls_back_without_breaking_identity_load(
+    tmp_path: Path,
+):
+    r = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: alice
+            aliases: [slack-U123]
+            access: admin
+          - canonical: bob
+            aliases: [discord-456]
+            access:
+              roles: [admin, owner, "", 42]
+              tier: root
+          - canonical: carol
+            aliases: [slack-U999]
+            access:
+              role: admin
+        """,
+    )
+    assert r.resolve("slack-U123") == "alice"
+    assert r.access_metadata("slack-U123") == AccessMetadata()
+    assert r.resolve("discord-456") == "bob"
+    assert r.access_metadata("discord-456") == AccessMetadata()
+    assert r.access_metadata("slack-U999") == AccessMetadata(
+        roles=("admin",),
+        tier="admin",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -144,6 +144,46 @@ def test_merge_preserves_operator_set_display_name(tmp_path: Path):
     assert jason["notes"] == "Operator-set notes"
 
 
+def test_merge_preserves_operator_authored_access_metadata(tmp_path: Path):
+    _write(
+        tmp_path,
+        """\
+        people:
+          - canonical: jason
+            aliases: [discord-100000000000000001]
+            access:
+              roles: [user, admin]
+              tier: admin
+        """,
+    )
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[
+            {
+                "aliases": ["discord-100000000000000001", "slack-U999"],
+                "display_name": "Jason",
+            }
+        ],
+        channels=[],
+    )
+    assert counts["people_updated"] == 1
+    doc = _read_doc(tmp_path)
+    jason = next(p for p in doc["people"] if p["canonical"] == "jason")
+    assert jason["access"] == {"roles": ["user", "admin"], "tier": "admin"}
+    assert "slack-U999" in jason["aliases"]
+
+    r = IdentityResolver(home=tmp_path)
+    r.reload()
+    assert r.access_dict("discord-100000000000000001") == {
+        "roles": ["user", "admin"],
+        "tier": "admin",
+    }
+    assert r.access_dict("slack-U999") == {
+        "roles": ["user", "admin"],
+        "tier": "admin",
+    }
+
+
 def test_merge_fills_blank_fields_only(tmp_path: Path):
     """Operator left display_name blank — the populator fills it in.
     Other operator-set fields stay untouched."""
