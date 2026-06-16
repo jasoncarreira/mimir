@@ -21,8 +21,7 @@ Schema (full example)::
           - bsky:alice.bsky.social          # Bluesky handle
           - email:alice@example.com         # email address
         access:                             # optional; canonical-level access metadata
-          roles: [user]                     # e.g. user, admin
-          tier: user                        # safe default is user
+          roles: [user]                     # explicit allowlist; omit/empty = unauthorized
         notes: Eng team lead                # optional; surfaces in prompt
 
     channels:
@@ -89,11 +88,18 @@ class AccessMetadata:
     therefore see the same access metadata.
     """
 
-    roles: tuple[str, ...] = ("user",)
-    tier: str = "user"
+    roles: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
-        return {"roles": list(self.roles), "tier": self.tier}
+        return {"roles": list(self.roles)}
+
+    @property
+    def is_authorized(self) -> bool:
+        return bool(self.roles)
+
+    @property
+    def is_admin(self) -> bool:
+        return "admin" in self.roles
 
 
 _KNOWN_ACCESS_VALUES = {"user", "admin"}
@@ -163,7 +169,7 @@ class IdentityResolver:
         rather than breaking identity loading or accidentally granting admin
         access. Supported shape:
 
-        ``access: {roles: [user|admin], tier: user|admin}``
+        ``access: {roles: [user|admin]}``
         """
         if raw is None:
             return AccessMetadata()
@@ -181,7 +187,7 @@ class IdentityResolver:
             raw_roles = [raw.get("role")]
 
         if raw_roles is None:
-            roles = ["user"]
+            roles = []
         elif isinstance(raw_roles, list):
             for role in raw_roles:
                 if isinstance(role, str) and role.strip() in _KNOWN_ACCESS_VALUES:
@@ -202,29 +208,15 @@ class IdentityResolver:
             )
             malformed = True
 
-        if malformed or not roles:
-            if malformed:
-                log.warning(
-                    "identities.yaml: %s access.roles contained invalid values, "
-                    "using default access",
-                    canonical,
-                )
-                return AccessMetadata()
-            roles = ["user"]
-
-        tier = raw.get("tier")
-        if tier is None:
-            tier = "admin" if "admin" in roles else "user"
-        elif isinstance(tier, str) and tier.strip() in _KNOWN_ACCESS_VALUES:
-            tier = tier.strip()
-        else:
+        if malformed:
             log.warning(
-                "identities.yaml: %s access.tier is malformed, using default access",
+                "identities.yaml: %s access.roles contained invalid values, "
+                "using default-deny access",
                 canonical,
             )
             return AccessMetadata()
 
-        return AccessMetadata(roles=tuple(roles), tier=tier)
+        return AccessMetadata(roles=tuple(roles))
 
     def reload(self) -> int:
         """Re-read the YAML file. Returns the number of aliases loaded.
@@ -514,7 +506,7 @@ class IdentityResolver:
         """Access metadata for ``author``'s canonical identity.
 
         Unknown authors and malformed/missing YAML metadata receive the
-        non-privileged default: ``roles=["user"], tier="user"``.
+        fail-closed default: no roles, therefore unauthorized.
         """
         if author is None:
             return AccessMetadata()
@@ -525,6 +517,18 @@ class IdentityResolver:
     def access_dict(self, author: str | None) -> dict[str, object]:
         """Dict form of :meth:`access_metadata` for JSON/tool callers."""
         return self.access_metadata(author).as_dict()
+
+    def is_authorized(self, author: str | None) -> bool:
+        """Whether ``author`` has an explicit non-empty role grant.
+
+        Identity presence is not authorization: unknown authors and known
+        auto-populated identities without roles both return False.
+        """
+        return self.access_metadata(author).is_authorized
+
+    def is_admin(self, author: str | None) -> bool:
+        """Whether ``author`` has the explicit ``admin`` role."""
+        return self.access_metadata(author).is_admin
 
     def dm_channel(self, author: str | None, platform: str | None = None) -> str | None:
         """The captured DM ``channel_id`` for ``author`` on ``platform``

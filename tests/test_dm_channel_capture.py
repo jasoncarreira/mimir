@@ -55,7 +55,7 @@ def test_capture_fills_existing_person_preserving_operator_fields_and_header(
         "  - canonical: alice\n"
         "    display_name: Alice Smith\n"
         "    aliases: [slack-U05ABC, discord-456]\n"
-        "    access: {roles: [user, admin], tier: admin}\n"
+        "    access: {roles: [user, admin]}\n"
         "    notes: eng lead\n",
         encoding="utf-8",
     )
@@ -69,19 +69,14 @@ def test_capture_fills_existing_person_preserving_operator_fields_and_header(
     assert alice["canonical"] == "alice"
     assert alice["display_name"] == "Alice Smith"
     assert alice["notes"] == "eng lead"
-    assert alice["access"] == {"roles": ["user", "admin"], "tier": "admin"}
+    assert alice["access"] == {"roles": ["user", "admin"]}
     assert alice["dm_channels"]["slack"] == "dm-slack-D07XYZ"
 
     resolver = IdentityResolver(home=home)
     resolver.reload()
-    assert resolver.access_dict("slack-U05ABC") == {
-        "roles": ["user", "admin"],
-        "tier": "admin",
-    }
-    assert resolver.access_dict("discord-456") == {
-        "roles": ["user", "admin"],
-        "tier": "admin",
-    }
+    assert resolver.access_dict("slack-U05ABC") == {"roles": ["user", "admin"]}
+    assert resolver.access_dict("discord-456") == {"roles": ["user", "admin"]}
+    assert resolver.is_authorized("slack-U05ABC") is True
 
 
 def test_capture_is_fill_blank_and_idempotent(tmp_path: Path) -> None:
