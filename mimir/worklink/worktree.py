@@ -80,7 +80,7 @@ def create_isolated_checkout(
     worklink_dir: str = ".worklink",
     runner: Runner = _default_runner,
 ) -> WorktreeLease:
-    """Create an attempt-scoped full checkout with its own ``.git`` directory.
+    """Create an attempt-scoped local clone with its own ``.git`` directory.
 
     Some coding CLIs inspect git metadata instead of honoring their process cwd.
     A normal ``git worktree`` stores a ``.git`` file that points back into the
@@ -102,7 +102,7 @@ def create_isolated_checkout(
         raise RuntimeError((start_sha.stderr or start_sha.stdout).strip() or "git rev-parse failed")
     local_base = start_sha.stdout.strip()
 
-    clone = runner(["git", "clone", "--local", "--no-hardlinks", "--quiet", str(repo), str(path)])
+    clone = runner(["git", "clone", "--local", "--quiet", str(repo), str(path)])
     if clone.returncode != 0:
         raise RuntimeError((clone.stderr or clone.stdout).strip() or "git clone failed")
 
@@ -153,8 +153,9 @@ def cleanup_worktree(lease: WorktreeLease, *, outcome: str, runner: Runner = _de
     if lease.isolated_checkout:
         shutil.rmtree(lease.path)
         delete = runner(["git", "-C", str(lease.repo), "branch", "-D", lease.branch])
-        # The branch may exist only inside the isolated checkout. Once the checkout
-        # is removed, branch deletion from the parent repo is best-effort cleanup.
+        # Isolated-checkout branches usually exist only inside the clone that was
+        # just removed; deleting the same name from the parent repo is a tolerated
+        # legacy no-op if an older attempt shape happened to create it there.
         if delete.returncode not in (0, 1):
             raise RuntimeError((delete.stderr or delete.stdout).strip() or "git branch delete failed")
         return True
