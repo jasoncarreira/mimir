@@ -6,6 +6,117 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-06-16
+
+Headline: **Worklink slices 2–3** (the autonomous worker rail grows a
+planner, pluggable compute backends, and an arbiter-gated ready-queue),
+a **full adversarial-audit hardening pass** (the #476–#503 backlog —
+high-severity through low, every finding verified against live code
+before fixing, each with a regression test), and **non-Docker
+portability** (mimir refuses to start without an explicit home and no
+longer hard-codes container paths).
+
+### Added
+
+- **Worklink — planner + decomposition contract** (`docs/internal/WORKLINK.md`,
+  chainlink #380): a planner decomposition contract (#647), portable
+  worker entrypoint (#655), and the operator `run` vertical's slice-1
+  runbook (#646).
+- **Worklink — pluggable `ComputeBackend` (execution substrate) axis**,
+  orthogonal to the `ToolBackend` (codex / claude_cli) axis:
+  - Local compute-backend seam (#653) and a claude-cli tool backend (#657).
+  - DockerSibling config surface (#672), broker client (#674), broker
+    policy guard (#680), and a sibling smoke runbook (#687).
+  - ECS `RunTask` remote compute backend (#673) with re-derived,
+    **observed** remote compute evidence — backend self-reports are
+    never trusted (#656).
+- **Worklink slice 3 — autonomy** (#444): an arbiter-gated ready-queue
+  poller with a concurrency cap, TTL reaper, and `worklink_run`; the
+  compute-backend autonomy policy **refuses unsandboxed autonomous
+  dispatch** (#460, #690), and autonomous claim safety is hardened
+  against races (#691).
+- **Worklink — tool-pin inventory + drift detection**: parse (#659),
+  inventory (#661), seed (#666), and a drift poller (#664) for the
+  configured coding-CLI pins.
+- **Worklink — backend-blocked path** (#466): added (#670), then
+  activated + hardened as a follow-up (#671); configurable base branch
+  + feature-branch model (#467, #669).
+- **Operator poller overrides** via `<home>/pollers-overrides.yaml`
+  (#651) — tune or disable discovered pollers without editing skills.
+
+### Changed
+
+- **Non-Docker portability** (#701): `mimir run` refuses to start
+  without an explicit `--home`/`MIMIR_HOME` (the silent cwd-as-home
+  fallback was the root of a cluster of coworker bugs — files
+  "not existing," wrong-channel replies); container paths
+  (`/mimir-home`, `/workspace/mimir`) are no longer hard-coded — they
+  read from env with safe fallbacks, and a misconfigured worklink
+  tool-pins poller emits `worklink_tool_pins_misconfigured` instead of
+  assuming `/mimir-home`.
+- **Coding-CLI pins bumped** (#679) and the `claude-code` CLI install
+  is gated in the scaffold Dockerfile (#650).
+- **Docker images ship Node 22 LTS** (was 20) — both the scaffold
+  generator and the top-level PyPI `Dockerfile` (#703).
+
+### Fixed
+
+- **Adversarial-audit hardening pass — the #476–#503 backlog**, every
+  finding verified against live code before fixing, each with a
+  regression test:
+  - *High-severity (#482–#486, #692):* retry-path remote-sync now holds
+    the home lock; the budget `snapshot()` staleness guard no longer
+    trusts stale no-reset observations.
+  - *Security cluster (#494, #495, #499, #500, #693):* child-spawn env
+    allowlist; expanded secret-redaction patterns (AKIA/ASIA, AWS
+    `*_key=`, JSON OAuth tokens); transactional skill install with
+    escaping-symlink rejection.
+  - *Server + scheduler (#487, #488, #694):* attachment/`extra` type
+    checks on inbound events; the poller fire re-consults the arbiter
+    after acquiring its slot.
+  - *Budget / quota (#489, #490, #696):* quota-recovery emit is
+    cross-process coordinated; a Codex cap reset is respected even when
+    the remaining-percent is unparseable.
+  - *Saga (#491, #492, #493, #695):* `agent_id IN (?, 'shared')`
+    scoping; index-add under lock; embedding-provider provenance
+    (`provider_name`/`model_id`) so `reindex` never stamps one
+    provider's vectors as another's.
+  - *Feedback (#496, #498, #697):* windowed scans complete under
+    snapshot saturation; dedup-set completeness.
+  - *Skills (#501, #502, #699):* skill-metadata conformance gate.
+  - *Reflection + commitments (#497, #503, #700):* applied-audit section
+    boundaries; commitment-snooze naive-ISO → UTC.
+  - *Worklink low-severity (#481, #698):* autonomy edge cases.
+  - Earlier correctness guards from the same sweep: stale quota evidence
+    + mismatched-dim session embeddings (#667).
+- **Robustness against bad input + scheduling races:**
+  - Non-UTF-8 bytes in core/index reads (#470, #663) and scheduled-tick
+    `prompt_file` reads (#470, #665) no longer crash the turn; broader
+    `UnicodeDecodeError` turn-failure hardening (#662).
+  - LLM-tick jobs no longer inherit the 1s misfire grace that silently
+    skipped the heartbeat (#660); the scheduler surfaces event-loop lag
+    (#675) and attributes it to the active turn hogging the loop (#702).
+  - `SchedulerJob` is constructed before `Scheduler.add_job` (#682);
+    mid-turn injection snapshots finalize atomically (#688); denied
+    writes are scoped by turn (#686); an aborted spawn releases its
+    exact rate slot (#685).
+  - `send_message` ignores undelivered sends in the loop detector
+    (#676); malformed action directive blocks are stripped (#677);
+    forced extra-file removals are backed up (#678); gave-up signal
+    counts stay distinct (#683); the defaults-upgrade ignores the
+    vendor scratch worktree (#684).
+  - Naive Anthropic reset headers are handled (#658); the ONNX default
+    model is used in the API-key embedding fallback (#681).
+- **Docs:** chainlink block argument order (#654); codex sandbox
+  boundary clarified (#648); ComputeBackend execution-substrate axis +
+  verified sandbox profile documented (#652); the web UI's turn viewer
+  + ops pages are highlighted across the onboarding skill, README, and
+  docker docs (#704); a non-Docker setup/troubleshooting guide
+  (`docs/mimir-nondocker-guide.md`) was added (#701); the SPEC +
+  `docs/internal/*` design docs were refreshed against the current code
+  (#705); and the skill-creator skill now documents channel addressing
+  for message-sending skills — prefix-qualified ids, no hardcoding (#707).
+
 ## [0.3.5] — 2026-06-11
 
 ### Added
