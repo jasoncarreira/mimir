@@ -1186,7 +1186,7 @@ Event types ported from open-strix (`open-strix-base/docs/events.md`):
 | `web_ui_started` | `host, port` |
 | `api_started` | `port` |
 | `error` | `where, message, traceback?` |
-| `slack_message` / `discord_message` / `bsky_message` | `channel_id, content, source_id, author, author_id, author_is_bot?, channel_name?, channel_conversation_type, channel_visibility, attachment_names?` — same shape as `web_message`, one type per bridge (§7.2.1) |
+| `slack_message` / `discord_message` | `channel_id, content, source_id, author, author_id, author_is_bot?, channel_name?, channel_conversation_type, channel_visibility, attachment_names?` — same shape as `web_message`, one type per in-process bridge (§7.2.1) |
 | `bridge_connecting` / `bridge_ready` / `bridge_error` | `bridge, source, error?` — bridge lifecycle |
 | `bridge_stub_called` | `bridge, channel_id, method` — stubbed bridges (§15 Phase 6.3) log instead of sending |
 | `saga_session_started` / `saga_session_ended` | `channel_id, saga_session_id, duration_s?, turn_count?, synthesis_ok?, feedback_count?, memory_writes?` — per-channel session lifecycle (§5.6) |
