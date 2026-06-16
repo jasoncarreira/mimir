@@ -74,6 +74,20 @@ class Bridge(ABC):
         has no native reaction support (e.g. Bluesky) — caller logs and
         moves on."""
 
+    async def resolve_dm_channel(self, author_id: str) -> str | None:
+        """Resolve the mimir DM `channel_id` for a user on this bridge,
+        given their raw platform user id (``AgentEvent.author_id``).
+
+        Returns a prefix-qualified id (``dm-slack-D…`` / ``dm-discord-…``)
+        or ``None`` if this bridge has no DM concept or resolution failed.
+        Bridges that support it (Discord, Slack) override; bench/web inherit
+        the ``None`` default. Used by the first-contact capture (see
+        ``mimir.identities_populator.capture_dm_channel``) so the agent can
+        DM a user it has only seen in a public channel. Best-effort — may
+        open/allocate the DM conversation on the platform, but sends no
+        message; never raises into the caller (return ``None`` on error)."""
+        return None
+
     async def send_typing_indicator(self, channel_id: str) -> None:
         """Best-effort typing indicator. Default is no-op — bridges that
         support it (Discord) override; bridges that don't (Slack — no

@@ -35,7 +35,11 @@ same way fetch_history does.
 
 from __future__ import annotations
 
+import functools
 import logging
+import os
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -125,6 +129,135 @@ def _strip_value(v: Any) -> Any:
     return v.strip() if isinstance(v, str) else v
 
 
+# All in-process writers of ``state/identities.yaml`` share this lock so the
+# read → mutate → write is atomic across the live first-contact DM capture
+# (``capture_dm_channel``) and the scheduled populator (``merge_into_yaml``) —
+# otherwise they lost-update each other. Unique temp files (below) additionally
+# remove the shared-``.tmp`` rename race. RLock in case a future caller nests;
+# today neither writer calls the other.
+_IDENTITIES_WRITE_LOCK = threading.RLock()
+
+
+def _serialized_identities_write(fn):
+    """Hold ``_IDENTITIES_WRITE_LOCK`` for the whole call — decorate every
+    function that does a read-modify-write of ``state/identities.yaml``."""
+    @functools.wraps(fn)
+    def _wrapper(*args, **kwargs):
+        with _IDENTITIES_WRITE_LOCK:
+            return fn(*args, **kwargs)
+    return _wrapper
+
+
+def _atomic_write_identities(yaml_path: Path, header: str, doc: dict) -> None:
+    """Write ``header + safe_dump(doc)`` to ``yaml_path`` via a UNIQUE temp
+    file + atomic rename, so concurrent writers never share (and clobber) a
+    fixed ``.tmp`` path. Caller must hold ``_IDENTITIES_WRITE_LOCK``."""
+    yaml_path.parent.mkdir(parents=True, exist_ok=True)
+    body = yaml.safe_dump(doc, sort_keys=False, allow_unicode=True, width=1_000)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(yaml_path.parent), prefix=".identities-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(header + body)
+        os.replace(tmp_name, yaml_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+@_serialized_identities_write
+def capture_dm_channel(
+    home: Path, author: str, platform: str, dm_channel_id: str
+) -> bool:
+    """Record a user's DM channel into ``state/identities.yaml`` on first
+    contact. Mirrors ``merge_into_yaml``'s match-by-alias + fill-blank
+    posture, and shares ``_IDENTITIES_WRITE_LOCK`` with it so the two writers
+    can't lost-update each other when the scheduled populator runs
+    concurrently.
+
+    Args:
+        home: mimir home; YAML lives at ``<home>/state/identities.yaml``.
+        author: the platform-prefixed inbound id (e.g. ``slack-U05ABC``,
+            ``discord-456789``) — the same value as ``AgentEvent.author``.
+        platform: ``"slack"`` / ``"discord"`` (the ``dm_channels`` key).
+        dm_channel_id: the mimir DM channel id (``dm-slack-D…`` /
+            ``dm-discord-…``) resolved from the bridge.
+
+    Finds the person whose ``aliases`` include ``author`` (or creates a
+    new entry keyed by ``author``), then sets ``dm_channels[platform]``
+    only if it isn't already set — an existing value (operator- or
+    previously-captured) is never overwritten. Atomic, header-preserving,
+    unique-temp write; a no-op (no mtime bump) when nothing changed. Returns
+    True iff it wrote. Best-effort: callers should not fail a turn on a
+    False/raise.
+    """
+    author = (author or "").strip()
+    platform = (platform or "").strip()
+    dm_channel_id = (dm_channel_id or "").strip()
+    if not (author and platform and dm_channel_id):
+        return False
+
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+
+    existing_people = doc.get("people")
+    if not isinstance(existing_people, list):
+        existing_people = []
+
+    match: dict[str, Any] | None = None
+    for entry in existing_people:
+        if not isinstance(entry, dict):
+            continue
+        if any(
+            isinstance(a, str) and a.strip() == author
+            for a in (entry.get("aliases") or [])
+        ):
+            match = entry
+            break
+
+    changed = False
+    if match is None:
+        # Brand-new person — canonical defaults to the inbound id, same as
+        # the populator does for an unknown alias (operator can merge later).
+        match = {"canonical": author, "aliases": [author]}
+        existing_people.append(match)
+        changed = True
+
+    dm = match.get("dm_channels")
+    if not isinstance(dm, dict):
+        dm = {}
+    if not dm.get(platform):
+        dm[platform] = dm_channel_id
+        match["dm_channels"] = dm
+        changed = True
+    elif dm.get(platform) != dm_channel_id:
+        # Already captured a different DM channel for this platform — leave
+        # it (stable per user; operator authority). Log the drift only.
+        log.info(
+            "capture_dm_channel: %s already has %s DM %r; not overwriting with %r",
+            match.get("canonical", author),
+            platform,
+            dm.get(platform),
+            dm_channel_id,
+        )
+
+    if not changed:
+        return False
+
+    doc["people"] = existing_people
+    _atomic_write_identities(yaml_path, header, doc)
+    log.info(
+        "captured DM channel for %s on %s: %s",
+        match.get("canonical", author), platform, dm_channel_id,
+    )
+    return True
+
+
+@_serialized_identities_write
 def merge_into_yaml(
     home: Path,
     *,
@@ -321,21 +454,13 @@ def merge_into_yaml(
         if people_added or people_updated or channels_added or channels_updated:
             doc["people"] = existing_people
             doc["channels"] = existing_channels
-            yaml_path.parent.mkdir(parents=True, exist_ok=True)
-            # Write atomically: write to a tempfile next to the target
-            # then rename. Avoids a torn-file window if the writer
-            # crashes mid-write while the runtime IdentityResolver is
-            # reloading.
-            tmp = yaml_path.with_suffix(yaml_path.suffix + ".tmp")
-            body = yaml.safe_dump(
-                doc, sort_keys=False, allow_unicode=True, width=1_000
-            )
-            # Prepend the operator's leading comment block (schema doc
-            # header on the canonical identities.yaml) so it survives
-            # populator writes. Inline / mid-document comments are NOT
-            # preserved — see _load_yaml docstring.
-            tmp.write_text(header + body, encoding="utf-8")
-            tmp.replace(yaml_path)
+            # Atomic, header-preserving, unique-temp write under the shared
+            # ``_IDENTITIES_WRITE_LOCK`` (held by this function's decorator) so
+            # a concurrent ``capture_dm_channel`` can't lost-update us and we
+            # can't clobber its just-captured dm_channels. The header prepend
+            # keeps the operator's schema doc-comment; inline / mid-document
+            # comments are NOT preserved — see _load_yaml docstring.
+            _atomic_write_identities(yaml_path, header, doc)
 
     return {
         "people_added": people_added,

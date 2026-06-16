@@ -518,7 +518,9 @@ Mimir uses open-strix's message-buffer model verbatim, with one extension (cross
 }
 ```
 
-`<channel_id>` follows the bridge prefix scheme from §7.2.3: `slack-<id>` / `dm-slack-<user_id>`, `discord-<id>` / `dm-discord-<user_id>`, `web-<conv_id>`, `bench-<task_id>`. The benchmark adapter uses one synthetic `bench-` channel per task. (Bluesky has no in-process bridge prefix — social posting runs through the `social-cli` optional skill poller.)
+`<channel_id>` follows the bridge prefix scheme from §7.2.3: `slack-<id>` / `dm-slack-<im_id>`, `discord-<id>` / `dm-discord-<dm_channel_id>`, `web-<conv_id>`, `bench-<task_id>`. The benchmark adapter uses one synthetic `bench-` channel per task. (Bluesky has no in-process bridge prefix — social posting runs through the `social-cli` optional skill poller.)
+
+A **DM channel id is the platform's *conversation* id, not the user id** — Slack's IM id (`D…`/`G…`), Discord's DM-channel snowflake — both assigned separately from the user id and not string-derivable from it. To make DMs addressable without operator setup, the first time a user messages on a bridge the framework resolves their DM channel (`bridge.resolve_dm_channel(author_id)` → Slack `conversations.open`, Discord `create_dm`; opens the conversation but sends no message) and caches it under that person's `dm_channels:` map in `state/identities.yaml` (fill-blank, never overwriting operator-set values). Captured DMs surface in the per-turn "Known identities" block and via the read-only **`list_channels`** tool (§7.1), so the agent can DM a person by their `dm-…` channel id.
 
 #### In-memory deques
 
@@ -759,6 +761,7 @@ Tools are deliberately minimal. Memory editing is *not* a tool — the agent use
 ### 7.1 Channel & messaging
 - `send_message(text: str, channel_id: str | None = None, attachment_paths: list[str] | None = None)` — emit to a channel. If `channel_id` is omitted, defaults to the current turn's channel. The `ChannelRegistry` (§7.2) dispatches on the channel_id prefix to the right bridge. Subject to the loop-detection circuit breaker (§7.2.4). Returns a status string: `send_message complete (sent={bool}, chunks={n}, message_id={id})`.
 - `react(emoji: str, message_id: str | None = None, channel_id: str | None = None)` — emit a reaction. Defaults to the most recent inbound message on the current channel. Discord and Slack react natively; web chat broadcasts a `react` event over its SSE stream; the bench bridge (stdout has no reaction concept) logs a no-op to `home/logs/reactions.jsonl`.
+- `list_channels(platform: str | None = None)` — read-only enumeration of the channels the agent knows about: operator-curated `channels:`, per-person captured DM channels (`dms`: person → `dm-…` channel id), and the live bridge prefixes. Optional `platform` (`"slack"`/`"discord"`) scopes the result to one bridge. The way to find where to send — especially to DM a person by their channel id (§5.4).
 
 ### 7.2 Channel layer — bridges and pollers
 

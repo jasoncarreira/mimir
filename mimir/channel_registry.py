@@ -82,6 +82,13 @@ class ChannelRegistry:
     def bridges(self) -> list[Bridge]:
         return list(self._bridges)
 
+    def prefixes(self) -> list[str]:
+        """Registered channel-id prefixes (e.g. ``discord-`` / ``dm-slack-``),
+        longest-first — the namespaces the connected bridges serve. A
+        ``channel_id`` must start with one of these or ``find`` returns None
+        (→ ``UnknownChannelError`` on send)."""
+        return [prefix for prefix, _ in self._entries]
+
     def find(self, channel_id: str) -> Bridge | None:
         for prefix, bridge in self._entries:
             if channel_id.startswith(prefix):

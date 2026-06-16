@@ -12,9 +12,23 @@ All notable changes will land here. Format loosely follows
   brand-new home now gets `memory/core/01-init.md` pointing the agent at its
   onboarding skill, so onboarding reliably fires on first contact instead of
   depending on the model noticing it has no persona blocks. First-run only:
-  the onboarding skill deletes the block when done and `setup` never re-seeds
-  it (so onboarding can't re-trigger). Documented in the README quickstart +
-  the non-Docker guide.
+  the onboarding skill removes the block (via the proposal that establishes
+  the persona) and `setup` never re-seeds it (so onboarding can't re-trigger).
+  Documented in the README quickstart + the non-Docker guide.
+- **First-contact DM-channel capture + a `list_channels` tool.** The first
+  time a user messages on a bridge, the framework resolves their DM channel
+  (`bridge.resolve_dm_channel` → Slack `conversations.open`, Discord
+  `create_dm`; opens the conversation, sends nothing) and caches it under
+  that person's new `dm_channels:` map in `state/identities.yaml` (fill-blank,
+  header-preserving, never overwriting operator-set values). Captured DMs
+  surface in the per-turn "Known identities" block and via a new read-only
+  **`list_channels(platform=None)`** tool (operator-curated channels +
+  per-person captured DMs + live bridge prefixes; optional bridge filter) —
+  so the agent can DM a person by their `dm-…` channel id without the
+  operator pre-configuring it. A DM channel id is the platform's
+  *conversation* id (Slack `D…`, Discord DM snowflake), never the user id;
+  docs (SPEC §5.4/§7.1, skill-creator, alert skill, setup `.env`) corrected
+  accordingly.
 
 ## [0.4.0] — 2026-06-16
 

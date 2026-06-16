@@ -509,6 +509,29 @@ class DiscordBridge(Bridge):
         self._client = None
         self._runner = None
 
+    async def resolve_dm_channel(self, author_id: str) -> str | None:
+        """Open/fetch the DM channel for a Discord user id → its mimir
+        channel id (``dm-discord-<dm-channel-snowflake>``). Allocates the
+        DM channel object but sends no message; best-effort."""
+        if self._client is None or self._client.is_closed():
+            return None
+        try:
+            uid = int(author_id)
+        except (TypeError, ValueError):
+            return None
+        try:
+            user = self._client.get_user(uid)
+            if user is None:
+                user = await self._client.fetch_user(uid)
+            if user is None:
+                return None
+            dm = getattr(user, "dm_channel", None) or await user.create_dm()
+            dm_id = str(getattr(dm, "id", "") or "")
+            return f"dm-discord-{dm_id}" if dm_id else None
+        except discord.DiscordException as exc:
+            log.warning("resolve_dm_channel failed for user %s: %s", author_id, exc)
+            return None
+
     async def send(
         self,
         channel_id: str,

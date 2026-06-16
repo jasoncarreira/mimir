@@ -15,8 +15,8 @@ success_criteria:
 # Operator alert channel
 
 If `MIMIR_OPERATOR_ALERT_CHANNEL` is configured, the system prompt's
-Operator config section will name a channel id (e.g. `dm-slack-U05ABC` or
-`dm-discord-NNN`). Use it for high-priority signals to the operator that
+Operator config section will name a channel id (e.g. `dm-slack-D05ABC` or
+`dm-discord-NNN` — a DM *conversation* id, not a user id). Use it for high-priority signals to the operator that
 *don't fit the current conversation*. If the line is absent, the feature
 is off — fall back to your usual options (heartbeat backlog, the channel
 you're already in).
@@ -42,7 +42,7 @@ dispatches by prefix. So just call `send_message` against it like any
 other channel:
 
 ```
-send_message(channel_id="dm-slack-U05ABC", text="...")
+send_message(channel_id="dm-slack-D05ABC", text="...")
 ```
 
 Make the message specific and self-contained. The operator may be

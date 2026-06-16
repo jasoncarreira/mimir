@@ -85,6 +85,11 @@ class Identity:
     display_name: str | None = None
     aliases: list[str] = field(default_factory=list)
     notes: str | None = None
+    # Captured DM channels, keyed by platform (e.g. {"slack": "dm-slack-D…",
+    # "discord": "dm-discord-…"}). Auto-populated on first contact per bridge
+    # (see ``capture_dm_channel`` in identities_populator) so the agent can
+    # reach this person directly without the operator pre-configuring it.
+    dm_channels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -228,11 +233,31 @@ class IdentityResolver:
             if notes is not None and not isinstance(notes, str):
                 notes = None
 
+            # dm_channels: platform → mimir channel_id. Liberal-on-read —
+            # a malformed map is dropped, not fatal.
+            raw_dm = raw.get("dm_channels") or {}
+            dm_channels: dict[str, str] = {}
+            if isinstance(raw_dm, dict):
+                for platform, cid in raw_dm.items():
+                    if (
+                        isinstance(platform, str)
+                        and isinstance(cid, str)
+                        and platform.strip()
+                        and cid.strip()
+                    ):
+                        dm_channels[platform.strip()] = cid.strip()
+            elif raw_dm:
+                log.warning(
+                    "identities.yaml: %s dm_channels is not a map, ignoring",
+                    canonical,
+                )
+
             identities[canonical] = Identity(
                 canonical=canonical,
                 display_name=display_name,
                 aliases=aliases,
                 notes=notes,
+                dm_channels=dm_channels,
             )
             if display_name:
                 display_names[canonical] = display_name
@@ -378,6 +403,28 @@ class IdentityResolver:
             return None
         canonical = self._alias_map.get(author, author)
         return self._display_names.get(canonical)
+
+    def dm_channels(self, author: str | None) -> dict[str, str]:
+        """Captured DM channels (platform → channel_id) for ``author``'s
+        canonical. ``{}`` when the alias is unknown or none are captured."""
+        if author is None:
+            return {}
+        canonical = self._alias_map.get(author, author)
+        ident = self._identities.get(canonical)
+        return dict(ident.dm_channels) if ident else {}
+
+    def dm_channel(self, author: str | None, platform: str | None = None) -> str | None:
+        """The captured DM ``channel_id`` for ``author`` on ``platform``
+        (``"slack"`` / ``"discord"``). With no platform, returns the sole
+        captured DM if exactly one is known, else ``None``."""
+        chans = self.dm_channels(author)
+        if not chans:
+            return None
+        if platform:
+            return chans.get(platform)
+        if len(chans) == 1:
+            return next(iter(chans.values()))
+        return None
 
     def all_identities(self) -> list[Identity]:
         """All loaded identities. Order is YAML file order."""
