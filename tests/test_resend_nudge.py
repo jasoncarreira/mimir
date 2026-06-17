@@ -5,7 +5,7 @@ the agent's ``_maybe_resend_nudge`` decision/recovery logic with a fake graph.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import timezone
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +14,9 @@ from langchain_core.messages import AIMessage
 from mimir.agent import Agent
 from mimir.config import Config
 from mimir.models import AgentEvent
-from mimir.resend_nudge import build_nudge_text, nudge_enabled, record_and_count
+import json
+
+from mimir.resend_nudge import build_nudge_text, count_recent_no_sends, nudge_enabled
 
 UTC = timezone.utc
 
@@ -37,27 +39,34 @@ def test_build_nudge_text_includes_tally_only_on_repeat():
     assert "3 times in the last 24 hours" in third
 
 
-def test_record_and_count_increments_then_prunes_after_24h(tmp_path):
-    now = datetime(2026, 6, 17, 12, 0, 0, tzinfo=UTC)
-    assert record_and_count(tmp_path, "discord-1", now) == 1
-    assert record_and_count(tmp_path, "discord-1", now + timedelta(minutes=1)) == 2
-    assert record_and_count(tmp_path, "discord-1", now + timedelta(minutes=2)) == 3
-    # 25h later: the earlier three fall outside the window → count resets to 1.
-    assert record_and_count(tmp_path, "discord-1", now + timedelta(hours=25)) == 1
+def _write_events(path, rows):
+    # events.jsonl is appended chronologically (oldest first); the windowed scan
+    # tails it newest-first and breaks at the cutoff.
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
 
-def test_record_and_count_is_per_channel(tmp_path):
-    now = datetime(2026, 6, 17, 12, 0, 0, tzinfo=UTC)
-    record_and_count(tmp_path, "discord-1", now)
-    record_and_count(tmp_path, "discord-1", now)
-    assert record_and_count(tmp_path, "discord-2", now) == 1
+def test_count_recent_no_sends_windowed_and_channel_scoped(tmp_path):
+    events = tmp_path / "events.jsonl"
+    _write_events(events, [
+        # before the cutoff → excluded
+        {"timestamp": "2026-06-16T20:00:00+00:00", "type": "interactive_turn_no_send_message", "channel_id": "discord-1"},
+        # in window, discord-1 → counted
+        {"timestamp": "2026-06-17T10:00:00+00:00", "type": "interactive_turn_no_send_message", "channel_id": "discord-1"},
+        # other channel → excluded
+        {"timestamp": "2026-06-17T11:00:00+00:00", "type": "interactive_turn_no_send_message", "channel_id": "discord-2"},
+        # other type → excluded
+        {"timestamp": "2026-06-17T12:00:00+00:00", "type": "send_message_sent", "channel_id": "discord-1"},
+        # in window, discord-1 → counted
+        {"timestamp": "2026-06-17T13:00:00+00:00", "type": "interactive_turn_no_send_message", "channel_id": "discord-1"},
+    ])
+    cutoff = "2026-06-17T00:00:00+00:00"
+    assert count_recent_no_sends(events, "discord-1", cutoff) == 2
+    assert count_recent_no_sends(events, "discord-2", cutoff) == 1
+    assert count_recent_no_sends(events, "discord-3", cutoff) == 0
 
 
-def test_record_and_count_survives_corrupt_file(tmp_path):
-    d = tmp_path / ".mimir"
-    d.mkdir(parents=True)
-    (d / "resend_nudge_log.json").write_text("{not valid json", encoding="utf-8")
-    assert record_and_count(tmp_path, "discord-1", datetime(2026, 6, 17, tzinfo=UTC)) == 1
+def test_count_recent_no_sends_missing_log_returns_zero(tmp_path):
+    assert count_recent_no_sends(tmp_path / "nope.jsonl", "discord-1", "2026-06-17T00:00:00+00:00") == 0
 
 
 def test_config_resend_nudge_channels_env(monkeypatch):

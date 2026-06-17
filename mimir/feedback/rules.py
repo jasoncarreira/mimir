@@ -99,6 +99,10 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # nothing. Surfaces in the next turn's feedback panel so the agent
     # self-corrects (and reflection can catch a recurring pattern).
     "interactive_turn_no_send_message": ("negative", "no_reply"),
+    # Resend-nudge re-prompted the agent to deliver, and it STILL didn't call
+    # send_message — the recovery failed, so the reply is lost. A stronger
+    # negative than the plain no-send (the in-band correction didn't take).
+    "resend_nudge_failed": ("negative", "resend_failed"),
     # Poller framework — health signals emitted by skill-side poller
     # subprocesses (via the ``"signal": "<event_type>"`` JSONL shape;
     # see ``mimir/pollers.py`` output contract). These surface

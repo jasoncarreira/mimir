@@ -41,7 +41,7 @@ import re
 import time
 import traceback
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
@@ -1528,7 +1528,7 @@ class Agent:
         ``resend_nudge_failed`` and gives up (no recursion). Every failure path is
         swallowed so the nudge can never fail the turn.
         """
-        from .resend_nudge import build_nudge_text, nudge_enabled, record_and_count
+        from .resend_nudge import build_nudge_text, count_recent_no_sends, nudge_enabled
 
         if not (turn_is_interactive and (output or "").strip()):
             return messages, events, output
@@ -1538,13 +1538,16 @@ class Agent:
         if not nudge_enabled(event.channel_id, self._config.resend_nudge_channels):
             return messages, events, output
 
+        # 24h recidivism tally, counted from events.jsonl the same way the
+        # algedonic block does (not a parallel counter). +1 for this turn's
+        # under-send, whose guard event hasn't been emitted yet at this point.
         try:
-            count = record_and_count(
-                self._config.home, event.channel_id, datetime.now(timezone.utc)
-            )
+            cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            events_path = self._config.home / "logs" / "events.jsonl"
+            count = count_recent_no_sends(events_path, event.channel_id, cutoff_iso) + 1
         except Exception:  # noqa: BLE001 — counting must never fail the turn
             log.exception("resend-nudge count failed")
-            count = 0
+            count = 1
         await safe_log_event(
             "resend_nudge_issued",
             channel_id=event.channel_id, turn_id=turn_id, no_send_count_24h=count,

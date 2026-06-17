@@ -16,13 +16,14 @@ raise into a turn.
 """
 from __future__ import annotations
 
-import json
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Sequence
 
-#: Recidivism window for the "N times in the last 24h" tally.
-WINDOW = timedelta(hours=24)
+from .jsonl_snapshot import iter_window_records
+
+#: The under-send signal the 24h tally counts — emitted by the forgot-to-send
+#: guard (#423) on every interactive turn that produced text but didn't deliver.
+_NO_SEND_EVENT = "interactive_turn_no_send_message"
 
 
 def nudge_enabled(channel_id: str | None, prefixes: Sequence[str]) -> bool:
@@ -52,56 +53,25 @@ def build_nudge_text(channel_id: str, count: int) -> str:
     )
 
 
-def record_and_count(home: Path | str, channel_id: str, now: datetime) -> int:
-    """Append ``now`` to the per-channel no-send log, prune entries older than
-    :data:`WINDOW`, and return the count within the window (including this one).
+def count_recent_no_sends(events_path: Path | str, channel_id: str, cutoff_iso: str) -> int:
+    """Count prior ``interactive_turn_no_send_message`` events for ``channel_id``
+    in the window ``[cutoff_iso, now]``, read from ``events.jsonl`` the same way
+    the algedonic block counts (a windowed tail scan via
+    :func:`iter_window_records`) — one source of truth, not a parallel counter.
 
-    Backed by a small JSON file under ``<home>/.mimir/`` so the tally survives
-    restarts without scanning the (potentially huge) events log. Best-effort:
-    a corrupt/unreadable file resets to just this occurrence rather than raising.
+    Returns the count of PRIOR occurrences (the caller adds 1 for the current,
+    not-yet-emitted one). Best-effort: 0 on a missing/unreadable log.
     """
-    path = Path(home) / ".mimir" / "resend_nudge_log.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    data: dict = {}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-        except Exception:
-            data = {}
-
-    cutoff = now - WINDOW
-    kept: list[datetime] = []
-    raw = data.get(channel_id)
-    if isinstance(raw, list):
-        for s in raw:
-            try:
-                ts = datetime.fromisoformat(s)
-            except Exception:
+    try:
+        count = 0
+        for ev in iter_window_records(None, Path(events_path)):  # newest-first
+            ts = ev.get("timestamp")
+            if not isinstance(ts, str) or ts < cutoff_iso:
+                if isinstance(ts, str):
+                    break  # walked past the window edge (log is chronological)
                 continue
-            if ts >= cutoff:
-                kept.append(ts)
-    kept.append(now)
-
-    # Prune other channels' stale entries too, so the file stays bounded.
-    pruned: dict[str, list[str]] = {channel_id: [ts.isoformat() for ts in kept]}
-    for chan, stamps in data.items():
-        if chan == channel_id or not isinstance(stamps, list):
-            continue
-        fresh = []
-        for s in stamps:
-            try:
-                ts = datetime.fromisoformat(s)
-            except Exception:
-                continue
-            if ts >= cutoff:
-                fresh.append(s)
-        if fresh:
-            pruned[chan] = fresh
-
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(pruned), encoding="utf-8")
-    tmp.replace(path)
-    return len(kept)
+            if ev.get("type") == _NO_SEND_EVENT and ev.get("channel_id") == channel_id:
+                count += 1
+        return count
+    except Exception:
+        return 0
