@@ -73,6 +73,18 @@ All notable changes will land here. Format loosely follows
   checks out the attempt branch off `FETCH_HEAD` first, then materializes the
   base ref — surfaced by the first real docker-sibling smoke (#540).
 
+- **Worklink worker ignored the orchestrator-resolved backend config on
+  non-shared substrates** (docker-sibling / ECS; rail #537). `run_worker_payload`
+  rebuilt the backend from its *own* empty registry (`registry.get(spec.backend)`),
+  discarding `spec.backend_config` — the `bin` + `args` the orchestrator already
+  resolved (e.g. codex `--sandbox danger-full-access`). With no `worklink.yaml`
+  of its own, the worker fell back to default codex args, ran sandboxed, wrote
+  nothing, and the run failed not-review-ready with no push. The worker now
+  builds the backend from `spec.backend_config` when present. Also surfaced by
+  the #540 smoke. (The docker-sibling smoke script now configures codex with
+  `danger-full-access` like a real `worklink.yaml`, so the orchestrator resolves
+  it into the spec.)
+
 ## [0.5.0] — 2026-06-17
 
 ### Added

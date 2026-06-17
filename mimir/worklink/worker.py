@@ -74,7 +74,17 @@ async def run_worker_payload(
     runner = runner or _run
     spec = payload.spec
     repo = _prepare_repo(payload, runner=runner)
-    backend = registry.get(spec.backend)
+    # Honor the backend config the orchestrator already resolved (bin + args,
+    # e.g. codex `--sandbox danger-full-access`). On a non-shared substrate
+    # (docker-sibling / ecs) the worker has no worklink.yaml of its own, so
+    # without this it falls back to the backend's default args and runs codex
+    # sandboxed → no file writes → empty diff → not review-ready → no push.
+    if spec.backend_config:
+        backend = BackendRegistry(
+            WorklinkConfig(backend_settings={spec.backend: dict(spec.backend_config)})
+        ).get(spec.backend)
+    else:
+        backend = registry.get(spec.backend)
     order = WorkOrder(
         issue_id=spec.issue_id,
         worktree=repo,

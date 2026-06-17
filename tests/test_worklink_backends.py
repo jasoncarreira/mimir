@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,12 @@ from mimir.worklink.backends import (
 )
 from mimir.worklink.backends.base import blocked_reason_from_output
 from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, LaunchHandle, WorkSpec
-from mimir.worklink.worker import WorkerPayload, payload_from_json, payload_to_json
+from mimir.worklink.worker import (
+    WorkerPayload,
+    payload_from_json,
+    payload_to_json,
+    run_worker_payload,
+)
 import mimir.worklink.backends.codex as codex_module
 import mimir.worklink.compute as compute_module
 
@@ -1213,3 +1219,62 @@ compute_backends:
     assert backend.config.subnets == ("subnet-a",)
     assert backend.config.security_groups == ("sg-worklink",)
     assert backend.config.safe_env == {"MIMIR_HOME": "/worklink/home"}
+
+
+@pytest.mark.asyncio
+async def test_worker_honors_spec_backend_config_codex_args(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # chainlink #540: a non-shared worker (docker-sibling/ecs) has no worklink.yaml,
+    # so it must run codex with the args the ORCHESTRATOR resolved into
+    # spec.backend_config (e.g. --sandbox danger-full-access). Without honoring it
+    # the worker falls back to default codex args, runs sandboxed, writes nothing,
+    # and the run fails not-review-ready (no push) — the bug the first smoke hit.
+    codex_calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        codex_calls.append(tuple(args))
+        return FakeProcess(returncode=0, stdout=b'{"type":"item.completed"}\n', stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def cp(args: Any, returncode: int = 0, stdout: str = "") -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
+
+    def runner(args: Any, **kw: Any) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and "diff" in args and "--name-only" in args:
+            return cp(args, stdout="docs/worklink-smoke.md\n")  # non-empty diff → review-ready
+        if args == "echo ok":
+            return cp(args, stdout="ok\n")  # test passes
+        return cp(args)
+
+    spec = WorkSpec(
+        issue_id=553,
+        attempt=1,
+        repo_url="https://github.com/jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="issue/553-a1",
+        prompt="create docs/worklink-smoke.md",
+        rules=None,
+        test_command="echo ok",
+        backend="codex",
+        timeout_s=60,
+        backend_config={"bin": "codex", "args": ["exec", "--json", "--sandbox", "danger-full-access"]},
+    )
+    payload = WorkerPayload(
+        spec=spec,
+        repo_dir=repo,
+        evidence_path=tmp_path / "evidence.json",
+        transcript_root=tmp_path / "transcripts",
+        safe_env={},
+    )
+
+    # No registry passed → exercises the spec.backend_config path (the fix).
+    await run_worker_payload(payload, runner=runner)
+
+    assert codex_calls, "codex backend was never invoked"
+    flat = [tok for call in codex_calls for tok in call]
+    assert "--sandbox" in flat and "danger-full-access" in flat
