@@ -60,6 +60,12 @@ class WorkSpec:
     backend_config: Mapping[str, Any] = field(default_factory=dict)
     local_worktree: Path | None = None
     local_argv: Sequence[str] | None = None
+    # chainlink #538: test-only run. The worker clones + checks out the pushed
+    # ``branch`` and runs ``test_command``, exiting with the test's exit code (no
+    # backend, no push). Lets the controller re-derive REMOTE test evidence in a
+    # fresh sandboxed compute job — controller-orchestrated, exit-code as the
+    # trust channel — instead of fail-closing on unverified tests.
+    test_only: bool = False
 
 
 @dataclass(frozen=True)

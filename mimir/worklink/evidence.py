@@ -229,6 +229,36 @@ def observe_remote_evidence(
     return validation
 
 
+def fold_remote_test_evidence(
+    validation: EvidenceValidation, test_command: str, exit_code: int
+) -> EvidenceValidation:
+    """Replace the stubbed remote test result with an OBSERVED one (chainlink
+    #538), then re-validate.
+
+    ``exit_code`` is the exit of a fresh sandboxed test job the controller ran on
+    the pushed branch (``worker --test-only``): 0 = tests passed. This is how a
+    docker-sibling/ecs run stops fail-closing on ``tests_not_observed`` — the
+    controller orchestrated the test execution and reads its exit code, the same
+    trust basis as the local path running tests itself."""
+    evidence = replace(
+        validation.evidence,
+        # Reset to the completed baseline before re-validating: the first pass
+        # downgraded status to "failed" solely on tests_not_observed and persisted
+        # it, and validate_evidence only ever downgrades. The caller folds only
+        # when there's a real observed diff (which exists only if the worker
+        # completed + pushed), so "completed" is the correct base; validate_evidence
+        # re-downgrades to "failed" if the folded test result is non-zero.
+        status="completed",
+        tests=TestResult(
+            test_command,
+            exit_code,
+            f"remote sandboxed test job: exit {exit_code}",
+            observed=True,
+        ),
+    )
+    return validate_evidence(evidence)
+
+
 def _observe_evidence_from_ref(
     *,
     issue: int,

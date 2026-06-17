@@ -153,9 +153,48 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         parser.error("payload path or --payload-json is required")
     payload = payload_from_json(payload_data)
+    if payload.spec.test_only:
+        # Exit code IS the result the controller reads (chainlink #538).
+        return asyncio.run(_run_test_only(payload))
     validation = asyncio.run(run_worker_payload(payload))
     print(json.dumps({"status": validation.status, "review_ready": validation.review_ready, "reasons": list(validation.reasons)}))
     return 0 if validation.status in {"completed", "failed", "blocked"} else 1
+
+
+async def _run_test_only(payload: WorkerPayload, *, runner: Any | None = None) -> int:
+    """Test-only worker run (chainlink #538): clone + check out the already-pushed
+    ``branch`` and run ``test_command``, returning the test's exit code.
+
+    No backend, no commit, no push — this is the controller's REMOTE test
+    re-derivation, run in a fresh sandboxed compute job so the test result is the
+    container's exit code (the standard ``ComputeResult`` channel) rather than a
+    worker self-report. A setup failure (clone/fetch/checkout) returns a distinct
+    non-zero sentinel; either way a non-zero exit fails the review gate closed.
+    """
+    runner = runner or _run
+    spec = payload.spec
+    repo = payload.repo_dir
+    repo.parent.mkdir(parents=True, exist_ok=True)
+    branch_refspec = f"+{spec.branch}:refs/remotes/origin/{spec.branch}"
+    try:
+        if not (repo / ".git").exists():
+            _check(runner(["git", "clone", spec.repo_url, str(repo)]), "git clone")
+        _check(runner(["git", "-C", str(repo), "fetch", "origin", branch_refspec]), "git fetch")
+        _check(
+            runner(["git", "-C", str(repo), "checkout", "--detach", f"origin/{spec.branch}"]),
+            "git checkout",
+        )
+    except Exception as exc:
+        print(json.dumps({"test_only": True, "setup_error": str(exc)}))
+        return 70  # setup failure — distinct from a test pass(0)/fail(non-zero)
+    test = runner(spec.test_command, cwd=repo)
+    print(json.dumps({
+        "test_only": True,
+        "branch": spec.branch,
+        "test_command": spec.test_command,
+        "exit_code": test.returncode,
+    }))
+    return test.returncode
 
 
 def _prepare_repo(payload: WorkerPayload, *, runner: Any) -> Path:
@@ -251,6 +290,7 @@ def _spec_from_json(data: Mapping[str, Any]) -> WorkSpec:
         backend_config=dict(data.get("backend_config") or {}),
         local_worktree=(Path(str(data["local_worktree"])) if data.get("local_worktree") else None),
         local_argv=tuple(str(arg) for arg in data.get("local_argv") or ()) or None,
+        test_only=bool(data.get("test_only", False)),
     )
 
 

@@ -23,6 +23,7 @@ from .claims import ChainlinkClaims
 from .evidence import (
     EvidenceValidation,
     WorklinkEvidence,
+    fold_remote_test_evidence,
     observe_evidence,
     observe_remote_evidence,
 )
@@ -336,6 +337,23 @@ class WorklinkRunner:
                     blocked_reason=raw.blocked_reason,
                     runner=runner,
                 )
+                # chainlink #538: remote runs can't run the worker's (untrusted)
+                # branch on the controller, so observe_remote_evidence stubs tests
+                # observed=false → the gate fails closed. When the re-derived diff
+                # is real, run a fresh sandboxed test job on the pushed branch and
+                # fold its exit code in (controller-orchestrated; exit-code is the
+                # trust channel). A launch/timeout failure leaves tests unobserved
+                # (still fail-closed).
+                if (
+                    test_cmd
+                    and validation.evidence.diff_observed
+                    and validation.evidence.files_changed
+                ):
+                    test_exit = await _run_remote_test_job(
+                        compute, spec, timeout_s=config.defaults.timeout_s
+                    )
+                    if test_exit is not None:
+                        validation = fold_remote_test_evidence(validation, test_cmd, test_exit)
                 evidence_path = _write_evidence(self.home, validation.evidence)
                 if validation.review_ready:
                     pr_url = _open_pr(
@@ -750,6 +768,43 @@ def _ensure_clean_worktree(worktree: Path, *, runner: Runner) -> None:
         raise WorklinkError((status.stderr or status.stdout).strip() or "git status failed")
     if status.stdout.strip():
         raise WorklinkError("worktree still dirty after Worklink commit")
+
+
+async def _run_remote_test_job(compute: Any, spec: Any, *, timeout_s: int) -> int | None:
+    """Dispatch a fresh sandboxed test job on the pushed branch and return its
+    exit code (chainlink #538): 0 = tests passed.
+
+    Reuses the same compute substrate as the implement run — the worker, in
+    ``test_only`` mode, clones + checks out the pushed branch, runs
+    ``test_command``, and exits with the test's code, which surfaces as the
+    job's ``ComputeResult.exit_code``. Returns ``None`` when the job couldn't run
+    cleanly (launch error / timeout) so the caller leaves tests unobserved and
+    the gate stays fail-closed.
+    """
+    test_spec = replace(spec, test_only=True)
+    handle = None
+    try:
+        handle = await compute.launch(test_spec)
+        result = await compute.wait(handle, timeout_s)
+    except ComputeLaunchError as exc:
+        _log_event("worklink_remote_test_job_launch_failed", issue_id=spec.issue_id, error=str(exc)[:300])
+        return None
+    except Exception as exc:  # noqa: BLE001 — any dispatch failure is non-fatal: fail closed, leaving tests unobserved
+        _log_event("worklink_remote_test_job_unobserved", issue_id=spec.issue_id, error=str(exc)[:300])
+        return None
+    finally:
+        if handle is not None:
+            await compute.cleanup(handle)
+    if result.launch_error or result.timed_out:
+        _log_event(
+            "worklink_remote_test_job_unobserved",
+            issue_id=spec.issue_id,
+            timed_out=result.timed_out,
+            error=(result.launch_error or "")[:300],
+        )
+        return None
+    _log_event("worklink_remote_test_job", issue_id=spec.issue_id, exit_code=result.exit_code)
+    return result.exit_code
 
 
 def _git_push(repo: Path, branch: str, *, runner: Runner) -> None:
