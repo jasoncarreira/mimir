@@ -207,15 +207,20 @@ def _prepare_repo(payload: WorkerPayload, *, runner: Any) -> Path:
     else:
         _check(runner(["git", "clone", spec.repo_url, str(repo)]), "git clone")
         _check(runner(["git", "-C", str(repo), "fetch", "origin", remote_ref]), "git fetch")
-    if not spec.base_ref.startswith("origin/"):
-        # Materialize the fetched base under a local ref so both the checkout
-        # below and the later `base...HEAD` diff can name it. Git allows slashes
-        # in branch names, so this works for simple ("main") and long-running
-        # feature ("integration/worklink") bases alike. origin/-prefixed bases
-        # are skipped: they resolve via the remote-tracking ref instead.
-        _check(runner(["git", "-C", str(repo), "branch", "-f", spec.base_ref, "FETCH_HEAD"]), "git branch")
-    checkout_ref = f"origin/{remote_ref}" if spec.base_ref.startswith("origin/") else spec.base_ref
+    # Check out the attempt branch off the fetched base FIRST. On a fresh clone
+    # (the non-shared docker-sibling / ecs path) the repo's HEAD is on base_ref
+    # (e.g. "main"); materializing the local base ref before moving off it fails
+    # with "cannot force update the branch '<base>' used by worktree". The local
+    # worktree path never hit this because its checkout isn't on base_ref.
+    checkout_ref = f"origin/{remote_ref}" if spec.base_ref.startswith("origin/") else "FETCH_HEAD"
     _check(runner(["git", "-C", str(repo), "checkout", "-B", spec.branch, checkout_ref]), "git checkout")
+    if not spec.base_ref.startswith("origin/"):
+        # Materialize the fetched base under a local ref so the later
+        # `base...HEAD` diff can name it. Safe now that the attempt branch — not
+        # base_ref — is the checked-out branch. Git allows slashes, so simple
+        # ("main") and long-running ("integration/worklink") bases both work.
+        # origin/-prefixed bases resolve via the remote-tracking ref instead.
+        _check(runner(["git", "-C", str(repo), "branch", "-f", spec.base_ref, "FETCH_HEAD"]), "git branch")
     return repo
 
 

@@ -302,10 +302,15 @@ def test_worker_prepares_slash_named_feature_base(tmp_path: Path) -> None:
     validation = asyncio.run(run_worker_payload(payload, registry=registry, runner=runner))
 
     assert validation.status == "completed"
-    # The slash base is fetched, materialized as a local ref, and checked out from it.
+    # The slash base is fetched, the attempt branch is checked out off FETCH_HEAD,
+    # THEN base is materialized as a local ref — in that order, so a fresh clone
+    # whose HEAD is on base_ref doesn't fail force-updating the checked-out branch
+    # ("cannot force update the branch used by worktree" — the docker-sibling bug).
     assert ["git", "-C", str(repo), "fetch", "origin", "integration/worklink"] in calls
-    assert ["git", "-C", str(repo), "branch", "-f", "integration/worklink", "FETCH_HEAD"] in calls
-    assert ["git", "-C", str(repo), "checkout", "-B", "issue/456-a1", "integration/worklink"] in calls
+    checkout = ["git", "-C", str(repo), "checkout", "-B", "issue/456-a1", "FETCH_HEAD"]
+    branch_f = ["git", "-C", str(repo), "branch", "-f", "integration/worklink", "FETCH_HEAD"]
+    assert checkout in calls and branch_f in calls
+    assert calls.index(checkout) < calls.index(branch_f)
 
 
 def test_worker_asks_backend_to_localize_tool_argv(tmp_path: Path) -> None:
