@@ -11,7 +11,7 @@ from textwrap import dedent
 import pytest
 
 from mimir.config import Config
-from mimir.dispatcher import Dispatcher, _ChannelQueue
+from mimir.dispatcher import Dispatcher, TRUSTED_INTERNAL_SOURCES, _ChannelQueue
 from mimir.event_logger import init_logger
 from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent
@@ -707,7 +707,7 @@ async def test_default_compat_allows_non_allowlisted_discord_user(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_access_gate_does_not_cover_non_user_message_or_non_bridge_sources(
+async def test_access_gate_allows_non_user_messages_and_trusted_internal_sources(
     tmp_path: Path,
 ):
     cfg = _make_config(tmp_path, access_control_enforced=True)
@@ -747,6 +747,86 @@ async def test_access_gate_does_not_cover_non_user_message_or_non_bridge_sources
 
     await disp.drain()
     assert ran == [("poller", "slack"), ("user_message", "api")]
+    assert "web" in TRUSTED_INTERNAL_SOURCES
+
+
+@pytest.mark.asyncio
+async def test_unknown_external_source_is_gated_fail_closed(tmp_path: Path):
+    cfg = _make_config(tmp_path, access_control_enforced=True)
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    ran: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        ran.append(event.content)
+
+    disp = Dispatcher(cfg, runner, resolver=resolver)
+    accepted = await disp.enqueue(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="bsky-C1",
+            content="future bridge",
+            author="bsky-unknown",
+            source="bsky",
+        )
+    )
+
+    assert accepted is False
+    await disp.drain()
+    assert ran == []
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    denied = [row for row in rows if row.get("type") == "inbound_event_denied"]
+    assert len(denied) == 1
+    assert denied[0]["source"] == "bsky"
+    assert denied[0]["reason"] == "unknown_author"
+    assert not any(row.get("type") == "event_queued" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_missing_source_user_message_is_gated_fail_closed(tmp_path: Path):
+    cfg = _make_config(tmp_path, access_control_enforced=True)
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    disp = Dispatcher(cfg, resolver=resolver)
+
+    accepted = await disp.enqueue(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="mystery-C1",
+            content="missing source",
+            author="mystery-unknown",
+        )
+    )
+
+    assert accepted is False
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    denied = [row for row in rows if row.get("type") == "inbound_event_denied"]
+    assert len(denied) == 1
+    assert denied[0]["source"] == "unknown"
+    assert denied[0]["reason"] == "unknown_author"
 
 
 @pytest.mark.asyncio

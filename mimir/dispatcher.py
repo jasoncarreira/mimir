@@ -35,6 +35,11 @@ InjectCallback = Callable[[AgentEvent], Awaitable[None]]
 # event — used for first-contact DM-channel capture (server.py). Must not
 # raise into enqueue and must not block it.
 EventObserver = Callable[[AgentEvent], Awaitable[None]]
+# Inbound user-message admission is fail-closed for bridge/external sources.
+# Only sources that are already authenticated/trusted by the server path bypass
+# the identity allowlist gate. ``web`` is covered by the API-key middleware on
+# POST /chat; ``api``/``stdin`` are operator/internal entry points.
+TRUSTED_INTERNAL_SOURCES = {"web", "api", "stdin"}
 
 
 class _ChannelQueue(asyncio.Queue):
@@ -130,10 +135,6 @@ class Dispatcher:
         """Late-bind the runner. Used to break the agent ↔ dispatcher
         ↔ scheduler initialization cycle in server.py."""
         self._run_turn = run_turn
-
-    def set_identity_resolver(self, resolver: "IdentityResolver | None") -> None:
-        """Late-bind the identity resolver used for inbound admission policy."""
-        self._identity_resolver = resolver
 
     def set_on_inject(self, on_inject: "InjectCallback") -> None:
         """Late-bind the inject callback (chainlink #376 PR 4). Invoked with the
@@ -241,9 +242,9 @@ class Dispatcher:
         return True
 
     async def _authorize_bridge_event(self, event: AgentEvent) -> bool:
-        """Gate Slack/Discord user messages before any admission side effect."""
+        """Gate external user messages before any admission side effect."""
         source = (event.source or "").strip().lower()
-        if event.trigger != "user_message" or source not in {"slack", "discord"}:
+        if event.trigger != "user_message" or source in TRUSTED_INTERNAL_SOURCES:
             return True
 
         decision = authorize_inbound(
@@ -256,7 +257,7 @@ class Dispatcher:
 
         await log_event(
             "inbound_event_denied",
-            source=source,
+            source=source or "unknown",
             channel_id=event.channel_id,
             author=decision.author,
             raw_author_handle=event.author,
