@@ -7,9 +7,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+EventLogger = Callable[..., None]
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -43,21 +44,39 @@ def create_worktree(
     attempt: int,
     base: str = "main",
     worklink_dir: str = ".worklink",
+    base_fetch: bool = True,
+    event_logger: EventLogger | None = None,
     runner: Runner = _default_runner,
 ) -> WorktreeLease:
     """Create an attempt-scoped branch/worktree from a fresh base ref."""
     path = repo / worklink_dir / f"{issue_id}-{attempt}"
     branch = f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
-    start_point = _resolve_local_base(repo, base, runner=runner)
+    fetch_ok = (
+        _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger)
+        if base_fetch
+        else False
+    )
+    start_point = _resolve_local_base(repo, base, prefer_origin=fetch_ok, runner=runner)
     # ``--no-track`` + an explicit, locally-resolvable start point: without them
     # ``git worktree add -b <branch> <path> <base>`` DWIMs a remote-only base
     # name (e.g. a slash-named feature branch that exists only as
     # ``origin/<base>``) into a tracking checkout — silently ignoring ``-b`` and
     # leaving the worktree on the base branch instead of the attempt branch.
-    result = runner([
-        "git", "-C", str(repo), "worktree", "add", "--no-track", "-b", branch, str(path), start_point
-    ])
+    result = runner(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            branch,
+            str(path),
+            start_point,
+        ]
+    )
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout).strip() or "git worktree add failed")
     return WorktreeLease(
@@ -78,6 +97,8 @@ def create_isolated_checkout(
     attempt: int,
     base: str = "main",
     worklink_dir: str = ".worklink",
+    base_fetch: bool = True,
+    event_logger: EventLogger | None = None,
     runner: Runner = _default_runner,
 ) -> WorktreeLease:
     """Create an attempt-scoped local clone with its own ``.git`` directory.
@@ -96,7 +117,12 @@ def create_isolated_checkout(
     if path.exists():
         raise RuntimeError(f"attempt checkout already exists: {path}")
 
-    start_point = _resolve_local_base(repo, base, runner=runner)
+    fetch_ok = (
+        _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger)
+        if base_fetch
+        else False
+    )
+    start_point = _resolve_local_base(repo, base, prefer_origin=fetch_ok, runner=runner)
     start_sha = runner(["git", "-C", str(repo), "rev-parse", "--verify", start_point])
     if start_sha.returncode != 0:
         raise RuntimeError((start_sha.stderr or start_sha.stdout).strip() or "git rev-parse failed")
@@ -108,7 +134,9 @@ def create_isolated_checkout(
 
     remote = runner(["git", "-C", str(repo), "config", "--get", "remote.origin.url"])
     if remote.returncode == 0 and remote.stdout.strip():
-        set_remote = runner(["git", "-C", str(path), "remote", "set-url", "origin", remote.stdout.strip()])
+        set_remote = runner(
+            ["git", "-C", str(path), "remote", "set-url", "origin", remote.stdout.strip()]
+        )
         if set_remote.returncode != 0:
             raise RuntimeError((set_remote.stderr or set_remote.stdout).strip() or "git remote set-url failed")
 
@@ -138,22 +166,54 @@ def create_isolated_checkout(
     )
 
 
-def _resolve_local_base(repo: Path, base: str, *, runner: Runner) -> str:
+def _fetch_base_from_origin(
+    repo: Path,
+    base: str,
+    *,
+    runner: Runner,
+    event_logger: EventLogger | None = None,
+) -> bool:
+    """Best-effort refresh of ``origin/<base>`` without touching local branches."""
+    if base.startswith("origin/"):
+        return False
+    result = runner(["git", "-C", str(repo), "fetch", "origin", base])
+    if result.returncode == 0:
+        return True
+    if event_logger is not None:
+        event_logger(
+            "worklink_base_fetch_failed",
+            repo=str(repo),
+            base=base,
+            returncode=result.returncode,
+            stdout=_strip_for_event(result.stdout),
+            stderr=_strip_for_event(result.stderr),
+        )
+    return False
+
+
+def _resolve_local_base(repo: Path, base: str, *, prefer_origin: bool = False, runner: Runner) -> str:
     """Resolve ``base`` to a locally-resolvable start point / diff floor.
 
-    Prefers an existing local branch, then the remote-tracking ``origin/<base>``,
-    else returns ``base`` unchanged (already ``origin/``-prefixed, a SHA, or a
-    tag — let git resolve it). Returning an explicit ref defeats
-    ``git worktree add``'s DWIM for remote-only base names.
+    After a successful base fetch, prefer the freshly-updated remote-tracking
+    ``origin/<base>``. Otherwise keep the historical local-first behavior so a
+    failed/disabled fetch does not silently use a stale remote-tracking ref.
+    Returning an explicit ref defeats ``git worktree add``'s DWIM for remote-only
+    base names.
     """
     if base.startswith("origin/"):
         return base
-    candidates = ((f"refs/heads/{base}", base), (f"refs/remotes/origin/{base}", f"origin/{base}"))
+    local = (f"refs/heads/{base}", base)
+    remote = (f"refs/remotes/origin/{base}", f"origin/{base}")
+    candidates = (remote, local) if prefer_origin else (local, remote)
     for ref, resolved in candidates:
         check = runner(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ref])
         if check.returncode == 0:
             return resolved
     return base
+
+
+def _strip_for_event(value: Any) -> str:
+    return str(value or "").strip()
 
 
 def _isolated_checkout_path(repo: Path, worklink_dir: str, issue_id: int, attempt: int) -> Path:

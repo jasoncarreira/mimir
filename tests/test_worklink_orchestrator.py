@@ -678,7 +678,7 @@ def test_worklink_rereads_issue_comments_before_claiming(tmp_path: Path) -> None
         "-b",
         "issue/441-a2",
         str(worktree),
-        "main",
+        "origin/main",
     ] in calls
 
 
@@ -715,8 +715,18 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
         for c in calls
     )
     # Default base: worktree cut from main, PR targets main explicitly.
+    assert ["git", "-C", str(repo), "fetch", "origin", "main"] in calls
     assert [
-        "git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "issue/441-a1", str(worktree), "main"
+        "git",
+        "-C",
+        str(repo),
+        "worktree",
+        "add",
+        "--no-track",
+        "-b",
+        "issue/441-a1",
+        str(worktree),
+        "origin/main",
     ] in calls
     pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
     assert pr_calls and pr_calls[0][pr_calls[0].index("--base") + 1] == "main"
@@ -747,9 +757,18 @@ def test_worklink_runner_cuts_worktree_and_pr_from_configured_base(tmp_path: Pat
 
     assert result.status == "completed"
     # Worktree is cut from the configured base, not main.
+    assert ["git", "-C", str(repo), "fetch", "origin", "integration/worklink"] in calls
     assert [
-        "git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "issue/441-a1", str(worktree),
-        "integration/worklink",
+        "git",
+        "-C",
+        str(repo),
+        "worktree",
+        "add",
+        "--no-track",
+        "-b",
+        "issue/441-a1",
+        str(worktree),
+        "origin/integration/worklink",
     ] in calls
     # And the PR targets that base (the feature-branch / stacking model).
     pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
@@ -774,8 +793,18 @@ def test_worklink_run_base_override_beats_config(tmp_path: Path) -> None:
     )
 
     assert result.status == "completed"
+    assert ["git", "-C", str(repo), "fetch", "origin", "release/2.0"] in calls
     assert [
-        "git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "issue/441-a1", str(worktree), "release/2.0"
+        "git",
+        "-C",
+        str(repo),
+        "worktree",
+        "add",
+        "--no-track",
+        "-b",
+        "issue/441-a1",
+        str(worktree),
+        "origin/release/2.0",
     ] in calls
     assert not any(
         isinstance(c, list) and c[:5] == ["git", "-C", str(repo), "worktree", "add"] and c[-1] == "develop"
@@ -783,6 +812,39 @@ def test_worklink_run_base_override_beats_config(tmp_path: Path) -> None:
     )
     pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
     assert pr_calls and pr_calls[0][pr_calls[0].index("--base") + 1] == "release/2.0"
+
+
+def test_worklink_base_fetch_can_be_disabled_by_config(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    (tmp_path / "worklink.yaml").write_text("defaults:\n  base_fetch: false\n")
+    calls, runner = _orchestrator_runner(repo, worktree)
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    assert not any(
+        isinstance(c, list) and c[:4] == ["git", "-C", str(repo), "fetch"] for c in calls
+    )
+    assert [
+        "git",
+        "-C",
+        str(repo),
+        "worktree",
+        "add",
+        "--no-track",
+        "-b",
+        "issue/441-a1",
+        str(worktree),
+        "main",
+    ] in calls
 
 
 
@@ -1224,7 +1286,11 @@ def test_codex_local_subprocess_uses_isolated_checkout(tmp_path: Path) -> None:
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
-        if args[:3] == ["git", "-C", str(tmp_path)] and args[3:6] == ["rev-parse", "--verify", "main"]:
+        if (
+            args[:3] == ["git", "-C", str(tmp_path)]
+            and args[3:6]
+            in (["rev-parse", "--verify", "main"], ["rev-parse", "--verify", "origin/main"])
+        ):
             return subprocess.CompletedProcess(args, 0, stdout="abc123\n", stderr="")
         # Self-containment assert (#517): report the checkout as rooted at itself.
         if args[3:5] == ["rev-parse", "--show-toplevel"]:

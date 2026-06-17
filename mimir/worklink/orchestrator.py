@@ -245,6 +245,8 @@ class WorklinkRunner:
                 base=base,
                 backend_name=selected_name,
                 compute_shared_filesystem=compute.capabilities().shared_filesystem,
+                base_fetch=config.defaults.base_fetch,
+                event_logger=_log_event,
                 runner=_list_runner(runner),
             )
             # chainlink #517: codex resolves the git project root from the
@@ -605,12 +607,28 @@ def _create_backend_checkout(
     backend_name: str,
     compute_shared_filesystem: bool,
     runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
+    base_fetch: bool = True,
+    event_logger: Callable[..., None] | None = None,
 ) -> WorktreeLease:
     if backend_name == "codex" and compute_shared_filesystem:
         return create_isolated_checkout(
-            repo, issue_id=issue_id, attempt=attempt, base=base, runner=runner
+            repo,
+            issue_id=issue_id,
+            attempt=attempt,
+            base=base,
+            base_fetch=base_fetch,
+            event_logger=event_logger,
+            runner=runner,
         )
-    return create_worktree(repo, issue_id=issue_id, attempt=attempt, base=base, runner=runner)
+    return create_worktree(
+        repo,
+        issue_id=issue_id,
+        attempt=attempt,
+        base=base,
+        base_fetch=base_fetch,
+        event_logger=event_logger,
+        runner=runner,
+    )
 
 
 def _with_outside_worktree_detection(
