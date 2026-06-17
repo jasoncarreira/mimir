@@ -43,6 +43,7 @@ from mimir.tools.registry import (
     set_current_channel_id,
     set_current_turn_interactive,
     set_dispatcher,
+    set_schedule_priority,
     set_scheduler,
 )
 
@@ -142,6 +143,7 @@ class _StubScheduler:
         self.reload_count: int = 0
         self.raise_on: str | None = None
         self._removed: bool = True  # default: job found and removed
+        self._jobs: list[SchedulerJob] = []  # for list_jobs / set_schedule_priority
 
     async def add_job(self, job: SchedulerJob) -> SchedulerJob:
         if self.raise_on == "add":
@@ -151,10 +153,19 @@ class _StubScheduler:
                 "name": job.name,
                 "cron": job.cron,
                 "prompt": job.prompt,
+                "prompt_file": job.prompt_file,
                 "channel_id": job.channel_id,
+                "priority": job.priority,
             }
         )
+        # Mirror the real add-or-replace so set_schedule_priority round-trips.
+        self._jobs = [j for j in self._jobs if j.name != job.name] + [job]
         return job
+
+    async def list_jobs(self) -> list[SchedulerJob]:
+        if self.raise_on == "list":
+            raise RuntimeError("list boom")
+        return list(self._jobs)
 
     async def remove_job(self, name: str) -> bool:
         if self.raise_on == "remove":
@@ -594,6 +605,79 @@ class TestAddSchedule:
         assert call["cron"] == "0 9 * * *"
         assert call["prompt"] == "Good morning"
         assert call["channel_id"] == "chan-1"
+        # #523: default priority is low when not specified.
+        assert call["priority"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_priority_is_persisted(self) -> None:
+        sched = _StubScheduler()
+        _STATE["scheduler"] = sched
+        out = await add_schedule.ainvoke(
+            {"name": "watch", "cron": "*/5 * * * *", "prompt": "watch", "priority": "high"}
+        )
+        assert "add_schedule ok:" in out
+        assert "priority=high" in out
+        assert sched.add_calls[0]["priority"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_invalid_priority_rejected_without_adding(self) -> None:
+        sched = _StubScheduler()
+        _STATE["scheduler"] = sched
+        out = await add_schedule.ainvoke(
+            {"name": "watch", "cron": "*/5 * * * *", "prompt": "watch", "priority": "urgent"}
+        )
+        assert "add_schedule failed: invalid priority" in out
+        assert "urgent" in out
+        assert sched.add_calls == []  # rejected before persisting
+
+
+class TestSetSchedulePriority:
+    @pytest.mark.asyncio
+    async def test_no_scheduler_returns_error(self) -> None:
+        _STATE["scheduler"] = None
+        out = await set_schedule_priority.ainvoke({"name": "x", "priority": "high"})
+        assert "set_schedule_priority failed: no scheduler configured" in out
+
+    @pytest.mark.asyncio
+    async def test_invalid_priority_rejected(self) -> None:
+        _STATE["scheduler"] = _StubScheduler()
+        out = await set_schedule_priority.ainvoke({"name": "x", "priority": "URGENT"})
+        assert "invalid priority" in out
+
+    @pytest.mark.asyncio
+    async def test_no_such_job(self) -> None:
+        _STATE["scheduler"] = _StubScheduler()
+        out = await set_schedule_priority.ainvoke({"name": "ghost", "priority": "high"})
+        assert "no job named" in out and "ghost" in out
+
+    @pytest.mark.asyncio
+    async def test_updates_priority_preserving_prompt_file(self) -> None:
+        sched = _StubScheduler()
+        sched._jobs = [
+            SchedulerJob(name="daily", prompt_file="daily.md", cron="0 0 * * *",
+                         channel_id=None, priority="low"),
+        ]
+        _STATE["scheduler"] = sched
+        out = await set_schedule_priority.ainvoke({"name": "daily", "priority": "high"})
+        assert "set_schedule_priority ok:" in out and "priority=high" in out
+        # Re-added with high priority, prompt_file preserved (not clobbered).
+        call = sched.add_calls[-1]
+        assert call["name"] == "daily"
+        assert call["priority"] == "high"
+        assert call["prompt_file"] == "daily.md"
+        assert not call["prompt"]  # prompt not fabricated; prompt_file preserved
+
+    @pytest.mark.asyncio
+    async def test_refuses_callable_job(self) -> None:
+        sched = _StubScheduler()
+        sched._jobs = [
+            SchedulerJob(name="saga", callable_name="saga-consolidate",
+                         cron="0 4 * * *", channel_id=None),
+        ]
+        _STATE["scheduler"] = sched
+        out = await set_schedule_priority.ainvoke({"name": "saga", "priority": "high"})
+        assert "callable job" in out
+        assert sched.add_calls == []  # not persisted
 
 
 class TestRemoveSchedule:
