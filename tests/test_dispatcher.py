@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from pathlib import Path
+from textwrap import dedent
 
 import pytest
 
 from mimir.config import Config
 from mimir.dispatcher import Dispatcher, _ChannelQueue
 from mimir.event_logger import init_logger
+from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent
 
 
@@ -22,7 +25,19 @@ def _make_config(home: Path, **overrides) -> Config:
         max_concurrent_turns=overrides.get("max_concurrent_turns", 4),
         max_channel_queue=overrides.get("max_channel_queue", 100),
         worker_idle_timeout_s=overrides.get("worker_idle_timeout_s", 1),
+        access_control_enforced=overrides.get(
+            "access_control_enforced", cfg.access_control_enforced
+        ),
     )
+
+
+def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "identities.yaml").write_text(dedent(body), encoding="utf-8")
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    return resolver
 
 
 @pytest.fixture(autouse=True)
@@ -564,6 +579,174 @@ def test_injection_enabled_prefix_matching(tmp_path: Path):
     assert not Dispatcher(_inj_config(tmp_path, ()), None)._injection_enabled("discord-99")
     # Wildcard enables all.
     assert Dispatcher(_inj_config(tmp_path, ("*",)), None)._injection_enabled("anything")
+
+
+@pytest.mark.asyncio
+async def test_slack_discord_denied_before_queue_observer_or_injection(tmp_path: Path):
+    cfg = replace(
+        _inj_config(tmp_path, ("discord-",)),
+        access_control_enforced=True,
+    )
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [discord-1]
+            access: {roles: [user]}
+        """,
+    )
+    disp = Dispatcher(cfg, resolver=resolver)
+    observed: list[AgentEvent] = []
+
+    async def on_event(event: AgentEvent) -> None:
+        observed.append(event)
+
+    disp.set_on_event(on_event)
+    disp._in_flight.add("discord-chan")
+    _mti.register_inflight("discord-chan")
+
+    accepted = await disp.enqueue(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="discord-chan",
+            content="do not leak",
+            author="discord-2",
+            author_display="Mallory",
+            author_id="2",
+            source="discord",
+        )
+    )
+
+    assert accepted is False
+    assert observed == []
+    assert "discord-chan" not in disp._queues
+    assert _mti._drain("discord-chan") == []
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    denied = [row for row in rows if row.get("type") == "inbound_event_denied"]
+    assert len(denied) == 1
+    assert denied[0]["source"] == "discord"
+    assert denied[0]["channel_id"] == "discord-chan"
+    assert denied[0]["author"] == "discord-2"
+    assert denied[0]["raw_author_handle"] == "discord-2"
+    assert denied[0]["canonical_author"] == "discord-2"
+    assert denied[0]["reason"] == "unknown_author"
+    assert "content" not in denied[0]
+    assert not any(row.get("type") == "event_queued" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_slack_user_message_enqueues_normally(tmp_path: Path):
+    cfg = _make_config(tmp_path, access_control_enforced=True)
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    ran: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        ran.append(event.content)
+
+    disp = Dispatcher(cfg, runner, resolver=resolver)
+    accepted = await disp.enqueue(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="slack-C1",
+            content="hello",
+            author="slack-U1",
+            author_id="U1",
+            source="slack",
+        )
+    )
+
+    assert accepted is True
+    await disp.drain()
+    assert ran == ["hello"]
+
+
+@pytest.mark.asyncio
+async def test_default_compat_allows_non_allowlisted_discord_user(tmp_path: Path):
+    cfg = _make_config(tmp_path, access_control_enforced=False)
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [discord-1]
+        """,
+    )
+    ran: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        ran.append(event.content)
+
+    disp = Dispatcher(cfg, runner, resolver=resolver)
+    accepted = await disp.enqueue(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="discord-C1",
+            content="legacy",
+            author="discord-1",
+            source="discord",
+        )
+    )
+
+    assert accepted is True
+    await disp.drain()
+    assert ran == ["legacy"]
+
+
+@pytest.mark.asyncio
+async def test_access_gate_does_not_cover_non_user_message_or_non_bridge_sources(
+    tmp_path: Path,
+):
+    cfg = _make_config(tmp_path, access_control_enforced=True)
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    ran: list[tuple[str, str | None]] = []
+
+    async def runner(event: AgentEvent) -> None:
+        ran.append((event.trigger, event.source))
+
+    disp = Dispatcher(cfg, runner, resolver=resolver)
+    assert await disp.enqueue(
+        AgentEvent(
+            trigger="poller",
+            channel_id="slack-C1",
+            content="tick",
+            author="slack-unknown",
+            source="slack",
+        )
+    )
+    assert await disp.enqueue(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="api-C1",
+            content="api",
+            author="api-unknown",
+            source="api",
+        )
+    )
+
+    await disp.drain()
+    assert ran == [("poller", "slack"), ("user_message", "api")]
 
 
 @pytest.mark.asyncio
