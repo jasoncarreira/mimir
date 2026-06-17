@@ -8,6 +8,16 @@ All notable changes will land here. Format loosely follows
 
 ### Fixed
 
+- **Worklink pushes the attempt branch from the checkout that owns it, not the
+  parent repo** (chainlink #518). With the isolated-checkout shape (#517), the
+  attempt branch and its commit live only inside `lease.path` (its own `.git`,
+  with `origin` already pointed at the remote). The local-path PR step still
+  pushed from `self.repo`, so once a run actually got through containment +
+  evidence it failed at publish with `src refspec issue/<id>-a<attempt> does not
+  match any` — the work was done safely but couldn't be published without manual
+  salvage. The push now runs from `lease.path`, which is also correct for the
+  legacy worktree shape (it shares the parent's refs). Surfaced by the first
+  clean autonomous run on the #517 rail.
 - **Worklink fails loud if codex runs on the controller without an isolated
   checkout** (chainlink #517). The codex CLI resolves the git project root from
   the filesystem, so when it executes on the controller (a shared-filesystem

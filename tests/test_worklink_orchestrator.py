@@ -599,7 +599,9 @@ def _orchestrator_runner(
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "commit"]:
             commit_seen = True
             return cp(args, stdout="[issue/441-a1 abc123] worklink\n")
-        if isinstance(args, list) and args[:3] == ["git", "-C", str(repo)] and args[3] == "push":
+        # #518: the attempt branch is pushed from the checkout that owns it
+        # (lease.path == worktree here), not the parent repo.
+        if isinstance(args, list) and args[:3] == ["git", "-C", str(worktree)] and args[3] == "push":
             return cp(args)
         if isinstance(args, list) and args[:3] == ["gh", "pr", "create"]:
             return cp(args, stdout="https://github.com/jasoncarreira/mimir/pull/999\n")
@@ -704,6 +706,14 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").is_file()
     assert ["git", "-C", str(worktree), "commit", "-m", "worklink: issue #441"] in calls
     assert ["chainlink", "locks", "release", "441"] in calls
+    # #518: the attempt branch is pushed from the checkout that owns it (lease.path),
+    # never from the parent repo — the isolated-checkout shape has the branch only
+    # inside lease.path, so a parent-repo push fails "src refspec ... does not match".
+    assert ["git", "-C", str(worktree), "push", "-u", "origin", "issue/441-a1"] in calls
+    assert not any(
+        isinstance(c, list) and c[:3] == ["git", "-C", str(repo)] and len(c) > 3 and c[3] == "push"
+        for c in calls
+    )
     # Default base: worktree cut from main, PR targets main explicitly.
     assert [
         "git", "-C", str(repo), "worktree", "add", "--no-track", "-b", "issue/441-a1", str(worktree), "main"
