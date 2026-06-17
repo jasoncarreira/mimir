@@ -30,6 +30,13 @@ def build_registry(*, broker_url: str, image: str, network: str) -> BackendRegis
 
     config = WorklinkConfig(
         defaults=WorklinkDefaults(backend="codex", compute_backend="docker_sibling"),
+        # Configure codex like a real worklink.yaml: the worker container IS the
+        # sandbox, so codex needs danger-full-access to write files + run git
+        # non-interactively. Without it codex runs read-only/approval-gated,
+        # produces no diff, and the run fails not-review-ready (no push).
+        backend_settings={
+            "codex": {"bin": "codex", "args": ["exec", "--json", "--sandbox", "danger-full-access"]}
+        },
         compute_backend_settings={
             "docker_sibling": {
                 "broker_url": broker_url,
