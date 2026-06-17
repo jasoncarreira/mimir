@@ -130,6 +130,13 @@ Once installed and configured (see frontmatter env), the scheduler runs the
    would otherwise kill it). The detached run does the claim/evidence/transition
    in the deterministic core executor.
 
+The detached run inherits the **poller's** env, so `pass_env` must carry anything
+the run needs — notably **`GITHUB_TOKEN`**: the core executor's `_open_pr`
+(`gh pr create`) runs on the controller side in this subprocess (not in the
+worker), so without the token `gh` can't authenticate and review-ready runs fail
+at PR creation → thrash to `worklink:blocked`. (Manual `bash -lc` dispatch hides
+this — it inherits the container's token.)
+
 Safety properties (do not bypass these in the poller):
 - **Per-issue exclusivity** is guaranteed by `chainlink locks claim` *inside*
   the run, not by the poller — a duplicate launch for the same id simply fails
