@@ -181,6 +181,56 @@ async def test_register_routes_is_idempotent(app):
         assert resp.status == 200
 
 
+@pytest.mark.asyncio
+async def test_react_app_serves_built_index_and_assets(tmp_path: Path):
+    dist = tmp_path / "dist"
+    assets = dist / "assets"
+    assets.mkdir(parents=True)
+    (dist / "index.html").write_text(
+        '<div id="root"></div><script src="/app/assets/app.js"></script>',
+        encoding="utf-8",
+    )
+    (assets / "app.js").write_text("console.log('mimir app')", encoding="utf-8")
+
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=dist,
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/app")
+        assert resp.status == 200
+        assert resp.content_type == "text/html"
+        assert "/app/assets/app.js" in await resp.text()
+
+        asset_resp = await client.get("/app/assets/app.js")
+        assert asset_resp.status == 200
+        assert await asset_resp.text() == "console.log('mimir app')"
+
+        fallback_resp = await client.get("/app/turns/42")
+        assert fallback_resp.status == 200
+        assert "/app/assets/app.js" in await fallback_resp.text()
+
+
+@pytest.mark.asyncio
+async def test_react_app_missing_build_returns_503(tmp_path: Path):
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/app")
+        assert resp.status == 503
+        assert "npm run build" in await resp.text()
+
+
 def _make_min_saga_db(path: Path) -> None:
     """Minimal saga DB with just the tables build_db_stats_payload reads."""
     import sqlite3

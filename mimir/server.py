@@ -296,11 +296,25 @@ def _safe_str_eq(a: str, b: str) -> bool:
 _AUTH_EXEMPT: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/"),
     ("GET", "/health"),
+    ("GET", "/app"),
     ("GET", "/turns"),
     ("GET", "/ops"),
     ("GET", "/saga"),
     ("GET", "/state"),
 })
+
+_AUTH_EXEMPT_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("GET", "/app/"),
+)
+
+
+def _is_auth_exempt(method: str, path: str) -> bool:
+    if (method, path) in _AUTH_EXEMPT:
+        return True
+    return any(
+        method == prefix_method and path.startswith(prefix)
+        for prefix_method, prefix in _AUTH_EXEMPT_PREFIXES
+    )
 
 
 def _make_auth_middleware(expected_key: str):
@@ -330,7 +344,7 @@ def _make_auth_middleware(expected_key: str):
             # No key configured → no auth. Dev / localhost-only path.
             return await handler(request)
 
-        if (request.method, request.path) in _AUTH_EXEMPT:
+        if _is_auth_exempt(request.method, request.path):
             return await handler(request)
 
         provided = request.headers.get("X-API-Key", "")

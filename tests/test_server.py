@@ -29,7 +29,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from mimir.server import (
     _AUTH_EXEMPT,
+    _AUTH_EXEMPT_PREFIXES,
     _MaskApiKeyInAccessLog,
+    _is_auth_exempt,
     _make_auth_middleware,
     _safe_str_eq,
     _handle_health,
@@ -75,6 +77,13 @@ class TestAuthExemptSet:
     def test_health_get_is_exempt(self) -> None:
         assert ("GET", "/health") in _AUTH_EXEMPT
 
+    def test_react_app_get_is_exempt(self) -> None:
+        assert ("GET", "/app") in _AUTH_EXEMPT
+
+    def test_react_assets_get_are_prefix_exempt(self) -> None:
+        assert ("GET", "/app/") in _AUTH_EXEMPT_PREFIXES
+        assert _is_auth_exempt("GET", "/app/assets/index.js") is True
+
     def test_turns_get_is_exempt(self) -> None:
         assert ("GET", "/turns") in _AUTH_EXEMPT
 
@@ -99,6 +108,9 @@ class TestAuthExemptSet:
 
     def test_turns_post_is_not_exempt(self) -> None:
         assert ("POST", "/turns") not in _AUTH_EXEMPT
+
+    def test_react_prefix_does_not_exempt_post(self) -> None:
+        assert _is_auth_exempt("POST", "/app/assets/index.js") is False
 
     def test_is_frozenset_of_tuples(self) -> None:
         assert isinstance(_AUTH_EXEMPT, frozenset)

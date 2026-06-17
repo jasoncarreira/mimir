@@ -20,6 +20,7 @@ hosts the WebUI bridge's ``/chat``. Routes:
                           returns file content (only .md files);
                           view=search&q=... returns full-text search hits;
                           view=channels returns channel dir names
+  GET /app              — built React app shell (additive migration route)
 
 The HTML page polls ``/api/turns`` every 5s for live updates. ``/api/events``
 is exposed for the (deferred) Events tab + ad-hoc scripting. ``/ops``
@@ -115,6 +116,7 @@ def register_routes(
     home: Path | None = None,
     saga_db: Path | None = None,
     active_usage_provider: str | None = None,
+    react_app_dist: Path | None = None,
 ) -> None:
     """Add viewer + API routes to an existing aiohttp app.
 
@@ -131,9 +133,13 @@ def register_routes(
 
     ``active_usage_provider`` collapses the /ops Usage chart to that single
     subscription provider (e.g. ``"codex_plus"``); None shows every provider
-    that has quota data."""
+    that has quota data.
+
+    ``react_app_dist`` points at the Vite build output. When omitted it defaults
+    to the packaged ``mimir/react_app/dist`` directory."""
 
     existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
+    _react_app_dist = react_app_dist or (Path(__file__).parent / "react_app" / "dist")
 
     async def turns_page(_request: web.Request) -> web.Response:
         return web.Response(text=_load_viewer_html(), content_type="text/html")
@@ -207,6 +213,29 @@ def register_routes(
         if limit > 0:
             out = out[-limit:]
         return web.json_response({"events": out})
+
+    async def react_app(request: web.Request) -> web.StreamResponse:
+        if not _react_app_dist.is_dir():
+            return web.Response(
+                text=(
+                    "React app build not found. Run `npm install` and "
+                    "`npm run build` from the repo root."
+                ),
+                status=503,
+                content_type="text/plain",
+            )
+
+        rel = request.match_info.get("path", "").strip("/")
+        requested = (_react_app_dist / rel).resolve() if rel else _react_app_dist / "index.html"
+        root = _react_app_dist.resolve()
+        try:
+            requested.relative_to(root)
+        except ValueError:
+            return web.Response(text="not found", status=404)
+
+        if requested.is_file():
+            return web.FileResponse(requested)
+        return web.FileResponse(root / "index.html")
 
     async def ops_page(request: web.Request) -> web.Response:
         # Static HTML shell — frontend AJAX-fetches /api/ops with the
@@ -315,6 +344,10 @@ def register_routes(
         app.router.add_get("/api/turns", turns_data)
     if ("GET", "/api/events") not in existing:
         app.router.add_get("/api/events", events_data)
+    if ("GET", "/app") not in existing:
+        app.router.add_get("/app", react_app)
+    if ("GET", "/app/") not in existing and ("GET", "/app/{path}") not in existing:
+        app.router.add_get("/app/{path:.*}", react_app)
     if ("GET", "/ops") not in existing:
         app.router.add_get("/ops", ops_page)
     if ("GET", "/api/ops") not in existing:
