@@ -175,6 +175,47 @@ def test_cleanup_removes_successful_isolated_checkout(tmp_path: Path) -> None:
     assert calls == [["git", "-C", str(repo), "branch", "-D", "issue/517-a1"]]
 
 
+def test_isolated_checkout_branch_pushes_from_checkout_not_parent(tmp_path: Path) -> None:
+    # #518: the attempt branch + its commit live ONLY inside the isolated checkout
+    # (own .git, origin already set). The PR push must run from the checkout, not
+    # the parent repo — a parent-repo push fails "src refspec ... does not match any".
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@e.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("base\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+
+    lease = create_isolated_checkout(repo, issue_id=518, attempt=1, base="main")
+    # Backend work + the worklink commit land inside the isolated checkout.
+    (lease.path / "b.txt").write_text("work\n")
+    _git(lease.path, "config", "user.email", "t@e.com")
+    _git(lease.path, "config", "user.name", "t")
+    _git(lease.path, "add", "b.txt")
+    _git(lease.path, "commit", "-q", "-m", "work")
+
+    # The bug: pushing the branch from the PARENT repo fails — it has no such ref.
+    parent_push = subprocess.run(
+        ["git", "-C", str(repo), "push", "-u", "origin", lease.branch],
+        capture_output=True, text=True,
+    )
+    assert parent_push.returncode != 0
+    assert "does not match any" in (parent_push.stderr + parent_push.stdout)
+
+    # The fix: pushing from the checkout that owns the branch succeeds, and the
+    # branch lands on the remote for the PR.
+    checkout_push = subprocess.run(
+        ["git", "-C", str(lease.path), "push", "-u", "origin", lease.branch],
+        capture_output=True, text=True,
+    )
+    assert checkout_push.returncode == 0, checkout_push.stderr
+    assert lease.branch in _git(repo, "ls-remote", "--heads", "origin")
+
+
 def test_self_containment_assert_rejects_parent_pointing_checkout(tmp_path: Path) -> None:
     # A checkout whose git toplevel resolves to the PARENT (the #517 escape shape)
     # must be refused, not silently used.
