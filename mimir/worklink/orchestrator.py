@@ -403,7 +403,14 @@ class WorklinkRunner:
                         )
                     evidence_path = _write_evidence(self.home, validation.evidence)
                 if validation.review_ready:
-                    _git_push(self.repo, lease.branch, runner=runner)
+                    # chainlink #518: push from the checkout that OWNS the attempt
+                    # branch, not the parent repo. With the isolated-checkout shape
+                    # (#517) the branch + its commit live only inside ``lease.path``
+                    # (its own .git, with ``origin`` already pointed at the real
+                    # remote); pushing from ``self.repo`` fails with
+                    # "src refspec <branch> does not match any". This is also correct
+                    # for the legacy worktree shape, which shares the parent's refs.
+                    _git_push(lease.path, lease.branch, runner=runner)
                     pr_url = _open_pr(
                         self.repo,
                         issue,
