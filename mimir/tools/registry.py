@@ -34,7 +34,7 @@ import re
 import subprocess
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Optional
@@ -44,6 +44,7 @@ log = logging.getLogger(__name__)
 from langchain_core.runnables import RunnableConfig
 
 from ..bridges._directives import parse_directives, ReactDirective, resolve_react_target
+from ..billing import PRIORITY_LEVELS
 from ..scheduler import SchedulerJob
 
 # Per-task ContextVar for channel_id — isolated across concurrent asyncio
@@ -759,14 +760,15 @@ def defer_injected_message(
 
 @tool
 async def list_schedules() -> str:
-    """List all scheduled jobs (heartbeat, reflect, custom ticks).
+    """List all scheduled work: yaml-config jobs AND skill pollers.
 
-    Returns each job's configuration: name, cron, channel, and the
-    prompt-source (one of ``prompt`` / ``prompt_file`` / ``callable``).
-    Runtime fields (``last_run`` / ``next_fire``) live on apscheduler
-    ``Job`` objects rather than the YAML-config ``SchedulerJob``;
-    surfacing them here would require joining the two views, which
-    we don't do today.
+    Each entry has a ``type`` (``"job"`` or ``"poller"``) so the two
+    registries are distinguishable. Jobs carry name, cron, ``priority``,
+    channel, and prompt-source (one of ``prompt`` / ``prompt_file`` /
+    ``callable``); pollers carry name, cron, ``priority``. ``priority``
+    (low|normal|high) is the arbiter's suppression band. Runtime fields
+    (``last_run`` / ``next_fire``) live on apscheduler ``Job`` objects rather
+    than the config view and are still not joined here.
     """
     scheduler = _STATE["scheduler"]
     if scheduler is None:
@@ -775,13 +777,18 @@ async def list_schedules() -> str:
         jobs = await scheduler.list_jobs()
     except Exception as exc:
         return f"list_schedules failed: {exc}"
-    if not jobs:
-        return "(no scheduled jobs)"
     out: list[dict[str, Any]] = []
     for j in jobs:
         entry: dict[str, Any] = {
+            # ``type`` distinguishes yaml-config scheduler jobs from skill
+            # pollers (appended below) — they're separate registries and used to
+            # be invisible here (chainlink #522).
+            "type": "job",
             "name": j.name,
             "cron": j.cron,
+            # Priority-banded arbiter suppression (low|normal|high). Surfaced so
+            # an operator can see/verify what a job is set to (chainlink #523).
+            "priority": getattr(j, "priority", "low"),
             "channel_id": j.channel_id,
         }
         # Surface whichever prompt-source field is populated (mutually
@@ -801,6 +808,22 @@ async def list_schedules() -> str:
         if time_of_day:
             entry["time_of_day"] = time_of_day
         out.append(entry)
+    # Skill pollers (chainlink #522): a separate registry from the yaml jobs.
+    # Surface them in the same view so the schedule isn't misleadingly empty.
+    poller_details = getattr(scheduler, "registered_poller_details", None)
+    if callable(poller_details):
+        for p in poller_details():
+            out.append({
+                "type": "poller",
+                "name": p.get("name"),
+                "cron": p.get("cron"),
+                "priority": p.get("priority"),
+            })
+    # Empty only when there is NO scheduled work of either kind — checked after
+    # pollers are appended so a poller-only deployment isn't reported as empty
+    # (the #522 visibility gap; mimir-carreira review on PR #728).
+    if not out:
+        return "(no scheduled jobs)"
     return json.dumps(out, indent=2, ensure_ascii=False, default=str)
 
 
@@ -810,8 +833,9 @@ async def add_schedule(
     cron: str,
     prompt: str,
     channel_id: Optional[str] = None,
+    priority: Optional[str] = None,
 ) -> str:
-    """Add a new scheduled tick.
+    """Add a new scheduled tick (add-or-replace by name).
 
     Args:
         name: Unique job identifier.
@@ -819,18 +843,69 @@ async def add_schedule(
         prompt: Inline prompt to fire on the cron tick.
         channel_id: Channel to dispatch the tick on. Defaults to
             ``scheduler:<name>`` synthetic.
+        priority: Arbiter suppression band — ``low`` (default), ``normal``, or
+            ``high``. Higher priority rides through more resource pressure before
+            the arbiter sheds the tick (``high`` is shed only at the most extreme
+            severity). To change an existing job's priority without rewriting its
+            prompt, use ``set_schedule_priority``.
     """
     scheduler = _STATE["scheduler"]
     if scheduler is None:
         return "add_schedule failed: no scheduler configured"
+    resolved_priority = "low"
+    if priority is not None:
+        resolved_priority = priority.strip().lower()
+        if resolved_priority not in PRIORITY_LEVELS:
+            return (
+                f"add_schedule failed: invalid priority {priority!r} "
+                f"(expected one of {sorted(PRIORITY_LEVELS)})"
+            )
     try:
         job = SchedulerJob(
             name=name, cron=cron, prompt=prompt, channel_id=channel_id,
+            priority=resolved_priority,
         )
         job = await scheduler.add_job(job)
     except Exception as exc:
         return f"add_schedule failed: {exc}"
-    return f"add_schedule ok: name={job.name} cron={job.cron}"
+    return f"add_schedule ok: name={job.name} cron={job.cron} priority={job.priority}"
+
+
+@tool
+async def set_schedule_priority(name: str, priority: str) -> str:
+    """Set the arbiter priority of an existing scheduled job.
+
+    ``priority`` is ``low``, ``normal``, or ``high`` — higher rides through more
+    resource pressure before the arbiter sheds the tick. Only the priority is
+    changed; the job's prompt / prompt_file / cron / channel are preserved (so
+    this is the safe way to bump a ``prompt_file`` job like a daily briefing).
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "set_schedule_priority failed: no scheduler configured"
+    norm = priority.strip().lower() if isinstance(priority, str) else ""
+    if norm not in PRIORITY_LEVELS:
+        return (
+            f"set_schedule_priority failed: invalid priority {priority!r} "
+            f"(expected one of {sorted(PRIORITY_LEVELS)})"
+        )
+    try:
+        jobs = await scheduler.list_jobs()
+        match = next((j for j in jobs if j.name == name), None)
+        if match is None:
+            return f"set_schedule_priority failed: no job named {name!r}"
+        if getattr(match, "callable_name", None):
+            # Callable entries bypass the arbiter gate entirely, so priority is a
+            # no-op for them (and isn't even persisted). Refuse rather than
+            # silently appearing to set it.
+            return (
+                f"set_schedule_priority: {name!r} is a callable job; priority "
+                f"does not apply (callables bypass the arbiter gate)"
+            )
+        await scheduler.add_job(replace(match, priority=norm))
+    except Exception as exc:
+        return f"set_schedule_priority failed: {exc}"
+    return f"set_schedule_priority ok: name={name} priority={norm}"
 
 
 @tool
@@ -1719,7 +1794,7 @@ def all_mimir_tools() -> list:
         # follow-up to its own turn instead of answering it in this one.
         defer_injected_message,
         # Scheduler
-        list_schedules, add_schedule, remove_schedule, reload_pollers,
+        list_schedules, add_schedule, set_schedule_priority, remove_schedule, reload_pollers,
         # Commitments
         commitment_complete, commitment_snooze,
         commitment_dismiss, commitment_list,

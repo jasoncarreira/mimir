@@ -26,15 +26,19 @@ from mimir.tools.registry import _STATE, list_schedules
 
 
 class _StubScheduler:
-    """Minimal stand-in for ``mimir.scheduler.Scheduler``: just
-    returns whatever list of :class:`SchedulerJob` we set up. The
-    real scheduler's ``list_jobs`` is ``async``; we mirror that."""
+    """Minimal stand-in for ``mimir.scheduler.Scheduler``: returns whatever
+    list of :class:`SchedulerJob` (and, for #522, poller details) we set up.
+    The real scheduler's ``list_jobs`` is ``async``; we mirror that."""
 
-    def __init__(self, jobs: list[SchedulerJob]) -> None:
+    def __init__(self, jobs: list[SchedulerJob], pollers=()) -> None:
         self._jobs = jobs
+        self._pollers = [dict(p) for p in pollers]
 
     async def list_jobs(self) -> list[SchedulerJob]:
         return list(self._jobs)
+
+    def registered_poller_details(self) -> list[dict[str, str]]:
+        return [dict(p) for p in self._pollers]
 
 
 @pytest.fixture
@@ -42,7 +46,9 @@ def stub_scheduler():
     """Install a stub Scheduler in the tool's _STATE for the test,
     restore on teardown so other tests don't inherit it."""
     prev = _STATE.get("scheduler")
-    yield lambda jobs: _STATE.__setitem__("scheduler", _StubScheduler(jobs))
+    yield lambda jobs, pollers=(): _STATE.__setitem__(
+        "scheduler", _StubScheduler(jobs, pollers)
+    )
     _STATE["scheduler"] = prev
 
 
@@ -151,6 +157,46 @@ async def test_list_schedules_surfaces_time_of_day(stub_scheduler):
 # ─── Empty / no-scheduler cases ────────────────────────────────────────
 
 
+# ─── #523/#522: priority + type discriminator + poller surfacing ──────
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_includes_type_and_priority(stub_scheduler):
+    """#523: every job entry carries its arbiter ``priority`` and a ``type``
+    discriminator so jobs and pollers are distinguishable."""
+    stub_scheduler([
+        SchedulerJob(
+            name="heartbeat", prompt_file="heartbeat.md",
+            cron="0 * * * *", channel_id=None, priority="high",
+        ),
+    ])
+    parsed = json.loads(await list_schedules.ainvoke({}))
+    assert parsed[0]["type"] == "job"
+    assert parsed[0]["priority"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_surfaces_pollers(stub_scheduler):
+    """#522: skill pollers (a separate registry) appear alongside jobs,
+    labeled ``type: poller``, with their cron + priority."""
+    stub_scheduler(
+        [SchedulerJob(name="heartbeat", prompt_file="heartbeat.md",
+                      cron="0 * * * *", channel_id=None)],
+        pollers=[{"name": "worklink-ready-queue", "cron": "*/10 * * * *",
+                  "priority": "normal"}],
+    )
+    parsed = json.loads(await list_schedules.ainvoke({}))
+    by_type: dict[str, list] = {}
+    for entry in parsed:
+        by_type.setdefault(entry["type"], []).append(entry)
+    assert [j["name"] for j in by_type["job"]] == ["heartbeat"]
+    assert len(by_type["poller"]) == 1
+    poller = by_type["poller"][0]
+    assert poller["name"] == "worklink-ready-queue"
+    assert poller["cron"] == "*/10 * * * *"
+    assert poller["priority"] == "normal"
+
+
 @pytest.mark.asyncio
 async def test_list_schedules_no_scheduler_configured():
     prev = _STATE.get("scheduler")
@@ -167,6 +213,24 @@ async def test_list_schedules_no_jobs(stub_scheduler):
     stub_scheduler([])
     result = await list_schedules.ainvoke({})
     assert "no scheduled jobs" in result
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_poller_only_deployment_not_reported_empty(stub_scheduler):
+    """#522 regression (mimir review on PR #728): an install with NO yaml-config
+    jobs but registered pollers must surface the pollers, not report
+    '(no scheduled jobs)' — that empty-check used to fire before poller rows
+    were appended, recreating the exact poller-only visibility gap."""
+    stub_scheduler(
+        [],
+        pollers=[{"name": "github-activity", "cron": "*/5 * * * *", "priority": "normal"}],
+    )
+    result = await list_schedules.ainvoke({})
+    assert "no scheduled jobs" not in result
+    parsed = json.loads(result)
+    assert len(parsed) == 1
+    assert parsed[0]["type"] == "poller"
+    assert parsed[0]["name"] == "github-activity"
 
 
 @pytest.mark.asyncio

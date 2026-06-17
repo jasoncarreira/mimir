@@ -6,6 +6,22 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **`list_schedules` surfaces pollers and priority; schedule priority is
+  settable via tools** (chainlink #522, #523). `list_schedules` previously
+  showed only the yaml-config scheduler jobs — skill pollers (a separate
+  registry) were invisible, so the schedule looked empty even when pollers were
+  firing, and a job's arbiter `priority` wasn't shown at all. It now tags each
+  entry with a `type` (`"job"` | `"poller"`), includes `priority`, and appends
+  poller rows (name + cron + priority) via the new
+  `Scheduler.registered_poller_details()`. `add_schedule` takes an optional
+  `priority` (validated `low|normal|high`; invalid values are rejected, not
+  silently coerced), and a new `set_schedule_priority(name, priority)` tool
+  changes an existing job's band without rewriting its prompt/prompt_file
+  (refusing callable jobs, which bypass the arbiter gate). Both mutation tools
+  are admin-gated alongside `add_schedule`/`remove_schedule`.
+
 ### Fixed
 
 - **Worklink pushes the attempt branch from the checkout that owns it, not the

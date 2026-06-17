@@ -63,6 +63,7 @@ _BUDGET_EXEMPT_TOOLS = frozenset({"send_message", "react"})
 _ADMIN_TOOL_NAMES = frozenset(
     {
         "add_schedule",
+        "set_schedule_priority",
         "remove_schedule",
         "reload_pollers",
         "open_proposal",

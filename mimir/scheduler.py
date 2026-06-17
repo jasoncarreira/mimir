@@ -1716,6 +1716,18 @@ class Scheduler:
         and by tests."""
         return sorted(self._pollers.keys())
 
+    def registered_poller_details(self) -> list[dict[str, str]]:
+        """Name + cron + priority for every registered poller, sorted by name.
+
+        Pollers live in a separate registry (``self._pollers``) from the
+        yaml-config scheduler jobs, so the job-only ``list_schedules`` view was
+        misleading — it looked like nothing was scheduled when pollers were
+        (chainlink #522). This lets that tool surface pollers alongside jobs."""
+        return [
+            {"name": p.name, "cron": p.cron, "priority": p.priority}
+            for p in sorted(self._pollers.values(), key=lambda p: p.name)
+        ]
+
     def last_invalid_manifest_events(self) -> list[dict[str, Any]]:
         """Snapshot of the most-recent reload's invalid-manifest event
         payloads (chainlink #84, PR #141 review item #1). Returns a
