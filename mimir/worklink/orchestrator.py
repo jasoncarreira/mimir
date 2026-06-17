@@ -23,6 +23,7 @@ from .claims import ChainlinkClaims
 from .evidence import (
     EvidenceValidation,
     WorklinkEvidence,
+    backend_completed,
     fold_remote_test_evidence,
     observe_evidence,
     observe_remote_evidence,
@@ -339,13 +340,16 @@ class WorklinkRunner:
                 )
                 # chainlink #538: remote runs can't run the worker's (untrusted)
                 # branch on the controller, so observe_remote_evidence stubs tests
-                # observed=false → the gate fails closed. When the re-derived diff
-                # is real, run a fresh sandboxed test job on the pushed branch and
-                # fold its exit code in (controller-orchestrated; exit-code is the
-                # trust channel). A launch/timeout failure leaves tests unobserved
-                # (still fail-closed).
+                # observed=false → the gate fails closed. When the run COMPLETED and
+                # the re-derived diff is real, run a fresh sandboxed test job on the
+                # pushed branch and fold its exit code in (controller-orchestrated;
+                # exit-code is the trust channel). Gate on backend_completed so we
+                # don't re-test (or launder into review-ready) a run that already
+                # failed/blocked but left a partial diff. A launch/timeout failure
+                # leaves tests unobserved (still fail-closed).
                 if (
                     test_cmd
+                    and backend_completed(raw.backend_status)
                     and validation.evidence.diff_observed
                     and validation.evidence.files_changed
                 ):
@@ -353,7 +357,9 @@ class WorklinkRunner:
                         compute, spec, timeout_s=config.defaults.timeout_s
                     )
                     if test_exit is not None:
-                        validation = fold_remote_test_evidence(validation, test_cmd, test_exit)
+                        validation = fold_remote_test_evidence(
+                            validation, test_cmd, test_exit, backend_status=raw.backend_status
+                        )
                 evidence_path = _write_evidence(self.home, validation.evidence)
                 if validation.review_ready:
                     pr_url = _open_pr(

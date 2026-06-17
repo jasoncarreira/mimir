@@ -17,6 +17,7 @@ import pytest
 from mimir.worklink.compute import WorkSpec
 from mimir.worklink.evidence import (
     EvidenceValidation,
+    backend_completed,
     fold_remote_test_evidence,
     observe_remote_evidence,
 )
@@ -46,10 +47,23 @@ def _remote_validation(tmp_path: Path, *, name_only="remote.txt\n") -> EvidenceV
     )
 
 
+# ─── backend_completed gate predicate ──────────────────────────────────
+
+def test_backend_completed_normalizes_synonyms_and_excludes_failures():
+    assert backend_completed("completed") is True
+    assert backend_completed("SUCCESS") is True
+    assert backend_completed(" succeeded ") is True
+    assert backend_completed("failed") is False
+    assert backend_completed("blocked") is False
+    assert backend_completed("needs_human") is False
+
+
 # ─── fold_remote_test_evidence ─────────────────────────────────────────
 
-def test_fold_passing_test_job_makes_review_ready(tmp_path: Path):
-    folded = fold_remote_test_evidence(_remote_validation(tmp_path), "echo ok", 0)
+def test_fold_passing_test_job_on_completed_run_makes_review_ready(tmp_path: Path):
+    folded = fold_remote_test_evidence(
+        _remote_validation(tmp_path), "echo ok", 0, backend_status="completed"
+    )
     assert folded.review_ready is True
     assert folded.status == "completed"
     assert folded.evidence.tests.observed is True
@@ -57,11 +71,32 @@ def test_fold_passing_test_job_makes_review_ready(tmp_path: Path):
 
 
 def test_fold_failing_test_job_blocks_review(tmp_path: Path):
-    folded = fold_remote_test_evidence(_remote_validation(tmp_path), "echo ok", 1)
+    folded = fold_remote_test_evidence(
+        _remote_validation(tmp_path), "echo ok", 1, backend_status="completed"
+    )
     assert folded.review_ready is False
     assert folded.status == "failed"
     assert "tests_failed" in folded.reasons
     assert folded.evidence.tests.observed is True  # observed, but failed
+
+
+def test_fold_cannot_launder_a_failed_run_even_when_tests_pass(tmp_path: Path):
+    # Defense in depth: even if fold is reached on a non-completed backend run
+    # (e.g. a partial diff got pushed), a passing test job must NOT flip it to
+    # review-ready — the original backend status governs.
+    folded = fold_remote_test_evidence(
+        _remote_validation(tmp_path), "echo ok", 0, backend_status="failed"
+    )
+    assert folded.review_ready is False
+    assert folded.status == "failed"
+
+
+def test_fold_does_not_make_a_blocked_run_review_ready(tmp_path: Path):
+    folded = fold_remote_test_evidence(
+        _remote_validation(tmp_path), "echo ok", 0, backend_status="blocked"
+    )
+    assert folded.review_ready is False  # never review-ready off a non-completed run
+    assert folded.status != "completed"
 
 
 # ─── worker test_only path ─────────────────────────────────────────────

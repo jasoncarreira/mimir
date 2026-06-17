@@ -230,7 +230,11 @@ def observe_remote_evidence(
 
 
 def fold_remote_test_evidence(
-    validation: EvidenceValidation, test_command: str, exit_code: int
+    validation: EvidenceValidation,
+    test_command: str,
+    exit_code: int,
+    *,
+    backend_status: str,
 ) -> EvidenceValidation:
     """Replace the stubbed remote test result with an OBSERVED one (chainlink
     #538), then re-validate.
@@ -239,16 +243,20 @@ def fold_remote_test_evidence(
     the pushed branch (``worker --test-only``): 0 = tests passed. This is how a
     docker-sibling/ecs run stops fail-closing on ``tests_not_observed`` — the
     controller orchestrated the test execution and reads its exit code, the same
-    trust basis as the local path running tests itself."""
+    trust basis as the local path running tests itself.
+
+    Folding only makes sense on a run the backend actually *completed*; pass the
+    original ``backend_status`` so a failed/blocked run can't be laundered into
+    review-ready by a passing test job (see the status reset below)."""
     evidence = replace(
         validation.evidence,
-        # Reset to the completed baseline before re-validating: the first pass
-        # downgraded status to "failed" solely on tests_not_observed and persisted
-        # it, and validate_evidence only ever downgrades. The caller folds only
-        # when there's a real observed diff (which exists only if the worker
-        # completed + pushed), so "completed" is the correct base; validate_evidence
-        # re-downgrades to "failed" if the folded test result is non-zero.
-        status="completed",
+        # Re-validate from the ORIGINAL backend status, not the persisted one: the
+        # first pass downgraded status to "failed" solely on tests_not_observed and
+        # persisted it, and validate_evidence only ever downgrades — so a naive
+        # re-validate stays "failed" even when tests then pass. Resetting to the
+        # true backend status lets a completed run recover to review-ready while a
+        # failed/blocked run stays failed/blocked regardless of the test exit code.
+        status=_common_status(backend_status),
         tests=TestResult(
             test_command,
             exit_code,
@@ -257,6 +265,13 @@ def fold_remote_test_evidence(
         ),
     )
     return validate_evidence(evidence)
+
+
+def backend_completed(backend_status: str) -> bool:
+    """True when the backend reported a completed run (chainlink #538). Used to
+    gate the remote test job: only re-run tests on a run that actually finished —
+    not one that already failed/blocked but left a partial diff on the branch."""
+    return _common_status(backend_status) == "completed"
 
 
 def _observe_evidence_from_ref(
