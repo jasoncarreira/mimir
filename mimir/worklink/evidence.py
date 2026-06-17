@@ -229,6 +229,51 @@ def observe_remote_evidence(
     return validation
 
 
+def fold_remote_test_evidence(
+    validation: EvidenceValidation,
+    test_command: str,
+    exit_code: int,
+    *,
+    backend_status: str,
+) -> EvidenceValidation:
+    """Replace the stubbed remote test result with an OBSERVED one (chainlink
+    #538), then re-validate.
+
+    ``exit_code`` is the exit of a fresh sandboxed test job the controller ran on
+    the pushed branch (``worker --test-only``): 0 = tests passed. This is how a
+    docker-sibling/ecs run stops fail-closing on ``tests_not_observed`` — the
+    controller orchestrated the test execution and reads its exit code, the same
+    trust basis as the local path running tests itself.
+
+    Folding only makes sense on a run the backend actually *completed*; pass the
+    original ``backend_status`` so a failed/blocked run can't be laundered into
+    review-ready by a passing test job (see the status reset below)."""
+    evidence = replace(
+        validation.evidence,
+        # Re-validate from the ORIGINAL backend status, not the persisted one: the
+        # first pass downgraded status to "failed" solely on tests_not_observed and
+        # persisted it, and validate_evidence only ever downgrades — so a naive
+        # re-validate stays "failed" even when tests then pass. Resetting to the
+        # true backend status lets a completed run recover to review-ready while a
+        # failed/blocked run stays failed/blocked regardless of the test exit code.
+        status=_common_status(backend_status),
+        tests=TestResult(
+            test_command,
+            exit_code,
+            f"remote sandboxed test job: exit {exit_code}",
+            observed=True,
+        ),
+    )
+    return validate_evidence(evidence)
+
+
+def backend_completed(backend_status: str) -> bool:
+    """True when the backend reported a completed run (chainlink #538). Used to
+    gate the remote test job: only re-run tests on a run that actually finished —
+    not one that already failed/blocked but left a partial diff on the branch."""
+    return _common_status(backend_status) == "completed"
+
+
 def _observe_evidence_from_ref(
     *,
     issue: int,

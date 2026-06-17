@@ -962,9 +962,13 @@ def test_remote_compute_gate_rederives_diff_but_does_not_run_tests_on_controller
         )
     )
 
-    assert result.status == "failed"
-    assert result.review_ready is False
-    assert result.pr_url is None
+    # #538: the diff is re-derived from refs (never checked out / tested on the
+    # controller), AND a fresh SANDBOXED test job runs on the pushed branch via
+    # the compute substrate. FakeCompute returns exit 0, so tests are observed +
+    # pass and the run reaches review-ready — the gate no longer fails closed.
+    assert result.status == "completed"
+    assert result.review_ready is True
+    assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/1000"
     assert ["git", "-C", str(worktree), "fetch", "origin", "+main:refs/remotes/origin/main"] in calls
     assert [
         "git",
@@ -974,24 +978,20 @@ def test_remote_compute_gate_rederives_diff_but_does_not_run_tests_on_controller
         "origin",
         "+issue/441-a1:refs/remotes/origin/issue/441-a1",
     ] in calls
+    # Controller-safety invariants preserved: never checks out or runs the
+    # untrusted branch's tests ON THE CONTROLLER (the runner raises if it tries).
     assert ["git", "-C", str(worktree), "checkout", "--detach", "origin/issue/441-a1"] not in calls
-    assert not any(
-        isinstance(call, list) and call[:4] == ["git", "-C", str(worktree), "add"]
-        for call in calls
-    )
-    assert not any(
-        isinstance(call, list)
-        and call[:3] == ["git", "-C", str(repo)]
-        and call[3] == "push"
-        for call in calls
-    )
+    # The test job WAS dispatched as a separate test_only compute launch.
+    assert len(compute.specs) == 2
+    assert compute.specs[0].test_only is False
+    assert compute.specs[1].test_only is True
     evidence = (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text(
         encoding="utf-8"
     )
     assert "remote.txt" in evidence
     assert "origin/main...origin/issue/441-a1" in evidence
-    assert '"observed": false' in evidence
-    assert "remote test re-run requires sandboxed compute" in evidence
+    assert '"observed": true' in evidence
+    assert "remote sandboxed test job" in evidence
 
 
 def test_remote_compute_fetch_failure_blocks_review_gate(tmp_path: Path) -> None:
@@ -1462,7 +1462,11 @@ def test_codex_on_non_shared_isolated_compute_is_allowed(tmp_path: Path) -> None
     # Not blocked for the codex/checkout reason, and codex WAS dispatched to the
     # isolated worker compute (the safe path) rather than short-circuited.
     assert "isolated checkout" not in (result.reason or "")
-    assert len(compute.specs) == 1
+    # Implement launch + the #538 sandboxed test-job launch (non-shared compute,
+    # non-empty diff), the latter flagged test_only.
+    assert len(compute.specs) == 2
+    assert compute.specs[0].test_only is False
+    assert compute.specs[1].test_only is True
 
 
 def test_codex_on_controller_requires_isolated_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

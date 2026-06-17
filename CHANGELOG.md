@@ -8,6 +8,24 @@ All notable changes will land here. Format loosely follows
 
 ### Added
 
+- **Remote worklink runs now re-run tests in a sandboxed job** (chainlink #538,
+  part of the docker-sibling rail #537). On a non-shared compute substrate
+  (docker-sibling / ECS) the controller can't run the worker's untrusted branch
+  itself, so the remote gate previously stubbed tests `observed=false` and
+  **failed closed** on `tests_not_observed` — review-ready was unreachable.
+  The controller now re-derives the diff from the pushed refs (unchanged) and,
+  when the run **completed** and that diff is real, dispatches a fresh
+  **`test_only`** worker job on the pushed branch via the *same* compute backend;
+  the job clones + checks out the branch, runs `test_command`, and exits with the
+  test's code, which the controller folds into the evidence (exit-code is the
+  trust channel — the controller never checks out or runs the untrusted branch).
+  A passing job makes the run review-ready; a non-zero job stays `tests_failed`;
+  a launch/timeout/dispatch failure leaves tests unobserved (still fail-closed).
+  The test job is gated on the implement run having completed, so a run that
+  already failed/blocked (but left a partial diff) is never re-tested or laundered
+  into review-ready. Unblocks review-ready outcomes for the docker-sibling/ECS
+  runner.
+
 - **Resend-nudge: forgot-to-send recovery** (opt-in). When an interactive turn
   produces a reply but never calls `send_message` (so the user gets nothing),
   the agent now re-prompts itself **once** to call `send_message` — recovering
