@@ -56,6 +56,132 @@ log = logging.getLogger(__name__)
 _STARTUP_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 
+class _PairingNotifier:
+    """Coalesced operator alerts plus DM-only fixed auto-replies."""
+
+    def __init__(self, config: Config, channels: ChannelRegistry) -> None:
+        self._config = config
+        self._channels = channels
+        self._operator_pending: list[dict[str, str]] = []
+        self._operator_task: asyncio.Task[Any] | None = None
+        self._operator_notified: set[str] = set()
+        self._dm_reply_sent: set[str] = set()
+        self._dm_reply_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self._dm_reply_task: asyncio.Task[Any] | None = None
+
+    async def notify_operator(
+        self,
+        *,
+        canonical: str,
+        display: str,
+        platform: str,
+        channel_id: str,
+        delivery: str,
+    ) -> None:
+        canonical = canonical.strip()
+        if not canonical or canonical in self._operator_notified:
+            return
+        alert_channel = (self._config.operator_alert_channel or "").strip()
+        if not alert_channel:
+            return
+        self._operator_notified.add(canonical)
+        self._operator_pending.append(
+            {
+                "canonical": canonical,
+                "display": display.strip() or canonical,
+                "platform": platform.strip() or "unknown",
+                "channel_id": channel_id.strip(),
+                "delivery": delivery,
+            }
+        )
+        if self._operator_task is None or self._operator_task.done():
+            self._operator_task = asyncio.create_task(self._flush_operator_later())
+
+    async def flush_operator_alerts(self) -> None:
+        if not self._operator_pending:
+            return
+        pending, self._operator_pending = self._operator_pending, []
+        lines = ["Pairing approval needed:"]
+        for item in pending:
+            where = "DM" if item["delivery"] == "dm" else item["channel_id"]
+            lines.append(
+                "- "
+                f"{item['canonical']} ({item['display']}; {item['platform']}; {where}) "
+                f"- approve: mimir identities approve-pairing {item['canonical']}"
+            )
+        try:
+            await self._channels.send(
+                self._config.operator_alert_channel,
+                "\n".join(lines),
+                final=True,
+            )
+            await log_event(
+                "pairing_operator_alert_sent",
+                count=len(pending),
+                channel_id=self._config.operator_alert_channel,
+            )
+        except Exception as exc:  # noqa: BLE001 — notification must not affect access
+            log.debug("pairing operator alert send failed", exc_info=True)
+            await log_event(
+                "pairing_operator_alert_failed",
+                channel_id=self._config.operator_alert_channel,
+                error=str(exc)[:500],
+            )
+
+    async def _flush_operator_later(self) -> None:
+        delay = max(
+            0.0,
+            float(self._config.pairing_operator_digest_delay_seconds or 0.0),
+        )
+        if delay:
+            await asyncio.sleep(delay)
+        await self.flush_operator_alerts()
+
+    async def maybe_reply_dm(self, *, canonical: str, dm_channel_id: str) -> None:
+        if not self._config.pairing_dm_auto_reply_enabled:
+            return
+        canonical = canonical.strip()
+        dm_channel_id = dm_channel_id.strip()
+        if not canonical or not dm_channel_id.startswith("dm-"):
+            return
+        if canonical in self._dm_reply_sent:
+            return
+        self._dm_reply_sent.add(canonical)
+        await self._dm_reply_queue.put((canonical, dm_channel_id))
+        if self._dm_reply_task is None or self._dm_reply_task.done():
+            self._dm_reply_task = asyncio.create_task(self._dm_reply_worker())
+
+    async def _dm_reply_worker(self) -> None:
+        interval = max(
+            0.0,
+            float(self._config.pairing_dm_auto_reply_interval_seconds or 0.0),
+        )
+        while not self._dm_reply_queue.empty():
+            canonical, dm_channel_id = await self._dm_reply_queue.get()
+            try:
+                await self._channels.send(
+                    dm_channel_id,
+                    self._config.pairing_dm_auto_reply_text,
+                    final=True,
+                )
+                await log_event(
+                    "pairing_dm_auto_reply_sent",
+                    author=canonical,
+                    channel_id=dm_channel_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort notification
+                log.debug("pairing DM auto-reply failed", exc_info=True)
+                await log_event(
+                    "pairing_dm_auto_reply_failed",
+                    author=canonical,
+                    channel_id=dm_channel_id,
+                    error=str(exc)[:500],
+                )
+            finally:
+                self._dm_reply_queue.task_done()
+            if interval and not self._dm_reply_queue.empty():
+                await asyncio.sleep(interval)
+
 
 async def _handle_event(request: web.Request) -> web.Response:
     # Auth: gated at the app-level middleware. See ``_make_auth_middleware``.
@@ -449,6 +575,7 @@ def build_app(config: Config) -> web.Application:
     # tokens (DISCORD_TOKEN etc.).
     channels = ChannelRegistry()
     channels.register(BenchBridge(home=config.home))
+    pairing_notifier = _PairingNotifier(config, channels)
 
     # Wiring order to break the (dispatcher → agent → scheduler → dispatcher)
     # cycle: dispatcher first with no runner, then scheduler bound to its
@@ -536,33 +663,62 @@ def build_app(config: Config) -> web.Application:
         try:
             author = (event.author or "").strip()
             platform = (event.source or "").strip()
-            dm_id = (event.channel_id or "").strip()
+            channel_id = (event.channel_id or "").strip()
+            is_dm = channel_id.startswith("dm-")
             if not (
                 author
                 and platform in ("slack", "discord")
-                and dm_id.startswith("dm-")
+                and channel_id
             ):
                 return
-            from .identities_populator import request_dm_pairing
+            from .identities_populator import request_pairing
             wrote = await asyncio.to_thread(
-                request_dm_pairing,
+                request_pairing,
                 config.home,
                 author,
                 platform,
-                dm_id,
+                channel_id=channel_id,
                 author_display=event.author_display,
+                is_dm=is_dm,
+                max_pending=config.pairing_pending_max,
             )
-            if wrote:
-                await asyncio.to_thread(identity_resolver.reload)
+            if not wrote:
+                return
+            await asyncio.to_thread(identity_resolver.reload)
+            canonical = (getattr(decision, "canonical_author", None) or author).strip()
+            delivery = "dm" if is_dm else "public_shared_channel"
+            await log_event(
+                "pairing_requested",
+                channel_id=event.channel_id,
+                author=author,
+                author_id=event.author_id,
+                canonical_author=canonical,
+                platform=platform,
+                delivery=delivery,
+                reason=getattr(decision, "denial_reason", None),
+            )
+            if is_dm:
                 await log_event(
                     "dm_pairing_requested",
                     channel_id=event.channel_id,
                     author=author,
                     author_id=event.author_id,
-                    canonical_author=getattr(decision, "canonical_author", None),
+                    canonical_author=canonical,
                     platform=platform,
-                    dm_channel=dm_id,
+                    dm_channel=channel_id,
                     reason=getattr(decision, "denial_reason", None),
+                )
+            await pairing_notifier.notify_operator(
+                canonical=canonical,
+                display=event.author_display or author,
+                platform=platform,
+                channel_id=channel_id,
+                delivery=delivery,
+            )
+            if is_dm:
+                await pairing_notifier.maybe_reply_dm(
+                    canonical=canonical,
+                    dm_channel_id=channel_id,
                 )
         except Exception:  # noqa: BLE001 — best-effort; never disrupt inbound
             log.debug("dm-pairing request failed", exc_info=True)
@@ -718,6 +874,7 @@ def build_app(config: Config) -> web.Application:
     app["scheduler"] = scheduler
     app["subagent_inbox"] = inbox
     app["channels"] = channels
+    app["pairing_notifier"] = pairing_notifier
     app["identity_resolver"] = identity_resolver
     app["replayed_messages"] = replayed
     app["aliases_loaded"] = aliases_loaded

@@ -17,6 +17,7 @@ from mimir.identities import IdentityResolver
 from mimir import identities_populator as _pop
 from mimir.identities_populator import capture_dm_channel, merge_into_yaml
 from mimir.identities_populator import approve_pairing, request_dm_pairing
+from mimir.identities_populator import request_pairing
 from mimir.bridges.bench import BenchBridge
 from mimir.tools.registry import (
     list_channels,
@@ -256,6 +257,71 @@ def test_request_dm_pairing_creates_pending_identity_without_roles(
     resolver = IdentityResolver(home=home)
     resolver.reload()
     assert resolver.is_authorized("slack-U05ABC") is False
+
+
+def test_request_public_pairing_creates_pending_identity_without_dm_or_roles(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "agent"
+    (home / "state").mkdir(parents=True)
+
+    assert request_pairing(
+        home,
+        "slack-U05ABC",
+        "slack",
+        channel_id="slack-C07XYZ",
+        author_display="Alice",
+        is_dm=False,
+    ) is True
+    assert request_pairing(
+        home,
+        "slack-U05ABC",
+        "slack",
+        channel_id="slack-C07XYZ",
+        author_display="Alice",
+        is_dm=False,
+    ) is False
+
+    person = _read(home)["people"][0]
+    assert person["canonical"] == "slack-U05ABC"
+    assert person["display_name"] == "Alice"
+    assert "dm_channels" not in person
+    assert person["pairing"]["status"] == "pending"
+    assert person["pairing"]["channel"] == "slack-C07XYZ"
+    assert person["pairing"]["delivery"] == "public_shared_channel"
+    assert "access" not in person
+
+    resolver = IdentityResolver(home=home)
+    resolver.reload()
+    assert resolver.is_authorized("slack-U05ABC") is False
+
+
+def test_request_pairing_bounds_new_pending_identity_growth(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "agent"
+    (home / "state").mkdir(parents=True)
+
+    assert request_pairing(
+        home,
+        "slack-U1",
+        "slack",
+        channel_id="dm-slack-D1",
+        is_dm=True,
+        max_pending=1,
+    ) is True
+    assert request_pairing(
+        home,
+        "slack-U2",
+        "slack",
+        channel_id="dm-slack-D2",
+        is_dm=True,
+        max_pending=1,
+    ) is False
+
+    people = _read(home)["people"]
+    assert [p["canonical"] for p in people] == ["slack-U1"]
+    assert people[0]["pairing"]["status"] == "pending"
 
 
 def test_approve_pairing_preserves_operator_fields_and_allowlists_canonical(

@@ -745,6 +745,16 @@ class Config:
     # event without queueing a normal agent turn. DM denials always use the
     # pending-pairing path when access control is enforced.
     unauthorized_user_behavior: str = "ignore"
+    # Pairing notification/reply controls. Operator alerts are deduped by the
+    # pending-pairing first-write edge and coalesced over this window. DM
+    # auto-replies are fixed text, DM-only, and globally rate-limited.
+    pairing_pending_max: int = 100
+    pairing_operator_digest_delay_seconds: float = 1.0
+    pairing_dm_auto_reply_enabled: bool = False
+    pairing_dm_auto_reply_interval_seconds: float = 30.0
+    pairing_dm_auto_reply_text: str = (
+        "Request forwarded to operator; no access until approved."
+    )
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -859,6 +869,20 @@ class Config:
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
             unauthorized_user_behavior=_env(
                 "MIMIR_UNAUTHORIZED_USER_BEHAVIOR", "ignore"
+            ),
+            pairing_pending_max=_env_int("MIMIR_PAIRING_PENDING_MAX", 100),
+            pairing_operator_digest_delay_seconds=_env_float(
+                "MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS", 1.0,
+            ),
+            pairing_dm_auto_reply_enabled=_env_bool(
+                "MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED", False,
+            ),
+            pairing_dm_auto_reply_interval_seconds=_env_float(
+                "MIMIR_PAIRING_DM_AUTO_REPLY_INTERVAL_SECONDS", 30.0,
+            ),
+            pairing_dm_auto_reply_text=_env(
+                "MIMIR_PAIRING_DM_AUTO_REPLY_TEXT",
+                "Request forwarded to operator; no access until approved.",
             ),
             api_key=_env("MIMIR_API_KEY"),
             web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),

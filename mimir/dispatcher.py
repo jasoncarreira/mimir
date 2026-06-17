@@ -277,7 +277,8 @@ class Dispatcher:
             status=decision.status.value,
             trigger=event.trigger,
         )
-        if self._is_dm_channel(event.channel_id):
+        is_dm = self._is_dm_channel(event.channel_id)
+        if is_dm:
             await log_event(
                 "inbound_pairing_required",
                 source=source or "unknown",
@@ -289,11 +290,6 @@ class Dispatcher:
                 status=decision.status.value,
                 delivery="dm",
             )
-            if self._on_pairing_required is not None:
-                try:
-                    await self._on_pairing_required(event, decision)
-                except Exception:  # noqa: BLE001 — denial must remain fail-closed
-                    log.debug("pairing-required observer failed", exc_info=True)
         elif self._unauthorized_behavior() == "prompt-to-pair":
             await log_event(
                 "inbound_pairing_prompted",
@@ -306,6 +302,11 @@ class Dispatcher:
                 status=decision.status.value,
                 delivery="public_shared_channel",
             )
+        if self._on_pairing_required is not None:
+            try:
+                await self._on_pairing_required(event, decision)
+            except Exception:  # noqa: BLE001 — denial must remain fail-closed
+                log.debug("pairing-required observer failed", exc_info=True)
         return False
 
     @staticmethod
