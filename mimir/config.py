@@ -756,6 +756,14 @@ class Config:
         "Request forwarded to operator; no access until approved."
     )
 
+    # Resend-nudge recovery (forgot-to-send): channels (prefix allow-list, ``*``
+    # = all) where an interactive turn that produced text but never delivered
+    # gets ONE in-band re-prompt to call send_message. Empty default = off; the
+    # re-prompt re-enters the same turn/thread (no extra SAGA cycle). For
+    # tool-shy models (minimax M3) that answer in final text instead of calling
+    # the tool. ``MIMIR_RESEND_NUDGE_CHANNELS``.
+    resend_nudge_channels: tuple[str, ...] = ()
+
     @classmethod
     def from_env(cls) -> "Config":
         raw_home = _env("MIMIR_HOME")
@@ -883,6 +891,10 @@ class Config:
             pairing_dm_auto_reply_text=_env(
                 "MIMIR_PAIRING_DM_AUTO_REPLY_TEXT",
                 "Request forwarded to operator; no access until approved.",
+            ),
+            resend_nudge_channels=tuple(
+                p.strip() for p in _env("MIMIR_RESEND_NUDGE_CHANNELS", "").split(",")
+                if p.strip()
             ),
             api_key=_env("MIMIR_API_KEY"),
             web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),

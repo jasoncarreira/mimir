@@ -41,7 +41,7 @@ import re
 import time
 import traceback
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
@@ -1499,6 +1499,79 @@ class Agent:
             except Exception:  # noqa: BLE001 — bookkeeping must not break the turn
                 log.debug("hard-stop delivery bookkeeping failed", exc_info=True)
 
+    async def _maybe_resend_nudge(
+        self,
+        agent: Any,
+        invoke_config: dict,
+        ctx: Any,
+        event: AgentEvent,
+        *,
+        turn_id: str,
+        turn_is_interactive: bool,
+        messages: list,
+        events: list,
+        output: str,
+    ) -> tuple[list, list, str]:
+        """Forgot-to-send recovery (opt-in via ``MIMIR_RESEND_NUDGE_CHANNELS``).
+
+        When an interactive turn produced final text but never DELIVERED to the
+        triggering channel, re-prompt the model ONCE to call ``send_message``.
+        The forgot-to-send guard (#423) only flags this for the next turn; this
+        recovers the reply the user is actually waiting on — aimed at tool-shy
+        models (minimax M3) that answer in final text instead of calling the tool.
+
+        Folded into the current turn: it re-enters the SAME graph thread, so it
+        inherits the original turn's context (the undelivered reply is already in
+        the message history) and triggers NO additional SAGA recall/synthesis
+        (recall is built once at turn start; synthesis is a separate idle turn).
+        Loop-safe — exactly one re-prompt; if it still doesn't deliver it logs
+        ``resend_nudge_failed`` and gives up (no recursion). Every failure path is
+        swallowed so the nudge can never fail the turn.
+        """
+        from .resend_nudge import build_nudge_text, count_recent_no_sends, nudge_enabled
+
+        if not (turn_is_interactive and (output or "").strip()):
+            return messages, events, output
+        delivered = getattr(ctx, "delivered_channel_ids", None) or set()
+        if event.channel_id in delivered:
+            return messages, events, output
+        if not nudge_enabled(event.channel_id, self._config.resend_nudge_channels):
+            return messages, events, output
+
+        # 24h recidivism tally, counted from events.jsonl the same way the
+        # algedonic block does (not a parallel counter). +1 for this turn's
+        # under-send, whose guard event hasn't been emitted yet at this point.
+        try:
+            cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            events_path = self._config.home / "logs" / "events.jsonl"
+            count = count_recent_no_sends(events_path, event.channel_id, cutoff_iso) + 1
+        except Exception:  # noqa: BLE001 — counting must never fail the turn
+            log.exception("resend-nudge count failed")
+            count = 1
+        await safe_log_event(
+            "resend_nudge_issued",
+            channel_id=event.channel_id, turn_id=turn_id, no_send_count_24h=count,
+        )
+        try:
+            async for chunk in agent.astream(
+                {"messages": [HumanMessage(content=build_nudge_text(event.channel_id, count))]},
+                config=invoke_config,
+                stream_mode="values",
+            ):
+                messages = list(chunk.get("messages", []))
+            events, output = extract_turn_events(messages)
+        except Exception:  # noqa: BLE001 — a re-prompt failure must not fail the turn
+            log.exception("resend-nudge re-prompt failed")
+            return messages, events, output
+
+        delivered = getattr(ctx, "delivered_channel_ids", None) or set()
+        if event.channel_id not in delivered:
+            await safe_log_event(
+                "resend_nudge_failed",
+                channel_id=event.channel_id, turn_id=turn_id, no_send_count_24h=count,
+            )
+        return messages, events, output
+
     async def _run_turn_body(
         self,
         event: AgentEvent,
@@ -1673,6 +1746,17 @@ class Agent:
                 ):
                     messages = list(chunk.get("messages", []))
                 events, output = extract_turn_events(messages)
+                # Forgot-to-send recovery (opt-in, MIMIR_RESEND_NUDGE_CHANNELS):
+                # an interactive turn that produced text but never delivered gets
+                # ONE in-band re-prompt to call send_message. Folded into THIS
+                # turn/thread, so it inherits the original context and adds no
+                # SAGA recall/synthesis.
+                messages, events, output = await self._maybe_resend_nudge(
+                    agent, invoke_config, ctx, event,
+                    turn_id=turn_id,
+                    turn_is_interactive=turn_is_interactive,
+                    messages=messages, events=events, output=output,
+                )
         except asyncio.TimeoutError:
             error = f"TurnTimeout: turn exceeded {timeout}s wall-clock limit"
             events = []

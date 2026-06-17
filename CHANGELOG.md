@@ -6,6 +6,20 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **Resend-nudge: forgot-to-send recovery** (opt-in). When an interactive turn
+  produces a reply but never calls `send_message` (so the user gets nothing),
+  the agent now re-prompts itself **once** to call `send_message` — recovering
+  the reply the user is waiting on, where the existing forgot-to-send guard
+  (#423) only flagged it for the *next* turn. Aimed at tool-shy models (minimax
+  M3) that answer in final text instead of calling the tool. The re-prompt is
+  **folded into the same turn/thread**, so it inherits the original turn's
+  context and triggers **no additional SAGA recall/synthesis**; it's loop-safe
+  (exactly one re-prompt, then it logs `resend_nudge_failed` and gives up) and
+  includes a 24h recidivism tally in the nudge. Opt-in per channel via
+  `MIMIR_RESEND_NUDGE_CHANNELS` (prefix allow-list, `*` = all; empty = off).
+
 ## [0.5.0] — 2026-06-17
 
 ### Added
