@@ -103,6 +103,11 @@ class TurnContext:
     # Origin source of the inbound event (carried from AgentEvent.source so
     # outbound assistant replies on the same channel inherit it).
     channel_source: str | None = None
+    # Runtime access-control context for tool middleware. Populated by
+    # Agent.run_turn from the inbound AgentEvent and Config/IdentityResolver.
+    author: str | None = None
+    identity_resolver: Any | None = None
+    access_control_enforced: bool = False
     # Number of successful send_message deliveries in this turn (incremented
     # only after the bridge confirms ``SendResult.sent``). The forgot-to-send
     # guard emits ``interactive_turn_no_send_message`` when an interactive turn

@@ -22,6 +22,8 @@ These tests exercise the middleware via two surfaces:
 from __future__ import annotations
 
 import time
+from pathlib import Path
+from textwrap import dedent
 from typing import Any
 
 import pytest
@@ -30,6 +32,7 @@ from langchain_core.messages import ToolMessage
 
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.models import TurnContext
+from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
     _check_and_increment_or_deny,
@@ -58,6 +61,15 @@ def _make_request(tool_name: str = "fake_tool",
         state=None,
         runtime=None,  # type: ignore[arg-type]
     )
+
+
+def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "identities.yaml").write_text(dedent(body), encoding="utf-8")
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    return resolver
 
 
 # ─── Bookkeeping helper ───────────────────────────────────────────
@@ -298,6 +310,127 @@ def test_denial_message_mentions_exempt_tools():
 
 
 @pytest.mark.asyncio
+async def test_admin_sensitive_tool_denied_for_non_admin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(kind: str, **kw: Any) -> None:
+        captured.append((kind, kw))
+
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", _capture)
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    ctx = _make_ctx(budget=0)
+    ctx.author = "slack-U1"
+    ctx.identity_resolver = resolver
+    ctx.access_control_enforced = True
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("worklink_run", "id-admin"), handler)
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.status == "error"
+    assert "requires an admin identity" in str(out.content)
+    assert handler_calls == 0
+    kinds = [kind for kind, _kw in captured]
+    assert "admin_tool_call_denied" in kinds
+    assert "tool_call_denied" in kinds
+    admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
+    assert admin_event["tool"] == "worklink_run"
+    assert admin_event["canonical_author"] == "alice"
+    assert admin_event["denial_reason"] == "admin_required"
+
+
+@pytest.mark.asyncio
+async def test_admin_sensitive_tool_allowed_via_canonical_discord_alias(
+    tmp_path: Path,
+) -> None:
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: root
+            aliases: [slack-UADMIN, discord-42]
+            access: {roles: [user, admin]}
+        """,
+    )
+    ctx = _make_ctx(budget=0)
+    ctx.author = "discord-42"
+    ctx.identity_resolver = resolver
+    ctx.access_control_enforced = True
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("reload_pollers", "id-admin"), handler)
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.content == "ok"
+    assert handler_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_read_only_tool_remains_available_to_non_admin(tmp_path: Path) -> None:
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    ctx = _make_ctx(budget=0)
+    ctx.author = "slack-U1"
+    ctx.identity_resolver = resolver
+    ctx.access_control_enforced = True
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="listed", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("list_schedules", "id-read"), handler)
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.content == "listed"
+    assert handler_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_middleware_catches_unregistered_tools():
     """The deepagents built-ins (``shell_exec``, ``read_file``, etc.)
     arrive at the middleware as ToolCallRequests whose ``tool`` may
@@ -327,6 +460,91 @@ async def test_middleware_catches_unregistered_tools():
     assert isinstance(out, ToolMessage)
     assert "shell_exec" in str(out.content)
     assert handler_invocations == 1
+
+
+@pytest.mark.asyncio
+async def test_admin_gate_allows_authorless_system_turns_when_enforced() -> None:
+    ctx = _make_ctx(budget=0)
+    ctx.trigger = "scheduled_tick"
+    ctx.author = None
+    ctx.access_control_enforced = True
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-system"), handler)
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.content == "ran"
+    assert handler_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_admin_gate_allows_trusted_web_user_message_without_author() -> None:
+    ctx = _make_ctx(budget=0)
+    ctx.channel_source = "web"
+    ctx.author = None
+    ctx.access_control_enforced = True
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-web"), handler)
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.content == "ran"
+    assert handler_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_admin_gate_denies_write_file_for_non_admin(tmp_path: Path) -> None:
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    ctx = _make_ctx(budget=0)
+    ctx.author = "slack-U1"
+    ctx.identity_resolver = resolver
+    ctx.access_control_enforced = True
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="wrote", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("write_file", "id-write"), handler)
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.status == "error"
+    assert "requires an admin identity" in str(out.content)
+    assert handler_calls == 0
 
 
 # ─── get_turn alias (unchanged from prior file) ───────────────────
@@ -502,3 +720,13 @@ async def test_middleware_emits_tool_error_for_budget_denial(
     assert len(denied_errors) == 1
     assert denied_errors[0]["tool"] == "shell_exec"
     assert denied_errors[0]["paired_tool_call"] is True
+
+
+def test_admin_sensitive_tool_matches_mcp_name_variants():
+    from mimir.tools.budget_gate import _is_admin_sensitive_tool
+
+    assert _is_admin_sensitive_tool("mcp__mimir__shell_exec")
+    assert _is_admin_sensitive_tool("mcp_mimir_shell_exec")
+    assert _is_admin_sensitive_tool("mcp__mimir__worklink_run")
+    assert _is_admin_sensitive_tool("mcp_mimir_worklink_run")
+    assert not _is_admin_sensitive_tool("mcp_mimir_read_file")

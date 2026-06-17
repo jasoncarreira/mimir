@@ -703,6 +703,7 @@ class Agent:
         self._config = config
         self._turn_logger = turn_logger
         self._buffer = message_buffer
+        self._identity_resolver = getattr(message_buffer, "resolver", None)
         self._indexes = index_generator
         self._indexer = indexer
         self._saga = saga_client
@@ -1312,6 +1313,10 @@ class Agent:
                 # recent_sources allowlist in recent_for_channel (chainlink #270);
                 # this field is no longer the source of that tag.
                 channel_source=event.source,
+                # Runtime access-control context consumed by tool middleware.
+                author=event.author,
+                identity_resolver=getattr(self, "_identity_resolver", None),
+                access_control_enforced=self._config.access_control_enforced,
             )
             # WikiBacklinksHook pre-snapshot — capture mtimes of every
             # state/wiki/ content page BEFORE the model loop runs so the
