@@ -6,6 +6,8 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-06-17
+
 ### Added
 
 - **`list_schedules` surfaces pollers and priority; schedule priority is
@@ -22,49 +24,6 @@ All notable changes will land here. Format loosely follows
   (refusing callable jobs, which bypass the arbiter gate). Both mutation tools
   are admin-gated alongside `add_schedule`/`remove_schedule`.
 
-### Fixed
-
-- **Worklink pushes the attempt branch from the checkout that owns it, not the
-  parent repo** (chainlink #518). With the isolated-checkout shape (#517), the
-  attempt branch and its commit live only inside `lease.path` (its own `.git`,
-  with `origin` already pointed at the remote). The local-path PR step still
-  pushed from `self.repo`, so once a run actually got through containment +
-  evidence it failed at publish with `src refspec issue/<id>-a<attempt> does not
-  match any` — the work was done safely but couldn't be published without manual
-  salvage. The push now runs from `lease.path`, which is also correct for the
-  legacy worktree shape (it shares the parent's refs). Surfaced by the first
-  clean autonomous run on the #517 rail.
-- **Worklink fails loud if codex runs on the controller without an isolated
-  checkout** (chainlink #517). The codex CLI resolves the git project root from
-  the filesystem, so when it executes on the controller (a shared-filesystem
-  compute) it must be pointed at an *isolated* checkout with its own `.git`,
-  never a parent-pointing worktree, or it edits the **repo root** (seen on
-  #512/#513). `_create_backend_checkout` already routes codex + shared-filesystem
-  to an isolated checkout; the orchestrator now also asserts that invariant after
-  lease creation (`worklink_unsafe_codex_checkout` → `blocked`) as a backstop
-  against the routing regressing. This is deliberately scoped to **controller**
-  execution: remote computes (`docker_sibling`/`ecs`) report
-  `shared_filesystem=false` because they run codex inside the worker's own clone,
-  which is the safe, preferred isolated-dispatch path and is left untouched.
-- **Worklink isolated checkout is relocated outside the parent repo** (chainlink
-  #517). On the `codex` + `shared_filesystem` path the attempt checkout was a
-  `git clone --local` *nested inside* the repo at `repo/.worklink/<id>-<attempt>`
-  — a clone-into-self that, under concurrent load, was the leading suspect for
-  the non-deterministic root leaks. The clone now lives at a sibling
-  `<repo.parent>/.worklink/<repo.name>/<id>-<attempt>`, fully detached from the
-  repo it was cloned from. A new cheap, deterministic **self-containment assert**
-  (`git rev-parse --show-toplevel` / `--absolute-git-dir`) runs right after the
-  clone and refuses (and cleans up) any checkout that resolves back to the
-  parent, before a metadata-inspecting backend like codex is ever pointed at it.
-- **Worklink quarantines leaked root edits recoverably** (chainlink #517). When
-  the `backend_wrote_outside_worktree` detector fires, the leaked paths are now
-  moved into a named, path-scoped `git stash` (`worklink-leak-<id>-a<attempt>`)
-  so the repo root is left clean without manual salvage — and *recoverably*, so
-  a containment regression can't silently destroy salvageable work. Pre-existing
-  unrelated dirt in the root is untouched; the stash label is surfaced in the
-  failure reason.
-
-### Added
 
 - **Per-turn model-iteration ceiling** (chainlink #511). A configurable, 3-tier
   cap (`MIMIR_MAX_TURN_ITERATIONS`, default **200**; 0 disables) on how many
@@ -146,6 +105,48 @@ All notable changes will land here. Format loosely follows
   logged each time).
 - **`GET /` redirects to `/turns`** — the bare web root now sends browsers to
   the turn viewer (302) instead of 404ing.
+
+### Fixed
+
+- **Worklink pushes the attempt branch from the checkout that owns it, not the
+  parent repo** (chainlink #518). With the isolated-checkout shape (#517), the
+  attempt branch and its commit live only inside `lease.path` (its own `.git`,
+  with `origin` already pointed at the remote). The local-path PR step still
+  pushed from `self.repo`, so once a run actually got through containment +
+  evidence it failed at publish with `src refspec issue/<id>-a<attempt> does not
+  match any` — the work was done safely but couldn't be published without manual
+  salvage. The push now runs from `lease.path`, which is also correct for the
+  legacy worktree shape (it shares the parent's refs). Surfaced by the first
+  clean autonomous run on the #517 rail.
+- **Worklink fails loud if codex runs on the controller without an isolated
+  checkout** (chainlink #517). The codex CLI resolves the git project root from
+  the filesystem, so when it executes on the controller (a shared-filesystem
+  compute) it must be pointed at an *isolated* checkout with its own `.git`,
+  never a parent-pointing worktree, or it edits the **repo root** (seen on
+  #512/#513). `_create_backend_checkout` already routes codex + shared-filesystem
+  to an isolated checkout; the orchestrator now also asserts that invariant after
+  lease creation (`worklink_unsafe_codex_checkout` → `blocked`) as a backstop
+  against the routing regressing. This is deliberately scoped to **controller**
+  execution: remote computes (`docker_sibling`/`ecs`) report
+  `shared_filesystem=false` because they run codex inside the worker's own clone,
+  which is the safe, preferred isolated-dispatch path and is left untouched.
+- **Worklink isolated checkout is relocated outside the parent repo** (chainlink
+  #517). On the `codex` + `shared_filesystem` path the attempt checkout was a
+  `git clone --local` *nested inside* the repo at `repo/.worklink/<id>-<attempt>`
+  — a clone-into-self that, under concurrent load, was the leading suspect for
+  the non-deterministic root leaks. The clone now lives at a sibling
+  `<repo.parent>/.worklink/<repo.name>/<id>-<attempt>`, fully detached from the
+  repo it was cloned from. A new cheap, deterministic **self-containment assert**
+  (`git rev-parse --show-toplevel` / `--absolute-git-dir`) runs right after the
+  clone and refuses (and cleans up) any checkout that resolves back to the
+  parent, before a metadata-inspecting backend like codex is ever pointed at it.
+- **Worklink quarantines leaked root edits recoverably** (chainlink #517). When
+  the `backend_wrote_outside_worktree` detector fires, the leaked paths are now
+  moved into a named, path-scoped `git stash` (`worklink-leak-<id>-a<attempt>`)
+  so the repo root is left clean without manual salvage — and *recoverably*, so
+  a containment regression can't silently destroy salvageable work. Pre-existing
+  unrelated dirt in the root is untouched; the stash label is surfaced in the
+  failure reason.
 
 ## [0.4.1] — 2026-06-16
 
