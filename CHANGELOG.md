@@ -62,6 +62,17 @@ All notable changes will land here. Format loosely follows
   includes a 24h recidivism tally in the nudge. Opt-in per channel via
   `MIMIR_RESEND_NUDGE_CHANNELS` (prefix allow-list, `*` = all; empty = off).
 
+### Fixed
+
+- **Worklink worker failed to prepare a fresh-cloned repo when the base branch
+  was checked out** (docker-sibling / ECS path; rail #537). `_prepare_repo`
+  force-updated the local base ref (`git branch -f main FETCH_HEAD`) *before*
+  moving off it, but a fresh `git clone`'s HEAD is on `main`, so git refused:
+  `cannot force update the branch 'main' used by worktree`. The local-subprocess
+  path never hit it (its checkout isn't on the base branch). Now the worker
+  checks out the attempt branch off `FETCH_HEAD` first, then materializes the
+  base ref — surfaced by the first real docker-sibling smoke (#540).
+
 ## [0.5.0] — 2026-06-17
 
 ### Added
