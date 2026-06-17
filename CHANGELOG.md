@@ -26,6 +26,18 @@ All notable changes will land here. Format loosely follows
   into review-ready. Unblocks review-ready outcomes for the docker-sibling/ECS
   runner.
 
+- **docker-sibling deploy-prep artifacts** (chainlink #539, docker-sibling rail
+  #537). Committed, CI-validated example configs under
+  `docs/examples/worklink/`: `worklink.docker-sibling.yaml` (a complete
+  agent-side config), `docker-broker-policy.yaml` (the broker trust boundary),
+  and a `worklink-worker.Dockerfile` template for the `mimir-worklink` worker
+  image that was referenced throughout the runbook but never had a build recipe.
+  The `WORKLINK.md` operator runbook now points to them, documents building the
+  worker image (pin a release including the #538 `test_only` worker), and notes
+  the sandboxed test job in the smoke evidence step.
+  `tests/test_worklink_example_configs.py` keeps the examples loadable by the
+  real parsers.
+
 - **Resend-nudge: forgot-to-send recovery** (opt-in). When an interactive turn
   produces a reply but never calls `send_message` (so the user gets nothing),
   the agent now re-prompts itself **once** to call `send_message` — recovering
