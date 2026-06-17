@@ -462,6 +462,91 @@ async def test_middleware_catches_unregistered_tools():
     assert handler_invocations == 1
 
 
+@pytest.mark.asyncio
+async def test_admin_gate_allows_authorless_system_turns_when_enforced() -> None:
+    ctx = _make_ctx(budget=0)
+    ctx.trigger = "scheduled_tick"
+    ctx.author = None
+    ctx.access_control_enforced = True
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-system"), handler)
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.content == "ran"
+    assert handler_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_admin_gate_allows_trusted_web_user_message_without_author() -> None:
+    ctx = _make_ctx(budget=0)
+    ctx.channel_source = "web"
+    ctx.author = None
+    ctx.access_control_enforced = True
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-web"), handler)
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.content == "ran"
+    assert handler_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_admin_gate_denies_write_file_for_non_admin(tmp_path: Path) -> None:
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    ctx = _make_ctx(budget=0)
+    ctx.author = "slack-U1"
+    ctx.identity_resolver = resolver
+    ctx.access_control_enforced = True
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="wrote", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("write_file", "id-write"), handler)
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.status == "error"
+    assert "requires an admin identity" in str(out.content)
+    assert handler_calls == 0
+
+
 # ─── get_turn alias (unchanged from prior file) ───────────────────
 
 

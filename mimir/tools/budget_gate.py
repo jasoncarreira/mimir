@@ -75,8 +75,20 @@ _ADMIN_TOOL_NAMES = frozenset(
         "spawn_claude_code",
         "spawn_codex",
         "saga_forget",
+        # Deepagents built-in write tools mutate tracked state / repo files.
+        # Under access-control enforcement they have comparable blast radius
+        # to reload_pollers and proposal tools, so gate them explicitly rather
+        # than leaving file writes as a prompt-policy-only boundary.
+        "write_file",
+        "edit_file",
     }
 )
+
+# Same trusted-source carve-out as dispatcher._authorize_bridge_event: these
+# sources are authenticated by their entrypoint rather than by a platform author
+# id. Non-user-message turns are likewise system/scheduler/poller work admitted
+# without an external author and must retain admin-tool access in enforced mode.
+_ADMIN_TRUSTED_INTERNAL_SOURCES = frozenset({"web", "api", "stdin"})
 
 _ADMIN_BUILTIN_TOOL_NAMES = frozenset(
     {
@@ -84,6 +96,8 @@ _ADMIN_BUILTIN_TOOL_NAMES = frozenset(
         "bash",
         "bash_exec",
         "shell",
+        "Write",
+        "Edit",
     }
 )
 
@@ -212,6 +226,14 @@ def _admin_denial_message(tool_name: str, reason: str | None) -> str:
     )
 
 
+def _turn_has_internal_admin_authority(ctx: Any) -> bool:
+    trigger = (getattr(ctx, "trigger", None) or "").strip()
+    if trigger != "user_message":
+        return True
+    source = (getattr(ctx, "channel_source", None) or "").strip().lower()
+    return source in _ADMIN_TRUSTED_INTERNAL_SOURCES
+
+
 def _check_admin_authorized(tool_name: str) -> str | None:
     if not _is_admin_sensitive_tool(tool_name):
         return None
@@ -223,6 +245,8 @@ def _check_admin_authorized(tool_name: str) -> str | None:
         return None
     enforce = bool(getattr(ctx, "access_control_enforced", False))
     if not enforce:
+        return None
+    if _turn_has_internal_admin_authority(ctx):
         return None
     decision = authorize_action(
         getattr(ctx, "author", None),
