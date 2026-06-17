@@ -6,6 +6,22 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Worklink fails loud on an unsafe codex/compute combination** (chainlink
+  #517). The codex CLI runs its shell tools on the compute's filesystem and
+  resolves the git project root itself, so on a shared-filesystem (local)
+  compute it must run inside an *isolated* attempt checkout — which the
+  orchestrator provisions only on the `codex` + `shared_filesystem` path. A
+  codex worklink on a compute that reports `shared_filesystem=false` would
+  instead get a parent-pointing git worktree and edit the **repo root** (seen
+  on #512/#513; previously caught only post-hoc by the `backend_wrote_outside_worktree`
+  detector, after the root was already dirtied). The orchestrator now **refuses
+  that combo up front** (`worklink_unsafe_codex_compute` → `blocked`) with an
+  actionable reason, rather than silently overriding the operator's compute
+  selection. Run codex worklinks on a `local_subprocess` compute (which sets up
+  the isolated checkout) or a codex substrate with its own filesystem.
+
 ### Added
 
 - **Per-turn model-iteration ceiling** (chainlink #511). A configurable, 3-tier

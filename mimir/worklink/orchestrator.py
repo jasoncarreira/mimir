@@ -172,6 +172,34 @@ class WorklinkRunner:
         # Per-run override beats worklink.yaml, which beats the built-in "main".
         base = base_branch or config.defaults.base_branch
 
+        # chainlink #517: fail loud on an unsafe codex/compute combination rather
+        # than silently leaking. The codex CLI runs its shell tools on the
+        # compute's filesystem and resolves the git project root itself; on a
+        # shared-filesystem (local) compute it MUST run inside an isolated attempt
+        # checkout or it walks up into the parent repo and edits the repo ROOT
+        # (observed on #512/#513; previously caught only post-hoc by the leak
+        # detector, after the root was already dirtied). The isolated checkout is
+        # provisioned ONLY on the ``codex`` + ``shared_filesystem`` path
+        # (_create_backend_checkout); any other compute hands codex a
+        # parent-pointing git worktree. Refuse the combo with an actionable reason
+        # instead of overriding the operator's compute selection.
+        if selected_name == "codex" and not compute.capabilities().shared_filesystem:
+            reason = (
+                f"codex worklinks require a shared-filesystem compute that "
+                f"provisions an isolated attempt checkout; the selected compute "
+                f"{compute.name!r} reports shared_filesystem=false, so codex would "
+                f"run against a parent-pointing git worktree and leak edits into the "
+                f"repo root (chainlink #517). Configure a local_subprocess compute "
+                f"for codex worklinks (it sets up an isolated checkout), or a codex "
+                f"substrate with its own filesystem."
+            )
+            _log_event(
+                "worklink_unsafe_codex_compute",
+                issue_id=issue.issue_id,
+                compute_backend=compute.name,
+            )
+            return WorklinkRunResult(issue.issue_id, None, "blocked", reason=reason)
+
         # Dry-run validates the issue and renders the exact prompt without claiming
         # or mutating Chainlink/git state.
         if dry_run:

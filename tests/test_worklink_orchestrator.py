@@ -1272,3 +1272,39 @@ def test_outside_worktree_detection_marks_root_leak_failed(tmp_path: Path) -> No
     assert result.review_ready is False
     assert "completed_empty_diff" in result.reasons
     assert any(reason.startswith("backend_wrote_outside_worktree:") for reason in result.reasons)
+
+
+# ─── chainlink #517: fail loud on unsafe codex/compute combo ──────────
+
+
+class _CodexNamedBackend(FakeBackend):
+    name = "codex"
+
+
+def test_codex_on_non_shared_compute_blocks_loudly(tmp_path: Path) -> None:
+    """A codex worklink on a compute that won't provision an isolated checkout
+    (shared_filesystem=False) must be refused with a clear reason, not run into
+    a parent-pointing worktree and leak into the repo root (chainlink #517)."""
+    repo = tmp_path / "repo"
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            return cp(args, stdout=ISSUE_JSON)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        return cp(args)
+
+    registry = BackendRegistry(
+        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    )
+    registry.register(_CodexNamedBackend(status="success"))
+    registry.register_compute(FakeCompute(shared_filesystem=False))
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="codex"
+        )
+    )
+    assert result.status == "blocked", (result.status, result.reason)
+    assert "isolated" in (result.reason or "").lower()
+    assert "shared_filesystem" in (result.reason or "")
