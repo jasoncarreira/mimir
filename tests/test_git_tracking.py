@@ -1325,6 +1325,64 @@ async def test_surfaces_ignored_note_under_tracked_root(
 
 
 @pytest.mark.asyncio
+async def test_ignored_note_marker_suppresses_intentional_artifact_subtree(
+    home_repo: Path, tmp_path: Path,
+) -> None:
+    """Ignored package/vendor trees under state/ can contain thousands of README
+    files. A local marker lets intentionally ignored artifact subtrees stay quiet
+    while plain lost notes under state/ still surface."""
+    home = home_repo
+    (home / ".gitignore").write_text("state/vendor-artifacts/\n")
+    artifact_dir = home / "state" / "vendor-artifacts"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / ".mimir-ignore-notes-ok").write_text(
+        "runtime package install; intentionally ignored\n"
+    )
+    (artifact_dir / "README.md").write_text("package readme, not mimir state\n")
+    # A tracked change so commit_turn_changes proceeds past the no-op fast path.
+    (home / "memory").mkdir(exist_ok=True)
+    (home / "memory" / "real.md").write_text("real\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home, enabled=True,
+    )
+
+    skipped = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_ignored_note_skipped"
+    ]
+    assert not skipped
+
+
+@pytest.mark.asyncio
+async def test_ignored_note_file_marker_suppresses_intentional_single_file(
+    home_repo: Path, tmp_path: Path,
+) -> None:
+    """A single intentionally local note can be suppressed without muting its
+    whole parent directory."""
+    home = home_repo
+    (home / ".gitignore").write_text("memory/issues/local-only.md*\n")
+    issue_dir = home / "memory" / "issues"
+    issue_dir.mkdir(parents=True)
+    (issue_dir / "local-only.md").write_text("local experiment note\n")
+    (issue_dir / "local-only.md.mimir-ignore-notes-ok").write_text(
+        "intentionally local\n"
+    )
+    # A tracked change so commit_turn_changes proceeds past the no-op fast path.
+    (home / "memory" / "real.md").write_text("real\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home, enabled=True,
+    )
+
+    skipped = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_ignored_note_skipped"
+    ]
+    assert not skipped
+
+
+@pytest.mark.asyncio
 async def test_no_ignored_note_event_for_attachments_root(
     home_repo: Path, tmp_path: Path,
 ) -> None:
