@@ -10,6 +10,10 @@ build/
 dist/
 .eggs/
 
+# Frontend toolchain
+node_modules/
+/mimir/react_app/dist/
+
 # Virtual envs
 .venv/
 venv/

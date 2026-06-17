@@ -249,6 +249,19 @@ uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/lan
 uv run pytest
 ```
 
+### React frontend
+
+The React migration shell lives under `frontend/` and is served by aiohttp at
+`/app` after it is built. The existing `/turns`, `/ops`, `/saga`, and `/state`
+HTML pages remain available during the migration.
+
+```bash
+npm install
+npm run dev      # Vite dev server for frontend work
+npm run build    # production bundle into mimir/react_app/dist
+npm run test     # TypeScript-only frontend check
+```
+
 The bench harness is in `benchmarks/longmemeval_via_mimir/`. See
 that directory's README for running an A/B of two saga configs and
 scoring with the gpt-4o judge.

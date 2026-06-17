@@ -125,3 +125,24 @@ jobs:
             exit 1
           fi
           echo "ran optional-skills tests for $ran skill(s)"
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Typecheck and build React app
+        run: |
+          npm run test
+          npm run build

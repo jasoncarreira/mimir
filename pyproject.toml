@@ -208,6 +208,7 @@ include = [
     # source trees. Ships SKILL.md + poller.py + pollers.json + tests.
     "mimir/optional-skills/**/*",
     "mimir/templates/**/*",
+    "mimir/react_app/dist/**/*",
     "mimir/turn_viewer.html",
     # chainlink #243: operator dashboards. HTML/JS lives in sibling .html
     # files next to the dashboard module; loaders read them at runtime.
