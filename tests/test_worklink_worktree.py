@@ -26,6 +26,8 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
+        if args[-1] == "refs/remotes/origin/main":
+            return completed(args, returncode=1)
         return completed(args)
 
     lease = create_worktree(tmp_path, issue_id=439, attempt=2, runner=runner)
@@ -35,8 +37,29 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
     assert lease.base_ref == "main"
     assert lease.local_base == "main"
     assert calls == [
+        ["git", "-C", str(tmp_path), "fetch", "origin", "main"],
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/main",
+        ],
         ["git", "-C", str(tmp_path), "rev-parse", "--verify", "--quiet", "refs/heads/main"],
-        ["git", "-C", str(tmp_path), "worktree", "add", "--no-track", "-b", "issue/439-a2", str(lease.path), "main"],
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            "issue/439-a2",
+            str(lease.path),
+            "main",
+        ],
     ]
 
 
@@ -90,6 +113,141 @@ def test_prune_attempt_worktrees_is_conservative(tmp_path: Path) -> None:
 def _git(cwd: Path, *args: str) -> str:
     out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True)
     return out.stdout.strip()
+
+
+def _repo_with_stale_local_main(tmp_path: Path) -> tuple[Path, Path, str, str]:
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@e.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "checkout", "-q", "-b", "main")
+    (repo / "a.txt").write_text("base\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+    _git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.write_text(exclude.read_text(encoding="utf-8") + "\n.worklink/\n", encoding="utf-8")
+    stale_sha = _git(repo, "rev-parse", "HEAD")
+
+    updater = tmp_path / "updater"
+    subprocess.run(["git", "clone", "-q", str(origin), str(updater)], check=True)
+    _git(updater, "config", "user.email", "t@e.com")
+    _git(updater, "config", "user.name", "t")
+    _git(updater, "checkout", "-q", "main")
+    (updater / "a.txt").write_text("base\nfresh\n")
+    _git(updater, "commit", "-q", "-am", "fresh")
+    _git(updater, "push", "-q", "origin", "HEAD:main")
+    fresh_sha = _git(updater, "rev-parse", "HEAD")
+    assert fresh_sha != stale_sha
+    return origin, repo, stale_sha, fresh_sha
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+def test_attempt_base_fetch_uses_fresh_origin_without_mutating_source(
+    tmp_path: Path, isolated: bool
+) -> None:
+    _origin, repo, stale_sha, fresh_sha = _repo_with_stale_local_main(tmp_path)
+    head_before = _git(repo, "rev-parse", "HEAD")
+    branch_before = _git(repo, "branch", "--show-current")
+    status_before = _git(repo, "status", "--short")
+
+    if isolated:
+        lease = create_isolated_checkout(repo, issue_id=521, attempt=1, base="main")
+    else:
+        lease = create_worktree(repo, issue_id=521, attempt=1, base="main")
+
+    assert head_before == stale_sha
+    assert _git(repo, "rev-parse", "HEAD") == head_before
+    assert _git(repo, "branch", "--show-current") == branch_before
+    assert _git(repo, "rev-parse", "refs/heads/main") == stale_sha
+    assert _git(repo, "status", "--short") == status_before
+    assert _git(repo, "rev-parse", "origin/main") == fresh_sha
+    assert _git(lease.path, "rev-parse", "HEAD") == fresh_sha
+    assert lease.local_base in ("origin/main", fresh_sha)
+
+
+def test_base_fetch_failure_falls_back_to_local_base_and_logs_event(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[:4] == ["git", "-C", str(tmp_path), "fetch"]:
+            return subprocess.CompletedProcess(list(args), 128, stdout="", stderr="network down\n")
+        return completed(args)
+
+    def event_logger(event_type: str, **payload: object) -> None:
+        events.append((event_type, payload))
+
+    lease = create_worktree(
+        tmp_path,
+        issue_id=521,
+        attempt=2,
+        base="main",
+        runner=runner,
+        event_logger=event_logger,
+    )
+
+    assert lease.local_base == "main"
+    assert calls[:3] == [
+        ["git", "-C", str(tmp_path), "fetch", "origin", "main"],
+        ["git", "-C", str(tmp_path), "rev-parse", "--verify", "--quiet", "refs/heads/main"],
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            "issue/521-a2",
+            str(lease.path),
+            "main",
+        ],
+    ]
+    assert events == [
+        (
+            "worklink_base_fetch_failed",
+            {
+                "repo": str(tmp_path),
+                "base": "main",
+                "returncode": 128,
+                "stdout": "",
+                "stderr": "network down",
+            },
+        )
+    ]
+
+
+def test_base_with_no_origin_counterpart_still_uses_local_branch(tmp_path: Path) -> None:
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@e.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "checkout", "-q", "-b", "main")
+    (repo / "a.txt").write_text("base\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "checkout", "-q", "-b", "local-only")
+    (repo / "a.txt").write_text("local\n")
+    _git(repo, "commit", "-q", "-am", "local")
+    local_sha = _git(repo, "rev-parse", "local-only")
+
+    lease = create_worktree(repo, issue_id=521, attempt=3, base="local-only")
+
+    assert lease.local_base == "local-only"
+    assert _git(lease.path, "rev-parse", "HEAD") == local_sha
+    missing = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "origin/local-only"],
+        capture_output=True,
+        text=True,
+    )
+    assert missing.returncode != 0
 
 
 def test_create_worktree_real_git_slash_named_remote_base(tmp_path: Path) -> None:

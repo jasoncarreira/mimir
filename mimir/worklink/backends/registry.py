@@ -33,6 +33,10 @@ class WorklinkDefaults:
     # it at a long-running integration/feature branch to stack Worklink leaves
     # there instead of opening every PR straight against main.
     base_branch: str = "main"
+    # Refresh origin/<base_branch> before cutting local attempts. The fetch is
+    # ref-only and does not update the source checkout's working tree or local
+    # branch; this can be disabled for local-only branch testing.
+    base_fetch: bool = True
     # Slice-3 autonomy. ``max_concurrent`` caps how many leaves may be
     # claimed (``worklink:in-progress``) at once across autonomous dispatch
     # (poller + tool); the operator CLI is not capped. ``reaper_ttl_s`` is
@@ -120,6 +124,7 @@ class WorklinkConfig:
                 )
             ),
             base_branch=str(defaults_data.get("base_branch", "main")),
+            base_fetch=_coerce_safety_bool(defaults_data.get("base_fetch", True), default=True),
             max_concurrent=_positive_int(
                 defaults_data.get("max_concurrent"),
                 default=WorklinkDefaults.max_concurrent,
