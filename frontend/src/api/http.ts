@@ -20,7 +20,7 @@ export class ApiError extends Error {
   }
 }
 
-function getStoredApiKey(): string {
+export function getStoredApiKey(): string {
   try {
     return globalThis.localStorage?.getItem(MIMIR_API_KEY_STORAGE_KEY) ?? "";
   } catch {

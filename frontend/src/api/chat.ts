@@ -1,4 +1,4 @@
-import { apiFetchJson, type ApiClientOptions } from "./http";
+import { apiFetchJson, getStoredApiKey, type ApiClientOptions } from "./http";
 
 export interface ChatPostRequest {
   channel_id?: string;
@@ -53,10 +53,12 @@ export function sendChatMessage(
 
 export function createChatStream(
   onPayload: (payload: ChatStreamPayload) => void,
-  options: { baseUrl?: string; eventSourceImpl?: typeof EventSource } = {}
+  options: { baseUrl?: string; apiKey?: string; eventSourceImpl?: typeof EventSource } = {}
 ): EventSource {
   const EventSourceCtor = options.eventSourceImpl ?? EventSource;
-  const stream = new EventSourceCtor(`${options.baseUrl ?? ""}/chat/stream`);
+  const key = options.apiKey ?? getStoredApiKey();
+  const query = key ? `?${new URLSearchParams({ api_key: key }).toString()}` : "";
+  const stream = new EventSourceCtor(`${options.baseUrl ?? ""}/chat/stream${query}`);
   stream.onmessage = (event) => {
     onPayload(JSON.parse(event.data) as ChatStreamPayload);
   };
