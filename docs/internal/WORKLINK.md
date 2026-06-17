@@ -605,6 +605,13 @@ compute_backends:
       network: none
 ```
 
+> Copy-paste-able, CI-validated versions of both config files live in
+> [`docs/examples/worklink/`](../examples/worklink/):
+> `worklink.docker-sibling.yaml` (a complete agent-side config) and
+> `docker-broker-policy.yaml` (the broker trust boundary).
+> `tests/test_worklink_example_configs.py` keeps them loadable as the schemas
+> evolve.
+
 The agent-side `docker-sibling` backend is a broker **client**, not a Docker
 launcher. Its contract is deliberately narrow: `POST /jobs` submits `{image,
 policy, worker_payload}`, `POST /jobs/<id>/wait` returns bounded compute result
@@ -640,6 +647,23 @@ The broker builds `docker run --rm --name <job> --network <policy.network> ...
 <allowed-image> mimir worklink worker --payload-json <payload>` from policy and
 the worker payload. Tests inject fake process primitives; no broker test requires
 a live Docker daemon.
+
+#### Building the worker image
+
+The `image:` the broker launches (`mimir-worklink:latest` above) is **not** the
+agent server image — it just needs `mimir`, `git`, and the routed backend CLI on
+`PATH`; the broker overrides the command. A starting-point template lives at
+[`docs/examples/worklink/worklink-worker.Dockerfile`](../examples/worklink/worklink-worker.Dockerfile).
+Two operator decisions are load-bearing: **pin `MIMIR_VERSION` to a release that
+includes the #538 `test_only` worker** (an older mimir silently re-runs the full
+implementation pass instead of the sandboxed test job), and **install the backend
+CLI(s)** your routes select (codex/claude). Build + tag to match the broker
+policy's `allowed_images`:
+
+```bash
+docker build -f docs/examples/worklink/worklink-worker.Dockerfile \
+  --build-arg MIMIR_VERSION=<release-with-#538> -t mimir-worklink:latest .
+```
 
 #### DockerSibling smoke / runbook
 
@@ -684,9 +708,14 @@ complete boundary rather than just unit-level broker calls:
 5. Inspect the evidence file before treating the smoke as passed. It should show
    the controller re-derived evidence from remote refs, including commands like
    `git fetch origin main`, `git fetch origin issue/<id>-a<attempt>`, and
-   `git diff --name-only origin/main...origin/issue/<id>-a<attempt>`. The worker's
-   own evidence file is only a handoff artifact; the orchestrator's remote
-   evidence gate is the trust boundary.
+   `git diff --name-only origin/main...origin/issue/<id>-a<attempt>`. On a
+   completed run with a real diff the controller also dispatches a **second,
+   sandboxed `test_only` job** on the pushed branch (#538) and folds its exit
+   code into the evidence (`tests.observed: true`, summary `remote sandboxed test
+   job: exit <n>`) — so review-ready means the tests were actually re-run in a
+   container, not asserted by the worker. The worker's own evidence file is only a
+   handoff artifact; the orchestrator's remote evidence gate is the trust
+   boundary.
 
 Cleanup is bounded on both sides. The orchestrator calls broker cleanup after
 `wait`, and the broker uses `docker run --rm` plus a best-effort `docker rm -f
