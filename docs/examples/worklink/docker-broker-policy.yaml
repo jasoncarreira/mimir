@@ -41,6 +41,20 @@ default_env:
   GITHUB_TOKEN: "ghp_replace_with_a_scoped_worklink_token"
   MIMIR_HOME: "/worklink/home"
 
+# Operator-declared, read-only credential mounts (#539). For backends whose creds
+# are FILES, not env vars — e.g. codex's ChatGPT OAuth bundle — the broker mounts
+# these host paths into every worker container, always `:ro`. The agent cannot
+# request or widen a mount; only what's listed here is mounted. `target` defaults
+# to `source`. Leave unset for env-only backends.
+#
+# Example: give workers the host's codex subscription auth (CODEX_HOME defaults to
+# ~/.codex in the worker; mount just the auth file so the rest stays writable for
+# codex's cache). `source` is a HOST path (the broker runs sibling containers on
+# the host daemon).
+# creds_mounts:
+#   - source: /Users/you/.codex/auth.json
+#     target: /home/worker/.codex/auth.json
+
 # Optional: override the in-container command. Defaults to the portable worker
 # entrypoint, which is almost always what you want — leave it unset.
 # worker_command: ["mimir", "worklink", "worker", "--payload-json"]

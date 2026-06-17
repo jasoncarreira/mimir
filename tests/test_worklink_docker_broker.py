@@ -184,6 +184,67 @@ def test_docker_broker_policy_rejects_host_network_and_default_env_outside_allow
         DockerBrokerPolicy(allowed_images=("img",), env_allowlist=("A",), default_env={"B": "1"})
 
 
+@pytest.mark.asyncio
+async def test_docker_broker_emits_operator_declared_readonly_creds_mounts() -> None:
+    # chainlink #539: file-based backend creds (codex's ~/.codex/auth.json) can't
+    # travel as an env var, so the operator policy may declare read-only mounts.
+    factory = RecordingProcessFactory()
+    policy = DockerBrokerPolicy.from_mapping(
+        {
+            "allowed_images": ["mimir-worklink:latest"],
+            "network": "none",
+            "max_timeout_s": 60,
+            "env_allowlist": ["GITHUB_TOKEN", "MIMIR_HOME"],
+            "default_env": {"GITHUB_TOKEN": "redacted-test-token"},
+            "creds_mounts": [
+                {"source": "/host/.codex/auth.json", "target": "/home/worker/.codex/auth.json"},
+                {"source": "/host/.codex/config.toml"},  # target defaults to source
+            ],
+        }
+    )
+    broker = DockerSiblingBroker(policy, process_factory=factory)
+
+    response = await broker.submit_job(
+        {
+            "image": "mimir-worklink:latest",
+            "policy": {"network": "none"},
+            "worker_payload": _worker_payload(),
+        }
+    )
+    await broker.wait_job(response["job_id"], timeout_s=5)
+
+    command = factory.calls[0]
+    # Mounted read-only, before the image, with the documented :ro suffix.
+    assert "-v" in command
+    assert "/host/.codex/auth.json:/home/worker/.codex/auth.json:ro" in command
+    assert "/host/.codex/config.toml:/host/.codex/config.toml:ro" in command  # target == source
+    image_idx = command.index("mimir-worklink:latest")
+    for i, tok in enumerate(command):
+        if tok == "-v":
+            assert i < image_idx  # mounts precede the image, not the worker args
+            assert command[i + 1].endswith(":ro")  # never writable
+
+
+def test_docker_broker_creds_mounts_reject_relative_paths_and_missing_source() -> None:
+    with pytest.raises(DockerBrokerPolicyError, match="absolute"):
+        DockerBrokerPolicy.from_mapping(
+            {"allowed_images": ["img"], "creds_mounts": [{"source": "relative/path"}]}
+        )
+    with pytest.raises(DockerBrokerPolicyError, match="source"):
+        DockerBrokerPolicy.from_mapping(
+            {"allowed_images": ["img"], "creds_mounts": [{"target": "/x"}]}
+        )
+    with pytest.raises(DockerBrokerPolicyError, match="list"):
+        DockerBrokerPolicy.from_mapping(
+            {"allowed_images": ["img"], "creds_mounts": "/host/.codex:/x"}
+        )
+
+
+def test_docker_broker_default_policy_has_no_creds_mounts() -> None:
+    # Opt-in: a policy without creds_mounts mounts nothing (the agent never gets one).
+    assert DockerBrokerPolicy.from_mapping({"allowed_images": ["img"]}).creds_mounts == ()
+
+
 def test_worklink_cli_registers_docker_broker_subcommand(tmp_path: Path) -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command")
