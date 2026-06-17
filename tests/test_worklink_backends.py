@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -1019,6 +1020,49 @@ def test_ecs_runtask_backend_builds_value_blind_runtask_request() -> None:
     assert env["MIMIR_HOME"] == "/worklink/home"
     assert env["WORKLINK_MODE"] == "test"
     assert "WORKLINK_PAYLOAD_JSON" not in env
+
+
+def test_ecs_payload_propagates_test_only_and_nulls_local_fields(tmp_path) -> None:
+    # chainlink #538: the ECS payload builder must carry spec.test_only. If it's
+    # dropped, the controller's sandboxed test job runs the full implementation
+    # worker again and the controller folds THAT exit code as if it were the test
+    # command's — silently wrong. (Regression: the old field-by-field rebuild
+    # omitted test_only; replace() carries it.)
+    config = EcsRunTaskConfig(
+        cluster="worklink",
+        task_definition="worklink-worker:7",
+        container_name="worker",
+        subnets=("subnet-a",),
+    )
+    spec = WorkSpec(
+        issue_id=538,
+        attempt=1,
+        repo_url="https://github.com/jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="issue/538-a1",
+        prompt="run tests only",
+        rules=None,
+        test_command="uv run pytest -q",
+        backend="codex",
+        timeout_s=900,
+        local_worktree=tmp_path,
+        local_argv=("mimir", "worklink", "worker"),
+        test_only=True,
+    )
+
+    payload = EcsRunTaskComputeBackend(config).build_request(spec).payload
+
+    assert payload["spec"]["test_only"] is True
+    # local-substrate-only fields are nulled for the remote worker
+    assert payload["spec"]["local_worktree"] is None
+    assert payload["spec"]["local_argv"] is None
+    # round-trips back to a test_only spec the worker will route to _run_test_only
+    assert payload_from_json(payload).spec.test_only is True
+    # a normal implementation spec stays test_only=False
+    normal_payload = EcsRunTaskComputeBackend(config).build_request(
+        replace(spec, test_only=False)
+    ).payload
+    assert normal_payload["spec"]["test_only"] is False
 
 
 def test_ecs_runtask_request_validates_against_botocore_param_model() -> None:

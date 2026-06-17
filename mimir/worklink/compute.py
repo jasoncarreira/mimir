@@ -11,7 +11,7 @@ orchestrator.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import http.client
 import json
 import os
@@ -610,23 +610,11 @@ def _ecs_worker_payload(config: EcsRunTaskConfig, spec: WorkSpec) -> dict[str, A
 
     return payload_to_json(
         WorkerPayload(
-                spec=WorkSpec(
-                    issue_id=spec.issue_id,
-                    attempt=spec.attempt,
-                    repo_url=spec.repo_url,
-                    base_ref=spec.base_ref,
-                    branch=spec.branch,
-                    prompt=spec.prompt,
-                    rules=spec.rules,
-                    test_command=spec.test_command,
-                    backend=spec.backend,
-                    timeout_s=spec.timeout_s,
-                    creds_ref=spec.creds_ref,
-                    env=spec.env,
-                    backend_config=spec.backend_config,
-                    local_worktree=None,
-                    local_argv=None,
-                ),
+                # Null only the local-substrate-only fields; replace() carries every
+                # other field (incl. test_only — #538) so a new WorkSpec field can't
+                # be silently dropped on the ECS path the way a field-by-field rebuild
+                # would.
+                spec=replace(spec, local_worktree=None, local_argv=None),
                 repo_dir=Path(config.worker_repo_dir),
                 evidence_path=Path(config.worker_evidence_path),
                 transcript_root=(
