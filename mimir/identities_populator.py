@@ -42,13 +42,15 @@ import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 import yaml
 
 from .event_logger import log_event
 
 log = logging.getLogger(__name__)
+
+PairingRequestStatus = Literal["changed", "unchanged", "capped"]
 
 
 # ---------------------------------------------------------------------------
@@ -322,12 +324,41 @@ def request_pairing(
     spam from growing ``identities.yaml`` without bound. Existing identities
     may still be updated so operator-authored entries remain repairable.
     """
+    return request_pairing_status(
+        home,
+        author,
+        platform,
+        channel_id=channel_id,
+        author_display=author_display,
+        is_dm=is_dm,
+        max_pending=max_pending,
+    ) == "changed"
+
+
+@_serialized_identities_write
+def request_pairing_status(
+    home: Path,
+    author: str,
+    platform: str,
+    *,
+    channel_id: str,
+    author_display: str | None = None,
+    is_dm: bool = False,
+    max_pending: int | None = None,
+) -> PairingRequestStatus:
+    """Create/refresh a pending pairing and report capped drops explicitly.
+
+    ``request_pairing`` preserves the historical bool API for callers that only
+    need to know whether YAML changed. Server-side notification needs to
+    distinguish "unchanged duplicate" from "new contact dropped because the
+    pending cap is full", so this status API keeps that signal observable.
+    """
     author = (author or "").strip()
     platform = (platform or "").strip()
     channel_id = (channel_id or "").strip()
     display = (author_display or "").strip()
     if not (author and platform and channel_id):
-        return False
+        return "unchanged"
 
     yaml_path = home / "state" / "identities.yaml"
     doc, header = _load_yaml(yaml_path)
@@ -347,7 +378,7 @@ def request_pairing(
                 if isinstance(pairing, dict) and pairing.get("status") == "pending":
                     pending_count += 1
             if pending_count >= max_pending:
-                return False
+                return "capped"
         match = {"canonical": author, "aliases": [author]}
         if display:
             match["display_name"] = display
@@ -390,7 +421,8 @@ def request_pairing(
         if changed:
             doc["people"] = people
             _atomic_write_identities(yaml_path, header, doc)
-        return changed
+            return "changed"
+        return "unchanged"
 
     pairing = match.get("pairing")
     if not isinstance(pairing, dict):
@@ -422,10 +454,10 @@ def request_pairing(
         match["pairing"] = pairing
 
     if not changed:
-        return False
+        return "unchanged"
     doc["people"] = people
     _atomic_write_identities(yaml_path, header, doc)
-    return True
+    return "changed"
 
 
 @_serialized_identities_write

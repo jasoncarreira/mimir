@@ -1001,6 +1001,34 @@ async def test_pairing_notifier_coalesces_operator_alerts_and_limits_dm_replies(
 
 
 @pytest.mark.asyncio
+async def test_pairing_notifier_sends_pending_cap_alert_once(tmp_path: Path):
+    channels = _FakePairingChannels()
+    cfg = replace(
+        _make_config(tmp_path),
+        operator_alert_channel="dm-slack-OPS",
+        pairing_pending_max=1,
+    )
+    notifier = _PairingNotifier(cfg, channels)
+
+    await notifier.notify_pending_cap_reached(
+        platform="slack",
+        channel_id="slack-C1",
+        delivery="public_shared_channel",
+    )
+    await notifier.notify_pending_cap_reached(
+        platform="slack",
+        channel_id="slack-C2",
+        delivery="public_shared_channel",
+    )
+
+    assert len(channels.sent) == 1
+    assert channels.sent[0][0] == "dm-slack-OPS"
+    assert "Pairing pending cap reached" in channels.sent[0][1]
+    assert "max=1" in channels.sent[0][1]
+    assert "slack-C1" in channels.sent[0][1]
+
+
+@pytest.mark.asyncio
 async def test_enqueue_injects_when_in_flight_and_opted_in(tmp_path: Path):
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
     disp._in_flight.add("c1")          # simulate a running turn

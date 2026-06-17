@@ -65,6 +65,7 @@ class _PairingNotifier:
         self._operator_pending: list[dict[str, str]] = []
         self._operator_task: asyncio.Task[Any] | None = None
         self._operator_notified: set[str] = set()
+        self._operator_cap_notified = False
         self._dm_reply_sent: set[str] = set()
         self._dm_reply_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._dm_reply_task: asyncio.Task[Any] | None = None
@@ -125,6 +126,47 @@ class _PairingNotifier:
             await log_event(
                 "pairing_operator_alert_failed",
                 channel_id=self._config.operator_alert_channel,
+                error=str(exc)[:500],
+            )
+
+    async def notify_pending_cap_reached(
+        self,
+        *,
+        platform: str,
+        channel_id: str,
+        delivery: str,
+    ) -> None:
+        if self._operator_cap_notified:
+            return
+        alert_channel = (self._config.operator_alert_channel or "").strip()
+        if not alert_channel:
+            return
+        self._operator_cap_notified = True
+        where = "DM" if delivery == "dm" else channel_id
+        text = (
+            "Pairing pending cap reached: new unknown contacts are being "
+            f"dropped without pending entries (max={self._config.pairing_pending_max}). "
+            f"Latest dropped contact came from {platform or 'unknown'} via {where}. "
+            "Clear/approve pending pairings or raise MIMIR_PAIRING_PENDING_MAX."
+        )
+        try:
+            await self._channels.send(alert_channel, text, final=True)
+            await log_event(
+                "pairing_pending_cap_alert_sent",
+                channel_id=alert_channel,
+                platform=platform,
+                source_channel_id=channel_id,
+                delivery=delivery,
+                max_pending=self._config.pairing_pending_max,
+            )
+        except Exception as exc:  # noqa: BLE001 — notification must not affect access
+            log.debug("pairing pending-cap alert send failed", exc_info=True)
+            await log_event(
+                "pairing_pending_cap_alert_failed",
+                channel_id=alert_channel,
+                platform=platform,
+                source_channel_id=channel_id,
+                delivery=delivery,
                 error=str(exc)[:500],
             )
 
@@ -671,9 +713,9 @@ def build_app(config: Config) -> web.Application:
                 and channel_id
             ):
                 return
-            from .identities_populator import request_pairing
-            wrote = await asyncio.to_thread(
-                request_pairing,
+            from .identities_populator import request_pairing_status
+            status = await asyncio.to_thread(
+                request_pairing_status,
                 config.home,
                 author,
                 platform,
@@ -682,11 +724,28 @@ def build_app(config: Config) -> web.Application:
                 is_dm=is_dm,
                 max_pending=config.pairing_pending_max,
             )
-            if not wrote:
+            delivery = "dm" if is_dm else "public_shared_channel"
+            if status == "capped":
+                await log_event(
+                    "pairing_pending_cap_reached",
+                    channel_id=event.channel_id,
+                    author=author,
+                    author_id=event.author_id,
+                    platform=platform,
+                    delivery=delivery,
+                    max_pending=config.pairing_pending_max,
+                    reason=getattr(decision, "denial_reason", None),
+                )
+                await pairing_notifier.notify_pending_cap_reached(
+                    platform=platform,
+                    channel_id=channel_id,
+                    delivery=delivery,
+                )
+                return
+            if status != "changed":
                 return
             await asyncio.to_thread(identity_resolver.reload)
             canonical = (getattr(decision, "canonical_author", None) or author).strip()
-            delivery = "dm" if is_dm else "public_shared_channel"
             await log_event(
                 "pairing_requested",
                 channel_id=event.channel_id,

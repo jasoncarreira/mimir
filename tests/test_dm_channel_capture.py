@@ -17,7 +17,7 @@ from mimir.identities import IdentityResolver
 from mimir import identities_populator as _pop
 from mimir.identities_populator import capture_dm_channel, merge_into_yaml
 from mimir.identities_populator import approve_pairing, request_dm_pairing
-from mimir.identities_populator import request_pairing
+from mimir.identities_populator import request_pairing, request_pairing_status
 from mimir.bridges.bench import BenchBridge
 from mimir.tools.registry import (
     list_channels,
@@ -318,6 +318,14 @@ def test_request_pairing_bounds_new_pending_identity_growth(
         is_dm=True,
         max_pending=1,
     ) is False
+    assert request_pairing_status(
+        home,
+        "slack-U2",
+        "slack",
+        channel_id="dm-slack-D2",
+        is_dm=True,
+        max_pending=1,
+    ) == "capped"
 
     people = _read(home)["people"]
     assert [p["canonical"] for p in people] == ["slack-U1"]

@@ -302,6 +302,10 @@ class Dispatcher:
                 status=decision.status.value,
                 delivery="public_shared_channel",
             )
+        # Pairing capture is intentionally independent of
+        # unauthorized_user_behavior. That config only controls whether mimir
+        # sends a public-channel prompt; the operator still needs visibility
+        # into unknown public/DM contacts so they can approve legitimate users.
         if self._on_pairing_required is not None:
             try:
                 await self._on_pairing_required(event, decision)
