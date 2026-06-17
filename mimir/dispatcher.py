@@ -16,12 +16,16 @@ import asyncio
 import collections
 import logging
 import traceback
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
+from .access_control import authorize_inbound
 from .config import Config
 from .event_logger import log_event
 from .models import AgentEvent
 from .scheduler import SCHEDULER_CHANNEL_PREFIX
+
+if TYPE_CHECKING:
+    from .identities import IdentityResolver
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +35,11 @@ InjectCallback = Callable[[AgentEvent], Awaitable[None]]
 # event — used for first-contact DM-channel capture (server.py). Must not
 # raise into enqueue and must not block it.
 EventObserver = Callable[[AgentEvent], Awaitable[None]]
+# Inbound user-message admission is fail-closed for bridge/external sources.
+# Only sources that are already authenticated/trusted by the server path bypass
+# the identity allowlist gate. ``web`` is covered by the API-key middleware on
+# POST /chat; ``api``/``stdin`` are operator/internal entry points.
+TRUSTED_INTERNAL_SOURCES = {"web", "api", "stdin"}
 
 
 class _ChannelQueue(asyncio.Queue):
@@ -70,9 +79,16 @@ class _ChannelQueue(asyncio.Queue):
 
 
 class Dispatcher:
-    def __init__(self, config: Config, run_turn: TurnRunner | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        run_turn: TurnRunner | None = None,
+        *,
+        resolver: "IdentityResolver | None" = None,
+    ) -> None:
         self._config = config
         self._run_turn = run_turn
+        self._identity_resolver = resolver
         # chainlink #376 (PR 4): called with the AgentEvent at the moment a
         # mid-turn message is INJECTED into a running turn, so the agent records
         # it in the chat-history buffer at its true arrival time (correctly
@@ -149,6 +165,9 @@ class Dispatcher:
         if self._closed:
             return False
 
+        if not await self._authorize_bridge_event(event):
+            return False
+
         # First-contact DM-channel capture (best-effort, fire-and-forget):
         # observe inbound user messages without blocking or risking admission.
         if self._on_event is not None and event.trigger == "user_message":
@@ -221,6 +240,34 @@ class Dispatcher:
                 self._worker_loop(channel_id), name=f"mimir-worker-{channel_id}"
             )
         return True
+
+    async def _authorize_bridge_event(self, event: AgentEvent) -> bool:
+        """Gate external user messages before any admission side effect."""
+        source = (event.source or "").strip().lower()
+        if event.trigger != "user_message" or source in TRUSTED_INTERNAL_SOURCES:
+            return True
+
+        decision = authorize_inbound(
+            event,
+            self._identity_resolver,
+            enforce=self._config.access_control_enforced,
+        )
+        if decision.allowed:
+            return True
+
+        await log_event(
+            "inbound_event_denied",
+            source=source or "unknown",
+            channel_id=event.channel_id,
+            author=decision.author,
+            raw_author_handle=event.author,
+            author_id=event.author_id,
+            canonical_author=decision.canonical_author,
+            reason=decision.denial_reason,
+            status=decision.status.value,
+            trigger=event.trigger,
+        )
+        return False
 
     def drain_startup_user_messages(self, channel_id: str | None) -> list[AgentEvent]:
         """Remove startup-queued same-channel user messages for the turn that

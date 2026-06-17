@@ -454,7 +454,7 @@ def build_app(config: Config) -> web.Application:
     # cycle: dispatcher first with no runner, then scheduler bound to its
     # enqueue, then agent (which builds the MCP server with all of them
     # wired up), then late-bind agent.run_turn onto the dispatcher.
-    dispatcher = Dispatcher(config)
+    dispatcher = Dispatcher(config, resolver=identity_resolver)
     scheduler = Scheduler(
         scheduler_yaml=config.home / "scheduler.yaml",
         enqueue=dispatcher.enqueue,
