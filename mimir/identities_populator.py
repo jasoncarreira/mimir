@@ -42,13 +42,15 @@ import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 import yaml
 
 from .event_logger import log_event
 
 log = logging.getLogger(__name__)
+
+PairingRequestStatus = Literal["changed", "unchanged", "capped"]
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +285,7 @@ def request_dm_pairing(
     dm_channel_id: str,
     *,
     author_display: str | None = None,
+    max_pending: int | None = None,
 ) -> bool:
     """Create or refresh an operator-reviewable pending DM pairing.
 
@@ -292,12 +295,70 @@ def request_dm_pairing(
     ``access.roles``, so an unknown DMer cannot self-authorize by triggering
     first contact.
     """
+    return request_pairing(
+        home,
+        author,
+        platform,
+        channel_id=dm_channel_id,
+        author_display=author_display,
+        is_dm=True,
+        max_pending=max_pending,
+    )
+
+
+@_serialized_identities_write
+def request_pairing(
+    home: Path,
+    author: str,
+    platform: str,
+    *,
+    channel_id: str,
+    author_display: str | None = None,
+    is_dm: bool = False,
+    max_pending: int | None = None,
+) -> bool:
+    """Create or refresh an operator-reviewable pending pairing.
+
+    Returns True only on a first pending transition or metadata write. New
+    pending identities are capped by ``max_pending`` to keep distinct-author
+    spam from growing ``identities.yaml`` without bound. Existing identities
+    may still be updated so operator-authored entries remain repairable.
+    """
+    return request_pairing_status(
+        home,
+        author,
+        platform,
+        channel_id=channel_id,
+        author_display=author_display,
+        is_dm=is_dm,
+        max_pending=max_pending,
+    ) == "changed"
+
+
+@_serialized_identities_write
+def request_pairing_status(
+    home: Path,
+    author: str,
+    platform: str,
+    *,
+    channel_id: str,
+    author_display: str | None = None,
+    is_dm: bool = False,
+    max_pending: int | None = None,
+) -> PairingRequestStatus:
+    """Create/refresh a pending pairing and report capped drops explicitly.
+
+    ``request_pairing`` preserves the historical bool API for callers that only
+    need to know whether YAML changed. Server-side notification needs to
+    distinguish "unchanged duplicate" from "new contact dropped because the
+    pending cap is full", so this status API keeps that signal observable.
+    """
     author = (author or "").strip()
     platform = (platform or "").strip()
-    dm_channel_id = (dm_channel_id or "").strip()
+    channel_id = (channel_id or "").strip()
     display = (author_display or "").strip()
-    if not (author and platform and dm_channel_id):
-        return False
+    if not (author and platform and channel_id):
+        return "unchanged"
 
     yaml_path = home / "state" / "identities.yaml"
     doc, header = _load_yaml(yaml_path)
@@ -308,6 +369,16 @@ def request_dm_pairing(
     match = _find_person(people, author)
     changed = False
     if match is None:
+        if max_pending is not None and max_pending >= 0:
+            pending_count = 0
+            for entry in people:
+                if not isinstance(entry, dict):
+                    continue
+                pairing = entry.get("pairing")
+                if isinstance(pairing, dict) and pairing.get("status") == "pending":
+                    pending_count += 1
+            if pending_count >= max_pending:
+                return "capped"
         match = {"canonical": author, "aliases": [author]}
         if display:
             match["display_name"] = display
@@ -329,13 +400,14 @@ def request_dm_pairing(
         match["display_name"] = display
         changed = True
 
-    dm = match.get("dm_channels")
-    if not isinstance(dm, dict):
-        dm = {}
-    if not dm.get(platform):
-        dm[platform] = dm_channel_id
-        match["dm_channels"] = dm
-        changed = True
+    if is_dm:
+        dm = match.get("dm_channels")
+        if not isinstance(dm, dict):
+            dm = {}
+        if not dm.get(platform):
+            dm[platform] = channel_id
+            match["dm_channels"] = dm
+            changed = True
 
     access = match.get("access")
     roles: list[Any] = []
@@ -349,7 +421,8 @@ def request_dm_pairing(
         if changed:
             doc["people"] = people
             _atomic_write_identities(yaml_path, header, doc)
-        return changed
+            return "changed"
+        return "unchanged"
 
     pairing = match.get("pairing")
     if not isinstance(pairing, dict):
@@ -360,8 +433,11 @@ def request_dm_pairing(
         "requested_at": requested_at,
         "platform": platform,
         "author": author,
-        "dm_channel": dm_channel_id,
+        "channel": channel_id,
+        "delivery": "dm" if is_dm else "public_shared_channel",
     }
+    if is_dm:
+        pending["dm_channel"] = channel_id
     if pairing.get("status") != "pending":
         pairing.update(pending)
         match["pairing"] = pairing
@@ -369,17 +445,19 @@ def request_dm_pairing(
     else:
         # Keep the first requested_at for audit stability; refresh only facts
         # that can be corrected by the bridge layer.
-        for key in ("platform", "author", "dm_channel"):
+        for key in ("platform", "author", "channel", "delivery", "dm_channel"):
+            if key not in pending:
+                continue
             if pairing.get(key) != pending[key]:
                 pairing[key] = pending[key]
                 changed = True
         match["pairing"] = pairing
 
     if not changed:
-        return False
+        return "unchanged"
     doc["people"] = people
     _atomic_write_identities(yaml_path, header, doc)
-    return True
+    return "changed"
 
 
 @_serialized_identities_write

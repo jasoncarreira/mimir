@@ -15,6 +15,7 @@ from mimir.dispatcher import Dispatcher, TRUSTED_INTERNAL_SOURCES, _ChannelQueue
 from mimir.event_logger import init_logger
 from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent
+from mimir.server import _PairingNotifier
 
 
 def _make_config(home: Path, **overrides) -> Config:
@@ -915,6 +916,116 @@ async def test_public_unauthorized_prompt_to_pair_logs_without_queueing(
     ]
     assert any(row.get("type") == "inbound_pairing_prompted" for row in rows)
     assert not any(row.get("type") == "event_queued" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_public_unknown_sender_gets_pairing_hook_without_public_send(
+    tmp_path: Path,
+):
+    cfg = _make_config(tmp_path, access_control_enforced=True)
+    resolver = _resolver(tmp_path, "people: []\n")
+    pairing: list[tuple[AgentEvent, str | None]] = []
+
+    async def on_pairing(event: AgentEvent, decision) -> None:
+        pairing.append((event, decision.denial_reason))
+
+    disp = Dispatcher(cfg, resolver=resolver)
+    disp.set_on_pairing_required(on_pairing)
+
+    accepted = await disp.enqueue(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="slack-C1",
+            content="public request",
+            author="slack-Uunknown",
+            source="slack",
+        )
+    )
+
+    assert accepted is False
+    await disp.drain()
+    assert pairing[0][0].channel_id == "slack-C1"
+    assert pairing[0][1] == "unknown_author"
+    assert "slack-C1" not in disp._queues
+
+
+class _FakePairingChannels:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str]] = []
+
+    async def send(self, channel_id: str, text: str, attachment_paths=None, *, final=True):
+        self.sent.append((channel_id, text))
+        return object()
+
+
+@pytest.mark.asyncio
+async def test_pairing_notifier_coalesces_operator_alerts_and_limits_dm_replies(
+    tmp_path: Path,
+):
+    channels = _FakePairingChannels()
+    cfg = replace(
+        _make_config(tmp_path),
+        operator_alert_channel="dm-slack-OPS",
+        pairing_operator_digest_delay_seconds=0.01,
+        pairing_dm_auto_reply_enabled=True,
+        pairing_dm_auto_reply_interval_seconds=0.0,
+    )
+    notifier = _PairingNotifier(cfg, channels)
+
+    for i in range(5):
+        await notifier.notify_operator(
+            canonical=f"slack-U{i}",
+            display=f"User {i}",
+            platform="slack",
+            channel_id=f"slack-C{i}",
+            delivery="public_shared_channel",
+        )
+    await asyncio.sleep(0.05)
+
+    operator_sends = [s for s in channels.sent if s[0] == "dm-slack-OPS"]
+    assert len(operator_sends) == 1
+    for i in range(5):
+        assert f"mimir identities approve-pairing slack-U{i}" in operator_sends[0][1]
+
+    await notifier.maybe_reply_dm(canonical="slack-U0", dm_channel_id="dm-slack-D0")
+    await notifier.maybe_reply_dm(canonical="slack-U0", dm_channel_id="dm-slack-D0")
+    await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="slack-C1")
+    await notifier._dm_reply_queue.join()
+
+    dm_sends = [s for s in channels.sent if s[0] == "dm-slack-D0"]
+    public_sends = [s for s in channels.sent if s[0] == "slack-C1"]
+    assert dm_sends == [
+        ("dm-slack-D0", "Request forwarded to operator; no access until approved.")
+    ]
+    assert public_sends == []
+
+
+@pytest.mark.asyncio
+async def test_pairing_notifier_sends_pending_cap_alert_once(tmp_path: Path):
+    channels = _FakePairingChannels()
+    cfg = replace(
+        _make_config(tmp_path),
+        operator_alert_channel="dm-slack-OPS",
+        pairing_pending_max=1,
+    )
+    notifier = _PairingNotifier(cfg, channels)
+
+    await notifier.notify_pending_cap_reached(
+        platform="slack",
+        channel_id="slack-C1",
+        delivery="public_shared_channel",
+    )
+    await notifier.notify_pending_cap_reached(
+        platform="slack",
+        channel_id="slack-C2",
+        delivery="public_shared_channel",
+    )
+
+    assert len(channels.sent) == 1
+    assert channels.sent[0][0] == "dm-slack-OPS"
+    assert "Pairing pending cap reached" in channels.sent[0][1]
+    assert "max=1" in channels.sent[0][1]
+    assert "slack-C1" in channels.sent[0][1]
 
 
 @pytest.mark.asyncio
