@@ -740,6 +740,12 @@ class Config:
     # thinking budget, not an effort level). "" leaves each provider's default.
     model_reasoning_effort: str = ""
 
+    # Unauthorized bridge user behavior for public/shared channels. ``ignore``
+    # only logs the denial; ``prompt-to-pair`` logs an explicit pairing prompt
+    # event without queueing a normal agent turn. DM denials always use the
+    # pending-pairing path when access control is enforced.
+    unauthorized_user_behavior: str = "ignore"
+
     @classmethod
     def from_env(cls) -> "Config":
         raw_home = _env("MIMIR_HOME")
@@ -851,6 +857,9 @@ class Config:
             access_control_enforced=_env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False),
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
+            unauthorized_user_behavior=_env(
+                "MIMIR_UNAUTHORIZED_USER_BEHAVIOR", "ignore"
+            ),
             api_key=_env("MIMIR_API_KEY"),
             web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),
             allow_unauthenticated=_env_bool("MIMIR_ALLOW_UNAUTHENTICATED", False),

@@ -532,6 +532,43 @@ def build_app(config: Config) -> web.Application:
 
     dispatcher.set_on_event(_capture_dm_channel)
 
+    async def _request_dm_pairing(event: AgentEvent, decision) -> None:
+        try:
+            author = (event.author or "").strip()
+            platform = (event.source or "").strip()
+            dm_id = (event.channel_id or "").strip()
+            if not (
+                author
+                and platform in ("slack", "discord")
+                and dm_id.startswith("dm-")
+            ):
+                return
+            from .identities_populator import request_dm_pairing
+            wrote = await asyncio.to_thread(
+                request_dm_pairing,
+                config.home,
+                author,
+                platform,
+                dm_id,
+                author_display=event.author_display,
+            )
+            if wrote:
+                await asyncio.to_thread(identity_resolver.reload)
+                await log_event(
+                    "dm_pairing_requested",
+                    channel_id=event.channel_id,
+                    author=author,
+                    author_id=event.author_id,
+                    canonical_author=getattr(decision, "canonical_author", None),
+                    platform=platform,
+                    dm_channel=dm_id,
+                    reason=getattr(decision, "denial_reason", None),
+                )
+        except Exception:  # noqa: BLE001 — best-effort; never disrupt inbound
+            log.debug("dm-pairing request failed", exc_info=True)
+
+    dispatcher.set_on_pairing_required(_request_dm_pairing)
+
     # Wire dep-injection setters on the production tool surface so
     # langchain @tool functions can reach the same singletons the SDK
     # tool builders received as args. Each setter is idempotent and

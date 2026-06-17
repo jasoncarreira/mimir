@@ -18,7 +18,7 @@ import logging
 import traceback
 from typing import TYPE_CHECKING, Awaitable, Callable
 
-from .access_control import authorize_inbound
+from .access_control import AccessDecision, authorize_inbound
 from .config import Config
 from .event_logger import log_event
 from .models import AgentEvent
@@ -35,6 +35,7 @@ InjectCallback = Callable[[AgentEvent], Awaitable[None]]
 # event — used for first-contact DM-channel capture (server.py). Must not
 # raise into enqueue and must not block it.
 EventObserver = Callable[[AgentEvent], Awaitable[None]]
+PairingObserver = Callable[[AgentEvent, AccessDecision], Awaitable[None]]
 # Inbound user-message admission is fail-closed for bridge/external sources.
 # Only sources that are already authenticated/trusted by the server path bypass
 # the identity allowlist gate. ``web`` is covered by the API-key middleware on
@@ -99,6 +100,7 @@ class Dispatcher:
         # tasks tracked in ``_bg_tasks`` so they aren't GC'd mid-flight
         # (the asyncio strong-ref gotcha, chainlink #118).
         self._on_event: EventObserver | None = None
+        self._on_pairing_required: PairingObserver | None = None
         self._bg_tasks: set[asyncio.Task] = set()
         self._queues: dict[str, asyncio.Queue[AgentEvent]] = {}
         self._workers: dict[str, asyncio.Task] = {}
@@ -147,6 +149,14 @@ class Dispatcher:
         Fired fire-and-forget for each enqueued ``user_message`` — never
         blocks or fails admission."""
         self._on_event = on_event
+
+    def set_on_pairing_required(self, on_pairing_required: "PairingObserver") -> None:
+        """Late-bind the denied-DM pairing observer.
+
+        Fired only after access-control denial and before returning False from
+        ``enqueue``. It is best-effort and cannot queue a normal agent turn.
+        """
+        self._on_pairing_required = on_pairing_required
 
     def _injection_enabled(self, channel_id: str) -> bool:
         """True iff ``channel_id`` opts into mid-turn message injection
@@ -267,7 +277,46 @@ class Dispatcher:
             status=decision.status.value,
             trigger=event.trigger,
         )
+        if self._is_dm_channel(event.channel_id):
+            await log_event(
+                "inbound_pairing_required",
+                source=source or "unknown",
+                channel_id=event.channel_id,
+                author=decision.author,
+                author_id=event.author_id,
+                canonical_author=decision.canonical_author,
+                reason=decision.denial_reason,
+                status=decision.status.value,
+                delivery="dm",
+            )
+            if self._on_pairing_required is not None:
+                try:
+                    await self._on_pairing_required(event, decision)
+                except Exception:  # noqa: BLE001 — denial must remain fail-closed
+                    log.debug("pairing-required observer failed", exc_info=True)
+        elif self._unauthorized_behavior() == "prompt-to-pair":
+            await log_event(
+                "inbound_pairing_prompted",
+                source=source or "unknown",
+                channel_id=event.channel_id,
+                author=decision.author,
+                author_id=event.author_id,
+                canonical_author=decision.canonical_author,
+                reason=decision.denial_reason,
+                status=decision.status.value,
+                delivery="public_shared_channel",
+            )
         return False
+
+    @staticmethod
+    def _is_dm_channel(channel_id: str) -> bool:
+        return channel_id.startswith("dm-")
+
+    def _unauthorized_behavior(self) -> str:
+        behavior = (
+            getattr(self._config, "unauthorized_user_behavior", "ignore") or "ignore"
+        ).strip().lower()
+        return behavior if behavior in {"ignore", "prompt-to-pair"} else "ignore"
 
     def drain_startup_user_messages(self, channel_id: str | None) -> list[AgentEvent]:
         """Remove startup-queued same-channel user messages for the turn that

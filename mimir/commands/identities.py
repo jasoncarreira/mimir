@@ -1,4 +1,4 @@
-"""Identities subcommand — ``mimir identities {list,add,remove,resolve}``.
+"""Identities subcommand — ``mimir identities {list,add,remove,resolve,...}``.
 
 Extracted from ``mimir.cli`` (Phase 2, chainlink #240).
 Manages the alias map at ``<home>/state/identities.yaml``.
@@ -13,6 +13,7 @@ from pathlib import Path
 import yaml
 
 from ..identities import IdentityResolver
+from ..identities_populator import approve_pairing
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +170,16 @@ def _identities_resolve_cmd(home: Path, author: str) -> None:
     print(f"{author} → {canonical}{suffix}")
 
 
+def _identities_approve_pairing_cmd(
+    home: Path, identity: str, roles: list[str]
+) -> None:
+    if not approve_pairing(home, identity, roles=roles):
+        raise ValueError(
+            f"no pending identity found for {identity!r}, or it is already approved"
+        )
+    print(f"approved pairing: {identity} ({', '.join(roles)})")
+
+
 # ---------------------------------------------------------------------------
 # argparse registration + dispatch
 # ---------------------------------------------------------------------------
@@ -227,6 +238,21 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
         "author", help="Author id to resolve (e.g. 'slack-U05ALICE').",
     )
 
+    id_approve_p = id_sub.add_parser(
+        "approve-pairing",
+        help="Approve a pending first-contact DM pairing.",
+    )
+    id_approve_p.add_argument("--home", type=Path, default=Path.cwd())
+    id_approve_p.add_argument(
+        "identity",
+        help="Canonical id or alias to approve (e.g. 'slack-U05ALICE').",
+    )
+    id_approve_p.add_argument(
+        "--admin",
+        action="store_true",
+        help="Grant both user and admin roles instead of user only.",
+    )
+
     return id_p
 
 
@@ -256,6 +282,9 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             )
         elif args.identities_action == "resolve":
             _identities_resolve_cmd(home, args.author)
+        elif args.identities_action == "approve-pairing":
+            roles = ["user", "admin"] if args.admin else ["user"]
+            _identities_approve_pairing_cmd(home, args.identity, roles)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

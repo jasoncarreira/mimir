@@ -830,6 +830,94 @@ async def test_missing_source_user_message_is_gated_fail_closed(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_unknown_dm_sender_gets_pairing_hook_without_normal_dispatch(
+    tmp_path: Path,
+):
+    cfg = _make_config(tmp_path, access_control_enforced=True)
+    resolver = _resolver(tmp_path, "people: []\n")
+    ran: list[str] = []
+    pairing: list[tuple[AgentEvent, str | None]] = []
+
+    async def runner(event: AgentEvent) -> None:
+        ran.append(event.content)
+
+    async def on_pairing(event: AgentEvent, decision) -> None:
+        pairing.append((event, decision.denial_reason))
+
+    disp = Dispatcher(cfg, runner, resolver=resolver)
+    disp.set_on_pairing_required(on_pairing)
+
+    accepted = await disp.enqueue(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="dm-slack-D1",
+            content="please help",
+            author="slack-Uunknown",
+            author_id="Uunknown",
+            source="slack",
+        )
+    )
+
+    assert accepted is False
+    await disp.drain()
+    # Let the fire-and-forget pairing callback complete.
+    for _ in range(20):
+        if pairing:
+            break
+        await asyncio.sleep(0.01)
+    assert ran == []
+    assert "dm-slack-D1" not in disp._queues
+    assert pairing[0][0].author == "slack-Uunknown"
+    assert pairing[0][1] == "unknown_author"
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(row.get("type") == "inbound_pairing_required" for row in rows)
+    assert not any(row.get("type") == "event_queued" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_public_unauthorized_prompt_to_pair_logs_without_queueing(
+    tmp_path: Path,
+):
+    cfg = replace(
+        _make_config(tmp_path, access_control_enforced=True),
+        unauthorized_user_behavior="prompt-to-pair",
+    )
+    resolver = _resolver(tmp_path, "people: []\n")
+    ran: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        ran.append(event.content)
+
+    disp = Dispatcher(cfg, runner, resolver=resolver)
+    accepted = await disp.enqueue(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="slack-C1",
+            content="public request",
+            author="slack-Uunknown",
+            source="slack",
+        )
+    )
+
+    assert accepted is False
+    await disp.drain()
+    assert ran == []
+    assert "slack-C1" not in disp._queues
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(row.get("type") == "inbound_pairing_prompted" for row in rows)
+    assert not any(row.get("type") == "event_queued" for row in rows)
+
+
+@pytest.mark.asyncio
 async def test_enqueue_injects_when_in_flight_and_opted_in(tmp_path: Path):
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
     disp._in_flight.add("c1")          # simulate a running turn

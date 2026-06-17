@@ -16,6 +16,7 @@ import yaml
 from mimir.identities import IdentityResolver
 from mimir import identities_populator as _pop
 from mimir.identities_populator import capture_dm_channel, merge_into_yaml
+from mimir.identities_populator import approve_pairing, request_dm_pairing
 from mimir.bridges.bench import BenchBridge
 from mimir.tools.registry import (
     list_channels,
@@ -229,3 +230,62 @@ def test_populator_merge_preserves_captured_dm_channels(tmp_path: Path) -> None:
     assert person["display_name"] == "Alice"
     # ...and the captured DM channel survived (no lost update).
     assert person["dm_channels"]["slack"] == "dm-slack-D1"
+
+
+def test_request_dm_pairing_creates_pending_identity_without_roles(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "agent"
+    (home / "state").mkdir(parents=True)
+
+    assert request_dm_pairing(
+        home,
+        "slack-U05ABC",
+        "slack",
+        "dm-slack-D07XYZ",
+        author_display="Alice",
+    ) is True
+
+    person = _read(home)["people"][0]
+    assert person["canonical"] == "slack-U05ABC"
+    assert person["display_name"] == "Alice"
+    assert person["dm_channels"] == {"slack": "dm-slack-D07XYZ"}
+    assert person["pairing"]["status"] == "pending"
+    assert "access" not in person
+
+    resolver = IdentityResolver(home=home)
+    resolver.reload()
+    assert resolver.is_authorized("slack-U05ABC") is False
+
+
+def test_approve_pairing_preserves_operator_fields_and_allowlists_canonical(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "agent"
+    (home / "state").mkdir(parents=True)
+    (home / "state" / "identities.yaml").write_text(
+        "people:\n"
+        "  - canonical: alice\n"
+        "    display_name: Alice Smith\n"
+        "    aliases: [slack-U05ABC, discord-456]\n"
+        "    notes: operator-authored\n"
+        "    dm_channels: {slack: dm-slack-D07XYZ}\n"
+        "    pairing: {status: pending, requested_at: '2026-01-01T00:00:00Z'}\n",
+        encoding="utf-8",
+    )
+
+    assert approve_pairing(home, "slack-U05ABC") is True
+
+    alice = _read(home)["people"][0]
+    assert alice["canonical"] == "alice"
+    assert alice["display_name"] == "Alice Smith"
+    assert alice["aliases"] == ["slack-U05ABC", "discord-456"]
+    assert alice["notes"] == "operator-authored"
+    assert alice["dm_channels"] == {"slack": "dm-slack-D07XYZ"}
+    assert alice["pairing"]["status"] == "approved"
+    assert alice["access"] == {"roles": ["user"]}
+
+    resolver = IdentityResolver(home=home)
+    resolver.reload()
+    assert resolver.is_authorized("slack-U05ABC") is True
+    assert resolver.resolve("discord-456") == "alice"

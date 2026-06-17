@@ -40,6 +40,7 @@ import logging
 import os
 import tempfile
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -127,6 +128,23 @@ def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
 def _strip_value(v: Any) -> Any:
     """If ``v`` is a string, strip whitespace; else return unchanged."""
     return v.strip() if isinstance(v, str) else v
+
+
+def _find_person(
+    people: Iterable[Any], author_or_canonical: str
+) -> dict[str, Any] | None:
+    for entry in people:
+        if not isinstance(entry, dict):
+            continue
+        canonical = entry.get("canonical")
+        if isinstance(canonical, str) and canonical.strip() == author_or_canonical:
+            return entry
+        if any(
+            isinstance(alias, str) and alias.strip() == author_or_canonical
+            for alias in (entry.get("aliases") or [])
+        ):
+            return entry
+    return None
 
 
 # All in-process writers of ``state/identities.yaml`` share this lock so the
@@ -254,6 +272,167 @@ def capture_dm_channel(
         "captured DM channel for %s on %s: %s",
         match.get("canonical", author), platform, dm_channel_id,
     )
+    return True
+
+
+@_serialized_identities_write
+def request_dm_pairing(
+    home: Path,
+    author: str,
+    platform: str,
+    dm_channel_id: str,
+    *,
+    author_display: str | None = None,
+) -> bool:
+    """Create or refresh an operator-reviewable pending DM pairing.
+
+    This is deliberately not an approval path: it records the canonical alias,
+    captured DM channel, display name if blank, and ``pairing.status=pending``
+    only when the identity is not already allowlisted. It never writes
+    ``access.roles``, so an unknown DMer cannot self-authorize by triggering
+    first contact.
+    """
+    author = (author or "").strip()
+    platform = (platform or "").strip()
+    dm_channel_id = (dm_channel_id or "").strip()
+    display = (author_display or "").strip()
+    if not (author and platform and dm_channel_id):
+        return False
+
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+    people = doc.get("people")
+    if not isinstance(people, list):
+        people = []
+
+    match = _find_person(people, author)
+    changed = False
+    if match is None:
+        match = {"canonical": author, "aliases": [author]}
+        if display:
+            match["display_name"] = display
+        people.append(match)
+        changed = True
+
+    aliases = match.get("aliases")
+    if not isinstance(aliases, list):
+        aliases = []
+    alias_set = {
+        alias.strip() for alias in aliases if isinstance(alias, str) and alias.strip()
+    }
+    if author not in alias_set:
+        aliases.append(author)
+        match["aliases"] = aliases
+        changed = True
+
+    if display and not match.get("display_name"):
+        match["display_name"] = display
+        changed = True
+
+    dm = match.get("dm_channels")
+    if not isinstance(dm, dict):
+        dm = {}
+    if not dm.get(platform):
+        dm[platform] = dm_channel_id
+        match["dm_channels"] = dm
+        changed = True
+
+    access = match.get("access")
+    roles: list[Any] = []
+    if isinstance(access, dict):
+        raw_roles = access.get("roles") or []
+        if isinstance(raw_roles, list):
+            roles = raw_roles
+        elif isinstance(raw_roles, str):
+            roles = [raw_roles]
+    if any(isinstance(role, str) and role.strip() for role in roles):
+        if changed:
+            doc["people"] = people
+            _atomic_write_identities(yaml_path, header, doc)
+        return changed
+
+    pairing = match.get("pairing")
+    if not isinstance(pairing, dict):
+        pairing = {}
+    requested_at = datetime.now(timezone.utc).isoformat()
+    pending = {
+        "status": "pending",
+        "requested_at": requested_at,
+        "platform": platform,
+        "author": author,
+        "dm_channel": dm_channel_id,
+    }
+    if pairing.get("status") != "pending":
+        pairing.update(pending)
+        match["pairing"] = pairing
+        changed = True
+    else:
+        # Keep the first requested_at for audit stability; refresh only facts
+        # that can be corrected by the bridge layer.
+        for key in ("platform", "author", "dm_channel"):
+            if pairing.get(key) != pending[key]:
+                pairing[key] = pending[key]
+                changed = True
+        match["pairing"] = pairing
+
+    if not changed:
+        return False
+    doc["people"] = people
+    _atomic_write_identities(yaml_path, header, doc)
+    return True
+
+
+@_serialized_identities_write
+def approve_pairing(
+    home: Path,
+    author_or_canonical: str,
+    *,
+    roles: Iterable[str] = ("user",),
+) -> bool:
+    """Approve a pending identity by granting canonical-level access roles.
+
+    The operator supplies an existing alias or canonical id. The write is
+    scoped to ``access.roles`` and ``pairing.status``; display names, notes,
+    aliases, DM channels, and other operator-authored fields are preserved.
+    """
+    key = (author_or_canonical or "").strip()
+    clean_roles = [
+        role.strip()
+        for role in roles
+        if isinstance(role, str) and role.strip() in {"user", "admin"}
+    ]
+    if not key or not clean_roles:
+        return False
+
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+    people = doc.get("people")
+    if not isinstance(people, list):
+        return False
+    match = _find_person(people, key)
+    if match is None:
+        return False
+
+    changed = False
+    access = match.get("access")
+    if not isinstance(access, dict):
+        access = {}
+    if access.get("roles") != clean_roles:
+        access["roles"] = clean_roles
+        match["access"] = access
+        changed = True
+
+    pairing = match.get("pairing")
+    if isinstance(pairing, dict) and pairing.get("status") != "approved":
+        pairing["status"] = "approved"
+        pairing["approved_at"] = datetime.now(timezone.utc).isoformat()
+        match["pairing"] = pairing
+        changed = True
+
+    if not changed:
+        return False
+    doc["people"] = people
+    _atomic_write_identities(yaml_path, header, doc)
     return True
 
 
