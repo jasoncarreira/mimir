@@ -15,6 +15,7 @@ from mimir.worklink.evidence import EvidenceValidation, WorklinkEvidence
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.compute import WorkSpec
 from mimir.worklink.worker import WorkerPayload, run_worker_payload
+from mimir.worklink.worktree import WorktreeLease
 from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
@@ -1346,13 +1347,63 @@ class _CodexNamedBackend(FakeBackend):
     name = "codex"
 
 
-def test_codex_on_non_shared_compute_blocks_loudly(tmp_path: Path) -> None:
-    """A codex worklink on a compute that won't provision an isolated checkout
-    (shared_filesystem=False) must be refused with a clear reason, not run into
-    a parent-pointing worktree and leak into the repo root (chainlink #517)."""
+def test_codex_on_non_shared_isolated_compute_is_allowed(tmp_path: Path) -> None:
+    """A codex worklink on a NON-shared compute (docker_sibling/ecs-style) must NOT
+    be blocked: those report shared_filesystem=false because codex runs inside the
+    worker's own isolated clone, not against a controller worktree. It is the safe,
+    preferred isolated-dispatch path — only controller execution needs the guard
+    (chainlink #517)."""
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    compute = FakeCompute(shared_filesystem=False)
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            return cp(args, stdout=ISSUE_JSON)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
+            worktree.mkdir(parents=True)
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"] and "--name-only" in args:
+            return cp(args, stdout="remote.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"] and "--stat" in args:
+            return cp(args, stdout=" remote.txt | 1 +\n")
+        return cp(args)
+
+    registry = BackendRegistry(
+        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    )
+    registry.register(_CodexNamedBackend(status="success", write_change=False))
+    registry.register_compute(compute)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="codex"
+        )
+    )
+
+    # Not blocked for the codex/checkout reason, and codex WAS dispatched to the
+    # isolated worker compute (the safe path) rather than short-circuited.
+    assert "isolated checkout" not in (result.reason or "")
+    assert len(compute.specs) == 1
+
+
+def test_codex_on_controller_requires_isolated_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defensive backstop: if the checkout factory ever regresses and hands codex a
+    parent-pointing worktree while executing on the controller (shared filesystem),
+    the run must fail loud (blocked), not leak into the repo root (chainlink #517)."""
+    import mimir.worklink.orchestrator as orch
+
     repo = tmp_path / "repo"
 
-    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+    def fake_checkout(*_: object, **__: object) -> WorktreeLease:
+        # Simulate the regression: a NON-isolated (worktree) lease for codex.
+        return WorktreeLease(441, 1, repo, repo / ".worklink" / "441-1", "issue/441-a1", "main")
+
+    monkeypatch.setattr(orch, "_create_backend_checkout", fake_checkout)
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
             return cp(args, stdout=ISSUE_JSON)
         if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
@@ -1363,7 +1414,7 @@ def test_codex_on_non_shared_compute_blocks_loudly(tmp_path: Path) -> None:
         WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
     )
     registry.register(_CodexNamedBackend(status="success"))
-    registry.register_compute(FakeCompute(shared_filesystem=False))
+    registry.register_compute(FakeCompute(shared_filesystem=True))
 
     result = asyncio.run(
         WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
@@ -1371,5 +1422,4 @@ def test_codex_on_non_shared_compute_blocks_loudly(tmp_path: Path) -> None:
         )
     )
     assert result.status == "blocked", (result.status, result.reason)
-    assert "isolated" in (result.reason or "").lower()
-    assert "shared_filesystem" in (result.reason or "")
+    assert "isolated checkout" in (result.reason or "")
