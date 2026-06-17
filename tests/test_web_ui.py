@@ -204,6 +204,7 @@ async def test_react_app_serves_built_index_and_assets(tmp_path: Path):
         resp = await client.get("/app")
         assert resp.status == 200
         assert resp.content_type == "text/html"
+        assert resp.headers["Cache-Control"].startswith("no-store")
         assert "/app/assets/app.js" in await resp.text()
 
         asset_resp = await client.get("/app/assets/app.js")
@@ -212,7 +213,57 @@ async def test_react_app_serves_built_index_and_assets(tmp_path: Path):
 
         fallback_resp = await client.get("/app/turns/42")
         assert fallback_resp.status == 200
+        assert fallback_resp.headers["Cache-Control"].startswith("no-store")
         assert "/app/assets/app.js" in await fallback_resp.text()
+
+
+@pytest.mark.asyncio
+async def test_web_bootstrap_is_no_store_and_secret_free(tmp_path: Path):
+    class _Config:
+        web_host = "0.0.0.0"
+
+    a = web.Application()
+    a["api_key"] = "super-secret"
+    a["config"] = _Config()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/web/bootstrap")
+        body_text = await resp.text()
+        body = json.loads(body_text)
+
+    assert resp.status == 200
+    assert resp.headers["Cache-Control"].startswith("no-store")
+    assert "super-secret" not in body_text
+    assert body["auth"]["required"] is True
+    assert body["server"]["public_bind"] is True
+    assert body["stream_auth"]["shape"] == "fetch-event-stream"
+    assert body["stream_auth"]["native_eventsource_supported_when_auth_required"] is False
+
+
+@pytest.mark.asyncio
+async def test_shared_web_auth_script_served_no_store(tmp_path: Path):
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/app/auth.js")
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert resp.headers["Cache-Control"].startswith("no-store")
+    assert "window.MimirAuth" in body
+    assert "api_key=" not in body
 
 
 @pytest.mark.asyncio
