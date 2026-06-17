@@ -5,8 +5,11 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
+import pytest
+
 from mimir.worklink.worktree import (
     WorktreeLease,
+    _assert_self_contained_checkout,
     cleanup_worktree,
     create_isolated_checkout,
     create_worktree,
@@ -139,7 +142,11 @@ def test_create_isolated_checkout_has_real_git_dir_and_preserves_origin(tmp_path
 
     lease = create_isolated_checkout(repo, issue_id=517, attempt=1, base="main")
 
-    assert lease.path == repo / ".worklink" / "517-1"
+    # #517: the isolated clone lives OUTSIDE the parent repo (a sibling), never
+    # nested under repo/.worklink, so codex cannot walk up into the repo it was
+    # cloned from and there is no clone-into-self.
+    assert lease.path == repo.parent / ".worklink" / repo.name / "517-1"
+    assert not lease.path.is_relative_to(repo)
     assert lease.branch == "issue/517-a1"
     assert lease.base_ref == "main"
     assert lease.isolated_checkout is True
@@ -166,3 +173,41 @@ def test_cleanup_removes_successful_isolated_checkout(tmp_path: Path) -> None:
     assert cleanup_worktree(lease, outcome="completed", runner=runner) is True
     assert not attempt.exists()
     assert calls == [["git", "-C", str(repo), "branch", "-D", "issue/517-a1"]]
+
+
+def test_self_containment_assert_rejects_parent_pointing_checkout(tmp_path: Path) -> None:
+    # A checkout whose git toplevel resolves to the PARENT (the #517 escape shape)
+    # must be refused, not silently used.
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    parent = str(tmp_path / "repo")
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        proc = completed(args)
+        if args[-1] == "--show-toplevel":
+            proc.stdout = parent
+        elif args[-1] == "--absolute-git-dir":
+            proc.stdout = f"{parent}/.git"
+        return proc
+
+    with pytest.raises(RuntimeError, match="self-containment"):
+        _assert_self_contained_checkout(attempt, runner=runner)
+
+
+def test_self_containment_assert_accepts_sound_clone(tmp_path: Path) -> None:
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@e.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("base\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+
+    lease = create_isolated_checkout(repo, issue_id=517, attempt=2, base="main")
+    # A real clone passes the cheap assert and is rooted at itself, not the parent.
+    _assert_self_contained_checkout(lease.path, runner=lambda a: subprocess.run(
+        list(a), capture_output=True, text=True, check=False))
+    assert _git(lease.path, "rev-parse", "--show-toplevel") == str(lease.path)

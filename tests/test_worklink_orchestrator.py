@@ -1215,6 +1215,11 @@ def test_codex_local_subprocess_uses_isolated_checkout(tmp_path: Path) -> None:
         calls.append(list(args))
         if args[:3] == ["git", "-C", str(tmp_path)] and args[3:6] == ["rev-parse", "--verify", "main"]:
             return subprocess.CompletedProcess(args, 0, stdout="abc123\n", stderr="")
+        # Self-containment assert (#517): report the checkout as rooted at itself.
+        if args[3:5] == ["rev-parse", "--show-toplevel"]:
+            return subprocess.CompletedProcess(args, 0, stdout=f"{args[2]}\n", stderr="")
+        if args[3:5] == ["rev-parse", "--absolute-git-dir"]:
+            return subprocess.CompletedProcess(args, 0, stdout=f"{args[2]}/.git\n", stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
     lease = _create_backend_checkout(
@@ -1272,6 +1277,66 @@ def test_outside_worktree_detection_marks_root_leak_failed(tmp_path: Path) -> No
     assert result.review_ready is False
     assert "completed_empty_diff" in result.reasons
     assert any(reason.startswith("backend_wrote_outside_worktree:") for reason in result.reasons)
+
+
+def test_outside_worktree_leak_is_quarantined_recoverably(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _dirty_paths, _with_outside_worktree_detection
+
+    def git(*args: str) -> str:
+        out = subprocess.run(
+            ["git", "-C", str(tmp_path), *args], capture_output=True, text=True, check=True
+        )
+        return out.stdout.strip()
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(list(args), capture_output=True, text=True, check=False)
+
+    git("init", "-q")
+    git("config", "user.email", "t@e.com")
+    git("config", "user.name", "t")
+    (tmp_path / "keep.txt").write_text("orig\n")
+    (tmp_path / "mod.py").write_text("v1\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+
+    # Pre-existing, unrelated operator dirt that MUST survive quarantine.
+    (tmp_path / "keep.txt").write_text("operator-work\n")
+    root_dirty_before = _dirty_paths(tmp_path, runner=runner)
+    assert root_dirty_before == ["keep.txt"]
+
+    # The leak: codex wrote into the repo root (a new file + a tracked edit) while
+    # the attempt diff is empty. The isolated checkout lives OUTSIDE the repo.
+    (tmp_path / "leaked.py").write_text("escaped\n")
+    (tmp_path / "mod.py").write_text("v1\nCODEX\n")
+    worktree = tmp_path.parent / ".worklink" / tmp_path.name / "517-1"
+
+    validation = EvidenceValidation(
+        status="failed",
+        review_ready=False,
+        reasons=("completed_empty_diff",),
+        evidence=WorklinkEvidence(
+            issue=517, attempt=1, backend="codex", branch="issue/517-a1",
+            worktree=str(worktree), started_at="2026-06-16T20:00:00+00:00",
+            finished_at="2026-06-16T20:05:00+00:00", files_changed=[], diff_stat="",
+            commands=[], tests=None, pr_url=None, status="failed",
+        ),
+    )
+
+    result = _with_outside_worktree_detection(
+        validation, issue=517, attempt=1, root=tmp_path, worktree=worktree,
+        runner=runner, root_dirty_before=root_dirty_before,
+    )
+
+    assert result.status == "failed"
+    assert any(r.startswith("backend_wrote_outside_worktree:") for r in result.reasons)
+    assert any("worklink-leak-517-a1" in r for r in result.reasons)
+
+    # The leaked paths are gone from the working tree; pre-existing dirt survives.
+    assert not (tmp_path / "leaked.py").exists()
+    assert (tmp_path / "mod.py").read_text() == "v1\n"
+    assert (tmp_path / "keep.txt").read_text() == "operator-work\n"
+    # ...and the leak is recoverable, not destroyed.
+    assert "worklink-leak-517-a1" in git("stash", "list")
 
 
 # ─── chainlink #517: fail loud on unsafe codex/compute combo ──────────
