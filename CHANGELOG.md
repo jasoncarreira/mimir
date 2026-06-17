@@ -48,7 +48,10 @@ All notable changes will land here. Format loosely follows
   worker image (pin a release including the #538 `test_only` worker), and notes
   the sandboxed test job in the smoke evidence step.
   `tests/test_worklink_example_configs.py` keeps the examples loadable by the
-  real parsers.
+  real parsers. The `worklink-worker.Dockerfile` template now reflects everything
+  the first real smoke (#540) proved a worker needs: `uv` (for `uv run` test
+  commands), a git credential helper + commit identity (clone/push + the worker's
+  own commit), a writable `/work`, and `CODEX_HOME` for the creds-mount target.
 
 - **Resend-nudge: forgot-to-send recovery** (opt-in). When an interactive turn
   produces a reply but never calls `send_message` (so the user gets nothing),
