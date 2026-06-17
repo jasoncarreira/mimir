@@ -386,11 +386,10 @@ def test_render_saga_html_is_valid_shell() -> None:
     assert "loadRecent()" in html
     assert "loadAtom(" in html
     assert "loadStats()" in html
-    # Auth pattern — unified key shared across all four dashboards.
-    assert "mimir.api_key" in html
-    assert "API_KEY_LS" in html
-    # No actual key is baked in.
-    assert "X-API-Key" in html
+    # Auth pattern — shared helper, no inline key handling.
+    assert "/app/auth.js" in html
+    assert "window.MimirAuth.authedJson" in html
+    assert "API_KEY_LS" not in html
 
 
 def test_render_saga_html_js_escapes_survive_python_rendering() -> None:

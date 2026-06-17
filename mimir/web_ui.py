@@ -66,6 +66,7 @@ from .saga_dashboard import (
 log = logging.getLogger(__name__)
 
 _TURN_VIEWER_HTML: str | None = None
+_WEB_AUTH_JS: str | None = None
 
 
 def _load_viewer_html() -> str:
@@ -75,6 +76,23 @@ def _load_viewer_html() -> str:
         path = Path(__file__).parent / "turn_viewer.html"
         _TURN_VIEWER_HTML = path.read_text(encoding="utf-8")
     return _TURN_VIEWER_HTML
+
+
+def _load_web_auth_js() -> str:
+    """Load the shared browser auth helper once and cache it."""
+    global _WEB_AUTH_JS
+    if _WEB_AUTH_JS is None:
+        path = Path(__file__).parent / "web_auth.js"
+        _WEB_AUTH_JS = path.read_text(encoding="utf-8")
+    return _WEB_AUTH_JS
+
+
+def _no_store_headers() -> dict[str, str]:
+    return {
+        "Cache-Control": "no-store, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
 
 
 def _read_jsonl(path: Path, *, max_records: int = 5000) -> list[dict[str, Any]]:
@@ -234,12 +252,46 @@ def register_routes(
             return web.Response(text="not found", status=404)
 
         if requested.is_file():
-            return web.FileResponse(requested)
-        return web.FileResponse(root / "index.html")
+            headers = _no_store_headers() if requested.name == "index.html" else None
+            return web.FileResponse(requested, headers=headers)
+        return web.FileResponse(root / "index.html", headers=_no_store_headers())
+
+    async def web_auth_js(_request: web.Request) -> web.Response:
+        return web.Response(
+            text=_load_web_auth_js(),
+            content_type="application/javascript",
+            headers=_no_store_headers(),
+        )
+
+    async def web_bootstrap(request: web.Request) -> web.Response:
+        api_key = str(request.app.get("api_key") or "")
+        config = request.app.get("config")
+        web_host = str(getattr(config, "web_host", "") or "")
+        public_bind = web_host not in ("", "127.0.0.1", "::1", "localhost")
+        return web.json_response(
+            {
+                "auth": {
+                    "required": bool(api_key),
+                    "scheme": "x-api-key",
+                    "storage": "browser-localStorage",
+                },
+                "server": {
+                    "web_host": web_host,
+                    "public_bind": public_bind,
+                    "unauthenticated_allowed": not bool(api_key),
+                },
+                "stream_auth": {
+                    "shape": "fetch-event-stream",
+                    "header": "X-API-Key",
+                    "native_eventsource_supported_when_auth_required": False,
+                },
+            },
+            headers=_no_store_headers(),
+        )
 
     async def ops_page(request: web.Request) -> web.Response:
-        # Static HTML shell — frontend AJAX-fetches /api/ops with the
-        # API key from localStorage. We still validate ``?days=`` here
+        # Static HTML shell — frontend AJAX-fetches /api/ops via the
+        # shared auth helper. We still validate ``?days=`` here
         # so a malformed value gets a clear error before the JS tries
         # to use the same query string against the data endpoint.
         try:
@@ -346,6 +398,10 @@ def register_routes(
         app.router.add_get("/api/events", events_data)
     if ("GET", "/app") not in existing:
         app.router.add_get("/app", react_app)
+    if ("GET", "/app/auth.js") not in existing:
+        app.router.add_get("/app/auth.js", web_auth_js)
+    if ("GET", "/api/web/bootstrap") not in existing:
+        app.router.add_get("/api/web/bootstrap", web_bootstrap)
     if ("GET", "/app/") not in existing and ("GET", "/app/{path}") not in existing:
         app.router.add_get("/app/{path:.*}", react_app)
     if ("GET", "/ops") not in existing:

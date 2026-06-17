@@ -236,81 +236,23 @@
       </section>
     </main>
 
+    <script src="/app/auth.js"></script>
     <script>
-      // ── API key bootstrap ────────────────────────────────────────────
-      // /ops is exempt from the auth middleware so this shell HTML
-      // loads unauthenticated; the data endpoint /api/ops requires
-      // X-API-Key. Shared localStorage key with /turns so an operator
-      // who entered the key on either page is signed in for both.
-      const API_KEY_LS = 'mimir.api_key';
-      function getApiKey() {
-        try { return localStorage.getItem(API_KEY_LS) || ''; }
-        catch (e) { return ''; }
-      }
-      function setApiKey(k) {
-        try {
-          if (k) localStorage.setItem(API_KEY_LS, k);
-          else localStorage.removeItem(API_KEY_LS);
-        } catch (e) { /* ignore */ }
-      }
-      function promptApiKey(reason) {
-        let msg = 'Enter MIMIR_API_KEY';
-        if (reason) msg += ' (' + reason + ')';
-        msg += ':\n\n(Saved to this browser; leave blank to skip — you\'ll see 401s if the server requires it.)';
-        const v = (window.prompt(msg, '') || '').trim();
-        setApiKey(v);
-        return v;
-      }
-      function authedFetch(url, opts) {
-        opts = opts || {};
-        opts.headers = opts.headers || {};
-        const key = getApiKey();
-        if (key) opts.headers['X-API-Key'] = key;
-        return fetch(url, opts).then(function(r) {
-          if (r.status === 401) {
-            setApiKey('');
-            const fresh = promptApiKey('previous key was rejected');
-            if (fresh) {
-              opts.headers['X-API-Key'] = fresh;
-              return fetch(url, opts);
-            }
-          }
-          return r;
-        });
-      }
-      // Header link wiring — manual key reset for the rare server-rotation
-      // case. The auto-prompt on first visit + auto-re-prompt on 401 covers
-      // 99% of operator flows; this is just an escape hatch when the
-      // server-side key was rotated and the operator wants to swap without
-      // first being denied. Only surfaces in the header when a key IS
-      // stored (the link toggle is wired below).
+      const authedFetch = window.MimirAuth.authedFetch;
+      const getApiKey = window.MimirAuth.getApiKey;
       window.__mimir_resetApiKey = function() {
-        setApiKey('');
-        promptApiKey('manual rotation');
+        window.MimirAuth.reset('manual rotation');
         window.location.reload();
       };
-      // Toggle the "↻ Reset key" link visibility based on whether the
-      // browser actually has a stored key. Run on DOMContentLoaded so the
-      // link element is in the tree.
-      document.addEventListener('DOMContentLoaded', function() {
-        const link = document.getElementById('reset-key-link');
-        if (link) link.style.display = getApiKey() ? '' : 'none';
+      window.MimirAuth.wireResetLink('reset-key-link', function() {
+        window.location.reload();
       });
-      // JSON link auth: the static <a href="/api/ops"> would 401 in
-      // auth-required mode because browser navigation doesn't send the
-      // X-API-Key header. The auth middleware accepts ``?api_key=`` as a
-      // query-param fallback (PR #291; access log masks the value), so we
-      // intercept the click and rewrite the URL. New tab so the operator
-      // doesn't lose the dashboard state.
+      // JSON link: never append API keys to URLs. A direct navigation may 401
+      // when auth is required because browsers cannot attach X-API-Key to links.
       document.addEventListener('DOMContentLoaded', function() {
         const jsonLink = document.getElementById('json-link');
         if (!jsonLink) return;
-        jsonLink.addEventListener('click', function(ev) {
-          ev.preventDefault();
-          const key = getApiKey();
-          const url = '/api/ops' + (key ? '?api_key=' + encodeURIComponent(key) : '');
-          window.open(url, '_blank', 'noopener,noreferrer');
-        });
+        jsonLink.setAttribute('href', '/api/ops');
       });
 
       // ── Dark-mode Chart.js defaults ──────────────────────────────────

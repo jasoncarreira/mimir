@@ -280,12 +280,11 @@ def _safe_str_eq(a: str, b: str) -> bool:
 
 
 # (method, path) tuples exempt from the auth middleware. HTML page
-# shells (the JS inside prompts for an API key on first visit, saves
-# to localStorage, and sends ``X-API-Key`` on subsequent data fetches)
-# and the liveness endpoint (which container orchestrators hit without
-# credentials). The data behind these surfaces is auth-required —
-# /turns and /ops serve only static-shaped HTML; their data comes
-# from /api/turns, /api/events, /api/ops which DO require auth.
+# shells and the shared browser auth/bootstrap script are public-shaped:
+# they carry no operator data or secrets, and browser code sends the key
+# in ``X-API-Key`` for protected JSON/stream routes. The data behind these
+# surfaces is auth-required — /turns and /ops serve only static-shaped HTML;
+# their data comes from /api/turns, /api/events, /api/ops which DO require auth.
 #
 # Method-keyed (PR #104 review fix): if a future ``POST /turns`` is
 # ever added (e.g. for a server-side form), it inherits NO exemption.
@@ -297,6 +296,8 @@ _AUTH_EXEMPT: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/"),
     ("GET", "/health"),
     ("GET", "/app"),
+    ("GET", "/app/auth.js"),
+    ("GET", "/api/web/bootstrap"),
     ("GET", "/turns"),
     ("GET", "/ops"),
     ("GET", "/saga"),
@@ -319,9 +320,7 @@ def _is_auth_exempt(method: str, path: str) -> bool:
 
 def _make_auth_middleware(expected_key: str):
     """Build an aiohttp middleware that gates every non-exempt route on
-    a matching ``X-API-Key`` header (or, as a fallback for clients that
-    can't set headers — SSE / EventSource — an ``?api_key=`` query
-    string parameter).
+    a matching ``X-API-Key`` header.
 
     Empty ``expected_key`` (``MIMIR_API_KEY`` unset) disables the gate
     entirely — the warning at startup tells the operator they're
@@ -348,16 +347,6 @@ def _make_auth_middleware(expected_key: str):
             return await handler(request)
 
         provided = request.headers.get("X-API-Key", "")
-        if not provided:
-            # Fallback: ``?api_key=...`` query param. Needed by SSE
-            # / EventSource clients (the browser API can't set
-            # custom headers natively) and by humans clicking a
-            # bookmarked URL once. Header is preferred when both
-            # are present; query is the fallback only. Note: query-
-            # param keys land in aiohttp's access log; the access-log
-            # filter installed in ``build_app`` masks ``api_key=`` in
-            # the request line so the secret doesn't end up on disk.
-            provided = request.query.get("api_key", "")
 
         if not provided or not _safe_str_eq(provided, expected_key):
             return web.json_response(
@@ -370,8 +359,7 @@ def _make_auth_middleware(expected_key: str):
 
 # Regex for the access-log filter — ``?api_key=...`` or ``&api_key=...``
 # in URL query strings. Replaces the value with ``REDACTED`` so the
-# query-param fallback in the auth middleware doesn't leave secrets
-# in stdout / log files.
+# server does not preserve stale URL-carried secrets in stdout / log files.
 _API_KEY_QUERY_RE = re.compile(
     r"([?&]api_key=)[^\s&]+",
     flags=re.IGNORECASE,
@@ -380,10 +368,9 @@ _API_KEY_QUERY_RE = re.compile(
 
 class _MaskApiKeyInAccessLog(logging.Filter):
     """Logging filter for ``aiohttp.access`` that masks ``api_key=``
-    query values in formatted records. aiohttp logs the full request
-    line including the query string; if a client used the ``?api_key=``
-    SSE fallback the secret would otherwise land in stdout / log
-    files. PR #104 review note (mimir-carreira)."""
+    query values in formatted records. URL API keys are no longer accepted
+    for auth, but the filter remains as defense-in-depth for stale clients,
+    bookmarks, and access logs. PR #104 review note (mimir-carreira)."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         # Both the raw msg and the formatted message can carry the
@@ -537,10 +524,9 @@ def build_app(config: Config) -> web.Application:
         else:
             log.warning(_msg)
 
-    # Access-log filter: mask ``?api_key=`` query values so the SSE
-    # fallback path doesn't leave secrets in stdout / log files. PR #104
-    # review note. Idempotent — multiple calls don't stack the filter
-    # because aiohttp.access is a singleton logger.
+    # Access-log filter: mask stale ``?api_key=`` query values so accidental
+    # URL secrets do not land in stdout / log files. Idempotent — multiple
+    # calls don't stack the filter because aiohttp.access is a singleton logger.
     _access_log = logging.getLogger("aiohttp.access")
     if not any(isinstance(f, _MaskApiKeyInAccessLog) for f in _access_log.filters):
         _access_log.addFilter(_MaskApiKeyInAccessLog())
