@@ -216,6 +216,24 @@ async def test_list_schedules_no_jobs(stub_scheduler):
 
 
 @pytest.mark.asyncio
+async def test_list_schedules_poller_only_deployment_not_reported_empty(stub_scheduler):
+    """#522 regression (mimir review on PR #728): an install with NO yaml-config
+    jobs but registered pollers must surface the pollers, not report
+    '(no scheduled jobs)' — that empty-check used to fire before poller rows
+    were appended, recreating the exact poller-only visibility gap."""
+    stub_scheduler(
+        [],
+        pollers=[{"name": "github-activity", "cron": "*/5 * * * *", "priority": "normal"}],
+    )
+    result = await list_schedules.ainvoke({})
+    assert "no scheduled jobs" not in result
+    parsed = json.loads(result)
+    assert len(parsed) == 1
+    assert parsed[0]["type"] == "poller"
+    assert parsed[0]["name"] == "github-activity"
+
+
+@pytest.mark.asyncio
 async def test_list_schedules_multiple_jobs_round_trip(stub_scheduler):
     """The real muninn schedule mixes prompt_file (most jobs), inline
     prompt (a couple of one-liners), and callable_name (saga jobs).

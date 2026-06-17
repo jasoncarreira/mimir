@@ -777,8 +777,6 @@ async def list_schedules() -> str:
         jobs = await scheduler.list_jobs()
     except Exception as exc:
         return f"list_schedules failed: {exc}"
-    if not jobs:
-        return "(no scheduled jobs)"
     out: list[dict[str, Any]] = []
     for j in jobs:
         entry: dict[str, Any] = {
@@ -821,6 +819,11 @@ async def list_schedules() -> str:
                 "cron": p.get("cron"),
                 "priority": p.get("priority"),
             })
+    # Empty only when there is NO scheduled work of either kind — checked after
+    # pollers are appended so a poller-only deployment isn't reported as empty
+    # (the #522 visibility gap; mimir-carreira review on PR #728).
+    if not out:
+        return "(no scheduled jobs)"
     return json.dumps(out, indent=2, ensure_ascii=False, default=str)
 
 
