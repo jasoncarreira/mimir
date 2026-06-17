@@ -13,7 +13,8 @@
         "CHAINLINK_BIN",
         "WORKLINK_RUN_BIN",
         "WORKLINK_REPO",
-        "WORKLINK_MAX_CONCURRENT"
+        "WORKLINK_MAX_CONCURRENT",
+        "GITHUB_TOKEN"
       ]
     }
   ]
