@@ -44,6 +44,7 @@ from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+from ..access_control import authorize_action
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
 log = logging.getLogger(__name__)
@@ -58,6 +59,33 @@ log = logging.getLogger(__name__)
 # get told to stop, but have no way to actually tell the operator. ``react``
 # is exempt for the same operator-facing-acknowledgement reason.
 _BUDGET_EXEMPT_TOOLS = frozenset({"send_message", "react"})
+
+_ADMIN_TOOL_NAMES = frozenset(
+    {
+        "add_schedule",
+        "remove_schedule",
+        "reload_pollers",
+        "open_proposal",
+        "submit_proposal",
+        "abandon_proposal",
+        "request_mimir_update",
+        "worklink_run",
+        "shell_exec",
+        "bash_async",
+        "spawn_claude_code",
+        "spawn_codex",
+        "saga_forget",
+    }
+)
+
+_ADMIN_BUILTIN_TOOL_NAMES = frozenset(
+    {
+        "Bash",
+        "bash",
+        "bash_exec",
+        "shell",
+    }
+)
 
 
 def _resolve_budget_state() -> tuple[Any, int] | None:
@@ -162,6 +190,66 @@ def _tool_call_id(request: ToolCallRequest) -> str:
     return str(tc.get("id") or "")
 
 
+def _is_admin_sensitive_tool(tool_name: str) -> bool:
+    if tool_name in _ADMIN_TOOL_NAMES or tool_name in _ADMIN_BUILTIN_TOOL_NAMES:
+        return True
+    # LangChain MCP bridge names have appeared in both double-underscore
+    # (`mcp__mimir__shell_exec`) and normalized single-underscore
+    # (`mcp_mimir_shell_exec`) forms. Match on the final tool component
+    # instead of one spelling so admin gating does not silently miss shell /
+    # scheduler / worklink aliases.
+    return any(
+        tool_name.endswith(f"__{name}") or tool_name.endswith(f"_{name}")
+        for name in _ADMIN_TOOL_NAMES
+    )
+
+
+def _admin_denial_message(tool_name: str, reason: str | None) -> str:
+    reason_text = f" ({reason})" if reason else ""
+    return (
+        f"{tool_name} requires an admin identity{reason_text}. "
+        "The tool call was refused before execution."
+    )
+
+
+def _check_admin_authorized(tool_name: str) -> str | None:
+    if not _is_admin_sensitive_tool(tool_name):
+        return None
+
+    from .._context import get_current_turn
+
+    ctx = get_current_turn()
+    if ctx is None:
+        return None
+    enforce = bool(getattr(ctx, "access_control_enforced", False))
+    if not enforce:
+        return None
+    decision = authorize_action(
+        getattr(ctx, "author", None),
+        getattr(ctx, "identity_resolver", None),
+        admin=True,
+        enforce=True,
+    )
+    if decision.allowed:
+        return None
+
+    fields = decision.as_log_fields()
+    _emit_event_sync(
+        "admin_tool_call_denied",
+        tool=tool_name,
+        **fields,
+    )
+    _emit_event_sync(
+        "tool_call_denied",
+        tool=tool_name,
+        reason=decision.denial_reason,
+        required_tier=decision.required_tier.value,
+        author=decision.author,
+        canonical_author=decision.canonical_author,
+    )
+    return _admin_denial_message(tool_name, decision.denial_reason)
+
+
 def _emit_tool_call_sync(
     tool_name: str,
     *,
@@ -228,6 +316,16 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
 
+        admin_denial = _check_admin_authorized(tool_name)
+        if admin_denial is not None:
+            _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
+            return ToolMessage(
+                content=admin_denial,
+                tool_call_id=_tool_call_id(request),
+                name=tool_name,
+                status="error",
+            )
+
         # Destructive-action guardrail (chainlink #259): an accident
         # deterrent against force-push-to-main/master, NOT a security
         # boundary — the regex screens the command arg and is bypassable
@@ -283,6 +381,16 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
+
+        admin_denial = _check_admin_authorized(tool_name)
+        if admin_denial is not None:
+            _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
+            return ToolMessage(
+                content=admin_denial,
+                tool_call_id=_tool_call_id(request),
+                name=tool_name,
+                status="error",
+            )
 
         # Destructive-action guardrail (chainlink #259): an accident
         # deterrent against force-push-to-main/master, NOT a security

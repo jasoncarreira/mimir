@@ -99,6 +99,30 @@ def test_admin_action_requires_admin_role(tmp_path: Path) -> None:
     assert admin.reason is None
 
 
+def test_admin_action_follows_canonical_aliases_across_slack_discord(
+    tmp_path: Path,
+) -> None:
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: root
+            aliases: [slack-UADMIN, discord-42]
+            access: {roles: [user, admin]}
+        """,
+    )
+
+    slack = authorize_action("slack-UADMIN", resolver, admin=True, enforce=True)
+    discord = authorize_action("discord-42", resolver, admin=True, enforce=True)
+
+    assert slack.allowed is True
+    assert discord.allowed is True
+    assert slack.canonical_author == "root"
+    assert discord.canonical_author == "root"
+    assert slack.roles == ("user", "admin")
+    assert discord.roles == ("user", "admin")
+
+
 def test_legacy_default_allows_but_reports_would_deny_reason(
     tmp_path: Path,
 ) -> None:
