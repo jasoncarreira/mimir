@@ -247,6 +247,36 @@ class WorklinkRunner:
                 compute_shared_filesystem=compute.capabilities().shared_filesystem,
                 runner=_list_runner(runner),
             )
+            # chainlink #517: codex resolves the git project root from the
+            # filesystem, so when it executes on the CONTROLLER (a shared-filesystem
+            # compute) it must be pointed at an isolated checkout with its own
+            # ``.git``, never a parent-pointing worktree, or it edits the repo root
+            # (observed on #512/#513). ``_create_backend_checkout`` already routes
+            # codex + shared_filesystem to ``create_isolated_checkout``; this is a
+            # fail-loud backstop against that routing regressing. It does NOT fire
+            # for remote computes (docker_sibling/ecs report shared_filesystem=false
+            # and run codex inside the worker's own clone, which is safe).
+            if (
+                selected_name == "codex"
+                and compute.capabilities().shared_filesystem
+                and not lease.isolated_checkout
+            ):
+                _log_event(
+                    "worklink_unsafe_codex_checkout",
+                    issue_id=issue.issue_id,
+                    attempt=record.attempt,
+                    compute_backend=compute.name,
+                )
+                return WorklinkRunResult(
+                    issue.issue_id,
+                    None,
+                    "blocked",
+                    reason=(
+                        "codex on a shared-filesystem compute must run in an isolated "
+                        "checkout (own .git), not a parent-pointing worktree, to avoid "
+                        "leaking edits into the repo root (chainlink #517)"
+                    ),
+                )
             root_dirty_before = _dirty_paths(self.repo, runner=runner)
             prompt = render_work_order(
                 issue,
@@ -607,10 +637,47 @@ def _with_outside_worktree_detection(
         worktree=str(worktree),
         files=escaped[:50],
     )
-    return _failed_validation(
-        validation,
-        "backend_wrote_outside_worktree: " + ", ".join(escaped[:10]),
+    stash = _quarantine_dirty_paths(root, escaped, issue=issue, attempt=attempt, runner=runner)
+    reason = "backend_wrote_outside_worktree: " + ", ".join(escaped[:10])
+    if stash:
+        reason += f" (quarantined to git stash '{stash}' in the repo root)"
+    return _failed_validation(validation, reason)
+
+
+def _quarantine_dirty_paths(
+    root: Path, paths: Sequence[str], *, issue: int, attempt: int, runner: Runner
+) -> str | None:
+    """Move leaked root edits into a recoverable, named ``git stash`` so the parent
+    repo is left clean without destroying the work (#517).
+
+    Recoverable on purpose: a hard ``git checkout`` would silently discard
+    salvageable changes if containment ever regresses. The stash is path-scoped to
+    the leaked paths, so pre-existing unrelated dirt in the root is untouched.
+    Best-effort — a stash failure is logged and the containment failure is still
+    surfaced. Returns the stash label on success, else ``None``.
+    """
+    if not paths:
+        return None
+    label = f"worklink-leak-{issue}-a{attempt}"
+    result = runner(
+        ["git", "-C", str(root), "stash", "push", "--include-untracked", "-m", label, "--", *paths]
     )
+    if result.returncode != 0:
+        _log_event(
+            "worklink_quarantine_failed",
+            issue_id=issue,
+            attempt=attempt,
+            error=(result.stderr or result.stdout).strip()[:500],
+        )
+        return None
+    _log_event(
+        "worklink_quarantined_outside_worktree",
+        issue_id=issue,
+        attempt=attempt,
+        stash=label,
+        files=list(paths)[:50],
+    )
+    return label
 
 
 def _dirty_paths(repo: Path, *, runner: Runner) -> list[str]:

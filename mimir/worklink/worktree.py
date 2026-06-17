@@ -90,7 +90,7 @@ def create_isolated_checkout(
     at the attempt path.
     """
 
-    path = repo / worklink_dir / f"{issue_id}-{attempt}"
+    path = _isolated_checkout_path(repo, worklink_dir, issue_id, attempt)
     branch = f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -115,6 +115,16 @@ def create_isolated_checkout(
     checkout = runner(["git", "-C", str(path), "checkout", "-B", branch, local_base])
     if checkout.returncode != 0:
         raise RuntimeError((checkout.stderr or checkout.stdout).strip() or "git checkout failed")
+
+    # #517: verify the clone is a real, self-contained repo rooted at ``path`` and
+    # does not resolve back to the parent before any backend inspects its git
+    # metadata. Fail loud (and clean up the half-made checkout) rather than handing
+    # codex a checkout that would walk up into the repo root.
+    try:
+        _assert_self_contained_checkout(path, runner=runner)
+    except RuntimeError:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
 
     return WorktreeLease(
         issue_id=issue_id,
@@ -144,6 +154,44 @@ def _resolve_local_base(repo: Path, base: str, *, runner: Runner) -> str:
         if check.returncode == 0:
             return resolved
     return base
+
+
+def _isolated_checkout_path(repo: Path, worklink_dir: str, issue_id: int, attempt: int) -> Path:
+    """Location for an isolated attempt checkout, OUTSIDE the parent repo (#517).
+
+    Codex resolves the active git repository from the filesystem, so the clone
+    must not live inside the repo it was cloned from: nesting invites both the
+    parent-resolution walk-up and a ``git clone --local`` into the repo's own
+    working tree under concurrent load. Placing it at a sibling
+    ``<repo.parent>/<worklink_dir>/<repo.name>/<issue>-<attempt>`` keeps the
+    independent clone fully detached, and the ``<repo.name>`` segment keeps
+    attempts for repos that share a parent directory from colliding.
+    """
+    return repo.parent / worklink_dir / repo.name / f"{issue_id}-{attempt}"
+
+
+def _assert_self_contained_checkout(path: Path, *, runner: Runner) -> None:
+    """Assert the checkout is a real repo rooted at ``path`` (cheap, deterministic).
+
+    A sound ``git clone`` resolves its own toplevel and keeps its git dir inside
+    the checkout. If either resolves elsewhere (e.g. back to the parent), a
+    metadata-inspecting backend like codex would operate on the wrong repository;
+    refuse the checkout instead of leaking edits into the repo root (#517).
+    """
+    resolved = path.resolve()
+    top = runner(["git", "-C", str(path), "rev-parse", "--show-toplevel"])
+    gitdir = runner(["git", "-C", str(path), "rev-parse", "--absolute-git-dir"])
+    top_ok = top.returncode == 0 and Path(top.stdout.strip()).resolve() == resolved
+    gitdir_ok = (
+        gitdir.returncode == 0
+        and Path(gitdir.stdout.strip()).resolve().is_relative_to(resolved)
+    )
+    if not (top_ok and gitdir_ok):
+        raise RuntimeError(
+            "isolated checkout failed self-containment check (#517): "
+            f"toplevel={top.stdout.strip()!r} git-dir={gitdir.stdout.strip()!r} "
+            f"expected rooted at {resolved}"
+        )
 
 
 def cleanup_worktree(lease: WorktreeLease, *, outcome: str, runner: Runner = _default_runner) -> bool:

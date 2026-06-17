@@ -15,6 +15,7 @@ from mimir.worklink.evidence import EvidenceValidation, WorklinkEvidence
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.compute import WorkSpec
 from mimir.worklink.worker import WorkerPayload, run_worker_payload
+from mimir.worklink.worktree import WorktreeLease
 from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
@@ -1215,6 +1216,11 @@ def test_codex_local_subprocess_uses_isolated_checkout(tmp_path: Path) -> None:
         calls.append(list(args))
         if args[:3] == ["git", "-C", str(tmp_path)] and args[3:6] == ["rev-parse", "--verify", "main"]:
             return subprocess.CompletedProcess(args, 0, stdout="abc123\n", stderr="")
+        # Self-containment assert (#517): report the checkout as rooted at itself.
+        if args[3:5] == ["rev-parse", "--show-toplevel"]:
+            return subprocess.CompletedProcess(args, 0, stdout=f"{args[2]}\n", stderr="")
+        if args[3:5] == ["rev-parse", "--absolute-git-dir"]:
+            return subprocess.CompletedProcess(args, 0, stdout=f"{args[2]}/.git\n", stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
     lease = _create_backend_checkout(
@@ -1272,3 +1278,148 @@ def test_outside_worktree_detection_marks_root_leak_failed(tmp_path: Path) -> No
     assert result.review_ready is False
     assert "completed_empty_diff" in result.reasons
     assert any(reason.startswith("backend_wrote_outside_worktree:") for reason in result.reasons)
+
+
+def test_outside_worktree_leak_is_quarantined_recoverably(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _dirty_paths, _with_outside_worktree_detection
+
+    def git(*args: str) -> str:
+        out = subprocess.run(
+            ["git", "-C", str(tmp_path), *args], capture_output=True, text=True, check=True
+        )
+        return out.stdout.strip()
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(list(args), capture_output=True, text=True, check=False)
+
+    git("init", "-q")
+    git("config", "user.email", "t@e.com")
+    git("config", "user.name", "t")
+    (tmp_path / "keep.txt").write_text("orig\n")
+    (tmp_path / "mod.py").write_text("v1\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+
+    # Pre-existing, unrelated operator dirt that MUST survive quarantine.
+    (tmp_path / "keep.txt").write_text("operator-work\n")
+    root_dirty_before = _dirty_paths(tmp_path, runner=runner)
+    assert root_dirty_before == ["keep.txt"]
+
+    # The leak: codex wrote into the repo root (a new file + a tracked edit) while
+    # the attempt diff is empty. The isolated checkout lives OUTSIDE the repo.
+    (tmp_path / "leaked.py").write_text("escaped\n")
+    (tmp_path / "mod.py").write_text("v1\nCODEX\n")
+    worktree = tmp_path.parent / ".worklink" / tmp_path.name / "517-1"
+
+    validation = EvidenceValidation(
+        status="failed",
+        review_ready=False,
+        reasons=("completed_empty_diff",),
+        evidence=WorklinkEvidence(
+            issue=517, attempt=1, backend="codex", branch="issue/517-a1",
+            worktree=str(worktree), started_at="2026-06-16T20:00:00+00:00",
+            finished_at="2026-06-16T20:05:00+00:00", files_changed=[], diff_stat="",
+            commands=[], tests=None, pr_url=None, status="failed",
+        ),
+    )
+
+    result = _with_outside_worktree_detection(
+        validation, issue=517, attempt=1, root=tmp_path, worktree=worktree,
+        runner=runner, root_dirty_before=root_dirty_before,
+    )
+
+    assert result.status == "failed"
+    assert any(r.startswith("backend_wrote_outside_worktree:") for r in result.reasons)
+    assert any("worklink-leak-517-a1" in r for r in result.reasons)
+
+    # The leaked paths are gone from the working tree; pre-existing dirt survives.
+    assert not (tmp_path / "leaked.py").exists()
+    assert (tmp_path / "mod.py").read_text() == "v1\n"
+    assert (tmp_path / "keep.txt").read_text() == "operator-work\n"
+    # ...and the leak is recoverable, not destroyed.
+    assert "worklink-leak-517-a1" in git("stash", "list")
+
+
+# ─── chainlink #517: fail loud on unsafe codex/compute combo ──────────
+
+
+class _CodexNamedBackend(FakeBackend):
+    name = "codex"
+
+
+def test_codex_on_non_shared_isolated_compute_is_allowed(tmp_path: Path) -> None:
+    """A codex worklink on a NON-shared compute (docker_sibling/ecs-style) must NOT
+    be blocked: those report shared_filesystem=false because codex runs inside the
+    worker's own isolated clone, not against a controller worktree. It is the safe,
+    preferred isolated-dispatch path — only controller execution needs the guard
+    (chainlink #517)."""
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    compute = FakeCompute(shared_filesystem=False)
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            return cp(args, stdout=ISSUE_JSON)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
+            worktree.mkdir(parents=True)
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"] and "--name-only" in args:
+            return cp(args, stdout="remote.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"] and "--stat" in args:
+            return cp(args, stdout=" remote.txt | 1 +\n")
+        return cp(args)
+
+    registry = BackendRegistry(
+        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    )
+    registry.register(_CodexNamedBackend(status="success", write_change=False))
+    registry.register_compute(compute)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="codex"
+        )
+    )
+
+    # Not blocked for the codex/checkout reason, and codex WAS dispatched to the
+    # isolated worker compute (the safe path) rather than short-circuited.
+    assert "isolated checkout" not in (result.reason or "")
+    assert len(compute.specs) == 1
+
+
+def test_codex_on_controller_requires_isolated_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defensive backstop: if the checkout factory ever regresses and hands codex a
+    parent-pointing worktree while executing on the controller (shared filesystem),
+    the run must fail loud (blocked), not leak into the repo root (chainlink #517)."""
+    import mimir.worklink.orchestrator as orch
+
+    repo = tmp_path / "repo"
+
+    def fake_checkout(*_: object, **__: object) -> WorktreeLease:
+        # Simulate the regression: a NON-isolated (worktree) lease for codex.
+        return WorktreeLease(441, 1, repo, repo / ".worklink" / "441-1", "issue/441-a1", "main")
+
+    monkeypatch.setattr(orch, "_create_backend_checkout", fake_checkout)
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            return cp(args, stdout=ISSUE_JSON)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        return cp(args)
+
+    registry = BackendRegistry(
+        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    )
+    registry.register(_CodexNamedBackend(status="success"))
+    registry.register_compute(FakeCompute(shared_filesystem=True))
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="codex"
+        )
+    )
+    assert result.status == "blocked", (result.status, result.reason)
+    assert "isolated checkout" in (result.reason or "")
