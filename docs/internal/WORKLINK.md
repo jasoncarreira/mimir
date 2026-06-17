@@ -633,6 +633,12 @@ env_allowlist: [GITHUB_TOKEN, MIMIR_HOME]
 default_env:
   GITHUB_TOKEN: "${GITHUB_TOKEN}"
 max_timeout_s: 1800
+# Backends whose creds are FILES, not env vars (e.g. codex's ChatGPT OAuth
+# bundle) need a read-only mount — env_allowlist can't carry them. creds_mounts
+# is operator-declared + always :ro; the agent can't request or widen a mount.
+creds_mounts:
+  - source: /Users/you/.codex/auth.json   # HOST path (broker runs sibling containers)
+    target: /home/worker/.codex/auth.json
 ```
 
 Run it on a Unix socket the agent can reach:

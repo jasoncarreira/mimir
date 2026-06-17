@@ -31,6 +31,27 @@ class DockerBrokerPolicyError(ValueError):
 
 
 @dataclass(frozen=True)
+class CredsMount:
+    """An operator-declared, read-only host path mounted into worker containers.
+
+    This is how a worker gets *file-based* backend credentials that can't travel
+    as an env var — e.g. codex's ``~/.codex/auth.json`` OAuth bundle. It is
+    always read-only and declared ONLY in the static, operator-owned policy file:
+    the agent cannot request a mount, so this widens what a worker can *read*
+    without widening what the agent can *control*. ``source`` is a host path (the
+    broker's ``docker run`` creates sibling containers on the host daemon)."""
+
+    source: str
+    target: str
+
+    def __post_init__(self) -> None:
+        if not (self.source.startswith("/") and self.target.startswith("/")):
+            raise DockerBrokerPolicyError(
+                "docker broker creds_mount source and target must be absolute paths"
+            )
+
+
+@dataclass(frozen=True)
 class DockerBrokerPolicy:
     """Static policy for Docker-sibling Worklink worker containers."""
 
@@ -39,6 +60,7 @@ class DockerBrokerPolicy:
     max_timeout_s: int = 1800
     env_allowlist: tuple[str, ...] = ()
     default_env: Mapping[str, str] = field(default_factory=dict)
+    creds_mounts: tuple[CredsMount, ...] = ()
     docker_bin: str = "docker"
     worker_command: tuple[str, ...] = ("mimir", "worklink", "worker", "--payload-json")
     job_prefix: str = "worklink"
@@ -107,6 +129,7 @@ class DockerBrokerPolicy:
             max_timeout_s=int(data.get("max_timeout_s", 1800)),
             env_allowlist=env_allowlist,
             default_env={str(key): str(value) for key, value in default_env.items()},
+            creds_mounts=_parse_creds_mounts(data.get("creds_mounts")),
             docker_bin=str(data.get("docker_bin", "docker")),
             worker_command=worker_command,
             job_prefix=str(data.get("job_prefix", "worklink")),
@@ -367,6 +390,11 @@ class DockerSiblingBroker:
         ]
         for key in sorted(self.policy.default_env):
             args.extend(["--env", key])
+        # Operator-declared read-only credential mounts (e.g. ~/.codex). Always
+        # :ro; the policy is static + operator-owned, so the agent can't add or
+        # widen these.
+        for mount in self.policy.creds_mounts:
+            args.extend(["-v", f"{mount.source}:{mount.target}:ro"])
         args.append(image)
         args.extend(self.policy.worker_command)
         args.append(payload_json)
@@ -446,6 +474,27 @@ _ALLOWED_NETWORKS = {"none", "bridge"}
 
 def _safe_env_name(value: str) -> bool:
     return bool(value) and all(ch.isalnum() or ch == "_" for ch in value) and not value[0].isdigit()
+
+
+def _parse_creds_mounts(raw: Any) -> tuple[CredsMount, ...]:
+    """Parse the policy's optional ``creds_mounts`` list. Each entry needs a
+    ``source`` (host path); ``target`` defaults to ``source``. Always read-only."""
+    if not raw:
+        return ()
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise DockerBrokerPolicyError("docker broker creds_mounts must be a list of {source, target}")
+    mounts: list[CredsMount] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise DockerBrokerPolicyError(
+                "docker broker creds_mounts entries must be mappings with a source"
+            )
+        source = item.get("source")
+        if not source:
+            raise DockerBrokerPolicyError("docker broker creds_mount requires a source path")
+        target = item.get("target") or source
+        mounts.append(CredsMount(source=str(source), target=str(target)))
+    return tuple(mounts)
 
 
 def _decode(data: bytes | str) -> str:

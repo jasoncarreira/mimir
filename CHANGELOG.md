@@ -8,6 +8,18 @@ All notable changes will land here. Format loosely follows
 
 ### Added
 
+- **docker-sibling broker: operator-declared read-only credential mounts**
+  (chainlink #539, rail #537). The broker launches workers with an env-only
+  `docker run`, which can't carry *file*-based backend credentials — e.g.
+  codex's ChatGPT OAuth bundle (`~/.codex/auth.json`), needed for the worker to
+  authenticate the model. The static broker policy now takes an optional
+  `creds_mounts: [{source, target}]` list, mounted into every worker container
+  **read-only** (`-v src:dst:ro`). It's operator-owned and opt-in: the agent
+  can't request or widen a mount, and a policy without `creds_mounts` mounts
+  nothing. Sources must be absolute host paths. This is what lets a docker-sibling
+  codex worker authenticate the model while keeping the broker's narrow trust
+  boundary intact.
+
 - **Remote worklink runs now re-run tests in a sandboxed job** (chainlink #538,
   part of the docker-sibling rail #537). On a non-shared compute substrate
   (docker-sibling / ECS) the controller can't run the worker's untrusted branch
