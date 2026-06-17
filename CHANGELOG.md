@@ -6,6 +6,8 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-06-17
+
 ### Added
 
 - **docker-sibling broker: operator-declared read-only credential mounts**
