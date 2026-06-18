@@ -22,6 +22,7 @@ import { SagaDashboard } from "./SagaDashboard";
 import { AdminConfigRoute } from "./routes/AdminConfigRoute";
 import { OpsRoute } from "./routes/OpsRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
+import { TurnsRoute } from "./routes/TurnsRoute";
 import { useRouteState } from "./routeState";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import {
@@ -435,7 +436,7 @@ function AppFrame() {
               <Route element={<Navigate replace to={firstRoute} />} path="/" />
               {surfaces.map((surface) => (
                 <Route
-                  element={surface.id === "saga" ? <SagaDashboard /> : surface.id === "ops" ? <OpsRoute /> : surface.id === "admin-config" ? <AdminConfigRoute /> : <SurfaceRoute surface={surface} />}
+                  element={surface.id === "saga" ? <SagaDashboard /> : surface.id === "ops" ? <OpsRoute /> : surface.id === "turns" ? <TurnsRoute /> : surface.id === "admin-config" ? <AdminConfigRoute /> : <SurfaceRoute surface={surface} />}
                   key={surface.id}
                   path={surface.path}
                 />
