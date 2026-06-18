@@ -33,16 +33,21 @@ None in v1. The response includes:
   "reveal_secret_values": false,
   "reveal_path": null,
   "edit_path": null,
-  "rate_limited": true
+  "rate_limited": false
 }
 ```
 
 Reveal and edit paths are intentionally omitted for this issue. Future mutation
 support should add explicit allowlisted fields, audit logging, and request-rate
-limits before exposing any write endpoint.
+limits before exposing any write endpoint. The v1 read-only endpoint itself is
+not mutation-rate-limited because it performs no writes.
 
 ## Redaction
 
 Secret-like names containing `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
-`CREDENTIAL`, or `AUTH` report only presence plus `[REDACTED]`. Secret values are
-not returned by default in either the env list or raw config.
+`CREDENTIAL`, or `AUTH` report only presence plus `[REDACTED]`. Raw config
+redaction is recursive, so nested structures such as `mcp_servers[].env.API_KEY`
+are masked before serialization. URL userinfo credentials are also masked, so a
+state remote like `https://user:token@example/repo.git` is displayed as
+`https://[REDACTED]@example/repo.git`. Secret values are not returned by default
+in either the env list or raw config.

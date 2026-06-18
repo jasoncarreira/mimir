@@ -781,6 +781,16 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-admin-config-secret")
     monkeypatch.setenv("MIMIR_API_KEY", "admin-route-secret")
+    monkeypatch.setenv("ADMIN_CONFIG_MCP_SECRET", "nested-admin-config-secret")
+    monkeypatch.setenv(
+        "MIMIR_MCP_SERVERS_JSON",
+        '[{"name": "demo", "command": "uvx", "args": ["mcp-server-demo"], '
+        '"env": {"API_KEY": "${ADMIN_CONFIG_MCP_SECRET}"}}]',
+    )
+    monkeypatch.setenv(
+        "MIMIR_STATE_REPO",
+        "https://user:raw-git-token@example.invalid/repo.git",
+    )
     config = Config.from_env()
 
     (tmp_path / "scheduler.yaml").write_text(
@@ -823,15 +833,23 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
         "reveal_secret_values": False,
         "reveal_path": None,
         "edit_path": None,
-        "rate_limited": True,
+        "rate_limited": False,
     }
 
     env_by_name = {row["name"]: row for row in data["env"]}
     assert env_by_name["ANTHROPIC_API_KEY"]["present"] is True
     assert env_by_name["ANTHROPIC_API_KEY"]["secret"] is True
     assert env_by_name["ANTHROPIC_API_KEY"]["value"] == "[REDACTED]"
-    assert "sk-ant-admin-config-secret" not in json.dumps(data)
+    serialized = json.dumps(data)
+    assert "sk-ant-admin-config-secret" not in serialized
+    assert "nested-admin-config-secret" not in serialized
+    assert "raw-git-token" not in serialized
     assert data["raw_config"]["anthropic_api_key"] == "[REDACTED]"
+    assert data["raw_config"]["mcp_servers"][0]["env"]["API_KEY"] == "[REDACTED]"
+    assert (
+        data["raw_config"]["git_state_repo"]
+        == "https://[REDACTED]@example.invalid/repo.git"
+    )
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,11 @@ SECRET_MARKERS = (
     "PASSWD",
     "CREDENTIAL",
     "AUTH",
+)
+
+_URL_USERINFO_RE = re.compile(
+    r"(?P<prefix>\b[a-z][a-z0-9+.-]*://)(?P<userinfo>[^/@\s]+)@",
+    re.IGNORECASE,
 )
 
 ENV_CATEGORIES: dict[str, tuple[str, ...]] = {
@@ -81,7 +87,7 @@ def _redacted_value(name: str, value: str | None) -> str | None:
         return None
     if _is_secret_name(name):
         return "[REDACTED]"
-    return value
+    return _redact_url_userinfo(value)
 
 
 def _env_row(category: str, name: str) -> dict[str, Any]:
@@ -127,14 +133,35 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _redact_url_userinfo(value: str) -> str:
+    """Mask credentials embedded in URL userinfo components."""
+
+    return _URL_USERINFO_RE.sub(r"\g<prefix>[REDACTED]@", value)
+
+
+def _redact_config_value(value: Any, *, key: str | None = None) -> Any:
+    """Recursively redact secret-looking config fields at any nesting depth."""
+
+    if key is not None and _is_secret_name(key):
+        return "[REDACTED]" if value else ""
+    if isinstance(value, dict):
+        return {
+            str(child_key): _redact_config_value(child_value, key=str(child_key))
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_config_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_url_userinfo(value)
+    return value
+
+
 def _redacted_config(config: Config) -> dict[str, Any]:
     raw = _json_safe(dataclasses.asdict(config))
     if not isinstance(raw, dict):
         return {}
-    for key in list(raw):
-        if _is_secret_name(key):
-            raw[key] = "[REDACTED]" if raw[key] else ""
-    return raw
+    redacted = _redact_config_value(raw)
+    return redacted if isinstance(redacted, dict) else {}
 
 
 def _schema_sections() -> list[dict[str, Any]]:
@@ -266,6 +293,6 @@ def build_admin_config_payload(
             "reveal_secret_values": False,
             "reveal_path": None,
             "edit_path": None,
-            "rate_limited": True,
+            "rate_limited": False,
         },
     }
