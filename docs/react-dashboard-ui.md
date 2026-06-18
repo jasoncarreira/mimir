@@ -43,6 +43,27 @@ export function ExampleDashboard() {
 }
 ```
 
+## Cross-Dashboard Drilldowns
+
+Shared route state is encoded in query parameters using these conventional
+keys: `tab`, `turn`, `session`, `atom`, `issue`, `job`, `filter`, `from`, `to`,
+`channel`, `event`, `target`, `q`, and `path`. Browser reload preserves these
+values naturally, and the shared link helpers strip secret-bearing keys such as
+API keys, tokens, passwords, credentials, and authorization values before
+creating drilldown URLs.
+
+Implemented drilldown paths:
+
+- Ops failure/event rows link to `/turns?filter=failure&event=...&channel=...&q=...`.
+- Turn SAGA call cards link to `/saga?tab=atoms&turn=...&atom=...&target=saga-call-N` when an atom id is present, or to the SAGA search tab otherwise.
+- SAGA atom details link back to `/turns?turn=...&session=...` and `/turns?channel=...` when source metadata is available.
+- Chainlink/Worklink issue drawers link to `/turns?issue=...&filter=...&q=...` and `/ops?tab=chainlink&issue=...`.
+- Scheduler schedule/poller rows link to `/turns?job=...&filter=...&event=...&channel=...&q=...` and `/ops?tab=scheduler&job=...`.
+- State/memory file details link to `/turns?path=...&filter=...&q=...` and `/chat?path=...&channel=...&q=...`.
+
+Missing or not-yet-loaded targets render explicit empty/error states in the
+target route rather than selecting unrelated data silently.
+
 ## Primitives
 
 Core primitives exported from `frontend/src/ui`:

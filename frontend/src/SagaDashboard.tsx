@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import React from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   getSagaActivationHistogram,
   getSagaAtom,
@@ -15,6 +16,7 @@ import {
   type SagaSqlCell
 } from "./api/saga";
 import type { ListMeta, SagaAtomDetailData } from "./api/generated/contracts";
+import { drilldownHref } from "./routeState";
 import { Badge, Button, DataTable, EmptyState, ErrorState, LoadingState, Panel, TextInput } from "./ui";
 
 type EvidenceKind = "atom" | "observation" | "triple";
@@ -64,6 +66,17 @@ function formatBool(value: unknown) {
 function formatTopics(value: unknown) {
   if (!Array.isArray(value) || !value.length) return "-";
   return value.map((item) => String(item)).join(", ");
+}
+
+function stringField(source: unknown, keys: string[]): string {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return "";
+  const record = source as Record<string, unknown>;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return "";
 }
 
 function kindBadge(kind: EvidenceKind) {
@@ -125,6 +138,12 @@ function AtomDetail({ atomId }: { atomId: string }) {
   const atom = query.data as SagaAtomDetailData & Record<string, unknown>;
   const embedding = atom.embedding as { provider?: string; model?: string; dim?: number } | null | undefined;
   const relations = Array.isArray(atom.relations_out) ? atom.relations_out as Array<Record<string, unknown>> : [];
+  const metadata = atom.metadata && typeof atom.metadata === "object" && !Array.isArray(atom.metadata)
+    ? atom.metadata as Record<string, unknown>
+    : {};
+  const sessionId = stringField(atom, ["session_id"]) || stringField(metadata, ["session_id", "source_session_id"]);
+  const turnId = stringField(atom, ["turn_id", "source_turn_id"]) || stringField(metadata, ["turn_id", "source_turn_id"]);
+  const channelId = stringField(atom, ["channel_id"]) || stringField(metadata, ["channel_id"]);
 
   return (
     <div className="saga-detail">
@@ -133,8 +152,9 @@ function AtomDetail({ atomId }: { atomId: string }) {
         <div><dt>Type</dt><dd>{String(atom.memory_type ?? "raw")}</dd></div>
         <div><dt>Source</dt><dd>{String(atom.source_type ?? "-")}</dd></div>
         <div><dt>Stream</dt><dd>{String(atom.stream ?? "semantic")}</dd></div>
-        <div><dt>Session</dt><dd>{String(atom.session_id ?? "-")}</dd></div>
-        <div><dt>Channel</dt><dd>{String(atom.channel_id ?? "-")}</dd></div>
+        <div><dt>Session</dt><dd>{sessionId ? <Link to={drilldownHref("/turns", { session: sessionId, turn: turnId || undefined })}>{sessionId}</Link> : "-"}</dd></div>
+        <div><dt>Channel</dt><dd>{channelId ? <Link to={drilldownHref("/turns", { channel: channelId })}>{channelId}</Link> : "-"}</dd></div>
+        <div><dt>Source turn</dt><dd>{turnId ? <Link to={drilldownHref("/turns", { turn: turnId, session: sessionId || undefined })}>{turnId}</Link> : "-"}</dd></div>
         <div><dt>Topics</dt><dd>{formatTopics(atom.topics)}</dd></div>
         <div><dt>Confidence</dt><dd>{atom.encoding_confidence == null ? "-" : Number(atom.encoding_confidence).toFixed(3)}</dd></div>
         <div><dt>Pinned</dt><dd>{formatBool(atom.is_pinned)}</dd></div>
@@ -163,11 +183,12 @@ function AtomDetail({ atomId }: { atomId: string }) {
 }
 
 function AtomsWorkflow() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [channel, setChannel] = React.useState("");
   const [limit, setLimit] = React.useState(50);
-  const [selectedAtom, setSelectedAtom] = React.useState("");
-  const [manualAtom, setManualAtom] = React.useState("");
+  const [manualAtom, setManualAtom] = React.useState(searchParams.get("atom") || "");
   const [manualError, setManualError] = React.useState("");
+  const selectedAtom = searchParams.get("atom") || "";
   const atomsQuery = useQuery({
     queryKey: ["saga", "recent", channel, limit],
     queryFn: () => listSagaAtoms({ channel, limit })
@@ -176,6 +197,13 @@ function AtomsWorkflow() {
   const channels = atomsQuery.data?.data.channels ?? [];
   const rawAtoms = atoms.filter((atom) => classifySagaEvidence(atom) === "atom");
   const observations = atoms.filter((atom) => classifySagaEvidence(atom) === "observation");
+
+  function selectAtom(atomId: string) {
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", "atoms");
+    params.set("atom", atomId);
+    setSearchParams(params);
+  }
 
   return (
     <div className="saga-workflow">
@@ -189,7 +217,7 @@ function AtomsWorkflow() {
         onSubmit={(event) => {
           event.preventDefault();
           try {
-            setSelectedAtom(validateSagaAtomId(manualAtom));
+            selectAtom(validateSagaAtomId(manualAtom));
             setManualError("");
           } catch (error) {
             setManualError(error instanceof Error ? error.message : String(error));
@@ -205,10 +233,10 @@ function AtomsWorkflow() {
       {!atomsQuery.isLoading && !atomsQuery.isError ? (
         <div className="saga-result-grid">
           <Panel title="Raw Atoms" subtitle="Non-observation atom records.">
-            <AtomTable atoms={rawAtoms} meta={atomsQuery.data?.meta} onInspect={setSelectedAtom} />
+            <AtomTable atoms={rawAtoms} meta={atomsQuery.data?.meta} onInspect={selectAtom} />
           </Panel>
           <Panel title="Observations" subtitle="Observation records are kept separate from raw atoms.">
-            <AtomTable atoms={observations} meta={atomsQuery.data?.meta} onInspect={setSelectedAtom} />
+            <AtomTable atoms={observations} meta={atomsQuery.data?.meta} onInspect={selectAtom} />
           </Panel>
         </div>
       ) : null}
@@ -220,17 +248,25 @@ function AtomsWorkflow() {
 }
 
 function SearchWorkflow() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [queryText, setQueryText] = React.useState("");
   const [channel, setChannel] = React.useState("");
   const [submitted, setSubmitted] = React.useState("");
   const [validation, setValidation] = React.useState("");
-  const [selectedAtom, setSelectedAtom] = React.useState("");
+  const selectedAtom = searchParams.get("atom") || "";
   const searchQuery = useQuery({
     enabled: Boolean(submitted),
     queryKey: ["saga", "search", submitted, channel],
     queryFn: () => searchSagaAtoms({ q: submitted, channel, limit: 100 })
   });
   const channels = searchQuery.data?.data.channel_filter ? [searchQuery.data.data.channel_filter] : [];
+
+  function selectAtom(atomId: string) {
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", "search");
+    params.set("atom", atomId);
+    setSearchParams(params);
+  }
 
   return (
     <div className="saga-workflow">
@@ -256,7 +292,7 @@ function SearchWorkflow() {
       {searchQuery.isError ? <ErrorState title="Search failed">{searchQuery.error instanceof Error ? searchQuery.error.message : String(searchQuery.error)}</ErrorState> : null}
       {searchQuery.data ? (
         <Panel title="Search Results" subtitle={`${searchQuery.data.meta?.total ?? searchQuery.data.data.atoms.length} matches for ${submitted}`}>
-          <AtomTable atoms={searchQuery.data.data.atoms} meta={searchQuery.data.meta} onInspect={setSelectedAtom} />
+          <AtomTable atoms={searchQuery.data.data.atoms} meta={searchQuery.data.meta} onInspect={selectAtom} />
         </Panel>
       ) : !submitted ? <EmptyState title="Enter a query to search atoms" /> : null}
       <Panel title="Result Detail">
@@ -383,7 +419,7 @@ function SqlWorkflow() {
 }
 
 export function SagaDashboard() {
-  const [tab, setTab] = React.useState("atoms");
+  const [searchParams, setSearchParams] = useSearchParams();
   const stats = useQuery({
     queryKey: ["saga", "stats"],
     queryFn: async () => (await getSagaStats()).data
@@ -395,6 +431,16 @@ export function SagaDashboard() {
     ["clusters", "Clusters"],
     ["triples", "Triples"]
   ] as const;
+  const tabIds = tabs.map(([id]) => id);
+  const tab = tabIds.includes(searchParams.get("tab") as typeof tabIds[number])
+    ? searchParams.get("tab") as typeof tabIds[number]
+    : "atoms";
+
+  function setTab(tabId: string) {
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", tabId);
+    setSearchParams(params);
+  }
 
   return (
     <>

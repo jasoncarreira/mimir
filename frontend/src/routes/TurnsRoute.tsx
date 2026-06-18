@@ -1,8 +1,9 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import React from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { listSessions, listTurns, type TurnRecord } from "../api";
 import type { ConversationSession } from "../api/generated/contracts";
+import { drilldownHref } from "../routeState";
 import { TurnDetailsPanel } from "../TurnDetailsPanel";
 import {
   Badge,
@@ -350,6 +351,7 @@ function SessionDetail({
               <div className="session-message" key={atom.id}>
                 <small>{atom.memory_type || "atom"} · <code>{atom.id}</code></small>
                 <p>{atom.content_preview}</p>
+                <Link to={drilldownHref("/saga", { tab: "atoms", atom: atom.id, session: session.id })}>Open atom</Link>
               </div>
             ))}
           </div>
@@ -362,17 +364,19 @@ function SessionDetail({
 export function TurnsRoute() {
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
-  const [trigger, setTrigger] = React.useState<TriggerFilter>("all");
+  const [trigger, setTrigger] = React.useState<TriggerFilter>((searchParams.get("trigger") as TriggerFilter) || "all");
   const [hidePollers, setHidePollers] = React.useState(false);
-  const [query, setQuery] = React.useState("");
-  const [sessionChannel, setSessionChannel] = React.useState("");
-  const [sessionTrigger, setSessionTrigger] = React.useState("");
-  const [sessionFrom, setSessionFrom] = React.useState("");
-  const [sessionTo, setSessionTo] = React.useState("");
-  const [sessionQuery, setSessionQuery] = React.useState("");
+  const [query, setQuery] = React.useState(searchParams.get("q") || searchParams.get("filter") || "");
+  const [sessionChannel, setSessionChannel] = React.useState(searchParams.get("channel") || "");
+  const [sessionTrigger, setSessionTrigger] = React.useState(searchParams.get("trigger") || "");
+  const [sessionFrom, setSessionFrom] = React.useState(searchParams.get("from") || "");
+  const [sessionTo, setSessionTo] = React.useState(searchParams.get("to") || "");
+  const [sessionQuery, setSessionQuery] = React.useState(searchParams.get("q") || searchParams.get("filter") || "");
   const { turns, isLoading, isError, initialError, loadError, loadingOlder, allOlderLoaded, loadOlder, refetch } = useTurnPages();
   const selectedId = searchParams.get("turn");
   const selectedSessionId = searchParams.get("session");
+  const channelParam = searchParams.get("channel") || "";
+  const eventParam = searchParams.get("event") || "";
   const sessionsQuery = useQuery({
     queryKey: ["sessions", SESSION_PAGE_SIZE, sessionChannel, sessionTrigger, sessionFrom, sessionTo, sessionQuery],
     queryFn: async () => {
@@ -389,10 +393,15 @@ export function TurnsRoute() {
     refetchInterval: 10000
   });
   const visibleTurns = React.useMemo(
-    () => filterTurns(turns, { trigger, hidePollers, query }),
-    [turns, trigger, hidePollers, query]
+    () => filterTurns(turns, { trigger, hidePollers, query }).filter((turn) => (
+      (!channelParam || turn.channel_id === channelParam)
+      && (!eventParam || turn.events.some((event) => event.type === eventParam || event.name === eventParam))
+    )),
+    [turns, trigger, hidePollers, query, channelParam, eventParam]
   );
-  const selectedTurn = visibleTurns.find((turn) => turn.turn_id === selectedId) ?? visibleTurns[0] ?? null;
+  const selectedTurn = selectedId
+    ? turns.find((turn) => turn.turn_id === selectedId) ?? null
+    : visibleTurns[0] ?? null;
   const selectedTurnQuery = useQuery<TurnRecord | null>({
     queryKey: ["turn", selectedTurn?.turn_id ?? ""],
     queryFn: async () => selectedTurn,
@@ -401,14 +410,27 @@ export function TurnsRoute() {
   });
   const detailTurn = selectedTurnQuery.data ?? selectedTurn;
   const sessions = sessionsQuery.data?.sessions ?? [];
-  const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? sessions[0] ?? null;
+  const selectedSession = selectedSessionId
+    ? sessions.find((session) => session.id === selectedSessionId) ?? null
+    : sessions[0] ?? null;
 
   React.useEffect(() => {
-    if (!selectedTurn || selectedId === selectedTurn.turn_id) return;
+    if (selectedId || !selectedTurn) return;
     const next = new URLSearchParams(searchParams);
     next.set("turn", selectedTurn.turn_id);
     setSearchParams(next, { replace: true });
   }, [searchParams, selectedId, selectedTurn, setSearchParams]);
+
+  React.useEffect(() => {
+    setQuery(searchParams.get("q") || searchParams.get("filter") || "");
+    const nextTrigger = (searchParams.get("trigger") as TriggerFilter) || "all";
+    setTrigger(triggerFilters.some((item) => item.id === nextTrigger) ? nextTrigger : "all");
+    setSessionChannel(searchParams.get("channel") || "");
+    setSessionTrigger(searchParams.get("trigger") || "");
+    setSessionFrom(searchParams.get("from") || "");
+    setSessionTo(searchParams.get("to") || "");
+    setSessionQuery(searchParams.get("q") || searchParams.get("filter") || "");
+  }, [searchParams]);
 
   React.useEffect(() => {
     if (!selectedTurn) return;
@@ -436,6 +458,13 @@ export function TurnsRoute() {
     node?.scrollIntoView({ block: "start" });
   }
 
+  function setRouteValue(key: string, value: string) {
+    const next = new URLSearchParams(searchParams);
+    if (value) next.set(key, value);
+    else next.delete(key);
+    setSearchParams(next);
+  }
+
   return (
     <div className="turns-route">
       <div className="turns-header-row">
@@ -460,7 +489,10 @@ export function TurnsRoute() {
                     aria-selected={trigger === filter.id}
                     className="turn-filter-tab"
                     key={filter.id}
-                    onClick={() => setTrigger(filter.id)}
+                    onClick={() => {
+                      setTrigger(filter.id);
+                      setRouteValue("trigger", filter.id === "all" ? "" : filter.id);
+                    }}
                     role="tab"
                     type="button"
                   >
@@ -486,6 +518,9 @@ export function TurnsRoute() {
               </ErrorState>
             ) : null}
             {loadError ? <ErrorState title="Turn refresh failed">{loadError.message}</ErrorState> : null}
+            {selectedId && !selectedTurn && !isLoading && !isError ? (
+              <ErrorState title="Turn not found">No loaded turn matches {selectedId}. Load older turns or adjust the URL filters.</ErrorState>
+            ) : null}
             {!isLoading && !isError ? (
               <TurnList
                 allOlderLoaded={allOlderLoaded}
@@ -509,16 +544,48 @@ export function TurnsRoute() {
                 placeholder="Search messages / output"
                 value={sessionQuery}
               />
-              <select aria-label="Filter sessions by channel" className="ui-input" onChange={(event) => setSessionChannel(event.currentTarget.value)} value={sessionChannel}>
+              <select
+                aria-label="Filter sessions by channel"
+                className="ui-input"
+                onChange={(event) => {
+                  setSessionChannel(event.currentTarget.value);
+                  setRouteValue("channel", event.currentTarget.value);
+                }}
+                value={sessionChannel}
+              >
                 <option value="">All channels</option>
                 {(sessionsQuery.data?.channels ?? []).map((channel) => <option key={channel} value={channel}>{channel}</option>)}
               </select>
-              <select aria-label="Filter sessions by trigger" className="ui-input" onChange={(event) => setSessionTrigger(event.currentTarget.value)} value={sessionTrigger}>
+              <select
+                aria-label="Filter sessions by trigger"
+                className="ui-input"
+                onChange={(event) => {
+                  setSessionTrigger(event.currentTarget.value);
+                  setRouteValue("trigger", event.currentTarget.value);
+                }}
+                value={sessionTrigger}
+              >
                 <option value="">All triggers</option>
                 {(sessionsQuery.data?.triggers ?? []).map((item) => <option key={item} value={item}>{item}</option>)}
               </select>
-              <TextInput aria-label="From date" onChange={(event) => setSessionFrom(event.currentTarget.value)} type="date" value={isoDateOnly(sessionFrom)} />
-              <TextInput aria-label="To date" onChange={(event) => setSessionTo(event.currentTarget.value)} type="date" value={isoDateOnly(sessionTo)} />
+              <TextInput
+                aria-label="From date"
+                onChange={(event) => {
+                  setSessionFrom(event.currentTarget.value);
+                  setRouteValue("from", event.currentTarget.value);
+                }}
+                type="date"
+                value={isoDateOnly(sessionFrom)}
+              />
+              <TextInput
+                aria-label="To date"
+                onChange={(event) => {
+                  setSessionTo(event.currentTarget.value);
+                  setRouteValue("to", event.currentTarget.value);
+                }}
+                type="date"
+                value={isoDateOnly(sessionTo)}
+              />
             </div>
             {sessionsQuery.isLoading ? <LoadingState label="Loading sessions" /> : null}
             {sessionsQuery.isError ? (
@@ -527,7 +594,11 @@ export function TurnsRoute() {
               </ErrorState>
             ) : null}
             {!sessionsQuery.isLoading && !sessionsQuery.isError ? (
-              <SessionList sessions={sessions} selectedId={selectedSession?.id ?? null} onSelect={selectSession} />
+              selectedSessionId && !selectedSession ? (
+                <ErrorState title="Session not found">No loaded session matches {selectedSessionId}. Adjust filters or the time range.</ErrorState>
+              ) : (
+                <SessionList sessions={sessions} selectedId={selectedSession?.id ?? null} onSelect={selectSession} />
+              )
             ) : null}
           </Panel>
         </section>

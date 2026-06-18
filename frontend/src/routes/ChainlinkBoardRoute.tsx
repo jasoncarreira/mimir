@@ -1,6 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import React from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { getChainlinkBoard, type ChainlinkBoardIssue } from "../api";
+import { drilldownHref } from "../routeState";
 import {
   Badge,
   Button,
@@ -168,6 +170,8 @@ function WorklinkPanel({ issue }: { issue: ChainlinkBoardIssue }) {
       {worklink.diff_stat ? <p className="app-copy">{worklink.diff_stat}</p> : null}
       {worklink.blocked_reason ? <p className="app-copy">{worklink.blocked_reason}</p> : null}
       <div className="chainlink-artifact-links">
+        <Link to={drilldownHref("/turns", { issue: issue.id, filter: `#${issue.id}`, q: String(issue.id) })}>Related turns</Link>
+        <Link to={drilldownHref("/ops", { tab: "chainlink", issue: issue.id, filter: `#${issue.id}` })}>Ops signals</Link>
         {worklink.evidence_href ? <a href={worklink.evidence_href}>Evidence JSON</a> : null}
         {worklink.transcript_href ? <a href={worklink.transcript_href}>Run transcript</a> : null}
         {worklink.pr_url ? <a href={worklink.pr_url}>Review PR</a> : null}
@@ -227,12 +231,16 @@ function IssueDrawer({
 }
 
 export function ChainlinkBoardRoute() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const query = useQuery({
     queryKey: ["chainlink-board"],
     queryFn: async () => (await getChainlinkBoard({ cache: "no-store" })).data
   });
-  const [filters, setFilters] = React.useState<ChainlinkBoardFilters>({ label: "", status: "", priority: "" });
-  const [selected, setSelected] = React.useState<ChainlinkBoardIssue | null>(null);
+  const [filters, setFilters] = React.useState<ChainlinkBoardFilters>({
+    label: searchParams.get("label") || "",
+    status: searchParams.get("status") || "",
+    priority: searchParams.get("priority") || ""
+  });
   const board = React.useMemo(() => safeChainlinkBoardData(query.data), [query.data]);
   const visibleIssues = React.useMemo(
     () => board.issues.filter((issue) => issueMatchesFilters(issue, filters)),
@@ -243,6 +251,33 @@ export function ChainlinkBoardRoute() {
     () => board.roots.map((id) => visibleById.get(id)).filter((issue): issue is ChainlinkBoardIssue => Boolean(issue)),
     [board.roots, visibleById]
   );
+  const selectedIssueId = Number.parseInt(searchParams.get("issue") || "", 10);
+  const selected = Number.isFinite(selectedIssueId)
+    ? board.issues.find((issue) => issue.id === selectedIssueId) ?? null
+    : null;
+
+  React.useEffect(() => {
+    setFilters({
+      label: searchParams.get("label") || "",
+      status: searchParams.get("status") || "",
+      priority: searchParams.get("priority") || ""
+    });
+  }, [searchParams]);
+
+  function selectIssue(issue: ChainlinkBoardIssue | null) {
+    const params = new URLSearchParams(searchParams);
+    if (issue) params.set("issue", String(issue.id));
+    else params.delete("issue");
+    setSearchParams(params);
+  }
+
+  function setFilter(key: keyof ChainlinkBoardFilters, value: string) {
+    setFilters((prior) => ({ ...prior, [key]: value }));
+    const params = new URLSearchParams(searchParams);
+    if (value) params.set(key, value);
+    else params.delete(key);
+    setSearchParams(params);
+  }
 
   return (
     <div className="chainlink-route">
@@ -275,10 +310,17 @@ export function ChainlinkBoardRoute() {
         <>
           <Panel title="Filters" className="chainlink-filter-panel">
             <div className="chainlink-filters">
-              <SelectFilter label="Label" value={filters.label} options={board.filters.labels} onChange={(label) => setFilters((prior) => ({ ...prior, label }))} />
-              <SelectFilter label="Status" value={filters.status} options={board.filters.statuses} onChange={(status) => setFilters((prior) => ({ ...prior, status }))} />
-              <SelectFilter label="Priority" value={filters.priority} options={board.filters.priorities} onChange={(priority) => setFilters((prior) => ({ ...prior, priority }))} />
-              <Button type="button" onClick={() => setFilters({ label: "", status: "", priority: "" })}>Clear</Button>
+              <SelectFilter label="Label" value={filters.label} options={board.filters.labels} onChange={(label) => setFilter("label", label)} />
+              <SelectFilter label="Status" value={filters.status} options={board.filters.statuses} onChange={(status) => setFilter("status", status)} />
+              <SelectFilter label="Priority" value={filters.priority} options={board.filters.priorities} onChange={(priority) => setFilter("priority", priority)} />
+              <Button type="button" onClick={() => {
+                setFilters({ label: "", status: "", priority: "" });
+                const params = new URLSearchParams(searchParams);
+                params.delete("label");
+                params.delete("status");
+                params.delete("priority");
+                setSearchParams(params);
+              }}>Clear</Button>
             </div>
           </Panel>
           <Panel title="Parent Trees" subtitle="Root issues and visible subissue progress from Chainlink.">
@@ -303,7 +345,7 @@ export function ChainlinkBoardRoute() {
                   </header>
                   <div className="chainlink-column__cards">
                     {issues.length ? issues.map((issue) => (
-                      <IssueCard issue={issue} key={issue.id} onOpen={setSelected} />
+                      <IssueCard issue={issue} key={issue.id} onOpen={selectIssue} />
                     )) : <EmptyState title="No issues" />}
                   </div>
                 </section>
@@ -323,7 +365,10 @@ export function ChainlinkBoardRoute() {
           </Panel>
         </>
       ) : null}
-      <IssueDrawer issue={selected} issues={board.issues} onClose={() => setSelected(null)} />
+      {searchParams.get("issue") && !selected && board.available ? (
+        <ErrorState title="Issue not found">No loaded Chainlink issue matches #{searchParams.get("issue")}.</ErrorState>
+      ) : null}
+      <IssueDrawer issue={selected} issues={board.issues} onClose={() => selectIssue(null)} />
     </div>
   );
 }

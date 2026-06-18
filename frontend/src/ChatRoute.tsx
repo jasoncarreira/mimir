@@ -71,8 +71,8 @@ function turnFromChatMessage(message: ChatTimelineMessage | undefined, sessionId
 }
 
 export function ChatRoute({ surface }: { surface: DashboardSurface }) {
-  const { filter, selectedTurn, update } = useRouteState(surface);
-  const initialChannel = filter || "web-default";
+  const { channel, filter, selectedTurn, update } = useRouteState(surface);
+  const initialChannel = channel || filter || "web-default";
   const [channelEntry, setChannelEntry] = React.useState(initialChannel);
   const [channelId, setChannelId] = React.useState(initialChannel);
   const [sessionId, setSessionId] = React.useState(() => makeDefaultChatSessionId());
@@ -87,11 +87,12 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const selectedMessageId = selectedTurn || storedSelectedMessageId;
 
   React.useEffect(() => {
-    if (filter && filter !== channelId) {
-      setChannelId(filter);
-      setChannelEntry(filter);
+    const routeChannel = channel || filter;
+    if (routeChannel && routeChannel !== channelId) {
+      setChannelId(routeChannel);
+      setChannelEntry(routeChannel);
     }
-  }, [channelId, filter]);
+  }, [channel, channelId, filter]);
 
   React.useEffect(() => {
     setStreamState("connecting");
@@ -172,7 +173,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
       if (accepted.data.channel_id !== channelId) {
         setChannelId(accepted.data.channel_id);
         setChannelEntry(accepted.data.channel_id);
-        update({ filter: accepted.data.channel_id });
+        update({ channel: accepted.data.channel_id, filter: accepted.data.channel_id });
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Message failed";
@@ -216,7 +217,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
                 event.preventDefault();
                 const nextChannel = channelEntry.trim() || "web-default";
                 setChannelId(nextChannel);
-                update({ filter: nextChannel });
+                update({ channel: nextChannel, filter: nextChannel });
               }}
             >
               <label>
