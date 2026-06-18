@@ -318,3 +318,10 @@ export type LiveEvent =
   | ChatReactionEvent
   | TurnEventLiveEvent
   | TurnLifecycleEvent;
+
+export interface LiveEventStreamItem {
+  id: string;
+  cursor: string;
+  ts?: string | null;
+  event: LiveEvent;
+}

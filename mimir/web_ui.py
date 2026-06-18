@@ -8,6 +8,8 @@ hosts the WebUI bridge's ``/chat``. Routes:
   GET /api/events       — events.jsonl as JSON (optional ``?since=<ts>``,
                           ``?type=<kind>``, ``?limit=<n>``); type may be
                           repeated to combine filters
+  GET /api/v1/live-events — fetch-authenticated SSE stream for React live
+                          dashboards with cursor backfill/dedup semantics
   GET /ops              — live ops dashboard (HTML, Chart.js)
   GET /api/ops          — JSON twin of /ops for ad-hoc scripting
   GET /saga             — saga DB operator viewer (HTML)
@@ -32,6 +34,7 @@ recomputes from events.jsonl on every request — no caching.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -40,6 +43,7 @@ from typing import Any
 from aiohttp import web
 
 from ._jsonl_tail import tail_jsonl_records
+from .live_events import read_live_event_items_since
 from .ops_dashboard import (
     build_dashboard_payload_async,
     parse_days_param,
@@ -68,6 +72,9 @@ log = logging.getLogger(__name__)
 
 _TURN_VIEWER_HTML: str | None = None
 _WEB_AUTH_JS: str | None = None
+LIVE_EVENTS_HEARTBEAT_S = 15.0
+LIVE_EVENTS_POLL_S = 1.0
+LIVE_EVENTS_MAX_STREAMS = int(os.environ.get("MIMIR_LIVE_EVENTS_MAX_STREAMS", "8"))
 
 
 def _load_viewer_html() -> str:
@@ -317,6 +324,90 @@ def register_routes(
     async def events_data_v1(request: web.Request) -> web.Response:
         events, meta = _events_window(request)
         return json_success({"events": events}, meta=meta)
+
+    live_events_active = 0
+    live_events_lock = asyncio.Lock()
+
+    async def _try_acquire_live_event_slot() -> bool:
+        nonlocal live_events_active
+        async with live_events_lock:
+            if live_events_active >= LIVE_EVENTS_MAX_STREAMS:
+                return False
+            live_events_active += 1
+            return True
+
+    async def _release_live_event_slot() -> None:
+        nonlocal live_events_active
+        async with live_events_lock:
+            live_events_active = max(0, live_events_active - 1)
+
+    async def _live_event_items(request: web.Request, since: str | None) -> list[dict[str, Any]]:
+        try:
+            limit = int(request.query.get("limit") or 0)
+        except ValueError:
+            limit = 0
+        items = await asyncio.to_thread(
+            read_live_event_items_since,
+            turns_log,
+            since=since,
+            limit=limit or None,
+        )
+        return [item.as_dict() for item in items]
+
+    async def live_events_stream(request: web.Request) -> web.StreamResponse:
+        """Fetch-authenticated SSE stream for React live dashboards.
+
+        Reconnect/backfill contract:
+        - each payload is ``{"id", "cursor", "ts", "event"}``;
+        - clients persist the highest delivered cursor and reconnect with
+          ``?since=<cursor>``;
+        - backfill uses strict ``cursor > since`` comparison, so the last
+          acknowledged event is not duplicated.
+        """
+        once = request.query.get("once") in {"1", "true", "yes"}
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        if not await _try_acquire_live_event_slot():
+            return web.Response(text="too many live event streams", status=429)
+
+        await resp.prepare(request)
+
+        delivered = request.query.get("since", "").strip() or None
+        idle_for = 0.0
+        try:
+            while True:
+                items = await _live_event_items(request, delivered)
+                for item in items:
+                    delivered = str(item["cursor"])
+                    block = (
+                        f"id: {item['cursor']}\n"
+                        "event: live-event\n"
+                        "data: "
+                        + json.dumps(item, ensure_ascii=False)
+                        + "\n\n"
+                    )
+                    await resp.write(block.encode("utf-8"))
+                if once:
+                    break
+                if items:
+                    idle_for = 0.0
+                else:
+                    idle_for += LIVE_EVENTS_POLL_S
+                    if idle_for >= LIVE_EVENTS_HEARTBEAT_S:
+                        idle_for = 0.0
+                        await resp.write(b": heartbeat\n\n")
+                await asyncio.sleep(LIVE_EVENTS_POLL_S)
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            await _release_live_event_slot()
+        return resp
 
     async def react_app(request: web.Request) -> web.StreamResponse:
         if not _react_app_dist.is_dir():
@@ -607,6 +698,8 @@ def register_routes(
         app.router.add_get("/api/events", events_data)
     if ("GET", "/api/v1/events") not in existing:
         app.router.add_get("/api/v1/events", events_data_v1)
+    if ("GET", "/api/v1/live-events") not in existing:
+        app.router.add_get("/api/v1/live-events", live_events_stream)
     if ("GET", "/app") not in existing:
         app.router.add_get("/app", react_app)
     if ("GET", "/app/auth.js") not in existing:

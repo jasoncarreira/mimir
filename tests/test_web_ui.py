@@ -13,6 +13,7 @@ from mimir import web_ui
 from mimir.web_contracts import (
     render_typescript_contracts,
     validate_api_envelope,
+    validate_live_event,
     validate_list_meta,
 )
 
@@ -195,6 +196,173 @@ async def test_api_v1_events_returns_envelope_and_list_metadata(app):
         "total": 2,
         "truncated": True,
     }
+
+
+def _sse_data_items(text: str) -> list[dict]:
+    items = []
+    for block in text.strip().split("\n\n"):
+        data_lines = [
+            line.removeprefix("data: ").removeprefix("data:")
+            for line in block.splitlines()
+            if line.startswith("data:")
+        ]
+        if data_lines:
+            items.append(json.loads("\n".join(data_lines)))
+    return items
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_backfill_orders_and_dedups(app):
+    a, turns_log, _ = app
+    rows = [
+        {
+            "turn_id": "t1",
+            "ts": "2026-01-01T00:00:01Z",
+            "events": [{"type": "reasoning", "content": "a"}],
+        },
+        {
+            "turn_id": "t2",
+            "ts": "2026-01-01T00:00:02Z",
+            "events": [
+                {"type": "tool_call", "id": "call-1"},
+                {"type": "tool_result", "id": "call-1"},
+            ],
+        },
+        {
+            "turn_id": "t2",
+            "ts": "2026-01-01T00:00:02Z",
+            "events": [{"type": "tool_call", "id": "call-1"}],
+        },
+    ]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/live-events?once=1")
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert resp.content_type == "text/event-stream"
+    items = _sse_data_items(body)
+    assert [item["cursor"] for item in items] == [
+        "2026-01-01T00:00:01Z:t1:000000",
+        "2026-01-01T00:00:01Z:t1:000001",
+        "2026-01-01T00:00:02Z:t2:000000",
+        "2026-01-01T00:00:02Z:t2:000001",
+        "2026-01-01T00:00:02Z:t2:000002",
+    ]
+    assert len({item["id"] for item in items}) == len(items)
+    for item in items:
+        validate_live_event(item["event"])
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_since_backfill_is_strict(app):
+    a, turns_log, _ = app
+    rows = [
+        {"turn_id": "t1", "ts": "2026-01-01T00:00:01Z", "events": [{"type": "a"}]},
+        {"turn_id": "t2", "ts": "2026-01-01T00:00:02Z", "events": [{"type": "b"}]},
+    ]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/live-events?once=1&since=2026-01-01T00:00:01Z:t1:000001")
+        body = await resp.text()
+
+    assert resp.status == 200
+    items = _sse_data_items(body)
+    assert [item["cursor"] for item in items] == ["2026-01-01T00:00:02Z:t2:000000", "2026-01-01T00:00:02Z:t2:000001"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_cursor_is_monotonic_for_random_turn_ids(app):
+    a, turns_log, _ = app
+    rows = [
+        {"turn_id": "f1c5e26f1c2e", "ts": "2026-01-01T00:00:01Z"},
+        {"turn_id": "37387608ce3b", "ts": "2026-01-01T00:00:02Z"},
+    ]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(
+            "/api/v1/live-events?once=1&since=2026-01-01T00:00:01Z:f1c5e26f1c2e:000000"
+        )
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert [item["event"]["turn_id"] for item in _sse_data_items(body)] == ["37387608ce3b"]
+
+
+def test_read_live_event_items_since_stops_after_crossing_acknowledged_timestamp(tmp_path: Path):
+    from mimir.live_events import read_live_event_items_since
+
+    path = tmp_path / "turns.jsonl"
+    path.write_text("", encoding="utf-8")
+    rows = [
+        {"turn_id": "very-old", "ts": "2026-01-01T00:00:00Z"},
+        {"turn_id": "old", "ts": "2026-01-01T00:00:01Z"},
+        {"turn_id": "seen", "ts": "2026-01-01T00:00:02Z"},
+        {"turn_id": "new", "ts": "2026-01-01T00:00:03Z"},
+    ]
+    calls = []
+
+    def tail_reader(_path: Path):
+        for row in reversed(rows):
+            calls.append(row["turn_id"])
+            yield row
+
+    items = read_live_event_items_since(
+        path,
+        since="2026-01-01T00:00:02Z:seen:000000",
+        tail_reader=tail_reader,
+    )
+
+    assert [item.event["turn_id"] for item in items] == ["new"]
+    assert calls == ["new", "seen", "old"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_auth_uses_header_not_query_param(tmp_path: Path):
+    from mimir.server import _make_auth_middleware
+
+    turns_log = tmp_path / "turns.jsonl"
+    events_log = tmp_path / "events.jsonl"
+    turns_log.write_text(
+        json.dumps({"turn_id": "t1", "ts": "2026-01-01T00:00:01Z"}) + "\n",
+        encoding="utf-8",
+    )
+    a = web.Application(middlewares=[_make_auth_middleware("live-secret")])
+    web_ui.register_routes(a, turns_log=turns_log, events_log=events_log)
+
+    async with TestClient(TestServer(a)) as client:
+        query_resp = await client.get("/api/v1/live-events?once=1&api_key=live-secret")
+        assert query_resp.status == 401
+
+        resp = await client.get(
+            "/api/v1/live-events?once=1",
+            headers={"X-API-Key": "live-secret"},
+        )
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert _sse_data_items(body)[0]["cursor"] == "2026-01-01T00:00:01Z:t1:000000"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_rejects_when_stream_cap_exhausted(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(web_ui, "LIVE_EVENTS_MAX_STREAMS", 0)
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/live-events?once=1")
+        body = await resp.text()
+
+    assert resp.status == 429
+    assert "too many live event streams" in body
 
 
 @pytest.mark.asyncio
