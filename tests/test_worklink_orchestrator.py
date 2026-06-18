@@ -1137,6 +1137,84 @@ STRICT_ISSUE_JSON = '''{
 }'''
 
 
+INVALID_STRICT_ISSUE_JSON = (
+    '{\n'
+    '  "id": 443,\n'
+    '  "title": "strict malformed worklink leaf",\n'
+    '  "description": "Acceptance criteria:\\nplain bullet without checklist\\n\\nReview criteria:\\n- reviewer verifies scope",\n'
+    '  "labels": ["worklink", "worklink:ready"],\n'
+    '  "parent_id": 380,\n'
+    '  "created_at": "2026-06-18T11:58:52Z",\n'
+    '  "comments": []\n'
+    '}'
+)
+
+
+def test_worklink_runner_demotes_template_invalid_ready_leaf_before_claim(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    calls: list[Sequence[str] | str] = []
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "443"]:
+            return cp(args, stdout=INVALID_STRICT_ISSUE_JSON)
+        if isinstance(args, list) and args[:3] in (
+            ["chainlink", "issue", "unlabel"],
+            ["chainlink", "issue", "label"],
+            ["chainlink", "issue", "comment"],
+        ):
+            return cp(args)
+        raise AssertionError(f"unexpected call after validation failure: {args}")
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    with pytest.raises(LeafValidationError, match="acceptance checklist item"):
+        asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+                443, backend_name="fake", test_command="echo ok"
+            )
+        )
+
+    assert ["chainlink", "issue", "unlabel", "443", "worklink:ready"] in calls
+    assert ["chainlink", "issue", "label", "443", "worklink:blocked"] in calls
+    comments = [
+        call
+        for call in calls
+        if isinstance(call, list) and call[:4] == ["chainlink", "issue", "comment", "443"]
+    ]
+    assert comments and "acceptance checklist item" in comments[0][4]
+    # The invalid leaf is removed from the ready queue before any worker claim,
+    # so the poller cannot redispatch this same lowest-id leaf forever.
+    assert not any(
+        isinstance(call, list) and call[:3] == ["chainlink", "locks", "claim"]
+        for call in calls
+    )
+
+
+def test_worklink_runner_dry_run_reports_template_error_without_demoting(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    calls: list[Sequence[str] | str] = []
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "443"]:
+            return cp(args, stdout=INVALID_STRICT_ISSUE_JSON)
+        raise AssertionError(f"dry-run must not mutate after validation failure: {args}")
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    with pytest.raises(LeafValidationError, match="acceptance checklist item"):
+        asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+                443, backend_name="fake", test_command="echo ok", dry_run=True
+            )
+        )
+
+    assert calls == [["chainlink", "issue", "show", "443", "--json"]]
+
+
 def test_validate_leaf_requires_worklink_notes_template_for_new_issues() -> None:
     issue = IssueContext(
         443,

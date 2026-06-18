@@ -117,6 +117,61 @@ def validate_leaf(issue: IssueContext) -> None:
     )
 
 
+def _demote_template_invalid_ready_leaf(
+    issue: IssueContext,
+    *,
+    reason: str,
+    runner: Runner,
+    chainlink_bin: str,
+) -> None:
+    """Best-effort demotion for strict-template invalid ready leaves.
+
+    Template validation happens before Worklink claims the issue. If a ready
+    leaf fails there and keeps ``worklink:ready``, the autonomous ready queue can
+    keep redispatching the same lowest-id issue forever. Demote only leaves that
+    are currently marked ready, and deliberately do not acquire a lock: this is
+    a pre-claim validation transition, not a worker attempt.
+    """
+
+    if "worklink:ready" not in issue.labels:
+        return
+
+    issue_id = str(issue.issue_id)
+    comment = (
+        "WORKLINK_BLOCKED leaf template validation failed before dispatch; "
+        f"{reason}. Re-plan this issue, then remove worklink:blocked and "
+        "re-add worklink:ready when the required checklist is present."
+    )
+    commands = (
+        (chainlink_bin, "issue", "unlabel", issue_id, "worklink:ready"),
+        (chainlink_bin, "issue", "label", issue_id, "worklink:blocked"),
+        (chainlink_bin, "issue", "comment", issue_id, comment),
+    )
+    for command in commands:
+        try:
+            result = runner(list(command))
+        except Exception as exc:  # pragma: no cover - defensive best-effort guard
+            _log_event(
+                "worklink_template_invalid_demote_failed",
+                issue_id=issue.issue_id,
+                command=list(command[:3]),
+                error=str(exc),
+            )
+            continue
+        if result.returncode != 0:
+            _log_event(
+                "worklink_template_invalid_demote_failed",
+                issue_id=issue.issue_id,
+                command=list(command[:3]),
+                error=(result.stderr or result.stdout).strip()[:500],
+            )
+    _log_event(
+        "worklink_template_invalid_demoted",
+        issue_id=issue.issue_id,
+        reason=reason,
+    )
+
+
 def render_work_order(
     issue: IssueContext, *, template_path: Path, backend_name: str, test_command: str
 ) -> str:
@@ -153,7 +208,17 @@ class WorklinkRunner:
     ) -> WorklinkRunResult:
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
-        validate_leaf(issue)
+        try:
+            validate_leaf(issue)
+        except LeafValidationError as exc:
+            if not dry_run:
+                _demote_template_invalid_ready_leaf(
+                    issue,
+                    reason=str(exc),
+                    runner=runner,
+                    chainlink_bin=self.chainlink_bin,
+                )
+            raise
         config = WorklinkConfig.load(self.home / "worklink.yaml")
         registry = self.registry or BackendRegistry(config)
         repo_url = _repo_remote_url(self.repo, runner=runner)
