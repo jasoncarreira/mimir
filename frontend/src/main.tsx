@@ -26,6 +26,7 @@ import {
   Panel,
   TextInput
 } from "./ui";
+import { TurnViewerRoute } from "./turnViewer";
 import "./styles.css";
 
 
@@ -353,6 +354,10 @@ function RoutePlaceholder({ surface }: { surface: DashboardSurface }) {
 }
 
 function SurfaceRoute({ surface }: { surface: DashboardSurface }) {
+  if (surface.id === "turns") {
+    return <TurnViewerRoute />;
+  }
+
   const { activeTab } = useRouteState(surface);
   const normalizedTab = surface.tabs.includes(activeTab) ? activeTab : surface.tabs[0];
   const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);

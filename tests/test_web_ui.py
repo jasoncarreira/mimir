@@ -106,15 +106,12 @@ def test_dashboard_extension_route_path_allows_app_prefix_words_only():
 
 
 @pytest.mark.asyncio
-async def test_turns_page_serves_html(app):
+async def test_turns_page_redirects_to_react_app(app):
     a, _, _ = app
     async with TestClient(TestServer(a)) as client:
-        resp = await client.get("/turns")
-        assert resp.status == 200
-        assert resp.content_type == "text/html"
-        body = await resp.text()
-        assert "mimir turns" in body  # header title (renamed from "Turn Viewer")
-        assert "/api/turns" in body  # the page polls this endpoint
+        resp = await client.get("/turns", allow_redirects=False)
+        assert resp.status == 302
+        assert resp.headers["Location"] == "/app/turns"
 
 
 @pytest.mark.asyncio

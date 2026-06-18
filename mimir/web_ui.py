@@ -3,7 +3,7 @@
 Mounts onto the same aiohttp app that serves ``/event`` + ``/health`` and
 hosts the WebUI bridge's ``/chat``. Routes:
 
-  GET /turns            — single-file vanilla-JS turn viewer (HTML)
+  GET /turns            — redirect to the React turn viewer
   GET /api/turns        — turns.jsonl as JSON (optional ``?after=<turn_id>``)
   GET /api/events       — events.jsonl as JSON (optional ``?since=<ts>``,
                           ``?type=<kind>``, ``?limit=<n>``); type may be
@@ -24,8 +24,8 @@ hosts the WebUI bridge's ``/chat``. Routes:
                           view=channels returns channel dir names
   GET /app              — built React app shell (additive migration route)
 
-The HTML page polls ``/api/turns`` every 5s for live updates. ``/api/events``
-is exposed for the (deferred) Events tab + ad-hoc scripting. ``/ops``
+The React turn route reads ``/api/v1/turns`` for paged turn data. ``/api/events``
+is exposed for ad-hoc scripting. ``/ops``
 recomputes from events.jsonl on every request — no caching.
 ``/saga`` reads the saga SQLite DB on each request — no caching.
 ``/memory`` reads ``<home>/memory/`` and ``<home>/state/`` on each request — no caching.
@@ -76,20 +76,10 @@ from .web_contracts import json_error, json_success, list_meta
 
 log = logging.getLogger(__name__)
 
-_TURN_VIEWER_HTML: str | None = None
 _WEB_AUTH_JS: str | None = None
 LIVE_EVENTS_HEARTBEAT_S = 15.0
 LIVE_EVENTS_POLL_S = 1.0
 LIVE_EVENTS_MAX_STREAMS = int(os.environ.get("MIMIR_LIVE_EVENTS_MAX_STREAMS", "8"))
-
-
-def _load_viewer_html() -> str:
-    """Load the bundled HTML once and cache it."""
-    global _TURN_VIEWER_HTML
-    if _TURN_VIEWER_HTML is None:
-        path = Path(__file__).parent / "turn_viewer.html"
-        _TURN_VIEWER_HTML = path.read_text(encoding="utf-8")
-    return _TURN_VIEWER_HTML
 
 
 def _load_web_auth_js() -> str:
@@ -180,7 +170,7 @@ def register_routes(
     _dashboard_extensions = dashboard_extensions or first_party_dashboard_extensions()
 
     async def turns_page(_request: web.Request) -> web.Response:
-        return web.Response(text=_load_viewer_html(), content_type="text/html")
+        raise web.HTTPFound("/app/turns")
 
     async def turns_data(request: web.Request) -> web.Response:
         # Records are oldest-first (append order). The viewer reverses to
