@@ -469,18 +469,23 @@ def _fake_chainlink_script(
     ready: list[int],
     in_progress: list[int] | None = None,
     active_locks: list[int] | None = None,
+    actionable: list[int] | None = None,
 ) -> Path:
-    """A tiny stand-in chainlink for ready-list + lock-count queries."""
+    """A tiny stand-in chainlink for ready-label + actionable queries."""
     script = tmp / "chainlink"
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
         "a = sys.argv[1:]\n"
         f"ready = {ready!r}\n"
+        f"actionable = {(ready if actionable is None else actionable)!r}\n"
         f"inprog = {(in_progress or [])!r}\n"
         f"locks = {(active_locks if active_locks is not None else (in_progress or []))!r}\n"
         "if a[:2] == ['locks','list']:\n"
         "    print(json.dumps({'version': 1, 'locks': {str(i): {'issue_id': i} for i in locks}}))\n"
+        "    sys.exit(0)\n"
+        "if a[:2] == ['issue','ready']:\n"
+        "    print(json.dumps([{'id': i} for i in actionable]))\n"
         "    sys.exit(0)\n"
         "if a[:2] == ['issue','list']:\n"
         "    label = a[a.index('--label')+1] if '--label' in a else ''\n"
@@ -590,6 +595,95 @@ def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
     assert dispatched[0]["issue_id"] == 201  # lowest id first
     scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
     assert scan["ready_count"] == 3 and scan["active"] == 1 and scan["dispatched"] == 1
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_filters_worklink_ready_through_chainlink_actionable_set(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path,
+        ready=[201, 202, 203],
+        actionable=[101, 201, 203],
+        active_locks=[],
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "3",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert [e["issue_id"] for e in dispatched] == [201, 203]
+    assert 202 not in [e["issue_id"] for e in dispatched]
+    scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
+    assert scan["ready_count"] == 2
+    assert scan["labeled_ready_count"] == 3
+    assert scan["blocked_ready_count"] == 1
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_leaves_blocked_worklink_ready_issues_untouched(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path, ready=[301, 302], actionable=[999], active_locks=[]
+    )
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "2",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    assert not [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert not (tmp_path / "dispatched.txt").exists()
+    scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
+    assert scan["ready_count"] == 0
+    assert scan["labeled_ready_count"] == 2
+    assert scan["blocked_ready_count"] == 2
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_dispatches_worklink_ready_after_blocker_closes(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # Simulates Chainlink's closed-blocker behavior: the issue remains labeled
+    # worklink:ready and appears in `issue ready` once its blocker closes.
+    chainlink = _fake_chainlink_script(
+        tmp_path, ready=[401], actionable=[401], active_locks=[]
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "2",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    assert [
+        e.get("issue_id") for e in events if e.get("signal") == "worklink_dispatched"
+    ] == [401]
+    scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
+    assert scan["ready_count"] == 1
+    assert scan["labeled_ready_count"] == 1
+    assert scan["blocked_ready_count"] == 0
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")

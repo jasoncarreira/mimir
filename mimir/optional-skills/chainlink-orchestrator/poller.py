@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Worklink ready-queue poller (chainlink #444).
 
-Discovers ``worklink:ready`` leaf issues and dispatches up to the
-concurrent-claim cap by invoking ``mimir worklink run <id>`` as a **detached**
-subprocess. It deliberately does NOT reimplement claim/evidence/transition —
-all of that lives in the deterministic core executor behind the CLI.
+Discovers ``worklink:ready`` leaf issues that are also unblocked in
+Chainlink, then dispatches up to the concurrent-claim cap by invoking
+``mimir worklink run <id>`` as a **detached** subprocess. It deliberately does
+NOT reimplement claim/evidence/transition — all of that lives in the
+deterministic core executor behind the CLI.
 
 Why detached: a leaf run can take minutes, but the poller framework kills a
 poller subprocess after ~60s. So we launch each run in a new session
@@ -121,6 +122,60 @@ def _issue_ids_with_label(home: Path, label: str) -> list[int] | None:
     return ids
 
 
+def _actionable_issue_ids(home: Path) -> list[int] | None:
+    """Open issue ids that Chainlink considers ready/actionable.
+
+    This intentionally delegates dependency semantics to ``chainlink issue ready``
+    instead of reimplementing blocker-edge logic in the poller. Chainlink's
+    ready command filters out issues blocked by open blockers while allowing
+    issues whose blockers have since closed. If the CLI cannot provide
+    parseable JSON, fail closed (``None``) rather than risk dispatching a
+    blocked leaf.
+    """
+    try:
+        proc = subprocess.run(
+            [_chainlink_bin(), "issue", "ready", "--json"],
+            cwd=str(home), capture_output=True, text=True, check=False, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    issues = data if isinstance(data, list) else data.get("issues", [])
+    ids: list[int] = []
+    for item in issues:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("id")
+        if raw is None:
+            raw = item.get("number")
+        try:
+            ids.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
+def _worklink_ready_actionable_ids(home: Path) -> tuple[list[int], int, int] | None:
+    """Return dispatchable ``worklink:ready`` ids plus raw/blocked counts.
+
+    ``worklink:ready`` remains the human/planner intent signal, but it is no
+    longer sufficient: the issue must also appear in Chainlink's ready set.
+    """
+    ready_ids = _issue_ids_with_label(home, READY_LABEL)
+    actionable_ids = _actionable_issue_ids(home)
+    if ready_ids is None or actionable_ids is None:
+        return None
+    labeled = set(ready_ids)
+    actionable = set(actionable_ids)
+    dispatchable = sorted(labeled & actionable)
+    blocked_count = len(labeled - actionable)
+    return dispatchable, len(labeled), blocked_count
+
 
 def _configured_cap(home: Path) -> int:
     """Autonomous concurrency cap: ``worklink.yaml`` is canonical.
@@ -155,17 +210,18 @@ def main() -> int:
         return 0
     home = Path(home_env)
 
-    ready_ids = _issue_ids_with_label(home, READY_LABEL)
+    ready_result = _worklink_ready_actionable_ids(home)
     active = _active_lock_count(home)
-    # Fail closed: if we can't read either the ready queue or the active lock
-    # count, do not dispatch (an undercounted cap could over-admit workers).
-    if ready_ids is None or active is None:
+    # Fail closed: if we can't read either the ready queue, Chainlink's
+    # actionable set, or the active lock count, do not dispatch (an undercounted
+    # cap or blocked issue could over-admit workers).
+    if ready_result is None or active is None:
         _emit({
             "signal": "worklink_poller_degraded",
-            "reason": "chainlink ready/lock read failed; skipping dispatch this cycle",
+            "reason": "chainlink ready/actionable/lock read failed; skipping dispatch this cycle",
         })
         return 0
-    ready = sorted(set(ready_ids))
+    ready, labeled_ready_count, blocked_ready_count = ready_result
     cap = _configured_cap(home)
     slots = max(0, cap - active)
 
@@ -173,6 +229,8 @@ def main() -> int:
         _emit({
             "signal": "worklink_ready_scan",
             "ready_count": len(ready),
+            "labeled_ready_count": labeled_ready_count,
+            "blocked_ready_count": blocked_ready_count,
             "active": active,
             "cap": cap,
             "slots": slots,
@@ -185,6 +243,8 @@ def main() -> int:
             "signal": "worklink_poller_misconfigured",
             "reason": "WORKLINK_REPO unset; cannot dispatch",
             "ready_count": len(ready),
+            "labeled_ready_count": labeled_ready_count,
+            "blocked_ready_count": blocked_ready_count,
         })
         return 0
 
@@ -231,6 +291,8 @@ def main() -> int:
     _emit({
         "signal": "worklink_ready_scan",
         "ready_count": len(ready),
+        "labeled_ready_count": labeled_ready_count,
+        "blocked_ready_count": blocked_ready_count,
         "active": active,
         "cap": cap,
         "dispatched": dispatched,
