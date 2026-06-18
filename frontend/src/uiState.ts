@@ -6,6 +6,7 @@ interface UiState {
   collapsedRegions: Record<string, boolean>;
   setDetailsPanelOpen: (open: boolean) => void;
   setSelectedChatMessageId: (id: string) => void;
+  setCollapsedRegion: (id: string, collapsed: boolean) => void;
   toggleCollapsedRegion: (id: string) => void;
 }
 
@@ -15,6 +16,13 @@ export const useUiState = create<UiState>((set) => ({
   collapsedRegions: {},
   setDetailsPanelOpen: (detailsPanelOpen) => set({ detailsPanelOpen }),
   setSelectedChatMessageId: (selectedChatMessageId) => set({ selectedChatMessageId }),
+  setCollapsedRegion: (id, collapsed) =>
+    set((state) => ({
+      collapsedRegions: {
+        ...state.collapsedRegions,
+        [id]: collapsed
+      }
+    })),
   toggleCollapsedRegion: (id) =>
     set((state) => ({
       collapsedRegions: {

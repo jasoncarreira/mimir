@@ -20,6 +20,7 @@ import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { LiveEventsProvider, useLiveEvents } from "./live-events";
 import { SagaDashboard } from "./SagaDashboard";
+import { AdminConfigRoute } from "./routes/AdminConfigRoute";
 import { OpsRoute } from "./routes/OpsRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { TurnsRoute } from "./routes/TurnsRoute";
@@ -441,7 +442,8 @@ function AppFrame() {
                       : surface.id === "ops" ? <OpsRoute />
                         : surface.id === "chainlink-board" ? <ChainlinkBoardRoute />
                           : surface.id === "turns" ? <TurnsRoute />
-                            : <SurfaceRoute surface={surface} />
+                            : surface.id === "admin-config" ? <AdminConfigRoute />
+                              : <SurfaceRoute surface={surface} />
                   }
                   key={surface.id}
                   path={surface.path}
@@ -457,6 +459,25 @@ function AppFrame() {
   );
 }
 
+function RoutedLiveEventsProvider({ children }: { children: React.ReactNode }) {
+  const [searchParams] = useSearchParams();
+  const selectedTurnId = searchParams.get("turn") || null;
+
+  return (
+    <LiveEventsProvider
+      apiKey={readStoredKey() || undefined}
+      cachePolicy={{
+        aggregateQueryKeys: [["web-bootstrap"], ["turns"]],
+        selectedTurnId,
+        selectedTurnQueryKey: selectedTurnId ? ["turn", selectedTurnId] : undefined
+      }}
+      queryClient={queryClient}
+    >
+      {children}
+    </LiveEventsProvider>
+  );
+}
+
 const root = document.getElementById("root");
 if (!root) {
   throw new Error("React root element not found");
@@ -466,15 +487,11 @@ createRoot(root).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
       <SkinProvider>
-        <LiveEventsProvider
-          apiKey={readStoredKey() || undefined}
-          cachePolicy={{ aggregateQueryKeys: [["web-bootstrap"]] }}
-          queryClient={queryClient}
-        >
-          <BrowserRouter basename={appBasename()}>
+        <BrowserRouter basename={appBasename()}>
+          <RoutedLiveEventsProvider>
             <AppFrame />
-          </BrowserRouter>
-        </LiveEventsProvider>
+          </RoutedLiveEventsProvider>
+        </BrowserRouter>
       </SkinProvider>
     </QueryClientProvider>
   </React.StrictMode>

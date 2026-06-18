@@ -46,10 +46,10 @@ const firstPartySurfaceMetadata: Record<
     tabs: ["state", "memory", "files"],
     filterLabel: "tier"
   },
-  "hermes-gaps": {
-    detail: "Reserved route for follow-up pages",
-    tabs: ["gaps", "handoffs", "notes"],
-    filterLabel: "owner"
+  "admin-config": {
+    detail: "Config, model, and redacted env",
+    tabs: ["model", "config", "env"],
+    filterLabel: "section"
   }
 };
 

@@ -43,6 +43,7 @@ from typing import Any
 from aiohttp import web
 
 from ._jsonl_tail import tail_jsonl_records
+from .admin_config import build_admin_config_payload
 from .dashboard_extensions import (
     DashboardBackendRoute,
     DashboardExtensionRegistry,
@@ -560,6 +561,15 @@ def register_routes(
             return json_error("artifact_not_found", "artifact not found", status=404)
         return web.FileResponse(artifact, headers=_no_store_headers())
 
+    async def admin_config_v1(request: web.Request) -> web.Response:
+        payload = await asyncio.to_thread(
+            build_admin_config_payload,
+            config=request.app.get("config"),
+            scheduler=request.app.get("scheduler"),
+            home=home,
+        )
+        return json_success(payload, headers=_no_store_headers())
+
     # ── /saga — saga DB viewer ───────────────────────────────────────
 
     # Resolve the DB path: use the explicit ``saga_db`` kwarg when
@@ -756,10 +766,19 @@ def register_routes(
             DashboardBackendRoute("GET", "/api/v1/chainlink-board/artifact", chainlink_board_artifact_v1),
         ]
 
+    def admin_config_backend_routes() -> list[DashboardBackendRoute]:
+        return [
+            DashboardBackendRoute("GET", "/api/v1/admin/config", admin_config_v1),
+        ]
+
     add_backend_namespace_routes(
         app,
         registry=_dashboard_extensions,
-        hooks={"ops": ops_backend_routes, "chainlink-board": chainlink_board_backend_routes},
+        hooks={
+            "ops": ops_backend_routes,
+            "chainlink-board": chainlink_board_backend_routes,
+            "admin-config": admin_config_backend_routes,
+        },
         existing=existing,
     )
     async def saga_sql(request: web.Request) -> web.Response:
