@@ -369,6 +369,8 @@ export interface ChainlinkBoardData {
   };
   truncated: boolean;
   total_count: number;
+}
+
 export interface AdminConfigFieldSchema {
   name: string;
   type: string;
