@@ -36,6 +36,11 @@ const firstPartySurfaceMetadata: Record<
     tabs: ["board", "dependencies", "worklink"],
     filterLabel: "label"
   },
+  scheduler: {
+    detail: "Schedules, pollers, and commitments",
+    tabs: ["schedules", "pollers", "commitments"],
+    filterLabel: "due"
+  },
   saga: {
     detail: "SAGA session shell",
     tabs: ["sessions", "atoms", "queries"],

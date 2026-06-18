@@ -180,6 +180,35 @@ def _identities_approve_pairing_cmd(
     print(f"approved pairing: {identity} ({', '.join(roles)})")
 
 
+def _identities_issue_key_cmd(
+    home: Path, canonical: str, roles: list[str] | None
+) -> None:
+    """Mint (or rotate) a per-user web API key and print it ONCE.
+
+    Only the SHA-256 hash is persisted to identities.yaml; the raw value below
+    is the sole copy — the operator distributes it out-of-band. Re-running
+    rotates (invalidates the prior key)."""
+    from ..identities_populator import issue_web_key
+
+    raw = issue_web_key(home, canonical, roles=roles)
+    role_str = ", ".join(roles) if roles else "(roles unchanged)"
+    print(f"issued web key for {canonical} [{role_str}] — previous key (if any) is now revoked")
+    print()
+    print("  ┌─ COPY NOW — shown once, not recoverable (only its hash is stored) ─")
+    print(f"  │  {raw}")
+    print("  └─ hand to the user over a secure out-of-band channel ─────────────")
+
+
+def _identities_revoke_key_cmd(home: Path, canonical: str) -> None:
+    """Drop a user's web API key (it stops working); roles are left intact."""
+    from ..identities_populator import revoke_web_key
+
+    if revoke_web_key(home, canonical):
+        print(f"revoked web key for {canonical}")
+    else:
+        print(f"(no web key to revoke for {canonical!r})")
+
+
 # ---------------------------------------------------------------------------
 # argparse registration + dispatch
 # ---------------------------------------------------------------------------
@@ -253,6 +282,33 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
         help="Grant both user and admin roles instead of user only.",
     )
 
+    id_issue_p = id_sub.add_parser(
+        "issue-key",
+        help="Mint or rotate a per-user web API key (printed once; only its hash is stored).",
+    )
+    id_issue_p.add_argument("--home", type=Path, default=Path.cwd())
+    id_issue_p.add_argument(
+        "canonical", help="Canonical id to issue the key for (created if new).",
+    )
+    issue_role_group = id_issue_p.add_mutually_exclusive_group()
+    issue_role_group.add_argument(
+        "--admin", action="store_true", help="Grant user+admin roles.",
+    )
+    issue_role_group.add_argument(
+        "--rotate-only",
+        action="store_true",
+        help="Rotate the key without changing the user's existing roles.",
+    )
+
+    id_revoke_p = id_sub.add_parser(
+        "revoke-key",
+        help="Revoke a user's web API key (the key stops working; roles are left intact).",
+    )
+    id_revoke_p.add_argument("--home", type=Path, default=Path.cwd())
+    id_revoke_p.add_argument(
+        "canonical", help="Canonical id whose web key to revoke.",
+    )
+
     return id_p
 
 
@@ -285,6 +341,13 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         elif args.identities_action == "approve-pairing":
             roles = ["user", "admin"] if args.admin else ["user"]
             _identities_approve_pairing_cmd(home, args.identity, roles)
+        elif args.identities_action == "issue-key":
+            roles = None if args.rotate_only else (
+                ["user", "admin"] if args.admin else ["user"]
+            )
+            _identities_issue_key_cmd(home, args.canonical, roles)
+        elif args.identities_action == "revoke-key":
+            _identities_revoke_key_cmd(home, args.canonical)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

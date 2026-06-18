@@ -157,6 +157,14 @@ def first_party_dashboard_extensions(
                 api_namespace="chainlink-board",
             ),
             DashboardExtensionManifest(
+                id="scheduler",
+                route_path="/scheduler",
+                label="Scheduler",
+                icon="calendar-clock",
+                nav_position=37,
+                api_namespace="scheduler",
+            ),
+            DashboardExtensionManifest(
                 id="saga",
                 route_path="/saga",
                 label="SAGA",

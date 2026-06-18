@@ -17,6 +17,10 @@ from mimir.dashboard_extensions import (
 )
 from mimir.chainlink_board import build_chainlink_board_payload
 from mimir import web_ui
+from mimir.commitments.models import CommitmentRecord
+from mimir.commitments.store import CommitmentsStore
+from mimir.pollers import PollerConfig
+from mimir.scheduler import Scheduler, SchedulerJob
 from mimir.web_contracts import (
     render_typescript_contracts,
     validate_api_envelope,
@@ -944,6 +948,129 @@ async def test_api_v1_ops_errors_use_stable_envelope(app):
     assert resp.status == 400
     validate_api_envelope(body, expect_ok=False)
     assert body["error"]["code"] == "invalid_days"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_scheduler_lists_schedules_pollers_and_commitments(tmp_path: Path):
+    async def enqueue(_event):
+        return True
+
+    home = tmp_path / "home"
+    home.mkdir()
+    scheduler_yaml = home / "scheduler.yaml"
+    scheduler = Scheduler(scheduler_yaml, enqueue, home=home)
+    await scheduler.add_job(
+        SchedulerJob(
+            name="morning-review",
+            prompt_file="morning.md",
+            cron="0 8 * * *",
+            channel_id="ops",
+            priority="normal",
+        )
+    )
+    scheduler._pollers["github"] = PollerConfig(  # noqa: SLF001
+        name="github",
+        command="python poller.py",
+        cron="*/5 * * * *",
+        env={
+            "API_KEY": "poller-secret-value",
+            "PUBLIC_URL": "https://user:embedded-token@example.invalid/path",
+            "NESTED": {"PASSWORD": "nested-secret-value"},
+        },  # type: ignore[arg-type]
+        pass_env=("GITHUB_TOKEN", "PUBLIC_FLAG"),
+        env_required=("GITHUB_TOKEN",),
+        skill_dir=home,
+        priority="high",
+    )
+    events_log = tmp_path / "events.jsonl"
+    events_log.write_text(
+        "\n".join([
+            json.dumps({
+                "timestamp": "2026-06-18T08:00:00+00:00",
+                "type": "scheduled_tick",
+                "schedule_name": "morning-review",
+                "channel_id": "ops",
+            }),
+            json.dumps({
+                "timestamp": "2026-06-18T08:01:00+00:00",
+                "type": "scheduled_tick_suppressed",
+                "schedule_name": "morning-review",
+                "reason": "quota_pressure",
+                "severity": "ELEVATED",
+            }),
+            json.dumps({
+                "timestamp": "2026-06-18T08:02:00+00:00",
+                "type": "poller_complete",
+                "poller": "github",
+                "events_emitted": 2,
+                "events_rejected": 0,
+            }),
+        ])
+        + "\n",
+        encoding="utf-8",
+    )
+
+    store = CommitmentsStore(home / ".mimir" / "commitments.jsonl")
+    await store.add(
+        CommitmentRecord(
+            id="c-soon",
+            channel_id="ops",
+            text="Send the scheduler report",
+            due_window_start_unix=60,
+            due_window_end_unix=3600,
+        )
+    )
+
+    a = web.Application()
+    a["scheduler"] = scheduler
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=events_log,
+        home=home,
+        commitments_store=store,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/scheduler?due_window=overdue")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    validate_list_meta(body["meta"])
+    assert body["data"]["schedules"][0]["name"] == "morning-review"
+    assert body["data"]["schedules"][0]["prompt_source"] == "file:morning.md"
+    assert body["data"]["schedules"][0]["suppression_reason"] == "quota_pressure"
+    assert body["data"]["pollers"][0]["name"] == "github"
+    assert body["data"]["pollers"][0]["priority"] == "high"
+    assert body["data"]["pollers"][0]["recent_result"] == "emitted=2 rejected=0"
+    poller = body["data"]["pollers"][0]
+    assert poller["pass_env"] == ["[REDACTED]", "PUBLIC_FLAG"]
+    assert poller["env_required"] == ["[REDACTED]"]
+    assert poller["config"]["env"]["API_KEY"] == "[REDACTED]"
+    assert poller["config"]["env"]["NESTED"]["PASSWORD"] == "[REDACTED]"
+    assert poller["config"]["env"]["PUBLIC_URL"] == "https://[REDACTED]@example.invalid/path"
+    serialized = json.dumps(body)
+    assert "poller-secret-value" not in serialized
+    assert "nested-secret-value" not in serialized
+    assert "embedded-token" not in serialized
+    assert "GITHUB_TOKEN" not in serialized
+    assert body["data"]["commitments"][0]["id"] == "c-soon"
+    assert body["data"]["actions"]["mutations_enabled"] is False
+    assert "trigger" in body["data"]["actions"]["deferred"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_scheduler_rejects_invalid_due_window(app):
+    a, _, _ = app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/scheduler?due_window=never")
+        body = await resp.json()
+
+    assert resp.status == 400
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "invalid_due_window"
 
 
 @pytest.mark.asyncio
