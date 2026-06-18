@@ -1,183 +1,517 @@
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import React from "react";
 import { createRoot } from "react-dom/client";
-import type { ApiEnvelope, WebBootstrapData } from "./api/generated/contracts";
+import {
+  BrowserRouter,
+  Link,
+  Navigate,
+  NavLink,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+  useSearchParams
+} from "react-router-dom";
+import { create } from "zustand";
+import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
+import type { WebBootstrapData } from "./api/generated/contracts";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import {
   Badge,
   Button,
   DashboardHeader,
-  DashboardShell,
   ErrorState,
   LoadingState,
-  NavList,
   Panel,
-  TextInput,
+  TextInput
 } from "./ui";
 import "./styles.css";
 
-type Bootstrap = WebBootstrapData;
+type SurfaceId = "chat" | "turns" | "ops" | "saga" | "memory" | "hermes";
 
-const legacySurfaces = [
-  { href: "/turns", label: "Turns", detail: "Turn viewer" },
-  { href: "/ops", label: "Ops", detail: "Operations dashboard" },
-  { href: "/saga", label: "Saga", detail: "Memory atoms" },
-  { href: "/state", label: "State", detail: "Memory files" }
+interface Surface {
+  id: SurfaceId;
+  path: string;
+  label: string;
+  title: string;
+  detail: string;
+  tabs: string[];
+  filterLabel: string;
+}
+
+const surfaces: Surface[] = [
+  {
+    id: "chat",
+    path: "/chat",
+    label: "Chat",
+    title: "Chat",
+    detail: "Conversation entry point",
+    tabs: ["compose", "history", "context"],
+    filterLabel: "channel"
+  },
+  {
+    id: "turns",
+    path: "/turns",
+    label: "Turn Viewer",
+    title: "Turn Viewer",
+    detail: "Inspect selected turns",
+    tabs: ["summary", "prompt", "events"],
+    filterLabel: "status"
+  },
+  {
+    id: "ops",
+    path: "/ops",
+    label: "Ops",
+    title: "Ops",
+    detail: "Operational overview",
+    tabs: ["overview", "queues", "health"],
+    filterLabel: "scope"
+  },
+  {
+    id: "saga",
+    path: "/saga",
+    label: "SAGA",
+    title: "SAGA",
+    detail: "SAGA session shell",
+    tabs: ["sessions", "atoms", "queries"],
+    filterLabel: "type"
+  },
+  {
+    id: "memory",
+    path: "/memory",
+    label: "State/Memory",
+    title: "State/Memory",
+    detail: "State and memory shell",
+    tabs: ["state", "memory", "files"],
+    filterLabel: "tier"
+  },
+  {
+    id: "hermes",
+    path: "/hermes",
+    label: "Hermes Gaps",
+    title: "Hermes Gaps",
+    detail: "Reserved route for follow-up pages",
+    tabs: ["gaps", "handoffs", "notes"],
+    filterLabel: "owner"
+  }
 ];
 
-const authStorageKey = "mimir.api_key";
+interface UiState {
+  detailsPanelOpen: boolean;
+  collapsedRegions: Record<string, boolean>;
+  setDetailsPanelOpen: (open: boolean) => void;
+  toggleCollapsedRegion: (id: string) => void;
+}
 
-const AuthContext = React.createContext<{
-  bootstrap: Bootstrap | null;
-  apiKeyPresent: boolean;
-  status: "loading" | "ready" | "error";
-  error: string | null;
-  setApiKey: (value: string) => void;
-  clearApiKey: () => void;
-} | null>(null);
+const useUiState = create<UiState>((set) => ({
+  detailsPanelOpen: true,
+  collapsedRegions: {},
+  setDetailsPanelOpen: (detailsPanelOpen) => set({ detailsPanelOpen }),
+  toggleCollapsedRegion: (id) =>
+    set((state) => ({
+      collapsedRegions: {
+        ...state.collapsedRegions,
+        [id]: !state.collapsedRegions[id]
+      }
+    }))
+}));
+
+const queryClient = new QueryClient();
+
+function appBasename() {
+  const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+  return base === "" ? "/" : base;
+}
 
 function readStoredKey() {
   try {
-    return window.localStorage.getItem(authStorageKey) || "";
+    return window.localStorage.getItem(MIMIR_API_KEY_STORAGE_KEY) || "";
   } catch {
     return "";
   }
 }
 
-function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [bootstrap, setBootstrap] = React.useState<Bootstrap | null>(null);
-  const [apiKeyPresent, setApiKeyPresent] = React.useState(Boolean(readStoredKey()));
-  const [status, setStatus] = React.useState<"loading" | "ready" | "error">("loading");
-  const [error, setError] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    fetch("/api/v1/web/bootstrap", { cache: "no-store" })
-      .then((response) => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json() as Promise<ApiEnvelope<Bootstrap>>;
-      })
-      .then((envelope) => {
-        if (!envelope.ok) throw new Error(envelope.error.message);
-        setBootstrap(envelope.data);
-        setStatus("ready");
-      })
-      .catch((err: unknown) => {
-        setError(err instanceof Error ? err.message : String(err));
-        setStatus("error");
+function useBootstrap() {
+  return useQuery({
+    queryKey: ["web-bootstrap"],
+    queryFn: async () => {
+      const envelope = await apiFetchEnvelope<WebBootstrapData>("/api/v1/web/bootstrap", {
+        cache: "no-store"
       });
-  }, []);
-
-  const setApiKey = React.useCallback((value: string) => {
-    const trimmed = value.trim();
-    try {
-      if (trimmed) window.localStorage.setItem(authStorageKey, trimmed);
-      else window.localStorage.removeItem(authStorageKey);
-    } catch {
-      // Storage may be blocked; visible status still reflects this attempt.
+      return envelope.data;
     }
-    setApiKeyPresent(Boolean(trimmed));
-  }, []);
-
-  const clearApiKey = React.useCallback(() => setApiKey(""), [setApiKey]);
-
-  return (
-    <AuthContext.Provider
-      value={{ bootstrap, apiKeyPresent, status, error, setApiKey, clearApiKey }}
-    >
-      {children}
-    </AuthContext.Provider>
-  );
+  });
 }
 
-function useAuth() {
-  const value = React.useContext(AuthContext);
-  if (!value) throw new Error("AuthProvider missing");
-  return value;
-}
-
-function BootstrapRoute() {
-  const { bootstrap, apiKeyPresent, status, error, setApiKey, clearApiKey } = useAuth();
+function AuthPanel() {
+  const { data: bootstrap, error, isError, isLoading } = useBootstrap();
   const [entry, setEntry] = React.useState("");
+  const [apiKeyPresent, setApiKeyPresent] = React.useState(Boolean(readStoredKey()));
   const requiresKey = bootstrap?.auth.required ?? false;
   const signedIn = !requiresKey || apiKeyPresent;
+
+  function setApiKey(value: string) {
+    const trimmed = value.trim();
+    try {
+      if (trimmed) window.localStorage.setItem(MIMIR_API_KEY_STORAGE_KEY, trimmed);
+      else window.localStorage.removeItem(MIMIR_API_KEY_STORAGE_KEY);
+    } catch {
+      // Storage can be blocked by browser policy; the visible state still updates.
+    }
+    setApiKeyPresent(Boolean(trimmed));
+  }
 
   return (
     <Panel
       actions={<Badge tone={signedIn ? "success" : "warning"}>{signedIn ? "ready" : "locked"}</Badge>}
       aria-labelledby="auth-title"
+      className="app-status-card"
       subtitle={
-        status === "loading"
+        isLoading
           ? "Loading server auth policy."
-          : status === "error"
-            ? `Bootstrap failed: ${error}`
+          : isError
+            ? `Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`
             : `${requiresKey ? "Protected" : "Local unauthenticated"} server on ${bootstrap?.server.web_host || "default host"}.`
       }
-      title={<span id="auth-title">{signedIn ? "Ready" : "API key required"}</span>}
+      title={<span id="auth-title">Status</span>}
     >
-      {status === "loading" ? <LoadingState label="Loading auth policy" /> : null}
-      {status === "error" ? <ErrorState title="Bootstrap failed">{error}</ErrorState> : null}
-
-      {status === "ready" ? (
-        <>
-          {requiresKey ? (
-            <form
-              className="auth-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                setApiKey(entry);
-                setEntry("");
-              }}
-            >
-              <TextInput
-                aria-label="MIMIR_API_KEY"
-                autoComplete="off"
-                placeholder={apiKeyPresent ? "Key stored in this browser" : "MIMIR_API_KEY"}
-                type="password"
-                value={entry}
-                onChange={(event) => setEntry(event.target.value)}
-              />
-              <Button type="submit" variant="primary">Save</Button>
-              <Button type="button" onClick={clearApiKey}>Clear</Button>
-            </form>
-          ) : null}
-
-          <dl className="facts-grid">
-            <div><dt>Browser key</dt><dd>{apiKeyPresent ? "stored" : "not stored"}</dd></div>
-            <div><dt>Bind</dt><dd>{bootstrap?.server.public_bind ? "public" : "localhost"}</dd></div>
-            <div><dt>Streams</dt><dd>{bootstrap?.stream_auth.shape || "loading"}</dd></div>
-          </dl>
-        </>
+      {isLoading ? <LoadingState label="Loading auth policy" /> : null}
+      {isError ? (
+        <ErrorState title="Bootstrap failed">
+          {error instanceof Error ? error.message : String(error)}
+        </ErrorState>
+      ) : null}
+      {!isLoading && !isError && requiresKey ? (
+        <form
+          className="auth-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            setApiKey(entry);
+            setEntry("");
+          }}
+        >
+          <TextInput
+            aria-label="MIMIR_API_KEY"
+            autoComplete="off"
+            placeholder={apiKeyPresent ? "Key stored in this browser" : "MIMIR_API_KEY"}
+            type="password"
+            value={entry}
+            onChange={(event) => setEntry(event.target.value)}
+          />
+          <Button type="submit" variant="primary">Save</Button>
+          <Button type="button" onClick={() => setApiKey("")}>Clear</Button>
+        </form>
+      ) : null}
+      {!isLoading && !isError ? (
+        <dl className="facts-grid facts-grid--compact">
+          <div><dt>Browser key</dt><dd>{apiKeyPresent ? "stored" : "not stored"}</dd></div>
+          <div><dt>Bind</dt><dd>{bootstrap?.server.public_bind ? "public" : "localhost"}</dd></div>
+          <div><dt>Streams</dt><dd>{bootstrap?.stream_auth.shape || "loading"}</dd></div>
+        </dl>
       ) : null}
     </Panel>
   );
 }
 
-function DirectoryRoute() {
+function AppNavigation() {
   return (
-    <Panel
-      subtitle="Current operator pages stay on their existing server routes while React surfaces migrate incrementally."
-      title="Operator surfaces"
-    >
-      <NavList label="Existing operator pages" items={legacySurfaces} />
-    </Panel>
+    <nav aria-label="Application sections" className="app-nav">
+      {surfaces.map((surface) => (
+        <NavLink
+          className={({ isActive }) => `app-nav__link${isActive ? " app-nav__link--active" : ""}`}
+          key={surface.id}
+          to={surface.path}
+        >
+          <span>{surface.label}</span>
+          <small>{surface.detail}</small>
+        </NavLink>
+      ))}
+    </nav>
   );
 }
 
-function App() {
+function useRouteState(surface: Surface) {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const activeTab = searchParams.get("tab") || surface.tabs[0];
+  const selectedTurn = searchParams.get("turn") || "";
+  const filter = searchParams.get("filter") || "";
+  const target = searchParams.get("target") || "";
+
+  function update(next: Record<string, string>) {
+    const params = new URLSearchParams(searchParams);
+    Object.entries(next).forEach(([key, value]) => {
+      if (value) params.set(key, value);
+      else params.delete(key);
+    });
+    setSearchParams(params, { replace: false });
+  }
+
+  return { activeTab, selectedTurn, filter, target, update };
+}
+
+function RouteTabs({
+  surface,
+  activeTab
+}: {
+  surface: Surface;
+  activeTab: string;
+}) {
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const tabsRef = React.useRef<Array<HTMLAnchorElement | null>>([]);
+  const panelId = `${surface.id}-${activeTab}-panel`;
+
+  function tabTarget(tab: string) {
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", tab);
+    return { pathname: surface.path, search: `?${params.toString()}` };
+  }
+
+  function moveFocus(nextIndex: number) {
+    const normalized = (nextIndex + surface.tabs.length) % surface.tabs.length;
+    const tab = surface.tabs[normalized];
+    tabsRef.current[normalized]?.focus();
+    navigate(tabTarget(tab));
+  }
+
+  return (
+    <div className="app-tabs">
+      <div aria-label={`${surface.label} tabs`} className="ui-tabs__list" role="tablist">
+        {surface.tabs.map((tab, index) => {
+          const selected = activeTab === tab;
+          return (
+            <Link
+              aria-controls={panelId}
+              aria-selected={selected}
+              className="ui-tabs__tab"
+              id={`${surface.id}-${tab}-tab`}
+              key={tab}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowRight") {
+                  event.preventDefault();
+                  moveFocus(index + 1);
+                } else if (event.key === "ArrowLeft") {
+                  event.preventDefault();
+                  moveFocus(index - 1);
+                } else if (event.key === "Home") {
+                  event.preventDefault();
+                  moveFocus(0);
+                } else if (event.key === "End") {
+                  event.preventDefault();
+                  moveFocus(surface.tabs.length - 1);
+                }
+              }}
+              ref={(node) => {
+                tabsRef.current[index] = node;
+              }}
+              role="tab"
+              tabIndex={selected ? 0 : -1}
+              to={tabTarget(tab)}
+            >
+              {tab}
+            </Link>
+          );
+        })}
+      </div>
+      <section
+        aria-labelledby={`${surface.id}-${activeTab}-tab`}
+        className="ui-tabs__panel app-tab-panel"
+        id={panelId}
+        role="tabpanel"
+        tabIndex={0}
+      >
+        <RoutePlaceholder surface={surface} />
+      </section>
+    </div>
+  );
+}
+
+function UrlStateControls({ surface }: { surface: Surface }) {
+  const { selectedTurn, filter, target, update } = useRouteState(surface);
+
+  return (
+    <form
+      className="route-state-form"
+      key={`${surface.id}:${selectedTurn}:${filter}:${target}`}
+      onSubmit={(event) => {
+        event.preventDefault();
+        const form = new FormData(event.currentTarget);
+        update({
+          turn: String(form.get("turn") || ""),
+          filter: String(form.get("filter") || ""),
+          target: String(form.get("target") || "")
+        });
+      }}
+    >
+      <label>
+        <span>Turn</span>
+        <TextInput defaultValue={selectedTurn} name="turn" placeholder="turn id" />
+      </label>
+      <label>
+        <span>{surface.filterLabel}</span>
+        <TextInput defaultValue={filter} name="filter" placeholder="filter" />
+      </label>
+      <label>
+        <span>Target</span>
+        <TextInput defaultValue={target} name="target" placeholder="drilldown target" />
+      </label>
+      <div className="route-state-form__actions">
+        <Button type="submit" variant="primary">Apply</Button>
+        <Button type="button" onClick={() => update({ turn: "", filter: "", target: "" })}>
+          Clear
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+function CollapsibleRegion({
+  id,
+  title,
+  children
+}: {
+  id: string;
+  title: string;
+  children: React.ReactNode;
+}) {
+  const collapsed = useUiState((state) => state.collapsedRegions[id] ?? false);
+  const toggle = useUiState((state) => state.toggleCollapsedRegion);
+  const contentId = `${id}-content`;
+
+  return (
+    <section className="collapsible-region">
+      <button
+        aria-controls={contentId}
+        aria-expanded={!collapsed}
+        className="collapsible-region__button"
+        onClick={() => toggle(id)}
+        type="button"
+      >
+        <span>{title}</span>
+        <span aria-hidden="true">{collapsed ? "+" : "-"}</span>
+      </button>
+      <div hidden={collapsed} id={contentId}>
+        {children}
+      </div>
+    </section>
+  );
+}
+
+function RoutePlaceholder({ surface }: { surface: Surface }) {
+  const { activeTab, selectedTurn, filter, target } = useRouteState(surface);
+
+  return (
+    <div className="route-placeholder">
+      <p>
+        {surface.title} route frame is mounted. Dashboard-specific content is intentionally deferred to its page issue.
+      </p>
+      <dl className="facts-grid">
+        <div><dt>Active tab</dt><dd>{activeTab}</dd></div>
+        <div><dt>Selected turn</dt><dd>{selectedTurn || "none"}</dd></div>
+        <div><dt>Filter</dt><dd>{filter || "none"}</dd></div>
+        <div><dt>Target</dt><dd>{target || "none"}</dd></div>
+      </dl>
+    </div>
+  );
+}
+
+function SurfaceRoute({ surface }: { surface: Surface }) {
+  const { activeTab } = useRouteState(surface);
+  const normalizedTab = surface.tabs.includes(activeTab) ? activeTab : surface.tabs[0];
+  const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
+  const setDetailsPanelOpen = useUiState((state) => state.setDetailsPanelOpen);
+
+  return (
+    <>
+      <DashboardHeader eyebrow="Route shell" title={surface.title}>
+        <p>{surface.detail}</p>
+      </DashboardHeader>
+      <div className="content-layout">
+        <section aria-label={`${surface.label} main content`} className="content-layout__main">
+          <Panel
+            actions={
+              <Button
+                aria-expanded={detailsPanelOpen}
+                aria-controls="details-panel-host"
+                onClick={() => setDetailsPanelOpen(!detailsPanelOpen)}
+              >
+                Details
+              </Button>
+            }
+            title="Navigation state"
+            subtitle="Tab, filter, selected turn, and drilldown target are encoded in the URL."
+          >
+            <UrlStateControls surface={surface} />
+          </Panel>
+
+          <Panel title={`${surface.label} tabs`}>
+            <RouteTabs surface={surface} activeTab={normalizedTab} />
+          </Panel>
+
+          <CollapsibleRegion id={`${surface.id}-notes`} title="Route contract">
+            <p className="app-copy">
+              This shell owns layout, navigation, and shareable route state only. Page parity, live transport,
+              graph polish, and reusable primitive expansion remain outside this issue.
+            </p>
+          </CollapsibleRegion>
+        </section>
+        <aside
+          aria-label="Details panel"
+          className="content-layout__details"
+          hidden={!detailsPanelOpen}
+          id="details-panel-host"
+        >
+          <Panel title="Details host" subtitle="Reserved for route-owned drilldown panels.">
+            <RoutePlaceholder surface={surface} />
+          </Panel>
+        </aside>
+      </div>
+    </>
+  );
+}
+
+function AppStatus() {
+  const location = useLocation();
+  return (
+    <footer aria-live="polite" className="app-status">
+      <span>Route</span>
+      <code>{location.pathname}{location.search}</code>
+    </footer>
+  );
+}
+
+function AppFrame() {
   const { skin } = useSkin();
 
   return (
-    <DashboardShell>
-      <DashboardHeader eyebrow={skin.name} title="Mimir App">
-        <p>
-          Central browser bootstrap for operator auth and migrated web surfaces.
-        </p>
-      </DashboardHeader>
-
-      <div className="route-grid">
-        <BootstrapRoute />
-        <DirectoryRoute />
+    <div className="app-frame">
+      <header className="app-chrome">
+        <div>
+          <p className="ui-eyebrow">{skin.name}</p>
+          <Link className="app-brand" to="/chat">Mimir App</Link>
+        </div>
+        <AuthPanel />
+      </header>
+      <div className="app-body">
+        <aside className="app-sidebar">
+          <AppNavigation />
+        </aside>
+        <main className="app-main" id="main-content">
+          <Routes>
+            <Route element={<Navigate replace to="/chat" />} path="/" />
+            {surfaces.map((surface) => (
+              <Route
+                element={<SurfaceRoute surface={surface} />}
+                key={surface.id}
+                path={surface.path}
+              />
+            ))}
+            <Route element={<Navigate replace to="/chat" />} path="*" />
+          </Routes>
+        </main>
       </div>
-    </DashboardShell>
+      <AppStatus />
+    </div>
   );
 }
 
@@ -188,10 +522,12 @@ if (!root) {
 
 createRoot(root).render(
   <React.StrictMode>
-    <AuthProvider>
+    <QueryClientProvider client={queryClient}>
       <SkinProvider>
-        <App />
+        <BrowserRouter basename={appBasename()}>
+          <AppFrame />
+        </BrowserRouter>
       </SkinProvider>
-    </AuthProvider>
+    </QueryClientProvider>
   </React.StrictMode>
 );
