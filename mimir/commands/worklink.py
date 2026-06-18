@@ -12,7 +12,12 @@ import sys
 import yaml
 
 from ..worklink.docker_broker import DockerBrokerPolicy, DockerBrokerPolicyError, run_broker
-from ..worklink.orchestrator import LeafValidationError, WorklinkError, run_worklink
+from ..worklink.orchestrator import (
+    LeafValidationError,
+    WorklinkError,
+    run_worklink,
+    run_worklink_reattach,
+)
 from ..worklink.worker import payload_from_json, run_worker_payload
 
 
@@ -50,6 +55,16 @@ def add_argparse(
         help=(
             "Base branch to cut the worktree from and target the PR at "
             "(overrides worklink.yaml defaults.base_branch; default: main)."
+        ),
+    )
+    run_p.add_argument(
+        "--reattach",
+        action="store_true",
+        help=(
+            "Resume an in-flight run after a controller restart (#561): wait on "
+            "the persisted worker handle, harvest evidence, and open the PR "
+            "instead of re-claiming and re-running from scratch. Used by the "
+            "startup reconcile; no-op (exit 1) if no run state exists for the issue."
         ),
     )
     run_p.add_argument(
@@ -153,16 +168,19 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         # deterministic Chainlink/git state transition.
         pass
     try:
-        result = run_worklink(
-            home=home,
-            repo=repo,
-            issue_id=args.issue_id,
-            backend=args.backend,
-            dry_run=args.dry_run,
-            test_command=args.test_command,
-            base_branch=args.base,
-            autonomous=args.autonomous,
-        )
+        if args.reattach:
+            result = run_worklink_reattach(home=home, repo=repo, issue_id=args.issue_id)
+        else:
+            result = run_worklink(
+                home=home,
+                repo=repo,
+                issue_id=args.issue_id,
+                backend=args.backend,
+                dry_run=args.dry_run,
+                test_command=args.test_command,
+                base_branch=args.base,
+                autonomous=args.autonomous,
+            )
     except LeafValidationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
