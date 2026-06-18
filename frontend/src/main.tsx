@@ -16,6 +16,7 @@ import { create } from "zustand";
 import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
 import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
+import { SagaDashboard } from "./SagaDashboard";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import {
   Badge,
@@ -357,6 +358,10 @@ function SurfaceRoute({ surface }: { surface: DashboardSurface }) {
   const normalizedTab = surface.tabs.includes(activeTab) ? activeTab : surface.tabs[0];
   const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
   const setDetailsPanelOpen = useUiState((state) => state.setDetailsPanelOpen);
+
+  if (surface.id === "saga") {
+    return <SagaDashboard />;
+  }
 
   return (
     <>

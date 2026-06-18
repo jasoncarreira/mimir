@@ -59,6 +59,46 @@ export type SagaSqlResponse = SagaSqlData & {
   error?: string;
 };
 
+const SQL_ALLOWED_FIRST_WORDS = new Set(["SELECT", "EXPLAIN", "WITH"]);
+const SQL_WRITE_KEYWORDS_RE = /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|ATTACH|DETACH|PRAGMA)\b/i;
+
+function positiveInteger(value: number | undefined, fallback: number, max: number) {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(Math.floor(value), max));
+}
+
+export function validateSagaAtomId(id: string): string {
+  const trimmed = id.trim();
+  if (!trimmed) {
+    throw new Error("Atom ID is required.");
+  }
+  return trimmed;
+}
+
+export function validateSagaSearchQuery(query: string): string {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    throw new Error("Search query is required.");
+  }
+  return trimmed;
+}
+
+export function validateSagaSql(sql: string): string {
+  const trimmed = sql.trim();
+  if (!trimmed) {
+    throw new Error("SQL statement is required.");
+  }
+  const firstWord = trimmed.split(/\s+/, 1)[0]?.toUpperCase();
+  if (!SQL_ALLOWED_FIRST_WORDS.has(firstWord)) {
+    throw new Error("Only SELECT, EXPLAIN, and WITH queries are allowed.");
+  }
+  const writeKeyword = SQL_WRITE_KEYWORDS_RE.exec(trimmed);
+  if (writeKeyword) {
+    throw new Error(`Write keyword ${writeKeyword[1].toUpperCase()} is not allowed.`);
+  }
+  return trimmed;
+}
+
 export function getSagaStats(
   options?: ApiClientOptions
 ): Promise<ApiSuccessEnvelope<SagaStatsData>> {
@@ -70,7 +110,11 @@ export function listSagaAtoms(
   options?: ApiClientOptions
 ): Promise<ApiSuccessEnvelope<SagaRecentData, ListMeta>> {
   return apiFetchEnvelope<SagaRecentData, ListMeta>(
-    `/api/v1/saga${buildQuery({ view: "recent", ...params })}`,
+    `/api/v1/saga${buildQuery({
+      view: "recent",
+      channel: params.channel?.trim(),
+      limit: positiveInteger(params.limit, 50, 200)
+    })}`,
     options
   );
 }
@@ -80,7 +124,7 @@ export function getSagaAtom(
   options?: ApiClientOptions
 ): Promise<ApiSuccessEnvelope<SagaAtomDetailData>> {
   return apiFetchEnvelope<SagaAtomDetailData>(
-    `/api/v1/saga${buildQuery({ view: "atom", id })}`,
+    `/api/v1/saga${buildQuery({ view: "atom", id: validateSagaAtomId(id) })}`,
     options
   );
 }
@@ -90,7 +134,12 @@ export function searchSagaAtoms(
   options?: ApiClientOptions
 ): Promise<ApiSuccessEnvelope<SagaSearchData, ListMeta>> {
   return apiFetchEnvelope<SagaSearchData, ListMeta>(
-    `/api/v1/saga${buildQuery({ view: "search", ...params })}`,
+    `/api/v1/saga${buildQuery({
+      view: "search",
+      q: validateSagaSearchQuery(params.q),
+      channel: params.channel?.trim(),
+      limit: positiveInteger(params.limit, 100, 100)
+    })}`,
     options
   );
 }
@@ -100,7 +149,10 @@ export function getSagaActivationHistogram(
   options?: ApiClientOptions
 ): Promise<ApiSuccessEnvelope<SagaActivationHistData, ListMeta>> {
   return apiFetchEnvelope<SagaActivationHistData, ListMeta>(
-    `/api/v1/saga${buildQuery({ view: "activation_hist", ...params })}`,
+    `/api/v1/saga${buildQuery({
+      view: "activation_hist",
+      days: positiveInteger(params.days, 7, 365)
+    })}`,
     options
   );
 }
@@ -110,7 +162,10 @@ export function getSagaClusters(
   options?: ApiClientOptions
 ): Promise<ApiSuccessEnvelope<SagaClustersData, ListMeta>> {
   return apiFetchEnvelope<SagaClustersData, ListMeta>(
-    `/api/v1/saga${buildQuery({ view: "clusters", ...params })}`,
+    `/api/v1/saga${buildQuery({
+      view: "clusters",
+      sample_size: positiveInteger(params.sample_size, 3, 20)
+    })}`,
     options
   );
 }
@@ -125,6 +180,6 @@ export function runSagaSql(
     ...options,
     method: "POST",
     headers,
-    body: JSON.stringify({ sql })
+    body: JSON.stringify({ sql: validateSagaSql(sql) })
   });
 }
