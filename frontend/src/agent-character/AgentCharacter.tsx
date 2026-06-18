@@ -39,10 +39,8 @@ function DotLottiePlayer({
     const player = playerRef.current;
     if (!player) return;
     player.addEventListener("loadError", onFallback);
-    player.addEventListener("renderError", onFallback);
     return () => {
       player.removeEventListener("loadError", onFallback);
-      player.removeEventListener("renderError", onFallback);
     };
   }, [onFallback]);
 
@@ -51,7 +49,6 @@ function DotLottiePlayer({
     autoplay: true,
     class: "agent-character__player",
     loop: true,
-    onError: onFallback,
     ref: playerRef,
     role: "img",
     src: href

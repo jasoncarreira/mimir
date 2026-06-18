@@ -13,14 +13,13 @@ import {
   useSearchParams
 } from "react-router-dom";
 import { create } from "zustand";
-import {
-  AgentCharacter,
-  characterStateFromLiveEvent
-} from "./agent-character";
+import { AgentCharacter, characterStateFromLiveEvent } from "./agent-character";
 import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
 import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { LiveEventsProvider, useLiveEvents } from "./live-events";
+import { OpsRoute } from "./routes/OpsRoute";
+import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import {
   Badge,
@@ -358,6 +357,10 @@ function RoutePlaceholder({ surface }: { surface: DashboardSurface }) {
 }
 
 function SurfaceRoute({ surface }: { surface: DashboardSurface }) {
+  if (surface.id === "state-memory") {
+    return <StateMemoryRoute surface={surface} />;
+  }
+
   const { activeTab } = useRouteState(surface);
   const normalizedTab = surface.tabs.includes(activeTab) ? activeTab : surface.tabs[0];
   const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
@@ -462,7 +465,7 @@ function AppFrame() {
               <Route element={<Navigate replace to={firstRoute} />} path="/" />
               {surfaces.map((surface) => (
                 <Route
-                  element={<SurfaceRoute surface={surface} />}
+                  element={surface.id === "ops" ? <OpsRoute /> : <SurfaceRoute surface={surface} />}
                   key={surface.id}
                   path={surface.path}
                 />

@@ -633,6 +633,116 @@ async def test_disabled_backend_namespace_manifest_skips_ops_api(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_api_v1_memory_tree_search_and_file_detail(tmp_path: Path):
+    home = tmp_path / "home"
+    memory = home / "memory"
+    state = home / "state"
+    memory.mkdir(parents=True)
+    state.mkdir(parents=True)
+    (memory / "INDEX.md").write_text("<!-- desc: Memory index -->\n# Memory\n")
+    topics = memory / "topics"
+    topics.mkdir()
+    (topics / "alpha.md").write_text("<!-- desc: Alpha topic -->\nAlpha memory note\n")
+    wiki = state / "wiki"
+    wiki.mkdir()
+    (wiki / "alpha.md").write_text("# Alpha state\nSearchable alpha state note\n")
+
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        tree_resp = await client.get("/api/v1/memory?view=tree")
+        tree_body = await tree_resp.json()
+        search_resp = await client.get("/api/v1/memory?view=search&q=alpha")
+        search_body = await search_resp.json()
+        file_resp = await client.get("/api/v1/memory?view=file&path=state/wiki/alpha.md")
+        file_body = await file_resp.json()
+
+    assert tree_resp.status == 200
+    validate_api_envelope(tree_body, expect_ok=True)
+    assert [child["name"] for child in tree_body["data"]["children"]] == [
+        "memory",
+        "state",
+    ]
+
+    def _find_path(node: dict, path: str) -> dict | None:
+        if node.get("path") == path:
+            return node
+        for child in node.get("children", []):
+            found = _find_path(child, path)
+            if found is not None:
+                return found
+        return None
+
+    alpha_node = _find_path(tree_body["data"], "memory/topics/alpha.md")
+    assert alpha_node is not None
+    assert alpha_node["desc"] == "Alpha topic"
+
+    assert search_resp.status == 200
+    validate_api_envelope(search_body, expect_ok=True)
+    validate_list_meta(search_body["meta"])
+    hit_paths = {hit["path"] for hit in search_body["data"]["hits"]}
+    assert {"memory/topics/alpha.md", "state/wiki/alpha.md"} <= hit_paths
+    assert search_body["meta"]["total"] >= 2
+
+    assert file_resp.status == 200
+    validate_api_envelope(file_body, expect_ok=True)
+    assert file_body["data"]["path"] == "state/wiki/alpha.md"
+    assert "Searchable alpha state note" in file_body["data"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_memory_file_errors_are_enveloped(tmp_path: Path):
+    home = tmp_path / "home"
+    (home / "memory").mkdir(parents=True)
+    (home / "state").mkdir(parents=True)
+    (home / "state" / "note.txt").write_text("not markdown\n")
+
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        missing_path = await client.get("/api/v1/memory?view=file")
+        non_md = await client.get("/api/v1/memory?view=file&path=state/note.txt")
+        missing_file = await client.get("/api/v1/memory?view=file&path=state/missing.md")
+        missing_query = await client.get("/api/v1/memory?view=search")
+
+        missing_path_body = await missing_path.json()
+        non_md_body = await non_md.json()
+        missing_file_body = await missing_file.json()
+        missing_query_body = await missing_query.json()
+
+    assert missing_path.status == 400
+    validate_api_envelope(missing_path_body, expect_ok=False)
+    assert missing_path_body["error"]["code"] == "missing_path"
+
+    assert non_md.status == 400
+    validate_api_envelope(non_md_body, expect_ok=False)
+    assert non_md_body["error"]["code"] == "memory_file_error"
+    assert "only .md" in non_md_body["error"]["message"]
+
+    assert missing_file.status == 404
+    validate_api_envelope(missing_file_body, expect_ok=False)
+    assert "not found" in missing_file_body["error"]["message"]
+
+    assert missing_query.status == 400
+    validate_api_envelope(missing_query_body, expect_ok=False)
+    assert missing_query_body["error"]["code"] == "missing_query"
+
+
+@pytest.mark.asyncio
 async def test_api_v1_web_bootstrap_auth_exempt_with_middleware(tmp_path: Path):
     from mimir.server import _make_auth_middleware
 
