@@ -333,6 +333,20 @@ def _is_auth_exempt(method: str, path: str) -> bool:
     )
 
 
+# Route prefixes that require the ``admin`` role (server-side RBAC boundary,
+# github #726). Any method on these paths is admin-only — config/model/env
+# admin (#543), scheduler/poller/commitments admin (#544), and the user/key
+# management endpoints all live under ``/api/v1/admin/``. This is the SECURITY
+# gate; React section-hiding is UX only and must never be the sole control.
+_ADMIN_REQUIRED_PREFIXES: tuple[str, ...] = (
+    "/api/v1/admin/",
+)
+
+
+def _is_admin_required(path: str) -> bool:
+    return any(path.startswith(prefix) for prefix in _ADMIN_REQUIRED_PREFIXES)
+
+
 def _make_auth_middleware(expected_key: str):
     """Build an aiohttp middleware that gates every non-exempt route on
     a matching ``X-API-Key`` header.
@@ -354,18 +368,48 @@ def _make_auth_middleware(expected_key: str):
       ad hoc shape the next author picked).
     """
     async def _auth_middleware(request: web.Request, handler):
-        if not expected_key:
-            # No key configured → no auth. Dev / localhost-only path.
-            return await handler(request)
-
         if _is_auth_exempt(request.method, request.path):
             return await handler(request)
 
-        provided = request.headers.get("X-API-Key", "")
+        # Per-user resolution reads the live resolver from the app (constructed
+        # after this middleware; populated by request time). github #726.
+        resolver = request.app.get("identity_resolver")
 
-        if not provided or not _safe_str_eq(provided, expected_key):
+        # The gate activates when EITHER a master key is set OR per-user web
+        # keys exist — so configuring users can't leave the server open even if
+        # MIMIR_API_KEY is unset. Neither → legacy dev/open path (no identity,
+        # no RBAC), preserving localhost behavior. Shared with /web/bootstrap
+        # (web_ui.web_gate_active) so the browser's reported auth state can't
+        # drift from what's enforced here (#770 review).
+        if not web_ui.web_gate_active(expected_key, resolver):
+            return await handler(request)
+
+        provided = request.headers.get("X-API-Key", "")
+        identity = None
+        is_master = False
+        if expected_key and provided and _safe_str_eq(provided, expected_key):
+            # Admin master key (MIMIR_API_KEY): admin for admin/automation
+            # routes, but NOT a chat/user identity (enforced per-route).
+            is_master = True
+        elif resolver is not None and provided:
+            identity = resolver.resolve_web_key(provided)
+
+        authorized = is_master or (
+            identity is not None and identity.access.is_authorized
+        )
+        if not authorized:
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        is_admin = is_master or (identity is not None and identity.access.is_admin)
+        # Attach the resolved identity for downstream handlers (web-chat
+        # attribution, /whoami). ``auth_identity`` is None for the master key.
+        request["auth_identity"] = identity
+        request["auth_is_master"] = is_master
+        request["auth_is_admin"] = is_admin
+
+        if _is_admin_required(request.path) and not is_admin:
             return web.json_response(
-                {"error": "unauthorized"}, status=401,
+                {"error": "forbidden", "detail": "admin role required"}, status=403,
             )
         return await handler(request)
 

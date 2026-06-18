@@ -170,12 +170,35 @@ class WebChatBridge(Bridge):
             return None, None, web.json_response(
                 {"error": "extra must be an object"}, status=400
             )
+
+        # Trusted attribution (github #726): when the auth middleware resolved a
+        # per-user identity, the author comes from the AUTHENTICATED key, not the
+        # client body (which is spoofable). The admin master key is NOT a chat
+        # identity — reject it so every chat message is attributable to a real
+        # person. Dev/open mode (no key configured) keeps the legacy
+        # client-asserted author.
+        identity = request.get("auth_identity")
+        if request.get("auth_is_master"):
+            return None, None, web.json_response(
+                {
+                    "error": "master_key_not_chat_identity",
+                    "detail": "the admin master key cannot post chat; use a per-user key",
+                },
+                status=403,
+            )
+        if identity is not None:
+            author = identity.display_name or identity.canonical
+            author_id = identity.canonical
+        else:
+            author = body.get("author")
+            author_id = body.get("author_id")
+
         event = AgentEvent(
             trigger="user_message",
             channel_id=channel_id,
             content=content,
-            author=body.get("author"),
-            author_id=body.get("author_id"),
+            author=author,
+            author_id=author_id,
             source_id=body.get("msg_id") or uuid.uuid4().hex[:12],
             source="web",
             extra=extra or {},

@@ -38,15 +38,17 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import secrets
 import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal, Sequence
 
 import yaml
 
-from .event_logger import log_event
+from .event_logger import log_event, log_event_sync
+from .identities import WEB_KEY_ALIAS_PREFIX, hash_web_key
 
 log = logging.getLogger(__name__)
 
@@ -187,6 +189,97 @@ def _atomic_write_identities(yaml_path: Path, header: str, doc: dict) -> None:
         except OSError:
             pass
         raise
+
+
+def _default_web_key() -> str:
+    """A URL-safe random web API key (~256 bits). Shown once, never stored raw."""
+    return secrets.token_urlsafe(32)
+
+
+@_serialized_identities_write
+def issue_web_key(
+    home: Path,
+    canonical: str,
+    *,
+    roles: Sequence[str] | None = None,
+    key_factory: Callable[[], str] | None = None,
+) -> str:
+    """Mint (or rotate) a per-user web API key for ``canonical`` and return the
+    RAW key — the only moment it is ever recoverable. The caller shows it once
+    and distributes it out-of-band; only ``webkey:<sha256>`` is persisted.
+
+    Rotation-safe: any existing ``webkey:`` alias on the person is dropped
+    first, so re-issuing immediately invalidates the prior key. Creates the
+    person entry if absent. ``roles`` (e.g. ``["user"]`` / ``["admin"]``), when
+    given, sets ``access.roles`` so a fresh user is usable in one step; omit to
+    leave existing access untouched. Atomic + header-preserving."""
+    raw_key = (key_factory or _default_web_key)()
+    alias = hash_web_key(raw_key)
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+    people = doc.get("people")
+    if not isinstance(people, list):
+        people = []
+        doc["people"] = people
+    entry = _find_person(people, canonical)
+    if entry is None:
+        entry = {"canonical": canonical, "aliases": []}
+        people.append(entry)
+    aliases = entry.get("aliases")
+    if not isinstance(aliases, list):
+        aliases = []
+        entry["aliases"] = aliases
+    # Drop any prior web key (rotate): the old key stops resolving immediately.
+    aliases[:] = [
+        a for a in aliases
+        if not (isinstance(a, str) and a.startswith(WEB_KEY_ALIAS_PREFIX))
+    ]
+    aliases.append(alias)
+    if roles is not None:
+        entry["access"] = {"roles": [str(role) for role in roles]}
+    _atomic_write_identities(yaml_path, header, doc)
+    try:
+        log_event_sync(
+            "identity_web_key_issued",
+            canonical=canonical,
+            roles=list(roles) if roles is not None else None,
+            rotated=True,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never fail a key operation
+        pass
+    return raw_key
+
+
+@_serialized_identities_write
+def revoke_web_key(home: Path, canonical: str) -> bool:
+    """Drop ``canonical``'s web key alias so the key stops resolving.
+
+    Returns True if a key was removed, False if the person is unknown or had
+    none. Access roles are left intact (revoke a key ≠ deauthorize the person)."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+    people = doc.get("people")
+    if not isinstance(people, list):
+        return False
+    entry = _find_person(people, canonical)
+    if entry is None:
+        return False
+    aliases = entry.get("aliases")
+    if not isinstance(aliases, list):
+        return False
+    before = len(aliases)
+    aliases[:] = [
+        a for a in aliases
+        if not (isinstance(a, str) and a.startswith(WEB_KEY_ALIAS_PREFIX))
+    ]
+    if len(aliases) == before:
+        return False
+    _atomic_write_identities(yaml_path, header, doc)
+    try:
+        log_event_sync("identity_web_key_revoked", canonical=canonical)
+    except Exception:  # noqa: BLE001 — telemetry must never fail a key operation
+        pass
+    return True
 
 
 @_serialized_identities_write
