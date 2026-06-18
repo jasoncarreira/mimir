@@ -1067,6 +1067,21 @@ textarea {
   gap: var(--mimir-space-md, 16px);
 }
 
+.admin-config {
+  margin-top: var(--mimir-space-xl, 32px);
+}
+
+.admin-config__split {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: var(--mimir-space-md, 16px);
+}
+
+.admin-config__split h3 {
+  margin: 0 0 var(--mimir-space-sm, 12px);
+  font-size: var(--mimir-font-size-md, 1rem);
+}
+
 .ops-resolution-grid,
 .ops-backlog-list {
   display: grid;

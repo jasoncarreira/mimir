@@ -319,6 +319,81 @@ export interface OpsDashboardData {
   token_usage_history: unknown[];
 }
 
+export interface AdminConfigFieldSchema {
+  name: string;
+  type: string;
+  mutable: boolean;
+}
+
+export interface AdminConfigSchemaSection {
+  id: string;
+  label: string;
+  mutable: boolean;
+  fields: AdminConfigFieldSchema[];
+}
+
+export interface AdminConfigEnvItem {
+  name: string;
+  category: string;
+  present: boolean;
+  secret: boolean;
+  value: string | null;
+  mutable: boolean;
+}
+
+export interface AdminConfigScheduleItem {
+  name: string;
+  kind: string;
+  cron?: string | null;
+  time_of_day?: string | null;
+  channel_id?: string | null;
+  deliver?: string | null;
+  priority?: string | null;
+  mutable: boolean;
+}
+
+export interface AdminConfigPollerItem {
+  name: string;
+  cron: string;
+  priority: string;
+  batch_size?: number;
+  recover_failed_turns?: boolean;
+  mutable: boolean;
+  [key: string]: unknown;
+}
+
+export interface AdminConfigData {
+  generated_at: string;
+  model: {
+    model_spec: string;
+    provider_prefix: string;
+    model: string;
+    provider: string;
+    anthropic_base_url_present: boolean;
+    context_window: string;
+    context_1m_enabled: boolean;
+    resource_window: {
+      billing_mode: string;
+      usage_block_enabled: boolean;
+      capture_rate_limits: boolean;
+      max_output_tokens: number | null;
+    };
+  };
+  schema_sections: AdminConfigSchemaSection[];
+  schedules: AdminConfigScheduleItem[];
+  pollers: AdminConfigPollerItem[];
+  env: AdminConfigEnvItem[];
+  raw_config: JsonObject;
+  mutation_policy: {
+    mode: "read_only_v1";
+    mutable_fields: string[];
+    reveal_secret_values: false;
+    reveal_path: string | null;
+    edit_path: string | null;
+    rate_limited: boolean;
+  };
+}
+
 export interface MemoryTreeDir {
   name: string;
   type: "dir";

@@ -9,6 +9,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from mimir.config import Config
 from mimir.dashboard_extensions import (
     DashboardExtensionManifest,
     first_party_dashboard_extensions,
@@ -766,6 +767,71 @@ async def test_api_v1_web_bootstrap_auth_exempt_with_middleware(tmp_path: Path):
     assert resp.status == 200
     validate_api_envelope(body, expect_ok=True)
     assert body["data"]["auth"]["required"] is True
+
+
+@pytest.mark.asyncio
+async def test_api_v1_admin_config_requires_auth_and_redacts_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.server import _make_auth_middleware
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:MiniMax-M2.7")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-admin-config-secret")
+    monkeypatch.setenv("MIMIR_API_KEY", "admin-route-secret")
+    config = Config.from_env()
+
+    (tmp_path / "scheduler.yaml").write_text(
+        "- name: heartbeat\n"
+        "  prompt: Check status.\n"
+        "  cron: '0 * * * *'\n"
+        "  channel_id: null\n",
+        encoding="utf-8",
+    )
+
+    a = web.Application(middlewares=[_make_auth_middleware("admin-route-secret")])
+    a["api_key"] = "admin-route-secret"
+    a["config"] = config
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        home=tmp_path,
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        denied = await client.get("/api/v1/admin/config")
+        allowed = await client.get(
+            "/api/v1/admin/config",
+            headers={"X-API-Key": "admin-route-secret"},
+        )
+        body = await allowed.json()
+
+    assert denied.status == 401
+    assert allowed.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    data = body["data"]
+    assert data["model"]["model_spec"] == "anthropic:MiniMax-M2.7"
+    assert data["model"]["provider"] == "minimax"
+    assert data["model"]["context_window"] == "1m beta"
+    assert data["schedules"][0]["name"] == "heartbeat"
+    assert data["mutation_policy"] == {
+        "mode": "read_only_v1",
+        "mutable_fields": [],
+        "reveal_secret_values": False,
+        "reveal_path": None,
+        "edit_path": None,
+        "rate_limited": True,
+    }
+
+    env_by_name = {row["name"]: row for row in data["env"]}
+    assert env_by_name["ANTHROPIC_API_KEY"]["present"] is True
+    assert env_by_name["ANTHROPIC_API_KEY"]["secret"] is True
+    assert env_by_name["ANTHROPIC_API_KEY"]["value"] == "[REDACTED]"
+    assert "sk-ant-admin-config-secret" not in json.dumps(data)
+    assert data["raw_config"]["anthropic_api_key"] == "[REDACTED]"
 
 
 @pytest.mark.asyncio
