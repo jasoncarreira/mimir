@@ -433,6 +433,19 @@ export interface SagaSqlData {
   rejected?: boolean;
 }
 
+export interface DashboardExtensionManifest {
+  id: string;
+  route_path: string;
+  label: string;
+  icon: string | null;
+  nav_position: number;
+  enabled: boolean;
+  bundle: string | null;
+  css: string[];
+  api_namespace: string | null;
+  trusted_first_party: true;
+}
+
 export interface WebBootstrapData {
   auth: {
     required: boolean;
@@ -449,6 +462,7 @@ export interface WebBootstrapData {
     header: "X-API-Key";
     native_eventsource_supported_when_auth_required: false;
   };
+  dashboard_extensions: DashboardExtensionManifest[];
 }
 
 export interface ChatPostRequest {

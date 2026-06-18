@@ -15,6 +15,7 @@ import {
 import { create } from "zustand";
 import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
 import type { WebBootstrapData } from "./api/generated/contracts";
+import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import {
   Badge,
@@ -27,74 +28,6 @@ import {
 } from "./ui";
 import "./styles.css";
 
-type SurfaceId = "chat" | "turns" | "ops" | "saga" | "memory" | "hermes";
-
-interface Surface {
-  id: SurfaceId;
-  path: string;
-  label: string;
-  title: string;
-  detail: string;
-  tabs: string[];
-  filterLabel: string;
-}
-
-const surfaces: Surface[] = [
-  {
-    id: "chat",
-    path: "/chat",
-    label: "Chat",
-    title: "Chat",
-    detail: "Conversation entry point",
-    tabs: ["compose", "history", "context"],
-    filterLabel: "channel"
-  },
-  {
-    id: "turns",
-    path: "/turns",
-    label: "Turn Viewer",
-    title: "Turn Viewer",
-    detail: "Inspect selected turns",
-    tabs: ["summary", "prompt", "events"],
-    filterLabel: "status"
-  },
-  {
-    id: "ops",
-    path: "/ops",
-    label: "Ops",
-    title: "Ops",
-    detail: "Operational overview",
-    tabs: ["overview", "queues", "health"],
-    filterLabel: "scope"
-  },
-  {
-    id: "saga",
-    path: "/saga",
-    label: "SAGA",
-    title: "SAGA",
-    detail: "SAGA session shell",
-    tabs: ["sessions", "atoms", "queries"],
-    filterLabel: "type"
-  },
-  {
-    id: "memory",
-    path: "/memory",
-    label: "State/Memory",
-    title: "State/Memory",
-    detail: "State and memory shell",
-    tabs: ["state", "memory", "files"],
-    filterLabel: "tier"
-  },
-  {
-    id: "hermes",
-    path: "/hermes",
-    label: "Hermes Gaps",
-    title: "Hermes Gaps",
-    detail: "Reserved route for follow-up pages",
-    tabs: ["gaps", "handoffs", "notes"],
-    filterLabel: "owner"
-  }
-];
 
 interface UiState {
   detailsPanelOpen: boolean;
@@ -143,8 +76,12 @@ function useBootstrap() {
   });
 }
 
-function AuthPanel() {
-  const { data: bootstrap, error, isError, isLoading } = useBootstrap();
+function AuthPanel({ bootstrap, error, isError, isLoading }: {
+  bootstrap?: WebBootstrapData;
+  error: Error | null;
+  isError: boolean;
+  isLoading: boolean;
+}) {
   const [entry, setEntry] = React.useState("");
   const [apiKeyPresent, setApiKeyPresent] = React.useState(Boolean(readStoredKey()));
   const requiresKey = bootstrap?.auth.required ?? false;
@@ -213,7 +150,7 @@ function AuthPanel() {
   );
 }
 
-function AppNavigation() {
+function AppNavigation({ surfaces }: { surfaces: DashboardSurface[] }) {
   return (
     <nav aria-label="Application sections" className="app-nav">
       {surfaces.map((surface) => (
@@ -230,7 +167,7 @@ function AppNavigation() {
   );
 }
 
-function useRouteState(surface: Surface) {
+function useRouteState(surface: DashboardSurface) {
   const [searchParams, setSearchParams] = useSearchParams();
   const activeTab = searchParams.get("tab") || surface.tabs[0];
   const selectedTurn = searchParams.get("turn") || "";
@@ -253,7 +190,7 @@ function RouteTabs({
   surface,
   activeTab
 }: {
-  surface: Surface;
+  surface: DashboardSurface;
   activeTab: string;
 }) {
   const [searchParams] = useSearchParams();
@@ -326,7 +263,7 @@ function RouteTabs({
   );
 }
 
-function UrlStateControls({ surface }: { surface: Surface }) {
+function UrlStateControls({ surface }: { surface: DashboardSurface }) {
   const { selectedTurn, filter, target, update } = useRouteState(surface);
 
   return (
@@ -397,7 +334,7 @@ function CollapsibleRegion({
   );
 }
 
-function RoutePlaceholder({ surface }: { surface: Surface }) {
+function RoutePlaceholder({ surface }: { surface: DashboardSurface }) {
   const { activeTab, selectedTurn, filter, target } = useRouteState(surface);
 
   return (
@@ -415,7 +352,7 @@ function RoutePlaceholder({ surface }: { surface: Surface }) {
   );
 }
 
-function SurfaceRoute({ surface }: { surface: Surface }) {
+function SurfaceRoute({ surface }: { surface: DashboardSurface }) {
   const { activeTab } = useRouteState(surface);
   const normalizedTab = surface.tabs.includes(activeTab) ? activeTab : surface.tabs[0];
   const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
@@ -482,6 +419,12 @@ function AppStatus() {
 
 function AppFrame() {
   const { skin } = useSkin();
+  const { data: bootstrap, error, isError, isLoading } = useBootstrap();
+  const surfaces = React.useMemo(
+    () => (bootstrap ? getDashboardSurfaces(bootstrap.dashboard_extensions) : []),
+    [bootstrap]
+  );
+  const firstRoute = surfaces[0]?.path ?? "/chat";
 
   return (
     <div className="app-frame">
@@ -490,24 +433,32 @@ function AppFrame() {
           <p className="ui-eyebrow">{skin.name}</p>
           <Link className="app-brand" to="/chat">Mimir App</Link>
         </div>
-        <AuthPanel />
+        <AuthPanel bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
       </header>
       <div className="app-body">
         <aside className="app-sidebar">
-          <AppNavigation />
+          <AppNavigation surfaces={surfaces} />
         </aside>
         <main className="app-main" id="main-content">
-          <Routes>
-            <Route element={<Navigate replace to="/chat" />} path="/" />
-            {surfaces.map((surface) => (
-              <Route
-                element={<SurfaceRoute surface={surface} />}
-                key={surface.id}
-                path={surface.path}
-              />
-            ))}
-            <Route element={<Navigate replace to="/chat" />} path="*" />
-          </Routes>
+          {isLoading ? <LoadingState label="Loading dashboard extensions" /> : null}
+          {isError ? (
+            <ErrorState title="Bootstrap failed">
+              {error instanceof Error ? error.message : String(error)}
+            </ErrorState>
+          ) : null}
+          {!isLoading && !isError ? (
+            <Routes>
+              <Route element={<Navigate replace to={firstRoute} />} path="/" />
+              {surfaces.map((surface) => (
+                <Route
+                  element={<SurfaceRoute surface={surface} />}
+                  key={surface.id}
+                  path={surface.path}
+                />
+              ))}
+              <Route element={<Navigate replace to={firstRoute} />} path="*" />
+            </Routes>
+          ) : null}
         </main>
       </div>
       <AppStatus />

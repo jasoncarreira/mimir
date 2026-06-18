@@ -80,6 +80,13 @@ coalesce invalidation instead of calling `invalidateQueries` for every event.
 interface so the frontend does not need to add TanStack Query before pages are
 cut over.
 
+## Dashboard Extensions
+
+`GET /api/v1/web/bootstrap` includes `dashboard_extensions`, the enabled
+first-party dashboard manifest list. This is trusted metadata for navigation and
+debugging, not a remote plugin loader. The manifest schema and security boundary
+are documented in `docs/react-dashboard-extensions.md`.
+
 ## Versioning
 
 `/api/v1/*` may add optional fields without a version bump. Removing fields,
