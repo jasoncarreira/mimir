@@ -13,7 +13,19 @@ import {
   useSearchParams
 } from "react-router-dom";
 import { create } from "zustand";
-import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
+import {
+  ApiError,
+  apiFetchEnvelope,
+  getMemoryFile,
+  getMemoryTree,
+  MIMIR_API_KEY_STORAGE_KEY,
+  searchMemoryFiles,
+  type MemoryFileData,
+  type MemorySearchHit,
+  type MemoryTreeDir,
+  type MemoryTreeFile,
+  type MemoryTreeNode
+} from "./api";
 import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
@@ -352,7 +364,276 @@ function RoutePlaceholder({ surface }: { surface: DashboardSurface }) {
   );
 }
 
+function sourceLayerForPath(path: string) {
+  if (path.startsWith("state/")) return "state";
+  if (path.startsWith("memory/core/")) return "core memory";
+  if (path.startsWith("memory/")) return "non-core memory";
+  return "unknown";
+}
+
+function flattenFiles(node: MemoryTreeNode): MemoryTreeFile[] {
+  if (node.type === "file") return [node];
+  return node.children.flatMap(flattenFiles);
+}
+
+function fmtBytes(value: number) {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function fmtTimestamp(value?: string) {
+  if (!value) return "unknown";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.valueOf())) return value;
+  return parsed.toISOString().replace("T", " ").slice(0, 19) + "Z";
+}
+
+function ApiErrorBlock({ error, title }: { error: unknown; title: string }) {
+  let detail = error instanceof Error ? error.message : String(error);
+  if (error instanceof ApiError && error.body && typeof error.body === "object") {
+    const body = error.body as { error?: { code?: string; message?: string } };
+    if (body.error?.code) detail = `${body.error.code}: ${body.error.message ?? detail}`;
+  }
+  return <ErrorState title={title}>{detail}</ErrorState>;
+}
+
+function TreeNodeView({
+  node,
+  selectedPath,
+  onSelect
+}: {
+  node: MemoryTreeNode;
+  selectedPath: string;
+  onSelect: (path: string) => void;
+}) {
+  const defaultOpen = (
+    node.path === ""
+    || node.path === "memory"
+    || node.path === "state"
+    || node.path === "memory/core"
+  );
+  const [open, setOpen] = React.useState(defaultOpen);
+
+  if (node.type === "file") {
+    return (
+      <button
+        className={`memory-browser__file${selectedPath === node.path ? " memory-browser__file--selected" : ""}`}
+        onClick={() => onSelect(node.path)}
+        type="button"
+      >
+        <span>{node.name}</span>
+        {node.desc ? <small>{node.desc}</small> : null}
+      </button>
+    );
+  }
+
+  return (
+    <div className="memory-browser__node">
+      {node.path ? (
+        <button
+          aria-expanded={open}
+          className="memory-browser__dir"
+          onClick={() => setOpen(!open)}
+          type="button"
+        >
+          <span aria-hidden="true">{open ? "v" : ">"}</span>
+          <span>{node.name}</span>
+        </button>
+      ) : null}
+      <div className="memory-browser__children" hidden={!open}>
+        {node.children.map((child) => (
+          <TreeNodeView
+            key={child.path}
+            node={child}
+            onSelect={onSelect}
+            selectedPath={selectedPath}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SearchResults({
+  hits,
+  onSelect
+}: {
+  hits: MemorySearchHit[];
+  onSelect: (path: string) => void;
+}) {
+  if (!hits.length) return <p className="memory-browser__muted">No matching files.</p>;
+  return (
+    <div className="memory-browser__search-results">
+      {hits.map((hit) => (
+        <button
+          className="memory-browser__hit"
+          key={`${hit.path}:${hit.line_no}:${hit.snippet}`}
+          onClick={() => onSelect(hit.path)}
+          type="button"
+        >
+          <span>{hit.path}:{hit.line_no}</span>
+          <small>{hit.snippet}</small>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function FileDetail({ path }: { path: string }) {
+  const fileQuery = useQuery({
+    enabled: Boolean(path),
+    queryKey: ["memory-file", path],
+    queryFn: async () => (await getMemoryFile(path)).data
+  });
+  const file = fileQuery.data as MemoryFileData | undefined;
+  const desc = React.useMemo(() => {
+    const firstLine = file?.content.split(/\r?\n/, 1)[0] ?? "";
+    const match = firstLine.match(/^<!--\s*desc:\s*(.*?)\s*-->$/i);
+    return match?.[1] ?? "";
+  }, [file?.content]);
+
+  if (!path) {
+    return <LoadingState label="Select a state or memory file" />;
+  }
+  if (fileQuery.isLoading) return <LoadingState label="Loading file" />;
+  if (fileQuery.isError) return <ApiErrorBlock error={fileQuery.error} title="File load failed" />;
+  if (!file) return <ErrorState title="File unavailable">No file payload was returned.</ErrorState>;
+
+  return (
+    <article className="memory-detail">
+      <header className="memory-detail__header">
+        <div>
+          <p className="ui-eyebrow">{sourceLayerForPath(file.path)}</p>
+          <h2>{file.path}</h2>
+          {desc ? <p>{desc}</p> : null}
+        </div>
+        <Badge tone="info">{fmtBytes(file.size)}</Badge>
+      </header>
+      <dl className="facts-grid facts-grid--compact">
+        <div><dt>Path</dt><dd>{file.path}</dd></div>
+        <div><dt>Layer</dt><dd>{sourceLayerForPath(file.path)}</dd></div>
+        <div><dt>Modified</dt><dd>{fmtTimestamp(file.modified)}</dd></div>
+      </dl>
+      <pre className="memory-detail__content">{file.content}</pre>
+    </article>
+  );
+}
+
+function StateMemoryRoute({ surface }: { surface: DashboardSurface }) {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [query, setQuery] = React.useState(searchParams.get("q") || "");
+  const selectedPath = searchParams.get("path") || "";
+  const treeQuery = useQuery({
+    queryKey: ["memory-tree"],
+    queryFn: async () => (await getMemoryTree()).data
+  });
+  const searchQuery = useQuery({
+    enabled: query.trim().length > 0,
+    queryKey: ["memory-search", query.trim()],
+    queryFn: async () => searchMemoryFiles(query.trim())
+  });
+  const tree = treeQuery.data as MemoryTreeDir | undefined;
+  const files = React.useMemo(() => (tree ? flattenFiles(tree) : []), [tree]);
+  const stateCount = files.filter((file) => file.path.startsWith("state/")).length;
+  const memoryCount = files.filter((file) => file.path.startsWith("memory/")).length;
+
+  function selectPath(path: string) {
+    const params = new URLSearchParams(searchParams);
+    params.set("path", path);
+    if (query.trim()) params.set("q", query.trim());
+    else params.delete("q");
+    setSearchParams(params);
+  }
+
+  function submitSearch(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const params = new URLSearchParams(searchParams);
+    if (query.trim()) params.set("q", query.trim());
+    else params.delete("q");
+    setSearchParams(params);
+  }
+
+  React.useEffect(() => {
+    if (!selectedPath && files.length) {
+      const preferred = files.find((file) => file.path === "memory/INDEX.md") ?? files[0];
+      selectPath(preferred.path);
+    }
+  }, [files, selectedPath]);
+
+  const searchEnvelope = searchQuery.data;
+
+  return (
+    <>
+      <DashboardHeader eyebrow="State and memory" title={surface.title}>
+        <p>Browse searchable markdown files exposed by the existing state/memory endpoints.</p>
+      </DashboardHeader>
+      <div className="memory-browser">
+        <Panel
+          className="memory-browser__sidebar"
+          subtitle="Known state/ files and non-core memory/ files are searchable; core memory is shown read-only when exposed by the tree."
+          title="Files"
+        >
+          <form className="memory-browser__search" onSubmit={submitSearch}>
+            <TextInput
+              aria-label="Search state and memory files"
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search files"
+              type="search"
+              value={query}
+            />
+            <Button type="submit" variant="primary">Search</Button>
+            <Button
+              type="button"
+              onClick={() => {
+                setQuery("");
+                const params = new URLSearchParams(searchParams);
+                params.delete("q");
+                setSearchParams(params);
+              }}
+            >
+              Clear
+            </Button>
+          </form>
+          <dl className="memory-browser__counts">
+            <div><dt>State</dt><dd>{stateCount}</dd></div>
+            <div><dt>Memory</dt><dd>{memoryCount}</dd></div>
+          </dl>
+          {treeQuery.isLoading ? <LoadingState label="Loading file tree" /> : null}
+          {treeQuery.isError ? <ApiErrorBlock error={treeQuery.error} title="Tree load failed" /> : null}
+          {query.trim() ? (
+            <section className="memory-browser__results" aria-label="Search results">
+              {searchQuery.isLoading ? <LoadingState label="Searching files" /> : null}
+              {searchQuery.isError ? <ApiErrorBlock error={searchQuery.error} title="Search failed" /> : null}
+              {searchEnvelope ? (
+                <>
+                  <p className="memory-browser__muted">
+                    {searchEnvelope.meta?.total ?? searchEnvelope.data.hits.length} result(s)
+                    {searchEnvelope.meta?.truncated ? " (truncated)" : ""}
+                  </p>
+                  <SearchResults hits={searchEnvelope.data.hits} onSelect={selectPath} />
+                </>
+              ) : null}
+            </section>
+          ) : tree ? (
+            <nav aria-label="State and memory file tree" className="memory-browser__tree">
+              <TreeNodeView node={tree} onSelect={selectPath} selectedPath={selectedPath} />
+            </nav>
+          ) : null}
+        </Panel>
+        <Panel className="memory-browser__detail" title="Detail">
+          <FileDetail path={selectedPath} />
+        </Panel>
+      </div>
+    </>
+  );
+}
+
 function SurfaceRoute({ surface }: { surface: DashboardSurface }) {
+  if (surface.id === "state-memory") {
+    return <StateMemoryRoute surface={surface} />;
+  }
+
   const { activeTab } = useRouteState(surface);
   const normalizedTab = surface.tabs.includes(activeTab) ? activeTab : surface.tabs[0];
   const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
