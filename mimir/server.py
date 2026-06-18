@@ -509,6 +509,66 @@ async def _handle_consolidate(request: web.Request) -> web.Response:
     return web.json_response(result or {})
 
 
+def reattach_inflight_worklink_runs(
+    home: Path,
+    *,
+    popen: Any = None,
+) -> list[int]:
+    """Startup reconcile (#561): resume Worklink runs orphaned by a restart.
+
+    A container restart kills the detached ``mimir worklink run`` controllers but
+    NOT the docker-sibling/ecs worker containers they launched. For each persisted
+    run state, spawn a detached ``mimir worklink run <id> --reattach`` that waits
+    on the surviving worker, harvests evidence, and opens the PR — instead of
+    orphaning the compute and waiting for the TTL reaper to re-run from scratch.
+
+    Gated on ``WORKLINK_REPO`` (the same env the ready-queue poller needs); no-op
+    on non-Worklink homes. Best-effort and non-blocking: each resume runs
+    detached so a long worker wait never delays startup; a spawn failure for one
+    leaf is logged and the rest still proceed."""
+    import shlex
+    import subprocess
+
+    from .worklink.run_state import list_run_states, reattach_dispatch_argv
+
+    spawn = popen or subprocess.Popen
+    repo = os.environ.get("WORKLINK_REPO")
+    if not repo:
+        return []
+    states = list_run_states(home)
+    if not states:
+        return []
+    run_bin = shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir")
+    state_dir = home / "state" / "worklink" / "runs"
+    dispatched: list[int] = []
+    for state in states:
+        argv = reattach_dispatch_argv(run_bin, home, repo, state.issue_id)
+        log_path = state_dir / f"reattach-{state.issue_id}.log"
+        try:
+            log_fh: Any = log_path.open("ab")
+        except OSError:
+            log_fh = subprocess.DEVNULL
+        try:
+            spawn(
+                argv,
+                cwd=repo,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=log_fh,
+                start_new_session=True,  # detach: survive this startup + outlive it
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        finally:
+            if log_fh not in (subprocess.DEVNULL, None):
+                try:
+                    log_fh.close()
+                except OSError:
+                    pass
+        dispatched.append(state.issue_id)
+    return dispatched
+
+
 def build_app(config: Config) -> web.Application:
     # 10MB body cap (aiohttp default is 1MB). Mimir takes JSON-only bodies on
     # /event and /chat — long bluesky transcripts and seed payloads can run
@@ -1155,6 +1215,18 @@ def build_app(config: Config) -> web.Application:
             )
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc), job="worklink-reaper")
+
+        # Resume Worklink runs orphaned by a restart (#561). The detached
+        # controllers died with the old container, but the docker-sibling/ecs
+        # workers they launched survive; reattach to them (wait + harvest + open
+        # the PR) instead of orphaning the compute and waiting for the reaper.
+        # Best-effort + non-blocking (each resume runs detached).
+        try:
+            resumed = reattach_inflight_worklink_runs(config.home)
+            if resumed:
+                await log_event("worklink_reattach_dispatched", issues=resumed)
+        except Exception as exc:  # noqa: BLE001 — startup reconcile must never abort boot
+            await log_event("worklink_reattach_dispatch_failed", error=str(exc))
 
         # Register the weekly viability report (SPEC §16 follow-up
         # from the 2026-05-23 VSM eval — collapse detection + curation

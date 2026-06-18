@@ -13,12 +13,13 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import warnings
 from typing import Any, Callable, Mapping, Sequence
 
 from .backends import BackendRegistry, WorkOrder, WorklinkConfig
-from .compute import ComputeLaunchError, ComputeResult
+from .compute import ComputeLaunchError, ComputeResult, LaunchHandle
 from .claims import ChainlinkClaims
 from .evidence import (
     EvidenceValidation,
@@ -33,6 +34,12 @@ from .planning import (
     render_decompose_prompt,
     suggested_test_command,
     uses_strict_leaf_validation,
+)
+from .run_state import (
+    WorklinkRunState,
+    clear_run_state,
+    load_run_state,
+    save_run_state,
 )
 from .worktree import WorktreeLease, cleanup_worktree, create_isolated_checkout, create_worktree
 
@@ -374,6 +381,24 @@ class WorklinkRunner:
             handle = None
             try:
                 handle = await compute.launch(spec)
+                # #561: persist the worker handle so a fresh controller can
+                # reattach after a container restart. Only substrates that survive
+                # a controller disconnect (docker_sibling/ecs) are recoverable;
+                # local_subprocess work dies with us, so nothing is persisted.
+                if compute.capabilities().persistent_after_disconnect:
+                    _persist_run_state(
+                        self.home,
+                        issue=issue,
+                        attempt=record.attempt,
+                        backend_name=selected_name,
+                        compute=compute,
+                        handle=handle,
+                        lease=lease,
+                        repo=self.repo,
+                        repo_url=repo_url,
+                        test_command=test_cmd,
+                        started_at=started,
+                    )
                 compute_result = await compute.wait(handle, spec.timeout_s)
             except ComputeLaunchError as exc:
                 compute_result = ComputeResult(
@@ -385,169 +410,21 @@ class WorklinkRunner:
             finally:
                 if handle is not None:
                     await compute.cleanup(handle)
-            raw = await backend.interpret(order, compute_result)
-            remote_gate = not compute.capabilities().shared_filesystem
-            pr_url = None
-            if remote_gate:
-                validation = observe_remote_evidence(
-                    issue=issue.issue_id,
-                    attempt=record.attempt,
-                    backend=selected_name,
-                    branch=lease.branch,
-                    worktree=lease.path,
-                    started_at=started,
-                    base_ref=lease.base_ref,
-                    backend_status=raw.backend_status,
-                    test_command=test_cmd,
-                    transcript=str(raw.transcript_path) if raw.transcript_path else None,
-                    blocked_reason=raw.blocked_reason,
-                    runner=runner,
-                )
-                # chainlink #538: remote runs can't run the worker's (untrusted)
-                # branch on the controller, so observe_remote_evidence stubs tests
-                # observed=false → the gate fails closed. When the run COMPLETED and
-                # the re-derived diff is real, run a fresh sandboxed test job on the
-                # pushed branch and fold its exit code in (controller-orchestrated;
-                # exit-code is the trust channel). Gate on backend_completed so we
-                # don't re-test (or launder into review-ready) a run that already
-                # failed/blocked but left a partial diff. A launch/timeout failure
-                # leaves tests unobserved (still fail-closed).
-                if (
-                    test_cmd
-                    and backend_completed(raw.backend_status)
-                    and validation.evidence.diff_observed
-                    and validation.evidence.files_changed
-                ):
-                    test_exit = await _run_remote_test_job(
-                        compute, spec, timeout_s=config.defaults.timeout_s
-                    )
-                    if test_exit is not None:
-                        validation = fold_remote_test_evidence(
-                            validation, test_cmd, test_exit, backend_status=raw.backend_status
-                        )
-                evidence_path = _write_evidence(self.home, validation.evidence)
-                if validation.review_ready:
-                    pr_url = _open_pr(
-                        self.repo,
-                        issue,
-                        lease.branch,
-                        validation.evidence,
-                        base=lease.base_ref,
-                        runner=runner,
-                    )
-                    validation = _with_pr_url(validation, pr_url)
-                    evidence_path = _write_evidence(self.home, validation.evidence)
-            else:
-                validation = observe_evidence(
-                    issue=issue.issue_id,
-                    attempt=record.attempt,
-                    backend=selected_name,
-                    branch=lease.branch,
-                    worktree=lease.path,
-                    started_at=started,
-                    base_ref=lease.local_base or lease.base_ref,
-                    backend_status=raw.backend_status,
-                    test_command=test_cmd,
-                    transcript=str(raw.transcript_path) if raw.transcript_path else None,
-                    blocked_reason=raw.blocked_reason,
-                    runner=runner,
-                )
-                validation = _with_outside_worktree_detection(
-                    validation,
-                    issue=issue.issue_id,
-                    attempt=record.attempt,
-                    root=self.repo,
-                    worktree=lease.path,
-                    runner=runner,
-                    root_dirty_before=root_dirty_before,
-                )
-                evidence_path = _write_evidence(self.home, validation.evidence)
-                if validation.review_ready:
-                    _commit_worktree_changes(lease.path, issue, runner=runner)
-                    try:
-                        _ensure_clean_worktree(lease.path, runner=runner)
-                    except WorklinkError as exc:
-                        validation = _failed_validation(validation, str(exc))
-                    else:
-                        validation = observe_evidence(
-                            issue=issue.issue_id,
-                            attempt=record.attempt,
-                            backend=selected_name,
-                            branch=lease.branch,
-                            worktree=lease.path,
-                            started_at=started,
-                            base_ref=lease.local_base or lease.base_ref,
-                            backend_status=raw.backend_status,
-                            test_command=test_cmd,
-                            transcript=str(raw.transcript_path) if raw.transcript_path else None,
-                            blocked_reason=raw.blocked_reason,
-                            runner=runner,
-                        )
-                        validation = _with_outside_worktree_detection(
-                            validation,
-                            issue=issue.issue_id,
-                            attempt=record.attempt,
-                            root=self.repo,
-                            worktree=lease.path,
-                            runner=runner,
-                            root_dirty_before=root_dirty_before,
-                        )
-                    evidence_path = _write_evidence(self.home, validation.evidence)
-                if validation.review_ready:
-                    # chainlink #518: push from the checkout that OWNS the attempt
-                    # branch, not the parent repo. With the isolated-checkout shape
-                    # (#517) the branch + its commit live only inside ``lease.path``
-                    # (its own .git, with ``origin`` already pointed at the real
-                    # remote); pushing from ``self.repo`` fails with
-                    # "src refspec <branch> does not match any". This is also correct
-                    # for the legacy worktree shape, which shares the parent's refs.
-                    _git_push(lease.path, lease.branch, runner=runner)
-                    pr_url = _open_pr(
-                        self.repo,
-                        issue,
-                        lease.branch,
-                        validation.evidence,
-                        base=lease.base_ref,
-                        runner=runner,
-                    )
-                    validation = _with_pr_url(validation, pr_url)
-                    evidence_path = _write_evidence(self.home, validation.evidence)
-            _comment_evidence(claims, validation.evidence, validation, evidence_path)
-            _log_event(
-                "worklink_evidence",
-                issue_id=issue.issue_id,
+            return await self._finalize(
+                issue=issue,
+                claims=claims,
                 attempt=record.attempt,
-                status=validation.status,
-                review_ready=validation.review_ready,
-                reasons=list(validation.reasons),
-            )
-            claims.transition_issue(
-                issue.issue_id,
-                status=validation.status,
-                review_ready=validation.review_ready,
-                attempt=record.attempt,
-                reason=validation.evidence.blocked_reason
-                if validation.status == "blocked"
-                else (", ".join(validation.reasons) if validation.reasons else None),
-            )
-            _log_event(
-                "worklink_transition",
-                issue_id=issue.issue_id,
-                attempt=record.attempt,
-                status=validation.status,
-                review_ready=validation.review_ready,
-                pr_url=pr_url,
-            )
-            cleanup_worktree(lease, outcome=validation.status, runner=_list_runner(runner))
-            return WorklinkRunResult(
-                issue.issue_id,
-                record.attempt,
-                validation.status,
-                review_ready=validation.review_ready,
-                pr_url=pr_url,
-                evidence_path=evidence_path,
-                worktree=lease.path,
-                branch=lease.branch,
+                config=config,
+                backend=backend,
+                compute=compute,
+                compute_result=compute_result,
+                order=order,
+                lease=lease,
+                spec=spec,
+                started=started,
+                test_cmd=test_cmd,
+                root_dirty_before=root_dirty_before,
+                runner=runner,
             )
         except Exception as exc:
             try:
@@ -577,6 +454,361 @@ class WorklinkRunner:
             )
         finally:
             claims.release_issue(issue.issue_id)
+            # The run reached a terminal transition (or failed): the worker no
+            # longer needs reattaching. A process killed BEFORE here leaves the
+            # state file in place for the startup reconcile.
+            clear_run_state(self.home, issue.issue_id)
+
+    async def _finalize(
+        self,
+        *,
+        issue: IssueContext,
+        claims: ChainlinkClaims,
+        attempt: int,
+        config: WorklinkConfig,
+        backend: Any,
+        compute: Any,
+        compute_result: ComputeResult,
+        order: WorkOrder,
+        lease: WorktreeLease,
+        spec: Any,
+        started: datetime,
+        test_cmd: str | None,
+        root_dirty_before: Sequence[str],
+        runner: Runner,
+    ) -> WorklinkRunResult:
+        """Post-launch pipeline: interpret the worker result, observe evidence,
+        open the PR on a passing gate, then transition + clean up.
+
+        Extracted so both a fresh ``run`` and a post-restart ``reattach`` share
+        the identical evidence/PR/transition path — the only difference between
+        them is how ``compute_result`` was obtained (launch+wait vs. wait on a
+        persisted handle)."""
+        selected_name = backend.name
+        raw = await backend.interpret(order, compute_result)
+        remote_gate = not compute.capabilities().shared_filesystem
+        pr_url = None
+        if remote_gate:
+            validation = observe_remote_evidence(
+                issue=issue.issue_id,
+                attempt=attempt,
+                backend=selected_name,
+                branch=lease.branch,
+                worktree=lease.path,
+                started_at=started,
+                base_ref=lease.base_ref,
+                backend_status=raw.backend_status,
+                test_command=test_cmd,
+                transcript=str(raw.transcript_path) if raw.transcript_path else None,
+                blocked_reason=raw.blocked_reason,
+                runner=runner,
+            )
+            # chainlink #538: remote runs can't run the worker's (untrusted)
+            # branch on the controller, so observe_remote_evidence stubs tests
+            # observed=false → the gate fails closed. When the run COMPLETED and
+            # the re-derived diff is real, run a fresh sandboxed test job on the
+            # pushed branch and fold its exit code in (controller-orchestrated;
+            # exit-code is the trust channel). Gate on backend_completed so we
+            # don't re-test (or launder into review-ready) a run that already
+            # failed/blocked but left a partial diff. A launch/timeout failure
+            # leaves tests unobserved (still fail-closed).
+            if (
+                test_cmd
+                and backend_completed(raw.backend_status)
+                and validation.evidence.diff_observed
+                and validation.evidence.files_changed
+            ):
+                test_exit = await _run_remote_test_job(
+                    compute, spec, timeout_s=config.defaults.timeout_s
+                )
+                if test_exit is not None:
+                    validation = fold_remote_test_evidence(
+                        validation, test_cmd, test_exit, backend_status=raw.backend_status
+                    )
+            evidence_path = _write_evidence(self.home, validation.evidence)
+            if validation.review_ready:
+                pr_url = _open_pr(
+                    self.repo,
+                    issue,
+                    lease.branch,
+                    validation.evidence,
+                    base=lease.base_ref,
+                    runner=runner,
+                )
+                validation = _with_pr_url(validation, pr_url)
+                evidence_path = _write_evidence(self.home, validation.evidence)
+        else:
+            validation = observe_evidence(
+                issue=issue.issue_id,
+                attempt=attempt,
+                backend=selected_name,
+                branch=lease.branch,
+                worktree=lease.path,
+                started_at=started,
+                base_ref=lease.local_base or lease.base_ref,
+                backend_status=raw.backend_status,
+                test_command=test_cmd,
+                transcript=str(raw.transcript_path) if raw.transcript_path else None,
+                blocked_reason=raw.blocked_reason,
+                runner=runner,
+            )
+            validation = _with_outside_worktree_detection(
+                validation,
+                issue=issue.issue_id,
+                attempt=attempt,
+                root=self.repo,
+                worktree=lease.path,
+                runner=runner,
+                root_dirty_before=root_dirty_before,
+            )
+            evidence_path = _write_evidence(self.home, validation.evidence)
+            if validation.review_ready:
+                _commit_worktree_changes(lease.path, issue, runner=runner)
+                try:
+                    _ensure_clean_worktree(lease.path, runner=runner)
+                except WorklinkError as exc:
+                    validation = _failed_validation(validation, str(exc))
+                else:
+                    validation = observe_evidence(
+                        issue=issue.issue_id,
+                        attempt=attempt,
+                        backend=selected_name,
+                        branch=lease.branch,
+                        worktree=lease.path,
+                        started_at=started,
+                        base_ref=lease.local_base or lease.base_ref,
+                        backend_status=raw.backend_status,
+                        test_command=test_cmd,
+                        transcript=str(raw.transcript_path) if raw.transcript_path else None,
+                        blocked_reason=raw.blocked_reason,
+                        runner=runner,
+                    )
+                    validation = _with_outside_worktree_detection(
+                        validation,
+                        issue=issue.issue_id,
+                        attempt=attempt,
+                        root=self.repo,
+                        worktree=lease.path,
+                        runner=runner,
+                        root_dirty_before=root_dirty_before,
+                    )
+                evidence_path = _write_evidence(self.home, validation.evidence)
+            if validation.review_ready:
+                # chainlink #518: push from the checkout that OWNS the attempt
+                # branch, not the parent repo. With the isolated-checkout shape
+                # (#517) the branch + its commit live only inside ``lease.path``
+                # (its own .git, with ``origin`` already pointed at the real
+                # remote); pushing from ``self.repo`` fails with
+                # "src refspec <branch> does not match any". This is also correct
+                # for the legacy worktree shape, which shares the parent's refs.
+                _git_push(lease.path, lease.branch, runner=runner)
+                pr_url = _open_pr(
+                    self.repo,
+                    issue,
+                    lease.branch,
+                    validation.evidence,
+                    base=lease.base_ref,
+                    runner=runner,
+                )
+                validation = _with_pr_url(validation, pr_url)
+                evidence_path = _write_evidence(self.home, validation.evidence)
+        _comment_evidence(claims, validation.evidence, validation, evidence_path)
+        _log_event(
+            "worklink_evidence",
+            issue_id=issue.issue_id,
+            attempt=attempt,
+            status=validation.status,
+            review_ready=validation.review_ready,
+            reasons=list(validation.reasons),
+        )
+        claims.transition_issue(
+            issue.issue_id,
+            status=validation.status,
+            review_ready=validation.review_ready,
+            attempt=attempt,
+            reason=validation.evidence.blocked_reason
+            if validation.status == "blocked"
+            else (", ".join(validation.reasons) if validation.reasons else None),
+        )
+        _log_event(
+            "worklink_transition",
+            issue_id=issue.issue_id,
+            attempt=attempt,
+            status=validation.status,
+            review_ready=validation.review_ready,
+            pr_url=pr_url,
+        )
+        cleanup_worktree(lease, outcome=validation.status, runner=_list_runner(runner))
+        return WorklinkRunResult(
+            issue.issue_id,
+            attempt,
+            validation.status,
+            review_ready=validation.review_ready,
+            pr_url=pr_url,
+            evidence_path=evidence_path,
+            worktree=lease.path,
+            branch=lease.branch,
+        )
+
+    async def reattach(self, issue_id: int) -> WorklinkRunResult:
+        """Resume an in-flight run after a controller restart (#561).
+
+        The worker (a docker-sibling/ecs container/task) survives the restart;
+        the persisted handle lets a fresh controller wait on it, harvest evidence
+        from the pushed branch, and open the PR — instead of orphaning the work
+        and waiting for the TTL reaper to re-run it from scratch.
+
+        Safe to lose: if the worker is unrecoverable (broker also restarted, job
+        gone), we transition the leaf off ``in-progress`` so the ready queue
+        re-dispatches it immediately rather than leaving it stuck. The chainlink
+        lock + ``in-progress`` label survive the restart, so this never re-claims
+        or bumps the attempt — it finishes the attempt already underway."""
+        state = load_run_state(self.home, issue_id)
+        if state is None:
+            return WorklinkRunResult(issue_id, None, "failed", reason="reattach: no run state")
+
+        runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
+        claims = ChainlinkClaims(
+            chainlink_bin=self.chainlink_bin,
+            agent_id=self.agent_id,
+            runner=_list_runner(runner),
+        )
+        # Only resume a leaf still in-progress. If the reaper already recovered it
+        # (or a prior run transitioned it) the work is no longer ours to finish —
+        # drop the stale state and stop. ``_issue_has_label`` fails open (assume
+        # in-progress) when labels can't be read, so a transient read error
+        # doesn't strand the worker.
+        if not claims._issue_has_label(issue_id, "worklink:in-progress"):  # noqa: SLF001
+            _log_event("worklink_reattach_skipped", issue_id=issue_id, reason="not_in_progress")
+            clear_run_state(self.home, issue_id)
+            return WorklinkRunResult(
+                issue_id, state.attempt, "failed", reason="reattach: leaf no longer in-progress"
+            )
+
+        config = WorklinkConfig.load(self.home / "worklink.yaml")
+        registry = self.registry or BackendRegistry(config)
+        try:
+            backend = registry.get(state.backend)
+            compute = registry.get_compute(state.compute_name)
+        except (KeyError, ValueError) as exc:
+            _log_event("worklink_reattach_failed", issue_id=issue_id, reason=str(exc))
+            clear_run_state(self.home, issue_id)
+            return WorklinkRunResult(issue_id, state.attempt, "failed", reason=f"reattach: {exc}")
+        if not compute.capabilities().persistent_after_disconnect:
+            # Defensive: only persistent substrates are ever persisted.
+            clear_run_state(self.home, issue_id)
+            return WorklinkRunResult(
+                issue_id, state.attempt, "failed", reason="reattach: compute not resumable"
+            )
+
+        handle = LaunchHandle(state.handle_substrate, state.handle_identifier)
+        issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
+        test_cmd = state.test_command
+        _log_event(
+            "worklink_reattach",
+            issue_id=issue_id,
+            attempt=state.attempt,
+            compute_backend=compute.name,
+            job=state.handle_identifier,
+        )
+
+        lease: WorktreeLease | None = None
+        try:
+            lease = _create_observation_worktree(
+                self.repo,
+                issue_id=issue_id,
+                attempt=state.attempt,
+                base=state.base_ref,
+                local_base=state.local_base,
+                branch=state.branch,
+                runner=_list_runner(runner),
+            )
+            started = _parse_chainlink_datetime(state.started_at) or datetime.now(UTC)
+            prompt = render_work_order(
+                issue,
+                template_path=_template_path(self.home),
+                backend_name=backend.name,
+                test_command=test_cmd or "",
+            )
+            order = WorkOrder(
+                issue_id=issue_id,
+                worktree=lease.path,
+                prompt=prompt,
+                rules=None,
+                timeout_s=config.defaults.timeout_s,
+                env={"MIMIR_HOME": str(self.home)},
+                transcript_root=self.home / "state" / "worklink" / "transcripts",
+            )
+            spec = backend.work_spec(
+                order,
+                attempt=state.attempt,
+                repo_url=state.repo_url,
+                base_ref=state.local_base or state.base_ref,
+                branch=state.branch,
+                test_command=test_cmd or "",
+            )
+            try:
+                compute_result = await compute.wait(handle, config.defaults.timeout_s)
+            finally:
+                await compute.cleanup(handle)
+            if _reattach_worker_lost(compute_result):
+                # Broker/substrate can no longer produce the result (e.g. it also
+                # restarted): the compute is wasted. Fall back to redispatch
+                # immediately so the leaf doesn't sit in-progress until the reaper.
+                _log_event(
+                    "worklink_reattach_lost",
+                    issue_id=issue_id,
+                    attempt=state.attempt,
+                    error=(compute_result.launch_error or "")[:300],
+                )
+                claims.transition_issue(
+                    issue_id,
+                    status="failed",
+                    review_ready=False,
+                    attempt=state.attempt,
+                    reason="reattach: worker lost after controller restart",
+                )
+                return WorklinkRunResult(
+                    issue_id, state.attempt, "failed", reason="reattach: worker lost"
+                )
+            return await self._finalize(
+                issue=issue,
+                claims=claims,
+                attempt=state.attempt,
+                config=config,
+                backend=backend,
+                compute=compute,
+                compute_result=compute_result,
+                order=order,
+                lease=lease,
+                spec=spec,
+                started=started,
+                test_cmd=test_cmd,
+                root_dirty_before=(),
+                runner=runner,
+            )
+        except Exception as exc:
+            try:
+                claims.transition_issue(
+                    issue_id,
+                    status="failed",
+                    review_ready=False,
+                    attempt=state.attempt,
+                    reason=f"reattach failed: {exc}",
+                )
+            except Exception:
+                pass
+            _log_event(
+                "worklink_reattach_failed", issue_id=issue_id, attempt=state.attempt, error=str(exc)
+            )
+            return WorklinkRunResult(
+                issue_id, state.attempt, "failed", reason=f"reattach failed: {exc}"
+            )
+        finally:
+            if lease is not None:
+                _remove_observation_worktree(self.repo, lease, runner=_list_runner(runner))
+            claims.release_issue(issue_id)
+            clear_run_state(self.home, issue_id)
 
 
 def run_worklink(
@@ -600,6 +832,114 @@ def run_worklink(
             autonomous=autonomous,
         )
     )
+
+
+def run_worklink_reattach(*, home: Path, repo: Path, issue_id: int) -> WorklinkRunResult:
+    """Resume one in-flight run after a controller restart (#561)."""
+    return asyncio.run(WorklinkRunner(home=home, repo=repo).reattach(issue_id))
+
+
+def _persist_run_state(
+    home: Path,
+    *,
+    issue: IssueContext,
+    attempt: int,
+    backend_name: str,
+    compute: Any,
+    handle: LaunchHandle,
+    lease: WorktreeLease,
+    repo: Path,
+    repo_url: str | None,
+    test_command: str | None,
+    started_at: datetime,
+) -> None:
+    """Record the worker handle so a fresh controller can reattach (#561).
+
+    Best-effort: a persist failure must not abort an otherwise-healthy run — the
+    only cost is falling back to the TTL reaper if this run is later interrupted."""
+    try:
+        save_run_state(
+            home,
+            WorklinkRunState(
+                issue_id=issue.issue_id,
+                attempt=attempt,
+                backend=backend_name,
+                compute_name=compute.name,
+                handle_substrate=handle.substrate,
+                handle_identifier=handle.identifier,
+                branch=lease.branch,
+                base_ref=lease.base_ref,
+                local_base=lease.local_base or lease.base_ref,
+                repo=str(repo),
+                repo_url=repo_url or "",
+                test_command=test_command,
+                started_at=started_at.astimezone(UTC).isoformat(),
+            ),
+        )
+    except OSError as exc:
+        _log_event("worklink_run_state_persist_failed", issue_id=issue.issue_id, error=str(exc))
+
+
+def _create_observation_worktree(
+    repo: Path,
+    *,
+    issue_id: int,
+    attempt: int,
+    base: str,
+    local_base: str,
+    branch: str,
+    runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
+) -> WorktreeLease:
+    """Throwaway detached worktree for re-deriving REMOTE evidence on reattach.
+
+    ``observe_remote_evidence`` fetches ``origin/<base>`` and ``origin/<branch>``
+    by refspec into this checkout and diffs the remote refs, so it only needs to
+    be a valid checkout with an ``origin`` remote — the worker already pushed the
+    branch. Detached + a dedicated ``reattach-`` path so it never collides with
+    the (possibly surviving) original attempt worktree."""
+    path = repo / ".worklink" / f"reattach-{issue_id}-{attempt}"
+    # Clear any leftover from a previous reattach of the same leaf.
+    runner(["git", "-C", str(repo), "worktree", "remove", "--force", str(path)])
+    shutil.rmtree(path, ignore_errors=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    add = runner(["git", "-C", str(repo), "worktree", "add", "--detach", str(path)])
+    if add.returncode != 0:
+        raise WorklinkError(
+            (add.stderr or add.stdout).strip() or "git worktree add (reattach observation) failed"
+        )
+    return WorktreeLease(
+        issue_id=issue_id,
+        attempt=attempt,
+        repo=repo,
+        path=path,
+        branch=branch,
+        base_ref=base,
+        local_base=local_base or base,
+        isolated_checkout=False,
+    )
+
+
+def _remove_observation_worktree(
+    repo: Path,
+    lease: WorktreeLease,
+    *,
+    runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
+) -> None:
+    """Best-effort removal of the throwaway reattach observation worktree.
+
+    ``_finalize`` only removes the worktree on a ``completed`` outcome (it retains
+    failed/blocked attempts for autopsy); the reattach worktree is disposable in
+    every outcome, so force-remove whatever's left without raising."""
+    runner(["git", "-C", str(repo), "worktree", "remove", "--force", str(lease.path)])
+    shutil.rmtree(lease.path, ignore_errors=True)
+
+
+def _reattach_worker_lost(result: ComputeResult) -> bool:
+    """True when the substrate can no longer produce the worker's result on
+    reattach — e.g. the broker container also restarted, or the job was already
+    cleaned up. A genuine timeout (worker still running, or it hit its own bound)
+    is NOT "lost": only a ``launch_error`` means we couldn't reach/find the job."""
+    return result.launch_error is not None
 
 
 def render_decomposition_prompt(
