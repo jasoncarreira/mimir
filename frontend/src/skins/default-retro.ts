@@ -76,13 +76,41 @@ export const defaultRetroSkin = {
     variant: "terminal-portrait",
     assets: [
       {
-        id: "default-retro-placeholder",
+        id: "default-retro-idle",
+        type: "css",
+        href: null
+      },
+      {
+        id: "default-retro-thinking",
+        type: "css",
+        href: null
+      },
+      {
+        id: "default-retro-typing",
+        type: "css",
+        href: null
+      },
+      {
+        id: "default-retro-tool",
+        type: "css",
+        href: null
+      },
+      {
+        id: "default-retro-error",
         type: "css",
         href: null
       }
     ],
+    stateMap: {
+      idle: "default-retro-idle",
+      thinking: "default-retro-thinking",
+      typing: "default-retro-typing",
+      tool: "default-retro-tool",
+      error: "default-retro-error"
+    },
+    fallbackState: "idle",
     capabilities: {
-      supportsExpressions: false,
+      supportsExpressions: true,
       supportsMotion: false
     }
   }

@@ -552,6 +552,12 @@ textarea {
   text-decoration: none;
 }
 
+.app-brand-block {
+  display: grid;
+  gap: var(--mimir-space-md, 16px);
+  align-content: start;
+}
+
 .app-status-card {
   min-width: 0;
   padding: var(--mimir-space-md, 16px);
@@ -1310,9 +1316,152 @@ textarea {
   white-space: nowrap;
 }
 
+.agent-character {
+  width: min(180px, 100%);
+  aspect-ratio: 1;
+  overflow: hidden;
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-panel, 8px);
+  background: var(--mimir-color-panel-background, #fff);
+}
+
+.agent-character__player,
+.agent-character__fallback {
+  width: 100%;
+  height: 100%;
+}
+
+.agent-character__fallback {
+  position: relative;
+  display: grid;
+  place-items: center;
+  padding: var(--mimir-space-sm, 12px);
+  background:
+    linear-gradient(90deg, rgb(22 32 27 / 5%) 1px, transparent 1px),
+    linear-gradient(0deg, rgb(22 32 27 / 5%) 1px, transparent 1px),
+    var(--mimir-color-panel-background-muted, #f1f5f2);
+  background-size: 16px 16px;
+}
+
+.agent-character__face {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(2, 16px);
+  gap: 16px;
+  place-content: center;
+  width: 92px;
+  height: 92px;
+  border: var(--mimir-border-width-chrome, 2px) solid var(--mimir-color-chrome-accent, #60786a);
+  border-radius: 50%;
+  background: var(--mimir-color-panel-background, #fff);
+  box-shadow: inset 0 -10px 0 rgb(96 120 106 / 10%);
+}
+
+.agent-character__eye {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--mimir-color-text, #16201b);
+}
+
+.agent-character__mouth {
+  position: absolute;
+  right: 30px;
+  bottom: 24px;
+  left: 30px;
+  height: 8px;
+  border-bottom: 3px solid var(--mimir-color-text, #16201b);
+  border-radius: 0 0 999px 999px;
+}
+
+.agent-character__signal {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--mimir-color-status-info, #315f7d);
+}
+
+.agent-character__state {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  max-width: calc(100% - 56px);
+  overflow: hidden;
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  font-weight: var(--mimir-font-weight-strong, 700);
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.agent-character--thinking .agent-character__signal,
+.agent-character--tool .agent-character__signal {
+  animation: agent-pulse 900ms ease-in-out infinite;
+}
+
+.agent-character--typing .agent-character__mouth {
+  animation: agent-talk 360ms steps(2, end) infinite;
+}
+
+.agent-character--error .agent-character__signal {
+  background: var(--mimir-color-status-danger, #8b3a3a);
+}
+
+.agent-character--error .agent-character__face {
+  border-color: var(--mimir-color-status-danger, #8b3a3a);
+}
+
+.agent-character-demo {
+  display: grid;
+  gap: var(--mimir-space-md, 16px);
+}
+
+.agent-character-demo .agent-character {
+  width: min(220px, 100%);
+}
+
+.agent-character-demo__controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mimir-space-xs, 8px);
+}
+
+.agent-character-demo__controls .ui-button[aria-pressed="true"] {
+  background: var(--mimir-color-chrome-accent, #60786a);
+  color: var(--mimir-color-chrome-accent-text, #fff);
+}
+
 @keyframes ui-spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes agent-pulse {
+  0%,
+  100% {
+    transform: scale(0.8);
+    opacity: 0.55;
+  }
+
+  50% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes agent-talk {
+  0%,
+  100% {
+    transform: scaleY(0.6);
+  }
+
+  50% {
+    transform: scaleY(1.3);
   }
 }
 

@@ -12,10 +12,12 @@ import {
   useNavigate,
   useSearchParams
 } from "react-router-dom";
+import { AgentCharacter, characterStateFromLiveEvent } from "./agent-character";
 import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
 import { ChatRoute } from "./ChatRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
+import { LiveEventsProvider, useLiveEvents } from "./live-events";
 import { SagaDashboard } from "./SagaDashboard";
 import { OpsRoute } from "./routes/OpsRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
@@ -394,19 +396,25 @@ function AppStatus() {
 
 function AppFrame() {
   const { skin } = useSkin();
+  const liveEvents = useLiveEvents();
   const { data: bootstrap, error, isError, isLoading } = useBootstrap();
   const surfaces = React.useMemo(
     () => (bootstrap ? getDashboardSurfaces(bootstrap.dashboard_extensions) : []),
     [bootstrap]
   );
   const firstRoute = surfaces[0]?.path ?? "/chat";
+  const agentState =
+    liveEvents.status === "error"
+      ? "error"
+      : characterStateFromLiveEvent(liveEvents.lastEvent?.event);
 
   return (
     <div className="app-frame">
       <header className="app-chrome">
-        <div>
+        <div className="app-brand-block">
           <p className="ui-eyebrow">{skin.name}</p>
           <Link className="app-brand" to="/chat">Mimir App</Link>
+          <AgentCharacter state={agentState} />
         </div>
         <AuthPanel bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
       </header>
@@ -450,9 +458,15 @@ createRoot(root).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
       <SkinProvider>
-        <BrowserRouter basename={appBasename()}>
-          <AppFrame />
-        </BrowserRouter>
+        <LiveEventsProvider
+          apiKey={readStoredKey() || undefined}
+          cachePolicy={{ aggregateQueryKeys: [["web-bootstrap"]] }}
+          queryClient={queryClient}
+        >
+          <BrowserRouter basename={appBasename()}>
+            <AppFrame />
+          </BrowserRouter>
+        </LiveEventsProvider>
       </SkinProvider>
     </QueryClientProvider>
   </React.StrictMode>
