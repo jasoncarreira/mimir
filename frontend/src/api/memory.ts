@@ -1,62 +1,42 @@
-import { apiFetchJson, buildQuery, type ApiClientOptions } from "./http";
+import { apiFetchEnvelope, buildQuery, type ApiClientOptions } from "./http";
+import type {
+  ApiSuccessEnvelope,
+  ListMeta,
+  MemoryChannelsData,
+  MemoryFileData,
+  MemorySearchData,
+  MemorySearchHit,
+  MemoryTreeDir,
+  MemoryTreeFile,
+  MemoryTreeNode
+} from "./generated/contracts";
 
-export interface MemoryTreeDir {
-  name: string;
-  type: "dir";
-  path: string;
-  desc: string | null;
-  children: MemoryTreeNode[];
-  error?: string;
-}
+export type {
+  MemorySearchHit,
+  MemoryTreeDir,
+  MemoryTreeFile,
+  MemoryTreeNode
+};
 
-export interface MemoryTreeFile {
-  name: string;
-  type: "file";
-  path: string;
-  size: number;
-  modified: string;
-  desc: string | null;
-}
-
-export type MemoryTreeNode = MemoryTreeDir | MemoryTreeFile;
-
-export interface MemoryFileResponse {
-  path: string;
-  content: string;
-  size: number;
-  modified: string;
-  error?: string;
-}
-
-export interface MemorySearchHit {
-  path: string;
-  line_no: number;
-  snippet: string;
-}
-
-export interface MemorySearchResponse {
-  query: string;
-  hits: MemorySearchHit[];
+export type MemoryFileResponse = MemoryFileData & { error?: string };
+export type MemorySearchResponse = MemorySearchData & {
   total: number;
   truncated: boolean;
-}
-
-export interface MemoryChannelsResponse {
-  channels: string[];
-}
+};
+export type MemoryChannelsResponse = MemoryChannelsData;
 
 export function getMemoryTree(
   options?: ApiClientOptions
-): Promise<MemoryTreeDir> {
-  return apiFetchJson<MemoryTreeDir>("/api/memory?view=tree", options);
+): Promise<ApiSuccessEnvelope<MemoryTreeDir>> {
+  return apiFetchEnvelope<MemoryTreeDir>("/api/v1/memory?view=tree", options);
 }
 
 export function getMemoryFile(
   path: string,
   options?: ApiClientOptions
-): Promise<MemoryFileResponse> {
-  return apiFetchJson<MemoryFileResponse>(
-    `/api/memory${buildQuery({ view: "file", path })}`,
+): Promise<ApiSuccessEnvelope<MemoryFileData>> {
+  return apiFetchEnvelope<MemoryFileData>(
+    `/api/v1/memory${buildQuery({ view: "file", path })}`,
     options
   );
 }
@@ -64,18 +44,18 @@ export function getMemoryFile(
 export function searchMemoryFiles(
   q: string,
   options?: ApiClientOptions
-): Promise<MemorySearchResponse> {
-  return apiFetchJson<MemorySearchResponse>(
-    `/api/memory${buildQuery({ view: "search", q })}`,
+): Promise<ApiSuccessEnvelope<MemorySearchData, ListMeta>> {
+  return apiFetchEnvelope<MemorySearchData, ListMeta>(
+    `/api/v1/memory${buildQuery({ view: "search", q })}`,
     options
   );
 }
 
 export function getMemoryChannels(
   options?: ApiClientOptions
-): Promise<MemoryChannelsResponse> {
-  return apiFetchJson<MemoryChannelsResponse>(
-    "/api/memory?view=channels",
+): Promise<ApiSuccessEnvelope<MemoryChannelsData, ListMeta>> {
+  return apiFetchEnvelope<MemoryChannelsData, ListMeta>(
+    "/api/v1/memory?view=channels",
     options
   );
 }

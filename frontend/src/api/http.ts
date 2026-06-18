@@ -1,3 +1,5 @@
+import type { ApiEnvelope, ApiSuccessEnvelope } from "./generated/contracts";
+
 export const MIMIR_API_KEY_STORAGE_KEY = "mimir.api_key";
 
 export type QueryValue = string | number | boolean | null | undefined;
@@ -64,11 +66,26 @@ export async function apiFetchJson<T>(
     : await response.text();
 
   if (!response.ok) {
-    const message =
-      body && typeof body === "object" && "error" in body
-        ? String((body as { error?: unknown }).error)
-        : undefined;
+    let message: string | undefined;
+    if (body && typeof body === "object" && "error" in body) {
+      const error = (body as { error?: unknown }).error;
+      message =
+        error && typeof error === "object" && "message" in error
+          ? String((error as { message?: unknown }).message)
+          : String(error);
+    }
     throw new ApiError(response.status, body, message);
   }
   return body as T;
+}
+
+export async function apiFetchEnvelope<TData, TMeta = undefined>(
+  path: string,
+  options: RequestInit & ApiClientOptions = {}
+): Promise<ApiSuccessEnvelope<TData, TMeta>> {
+  const envelope = await apiFetchJson<ApiEnvelope<TData, TMeta>>(path, options);
+  if (!envelope.ok) {
+    throw new ApiError(200, envelope, envelope.error.message);
+  }
+  return envelope;
 }

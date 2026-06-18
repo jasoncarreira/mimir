@@ -35,6 +35,12 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from ..models import AgentEvent
+from ..web_contracts import (
+    json_error,
+    json_success,
+    make_chat_message_event,
+    make_chat_reaction_event,
+)
 from .base import Bridge, SendResult
 
 log = logging.getLogger(__name__)
@@ -97,12 +103,19 @@ class WebChatBridge(Bridge):
         # gating. No typing-indicator affordance to hold.
         del final
         message_id = uuid.uuid4().hex[:12]
-        payload = {
+        legacy_payload = {
             "channel_id": channel_id,
             "text": text,
             "message_id": message_id,
             "attachments": [str(p) for p in attachment_paths or []],
         }
+        payload = make_chat_message_event(
+            channel_id=channel_id,
+            text=text,
+            message_id=message_id,
+            attachments=[str(p) for p in attachment_paths or []],
+        )
+        payload.update(legacy_payload)
         # Fan out to every connected SSE subscriber. Lazy lock — set once we
         # have an event loop.
         if self._lock is None:
@@ -120,12 +133,12 @@ class WebChatBridge(Bridge):
         # Reactions broadcast as a "react" event over the same SSE stream.
         if self._lock is None:
             self._lock = asyncio.Lock()
-        payload = {
-            "_event": "react",
-            "channel_id": channel_id,
-            "message_id": message_id,
-            "emoji": emoji,
-        }
+        payload = make_chat_reaction_event(
+            channel_id=channel_id,
+            message_id=message_id,
+            emoji=emoji,
+        )
+        payload["_event"] = "react"
         async with self._lock:
             for q in list(self._subscribers):
                 try:
@@ -136,14 +149,17 @@ class WebChatBridge(Bridge):
 
     # ---- HTTP route handlers ------------------------------------------
 
-    async def _handle_post(self, request: web.Request) -> web.Response:
+    async def _build_inbound_event(
+        self,
+        request: web.Request,
+    ) -> tuple[AgentEvent | None, str | None, web.Response | None]:
         try:
             body = await request.json()
         except json.JSONDecodeError:
-            return web.json_response({"error": "invalid json"}, status=400)
+            return None, None, web.json_response({"error": "invalid json"}, status=400)
         content = (body.get("content") or "").strip()
         if not content:
-            return web.json_response({"error": "content required"}, status=400)
+            return None, None, web.json_response({"error": "content required"}, status=400)
         channel_id = (body.get("channel_id") or DEFAULT_CHANNEL).strip()
         if not channel_id.startswith("web-"):
             channel_id = "web-" + channel_id
@@ -151,7 +167,9 @@ class WebChatBridge(Bridge):
         # ``or {}`` and later ``event.extra.get(...)`` raises.
         extra = body.get("extra")
         if extra is not None and not isinstance(extra, dict):
-            return web.json_response({"error": "extra must be an object"}, status=400)
+            return None, None, web.json_response(
+                {"error": "extra must be an object"}, status=400
+            )
         event = AgentEvent(
             trigger="user_message",
             channel_id=channel_id,
@@ -162,6 +180,13 @@ class WebChatBridge(Bridge):
             source="web",
             extra=extra or {},
         )
+        return event, channel_id, None
+
+    async def _handle_post(self, request: web.Request) -> web.Response:
+        event, channel_id, error = await self._build_inbound_event(request)
+        if error is not None:
+            return error
+        assert event is not None and channel_id is not None
         accepted = await self.enqueue(event)
         if not accepted:
             return web.json_response(
@@ -169,6 +194,26 @@ class WebChatBridge(Bridge):
                 status=503,
             )
         return web.json_response({"ok": True, "channel_id": channel_id})
+
+    async def _handle_post_v1(self, request: web.Request) -> web.Response:
+        event, channel_id, error = await self._build_inbound_event(request)
+        if error is not None:
+            try:
+                legacy = json.loads(error.text or "{}")
+            except json.JSONDecodeError:
+                legacy = {"error": error.text or "invalid request"}
+            message = str(legacy.get("error") or "invalid request")
+            return json_error("bad_request", message, status=error.status)
+        assert event is not None and channel_id is not None
+        accepted = await self.enqueue(event)
+        if not accepted:
+            return json_error(
+                "queue_full_or_closed",
+                "queue full or closed",
+                status=503,
+                details={"channel_id": channel_id},
+            )
+        return json_success({"channel_id": channel_id, "source_id": event.source_id})
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
         resp = web.StreamResponse(
@@ -222,5 +267,7 @@ class WebChatBridge(Bridge):
         existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
         if ("POST", "/chat") not in existing:
             app.router.add_post("/chat", self._handle_post)
+        if ("POST", "/api/v1/chat") not in existing:
+            app.router.add_post("/api/v1/chat", self._handle_post_v1)
         if ("GET", "/chat/stream") not in existing:
             app.router.add_get("/chat/stream", self._handle_stream)

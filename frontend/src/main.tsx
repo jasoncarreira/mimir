@@ -1,25 +1,10 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
+import type { ApiEnvelope, WebBootstrapData } from "./api/generated/contracts";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import "./styles.css";
 
-type Bootstrap = {
-  auth: {
-    required: boolean;
-    scheme: string;
-    storage: string;
-  };
-  server: {
-    web_host: string;
-    public_bind: boolean;
-    unauthenticated_allowed: boolean;
-  };
-  stream_auth: {
-    shape: string;
-    header: string;
-    native_eventsource_supported_when_auth_required: boolean;
-  };
-};
+type Bootstrap = WebBootstrapData;
 
 const legacySurfaces = [
   { href: "/turns", label: "Turns", detail: "Turn viewer" },
@@ -54,13 +39,14 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   const [error, setError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
-    fetch("/api/web/bootstrap", { cache: "no-store" })
+    fetch("/api/v1/web/bootstrap", { cache: "no-store" })
       .then((response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json() as Promise<Bootstrap>;
+        return response.json() as Promise<ApiEnvelope<Bootstrap>>;
       })
-      .then((payload) => {
-        setBootstrap(payload);
+      .then((envelope) => {
+        if (!envelope.ok) throw new Error(envelope.error.message);
+        setBootstrap(envelope.data);
         setStatus("ready");
       })
       .catch((err: unknown) => {
