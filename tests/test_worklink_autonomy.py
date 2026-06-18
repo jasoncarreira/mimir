@@ -703,6 +703,53 @@ def test_poller_no_dispatch_when_cap_reached(tmp_path: Path) -> None:
     assert scan["slots"] == 0
 
 
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_accepts_chainlink_ready_text_when_json_flag_is_ignored(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    script = tmp_path / "chainlink"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "a = sys.argv[1:]\n"
+        "if a[:2] == ['locks','list']:\n"
+        "    print(json.dumps({'version': 1, 'locks': {}}))\n"
+        "    sys.exit(0)\n"
+        "if a[:2] == ['issue','ready']:\n"
+        "    print('Ready issues (no blockers):')\n"
+        "    print('  #201  high     unblocked worklink leaf')\n"
+        "    print('  #203  medium   another unblocked leaf')\n"
+        "    sys.exit(0)\n"
+        "if a[:2] == ['issue','list']:\n"
+        "    print(json.dumps([{'id': 201}, {'id': 202}, {'id': 203}]))\n"
+        "    sys.exit(0)\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(script),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "3",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert [e["issue_id"] for e in dispatched] == [201, 203]
+    scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
+    assert scan["ready_count"] == 2
+    assert scan["labeled_ready_count"] == 3
+    assert scan["blocked_ready_count"] == 1
+
+
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
 def test_poller_fails_closed_when_chainlink_errors(tmp_path: Path) -> None:
     home = tmp_path / "home"
