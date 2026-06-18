@@ -108,7 +108,7 @@ describe("ChatRoute", () => {
     fireEvent.change(input, { target: { value: "fail please" } });
     fireEvent.submit(input.closest("form") as HTMLFormElement);
 
-    await waitFor(() => expect(screen.getByText("queue full")).toBeTruthy());
+    await waitFor(() => expect(screen.getAllByText("queue full").length).toBeGreaterThan(0));
     expect(screen.getAllByText("error").length).toBeGreaterThan(0);
   });
 
