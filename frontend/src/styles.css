@@ -1348,6 +1348,10 @@ textarea {
   margin-bottom: var(--mimir-space-md, 16px);
 }
 
+.turns-controls--sessions {
+  grid-template-columns: minmax(220px, 1.4fr) minmax(150px, 0.8fr) minmax(150px, 0.8fr) minmax(130px, 0.6fr) minmax(130px, 0.6fr);
+}
+
 .turn-filter-tabs {
   display: flex;
   gap: var(--mimir-space-2xs, 4px);
@@ -1384,6 +1388,86 @@ textarea {
 .turn-list {
   display: grid;
   gap: var(--mimir-space-xs, 8px);
+}
+
+.session-list,
+.session-message-stack,
+.session-turn-stack {
+  display: grid;
+  gap: var(--mimir-space-xs, 8px);
+}
+
+.session-row {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.6fr) minmax(160px, 1fr) 92px 110px;
+  gap: var(--mimir-space-sm, 12px);
+  width: 100%;
+  min-height: 72px;
+  align-items: center;
+  padding: var(--mimir-space-sm, 12px);
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-control, 6px);
+  background: var(--mimir-color-panel-background, #fff);
+  color: var(--mimir-color-text, #16201b);
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-row:hover,
+.session-row--selected {
+  border-color: var(--mimir-color-chrome-accent, #60786a);
+  background: var(--mimir-interaction-hover-background, #e8f0eb);
+}
+
+.session-row > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.session-row__main {
+  display: grid;
+  gap: var(--mimir-space-2xs, 4px);
+}
+
+.session-row__main small,
+.session-message small,
+.session-turn-link small,
+.session-copy-status {
+  color: var(--mimir-color-text-muted, #58685f);
+}
+
+.session-message,
+.session-turn-link {
+  min-width: 0;
+  padding: var(--mimir-space-sm, 12px);
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-control, 6px);
+  background: var(--mimir-color-background, #f7faf8);
+}
+
+.session-message p {
+  margin: var(--mimir-space-xs, 8px) 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.session-turn-link {
+  display: grid;
+  gap: var(--mimir-space-2xs, 4px);
+  width: 100%;
+  color: var(--mimir-color-text, #16201b);
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-turn-link:hover {
+  border-color: var(--mimir-color-chrome-accent, #60786a);
+  background: var(--mimir-interaction-hover-background, #e8f0eb);
+}
+
+.session-plain-list {
+  margin: 0;
+  padding-left: 1.2rem;
 }
 
 .turn-list__head,
@@ -1930,7 +2014,9 @@ textarea {
   .chat-identity-form,
   .chat-composer,
   .route-state-form,
-  .turns-controls {
+  .turns-controls,
+  .turns-controls--sessions,
+  .session-row {
     grid-template-columns: 1fr;
   }
 

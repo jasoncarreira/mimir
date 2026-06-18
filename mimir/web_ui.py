@@ -81,6 +81,7 @@ from .saga_dashboard import (
     build_sql_payload,
     render_saga_html,
 )
+from .session_browser import build_sessions_payload
 from .web_contracts import json_error, json_success, list_meta
 
 log = logging.getLogger(__name__)
@@ -343,6 +344,37 @@ def register_routes(
         turns, meta = _turns_window(request)
         return json_success({"turns": turns}, meta=meta)
 
+    async def sessions_data_v1(request: web.Request) -> web.Response:
+        try:
+            limit = int(request.query.get("limit") or 200)
+        except ValueError:
+            limit = 200
+        payload = await asyncio.to_thread(
+            build_sessions_payload,
+            turns_log=turns_log,
+            chat_history=(home / "messages" / "chat_history.jsonl") if home is not None else None,
+            saga_db=_saga_db,
+            limit=limit,
+            query=request.query.get("q", ""),
+            channel=request.query.get("channel", "").strip() or None,
+            trigger=request.query.get("trigger", "").strip() or None,
+            date_from=request.query.get("from", "").strip() or None,
+            date_to=request.query.get("to", "").strip() or None,
+        )
+        total = int(payload.pop("total", 0) or 0)
+        effective_limit = int(payload.pop("limit", limit) or limit)
+        sessions = payload.get("sessions") or []
+        cursor = str(sessions[-1].get("id")) if sessions and sessions[-1].get("id") else None
+        return json_success(
+            payload,
+            meta=list_meta(
+                cursor=cursor,
+                limit=effective_limit,
+                total=total,
+                truncated=total > effective_limit,
+            ),
+        )
+
     async def events_data(request: web.Request) -> web.Response:
         records = _read_jsonl(events_log)
         since = request.query.get("since", "").strip()
@@ -574,6 +606,12 @@ def register_routes(
             headers=_no_store_headers(),
         )
 
+    # Resolve the DB path before sessions_data_v1 handles requests. It is
+    # referenced by both the session browser and the SAGA dashboard handlers.
+    _saga_db: Path | None = saga_db
+    if _saga_db is None and home is not None:
+        _saga_db = home / ".mimir" / "saga.db"
+
     async def ops_page(request: web.Request) -> web.Response:
         # Static HTML shell — frontend AJAX-fetches /api/ops via the
         # shared auth helper. We still validate ``?days=`` here
@@ -670,10 +708,6 @@ def register_routes(
     # ``<home>/.mimir/saga.db`` (saga's default ``[storage].db_path``);
     # the older ``<home>/state/saga.db`` fallback predated the move to
     # ``.mimir/`` and pointed at a file that no longer exists.
-    _saga_db: Path | None = saga_db
-    if _saga_db is None and home is not None:
-        _saga_db = home / ".mimir" / "saga.db"
-
     async def saga_page(_request: web.Request) -> web.Response:
         return web.Response(
             text=render_saga_html(),
@@ -845,6 +879,8 @@ def register_routes(
         app.router.add_get("/api/turns", turns_data)
     if ("GET", "/api/v1/turns") not in existing:
         app.router.add_get("/api/v1/turns", turns_data_v1)
+    if ("GET", "/api/v1/sessions") not in existing:
+        app.router.add_get("/api/v1/sessions", sessions_data_v1)
     if ("GET", "/api/events") not in existing:
         app.router.add_get("/api/events", events_data)
     if ("GET", "/api/v1/events") not in existing:
