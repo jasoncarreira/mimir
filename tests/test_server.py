@@ -251,11 +251,11 @@ def _root_app() -> web.Application:
 
 
 class TestRootRedirect:
-    async def test_root_redirects_to_turns(self) -> None:
+    async def test_root_redirects_to_react_app(self) -> None:
         async with TestClient(TestServer(_root_app())) as client:
             resp = await client.get("/", allow_redirects=False)
             assert resp.status == 302
-            assert resp.headers["Location"] == "/turns"
+            assert resp.headers["Location"] == "/app"
 
 
 class TestHandleHealth:

@@ -143,23 +143,33 @@ See `.env.example` for every environment variable mimir reads.
 ## Web UI
 
 Once running, mimir serves an operator web UI on `MIMIR_WEB_PORT` (default port
-`8080`). There's no root landing page — start at a page route such as
-`http://localhost:8080/turns`; the page prompts for `MIMIR_API_KEY` on first
-visit and remembers it:
+`8080`). The documented default frontend is the React app at
+`http://localhost:8080/app`; the bare root redirects there. The app prompts for
+`MIMIR_API_KEY` on first visit and remembers it:
 
-- **`/turns` — turn viewer.** A live, auto-refreshing feed of every turn: the
+- **`/app/chat` — chat.** Send local web-chat messages and watch streamed
+  replies/reactions.
+- **`/app/turns` — turn viewer.** A live, auto-refreshing feed of every turn: the
   inbound trigger, the tools the agent ran, and what it said back. The first
   place to watch the agent work or debug a turn.
-- **`/ops` — ops dashboard.** Live health + usage: token/cost rate, plan-window
+- **`/app/ops` — ops dashboard.** Live health + usage: token/cost rate, plan-window
   headroom, scheduled-tick activity, recent errors, and pending `mimir-agent`
   updates.
-- **`/saga` — memory viewer.** Browse saga's memory atoms.
-- **`/state` — file browser.** Browse `memory/` and `state/`.
+- **`/app/saga` — memory viewer.** Browse saga's memory atoms.
+- **`/app/memory` — state/memory browser.** Browse `memory/` and `state/`.
+- **`/app/admin` — admin/config.** Inspect model/config/env state with secrets
+  redacted.
 
-Each HTML page has a JSON twin (`/api/turns`, `/api/ops`, `/api/saga`,
-`/api/memory`) for scripting. The data/API routes are auth-gated by
-`MIMIR_API_KEY` (the HTML shells and `/health` are exempt so the JS can load
-and prompt for the key); expose the port publicly only with `MIMIR_API_KEY` set.
+Legacy vanilla HTML routes (`/turns`, `/ops`, `/saga`, `/state`) remain
+available while parity is verified. They return `X-Mimir-Frontend: legacy-html`
+and link to `/app`; treat them as compatibility routes, not the default UI.
+
+React uses the same JSON/API routes (`/api/v1/turns`, `/api/v1/ops`,
+`/api/v1/saga`, `/api/v1/memory`, `/api/v1/web/bootstrap`) plus the web-chat
+bridge. API routes are auth-gated by `MIMIR_API_KEY` (the React shell, retained
+legacy HTML shells, bootstrap/auth helpers, and `/health` are exempt so browser
+code can load and prompt for the key); expose the port publicly only with
+`MIMIR_API_KEY` set.
 
 ## Alternative providers (Minimax, Kimi, …)
 
@@ -251,16 +261,31 @@ uv run pytest
 
 ### React frontend
 
-The React migration shell lives under `frontend/` and is served by aiohttp at
-`/app` after it is built. The existing `/turns`, `/ops`, `/saga`, and `/state`
-HTML pages remain available during the migration.
+The React app lives under `frontend/` and is served by aiohttp at `/app`.
+Production builds write to `mimir/react_app/dist`, which is included in package
+data when a release artifact is built. Docker/PyPI installs serve that packaged
+bundle directly; source-checkout/non-Docker runs must build it once before
+expecting `/app` to load.
 
 ```bash
-npm install
+npm ci
 npm run dev      # Vite dev server for frontend work
 npm run build    # production bundle into mimir/react_app/dist
-npm run test     # TypeScript-only frontend check
+npm test         # Vitest frontend tests
 ```
+
+Focused cutover validation:
+
+```bash
+env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_web_ui.py tests/test_web_chat_bridge.py --tb=short
+npm ci
+npm test
+```
+
+See [`docs/react-frontend-cutover.md`](./docs/react-frontend-cutover.md) for the
+end-to-end smoke checklist covering Chat, Turn Viewer, Ops, SAGA, State/Memory,
+the right-side details panel, default-retro skin loading, and PR evidence for
+GitHub issue #726 under Chainlink parent #524.
 
 The bench harness is in `benchmarks/longmemeval_via_mimir/`. See
 that directory's README for running an A/B of two saga configs and
