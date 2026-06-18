@@ -1,5 +1,6 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
+import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import "./styles.css";
 
 type Bootstrap = {
@@ -148,10 +149,12 @@ function AuthPanel() {
 }
 
 function App() {
+  const { skin } = useSkin();
+
   return (
     <main className="app-shell">
       <section className="intro" aria-labelledby="app-title">
-        <p className="eyebrow">React app</p>
+        <p className="eyebrow">{skin.name}</p>
         <h1 id="app-title">Mimir App</h1>
         <p>
           Central browser bootstrap for operator auth and migrated web surfaces.
@@ -180,7 +183,9 @@ if (!root) {
 createRoot(root).render(
   <React.StrictMode>
     <AuthProvider>
-      <App />
+      <SkinProvider>
+        <App />
+      </SkinProvider>
     </AuthProvider>
   </React.StrictMode>
 );
