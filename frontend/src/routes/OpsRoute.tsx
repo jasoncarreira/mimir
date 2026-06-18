@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import React from "react";
 import { useSearchParams } from "react-router-dom";
 import { getOpsDashboard } from "../api";
-import type { ChainlinkIssue, OpsDashboardResponse } from "../api/ops";
+import type { ChainlinkIssue } from "../api/ops";
 import {
   Badge,
   Button,
@@ -16,19 +16,15 @@ import {
 } from "../ui";
 import {
   buildOpsSummaryMetrics,
+  formatCost,
+  formatPercent,
   mapToRows,
   quotaRows,
+  safeOpsDashboardData,
   schedulerEventRows,
-  tokenUsageRows
+  tokenUsageRows,
+  type SafeOpsDashboardData
 } from "./opsViewModel";
-
-function formatPercent(value: number | null) {
-  return value === null ? "n/a" : `${(value * 100).toFixed(1)}%`;
-}
-
-function formatCost(value: number | null) {
-  return value === null ? "n/a" : `$${value.toFixed(4)}`;
-}
 
 function asDisplay(value: unknown) {
   if (value === null || value === undefined) return "";
@@ -38,7 +34,7 @@ function asDisplay(value: unknown) {
   return JSON.stringify(value);
 }
 
-function SummaryGrid({ data }: { data: OpsDashboardResponse }) {
+function SummaryGrid({ data }: { data: SafeOpsDashboardData }) {
   const metrics = buildOpsSummaryMetrics(data.summary);
   return (
     <section aria-label="Ops summary" className="ops-summary-grid">
@@ -77,7 +73,7 @@ function RowsTable({
   );
 }
 
-function ResourceQuotaPanel({ data }: { data: OpsDashboardResponse }) {
+function ResourceQuotaPanel({ data }: { data: SafeOpsDashboardData }) {
   const quotas = quotaRows(data.usage_history);
   const tokens = tokenUsageRows(data.token_usage_history);
   const resourceRows = mapToRows(
@@ -141,7 +137,7 @@ function ResourceQuotaPanel({ data }: { data: OpsDashboardResponse }) {
   );
 }
 
-function SchedulerPanel({ data }: { data: OpsDashboardResponse }) {
+function SchedulerPanel({ data }: { data: SafeOpsDashboardData }) {
   return (
     <div className="ops-panel-stack">
       <Panel title="Scheduler, Poller, and Job Signals">
@@ -175,7 +171,7 @@ function SchedulerPanel({ data }: { data: OpsDashboardResponse }) {
   );
 }
 
-function AsyncJobsPanel({ data }: { data: OpsDashboardResponse }) {
+function AsyncJobsPanel({ data }: { data: SafeOpsDashboardData }) {
   const shell = data.shell_jobs;
   return (
     <div className="ops-panel-stack">
@@ -221,7 +217,7 @@ function AsyncJobsPanel({ data }: { data: OpsDashboardResponse }) {
   );
 }
 
-function HealthPanel({ data }: { data: OpsDashboardResponse }) {
+function HealthPanel({ data }: { data: SafeOpsDashboardData }) {
   return (
     <div className="ops-panel-stack">
       <Panel title="Failures by Kind">
@@ -251,7 +247,7 @@ function HealthPanel({ data }: { data: OpsDashboardResponse }) {
   );
 }
 
-function ChainlinkPanel({ data }: { data: OpsDashboardResponse }) {
+function ChainlinkPanel({ data }: { data: SafeOpsDashboardData }) {
   const chainlink = data.chainlink_issues;
   if (!chainlink.available) {
     return <ErrorState title="Chainlink unavailable">{chainlink.error || "No Chainlink issue data for this home."}</ErrorState>;
@@ -305,7 +301,7 @@ function ChainlinkPanel({ data }: { data: OpsDashboardResponse }) {
   );
 }
 
-function RawPanel({ data }: { data: OpsDashboardResponse }) {
+function RawPanel({ data }: { data: SafeOpsDashboardData }) {
   return (
     <div className="ops-panel-stack">
       <Panel title="All Event Types">
@@ -318,7 +314,8 @@ function RawPanel({ data }: { data: OpsDashboardResponse }) {
   );
 }
 
-function OpsContent({ data }: { data: OpsDashboardResponse }) {
+function OpsContent({ data: rawData }: { data: unknown }) {
+  const data = safeOpsDashboardData(rawData);
   const [activeTab, setActiveTab] = React.useState("overview");
   const tabs = [
     ["overview", "Overview"],
