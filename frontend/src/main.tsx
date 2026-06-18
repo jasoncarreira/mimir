@@ -16,6 +16,7 @@ import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
 import { ChatRoute } from "./ChatRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
+import { SagaDashboard } from "./SagaDashboard";
 import { OpsRoute } from "./routes/OpsRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { useRouteState } from "./routeState";
@@ -328,6 +329,10 @@ function SurfaceRoute({ surface }: { surface: DashboardSurface }) {
   const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
   const setDetailsPanelOpen = useUiState((state) => state.setDetailsPanelOpen);
 
+  if (surface.id === "saga") {
+    return <SagaDashboard />;
+  }
+
   return (
     <>
       <DashboardHeader eyebrow="Route shell" title={surface.title}>
@@ -421,7 +426,7 @@ function AppFrame() {
               <Route element={<Navigate replace to={firstRoute} />} path="/" />
               {surfaces.map((surface) => (
                 <Route
-                  element={surface.id === "ops" ? <OpsRoute /> : <SurfaceRoute surface={surface} />}
+                  element={surface.id === "saga" ? <SagaDashboard /> : surface.id === "ops" ? <OpsRoute /> : <SurfaceRoute surface={surface} />}
                   key={surface.id}
                   path={surface.path}
                 />
