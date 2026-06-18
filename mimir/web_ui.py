@@ -62,6 +62,7 @@ from .saga_dashboard import (
     build_sql_payload,
     render_saga_html,
 )
+from .web_contracts import json_error, json_success, list_meta
 
 log = logging.getLogger(__name__)
 
@@ -207,6 +208,56 @@ def register_routes(
             records = records[-limit:]
         return web.json_response({"turns": records})
 
+    def _turns_window(request: web.Request) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        records = _read_jsonl(turns_log)
+        after = request.query.get("after", "")
+        before = request.query.get("before", "")
+        try:
+            limit = int(request.query.get("limit") or 0)
+        except ValueError:
+            limit = 0
+
+        total = len(records)
+        if after:
+            cut = []
+            seen = False
+            for r in records:
+                if seen:
+                    cut.append(r)
+                elif r.get("turn_id") == after:
+                    seen = True
+            cursor = str(cut[-1].get("turn_id")) if cut and cut[-1].get("turn_id") else None
+            return cut, list_meta(cursor=cursor, limit=limit or None, total=total, truncated=False)
+        if before:
+            idx = next(
+                (i for i, r in enumerate(records) if r.get("turn_id") == before),
+                None,
+            )
+            if idx is None:
+                window = []
+            else:
+                start = max(0, idx - limit) if limit > 0 else 0
+                window = records[start:idx]
+            cursor = str(window[0].get("turn_id")) if window and window[0].get("turn_id") else None
+            return window, list_meta(
+                cursor=cursor,
+                limit=limit or None,
+                total=total,
+                truncated=idx is not None and bool(limit > 0 and idx > limit),
+            )
+        window = records[-limit:] if limit > 0 else records
+        cursor = str(window[-1].get("turn_id")) if window and window[-1].get("turn_id") else None
+        return window, list_meta(
+            cursor=cursor,
+            limit=limit or None,
+            total=total,
+            truncated=bool(limit > 0 and total > limit),
+        )
+
+    async def turns_data_v1(request: web.Request) -> web.Response:
+        turns, meta = _turns_window(request)
+        return json_success({"turns": turns}, meta=meta)
+
     async def events_data(request: web.Request) -> web.Response:
         records = _read_jsonl(events_log)
         since = request.query.get("since", "").strip()
@@ -231,6 +282,41 @@ def register_routes(
         if limit > 0:
             out = out[-limit:]
         return web.json_response({"events": out})
+
+    def _events_window(request: web.Request) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        records = _read_jsonl(events_log)
+        since = request.query.get("since", "").strip()
+        types = request.query.getall("type", []) or []
+        type_filter: set[str] = set()
+        for t in types:
+            for tok in t.split(","):
+                tok = tok.strip()
+                if tok:
+                    type_filter.add(tok)
+        try:
+            limit = int(request.query.get("limit") or 0)
+        except ValueError:
+            limit = 0
+
+        out = records
+        if since:
+            out = [r for r in out if str(r.get("timestamp", "")) >= since]
+        if type_filter:
+            out = [r for r in out if r.get("type") in type_filter]
+        total = len(out)
+        if limit > 0:
+            out = out[-limit:]
+        cursor = str(out[-1].get("timestamp")) if out and out[-1].get("timestamp") else None
+        return out, list_meta(
+            cursor=cursor,
+            limit=limit or None,
+            total=total,
+            truncated=bool(limit > 0 and total > limit),
+        )
+
+    async def events_data_v1(request: web.Request) -> web.Response:
+        events, meta = _events_window(request)
+        return json_success({"events": events}, meta=meta)
 
     async def react_app(request: web.Request) -> web.StreamResponse:
         if not _react_app_dist.is_dir():
@@ -289,6 +375,32 @@ def register_routes(
             headers=_no_store_headers(),
         )
 
+    async def web_bootstrap_v1(request: web.Request) -> web.Response:
+        api_key = str(request.app.get("api_key") or "")
+        config = request.app.get("config")
+        web_host = str(getattr(config, "web_host", "") or "")
+        public_bind = web_host not in ("", "127.0.0.1", "::1", "localhost")
+        return json_success(
+            {
+                "auth": {
+                    "required": bool(api_key),
+                    "scheme": "x-api-key",
+                    "storage": "browser-localStorage",
+                },
+                "server": {
+                    "web_host": web_host,
+                    "public_bind": public_bind,
+                    "unauthenticated_allowed": not bool(api_key),
+                },
+                "stream_auth": {
+                    "shape": "fetch-event-stream",
+                    "header": "X-API-Key",
+                    "native_eventsource_supported_when_auth_required": False,
+                },
+            },
+            headers=_no_store_headers(),
+        )
+
     async def ops_page(request: web.Request) -> web.Response:
         # Static HTML shell — frontend AJAX-fetches /api/ops via the
         # shared auth helper. We still validate ``?days=`` here
@@ -313,6 +425,19 @@ def register_routes(
                 active_provider=active_usage_provider,
             ),
         )
+
+    async def ops_data_v1(request: web.Request) -> web.Response:
+        try:
+            days = parse_days_param(request.query.get("days"))
+        except ValueError as exc:
+            return json_error("invalid_days", str(exc), status=400)
+        payload = await build_dashboard_payload_async(
+            events_log,
+            days,
+            home=home,
+            active_provider=active_usage_provider,
+        )
+        return json_success(payload)
 
     # ── /saga — saga DB viewer ───────────────────────────────────────
 
@@ -390,24 +515,114 @@ def register_routes(
             return web.json_response(payload, status=404 if "not found" in str(payload["error"]) else 503)
         return web.json_response(payload)
 
+    async def saga_data_v1(request: web.Request) -> web.Response:
+        view = request.query.get("view", "recent")
+
+        if _saga_db is None:
+            return json_error("saga_db_not_configured", "saga_db path not configured", status=503)
+
+        meta: dict[str, Any] | None = None
+        if view == "stats":
+            payload = await asyncio.to_thread(build_db_stats_payload, _saga_db)
+        elif view == "atom":
+            atom_id = request.query.get("id", "").strip()
+            if not atom_id:
+                return json_error("missing_id", "id param required", status=400)
+            payload = await asyncio.to_thread(build_atom_payload, _saga_db, atom_id)
+        elif view == "search":
+            query = request.query.get("q", "").strip()
+            if not query:
+                return json_error("missing_query", "q param required", status=400)
+            channel = request.query.get("channel", "").strip() or None
+            try:
+                limit = int(request.query.get("limit") or 100)
+            except ValueError:
+                limit = 100
+            payload = await asyncio.to_thread(
+                build_search_payload,
+                _saga_db, query, channel=channel, limit=limit,  # type: ignore[arg-type]
+            )
+            total = int(payload.get("total_matched") or len(payload.get("atoms") or []))
+            payload = dict(payload)
+            payload.pop("total_matched", None)
+            payload.pop("limit", None)
+            meta = list_meta(
+                cursor=None,
+                limit=limit,
+                total=total,
+                truncated=total > limit,
+            )
+        elif view == "activation_hist":
+            try:
+                days = int(request.query.get("days") or 7)
+            except ValueError:
+                days = 7
+            payload = await asyncio.to_thread(
+                build_activation_hist_payload,
+                _saga_db, days=days,  # type: ignore[arg-type]
+            )
+            total = int(payload.pop("total", 0) or 0)
+            meta = list_meta(cursor=None, limit=None, total=total, truncated=False)
+        elif view == "clusters":
+            try:
+                sample_size = int(request.query.get("sample_size") or 3)
+            except ValueError:
+                sample_size = 3
+            payload = await asyncio.to_thread(
+                build_clusters_payload,
+                _saga_db, sample_size=sample_size,  # type: ignore[arg-type]
+            )
+            total = int(payload.pop("total_clusters", 0) or 0)
+            meta = list_meta(cursor=None, limit=None, total=total, truncated=False)
+        else:
+            channel = request.query.get("channel", "").strip() or None
+            try:
+                limit = int(request.query.get("limit") or 50)
+            except ValueError:
+                limit = 50
+            payload = await asyncio.to_thread(
+                build_recent_atoms_payload,
+                _saga_db, channel=channel, limit=limit,  # type: ignore[arg-type]
+            )
+            total = int(payload.get("total") or len(payload.get("atoms") or []))
+            payload = dict(payload)
+            payload.pop("total", None)
+            payload.pop("limit", None)
+            atoms = payload.get("atoms") or []
+            cursor = str(atoms[-1].get("id")) if atoms and atoms[-1].get("id") else None
+            meta = list_meta(cursor=cursor, limit=limit, total=total, truncated=total > limit)
+
+        if "error" in payload:
+            status = 404 if "not found" in str(payload["error"]) else 503
+            return json_error("saga_error", str(payload["error"]), status=status)
+        return json_success(payload, meta=meta)
+
     if ("GET", "/turns") not in existing:
         app.router.add_get("/turns", turns_page)
     if ("GET", "/api/turns") not in existing:
         app.router.add_get("/api/turns", turns_data)
+    if ("GET", "/api/v1/turns") not in existing:
+        app.router.add_get("/api/v1/turns", turns_data_v1)
     if ("GET", "/api/events") not in existing:
         app.router.add_get("/api/events", events_data)
+    if ("GET", "/api/v1/events") not in existing:
+        app.router.add_get("/api/v1/events", events_data_v1)
     if ("GET", "/app") not in existing:
         app.router.add_get("/app", react_app)
     if ("GET", "/app/auth.js") not in existing:
         app.router.add_get("/app/auth.js", web_auth_js)
     if ("GET", "/api/web/bootstrap") not in existing:
         app.router.add_get("/api/web/bootstrap", web_bootstrap)
+    if ("GET", "/api/v1/web/bootstrap") not in existing:
+        app.router.add_get("/api/v1/web/bootstrap", web_bootstrap_v1)
     if ("GET", "/app/") not in existing and ("GET", "/app/{path}") not in existing:
         app.router.add_get("/app/{path:.*}", react_app)
     if ("GET", "/ops") not in existing:
         app.router.add_get("/ops", ops_page)
     if ("GET", "/api/ops") not in existing:
         app.router.add_get("/api/ops", ops_data)
+    if ("GET", "/api/v1/ops") not in existing:
+        app.router.add_get("/api/v1/ops", ops_data_v1)
     async def saga_sql(request: web.Request) -> web.Response:
         """POST /api/saga/sql — read-only SQL passthrough.
 
@@ -435,13 +650,41 @@ def register_routes(
             return web.json_response(payload, status=500)
         return web.json_response(payload)
 
+    async def saga_sql_v1(request: web.Request) -> web.Response:
+        if _saga_db is None:
+            return json_error("saga_db_not_configured", "saga_db path not configured", status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            return json_error("invalid_json", "invalid JSON body", status=400)
+        sql = (body.get("sql") or "").strip()
+        if not sql:
+            return json_error("missing_sql", "sql field is required", status=400)
+
+        payload = await asyncio.to_thread(build_sql_payload, _saga_db, sql)
+        if payload.get("rejected"):
+            return json_error("sql_rejected", str(payload.get("error") or "SQL rejected"), status=400)
+        if "error" in payload:
+            return json_error("sql_error", str(payload["error"]), status=500)
+        meta = list_meta(
+            cursor=None,
+            limit=None,
+            total=int(payload.get("row_count") or len(payload.get("rows") or [])),
+            truncated=bool(payload.get("truncated")),
+        )
+        return json_success(payload, meta=meta)
+
     if ("GET", "/saga") not in existing:
         app.router.add_get("/saga", saga_page)
     if ("GET", "/api/saga") not in existing:
         app.router.add_get("/api/saga", saga_data)
+    if ("GET", "/api/v1/saga") not in existing:
+        app.router.add_get("/api/v1/saga", saga_data_v1)
     if os.environ.get("MIMIR_SAGA_SQL_ENABLED", "").strip() == "1":
         if ("POST", "/api/saga/sql") not in existing:
             app.router.add_post("/api/saga/sql", saga_sql)
+        if ("POST", "/api/v1/saga/sql") not in existing:
+            app.router.add_post("/api/v1/saga/sql", saga_sql_v1)
             log.info("saga SQL passthrough enabled (MIMIR_SAGA_SQL_ENABLED=1)")
     else:
         log.debug("saga SQL passthrough disabled (set MIMIR_SAGA_SQL_ENABLED=1 to enable)")
@@ -493,8 +736,53 @@ def register_routes(
         payload = await asyncio.to_thread(list_trees, _memory_roots)
         return web.json_response(payload)
 
+    async def memory_data_v1(request: web.Request) -> web.Response:
+        view = request.query.get("view", "tree")
+        if not _memory_roots:
+            return json_error("home_not_configured", "home not configured", status=503)
+
+        if view == "file":
+            rel = request.query.get("path", "").strip()
+            if not rel:
+                return json_error("missing_path", "path param required", status=400)
+            payload = await asyncio.to_thread(
+                read_file_safe_multi, _memory_roots, rel,
+            )
+            if "error" in payload:
+                err = str(payload["error"])
+                status = 400
+                if "not found" in err:
+                    status = 404
+                return json_error("memory_file_error", err, status=status)
+            return json_success(payload)
+
+        if view == "search":
+            q = request.query.get("q", "").strip()
+            if not q:
+                return json_error("missing_query", "q param required", status=400)
+            payload = await asyncio.to_thread(search_files, _memory_roots, q)
+            total = int(payload.pop("total", 0) or 0)
+            truncated = bool(payload.pop("truncated", False))
+            return json_success(
+                payload,
+                meta=list_meta(cursor=None, limit=None, total=total, truncated=truncated),
+            )
+
+        if view == "channels":
+            mem_root = _memory_roots[0]
+            channels = await asyncio.to_thread(list_channel_dirs, mem_root)
+            return json_success(
+                {"channels": channels},
+                meta=list_meta(cursor=None, limit=None, total=len(channels), truncated=False),
+            )
+
+        payload = await asyncio.to_thread(list_trees, _memory_roots)
+        return json_success(payload)
+
     # Renamed /memory → /state (the page surfaces <home>/state/ + memory/).
     if ("GET", "/state") not in existing:
         app.router.add_get("/state", memory_page)
     if ("GET", "/api/memory") not in existing:
         app.router.add_get("/api/memory", memory_data)
+    if ("GET", "/api/v1/memory") not in existing:
+        app.router.add_get("/api/v1/memory", memory_data_v1)

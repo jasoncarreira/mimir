@@ -82,6 +82,35 @@ class TestAuthExemptSet:
     def test_browser_auth_bootstrap_is_exempt(self) -> None:
         assert ("GET", "/app/auth.js") in _AUTH_EXEMPT
         assert ("GET", "/api/web/bootstrap") in _AUTH_EXEMPT
+        assert ("GET", "/api/v1/web/bootstrap") in _AUTH_EXEMPT
+
+    def test_skill_auto_update_event_reports_failures_without_drift(self) -> None:
+        from mimir.server import _skill_auto_update_event
+        from mimir.skill_install import AutoSkillUpdateResult
+
+        event = _skill_auto_update_event(AutoSkillUpdateResult(
+            failed={"github-poller": ["poller.py"]},
+        ))
+
+        assert event is not None
+        kind, fields = event
+        assert kind == "skills_auto_update_failed"
+        assert fields["failed"] == {"github-poller": ["poller.py"]}
+
+    def test_skill_auto_update_event_reports_remaining_drift_as_non_failed(self) -> None:
+        from mimir.server import _skill_auto_update_event
+        from mimir.skill_install import AutoSkillUpdateResult
+
+        event = _skill_auto_update_event(AutoSkillUpdateResult(
+            remaining_drift={"github-poller": {"extra": ["local-note.md"]}},
+        ))
+
+        assert event is not None
+        kind, fields = event
+        assert kind == "skills_auto_update"
+        assert fields["remaining_drift"] == {
+            "github-poller": {"extra": ["local-note.md"]}
+        }
 
     def test_react_assets_get_are_prefix_exempt(self) -> None:
         assert ("GET", "/app/") in _AUTH_EXEMPT_PREFIXES
@@ -270,6 +299,8 @@ def _auth_app(expected_key: str) -> web.Application:
     app.router.add_get("/ops", _ok_handler)
     app.router.add_get("/saga", _ok_handler)
     app.router.add_get("/state", _ok_handler)
+    app.router.add_get("/api/web/bootstrap", _ok_handler)
+    app.router.add_get("/api/v1/web/bootstrap", _ok_handler)
     return app
 
 
@@ -387,6 +418,12 @@ class TestAuthMiddlewareExemptRoutes:
     async def test_state_is_exempt(self) -> None:
         async with TestClient(TestServer(_auth_app("secret"))) as client:
             resp = await client.get("/state")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_v1_web_bootstrap_is_exempt(self) -> None:
+        async with TestClient(TestServer(_auth_app("secret"))) as client:
+            resp = await client.get("/api/v1/web/bootstrap")
         assert resp.status == 200
 
 

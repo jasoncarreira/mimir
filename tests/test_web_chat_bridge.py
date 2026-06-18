@@ -13,6 +13,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from mimir.bridges.web_chat import DEFAULT_CHANNEL, WebChatBridge
 from mimir.models import AgentEvent
 from mimir.server import _make_auth_middleware
+from mimir.web_contracts import validate_api_envelope, validate_live_event
 
 
 @pytest.fixture
@@ -63,6 +64,22 @@ async def test_post_chat_enqueues_user_message(bridge_app):
 
 
 @pytest.mark.asyncio
+async def test_post_chat_v1_enqueues_and_returns_contract_envelope(bridge_app):
+    _, a, enqueued = bridge_app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post(
+            "/api/v1/chat",
+            json={"channel_id": "web-foo", "content": "hello", "msg_id": "client-1"},
+        )
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"] == {"channel_id": "web-foo", "source_id": "client-1"}
+    assert enqueued[0].source_id == "client-1"
+
+
+@pytest.mark.asyncio
 async def test_post_chat_default_channel(bridge_app):
     _, a, enqueued = bridge_app
     async with TestClient(TestServer(a)) as client:
@@ -86,6 +103,18 @@ async def test_post_chat_rejects_empty_content(bridge_app):
     async with TestClient(TestServer(a)) as client:
         resp = await client.post("/chat", json={"content": "   "})
         assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_errors_use_stable_envelope(bridge_app):
+    _, a, _ = bridge_app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/api/v1/chat", json={"content": "   "})
+        body = await resp.json()
+
+    assert resp.status == 400
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "bad_request"
 
 
 @pytest.mark.asyncio
@@ -119,6 +148,8 @@ async def test_send_fans_out_to_subscribers(bridge_app):
             chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
         assert chunk.startswith(b"data: ")
         payload = json.loads(chunk[len(b"data: "):].strip())
+        validate_live_event(payload)
+        assert payload["kind"] == "chat.message"
         assert payload["channel_id"] == "web-foo"
         assert payload["text"] == "hello there"
         assert payload["message_id"] == result.message_id
@@ -168,6 +199,8 @@ async def test_react_emits_event(bridge_app):
         while chunk and not chunk.startswith(b"data:"):
             chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
         payload = json.loads(chunk[len(b"data: "):].strip())
+        validate_live_event(payload)
+        assert payload["kind"] == "chat.reaction"
         assert payload["_event"] == "react"
         assert payload["emoji"] == "👍"
 
