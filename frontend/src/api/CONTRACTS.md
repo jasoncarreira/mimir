@@ -152,6 +152,11 @@ Accepted response:
 
 `GET /chat/stream`
 
+Stream clients must use fetch-based SSE with `Accept: text/event-stream` and
+`X-API-Key` when a key is configured. Native `EventSource` is not supported for
+authenticated streams because it cannot set headers and API keys in URLs are not
+accepted.
+
 Server-sent event `data:` payloads:
 
 ```json

@@ -51,16 +51,71 @@ export function sendChatMessage(
   });
 }
 
+export interface ChatStreamOptions {
+  baseUrl?: string;
+  apiKey?: string;
+  fetchImpl?: typeof fetch;
+  onError?: (error: unknown) => void;
+}
+
+export interface ChatStreamHandle {
+  close(): void;
+}
+
+function dispatchSseBlock(block: string, onPayload: (payload: ChatStreamPayload) => void): void {
+  const data = block
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).replace(/^ /, ""))
+    .join("\n");
+  if (!data) return;
+  onPayload(JSON.parse(data) as ChatStreamPayload);
+}
+
 export function createChatStream(
   onPayload: (payload: ChatStreamPayload) => void,
-  options: { baseUrl?: string; apiKey?: string; eventSourceImpl?: typeof EventSource } = {}
-): EventSource {
-  const EventSourceCtor = options.eventSourceImpl ?? EventSource;
-  const key = options.apiKey ?? getStoredApiKey();
-  const query = key ? `?${new URLSearchParams({ api_key: key }).toString()}` : "";
-  const stream = new EventSourceCtor(`${options.baseUrl ?? ""}/chat/stream${query}`);
-  stream.onmessage = (event) => {
-    onPayload(JSON.parse(event.data) as ChatStreamPayload);
+  options: ChatStreamOptions = {}
+): ChatStreamHandle {
+  const { baseUrl = "", apiKey, fetchImpl = fetch, onError } = options;
+  const controller = new AbortController();
+  const headers = new Headers({ Accept: "text/event-stream" });
+  const key = apiKey ?? getStoredApiKey();
+  if (key) headers.set("X-API-Key", key);
+
+  void (async () => {
+    try {
+      const response = await fetchImpl(`${baseUrl}/chat/stream`, {
+        headers,
+        signal: controller.signal
+      });
+      if (!response.ok || !response.body) {
+        onError?.(response);
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        const parts = buffer.split(/\r?\n\r?\n/);
+        buffer = parts.pop() ?? "";
+        for (const part of parts) dispatchSseBlock(part, onPayload);
+      }
+
+      buffer += decoder.decode();
+      if (buffer) dispatchSseBlock(buffer, onPayload);
+    } catch (error) {
+      if (!controller.signal.aborted) onError?.(error);
+    }
+  })();
+
+  return {
+    close() {
+      controller.abort();
+    }
   };
-  return stream;
 }
