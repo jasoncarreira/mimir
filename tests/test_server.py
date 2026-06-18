@@ -84,6 +84,34 @@ class TestAuthExemptSet:
         assert ("GET", "/api/web/bootstrap") in _AUTH_EXEMPT
         assert ("GET", "/api/v1/web/bootstrap") in _AUTH_EXEMPT
 
+    def test_skill_auto_update_event_reports_failures_without_drift(self) -> None:
+        from mimir.server import _skill_auto_update_event
+        from mimir.skill_install import AutoSkillUpdateResult
+
+        event = _skill_auto_update_event(AutoSkillUpdateResult(
+            failed={"github-poller": ["poller.py"]},
+        ))
+
+        assert event is not None
+        kind, fields = event
+        assert kind == "skills_auto_update_failed"
+        assert fields["failed"] == {"github-poller": ["poller.py"]}
+
+    def test_skill_auto_update_event_reports_remaining_drift_as_non_failed(self) -> None:
+        from mimir.server import _skill_auto_update_event
+        from mimir.skill_install import AutoSkillUpdateResult
+
+        event = _skill_auto_update_event(AutoSkillUpdateResult(
+            remaining_drift={"github-poller": {"extra": ["local-note.md"]}},
+        ))
+
+        assert event is not None
+        kind, fields = event
+        assert kind == "skills_auto_update"
+        assert fields["remaining_drift"] == {
+            "github-poller": {"extra": ["local-note.md"]}
+        }
+
     def test_react_assets_get_are_prefix_exempt(self) -> None:
         assert ("GET", "/app/") in _AUTH_EXEMPT_PREFIXES
         assert _is_auth_exempt("GET", "/app/assets/index.js") is True

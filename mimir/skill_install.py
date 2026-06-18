@@ -38,6 +38,7 @@ import datetime
 import hashlib
 import json
 import difflib
+import logging
 import os
 import re
 import shutil
@@ -54,6 +55,8 @@ from mimir.skill_defs import (
     reject_escaping_symlinks,
 )
 from mimir.skill_md import frontmatter_list_field, parse_env_block, parse_frontmatter
+
+log = logging.getLogger(__name__)
 
 # Source root for optional-skills, relative to this file.
 #: ``mimir/skill_install.py`` lives at ``mimir/skill_install.py`` and the
@@ -816,9 +819,11 @@ def cmd_list(args) -> int:
 #: ``.pytest_cache`` are build artifacts; ``.pre-update-backup`` is created by
 #: ``apply_skill_update`` itself (a pre-overwrite snapshot inside the skill
 #: dir) — without excluding it, the backup files show up as ``extra`` and the
-#: detector flags its own backups as drift (a false positive).
+#: detector flags its own backups as drift (a false positive). Per-skill
+#: ``.env`` files are operator-local config/secrets and must never be copied
+#: from source, overwritten, or surfaced as drift.
 _DRIFT_IGNORE: frozenset[str] = frozenset(
-    {"__pycache__", ".pytest_cache", ".pre-update-backup"}
+    {"__pycache__", ".pytest_cache", ".pre-update-backup", ".env"}
 )
 
 
@@ -826,7 +831,8 @@ def _file_hashes(root: Path) -> dict[str, str]:
     """Return ``relative-path-str → sha256-hex`` for every file under
     *root*, recursively.  Skips any path whose components include a
     name in ``_DRIFT_IGNORE`` (``__pycache__``, ``.pytest_cache``,
-    ``.pre-update-backup``).
+    ``.pre-update-backup``).  Per-skill ``.env`` files are operator-local
+    secrets/config and are intentionally never compared or overwritten.
     """
     hashes: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
@@ -849,6 +855,35 @@ class AcceptedSkillDriftEntry:
     installed_hash: str
     source_hash: str
     accepted_at: str | None = None
+
+
+def summarize_skill_drift(result: "SkillDriftResult") -> dict[str, object]:
+    """Return a compact JSON-safe summary of one skill drift result."""
+    data: dict[str, object] = {}
+    if result.orphaned:
+        data["orphaned"] = True
+    differs = result.unaccepted_differs
+    if differs:
+        data["differs"] = differs
+    if result.added:
+        data["added"] = list(result.added)
+    if result.extra:
+        data["extra"] = list(result.extra)
+    if result.accepted:
+        data["accepted"] = list(result.accepted)
+    return data
+
+
+def summarize_skill_drift_results(
+    results: list["SkillDriftResult"],
+) -> dict[str, dict[str, object]]:
+    """Return actionable drift details keyed by skill name."""
+    return {
+        r.name: summary
+        for r in results
+        if r.has_unaccepted_drift
+        if (summary := summarize_skill_drift(r))
+    }
 
 
 @dataclass
@@ -1133,6 +1168,7 @@ def detect_skill_drift(
             ))
             continue
 
+        reject_escaping_symlinks(source_dir)
         installed_hashes = _file_hashes(installed_dir)
         source_hashes = _file_hashes(source_dir)
 
@@ -1318,6 +1354,7 @@ def apply_skill_update(
     failed: list[str] = []
 
     assert result.source_path is not None  # guaranteed when not orphaned
+    reject_escaping_symlinks(result.source_path)
 
     # Backup directory for differs files: .pre-update-backup/<timestamp>/ inside
     # the installed skill directory.  Created lazily on first use.
@@ -1433,6 +1470,92 @@ def apply_skill_update(
         )
 
     return updated, failed, pollers_hint
+
+
+@dataclass
+class AutoSkillUpdateResult:
+    """Summary from startup-time optional-skill source sync.
+
+    ``auto_update_installed_optional_skills`` applies the safe subset of
+    ``mimir skills update --apply`` at boot: source-side changes to files that
+    exist on both sides plus source-added files.  It never forces removal of
+    installed-only files, so operator-local artifacts (including per-skill
+    ``.env`` files, which drift detection ignores entirely) are preserved.
+    """
+
+    updated: dict[str, list[str]] = field(default_factory=dict)
+    failed: dict[str, list[str]] = field(default_factory=dict)
+    pollers_json_updated: list[str] = field(default_factory=list)
+    remaining_drift: dict[str, dict[str, object]] = field(default_factory=dict)
+
+    @property
+    def any_updates(self) -> bool:
+        return bool(
+            self.updated
+            or self.failed
+            or self.pollers_json_updated
+            or self.remaining_drift
+        )
+
+
+def auto_update_installed_optional_skills(
+    home: Path,
+    optional_skills_root: Path | None = None,
+) -> AutoSkillUpdateResult:
+    """Safely refresh installed optional skills from bundled source.
+
+    This is the deploy/startup counterpart to ``mimir skills update --apply``
+    for chainlink #557.  It intentionally uses ``detect_skill_drift`` +
+    ``apply_skill_update`` rather than ``install(..., force=True)`` so existing
+    operator-local files are backed up or preserved instead of clobbered.
+
+    Applied automatically:
+    - ``unaccepted_differs``: files present on both sides whose content differs
+      and whose current fingerprint has not been accepted by the operator.
+    - ``added``: new files shipped in source and absent from the installed copy.
+
+    Preserved / surfaced, not forced:
+    - ``accepted`` differs: intentional local divergence.
+    - ``extra`` files: installed-only local artifacts or source-deleted files.
+    - ``orphaned`` skills: no source counterpart.
+
+    Returns a compact summary for startup logging.  Poller reload is not done
+    here because startup calls this before registering poller jobs; the
+    subsequent discovery sees the updated ``pollers.json`` directly.
+    """
+    summary = AutoSkillUpdateResult()
+    results = detect_skill_drift(home, optional_skills_root)
+
+    for result in results:
+        if result.orphaned:
+            continue
+        # Only auto-apply source-driven changes.  A result that has only
+        # ``extra`` files would make ``apply_skill_update(force=False)`` print a
+        # warning but write nothing; leave it for the visible drift surface.
+        if not (result.unaccepted_differs or result.added):
+            continue
+        updated, failed, _hint = apply_skill_update(result, force=False)
+        if updated:
+            summary.updated[result.name] = updated
+            if "pollers.json" in updated:
+                summary.pollers_json_updated.append(result.name)
+        if failed:
+            summary.failed[result.name] = failed
+
+    # Recompute after applying so residual source drift / preserved extras /
+    # orphaned skills stay visible to the update digest/status surfaces.
+    try:
+        post = detect_skill_drift(home, optional_skills_root)
+        summary.remaining_drift = summarize_skill_drift_results(post)
+    except Exception as exc:
+        # The update itself already happened; don't fail startup just because
+        # the informational post-scan failed.  Emit a debug log so residual
+        # drift is not silently under-reported as "all clear."
+        log.debug("optional-skill auto-update post-scan failed: %s", exc)
+        summary.remaining_drift = {}
+
+    summary.pollers_json_updated = sorted(set(summary.pollers_json_updated))
+    return summary
 
 
 def add_argparse_update(parser) -> None:
