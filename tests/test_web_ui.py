@@ -13,6 +13,7 @@ from mimir import web_ui
 from mimir.web_contracts import (
     render_typescript_contracts,
     validate_api_envelope,
+    validate_live_event,
     validate_list_meta,
 )
 
@@ -195,6 +196,108 @@ async def test_api_v1_events_returns_envelope_and_list_metadata(app):
         "total": 2,
         "truncated": True,
     }
+
+
+def _sse_data_items(text: str) -> list[dict]:
+    items = []
+    for block in text.strip().split("\n\n"):
+        data_lines = [
+            line.removeprefix("data: ").removeprefix("data:")
+            for line in block.splitlines()
+            if line.startswith("data:")
+        ]
+        if data_lines:
+            items.append(json.loads("\n".join(data_lines)))
+    return items
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_backfill_orders_and_dedups(app):
+    a, turns_log, _ = app
+    rows = [
+        {
+            "turn_id": "t1",
+            "ts": "2026-01-01T00:00:01Z",
+            "events": [{"type": "reasoning", "content": "a"}],
+        },
+        {
+            "turn_id": "t2",
+            "ts": "2026-01-01T00:00:02Z",
+            "events": [
+                {"type": "tool_call", "id": "call-1"},
+                {"type": "tool_result", "id": "call-1"},
+            ],
+        },
+        {
+            "turn_id": "t2",
+            "ts": "2026-01-01T00:00:02Z",
+            "events": [{"type": "tool_call", "id": "call-1"}],
+        },
+    ]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/live-events?once=1")
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert resp.content_type == "text/event-stream"
+    items = _sse_data_items(body)
+    assert [item["cursor"] for item in items] == [
+        "turn:t1:000000",
+        "turn:t1:000001",
+        "turn:t2:000000",
+        "turn:t2:000001",
+        "turn:t2:000002",
+    ]
+    assert len({item["id"] for item in items}) == len(items)
+    for item in items:
+        validate_live_event(item["event"])
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_since_backfill_is_strict(app):
+    a, turns_log, _ = app
+    rows = [
+        {"turn_id": "t1", "ts": "2026-01-01T00:00:01Z", "events": [{"type": "a"}]},
+        {"turn_id": "t2", "ts": "2026-01-01T00:00:02Z", "events": [{"type": "b"}]},
+    ]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/live-events?once=1&since=turn:t1:000001")
+        body = await resp.text()
+
+    assert resp.status == 200
+    items = _sse_data_items(body)
+    assert [item["cursor"] for item in items] == ["turn:t2:000000", "turn:t2:000001"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_auth_uses_header_not_query_param(tmp_path: Path):
+    from mimir.server import _make_auth_middleware
+
+    turns_log = tmp_path / "turns.jsonl"
+    events_log = tmp_path / "events.jsonl"
+    turns_log.write_text(
+        json.dumps({"turn_id": "t1", "ts": "2026-01-01T00:00:01Z"}) + "\n",
+        encoding="utf-8",
+    )
+    a = web.Application(middlewares=[_make_auth_middleware("live-secret")])
+    web_ui.register_routes(a, turns_log=turns_log, events_log=events_log)
+
+    async with TestClient(TestServer(a)) as client:
+        query_resp = await client.get("/api/v1/live-events?once=1&api_key=live-secret")
+        assert query_resp.status == 401
+
+        resp = await client.get(
+            "/api/v1/live-events?once=1",
+            headers={"X-API-Key": "live-secret"},
+        )
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert _sse_data_items(body)[0]["cursor"] == "turn:t1:000000"
 
 
 @pytest.mark.asyncio

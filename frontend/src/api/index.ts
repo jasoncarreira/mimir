@@ -5,9 +5,11 @@ export type {
   ApiSuccessEnvelope,
   ApiVersion,
   ListMeta,
-  LiveEvent
+  LiveEvent,
+  LiveEventStreamItem
 } from "./generated/contracts";
 export * from "./http";
+export * from "./live-events";
 export * from "./memory";
 export * from "./ops";
 export * from "./saga";

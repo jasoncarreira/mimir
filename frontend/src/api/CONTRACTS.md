@@ -19,6 +19,7 @@ React dashboard parity surface inventoried from the legacy pages:
 - `GET /api/v1/web/bootstrap`
 - `GET /api/v1/turns`
 - `GET /api/v1/events`
+- `GET /api/v1/live-events`
 - `GET /api/v1/ops`
 - `GET /api/v1/saga`
 - `POST /api/v1/saga/sql` when `MIMIR_SAGA_SQL_ENABLED=1`
@@ -59,6 +60,25 @@ union with `kind` discriminators:
 
 Existing `/chat/stream` payloads also keep legacy fields such as `_event` for
 backward compatibility.
+
+`GET /api/v1/live-events` is the shared React dashboard SSE substrate. It uses
+fetch-based SSE with `X-API-Key` auth, never URL-carried keys. Each SSE data
+payload is a `LiveEventStreamItem`:
+
+```json
+{"id": "turn:t1:event:1", "cursor": "turn:t1:000001", "ts": "2026-01-01T00:00:00Z", "event": {"kind": "turn.event", "turn_id": "t1", "event": {"type": "tool_call"}}}
+```
+
+Reconnect with `?since=<last cursor>`; backfill is strict (`cursor > since`) so
+the last acknowledged item is not replayed. Clients should also deduplicate by
+`id`, because reconnects and log rewrites can overlap.
+
+TanStack Query integration policy: high-frequency events for the selected turn
+must update local/query state directly. Aggregate views should debounce and
+coalesce invalidation instead of calling `invalidateQueries` for every event.
+`LiveEventsProvider` implements this policy with a structural query-client
+interface so the frontend does not need to add TanStack Query before pages are
+cut over.
 
 ## Versioning
 

@@ -37,4 +37,9 @@ fetch("/chat/stream", {
 });
 ```
 
-The shared browser helper exposes `MimirAuth.fetchEventStream()` for this pattern. This is the stream-auth shape to reuse for live-events work in #542.
+The shared browser helper exposes `MimirAuth.fetchEventStream()` for this pattern.
+React live dashboards use the same shape for `GET /api/v1/live-events`.
+
+Do not append `api_key` to stream URLs. The auth middleware rejects URL keys for
+streams just like REST APIs, and access logs continue masking stale `api_key=`
+query strings as defense in depth.
