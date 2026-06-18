@@ -1,3 +1,4 @@
+export * from "./admin";
 export * from "./chat";
 export type {
   ApiEnvelope,

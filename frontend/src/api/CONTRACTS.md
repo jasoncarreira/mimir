@@ -20,6 +20,7 @@ React dashboard parity surface inventoried from the legacy pages:
 - `GET /api/v1/turns`
 - `GET /api/v1/events`
 - `GET /api/v1/live-events`
+- `GET /api/v1/admin/config`
 - `GET /api/v1/ops`
 - `GET /api/v1/saga`
 - `POST /api/v1/saga/sql` when `MIMIR_SAGA_SQL_ENABLED=1`
@@ -28,6 +29,19 @@ React dashboard parity surface inventoried from the legacy pages:
 
 Legacy `/api/*` and `/chat` routes remain compatible with the static HTML pages
 until those pages are cut over.
+
+## Admin Config
+
+`GET /api/v1/admin/config` is read-only in v1. It returns effective
+model/provider/context-window/resource-window state, typed config schema
+sections, configured scheduler jobs and pollers, categorized environment
+presence, and redacted raw config. Secret-bearing fields and env vars return
+presence plus `[REDACTED]`, never the stored value.
+
+The v1 admin contract intentionally has no reveal or mutation endpoint.
+`capabilities.secret_reveal.available` and `capabilities.edits.available` are
+`false`; future editable settings must add an explicit field allowlist, auth
+gate, audit trail, and rate limit before a write path is exposed.
 
 ## Envelope
 

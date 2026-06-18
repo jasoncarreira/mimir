@@ -270,6 +270,90 @@ export interface WebBootstrapData {
   };
 }
 
+export interface AdminModelData {
+  model_spec: string;
+  provider_prefix: string;
+  model_name: string;
+  provider: string;
+  subscription_provider: string | null;
+  billing_mode: string;
+  context_window: {
+    tokens: number | null;
+    context_1m_enabled: boolean;
+    note: string;
+  };
+  resource_window: {
+    tool_call_budget: number;
+    max_turn_iterations: number;
+    turn_timeout_seconds: number;
+    post_turn_timeout_seconds: number;
+    max_concurrent_turns: number;
+    max_channel_queue: number;
+    model_max_tokens: number;
+  };
+}
+
+export interface AdminSchemaField {
+  name: string;
+  type: string;
+  mutable: boolean;
+  secret: boolean;
+}
+
+export interface AdminScheduleData {
+  name: string;
+  kind: "callable" | "prompt";
+  cron: string | null;
+  time_of_day: string | null;
+  channel_id: string | null;
+  deliver: string | null;
+  priority: string;
+  misfire_grace_time: number;
+  prompt_configured: boolean;
+  prompt_file: string | null;
+  callable: string | null;
+}
+
+export interface AdminPollerData {
+  name: string;
+  cron: string;
+  channel_id: string;
+  priority: string;
+  batch_size: number;
+  recover_failed_turns: boolean;
+  deliver: string | null;
+  manifest_path: string | null;
+  env_keys: string[];
+  pass_env: string[];
+  env_required: string[];
+}
+
+export interface AdminEnvData {
+  name: string;
+  category: string;
+  present: boolean;
+  secret: boolean;
+  value: string | null;
+}
+
+export interface AdminConfigData {
+  model: AdminModelData;
+  schema: {
+    sections: Array<{ id: string; title: string; mutable: boolean }>;
+    fields: AdminSchemaField[];
+  };
+  schedules: AdminScheduleData[];
+  pollers: AdminPollerData[];
+  env: AdminEnvData[];
+  raw_config: JsonObject;
+  capabilities: {
+    read_only: string[];
+    mutable: string[];
+    secret_reveal: { available: boolean; reason: string };
+    edits: { available: boolean; reason: string };
+  };
+}
+
 export interface ChatPostRequest {
   channel_id?: string;
   content: string;

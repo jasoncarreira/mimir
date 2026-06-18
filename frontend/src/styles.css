@@ -253,6 +253,25 @@ input {
   padding-top: var(--mimir-space-md, 16px);
 }
 
+.admin-config,
+.admin-stack {
+  display: grid;
+  gap: var(--mimir-space-md, 16px);
+}
+
+.admin-capabilities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mimir-space-xs, 8px);
+  align-items: center;
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-sm, 0.875rem);
+}
+
+.admin-config .facts-grid dd {
+  overflow-wrap: anywhere;
+}
+
 .ui-nav-list {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));

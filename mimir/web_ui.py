@@ -10,6 +10,7 @@ hosts the WebUI bridge's ``/chat``. Routes:
                           repeated to combine filters
   GET /api/v1/live-events — fetch-authenticated SSE stream for React live
                           dashboards with cursor backfill/dedup semantics
+  GET /api/v1/admin/config — redacted read-only config/model/env admin payload
   GET /ops              — live ops dashboard (HTML, Chart.js)
   GET /api/ops          — JSON twin of /ops for ad-hoc scripting
   GET /saga             — saga DB operator viewer (HTML)
@@ -43,6 +44,7 @@ from typing import Any
 from aiohttp import web
 
 from ._jsonl_tail import tail_jsonl_records
+from .admin_config import build_admin_config_payload
 from .live_events import read_live_event_items_since
 from .ops_dashboard import (
     build_dashboard_payload_async,
@@ -492,6 +494,17 @@ def register_routes(
             headers=_no_store_headers(),
         )
 
+    async def admin_config_v1(request: web.Request) -> web.Response:
+        config = request.app.get("config")
+        if config is None:
+            return json_error(
+                "config_not_configured",
+                "config object not configured",
+                status=503,
+            )
+        payload = await asyncio.to_thread(build_admin_config_payload, config)
+        return json_success(payload, headers=_no_store_headers())
+
     async def ops_page(request: web.Request) -> web.Response:
         # Static HTML shell — frontend AJAX-fetches /api/ops via the
         # shared auth helper. We still validate ``?days=`` here
@@ -708,6 +721,8 @@ def register_routes(
         app.router.add_get("/api/web/bootstrap", web_bootstrap)
     if ("GET", "/api/v1/web/bootstrap") not in existing:
         app.router.add_get("/api/v1/web/bootstrap", web_bootstrap_v1)
+    if ("GET", "/api/v1/admin/config") not in existing:
+        app.router.add_get("/api/v1/admin/config", admin_config_v1)
     if ("GET", "/app/") not in existing and ("GET", "/app/{path}") not in existing:
         app.router.add_get("/app/{path:.*}", react_app)
     if ("GET", "/ops") not in existing:

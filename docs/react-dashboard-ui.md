@@ -77,3 +77,10 @@ contracts in the existing backend layer. The React route component should only
 compose primitives, call the typed API client, and render page-specific data.
 If a route needs a visual pattern missing from the UI kit, add the reusable
 primitive and an example before using it in the route.
+
+## Admin Config Page
+
+The `/admin` React route consumes `GET /api/v1/admin/config`. In v1, all admin
+sections are read-only: model/provider/window state, scheduler jobs, pollers,
+env presence, schema sections, and raw config inspection. No secret reveal or
+config mutation path exists; secret fields are presence-only and redacted.

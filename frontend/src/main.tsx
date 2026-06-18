@@ -19,15 +19,19 @@ import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import {
   Badge,
   Button,
+  CodeBlock,
   DashboardHeader,
+  DataTable,
   ErrorState,
   LoadingState,
   Panel,
   TextInput
 } from "./ui";
+import { fetchAdminConfig } from "./api/admin";
+import type { AdminConfigData } from "./api/generated/contracts";
 import "./styles.css";
 
-type SurfaceId = "chat" | "turns" | "ops" | "saga" | "memory" | "hermes";
+type SurfaceId = "chat" | "turns" | "ops" | "saga" | "memory" | "admin";
 
 interface Surface {
   id: SurfaceId;
@@ -86,13 +90,13 @@ const surfaces: Surface[] = [
     filterLabel: "tier"
   },
   {
-    id: "hermes",
-    path: "/hermes",
-    label: "Hermes Gaps",
-    title: "Hermes Gaps",
-    detail: "Reserved route for follow-up pages",
-    tabs: ["gaps", "handoffs", "notes"],
-    filterLabel: "owner"
+    id: "admin",
+    path: "/admin",
+    label: "Admin",
+    title: "Admin",
+    detail: "Config, model, schedules, and env",
+    tabs: ["model", "schedules", "pollers", "env", "raw"],
+    filterLabel: "section"
   }
 ];
 
@@ -320,7 +324,7 @@ function RouteTabs({
         role="tabpanel"
         tabIndex={0}
       >
-        <RoutePlaceholder surface={surface} />
+        <RoutePlaceholder activeTabOverride={activeTab} surface={surface} />
       </section>
     </div>
   );
@@ -397,8 +401,19 @@ function CollapsibleRegion({
   );
 }
 
-function RoutePlaceholder({ surface }: { surface: Surface }) {
+function RoutePlaceholder({
+  surface,
+  activeTabOverride
+}: {
+  surface: Surface;
+  activeTabOverride?: string;
+}) {
   const { activeTab, selectedTurn, filter, target } = useRouteState(surface);
+  const effectiveTab = activeTabOverride || activeTab;
+
+  if (surface.id === "admin") {
+    return <AdminConfigPage activeTab={effectiveTab} />;
+  }
 
   return (
     <div className="route-placeholder">
@@ -406,11 +421,166 @@ function RoutePlaceholder({ surface }: { surface: Surface }) {
         {surface.title} route frame is mounted. Dashboard-specific content is intentionally deferred to its page issue.
       </p>
       <dl className="facts-grid">
-        <div><dt>Active tab</dt><dd>{activeTab}</dd></div>
+        <div><dt>Active tab</dt><dd>{effectiveTab}</dd></div>
         <div><dt>Selected turn</dt><dd>{selectedTurn || "none"}</dd></div>
         <div><dt>Filter</dt><dd>{filter || "none"}</dd></div>
         <div><dt>Target</dt><dd>{target || "none"}</dd></div>
       </dl>
+    </div>
+  );
+}
+
+function useAdminConfig() {
+  return useQuery({
+    queryKey: ["admin-config"],
+    queryFn: async () => {
+      const envelope = await fetchAdminConfig();
+      return envelope.data;
+    }
+  });
+}
+
+function AdminConfigPage({ activeTab }: { activeTab: string }) {
+  const { data, error, isError, isLoading } = useAdminConfig();
+  if (isLoading) return <LoadingState label="Loading admin config" />;
+  if (isError || !data) {
+    return (
+      <ErrorState title="Admin config failed">
+        {error instanceof Error ? error.message : String(error)}
+      </ErrorState>
+    );
+  }
+
+  const tab = activeTab === "raw" ? "raw_config" : activeTab;
+  return (
+    <div className="admin-config">
+      <AdminCapabilityBanner data={data} />
+      {tab === "model" ? <AdminModel data={data} /> : null}
+      {tab === "schedules" ? <AdminSchedules data={data} /> : null}
+      {tab === "pollers" ? <AdminPollers data={data} /> : null}
+      {tab === "env" ? <AdminEnv data={data} /> : null}
+      {tab === "raw_config" ? <AdminRawConfig data={data} /> : null}
+    </div>
+  );
+}
+
+function AdminCapabilityBanner({ data }: { data: AdminConfigData }) {
+  return (
+    <div className="admin-capabilities" aria-label="Admin capabilities">
+      <Badge tone="neutral">read-only</Badge>
+      <span>{data.capabilities.secret_reveal.reason}</span>
+      <span>{data.capabilities.edits.reason}</span>
+    </div>
+  );
+}
+
+function AdminModel({ data }: { data: AdminConfigData }) {
+  const model = data.model;
+  return (
+    <div className="admin-stack">
+      <dl className="facts-grid">
+        <div><dt>Model</dt><dd>{model.model_name}</dd></div>
+        <div><dt>Provider</dt><dd>{model.provider}</dd></div>
+        <div><dt>Spec</dt><dd>{model.model_spec}</dd></div>
+        <div><dt>Billing</dt><dd>{model.billing_mode}</dd></div>
+        <div><dt>Context</dt><dd>{model.context_window.tokens ? model.context_window.tokens.toLocaleString() : "unknown"}</dd></div>
+        <div><dt>Window</dt><dd>{model.context_window.note}</dd></div>
+      </dl>
+      <DataTable
+        columns={[
+          { key: "setting", header: "Setting" },
+          { key: "value", header: "Value" }
+        ]}
+        rows={Object.entries(model.resource_window).map(([key, value]) => ({
+          setting: key,
+          value: String(value)
+        }))}
+      />
+    </div>
+  );
+}
+
+function AdminSchedules({ data }: { data: AdminConfigData }) {
+  return (
+    <DataTable
+      columns={[
+        { key: "name", header: "Name" },
+        { key: "kind", header: "Kind" },
+        { key: "schedule", header: "Schedule" },
+        { key: "target", header: "Target" },
+        { key: "priority", header: "Priority" }
+      ]}
+      rows={data.schedules.map((item) => ({
+        name: item.name,
+        kind: item.kind,
+        schedule: item.cron || item.time_of_day || "disabled",
+        target: item.callable || item.prompt_file || item.channel_id || "global",
+        priority: item.priority
+      }))}
+      caption={data.schedules.length ? undefined : "No scheduler.yaml jobs configured."}
+    />
+  );
+}
+
+function AdminPollers({ data }: { data: AdminConfigData }) {
+  return (
+    <DataTable
+      columns={[
+        { key: "name", header: "Name" },
+        { key: "cron", header: "Cron" },
+        { key: "channel", header: "Channel" },
+        { key: "priority", header: "Priority" },
+        { key: "env", header: "Env" }
+      ]}
+      rows={data.pollers.map((item) => ({
+        name: item.name,
+        cron: item.cron,
+        channel: item.channel_id,
+        priority: item.priority,
+        env: [...item.env_required, ...item.pass_env].join(", ") || "none"
+      }))}
+      caption={data.pollers.length ? undefined : "No poller manifests discovered."}
+    />
+  );
+}
+
+function AdminEnv({ data }: { data: AdminConfigData }) {
+  return (
+    <DataTable
+      columns={[
+        { key: "name", header: "Name" },
+        { key: "category", header: "Category" },
+        { key: "present", header: "Present" },
+        { key: "value", header: "Value" }
+      ]}
+      rows={data.env.map((item) => ({
+        name: item.name,
+        category: item.category,
+        present: <Badge tone={item.present ? "success" : "neutral"}>{item.present ? "set" : "unset"}</Badge>,
+        value: item.value ?? ""
+      }))}
+    />
+  );
+}
+
+function AdminRawConfig({ data }: { data: AdminConfigData }) {
+  return (
+    <div className="admin-stack">
+      <DataTable
+        columns={[
+          { key: "section", header: "Section" },
+          { key: "mutable", header: "Mutable" }
+        ]}
+        rows={data.schema.sections.map((section) => ({
+          section: section.title,
+          mutable: section.mutable ? "yes" : "no"
+        }))}
+      />
+      <CodeBlock
+        code={JSON.stringify(data.raw_config, null, 2)}
+        language="json"
+        title="Redacted raw config"
+      />
     </div>
   );
 }

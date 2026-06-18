@@ -10,6 +10,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from mimir import web_ui
+from mimir.config import Config
 from mimir.web_contracts import (
     render_typescript_contracts,
     validate_api_envelope,
@@ -525,6 +526,89 @@ async def test_api_v1_web_bootstrap_auth_exempt_with_middleware(tmp_path: Path):
     assert resp.status == 200
     validate_api_envelope(body, expect_ok=True)
     assert body["data"]["auth"]["required"] is True
+
+
+@pytest.mark.asyncio
+async def test_api_v1_admin_config_is_redacted_and_read_only(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:claude-sonnet-4-6")
+    monkeypatch.setenv("MIMIR_CONTEXT_1M", "true")
+    monkeypatch.setenv("MIMIR_API_KEY", "admin-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-secret")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test-secret")
+    (tmp_path / "scheduler.yaml").write_text(
+        "- name: daily-review\n"
+        "  prompt: review\n"
+        "  cron: '0 8 * * *'\n"
+        "  channel_id: null\n",
+        encoding="utf-8",
+    )
+    cfg = Config.from_env()
+    a = web.Application()
+    a["config"] = cfg
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/admin/config")
+        body_text = await resp.text()
+        body = json.loads(body_text)
+
+    assert resp.status == 200
+    assert resp.headers["Cache-Control"].startswith("no-store")
+    validate_api_envelope(body, expect_ok=True)
+    data = body["data"]
+    assert data["model"]["model_spec"] == "anthropic:claude-sonnet-4-6"
+    assert data["model"]["provider"] == "anthropic-api"
+    assert data["model"]["context_window"]["tokens"] == 1_000_000
+    assert data["schedules"][0]["name"] == "daily-review"
+    assert data["capabilities"]["secret_reveal"]["available"] is False
+    assert data["capabilities"]["edits"]["available"] is False
+    assert data["capabilities"]["mutable"] == []
+    assert "admin-secret" not in body_text
+    assert "sk-ant-test-secret" not in body_text
+    assert "xoxb-test-secret" not in body_text
+    assert data["raw_config"]["api_key"] == "[REDACTED]"
+    env_by_name = {row["name"]: row for row in data["env"]}
+    assert env_by_name["ANTHROPIC_API_KEY"] == {
+        "name": "ANTHROPIC_API_KEY",
+        "category": "secrets",
+        "present": True,
+        "secret": True,
+        "value": "[REDACTED]",
+    }
+
+
+@pytest.mark.asyncio
+async def test_api_v1_admin_config_requires_header_auth(tmp_path: Path, monkeypatch):
+    from mimir.server import _make_auth_middleware
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    cfg = Config.from_env()
+    a = web.Application(middlewares=[_make_auth_middleware("admin-secret")])
+    a["config"] = cfg
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        query_resp = await client.get("/api/v1/admin/config?api_key=admin-secret")
+        header_resp = await client.get(
+            "/api/v1/admin/config",
+            headers={"X-API-Key": "admin-secret"},
+        )
+        body = await header_resp.json()
+
+    assert query_resp.status == 401
+    assert header_resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
 
 
 @pytest.mark.asyncio
