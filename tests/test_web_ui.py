@@ -79,6 +79,32 @@ def test_dashboard_extension_registry_sorts_hides_and_validates_scope():
         )
 
 
+def test_dashboard_extension_route_path_allows_app_prefix_words_only():
+    DashboardExtensionManifest(
+        id="apple",
+        route_path="/apple",
+        label="Apple",
+    ).validate()
+    DashboardExtensionManifest(
+        id="applications",
+        route_path="/applications",
+        label="Applications",
+    ).validate()
+
+    with pytest.raises(ValueError, match="route_path"):
+        DashboardExtensionManifest(
+            id="app",
+            route_path="/app",
+            label="App",
+        ).validate()
+    with pytest.raises(ValueError, match="route_path"):
+        DashboardExtensionManifest(
+            id="app-child",
+            route_path="/app/child",
+            label="App Child",
+        ).validate()
+
+
 @pytest.mark.asyncio
 async def test_turns_page_serves_html(app):
     a, _, _ = app

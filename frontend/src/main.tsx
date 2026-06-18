@@ -15,7 +15,7 @@ import {
 import { create } from "zustand";
 import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
 import type { WebBootstrapData } from "./api/generated/contracts";
-import { dashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
+import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import {
   Badge,
@@ -28,7 +28,6 @@ import {
 } from "./ui";
 import "./styles.css";
 
-const surfaces = dashboardSurfaces;
 
 interface UiState {
   detailsPanelOpen: boolean;
@@ -77,8 +76,12 @@ function useBootstrap() {
   });
 }
 
-function AuthPanel() {
-  const { data: bootstrap, error, isError, isLoading } = useBootstrap();
+function AuthPanel({ bootstrap, error, isError, isLoading }: {
+  bootstrap?: WebBootstrapData;
+  error: Error | null;
+  isError: boolean;
+  isLoading: boolean;
+}) {
   const [entry, setEntry] = React.useState("");
   const [apiKeyPresent, setApiKeyPresent] = React.useState(Boolean(readStoredKey()));
   const requiresKey = bootstrap?.auth.required ?? false;
@@ -147,7 +150,7 @@ function AuthPanel() {
   );
 }
 
-function AppNavigation() {
+function AppNavigation({ surfaces }: { surfaces: DashboardSurface[] }) {
   return (
     <nav aria-label="Application sections" className="app-nav">
       {surfaces.map((surface) => (
@@ -416,6 +419,12 @@ function AppStatus() {
 
 function AppFrame() {
   const { skin } = useSkin();
+  const { data: bootstrap, error, isError, isLoading } = useBootstrap();
+  const surfaces = React.useMemo(
+    () => (bootstrap ? getDashboardSurfaces(bootstrap.dashboard_extensions) : []),
+    [bootstrap]
+  );
+  const firstRoute = surfaces[0]?.path ?? "/chat";
 
   return (
     <div className="app-frame">
@@ -424,24 +433,32 @@ function AppFrame() {
           <p className="ui-eyebrow">{skin.name}</p>
           <Link className="app-brand" to="/chat">Mimir App</Link>
         </div>
-        <AuthPanel />
+        <AuthPanel bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
       </header>
       <div className="app-body">
         <aside className="app-sidebar">
-          <AppNavigation />
+          <AppNavigation surfaces={surfaces} />
         </aside>
         <main className="app-main" id="main-content">
-          <Routes>
-            <Route element={<Navigate replace to="/chat" />} path="/" />
-            {surfaces.map((surface) => (
-              <Route
-                element={<SurfaceRoute surface={surface} />}
-                key={surface.id}
-                path={surface.path}
-              />
-            ))}
-            <Route element={<Navigate replace to="/chat" />} path="*" />
-          </Routes>
+          {isLoading ? <LoadingState label="Loading dashboard extensions" /> : null}
+          {isError ? (
+            <ErrorState title="Bootstrap failed">
+              {error instanceof Error ? error.message : String(error)}
+            </ErrorState>
+          ) : null}
+          {!isLoading && !isError ? (
+            <Routes>
+              <Route element={<Navigate replace to={firstRoute} />} path="/" />
+              {surfaces.map((surface) => (
+                <Route
+                  element={<SurfaceRoute surface={surface} />}
+                  key={surface.id}
+                  path={surface.path}
+                />
+              ))}
+              <Route element={<Navigate replace to={firstRoute} />} path="*" />
+            </Routes>
+          ) : null}
         </main>
       </div>
       <AppStatus />

@@ -7,32 +7,35 @@ security sandbox.
 ## Trust Boundary
 
 Dashboard extension v1 only accepts trusted first-party code shipped with mimir.
-Manifests must set `trustedFirstParty: true` in TypeScript and
-`trusted_first_party=True` in Python. Arbitrary remote bundles, operator-installed
+Manifests must set `trusted_first_party: true` in the generated TypeScript
+contract and `trusted_first_party=True` in Python. Arbitrary remote bundles, operator-installed
 marketplace plugins, privilege separation, and browser sandboxing are out of
 scope for this contract.
 
 ## Manifest Shape
 
-Frontend manifests live in `frontend/src/dashboardExtensions.ts`; backend
-manifests live in `mimir/dashboard_extensions.py`.
+Backend manifests live in `mimir/dashboard_extensions.py` and are exposed to
+React through the generated `DashboardExtensionManifest` contract in
+`frontend/src/api/generated/contracts.ts`. `frontend/src/dashboardExtensions.ts`
+adds shell-only metadata (placeholder tabs, details copy, filter labels) but
+reuses the generated manifest shape instead of declaring a second interface.
 
 ```ts
 interface DashboardExtensionManifest {
   id: string;
-  routePath: `/${string}`;
+  route_path: string;
   label: string;
-  icon?: string;
-  navPosition: number;
+  icon: string | null;
+  nav_position: number;
   enabled: boolean;
-  bundle?: string;
-  css?: string[];
-  apiNamespace?: string;
-  trustedFirstParty: true;
+  bundle: string | null;
+  css: string[];
+  api_namespace: string | null;
+  trusted_first_party: true;
 }
 ```
 
-Python uses the same fields in snake_case:
+Python uses the same fields:
 
 ```py
 DashboardExtensionManifest(
@@ -47,18 +50,20 @@ DashboardExtensionManifest(
 )
 ```
 
-`routePath` is the React route under the `/app` basename. `navPosition` controls
-tab order; lower values render first. `enabled=false` hides the tab and prevents
-its optional backend namespace hook from registering routes. `bundle` and `css`
-are reserved for packaged first-party assets; v1 does not load arbitrary remote
-URLs.
+`route_path` is the React route under the `/app` basename. `nav_position`
+controls tab order; lower values render first. `enabled=false` hides the tab and
+prevents its optional backend namespace hook from registering routes. `bundle`
+and `css` are reserved for packaged first-party assets; v1 does not load
+arbitrary remote URLs.
 
 ## Registry And Navigation
 
-The app shell imports `dashboardSurfaces` from
+The app shell reads `dashboard_extensions` from `/api/v1/web/bootstrap` and
+passes that generated-contract payload into `getDashboardSurfaces()` in
 `frontend/src/dashboardExtensions.ts`. To hide, show, or reorder tabs, change
-the manifest data or pass overrides to `getDashboardSurfaces()`; the shell maps
-the enabled, sorted registry into both navigation links and `<Route>` entries.
+the backend manifest data or pass overrides to `getDashboardSurfaces()`; the
+shell maps the enabled, sorted registry into both navigation links and `<Route>`
+entries.
 
 At least one dashboard tab, `chat`, is registered only through this registry
 path. The other first-party shell routes use the same path so route edits are not
@@ -66,9 +71,9 @@ needed for tab ordering or visibility changes.
 
 ## Backend API Namespaces
 
-`apiNamespace` is optional. When present, it is a key into trusted backend hooks
-provided by mimir, not a dynamic import path. `web_ui.register_routes()` wires
-enabled manifests through `add_backend_namespace_routes()`.
+`api_namespace` is optional. When present, it is a key into trusted backend
+hooks provided by mimir, not a dynamic import path. `web_ui.register_routes()`
+wires enabled manifests through `add_backend_namespace_routes()`.
 
 The first registered namespace is `ops`, which owns:
 

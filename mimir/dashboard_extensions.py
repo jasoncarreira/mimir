@@ -50,7 +50,9 @@ class DashboardExtensionManifest:
     def validate(self) -> None:
         if not _ID_RE.fullmatch(self.id):
             raise ValueError(f"dashboard extension id must be kebab-case: {self.id!r}")
-        if not self.route_path.startswith("/") or self.route_path.startswith("/app"):
+        if not self.route_path.startswith("/") or (
+            self.route_path == "/app" or self.route_path.startswith("/app/")
+        ):
             raise ValueError(
                 f"dashboard extension route_path must be an in-app absolute path: {self.route_path!r}"
             )
