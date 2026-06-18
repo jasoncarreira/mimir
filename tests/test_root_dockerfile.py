@@ -1,0 +1,38 @@
+"""Validation for the published runtime image (``./Dockerfile``).
+
+The repo root ``Dockerfile`` is the canonical mimir image. These checks keep
+operationally-relied-on CLI tools present and the apt layer hygienic so a clean
+rebuild can't silently drop them.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
+
+
+def _text() -> str:
+    return DOCKERFILE.read_text(encoding="utf-8")
+
+
+def test_apt_install_layer_includes_jq() -> None:
+    """jq must be installed in the same ``--no-install-recommends`` apt layer
+    that also cleans the cache, so it ships without a sloppy extra layer (#560)."""
+    text = _text()
+    block = re.search(
+        r"apt-get install -y --no-install-recommends(?P<body>[\s\S]*?)apt-get clean",
+        text,
+    )
+    assert block is not None, "could not find the apt install -> clean layer"
+    assert re.search(r"(?m)^\s*ca-certificates\b.*\bjq\b", block.group("body")) or re.search(
+        r"(?m)^\s+jq\b", block.group("body")
+    ), "jq is not listed in the apt install layer"
+
+
+def test_apt_layer_keeps_cache_hygiene() -> None:
+    """The package layer still cleans apt caches (no image bloat regression)."""
+    text = _text()
+    assert "apt-get clean" in text
+    assert "rm -rf /var/lib/apt/lists/*" in text
