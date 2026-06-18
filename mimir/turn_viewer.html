@@ -209,6 +209,7 @@ tr:hover td{background:var(--surface2);cursor:pointer}
   </div>
 </div>
 
+<script src="/app/auth.js"></script>
 <script>
 (function() {
 var allTurns = [];                 // loaded turns, newest-first (NOT the whole file)
@@ -233,64 +234,14 @@ function lsSet(key, value) {
   try { localStorage.setItem(LS_PREFIX + key, value); } catch (e) { /* private mode / quota */ }
 }
 
-// ── API key bootstrap ──────────────────────────────────────────────────────
-// MIMIR_API_KEY gates /api/* routes. The shell HTML at /turns is exempt so
-// this JS can prompt for a key on first access. Stored under a SHARED
-// localStorage key (no LS_PREFIX) so /turns and /ops share the same key.
-var API_KEY_LS = 'mimir.api_key';
-function getApiKey() {
-  try { return localStorage.getItem(API_KEY_LS) || ''; }
-  catch (e) { return ''; }
-}
-function setApiKey(k) {
-  try {
-    if (k) localStorage.setItem(API_KEY_LS, k);
-    else localStorage.removeItem(API_KEY_LS);
-  } catch (e) { /* ignore */ }
-}
-function promptApiKey(reason) {
-  var msg = 'Enter MIMIR_API_KEY';
-  if (reason) msg += ' (' + reason + ')';
-  msg += ':\n\n(Saved to this browser; leave blank to skip — you\'ll see 401s if the server requires it.)';
-  var v = window.prompt(msg, '') || '';
-  v = v.trim();
-  setApiKey(v);
-  return v;
-}
-// authedFetch: thin wrapper around fetch() that adds X-API-Key when
-// present in localStorage. On 401, clears the key and re-prompts once,
-// then retries — so a wrong-key entry self-recovers without a page reload.
-function authedFetch(url, opts) {
-  opts = opts || {};
-  opts.headers = opts.headers || {};
-  var key = getApiKey();
-  if (key) opts.headers['X-API-Key'] = key;
-  return fetch(url, opts).then(function(r) {
-    if (r.status === 401) {
-      setApiKey('');
-      var fresh = promptApiKey('previous key was rejected');
-      if (fresh) {
-        opts.headers['X-API-Key'] = fresh;
-        return fetch(url, opts);
-      }
-    }
-    return r;
-  });
-}
-// Manual key reset — surfaces only when a key IS stored (see the
-// reset-key-link toggle below). Lets the operator swap to a freshly
-// rotated server-side key without first being denied. The auto-prompt
-// on first visit + auto-re-prompt on 401 covers the rest.
+var authedFetch = window.MimirAuth.authedFetch;
+var getApiKey = window.MimirAuth.getApiKey;
 window.__mimir_resetApiKey = function() {
-  setApiKey('');
-  promptApiKey('manual rotation');
-  // Force a fresh initial load so the next poll uses the new key.
+  window.MimirAuth.reset('manual rotation');
   if (typeof loadInitial === 'function') loadInitial();
 };
-// Toggle the "↻ Reset key" link visibility on page load.
-document.addEventListener('DOMContentLoaded', function() {
-  var link = document.getElementById('reset-key-link');
-  if (link) link.style.display = getApiKey() ? '' : 'none';
+window.MimirAuth.wireResetLink('reset-key-link', function() {
+  if (typeof loadInitial === 'function') loadInitial();
 });
 var activeTrigger = lsGet('activeTrigger', 'all');
 var searchQuery = '';

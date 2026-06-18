@@ -367,7 +367,9 @@ def test_render_dashboard_html_returns_static_shell(tmp_path: Path):
     # The shell MUST contain the bootstrap markers proving the new path.
     assert "authedFetch('/api/ops'" in html
     assert "function render(D)" in html
-    assert "API_KEY_LS" in html
+    assert "/app/auth.js" in html
+    assert "window.MimirAuth.authedFetch" in html
+    assert "API_KEY_LS" not in html
 
 
 def test_render_dashboard_html_handles_empty_payload(tmp_path: Path):

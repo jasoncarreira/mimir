@@ -402,6 +402,32 @@ async def _stage_and_commit(*, turn_id: str, trigger: str, home: Path) -> bool:
 # + force-tracked via ``!prompts/**``, so the scan can never fire there.)
 _IGNORED_NOTE_EXTS = (".md", ".markdown", ".txt", ".rst")
 _IGNORED_NOTE_ROOTS = ("memory", "state")
+# Explicit escape hatch for intentionally ignored bulk/vendor trees under a
+# tracked root. ``git ls-files --others --ignored`` only tells us the file is
+# ignored, not whether that is a lost note or a deliberately local runtime
+# artifact. A marker in the ignored subtree makes the intent local and auditable
+# without hard-coding deployment-specific paths.
+_IGNORED_NOTE_OK_MARKER = ".mimir-ignore-notes-ok"
+
+
+def _has_ignored_note_ok_marker(home: Path, rel_path: str) -> bool:
+    path = Path(rel_path)
+    try:
+        if (home / f"{rel_path}{_IGNORED_NOTE_OK_MARKER}").exists():
+            return True
+    except OSError:
+        pass
+    # Check the file's parent and each ancestor down to the home-relative root.
+    for ancestor in path.parents:
+        if ancestor == Path("."):
+            break
+        try:
+            marker = home / ancestor / _IGNORED_NOTE_OK_MARKER
+        except OSError:
+            continue
+        if marker.exists():
+            return True
+    return False
 
 
 async def _surface_ignored_notes(*, home: Path, turn_id: str) -> None:
@@ -417,7 +443,11 @@ async def _surface_ignored_notes(*, home: Path, turn_id: str) -> None:
         return
     paths = [
         p for p in (res.stdout or "").splitlines()
-        if p.strip() and p.lower().endswith(_IGNORED_NOTE_EXTS)
+        if (
+            p.strip()
+            and p.lower().endswith(_IGNORED_NOTE_EXTS)
+            and not _has_ignored_note_ok_marker(home, p.strip())
+        )
     ]
     if not paths:
         return

@@ -12,6 +12,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from mimir.bridges.web_chat import DEFAULT_CHANNEL, WebChatBridge
 from mimir.models import AgentEvent
+from mimir.server import _make_auth_middleware
 
 
 @pytest.fixture
@@ -24,6 +25,20 @@ def bridge_app(tmp_path: Path):
 
     bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
     a = web.Application()
+    bridge.register_routes(a)
+    return bridge, a, enqueued
+
+
+@pytest.fixture
+def authed_bridge_app(tmp_path: Path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[_make_auth_middleware("stream-secret")])
     bridge.register_routes(a)
     return bridge, a, enqueued
 
@@ -107,6 +122,29 @@ async def test_send_fans_out_to_subscribers(bridge_app):
         assert payload["channel_id"] == "web-foo"
         assert payload["text"] == "hello there"
         assert payload["message_id"] == result.message_id
+
+
+@pytest.mark.asyncio
+async def test_stream_auth_uses_header_not_query_param(authed_bridge_app):
+    bridge, a, _ = authed_bridge_app
+    async with TestClient(TestServer(a)) as client:
+        query_resp = await client.get("/chat/stream?api_key=stream-secret")
+        assert query_resp.status == 401
+
+        resp = await client.get(
+            "/chat/stream",
+            headers={"X-API-Key": "stream-secret"},
+        )
+        assert resp.status == 200
+        assert resp.content_type == "text/event-stream"
+
+        await asyncio.sleep(0.05)
+        await bridge.send("web-foo", "header authed")
+        chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+        while chunk and not chunk.startswith(b"data:"):
+            chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+        payload = json.loads(chunk[len(b"data: "):].strip())
+        assert payload["text"] == "header authed"
 
 
 @pytest.mark.asyncio

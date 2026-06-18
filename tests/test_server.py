@@ -5,8 +5,7 @@ existing focused files (test_server_auth_warning, test_server_bind_security,
 test_server_consolidate):
 
 - ``_safe_str_eq``         — constant-time string comparison helper
-- ``_make_auth_middleware`` — key-header gate + query-param fallback +
-                              exempt-route bypass
+- ``_make_auth_middleware`` — key-header gate + exempt-route bypass
 - ``_AUTH_EXEMPT``         — correct set membership
 - ``_MaskApiKeyInAccessLog`` — access-log filter redaction
 - ``_handle_health``       — liveness endpoint
@@ -79,6 +78,10 @@ class TestAuthExemptSet:
 
     def test_react_app_get_is_exempt(self) -> None:
         assert ("GET", "/app") in _AUTH_EXEMPT
+
+    def test_browser_auth_bootstrap_is_exempt(self) -> None:
+        assert ("GET", "/app/auth.js") in _AUTH_EXEMPT
+        assert ("GET", "/api/web/bootstrap") in _AUTH_EXEMPT
 
     def test_react_assets_get_are_prefix_exempt(self) -> None:
         assert ("GET", "/app/") in _AUTH_EXEMPT_PREFIXES
@@ -319,14 +322,14 @@ class TestAuthMiddlewareWithKey:
         assert body.get("error") == "unauthorized"
 
     @pytest.mark.asyncio
-    async def test_query_param_fallback_correct(self) -> None:
-        """?api_key= is the SSE-client fallback (can't set headers natively)."""
+    async def test_query_param_api_key_is_rejected(self) -> None:
+        """API keys in URLs are rejected; browsers use header-based fetch."""
         async with TestClient(TestServer(_auth_app("my-secret"))) as client:
             resp = await client.get("/protected?api_key=my-secret")
-        assert resp.status == 200
+        assert resp.status == 401
 
     @pytest.mark.asyncio
-    async def test_query_param_fallback_wrong(self) -> None:
+    async def test_query_param_wrong_key_is_rejected(self) -> None:
         async with TestClient(TestServer(_auth_app("my-secret"))) as client:
             resp = await client.get("/protected?api_key=nope")
         assert resp.status == 401
@@ -335,25 +338,22 @@ class TestAuthMiddlewareWithKey:
     async def test_header_takes_precedence_over_query_when_both_present(
         self,
     ) -> None:
-        """Header wins when both header and query are supplied. Correct header +
-        garbage query param → 200."""
+        """Header auth still works if a non-auth query string is present."""
         async with TestClient(TestServer(_auth_app("my-secret"))) as client:
             resp = await client.get(
                 "/protected?api_key=garbage",
                 headers={"X-API-Key": "my-secret"},
             )
-        # Header is checked first; when it's correct the query is not used.
         assert resp.status == 200
 
     @pytest.mark.asyncio
-    async def test_empty_header_falls_back_to_query(self) -> None:
-        """An empty X-API-Key header is treated as absent → falls back to query param."""
+    async def test_empty_header_does_not_fall_back_to_query(self) -> None:
         async with TestClient(TestServer(_auth_app("my-secret"))) as client:
             resp = await client.get(
                 "/protected?api_key=my-secret",
                 headers={"X-API-Key": ""},
             )
-        assert resp.status == 200
+        assert resp.status == 401
 
 
 class TestAuthMiddlewareExemptRoutes:

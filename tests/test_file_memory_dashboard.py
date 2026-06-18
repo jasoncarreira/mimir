@@ -382,10 +382,10 @@ def test_render_memory_html_is_valid_shell() -> None:
     assert "<!doctype html>" in html
     assert "/api/memory" in html
     assert "loadTree()" in html
-    # Auth pattern — unified key shared across all four dashboards.
-    assert "mimir.api_key" in html
-    assert "API_KEY_LS" in html
-    assert "X-API-Key" in html
+    # Auth pattern — shared helper, no inline key handling.
+    assert "/app/auth.js" in html
+    assert "window.MimirAuth.authedJson" in html
+    assert "API_KEY_LS" not in html
 
 
 def test_render_memory_html_has_search_ui() -> None:
