@@ -451,6 +451,61 @@ export interface AdminConfigData {
   };
 }
 
+export interface SchedulerRunSurface {
+  id: string;
+  name: string;
+  kind: "schedule" | "poller";
+  cron?: string | null;
+  time_of_day?: string | null;
+  next_run_at?: string | null;
+  last_run_at?: string | null;
+  channel?: string | null;
+  deliver?: string | null;
+  priority: string;
+  prompt_source: string;
+  recent_result?: string | null;
+  recent_error?: string | null;
+  suppression_reason?: string | null;
+  suppression_severity?: string | null;
+  manifest_path?: string | null;
+  pass_env?: string[];
+  env_required?: string[];
+  config?: JsonObject;
+}
+
+export interface CommitmentSurface {
+  id: string;
+  text: string;
+  status: string;
+  kind: string;
+  sensitivity: string;
+  channel?: string | null;
+  recipient_identity?: string | null;
+  due_window_start?: string | null;
+  due_window_end?: string | null;
+  due_window_hint?: string | null;
+  due_bucket: string;
+  attempts: number;
+  snooze_count: number;
+  snoozed_until?: string | null;
+  suggested_reminder?: string;
+  source_turn_id?: string | null;
+}
+
+export interface SchedulerDashboardData {
+  generated_at: string;
+  available: boolean;
+  due_window: string;
+  schedules: SchedulerRunSurface[];
+  pollers: SchedulerRunSurface[];
+  commitments: CommitmentSurface[];
+  actions: {
+    mutations_enabled: boolean;
+    policy: string;
+    deferred: string[];
+  };
+}
+
 export interface MemoryTreeDir {
   name: string;
   type: "dir";
