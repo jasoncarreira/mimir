@@ -66,11 +66,7 @@ def _skill_auto_update_event(result: Any) -> tuple[str, dict[str, Any]] | None:
         "pollers_json_updated": result.pollers_json_updated,
         "remaining_drift": result.remaining_drift,
     }
-    event_kind = (
-        "skills_auto_update_failed"
-        if (result.failed or result.remaining_drift)
-        else "skills_auto_update"
-    )
+    event_kind = "skills_auto_update_failed" if result.failed else "skills_auto_update"
     return event_kind, fields
 
 
