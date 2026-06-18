@@ -35,6 +35,7 @@ keys).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -411,7 +412,7 @@ def make_codex_plus_rate_limit_callback(
 
     from .event_logger import log_event_sync
 
-    def _callback(rl: Any) -> None:
+    def _sync_callback(rl: Any) -> None:
         observed_at = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
         if rl is None:
             return
@@ -464,6 +465,30 @@ def make_codex_plus_rate_limit_callback(
                 log_event_sync("codex_plus_usage_ok", recorded=recorded)
             except (RuntimeError, OSError):
                 pass
+
+    background_lock = asyncio.Lock()
+    background_tasks: set[asyncio.Task[None]] = set()
+
+    async def _async_callback(rl: Any) -> None:
+        async with background_lock:
+            await asyncio.to_thread(_sync_callback, rl)
+
+    def _background_done(task: asyncio.Task[None]) -> None:
+        background_tasks.discard(task)
+        try:
+            task.result()
+        except Exception:  # noqa: BLE001 — callback is best-effort telemetry
+            log.exception("codex_plus rate-limit callback background write failed")
+
+    def _callback(rl: Any) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _sync_callback(rl)
+            return
+        task = loop.create_task(_async_callback(rl))
+        background_tasks.add(task)
+        task.add_done_callback(_background_done)
 
     return _callback
 
