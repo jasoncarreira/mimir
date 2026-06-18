@@ -314,7 +314,12 @@ def _env_gaps(home: Path) -> list[tuple[str, str]]:
     return gaps
 
 
-def _compute_update_digest(home: Path, prior_version: str) -> UpdateDigest:
+def _compute_update_digest(
+    home: Path,
+    prior_version: str,
+    *,
+    skill_update_result: object | None = None,
+) -> UpdateDigest:
     """Compute the post-update diff digest.
 
     Called from ``apply_pending_update`` *after* a successful pip install
@@ -325,17 +330,22 @@ def _compute_update_digest(home: Path, prior_version: str) -> UpdateDigest:
     in-process ``mimir.__version__`` (which still reflects the old version
     until after execv reloads everything).
 
-    On versions that include chainlink #557, this may safely mutate installed
-    optional skills by applying source-side file changes.  That is intentional:
-    self-update and operator-deploy version bumps share the same optional-skill
-    refresh path before the digest is surfaced.
+    On the self-update path this may safely mutate installed optional skills
+    by applying source-side file changes before the digest is persisted.  On
+    normal startup, where server.py already ran the refresh before poller
+    registration, pass that result as ``skill_update_result`` so the digest
+    reports the boot's actual updates instead of re-running the updater.
 
     Parameters
     ----------
     home:
         Agent home directory.
     prior_version:
-        ``mimir.__version__`` captured *before* pip ran.
+        ``mimir.__version__`` captured *before* pip ran, or the prior booted
+        version for operator-deploy bump detection.
+    skill_update_result:
+        Optional result from the startup auto-refresh.  When provided, this
+        function is read-only with respect to optional skills.
     """
     # After pip install, importlib.metadata reflects the new version;
     # the in-process mimir.__version__ still reflects the old one.
@@ -346,22 +356,25 @@ def _compute_update_digest(home: Path, prior_version: str) -> UpdateDigest:
     except Exception:
         new_version = _current_version()
 
-    # Optional skill updates are now applied automatically at startup, using
-    # the safe ``mimir skills update --apply`` subset (no forced removal of
-    # installed-only files).  The digest still carries any residual drift or
-    # failures so the operator can inspect what could not be applied.
+    # Optional skill updates are applied automatically at startup, using the
+    # safe ``mimir skills update --apply`` subset (no forced removal of
+    # installed-only files).  For the self-update pre-exec path we still run
+    # that updater here; for the normal startup version-bump digest, reuse the
+    # result already computed before poller registration so the digest is
+    # read-only and does not under-report updates after a second pass.
     skills_drift: dict[str, dict[str, object]] = {}
     skills_auto_updated: dict[str, list[str]] = {}
     skills_update_failed: dict[str, list[str]] = {}
     skills_pollers_json_updated: list[str] = []
     try:
-        from .skill_install import auto_update_installed_optional_skills
+        if skill_update_result is None:
+            from .skill_install import auto_update_installed_optional_skills
 
-        update_result = auto_update_installed_optional_skills(home)
-        skills_drift = update_result.remaining_drift
-        skills_auto_updated = update_result.updated
-        skills_update_failed = update_result.failed
-        skills_pollers_json_updated = update_result.pollers_json_updated
+            skill_update_result = auto_update_installed_optional_skills(home)
+        skills_drift = skill_update_result.remaining_drift
+        skills_auto_updated = skill_update_result.updated
+        skills_update_failed = skill_update_result.failed
+        skills_pollers_json_updated = skill_update_result.pollers_json_updated
     except Exception as exc:
         log.warning("_compute_update_digest: skill auto-update check failed: %s", exc)
 
@@ -457,6 +470,7 @@ async def emit_version_bump_digest(
     async_log_event: Callable[..., Awaitable[None]],
     *,
     already_drained: bool = False,
+    skill_update_result: object | None = None,
 ) -> int:
     """Deploy-agnostic version-bump notice (chainlink #363).
 
@@ -474,8 +488,10 @@ async def emit_version_bump_digest(
     emit ``mimir_update_digest`` so the agent surfaces what was auto-applied
     and what still needs inspection. Records the version so it fires once per
     bump (the first boot just establishes the baseline silently). Source-side
-    optional-skill changes are auto-applied by the digest computation; the
-    notice is still best-effort and never blocks boot.
+    optional-skill changes are auto-applied before this function on the normal
+    startup path; pass the result via ``skill_update_result`` so this digest
+    does not re-run the updater. The notice is still best-effort and never
+    blocks boot.
 
     Returns 1 if a digest was emitted, else 0.
     """
@@ -489,11 +505,14 @@ async def emit_version_bump_digest(
             and current != "unknown"
             and last != current
         ):
-            # _compute_update_digest also runs the safe optional-skill
-            # auto-refresh path (source-changed/source-added files only). Keep
-            # it inline: the installed-skill tree is small and startup already
-            # needs the resulting digest before poller registration.
-            digest = _compute_update_digest(home, last)
+            # Reuse the optional-skill auto-refresh result already computed
+            # before poller registration so the digest is read-only and reports
+            # what this boot actually changed.
+            digest = _compute_update_digest(
+                home,
+                last,
+                skill_update_result=skill_update_result,
+            )
             # Speak only when there's something actionable — otherwise this was
             # a silent version bump (no drift, no scheduler/env delta).
             if (

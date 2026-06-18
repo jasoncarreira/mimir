@@ -38,6 +38,7 @@ import datetime
 import hashlib
 import json
 import difflib
+import logging
 import os
 import re
 import shutil
@@ -54,6 +55,8 @@ from mimir.skill_defs import (
     reject_escaping_symlinks,
 )
 from mimir.skill_md import frontmatter_list_field, parse_env_block, parse_frontmatter
+
+log = logging.getLogger(__name__)
 
 # Source root for optional-skills, relative to this file.
 #: ``mimir/skill_install.py`` lives at ``mimir/skill_install.py`` and the
@@ -1487,7 +1490,12 @@ class AutoSkillUpdateResult:
 
     @property
     def any_updates(self) -> bool:
-        return bool(self.updated or self.failed or self.pollers_json_updated)
+        return bool(
+            self.updated
+            or self.failed
+            or self.pollers_json_updated
+            or self.remaining_drift
+        )
 
 
 def auto_update_installed_optional_skills(
@@ -1539,10 +1547,11 @@ def auto_update_installed_optional_skills(
     try:
         post = detect_skill_drift(home, optional_skills_root)
         summary.remaining_drift = summarize_skill_drift_results(post)
-    except Exception:
+    except Exception as exc:
         # The update itself already happened; don't fail startup just because
-        # the informational post-scan failed.  The caller's failure event would
-        # be misleading here, so leave remaining_drift empty.
+        # the informational post-scan failed.  Emit a debug log so residual
+        # drift is not silently under-reported as "all clear."
+        log.debug("optional-skill auto-update post-scan failed: %s", exc)
         summary.remaining_drift = {}
 
     summary.pollers_json_updated = sorted(set(summary.pollers_json_updated))

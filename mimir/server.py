@@ -56,6 +56,24 @@ log = logging.getLogger(__name__)
 _STARTUP_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 
+def _skill_auto_update_event(result: Any) -> tuple[str, dict[str, Any]] | None:
+    """Return the startup event payload for optional-skill auto-refresh."""
+    if not getattr(result, "any_updates", False):
+        return None
+    fields = {
+        "updated": result.updated,
+        "failed": result.failed,
+        "pollers_json_updated": result.pollers_json_updated,
+        "remaining_drift": result.remaining_drift,
+    }
+    event_kind = (
+        "skills_auto_update_failed"
+        if (result.failed or result.remaining_drift)
+        else "skills_auto_update"
+    )
+    return event_kind, fields
+
+
 class _PairingNotifier:
     """Coalesced operator alerts plus DM-only fixed auto-replies."""
 
@@ -1411,6 +1429,7 @@ def build_app(config: Config) -> web.Application:
         # ``mimir skills update --apply`` (chainlink #557).  The helper uses
         # the safe update path: source-changed/source-added files are applied
         # with backups; installed-only files and per-skill .env are preserved.
+        skill_update_result = None
         try:
             from .skill_install import auto_update_installed_optional_skills
 
@@ -1418,24 +1437,10 @@ def build_app(config: Config) -> web.Application:
                 auto_update_installed_optional_skills,
                 config.home,
             )
-            if (
-                skill_update_result.updated
-                or skill_update_result.failed
-                or skill_update_result.pollers_json_updated
-                or skill_update_result.remaining_drift
-            ):
-                event_kind = (
-                    "skills_auto_update_failed"
-                    if (skill_update_result.failed or skill_update_result.remaining_drift)
-                    else "skills_auto_update"
-                )
-                await log_event(
-                    event_kind,
-                    updated=skill_update_result.updated,
-                    failed=skill_update_result.failed,
-                    pollers_json_updated=skill_update_result.pollers_json_updated,
-                    remaining_drift=skill_update_result.remaining_drift,
-                )
+            update_event = _skill_auto_update_event(skill_update_result)
+            if update_event is not None:
+                event_kind, fields = update_event
+                await log_event(event_kind, **fields)
         except Exception as exc:  # noqa: BLE001 — skill sync must not block boot
             await log_event(
                 "skills_auto_update_failed",
@@ -1514,7 +1519,10 @@ def build_app(config: Config) -> web.Application:
         # the agent sees what changed and what still needs inspection.
         try:
             bumped = await emit_version_bump_digest(
-                config.home, log_event, already_drained=bool(drained_digest),
+                config.home,
+                log_event,
+                already_drained=bool(drained_digest),
+                skill_update_result=skill_update_result,
             )
             if bumped:
                 log.info("emitted version-bump digest (operator deploy)")

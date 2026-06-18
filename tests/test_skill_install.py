@@ -1283,6 +1283,35 @@ def test_auto_update_installed_optional_skills_surfaces_orphaned_skills(
     assert result.remaining_drift == {"fake-skill": {"orphaned": True}}
 
 
+def test_auto_update_installed_optional_skills_reports_partial_failure(
+    fake_optional_root: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Startup auto-update surfaces copy failures and leaves stale file intact."""
+    import shutil as _shutil
+
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    installed = fake_home / "skills" / "fake-poller"
+    stale = installed / "poller.py"
+    stale.write_text("# stale poller\n")
+
+    real_copy2 = _shutil.copy2
+
+    def flaky_copy2(src, dst, *args, **kwargs):
+        if Path(src).name == "poller.py" and Path(dst).name == "poller.py":
+            raise OSError("simulated copy failure")
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr("mimir.skill_install.shutil.copy2", flaky_copy2)
+
+    result = auto_update_installed_optional_skills(fake_home, fake_optional_root)
+
+    assert result.updated == {}
+    assert result.failed == {"fake-poller": ["poller.py"]}
+    assert result.remaining_drift == {"fake-poller": {"differs": ["poller.py"]}}
+    assert result.any_updates is True
+    assert stale.read_text() == "# stale poller\n"
+
+
 def test_auto_update_installed_optional_skills_rejects_escaping_source_symlink(
     fake_optional_root: Path, fake_home: Path, tmp_path: Path,
 ):

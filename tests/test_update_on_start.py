@@ -1052,7 +1052,16 @@ async def test_version_bump_digest_reports_auto_updated_skills(tmp_path, monkeyp
     )
 
     log, calls = _capture_log()
-    n = await emit_version_bump_digest(tmp_path, log, already_drained=False)
+    n = await emit_version_bump_digest(
+        tmp_path,
+        log,
+        already_drained=False,
+        skill_update_result=AutoSkillUpdateResult(
+            updated={"github-poller": ["poller.py", "pollers.json"]},
+            pollers_json_updated=["github-poller"],
+            remaining_drift={"social-cli": {"extra": ["local-note.md"]}},
+        ),
+    )
 
     assert n == 1
     kind, fields = calls[0]
@@ -1060,6 +1069,36 @@ async def test_version_bump_digest_reports_auto_updated_skills(tmp_path, monkeyp
     assert fields["skills_auto_updated"] == {"github-poller": ["poller.py", "pollers.json"]}
     assert fields["skills_pollers_json_updated"] == ["github-poller"]
     assert fields["skills_drift"] == {"social-cli": {"extra": ["local-note.md"]}}
+
+
+@pytest.mark.asyncio
+async def test_version_bump_digest_reuses_startup_skill_update_result(tmp_path, monkeypatch):
+    from mimir.skill_install import AutoSkillUpdateResult
+    from mimir.update_on_start import emit_version_bump_digest, _write_last_booted_version
+
+    _write_last_booted_version(tmp_path, "0.2.11")
+    _patch_digest_inputs(monkeypatch, current="0.2.12")
+
+    def fail_if_called(home):  # pragma: no cover - assertion helper
+        raise AssertionError("startup digest must not re-run skill auto-update")
+
+    monkeypatch.setattr(
+        "mimir.skill_install.auto_update_installed_optional_skills",
+        fail_if_called,
+    )
+
+    log, calls = _capture_log()
+    n = await emit_version_bump_digest(
+        tmp_path,
+        log,
+        already_drained=False,
+        skill_update_result=AutoSkillUpdateResult(
+            updated={"github-poller": ["poller.py"]},
+        ),
+    )
+
+    assert n == 1
+    assert calls[0][1]["skills_auto_updated"] == {"github-poller": ["poller.py"]}
 
 
 @pytest.mark.asyncio
