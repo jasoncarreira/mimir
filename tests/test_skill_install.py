@@ -1218,7 +1218,7 @@ def test_auto_update_installed_optional_skills_applies_safe_source_changes(
     assert result.updated == {"fake-poller": ["poller.py", "new-helper.py"]}
     assert result.failed == {}
     assert result.pollers_json_updated == []
-    assert result.remaining_drift == ["fake-poller"]  # preserved installed-only file
+    assert result.remaining_drift == {"fake-poller": {"extra": ["local-note.md"]}}
     assert (installed / "poller.py").read_text() == "# placeholder\n"
     assert (installed / "new-helper.py").read_text() == "# new helper\n"
     assert (installed / "local-note.md").read_text() == "operator notes\n"
@@ -1240,11 +1240,60 @@ def test_auto_update_installed_optional_skills_tracks_poller_manifest_updates(
     assert result.updated == {"fake-poller": ["pollers.json"]}
     assert result.failed == {}
     assert result.pollers_json_updated == ["fake-poller"]
-    assert result.remaining_drift == []
+    assert result.remaining_drift == {}
     assert (
         (fake_home / "skills" / "fake-poller" / "pollers.json").read_text()
         == source_manifest.read_text()
     )
+
+
+def test_auto_update_installed_optional_skills_surfaces_source_deleted_pollers_json(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """A source-deleted poller manifest remains visible as stale drift."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    (fake_optional_root / "fake-poller" / "pollers.json").unlink()
+
+    result = auto_update_installed_optional_skills(fake_home, fake_optional_root)
+
+    assert result.updated == {}
+    assert result.failed == {}
+    assert result.pollers_json_updated == []
+    assert result.remaining_drift == {"fake-poller": {"extra": ["pollers.json"]}}
+    assert (fake_home / "skills" / "fake-poller" / "pollers.json").is_file()
+
+
+def test_auto_update_installed_optional_skills_surfaces_orphaned_skills(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """Installed optional skills with no source counterpart are not silent."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    source = fake_optional_root / "fake-skill"
+    for path in sorted(source.rglob("*"), reverse=True):
+        if path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            path.rmdir()
+    source.rmdir()
+
+    result = auto_update_installed_optional_skills(fake_home, fake_optional_root)
+
+    assert result.updated == {}
+    assert result.failed == {}
+    assert result.remaining_drift == {"fake-skill": {"orphaned": True}}
+
+
+def test_auto_update_installed_optional_skills_rejects_escaping_source_symlink(
+    fake_optional_root: Path, fake_home: Path, tmp_path: Path,
+):
+    """Startup auto-update uses the same escaping-symlink guard as install."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    (fake_optional_root / "fake-skill" / "leak.txt").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symlink escaping"):
+        auto_update_installed_optional_skills(fake_home, fake_optional_root)
 
 
 def test_auto_update_installed_optional_skills_skips_accepted_drift(
@@ -1260,7 +1309,7 @@ def test_auto_update_installed_optional_skills_skips_accepted_drift(
 
     assert result.updated == {}
     assert result.failed == {}
-    assert result.remaining_drift == []
+    assert result.remaining_drift == {}
     assert "local accepted" in installed_md.read_text()
 
 

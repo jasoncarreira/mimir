@@ -542,15 +542,32 @@ def test_update_digest_roundtrip(tmp_path: Path) -> None:
         prior_version="0.2.1",
         new_version="0.2.2",
         scheduler_delta=["issues-audit", "commitments-review"],
-        skills_drift=["github"],
-        skills_auto_updated=["github-poller"],
-        skills_update_failed=["social-cli"],
+        skills_drift={"github": {"extra": ["local-note.md"]}},
+        skills_auto_updated={"github-poller": ["poller.py"]},
+        skills_update_failed={"social-cli": ["poller.py"]},
         skills_pollers_json_updated=["github-poller"],
         env_gaps=[("weather", "OPENWEATHER_API_KEY"), ("ntfy", "NTFY_TOPIC")],
     )
     restored = UpdateDigest.from_dict(orig.to_dict())
     assert restored == orig
     assert isinstance(restored.env_gaps[0], tuple)
+
+
+def test_update_digest_from_dict_accepts_legacy_name_lists() -> None:
+    """Old sidecars used name lists before file-level skill details existed."""
+    from mimir.update_on_start import UpdateDigest
+
+    restored = UpdateDigest.from_dict({
+        "prior_version": "0.2.1",
+        "new_version": "0.2.2",
+        "skills_drift": ["github"],
+        "skills_auto_updated": ["github-poller"],
+        "skills_update_failed": ["social-cli"],
+    })
+
+    assert restored.skills_drift == {"github": {}}
+    assert restored.skills_auto_updated == {"github-poller": []}
+    assert restored.skills_update_failed == {"social-cli": []}
 
 
 def test_update_digest_empty_roundtrip() -> None:
@@ -562,9 +579,9 @@ def test_update_digest_empty_roundtrip() -> None:
     restored = UpdateDigest.from_dict(orig.to_dict())
     assert restored == orig
     assert restored.scheduler_delta == []
-    assert restored.skills_drift == []
-    assert restored.skills_auto_updated == []
-    assert restored.skills_update_failed == []
+    assert restored.skills_drift == {}
+    assert restored.skills_auto_updated == {}
+    assert restored.skills_update_failed == {}
     assert restored.skills_pollers_json_updated == []
     assert restored.env_gaps == []
 
@@ -844,9 +861,9 @@ async def test_update_digest_sidecar_roundtrip(tmp_path: Path) -> None:
         prior_version="0.2.1",
         new_version="0.2.2",
         scheduler_delta=["issues-audit", "commitments-review"],
-        skills_drift=["github"],
-        skills_auto_updated=["github-poller"],
-        skills_update_failed=["social-cli"],
+        skills_drift={"github": {"extra": ["local-note.md"]}},
+        skills_auto_updated={"github-poller": ["poller.py"]},
+        skills_update_failed={"social-cli": ["poller.py"]},
         skills_pollers_json_updated=["github-poller"],
         env_gaps=[("weather", "OPENWEATHER_API_KEY")],
     )
@@ -906,7 +923,7 @@ def test_mimir_update_digest_render_all_surfaces() -> None:
             "prior_version": "0.2.1",
             "new_version": "0.2.2",
             "scheduler_delta": ["issues-audit", "commitments-review"],
-            "skills_drift": ["github"],
+            "skills_drift": {"github": {"extra": ["local-note.md"]}},
             "env_gaps": [["weather", "OPENWEATHER_API_KEY"]],
         },
     )
@@ -930,7 +947,7 @@ def test_mimir_update_digest_render_nothing_required() -> None:
             "prior_version": "0.2.2",
             "new_version": "0.2.3",
             "scheduler_delta": [],
-            "skills_drift": [],
+            "skills_drift": {},
             "env_gaps": [],
         },
     )
@@ -981,11 +998,11 @@ def _patch_digest_inputs(monkeypatch, *, current, drift=None, auto_update_result
     monkeypatch.setattr("mimir.update_on_start._env_gaps", lambda home: [])
     if auto_update_result is None:
         from mimir.skill_install import AutoSkillUpdateResult
-        remaining = sorted(
-            r.name for r in (drift or [])
-            if (not r.orphaned)
-            and getattr(r, "has_unaccepted_drift", (not r.is_clean))
-        )
+        remaining = {
+            r.name: {"orphaned": True} if getattr(r, "orphaned", False) else {"differs": ["SKILL.md"]}
+            for r in (drift or [])
+            if getattr(r, "has_unaccepted_drift", (not r.is_clean))
+        }
         auto_update_result = AutoSkillUpdateResult(remaining_drift=remaining)
     monkeypatch.setattr(
         "mimir.skill_install.auto_update_installed_optional_skills",
@@ -1013,7 +1030,7 @@ async def test_version_bump_emits_digest_with_drift(tmp_path, monkeypatch):
     assert kind == "mimir_update_digest"
     assert fields["prior_version"] == "0.2.11"
     assert fields["new_version"] == "0.2.12"
-    assert fields["skills_drift"] == ["social-cli"]  # clean skill excluded
+    assert fields["skills_drift"] == {"social-cli": {"differs": ["SKILL.md"]}}
     # baseline advanced so it won't re-fire next boot
     assert _read_last_booted_version(tmp_path) == "0.2.12"
 
@@ -1030,7 +1047,7 @@ async def test_version_bump_digest_reports_auto_updated_skills(tmp_path, monkeyp
         auto_update_result=AutoSkillUpdateResult(
             updated={"github-poller": ["poller.py", "pollers.json"]},
             pollers_json_updated=["github-poller"],
-            remaining_drift=["social-cli"],
+            remaining_drift={"social-cli": {"extra": ["local-note.md"]}},
         ),
     )
 
@@ -1040,9 +1057,9 @@ async def test_version_bump_digest_reports_auto_updated_skills(tmp_path, monkeyp
     assert n == 1
     kind, fields = calls[0]
     assert kind == "mimir_update_digest"
-    assert fields["skills_auto_updated"] == ["github-poller"]
+    assert fields["skills_auto_updated"] == {"github-poller": ["poller.py", "pollers.json"]}
     assert fields["skills_pollers_json_updated"] == ["github-poller"]
-    assert fields["skills_drift"] == ["social-cli"]
+    assert fields["skills_drift"] == {"social-cli": {"extra": ["local-note.md"]}}
 
 
 @pytest.mark.asyncio
@@ -1101,11 +1118,12 @@ async def test_version_bump_fires_once(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_version_bump_excludes_orphaned_from_drift(tmp_path, monkeypatch):
-    """Orphaned skills (no shipped source) must NOT appear in the digest's
-    skills_drift — they aren't fixable via `mimir skills update --apply`, so
-    listing them is noise. Only real drift (differs/added) is reported.
-    (Follow-up to #363/#565: the 0.2.13 rollout flagged ~12 orphaned skills.)"""
+async def test_version_bump_surfaces_orphaned_drift(tmp_path, monkeypatch):
+    """Orphaned installed optional skills stay visible in the digest.
+
+    They are not safely auto-fixable, but silence would let stale installed
+    poller code keep running forever after a source rename/removal.
+    """
     from mimir.update_on_start import (
         emit_version_bump_digest,
         _write_last_booted_version,
@@ -1113,7 +1131,7 @@ async def test_version_bump_excludes_orphaned_from_drift(tmp_path, monkeypatch):
     _write_last_booted_version(tmp_path, "0.2.13")
     _patch_digest_inputs(monkeypatch, current="0.2.14", drift=[
         _Drift("github-poller", is_clean=False, orphaned=False),    # real drift
-        _Drift("custom-watcher", is_clean=False, orphaned=True),    # orphaned — noise
+        _Drift("custom-watcher", is_clean=False, orphaned=True),    # orphaned — stale code risk
         _Drift("gmail-poller", is_clean=True, orphaned=False),      # clean
     ])
     log, calls = _capture_log()
@@ -1121,7 +1139,10 @@ async def test_version_bump_excludes_orphaned_from_drift(tmp_path, monkeypatch):
     assert n == 1
     kind, fields = calls[0]
     assert kind == "mimir_update_digest"
-    assert fields["skills_drift"] == ["github-poller"]  # orphaned + clean excluded
+    assert fields["skills_drift"] == {
+        "github-poller": {"differs": ["SKILL.md"]},
+        "custom-watcher": {"orphaned": True},
+    }
 
 
 @pytest.mark.asyncio
@@ -1141,4 +1162,4 @@ async def test_version_bump_excludes_accepted_only_skill_drift(tmp_path, monkeyp
     assert n == 1
     kind, fields = calls[0]
     assert kind == "mimir_update_digest"
-    assert fields["skills_drift"] == ["github-poller"]
+    assert fields["skills_drift"] == {"github-poller": {"differs": ["SKILL.md"]}}

@@ -1426,7 +1426,7 @@ def build_app(config: Config) -> web.Application:
             ):
                 event_kind = (
                     "skills_auto_update_failed"
-                    if skill_update_result.failed
+                    if (skill_update_result.failed or skill_update_result.remaining_drift)
                     else "skills_auto_update"
                 )
                 await log_event(

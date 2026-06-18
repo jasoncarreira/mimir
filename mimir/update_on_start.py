@@ -139,16 +139,16 @@ class UpdateDigest:
         shipped with the new version but won't activate until the
         operator (or the agent) adds them to the live scheduler.
     skills_drift:
-        Names of optional skills whose installed copy still differs from the
-        bundled source after startup auto-update.  Non-empty means remaining
-        drift needs inspection (usually preserved installed-only files,
-        accepted local divergence, or failed per-file updates).
+        Optional skills whose installed copy still differs from the bundled
+        source after startup auto-update, keyed by skill name with bounded
+        file-category details (``differs``, ``added``, ``extra``,
+        ``accepted``, or ``orphaned``).
     skills_auto_updated:
-        Optional skills whose installed copy was safely refreshed from source
-        during startup.
+        Optional skills whose installed copy was safely refreshed from source,
+        keyed by skill name with the relative paths that changed.
     skills_update_failed:
         Optional skills with at least one source-driven file that could not be
-        applied automatically.
+        applied automatically, keyed by skill name with relative paths.
     skills_pollers_json_updated:
         Optional skills whose ``pollers.json`` changed during auto-update.
         Startup poller discovery sees the new manifest directly; already-live
@@ -162,9 +162,9 @@ class UpdateDigest:
     prior_version: str
     new_version: str
     scheduler_delta: list[str] = field(default_factory=list)
-    skills_drift: list[str] = field(default_factory=list)
-    skills_auto_updated: list[str] = field(default_factory=list)
-    skills_update_failed: list[str] = field(default_factory=list)
+    skills_drift: dict[str, dict[str, object]] = field(default_factory=dict)
+    skills_auto_updated: dict[str, list[str]] = field(default_factory=dict)
+    skills_update_failed: dict[str, list[str]] = field(default_factory=dict)
     skills_pollers_json_updated: list[str] = field(default_factory=list)
     env_gaps: list[tuple[str, str]] = field(default_factory=list)
 
@@ -176,22 +176,41 @@ class UpdateDigest:
             "prior_version": self.prior_version,
             "new_version": self.new_version,
             "scheduler_delta": list(self.scheduler_delta),
-            "skills_drift": list(self.skills_drift),
-            "skills_auto_updated": list(self.skills_auto_updated),
-            "skills_update_failed": list(self.skills_update_failed),
+            "skills_drift": dict(self.skills_drift),
+            "skills_auto_updated": dict(self.skills_auto_updated),
+            "skills_update_failed": dict(self.skills_update_failed),
             "skills_pollers_json_updated": list(self.skills_pollers_json_updated),
             "env_gaps": [[s, k] for s, k in self.env_gaps],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "UpdateDigest":
+        def _drift_details(value: object) -> dict[str, dict[str, object]]:
+            if isinstance(value, dict):
+                out: dict[str, dict[str, object]] = {}
+                for key, detail in value.items():
+                    out[str(key)] = dict(detail) if isinstance(detail, dict) else {}
+                return out
+            # Back-compat for pre-#557 sidecars that carried name lists.
+            if isinstance(value, list):
+                return {str(name): {} for name in value}
+            return {}
+
+        def _file_lists(value: object) -> dict[str, list[str]]:
+            if isinstance(value, dict):
+                return {str(k): [str(item) for item in (v or [])] for k, v in value.items()}
+            # Back-compat for pre-detail name lists.
+            if isinstance(value, list):
+                return {str(name): [] for name in value}
+            return {}
+
         return cls(
             prior_version=str(data.get("prior_version") or ""),
             new_version=str(data.get("new_version") or ""),
             scheduler_delta=list(data.get("scheduler_delta") or []),
-            skills_drift=list(data.get("skills_drift") or []),
-            skills_auto_updated=list(data.get("skills_auto_updated") or []),
-            skills_update_failed=list(data.get("skills_update_failed") or []),
+            skills_drift=_drift_details(data.get("skills_drift")),
+            skills_auto_updated=_file_lists(data.get("skills_auto_updated")),
+            skills_update_failed=_file_lists(data.get("skills_update_failed")),
             skills_pollers_json_updated=list(data.get("skills_pollers_json_updated") or []),
             env_gaps=[(str(s), str(k)) for s, k in (data.get("env_gaps") or [])],
         )
@@ -331,17 +350,17 @@ def _compute_update_digest(home: Path, prior_version: str) -> UpdateDigest:
     # the safe ``mimir skills update --apply`` subset (no forced removal of
     # installed-only files).  The digest still carries any residual drift or
     # failures so the operator can inspect what could not be applied.
-    skills_drift_names: list[str] = []
-    skills_auto_updated: list[str] = []
-    skills_update_failed: list[str] = []
+    skills_drift: dict[str, dict[str, object]] = {}
+    skills_auto_updated: dict[str, list[str]] = {}
+    skills_update_failed: dict[str, list[str]] = {}
     skills_pollers_json_updated: list[str] = []
     try:
         from .skill_install import auto_update_installed_optional_skills
 
         update_result = auto_update_installed_optional_skills(home)
-        skills_drift_names = update_result.remaining_drift
-        skills_auto_updated = sorted(update_result.updated)
-        skills_update_failed = sorted(update_result.failed)
+        skills_drift = update_result.remaining_drift
+        skills_auto_updated = update_result.updated
+        skills_update_failed = update_result.failed
         skills_pollers_json_updated = update_result.pollers_json_updated
     except Exception as exc:
         log.warning("_compute_update_digest: skill auto-update check failed: %s", exc)
@@ -350,7 +369,7 @@ def _compute_update_digest(home: Path, prior_version: str) -> UpdateDigest:
         prior_version=prior_version,
         new_version=new_version,
         scheduler_delta=_scheduler_delta(home),
-        skills_drift=skills_drift_names,
+        skills_drift=skills_drift,
         skills_auto_updated=skills_auto_updated,
         skills_update_failed=skills_update_failed,
         skills_pollers_json_updated=skills_pollers_json_updated,

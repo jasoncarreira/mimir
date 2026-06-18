@@ -43,6 +43,36 @@ def _sanitize_field(value: object, max_len: int = _FIELD_MAX_LEN) -> str:
 
 # Render hooks: per-kind one-liner builders. Defaults to a generic
 # "<kind>: <event-type-specific note>" if no specialized renderer fits.
+def _render_skill_details(items: object, *, limit: int = 4) -> str:
+    """Render compact per-skill file/category details for feedback lines."""
+    if isinstance(items, dict):
+        rendered: list[str] = []
+        for skill in sorted(items):
+            detail = items.get(skill)
+            if isinstance(detail, dict):
+                cats: list[str] = []
+                for key in ("differs", "added", "extra", "accepted", "failed"):
+                    vals = detail.get(key)
+                    if isinstance(vals, (list, tuple)) and vals:
+                        shown = ",".join(_sanitize_field(str(v)) for v in vals[:limit])
+                        more = f"+{len(vals) - limit}" if len(vals) > limit else ""
+                        cats.append(f"{key}={shown}{more}")
+                if detail.get("orphaned"):
+                    cats.append("orphaned")
+                suffix = f" ({'; '.join(cats)})" if cats else ""
+                rendered.append(f"{_sanitize_field(str(skill))}{suffix}")
+            elif isinstance(detail, (list, tuple)):
+                shown = ",".join(_sanitize_field(str(v)) for v in detail[:limit])
+                more = f"+{len(detail) - limit}" if len(detail) > limit else ""
+                suffix = f" ({shown}{more})" if shown or more else ""
+                rendered.append(f"{_sanitize_field(str(skill))}{suffix}")
+            else:
+                rendered.append(_sanitize_field(str(skill)))
+        return ", ".join(rendered)
+    if isinstance(items, (list, tuple)):
+        return ", ".join(_sanitize_field(str(n)) for n in items)
+    return _sanitize_field(str(items))
+
 def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "tool_denied":
         tool = ev.get("tool") or ev.get("name") or "?"
@@ -679,6 +709,8 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         gaps = ev.get("env_gaps") or []
 
         def _names(items: object) -> str:
+            if isinstance(items, dict):
+                return ", ".join(_sanitize_field(str(n)) for n in sorted(items))
             if isinstance(items, (list, tuple)):
                 return ", ".join(_sanitize_field(str(n)) for n in items)
             return _sanitize_field(str(items))
@@ -688,10 +720,8 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             names = _names(sched)
             parts.append(f"scheduler +{len(sched)} tick(s): {names}")
         if auto_updated:
-            names = _names(auto_updated)
-            parts.append(
-                f"skills auto-updated from source: {names}"
-            )
+            names = _render_skill_details(auto_updated)
+            parts.append(f"skills auto-updated from source: {names}")
         if pollers_updated:
             names = _names(pollers_updated)
             parts.append(
@@ -699,13 +729,13 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
                 f"the new manifests; if changed at runtime, reload pollers"
             )
         if update_failed:
-            names = _names(update_failed)
+            names = _render_skill_details(update_failed)
             parts.append(
                 f"skills auto-update FAILED/PARTIAL: {names} — inspect with "
                 f"`mimir skills update`; backups are under .pre-update-backup/"
             )
         if drift:
-            names = _names(drift)
+            names = _render_skill_details(drift)
             # Auto-update has already applied safe source changes. Remaining
             # drift usually means preserved extras, accepted local divergence,
             # or per-file failures — inspect before clobbering.
@@ -729,12 +759,11 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         updated = ev.get("updated") or {}
         pollers_updated = ev.get("pollers_json_updated") or []
         remaining = ev.get("remaining_drift") or []
-        updated_names = sorted(updated) if isinstance(updated, dict) else updated
         parts: list[str] = []
-        if updated_names:
+        if updated:
             parts.append(
                 "updated installed optional skills from source: "
-                + ", ".join(_sanitize_field(str(n)) for n in updated_names)
+                + _render_skill_details(updated)
             )
         if pollers_updated:
             parts.append(
@@ -744,7 +773,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         if remaining:
             parts.append(
                 "remaining skill drift: "
-                + ", ".join(_sanitize_field(str(n)) for n in remaining)
+                + _render_skill_details(remaining)
                 + " — inspect with `mimir skills update`"
             )
         return "; ".join(parts) if parts else "installed optional skills already current"
@@ -752,10 +781,9 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         failed = ev.get("failed") or {}
         error = ev.get("error")
         if failed:
-            names = sorted(failed) if isinstance(failed, dict) else failed
             return (
                 "installed optional skill auto-update partial/failed: "
-                + ", ".join(_sanitize_field(str(n)) for n in names)
+                + _render_skill_details(failed)
                 + " — inspect with `mimir skills update`; backups are under .pre-update-backup/"
             )
         if error:

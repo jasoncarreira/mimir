@@ -854,6 +854,35 @@ class AcceptedSkillDriftEntry:
     accepted_at: str | None = None
 
 
+def summarize_skill_drift(result: "SkillDriftResult") -> dict[str, object]:
+    """Return a compact JSON-safe summary of one skill drift result."""
+    data: dict[str, object] = {}
+    if result.orphaned:
+        data["orphaned"] = True
+    differs = result.unaccepted_differs
+    if differs:
+        data["differs"] = differs
+    if result.added:
+        data["added"] = list(result.added)
+    if result.extra:
+        data["extra"] = list(result.extra)
+    if result.accepted:
+        data["accepted"] = list(result.accepted)
+    return data
+
+
+def summarize_skill_drift_results(
+    results: list["SkillDriftResult"],
+) -> dict[str, dict[str, object]]:
+    """Return actionable drift details keyed by skill name."""
+    return {
+        r.name: summary
+        for r in results
+        if r.has_unaccepted_drift
+        if (summary := summarize_skill_drift(r))
+    }
+
+
 @dataclass
 class SkillDriftResult:
     """Comparison result for one installed optional skill vs its source.
@@ -1136,6 +1165,7 @@ def detect_skill_drift(
             ))
             continue
 
+        reject_escaping_symlinks(source_dir)
         installed_hashes = _file_hashes(installed_dir)
         source_hashes = _file_hashes(source_dir)
 
@@ -1321,6 +1351,7 @@ def apply_skill_update(
     failed: list[str] = []
 
     assert result.source_path is not None  # guaranteed when not orphaned
+    reject_escaping_symlinks(result.source_path)
 
     # Backup directory for differs files: .pre-update-backup/<timestamp>/ inside
     # the installed skill directory.  Created lazily on first use.
@@ -1452,7 +1483,7 @@ class AutoSkillUpdateResult:
     updated: dict[str, list[str]] = field(default_factory=dict)
     failed: dict[str, list[str]] = field(default_factory=dict)
     pollers_json_updated: list[str] = field(default_factory=list)
-    remaining_drift: list[str] = field(default_factory=list)
+    remaining_drift: dict[str, dict[str, object]] = field(default_factory=dict)
 
     @property
     def any_updates(self) -> bool:
@@ -1507,16 +1538,12 @@ def auto_update_installed_optional_skills(
     # orphaned skills stay visible to the update digest/status surfaces.
     try:
         post = detect_skill_drift(home, optional_skills_root)
-        summary.remaining_drift = sorted(
-            r.name for r in post
-            if (not r.orphaned)
-            and getattr(r, "has_unaccepted_drift", (not r.is_clean))
-        )
+        summary.remaining_drift = summarize_skill_drift_results(post)
     except Exception:
         # The update itself already happened; don't fail startup just because
         # the informational post-scan failed.  The caller's failure event would
         # be misleading here, so leave remaining_drift empty.
-        summary.remaining_drift = []
+        summary.remaining_drift = {}
 
     summary.pollers_json_updated = sorted(set(summary.pollers_json_updated))
     return summary

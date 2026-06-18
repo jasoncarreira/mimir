@@ -2347,7 +2347,7 @@ def test_mimir_update_digest_no_remediation_when_no_drift():
     line = _render_event_line("mimir_update_digest", {
         "prior_version": "0.2.11",
         "new_version": "0.2.12",
-        "skills_drift": [],
+        "skills_drift": {},
         "scheduler_delta": [],
         "env_gaps": [],
     })
@@ -2360,18 +2360,20 @@ def test_mimir_update_digest_renders_auto_updated_skills():
     line = _render_event_line("mimir_update_digest", {
         "prior_version": "0.2.11",
         "new_version": "0.2.12",
-        "skills_auto_updated": ["github-poller"],
+        "skills_auto_updated": {"github-poller": ["poller.py", "pollers.json"]},
         "skills_pollers_json_updated": ["github-poller"],
-        "skills_update_failed": ["social-cli"],
-        "skills_drift": ["social-cli"],
+        "skills_update_failed": {"social-cli": ["poller.py"]},
+        "skills_drift": {"social-cli": {"extra": ["local-note.md"]}},
         "scheduler_delta": [],
         "env_gaps": [],
     })
 
     assert "skills auto-updated from source: github-poller" in line
+    assert "poller.py" in line
     assert "poller manifests updated: github-poller" in line
     assert "skills auto-update FAILED/PARTIAL: social-cli" in line
     assert "skills still drifted: social-cli" in line
+    assert "local-note.md" in line
 
 
 def test_skills_auto_update_event_renderer():
@@ -2380,12 +2382,13 @@ def test_skills_auto_update_event_renderer():
     line = _render_event_line("skills_auto_update", {
         "updated": {"github-poller": ["poller.py"]},
         "pollers_json_updated": ["github-poller"],
-        "remaining_drift": ["social-cli"],
+        "remaining_drift": {"social-cli": {"extra": ["local-note.md"]}},
     })
 
     assert "updated installed optional skills from source: github-poller" in line
     assert "poller manifests updated before registration: github-poller" in line
     assert "remaining skill drift: social-cli" in line
+    assert "local-note.md" in line
 
 
 def test_skills_auto_update_failed_event_renderer():
@@ -2396,4 +2399,5 @@ def test_skills_auto_update_failed_event_renderer():
     })
 
     assert "installed optional skill auto-update partial/failed: github-poller" in line
+    assert "poller.py" in line
     assert "mimir skills update" in line
