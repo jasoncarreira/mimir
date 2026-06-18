@@ -55,6 +55,10 @@ from .ops_dashboard import (
     parse_days_param,
     render_dashboard_html,
 )
+from .scheduler_dashboard import (
+    build_scheduler_dashboard_payload,
+    parse_due_window,
+)
 from .file_memory_dashboard import (
     list_channel_dirs,
     list_trees,
@@ -147,6 +151,7 @@ def register_routes(
     events_log: Path,
     home: Path | None = None,
     saga_db: Path | None = None,
+    commitments_store: Any | None = None,
     active_usage_provider: str | None = None,
     react_app_dist: Path | None = None,
     dashboard_extensions: DashboardExtensionRegistry | None = None,
@@ -544,6 +549,31 @@ def register_routes(
         )
         return json_success(payload)
 
+    async def scheduler_data_v1(request: web.Request) -> web.Response:
+        try:
+            due_window = parse_due_window(request.query.get("due_window"))
+        except ValueError as exc:
+            return json_error("invalid_due_window", str(exc), status=400)
+        def _build_payload() -> dict[str, Any]:
+            return build_scheduler_dashboard_payload(
+                scheduler=request.app.get("scheduler"),
+                commitments_store=commitments_store,
+                events=_read_jsonl(events_log),
+                due_window=due_window,
+            )
+
+        payload = await asyncio.to_thread(_build_payload)
+        return json_success(
+            payload,
+            meta=list_meta(
+                total=(
+                    len(payload.get("schedules", []))
+                    + len(payload.get("pollers", []))
+                    + len(payload.get("commitments", []))
+                ),
+            ),
+        )
+
     # ── /saga — saga DB viewer ───────────────────────────────────────
 
     # Resolve the DB path: use the explicit ``saga_db`` kwarg when
@@ -734,10 +764,15 @@ def register_routes(
             DashboardBackendRoute("GET", "/api/v1/ops", ops_data_v1),
         ]
 
+    def scheduler_backend_routes() -> list[DashboardBackendRoute]:
+        return [
+            DashboardBackendRoute("GET", "/api/v1/scheduler", scheduler_data_v1),
+        ]
+
     add_backend_namespace_routes(
         app,
         registry=_dashboard_extensions,
-        hooks={"ops": ops_backend_routes},
+        hooks={"ops": ops_backend_routes, "scheduler": scheduler_backend_routes},
         existing=existing,
     )
     async def saga_sql(request: web.Request) -> web.Response:

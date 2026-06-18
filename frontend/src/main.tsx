@@ -20,6 +20,7 @@ import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensio
 import { LiveEventsProvider, useLiveEvents } from "./live-events";
 import { SagaDashboard } from "./SagaDashboard";
 import { OpsRoute } from "./routes/OpsRoute";
+import { SchedulerRoute } from "./routes/SchedulerRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { useRouteState } from "./routeState";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
@@ -434,7 +435,15 @@ function AppFrame() {
               <Route element={<Navigate replace to={firstRoute} />} path="/" />
               {surfaces.map((surface) => (
                 <Route
-                  element={surface.id === "saga" ? <SagaDashboard /> : surface.id === "ops" ? <OpsRoute /> : <SurfaceRoute surface={surface} />}
+                  element={
+                    surface.id === "saga"
+                      ? <SagaDashboard />
+                      : surface.id === "ops"
+                        ? <OpsRoute />
+                        : surface.id === "scheduler"
+                          ? <SchedulerRoute />
+                          : <SurfaceRoute surface={surface} />
+                  }
                   key={surface.id}
                   path={surface.path}
                 />

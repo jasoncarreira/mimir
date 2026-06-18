@@ -31,6 +31,11 @@ const firstPartySurfaceMetadata: Record<
     tabs: ["overview", "queues", "health"],
     filterLabel: "scope"
   },
+  scheduler: {
+    detail: "Schedules, pollers, and commitments",
+    tabs: ["schedules", "pollers", "commitments"],
+    filterLabel: "due"
+  },
   saga: {
     detail: "SAGA session shell",
     tabs: ["sessions", "atoms", "queries"],
