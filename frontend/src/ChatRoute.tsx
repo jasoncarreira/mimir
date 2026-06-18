@@ -1,7 +1,9 @@
 import React from "react";
+import type { TurnRecord } from "./api";
 import { createChatStream, sendChatMessage, type ChatStreamPayload } from "./api/chat";
 import type { DashboardSurface } from "./dashboardExtensions";
 import { useRouteState } from "./routeState";
+import { TurnDetailsPanel } from "./TurnDetailsPanel";
 import { Badge, Button, DashboardHeader, ErrorState, Panel, TextInput } from "./ui";
 import { useUiState } from "./uiState";
 
@@ -45,6 +47,29 @@ function statusTone(status: ChatMessageStatus | ChatStreamState): "neutral" | "i
   return "warning";
 }
 
+function turnFromChatMessage(message: ChatTimelineMessage | undefined, sessionId: string): TurnRecord | null {
+  if (!message) return null;
+  return {
+    turn_id: message.id,
+    ts: message.timestamp,
+    trigger: "user_message",
+    kind: "web_chat_message",
+    channel_id: message.channelId,
+    input: message.role === "user" ? message.text : "",
+    output: message.role === "assistant" ? message.text : "",
+    error: message.error ?? null,
+    events: [
+      {
+        type: "message",
+        role: message.role,
+        content: message.text
+      }
+    ],
+    status: message.status,
+    web_session_id: sessionId
+  };
+}
+
 export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const { filter, selectedTurn, update } = useRouteState(surface);
   const initialChannel = filter || "web-default";
@@ -56,6 +81,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const [streamError, setStreamError] = React.useState("");
   const [messages, setMessages] = React.useState<ChatTimelineMessage[]>([]);
   const setDetailsPanelOpen = useUiState((state) => state.setDetailsPanelOpen);
+  const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
   const setSelectedChatMessageId = useUiState((state) => state.setSelectedChatMessageId);
   const storedSelectedMessageId = useUiState((state) => state.selectedChatMessageId);
   const selectedMessageId = selectedTurn || storedSelectedMessageId;
@@ -157,6 +183,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   }
 
   const selectedMessage = messages.find((message) => message.id === selectedMessageId);
+  const selectedTurnRecord = turnFromChatMessage(selectedMessage, sessionId);
   const visibleMessages = messages.filter((message) => message.channelId === channelId);
 
   return (
@@ -167,7 +194,19 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
       <div className="content-layout chat-layout">
         <section aria-label="Chat timeline" className="content-layout__main chat-main">
           <Panel
-            actions={<Badge tone={statusTone(streamState)}>{streamState}</Badge>}
+            actions={
+              <>
+                <Badge tone={statusTone(streamState)}>{streamState}</Badge>
+                <Button
+                  aria-expanded={detailsPanelOpen}
+                  aria-controls="details-panel-host"
+                  onClick={() => setDetailsPanelOpen(!detailsPanelOpen)}
+                  type="button"
+                >
+                  Details
+                </Button>
+              </>
+            }
             title="Conversation"
             subtitle="Messages are scoped to the selected web channel. Session ID is sent as request metadata for traceability."
           >
@@ -227,21 +266,19 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
             </form>
           </Panel>
         </section>
-        <aside aria-label="Details panel" className="content-layout__details" id="details-panel-host">
-          <Panel title="Selected turn" subtitle="Route-owned selection for the details panel host.">
-            {selectedMessage ? (
-              <dl className="facts-grid facts-grid--compact">
-                <div><dt>Message</dt><dd>{selectedMessage.id}</dd></div>
-                <div><dt>Role</dt><dd>{selectedMessage.role}</dd></div>
-                <div><dt>Status</dt><dd>{selectedMessage.status}</dd></div>
-                <div><dt>Channel</dt><dd>{selectedMessage.channelId}</dd></div>
-                <div><dt>Request session</dt><dd>{sessionId}</dd></div>
-                <div><dt>Time</dt><dd>{formatMessageTime(selectedMessage.timestamp)}</dd></div>
-              </dl>
-            ) : (
+        <aside
+          aria-label="Details panel"
+          className="content-layout__details"
+          hidden={!detailsPanelOpen}
+          id="details-panel-host"
+        >
+          {selectedTurnRecord ? (
+            <TurnDetailsPanel routeKey="chat" turn={selectedTurnRecord} />
+          ) : (
+            <Panel title="Details">
               <RoutePlaceholder surface={surface} />
-            )}
-          </Panel>
+            </Panel>
+          )}
         </aside>
       </div>
     </>

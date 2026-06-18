@@ -451,6 +451,25 @@ function AppFrame() {
   );
 }
 
+function RoutedLiveEventsProvider({ children }: { children: React.ReactNode }) {
+  const [searchParams] = useSearchParams();
+  const selectedTurnId = searchParams.get("turn") || null;
+
+  return (
+    <LiveEventsProvider
+      apiKey={readStoredKey() || undefined}
+      cachePolicy={{
+        aggregateQueryKeys: [["web-bootstrap"], ["turns"]],
+        selectedTurnId,
+        selectedTurnQueryKey: selectedTurnId ? ["turn", selectedTurnId] : undefined
+      }}
+      queryClient={queryClient}
+    >
+      {children}
+    </LiveEventsProvider>
+  );
+}
+
 const root = document.getElementById("root");
 if (!root) {
   throw new Error("React root element not found");
@@ -460,15 +479,11 @@ createRoot(root).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
       <SkinProvider>
-        <LiveEventsProvider
-          apiKey={readStoredKey() || undefined}
-          cachePolicy={{ aggregateQueryKeys: [["web-bootstrap"]] }}
-          queryClient={queryClient}
-        >
-          <BrowserRouter basename={appBasename()}>
+        <BrowserRouter basename={appBasename()}>
+          <RoutedLiveEventsProvider>
             <AppFrame />
-          </BrowserRouter>
-        </LiveEventsProvider>
+          </RoutedLiveEventsProvider>
+        </BrowserRouter>
       </SkinProvider>
     </QueryClientProvider>
   </React.StrictMode>

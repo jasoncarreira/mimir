@@ -42,7 +42,8 @@ const knownTopLevel = new Set([
   "duration_ms",
   "events",
   "saga_calls",
-  "injected_inputs"
+  "injected_inputs",
+  "metadata"
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -83,9 +84,10 @@ export function normalizeInjectedInputs(value: unknown): InjectedInput[] {
 
 export function safeTurn(record: TurnRecord, index = 0): SafeTurn {
   const source = isRecord(record) ? record : {};
-  const metadata = Object.fromEntries(
-    Object.entries(source).filter(([key]) => !knownTopLevel.has(key))
-  );
+  const metadata = {
+    ...(isRecord(source.metadata) ? source.metadata : {}),
+    ...Object.fromEntries(Object.entries(source).filter(([key]) => !knownTopLevel.has(key)))
+  };
   return {
     ...(source as TurnRecord),
     turn_id: stringFrom(source.turn_id, `turn-${index + 1}`),
