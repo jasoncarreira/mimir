@@ -272,6 +272,63 @@ export interface TurnsData {
   turns: TurnRecord[];
 }
 
+export interface SessionMessage {
+  ts: string;
+  kind: string;
+  author?: string | null;
+  content: string;
+  content_snippet: string;
+  msg_id?: string | null;
+}
+
+export interface SessionTurnSummary {
+  turn_id: string;
+  ts: string;
+  trigger: string;
+  channel_id: string;
+  input_snippet: string;
+  output_snippet: string;
+}
+
+export interface SessionSagaAtom {
+  id: string;
+  content_preview: string;
+  memory_type?: string | null;
+  stream?: string | null;
+  source_type?: string | null;
+  topics?: unknown[];
+  created_at?: string | null;
+}
+
+export interface ConversationSession {
+  id: string;
+  saga_session_id?: string | null;
+  channel_id?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  last_activity_at?: string | null;
+  reflected_at?: string | null;
+  turn_ids: string[];
+  turns: SessionTurnSummary[];
+  messages: SessionMessage[];
+  triggers: string[];
+  summary: string;
+  unfinished: unknown[];
+  topics_discussed?: unknown[];
+  decisions_made?: unknown[];
+  closed_since?: unknown[];
+  related_saga_atoms: SessionSagaAtom[];
+  synthetic: boolean;
+  message_count: number;
+  turn_count: number;
+}
+
+export interface SessionsData {
+  sessions: ConversationSession[];
+  channels: string[];
+  triggers: string[];
+}
+
 export interface EventsData {
   events: JsonObject[];
 }

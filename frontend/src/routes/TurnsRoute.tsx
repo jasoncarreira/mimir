@@ -1,7 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import React from "react";
 import { useSearchParams } from "react-router-dom";
-import { listTurns, type SagaCall, type TurnEvent } from "../api";
+import { listSessions, listTurns, type SagaCall, type TurnEvent } from "../api";
+import type { ConversationSession } from "../api/generated/contracts";
 import {
   Badge,
   Button,
@@ -36,6 +37,8 @@ const triggerFilters: Array<{ id: TriggerFilter; label: string }> = [
   { id: "claude_code_spawn", label: "Spawn" },
   { id: "shell_job_complete", label: "Job" }
 ];
+
+const SESSION_PAGE_SIZE = 200;
 
 function useTurnPages() {
   const [turns, setTurns] = React.useState<SafeTurn[]>([]);
@@ -128,6 +131,28 @@ function truncate(value: string, fallback = "-") {
   return trimmed.length > 140 ? `${trimmed.slice(0, 140)}...` : trimmed;
 }
 
+function isoDateOnly(value: string | null) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toISOString().slice(0, 10);
+}
+
+function copyText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    return navigator.clipboard.writeText(value);
+  }
+  const node = document.createElement("textarea");
+  node.value = value;
+  node.style.position = "fixed";
+  node.style.opacity = "0";
+  document.body.appendChild(node);
+  node.select();
+  document.execCommand("copy");
+  document.body.removeChild(node);
+  return Promise.resolve();
+}
+
 function TurnList({
   turns,
   selectedId,
@@ -181,6 +206,144 @@ function TurnList({
         )}
       </div>
     </div>
+  );
+}
+
+function SessionList({
+  sessions,
+  selectedId,
+  onSelect
+}: {
+  sessions: ConversationSession[];
+  selectedId: string | null;
+  onSelect: (session: ConversationSession) => void;
+}) {
+  if (!sessions.length) return <EmptyState title="No sessions match the current filters" />;
+  return (
+    <div className="session-list" role="list" aria-label="Sessions">
+      {sessions.map((session) => (
+        <button
+          className={`session-row${selectedId === session.id ? " session-row--selected" : ""}`}
+          key={session.id}
+          onClick={() => onSelect(session)}
+          type="button"
+        >
+          <span className="session-row__main">
+            <strong>{session.channel_id || "unknown channel"}</strong>
+            <small>{formatTurnTime(session.last_activity_at || session.ended_at || session.started_at || "")}</small>
+            <span>{truncate(session.summary || session.messages[0]?.content_snippet || session.turns[0]?.input_snippet || session.id, "No summary")}</span>
+          </span>
+          <span className="turn-badges">
+            {session.triggers.slice(0, 3).map((trigger) => <Badge key={trigger}>{trigger}</Badge>)}
+            {session.synthetic ? <Badge tone="warning">inferred</Badge> : null}
+          </span>
+          <span>{session.turn_count} turns</span>
+          <span>{session.message_count} messages</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function SessionDetail({
+  session,
+  onOpenTurn
+}: {
+  session: ConversationSession;
+  onOpenTurn: (turnId: string) => void;
+}) {
+  const [copyStatus, setCopyStatus] = React.useState("");
+
+  function sessionUrl() {
+    const url = new URL(window.location.href);
+    url.searchParams.set("session", session.id);
+    if (session.turn_ids[0]) url.searchParams.set("turn", session.turn_ids[0]);
+    return url.toString();
+  }
+
+  async function copyLink() {
+    await copyText(sessionUrl());
+    setCopyStatus("link copied");
+  }
+
+  async function exportSession() {
+    await copyText(JSON.stringify(session, null, 2));
+    setCopyStatus("json copied");
+  }
+
+  return (
+    <aside className="turn-detail session-detail" aria-label="Selected session detail">
+      <Panel
+        title="Selected Session"
+        subtitle={session.id}
+        actions={
+          <>
+            <Button onClick={copyLink}>Copy link</Button>
+            <Button onClick={exportSession}>Export</Button>
+          </>
+        }
+      >
+        <dl className="facts-grid facts-grid--compact">
+          <div><dt>Channel</dt><dd>{session.channel_id || "-"}</dd></div>
+          <div><dt>Started</dt><dd>{formatTurnTime(session.started_at || "")}</dd></div>
+          <div><dt>Last activity</dt><dd>{formatTurnTime(session.last_activity_at || session.ended_at || "")}</dd></div>
+          <div><dt>Counts</dt><dd>{session.turn_count} turns / {session.message_count} messages</dd></div>
+        </dl>
+        {copyStatus ? <p className="session-copy-status">{copyStatus}</p> : null}
+      </Panel>
+
+      <DetailsBlock title="Summary">
+        <p className="turn-prewrap">{session.summary || "(no summary recorded)"}</p>
+      </DetailsBlock>
+
+      <DetailsBlock title={`Unfinished (${session.unfinished.length})`}>
+        {session.unfinished.length ? (
+          <ul className="session-plain-list">
+            {session.unfinished.map((item, index) => <li key={index}>{String(item)}</li>)}
+          </ul>
+        ) : <EmptyState title="No unfinished items recorded" />}
+      </DetailsBlock>
+
+      <DetailsBlock title={`Messages (${session.messages.length})`}>
+        {session.messages.length ? (
+          <div className="session-message-stack">
+            {session.messages.map((message, index) => (
+              <div className="session-message" key={`${message.msg_id || message.ts}-${index}`}>
+                <small>{formatTurnTime(message.ts)} · {message.kind} · {message.author || "unknown"}</small>
+                <p>{message.content}</p>
+              </div>
+            ))}
+          </div>
+        ) : <EmptyState title="No chat history messages matched this session" />}
+      </DetailsBlock>
+
+      <DetailsBlock title={`Turns (${session.turns.length})`}>
+        {session.turns.length ? (
+          <div className="session-turn-stack">
+            {session.turns.map((turn) => (
+              <button className="session-turn-link" key={turn.turn_id} onClick={() => onOpenTurn(turn.turn_id)} type="button">
+                <span><Badge>{turn.trigger}</Badge> <code>{turn.turn_id}</code></span>
+                <small>{formatTurnTime(turn.ts)}</small>
+                <span>{turn.input_snippet || turn.output_snippet || "(empty)"}</span>
+              </button>
+            ))}
+          </div>
+        ) : <EmptyState title="No turn records matched this session" />}
+      </DetailsBlock>
+
+      <DetailsBlock title={`Related SAGA atoms (${session.related_saga_atoms.length})`}>
+        {session.related_saga_atoms.length ? (
+          <div className="session-message-stack">
+            {session.related_saga_atoms.map((atom) => (
+              <div className="session-message" key={atom.id}>
+                <small>{atom.memory_type || "atom"} · <code>{atom.id}</code></small>
+                <p>{atom.content_preview}</p>
+              </div>
+            ))}
+          </div>
+        ) : <EmptyState title="No related SAGA atoms available" />}
+      </DetailsBlock>
+    </aside>
   );
 }
 
@@ -322,13 +485,36 @@ export function TurnsRoute() {
   const [trigger, setTrigger] = React.useState<TriggerFilter>("all");
   const [hidePollers, setHidePollers] = React.useState(false);
   const [query, setQuery] = React.useState("");
+  const [sessionChannel, setSessionChannel] = React.useState("");
+  const [sessionTrigger, setSessionTrigger] = React.useState("");
+  const [sessionFrom, setSessionFrom] = React.useState("");
+  const [sessionTo, setSessionTo] = React.useState("");
+  const [sessionQuery, setSessionQuery] = React.useState("");
   const { turns, isLoading, isError, initialError, loadError, loadingOlder, allOlderLoaded, loadOlder, refetch } = useTurnPages();
   const selectedId = searchParams.get("turn");
+  const selectedSessionId = searchParams.get("session");
+  const sessionsQuery = useQuery({
+    queryKey: ["sessions", SESSION_PAGE_SIZE, sessionChannel, sessionTrigger, sessionFrom, sessionTo, sessionQuery],
+    queryFn: async () => {
+      const envelope = await listSessions({
+        limit: SESSION_PAGE_SIZE,
+        q: sessionQuery,
+        channel: sessionChannel,
+        trigger: sessionTrigger,
+        from: sessionFrom,
+        to: sessionTo
+      }, { cache: "no-store" });
+      return envelope.data;
+    },
+    refetchInterval: 10000
+  });
   const visibleTurns = React.useMemo(
     () => filterTurns(turns, { trigger, hidePollers, query }),
     [turns, trigger, hidePollers, query]
   );
   const selectedTurn = visibleTurns.find((turn) => turn.turn_id === selectedId) ?? visibleTurns[0] ?? null;
+  const sessions = sessionsQuery.data?.sessions ?? [];
+  const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? sessions[0] ?? null;
 
   React.useEffect(() => {
     if (!selectedTurn || selectedId === selectedTurn.turn_id) return;
@@ -341,6 +527,21 @@ export function TurnsRoute() {
     const next = new URLSearchParams(searchParams);
     next.set("turn", turn.turn_id);
     setSearchParams(next);
+  }
+
+  function selectSession(session: ConversationSession) {
+    const next = new URLSearchParams(searchParams);
+    next.set("session", session.id);
+    if (session.turn_ids[0]) next.set("turn", session.turn_ids[0]);
+    setSearchParams(next);
+  }
+
+  function openSessionTurn(turnId: string) {
+    const next = new URLSearchParams(searchParams);
+    next.set("turn", turnId);
+    setSearchParams(next);
+    const node = document.getElementById("turn-browser-panel");
+    node?.scrollIntoView({ block: "start" });
   }
 
   return (
@@ -403,6 +604,42 @@ export function TurnsRoute() {
         ) : null}
       </Panel>
 
+      <Panel
+        title="Browse Sessions"
+        subtitle="Conversation-level grouping over turns, chat history, and SAGA summaries."
+      >
+        <div className="turns-controls turns-controls--sessions">
+          <TextInput
+            aria-label="Search session messages and outputs"
+            onChange={(event) => setSessionQuery(event.currentTarget.value)}
+            placeholder="Search messages / output"
+            value={sessionQuery}
+          />
+          <select aria-label="Filter sessions by channel" className="ui-input" onChange={(event) => setSessionChannel(event.currentTarget.value)} value={sessionChannel}>
+            <option value="">All channels</option>
+            {(sessionsQuery.data?.channels ?? []).map((channel) => <option key={channel} value={channel}>{channel}</option>)}
+          </select>
+          <select aria-label="Filter sessions by trigger" className="ui-input" onChange={(event) => setSessionTrigger(event.currentTarget.value)} value={sessionTrigger}>
+            <option value="">All triggers</option>
+            {(sessionsQuery.data?.triggers ?? []).map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+          <TextInput aria-label="From date" onChange={(event) => setSessionFrom(event.currentTarget.value)} type="date" value={isoDateOnly(sessionFrom)} />
+          <TextInput aria-label="To date" onChange={(event) => setSessionTo(event.currentTarget.value)} type="date" value={isoDateOnly(sessionTo)} />
+        </div>
+        {sessionsQuery.isLoading ? <LoadingState label="Loading sessions" /> : null}
+        {sessionsQuery.isError ? (
+          <ErrorState title="Could not load sessions">
+            {sessionsQuery.error instanceof Error ? sessionsQuery.error.message : String(sessionsQuery.error)}
+          </ErrorState>
+        ) : null}
+        {!sessionsQuery.isLoading && !sessionsQuery.isError ? (
+          <SessionList sessions={sessions} selectedId={selectedSession?.id ?? null} onSelect={selectSession} />
+        ) : null}
+      </Panel>
+
+      {selectedSession ? <SessionDetail session={selectedSession} onOpenTurn={openSessionTurn} /> : null}
+
+      <div id="turn-browser-panel" />
       {selectedTurn ? <TurnDetail turn={selectedTurn} /> : (
         <Panel title="Selected Turn">
           <EmptyState title={turns.length ? "No turn selected" : "No turns recorded yet"} />

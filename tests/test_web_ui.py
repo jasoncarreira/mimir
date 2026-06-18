@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -153,6 +154,122 @@ async def test_api_v1_turns_returns_envelope_and_list_metadata(app):
         "total": 5,
         "truncated": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_api_v1_sessions_groups_missing_saga_session_id_by_channel_time(tmp_path: Path):
+    turns_log = tmp_path / "turns.jsonl"
+    events_log = tmp_path / "events.jsonl"
+    home = tmp_path / "home"
+    home.mkdir()
+    rows = [
+        {
+            "turn_id": "t1",
+            "ts": "2026-06-18T10:00:00Z",
+            "trigger": "user_message",
+            "channel_id": "web-a",
+            "input": "alpha prompt",
+            "output": "alpha answer",
+        },
+        {
+            "turn_id": "t2",
+            "ts": "2026-06-18T10:05:00Z",
+            "trigger": "user_message",
+            "channel_id": "web-a",
+            "input": "follow up",
+            "output": "still alpha",
+        },
+        {
+            "turn_id": "t3",
+            "ts": "2026-06-18T11:00:00Z",
+            "trigger": "scheduled_tick",
+            "channel_id": "web-a",
+            "input": "later",
+            "output": "later answer",
+        },
+    ]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    a = web.Application()
+    web_ui.register_routes(a, turns_log=turns_log, events_log=events_log, home=home)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/sessions?q=alpha&channel=web-a&trigger=user_message")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["meta"]["total"] == 1
+    [session] = body["data"]["sessions"]
+    assert session["synthetic"] is True
+    assert session["saga_session_id"] is None
+    assert session["turn_ids"] == ["t1", "t2"]
+    assert session["triggers"] == ["user_message"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_sessions_includes_synthesis_only_saga_summary(tmp_path: Path):
+    turns_log = tmp_path / "turns.jsonl"
+    events_log = tmp_path / "events.jsonl"
+    home = tmp_path / "home"
+    saga_dir = home / ".mimir"
+    saga_dir.mkdir(parents=True)
+    saga_db = saga_dir / "saga.db"
+    conn = sqlite3.connect(saga_db)
+    try:
+        conn.executescript((Path("mimir/saga/schema.sql")).read_text(encoding="utf-8"))
+        conn.execute(
+            """
+            INSERT INTO sessions (
+                id, channel_id, started_at, ended_at, summary, reflected_at,
+                topics_discussed, decisions_made, unfinished, closed_since
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "saga-web-a-1",
+                "web-a",
+                "2026-06-18T10:00:00Z",
+                "2026-06-18T10:30:00Z",
+                "Synthesized without retained turn records.",
+                "2026-06-18T10:31:00Z",
+                json.dumps(["browser"]),
+                json.dumps([]),
+                json.dumps(["wire detail view"]),
+                json.dumps([]),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO atoms (
+                id, content, content_hash, source_type, created_at, session_id
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "atom-1",
+                "Session atom tied to synthesis-only browser work.",
+                "hash-1",
+                "conversation",
+                "2026-06-18T10:32:00Z",
+                "saga-web-a-1",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    a = web.Application()
+    web_ui.register_routes(a, turns_log=turns_log, events_log=events_log, home=home)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/sessions?q=retained")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    [session] = body["data"]["sessions"]
+    assert session["id"] == "saga-web-a-1"
+    assert session["turn_ids"] == []
+    assert session["summary"] == "Synthesized without retained turn records."
+    assert session["unfinished"] == ["wire detail view"]
+    assert session["related_saga_atoms"][0]["id"] == "atom-1"
 
 
 @pytest.mark.asyncio
