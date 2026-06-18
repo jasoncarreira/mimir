@@ -130,8 +130,9 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         payload = payload_from_json(payload_data)
         validation = asyncio.run(run_worker_payload(payload))
         suffix = " review-ready" if validation.review_ready else ""
-        print(f"worklink worker: {validation.status}{suffix}")
-        return 0
+        reason_suffix = _worker_reason_suffix(validation)
+        print(f"worklink worker: {validation.status}{suffix}{reason_suffix}")
+        return 0 if validation.status in {"completed", "blocked"} else 1
 
     if args.worklink_action != "run":
         parser.print_help()
@@ -181,7 +182,19 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         f"worklink #{result.issue_id} attempt {result.attempt}: {result.status}"
         + (" review-ready" if result.review_ready else "")
         + (f" PR {result.pr_url}" if result.pr_url else "")
+        + (f" — {result.reason}" if result.reason else "")
     )
     if result.evidence_path:
         print(f"evidence: {result.evidence_path}")
     return 0 if result.status in {"completed", "blocked"} else 1
+
+
+def _worker_reason_suffix(validation: object) -> str:
+    reasons = tuple(str(item) for item in getattr(validation, "reasons", ()) if item)
+    evidence = getattr(validation, "evidence", None)
+    blocked_reason = getattr(evidence, "blocked_reason", None) if evidence is not None else None
+    if blocked_reason:
+        return f" — {blocked_reason}"
+    if reasons:
+        return " — " + ", ".join(reasons)
+    return ""

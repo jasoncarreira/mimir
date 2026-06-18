@@ -12,6 +12,7 @@ import type {
 } from "./generated/contracts";
 
 export type {
+  MemoryFileData,
   MemorySearchHit,
   MemoryTreeDir,
   MemoryTreeFile,
