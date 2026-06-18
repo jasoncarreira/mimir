@@ -281,7 +281,7 @@ function RouteTabs({
           const selected = activeTab === tab;
           return (
             <Link
-              aria-controls={selected ? panelId : `${surface.id}-${tab}-panel`}
+              aria-controls={panelId}
               aria-selected={selected}
               className="ui-tabs__tab"
               id={`${surface.id}-${tab}-tab`}
