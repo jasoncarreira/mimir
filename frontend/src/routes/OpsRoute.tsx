@@ -1,8 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import React from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { getOpsDashboard } from "../api";
 import type { ChainlinkIssue } from "../api/ops";
+import { drilldownHref } from "../routeState";
 import {
   Badge,
   Button,
@@ -141,11 +142,23 @@ function SchedulerPanel({ data }: { data: SafeOpsDashboardData }) {
   return (
     <div className="ops-panel-stack">
       <Panel title="Scheduler, Poller, and Job Signals">
-        <RowsTable
-          caption="Scheduler-like event counts"
-          empty="No scheduler, poller, job, resource, or queue signals in this window"
-          rows={schedulerEventRows(data)}
-        />
+        {schedulerEventRows(data).length ? (
+          <DataTable
+            caption="Scheduler-like event counts"
+            columns={[
+              { key: "key", header: "Signal" },
+              { key: "value", header: "Count" },
+              { key: "trace", header: "Trace" }
+            ]}
+            rows={schedulerEventRows(data).map((row) => ({
+              key: <code>{row.key}</code>,
+              value: row.value.toLocaleString(),
+              trace: <Link to={drilldownHref("/turns", { filter: row.key, event: row.key })}>Turns</Link>
+            }))}
+          />
+        ) : (
+          <EmptyState title="No scheduler, poller, job, resource, or queue signals in this window" />
+        )}
       </Panel>
       <Panel title="Queued by Trigger">
         <RowsTable caption="Queued events by trigger" empty="No queued trigger data" rows={mapToRows(data.queued_by_trigger)} />
@@ -236,7 +249,17 @@ function HealthPanel({ data }: { data: SafeOpsDashboardData }) {
               t: failure.t,
               kind: <code>{failure.kind}</code>,
               channel: failure.channel_id ?? "",
-              detail: failure.detail
+              detail: (
+                <>
+                  <span>{failure.detail}</span>{" "}
+                  <Link to={drilldownHref("/turns", {
+                    filter: "failure",
+                    event: failure.kind,
+                    channel: failure.channel_id || undefined,
+                    q: failure.detail || failure.kind
+                  })}>Turns</Link>
+                </>
+              )
             }))}
           />
         ) : (
@@ -315,8 +338,8 @@ function RawPanel({ data }: { data: SafeOpsDashboardData }) {
 }
 
 function OpsContent({ data: rawData }: { data: unknown }) {
+  const [searchParams, setSearchParams] = useSearchParams();
   const data = safeOpsDashboardData(rawData);
-  const [activeTab, setActiveTab] = React.useState("overview");
   const tabs = [
     ["overview", "Overview"],
     ["resources", "Resources"],
@@ -326,6 +349,13 @@ function OpsContent({ data: rawData }: { data: unknown }) {
     ["chainlink", "Chainlink"],
     ["raw", "Raw"]
   ];
+  const activeTab = tabs.some(([id]) => id === searchParams.get("tab")) ? searchParams.get("tab") || "overview" : "overview";
+
+  function setActiveTab(tab: string) {
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", tab);
+    setSearchParams(params);
+  }
 
   return (
     <div className="ops-route">
@@ -412,7 +442,9 @@ export function OpsRoute() {
             event.preventDefault();
             const form = new FormData(event.currentTarget);
             const nextDays = String(form.get("days") || "7");
-            setSearchParams({ days: nextDays }, { replace: false });
+            const params = new URLSearchParams(searchParams);
+            params.set("days", nextDays);
+            setSearchParams(params, { replace: false });
           }}
         >
           <label>

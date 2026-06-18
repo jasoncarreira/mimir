@@ -1,7 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import React from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { getSchedulerDashboard } from "../api";
+import { drilldownHref } from "../routeState";
 import {
   Badge,
   Button,
@@ -43,6 +44,7 @@ function RunTable({
             { key: "source", header: "Prompt source" },
             { key: "status", header: "Status" },
             { key: "detail", header: "Result / suppression" },
+            { key: "trace", header: "Trace" },
             { key: "config", header: "Config" }
           ]}
           rows={rows.map((row) => ({
@@ -54,6 +56,18 @@ function RunTable({
             source: row.prompt_source,
             status: <Badge tone={runStateTone(row)}>{runStateLabel(row)}</Badge>,
             detail: row.recent_error || row.suppression_reason || row.recent_result || "",
+            trace: (
+              <>
+                <Link to={drilldownHref("/turns", {
+                  job: row.name,
+                  filter: row.recent_error ? "failure" : row.kind,
+                  event: row.kind,
+                  channel: row.channel || undefined,
+                  q: row.name
+                })}>Turns</Link>{" "}
+                <Link to={drilldownHref("/ops", { tab: "scheduler", job: row.name, filter: row.kind })}>Ops</Link>
+              </>
+            ),
             config: row.kind === "poller"
               ? (row.pass_env?.length ? <code>{row.pass_env.join(", ")}</code> : "")
               : (Object.keys(row.config || {}).length ? <code>redacted config</code> : "")

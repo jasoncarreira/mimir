@@ -1,5 +1,7 @@
 import React from "react";
+import { Link } from "react-router-dom";
 import type { SagaCall, TurnEvent, TurnRecord } from "./api";
+import { drilldownHref } from "./routeState";
 import { Badge, CodeBlock, EmptyState, ErrorState, Panel } from "./ui";
 import { useUiState } from "./uiState";
 import {
@@ -93,6 +95,23 @@ function resultPlaceholder(event: TurnEvent): string {
   return "";
 }
 
+function stringField(source: unknown, keys: string[]): string {
+  if (!isRecord(source)) return "";
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return "";
+}
+
+function sagaAtomId(call: SagaCall): string {
+  return (
+    stringField(call.result, ["atom_id", "atom", "id", "target_id"])
+    || stringField(call.args, ["atom_id", "atom", "id", "target_id"])
+  );
+}
+
 function PreviewText({ value, empty = "(empty)" }: { value: unknown; empty?: string }) {
   const text = asText(value);
   const display = text.length > 12000 ? `${text.slice(0, 12000)}\n\n[truncated preview]` : text;
@@ -143,7 +162,8 @@ function EventCard({ event, index }: { event: TurnEvent; index: number }) {
   );
 }
 
-function SagaCard({ call, index }: { call: SagaCall; index: number }) {
+function SagaCard({ call, index, turnId }: { call: SagaCall; index: number; turnId: string }) {
+  const atomId = sagaAtomId(call);
   return (
     <div className="turn-event-card">
       <div className="turn-event-title">
@@ -151,6 +171,14 @@ function SagaCard({ call, index }: { call: SagaCall; index: number }) {
         <span>#{index + 1}</span>
         {typeof call.latency_ms === "number" ? <small>{Math.round(call.latency_ms)}ms</small> : null}
         {formatRelativeMs(call.t_ms) ? <small>{formatRelativeMs(call.t_ms)}</small> : null}
+        <Link to={drilldownHref("/saga", {
+          tab: atomId ? "atoms" : "search",
+          turn: turnId,
+          atom: atomId || undefined,
+          target: `saga-call-${index + 1}`
+        })}>
+          SAGA
+        </Link>
       </div>
       {call.error ? <ErrorState title="Saga call error">{call.error}</ErrorState> : null}
       <CodeBlock code={`args:\n${stringify(call.args ?? {})}\n\nresult:\n${stringify(call.result ?? {})}`} language="json" />
@@ -317,7 +345,7 @@ export function TurnDetailsPanel({
       {(normalized.saga_calls.length || contextEntries.length || normalized.injected_inputs.length) ? (
         <CollapsibleSection routeKey={routeKey} turnId={turnId} section="related-context" title="Related context" count={normalized.saga_calls.length + contextEntries.length + normalized.injected_inputs.length} defaultOpen={false}>
           <div className="turn-event-stack">
-            {normalized.saga_calls.map((call, index) => <SagaCard call={call} index={index} key={`saga-${index}`} />)}
+            {normalized.saga_calls.map((call, index) => <SagaCard call={call} index={index} key={`saga-${index}`} turnId={turnId} />)}
             {contextEntries.map(([key, value]) => (
               <CodeBlock code={stringify(value)} key={key} language="json" title={key} />
             ))}

@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import React from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   ApiError,
   getMemoryFile,
@@ -12,6 +12,7 @@ import {
   type MemoryTreeNode
 } from "../api";
 import type { DashboardSurface } from "../dashboardExtensions";
+import { drilldownHref } from "../routeState";
 import { Badge, Button, DashboardHeader, ErrorState, LoadingState, Panel, TextInput } from "../ui";
 import {
   countByLayer,
@@ -123,6 +124,14 @@ function FileDetail({ path }: { path: string }) {
   });
   const file = fileQuery.data as MemoryFileData | undefined;
   const desc = React.useMemo(() => descriptionFromContent(file?.content), [file?.content]);
+  const relatedQuery = React.useMemo(() => {
+    const name = path.split("/").filter(Boolean).pop() || path;
+    return name.replace(/\.(md|json|yaml|yml|txt)$/i, "");
+  }, [path]);
+  const channelHint = React.useMemo(() => {
+    const match = path.match(/(?:channels?|chat)[/_-]([^/.]+)/i);
+    return match?.[1] || "";
+  }, [path]);
 
   if (!path) {
     return <LoadingState label="Select a state or memory file" />;
@@ -145,6 +154,13 @@ function FileDetail({ path }: { path: string }) {
         <div><dt>Path</dt><dd>{file.path}</dd></div>
         <div><dt>Layer</dt><dd>{sourceLayerForPath(file.path)}</dd></div>
         <div><dt>Modified</dt><dd>{fmtTimestamp(file.modified)}</dd></div>
+        <div>
+          <dt>Related activity</dt>
+          <dd>
+            <Link to={drilldownHref("/turns", { path: file.path, filter: relatedQuery, q: relatedQuery, channel: channelHint || undefined })}>Turns</Link>{" "}
+            <Link to={drilldownHref("/chat", { path: file.path, channel: channelHint || undefined, q: relatedQuery })}>Chat</Link>
+          </dd>
+        </div>
       </dl>
       <pre className="memory-detail__content">{file.content}</pre>
     </article>
