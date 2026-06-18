@@ -9,6 +9,10 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from mimir.dashboard_extensions import (
+    DashboardExtensionManifest,
+    first_party_dashboard_extensions,
+)
 from mimir import web_ui
 from mimir.web_contracts import (
     render_typescript_contracts,
@@ -32,6 +36,47 @@ def test_generated_typescript_contracts_are_current():
         encoding="utf-8"
     )
     assert generated == render_typescript_contracts()
+
+
+def test_dashboard_extension_registry_sorts_hides_and_validates_scope():
+    registry = first_party_dashboard_extensions(
+        [
+            DashboardExtensionManifest(
+                id="late",
+                route_path="/late",
+                label="Late",
+                nav_position=20,
+            ),
+            DashboardExtensionManifest(
+                id="early",
+                route_path="/early",
+                label="Early",
+                nav_position=10,
+            ),
+            DashboardExtensionManifest(
+                id="hidden",
+                route_path="/hidden",
+                label="Hidden",
+                nav_position=1,
+                enabled=False,
+            ),
+        ]
+    )
+
+    assert [manifest.id for manifest in registry.enabled()] == ["early", "late"]
+    assert [item["id"] for item in registry.navigation_payload()] == ["early", "late"]
+
+    with pytest.raises(ValueError, match="trusted first-party"):
+        first_party_dashboard_extensions(
+            [
+                DashboardExtensionManifest(
+                    id="remote",
+                    route_path="/remote",
+                    label="Remote",
+                    trusted_first_party=False,
+                )
+            ]
+        )
 
 
 @pytest.mark.asyncio
@@ -499,6 +544,66 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     validate_api_envelope(body, expect_ok=True)
     assert body["data"]["auth"]["required"] is True
     assert body["data"]["server"]["public_bind"] is True
+    assert [item["id"] for item in body["data"]["dashboard_extensions"]][:3] == [
+        "chat",
+        "turns",
+        "ops",
+    ]
+    ops_manifest = next(
+        item for item in body["data"]["dashboard_extensions"] if item["id"] == "ops"
+    )
+    assert ops_manifest["api_namespace"] == "ops"
+    assert ops_manifest["trusted_first_party"] is True
+
+
+@pytest.mark.asyncio
+async def test_first_party_backend_namespace_hook_registers_ops_api(tmp_path: Path):
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/ops")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_disabled_backend_namespace_manifest_skips_ops_api(tmp_path: Path):
+    registry = first_party_dashboard_extensions(
+        [
+            DashboardExtensionManifest(
+                id="ops",
+                route_path="/ops",
+                label="Ops",
+                nav_position=10,
+                enabled=False,
+                api_namespace="ops",
+            )
+        ]
+    )
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+        dashboard_extensions=registry,
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/ops")
+        bootstrap = await client.get("/api/v1/web/bootstrap")
+        body = await bootstrap.json()
+
+    assert resp.status == 404
+    assert body["data"]["dashboard_extensions"] == []
 
 
 @pytest.mark.asyncio
