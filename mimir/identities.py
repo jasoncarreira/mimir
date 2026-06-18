@@ -531,6 +531,15 @@ class IdentityResolver:
         ident = self._identities.get(canonical)
         return ident.access if ident else AccessMetadata()
 
+    def has_web_keys(self) -> bool:
+        """True if any identity carries a ``webkey:`` alias.
+
+        The auth middleware uses this to fail safe: if per-user keys are
+        configured, the web gate activates even when the ``MIMIR_API_KEY``
+        master key is unset — so adding users can't leave the server
+        unintentionally wide open."""
+        return any(alias.startswith(WEB_KEY_ALIAS_PREFIX) for alias in self._alias_map)
+
     def resolve_web_key(self, raw_key: str | None) -> Identity | None:
         """Resolve a raw web API key to its identity record, or ``None``.
 
