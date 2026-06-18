@@ -25,6 +25,7 @@ from mimir.skill_install import (
     accept_skill_drift,
     clear_accepted_skill_drift,
     apply_skill_update,
+    auto_update_installed_optional_skills,
     cmd_accept_skill_drift,
     cmd_configure,
     cmd_install,
@@ -709,6 +710,18 @@ def test_drift_extra_file_in_installed(fake_optional_root: Path, fake_home: Path
     assert r.added == []
 
 
+def test_drift_ignores_per_skill_env_file(fake_optional_root: Path, fake_home: Path):
+    """Per-skill .env files are operator-local config and must not count as drift."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    env_file = fake_home / "skills" / "fake-poller" / ".env"
+    env_file.write_text("GITHUB_TOKEN=secret\n")
+
+    results = detect_skill_drift(fake_home, fake_optional_root)
+    r = next(r for r in results if r.name == "fake-poller")
+    assert r.is_clean
+    assert ".env" not in r.extra
+
+
 def test_drift_orphaned_skill(fake_home: Path, tmp_path: Path):
     """An installed skill with no matching source directory is orphaned."""
     # Create a skill in home that has no source counterpart.
@@ -1185,6 +1198,148 @@ def test_apply_copies_added_file(
     assert "helper.py" in updated
     assert failed == []
     assert (fake_home / "skills" / "fake-skill" / "helper.py").read_text() == "# new\n"
+
+
+def test_auto_update_installed_optional_skills_applies_safe_source_changes(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """Startup auto-update applies source-driven changes but preserves extras."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+
+    installed = fake_home / "skills" / "fake-poller"
+    source = fake_optional_root / "fake-poller"
+    (installed / "poller.py").write_text("# stale poller\n")
+    (source / "new-helper.py").write_text("# new helper\n")
+    (installed / "local-note.md").write_text("operator notes\n")
+    (installed / ".env").write_text("TOKEN=secret\n")
+
+    result = auto_update_installed_optional_skills(fake_home, fake_optional_root)
+
+    assert result.updated == {"fake-poller": ["poller.py", "new-helper.py"]}
+    assert result.failed == {}
+    assert result.pollers_json_updated == []
+    assert result.remaining_drift == {"fake-poller": {"extra": ["local-note.md"]}}
+    assert (installed / "poller.py").read_text() == "# placeholder\n"
+    assert (installed / "new-helper.py").read_text() == "# new helper\n"
+    assert (installed / "local-note.md").read_text() == "operator notes\n"
+    assert (installed / ".env").read_text() == "TOKEN=secret\n"
+
+
+def test_auto_update_installed_optional_skills_tracks_poller_manifest_updates(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """pollers.json updates are called out so startup can surface reload semantics."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    source_manifest = fake_optional_root / "fake-poller" / "pollers.json"
+    source_manifest.write_text(
+        '{"pollers": [{"name": "fake", "command": "echo updated", "cron": "*/10 * * * *"}]}'
+    )
+
+    result = auto_update_installed_optional_skills(fake_home, fake_optional_root)
+
+    assert result.updated == {"fake-poller": ["pollers.json"]}
+    assert result.failed == {}
+    assert result.pollers_json_updated == ["fake-poller"]
+    assert result.remaining_drift == {}
+    assert (
+        (fake_home / "skills" / "fake-poller" / "pollers.json").read_text()
+        == source_manifest.read_text()
+    )
+
+
+def test_auto_update_installed_optional_skills_surfaces_source_deleted_pollers_json(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """A source-deleted poller manifest remains visible as stale drift."""
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    (fake_optional_root / "fake-poller" / "pollers.json").unlink()
+
+    result = auto_update_installed_optional_skills(fake_home, fake_optional_root)
+
+    assert result.updated == {}
+    assert result.failed == {}
+    assert result.pollers_json_updated == []
+    assert result.remaining_drift == {"fake-poller": {"extra": ["pollers.json"]}}
+    assert (fake_home / "skills" / "fake-poller" / "pollers.json").is_file()
+
+
+def test_auto_update_installed_optional_skills_surfaces_orphaned_skills(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """Installed optional skills with no source counterpart are not silent."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    source = fake_optional_root / "fake-skill"
+    for path in sorted(source.rglob("*"), reverse=True):
+        if path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            path.rmdir()
+    source.rmdir()
+
+    result = auto_update_installed_optional_skills(fake_home, fake_optional_root)
+
+    assert result.updated == {}
+    assert result.failed == {}
+    assert result.remaining_drift == {"fake-skill": {"orphaned": True}}
+
+
+def test_auto_update_installed_optional_skills_reports_partial_failure(
+    fake_optional_root: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Startup auto-update surfaces copy failures and leaves stale file intact."""
+    import shutil as _shutil
+
+    install("fake-poller", fake_home, optional_skills_root=fake_optional_root)
+    installed = fake_home / "skills" / "fake-poller"
+    stale = installed / "poller.py"
+    stale.write_text("# stale poller\n")
+
+    real_copy2 = _shutil.copy2
+
+    def flaky_copy2(src, dst, *args, **kwargs):
+        if Path(src).name == "poller.py" and Path(dst).name == "poller.py":
+            raise OSError("simulated copy failure")
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr("mimir.skill_install.shutil.copy2", flaky_copy2)
+
+    result = auto_update_installed_optional_skills(fake_home, fake_optional_root)
+
+    assert result.updated == {}
+    assert result.failed == {"fake-poller": ["poller.py"]}
+    assert result.remaining_drift == {"fake-poller": {"differs": ["poller.py"]}}
+    assert result.any_updates is True
+    assert stale.read_text() == "# stale poller\n"
+
+
+def test_auto_update_installed_optional_skills_rejects_escaping_source_symlink(
+    fake_optional_root: Path, fake_home: Path, tmp_path: Path,
+):
+    """Startup auto-update uses the same escaping-symlink guard as install."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    (fake_optional_root / "fake-skill" / "leak.txt").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symlink escaping"):
+        auto_update_installed_optional_skills(fake_home, fake_optional_root)
+
+
+def test_auto_update_installed_optional_skills_skips_accepted_drift(
+    fake_optional_root: Path, fake_home: Path,
+):
+    """Accepted local divergence is preserved during startup auto-update."""
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    installed_md = fake_home / "skills" / "fake-skill" / "SKILL.md"
+    installed_md.write_text("---\nname: fake-skill\ndescription: local accepted\n---\n")
+    accept_skill_drift(fake_home, "fake-skill", fake_optional_root, files=["SKILL.md"])
+
+    result = auto_update_installed_optional_skills(fake_home, fake_optional_root)
+
+    assert result.updated == {}
+    assert result.failed == {}
+    assert result.remaining_drift == {}
+    assert "local accepted" in installed_md.read_text()
 
 
 def test_apply_skips_extra_without_force(

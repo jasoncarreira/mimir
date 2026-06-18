@@ -56,6 +56,20 @@ log = logging.getLogger(__name__)
 _STARTUP_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 
+def _skill_auto_update_event(result: Any) -> tuple[str, dict[str, Any]] | None:
+    """Return the startup event payload for optional-skill auto-refresh."""
+    if not getattr(result, "any_updates", False):
+        return None
+    fields = {
+        "updated": result.updated,
+        "failed": result.failed,
+        "pollers_json_updated": result.pollers_json_updated,
+        "remaining_drift": result.remaining_drift,
+    }
+    event_kind = "skills_auto_update_failed" if result.failed else "skills_auto_update"
+    return event_kind, fields
+
+
 class _PairingNotifier:
     """Coalesced operator alerts plus DM-only fixed auto-replies."""
 
@@ -1405,6 +1419,31 @@ def build_app(config: Config) -> web.Application:
                 error=str(exc),
             )
 
+        # Auto-refresh installed optional skills from shipped source before
+        # poller registration.  This closes the deploy gap where
+        # ``mimir/optional-skills/<name>/`` changed but the operator-installed
+        # ``<home>/skills/<name>/`` copy stayed stale until someone manually ran
+        # ``mimir skills update --apply`` (chainlink #557).  The helper uses
+        # the safe update path: source-changed/source-added files are applied
+        # with backups; installed-only files and per-skill .env are preserved.
+        skill_update_result = None
+        try:
+            from .skill_install import auto_update_installed_optional_skills
+
+            skill_update_result = await asyncio.to_thread(
+                auto_update_installed_optional_skills,
+                config.home,
+            )
+            update_event = _skill_auto_update_event(skill_update_result)
+            if update_event is not None:
+                event_kind, fields = update_event
+                await log_event(event_kind, **fields)
+        except Exception as exc:  # noqa: BLE001 — skill sync must not block boot
+            await log_event(
+                "skills_auto_update_failed",
+                error=str(exc)[:500],
+            )
+
         # Load LLM-tick jobs from scheduler.yaml.
         reload_stats = scheduler.reload()
 
@@ -1470,14 +1509,17 @@ def build_app(config: Config) -> web.Application:
                 log.info("drained post-update digest into events.jsonl")
         except Exception:  # noqa: BLE001 — drain is best-effort
             log.exception("post-update digest drain failed")
-        # chainlink #363: operator deploys (pip install / git pull + docker
-        # restart) bump the version WITHOUT the self-update path's digest, so
-        # installed optional skills go silently stale. Detect the bump here and
-        # emit the same mimir_update_digest (notably its skills_drift list) so
-        # the agent can run `mimir skills update --apply`. Notify-only.
+        # chainlink #363 / #557: operator deploys (pip install / git pull +
+        # docker restart) bump the version WITHOUT the self-update path's
+        # digest. Detect the bump here, safely auto-refresh installed optional
+        # skills from shipped source, and emit the same mimir_update_digest so
+        # the agent sees what changed and what still needs inspection.
         try:
             bumped = await emit_version_bump_digest(
-                config.home, log_event, already_drained=bool(drained_digest),
+                config.home,
+                log_event,
+                already_drained=bool(drained_digest),
+                skill_update_result=skill_update_result,
             )
             if bumped:
                 log.info("emitted version-bump digest (operator deploy)")

@@ -43,6 +43,36 @@ def _sanitize_field(value: object, max_len: int = _FIELD_MAX_LEN) -> str:
 
 # Render hooks: per-kind one-liner builders. Defaults to a generic
 # "<kind>: <event-type-specific note>" if no specialized renderer fits.
+def _render_skill_details(items: object, *, limit: int = 4) -> str:
+    """Render compact per-skill file/category details for feedback lines."""
+    if isinstance(items, dict):
+        rendered: list[str] = []
+        for skill in sorted(items):
+            detail = items.get(skill)
+            if isinstance(detail, dict):
+                cats: list[str] = []
+                for key in ("differs", "added", "extra", "accepted", "failed"):
+                    vals = detail.get(key)
+                    if isinstance(vals, (list, tuple)) and vals:
+                        shown = ",".join(_sanitize_field(str(v)) for v in vals[:limit])
+                        more = f"+{len(vals) - limit}" if len(vals) > limit else ""
+                        cats.append(f"{key}={shown}{more}")
+                if detail.get("orphaned"):
+                    cats.append("orphaned")
+                suffix = f" ({'; '.join(cats)})" if cats else ""
+                rendered.append(f"{_sanitize_field(str(skill))}{suffix}")
+            elif isinstance(detail, (list, tuple)):
+                shown = ",".join(_sanitize_field(str(v)) for v in detail[:limit])
+                more = f"+{len(detail) - limit}" if len(detail) > limit else ""
+                suffix = f" ({shown}{more})" if shown or more else ""
+                rendered.append(f"{_sanitize_field(str(skill))}{suffix}")
+            else:
+                rendered.append(_sanitize_field(str(skill)))
+        return ", ".join(rendered)
+    if isinstance(items, (list, tuple)):
+        return ", ".join(_sanitize_field(str(n)) for n in items)
+    return _sanitize_field(str(items))
+
 def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "tool_denied":
         tool = ev.get("tool") or ev.get("name") or "?"
@@ -673,21 +703,47 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         new = ev.get("new_version") or "?"
         sched = ev.get("scheduler_delta") or []
         drift = ev.get("skills_drift") or []
+        auto_updated = ev.get("skills_auto_updated") or []
+        update_failed = ev.get("skills_update_failed") or []
+        pollers_updated = ev.get("skills_pollers_json_updated") or []
         gaps = ev.get("env_gaps") or []
+
+        def _names(items: object) -> str:
+            if isinstance(items, dict):
+                return ", ".join(_sanitize_field(str(n)) for n in sorted(items))
+            if isinstance(items, (list, tuple)):
+                return ", ".join(_sanitize_field(str(n)) for n in items)
+            return _sanitize_field(str(items))
+
         parts: list[str] = []
         if sched:
-            names = ", ".join(_sanitize_field(str(n)) for n in sched)
+            names = _names(sched)
             parts.append(f"scheduler +{len(sched)} tick(s): {names}")
-        if drift:
-            names = ", ".join(_sanitize_field(str(n)) for n in drift)
-            # Make both intents explicit. `--apply` overwrites local files
-            # with source; `accept` records intentional local drift so the
-            # digest stops steering the agent into a clobber loop.
+        if auto_updated:
+            names = _render_skill_details(auto_updated)
+            parts.append(f"skills auto-updated from source: {names}")
+        if pollers_updated:
+            names = _names(pollers_updated)
             parts.append(
-                f"skills drifted: {names} — `mimir skills update` to inspect; "
-                f"`mimir skills update --apply` to overwrite local files with "
-                f"source, or `mimir skills accept <name>` to keep intentional "
-                f"local changes and stop this notice"
+                f"poller manifests updated: {names} — startup registration uses "
+                f"the new manifests; if changed at runtime, reload pollers"
+            )
+        if update_failed:
+            names = _render_skill_details(update_failed)
+            parts.append(
+                f"skills auto-update FAILED/PARTIAL: {names} — inspect with "
+                f"`mimir skills update`; backups are under .pre-update-backup/"
+            )
+        if drift:
+            names = _render_skill_details(drift)
+            # Auto-update has already applied safe source changes. Remaining
+            # drift usually means preserved extras, accepted local divergence,
+            # or per-file failures — inspect before clobbering.
+            parts.append(
+                f"skills still drifted: {names} — `mimir skills update` to "
+                f"inspect; `mimir skills accept <name>` for intentional local "
+                f"changes, or `mimir skills update --apply --force` only if "
+                f"installed-only files should be removed"
             )
         if gaps:
             pairs = ", ".join(
@@ -699,6 +755,40 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             parts.append(f"env missing: {pairs}")
         detail = "; ".join(parts) if parts else "nothing requires action"
         return f"[mimir v{prior}→{new}] {detail}"
+    if rule_kind == "skills_auto_update":
+        updated = ev.get("updated") or {}
+        pollers_updated = ev.get("pollers_json_updated") or []
+        remaining = ev.get("remaining_drift") or []
+        parts: list[str] = []
+        if updated:
+            parts.append(
+                "updated installed optional skills from source: "
+                + _render_skill_details(updated)
+            )
+        if pollers_updated:
+            parts.append(
+                "poller manifests updated before registration: "
+                + ", ".join(_sanitize_field(str(n)) for n in pollers_updated)
+            )
+        if remaining:
+            parts.append(
+                "remaining skill drift: "
+                + _render_skill_details(remaining)
+                + " — inspect with `mimir skills update`"
+            )
+        return "; ".join(parts) if parts else "installed optional skills already current"
+    if rule_kind == "skills_auto_update_failed":
+        failed = ev.get("failed") or {}
+        error = ev.get("error")
+        if failed:
+            return (
+                "installed optional skill auto-update partial/failed: "
+                + _render_skill_details(failed)
+                + " — inspect with `mimir skills update`; backups are under .pre-update-backup/"
+            )
+        if error:
+            return "installed optional skill auto-update failed: " + _sanitize_field(error)
+        return "installed optional skill auto-update failed"
     if rule_kind == "mimir_update_failed":
         spec = ev.get("spec") or "?"
         rc = ev.get("rc")
