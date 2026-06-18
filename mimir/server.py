@@ -1088,6 +1088,7 @@ def build_app(config: Config) -> web.Application:
         # ``<home>/state/saga.db`` fallback — which no longer exists and
         # produced "saga db not found or unreadable" on the page.
         saga_db=_db_path,
+        commitments_store=commitments_store,
         # Collapse the /ops Usage chart to the live subscription provider so
         # stale windows from a prior provider (e.g. Anthropic after a Codex
         # cutover, chainlink #301) don't render a second chart.
