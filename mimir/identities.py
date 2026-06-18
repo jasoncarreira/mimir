@@ -70,6 +70,7 @@ identity reconciliation never lifts DM content into a non-DM channel.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,6 +78,22 @@ from pathlib import Path
 import yaml
 
 log = logging.getLogger(__name__)
+
+#: Alias prefix for a person's hashed web API key (per-user auth, github #726).
+#: The raw key is NEVER stored — only ``webkey:<sha256hex>`` goes in the
+#: person's ``aliases:``, so identities.yaml at rest carries no usable secret.
+#: The web auth middleware hashes the incoming ``X-API-Key`` and resolves the
+#: resulting ``webkey:`` alias through the same map as every other alias.
+WEB_KEY_ALIAS_PREFIX = "webkey:"
+
+
+def hash_web_key(raw_key: str) -> str:
+    """Hash a raw web API key into its ``identities.yaml`` alias form.
+
+    SHA-256 hex. Used both by the auth middleware (to look up the presented
+    key) and by the key-mint CLI (to write the alias). Lookup is by hash, so
+    the raw secret is never string-compared against stored material."""
+    return WEB_KEY_ALIAS_PREFIX + hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -513,6 +530,22 @@ class IdentityResolver:
         canonical = self._alias_map.get(author, author)
         ident = self._identities.get(canonical)
         return ident.access if ident else AccessMetadata()
+
+    def resolve_web_key(self, raw_key: str | None) -> Identity | None:
+        """Resolve a raw web API key to its identity record, or ``None``.
+
+        Hashes the presented key and looks up the ``webkey:<hash>`` alias —
+        the same alias map every other platform id flows through. Returns the
+        full :class:`Identity` (carrying ``access.roles``) so the caller can
+        both attribute the request and authorize it; ``None`` for an unknown
+        or empty key. Authorization is the caller's job: a resolved identity
+        with no roles is still unauthorized (see ``access.is_authorized``)."""
+        if not raw_key:
+            return None
+        canonical = self._alias_map.get(hash_web_key(raw_key))
+        if canonical is None:
+            return None
+        return self._identities.get(canonical)
 
     def identity(self, author: str | None) -> Identity | None:
         """Return ``author``'s canonical identity record, if known.
