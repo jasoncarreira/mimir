@@ -149,6 +149,14 @@ def first_party_dashboard_extensions(
                 api_namespace="ops",
             ),
             DashboardExtensionManifest(
+                id="chainlink-board",
+                route_path="/chainlink",
+                label="Chainlink",
+                icon="kanban",
+                nav_position=35,
+                api_namespace="chainlink-board",
+            ),
+            DashboardExtensionManifest(
                 id="saga",
                 route_path="/saga",
                 label="SAGA",

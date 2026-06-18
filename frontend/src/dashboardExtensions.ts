@@ -31,6 +31,11 @@ const firstPartySurfaceMetadata: Record<
     tabs: ["overview", "queues", "health"],
     filterLabel: "scope"
   },
+  "chainlink-board": {
+    detail: "Chainlink lifecycle and Worklink evidence",
+    tabs: ["board", "dependencies", "worklink"],
+    filterLabel: "label"
+  },
   saga: {
     detail: "SAGA session shell",
     tabs: ["sessions", "atoms", "queries"],

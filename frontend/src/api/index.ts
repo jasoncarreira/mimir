@@ -1,4 +1,5 @@
 export * from "./chat";
+export * from "./chainlink-board";
 export type {
   ApiEnvelope,
   ApiErrorEnvelope,
