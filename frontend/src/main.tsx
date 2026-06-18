@@ -15,6 +15,7 @@ import {
 import { AgentCharacter, characterStateFromLiveEvent } from "./agent-character";
 import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
 import { ChatRoute } from "./ChatRoute";
+import { ChainlinkBoardRoute } from "./routes/ChainlinkBoardRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { LiveEventsProvider, useLiveEvents } from "./live-events";
@@ -442,13 +443,15 @@ function AppFrame() {
                       ? <SagaDashboard />
                       : surface.id === "ops"
                         ? <OpsRoute />
-                        : surface.id === "turns"
-                          ? <TurnsRoute />
-                          : surface.id === "admin-config"
-                            ? <AdminConfigRoute />
-                            : surface.id === "scheduler"
-                              ? <SchedulerRoute />
-                              : <SurfaceRoute surface={surface} />
+                        : surface.id === "chainlink-board"
+                          ? <ChainlinkBoardRoute />
+                          : surface.id === "turns"
+                            ? <TurnsRoute />
+                            : surface.id === "admin-config"
+                              ? <AdminConfigRoute />
+                              : surface.id === "scheduler"
+                                ? <SchedulerRoute />
+                                : <SurfaceRoute surface={surface} />
                   }
                   key={surface.id}
                   path={surface.path}

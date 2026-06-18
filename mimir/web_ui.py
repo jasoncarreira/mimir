@@ -3,26 +3,26 @@
 Mounts onto the same aiohttp app that serves ``/event`` + ``/health`` and
 hosts the WebUI bridge's ``/chat``. Routes:
 
-  GET /turns            — single-file vanilla-JS turn viewer (HTML)
+  GET /turns            — legacy single-file vanilla-JS turn viewer (HTML)
   GET /api/turns        — turns.jsonl as JSON (optional ``?after=<turn_id>``)
   GET /api/events       — events.jsonl as JSON (optional ``?since=<ts>``,
                           ``?type=<kind>``, ``?limit=<n>``); type may be
                           repeated to combine filters
   GET /api/v1/live-events — fetch-authenticated SSE stream for React live
                           dashboards with cursor backfill/dedup semantics
-  GET /ops              — live ops dashboard (HTML, Chart.js)
+  GET /ops              — legacy live ops dashboard (HTML, Chart.js)
   GET /api/ops          — JSON twin of /ops for ad-hoc scripting
-  GET /saga             — saga DB operator viewer (HTML)
+  GET /saga             — legacy saga DB operator viewer (HTML)
   GET /api/saga         — JSON twin of /saga; view= selects the payload
                           shape (recent, atom, stats)
-  GET /state            — file-based memory browser (HTML, two-pane;
+  GET /state            — legacy file-based memory browser (HTML, two-pane;
                           renamed from /memory — surfaces memory/ + state/)
   GET /api/memory       — JSON twin of /state; view=tree returns nested
                           dir/file tree (memory/ + state/); view=file&path=...
                           returns file content (only .md files);
                           view=search&q=... returns full-text search hits;
                           view=channels returns channel dir names
-  GET /app              — built React app shell (additive migration route)
+  GET /app              — built React app shell (default frontend)
 
 The HTML page polls ``/api/turns`` every 5s for live updates. ``/api/events``
 is exposed for the (deferred) Events tab + ad-hoc scripting. ``/ops``
@@ -49,6 +49,10 @@ from .dashboard_extensions import (
     DashboardExtensionRegistry,
     add_backend_namespace_routes,
     first_party_dashboard_extensions,
+)
+from .chainlink_board import (
+    build_chainlink_board_payload,
+    resolve_worklink_artifact,
 )
 from .live_events import read_live_event_items_since
 from .ops_dashboard import (
@@ -112,6 +116,13 @@ def _no_store_headers() -> dict[str, str]:
         "Cache-Control": "no-store, max-age=0",
         "Pragma": "no-cache",
         "Expires": "0",
+    }
+
+
+def _legacy_frontend_headers() -> dict[str, str]:
+    return {
+        "X-Mimir-Frontend": "legacy-html",
+        "Link": "</app>; rel=\"alternate\"",
     }
 
 
@@ -232,7 +243,11 @@ def register_routes(
     _dashboard_extensions = dashboard_extensions or first_party_dashboard_extensions()
 
     async def turns_page(_request: web.Request) -> web.Response:
-        return web.Response(text=_load_viewer_html(), content_type="text/html")
+        return web.Response(
+            text=_load_viewer_html(),
+            content_type="text/html",
+            headers=_legacy_frontend_headers(),
+        )
 
     async def turns_data(request: web.Request) -> web.Response:
         # Records are oldest-first (append order). The viewer reverses to
@@ -607,7 +622,9 @@ def register_routes(
         except ValueError as exc:
             return web.Response(text=str(exc), status=400)
         return web.Response(
-            text=render_dashboard_html(), content_type="text/html",
+            text=render_dashboard_html(),
+            content_type="text/html",
+            headers=_legacy_frontend_headers(),
         )
 
     async def ops_data(request: web.Request) -> web.Response:
@@ -634,6 +651,18 @@ def register_routes(
             active_provider=active_usage_provider,
         )
         return json_success(payload)
+
+    async def chainlink_board_data_v1(_request: web.Request) -> web.Response:
+        payload = await build_chainlink_board_payload(home)
+        return json_success(payload)
+
+    async def chainlink_board_artifact_v1(request: web.Request) -> web.StreamResponse:
+        if home is None:
+            return json_error("home_not_configured", "home path not configured", status=503)
+        artifact = resolve_worklink_artifact(home, request.query.get("path", ""))
+        if artifact is None:
+            return json_error("artifact_not_found", "artifact not found", status=404)
+        return web.FileResponse(artifact, headers=_no_store_headers())
 
     async def scheduler_data_v1(request: web.Request) -> web.Response:
         try:
@@ -680,7 +709,11 @@ def register_routes(
     # the older ``<home>/state/saga.db`` fallback predated the move to
     # ``.mimir/`` and pointed at a file that no longer exists.
     async def saga_page(_request: web.Request) -> web.Response:
-        return web.Response(text=render_saga_html(), content_type="text/html")
+        return web.Response(
+            text=render_saga_html(),
+            content_type="text/html",
+            headers=_legacy_frontend_headers(),
+        )
 
     async def saga_data(request: web.Request) -> web.Response:
         view = request.query.get("view", "recent")
@@ -876,6 +909,12 @@ def register_routes(
             DashboardBackendRoute("GET", "/api/v1/ops", ops_data_v1),
         ]
 
+    def chainlink_board_backend_routes() -> list[DashboardBackendRoute]:
+        return [
+            DashboardBackendRoute("GET", "/api/v1/chainlink-board", chainlink_board_data_v1),
+            DashboardBackendRoute("GET", "/api/v1/chainlink-board/artifact", chainlink_board_artifact_v1),
+        ]
+
     def scheduler_backend_routes() -> list[DashboardBackendRoute]:
         return [
             DashboardBackendRoute("GET", "/api/v1/scheduler", scheduler_data_v1),
@@ -891,6 +930,7 @@ def register_routes(
         registry=_dashboard_extensions,
         hooks={
             "ops": ops_backend_routes,
+            "chainlink-board": chainlink_board_backend_routes,
             "scheduler": scheduler_backend_routes,
             "admin-config": admin_config_backend_routes,
         },
@@ -970,7 +1010,11 @@ def register_routes(
     )
 
     async def memory_page(_request: web.Request) -> web.Response:
-        return web.Response(text=render_memory_html(), content_type="text/html")
+        return web.Response(
+            text=render_memory_html(),
+            content_type="text/html",
+            headers=_legacy_frontend_headers(),
+        )
 
     async def memory_data(request: web.Request) -> web.Response:
         view = request.query.get("view", "tree")

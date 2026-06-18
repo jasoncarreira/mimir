@@ -303,7 +303,7 @@ def _safe_str_eq(a: str, b: str) -> bool:
 # Method-keyed (PR #104 review fix): if a future ``POST /turns`` is
 # ever added (e.g. for a server-side form), it inherits NO exemption.
 #
-# ``GET /`` is exempt too: it's a bare convenience redirect to /turns
+# ``GET /`` is exempt too: it's a bare convenience redirect to /app
 # (``_handle_root``) that carries no data of its own — and its target is
 # itself an exempt HTML shell whose data APIs require auth.
 _AUTH_EXEMPT: frozenset[tuple[str, str]] = frozenset({
@@ -450,13 +450,13 @@ async def _handle_health(request: web.Request) -> web.Response:
 
 
 async def _handle_root(request: web.Request) -> web.Response:
-    """Redirect the bare web root to the turn viewer.
+    """Redirect the bare web root to the React frontend.
 
-    The root has no content of its own; ``/turns`` is the default operator
+    The root has no content of its own; ``/app`` is the default operator
     landing page. 302 (Found), not 301 — so we can repoint this or add a real
     landing page later without fighting browsers that cached a permanent
     redirect. Auth-exempt (see ``_AUTH_EXEMPT``): it leaks nothing."""
-    raise web.HTTPFound("/turns")
+    raise web.HTTPFound("/app")
 
 
 # chainlink #233: bound for caller-supplied max_clusters on the
