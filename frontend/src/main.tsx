@@ -1,6 +1,18 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
+import {
+  Badge,
+  Button,
+  DashboardHeader,
+  DashboardShell,
+  ErrorState,
+  LoadingState,
+  NavList,
+  Panel,
+  TextInput,
+} from "./ui";
+import { DashboardUiExamples } from "./ui/examples";
 import "./styles.css";
 
 type Bootstrap = {
@@ -97,54 +109,71 @@ function useAuth() {
   return value;
 }
 
-function AuthPanel() {
+function BootstrapRoute() {
   const { bootstrap, apiKeyPresent, status, error, setApiKey, clearApiKey } = useAuth();
   const [entry, setEntry] = React.useState("");
   const requiresKey = bootstrap?.auth.required ?? false;
   const signedIn = !requiresKey || apiKeyPresent;
 
   return (
-    <section className="auth-panel" aria-labelledby="auth-title">
-      <div>
-        <p className="eyebrow">Auth bootstrap</p>
-        <h2 id="auth-title">{signedIn ? "Ready" : "API key required"}</h2>
-        <p>
-          {status === "loading"
-            ? "Loading server auth policy."
-            : status === "error"
-              ? `Bootstrap failed: ${error}`
-              : `${requiresKey ? "Protected" : "Local unauthenticated"} server on ${bootstrap?.server.web_host || "default host"}.`}
-        </p>
-      </div>
+    <Panel
+      actions={<Badge tone={signedIn ? "success" : "warning"}>{signedIn ? "ready" : "locked"}</Badge>}
+      aria-labelledby="auth-title"
+      subtitle={
+        status === "loading"
+          ? "Loading server auth policy."
+          : status === "error"
+            ? `Bootstrap failed: ${error}`
+            : `${requiresKey ? "Protected" : "Local unauthenticated"} server on ${bootstrap?.server.web_host || "default host"}.`
+      }
+      title={<span id="auth-title">{signedIn ? "Ready" : "API key required"}</span>}
+    >
+      {status === "loading" ? <LoadingState label="Loading auth policy" /> : null}
+      {status === "error" ? <ErrorState title="Bootstrap failed">{error}</ErrorState> : null}
 
-      {requiresKey ? (
-        <form
-          className="key-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            setApiKey(entry);
-            setEntry("");
-          }}
-        >
-          <input
-            aria-label="MIMIR_API_KEY"
-            autoComplete="off"
-            placeholder={apiKeyPresent ? "Key stored in this browser" : "MIMIR_API_KEY"}
-            type="password"
-            value={entry}
-            onChange={(event) => setEntry(event.target.value)}
-          />
-          <button type="submit">Save</button>
-          <button type="button" onClick={clearApiKey}>Clear</button>
-        </form>
+      {status === "ready" ? (
+        <>
+          {requiresKey ? (
+            <form
+              className="auth-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                setApiKey(entry);
+                setEntry("");
+              }}
+            >
+              <TextInput
+                aria-label="MIMIR_API_KEY"
+                autoComplete="off"
+                placeholder={apiKeyPresent ? "Key stored in this browser" : "MIMIR_API_KEY"}
+                type="password"
+                value={entry}
+                onChange={(event) => setEntry(event.target.value)}
+              />
+              <Button type="submit" variant="primary">Save</Button>
+              <Button type="button" onClick={clearApiKey}>Clear</Button>
+            </form>
+          ) : null}
+
+          <dl className="facts-grid">
+            <div><dt>Browser key</dt><dd>{apiKeyPresent ? "stored" : "not stored"}</dd></div>
+            <div><dt>Bind</dt><dd>{bootstrap?.server.public_bind ? "public" : "localhost"}</dd></div>
+            <div><dt>Streams</dt><dd>{bootstrap?.stream_auth.shape || "loading"}</dd></div>
+          </dl>
+        </>
       ) : null}
+    </Panel>
+  );
+}
 
-      <dl className="auth-facts">
-        <div><dt>Browser key</dt><dd>{apiKeyPresent ? "stored" : "not stored"}</dd></div>
-        <div><dt>Bind</dt><dd>{bootstrap?.server.public_bind ? "public" : "localhost"}</dd></div>
-        <div><dt>Streams</dt><dd>{bootstrap?.stream_auth.shape || "loading"}</dd></div>
-      </dl>
-    </section>
+function DirectoryRoute() {
+  return (
+    <Panel
+      subtitle="Current operator pages stay on their existing server routes while React surfaces migrate incrementally."
+      title="Operator surfaces"
+    >
+      <NavList label="Existing operator pages" items={legacySurfaces} />
+    </Panel>
   );
 }
 
@@ -152,26 +181,19 @@ function App() {
   const { skin } = useSkin();
 
   return (
-    <main className="app-shell">
-      <section className="intro" aria-labelledby="app-title">
-        <p className="eyebrow">{skin.name}</p>
-        <h1 id="app-title">Mimir App</h1>
+    <DashboardShell>
+      <DashboardHeader eyebrow={skin.name} title="Mimir App">
         <p>
           Central browser bootstrap for operator auth and migrated web surfaces.
         </p>
-      </section>
+      </DashboardHeader>
 
-      <AuthPanel />
-
-      <nav className="surface-grid" aria-label="Existing operator pages">
-        {legacySurfaces.map((surface) => (
-          <a className="surface-link" href={surface.href} key={surface.href}>
-            <span>{surface.label}</span>
-            <small>{surface.detail}</small>
-          </a>
-        ))}
-      </nav>
-    </main>
+      <div className="route-grid">
+        <BootstrapRoute />
+        <DirectoryRoute />
+      </div>
+      <DashboardUiExamples />
+    </DashboardShell>
   );
 }
 
