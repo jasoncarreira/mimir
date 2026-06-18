@@ -17,7 +17,9 @@ import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
 import { ChatRoute } from "./ChatRoute";
 import { ChainlinkBoardRoute } from "./routes/ChainlinkBoardRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
-import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
+import { getDashboardSurfaces, visibleSurfaces, type DashboardSurface } from "./dashboardExtensions";
+import { getWhoami } from "./api/whoami";
+import { UsersRoute } from "./routes/UsersRoute";
 import { LiveEventsProvider, useLiveEvents } from "./live-events";
 import { SagaDashboard } from "./SagaDashboard";
 import { AdminConfigRoute } from "./routes/AdminConfigRoute";
@@ -64,6 +66,13 @@ function useBootstrap() {
       });
       return envelope.data;
     }
+  });
+}
+
+function useWhoami() {
+  return useQuery({
+    queryKey: ["whoami"],
+    queryFn: async () => (await getWhoami()).data
   });
 }
 
@@ -402,9 +411,16 @@ function AppFrame() {
   const { skin } = useSkin();
   const liveEvents = useLiveEvents();
   const { data: bootstrap, error, isError, isLoading } = useBootstrap();
+  const { data: whoami } = useWhoami();
+  // Open/dev mode (auth not required) doesn't gate /api/v1/admin/ server-side,
+  // so surface admin sections there; in a gated server, hide them unless the
+  // resolved identity is an admin (server still 403s either way — this is UX).
+  const isAdmin = (whoami?.is_admin ?? false) || !(bootstrap?.auth.required ?? false);
   const surfaces = React.useMemo(
-    () => (bootstrap ? getDashboardSurfaces(bootstrap.dashboard_extensions) : []),
-    [bootstrap]
+    () => (bootstrap
+      ? visibleSurfaces(getDashboardSurfaces(bootstrap.dashboard_extensions), isAdmin)
+      : []),
+    [bootstrap, isAdmin]
   );
   const firstRoute = surfaces[0]?.path ?? "/chat";
   const agentState =
@@ -449,9 +465,11 @@ function AppFrame() {
                             ? <TurnsRoute />
                             : surface.id === "admin-config"
                               ? <AdminConfigRoute />
-                              : surface.id === "scheduler"
-                                ? <SchedulerRoute />
-                                : <SurfaceRoute surface={surface} />
+                              : surface.id === "admin-users"
+                                ? <UsersRoute />
+                                : surface.id === "scheduler"
+                                  ? <SchedulerRoute />
+                                  : <SurfaceRoute surface={surface} />
                   }
                   key={surface.id}
                   path={surface.path}
