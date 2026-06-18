@@ -12,14 +12,16 @@ import {
   useNavigate,
   useSearchParams
 } from "react-router-dom";
-import { create } from "zustand";
 import { AgentCharacter, characterStateFromLiveEvent } from "./agent-character";
 import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
+import { ChatRoute } from "./ChatRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { LiveEventsProvider, useLiveEvents } from "./live-events";
+import { SagaDashboard } from "./SagaDashboard";
 import { OpsRoute } from "./routes/OpsRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
+import { useRouteState } from "./routeState";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import {
   Badge,
@@ -30,28 +32,9 @@ import {
   Panel,
   TextInput
 } from "./ui";
+import { useUiState } from "./uiState";
 import "./styles.css";
 
-
-interface UiState {
-  detailsPanelOpen: boolean;
-  collapsedRegions: Record<string, boolean>;
-  setDetailsPanelOpen: (open: boolean) => void;
-  toggleCollapsedRegion: (id: string) => void;
-}
-
-const useUiState = create<UiState>((set) => ({
-  detailsPanelOpen: true,
-  collapsedRegions: {},
-  setDetailsPanelOpen: (detailsPanelOpen) => set({ detailsPanelOpen }),
-  toggleCollapsedRegion: (id) =>
-    set((state) => ({
-      collapsedRegions: {
-        ...state.collapsedRegions,
-        [id]: !state.collapsedRegions[id]
-      }
-    }))
-}));
 
 const queryClient = new QueryClient();
 
@@ -169,25 +152,6 @@ function AppNavigation({ surfaces }: { surfaces: DashboardSurface[] }) {
       ))}
     </nav>
   );
-}
-
-function useRouteState(surface: DashboardSurface) {
-  const [searchParams, setSearchParams] = useSearchParams();
-  const activeTab = searchParams.get("tab") || surface.tabs[0];
-  const selectedTurn = searchParams.get("turn") || "";
-  const filter = searchParams.get("filter") || "";
-  const target = searchParams.get("target") || "";
-
-  function update(next: Record<string, string>) {
-    const params = new URLSearchParams(searchParams);
-    Object.entries(next).forEach(([key, value]) => {
-      if (value) params.set(key, value);
-      else params.delete(key);
-    });
-    setSearchParams(params, { replace: false });
-  }
-
-  return { activeTab, selectedTurn, filter, target, update };
 }
 
 function RouteTabs({
@@ -360,11 +324,16 @@ function SurfaceRoute({ surface }: { surface: DashboardSurface }) {
   if (surface.id === "state-memory") {
     return <StateMemoryRoute surface={surface} />;
   }
+  if (surface.id === "chat") return <ChatRoute surface={surface} />;
 
   const { activeTab } = useRouteState(surface);
   const normalizedTab = surface.tabs.includes(activeTab) ? activeTab : surface.tabs[0];
   const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
   const setDetailsPanelOpen = useUiState((state) => state.setDetailsPanelOpen);
+
+  if (surface.id === "saga") {
+    return <SagaDashboard />;
+  }
 
   return (
     <>
@@ -465,7 +434,7 @@ function AppFrame() {
               <Route element={<Navigate replace to={firstRoute} />} path="/" />
               {surfaces.map((surface) => (
                 <Route
-                  element={surface.id === "ops" ? <OpsRoute /> : <SurfaceRoute surface={surface} />}
+                  element={surface.id === "saga" ? <SagaDashboard /> : surface.id === "ops" ? <OpsRoute /> : <SurfaceRoute surface={surface} />}
                   key={surface.id}
                   path={surface.path}
                 />
