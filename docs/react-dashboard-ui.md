@@ -55,7 +55,9 @@ Core primitives exported from `frontend/src/ui`:
 - `Timeline` for ordered activity streams
 
 `frontend/src/ui/examples.tsx` is the Storybook-style catalog. Add examples
-there when introducing a primitive or a meaningful variant.
+there when introducing a primitive or a meaningful variant. Keep the catalog
+out of production routes; import it only from development-only tooling or
+manual local previews.
 
 ## Accessibility Rules
 

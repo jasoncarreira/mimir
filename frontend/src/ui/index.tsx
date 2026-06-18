@@ -382,13 +382,14 @@ export function Dialog({
   onClose: () => void;
 }) {
   const dialogRef = React.useRef<HTMLDivElement>(null);
+  const titleId = React.useId();
   useFocusTrap(open, dialogRef);
   if (!open) return null;
 
   return (
     <div className="ui-overlay" onMouseDown={onClose}>
       <section
-        aria-labelledby="ui-dialog-title"
+        aria-labelledby={titleId}
         aria-modal="true"
         className="ui-dialog"
         onKeyDown={(event) => {
@@ -400,7 +401,7 @@ export function Dialog({
         tabIndex={-1}
       >
         <div className="ui-dialog__header">
-          <h2 id="ui-dialog-title">{title}</h2>
+          <h2 id={titleId}>{title}</h2>
           <Button aria-label="Close dialog" onClick={onClose} variant="ghost">
             x
           </Button>
@@ -425,13 +426,14 @@ export function Drawer({
   onClose: () => void;
 }) {
   const drawerRef = React.useRef<HTMLDivElement>(null);
+  const titleId = React.useId();
   useFocusTrap(open, drawerRef);
   if (!open) return null;
 
   return (
     <div className="ui-overlay ui-overlay--drawer" onMouseDown={onClose}>
       <aside
-        aria-labelledby="ui-drawer-title"
+        aria-labelledby={titleId}
         aria-modal="true"
         className={`ui-drawer ui-drawer--${side}`}
         onKeyDown={(event) => {
@@ -443,7 +445,7 @@ export function Drawer({
         tabIndex={-1}
       >
         <div className="ui-dialog__header">
-          <h2 id="ui-drawer-title">{title}</h2>
+          <h2 id={titleId}>{title}</h2>
           <Button aria-label="Close drawer" onClick={onClose} variant="ghost">
             x
           </Button>

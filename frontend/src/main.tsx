@@ -13,7 +13,6 @@ import {
   Panel,
   TextInput,
 } from "./ui";
-import { DashboardUiExamples } from "./ui/examples";
 import "./styles.css";
 
 type Bootstrap = WebBootstrapData;
@@ -178,7 +177,6 @@ function App() {
         <BootstrapRoute />
         <DirectoryRoute />
       </div>
-      <DashboardUiExamples />
     </DashboardShell>
   );
 }
