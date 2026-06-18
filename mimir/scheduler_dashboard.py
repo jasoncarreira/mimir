@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from typing import Any
 
 from .commitments.models import CommitmentRecord, CommitmentStatus
@@ -16,6 +17,52 @@ ACTIVE_COMMITMENT_STATUSES = frozenset({
     CommitmentStatus.DELIVERED.value,
     CommitmentStatus.SNOOZED.value,
 })
+
+SECRET_MARKERS = (
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTH",
+)
+
+_URL_USERINFO_RE = re.compile(
+    r"(?P<prefix>\b[a-z][a-z0-9+.-]*://)(?P<userinfo>[^/@\s]+)@",
+    re.IGNORECASE,
+)
+
+
+def _is_secret_name(name: str) -> bool:
+    upper = name.upper()
+    return any(marker in upper for marker in SECRET_MARKERS)
+
+
+def _redact_url_userinfo(value: str) -> str:
+    return _URL_USERINFO_RE.sub(r"\g<prefix>[REDACTED]@", value)
+
+
+def _redact_config_value(value: Any, *, key: str | None = None) -> Any:
+    if key is not None and _is_secret_name(key):
+        return "[REDACTED]" if value else ""
+    if isinstance(value, dict):
+        return {
+            str(child_key): _redact_config_value(child_value, key=str(child_key))
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_config_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_url_userinfo(value)
+    return value
+
+
+def _redacted_env_names(names: object) -> list[str]:
+    return [
+        "[REDACTED]" if _is_secret_name(str(name)) else str(name)
+        for name in (names or [])
+    ]
 
 
 def _iso(value: object) -> str | None:
@@ -148,6 +195,13 @@ def _schedule_rows(
             "deliver": getattr(config_job, "deliver", None),
             "priority": getattr(config_job, "priority", "low"),
             "prompt_source": _prompt_source(config_job),
+            "config": _redact_config_value({
+                "channel_id": getattr(config_job, "channel_id", None),
+                "deliver": getattr(config_job, "deliver", None),
+                "priority": getattr(config_job, "priority", "low"),
+                "prompt_file": getattr(config_job, "prompt_file", None),
+                "callable_name": getattr(config_job, "callable_name", None),
+            }),
             "recent_result": _event_detail(last_ok) if last_ok else None,
             "recent_error": _event_detail(recent_error) if recent_error else None,
             "suppression_reason": _event_detail(suppressed) if suppressed else None,
@@ -198,6 +252,15 @@ def _poller_rows(
             "deliver": poller.deliver,
             "priority": poller.priority,
             "prompt_source": "poller stdout",
+            "pass_env": _redacted_env_names(poller.pass_env),
+            "env_required": _redacted_env_names(poller.env_required),
+            "config": _redact_config_value({
+                "env": poller.env,
+                "pass_env": _redacted_env_names(poller.pass_env),
+                "env_required": _redacted_env_names(poller.env_required),
+                "batch_size": poller.batch_size,
+                "recover_failed_turns": poller.recover_failed_turns,
+            }),
             "recent_result": _event_detail(last_ok) if last_ok else None,
             "recent_error": _event_detail(recent_error) if recent_error else None,
             "suppression_reason": _event_detail(suppressed) if suppressed else None,

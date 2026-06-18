@@ -42,7 +42,8 @@ function RunTable({
             { key: "channel", header: "Channel" },
             { key: "source", header: "Prompt source" },
             { key: "status", header: "Status" },
-            { key: "detail", header: "Result / suppression" }
+            { key: "detail", header: "Result / suppression" },
+            { key: "config", header: "Config" }
           ]}
           rows={rows.map((row) => ({
             name: <code>{row.name}</code>,
@@ -52,7 +53,10 @@ function RunTable({
             channel: row.channel ? <code>{row.channel}</code> : "n/a",
             source: row.prompt_source,
             status: <Badge tone={runStateTone(row)}>{runStateLabel(row)}</Badge>,
-            detail: row.recent_error || row.suppression_reason || row.recent_result || ""
+            detail: row.recent_error || row.suppression_reason || row.recent_result || "",
+            config: row.kind === "poller"
+              ? (row.pass_env?.length ? <code>{row.pass_env.join(", ")}</code> : "")
+              : (Object.keys(row.config || {}).length ? <code>redacted config</code> : "")
           }))}
         />
       ) : (

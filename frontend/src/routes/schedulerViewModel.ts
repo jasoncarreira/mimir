@@ -1,3 +1,4 @@
+import type { JsonObject } from "../api/generated/contracts";
 import type { SchedulerDashboardResponse } from "../api/scheduler";
 
 export type DueWindowOption = {
@@ -39,6 +40,14 @@ function boolFrom(value: unknown): boolean {
   return typeof value === "boolean" ? value : false;
 }
 
+function stringArrayFrom(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((item) => String(item)) : [];
+}
+
+function jsonObjectFrom(value: unknown): JsonObject {
+  return isRecord(value) ? value as JsonObject : {};
+}
+
 export type SafeSchedulerDashboardData = SchedulerDashboardResponse;
 
 function normalizeRun(value: Record<string, unknown>) {
@@ -58,7 +67,10 @@ function normalizeRun(value: Record<string, unknown>) {
     recent_error: nullableStringFrom(value.recent_error),
     suppression_reason: nullableStringFrom(value.suppression_reason),
     suppression_severity: nullableStringFrom(value.suppression_severity),
-    manifest_path: nullableStringFrom(value.manifest_path)
+    manifest_path: nullableStringFrom(value.manifest_path),
+    pass_env: stringArrayFrom(value.pass_env),
+    env_required: stringArrayFrom(value.env_required),
+    config: jsonObjectFrom(value.config)
   };
 }
 

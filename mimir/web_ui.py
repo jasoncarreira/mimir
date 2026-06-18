@@ -43,6 +43,7 @@ from typing import Any
 from aiohttp import web
 
 from ._jsonl_tail import tail_jsonl_records
+from .admin_config import build_admin_config_payload
 from .dashboard_extensions import (
     DashboardBackendRoute,
     DashboardExtensionRegistry,
@@ -554,6 +555,7 @@ def register_routes(
             due_window = parse_due_window(request.query.get("due_window"))
         except ValueError as exc:
             return json_error("invalid_due_window", str(exc), status=400)
+
         def _build_payload() -> dict[str, Any]:
             return build_scheduler_dashboard_payload(
                 scheduler=request.app.get("scheduler"),
@@ -573,6 +575,16 @@ def register_routes(
                 ),
             ),
         )
+
+    async def admin_config_v1(request: web.Request) -> web.Response:
+        payload = await asyncio.to_thread(
+            build_admin_config_payload,
+            config=request.app.get("config"),
+            scheduler=request.app.get("scheduler"),
+            home=home,
+        )
+        return json_success(payload, headers=_no_store_headers())
+
 
     # ── /saga — saga DB viewer ───────────────────────────────────────
 
@@ -769,10 +781,19 @@ def register_routes(
             DashboardBackendRoute("GET", "/api/v1/scheduler", scheduler_data_v1),
         ]
 
+    def admin_config_backend_routes() -> list[DashboardBackendRoute]:
+        return [
+            DashboardBackendRoute("GET", "/api/v1/admin/config", admin_config_v1),
+        ]
+
     add_backend_namespace_routes(
         app,
         registry=_dashboard_extensions,
-        hooks={"ops": ops_backend_routes, "scheduler": scheduler_backend_routes},
+        hooks={
+            "ops": ops_backend_routes,
+            "scheduler": scheduler_backend_routes,
+            "admin-config": admin_config_backend_routes,
+        },
         existing=existing,
     )
     async def saga_sql(request: web.Request) -> web.Response:

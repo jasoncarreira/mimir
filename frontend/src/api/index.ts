@@ -9,6 +9,7 @@ export type {
   LiveEventStreamItem
 } from "./generated/contracts";
 export * from "./http";
+export * from "./admin-config";
 export * from "./live-events";
 export * from "./memory";
 export * from "./ops";
