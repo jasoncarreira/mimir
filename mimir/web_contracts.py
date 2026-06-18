@@ -683,6 +683,37 @@ export interface DashboardExtensionManifest {
   css: string[];
   api_namespace: string | null;
   trusted_first_party: true;
+  requires_role?: string | null;
+}
+
+export interface WhoamiData {
+  canonical: string | null;
+  display_name: string | null;
+  roles: string[];
+  is_admin: boolean;
+  is_master: boolean;
+}
+
+export interface AdminUser {
+  canonical: string;
+  display_name: string | null;
+  roles: string[];
+  is_admin: boolean;
+  has_web_key: boolean;
+}
+
+export interface AdminUsersData {
+  users: AdminUser[];
+}
+
+export interface IssueKeyData {
+  canonical: string;
+  key: string;
+}
+
+export interface RevokeKeyData {
+  canonical: string;
+  revoked: boolean;
 }
 
 export interface WebBootstrapData {
