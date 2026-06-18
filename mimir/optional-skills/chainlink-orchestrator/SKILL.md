@@ -123,9 +123,12 @@ silently with an unlabeled executable leaf.
 Once installed and configured (see frontmatter env), the scheduler runs the
 `worklink-ready-queue` poller on its cron (default every 10 min). Each fire:
 
-1. Lists `worklink:ready` leaves and counts `worklink:in-progress` claims.
+1. Lists open `worklink:ready` leaves, intersects them with `chainlink issue ready`
+   actionability, and counts active Chainlink locks. A pre-labeled leaf blocked by
+   open dependencies stays untouched until Chainlink reports it ready; once its
+   blocker closes it is eligible on the next poller fire.
 2. Computes free slots from `worklink.yaml` `defaults.max_concurrent` minus active claims. Default cap is 2; `WORKLINK_MAX_CONCURRENT` is only a legacy fallback when the YAML key is absent.
-3. Launches `mimir worklink run <id>` **detached** for up to that many leaves,
+3. Launches `mimir worklink run <id>` **detached** for up to that many actionable leaves,
    then returns immediately (a run can take minutes; the poller's own 60s budget
    would otherwise kill it). The detached run does the claim/evidence/transition
    in the deterministic core executor.
@@ -151,5 +154,6 @@ Safety properties (do not bypass these in the poller):
   `worklink:blocked` once attempts are spent).
 
 The poller never decides *what* is implementable — only the planner half (and
-the `worklink:ready` label it applies) does. The poller dispatches what's
-already marked ready.
+the `worklink:ready` label it applies) does. The poller dispatches only the
+subset that is both marked ready and currently unblocked by Chainlink, so it is
+safe to apply `worklink:ready` ahead of dependency availability.
