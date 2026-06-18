@@ -298,6 +298,7 @@ _AUTH_EXEMPT: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/app"),
     ("GET", "/app/auth.js"),
     ("GET", "/api/web/bootstrap"),
+    ("GET", "/api/v1/web/bootstrap"),
     ("GET", "/turns"),
     ("GET", "/ops"),
     ("GET", "/saga"),

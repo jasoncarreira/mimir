@@ -334,6 +334,32 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_api_v1_web_bootstrap_auth_exempt_with_middleware(tmp_path: Path):
+    from mimir.server import _make_auth_middleware
+
+    class _Config:
+        web_host = "0.0.0.0"
+
+    a = web.Application(middlewares=[_make_auth_middleware("super-secret")])
+    a["api_key"] = "super-secret"
+    a["config"] = _Config()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/web/bootstrap")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"]["auth"]["required"] is True
+
+
+@pytest.mark.asyncio
 async def test_api_v1_ops_errors_use_stable_envelope(app):
     a, _, _ = app
     async with TestClient(TestServer(a)) as client:
