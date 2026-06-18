@@ -303,6 +303,8 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # refresh, env vars to provision). If all diffs are empty: "nothing requires
     # action" — still positive (update was clean).
     "mimir_update_digest": ("positive", "mimir_update_digest"),
+    "skills_auto_update": ("positive", "skills_auto_update"),
+    "skills_auto_update_failed": ("negative", "skills_auto_update_failed"),
     # chainlink #214: pre-merge CHANGES_REQUESTED gate blocked an auto-merge.
     # Surfaces when the agent's pre-merge review-state check finds any
     # reviewer's current state is CHANGES_REQUESTED — the merge was refused

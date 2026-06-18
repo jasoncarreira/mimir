@@ -1404,6 +1404,44 @@ def build_app(config: Config) -> web.Application:
                 error=str(exc),
             )
 
+        # Auto-refresh installed optional skills from shipped source before
+        # poller registration.  This closes the deploy gap where
+        # ``mimir/optional-skills/<name>/`` changed but the operator-installed
+        # ``<home>/skills/<name>/`` copy stayed stale until someone manually ran
+        # ``mimir skills update --apply`` (chainlink #557).  The helper uses
+        # the safe update path: source-changed/source-added files are applied
+        # with backups; installed-only files and per-skill .env are preserved.
+        try:
+            from .skill_install import auto_update_installed_optional_skills
+
+            skill_update_result = await asyncio.to_thread(
+                auto_update_installed_optional_skills,
+                config.home,
+            )
+            if (
+                skill_update_result.updated
+                or skill_update_result.failed
+                or skill_update_result.pollers_json_updated
+                or skill_update_result.remaining_drift
+            ):
+                event_kind = (
+                    "skills_auto_update_failed"
+                    if skill_update_result.failed
+                    else "skills_auto_update"
+                )
+                await log_event(
+                    event_kind,
+                    updated=skill_update_result.updated,
+                    failed=skill_update_result.failed,
+                    pollers_json_updated=skill_update_result.pollers_json_updated,
+                    remaining_drift=skill_update_result.remaining_drift,
+                )
+        except Exception as exc:  # noqa: BLE001 — skill sync must not block boot
+            await log_event(
+                "skills_auto_update_failed",
+                error=str(exc)[:500],
+            )
+
         # Load LLM-tick jobs from scheduler.yaml.
         reload_stats = scheduler.reload()
 
@@ -1469,11 +1507,11 @@ def build_app(config: Config) -> web.Application:
                 log.info("drained post-update digest into events.jsonl")
         except Exception:  # noqa: BLE001 — drain is best-effort
             log.exception("post-update digest drain failed")
-        # chainlink #363: operator deploys (pip install / git pull + docker
-        # restart) bump the version WITHOUT the self-update path's digest, so
-        # installed optional skills go silently stale. Detect the bump here and
-        # emit the same mimir_update_digest (notably its skills_drift list) so
-        # the agent can run `mimir skills update --apply`. Notify-only.
+        # chainlink #363 / #557: operator deploys (pip install / git pull +
+        # docker restart) bump the version WITHOUT the self-update path's
+        # digest. Detect the bump here, safely auto-refresh installed optional
+        # skills from shipped source, and emit the same mimir_update_digest so
+        # the agent sees what changed and what still needs inspection.
         try:
             bumped = await emit_version_bump_digest(
                 config.home, log_event, already_drained=bool(drained_digest),

@@ -543,6 +543,9 @@ def test_update_digest_roundtrip(tmp_path: Path) -> None:
         new_version="0.2.2",
         scheduler_delta=["issues-audit", "commitments-review"],
         skills_drift=["github"],
+        skills_auto_updated=["github-poller"],
+        skills_update_failed=["social-cli"],
+        skills_pollers_json_updated=["github-poller"],
         env_gaps=[("weather", "OPENWEATHER_API_KEY"), ("ntfy", "NTFY_TOPIC")],
     )
     restored = UpdateDigest.from_dict(orig.to_dict())
@@ -560,6 +563,9 @@ def test_update_digest_empty_roundtrip() -> None:
     assert restored == orig
     assert restored.scheduler_delta == []
     assert restored.skills_drift == []
+    assert restored.skills_auto_updated == []
+    assert restored.skills_update_failed == []
+    assert restored.skills_pollers_json_updated == []
     assert restored.env_gaps == []
 
 
@@ -839,6 +845,9 @@ async def test_update_digest_sidecar_roundtrip(tmp_path: Path) -> None:
         new_version="0.2.2",
         scheduler_delta=["issues-audit", "commitments-review"],
         skills_drift=["github"],
+        skills_auto_updated=["github-poller"],
+        skills_update_failed=["social-cli"],
+        skills_pollers_json_updated=["github-poller"],
         env_gaps=[("weather", "OPENWEATHER_API_KEY")],
     )
     _write_update_digest_sidecar(tmp_path, digest)
@@ -905,7 +914,7 @@ def test_mimir_update_digest_render_all_surfaces() -> None:
     assert "[mimir v0.2.1→0.2.2]" in line
     assert "scheduler +2 tick(s)" in line
     assert "issues-audit" in line
-    assert "skills drifted: github" in line
+    assert "skills still drifted: github" in line
     assert "mimir skills accept <name>" in line
     assert "env missing: weather/OPENWEATHER_API_KEY" in line
 
@@ -958,9 +967,8 @@ def _capture_log():
     return _async_log, calls
 
 
-def _patch_digest_inputs(monkeypatch, *, current, drift):
-    """Pin the version + skill-drift + zero out scheduler/env deltas so the
-    digest reflects only the injected drift.
+def _patch_digest_inputs(monkeypatch, *, current, drift=None, auto_update_result=None):
+    """Pin the version + skill-update + zero out scheduler/env deltas.
 
     Pins BOTH version sources to ``current``: the gate reads
     ``_current_version()`` while ``_compute_update_digest`` reads the digest's
@@ -969,9 +977,20 @@ def _patch_digest_inputs(monkeypatch, *, current, drift):
     couple to whatever the repo's current pyproject version happens to be."""
     monkeypatch.setattr("mimir.update_on_start._current_version", lambda: current)
     monkeypatch.setattr("importlib.metadata.version", lambda *a, **k: current)
-    monkeypatch.setattr("mimir.skill_install.detect_skill_drift", lambda home, *a, **k: drift)
     monkeypatch.setattr("mimir.update_on_start._scheduler_delta", lambda home: [])
     monkeypatch.setattr("mimir.update_on_start._env_gaps", lambda home: [])
+    if auto_update_result is None:
+        from mimir.skill_install import AutoSkillUpdateResult
+        remaining = sorted(
+            r.name for r in (drift or [])
+            if (not r.orphaned)
+            and getattr(r, "has_unaccepted_drift", (not r.is_clean))
+        )
+        auto_update_result = AutoSkillUpdateResult(remaining_drift=remaining)
+    monkeypatch.setattr(
+        "mimir.skill_install.auto_update_installed_optional_skills",
+        lambda home, *a, **k: auto_update_result,
+    )
 
 
 @pytest.mark.asyncio
@@ -997,6 +1016,33 @@ async def test_version_bump_emits_digest_with_drift(tmp_path, monkeypatch):
     assert fields["skills_drift"] == ["social-cli"]  # clean skill excluded
     # baseline advanced so it won't re-fire next boot
     assert _read_last_booted_version(tmp_path) == "0.2.12"
+
+
+@pytest.mark.asyncio
+async def test_version_bump_digest_reports_auto_updated_skills(tmp_path, monkeypatch):
+    from mimir.skill_install import AutoSkillUpdateResult
+    from mimir.update_on_start import emit_version_bump_digest, _write_last_booted_version
+
+    _write_last_booted_version(tmp_path, "0.2.11")
+    _patch_digest_inputs(
+        monkeypatch,
+        current="0.2.12",
+        auto_update_result=AutoSkillUpdateResult(
+            updated={"github-poller": ["poller.py", "pollers.json"]},
+            pollers_json_updated=["github-poller"],
+            remaining_drift=["social-cli"],
+        ),
+    )
+
+    log, calls = _capture_log()
+    n = await emit_version_bump_digest(tmp_path, log, already_drained=False)
+
+    assert n == 1
+    kind, fields = calls[0]
+    assert kind == "mimir_update_digest"
+    assert fields["skills_auto_updated"] == ["github-poller"]
+    assert fields["skills_pollers_json_updated"] == ["github-poller"]
+    assert fields["skills_drift"] == ["social-cli"]
 
 
 @pytest.mark.asyncio

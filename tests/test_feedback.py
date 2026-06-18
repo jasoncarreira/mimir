@@ -2323,9 +2323,8 @@ def test_sanitize_field_applied_to_commitment_due_text(tmp_path: Path) -> None:
 
 
 def test_mimir_update_digest_renders_skill_drift_with_remediation():
-    """chainlink #363 follow-up: the drifted-skills line must tell the agent
-    HOW to fix it (the `mimir skills update --apply` remediation), not just
-    WHAT drifted — otherwise the notice isn't actionable."""
+    """Remaining skill drift after auto-update must steer toward inspection,
+    not the old blind overwrite path."""
     from mimir.feedback.renderers import _render_event_line
     line = _render_event_line("mimir_update_digest", {
         "prior_version": "0.2.11",
@@ -2335,10 +2334,10 @@ def test_mimir_update_digest_renders_skill_drift_with_remediation():
         "env_gaps": [],
     })
     assert "social-cli" in line and "github-poller" in line
-    assert "mimir skills update --apply" in line   # overwrite remediation
+    assert "skills still drifted" in line
+    assert "mimir skills update" in line            # inspection remediation
     assert "mimir skills accept <name>" in line     # keep-local-drift remediation
-    assert "overwrite local files" in line
-    assert "keep intentional local changes" in line
+    assert "--force" in line                        # destructive path named explicitly
     assert "v0.2.11→0.2.12" in line
 
 
@@ -2354,3 +2353,47 @@ def test_mimir_update_digest_no_remediation_when_no_drift():
     })
     assert "mimir skills update" not in line
     assert "nothing requires action" in line
+
+def test_mimir_update_digest_renders_auto_updated_skills():
+    from mimir.feedback.renderers import _render_event_line
+
+    line = _render_event_line("mimir_update_digest", {
+        "prior_version": "0.2.11",
+        "new_version": "0.2.12",
+        "skills_auto_updated": ["github-poller"],
+        "skills_pollers_json_updated": ["github-poller"],
+        "skills_update_failed": ["social-cli"],
+        "skills_drift": ["social-cli"],
+        "scheduler_delta": [],
+        "env_gaps": [],
+    })
+
+    assert "skills auto-updated from source: github-poller" in line
+    assert "poller manifests updated: github-poller" in line
+    assert "skills auto-update FAILED/PARTIAL: social-cli" in line
+    assert "skills still drifted: social-cli" in line
+
+
+def test_skills_auto_update_event_renderer():
+    from mimir.feedback.renderers import _render_event_line
+
+    line = _render_event_line("skills_auto_update", {
+        "updated": {"github-poller": ["poller.py"]},
+        "pollers_json_updated": ["github-poller"],
+        "remaining_drift": ["social-cli"],
+    })
+
+    assert "updated installed optional skills from source: github-poller" in line
+    assert "poller manifests updated before registration: github-poller" in line
+    assert "remaining skill drift: social-cli" in line
+
+
+def test_skills_auto_update_failed_event_renderer():
+    from mimir.feedback.renderers import _render_event_line
+
+    line = _render_event_line("skills_auto_update_failed", {
+        "failed": {"github-poller": ["poller.py"]},
+    })
+
+    assert "installed optional skill auto-update partial/failed: github-poller" in line
+    assert "mimir skills update" in line
