@@ -206,3 +206,50 @@ def test_worklink_worker_accepts_inline_payload_json(
     assert exc.value.code == 0
     assert calls == [("payload", {"spec": {"issue_id": 459}}), ("run", {"payload": {"spec": {"issue_id": 459}}})]
     assert "worklink worker: blocked" in capsys.readouterr().out
+
+
+def test_worklink_worker_failed_validation_exits_nonzero_with_reason(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class FakeEvidence:
+        blocked_reason = "git push failed: auth denied"
+
+    class FakeValidation:
+        status = "failed"
+        review_ready = False
+        reasons = ("worker_error",)
+        evidence = FakeEvidence()
+
+    import mimir.commands.worklink as worklink_cmd
+
+    monkeypatch.setattr(worklink_cmd, "payload_from_json", lambda data: {"payload": data})
+
+    async def fake_run_worker_payload(payload_obj: object) -> FakeValidation:
+        return FakeValidation()
+
+    monkeypatch.setattr(worklink_cmd, "run_worker_payload", fake_run_worker_payload)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "worker", "--payload-json", '{"spec":{"issue_id":529}}'])
+
+    assert exc.value.code == 1
+    assert "worklink worker: failed — git push failed: auth denied" in capsys.readouterr().out
+
+
+def test_worklink_run_failed_without_attempt_prints_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from mimir.worklink.orchestrator import WorklinkRunResult
+
+    import mimir.commands.worklink as worklink_cmd
+
+    def fake_run_worklink(**kwargs: object) -> WorklinkRunResult:
+        return WorklinkRunResult(529, None, "failed", reason="claim_failed: lock held")
+
+    monkeypatch.setattr(worklink_cmd, "run_worklink", fake_run_worklink)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "run", "529", "--home", str(tmp_path), "--repo", str(tmp_path)])
+
+    assert exc.value.code == 1
+    assert "worklink #529 attempt None: failed — claim_failed: lock held" in capsys.readouterr().out
