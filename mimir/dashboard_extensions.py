@@ -149,6 +149,14 @@ def first_party_dashboard_extensions(
                 api_namespace="ops",
             ),
             DashboardExtensionManifest(
+                id="scheduler",
+                route_path="/scheduler",
+                label="Scheduler",
+                icon="calendar-clock",
+                nav_position=35,
+                api_namespace="scheduler",
+            ),
+            DashboardExtensionManifest(
                 id="saga",
                 route_path="/saga",
                 label="SAGA",

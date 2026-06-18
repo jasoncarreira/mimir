@@ -14,4 +14,5 @@ export * from "./live-events";
 export * from "./memory";
 export * from "./ops";
 export * from "./saga";
+export * from "./scheduler";
 export * from "./turns";
