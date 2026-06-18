@@ -141,6 +141,38 @@ def _read_jsonl(path: Path, *, max_records: int = 5000) -> list[dict[str, Any]]:
     return out
 
 
+def _whoami_payload(identity: Any, is_master: bool) -> dict[str, Any]:
+    """The ``/api/v1/whoami`` body for a resolved auth identity (github #726).
+
+    Pure (no request object) so it's unit-testable. ``identity`` is the
+    ``Identity`` the auth middleware resolved from the presented key — ``None``
+    for the admin master key or dev/open mode. The master key reports as a
+    role-admin, non-chat operator; an unresolved identity reports empty."""
+    if is_master:
+        return {
+            "canonical": None,
+            "display_name": "operator (master key)",
+            "roles": ["admin"],
+            "is_admin": True,
+            "is_master": True,
+        }
+    if identity is not None:
+        return {
+            "canonical": identity.canonical,
+            "display_name": identity.display_name,
+            "roles": list(identity.access.roles),
+            "is_admin": identity.access.is_admin,
+            "is_master": False,
+        }
+    return {
+        "canonical": None,
+        "display_name": None,
+        "roles": [],
+        "is_admin": False,
+        "is_master": False,
+    }
+
+
 def register_routes(
     app: web.Application,
     *,
@@ -712,6 +744,21 @@ def register_routes(
             return json_error("saga_error", str(payload["error"]), status=status)
         return json_success(payload, meta=meta)
 
+    async def whoami_v1(request: web.Request) -> web.Response:
+        """GET /api/v1/whoami — the authenticated caller's identity + roles.
+
+        Lets the React app adapt to the user (hide admin-only sections for
+        non-admins; show who you're posting chat as). Auth-required; reads the
+        identity the auth middleware resolved from the presented X-API-Key
+        (github #726). The master key reports as a role-admin, non-chat
+        operator; dev/open mode (no key configured) reports an empty identity."""
+        return json_success(
+            _whoami_payload(
+                request.get("auth_identity"),
+                bool(request.get("auth_is_master")),
+            )
+        )
+
     if ("GET", "/turns") not in existing:
         app.router.add_get("/turns", turns_page)
     if ("GET", "/api/turns") not in existing:
@@ -732,6 +779,8 @@ def register_routes(
         app.router.add_get("/api/web/bootstrap", web_bootstrap)
     if ("GET", "/api/v1/web/bootstrap") not in existing:
         app.router.add_get("/api/v1/web/bootstrap", web_bootstrap_v1)
+    if ("GET", "/api/v1/whoami") not in existing:
+        app.router.add_get("/api/v1/whoami", whoami_v1)
     if ("GET", "/app/") not in existing and ("GET", "/app/{path}") not in existing:
         app.router.add_get("/app/{path:.*}", react_app)
     if ("GET", "/ops") not in existing:
