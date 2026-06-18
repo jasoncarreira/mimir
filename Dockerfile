@@ -35,6 +35,10 @@ FROM python:3.11-slim AS base
 #     mimir-agent extra (PyPI rejects direct git URLs), so it ships
 #     as an EXTRA build step that builds add explicitly (see the
 #     ``MIMIR_ENABLE_CLAUDE_CODE`` block below).
+#   - jq: JSON/JSONL parsing relied on by pollers, skill bodies, and
+#     operational/debugging shell workflows. Kept in parity with the
+#     scaffold-generated image (scaffold_docker.py), which already ships
+#     jq, so clean rebuilds of this image keep the same capability (#560).
 #   - nodejs + npm: Node runtime/tooling. The Claude Code CLI is installed
 #     only when ``MIMIR_ENABLE_CLAUDE_CODE=1`` (same gate as the Python
 #     subprocess provider below).
@@ -47,7 +51,7 @@ FROM python:3.11-slim AS base
 ENV NODE_VERSION=22
 ARG MIMIR_ENABLE_CLAUDE_CODE=0
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg git xz-utils \
+        ca-certificates curl gnupg git jq xz-utils \
         poppler-utils tesseract-ocr tesseract-ocr-eng \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \

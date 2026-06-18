@@ -337,6 +337,14 @@ def test_render_dockerfile_gates_claude_code_cli_on_build_arg():
         assert "@anthropic-ai/claude-code@2.1.177 @mermaid-js/mermaid-cli" not in out, mode
 
 
+def test_render_dockerfile_installs_jq_in_both_modes():
+    """jq ships in the generated image (both modes) for JSONL log parsing and
+    poller/skill shell workflows — parity with the published image (#560)."""
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode)
+        assert "\n        jq \\" in out, mode
+
+
 # ── codex CLI install (chainlink #293) ─────────────────────────────
 
 
