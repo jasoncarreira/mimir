@@ -31,6 +31,11 @@ const firstPartySurfaceMetadata: Record<
     tabs: ["overview", "queues", "health"],
     filterLabel: "scope"
   },
+  "chainlink-board": {
+    detail: "Chainlink lifecycle and Worklink evidence",
+    tabs: ["board", "dependencies", "worklink"],
+    filterLabel: "label"
+  },
   scheduler: {
     detail: "Schedules, pollers, and commitments",
     tabs: ["schedules", "pollers", "commitments"],

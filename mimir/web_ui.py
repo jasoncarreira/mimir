@@ -50,6 +50,10 @@ from .dashboard_extensions import (
     add_backend_namespace_routes,
     first_party_dashboard_extensions,
 )
+from .chainlink_board import (
+    build_chainlink_board_payload,
+    resolve_worklink_artifact,
+)
 from .live_events import read_live_event_items_since
 from .ops_dashboard import (
     build_dashboard_payload_async,
@@ -597,6 +601,18 @@ def register_routes(
         )
         return json_success(payload)
 
+    async def chainlink_board_data_v1(_request: web.Request) -> web.Response:
+        payload = await build_chainlink_board_payload(home)
+        return json_success(payload)
+
+    async def chainlink_board_artifact_v1(request: web.Request) -> web.StreamResponse:
+        if home is None:
+            return json_error("home_not_configured", "home path not configured", status=503)
+        artifact = resolve_worklink_artifact(home, request.query.get("path", ""))
+        if artifact is None:
+            return json_error("artifact_not_found", "artifact not found", status=404)
+        return web.FileResponse(artifact, headers=_no_store_headers())
+
     async def scheduler_data_v1(request: web.Request) -> web.Response:
         try:
             due_window = parse_due_window(request.query.get("due_window"))
@@ -840,6 +856,12 @@ def register_routes(
             DashboardBackendRoute("GET", "/api/v1/ops", ops_data_v1),
         ]
 
+    def chainlink_board_backend_routes() -> list[DashboardBackendRoute]:
+        return [
+            DashboardBackendRoute("GET", "/api/v1/chainlink-board", chainlink_board_data_v1),
+            DashboardBackendRoute("GET", "/api/v1/chainlink-board/artifact", chainlink_board_artifact_v1),
+        ]
+
     def scheduler_backend_routes() -> list[DashboardBackendRoute]:
         return [
             DashboardBackendRoute("GET", "/api/v1/scheduler", scheduler_data_v1),
@@ -855,6 +877,7 @@ def register_routes(
         registry=_dashboard_extensions,
         hooks={
             "ops": ops_backend_routes,
+            "chainlink-board": chainlink_board_backend_routes,
             "scheduler": scheduler_backend_routes,
             "admin-config": admin_config_backend_routes,
         },

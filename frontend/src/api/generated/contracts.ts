@@ -138,6 +138,58 @@ export interface OpsDashboardData {
   token_usage_history: unknown[];
 }
 
+export interface ChainlinkBoardIssue {
+  id: number;
+  title: string;
+  status: "open" | "ready" | "blocked" | "in-progress" | "review" | "done" | string;
+  raw_status: string;
+  priority: string;
+  labels: string[];
+  parent_id: number | null;
+  child_ids: number[];
+  child_progress: { done: number; total: number };
+  blocked_by: number[];
+  blocking: number[];
+  updated_at: string;
+  created_at: string;
+  description: string;
+  comments: Array<{ id: string; author: string; created_at: string; body: string }>;
+  worklink?: {
+    issue: number;
+    attempt: number;
+    backend: string;
+    status: string;
+    branch: string;
+    started_at: string;
+    finished_at: string;
+    diff_stat: string;
+    tests: Record<string, unknown> | null;
+    pr_url: string;
+    blocked_reason: string;
+    transcript: string;
+    transcript_href: string;
+    evidence_path: string;
+    evidence_href: string;
+  } | null;
+}
+
+export interface ChainlinkBoardData {
+  available: boolean;
+  error?: string | null;
+  generated_at: string;
+  columns: Array<{ id: string; title: string; issue_ids: number[] }>;
+  issues: ChainlinkBoardIssue[];
+  roots: number[];
+  edges: Array<{ from: number; to: number; kind: "blocks" | "parent" | string }>;
+  filters: {
+    labels: string[];
+    statuses: string[];
+    priorities: string[];
+  };
+  truncated: boolean;
+  total_count: number;
+}
+
 export interface AdminConfigFieldSchema {
   name: string;
   type: string;

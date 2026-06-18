@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from mimir.dashboard_extensions import (
     DashboardExtensionManifest,
     first_party_dashboard_extensions,
 )
+from mimir.chainlink_board import build_chainlink_board_payload
 from mimir import web_ui
 from mimir.commitments.models import CommitmentRecord
 from mimir.commitments.store import CommitmentsStore
@@ -82,6 +84,86 @@ def test_dashboard_extension_registry_sorts_hides_and_validates_scope():
                 )
             ]
         )
+
+
+@pytest.mark.asyncio
+async def test_chainlink_board_parses_cli_json_and_worklink_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    bin_dir = tmp_path / "bin"
+    home.mkdir()
+    bin_dir.mkdir()
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    (home / "state" / "worklink" / "transcripts").mkdir(parents=True)
+    (evidence_dir / "545-2.json").write_text(
+        json.dumps({
+            "issue": 545,
+            "attempt": 2,
+            "backend": "codex",
+            "status": "completed",
+            "branch": "issue/545-a2",
+            "diff_stat": "3 files changed",
+            "tests": {"cmd": "npm test", "exit_code": 0},
+            "transcript": "state/worklink/transcripts/545-2.jsonl",
+            "pr_url": "https://example.test/pr/1",
+        }),
+        encoding="utf-8",
+    )
+    chainlink = bin_dir / "chainlink"
+    chainlink.write_text(
+        """#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+if args[:2] == ["issue", "list"]:
+    print(json.dumps([
+        {"id": 524, "title": "Parent", "status": "open", "priority": "high", "labels": ["epic"], "updated_at": "2026-06-18T00:00:00Z"},
+        {"id": 545, "title": "Board", "status": "open", "priority": "medium", "labels": ["worklink:review", "frontend"], "parent_id": 524, "blocked_by": [540], "updated_at": "2026-06-18T01:00:00Z"},
+        {"id": 540, "title": "Prereq", "status": "closed", "priority": "low", "labels": [], "updated_at": "2026-06-17T00:00:00Z"}
+    ]))
+elif args[:2] == ["issue", "show"] and args[2] == "545":
+    print(json.dumps({"id": 545, "description": "Acceptance criteria", "comments": [{"author": "mimir", "created_at": "2026-06-18T02:00:00Z", "body": "WORKLINK_EVIDENCE attached"}]}))
+elif args[:2] == ["issue", "show"] and args[2] == "524":
+    print(json.dumps({"id": 524, "subissues": [545]}))
+elif args[:2] == ["issue", "show"] and args[2] == "540":
+    print(json.dumps({"id": 540}))
+else:
+    raise SystemExit(2)
+""",
+        encoding="utf-8",
+    )
+    chainlink.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+
+    payload = await build_chainlink_board_payload(home)
+
+    assert payload["available"] is True
+    board = next(issue for issue in payload["issues"] if issue["id"] == 545)
+    parent = next(issue for issue in payload["issues"] if issue["id"] == 524)
+    assert board["status"] == "review"
+    assert board["blocked_by"] == [540]
+    assert board["comments"][0]["body"] == "WORKLINK_EVIDENCE attached"
+    assert board["worklink"]["attempt"] == 2
+    assert board["worklink"]["evidence_href"].endswith("state/worklink/evidence/545-2.json")
+    assert parent["child_progress"] == {"done": 0, "total": 1}
+    assert {"from": 524, "to": 545, "kind": "parent"} in payload["edges"]
+    assert {"from": 540, "to": 545, "kind": "blocks"} in payload["edges"]
+
+
+@pytest.mark.asyncio
+async def test_chainlink_board_degrades_when_cli_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+
+    payload = await build_chainlink_board_payload(tmp_path)
+
+    assert payload["available"] is False
+    assert payload["issues"] == []
+    assert "chainlink CLI not on PATH" in payload["error"]
 
 
 def test_dashboard_extension_route_path_allows_app_prefix_words_only():
