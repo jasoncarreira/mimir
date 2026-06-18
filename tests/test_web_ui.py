@@ -244,11 +244,11 @@ async def test_api_v1_live_events_backfill_orders_and_dedups(app):
     assert resp.content_type == "text/event-stream"
     items = _sse_data_items(body)
     assert [item["cursor"] for item in items] == [
-        "turn:t1:000000",
-        "turn:t1:000001",
-        "turn:t2:000000",
-        "turn:t2:000001",
-        "turn:t2:000002",
+        "2026-01-01T00:00:01Z:t1:000000",
+        "2026-01-01T00:00:01Z:t1:000001",
+        "2026-01-01T00:00:02Z:t2:000000",
+        "2026-01-01T00:00:02Z:t2:000001",
+        "2026-01-01T00:00:02Z:t2:000002",
     ]
     assert len({item["id"] for item in items}) == len(items)
     for item in items:
@@ -265,12 +265,59 @@ async def test_api_v1_live_events_since_backfill_is_strict(app):
     turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
 
     async with TestClient(TestServer(a)) as client:
-        resp = await client.get("/api/v1/live-events?once=1&since=turn:t1:000001")
+        resp = await client.get("/api/v1/live-events?once=1&since=2026-01-01T00:00:01Z:t1:000001")
         body = await resp.text()
 
     assert resp.status == 200
     items = _sse_data_items(body)
-    assert [item["cursor"] for item in items] == ["turn:t2:000000", "turn:t2:000001"]
+    assert [item["cursor"] for item in items] == ["2026-01-01T00:00:02Z:t2:000000", "2026-01-01T00:00:02Z:t2:000001"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_cursor_is_monotonic_for_random_turn_ids(app):
+    a, turns_log, _ = app
+    rows = [
+        {"turn_id": "f1c5e26f1c2e", "ts": "2026-01-01T00:00:01Z"},
+        {"turn_id": "37387608ce3b", "ts": "2026-01-01T00:00:02Z"},
+    ]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(
+            "/api/v1/live-events?once=1&since=2026-01-01T00:00:01Z:f1c5e26f1c2e:000000"
+        )
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert [item["event"]["turn_id"] for item in _sse_data_items(body)] == ["37387608ce3b"]
+
+
+def test_read_live_event_items_since_stops_after_crossing_acknowledged_timestamp(tmp_path: Path):
+    from mimir.live_events import read_live_event_items_since
+
+    path = tmp_path / "turns.jsonl"
+    path.write_text("", encoding="utf-8")
+    rows = [
+        {"turn_id": "very-old", "ts": "2026-01-01T00:00:00Z"},
+        {"turn_id": "old", "ts": "2026-01-01T00:00:01Z"},
+        {"turn_id": "seen", "ts": "2026-01-01T00:00:02Z"},
+        {"turn_id": "new", "ts": "2026-01-01T00:00:03Z"},
+    ]
+    calls = []
+
+    def tail_reader(_path: Path):
+        for row in reversed(rows):
+            calls.append(row["turn_id"])
+            yield row
+
+    items = read_live_event_items_since(
+        path,
+        since="2026-01-01T00:00:02Z:seen:000000",
+        tail_reader=tail_reader,
+    )
+
+    assert [item.event["turn_id"] for item in items] == ["new"]
+    assert calls == ["new", "seen", "old"]
 
 
 @pytest.mark.asyncio
@@ -297,7 +344,25 @@ async def test_api_v1_live_events_auth_uses_header_not_query_param(tmp_path: Pat
         body = await resp.text()
 
     assert resp.status == 200
-    assert _sse_data_items(body)[0]["cursor"] == "turn:t1:000000"
+    assert _sse_data_items(body)[0]["cursor"] == "2026-01-01T00:00:01Z:t1:000000"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_rejects_when_stream_cap_exhausted(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(web_ui, "LIVE_EVENTS_MAX_STREAMS", 0)
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/live-events?once=1")
+        body = await resp.text()
+
+    assert resp.status == 429
+    assert "too many live event streams" in body
 
 
 @pytest.mark.asyncio

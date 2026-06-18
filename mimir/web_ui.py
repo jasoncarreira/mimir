@@ -43,7 +43,7 @@ from typing import Any
 from aiohttp import web
 
 from ._jsonl_tail import tail_jsonl_records
-from .live_events import build_live_event_backfill
+from .live_events import read_live_event_items_since
 from .ops_dashboard import (
     build_dashboard_payload_async,
     parse_days_param,
@@ -74,6 +74,7 @@ _TURN_VIEWER_HTML: str | None = None
 _WEB_AUTH_JS: str | None = None
 LIVE_EVENTS_HEARTBEAT_S = 15.0
 LIVE_EVENTS_POLL_S = 1.0
+LIVE_EVENTS_MAX_STREAMS = int(os.environ.get("MIMIR_LIVE_EVENTS_MAX_STREAMS", "8"))
 
 
 def _load_viewer_html() -> str:
@@ -324,14 +325,30 @@ def register_routes(
         events, meta = _events_window(request)
         return json_success({"events": events}, meta=meta)
 
-    def _live_event_items(request: web.Request) -> list[dict[str, Any]]:
-        since = request.query.get("since", "").strip() or None
+    live_events_active = 0
+    live_events_lock = asyncio.Lock()
+
+    async def _try_acquire_live_event_slot() -> bool:
+        nonlocal live_events_active
+        async with live_events_lock:
+            if live_events_active >= LIVE_EVENTS_MAX_STREAMS:
+                return False
+            live_events_active += 1
+            return True
+
+    async def _release_live_event_slot() -> None:
+        nonlocal live_events_active
+        async with live_events_lock:
+            live_events_active = max(0, live_events_active - 1)
+
+    async def _live_event_items(request: web.Request, since: str | None) -> list[dict[str, Any]]:
         try:
             limit = int(request.query.get("limit") or 0)
         except ValueError:
             limit = 0
-        items = build_live_event_backfill(
-            _read_jsonl(turns_log),
+        items = await asyncio.to_thread(
+            read_live_event_items_since,
+            turns_log,
             since=since,
             limit=limit or None,
         )
@@ -356,15 +373,16 @@ def register_routes(
                 "Connection": "keep-alive",
             },
         )
+        if not await _try_acquire_live_event_slot():
+            return web.Response(text="too many live event streams", status=429)
+
         await resp.prepare(request)
 
-        delivered = request.query.get("since", "").strip()
+        delivered = request.query.get("since", "").strip() or None
         idle_for = 0.0
         try:
             while True:
-                items = _live_event_items(request)
-                if delivered:
-                    items = [item for item in items if str(item["cursor"]) > delivered]
+                items = await _live_event_items(request, delivered)
                 for item in items:
                     delivered = str(item["cursor"])
                     block = (
@@ -387,6 +405,8 @@ def register_routes(
                 await asyncio.sleep(LIVE_EVENTS_POLL_S)
         except (ConnectionResetError, asyncio.CancelledError):
             pass
+        finally:
+            await _release_live_event_slot()
         return resp
 
     async def react_app(request: web.Request) -> web.StreamResponse:

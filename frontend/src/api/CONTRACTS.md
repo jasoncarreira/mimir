@@ -66,10 +66,10 @@ fetch-based SSE with `X-API-Key` auth, never URL-carried keys. Each SSE data
 payload is a `LiveEventStreamItem`:
 
 ```json
-{"id": "turn:t1:event:1", "cursor": "turn:t1:000001", "ts": "2026-01-01T00:00:00Z", "event": {"kind": "turn.event", "turn_id": "t1", "event": {"type": "tool_call"}}}
+{"id": "turn:t1:event:1", "cursor": "2026-01-01T00:00:00Z:t1:000001", "ts": "2026-01-01T00:00:00Z", "event": {"kind": "turn.event", "turn_id": "t1", "event": {"type": "tool_call"}}}
 ```
 
-Reconnect with `?since=<last cursor>`; backfill is strict (`cursor > since`) so
+Reconnect with `?since=<last cursor>`; cursors are timestamp-prefixed so lexical order matches delivery order, and backfill is strict (`cursor > since`) so
 the last acknowledged item is not replayed. Clients should also deduplicate by
 `id`, because reconnects and log rewrites can overlap.
 

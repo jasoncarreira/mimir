@@ -10,6 +10,7 @@ export interface LiveEventStreamOptions {
   initialCursor?: string;
   backfillLimit?: number;
   reconnectDelayMs?: number;
+  maxSeenIds?: number;
   onOpen?: () => void;
   onError?: (error: unknown) => void;
   onCursor?: (cursor: string) => void;
@@ -67,17 +68,28 @@ export function createLiveEventStream(
     initialCursor = "",
     backfillLimit = 500,
     reconnectDelayMs = 1000,
+    maxSeenIds = 1000,
     onOpen,
     onError,
     onCursor
   } = options;
   const controller = new AbortController();
   const seen = new Set<string>();
+  const seenOrder: string[] = [];
   let cursor = initialCursor;
+
+  const remember = (id: string) => {
+    seen.add(id);
+    seenOrder.push(id);
+    while (seenOrder.length > maxSeenIds) {
+      const oldest = seenOrder.shift();
+      if (oldest) seen.delete(oldest);
+    }
+  };
 
   const deliver = (item: LiveEventStreamItem) => {
     if (!item.id || seen.has(item.id)) return;
-    seen.add(item.id);
+    remember(item.id);
     cursor = item.cursor || cursor;
     onCursor?.(cursor);
     onItem(item);
@@ -100,7 +112,8 @@ export function createLiveEventStream(
         if (!controller.signal.aborted) onError?.(error);
       }
       if (!controller.signal.aborted) {
-        await new Promise((resolve) => setTimeout(resolve, reconnectDelayMs));
+        const jitterMs = Math.floor(Math.random() * Math.max(1, reconnectDelayMs));
+        await new Promise((resolve) => setTimeout(resolve, reconnectDelayMs + jitterMs));
       }
     }
   })();
