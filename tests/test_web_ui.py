@@ -10,6 +10,11 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from mimir import web_ui
+from mimir.web_contracts import (
+    render_typescript_contracts,
+    validate_api_envelope,
+    validate_list_meta,
+)
 
 
 @pytest.fixture
@@ -19,6 +24,13 @@ def app(tmp_path: Path) -> tuple[web.Application, Path, Path]:
     a = web.Application()
     web_ui.register_routes(a, turns_log=turns_log, events_log=events_log)
     return a, turns_log, events_log
+
+
+def test_generated_typescript_contracts_are_current():
+    generated = Path("frontend/src/api/generated/contracts.ts").read_text(
+        encoding="utf-8"
+    )
+    assert generated == render_typescript_contracts()
 
 
 @pytest.mark.asyncio
@@ -46,6 +58,28 @@ async def test_api_turns_returns_records(app):
         resp = await client.get("/api/turns")
         body = await resp.json()
     assert [t["turn_id"] for t in body["turns"]] == ["t1", "t2"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_turns_returns_envelope_and_list_metadata(app):
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(5)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/turns?limit=2")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    validate_list_meta(body["meta"])
+    assert [t["turn_id"] for t in body["data"]["turns"]] == ["t3", "t4"]
+    assert body["meta"] == {
+        "cursor": "t4",
+        "limit": 2,
+        "total": 5,
+        "truncated": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -136,6 +170,31 @@ async def test_api_events_filters_by_type_and_limit(app):
         resp = await client.get("/api/events?since=2026-01-01T00:00:02Z")
         body = await resp.json()
         assert [e["type"] for e in body["events"]] == ["tool_call", "turn_finished"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_events_returns_envelope_and_list_metadata(app):
+    a, _, events_log = app
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "turn_started"},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "tool_call"},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "tool_call"},
+    ]
+    events_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/events?type=tool_call&limit=1")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert [e["timestamp"] for e in body["data"]["events"]] == ["2026-01-01T00:00:02Z"]
+    assert body["meta"] == {
+        "cursor": "2026-01-01T00:00:02Z",
+        "limit": 1,
+        "total": 2,
+        "truncated": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -244,6 +303,72 @@ async def test_web_bootstrap_is_no_store_and_secret_free(tmp_path: Path):
     assert body["server"]["public_bind"] is True
     assert body["stream_auth"]["shape"] == "fetch-event-stream"
     assert body["stream_auth"]["native_eventsource_supported_when_auth_required"] is False
+
+
+@pytest.mark.asyncio
+async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_path: Path):
+    class _Config:
+        web_host = "0.0.0.0"
+
+    a = web.Application()
+    a["api_key"] = "super-secret"
+    a["config"] = _Config()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/web/bootstrap")
+        body_text = await resp.text()
+        body = json.loads(body_text)
+
+    assert resp.status == 200
+    assert resp.headers["Cache-Control"].startswith("no-store")
+    assert "super-secret" not in body_text
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"]["auth"]["required"] is True
+    assert body["data"]["server"]["public_bind"] is True
+
+
+@pytest.mark.asyncio
+async def test_api_v1_web_bootstrap_auth_exempt_with_middleware(tmp_path: Path):
+    from mimir.server import _make_auth_middleware
+
+    class _Config:
+        web_host = "0.0.0.0"
+
+    a = web.Application(middlewares=[_make_auth_middleware("super-secret")])
+    a["api_key"] = "super-secret"
+    a["config"] = _Config()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/web/bootstrap")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"]["auth"]["required"] is True
+
+
+@pytest.mark.asyncio
+async def test_api_v1_ops_errors_use_stable_envelope(app):
+    a, _, _ = app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/ops?days=bad")
+        body = await resp.json()
+
+    assert resp.status == 400
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "invalid_days"
 
 
 @pytest.mark.asyncio

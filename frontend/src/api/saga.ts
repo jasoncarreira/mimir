@@ -1,142 +1,76 @@
-import { apiFetchJson, buildQuery, type ApiClientOptions } from "./http";
+import { apiFetchEnvelope, buildQuery, type ApiClientOptions } from "./http";
+import type {
+  ApiSuccessEnvelope,
+  ListMeta,
+  SagaActivationHistData,
+  SagaAtomDetailData,
+  SagaAtomSummary,
+  SagaClustersData,
+  SagaRecentData,
+  SagaSearchData,
+  SagaSqlCell,
+  SagaSqlData,
+  SagaStatsData
+} from "./generated/contracts";
 
-export interface SagaAtomSummary {
-  id: string;
-  content_preview: string;
-  memory_type?: string | null;
-  stream?: string | null;
-  source_type?: string | null;
-  topics?: string[];
-  arousal?: number | null;
-  valence?: number | null;
-  encoding_confidence?: number | null;
-  is_pinned?: boolean | number;
-  created_at?: string | null;
-  session_id?: string | null;
-  channel_id?: string | null;
-}
+export type { SagaAtomSummary, SagaSqlCell };
 
-export interface SagaRecentResponse {
-  atoms: SagaAtomSummary[];
+export type SagaRecentResponse = SagaRecentData & {
   total: number;
   limit: number;
-  channel_filter?: string | null;
-  channels: string[];
   error?: string;
-}
-
-export interface SagaStatsResponse {
-  ready: boolean;
-  atom_count?: number;
-  tombstoned_count?: number;
-  session_count?: number;
-  triple_count?: number;
-  schema_version?: number | null;
-  db_size_bytes?: number;
-  db_path?: string;
-  error?: string;
-}
-
-export interface SagaEmbedding {
+};
+export type SagaStatsResponse = SagaStatsData & { error?: string };
+export type SagaEmbedding = {
   provider: string;
   model: string;
   dim: number;
   embedded_at?: string | null;
-}
-
-export interface SagaRelation {
+};
+export type SagaRelation = {
   relation_type: string;
   target_id: string;
   confidence?: number | null;
   target_preview?: string | null;
-}
-
-export interface SagaAtomDetail {
-  id: string;
-  content?: string;
-  memory_type?: string | null;
-  stream?: string | null;
-  source_type?: string | null;
-  topics?: string[];
-  metadata?: Record<string, unknown>;
-  arousal?: number | null;
-  valence?: number | null;
-  encoding_confidence?: number | null;
-  is_pinned?: boolean | number;
-  created_at?: string | null;
-  session_id?: string | null;
-  channel_id?: string | null;
-  session_started_at?: string | null;
-  access_count?: number;
-  last_access_ts?: string | null;
-  last_access_source?: string | null;
+};
+export type SagaAtomDetail = SagaAtomDetailData & {
+  error?: string;
   embedding?: SagaEmbedding | null;
   relations_out?: SagaRelation[];
-  tombstoned?: boolean | number;
-  tombstoned_reason?: string | null;
-  error?: string;
-  [key: string]: unknown;
-}
-
-export interface SagaSearchResponse {
-  atoms: SagaAtomSummary[];
+};
+export type SagaSearchResponse = SagaSearchData & {
   total_matched: number;
-  query: string;
-  channel_filter?: string | null;
   limit: number;
   error?: string;
-}
-
-export interface SagaActivationBucket {
-  range_start: number;
-  range_end: number;
-  count: number;
-}
-
-export interface SagaActivationHistResponse {
-  buckets: SagaActivationBucket[];
+};
+export type SagaActivationBucket = SagaActivationHistData["buckets"][number];
+export type SagaActivationHistResponse = SagaActivationHistData & {
   total: number;
-  never_accessed?: number;
-  days?: number;
   error?: string;
-}
-
-export interface SagaCluster {
-  cluster_id: string | null;
-  size: number;
-  sample_atoms: Array<{ id: string; content_preview: string }>;
-}
-
-export interface SagaClustersResponse {
-  clusters: SagaCluster[];
+};
+export type SagaCluster = SagaClustersData["clusters"][number];
+export type SagaClustersResponse = SagaClustersData & {
   total_clusters?: number;
   total_atoms?: number;
   error?: string;
-}
-
-export type SagaSqlCell = string | number | boolean | null;
-
-export interface SagaSqlResponse {
-  columns?: string[];
-  rows?: SagaSqlCell[][];
-  row_count?: number;
+};
+export type SagaSqlResponse = SagaSqlData & {
   truncated?: boolean;
   error?: string;
-  rejected?: boolean;
-}
+};
 
 export function getSagaStats(
   options?: ApiClientOptions
-): Promise<SagaStatsResponse> {
-  return apiFetchJson<SagaStatsResponse>("/api/saga?view=stats", options);
+): Promise<ApiSuccessEnvelope<SagaStatsData>> {
+  return apiFetchEnvelope<SagaStatsData>("/api/v1/saga?view=stats", options);
 }
 
 export function listSagaAtoms(
   params: { channel?: string; limit?: number } = {},
   options?: ApiClientOptions
-): Promise<SagaRecentResponse> {
-  return apiFetchJson<SagaRecentResponse>(
-    `/api/saga${buildQuery({ view: "recent", ...params })}`,
+): Promise<ApiSuccessEnvelope<SagaRecentData, ListMeta>> {
+  return apiFetchEnvelope<SagaRecentData, ListMeta>(
+    `/api/v1/saga${buildQuery({ view: "recent", ...params })}`,
     options
   );
 }
@@ -144,9 +78,9 @@ export function listSagaAtoms(
 export function getSagaAtom(
   id: string,
   options?: ApiClientOptions
-): Promise<SagaAtomDetail> {
-  return apiFetchJson<SagaAtomDetail>(
-    `/api/saga${buildQuery({ view: "atom", id })}`,
+): Promise<ApiSuccessEnvelope<SagaAtomDetailData>> {
+  return apiFetchEnvelope<SagaAtomDetailData>(
+    `/api/v1/saga${buildQuery({ view: "atom", id })}`,
     options
   );
 }
@@ -154,9 +88,9 @@ export function getSagaAtom(
 export function searchSagaAtoms(
   params: { q: string; channel?: string; limit?: number },
   options?: ApiClientOptions
-): Promise<SagaSearchResponse> {
-  return apiFetchJson<SagaSearchResponse>(
-    `/api/saga${buildQuery({ view: "search", ...params })}`,
+): Promise<ApiSuccessEnvelope<SagaSearchData, ListMeta>> {
+  return apiFetchEnvelope<SagaSearchData, ListMeta>(
+    `/api/v1/saga${buildQuery({ view: "search", ...params })}`,
     options
   );
 }
@@ -164,9 +98,9 @@ export function searchSagaAtoms(
 export function getSagaActivationHistogram(
   params: { days?: number } = {},
   options?: ApiClientOptions
-): Promise<SagaActivationHistResponse> {
-  return apiFetchJson<SagaActivationHistResponse>(
-    `/api/saga${buildQuery({ view: "activation_hist", ...params })}`,
+): Promise<ApiSuccessEnvelope<SagaActivationHistData, ListMeta>> {
+  return apiFetchEnvelope<SagaActivationHistData, ListMeta>(
+    `/api/v1/saga${buildQuery({ view: "activation_hist", ...params })}`,
     options
   );
 }
@@ -174,9 +108,9 @@ export function getSagaActivationHistogram(
 export function getSagaClusters(
   params: { sample_size?: number } = {},
   options?: ApiClientOptions
-): Promise<SagaClustersResponse> {
-  return apiFetchJson<SagaClustersResponse>(
-    `/api/saga${buildQuery({ view: "clusters", ...params })}`,
+): Promise<ApiSuccessEnvelope<SagaClustersData, ListMeta>> {
+  return apiFetchEnvelope<SagaClustersData, ListMeta>(
+    `/api/v1/saga${buildQuery({ view: "clusters", ...params })}`,
     options
   );
 }
@@ -184,10 +118,10 @@ export function getSagaClusters(
 export function runSagaSql(
   sql: string,
   options?: RequestInit & ApiClientOptions
-): Promise<SagaSqlResponse> {
+): Promise<ApiSuccessEnvelope<SagaSqlData, ListMeta>> {
   const headers = new Headers(options?.headers);
   headers.set("Content-Type", "application/json");
-  return apiFetchJson<SagaSqlResponse>("/api/saga/sql", {
+  return apiFetchEnvelope<SagaSqlData, ListMeta>("/api/v1/saga/sql", {
     ...options,
     method: "POST",
     headers,

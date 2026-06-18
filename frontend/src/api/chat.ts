@@ -1,49 +1,40 @@
-import { apiFetchJson, getStoredApiKey, type ApiClientOptions } from "./http";
+import { apiFetchEnvelope, getStoredApiKey, type ApiClientOptions } from "./http";
+import type {
+  ApiSuccessEnvelope,
+  ChatAcceptedData,
+  ChatMessageEvent as GeneratedChatMessageEvent,
+  ChatPostRequest,
+  ChatReactionEvent as GeneratedChatReactionEvent,
+  LiveEvent
+} from "./generated/contracts";
 
-export interface ChatPostRequest {
-  channel_id?: string;
-  content: string;
-  author?: string;
-  author_id?: string;
-  msg_id?: string;
-  extra?: Record<string, unknown>;
-}
+export type { ChatPostRequest, LiveEvent };
 
-export interface ChatPostAccepted {
-  ok: true;
-  channel_id: string;
-}
-
+export type ChatPostAccepted = Omit<ChatAcceptedData, "source_id"> & {
+  source_id?: string;
+  ok?: true;
+};
 export interface ChatPostRejected {
   error: "invalid json" | "content required" | "extra must be an object" | "queue_full_or_closed" | string;
   channel_id?: string;
 }
-
-export type ChatPostResponse = ChatPostAccepted | ChatPostRejected;
-
-export interface ChatOutboundMessage {
-  channel_id: string;
-  text: string;
-  message_id: string;
-  attachments: string[];
-}
-
-export interface ChatReactionEvent {
-  _event: "react";
-  channel_id: string;
-  message_id: string;
-  emoji: string;
-}
-
-export type ChatStreamPayload = ChatOutboundMessage | ChatReactionEvent;
+export type ChatPostResponse = ApiSuccessEnvelope<ChatAcceptedData>;
+export type ChatOutboundMessage = Omit<GeneratedChatMessageEvent, "kind"> & {
+  kind?: "chat.message";
+};
+export type ChatReactionEvent = Omit<GeneratedChatReactionEvent, "kind"> & {
+  kind?: "chat.reaction";
+  _event?: "react";
+};
+export type ChatStreamPayload = LiveEvent;
 
 export function sendChatMessage(
   body: ChatPostRequest,
   options?: RequestInit & ApiClientOptions
-): Promise<ChatPostResponse> {
+): Promise<ApiSuccessEnvelope<ChatAcceptedData>> {
   const headers = new Headers(options?.headers);
   headers.set("Content-Type", "application/json");
-  return apiFetchJson<ChatPostResponse>("/chat", {
+  return apiFetchEnvelope<ChatAcceptedData>("/api/v1/chat", {
     ...options,
     method: "POST",
     headers,
@@ -62,6 +53,35 @@ export interface ChatStreamHandle {
   close(): void;
 }
 
+function normalizeLegacyPayload(payload: unknown): ChatStreamPayload {
+  if (payload && typeof payload === "object" && "kind" in payload) {
+    return payload as ChatStreamPayload;
+  }
+  const item = payload as {
+    _event?: string;
+    channel_id?: string;
+    text?: string;
+    message_id?: string;
+    attachments?: string[];
+    emoji?: string;
+  };
+  if (item?._event === "react") {
+    return {
+      kind: "chat.reaction",
+      channel_id: item.channel_id ?? "",
+      message_id: item.message_id ?? "",
+      emoji: item.emoji ?? ""
+    };
+  }
+  return {
+    kind: "chat.message",
+    channel_id: item.channel_id ?? "",
+    text: item.text ?? "",
+    message_id: item.message_id ?? "",
+    attachments: item.attachments ?? []
+  };
+}
+
 function dispatchSseBlock(block: string, onPayload: (payload: ChatStreamPayload) => void): void {
   const data = block
     .split(/\r?\n/)
@@ -69,7 +89,7 @@ function dispatchSseBlock(block: string, onPayload: (payload: ChatStreamPayload)
     .map((line) => line.slice(5).replace(/^ /, ""))
     .join("\n");
   if (!data) return;
-  onPayload(JSON.parse(data) as ChatStreamPayload);
+  onPayload(normalizeLegacyPayload(JSON.parse(data)));
 }
 
 export function createChatStream(

@@ -82,6 +82,7 @@ class TestAuthExemptSet:
     def test_browser_auth_bootstrap_is_exempt(self) -> None:
         assert ("GET", "/app/auth.js") in _AUTH_EXEMPT
         assert ("GET", "/api/web/bootstrap") in _AUTH_EXEMPT
+        assert ("GET", "/api/v1/web/bootstrap") in _AUTH_EXEMPT
 
     def test_react_assets_get_are_prefix_exempt(self) -> None:
         assert ("GET", "/app/") in _AUTH_EXEMPT_PREFIXES
@@ -270,6 +271,8 @@ def _auth_app(expected_key: str) -> web.Application:
     app.router.add_get("/ops", _ok_handler)
     app.router.add_get("/saga", _ok_handler)
     app.router.add_get("/state", _ok_handler)
+    app.router.add_get("/api/web/bootstrap", _ok_handler)
+    app.router.add_get("/api/v1/web/bootstrap", _ok_handler)
     return app
 
 
@@ -387,6 +390,12 @@ class TestAuthMiddlewareExemptRoutes:
     async def test_state_is_exempt(self) -> None:
         async with TestClient(TestServer(_auth_app("secret"))) as client:
             resp = await client.get("/state")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_v1_web_bootstrap_is_exempt(self) -> None:
+        async with TestClient(TestServer(_auth_app("secret"))) as client:
+            resp = await client.get("/api/v1/web/bootstrap")
         assert resp.status == 200
 
 
