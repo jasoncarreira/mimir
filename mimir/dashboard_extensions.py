@@ -46,6 +46,12 @@ class DashboardExtensionManifest:
     css: tuple[str, ...] = ()
     api_namespace: str | None = None
     trusted_first_party: bool = True
+    #: Minimum role required to SEE this nav entry in the React app (github
+    #: #563). ``None`` = visible to any authenticated user; ``"admin"`` = the
+    #: app hides it unless /whoami reports the admin role. UX only — the real
+    #: boundary is the server-side ``/api/v1/admin/`` gate; this just keeps
+    #: admin entries out of non-admin navigation.
+    requires_role: str | None = None
 
     def validate(self) -> None:
         if not _ID_RE.fullmatch(self.id):
@@ -77,6 +83,7 @@ class DashboardExtensionManifest:
             "css": list(self.css),
             "api_namespace": self.api_namespace,
             "trusted_first_party": self.trusted_first_party,
+            "requires_role": self.requires_role,
         }
 
 
@@ -187,6 +194,16 @@ def first_party_dashboard_extensions(
                 icon="settings",
                 nav_position=60,
                 api_namespace="admin-config",
+                requires_role="admin",
+            ),
+            DashboardExtensionManifest(
+                id="admin-users",
+                route_path="/admin/users",
+                label="Users",
+                icon="users",
+                nav_position=61,
+                api_namespace="admin-users",
+                requires_role="admin",
             ),
         )
     )
