@@ -10,8 +10,9 @@ from aiohttp.test_utils import TestClient, TestServer
 from mimir.bridges.web_chat import WebChatBridge
 from mimir.identities import IdentityResolver
 from mimir.identities_populator import issue_web_key
+from mimir import web_ui
 from mimir.server import _make_auth_middleware
-from mimir.web_ui import _whoami_payload
+from mimir.web_ui import _whoami_payload, web_gate_active
 
 
 async def _echo(request: web.Request) -> web.Response:
@@ -131,6 +132,58 @@ def test_whoami_payload_empty() -> None:
         "canonical": None, "display_name": None,
         "roles": [], "is_admin": False, "is_master": False,
     }
+
+
+# ── gate predicate (shared by middleware + bootstrap) ───────────────────
+
+
+def test_web_gate_active_predicate(tmp_path: Path) -> None:
+    assert web_gate_active("master", None) is True            # master key set
+    assert web_gate_active("", None) is False                 # dev: no key, no resolver
+    assert web_gate_active("", _resolver(tmp_path)) is False  # resolver, but no web keys
+    issue_web_key(tmp_path, "alice", roles=["user"])          # now a web key exists
+    assert web_gate_active("", _resolver(tmp_path)) is True   # fail-safe: gate on w/o master
+    assert web_gate_active(None, _resolver(tmp_path)) is True
+
+
+class _Config:
+    web_host = "127.0.0.1"
+
+
+def _bootstrap_app(home: Path, master_key: str, *, with_user: bool) -> web.Application:
+    if with_user:
+        issue_web_key(home, "alice", roles=["user"])
+    app = web.Application()
+    app["api_key"] = master_key
+    app["config"] = _Config()
+    app["identity_resolver"] = _resolver(home)
+    web_ui.register_routes(
+        app,
+        turns_log=home / "t.jsonl",
+        events_log=home / "e.jsonl",
+        react_app_dist=home / "missing-dist",
+    )
+    return app
+
+
+async def test_bootstrap_reports_gate_active_with_webkeys_and_no_master(tmp_path: Path) -> None:
+    # The bug mimir caught: no MIMIR_API_KEY but per-user keys exist → the
+    # middleware gates, so bootstrap must tell the browser auth is required.
+    async with TestClient(TestServer(_bootstrap_app(tmp_path, "", with_user=True))) as c:
+        for path in ("/api/web/bootstrap", "/api/v1/web/bootstrap"):
+            body = await (await c.get(path)).json()
+            data = body.get("data", body)  # v1 is enveloped, legacy is flat
+            assert data["auth"]["required"] is True, path
+            assert data["server"]["unauthenticated_allowed"] is False, path
+
+
+async def test_bootstrap_dev_mode_reports_no_auth(tmp_path: Path) -> None:
+    async with TestClient(TestServer(_bootstrap_app(tmp_path, "", with_user=False))) as c:
+        for path in ("/api/web/bootstrap", "/api/v1/web/bootstrap"):
+            body = await (await c.get(path)).json()
+            data = body.get("data", body)
+            assert data["auth"]["required"] is False, path
+            assert data["server"]["unauthenticated_allowed"] is True, path
 
 
 # ── web-chat trusted attribution ────────────────────────────────────────

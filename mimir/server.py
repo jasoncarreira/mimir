@@ -378,11 +378,10 @@ def _make_auth_middleware(expected_key: str):
         # The gate activates when EITHER a master key is set OR per-user web
         # keys exist — so configuring users can't leave the server open even if
         # MIMIR_API_KEY is unset. Neither → legacy dev/open path (no identity,
-        # no RBAC), preserving localhost behavior.
-        gate_active = bool(expected_key) or (
-            resolver is not None and resolver.has_web_keys()
-        )
-        if not gate_active:
+        # no RBAC), preserving localhost behavior. Shared with /web/bootstrap
+        # (web_ui.web_gate_active) so the browser's reported auth state can't
+        # drift from what's enforced here (#770 review).
+        if not web_ui.web_gate_active(expected_key, resolver):
             return await handler(request)
 
         provided = request.headers.get("X-API-Key", "")

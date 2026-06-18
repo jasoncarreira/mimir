@@ -141,6 +141,19 @@ def _read_jsonl(path: Path, *, max_records: int = 5000) -> list[dict[str, Any]]:
     return out
 
 
+def web_gate_active(api_key: str | None, resolver: Any) -> bool:
+    """Whether the web auth gate is active (github #726).
+
+    Single source of truth shared by the auth middleware (server.py) AND
+    /web/bootstrap, so the auth state the browser is told never drifts from
+    what the middleware actually enforces. The gate is on when a master key is
+    set OR per-user web keys exist (the fail-safe: configuring users can't
+    leave the server open even if MIMIR_API_KEY is unset)."""
+    if api_key:
+        return True
+    return resolver is not None and resolver.has_web_keys()
+
+
 def _whoami_payload(identity: Any, is_master: bool) -> dict[str, Any]:
     """The ``/api/v1/whoami`` body for a resolved auth identity (github #726).
 
@@ -487,20 +500,21 @@ def register_routes(
 
     async def web_bootstrap(request: web.Request) -> web.Response:
         api_key = str(request.app.get("api_key") or "")
+        gate = web_gate_active(api_key, request.app.get("identity_resolver"))
         config = request.app.get("config")
         web_host = str(getattr(config, "web_host", "") or "")
         public_bind = web_host not in ("", "127.0.0.1", "::1", "localhost")
         return web.json_response(
             {
                 "auth": {
-                    "required": bool(api_key),
+                    "required": gate,
                     "scheme": "x-api-key",
                     "storage": "browser-localStorage",
                 },
                 "server": {
                     "web_host": web_host,
                     "public_bind": public_bind,
-                    "unauthenticated_allowed": not bool(api_key),
+                    "unauthenticated_allowed": not gate,
                 },
                 "stream_auth": {
                     "shape": "fetch-event-stream",
@@ -514,20 +528,21 @@ def register_routes(
 
     async def web_bootstrap_v1(request: web.Request) -> web.Response:
         api_key = str(request.app.get("api_key") or "")
+        gate = web_gate_active(api_key, request.app.get("identity_resolver"))
         config = request.app.get("config")
         web_host = str(getattr(config, "web_host", "") or "")
         public_bind = web_host not in ("", "127.0.0.1", "::1", "localhost")
         return json_success(
             {
                 "auth": {
-                    "required": bool(api_key),
+                    "required": gate,
                     "scheme": "x-api-key",
                     "storage": "browser-localStorage",
                 },
                 "server": {
                     "web_host": web_host,
                     "public_bind": public_bind,
-                    "unauthenticated_allowed": not bool(api_key),
+                    "unauthenticated_allowed": not gate,
                 },
                 "stream_auth": {
                     "shape": "fetch-event-stream",
