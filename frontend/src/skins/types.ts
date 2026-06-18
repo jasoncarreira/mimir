@@ -5,8 +5,16 @@ export type SkinId = "default-retro";
 export type CharacterRendererKind =
   | "static-image"
   | "sprite-sheet"
+  | "dotlottie"
   | "lottie"
   | "react-placeholder";
+
+export type AgentCharacterState =
+  | "idle"
+  | "thinking"
+  | "typing"
+  | "tool"
+  | "error";
 
 export type SkinTokenName =
   | "colorText"
@@ -82,9 +90,11 @@ export interface SkinCharacterRendererMetadata {
   variant: string;
   assets: Array<{
     id: string;
-    type: "css" | "image" | "json" | "sprite";
+    type: "css" | "dotlottie" | "image" | "json" | "sprite";
     href: string | null;
   }>;
+  stateMap: Record<AgentCharacterState, string>;
+  fallbackState: AgentCharacterState;
   capabilities: {
     supportsExpressions: boolean;
     supportsMotion: boolean;

@@ -71,19 +71,47 @@ export const defaultRetroSkin = {
     hoverBehavior: "border-accent"
   },
   characterRenderer: {
-    kind: "react-placeholder",
+    kind: "dotlottie",
     componentSlot: "agent-character",
     variant: "terminal-portrait",
     assets: [
       {
-        id: "default-retro-placeholder",
-        type: "css",
-        href: null
+        id: "default-retro-idle",
+        type: "dotlottie",
+        href: "/app/skins/default-retro/agent-idle.lottie"
+      },
+      {
+        id: "default-retro-thinking",
+        type: "dotlottie",
+        href: "/app/skins/default-retro/agent-thinking.lottie"
+      },
+      {
+        id: "default-retro-typing",
+        type: "dotlottie",
+        href: "/app/skins/default-retro/agent-typing.lottie"
+      },
+      {
+        id: "default-retro-tool",
+        type: "dotlottie",
+        href: "/app/skins/default-retro/agent-tool.lottie"
+      },
+      {
+        id: "default-retro-error",
+        type: "dotlottie",
+        href: "/app/skins/default-retro/agent-error.lottie"
       }
     ],
+    stateMap: {
+      idle: "default-retro-idle",
+      thinking: "default-retro-thinking",
+      typing: "default-retro-typing",
+      tool: "default-retro-tool",
+      error: "default-retro-error"
+    },
+    fallbackState: "idle",
     capabilities: {
-      supportsExpressions: false,
-      supportsMotion: false
+      supportsExpressions: true,
+      supportsMotion: true
     }
   }
 } satisfies SkinManifest;

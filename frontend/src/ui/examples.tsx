@@ -1,4 +1,5 @@
 import React from "react";
+import { AgentCharacterDemo } from "../agent-character";
 import {
   Badge,
   Button,
@@ -97,6 +98,9 @@ export function DashboardUiExamples() {
                 <EmptyState title="No records">The selected filter has no matching records.</EmptyState>
                 <ErrorState title="Fetch failed">The API returned a non-200 response.</ErrorState>
                 <LoadingState label="Loading records" />
+                <Card title="Agent character">
+                  <AgentCharacterDemo />
+                </Card>
               </div>
             )
           },
