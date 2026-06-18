@@ -27,7 +27,7 @@ export type OpsDashboardResponse = OpsDashboardData;
 
 export function getOpsDashboard(
   params: { days?: number } = {},
-  options?: ApiClientOptions
+  options?: ApiClientOptions & RequestInit
 ): Promise<ApiSuccessEnvelope<OpsDashboardData>> {
   return apiFetchEnvelope<OpsDashboardData>(
     `/api/v1/ops${buildQuery(params)}`,
