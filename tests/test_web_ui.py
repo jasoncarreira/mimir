@@ -199,9 +199,33 @@ async def test_turns_page_serves_html(app):
         resp = await client.get("/turns")
         assert resp.status == 200
         assert resp.content_type == "text/html"
+        assert resp.headers["X-Mimir-Frontend"] == "legacy-html"
+        assert resp.headers["Link"] == '</app>; rel="alternate"'
         body = await resp.text()
         assert "mimir turns" in body  # header title (renamed from "Turn Viewer")
         assert "/api/turns" in body  # the page polls this endpoint
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/turns", "/ops", "/saga", "/state"])
+async def test_legacy_html_routes_are_marked(path, tmp_path: Path):
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=tmp_path,
+        saga_db=tmp_path / "saga.db",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(path)
+
+    assert resp.status == 200
+    assert resp.content_type == "text/html"
+    assert resp.headers["X-Mimir-Frontend"] == "legacy-html"
+    assert resp.headers["Link"] == '</app>; rel="alternate"'
 
 
 @pytest.mark.asyncio
@@ -589,6 +613,7 @@ async def test_react_app_serves_built_index_and_assets(tmp_path: Path):
         resp = await client.get("/app")
         assert resp.status == 200
         assert resp.content_type == "text/html"
+        assert "X-Mimir-Frontend" not in resp.headers
         assert resp.headers["Cache-Control"].startswith("no-store")
         assert "/app/assets/app.js" in await resp.text()
 
