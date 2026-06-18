@@ -19,6 +19,7 @@ import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { LiveEventsProvider, useLiveEvents } from "./live-events";
 import { SagaDashboard } from "./SagaDashboard";
+import { AdminConfigRoute } from "./routes/AdminConfigRoute";
 import { OpsRoute } from "./routes/OpsRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { TurnsRoute } from "./routes/TurnsRoute";
@@ -435,7 +436,7 @@ function AppFrame() {
               <Route element={<Navigate replace to={firstRoute} />} path="/" />
               {surfaces.map((surface) => (
                 <Route
-                  element={surface.id === "saga" ? <SagaDashboard /> : surface.id === "ops" ? <OpsRoute /> : surface.id === "turns" ? <TurnsRoute /> : <SurfaceRoute surface={surface} />}
+                  element={surface.id === "saga" ? <SagaDashboard /> : surface.id === "ops" ? <OpsRoute /> : surface.id === "turns" ? <TurnsRoute /> : surface.id === "admin-config" ? <AdminConfigRoute /> : <SurfaceRoute surface={surface} />}
                   key={surface.id}
                   path={surface.path}
                 />

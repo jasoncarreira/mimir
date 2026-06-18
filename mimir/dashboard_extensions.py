@@ -165,11 +165,12 @@ def first_party_dashboard_extensions(
                 api_namespace="memory",
             ),
             DashboardExtensionManifest(
-                id="hermes-gaps",
-                route_path="/hermes",
-                label="Hermes Gaps",
-                icon="route",
+                id="admin-config",
+                route_path="/admin",
+                label="Admin",
+                icon="settings",
                 nav_position=60,
+                api_namespace="admin-config",
             ),
         )
     )
