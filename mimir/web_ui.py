@@ -43,6 +43,12 @@ from typing import Any
 from aiohttp import web
 
 from ._jsonl_tail import tail_jsonl_records
+from .dashboard_extensions import (
+    DashboardBackendRoute,
+    DashboardExtensionRegistry,
+    add_backend_namespace_routes,
+    first_party_dashboard_extensions,
+)
 from .live_events import read_live_event_items_since
 from .ops_dashboard import (
     build_dashboard_payload_async,
@@ -143,6 +149,7 @@ def register_routes(
     saga_db: Path | None = None,
     active_usage_provider: str | None = None,
     react_app_dist: Path | None = None,
+    dashboard_extensions: DashboardExtensionRegistry | None = None,
 ) -> None:
     """Add viewer + API routes to an existing aiohttp app.
 
@@ -162,10 +169,15 @@ def register_routes(
     that has quota data.
 
     ``react_app_dist`` points at the Vite build output. When omitted it defaults
-    to the packaged ``mimir/react_app/dist`` directory."""
+    to the packaged ``mimir/react_app/dist`` directory.
+
+    ``dashboard_extensions`` is the trusted first-party dashboard registry.
+    Enabled manifests drive optional backend namespace hook registration; this
+    is not a remote plugin loading mechanism."""
 
     existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
     _react_app_dist = react_app_dist or (Path(__file__).parent / "react_app" / "dist")
+    _dashboard_extensions = dashboard_extensions or first_party_dashboard_extensions()
 
     async def turns_page(_request: web.Request) -> web.Response:
         return web.Response(text=_load_viewer_html(), content_type="text/html")
@@ -462,6 +474,7 @@ def register_routes(
                     "header": "X-API-Key",
                     "native_eventsource_supported_when_auth_required": False,
                 },
+                "dashboard_extensions": _dashboard_extensions.navigation_payload(),
             },
             headers=_no_store_headers(),
         )
@@ -488,6 +501,7 @@ def register_routes(
                     "header": "X-API-Key",
                     "native_eventsource_supported_when_auth_required": False,
                 },
+                "dashboard_extensions": _dashboard_extensions.navigation_payload(),
             },
             headers=_no_store_headers(),
         )
@@ -712,10 +726,20 @@ def register_routes(
         app.router.add_get("/app/{path:.*}", react_app)
     if ("GET", "/ops") not in existing:
         app.router.add_get("/ops", ops_page)
-    if ("GET", "/api/ops") not in existing:
-        app.router.add_get("/api/ops", ops_data)
-    if ("GET", "/api/v1/ops") not in existing:
-        app.router.add_get("/api/v1/ops", ops_data_v1)
+        existing.add(("GET", "/ops"))
+
+    def ops_backend_routes() -> list[DashboardBackendRoute]:
+        return [
+            DashboardBackendRoute("GET", "/api/ops", ops_data),
+            DashboardBackendRoute("GET", "/api/v1/ops", ops_data_v1),
+        ]
+
+    add_backend_namespace_routes(
+        app,
+        registry=_dashboard_extensions,
+        hooks={"ops": ops_backend_routes},
+        existing=existing,
+    )
     async def saga_sql(request: web.Request) -> web.Response:
         """POST /api/saga/sql — read-only SQL passthrough.
 

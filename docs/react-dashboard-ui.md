@@ -4,6 +4,9 @@ The React dashboard UI kit lives in `frontend/src/ui`. Dashboard pages should
 compose these primitives instead of adding page-local chrome, table, badge,
 modal, or loading-state CSS.
 
+Dashboard tabs are registered through the first-party extension registry
+documented in `docs/react-dashboard-extensions.md`.
+
 ## Theme Tokens
 
 `SkinProvider` converts the active skin manifest into `--mimir-*` CSS variables

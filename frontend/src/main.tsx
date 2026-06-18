@@ -15,6 +15,7 @@ import {
 import { create } from "zustand";
 import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
 import type { WebBootstrapData } from "./api/generated/contracts";
+import { dashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import {
   Badge,
@@ -27,74 +28,7 @@ import {
 } from "./ui";
 import "./styles.css";
 
-type SurfaceId = "chat" | "turns" | "ops" | "saga" | "memory" | "hermes";
-
-interface Surface {
-  id: SurfaceId;
-  path: string;
-  label: string;
-  title: string;
-  detail: string;
-  tabs: string[];
-  filterLabel: string;
-}
-
-const surfaces: Surface[] = [
-  {
-    id: "chat",
-    path: "/chat",
-    label: "Chat",
-    title: "Chat",
-    detail: "Conversation entry point",
-    tabs: ["compose", "history", "context"],
-    filterLabel: "channel"
-  },
-  {
-    id: "turns",
-    path: "/turns",
-    label: "Turn Viewer",
-    title: "Turn Viewer",
-    detail: "Inspect selected turns",
-    tabs: ["summary", "prompt", "events"],
-    filterLabel: "status"
-  },
-  {
-    id: "ops",
-    path: "/ops",
-    label: "Ops",
-    title: "Ops",
-    detail: "Operational overview",
-    tabs: ["overview", "queues", "health"],
-    filterLabel: "scope"
-  },
-  {
-    id: "saga",
-    path: "/saga",
-    label: "SAGA",
-    title: "SAGA",
-    detail: "SAGA session shell",
-    tabs: ["sessions", "atoms", "queries"],
-    filterLabel: "type"
-  },
-  {
-    id: "memory",
-    path: "/memory",
-    label: "State/Memory",
-    title: "State/Memory",
-    detail: "State and memory shell",
-    tabs: ["state", "memory", "files"],
-    filterLabel: "tier"
-  },
-  {
-    id: "hermes",
-    path: "/hermes",
-    label: "Hermes Gaps",
-    title: "Hermes Gaps",
-    detail: "Reserved route for follow-up pages",
-    tabs: ["gaps", "handoffs", "notes"],
-    filterLabel: "owner"
-  }
-];
+const surfaces = dashboardSurfaces;
 
 interface UiState {
   detailsPanelOpen: boolean;
@@ -230,7 +164,7 @@ function AppNavigation() {
   );
 }
 
-function useRouteState(surface: Surface) {
+function useRouteState(surface: DashboardSurface) {
   const [searchParams, setSearchParams] = useSearchParams();
   const activeTab = searchParams.get("tab") || surface.tabs[0];
   const selectedTurn = searchParams.get("turn") || "";
@@ -253,7 +187,7 @@ function RouteTabs({
   surface,
   activeTab
 }: {
-  surface: Surface;
+  surface: DashboardSurface;
   activeTab: string;
 }) {
   const [searchParams] = useSearchParams();
@@ -326,7 +260,7 @@ function RouteTabs({
   );
 }
 
-function UrlStateControls({ surface }: { surface: Surface }) {
+function UrlStateControls({ surface }: { surface: DashboardSurface }) {
   const { selectedTurn, filter, target, update } = useRouteState(surface);
 
   return (
@@ -397,7 +331,7 @@ function CollapsibleRegion({
   );
 }
 
-function RoutePlaceholder({ surface }: { surface: Surface }) {
+function RoutePlaceholder({ surface }: { surface: DashboardSurface }) {
   const { activeTab, selectedTurn, filter, target } = useRouteState(surface);
 
   return (
@@ -415,7 +349,7 @@ function RoutePlaceholder({ surface }: { surface: Surface }) {
   );
 }
 
-function SurfaceRoute({ surface }: { surface: Surface }) {
+function SurfaceRoute({ surface }: { surface: DashboardSurface }) {
   const { activeTab } = useRouteState(surface);
   const normalizedTab = surface.tabs.includes(activeTab) ? activeTab : surface.tabs[0];
   const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
