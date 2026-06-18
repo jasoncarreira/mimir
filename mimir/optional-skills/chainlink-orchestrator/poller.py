@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -122,30 +123,13 @@ def _issue_ids_with_label(home: Path, label: str) -> list[int] | None:
     return ids
 
 
-def _actionable_issue_ids(home: Path) -> list[int] | None:
-    """Open issue ids that Chainlink considers ready/actionable.
-
-    This intentionally delegates dependency semantics to ``chainlink issue ready``
-    instead of reimplementing blocker-edge logic in the poller. Chainlink's
-    ready command filters out issues blocked by open blockers while allowing
-    issues whose blockers have since closed. If the CLI cannot provide
-    parseable JSON, fail closed (``None``) rather than risk dispatching a
-    blocked leaf.
-    """
-    try:
-        proc = subprocess.run(
-            [_chainlink_bin(), "issue", "ready", "--json"],
-            cwd=str(home), capture_output=True, text=True, check=False, timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    try:
-        data = json.loads(proc.stdout or "[]")
-    except json.JSONDecodeError:
-        return None
-    issues = data if isinstance(data, list) else data.get("issues", [])
+def _issue_ids_from_records(data: object) -> list[int]:
+    if isinstance(data, list):
+        issues = data
+    elif isinstance(data, dict):
+        issues = data.get("issues", [])
+    else:
+        issues = []
     ids: list[int] = []
     for item in issues:
         if not isinstance(item, dict):
@@ -158,6 +142,48 @@ def _actionable_issue_ids(home: Path) -> list[int] | None:
         except (TypeError, ValueError):
             continue
     return ids
+
+
+def _issue_ids_from_ready_text(text: str) -> list[int]:
+    """Parse ``chainlink issue ready`` text output when ``--json`` is ignored.
+
+    chainlink 0.2.0 advertises ``--json`` for ``issue ready`` but still prints
+    the human format in some deployed builds. The text is already Chainlink's
+    filtered ready set, so parsing only leading ``#<id>`` rows preserves the
+    blocker semantics without reimplementing edges in the poller.
+    """
+    ids: list[int] = []
+    for line in text.splitlines():
+        match = re.match(r"^\s*#(\d+)\b", line)
+        if match:
+            ids.append(int(match.group(1)))
+    return ids
+
+
+def _actionable_issue_ids(home: Path) -> list[int] | None:
+    """Open issue ids that Chainlink considers ready/actionable.
+
+    This intentionally delegates dependency semantics to ``chainlink issue ready``
+    instead of reimplementing blocker-edge logic in the poller. Chainlink's
+    ready command filters out issues blocked by open blockers while allowing
+    issues whose blockers have since closed. If the CLI cannot provide
+    parseable JSON or recognizable ready-list text, fail closed (``None``) rather
+    than risk dispatching a blocked leaf.
+    """
+    try:
+        proc = subprocess.run(
+            [_chainlink_bin(), "issue", "ready", "--json"],
+            cwd=str(home), capture_output=True, text=True, check=False, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    output = proc.stdout or ""
+    try:
+        return _issue_ids_from_records(json.loads(output or "[]"))
+    except json.JSONDecodeError:
+        return _issue_ids_from_ready_text(output)
 
 
 def _worklink_ready_actionable_ids(home: Path) -> tuple[list[int], int, int] | None:
