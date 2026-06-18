@@ -42,6 +42,30 @@ function formatCell(value: SagaSqlCell | undefined) {
   return String(value);
 }
 
+function formatBytes(value: number | null | undefined) {
+  if (value == null) return "-";
+  if (value < 1024) return `${value} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let scaled = value / 1024;
+  let unitIndex = 0;
+  while (scaled >= 1024 && unitIndex < units.length - 1) {
+    scaled /= 1024;
+    unitIndex += 1;
+  }
+  return `${scaled.toFixed(scaled >= 10 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function formatBool(value: unknown) {
+  if (value === true || value === 1) return "yes";
+  if (value === false || value === 0) return "no";
+  return "-";
+}
+
+function formatTopics(value: unknown) {
+  if (!Array.isArray(value) || !value.length) return "-";
+  return value.map((item) => String(item)).join(", ");
+}
+
 function kindBadge(kind: EvidenceKind) {
   if (kind === "observation") return <Badge tone="info">observation</Badge>;
   if (kind === "triple") return <Badge tone="success">triple</Badge>;
@@ -107,10 +131,18 @@ function AtomDetail({ atomId }: { atomId: string }) {
       <dl className="facts-grid facts-grid--compact">
         <div><dt>ID</dt><dd>{atom.id}</dd></div>
         <div><dt>Type</dt><dd>{String(atom.memory_type ?? "raw")}</dd></div>
+        <div><dt>Source</dt><dd>{String(atom.source_type ?? "-")}</dd></div>
         <div><dt>Stream</dt><dd>{String(atom.stream ?? "semantic")}</dd></div>
+        <div><dt>Session</dt><dd>{String(atom.session_id ?? "-")}</dd></div>
         <div><dt>Channel</dt><dd>{String(atom.channel_id ?? "-")}</dd></div>
+        <div><dt>Topics</dt><dd>{formatTopics(atom.topics)}</dd></div>
+        <div><dt>Confidence</dt><dd>{atom.encoding_confidence == null ? "-" : Number(atom.encoding_confidence).toFixed(3)}</dd></div>
+        <div><dt>Pinned</dt><dd>{formatBool(atom.is_pinned)}</dd></div>
+        <div><dt>Tombstoned</dt><dd>{formatBool(atom.tombstoned)}</dd></div>
+        <div><dt>Tombstone reason</dt><dd>{String(atom.tombstoned_reason ?? "-")}</dd></div>
         <div><dt>Accesses</dt><dd>{String(atom.access_count ?? "-")}</dd></div>
         <div><dt>Last access</dt><dd>{formatDate(atom.last_access_ts as string | undefined)}</dd></div>
+        <div><dt>Last access source</dt><dd>{String(atom.last_access_source ?? "-")}</dd></div>
         <div><dt>Activation</dt><dd>{`arousal ${Number(atom.arousal ?? 0).toFixed(3)} · valence ${Number(atom.valence ?? 0).toFixed(3)}`}</dd></div>
         <div><dt>Embedding</dt><dd>{embedding ? `${embedding.provider}/${embedding.model} dim=${embedding.dim}` : "none"}</dd></div>
       </dl>
@@ -378,6 +410,7 @@ export function SagaDashboard() {
           ["Sessions", stats.data?.session_count],
           ["Triples", stats.data?.triple_count],
           ["Tombstoned", stats.data?.tombstoned_count],
+          ["DB size", formatBytes(stats.data?.db_size_bytes)],
           ["Schema", stats.data?.schema_version == null ? undefined : `v${stats.data.schema_version}`]
         ].map(([label, value]) => (
           <div className="saga-stat" key={label}>

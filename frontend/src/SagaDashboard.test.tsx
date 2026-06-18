@@ -49,7 +49,8 @@ describe("SAGA dashboard rendering", () => {
           session_count: 1,
           triple_count: 1,
           tombstoned_count: 0,
-          schema_version: 6
+          schema_version: 6,
+          db_size_bytes: 1536
         }));
       }
       if (url.includes("view=recent")) {
@@ -61,6 +62,12 @@ describe("SAGA dashboard rendering", () => {
               memory_type: "raw",
               stream: "episodic",
               encoding_confidence: 0.7,
+              source_type: "agent_authored",
+              session_id: "session-1",
+              topics: ["runtime", "memory"],
+              is_pinned: true,
+              tombstoned: false,
+              last_access_source: "query",
               created_at: "2026-06-18T00:00:00Z"
             },
             {
@@ -83,8 +90,58 @@ describe("SAGA dashboard rendering", () => {
     const rawPanel = await screen.findByRole("heading", { name: "Raw Atoms" });
     const observationsPanel = await screen.findByRole("heading", { name: "Observations" });
 
+    expect(screen.getByText("1.5 KB")).toBeTruthy();
     expect(within(rawPanel.closest("section") as HTMLElement).getByText("Raw turn content")).toBeTruthy();
     expect(within(observationsPanel.closest("section") as HTMLElement).getByText("User prefers concise answers")).toBeTruthy();
+  });
+
+  it("renders legacy atom detail fields instead of silently dropping them", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("view=stats")) {
+        return jsonResponse(envelope({ ready: true, atom_count: 1, session_count: 1, triple_count: 0, tombstoned_count: 0, db_size_bytes: 2048 }));
+      }
+      if (url.includes("view=recent")) {
+        return jsonResponse(envelope({
+          atoms: [{ id: "raw-1", content_preview: "Raw turn content", memory_type: "raw", stream: "episodic" }],
+          channels: []
+        }, { cursor: "raw-1", limit: 50, total: 1, truncated: false }));
+      }
+      if (url.includes("view=atom") && url.includes("raw-1")) {
+        return jsonResponse(envelope({
+          id: "raw-1",
+          content: "Full atom body",
+          memory_type: "raw",
+          source_type: "agent_authored",
+          stream: "episodic",
+          session_id: "session-1",
+          channel_id: "discord-123",
+          topics: ["runtime", "memory"],
+          encoding_confidence: 0.875,
+          is_pinned: 1,
+          tombstoned: 0,
+          tombstoned_reason: null,
+          access_count: 3,
+          last_access_ts: "2026-06-18T00:02:00Z",
+          last_access_source: "saga_query",
+          arousal: 0.12,
+          valence: -0.03
+        }));
+      }
+      return jsonResponse(envelope({}));
+    }));
+
+    renderDashboard();
+
+    const rawPanel = (await screen.findByRole("heading", { name: "Raw Atoms" })).closest("section") as HTMLElement;
+    fireEvent.click(within(rawPanel).getByRole("button", { name: "Inspect" }));
+
+    expect(await screen.findByText("agent_authored")).toBeTruthy();
+    expect(screen.getByText("session-1")).toBeTruthy();
+    expect(screen.getByText("runtime, memory")).toBeTruthy();
+    expect(screen.getByText("0.875")).toBeTruthy();
+    expect(screen.getAllByText("yes").length).toBeGreaterThan(0);
+    expect(screen.getByText("saga_query")).toBeTruthy();
+    expect(screen.getByText("Full atom body")).toBeTruthy();
   });
 
   it("renders triple SQL rows as typed triples instead of only generic SQL evidence", async () => {
