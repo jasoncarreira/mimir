@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["lottie==0.7.2"]
+# ///
 """Generate the default retro agent-character Lottie set (chainlink #565).
 
 Builds a simple, cohesive CRT-terminal-face character with one animation per
@@ -10,7 +14,9 @@ is deliberately geometric — programmatic vector shapes, not illustrated mascot
 art — so it ships as a real animated default that a designer can later replace
 without any code change (just swap the .lottie files).
 
-Run:  uv run python scripts/generate_agent_character.py
+Run:  uv run --script scripts/generate_agent_character.py
+      (the only dep, python-lottie, is declared inline via PEP 723 above, so
+      this works from a clean checkout with no project install or sync.)
 Out:  frontend/src/assets/agent-character/{idle,thinking,typing,tool,error}.lottie
 """
 
@@ -197,10 +203,18 @@ def write_dotlottie(an: objects.Animation, path: Path) -> None:
         "generator": "mimir/scripts/generate_agent_character.py",
         "animations": [{"id": an.name, "loop": True, "autoplay": True, "speed": 1.0}],
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # Deterministic ZIP: fixed timestamps + mode so regenerating from a clean
+    # checkout reproduces byte-identical .lottie files (no spurious diffs).
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("manifest.json", json.dumps(manifest, separators=(",", ":")))
-        zf.writestr(f"animations/{an.name}.json", anim_json)
+        _zip_write(zf, "manifest.json", json.dumps(manifest, separators=(",", ":")))
+        _zip_write(zf, f"animations/{an.name}.json", anim_json)
+
+
+def _zip_write(zf: zipfile.ZipFile, name: str, data: str) -> None:
+    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o644 << 16
+    zf.writestr(info, data)
 
 
 def main() -> None:
