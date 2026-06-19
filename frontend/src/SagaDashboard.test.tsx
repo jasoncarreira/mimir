@@ -150,6 +150,50 @@ describe("SAGA dashboard rendering", () => {
     expect(screen.getByText("Full atom body")).toBeTruthy();
   });
 
+  it("filters by type and surfaces triples with click-to-detail (#574)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.includes("view=stats")) {
+        return jsonResponse(envelope({ ready: true, atom_count: 2, triple_count: 1 }));
+      }
+      if (url.includes("view=recent")) {
+        return jsonResponse(envelope({
+          atoms: [
+            { id: "raw-1", content_preview: "Raw turn content", memory_type: "raw", created_at: "2026-06-18T00:00:00Z" },
+            { id: "obs-1", content_preview: "User prefers concise answers", memory_type: "observation", created_at: "2026-06-18T00:01:00Z" }
+          ],
+          channels: []
+        }, { cursor: "obs-1", limit: 50, total: 2, truncated: false }));
+      }
+      if (url.includes("/api/v1/saga/sql") && init?.method === "POST") {
+        return jsonResponse(envelope({
+          columns: ["id", "subject", "predicate", "object", "confidence"],
+          rows: [["tr-1", "user", "prefers", "concise answers", 0.91]],
+          row_count: 1,
+          truncated: false
+        }, { cursor: null, limit: null, total: 1, truncated: false }));
+      }
+      return jsonResponse(envelope({}));
+    }));
+
+    renderDashboard();
+
+    // Unified list shows both kinds by default.
+    expect(await screen.findByText("Raw turn content")).toBeTruthy();
+    expect(screen.getByText("User prefers concise answers")).toBeTruthy();
+
+    // Filter to Observations -> the raw atom drops out.
+    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "observation" } });
+    expect(screen.queryByText("Raw turn content")).toBeNull();
+    expect(screen.getByText("User prefers concise answers")).toBeTruthy();
+
+    // Switch to Triples -> triples become visible; click opens the triple detail.
+    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "triple" } });
+    const tripleRow = await screen.findByRole("button", { name: /prefers/ });
+    fireEvent.click(tripleRow);
+    expect(await screen.findByText("Triple Detail")).toBeTruthy();
+    expect(screen.getByText("concise answers")).toBeTruthy();
+  });
+
   it("renders triple SQL rows as typed triples instead of only generic SQL evidence", async () => {
     vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
       if (url.includes("view=stats")) {

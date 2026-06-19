@@ -2075,6 +2075,21 @@ textarea {
   gap: var(--mimir-space-2xs, 4px);
 }
 
+/* github #574: date-group header in the unified atoms list. */
+.saga-atom-list__day {
+  margin-top: var(--mimir-space-sm, 12px);
+  padding: var(--mimir-space-2xs, 4px) var(--mimir-space-sm, 12px);
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  font-weight: var(--mimir-font-weight-strong, 700);
+  letter-spacing: 0.08em;
+  border-bottom: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+}
+
+.saga-atom-list__day:first-child {
+  margin-top: 0;
+}
+
 .saga-atom-row {
   display: grid;
   grid-template-columns: 92px minmax(0, 1fr) minmax(0, auto) auto;
