@@ -895,6 +895,47 @@ textarea {
   list-style: none;
 }
 
+/* github #572: live activity feed in the chat right panel. */
+.live-activity__feed {
+  display: grid;
+  gap: var(--mimir-space-xs, 8px);
+  max-height: 58vh;
+  overflow: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.live-activity__item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: var(--mimir-space-xs, 8px);
+  align-items: baseline;
+  padding: var(--mimir-space-xs, 8px) var(--mimir-space-sm, 12px);
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-control, 6px);
+  background: var(--mimir-color-panel-background, #fff);
+}
+
+.live-activity__type {
+  font-family: var(--mimir-font-family-mono, monospace);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  font-weight: var(--mimir-font-weight-strong, 700);
+  color: var(--mimir-color-status-info, #315f7d);
+}
+
+.live-activity__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-activity__time {
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+}
+
 .chat-empty {
   display: grid;
   place-items: center;
