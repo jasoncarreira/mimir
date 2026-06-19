@@ -150,7 +150,7 @@ def first_party_dashboard_extensions(
             DashboardExtensionManifest(
                 id="ops",
                 route_path="/ops",
-                label="Ops",
+                label="Usage",
                 icon="activity",
                 nav_position=30,
                 api_namespace="ops",

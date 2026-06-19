@@ -204,8 +204,8 @@ export type SafeOpsDashboardData = Omit<OpsDashboardResponse,
     truncated?: boolean;
     total_count?: number;
   };
-  usage_history: Record<string, Record<string, unknown[]>>;
-  token_usage_history: unknown[];
+  usage_history: OpsDashboardResponse["usage_history"];
+  token_usage_history: OpsDashboardResponse["token_usage_history"];
 };
 
 export function safeOpsDashboardData(data: unknown): SafeOpsDashboardData {
@@ -265,7 +265,9 @@ export function safeOpsDashboardData(data: unknown): SafeOpsDashboardData {
     },
     usage_history: Object.fromEntries(
       Object.entries(recordFrom(source.usage_history)).map(([provider, windows]) => [provider, recordFrom(windows)])
-    ) as Record<string, Record<string, unknown[]>>,
-    token_usage_history: Array.isArray(source.token_usage_history) ? source.token_usage_history : []
+    ) as OpsDashboardResponse["usage_history"],
+    token_usage_history: Array.isArray(source.token_usage_history)
+      ? source.token_usage_history as OpsDashboardResponse["token_usage_history"]
+      : []
   };
 }

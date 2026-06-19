@@ -844,6 +844,7 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     ops_manifest = next(
         item for item in body["data"]["dashboard_extensions"] if item["id"] == "ops"
     )
+    assert ops_manifest["label"] == "Usage"
     assert ops_manifest["api_namespace"] == "ops"
     assert ops_manifest["trusted_first_party"] is True
 
