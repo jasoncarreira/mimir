@@ -591,6 +591,17 @@ async def test_api_v1_live_events_cursor_is_monotonic_for_random_turn_ids(app):
     assert [item["event"]["turn_id"] for item in _sse_data_items(body)] == ["37387608ce3b"]
 
 
+def test_turn_record_to_live_items_carries_seq_on_lifecycle():
+    from mimir.live_events import turn_record_to_live_items
+
+    items = turn_record_to_live_items({"turn_id": "t1", "ts": "2026-01-01T00:00:00Z", "seq": 42})
+    lifecycle = next(i for i in items if i.event["kind"] == "turn.lifecycle")
+    assert lifecycle.event["seq"] == 42
+    # Records predating seq surface None (the dossier just ignores them).
+    legacy = turn_record_to_live_items({"turn_id": "t2", "ts": "2026-01-01T00:00:01Z"})
+    assert legacy[0].event["seq"] is None
+
+
 def test_read_live_event_items_since_stops_after_crossing_acknowledged_timestamp(tmp_path: Path):
     from mimir.live_events import read_live_event_items_since
 
@@ -801,6 +812,8 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     assert body["data"]["version"]  # mimir build/release version surfaced
     # Running model = the model part of the provider:model spec.
     assert body["data"]["model"] == "gpt-5.5"
+    # No turns logged in this fixture -> running total is 0.
+    assert body["data"]["turns_total"] == 0
     # No home configured -> agent UI config falls back to defaults.
     assert body["data"]["ui"] == {"agent_name": "Mimir", "skin": "neon-terminal"}
     assert body["data"]["auth"]["required"] is True
@@ -845,6 +858,17 @@ def test_read_web_ui_config_falls_back_to_defaults(tmp_path: Path):
         "agent_name": "Solo",
         "skin": "neon-terminal",
     }
+
+
+def test_read_turns_total_uses_newest_seq(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    assert web_ui.read_turns_total(path) == 0  # missing file -> 0
+    path.write_text(
+        json.dumps({"turn_id": "a", "seq": 41}) + "\n"
+        + json.dumps({"turn_id": "b", "seq": 42}) + "\n",
+        encoding="utf-8",
+    )
+    assert web_ui.read_turns_total(path) == 42  # newest record's seq
 
 
 def test_ensure_web_ui_config_seeds_defaults_without_clobbering(tmp_path: Path):

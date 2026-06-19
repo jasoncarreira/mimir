@@ -233,6 +233,12 @@ class TurnRecord:
     # predating this field — the turn viewer treats absent agent_id as
     # "unknown / single-agent legacy run".
     agent_id: str | None = None
+    # Monotonically increasing turn sequence number, assigned by TurnLogger on
+    # write. Survives retention trimming (the high-water mark is re-seeded from
+    # the newest retained record), so the latest record's ``seq`` is the running
+    # turn total surfaced in the web dossier. ``None`` on legacy records until
+    # TurnLogger backfills them on startup.
+    seq: int | None = None
     saga_atom_ids: list[str] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     output: str = ""

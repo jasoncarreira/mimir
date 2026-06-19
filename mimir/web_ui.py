@@ -43,7 +43,7 @@ from typing import Any
 from aiohttp import web
 
 from . import __version__
-from ._jsonl_tail import tail_jsonl_records
+from ._jsonl_tail import count_lines_chunked, tail_jsonl_records
 from .admin_config import build_admin_config_payload
 from .admin_users import build_users_payload, roles_for_request
 from .dashboard_extensions import (
@@ -125,6 +125,24 @@ def read_web_ui_config(home: Path | None) -> dict[str, str]:
             if isinstance(configured_skin, str) and configured_skin.strip():
                 skin = configured_skin.strip()
     return {"agent_name": agent_name, "skin": skin}
+
+
+def read_turns_total(turns_log: Path) -> int:
+    """Running turn total for the dossier = the newest turn record's ``seq``.
+
+    TurnLogger keeps ``seq`` monotonic across retention trims, so the newest
+    record carries the count. Falls back to a line count for records that
+    predate ``seq`` (until TurnLogger backfills them on startup).
+    """
+    for record in tail_jsonl_records(turns_log):  # newest-first
+        seq = record.get("seq")
+        if isinstance(seq, int):
+            return seq
+        break
+    try:
+        return count_lines_chunked(turns_log)
+    except OSError:
+        return 0
 
 
 def ensure_web_ui_config(home: Path | None) -> None:
@@ -656,6 +674,7 @@ def register_routes(
             {
                 "version": __version__,
                 "model": model,
+                "turns_total": read_turns_total(turns_log),
                 "auth": {
                     "required": gate,
                     "scheme": "x-api-key",

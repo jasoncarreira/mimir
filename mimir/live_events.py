@@ -62,6 +62,10 @@ def turn_record_to_live_items(turn: dict[str, Any]) -> list[LiveEventItem]:
 
     ts = _turn_sort_ts(turn) or None
     phase = "failed" if turn.get("error") else "finished"
+    # Carry the monotonic turn seq so consumers can show the running total from
+    # max(seq) instead of counting events — backfilled lifecycle items then can't
+    # inflate the count (their seq is <= the bootstrap's turns_total).
+    seq = turn.get("seq")
     items = [
         LiveEventItem(
             id=f"turn:{turn_id}:lifecycle:{phase}",
@@ -73,6 +77,7 @@ def turn_record_to_live_items(turn: dict[str, Any]) -> list[LiveEventItem]:
                 "phase": phase,
                 "ts": ts,
                 "error": turn.get("error"),
+                "seq": seq if isinstance(seq, int) else None,
             },
         )
     ]

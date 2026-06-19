@@ -902,6 +902,46 @@ async def test_turn_logger_writes_appendable_jsonl(tmp_path: Path):
     assert first["events"][0]["type"] == "reasoning"
 
 
+def _seq_record(turn_id: str) -> TurnRecord:
+    return TurnRecord(
+        ts="2026-05-15T12:00:00Z",
+        turn_id=turn_id,
+        session_id="s",
+        saga_session_id=None,
+        trigger="user_message",
+        channel_id="c",
+        input="hi",
+    )
+
+
+async def test_turn_logger_assigns_and_reseeds_monotonic_seq(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    log = TurnLogger(path)
+    await log.write(_seq_record("t1"))
+    await log.write(_seq_record("t2"))
+    seqs = [json.loads(line)["seq"] for line in path.read_text().splitlines()]
+    assert seqs == [1, 2]
+
+    # A fresh logger re-seeds from the newest record's seq (survives restart),
+    # so the count keeps climbing rather than resetting.
+    log2 = TurnLogger(path)
+    await log2.write(_seq_record("t3"))
+    assert json.loads(path.read_text().splitlines()[-1])["seq"] == 3
+
+
+def test_turn_logger_backfills_legacy_records_without_seq(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    path.write_text(
+        json.dumps({"turn_id": "a", "input": "x"}) + "\n"
+        + json.dumps({"turn_id": "b", "input": "y"}) + "\n",
+        encoding="utf-8",
+    )
+    log = TurnLogger(path)  # populates seq on startup
+    seqs = [json.loads(line)["seq"] for line in path.read_text().splitlines()]
+    assert seqs == [1, 2]
+    assert log._seq == 2
+
+
 # ─── _coerce_content content-block filtering (Anthropic extended thinking) ──
 
 
