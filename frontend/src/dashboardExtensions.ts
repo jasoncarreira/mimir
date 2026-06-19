@@ -55,6 +55,11 @@ const firstPartySurfaceMetadata: Record<
     detail: "Config, model, and redacted env",
     tabs: ["model", "config", "env"],
     filterLabel: "section"
+  },
+  "admin-users": {
+    detail: "Per-user keys and roles",
+    tabs: ["users"],
+    filterLabel: "role"
   }
 };
 
@@ -94,4 +99,17 @@ export function getDashboardSurfaces(
       || a.label.localeCompare(b.label)
       || a.id.localeCompare(b.id)
     ));
+}
+
+// Role-gate surfaces for the nav + router (github #563): a surface with
+// requires_role "admin" is hidden unless the caller is an admin. UX only — the
+// server still enforces /api/v1/admin/ with a 403; this just keeps admin
+// entries out of non-admin navigation (and their routes unreachable in-app).
+export function visibleSurfaces(
+  surfaces: DashboardSurface[],
+  isAdmin: boolean
+): DashboardSurface[] {
+  return surfaces.filter(
+    (surface) => surface.requires_role !== "admin" || isAdmin
+  );
 }

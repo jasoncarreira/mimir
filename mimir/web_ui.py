@@ -44,6 +44,7 @@ from aiohttp import web
 
 from ._jsonl_tail import tail_jsonl_records
 from .admin_config import build_admin_config_payload
+from .admin_users import build_users_payload, roles_for_request
 from .dashboard_extensions import (
     DashboardBackendRoute,
     DashboardExtensionRegistry,
@@ -699,6 +700,58 @@ def register_routes(
         )
         return json_success(payload, headers=_no_store_headers())
 
+    # ── admin Users page: list + mint/rotate/revoke keys (#563) ───────
+    # All under /api/v1/admin/ → admin-gated by the auth middleware. The list
+    # NEVER returns key material; mint returns the raw key ONCE (out-of-band
+    # hand-off), and after a mint/revoke the live resolver is reloaded so the
+    # change takes effect for auth immediately.
+
+    async def admin_users_v1(request: web.Request) -> web.Response:
+        resolver = request.app.get("identity_resolver")
+        if resolver is None:
+            return json_error("unavailable", "identity resolver not configured", status=503)
+        return json_success(build_users_payload(resolver), headers=_no_store_headers())
+
+    async def admin_users_issue_key_v1(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return json_error("bad_request", "invalid json", status=400)
+        canonical = str((body or {}).get("canonical") or "").strip()
+        if not canonical:
+            return json_error("bad_request", "canonical required", status=400)
+        try:
+            roles = roles_for_request((body or {}).get("role"))
+        except ValueError as exc:
+            return json_error("bad_request", str(exc), status=400)
+        from .identities_populator import issue_web_key
+
+        raw_key = await asyncio.to_thread(issue_web_key, home, canonical, roles=roles)
+        resolver = request.app.get("identity_resolver")
+        if resolver is not None:
+            await asyncio.to_thread(resolver.reload)  # make the new key live now
+        # The raw key is returned ONCE — never persisted, never re-fetchable.
+        return json_success(
+            {"canonical": canonical, "key": raw_key}, headers=_no_store_headers()
+        )
+
+    async def admin_users_revoke_key_v1(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return json_error("bad_request", "invalid json", status=400)
+        canonical = str((body or {}).get("canonical") or "").strip()
+        if not canonical:
+            return json_error("bad_request", "canonical required", status=400)
+        from .identities_populator import revoke_web_key
+
+        revoked = await asyncio.to_thread(revoke_web_key, home, canonical)
+        resolver = request.app.get("identity_resolver")
+        if resolver is not None:
+            await asyncio.to_thread(resolver.reload)
+        return json_success(
+            {"canonical": canonical, "revoked": revoked}, headers=_no_store_headers()
+        )
 
     # ── /saga — saga DB viewer ───────────────────────────────────────
 
@@ -925,6 +978,13 @@ def register_routes(
             DashboardBackendRoute("GET", "/api/v1/admin/config", admin_config_v1),
         ]
 
+    def admin_users_backend_routes() -> list[DashboardBackendRoute]:
+        return [
+            DashboardBackendRoute("GET", "/api/v1/admin/users", admin_users_v1),
+            DashboardBackendRoute("POST", "/api/v1/admin/users/key", admin_users_issue_key_v1),
+            DashboardBackendRoute("POST", "/api/v1/admin/users/revoke", admin_users_revoke_key_v1),
+        ]
+
     add_backend_namespace_routes(
         app,
         registry=_dashboard_extensions,
@@ -933,6 +993,7 @@ def register_routes(
             "chainlink-board": chainlink_board_backend_routes,
             "scheduler": scheduler_backend_routes,
             "admin-config": admin_config_backend_routes,
+            "admin-users": admin_users_backend_routes,
         },
         existing=existing,
     )

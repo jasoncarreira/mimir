@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
 import React from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -17,7 +17,9 @@ import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
 import { ChatRoute } from "./ChatRoute";
 import { ChainlinkBoardRoute } from "./routes/ChainlinkBoardRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
-import { getDashboardSurfaces, type DashboardSurface } from "./dashboardExtensions";
+import { getDashboardSurfaces, visibleSurfaces, type DashboardSurface } from "./dashboardExtensions";
+import { getWhoami } from "./api/whoami";
+import { UsersRoute } from "./routes/UsersRoute";
 import { LiveEventsProvider, useLiveEvents } from "./live-events";
 import { SagaDashboard } from "./SagaDashboard";
 import { AdminConfigRoute } from "./routes/AdminConfigRoute";
@@ -67,12 +69,20 @@ function useBootstrap() {
   });
 }
 
+function useWhoami() {
+  return useQuery({
+    queryKey: ["whoami"],
+    queryFn: async () => (await getWhoami()).data
+  });
+}
+
 function AuthPanel({ bootstrap, error, isError, isLoading }: {
   bootstrap?: WebBootstrapData;
   error: Error | null;
   isError: boolean;
   isLoading: boolean;
 }) {
+  const client = useQueryClient();
   const [entry, setEntry] = React.useState("");
   const [apiKeyPresent, setApiKeyPresent] = React.useState(Boolean(readStoredKey()));
   const requiresKey = bootstrap?.auth.required ?? false;
@@ -87,6 +97,11 @@ function AuthPanel({ bootstrap, error, isError, isLoading }: {
       // Storage can be blocked by browser policy; the visible state still updates.
     }
     setApiKeyPresent(Boolean(trimmed));
+    // The signed-in identity just changed: refetch whoami so role-gated surfaces
+    // (admin Users/Config) appear right after login and disappear on logout,
+    // without a page reload (github #563). whoami reads the new key from
+    // localStorage via apiFetchEnvelope.
+    void client.invalidateQueries({ queryKey: ["whoami"] });
   }
 
   return (
@@ -398,13 +413,20 @@ function AppStatus() {
   );
 }
 
-function AppFrame() {
+export function AppFrame() {
   const { skin } = useSkin();
   const liveEvents = useLiveEvents();
   const { data: bootstrap, error, isError, isLoading } = useBootstrap();
+  const { data: whoami } = useWhoami();
+  // Open/dev mode (auth not required) doesn't gate /api/v1/admin/ server-side,
+  // so surface admin sections there; in a gated server, hide them unless the
+  // resolved identity is an admin (server still 403s either way — this is UX).
+  const isAdmin = (whoami?.is_admin ?? false) || !(bootstrap?.auth.required ?? false);
   const surfaces = React.useMemo(
-    () => (bootstrap ? getDashboardSurfaces(bootstrap.dashboard_extensions) : []),
-    [bootstrap]
+    () => (bootstrap
+      ? visibleSurfaces(getDashboardSurfaces(bootstrap.dashboard_extensions), isAdmin)
+      : []),
+    [bootstrap, isAdmin]
   );
   const firstRoute = surfaces[0]?.path ?? "/chat";
   const agentState =
@@ -449,9 +471,11 @@ function AppFrame() {
                             ? <TurnsRoute />
                             : surface.id === "admin-config"
                               ? <AdminConfigRoute />
-                              : surface.id === "scheduler"
-                                ? <SchedulerRoute />
-                                : <SurfaceRoute surface={surface} />
+                              : surface.id === "admin-users"
+                                ? <UsersRoute />
+                                : surface.id === "scheduler"
+                                  ? <SchedulerRoute />
+                                  : <SurfaceRoute surface={surface} />
                   }
                   key={surface.id}
                   path={surface.path}
@@ -486,21 +510,21 @@ function RoutedLiveEventsProvider({ children }: { children: React.ReactNode }) {
   );
 }
 
+// Guarded so importing this module in tests (jsdom, no #root) doesn't mount the
+// app; the browser bundle always has #root. AppFrame is exported for testing.
 const root = document.getElementById("root");
-if (!root) {
-  throw new Error("React root element not found");
+if (root) {
+  createRoot(root).render(
+    <React.StrictMode>
+      <QueryClientProvider client={queryClient}>
+        <SkinProvider>
+          <BrowserRouter basename={appBasename()}>
+            <RoutedLiveEventsProvider>
+              <AppFrame />
+            </RoutedLiveEventsProvider>
+          </BrowserRouter>
+        </SkinProvider>
+      </QueryClientProvider>
+    </React.StrictMode>
+  );
 }
-
-createRoot(root).render(
-  <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <SkinProvider>
-        <BrowserRouter basename={appBasename()}>
-          <RoutedLiveEventsProvider>
-            <AppFrame />
-          </RoutedLiveEventsProvider>
-        </BrowserRouter>
-      </SkinProvider>
-    </QueryClientProvider>
-  </React.StrictMode>
-);
