@@ -1,13 +1,20 @@
 import React from "react";
+import { AgentDossier } from "./AgentDossier";
 import { createChatStream, sendChatMessage, type ChatStreamPayload } from "./api/chat";
+import { useBootstrap } from "./api/bootstrap";
 import { useChatStore, type ChatMessageStatus } from "./chatStore";
 import type { DashboardSurface } from "./dashboardExtensions";
 import { LiveActivityPanel } from "./LiveActivityPanel";
 import { useRouteState } from "./routeState";
-import { Badge, Button, DashboardHeader, ErrorState, Panel, TextInput } from "./ui";
+import { Badge, Button, ErrorState, TextInput } from "./ui";
 import { useUiState } from "./uiState";
 
 type ChatStreamState = "connecting" | "open" | "error";
+
+// github #581: a glyph palette next to Send. Most insert their symbol into the
+// composer (terminal flavor); "⌫" clears it. Richer per-glyph commands (skills,
+// shortcuts, recall/history) are a follow-up.
+const COMPOSER_GLYPHS = ["/", "⌘", "↑", "↻", "§", "Δ", "⌫", "⇪", "◇", "×", "±", "⇄"] as const;
 
 function makeDefaultChatSessionId() {
   const generated = `session-${Math.random().toString(36).slice(2, 10)}`;
@@ -21,14 +28,6 @@ function makeDefaultChatSessionId() {
   return generated;
 }
 
-function formatMessageTime(timestamp: string) {
-  return new Intl.DateTimeFormat(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit"
-  }).format(new Date(timestamp));
-}
-
 function statusTone(status: ChatMessageStatus | ChatStreamState): "neutral" | "info" | "success" | "warning" | "danger" {
   if (status === "done") return "success";
   if (status === "error") return "danger";
@@ -37,7 +36,7 @@ function statusTone(status: ChatMessageStatus | ChatStreamState): "neutral" | "i
 }
 
 export function ChatRoute({ surface }: { surface: DashboardSurface }) {
-  const { channel, filter, selectedTurn, update } = useRouteState(surface);
+  const { channel, filter, update } = useRouteState(surface);
   const initialChannel = channel || filter || "web-default";
   const [channelEntry, setChannelEntry] = React.useState(initialChannel);
   const [channelId, setChannelId] = React.useState(initialChannel);
@@ -48,12 +47,18 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   // github #567: persisted across tab switches (route unmount) — see chatStore.
   const messages = useChatStore((state) => state.messages);
   const setMessages = useChatStore((state) => state.setMessages);
-  const setDetailsPanelOpen = useUiState((state) => state.setDetailsPanelOpen);
-  const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
   const setSelectedChatMessageId = useUiState((state) => state.setSelectedChatMessageId);
-  const storedSelectedMessageId = useUiState((state) => state.selectedChatMessageId);
   const setComposerActive = useUiState((state) => state.setComposerActive);
-  const selectedMessageId = selectedTurn || storedSelectedMessageId;
+  const { data: bootstrap } = useBootstrap();
+  const agentName = bootstrap?.ui?.agent_name || "Mimir";
+
+  function applyGlyph(glyph: string) {
+    if (glyph === "⌫") {
+      setComposerText("");
+      return;
+    }
+    setComposerText((current) => current + glyph);
+  }
 
   // github #580: clear the listening signal when leaving the chat.
   React.useEffect(() => () => setComposerActive(false), [setComposerActive]);
@@ -160,96 +165,78 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const visibleMessages = messages.filter((message) => message.channelId === channelId);
 
   return (
-    <>
-      <DashboardHeader eyebrow="Web chat" title={surface.title}>
-        <p>{surface.detail}</p>
-      </DashboardHeader>
-      <div className="content-layout chat-layout">
-        <section aria-label="Chat timeline" className="content-layout__main chat-main">
-          <Panel
-            actions={
-              <>
-                <Badge tone={statusTone(streamState)}>{streamState}</Badge>
-                <Button
-                  aria-expanded={detailsPanelOpen}
-                  aria-controls="activity-panel-host"
-                  onClick={() => setDetailsPanelOpen(!detailsPanelOpen)}
+    <div className="content-layout chat-layout">
+      <section aria-label="Chat timeline" className="content-layout__main chat-main">
+        <div className="chat-panel">
+          <header className="chat-panel__head">
+            <span className="chat-panel__title">WEB CHAT — {sessionId}</span>
+            <span className="chat-panel__meta">
+              <span className="chat-panel__channel">CHANNEL {channelId}</span>
+              <Badge tone={statusTone(streamState)}>{streamState}</Badge>
+            </span>
+          </header>
+          <form
+            className="chat-identity-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const nextChannel = channelEntry.trim() || "web-default";
+              setChannelId(nextChannel);
+              update({ channel: nextChannel, filter: nextChannel });
+            }}
+          >
+            <label>
+              <span>Channel</span>
+              <TextInput value={channelEntry} onChange={(event) => setChannelEntry(event.target.value)} />
+            </label>
+            <label>
+              <span>Session</span>
+              <TextInput value={sessionId} onChange={(event) => setSessionId(event.target.value.trim())} />
+            </label>
+            <Button type="submit">Apply</Button>
+          </form>
+          {streamError ? <ErrorState title="Stream error">{streamError}</ErrorState> : null}
+          <ol aria-label="Messages" className="chat-timeline">
+            {visibleMessages.length === 0 ? (
+              <li className="chat-empty">No messages in this channel yet.</li>
+            ) : visibleMessages.map((message) => (
+              <li className={`chat-message chat-message--${message.role}`} key={message.id}>
+                <span className="chat-message__role">{message.role === "user" ? "You" : agentName}</span>
+                <span className="chat-message__text">{message.text}</span>
+                {message.error ? <span className="chat-message__error">{message.error}</span> : null}
+              </li>
+            ))}
+          </ol>
+          <form className="chat-composer" onSubmit={submitMessage}>
+            <textarea
+              aria-label="Message"
+              className="ui-input chat-composer__input"
+              placeholder="Send a message"
+              value={composerText}
+              onChange={(event) => setComposerText(event.target.value)}
+              onFocus={() => setComposerActive(true)}
+              onBlur={() => setComposerActive(false)}
+            />
+            <div className="chat-composer__glyphs" aria-label="Composer glyphs">
+              {COMPOSER_GLYPHS.map((glyph) => (
+                <button
+                  className="chat-composer__glyph"
+                  key={glyph}
+                  onClick={() => applyGlyph(glyph)}
+                  title={glyph === "⌫" ? "Clear" : `Insert ${glyph}`}
                   type="button"
                 >
-                  Activity
-                </Button>
-              </>
-            }
-            title="Conversation"
-            subtitle="Messages are scoped to the selected web channel. Session ID is sent as request metadata for traceability."
-          >
-            <form
-              className="chat-identity-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                const nextChannel = channelEntry.trim() || "web-default";
-                setChannelId(nextChannel);
-                update({ channel: nextChannel, filter: nextChannel });
-              }}
-            >
-              <label>
-                <span>Channel</span>
-                <TextInput value={channelEntry} onChange={(event) => setChannelEntry(event.target.value)} />
-              </label>
-              <label>
-                <span>Session</span>
-                <TextInput value={sessionId} onChange={(event) => setSessionId(event.target.value.trim())} />
-              </label>
-              <Button type="submit">Apply</Button>
-            </form>
-            {streamError ? <ErrorState title="Stream error">{streamError}</ErrorState> : null}
-            <ol aria-label="Messages" className="chat-timeline">
-              {visibleMessages.length === 0 ? (
-                <li className="chat-empty">No messages in this channel yet.</li>
-              ) : visibleMessages.map((message) => (
-                <li className={`chat-message chat-message--${message.role}`} key={message.id}>
-                  <button
-                    aria-pressed={selectedMessageId === message.id}
-                    className="chat-message__button"
-                    onClick={() => selectMessage(message.id)}
-                    type="button"
-                  >
-                    <span className="chat-message__meta">
-                      <strong>{message.role}</strong>
-                      <time dateTime={message.timestamp}>{formatMessageTime(message.timestamp)}</time>
-                      <Badge tone={statusTone(message.status)}>{message.status}</Badge>
-                    </span>
-                    <span className="chat-message__text">{message.text}</span>
-                    {message.error ? <span className="chat-message__error">{message.error}</span> : null}
-                  </button>
-                </li>
+                  {glyph}
+                </button>
               ))}
-            </ol>
-            <form className="chat-composer" onSubmit={submitMessage}>
-              <label>
-                <span>Message</span>
-                <textarea
-                  className="ui-input chat-composer__input"
-                  placeholder="Send a message"
-                  value={composerText}
-                  onChange={(event) => setComposerText(event.target.value)}
-                  onFocus={() => setComposerActive(true)}
-                  onBlur={() => setComposerActive(false)}
-                />
-              </label>
-              <Button disabled={!composerText.trim()} type="submit" variant="primary">Send</Button>
-            </form>
-          </Panel>
-        </section>
-        <aside
-          aria-label="Live activity"
-          className="content-layout__details"
-          hidden={!detailsPanelOpen}
-          id="activity-panel-host"
-        >
-          <LiveActivityPanel />
-        </aside>
-      </div>
-    </>
+            </div>
+            <Button className="chat-composer__send" disabled={!composerText.trim()} type="submit" variant="primary">Send</Button>
+          </form>
+        </div>
+      </section>
+      <aside aria-label="Agent" className="content-layout__details chat-rail">
+        <AgentDossier />
+        <LiveActivityPanel />
+      </aside>
+    </div>
   );
 }

@@ -5,6 +5,7 @@ import {
   useMemo,
   type PropsWithChildren
 } from "react";
+import { useBootstrap } from "../api/bootstrap";
 import { cosmicNebulaSkin } from "./cosmic-nebula";
 import { defaultRetroSkin } from "./default-retro";
 import { neonTerminalSkin } from "./neon-terminal";
@@ -165,8 +166,16 @@ export function SkinProvider({
   children,
   skinId
 }: SkinProviderProps) {
-  // Explicit prop wins (tests/embeds); otherwise resolve from the URL/default.
-  const skin = loadSkin(skinId ?? resolveSkinId());
+  // Precedence: explicit prop (tests/embeds) > ?skin= override > the agent's
+  // configured skin (bootstrap.ui.skin) > default. Bootstrap loads async, so the
+  // configured skin applies once it arrives (default until then).
+  const { data: bootstrap } = useBootstrap();
+  const configured = bootstrap?.ui?.skin;
+  const fallback =
+    configured && Object.prototype.hasOwnProperty.call(localSkins, configured)
+      ? (configured as SkinId)
+      : DEFAULT_SKIN_ID;
+  const skin = loadSkin(skinId ?? resolveSkinId(fallback));
   useSkinFonts(skin);
   const cssVariables = useMemo(() => skinTokensToCssVariables(skin), [skin]);
   const contextValue = useMemo(
