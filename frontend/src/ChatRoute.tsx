@@ -6,7 +6,7 @@ import { useChatStore, type ChatMessageStatus } from "./chatStore";
 import type { DashboardSurface } from "./dashboardExtensions";
 import { LiveActivityPanel } from "./LiveActivityPanel";
 import { useRouteState } from "./routeState";
-import { Badge, Button, ErrorState, TextInput } from "./ui";
+import { Badge, Button, ErrorState } from "./ui";
 import { useUiState } from "./uiState";
 
 type ChatStreamState = "connecting" | "open" | "error";
@@ -38,9 +38,8 @@ function statusTone(status: ChatMessageStatus | ChatStreamState): "neutral" | "i
 export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const { channel, filter, update } = useRouteState(surface);
   const initialChannel = channel || filter || "web-default";
-  const [channelEntry, setChannelEntry] = React.useState(initialChannel);
   const [channelId, setChannelId] = React.useState(initialChannel);
-  const [sessionId, setSessionId] = React.useState(() => makeDefaultChatSessionId());
+  const [sessionId] = React.useState(() => makeDefaultChatSessionId());
   const [composerText, setComposerText] = React.useState("");
   const [streamState, setStreamState] = React.useState<ChatStreamState>("connecting");
   const [streamError, setStreamError] = React.useState("");
@@ -67,7 +66,6 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     const routeChannel = channel || filter;
     if (routeChannel && routeChannel !== channelId) {
       setChannelId(routeChannel);
-      setChannelEntry(routeChannel);
     }
   }, [channel, channelId, filter]);
 
@@ -151,7 +149,6 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
       )));
       if (accepted.data.channel_id !== channelId) {
         setChannelId(accepted.data.channel_id);
-        setChannelEntry(accepted.data.channel_id);
         update({ channel: accepted.data.channel_id, filter: accepted.data.channel_id });
       }
     } catch (error) {
@@ -175,25 +172,6 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
               <Badge tone={statusTone(streamState)}>{streamState}</Badge>
             </span>
           </header>
-          <form
-            className="chat-identity-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              const nextChannel = channelEntry.trim() || "web-default";
-              setChannelId(nextChannel);
-              update({ channel: nextChannel, filter: nextChannel });
-            }}
-          >
-            <label>
-              <span>Channel</span>
-              <TextInput value={channelEntry} onChange={(event) => setChannelEntry(event.target.value)} />
-            </label>
-            <label>
-              <span>Session</span>
-              <TextInput value={sessionId} onChange={(event) => setSessionId(event.target.value.trim())} />
-            </label>
-            <Button type="submit">Apply</Button>
-          </form>
           {streamError ? <ErrorState title="Stream error">{streamError}</ErrorState> : null}
           <ol aria-label="Messages" className="chat-timeline">
             {visibleMessages.length === 0 ? (

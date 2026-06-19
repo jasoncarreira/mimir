@@ -646,9 +646,16 @@ def register_routes(
         config = request.app.get("config")
         web_host = str(getattr(config, "web_host", "") or "")
         public_bind = web_host not in ("", "127.0.0.1", "::1", "localhost")
+        # The running model is the model part of the "provider:model" spec
+        # (e.g. "codex_plus:gpt-5.5" -> "gpt-5.5"); fall back to the bare model.
+        model_spec = str(getattr(config, "model_spec", "") or "")
+        model = model_spec.split(":", 1)[1] if ":" in model_spec else (
+            model_spec or str(getattr(config, "model", "") or "")
+        )
         return json_success(
             {
                 "version": __version__,
+                "model": model,
                 "auth": {
                     "required": gate,
                     "scheme": "x-api-key",
