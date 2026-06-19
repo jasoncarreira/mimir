@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
 import React from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -82,6 +82,7 @@ function AuthPanel({ bootstrap, error, isError, isLoading }: {
   isError: boolean;
   isLoading: boolean;
 }) {
+  const client = useQueryClient();
   const [entry, setEntry] = React.useState("");
   const [apiKeyPresent, setApiKeyPresent] = React.useState(Boolean(readStoredKey()));
   const requiresKey = bootstrap?.auth.required ?? false;
@@ -96,6 +97,11 @@ function AuthPanel({ bootstrap, error, isError, isLoading }: {
       // Storage can be blocked by browser policy; the visible state still updates.
     }
     setApiKeyPresent(Boolean(trimmed));
+    // The signed-in identity just changed: refetch whoami so role-gated surfaces
+    // (admin Users/Config) appear right after login and disappear on logout,
+    // without a page reload (github #563). whoami reads the new key from
+    // localStorage via apiFetchEnvelope.
+    void client.invalidateQueries({ queryKey: ["whoami"] });
   }
 
   return (
@@ -407,7 +413,7 @@ function AppStatus() {
   );
 }
 
-function AppFrame() {
+export function AppFrame() {
   const { skin } = useSkin();
   const liveEvents = useLiveEvents();
   const { data: bootstrap, error, isError, isLoading } = useBootstrap();
@@ -504,21 +510,21 @@ function RoutedLiveEventsProvider({ children }: { children: React.ReactNode }) {
   );
 }
 
+// Guarded so importing this module in tests (jsdom, no #root) doesn't mount the
+// app; the browser bundle always has #root. AppFrame is exported for testing.
 const root = document.getElementById("root");
-if (!root) {
-  throw new Error("React root element not found");
+if (root) {
+  createRoot(root).render(
+    <React.StrictMode>
+      <QueryClientProvider client={queryClient}>
+        <SkinProvider>
+          <BrowserRouter basename={appBasename()}>
+            <RoutedLiveEventsProvider>
+              <AppFrame />
+            </RoutedLiveEventsProvider>
+          </BrowserRouter>
+        </SkinProvider>
+      </QueryClientProvider>
+    </React.StrictMode>
+  );
 }
-
-createRoot(root).render(
-  <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <SkinProvider>
-        <BrowserRouter basename={appBasename()}>
-          <RoutedLiveEventsProvider>
-            <AppFrame />
-          </RoutedLiveEventsProvider>
-        </BrowserRouter>
-      </SkinProvider>
-    </QueryClientProvider>
-  </React.StrictMode>
-);
