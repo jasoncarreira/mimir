@@ -54,7 +54,8 @@ export function LiveEventsProvider({
   initialCursor = "",
   apiKey,
   baseUrl,
-  fetchImpl
+  fetchImpl,
+  enabled = true
 }: {
   children: React.ReactNode;
   queryClient?: LiveEventsQueryClient;
@@ -63,9 +64,13 @@ export function LiveEventsProvider({
   apiKey?: string;
   baseUrl?: string;
   fetchImpl?: typeof fetch;
+  // When false, the provider does NOT open the stream — used to keep a protected
+  // server from fetching /api/v1/live-events before the user has signed in. The
+  // stream connects when this flips true.
+  enabled?: boolean;
 }) {
   const [value, setValue] = React.useState<LiveEventsContextValue>({
-    status: "connecting",
+    status: enabled ? "connecting" : "closed",
     cursor: initialCursor,
     lastEvent: null,
     error: null
@@ -75,6 +80,12 @@ export function LiveEventsProvider({
   policyRef.current = cachePolicy;
 
   React.useEffect(() => {
+    if (!enabled) {
+      // Not signed in (or auth policy still unknown): stay closed, no fetch.
+      setValue((current) => ({ ...current, status: "closed" }));
+      return;
+    }
+
     const flushAggregateInvalidations = () => {
       invalidateTimer.current = null;
       const keys = policyRef.current.aggregateQueryKeys ?? [];
@@ -131,7 +142,7 @@ export function LiveEventsProvider({
       if (invalidateTimer.current) clearTimeout(invalidateTimer.current);
       setValue((current) => ({ ...current, status: "closed" }));
     };
-  }, [apiKey, baseUrl, fetchImpl, initialCursor, queryClient]);
+  }, [apiKey, baseUrl, fetchImpl, initialCursor, queryClient, enabled]);
 
   return (
     <LiveEventsContext.Provider value={value}>

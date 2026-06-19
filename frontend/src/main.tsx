@@ -69,11 +69,25 @@ function useBootstrap() {
   });
 }
 
-function useWhoami() {
+function useWhoami(enabled: boolean) {
   return useQuery({
     queryKey: ["whoami"],
-    queryFn: async () => (await getWhoami()).data
+    queryFn: async () => (await getWhoami()).data,
+    // Don't call /api/v1/whoami until the user is signed in — a protected server
+    // with no key would otherwise issue an unauthenticated request pre-login.
+    enabled
   });
+}
+
+// Whether the dashboard (and its authenticated clients) may run: the auth policy
+// must be known, and either the server is open or a key is stored. Bootstrap
+// itself is public, so it's allowed to load before this is true.
+function isSignedIn(
+  bootstrap: WebBootstrapData | undefined,
+  apiKeyPresent: boolean
+): boolean {
+  if (!bootstrap) return false;
+  return !bootstrap.auth.required || apiKeyPresent;
 }
 
 // Writes/clears the API key + flips the shared store flag (so AppFrame's login
@@ -498,7 +512,10 @@ function LoginScreen({ bootstrap, error, isError, isLoading }: {
 export function AppFrame() {
   const liveEvents = useLiveEvents();
   const { data: bootstrap, error, isError, isLoading } = useBootstrap();
-  const { data: whoami } = useWhoami();
+  const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
+  const signedIn = isSignedIn(bootstrap, apiKeyPresent);
+  // Gate identity on sign-in so a protected server doesn't fetch whoami pre-login.
+  const { data: whoami } = useWhoami(signedIn);
   // Open/dev mode (auth not required) doesn't gate /api/v1/admin/ server-side,
   // so surface admin sections there; in a gated server, hide them unless the
   // resolved identity is an admin (server still 403s either way — this is UX).
@@ -518,9 +535,6 @@ export function AppFrame() {
       ? "error"
       : characterStateFromLiveEvent(liveEvents.lastEvent?.event);
   const agentState = withComposerListening(eventState, composerActive);
-  const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
-  const requiresKey = bootstrap?.auth.required ?? false;
-  const signedIn = !requiresKey || apiKeyPresent;
 
   // Protected + not signed in (or still resolving the policy): show a focused
   // login screen instead of a dashboard full of 401 error panels.
@@ -581,12 +595,18 @@ export function AppFrame() {
 function RoutedLiveEventsProvider({ children }: { children: React.ReactNode }) {
   const [searchParams] = useSearchParams();
   const selectedTurnId = searchParams.get("turn") || null;
-  // Re-render on sign-in/out so the stream reconnects with the new key.
+  // Re-render on sign-in/out so the stream connects/reconnects with the new key.
   const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
+  // Shares the cached ["web-bootstrap"] query with AppFrame (public, no auth).
+  const { data: bootstrap } = useBootstrap();
+  const signedIn = isSignedIn(bootstrap, apiKeyPresent);
 
   return (
     <LiveEventsProvider
       apiKey={apiKeyPresent ? readStoredKey() || undefined : undefined}
+      // Don't open the authenticated SSE stream until signed in — otherwise a
+      // protected server fetches /api/v1/live-events while the login screen shows.
+      enabled={signedIn}
       cachePolicy={{
         aggregateQueryKeys: [["web-bootstrap"], ["turns"]],
         selectedTurnId,

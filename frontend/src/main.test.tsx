@@ -114,6 +114,9 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
     expect(await screen.findByRole("button", { name: "Sign in" })).toBeTruthy();
     expect(screen.queryByRole("link", { name: /Chat/ })).toBeNull();
     expect(screen.queryByRole("link", { name: /Users/ })).toBeNull();
+    // ...and no authenticated client runs pre-login: whoami stays disabled until
+    // signed in (the live-events stream gate is covered in LiveEventsProvider.test).
+    expect(whoami.getWhoami).not.toHaveBeenCalled();
 
     // Operator enters an admin key and signs in.
     fireEvent.change(screen.getByLabelText("MIMIR_API_KEY"), {
