@@ -72,7 +72,7 @@ export const neonTerminalSkin = {
     motionDurationNormal: "180ms"
   },
   chrome: {
-    layout: "centered-shell",
+    layout: "top-nav",
     density: "compact",
     accentPlacement: "top-rule"
   },
