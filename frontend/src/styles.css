@@ -36,6 +36,12 @@ textarea {
   min-height: 100vh;
   color: var(--mimir-color-text, #16201b);
   background: var(--mimir-color-background, #f8faf9);
+  /* The skin's CSS variables are defined on THIS element (inline style), so the
+     font must be applied here — at :root the vars are undefined and font-family
+     silently fell back to sans, ignoring the skin's webfont. */
+  font-family: var(--mimir-font-family-base, ui-sans-serif, system-ui, sans-serif);
+  font-size: var(--mimir-font-size-md, 1rem);
+  line-height: var(--mimir-line-height-body, 1.5);
 }
 
 .ui-shell {
@@ -633,6 +639,25 @@ textarea {
   min-width: 0;
 }
 
+/* github #576: compact header status strip (replaces the status card). */
+.app-status-chip {
+  padding: 2px 10px;
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-chrome-accent, #60786a);
+  border-radius: var(--mimir-radius-control, 6px);
+  background: var(--mimir-color-chrome-accent, #60786a);
+  color: var(--mimir-color-chrome-accent-text, #ffffff);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  font-weight: var(--mimir-font-weight-strong, 700);
+  letter-spacing: 0.08em;
+}
+
+.app-header__signal {
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+}
+
 /* Compound selector so this beats the later base `.agent-character` width
    (min(180px,100%)) — otherwise the header avatar squashes (#784 review). */
 .agent-character.app-header__character {
@@ -645,9 +670,11 @@ textarea {
   min-width: 0;
 }
 
-/* github #577: horizontal top-nav bar (was a left sidebar). */
+/* github #577: horizontal top-nav bar (was a left sidebar). No bottom padding so
+   the connected tabs' bottom edge meets the baseline rule (they overlap it by
+   1px via margin-bottom) instead of floating above it. */
 .app-topnav {
-  padding: var(--mimir-space-sm, 12px) var(--mimir-space-lg, 24px);
+  padding: var(--mimir-space-sm, 12px) var(--mimir-space-lg, 24px) 0;
   border-bottom: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-chrome-border, #c9d7ce);
   background: var(--mimir-color-chrome-background, #edf3ef);
   overflow-x: auto;
@@ -1965,6 +1992,165 @@ textarea {
   gap: var(--mimir-space-md, 16px);
   padding: var(--mimir-space-md, 16px);
   overflow-y: auto;
+}
+
+/* ===== github: reusable pop-out detail drawer (DetailDrawer) ===== */
+.detail-drawer__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  padding: 0;
+  border: 0;
+  background: rgb(0 0 0 / 45%);
+  cursor: pointer;
+}
+
+.detail-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 100%);
+  height: 100vh;
+  border-left: var(--mimir-border-width-chrome, 2px) solid var(--mimir-color-chrome-border, #c9d7ce);
+  background: var(--mimir-color-chrome-background, #edf3ef);
+  box-shadow: var(--mimir-elevation-overlay, 0 24px 80px rgb(0 0 0 / 35%));
+}
+
+.detail-drawer__head {
+  display: flex;
+  flex: none;
+  gap: var(--mimir-space-sm, 12px);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--mimir-space-sm, 12px) var(--mimir-space-md, 16px);
+  border-bottom: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-chrome-border, #c9d7ce);
+}
+
+.detail-drawer__title {
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  font-weight: var(--mimir-font-weight-strong, 700);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.detail-drawer__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-control, 6px);
+  background: transparent;
+  color: var(--mimir-color-text, #16201b);
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.detail-drawer__close:hover,
+.detail-drawer__close:focus-visible {
+  border-color: var(--mimir-color-panel-border-hover, #60786a);
+  background: var(--mimir-interaction-hover-background, transparent);
+}
+
+.detail-drawer__body {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: var(--mimir-space-md, 16px);
+  padding: var(--mimir-space-md, 16px);
+  overflow-y: auto;
+}
+
+/* ===== github: one-line atoms + observations list (old saga viewer shape) ===== */
+.saga-atom-list {
+  display: grid;
+  gap: var(--mimir-space-2xs, 4px);
+}
+
+/* github #574: date-group header in the unified atoms list. */
+.saga-atom-list__day {
+  margin-top: var(--mimir-space-sm, 12px);
+  padding: var(--mimir-space-2xs, 4px) var(--mimir-space-sm, 12px);
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  font-weight: var(--mimir-font-weight-strong, 700);
+  letter-spacing: 0.08em;
+  border-bottom: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+}
+
+.saga-atom-list__day:first-child {
+  margin-top: 0;
+}
+
+.saga-atom-row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) minmax(0, auto) auto;
+  gap: var(--mimir-space-sm, 12px);
+  align-items: center;
+  width: 100%;
+  padding: var(--mimir-space-xs, 8px) var(--mimir-space-sm, 12px);
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-control, 6px);
+  background: var(--mimir-color-panel-background, #fff);
+  color: var(--mimir-color-text, #16201b);
+  text-align: left;
+  cursor: pointer;
+}
+
+.saga-atom-row:hover,
+.saga-atom-row--selected {
+  border-color: var(--mimir-color-panel-border-hover, #60786a);
+  background: var(--mimir-interaction-hover-background, #e8f0eb);
+}
+
+.saga-atom-row > span {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.saga-atom-row__kind {
+  justify-self: start;
+  padding: 1px 8px;
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: 999px;
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  font-weight: var(--mimir-font-weight-strong, 700);
+}
+
+.saga-atom-row__kind[data-kind="atom"] {
+  color: #5be88f;
+  border-color: rgb(47 224 112 / 36%);
+}
+
+.saga-atom-row__kind[data-kind="observation"] {
+  color: #7fb6ff;
+  border-color: rgb(90 150 255 / 38%);
+}
+
+.saga-atom-row__kind[data-kind="triple"] {
+  color: #c9a3ff;
+  border-color: rgb(160 90 255 / 38%);
+}
+
+.saga-atom-row__meta,
+.saga-atom-row__time {
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-sm, 0.875rem);
+}
+
+.saga-atom-row__time {
+  font-family: var(--mimir-font-family-mono, ui-monospace, monospace);
 }
 
 /* Color-coded trigger pills (github #570) — distinct hues per trigger make the

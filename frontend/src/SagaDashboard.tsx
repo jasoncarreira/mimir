@@ -15,9 +15,10 @@ import {
   type SagaAtomSummary,
   type SagaSqlCell
 } from "./api/saga";
-import type { ListMeta, SagaAtomDetailData } from "./api/generated/contracts";
+import type { SagaAtomDetailData } from "./api/generated/contracts";
+import { DetailDrawer } from "./DetailDrawer";
 import { drilldownHref } from "./routeState";
-import { Badge, Button, DataTable, EmptyState, ErrorState, LoadingState, Panel, TextInput } from "./ui";
+import { Button, DataTable, EmptyState, ErrorState, LoadingState, Panel, TextInput } from "./ui";
 
 type EvidenceKind = "atom" | "observation" | "triple";
 
@@ -79,49 +80,6 @@ function stringField(source: unknown, keys: string[]): string {
   return "";
 }
 
-function kindBadge(kind: EvidenceKind) {
-  if (kind === "observation") return <Badge tone="info">observation</Badge>;
-  if (kind === "triple") return <Badge tone="success">triple</Badge>;
-  return <Badge>atom</Badge>;
-}
-
-function AtomTable({
-  atoms,
-  meta,
-  onInspect
-}: {
-  atoms: SagaAtomSummary[];
-  meta?: ListMeta;
-  onInspect: (id: string) => void;
-}) {
-  if (!atoms.length) return <EmptyState title="No atoms found" />;
-  return (
-    <DataTable
-      caption={`Showing ${atoms.length}${meta?.total != null ? ` of ${meta.total}` : ""} results`}
-      columns={[
-        { key: "content", header: "Content" },
-        { key: "kind", header: "Type" },
-        { key: "stream", header: "Stream" },
-        { key: "metadata", header: "Metadata" },
-        { key: "created", header: "Created" },
-        { key: "action", header: "" }
-      ]}
-      rows={atoms.map((atom) => ({
-        content: <span className="saga-content-preview">{atom.content_preview || "(empty)"}</span>,
-        kind: kindBadge(classifySagaEvidence(atom)),
-        stream: atom.stream || "semantic",
-        metadata: (
-          <span className="saga-meta-line">
-            {atom.channel_id || "no channel"} · conf {atom.encoding_confidence?.toFixed(3) ?? "-"}
-            {atom.is_pinned ? " · pinned" : ""}
-          </span>
-        ),
-        created: formatDate(atom.created_at),
-        action: <Button onClick={() => onInspect(atom.id)}>Inspect</Button>
-      }))}
-    />
-  );
-}
 
 function AtomDetail({ atomId }: { atomId: string }) {
   const query = useQuery({
@@ -147,6 +105,7 @@ function AtomDetail({ atomId }: { atomId: string }) {
 
   return (
     <div className="saga-detail">
+      <pre className="saga-content-full">{String(atom.content ?? "")}</pre>
       <dl className="facts-grid facts-grid--compact">
         <div><dt>ID</dt><dd>{atom.id}</dd></div>
         <div><dt>Type</dt><dd>{String(atom.memory_type ?? "raw")}</dd></div>
@@ -166,7 +125,6 @@ function AtomDetail({ atomId }: { atomId: string }) {
         <div><dt>Activation</dt><dd>{`arousal ${Number(atom.arousal ?? 0).toFixed(3)} · valence ${Number(atom.valence ?? 0).toFixed(3)}`}</dd></div>
         <div><dt>Embedding</dt><dd>{embedding ? `${embedding.provider}/${embedding.model} dim=${embedding.dim}` : "none"}</dd></div>
       </dl>
-      <pre className="saga-content-full">{String(atom.content ?? "")}</pre>
       <section className="saga-relations">
         <h3>Relations out</h3>
         {relations.length ? relations.map((relation, index) => (
@@ -182,21 +140,177 @@ function AtomDetail({ atomId }: { atomId: string }) {
   );
 }
 
+// The calendar day an item was created (YYYY-MM-DD), for date grouping.
+function dayKey(value: string | null | undefined): string {
+  if (!value) return "undated";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "undated" : date.toISOString().slice(0, 10);
+}
+
+// Group already-sorted (newest-first) items into consecutive day buckets.
+function groupByDay<T>(items: T[], getCreated: (item: T) => string | null | undefined) {
+  const groups: Array<{ day: string; items: T[] }> = [];
+  for (const item of items) {
+    const day = dayKey(getCreated(item));
+    const last = groups[groups.length - 1];
+    if (last && last.day === day) last.items.push(item);
+    else groups.push({ day, items: [item] });
+  }
+  return groups;
+}
+
+// github #574: combined, date-organized one-line list of atoms + observations
+// (the old saga viewer's shape). Click a row to pop out the detail.
+function SagaAtomList({
+  atoms,
+  selectedId,
+  onSelect
+}: {
+  atoms: SagaAtomSummary[];
+  selectedId: string;
+  onSelect: (id: string) => void;
+}) {
+  if (!atoms.length) return <EmptyState title="No atoms or observations found" />;
+  return (
+    <div aria-label="Atoms and observations" className="saga-atom-list" role="list">
+      {groupByDay(atoms, (atom) => atom.created_at).map((group) => (
+        <React.Fragment key={group.day}>
+          <div className="saga-atom-list__day">{group.day}</div>
+          {group.items.map((atom) => {
+            const kind = classifySagaEvidence(atom);
+            return (
+              <button
+                className={`saga-atom-row${selectedId === atom.id ? " saga-atom-row--selected" : ""}`}
+                key={atom.id}
+                onClick={() => onSelect(atom.id)}
+                type="button"
+              >
+                <span className="saga-atom-row__kind" data-kind={kind}>{kind}</span>
+                <span className="saga-atom-row__content">{atom.content_preview || "(empty)"}</span>
+                <span className="saga-atom-row__meta">
+                  {atom.channel_id || "no channel"}
+                  {atom.encoding_confidence != null ? ` · conf ${atom.encoding_confidence.toFixed(2)}` : ""}
+                  {atom.is_pinned ? " · pinned" : ""}
+                </span>
+                <span className="saga-atom-row__time">{formatDate(atom.created_at)}</span>
+              </button>
+            );
+          })}
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+interface SagaTriple {
+  id: string;
+  subject: string;
+  predicate: string;
+  object: string;
+  confidence: string;
+}
+
+// github #574: triples surfaced in the Saga section as a one-line list mode.
+function SagaTripleList({
+  triples,
+  selectedId,
+  onSelect
+}: {
+  triples: SagaTriple[];
+  selectedId: string;
+  onSelect: (id: string) => void;
+}) {
+  if (!triples.length) return <EmptyState title="No triples found" />;
+  return (
+    <div aria-label="Triples" className="saga-atom-list" role="list">
+      {triples.map((triple) => (
+        <button
+          className={`saga-atom-row${selectedId === triple.id ? " saga-atom-row--selected" : ""}`}
+          key={triple.id}
+          onClick={() => onSelect(triple.id)}
+          type="button"
+        >
+          <span className="saga-atom-row__kind" data-kind="triple">triple</span>
+          <span className="saga-atom-row__content">
+            <strong>{triple.subject}</strong> {triple.predicate} {triple.object}
+          </span>
+          <span className="saga-atom-row__meta">
+            {triple.confidence ? `conf ${triple.confidence}` : ""}
+          </span>
+          <span className="saga-atom-row__time" />
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function TripleDetail({ triple }: { triple: SagaTriple | null }) {
+  if (!triple) return <EmptyState title="Select a triple" />;
+  return (
+    <div className="saga-detail">
+      <pre className="saga-content-full">{triple.subject} {triple.predicate} {triple.object}</pre>
+      <dl className="facts-grid facts-grid--compact">
+        <div><dt>ID</dt><dd>{triple.id}</dd></div>
+        <div><dt>Subject</dt><dd>{triple.subject}</dd></div>
+        <div><dt>Predicate</dt><dd>{triple.predicate}</dd></div>
+        <div><dt>Object</dt><dd>{triple.object}</dd></div>
+        <div><dt>Confidence</dt><dd>{triple.confidence || "-"}</dd></div>
+      </dl>
+    </div>
+  );
+}
+
+type SagaTypeFilter = "all" | "atom" | "observation" | "triple";
+const SAGA_TYPE_FILTERS: Array<{ id: SagaTypeFilter; label: string }> = [
+  { id: "all", label: "All" },
+  { id: "atom", label: "Atoms" },
+  { id: "observation", label: "Observations" },
+  { id: "triple", label: "Triples" }
+];
+
 function AtomsWorkflow() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [channel, setChannel] = React.useState("");
   const [limit, setLimit] = React.useState(50);
+  const [typeFilter, setTypeFilter] = React.useState<SagaTypeFilter>("all");
   const [manualAtom, setManualAtom] = React.useState(searchParams.get("atom") || "");
   const [manualError, setManualError] = React.useState("");
+  const [selectedTripleId, setSelectedTripleId] = React.useState("");
   const selectedAtom = searchParams.get("atom") || "";
+
   const atomsQuery = useQuery({
+    enabled: typeFilter !== "triple",
     queryKey: ["saga", "recent", channel, limit],
     queryFn: () => listSagaAtoms({ channel, limit })
   });
-  const atoms = atomsQuery.data?.data.atoms ?? [];
+  const triplesQuery = useQuery({
+    enabled: typeFilter === "triple",
+    queryKey: ["saga", "triples", limit],
+    queryFn: () => runSagaSql(validateSagaSql(
+      `SELECT id, subject, predicate, object, confidence FROM triples WHERE tombstoned=0 ORDER BY id DESC LIMIT ${limit}`
+    ))
+  });
+
+  const allAtoms = atomsQuery.data?.data.atoms ?? [];
   const channels = atomsQuery.data?.data.channels ?? [];
-  const rawAtoms = atoms.filter((atom) => classifySagaEvidence(atom) === "atom");
-  const observations = atoms.filter((atom) => classifySagaEvidence(atom) === "observation");
+  // Unified list, filtered by type (triples are fetched separately).
+  const atoms = typeFilter === "all" || typeFilter === "triple"
+    ? allAtoms
+    : allAtoms.filter((atom) => classifySagaEvidence(atom) === typeFilter);
+
+  const triples: SagaTriple[] = React.useMemo(() => {
+    const columns = triplesQuery.data?.data.columns ?? [];
+    const rows = triplesQuery.data?.data.rows ?? [];
+    const col = (name: string) => columns.indexOf(name);
+    return rows.map((row) => ({
+      id: String(row[col("id")] ?? ""),
+      subject: formatCell(row[col("subject")]),
+      predicate: formatCell(row[col("predicate")]),
+      object: formatCell(row[col("object")]),
+      confidence: row[col("confidence")] == null ? "" : String(row[col("confidence")])
+    }));
+  }, [triplesQuery.data]);
+  const selectedTriple = triples.find((triple) => triple.id === selectedTripleId) ?? null;
 
   function selectAtom(atomId: string) {
     const params = new URLSearchParams(searchParams);
@@ -205,12 +319,23 @@ function AtomsWorkflow() {
     setSearchParams(params);
   }
 
+  function clearAtom() {
+    const params = new URLSearchParams(searchParams);
+    params.delete("atom");
+    setSearchParams(params);
+    setSelectedTripleId("");
+  }
+
+  const showTriples = typeFilter === "triple";
+  const activeQuery = showTriples ? triplesQuery : atomsQuery;
+
   return (
     <div className="saga-workflow">
       <form className="saga-controls" onSubmit={(event) => event.preventDefault()}>
-        <label><span>Channel</span><select value={channel} onChange={(event) => setChannel(event.target.value)}><option value="">all channels</option>{channels.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+        <label><span>Type</span><select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as SagaTypeFilter)}>{SAGA_TYPE_FILTERS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+        <label><span>Channel</span><select disabled={showTriples} value={channel} onChange={(event) => setChannel(event.target.value)}><option value="">all channels</option>{channels.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
         <label><span>Limit</span><select value={limit} onChange={(event) => setLimit(Number(event.target.value))}>{[25, 50, 100, 200].map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
-        <Button onClick={() => void atomsQuery.refetch()} type="button">Refresh</Button>
+        <Button onClick={() => void activeQuery.refetch()} type="button">Refresh</Button>
       </form>
       <form
         className="saga-controls"
@@ -228,21 +353,23 @@ function AtomsWorkflow() {
         <Button type="submit" variant="primary">Inspect</Button>
         {manualError ? <span className="saga-validation">{manualError}</span> : null}
       </form>
-      {atomsQuery.isLoading ? <LoadingState label="Loading atoms" /> : null}
-      {atomsQuery.isError ? <ErrorState title="Atoms failed">{atomsQuery.error instanceof Error ? atomsQuery.error.message : String(atomsQuery.error)}</ErrorState> : null}
-      {!atomsQuery.isLoading && !atomsQuery.isError ? (
-        <div className="saga-result-grid">
-          <Panel title="Raw Atoms" subtitle="Non-observation atom records.">
-            <AtomTable atoms={rawAtoms} meta={atomsQuery.data?.meta} onInspect={selectAtom} />
-          </Panel>
-          <Panel title="Observations" subtitle="Observation records are kept separate from raw atoms.">
-            <AtomTable atoms={observations} meta={atomsQuery.data?.meta} onInspect={selectAtom} />
-          </Panel>
-        </div>
+      {activeQuery.isLoading ? <LoadingState label={showTriples ? "Loading triples" : "Loading atoms"} /> : null}
+      {activeQuery.isError ? <ErrorState title={showTriples ? "Triples failed" : "Atoms failed"}>{activeQuery.error instanceof Error ? activeQuery.error.message : String(activeQuery.error)}</ErrorState> : null}
+      {!activeQuery.isLoading && !activeQuery.isError ? (
+        <Panel
+          title={showTriples ? "Triples" : "Atoms & Observations"}
+          subtitle={showTriples
+            ? `${triples.length} triple${triples.length === 1 ? "" : "s"} · click a row for detail.`
+            : `Newest first, by date${atomsQuery.data?.meta?.total != null ? ` · ${atoms.length} of ${atomsQuery.data.meta.total}` : ""} · click a row for detail.`}
+        >
+          {showTriples
+            ? <SagaTripleList triples={triples} selectedId={selectedTripleId} onSelect={setSelectedTripleId} />
+            : <SagaAtomList atoms={atoms} selectedId={selectedAtom} onSelect={selectAtom} />}
+        </Panel>
       ) : null}
-      <Panel title="Atom Detail" subtitle="Activation, retrieval, embedding, and relation metadata when available.">
-        <AtomDetail atomId={selectedAtom} />
-      </Panel>
+      <DetailDrawer onClose={clearAtom} open={Boolean(selectedAtom || selectedTriple)} title={selectedTriple ? "Triple Detail" : "Atom Detail"}>
+        {selectedTriple ? <TripleDetail triple={selectedTriple} /> : <AtomDetail atomId={selectedAtom} />}
+      </DetailDrawer>
     </div>
   );
 }
@@ -265,6 +392,12 @@ function SearchWorkflow() {
     const params = new URLSearchParams(searchParams);
     params.set("tab", "search");
     params.set("atom", atomId);
+    setSearchParams(params);
+  }
+
+  function clearAtom() {
+    const params = new URLSearchParams(searchParams);
+    params.delete("atom");
     setSearchParams(params);
   }
 
@@ -292,12 +425,12 @@ function SearchWorkflow() {
       {searchQuery.isError ? <ErrorState title="Search failed">{searchQuery.error instanceof Error ? searchQuery.error.message : String(searchQuery.error)}</ErrorState> : null}
       {searchQuery.data ? (
         <Panel title="Search Results" subtitle={`${searchQuery.data.meta?.total ?? searchQuery.data.data.atoms.length} matches for ${submitted}`}>
-          <AtomTable atoms={searchQuery.data.data.atoms} meta={searchQuery.data.meta} onInspect={selectAtom} />
+          <SagaAtomList atoms={searchQuery.data.data.atoms} selectedId={selectedAtom} onSelect={selectAtom} />
         </Panel>
       ) : !submitted ? <EmptyState title="Enter a query to search atoms" /> : null}
-      <Panel title="Result Detail">
+      <DetailDrawer onClose={clearAtom} open={Boolean(selectedAtom)} title="Atom Detail">
         <AtomDetail atomId={selectedAtom} />
-      </Panel>
+      </DetailDrawer>
     </div>
   );
 }

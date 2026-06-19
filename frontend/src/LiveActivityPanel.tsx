@@ -1,4 +1,5 @@
 import React from "react";
+import { isChatLiveEvent } from "./agent-character";
 import type { TurnEventBase } from "./api/generated/contracts";
 import { useLiveEvents } from "./live-events";
 import { Badge, EmptyState, Panel } from "./ui";
@@ -61,6 +62,9 @@ export function LiveActivityPanel() {
     seenId.current = lastEvent.id;
     const event = lastEvent.event;
     const ts = lastEvent.ts ?? "";
+    // Field Log is scoped to web-chat turns — skip background poller/heartbeat
+    // turns (live turn events carry the turn's channel_id).
+    if (!isChatLiveEvent(event)) return;
     if (event.kind === "turn.lifecycle") {
       setTurn({ id: event.turn_id, phase: event.phase });
       setItems((current) => [

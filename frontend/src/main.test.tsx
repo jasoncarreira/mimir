@@ -140,10 +140,8 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
 
     expect(await screen.findByRole("link", { name: /Users/ })).toBeTruthy();
 
-    // github #571: the status box collapses once signed in, so expand it before
-    // reaching the Clear control.
-    fireEvent.click(screen.getByRole("button", { name: "Details" }));
-    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    // The header status chip doubles as sign-out (clears the stored key).
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
 
     // Key gone -> gated again: dashboard nav disappears, login screen returns.
     await waitFor(() =>
