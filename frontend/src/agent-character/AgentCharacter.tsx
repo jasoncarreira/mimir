@@ -88,6 +88,9 @@ function AgentCharacterFallback({
   );
 }
 
+// After this long with nothing happening, the character drifts to "bored".
+const IDLE_TO_BORED_MS = 90_000;
+
 export function AgentCharacter({
   state,
   label = "Agent character",
@@ -96,7 +99,19 @@ export function AgentCharacter({
 }: AgentCharacterProps) {
   const { skin } = useSkin();
   const renderer = skin.characterRenderer;
-  const asset = resolveAgentCharacterAsset(renderer, state);
+  // Drift to "bored" after a stretch of idle; snap back the instant the agent
+  // does anything else. Skins without bored art fall back via the resolver.
+  const [effectiveState, setEffectiveState] = React.useState<AgentCharacterState>(state);
+  React.useEffect(() => {
+    if (state !== "idle") {
+      setEffectiveState(state);
+      return;
+    }
+    setEffectiveState("idle");
+    const timer = window.setTimeout(() => setEffectiveState("bored"), IDLE_TO_BORED_MS);
+    return () => window.clearTimeout(timer);
+  }, [state]);
+  const asset = resolveAgentCharacterAsset(renderer, effectiveState);
   const [assetFailed, setAssetFailed] = React.useState(false);
 
   React.useEffect(() => {

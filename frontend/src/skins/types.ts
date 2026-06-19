@@ -1,6 +1,6 @@
 import type React from "react";
 
-export type SkinId = "default-retro";
+export type SkinId = "default-retro" | "neon-terminal";
 
 export type CharacterRendererKind =
   | "static-image"
@@ -14,7 +14,8 @@ export type AgentCharacterState =
   | "thinking"
   | "typing"
   | "tool"
-  | "error";
+  | "error"
+  | "bored";
 
 export type SkinTokenName =
   | "colorText"
@@ -93,7 +94,10 @@ export interface SkinCharacterRendererMetadata {
     type: "css" | "dotlottie" | "image" | "json" | "sprite";
     href: string | null;
   }>;
-  stateMap: Record<AgentCharacterState, string>;
+  // Partial: a skin maps only the states it ships art for; resolveAgentCharacterAsset
+  // falls back to fallbackState for the rest. Lets new states (e.g. "bored") be
+  // added to the union without forcing every skin to define them at once.
+  stateMap: Partial<Record<AgentCharacterState, string>>;
   fallbackState: AgentCharacterState;
   capabilities: {
     supportsExpressions: boolean;
