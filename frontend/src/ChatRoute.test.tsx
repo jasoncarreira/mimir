@@ -132,4 +132,15 @@ describe("ChatRoute", () => {
     unmount();
     expect(chatApi.close).toHaveBeenCalledOnce();
   });
+
+  it("keeps the conversation when the route unmounts and remounts (#567)", () => {
+    const first = renderChat();
+    emitMessage("web-default", "still here after a tab switch");
+    expect(screen.getByText("still here after a tab switch")).toBeTruthy();
+
+    // Switching to another tab unmounts ChatRoute; coming back remounts it.
+    first.unmount();
+    renderChat();
+    expect(screen.getByText("still here after a tab switch")).toBeTruthy();
+  });
 });

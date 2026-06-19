@@ -399,9 +399,11 @@ export function TurnsRoute() {
     )),
     [turns, trigger, hidePollers, query, channelParam, eventParam]
   );
+  // github #568: only an explicitly selected turn shows details — no
+  // auto-selecting the first row, so the panel starts empty and follows clicks.
   const selectedTurn = selectedId
     ? turns.find((turn) => turn.turn_id === selectedId) ?? null
-    : visibleTurns[0] ?? null;
+    : null;
   const selectedTurnQuery = useQuery<TurnRecord | null>({
     queryKey: ["turn", selectedTurn?.turn_id ?? ""],
     queryFn: async () => selectedTurn,
@@ -412,14 +414,7 @@ export function TurnsRoute() {
   const sessions = sessionsQuery.data?.sessions ?? [];
   const selectedSession = selectedSessionId
     ? sessions.find((session) => session.id === selectedSessionId) ?? null
-    : sessions[0] ?? null;
-
-  React.useEffect(() => {
-    if (selectedId || !selectedTurn) return;
-    const next = new URLSearchParams(searchParams);
-    next.set("turn", selectedTurn.turn_id);
-    setSearchParams(next, { replace: true });
-  }, [searchParams, selectedId, selectedTurn, setSearchParams]);
+    : null;
 
   React.useEffect(() => {
     setQuery(searchParams.get("q") || searchParams.get("filter") || "");

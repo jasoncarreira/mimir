@@ -1,5 +1,6 @@
 import { afterEach } from "vitest";
 
+import { useChatStore } from "./chatStore";
 import { useUiState } from "./uiState";
 
 // chainlink #564: the Zustand UI store (collapsedRegions, detailsPanelOpen,
@@ -9,7 +10,11 @@ import { useUiState } from "./uiState";
 // it flaked in CI as "expected 'true' to be 'false'". Snapshot the initial
 // state once and restore it after every test so each case starts deterministic.
 const initialUiState = useUiState.getInitialState();
+// github #567: the chat timeline is now a module store too (persists across tab
+// switches), so reset it between tests the same way or messages leak forward.
+const initialChatState = useChatStore.getInitialState();
 
 afterEach(() => {
   useUiState.setState(initialUiState, true);
+  useChatStore.setState(initialChatState, true);
 });

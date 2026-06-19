@@ -803,6 +803,15 @@ textarea {
   margin: var(--mimir-space-md, 16px) 0;
 }
 
+@media (max-width: 1080px) {
+  /* github #566: below this width a main + 280-360px details column squeezes
+     the main content past the viewport. Stack the details panel under the main
+     so the page never scrolls horizontally. */
+  .content-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 720px) {
   .saga-histogram__row {
     grid-template-columns: 1fr;
@@ -1388,6 +1397,9 @@ textarea {
 .turn-list {
   display: grid;
   gap: var(--mimir-space-xs, 8px);
+  /* github #566: the 7-column grid has a wide intrinsic minimum; let it scroll
+     inside its panel instead of forcing horizontal scroll on the whole page. */
+  overflow-x: auto;
 }
 
 .session-list,
@@ -1473,9 +1485,12 @@ textarea {
 .turn-list__head,
 .turn-row {
   display: grid;
-  grid-template-columns: minmax(128px, 0.9fr) minmax(130px, 1fr) minmax(100px, 0.8fr) 64px 84px minmax(180px, 1.5fr) minmax(180px, 1.5fr);
+  grid-template-columns: minmax(92px, 0.9fr) minmax(104px, 1fr) minmax(78px, 0.8fr) 48px 60px minmax(132px, 1.5fr) minmax(132px, 1.5fr);
   gap: var(--mimir-space-sm, 12px);
   align-items: start;
+  /* Shared floor so the header and rows scroll together when the panel is
+     narrower than the table (github #566). */
+  min-width: 640px;
 }
 
 .turn-list__head {
