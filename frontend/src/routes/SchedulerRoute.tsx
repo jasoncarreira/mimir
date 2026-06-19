@@ -142,27 +142,6 @@ function CommitmentsPanel({ data }: { data: SafeSchedulerDashboardData }) {
   );
 }
 
-function DeferredActionsPanel({ data }: { data: SafeSchedulerDashboardData }) {
-  return (
-    <Panel
-      title="Actions"
-      actions={<Badge tone={data.actions.mutations_enabled ? "warning" : "info"}>{data.actions.mutations_enabled ? "enabled" : "read-only"}</Badge>}
-    >
-      <p className="app-copy">{data.actions.policy}</p>
-      <DataTable
-        columns={[
-          { key: "action", header: "Action" },
-          { key: "state", header: "State" }
-        ]}
-        rows={data.actions.deferred.map((action) => ({
-          action,
-          state: <Badge tone="info">deferred</Badge>
-        }))}
-      />
-    </Panel>
-  );
-}
-
 export function SchedulerRoute() {
   const [searchParams] = useSearchParams();
   const dueWindow = searchParams.get("due_window") || "all";
@@ -198,7 +177,6 @@ export function SchedulerRoute() {
           <RunTable title="Schedules" empty="No configured schedules" rows={data.schedules} />
           <RunTable title="Pollers" empty="No registered pollers" rows={data.pollers} />
           <CommitmentsPanel data={data} />
-          <DeferredActionsPanel data={data} />
         </div>
       ) : null}
     </>
