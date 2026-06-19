@@ -104,53 +104,79 @@ function AuthPanel({ bootstrap, error, isError, isLoading }: {
     void client.invalidateQueries({ queryKey: ["whoami"] });
   }
 
+  const [override, setOverride] = React.useState<boolean | null>(null);
+  // github #571: keep the status box from dominating the header. Auto-expand
+  // only when there's something to act on (loading, bootstrap error, or a
+  // locked/login state); once the session is ready it collapses to a one-line
+  // indicator. The toggle lets the user pin it open or closed.
+  const autoExpand = isLoading || isError || !signedIn;
+  const expanded = override ?? autoExpand;
+
   return (
     <Panel
-      actions={<Badge tone={signedIn ? "success" : "warning"}>{signedIn ? "ready" : "locked"}</Badge>}
+      actions={
+        <>
+          <Badge tone={signedIn ? "success" : "warning"}>{signedIn ? "ready" : "locked"}</Badge>
+          <Button
+            aria-controls="auth-panel-body"
+            aria-expanded={expanded}
+            onClick={() => setOverride(!expanded)}
+            type="button"
+          >
+            {expanded ? "Hide" : "Details"}
+          </Button>
+        </>
+      }
       aria-labelledby="auth-title"
       className="app-status-card"
       subtitle={
-        isLoading
-          ? "Loading server auth policy."
-          : isError
-            ? `Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`
-            : `${requiresKey ? "Protected" : "Local unauthenticated"} server on ${bootstrap?.server.web_host || "default host"}.`
+        expanded
+          ? (isLoading
+              ? "Loading server auth policy."
+              : isError
+                ? `Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`
+                : `${requiresKey ? "Protected" : "Local unauthenticated"} server on ${bootstrap?.server.web_host || "default host"}.`)
+          : undefined
       }
       title={<span id="auth-title">Status</span>}
     >
-      {isLoading ? <LoadingState label="Loading auth policy" /> : null}
-      {isError ? (
-        <ErrorState title="Bootstrap failed">
-          {error instanceof Error ? error.message : String(error)}
-        </ErrorState>
-      ) : null}
-      {!isLoading && !isError && requiresKey ? (
-        <form
-          className="auth-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            setApiKey(entry);
-            setEntry("");
-          }}
-        >
-          <TextInput
-            aria-label="MIMIR_API_KEY"
-            autoComplete="off"
-            placeholder={apiKeyPresent ? "Key stored in this browser" : "MIMIR_API_KEY"}
-            type="password"
-            value={entry}
-            onChange={(event) => setEntry(event.target.value)}
-          />
-          <Button type="submit" variant="primary">Save</Button>
-          <Button type="button" onClick={() => setApiKey("")}>Clear</Button>
-        </form>
-      ) : null}
-      {!isLoading && !isError ? (
-        <dl className="facts-grid facts-grid--compact">
-          <div><dt>Browser key</dt><dd>{apiKeyPresent ? "stored" : "not stored"}</dd></div>
-          <div><dt>Bind</dt><dd>{bootstrap?.server.public_bind ? "public" : "localhost"}</dd></div>
-          <div><dt>Streams</dt><dd>{bootstrap?.stream_auth.shape || "loading"}</dd></div>
-        </dl>
+      {expanded ? (
+        <div id="auth-panel-body">
+          {isLoading ? <LoadingState label="Loading auth policy" /> : null}
+          {isError ? (
+            <ErrorState title="Bootstrap failed">
+              {error instanceof Error ? error.message : String(error)}
+            </ErrorState>
+          ) : null}
+          {!isLoading && !isError && requiresKey ? (
+            <form
+              className="auth-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                setApiKey(entry);
+                setEntry("");
+              }}
+            >
+              <TextInput
+                aria-label="MIMIR_API_KEY"
+                autoComplete="off"
+                placeholder={apiKeyPresent ? "Key stored in this browser" : "MIMIR_API_KEY"}
+                type="password"
+                value={entry}
+                onChange={(event) => setEntry(event.target.value)}
+              />
+              <Button type="submit" variant="primary">Save</Button>
+              <Button type="button" onClick={() => setApiKey("")}>Clear</Button>
+            </form>
+          ) : null}
+          {!isLoading && !isError ? (
+            <dl className="facts-grid facts-grid--compact">
+              <div><dt>Browser key</dt><dd>{apiKeyPresent ? "stored" : "not stored"}</dd></div>
+              <div><dt>Bind</dt><dd>{bootstrap?.server.public_bind ? "public" : "localhost"}</dd></div>
+              <div><dt>Streams</dt><dd>{bootstrap?.stream_auth.shape || "loading"}</dd></div>
+            </dl>
+          ) : null}
+        </div>
       ) : null}
     </Panel>
   );

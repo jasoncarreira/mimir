@@ -122,6 +122,9 @@ describe("AppFrame admin surface gating after login (#563)", () => {
 
     expect(await screen.findByRole("link", { name: /Users/ })).toBeTruthy();
 
+    // github #571: the status box collapses once signed in, so expand it before
+    // reaching the Clear control.
+    fireEvent.click(screen.getByRole("button", { name: "Details" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
 
     await waitFor(() =>
