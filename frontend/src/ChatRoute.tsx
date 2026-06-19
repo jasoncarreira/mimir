@@ -1,24 +1,14 @@
 import React from "react";
 import type { TurnRecord } from "./api";
 import { createChatStream, sendChatMessage, type ChatStreamPayload } from "./api/chat";
+import { useChatStore, type ChatMessageStatus, type ChatTimelineMessage } from "./chatStore";
 import type { DashboardSurface } from "./dashboardExtensions";
 import { useRouteState } from "./routeState";
 import { TurnDetailsPanel } from "./TurnDetailsPanel";
 import { Badge, Button, DashboardHeader, ErrorState, Panel, TextInput } from "./ui";
 import { useUiState } from "./uiState";
 
-type ChatMessageStatus = "pending" | "running" | "done" | "error";
 type ChatStreamState = "connecting" | "open" | "error";
-
-interface ChatTimelineMessage {
-  id: string;
-  role: "user" | "assistant";
-  channelId: string;
-  text: string;
-  timestamp: string;
-  status: ChatMessageStatus;
-  error?: string;
-}
 
 function makeDefaultChatSessionId() {
   const generated = `session-${Math.random().toString(36).slice(2, 10)}`;
@@ -79,7 +69,9 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const [composerText, setComposerText] = React.useState("");
   const [streamState, setStreamState] = React.useState<ChatStreamState>("connecting");
   const [streamError, setStreamError] = React.useState("");
-  const [messages, setMessages] = React.useState<ChatTimelineMessage[]>([]);
+  // github #567: persisted across tab switches (route unmount) — see chatStore.
+  const messages = useChatStore((state) => state.messages);
+  const setMessages = useChatStore((state) => state.setMessages);
   const setDetailsPanelOpen = useUiState((state) => state.setDetailsPanelOpen);
   const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
   const setSelectedChatMessageId = useUiState((state) => state.setSelectedChatMessageId);

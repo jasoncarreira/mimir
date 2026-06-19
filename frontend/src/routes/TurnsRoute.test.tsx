@@ -81,7 +81,10 @@ describe("TurnsRoute", () => {
 
     const list = await screen.findByRole("list", { name: "Turns" });
     expect(within(list).getByText("Summarize the current state.")).toBeTruthy();
-    expect(screen.getByText("Read current memory summary.")).toBeTruthy();
+    // github #568: details only appear after selecting a turn (no auto-select).
+    expect(screen.getByText("No turn selected")).toBeTruthy();
+    fireEvent.click(within(list).getByText("Summarize the current state."));
+    expect(await screen.findByText("Read current memory summary.")).toBeTruthy();
     expect(screen.getAllByText("state_read").length).toBeGreaterThan(0);
     expect(screen.getByText("Loaded memory index.")).toBeTruthy();
     expect(screen.getByText(/Result offloaded/)).toBeTruthy();
