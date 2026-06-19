@@ -5,6 +5,7 @@ import { listSessions, listTurns, type TurnRecord } from "../api";
 import type { ConversationSession } from "../api/generated/contracts";
 import { drilldownHref } from "../routeState";
 import { TurnDetailsPanel } from "../TurnDetailsPanel";
+import { TriggerPill } from "./triggerPill";
 import {
   Badge,
   Button,
@@ -115,7 +116,7 @@ function useTurnPages() {
 function TurnBadge({ trigger, kind }: { trigger: string; kind?: string | null }) {
   return (
     <span className="turn-badges">
-      <Badge tone={trigger === "unknown" ? "warning" : "neutral"}>{trigger || "unknown"}</Badge>
+      <TriggerPill trigger={trigger || "unknown"} />
       {kind && kind !== trigger ? <Badge tone="info">{kind}</Badge> : null}
     </span>
   );
@@ -174,7 +175,6 @@ function TurnList({
         <span>Events</span>
         <span>Duration</span>
         <span>Input</span>
-        <span>Output</span>
       </div>
       <div role="list" aria-label="Turns">
         {turns.map((turn) => (
@@ -189,8 +189,7 @@ function TurnList({
             <span>{turn.channel_id ? <Badge>{turn.channel_id}</Badge> : "-"}</span>
             <span>{turn.events.length}</span>
             <span>{formatDuration(turn.duration_ms)}</span>
-            <span>{truncate(turn.input)}</span>
-            <span>{truncate(turn.error || turn.output)}</span>
+            <span className="turn-row__input">{truncate(turn.input || turn.error || turn.output)}</span>
           </button>
         ))}
       </div>
@@ -432,6 +431,22 @@ export function TurnsRoute() {
     queryClient.setQueryData(["turn", selectedTurn.turn_id], selectedTurn);
   }, [queryClient, selectedTurn]);
 
+  const drawerOpen = Boolean(selectedTurn || selectedSession);
+
+  // Escape closes the detail drawer (reads live params so it never goes stale).
+  React.useEffect(() => {
+    if (!drawerOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      const next = new URLSearchParams(window.location.search);
+      next.delete("turn");
+      next.delete("session");
+      setSearchParams(next);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [drawerOpen, setSearchParams]);
+
   function selectTurn(turn: SafeTurn) {
     const next = new URLSearchParams(searchParams);
     next.set("turn", turn.turn_id);
@@ -460,6 +475,15 @@ export function TurnsRoute() {
     setSearchParams(next);
   }
 
+  // github #568: the detail panel is a pop-out drawer — closing it just clears
+  // the turn/session selection from the URL.
+  function closeDrawer() {
+    const next = new URLSearchParams(searchParams);
+    next.delete("turn");
+    next.delete("session");
+    setSearchParams(next);
+  }
+
   return (
     <div className="turns-route">
       <div className="turns-header-row">
@@ -474,8 +498,8 @@ export function TurnsRoute() {
         </div>
       </div>
 
-      <div className="content-layout turns-layout">
-        <section aria-label="Turn browser" className="content-layout__main">
+      <div className="turns-body">
+        <section aria-label="Turn browser" className="turns-main">
           <Panel title="Browse Turns" subtitle={allOlderLoaded ? "Newest loaded turn records." : "Newest records loaded first. Load older pages as needed."}>
             <div className="turns-controls">
               <div className="turn-filter-tabs" role="tablist" aria-label="Trigger filter">
@@ -597,16 +621,39 @@ export function TurnsRoute() {
             ) : null}
           </Panel>
         </section>
-        <aside aria-label="Details panel" className="content-layout__details" id="details-panel-host">
-          {selectedSession ? <SessionDetail session={selectedSession} onOpenTurn={openSessionTurn} /> : null}
-          <div id="turn-browser-panel" />
-          <TurnDetailsPanel
-            emptyTitle={turns.length ? "No turn selected" : "No turns recorded yet"}
-            routeKey="turns"
-            turn={detailTurn}
-          />
-        </aside>
       </div>
+      {drawerOpen ? (
+        <>
+          <button
+            aria-label="Dismiss details"
+            className="turn-drawer__backdrop"
+            onClick={closeDrawer}
+            type="button"
+          />
+          <aside aria-label="Details panel" className="turn-drawer" id="details-panel-host">
+            <div className="turn-drawer__head">
+              <span className="turn-drawer__title">Details</span>
+              <button
+                aria-label="Close details"
+                className="turn-drawer__close"
+                onClick={closeDrawer}
+                type="button"
+              >
+                ×
+              </button>
+            </div>
+            <div className="turn-drawer__body">
+              {selectedSession ? <SessionDetail session={selectedSession} onOpenTurn={openSessionTurn} /> : null}
+              <div id="turn-browser-panel" />
+              <TurnDetailsPanel
+                emptyTitle={turns.length ? "No turn selected" : "No turns recorded yet"}
+                routeKey="turns"
+                turn={detailTurn}
+              />
+            </div>
+          </aside>
+        </>
+      ) : null}
     </div>
   );
 }

@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import type { SagaCall, TurnEvent, TurnRecord } from "./api";
 import { drilldownHref } from "./routeState";
 import { Badge, CodeBlock, EmptyState, ErrorState, Panel } from "./ui";
+import { TriggerPill } from "./routes/triggerPill";
 import { useUiState } from "./uiState";
 import {
   buildTimeline,
@@ -292,7 +293,7 @@ export function TurnDetailsPanel({
       <Panel
         title="Selected Turn"
         subtitle={turnId}
-        actions={<Badge tone={normalized.error ? "danger" : "neutral"}>{normalized.trigger}</Badge>}
+        actions={<TriggerPill trigger={normalized.trigger} />}
       >
         <dl className="facts-grid facts-grid--compact">
           <div><dt>Time</dt><dd>{formatTurnTime(normalized.ts)}</dd></div>
