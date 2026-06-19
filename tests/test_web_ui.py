@@ -815,7 +815,9 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
 
 
 def test_read_web_ui_config_reads_agent_file(tmp_path: Path):
-    (tmp_path / "web_ui.json").write_text(
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "web_ui.json").write_text(
         json.dumps({"agent_name": "Nebula-9", "skin": "cosmic-nebula"}), encoding="utf-8"
     )
     assert web_ui.read_web_ui_config(tmp_path) == {
@@ -826,12 +828,14 @@ def test_read_web_ui_config_reads_agent_file(tmp_path: Path):
 
 def test_read_web_ui_config_falls_back_to_defaults(tmp_path: Path):
     defaults = {"agent_name": "Mimir", "skin": "neon-terminal"}
+    state = tmp_path / "state"
+    state.mkdir()
     # No home, missing file, malformed JSON, and partial config all fall back.
     assert web_ui.read_web_ui_config(None) == defaults
     assert web_ui.read_web_ui_config(tmp_path) == defaults
-    (tmp_path / "web_ui.json").write_text("{ not json", encoding="utf-8")
+    (state / "web_ui.json").write_text("{ not json", encoding="utf-8")
     assert web_ui.read_web_ui_config(tmp_path) == defaults
-    (tmp_path / "web_ui.json").write_text(
+    (state / "web_ui.json").write_text(
         json.dumps({"agent_name": "  Solo  "}), encoding="utf-8"
     )
     assert web_ui.read_web_ui_config(tmp_path) == {
@@ -841,8 +845,8 @@ def test_read_web_ui_config_falls_back_to_defaults(tmp_path: Path):
 
 
 def test_ensure_web_ui_config_seeds_defaults_without_clobbering(tmp_path: Path):
-    path = tmp_path / "web_ui.json"
-    # Missing -> seeded with defaults.
+    path = tmp_path / "state" / "web_ui.json"
+    # Missing -> seeded with defaults (and the state/ dir is created).
     web_ui.ensure_web_ui_config(tmp_path)
     assert json.loads(path.read_text(encoding="utf-8")) == {
         "agent_name": "Mimir",
