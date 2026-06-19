@@ -106,6 +106,28 @@ export interface SkinCharacterRendererMetadata {
   };
 }
 
+// A webfont a skin needs for its fontFamily* tokens to render as designed.
+// The skin imports the bundled asset (`import url from "...woff2?url"`) and the
+// SkinProvider registers an @font-face for it while that skin is active, so the
+// font is self-hosted (no CDN, works under a strict CSP) and only loaded when
+// used. Skins on system fonts omit this entirely.
+export interface SkinFontSource {
+  // Bundled, fingerprinted asset URL (Vite `?url` import).
+  url: string;
+  format: "woff2" | "woff" | "truetype";
+}
+
+export interface SkinFontFace {
+  // Must match the primary family used in a fontFamily* token.
+  family: string;
+  // A single weight (400) or a CSS range for variable fonts ("400 700").
+  weight?: number | string;
+  style?: "normal" | "italic";
+  display?: "auto" | "block" | "swap" | "fallback" | "optional";
+  unicodeRange?: string;
+  src: SkinFontSource[];
+}
+
 export interface SkinManifest {
   id: SkinId;
   name: string;
@@ -114,6 +136,7 @@ export interface SkinManifest {
   chrome: SkinChromeMetadata;
   panel: SkinPanelMetadata;
   characterRenderer: SkinCharacterRendererMetadata;
+  fonts?: SkinFontFace[];
 }
 
 export type SkinCssVariables = React.CSSProperties &
