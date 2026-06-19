@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   formatBoardTime,
+  isCompletedStatus,
   issueMatchesFilters,
+  partitionDependencies,
   safeChainlinkBoardData
 } from "./chainlinkBoardViewModel";
 
@@ -68,5 +70,29 @@ describe("chainlink board view-model", () => {
     expect(issueMatchesFilters(issue, { label: "backend", status: "ready", priority: "high" })).toBe(false);
     expect(issueMatchesFilters(issue, { label: "", status: "", priority: "" })).toBe(true);
     expect(formatBoardTime("not-a-date")).toBe("not-a-date");
+  });
+
+  it("partitions active issues into ready and blocked by live dependencies (#570)", () => {
+    const board = safeChainlinkBoardData({
+      available: true,
+      issues: [
+        // done prereq — resolved, so #2 is no longer blocked by it
+        { id: 1, title: "done prereq", status: "done", priority: "low", blocking: [2] },
+        // unblocked + blocks an active issue -> ready, "unlocks #4"
+        { id: 3, title: "unlocker", status: "open", priority: "high", blocking: [4] },
+        // blocked by an active issue (#3) -> blocked
+        { id: 4, title: "downstream", status: "open", priority: "medium", blocked_by: [3] },
+        // blocked_by only a done issue (#1) -> not blocked; blocks nothing active -> not listed
+        { id: 2, title: "freed", status: "open", priority: "low", blocked_by: [1] }
+      ]
+    });
+
+    const { ready, blocked } = partitionDependencies(board.issues);
+    expect(ready.map((entry) => entry.issue.id)).toEqual([3]);
+    expect(ready[0].unlocks.map((item) => item.id)).toEqual([4]);
+    expect(blocked.map((entry) => entry.issue.id)).toEqual([4]);
+    expect(blocked[0].blockers.map((item) => item.id)).toEqual([3]);
+    expect(isCompletedStatus("done")).toBe(true);
+    expect(isCompletedStatus("open")).toBe(false);
   });
 });

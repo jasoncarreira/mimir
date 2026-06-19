@@ -1230,6 +1230,59 @@ textarea {
   align-items: center;
 }
 
+/* github #570: Ready / Blocked dependency view. */
+.chainlink-deps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  gap: var(--mimir-space-lg, 24px);
+}
+
+.chainlink-deps__group h3 {
+  display: flex;
+  gap: var(--mimir-space-xs, 8px);
+  align-items: center;
+  margin: 0 0 var(--mimir-space-sm, 12px);
+  font-size: var(--mimir-font-size-md, 1rem);
+}
+
+.chainlink-deps__list {
+  display: grid;
+  gap: var(--mimir-space-xs, 8px);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chainlink-deps__issue {
+  display: grid;
+  gap: var(--mimir-space-2xs, 4px);
+  width: 100%;
+  padding: var(--mimir-space-sm, 12px);
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-control, 6px);
+  background: var(--mimir-color-panel-background, #fff);
+  color: var(--mimir-color-text, #16201b);
+  text-align: left;
+  cursor: pointer;
+}
+
+.chainlink-deps__issue:hover,
+.chainlink-deps__issue:focus-visible {
+  border-color: var(--mimir-color-panel-border-hover, #60786a);
+}
+
+.chainlink-deps__title {
+  display: flex;
+  gap: var(--mimir-space-xs, 8px);
+  align-items: center;
+  font-weight: var(--mimir-font-weight-strong, 700);
+}
+
+.chainlink-deps__issue small {
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+}
+
 .chainlink-labels span,
 .chainlink-edge-list span {
   max-width: 100%;

@@ -127,6 +127,64 @@ export function issueMatchesFilters(issue: ChainlinkBoardIssue, filters: Chainli
   return true;
 }
 
+const COMPLETED_STATUSES = new Set(["done", "closed"]);
+
+// github #569: "open tasks" = anything not finished. Closed/done work is hidden
+// by default so the board shows active work.
+export function isCompletedStatus(status: string): boolean {
+  return COMPLETED_STATUSES.has(status);
+}
+
+const PRIORITY_RANK: Record<string, number> = { high: 0, medium: 1, normal: 2, low: 3 };
+
+function byPriority(a: ChainlinkBoardIssue, b: ChainlinkBoardIssue): number {
+  return (PRIORITY_RANK[a.priority] ?? 2) - (PRIORITY_RANK[b.priority] ?? 2) || a.id - b.id;
+}
+
+export interface ReadyDependency {
+  issue: ChainlinkBoardIssue;
+  unlocks: ChainlinkBoardIssue[];
+}
+
+export interface BlockedDependency {
+  issue: ChainlinkBoardIssue;
+  blockers: ChainlinkBoardIssue[];
+}
+
+export interface DependencyPartition {
+  ready: ReadyDependency[];
+  blocked: BlockedDependency[];
+}
+
+// github #570: answer "what is blocked, by what, and what unlocks next" instead
+// of dumping raw edges. Over active (not done/closed) issues:
+//   - blocked: has >=1 unresolved (still-active) blocker → list those blockers.
+//   - ready:   not blocked AND blocks >=1 still-active issue → finishing it
+//              unlocks that downstream work.
+// Issues with no live dependency edges aren't listed — they live in the columns.
+export function partitionDependencies(issues: ChainlinkBoardIssue[]): DependencyPartition {
+  const byId = new Map(issues.map((issue) => [issue.id, issue]));
+  const activeFrom = (ids: number[]): ChainlinkBoardIssue[] =>
+    ids
+      .map((id) => byId.get(id))
+      .filter((item): item is ChainlinkBoardIssue => item !== undefined && !isCompletedStatus(item.status));
+  const ready: ReadyDependency[] = [];
+  const blocked: BlockedDependency[] = [];
+  for (const issue of issues) {
+    if (isCompletedStatus(issue.status)) continue;
+    const blockers = activeFrom(issue.blocked_by);
+    if (blockers.length) {
+      blocked.push({ issue, blockers });
+      continue;
+    }
+    const unlocks = activeFrom(issue.blocking);
+    if (unlocks.length) ready.push({ issue, unlocks });
+  }
+  ready.sort((a, b) => byPriority(a.issue, b.issue));
+  blocked.sort((a, b) => byPriority(a.issue, b.issue));
+  return { ready, blocked };
+}
+
 export function formatBoardTime(value: string): string {
   if (!value) return "";
   const date = new Date(value);

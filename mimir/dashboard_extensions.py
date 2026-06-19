@@ -158,7 +158,7 @@ def first_party_dashboard_extensions(
             DashboardExtensionManifest(
                 id="chainlink-board",
                 route_path="/chainlink",
-                label="Chainlink",
+                label="Tasks",
                 icon="kanban",
                 nav_position=35,
                 api_namespace="chainlink-board",
