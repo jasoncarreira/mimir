@@ -689,6 +689,15 @@ textarea {
   display: none;
 }
 
+/* Neon Terminal reads as a CRT terminal — uppercase the interactive labels
+   (tabs + buttons). Scoped to the skin via the data-skin attribute SkinProvider
+   sets, so other skins (e.g. cosmic-nebula) keep their natural casing. */
+[data-skin="neon-terminal"] .app-nav__link,
+[data-skin="neon-terminal"] button {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
 .app-main {
   width: min(1280px, 100%);
   min-width: 0;
