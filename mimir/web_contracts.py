@@ -717,6 +717,8 @@ export interface RevokeKeyData {
 }
 
 export interface WebBootstrapData {
+  /** mimir build/release version, for the app shell's version label. */
+  version: string;
   auth: {
     required: boolean;
     scheme: "x-api-key";
@@ -731,6 +733,11 @@ export interface WebBootstrapData {
     shape: "fetch-event-stream";
     header: "X-API-Key";
     native_eventsource_supported_when_auth_required: false;
+  };
+  /** Agent-owned UI config (<home>/state/web_ui.json), editable by the agent. */
+  ui: {
+    agent_name: string;
+    skin: string;
   };
   dashboard_extensions: DashboardExtensionManifest[];
 }

@@ -42,6 +42,7 @@ from typing import Any
 
 from aiohttp import web
 
+from . import __version__
 from ._jsonl_tail import tail_jsonl_records
 from .admin_config import build_admin_config_payload
 from .admin_users import build_users_payload, roles_for_request
@@ -89,9 +90,65 @@ log = logging.getLogger(__name__)
 
 _TURN_VIEWER_HTML: str | None = None
 _WEB_AUTH_JS: str | None = None
+# Under the agent-writable ``state/`` root (DEFAULT_FOLDERS) so the agent can
+# edit it with its own Write/Edit tools — a top-level <home> file is outside the
+# WriteGuardBackend's writable roots and would be refused.
+WEB_UI_CONFIG_RELPATH = ("state", "web_ui.json")
+DEFAULT_AGENT_NAME = "Mimir"
+DEFAULT_WEB_SKIN = "neon-terminal"
 LIVE_EVENTS_HEARTBEAT_S = 15.0
 LIVE_EVENTS_POLL_S = 1.0
 LIVE_EVENTS_MAX_STREAMS = int(os.environ.get("MIMIR_LIVE_EVENTS_MAX_STREAMS", "8"))
+
+
+def read_web_ui_config(home: Path | None) -> dict[str, str]:
+    """Agent-owned UI config: ``<home>/state/web_ui.json``.
+
+    The agent edits this file itself (e.g. during onboarding) to set its display
+    name and active skin — ``state/`` is an agent-writable root. Read per-request
+    like the other ``<home>/`` sources; a missing file or malformed JSON falls
+    back to defaults. The skin value is passed through verbatim — the frontend
+    validates it against its registry.
+    """
+    agent_name = DEFAULT_AGENT_NAME
+    skin = DEFAULT_WEB_SKIN
+    if home is not None:
+        try:
+            raw = json.loads((home.joinpath(*WEB_UI_CONFIG_RELPATH)).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = None
+        if isinstance(raw, dict):
+            name = raw.get("agent_name")
+            if isinstance(name, str) and name.strip():
+                agent_name = name.strip()
+            configured_skin = raw.get("skin")
+            if isinstance(configured_skin, str) and configured_skin.strip():
+                skin = configured_skin.strip()
+    return {"agent_name": agent_name, "skin": skin}
+
+
+def ensure_web_ui_config(home: Path | None) -> None:
+    """Create ``<home>/state/web_ui.json`` with defaults if it doesn't exist yet.
+
+    Run once at startup so the agent has a discoverable, well-formed file to edit
+    (e.g. during onboarding). Existing files are never overwritten.
+    """
+    if home is None:
+        return
+    path = home.joinpath(*WEB_UI_CONFIG_RELPATH)
+    if path.exists():
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {"agent_name": DEFAULT_AGENT_NAME, "skin": DEFAULT_WEB_SKIN}, indent=2
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        log.warning("could not seed %s", path, exc_info=True)
 
 
 def _load_viewer_html() -> str:
@@ -238,6 +295,10 @@ def register_routes(
     ``dashboard_extensions`` is the trusted first-party dashboard registry.
     Enabled manifests drive optional backend namespace hook registration; this
     is not a remote plugin loading mechanism."""
+
+    # Seed the agent-owned UI config on startup so there's a discoverable file
+    # for the agent to edit (its name + skin).
+    ensure_web_ui_config(home)
 
     existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
     _react_app_dist = react_app_dist or (Path(__file__).parent / "react_app" / "dist")
@@ -587,6 +648,7 @@ def register_routes(
         public_bind = web_host not in ("", "127.0.0.1", "::1", "localhost")
         return json_success(
             {
+                "version": __version__,
                 "auth": {
                     "required": gate,
                     "scheme": "x-api-key",
@@ -602,6 +664,7 @@ def register_routes(
                     "header": "X-API-Key",
                     "native_eventsource_supported_when_auth_required": False,
                 },
+                "ui": read_web_ui_config(home),
                 "dashboard_extensions": _dashboard_extensions.navigation_payload(),
             },
             headers=_no_store_headers(),

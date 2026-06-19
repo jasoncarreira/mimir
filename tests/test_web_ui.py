@@ -797,6 +797,9 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     assert resp.headers["Cache-Control"].startswith("no-store")
     assert "super-secret" not in body_text
     validate_api_envelope(body, expect_ok=True)
+    assert body["data"]["version"]  # mimir build/release version surfaced
+    # No home configured -> agent UI config falls back to defaults.
+    assert body["data"]["ui"] == {"agent_name": "Mimir", "skin": "neon-terminal"}
     assert body["data"]["auth"]["required"] is True
     assert body["data"]["server"]["public_bind"] is True
     assert [item["id"] for item in body["data"]["dashboard_extensions"]][:3] == [
@@ -809,6 +812,52 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     )
     assert ops_manifest["api_namespace"] == "ops"
     assert ops_manifest["trusted_first_party"] is True
+
+
+def test_read_web_ui_config_reads_agent_file(tmp_path: Path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "web_ui.json").write_text(
+        json.dumps({"agent_name": "Nebula-9", "skin": "cosmic-nebula"}), encoding="utf-8"
+    )
+    assert web_ui.read_web_ui_config(tmp_path) == {
+        "agent_name": "Nebula-9",
+        "skin": "cosmic-nebula",
+    }
+
+
+def test_read_web_ui_config_falls_back_to_defaults(tmp_path: Path):
+    defaults = {"agent_name": "Mimir", "skin": "neon-terminal"}
+    state = tmp_path / "state"
+    state.mkdir()
+    # No home, missing file, malformed JSON, and partial config all fall back.
+    assert web_ui.read_web_ui_config(None) == defaults
+    assert web_ui.read_web_ui_config(tmp_path) == defaults
+    (state / "web_ui.json").write_text("{ not json", encoding="utf-8")
+    assert web_ui.read_web_ui_config(tmp_path) == defaults
+    (state / "web_ui.json").write_text(
+        json.dumps({"agent_name": "  Solo  "}), encoding="utf-8"
+    )
+    assert web_ui.read_web_ui_config(tmp_path) == {
+        "agent_name": "Solo",
+        "skin": "neon-terminal",
+    }
+
+
+def test_ensure_web_ui_config_seeds_defaults_without_clobbering(tmp_path: Path):
+    path = tmp_path / "state" / "web_ui.json"
+    # Missing -> seeded with defaults (and the state/ dir is created).
+    web_ui.ensure_web_ui_config(tmp_path)
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "agent_name": "Mimir",
+        "skin": "neon-terminal",
+    }
+    # Existing -> left untouched (agent edits survive restarts).
+    path.write_text(json.dumps({"agent_name": "Nebula-9", "skin": "cosmic-nebula"}), encoding="utf-8")
+    web_ui.ensure_web_ui_config(tmp_path)
+    assert json.loads(path.read_text(encoding="utf-8"))["agent_name"] == "Nebula-9"
+    # No home is a no-op (doesn't raise).
+    web_ui.ensure_web_ui_config(None)
 
 
 @pytest.mark.asyncio
