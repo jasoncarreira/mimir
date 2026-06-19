@@ -1,4 +1,9 @@
 import type { SkinManifest } from "./types";
+import idleUrl from "../assets/agent-character/idle.lottie?url";
+import thinkingUrl from "../assets/agent-character/thinking.lottie?url";
+import typingUrl from "../assets/agent-character/typing.lottie?url";
+import toolUrl from "../assets/agent-character/tool.lottie?url";
+import errorUrl from "../assets/agent-character/error.lottie?url";
 
 export const defaultRetroSkin = {
   id: "default-retro",
@@ -71,34 +76,34 @@ export const defaultRetroSkin = {
     hoverBehavior: "border-accent"
   },
   characterRenderer: {
-    kind: "react-placeholder",
+    kind: "dotlottie",
     componentSlot: "agent-character",
     variant: "terminal-portrait",
     assets: [
       {
         id: "default-retro-idle",
-        type: "css",
-        href: null
+        type: "dotlottie",
+        href: idleUrl
       },
       {
         id: "default-retro-thinking",
-        type: "css",
-        href: null
+        type: "dotlottie",
+        href: thinkingUrl
       },
       {
         id: "default-retro-typing",
-        type: "css",
-        href: null
+        type: "dotlottie",
+        href: typingUrl
       },
       {
         id: "default-retro-tool",
-        type: "css",
-        href: null
+        type: "dotlottie",
+        href: toolUrl
       },
       {
         id: "default-retro-error",
-        type: "css",
-        href: null
+        type: "dotlottie",
+        href: errorUrl
       }
     ],
     stateMap: {
