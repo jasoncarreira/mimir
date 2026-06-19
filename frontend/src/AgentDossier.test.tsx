@@ -15,6 +15,7 @@ vi.mock("./api/bootstrap", () => ({
 vi.mock("./agent-character", () => ({
   AgentCharacter: () => null,
   characterStateFromLiveEvent: () => "idle",
+  isChatLiveEvent: () => true,
   withComposerListening: (state: string) => state
 }));
 vi.mock("./uiState", () => ({

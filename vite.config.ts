@@ -1,11 +1,24 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { readFileSync } from "node:fs";
 
-// Minimal ambient typing so the dev-proxy can read MIMIR_DEV_API without pulling
-// in @types/node (the config runs in Node, which provides the real `process`).
-declare const process: { env: Record<string, string | undefined> };
+
+// Build-time fallback for the app shell's version label: the mimir package
+// version (pyproject). The runtime bootstrap's `version` wins when present; this
+// keeps the BUILD label populated offline / before the backend carries it.
+function mimirVersion(): string {
+  try {
+    const toml = readFileSync("pyproject.toml", "utf-8");
+    return /^version\s*=\s*"([^"]+)"/m.exec(toml)?.[1] ?? "";
+  } catch {
+    return "";
+  }
+}
 
 export default defineConfig({
+  define: {
+    __APP_VERSION__: JSON.stringify(mimirVersion())
+  },
   plugins: [react()],
   root: "frontend",
   base: "/app/",

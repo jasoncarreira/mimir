@@ -43,7 +43,7 @@ describe("SAGA dashboard rendering", () => {
     expect(classifySagaEvidence({ subject: "s", predicate: "p", object: "o" })).toBe("triple");
   });
 
-  it("renders representative mixed atom and observation results in separate sections", async () => {
+  it("renders mixed atoms and observations together in one combined list", async () => {
     vi.stubGlobal("fetch", vi.fn(async (url: string) => {
       if (url.includes("view=stats")) {
         return jsonResponse(envelope({
@@ -90,15 +90,18 @@ describe("SAGA dashboard rendering", () => {
 
     renderDashboard();
 
-    const rawPanel = await screen.findByRole("heading", { name: "Raw Atoms" });
-    const observationsPanel = await screen.findByRole("heading", { name: "Observations" });
+    const panel = (await screen.findByRole("heading", { name: "Atoms & Observations" })).closest("section") as HTMLElement;
+    const list = within(panel).getByRole("list", { name: "Atoms and observations" });
 
     expect(screen.getByText("1.5 KB")).toBeTruthy();
-    expect(within(rawPanel.closest("section") as HTMLElement).getByText("Raw turn content")).toBeTruthy();
-    expect(within(observationsPanel.closest("section") as HTMLElement).getByText("User prefers concise answers")).toBeTruthy();
+    // Both kinds share one list, one line each, each carrying its kind pill.
+    expect(within(list).getByText("Raw turn content")).toBeTruthy();
+    expect(within(list).getByText("User prefers concise answers")).toBeTruthy();
+    expect(within(list).getByText("atom")).toBeTruthy();
+    expect(within(list).getByText("observation")).toBeTruthy();
   });
 
-  it("renders legacy atom detail fields instead of silently dropping them", async () => {
+  it("pops out legacy atom detail fields on click instead of dropping them", async () => {
     vi.stubGlobal("fetch", vi.fn(async (url: string) => {
       if (url.includes("view=stats")) {
         return jsonResponse(envelope({ ready: true, atom_count: 1, session_count: 1, triple_count: 0, tombstoned_count: 0, db_size_bytes: 2048 }));
@@ -135,8 +138,8 @@ describe("SAGA dashboard rendering", () => {
 
     renderDashboard();
 
-    const rawPanel = (await screen.findByRole("heading", { name: "Raw Atoms" })).closest("section") as HTMLElement;
-    fireEvent.click(within(rawPanel).getByRole("button", { name: "Inspect" }));
+    // Click the atom row -> detail pops out in the drawer.
+    fireEvent.click(await screen.findByRole("button", { name: /Raw turn content/ }));
 
     expect(await screen.findByText("agent_authored")).toBeTruthy();
     expect(screen.getByText("session-1")).toBeTruthy();

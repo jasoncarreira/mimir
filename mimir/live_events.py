@@ -62,10 +62,13 @@ def turn_record_to_live_items(turn: dict[str, Any]) -> list[LiveEventItem]:
 
     ts = _turn_sort_ts(turn) or None
     phase = "failed" if turn.get("error") else "finished"
-    # Carry the monotonic turn seq so consumers can show the running total from
-    # max(seq) instead of counting events — backfilled lifecycle items then can't
-    # inflate the count (their seq is <= the bootstrap's turns_total).
+    # Carry the turn's seq, channel, and trigger on every live item: seq lets
+    # consumers show the running total as max(seq) (no double-count on backfill);
+    # channel_id/trigger let them scope (e.g. the chat Field Log shows only
+    # web-chat turns, not background poller/heartbeat turns).
     seq = turn.get("seq")
+    channel_id = turn.get("channel_id")
+    trigger = turn.get("trigger")
     items = [
         LiveEventItem(
             id=f"turn:{turn_id}:lifecycle:{phase}",
@@ -78,6 +81,8 @@ def turn_record_to_live_items(turn: dict[str, Any]) -> list[LiveEventItem]:
                 "ts": ts,
                 "error": turn.get("error"),
                 "seq": seq if isinstance(seq, int) else None,
+                "channel_id": channel_id,
+                "trigger": trigger,
             },
         )
     ]
@@ -96,6 +101,8 @@ def turn_record_to_live_items(turn: dict[str, Any]) -> list[LiveEventItem]:
                     event={
                         "kind": "turn.event",
                         "turn_id": turn_id,
+                        "channel_id": channel_id,
+                        "trigger": trigger,
                         "event": event,
                     },
                 )

@@ -46,6 +46,10 @@ import "./styles.css";
 
 const queryClient = new QueryClient();
 
+// Build-time mimir version from vite's define (vite.config). Guarded with typeof
+// so it's safe where the define isn't applied (e.g. vitest) — falls back to "".
+const APP_BUILD_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "";
+
 function appBasename() {
   const base = import.meta.env.BASE_URL.replace(/\/$/, "");
   return base === "" ? "/" : base;
@@ -557,18 +561,36 @@ function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[
 }
 
 // github #577: header strip over a horizontal tab bar (Neon Terminal / default).
-function TopNavShell({ surfaces, firstRoute, bootstrap, error, isError, isLoading }: ShellProps) {
+function TopNavShell({ surfaces, firstRoute, bootstrap }: ShellProps) {
+  const buildVersion = bootstrap?.version || APP_BUILD_VERSION;
+  const setApiKey = useSetApiKey();
+  const requiresKey = bootstrap?.auth.required ?? false;
   return (
     <div className="app-frame">
       <header className="app-header">
         <Link className="app-brand" to="/chat">
           <span className="app-brand__name">MIMIR://OPS</span>
-          {bootstrap?.version ? (
-            <span className="app-brand__build">· BUILD {bootstrap.version}</span>
+          {buildVersion ? (
+            <span className="app-brand__build">· BUILD {buildVersion}</span>
           ) : null}
         </Link>
         <div className="app-header__status">
-          <AuthPanel bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
+          {/* On a protected server the status chip doubles as sign-out (clears
+              the stored key → login screen); open servers show it as a label. */}
+          {requiresKey ? (
+            <button
+              aria-label="Sign out"
+              className="app-status-chip"
+              onClick={() => setApiKey("")}
+              title="Sign out"
+              type="button"
+            >
+              READY
+            </button>
+          ) : (
+            <span className="app-status-chip">READY</span>
+          )}
+          <span className="app-header__signal" aria-hidden="true">◇ MEM-LINKED · SIGNAL ▮▮▯ LOW</span>
         </div>
       </header>
       <div className="app-topnav">

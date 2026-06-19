@@ -15,9 +15,10 @@ import {
   type SagaAtomSummary,
   type SagaSqlCell
 } from "./api/saga";
-import type { ListMeta, SagaAtomDetailData } from "./api/generated/contracts";
+import type { SagaAtomDetailData } from "./api/generated/contracts";
+import { DetailDrawer } from "./DetailDrawer";
 import { drilldownHref } from "./routeState";
-import { Badge, Button, DataTable, EmptyState, ErrorState, LoadingState, Panel, TextInput } from "./ui";
+import { Button, DataTable, EmptyState, ErrorState, LoadingState, Panel, TextInput } from "./ui";
 
 type EvidenceKind = "atom" | "observation" | "triple";
 
@@ -79,49 +80,6 @@ function stringField(source: unknown, keys: string[]): string {
   return "";
 }
 
-function kindBadge(kind: EvidenceKind) {
-  if (kind === "observation") return <Badge tone="info">observation</Badge>;
-  if (kind === "triple") return <Badge tone="success">triple</Badge>;
-  return <Badge>atom</Badge>;
-}
-
-function AtomTable({
-  atoms,
-  meta,
-  onInspect
-}: {
-  atoms: SagaAtomSummary[];
-  meta?: ListMeta;
-  onInspect: (id: string) => void;
-}) {
-  if (!atoms.length) return <EmptyState title="No atoms found" />;
-  return (
-    <DataTable
-      caption={`Showing ${atoms.length}${meta?.total != null ? ` of ${meta.total}` : ""} results`}
-      columns={[
-        { key: "content", header: "Content" },
-        { key: "kind", header: "Type" },
-        { key: "stream", header: "Stream" },
-        { key: "metadata", header: "Metadata" },
-        { key: "created", header: "Created" },
-        { key: "action", header: "" }
-      ]}
-      rows={atoms.map((atom) => ({
-        content: <span className="saga-content-preview">{atom.content_preview || "(empty)"}</span>,
-        kind: kindBadge(classifySagaEvidence(atom)),
-        stream: atom.stream || "semantic",
-        metadata: (
-          <span className="saga-meta-line">
-            {atom.channel_id || "no channel"} · conf {atom.encoding_confidence?.toFixed(3) ?? "-"}
-            {atom.is_pinned ? " · pinned" : ""}
-          </span>
-        ),
-        created: formatDate(atom.created_at),
-        action: <Button onClick={() => onInspect(atom.id)}>Inspect</Button>
-      }))}
-    />
-  );
-}
 
 function AtomDetail({ atomId }: { atomId: string }) {
   const query = useQuery({
@@ -147,6 +105,7 @@ function AtomDetail({ atomId }: { atomId: string }) {
 
   return (
     <div className="saga-detail">
+      <pre className="saga-content-full">{String(atom.content ?? "")}</pre>
       <dl className="facts-grid facts-grid--compact">
         <div><dt>ID</dt><dd>{atom.id}</dd></div>
         <div><dt>Type</dt><dd>{String(atom.memory_type ?? "raw")}</dd></div>
@@ -166,7 +125,6 @@ function AtomDetail({ atomId }: { atomId: string }) {
         <div><dt>Activation</dt><dd>{`arousal ${Number(atom.arousal ?? 0).toFixed(3)} · valence ${Number(atom.valence ?? 0).toFixed(3)}`}</dd></div>
         <div><dt>Embedding</dt><dd>{embedding ? `${embedding.provider}/${embedding.model} dim=${embedding.dim}` : "none"}</dd></div>
       </dl>
-      <pre className="saga-content-full">{String(atom.content ?? "")}</pre>
       <section className="saga-relations">
         <h3>Relations out</h3>
         {relations.length ? relations.map((relation, index) => (
@@ -178,6 +136,44 @@ function AtomDetail({ atomId }: { atomId: string }) {
           </p>
         )) : <p className="app-copy">none</p>}
       </section>
+    </div>
+  );
+}
+
+// github: combined one-line list of atoms + observations (the old saga viewer's
+// shape). Click a row to pop out the detail.
+function SagaAtomList({
+  atoms,
+  selectedId,
+  onSelect
+}: {
+  atoms: SagaAtomSummary[];
+  selectedId: string;
+  onSelect: (id: string) => void;
+}) {
+  if (!atoms.length) return <EmptyState title="No atoms or observations found" />;
+  return (
+    <div aria-label="Atoms and observations" className="saga-atom-list" role="list">
+      {atoms.map((atom) => {
+        const kind = classifySagaEvidence(atom);
+        return (
+          <button
+            className={`saga-atom-row${selectedId === atom.id ? " saga-atom-row--selected" : ""}`}
+            key={atom.id}
+            onClick={() => onSelect(atom.id)}
+            type="button"
+          >
+            <span className="saga-atom-row__kind" data-kind={kind}>{kind}</span>
+            <span className="saga-atom-row__content">{atom.content_preview || "(empty)"}</span>
+            <span className="saga-atom-row__meta">
+              {atom.channel_id || "no channel"}
+              {atom.encoding_confidence != null ? ` · conf ${atom.encoding_confidence.toFixed(2)}` : ""}
+              {atom.is_pinned ? " · pinned" : ""}
+            </span>
+            <span className="saga-atom-row__time">{formatDate(atom.created_at)}</span>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -195,13 +191,17 @@ function AtomsWorkflow() {
   });
   const atoms = atomsQuery.data?.data.atoms ?? [];
   const channels = atomsQuery.data?.data.channels ?? [];
-  const rawAtoms = atoms.filter((atom) => classifySagaEvidence(atom) === "atom");
-  const observations = atoms.filter((atom) => classifySagaEvidence(atom) === "observation");
 
   function selectAtom(atomId: string) {
     const params = new URLSearchParams(searchParams);
     params.set("tab", "atoms");
     params.set("atom", atomId);
+    setSearchParams(params);
+  }
+
+  function clearAtom() {
+    const params = new URLSearchParams(searchParams);
+    params.delete("atom");
     setSearchParams(params);
   }
 
@@ -231,18 +231,16 @@ function AtomsWorkflow() {
       {atomsQuery.isLoading ? <LoadingState label="Loading atoms" /> : null}
       {atomsQuery.isError ? <ErrorState title="Atoms failed">{atomsQuery.error instanceof Error ? atomsQuery.error.message : String(atomsQuery.error)}</ErrorState> : null}
       {!atomsQuery.isLoading && !atomsQuery.isError ? (
-        <div className="saga-result-grid">
-          <Panel title="Raw Atoms" subtitle="Non-observation atom records.">
-            <AtomTable atoms={rawAtoms} meta={atomsQuery.data?.meta} onInspect={selectAtom} />
-          </Panel>
-          <Panel title="Observations" subtitle="Observation records are kept separate from raw atoms.">
-            <AtomTable atoms={observations} meta={atomsQuery.data?.meta} onInspect={selectAtom} />
-          </Panel>
-        </div>
+        <Panel
+          title="Atoms & Observations"
+          subtitle={`Newest first${atomsQuery.data?.meta?.total != null ? ` · ${atoms.length} of ${atomsQuery.data.meta.total}` : ""} · click a row for detail.`}
+        >
+          <SagaAtomList atoms={atoms} selectedId={selectedAtom} onSelect={selectAtom} />
+        </Panel>
       ) : null}
-      <Panel title="Atom Detail" subtitle="Activation, retrieval, embedding, and relation metadata when available.">
+      <DetailDrawer onClose={clearAtom} open={Boolean(selectedAtom)} title="Atom Detail">
         <AtomDetail atomId={selectedAtom} />
-      </Panel>
+      </DetailDrawer>
     </div>
   );
 }
@@ -265,6 +263,12 @@ function SearchWorkflow() {
     const params = new URLSearchParams(searchParams);
     params.set("tab", "search");
     params.set("atom", atomId);
+    setSearchParams(params);
+  }
+
+  function clearAtom() {
+    const params = new URLSearchParams(searchParams);
+    params.delete("atom");
     setSearchParams(params);
   }
 
@@ -292,12 +296,12 @@ function SearchWorkflow() {
       {searchQuery.isError ? <ErrorState title="Search failed">{searchQuery.error instanceof Error ? searchQuery.error.message : String(searchQuery.error)}</ErrorState> : null}
       {searchQuery.data ? (
         <Panel title="Search Results" subtitle={`${searchQuery.data.meta?.total ?? searchQuery.data.data.atoms.length} matches for ${submitted}`}>
-          <AtomTable atoms={searchQuery.data.data.atoms} meta={searchQuery.data.meta} onInspect={selectAtom} />
+          <SagaAtomList atoms={searchQuery.data.data.atoms} selectedId={selectedAtom} onSelect={selectAtom} />
         </Panel>
       ) : !submitted ? <EmptyState title="Enter a query to search atoms" /> : null}
-      <Panel title="Result Detail">
+      <DetailDrawer onClose={clearAtom} open={Boolean(selectedAtom)} title="Atom Detail">
         <AtomDetail atomId={selectedAtom} />
-      </Panel>
+      </DetailDrawer>
     </div>
   );
 }

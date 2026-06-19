@@ -40,6 +40,22 @@ export function resolveAgentCharacterAsset(
   };
 }
 
+// github: the chat Field Log + Agent Dossier should reflect only web-chat turns,
+// not background poller/heartbeat turns. Live turn events now carry the turn's
+// channel_id; treat web-* as chat. Events from a backend that predates the field
+// (channel_id === undefined) are included so nothing silently disappears.
+export function isChatLiveEvent(event: LiveEvent | null | undefined): boolean {
+  if (!event) return false;
+  if (event.kind === "chat.message" || event.kind === "chat.reaction") {
+    return typeof event.channel_id === "string" && event.channel_id.startsWith("web-");
+  }
+  if (event.kind === "turn.event" || event.kind === "turn.lifecycle") {
+    if (event.channel_id === undefined) return true; // pre-channel_id backend
+    return typeof event.channel_id === "string" && event.channel_id.startsWith("web-");
+  }
+  return false;
+}
+
 export function characterStateFromLiveEvent(
   event: LiveEvent | null | undefined
 ): AgentCharacterState {

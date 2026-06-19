@@ -602,6 +602,24 @@ def test_turn_record_to_live_items_carries_seq_on_lifecycle():
     assert legacy[0].event["seq"] is None
 
 
+def test_turn_record_to_live_items_carries_channel_and_trigger():
+    from mimir.live_events import turn_record_to_live_items
+
+    items = turn_record_to_live_items({
+        "turn_id": "t1",
+        "ts": "2026-01-01T00:00:00Z",
+        "channel_id": "web-default",
+        "trigger": "user_message",
+        "events": [{"type": "tool_call", "name": "x"}],
+    })
+    lifecycle = next(i for i in items if i.event["kind"] == "turn.lifecycle")
+    event = next(i for i in items if i.event["kind"] == "turn.event")
+    assert lifecycle.event["channel_id"] == "web-default"
+    assert lifecycle.event["trigger"] == "user_message"
+    assert event.event["channel_id"] == "web-default"
+    assert event.event["trigger"] == "user_message"
+
+
 def test_read_live_event_items_since_stops_after_crossing_acknowledged_timestamp(tmp_path: Path):
     from mimir.live_events import read_live_event_items_since
 

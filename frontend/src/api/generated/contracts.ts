@@ -597,6 +597,9 @@ export interface ChatReactionEvent {
 export interface TurnEventLiveEvent {
   kind: "turn.event";
   turn_id: string;
+  /** The turn's channel + trigger, so consumers can scope (e.g. chat-only). */
+  channel_id?: string | null;
+  trigger?: string | null;
   event: TurnEventBase;
 }
 
@@ -608,6 +611,9 @@ export interface TurnLifecycleEvent {
   error?: string | null;
   /** Monotonic turn seq — consumers show the running total as max(seq). */
   seq?: number | null;
+  /** The turn's channel + trigger, so consumers can scope (e.g. chat-only). */
+  channel_id?: string | null;
+  trigger?: string | null;
 }
 
 export type LiveEvent =
