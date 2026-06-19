@@ -319,6 +319,8 @@ textarea {
 
 .ui-code,
 .ui-log {
+  min-width: 0;
+  max-width: 100%;
   margin: 0;
   border-radius: var(--mimir-radius-panel, 8px);
   background: var(--mimir-color-code-background, #17211c);
@@ -1804,6 +1806,7 @@ textarea {
 .turn-drawer__body {
   flex: 1 1 auto;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   align-content: start;
   gap: var(--mimir-space-md, 16px);
   padding: var(--mimir-space-md, 16px);
@@ -2043,6 +2046,7 @@ textarea {
 
 .turn-detail {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-md, 16px);
 }
 
@@ -2080,12 +2084,16 @@ textarea {
 
 .turn-event-stack {
   display: grid;
+  /* minmax(0, 1fr) caps the column at the container so wide code blocks scroll
+     inside their own <pre> instead of stretching the drawer (github #570). */
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-sm, 12px);
 }
 
 .turn-event-card,
 .turn-message-stack > div {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-xs, 8px);
   min-width: 0;
   padding: var(--mimir-space-sm, 12px);
@@ -2096,6 +2104,7 @@ textarea {
 
 .turn-message-stack {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-sm, 12px);
 }
 
@@ -2106,6 +2115,7 @@ textarea {
 
 .turn-result-body {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-xs, 8px);
 }
 
