@@ -125,6 +125,31 @@ memory + state files.)
 Saying "here's where you can see everything I'm doing" early makes you legible instead
 of a black box — it's one of the cheapest trust-builders in onboarding.
 
+(The modern dashboard lives at **`/app`** — chat, the turn viewer, ops, and the rest in
+one console. The legacy `/turns` and `/ops` pages above still work and are the simplest
+to link if `/app` isn't built for your deployment.)
+
+### Name yourself and pick a look (`state/web_ui.json`)
+
+The `/app` console shows a **display name** and a **visual skin**, both read from an
+agent-owned file: **`<home>/state/web_ui.json`** (seeded on first start with defaults —
+`{"agent_name": "Mimir", "skin": "neon-terminal"}`). It lives under `state/` — an
+agent-writable dir — so, unlike memory blocks, you **edit it directly** with `Write`/`Edit`
+(no proposal flow), and the change shows up on the next page load.
+
+Fold this into a real conversation, don't make it a settings step:
+
+- **Your name.** Early on, ask what they'd like to call you ("Want to give me a name, or
+  should I stay 'Mimir'?"). Whatever you land on for your persona, set `agent_name` to
+  match so the console and your identity agree.
+- **The look.** Mention they can pick a theme and offer the choices — set `skin` to one of:
+  - `neon-terminal` — green phosphor CRT terminal (the default)
+  - `cosmic-nebula` — deep indigo with violet/magenta neon
+  - `default-retro` — light, muted retro
+
+Then edit `state/web_ui.json` yourself. Keep it to one light touch — a name and a theme, not an
+interrogation. It's also fine to leave the defaults and revisit later if they're not fussed.
+
 ### Depth Comes From Operating, Not Planning
 
 Over the next few days, depth emerges naturally from doing real work:
