@@ -1,6 +1,6 @@
 import type React from "react";
 
-export type SkinId = "default-retro" | "neon-terminal";
+export type SkinId = "default-retro" | "neon-terminal" | "cosmic-nebula";
 
 export type CharacterRendererKind =
   | "static-image"

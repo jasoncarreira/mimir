@@ -5,13 +5,15 @@ import {
   useMemo,
   type PropsWithChildren
 } from "react";
+import { cosmicNebulaSkin } from "./cosmic-nebula";
 import { defaultRetroSkin } from "./default-retro";
 import { neonTerminalSkin } from "./neon-terminal";
 import type { SkinCssVariables, SkinId, SkinManifest } from "./types";
 
 const localSkins = {
   "default-retro": defaultRetroSkin,
-  "neon-terminal": neonTerminalSkin
+  "neon-terminal": neonTerminalSkin,
+  "cosmic-nebula": cosmicNebulaSkin
 } satisfies Record<SkinId, SkinManifest>;
 
 // Active skin until per-user skin selection ships (#562). neon-terminal is the
@@ -84,6 +86,24 @@ export function loadSkin(skinId: SkinId = DEFAULT_SKIN_ID): SkinManifest {
   return localSkins[skinId];
 }
 
+// Interim skin selection until the picker ships (#562): a `?skin=<id>` query
+// param overrides the default, so registered skins (e.g. cosmic-nebula) are
+// previewable without a rebuild. Unknown/absent → the default skin.
+export function resolveSkinId(fallback: SkinId = DEFAULT_SKIN_ID): SkinId {
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  try {
+    const requested = new URLSearchParams(window.location.search).get("skin");
+    if (requested && Object.prototype.hasOwnProperty.call(localSkins, requested)) {
+      return requested as SkinId;
+    }
+  } catch {
+    /* malformed URL — fall through to the default */
+  }
+  return fallback;
+}
+
 export function skinTokensToCssVariables(
   skin: SkinManifest
 ): SkinCssVariables {
@@ -143,9 +163,10 @@ interface SkinProviderProps extends PropsWithChildren {
 
 export function SkinProvider({
   children,
-  skinId = DEFAULT_SKIN_ID
+  skinId
 }: SkinProviderProps) {
-  const skin = loadSkin(skinId);
+  // Explicit prop wins (tests/embeds); otherwise resolve from the URL/default.
+  const skin = loadSkin(skinId ?? resolveSkinId());
   useSkinFonts(skin);
   const cssVariables = useMemo(() => skinTokensToCssVariables(skin), [skin]);
   const contextValue = useMemo(
