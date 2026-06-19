@@ -81,10 +81,12 @@ describe("TurnsRoute", () => {
 
     const list = await screen.findByRole("list", { name: "Turns" });
     expect(within(list).getByText("Summarize the current state.")).toBeTruthy();
-    // github #568: details only appear after selecting a turn (no auto-select).
-    expect(screen.getByText("No turn selected")).toBeTruthy();
+    // github #568/#570: the detail drawer is closed until a turn is clicked.
+    expect(screen.queryByText("Selected Turn")).toBeNull();
     fireEvent.click(within(list).getByText("Summarize the current state."));
     expect(await screen.findByText("Read current memory summary.")).toBeTruthy();
+    // ...and now the drawer is open.
+    expect(screen.getByText("Selected Turn")).toBeTruthy();
     expect(screen.getAllByText("state_read").length).toBeGreaterThan(0);
     expect(screen.getByText("Loaded memory index.")).toBeTruthy();
     expect(screen.getByText(/Result offloaded/)).toBeTruthy();
@@ -119,6 +121,28 @@ describe("TurnsRoute", () => {
     renderTurns();
 
     expect(await screen.findByText("No turns match the current filter")).toBeTruthy();
-    expect(screen.getByText("No turns recorded yet")).toBeTruthy();
+    // github #568: with no turns there's nothing to select, so the detail drawer
+    // stays closed (no permanent empty panel).
+    expect(screen.queryByText("Selected Turn")).toBeNull();
+  });
+
+  it("opens the detail drawer on click and closes it again (#568/#570)", async () => {
+    turnsApi.listTurns.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: { turns: [turnsFixture.turns[0]] },
+      meta: { cursor: null, limit: 200, total: 1, truncated: false }
+    });
+
+    renderTurns();
+
+    const list = await screen.findByRole("list", { name: "Turns" });
+    expect(screen.queryByText("Selected Turn")).toBeNull();
+
+    fireEvent.click(within(list).getByText("Summarize the current state."));
+    expect(await screen.findByText("Selected Turn")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close details" }));
+    await waitFor(() => expect(screen.queryByText("Selected Turn")).toBeNull());
   });
 });

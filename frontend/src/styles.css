@@ -319,6 +319,8 @@ textarea {
 
 .ui-code,
 .ui-log {
+  min-width: 0;
+  max-width: 100%;
   margin: 0;
   border-radius: var(--mimir-radius-panel, 8px);
   background: var(--mimir-color-code-background, #17211c);
@@ -1723,11 +1725,175 @@ textarea {
   white-space: nowrap;
 }
 
+/* ===== github #568/#570: full-width turns + pop-out detail drawer ===== */
+.turns-body {
+  margin-top: var(--mimir-space-xl, 32px);
+}
+
+.turns-main {
+  display: grid;
+  gap: var(--mimir-space-md, 16px);
+  min-width: 0;
+}
+
+/* The detail panel only appears when a turn/session is selected (clicked); it
+   slides over from the right with a dimmed backdrop instead of taking a
+   permanent column. */
+.turn-drawer__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  padding: 0;
+  border: 0;
+  background: rgb(0 0 0 / 45%);
+  cursor: pointer;
+}
+
+.turn-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 100%);
+  height: 100vh;
+  border-left: var(--mimir-border-width-chrome, 2px) solid var(--mimir-color-chrome-border, #c9d7ce);
+  background: var(--mimir-color-chrome-background, #edf3ef);
+  box-shadow: var(--mimir-elevation-overlay, 0 24px 80px rgb(0 0 0 / 35%));
+}
+
+.turn-drawer__head {
+  display: flex;
+  flex: none;
+  gap: var(--mimir-space-sm, 12px);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--mimir-space-sm, 12px) var(--mimir-space-md, 16px);
+  border-bottom: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-chrome-border, #c9d7ce);
+}
+
+.turn-drawer__title {
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  font-weight: var(--mimir-font-weight-strong, 700);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.turn-drawer__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-control, 6px);
+  background: transparent;
+  color: var(--mimir-color-text, #16201b);
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.turn-drawer__close:hover,
+.turn-drawer__close:focus-visible {
+  border-color: var(--mimir-color-panel-border-hover, #60786a);
+  background: var(--mimir-interaction-hover-background, transparent);
+}
+
+.turn-drawer__body {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: var(--mimir-space-md, 16px);
+  padding: var(--mimir-space-md, 16px);
+  overflow-y: auto;
+}
+
+/* Color-coded trigger pills (github #570) — distinct hues per trigger make the
+   list scannable. Unknown/unmapped triggers fall back to this neutral style. */
+.turn-trigger {
+  display: inline-block;
+  max-width: 100%;
+  padding: 2px 8px;
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: 999px;
+  background: var(--mimir-color-panel-background-muted, transparent);
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  font-weight: var(--mimir-font-weight-strong, 700);
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  text-transform: none;
+}
+
+.turn-trigger[data-trigger="saga_session_end"] {
+  color: #c9a3ff;
+  background: rgb(160 90 255 / 16%);
+  border-color: rgb(160 90 255 / 38%);
+}
+
+.turn-trigger[data-trigger="scheduled_tick"] {
+  color: #e7b357;
+  background: rgb(224 178 74 / 15%);
+  border-color: rgb(224 178 74 / 38%);
+}
+
+.turn-trigger[data-trigger="poller"] {
+  color: #5be8c0;
+  background: rgb(47 224 160 / 14%);
+  border-color: rgb(47 224 160 / 36%);
+}
+
+.turn-trigger[data-trigger="user_message"],
+.turn-trigger[data-trigger="user"] {
+  color: #7fb6ff;
+  background: rgb(90 150 255 / 16%);
+  border-color: rgb(90 150 255 / 38%);
+}
+
+.turn-trigger[data-trigger="synthesis"] {
+  color: #5be88f;
+  background: rgb(47 224 112 / 14%);
+  border-color: rgb(47 224 112 / 36%);
+}
+
+.turn-trigger[data-trigger="heartbeat"] {
+  color: #ff8fb0;
+  background: rgb(255 90 130 / 14%);
+  border-color: rgb(255 90 130 / 36%);
+}
+
+.turn-trigger[data-trigger="spawn"] {
+  color: #a6a6ff;
+  background: rgb(130 130 255 / 16%);
+  border-color: rgb(130 130 255 / 38%);
+}
+
+.turn-trigger[data-trigger="job"] {
+  color: #8fd6e6;
+  background: rgb(90 190 215 / 14%);
+  border-color: rgb(90 190 215 / 36%);
+}
+
+/* Neon Terminal uppercases interactive labels, but turn/session rows are
+   buttons holding *data* — keep their content readable (not shouted). */
+[data-skin="neon-terminal"] .turn-row,
+[data-skin="neon-terminal"] .session-row {
+  text-transform: none;
+}
+
 .turn-list {
   display: grid;
   gap: var(--mimir-space-xs, 8px);
-  /* github #566: the 7-column grid has a wide intrinsic minimum; let it scroll
-     inside its panel instead of forcing horizontal scroll on the whole page. */
+  /* github #566: the table has a wide intrinsic minimum; let it scroll inside
+     its panel instead of forcing horizontal scroll on the whole page. */
   overflow-x: auto;
 }
 
@@ -1814,12 +1980,14 @@ textarea {
 .turn-list__head,
 .turn-row {
   display: grid;
-  grid-template-columns: minmax(92px, 0.9fr) minmax(104px, 1fr) minmax(78px, 0.8fr) 48px 60px minmax(132px, 1.5fr) minmax(132px, 1.5fr);
+  /* github #570: one-line rows (Time, Trigger, Channel, Events, Duration,
+     Input) — Output moved to the detail drawer. */
+  grid-template-columns: minmax(96px, 0.7fr) minmax(120px, 0.9fr) minmax(96px, 0.8fr) 52px 64px minmax(220px, 2.6fr);
   gap: var(--mimir-space-sm, 12px);
-  align-items: start;
+  align-items: center;
   /* Shared floor so the header and rows scroll together when the panel is
      narrower than the table (github #566). */
-  min-width: 640px;
+  min-width: 560px;
 }
 
 .turn-list__head {
@@ -1832,8 +2000,7 @@ textarea {
 
 .turn-row {
   width: 100%;
-  min-height: 64px;
-  padding: var(--mimir-space-sm, 12px);
+  padding: var(--mimir-space-xs, 8px) var(--mimir-space-sm, 12px);
   border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
   border-radius: var(--mimir-radius-control, 6px);
   background: var(--mimir-color-panel-background, #fff);
@@ -1852,9 +2019,16 @@ textarea {
   border-color: var(--mimir-color-status-danger, #8b3a3a);
 }
 
+/* One-line cells: clip to the column with an ellipsis instead of wrapping. */
 .turn-row > span {
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.turn-row__input {
+  color: var(--mimir-color-text-muted, #58685f);
 }
 
 .turn-row__time {
@@ -1872,6 +2046,7 @@ textarea {
 
 .turn-detail {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-md, 16px);
 }
 
@@ -1909,12 +2084,16 @@ textarea {
 
 .turn-event-stack {
   display: grid;
+  /* minmax(0, 1fr) caps the column at the container so wide code blocks scroll
+     inside their own <pre> instead of stretching the drawer (github #570). */
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-sm, 12px);
 }
 
 .turn-event-card,
 .turn-message-stack > div {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-xs, 8px);
   min-width: 0;
   padding: var(--mimir-space-sm, 12px);
@@ -1925,6 +2104,7 @@ textarea {
 
 .turn-message-stack {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-sm, 12px);
 }
 
@@ -1935,6 +2115,7 @@ textarea {
 
 .turn-result-body {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-xs, 8px);
 }
 
