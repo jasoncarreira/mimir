@@ -22,19 +22,6 @@ const STATE_LABELS: Record<AgentCharacterState, string> = {
   listening: "Listening"
 };
 
-// Display chips mirroring the live state. `null` = AUTO, always lit because the
-// dossier follows the stream (manual override is a follow-up).
-const STATE_CHIPS: Array<{ label: string; state: AgentCharacterState | null }> = [
-  { label: "IDLE", state: "idle" },
-  { label: "LISTEN", state: "listening" },
-  { label: "THINK", state: "thinking" },
-  { label: "TOOL", state: "tool" },
-  { label: "TALK", state: "typing" },
-  { label: "ALERT", state: "error" },
-  { label: "BORED", state: "bored" },
-  { label: "AUTO", state: null }
-];
-
 export function AgentDossier() {
   const liveEvents = useLiveEvents();
   const composerActive = useUiState((state) => state.composerActive);
@@ -45,6 +32,7 @@ export function AgentDossier() {
       : characterStateFromLiveEvent(liveEvents.lastEvent?.event);
   const agentState = withComposerListening(eventState, composerActive);
   const agentName = bootstrap?.ui?.agent_name || "Mimir";
+  const model = bootstrap?.model || "";
 
   return (
     <Panel aria-label="Agent dossier" className="agent-dossier" title="Agent Dossier">
@@ -52,23 +40,9 @@ export function AgentDossier() {
         <AgentCharacter className="agent-dossier__character" state={agentState} />
         <dl className="agent-dossier__facts">
           <div><dt>Agent</dt><dd>{agentName}</dd></div>
-          <div><dt>Memory</dt><dd>Long-lived</dd></div>
+          {model ? <div><dt>Model</dt><dd>{model}</dd></div> : null}
           <div><dt>State</dt><dd>{STATE_LABELS[agentState]}</dd></div>
         </dl>
-      </div>
-      <div className="agent-dossier__chips" aria-label="Agent states">
-        {STATE_CHIPS.map((chip) => (
-          <span
-            className={`agent-dossier__chip${
-              chip.state === agentState || chip.state === null
-                ? " agent-dossier__chip--active"
-                : ""
-            }`}
-            key={chip.label}
-          >
-            {chip.label}
-          </span>
-        ))}
       </div>
     </Panel>
   );

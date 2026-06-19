@@ -136,8 +136,12 @@ export function AgentCharacter({
       {...props}
     >
       {renderer.kind === "dotlottie" && asset.href && !assetFailed ? (
+        // key on href forces a fresh <dotlottie-wc> when the state's asset
+        // changes — the web component doesn't reload on a src attribute change,
+        // so without this the animation stays on the first state.
         <DotLottiePlayer
           href={asset.href}
+          key={asset.href}
           label={resolvedLabel}
           onFallback={() => setAssetFailed(true)}
         />

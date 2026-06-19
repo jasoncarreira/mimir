@@ -538,6 +538,8 @@ export interface RevokeKeyData {
 export interface WebBootstrapData {
   /** mimir build/release version, for the app shell's version label. */
   version: string;
+  /** The model the agent is running on (e.g. "gpt-5.5"), for the dossier. */
+  model: string;
   auth: {
     required: boolean;
     scheme: "x-api-key";

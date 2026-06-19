@@ -1282,11 +1282,16 @@ textarea {
   align-items: center;
 }
 
-/* Compound selector beats the base .agent-character width (min(180px,100%)). */
+/* Compound selector beats the base .agent-character width (min(180px,100%)).
+   No border/background here — the lottie art ships its own frame, so the base
+   .agent-character box would double it up. */
 .agent-character.agent-dossier__character {
   width: 104px;
   height: 104px;
   flex: none;
+  border: none;
+  border-radius: 0;
+  background: none;
 }
 
 .agent-dossier__facts {

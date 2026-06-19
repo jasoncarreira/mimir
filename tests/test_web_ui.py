@@ -777,6 +777,7 @@ async def test_web_bootstrap_is_no_store_and_secret_free(tmp_path: Path):
 async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_path: Path):
     class _Config:
         web_host = "0.0.0.0"
+        model_spec = "codex_plus:gpt-5.5"
 
     a = web.Application()
     a["api_key"] = "super-secret"
@@ -798,6 +799,8 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     assert "super-secret" not in body_text
     validate_api_envelope(body, expect_ok=True)
     assert body["data"]["version"]  # mimir build/release version surfaced
+    # Running model = the model part of the provider:model spec.
+    assert body["data"]["model"] == "gpt-5.5"
     # No home configured -> agent UI config falls back to defaults.
     assert body["data"]["ui"] == {"agent_name": "Mimir", "skin": "neon-terminal"}
     assert body["data"]["auth"]["required"] is True
