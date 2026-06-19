@@ -26,6 +26,12 @@ vi.mock("./api/chat", () => ({
   sendChatMessage: chatApi.sendChatMessage
 }));
 
+// ChatRoute's right panel is now the live-activity panel (github #572), which
+// consumes useLiveEvents; stub it so the route renders without a provider.
+vi.mock("./live-events", () => ({
+  useLiveEvents: () => ({ status: "open", cursor: "", lastEvent: null, error: null })
+}));
+
 const surface: DashboardSurface = {
   id: "chat",
   label: "Chat",

@@ -1,10 +1,9 @@
 import React from "react";
-import type { TurnRecord } from "./api";
 import { createChatStream, sendChatMessage, type ChatStreamPayload } from "./api/chat";
-import { useChatStore, type ChatMessageStatus, type ChatTimelineMessage } from "./chatStore";
+import { useChatStore, type ChatMessageStatus } from "./chatStore";
 import type { DashboardSurface } from "./dashboardExtensions";
+import { LiveActivityPanel } from "./LiveActivityPanel";
 import { useRouteState } from "./routeState";
-import { TurnDetailsPanel } from "./TurnDetailsPanel";
 import { Badge, Button, DashboardHeader, ErrorState, Panel, TextInput } from "./ui";
 import { useUiState } from "./uiState";
 
@@ -35,29 +34,6 @@ function statusTone(status: ChatMessageStatus | ChatStreamState): "neutral" | "i
   if (status === "error") return "danger";
   if (status === "running" || status === "open" || status === "connecting") return "info";
   return "warning";
-}
-
-function turnFromChatMessage(message: ChatTimelineMessage | undefined, sessionId: string): TurnRecord | null {
-  if (!message) return null;
-  return {
-    turn_id: message.id,
-    ts: message.timestamp,
-    trigger: "user_message",
-    kind: "web_chat_message",
-    channel_id: message.channelId,
-    input: message.role === "user" ? message.text : "",
-    output: message.role === "assistant" ? message.text : "",
-    error: message.error ?? null,
-    events: [
-      {
-        type: "message",
-        role: message.role,
-        content: message.text
-      }
-    ],
-    status: message.status,
-    web_session_id: sessionId
-  };
 }
 
 export function ChatRoute({ surface }: { surface: DashboardSurface }) {
@@ -121,8 +97,10 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   }, [channelId]);
 
   function selectMessage(id: string) {
+    // Highlights the message + deep-links it in the URL. The right panel now
+    // shows live activity (github #572), so selecting no longer opens a details
+    // pane — message content is already in the timeline.
     setSelectedChatMessageId(id);
-    setDetailsPanelOpen(true);
     update({ turn: id });
   }
 
@@ -175,8 +153,6 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     }
   }
 
-  const selectedMessage = messages.find((message) => message.id === selectedMessageId);
-  const selectedTurnRecord = turnFromChatMessage(selectedMessage, sessionId);
   const visibleMessages = messages.filter((message) => message.channelId === channelId);
 
   return (
@@ -192,11 +168,11 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
                 <Badge tone={statusTone(streamState)}>{streamState}</Badge>
                 <Button
                   aria-expanded={detailsPanelOpen}
-                  aria-controls="details-panel-host"
+                  aria-controls="activity-panel-host"
                   onClick={() => setDetailsPanelOpen(!detailsPanelOpen)}
                   type="button"
                 >
-                  Details
+                  Activity
                 </Button>
               </>
             }
@@ -260,38 +236,14 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
           </Panel>
         </section>
         <aside
-          aria-label="Details panel"
+          aria-label="Live activity"
           className="content-layout__details"
           hidden={!detailsPanelOpen}
-          id="details-panel-host"
+          id="activity-panel-host"
         >
-          {selectedTurnRecord ? (
-            <TurnDetailsPanel routeKey="chat" turn={selectedTurnRecord} />
-          ) : (
-            <Panel title="Details">
-              <RoutePlaceholder surface={surface} />
-            </Panel>
-          )}
+          <LiveActivityPanel />
         </aside>
       </div>
     </>
-  );
-}
-
-function RoutePlaceholder({ surface }: { surface: DashboardSurface }) {
-  const { activeTab, selectedTurn, filter, target } = useRouteState(surface);
-
-  return (
-    <div className="route-placeholder">
-      <p>
-        {surface.title} route frame is mounted. Dashboard-specific content is intentionally deferred to its page issue.
-      </p>
-      <dl className="facts-grid">
-        <div><dt>Active tab</dt><dd>{activeTab}</dd></div>
-        <div><dt>Selected turn</dt><dd>{selectedTurn || "none"}</dd></div>
-        <div><dt>Filter</dt><dd>{filter || "none"}</dd></div>
-        <div><dt>Target</dt><dd>{target || "none"}</dd></div>
-      </dl>
-    </div>
   );
 }
