@@ -12,7 +12,7 @@ import {
   useNavigate,
   useSearchParams
 } from "react-router-dom";
-import { AgentCharacter, characterStateFromLiveEvent } from "./agent-character";
+import { AgentCharacter, characterStateFromLiveEvent, withComposerListening } from "./agent-character";
 import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
 import { ChatRoute } from "./ChatRoute";
 import { ChainlinkBoardRoute } from "./routes/ChainlinkBoardRoute";
@@ -455,10 +455,14 @@ export function AppFrame() {
     [bootstrap, isAdmin]
   );
   const firstRoute = surfaces[0]?.path ?? "/chat";
-  const agentState =
+  // github #580: while the user is engaging the composer and the agent isn't
+  // already busy, the character "listens"; otherwise it follows the live stream.
+  const composerActive = useUiState((state) => state.composerActive);
+  const eventState =
     liveEvents.status === "error"
       ? "error"
       : characterStateFromLiveEvent(liveEvents.lastEvent?.event);
+  const agentState = withComposerListening(eventState, composerActive);
 
   return (
     <div className="app-frame">
