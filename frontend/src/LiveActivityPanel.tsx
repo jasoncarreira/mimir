@@ -96,16 +96,21 @@ export function LiveActivityPanel() {
   return (
     <Panel
       actions={<Badge tone={statusTone}>{status}</Badge>}
-      aria-label="Live activity"
+      aria-label="Field log"
       className="live-activity"
       subtitle={subtitle}
-      title="Live Activity"
+      title="Field Log"
     >
       {items.length ? (
         <ol className="live-activity__feed" aria-label="Recent agent activity">
           {items.map((item) => (
             <li className="live-activity__item" key={item.id}>
-              <span className="live-activity__type">{item.type}</span>
+              <span
+                className="live-activity__type"
+                data-type={item.type.replace(/[^a-z0-9]+/gi, "_").toLowerCase()}
+              >
+                {item.type}
+              </span>
               {item.label ? <span className="live-activity__label">{item.label}</span> : null}
               <time className="live-activity__time">{clockTime(item.ts)}</time>
             </li>

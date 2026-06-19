@@ -13,7 +13,8 @@ import {
   useSearchParams
 } from "react-router-dom";
 import { AgentCharacter, characterStateFromLiveEvent, withComposerListening } from "./agent-character";
-import { apiFetchEnvelope, MIMIR_API_KEY_STORAGE_KEY } from "./api";
+import { MIMIR_API_KEY_STORAGE_KEY } from "./api";
+import { useBootstrap } from "./api/bootstrap";
 import { ChatRoute } from "./ChatRoute";
 import { ChainlinkBoardRoute } from "./routes/ChainlinkBoardRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
@@ -58,17 +59,6 @@ function readStoredKey() {
   }
 }
 
-function useBootstrap() {
-  return useQuery({
-    queryKey: ["web-bootstrap"],
-    queryFn: async () => {
-      const envelope = await apiFetchEnvelope<WebBootstrapData>("/api/v1/web/bootstrap", {
-        cache: "no-store"
-      });
-      return envelope.data;
-    }
-  });
-}
 
 function useWhoami(enabled: boolean) {
   return useQuery({
@@ -567,13 +557,17 @@ function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[
 }
 
 // github #577: header strip over a horizontal tab bar (Neon Terminal / default).
-function TopNavShell({ surfaces, firstRoute, agentState, bootstrap, error, isError, isLoading }: ShellProps) {
+function TopNavShell({ surfaces, firstRoute, bootstrap, error, isError, isLoading }: ShellProps) {
   return (
     <div className="app-frame">
       <header className="app-header">
-        <Link className="app-brand" to="/chat">MIMIR://OPS</Link>
+        <Link className="app-brand" to="/chat">
+          <span className="app-brand__name">MIMIR://OPS</span>
+          {bootstrap?.version ? (
+            <span className="app-brand__build">· BUILD {bootstrap.version}</span>
+          ) : null}
+        </Link>
         <div className="app-header__status">
-          <AgentCharacter className="app-header__character" state={agentState} />
           <AuthPanel bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
         </div>
       </header>
@@ -593,17 +587,18 @@ function TopNavShell({ surfaces, firstRoute, agentState, bootstrap, error, isErr
 // bar above the routed content.
 function SidebarShell({ surfaces, firstRoute, agentState, bootstrap, error, isError, isLoading }: ShellProps) {
   const { skin } = useSkin();
+  const agentName = bootstrap?.ui?.agent_name || AGENT_NAME;
   return (
     <div className="app-frame app-frame--sidebar">
       <aside className="app-sidebar">
         <Link className="app-brand app-brand--stacked" to="/chat">
           <span className="app-brand__eyebrow">Agent Console</span>
-          <span className="app-brand__name">{AGENT_NAME}</span>
+          <span className="app-brand__name">{agentName}</span>
         </Link>
         <div className="agent-card">
           <AgentCharacter className="agent-card__character" state={agentState} />
           <div className="agent-card__meta">
-            <span className="agent-card__name">{AGENT_NAME}</span>
+            <span className="agent-card__name">{agentName}</span>
             <span className="agent-card__state">{AGENT_STATE_LABELS[agentState]}</span>
           </div>
         </div>

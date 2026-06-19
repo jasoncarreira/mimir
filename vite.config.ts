@@ -16,7 +16,13 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      // The chat bridge serves GET /chat/stream + POST /chat at the root (not
+      // under /api), so proxy both prefixes or the chat stream 404s in dev.
       "/api": {
+        target: process.env.MIMIR_DEV_API || "http://localhost:8090",
+        changeOrigin: true
+      },
+      "/chat": {
         target: process.env.MIMIR_DEV_API || "http://localhost:8090",
         changeOrigin: true
       }

@@ -607,12 +607,23 @@ textarea {
 }
 
 .app-brand {
+  display: inline-flex;
+  gap: var(--mimir-space-xs, 8px);
+  align-items: baseline;
   color: var(--mimir-color-text, #16201b);
   font-size: 1.25rem;
   font-weight: var(--mimir-font-weight-strong, 700);
   letter-spacing: 0.04em;
   line-height: 1.1;
   text-decoration: none;
+}
+
+/* github #576: build/version label next to the brand. */
+.app-brand__build {
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-sm, 0.875rem);
+  font-weight: var(--mimir-font-weight-regular, 400);
+  letter-spacing: 0.08em;
 }
 
 .app-header__status {
@@ -645,19 +656,21 @@ textarea {
 .app-nav {
   display: flex;
   gap: var(--mimir-space-xs, 8px);
-  align-items: stretch;
+  align-items: end;
   min-width: max-content;
 }
 
-/* Outlined tab boxes: each link reads as a discrete tab (the bottom-rule-only
-   styling left them looking like bare links). Idle = hairline outline; hover =
-   accent outline; active = filled accent chip. */
+/* Connected tabs: top-rounded boxes seated on the topnav's baseline rule (no
+   bottom border, overlapping the rule by 1px). Idle = hairline outline; hover =
+   accent outline; active = filled accent block. */
 .app-nav__link {
   display: grid;
   align-content: center;
+  margin-bottom: calc(-1 * var(--mimir-border-width-hairline, 1px));
   padding: var(--mimir-space-xs, 8px) var(--mimir-space-md, 16px);
   border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #c9d7ce);
-  border-radius: var(--mimir-radius-control, 6px);
+  border-bottom: none;
+  border-radius: var(--mimir-radius-control, 6px) var(--mimir-radius-control, 6px) 0 0;
   color: var(--mimir-color-text-muted, #58685f);
   white-space: nowrap;
   text-decoration: none;
@@ -1091,20 +1104,54 @@ textarea {
   min-height: 180px;
 }
 
+/* github #576: chat console. The chat box and the right rail fill the main
+   area's height; the transcript scrolls and the composer pins to the bottom. */
 .chat-layout {
   grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
+  align-items: stretch;
+  min-height: 0;
+  height: 100%;
 }
 
-.chat-main .ui-panel {
-  display: grid;
+.chat-panel {
+  display: flex;
+  flex-direction: column;
   gap: var(--mimir-space-md, 16px);
+  min-height: 0;
+  padding: var(--mimir-space-md, 16px) var(--mimir-space-lg, 24px);
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-panel, 8px);
+  background: var(--mimir-color-panel-background, #fff);
+  box-shadow: var(--mimir-elevation-panel, none);
+}
+
+.chat-panel__head {
+  display: flex;
+  flex: none;
+  gap: var(--mimir-space-sm, 12px);
+  align-items: center;
+  justify-content: space-between;
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-sm, 0.875rem);
+  letter-spacing: 0.04em;
+}
+
+.chat-panel__title {
+  font-weight: var(--mimir-font-weight-strong, 700);
+}
+
+.chat-panel__meta {
+  display: inline-flex;
+  gap: var(--mimir-space-sm, 12px);
+  align-items: center;
 }
 
 .chat-identity-form {
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) minmax(180px, 1fr) auto;
+  grid-template-columns: minmax(140px, 1fr) minmax(160px, 1fr) auto;
   gap: var(--mimir-space-sm, 12px);
   align-items: end;
+  flex: none;
 }
 
 .chat-identity-form label,
@@ -1118,25 +1165,185 @@ textarea {
   text-transform: uppercase;
 }
 
+/* Boxless transcript: each message is a line, only as tall as its text. */
 .chat-timeline {
-  display: grid;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
   gap: var(--mimir-space-sm, 12px);
-  min-height: 320px;
-  max-height: 58vh;
+  min-height: 0;
   overflow: auto;
   margin: 0;
-  padding: var(--mimir-space-sm, 12px);
-  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
-  border-radius: var(--mimir-radius-panel, 8px);
-  background: var(--mimir-color-panel-background-muted, #f1f5f2);
+  padding: 0;
   list-style: none;
 }
 
-/* github #572: live activity feed in the chat right panel. */
+.chat-empty {
+  display: grid;
+  flex: 1 1 auto;
+  place-items: center;
+  color: var(--mimir-color-text-muted, #58685f);
+  text-align: center;
+}
+
+.chat-message {
+  display: block;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  line-height: var(--mimir-line-height-body, 1.5);
+}
+
+.chat-message__role {
+  margin-right: var(--mimir-space-xs, 8px);
+  font-weight: var(--mimir-font-weight-strong, 700);
+  text-transform: uppercase;
+}
+
+.chat-message--user .chat-message__role {
+  color: var(--mimir-color-status-info, #315f7d);
+}
+
+.chat-message--assistant .chat-message__role {
+  color: var(--mimir-color-chrome-accent, #60786a);
+}
+
+.chat-message__error {
+  display: block;
+  color: var(--mimir-color-status-danger, #8b3a3a);
+  font-size: var(--mimir-font-size-sm, 0.875rem);
+}
+
+/* Composer: textarea, a 4-column glyph palette, then Send. */
+.chat-composer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: var(--mimir-space-sm, 12px);
+  align-items: end;
+  flex: none;
+}
+
+.chat-composer__input {
+  min-height: 96px;
+  resize: vertical;
+}
+
+.chat-composer__glyphs {
+  display: grid;
+  grid-template-columns: repeat(4, auto);
+  gap: var(--mimir-space-2xs, 4px);
+}
+
+.chat-composer__glyph {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-control, 6px);
+  background: transparent;
+  color: var(--mimir-color-text, #16201b);
+  font-family: var(--mimir-font-family-mono, monospace);
+  cursor: pointer;
+}
+
+.chat-composer__glyph:hover,
+.chat-composer__glyph:focus-visible {
+  border-color: var(--mimir-color-panel-border-hover, #60786a);
+  background: var(--mimir-interaction-hover-background, transparent);
+}
+
+.chat-composer__send {
+  align-self: stretch;
+}
+
+/* Right rail: dossier (intrinsic) on top, field log fills the rest. */
+.chat-rail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mimir-space-md, 16px);
+  min-height: 0;
+  height: 100%;
+}
+
+.chat-rail .agent-dossier {
+  flex: none;
+}
+
+.chat-rail .live-activity {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* github #578: agent dossier card — character + identity + state chips. */
+.agent-dossier__body {
+  display: flex;
+  gap: var(--mimir-space-md, 16px);
+  align-items: center;
+}
+
+/* Compound selector beats the base .agent-character width (min(180px,100%)). */
+.agent-character.agent-dossier__character {
+  width: 104px;
+  height: 104px;
+  flex: none;
+}
+
+.agent-dossier__facts {
+  display: grid;
+  gap: var(--mimir-space-2xs, 4px);
+  min-width: 0;
+  margin: 0;
+}
+
+.agent-dossier__facts > div {
+  display: flex;
+  gap: var(--mimir-space-xs, 8px);
+  align-items: baseline;
+}
+
+.agent-dossier__facts dt {
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.agent-dossier__facts dd {
+  margin: 0;
+  font-weight: var(--mimir-font-weight-strong, 700);
+}
+
+.agent-dossier__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mimir-space-2xs, 4px);
+  margin-top: var(--mimir-space-md, 16px);
+}
+
+.agent-dossier__chip {
+  padding: 2px 8px;
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-control, 6px);
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  font-weight: var(--mimir-font-weight-strong, 700);
+  letter-spacing: 0.04em;
+}
+
+.agent-dossier__chip--active {
+  border-color: var(--mimir-color-chrome-accent, #60786a);
+  background: var(--mimir-color-chrome-accent, #60786a);
+  color: var(--mimir-color-chrome-accent-text, #ffffff);
+}
+
+/* github #572/#579: field log feed (fills the panel) with colored type pills. */
 .live-activity__feed {
   display: grid;
+  flex: 1 1 auto;
+  align-content: start;
   gap: var(--mimir-space-xs, 8px);
-  max-height: 58vh;
+  min-height: 0;
   overflow: auto;
   margin: 0;
   padding: 0;
@@ -1148,17 +1355,37 @@ textarea {
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: var(--mimir-space-xs, 8px);
   align-items: baseline;
-  padding: var(--mimir-space-xs, 8px) var(--mimir-space-sm, 12px);
-  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
-  border-radius: var(--mimir-radius-control, 6px);
-  background: var(--mimir-color-panel-background, #fff);
 }
 
 .live-activity__type {
+  padding: 1px 6px;
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: 999px;
+  color: var(--mimir-color-text-muted, #58685f);
   font-family: var(--mimir-font-family-mono, monospace);
   font-size: var(--mimir-font-size-xs, 0.75rem);
   font-weight: var(--mimir-font-weight-strong, 700);
-  color: var(--mimir-color-status-info, #315f7d);
+  white-space: nowrap;
+}
+
+.live-activity__type[data-type="tool_result"] {
+  color: #5be8c0;
+  border-color: rgb(47 224 160 / 36%);
+}
+
+.live-activity__type[data-type="tool_call"] {
+  color: #7fb6ff;
+  border-color: rgb(90 150 255 / 38%);
+}
+
+.live-activity__type[data-type="memory"] {
+  color: #c9a3ff;
+  border-color: rgb(160 90 255 / 38%);
+}
+
+.live-activity__type[data-type="reasoning"] {
+  color: #e7b357;
+  border-color: rgb(224 178 74 / 38%);
 }
 
 .live-activity__label {
@@ -1171,84 +1398,6 @@ textarea {
 .live-activity__time {
   color: var(--mimir-color-text-muted, #58685f);
   font-size: var(--mimir-font-size-xs, 0.75rem);
-}
-
-.chat-empty {
-  display: grid;
-  place-items: center;
-  min-height: 220px;
-  color: var(--mimir-color-text-muted, #58685f);
-  text-align: center;
-}
-
-.chat-message {
-  display: flex;
-}
-
-.chat-message--user {
-  justify-content: end;
-}
-
-.chat-message--assistant {
-  justify-content: start;
-}
-
-.chat-message__button {
-  display: grid;
-  gap: var(--mimir-space-xs, 8px);
-  width: min(680px, 88%);
-  padding: var(--mimir-space-sm, 12px);
-  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
-  border-radius: var(--mimir-radius-panel, 8px);
-  background: var(--mimir-color-panel-background, #fff);
-  color: var(--mimir-color-text, #16201b);
-  text-align: left;
-  cursor: pointer;
-}
-
-.chat-message--user .chat-message__button {
-  border-color: var(--mimir-color-chrome-accent, #60786a);
-}
-
-.chat-message__button[aria-pressed="true"] {
-  box-shadow: inset 0 0 0 2px var(--mimir-color-chrome-accent, #60786a);
-}
-
-.chat-message__meta {
-  display: flex;
-  gap: var(--mimir-space-xs, 8px);
-  align-items: center;
-  flex-wrap: wrap;
-  color: var(--mimir-color-text-muted, #58685f);
-  font-size: var(--mimir-font-size-sm, 0.875rem);
-}
-
-.chat-message__meta strong {
-  color: var(--mimir-color-text, #16201b);
-  text-transform: capitalize;
-}
-
-.chat-message__text,
-.chat-message__error {
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-}
-
-.chat-message__error {
-  color: var(--mimir-color-status-danger, #8b3a3a);
-  font-size: var(--mimir-font-size-sm, 0.875rem);
-}
-
-.chat-composer {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: var(--mimir-space-sm, 12px);
-  align-items: end;
-}
-
-.chat-composer__input {
-  min-height: 96px;
-  resize: vertical;
 }
 
 .route-placeholder {
@@ -2542,10 +2691,6 @@ textarea {
   .turns-controls--sessions,
   .session-row {
     grid-template-columns: 1fr;
-  }
-
-  .chat-message__button {
-    width: 100%;
   }
 
   .app-main,

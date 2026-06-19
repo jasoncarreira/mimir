@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -26,10 +27,18 @@ vi.mock("./api/chat", () => ({
   sendChatMessage: chatApi.sendChatMessage
 }));
 
-// ChatRoute's right panel is now the live-activity panel (github #572), which
-// consumes useLiveEvents; stub it so the route renders without a provider.
+// ChatRoute's right rail (field log + agent dossier) consumes useLiveEvents;
+// stub it so the route renders without a provider.
 vi.mock("./live-events", () => ({
   useLiveEvents: () => ({ status: "open", cursor: "", lastEvent: null, error: null })
+}));
+
+// The dossier renders the dotLottie character; stub the agent-character module so
+// the test doesn't need a real canvas/WASM.
+vi.mock("./agent-character", () => ({
+  AgentCharacter: () => null,
+  characterStateFromLiveEvent: () => "idle",
+  withComposerListening: (state: string) => state
 }));
 
 const surface: DashboardSurface = {
@@ -51,12 +60,15 @@ const surface: DashboardSurface = {
 };
 
 function renderChat(initialEntry = "/chat") {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
-    <MemoryRouter initialEntries={[initialEntry]}>
-      <Routes>
-        <Route element={<ChatRoute surface={surface} />} path="/chat" />
-      </Routes>
-    </MemoryRouter>
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <Routes>
+          <Route element={<ChatRoute surface={surface} />} path="/chat" />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>
   );
 }
 
@@ -103,7 +115,10 @@ describe("ChatRoute", () => {
 
     const timeline = screen.getByRole("list", { name: "Messages" });
     expect(within(timeline).getByText("hello mimir")).toBeTruthy();
-    await waitFor(() => expect(within(timeline).getByText("done")).toBeTruthy());
+    // The optimistic message stays in the transcript once accepted (boxless;
+    // no per-message status badge anymore).
+    await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalled());
+    expect(within(timeline).getByText("hello mimir")).toBeTruthy();
   });
 
   it("marks a send rejection as an error", async () => {
@@ -115,7 +130,6 @@ describe("ChatRoute", () => {
     fireEvent.submit(input.closest("form") as HTMLFormElement);
 
     await waitFor(() => expect(screen.getAllByText("queue full").length).toBeGreaterThan(0));
-    expect(screen.getAllByText("error").length).toBeGreaterThan(0);
   });
 
   it("drops inbound chat messages for other channels", () => {
@@ -133,7 +147,6 @@ describe("ChatRoute", () => {
 
     act(() => chatApi.activeError?.(new Error("stream broke")));
     expect(await screen.findByText("stream broke")).toBeTruthy();
-    expect(screen.getAllByText("error").length).toBeGreaterThan(0);
 
     unmount();
     expect(chatApi.close).toHaveBeenCalledOnce();
