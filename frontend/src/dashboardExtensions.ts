@@ -32,7 +32,7 @@ const firstPartySurfaceMetadata: Record<
     filterLabel: "scope"
   },
   "chainlink-board": {
-    detail: "Chainlink lifecycle and Worklink evidence",
+    detail: "Task board, dependencies, and Worklink evidence",
     tabs: ["board", "dependencies", "worklink"],
     filterLabel: "label"
   },

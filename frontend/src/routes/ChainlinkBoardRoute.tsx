@@ -15,7 +15,9 @@ import {
 } from "../ui";
 import {
   formatBoardTime,
+  isCompletedStatus,
   issueMatchesFilters,
+  partitionDependencies,
   safeChainlinkBoardData,
   type ChainlinkBoardFilters
 } from "./chainlinkBoardViewModel";
@@ -241,11 +243,21 @@ export function ChainlinkBoardRoute() {
     status: searchParams.get("status") || "",
     priority: searchParams.get("priority") || ""
   });
+  const [showCompleted, setShowCompleted] = React.useState(false);
   const board = React.useMemo(() => safeChainlinkBoardData(query.data), [query.data]);
   const visibleIssues = React.useMemo(
-    () => board.issues.filter((issue) => issueMatchesFilters(issue, filters)),
-    [board.issues, filters]
+    () => board.issues.filter((issue) => {
+      if (!issueMatchesFilters(issue, filters)) return false;
+      // github #569: hide completed work by default unless explicitly shown or
+      // the status filter itself targets a completed status.
+      if (!showCompleted && !isCompletedStatus(filters.status) && isCompletedStatus(issue.status)) {
+        return false;
+      }
+      return true;
+    }),
+    [board.issues, filters, showCompleted]
   );
+  const dependencies = React.useMemo(() => partitionDependencies(board.issues), [board.issues]);
   const visibleById = React.useMemo(() => new Map(visibleIssues.map((issue) => [issue.id, issue])), [visibleIssues]);
   const rootIssues = React.useMemo(
     () => board.roots.map((id) => visibleById.get(id)).filter((issue): issue is ChainlinkBoardIssue => Boolean(issue)),
@@ -313,8 +325,17 @@ export function ChainlinkBoardRoute() {
               <SelectFilter label="Label" value={filters.label} options={board.filters.labels} onChange={(label) => setFilter("label", label)} />
               <SelectFilter label="Status" value={filters.status} options={board.filters.statuses} onChange={(status) => setFilter("status", status)} />
               <SelectFilter label="Priority" value={filters.priority} options={board.filters.priorities} onChange={(priority) => setFilter("priority", priority)} />
+              <label className="turn-checkbox">
+                <input
+                  checked={showCompleted}
+                  onChange={(event) => setShowCompleted(event.currentTarget.checked)}
+                  type="checkbox"
+                />
+                <span>Show completed</span>
+              </label>
               <Button type="button" onClick={() => {
                 setFilters({ label: "", status: "", priority: "" });
+                setShowCompleted(false);
                 const params = new URLSearchParams(searchParams);
                 params.delete("label");
                 params.delete("status");
@@ -352,15 +373,48 @@ export function ChainlinkBoardRoute() {
               );
             })}
           </div>
-          <Panel title="Dependency Edges" subtitle="Parent/child and blocking edges from Chainlink.">
-            {board.edges.length ? (
-              <div className="chainlink-edge-list">
-                {board.edges.slice(0, 80).map((edge, index) => (
-                  <span key={`${edge.from}-${edge.to}-${edge.kind}-${index}`}>#{edge.from} {edge.kind} #{edge.to}</span>
-                ))}
+          <Panel title="Dependencies" subtitle="What's blocked, by what, and what finishing next unlocks.">
+            {dependencies.ready.length || dependencies.blocked.length ? (
+              <div className="chainlink-deps">
+                <section className="chainlink-deps__group">
+                  <h3>Ready to start <Badge tone="info">{dependencies.ready.length}</Badge></h3>
+                  {dependencies.ready.length ? (
+                    <ul className="chainlink-deps__list">
+                      {dependencies.ready.map(({ issue, unlocks }) => (
+                        <li key={issue.id}>
+                          <button className="chainlink-deps__issue" onClick={() => selectIssue(issue)} type="button">
+                            <span className="chainlink-deps__title">
+                              <Badge tone={priorityTone[issue.priority] ?? "neutral"}>{issue.priority}</Badge>
+                              #{issue.id} {issue.title}
+                            </span>
+                            <small>unlocks {unlocks.map((item) => `#${item.id}`).join(", ")}</small>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : <p className="app-copy">Nothing unblocked is waiting on downstream work.</p>}
+                </section>
+                <section className="chainlink-deps__group">
+                  <h3>Blocked <Badge tone="danger">{dependencies.blocked.length}</Badge></h3>
+                  {dependencies.blocked.length ? (
+                    <ul className="chainlink-deps__list">
+                      {dependencies.blocked.map(({ issue, blockers }) => (
+                        <li key={issue.id}>
+                          <button className="chainlink-deps__issue" onClick={() => selectIssue(issue)} type="button">
+                            <span className="chainlink-deps__title">
+                              <Badge tone={priorityTone[issue.priority] ?? "neutral"}>{issue.priority}</Badge>
+                              #{issue.id} {issue.title}
+                            </span>
+                            <small>blocked by {blockers.map((item) => `#${item.id} (${item.status})`).join(", ")}</small>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : <p className="app-copy">Nothing is blocked.</p>}
+                </section>
               </div>
             ) : (
-              <EmptyState title="No dependency edges" />
+              <EmptyState title="No dependencies between active issues" />
             )}
           </Panel>
         </>
