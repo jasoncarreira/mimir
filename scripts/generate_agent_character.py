@@ -64,15 +64,26 @@ def _ellipse(layer, cx, cy, w, h, color):
 
 
 def _base(name: str) -> tuple[objects.Animation, objects.ShapeLayer]:
-    """CRT bezel + glass screen, shared by every state."""
+    """New animation + the frontmost face layer.
+
+    python-lottie renders ``layers[0]`` ON TOP, so layers must be added
+    front-to-back. The face layer is added first (frontmost); the CRT
+    bezel/screen backplate is added LAST via _backplate() so the dark glass
+    sits behind the eyes/mouth instead of covering them.
+    """
     an = objects.Animation(60)
     an.width, an.height, an.frame_rate = W, H, FR
     an.name = name
-    bezel = an.add_layer(objects.ShapeLayer())
-    _rrect(bezel, 128, 128, 220, 200, BEZEL, radius=26)
-    _rrect(bezel, 128, 122, 188, 156, SCREEN, radius=18)
     face = an.add_layer(objects.ShapeLayer())
     return an, face
+
+
+def _backplate(an: objects.Animation) -> None:
+    """CRT bezel + glass screen as the backmost layer — call LAST."""
+    back = an.add_layer(objects.ShapeLayer())
+    # First shape is on top within a layer: the glass sits inset on the bezel.
+    _rrect(back, 128, 122, 188, 156, SCREEN, radius=18)
+    _rrect(back, 128, 128, 220, 200, BEZEL, radius=26)
 
 
 def _scanline(an: objects.Animation, color=GREEN_DIM):
@@ -227,7 +238,9 @@ def main() -> None:
     }
     for state, builder in builders.items():
         out = OUT / f"{state}.lottie"
-        write_dotlottie(builder(), out)
+        an = builder()
+        _backplate(an)  # CRT bezel/screen behind everything (backmost layer)
+        write_dotlottie(an, out)
         print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 
