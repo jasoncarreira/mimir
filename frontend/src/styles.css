@@ -534,6 +534,58 @@ textarea {
   min-height: 100vh;
 }
 
+/* github #577: full-screen login gate — shown when the server is protected and
+   no key is stored, instead of a dashboard full of 401 error panels. */
+.login-screen {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: var(--mimir-space-lg, 24px);
+  background: var(--mimir-color-background, #f8faf9);
+}
+
+.login-screen__card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mimir-space-md, 16px);
+  width: min(440px, 100%);
+  padding: var(--mimir-space-xl, 32px);
+  border: var(--mimir-border-width-chrome, 2px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-panel, 12px);
+  background: var(--mimir-color-panel-background, #ffffff);
+  box-shadow: var(--mimir-elevation-panel, none);
+}
+
+.login-screen__brand {
+  margin: 0;
+  color: var(--mimir-color-text, #16201b);
+  font-size: 1.5rem;
+  font-weight: var(--mimir-font-weight-strong, 700);
+  letter-spacing: 0.04em;
+}
+
+.login-screen__subtitle {
+  margin: 0;
+  color: var(--mimir-color-text-muted, #58685f);
+}
+
+.login-screen__form {
+  display: flex;
+  gap: var(--mimir-space-sm, 12px);
+  align-items: stretch;
+}
+
+.login-screen__form input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.login-screen__hint {
+  margin: 0;
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-sm, 0.875rem);
+}
+
 /* github #577: compact one-line header strip (brand + status). */
 .app-header {
   display: flex;

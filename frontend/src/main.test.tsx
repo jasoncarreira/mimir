@@ -5,10 +5,10 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
 
-// Regression for github #563 / PR #774: saving an API key in AuthPanel must
-// refetch whoami so role-gated admin surfaces appear immediately, without a
-// page reload. Previously useWhoami used a fixed queryKey that was never
-// invalidated on login, so the admin nav stayed hidden after pasting a key.
+// Regression for github #563 / PR #774: saving an API key must refetch whoami so
+// role-gated admin surfaces appear immediately, without a page reload. Plus the
+// github #577 login gate: a protected server with no stored key shows a focused
+// login screen instead of a dashboard full of 401 error panels.
 
 const STORAGE_KEY = "mimir.api_key";
 
@@ -27,7 +27,7 @@ whoami.getWhoami = vi.fn(async () => {
   };
 });
 
-const bootstrapFixture = {
+const protectedBootstrap = {
   auth: { required: true, scheme: "x-api-key", storage: "browser-localStorage" },
   server: { web_host: "0.0.0.0", public_bind: true, unauthenticated_allowed: false },
   stream_auth: {
@@ -48,13 +48,16 @@ const bootstrapFixture = {
   ]
 };
 
+// Per-test override so a single test can render against an open server.
+let bootstrapOverride: typeof protectedBootstrap | null = null;
+
 vi.mock("./api/whoami", () => ({ getWhoami: (...args: unknown[]) => whoami.getWhoami(...args) }));
 
 vi.mock("./api", async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
   apiFetchEnvelope: vi.fn(async (path: string) => {
     if (path.startsWith("/api/v1/web/bootstrap")) {
-      return { ok: true, version: "v1", data: bootstrapFixture };
+      return { ok: true, version: "v1", data: bootstrapOverride ?? protectedBootstrap };
     }
     throw new Error(`unexpected fetch in test: ${path}`);
   })
@@ -80,8 +83,12 @@ vi.mock("./ChatRoute", () => ({ ChatRoute: () => <div>chat-stub</div> }));
 
 // Imported after mocks are registered.
 const { AppFrame } = await import("./main");
+const { useUiState } = await import("./uiState");
 
 function renderApp() {
+  // The store seeds apiKeyPresent from localStorage at import (when it's empty);
+  // mirror a fresh page load by syncing it to the current key before each render.
+  useUiState.setState({ apiKeyPresent: Boolean(window.localStorage.getItem(STORAGE_KEY)) });
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
@@ -95,29 +102,32 @@ function renderApp() {
 afterEach(() => {
   cleanup();
   window.localStorage.clear();
+  bootstrapOverride = null;
   vi.clearAllMocks();
 });
 
-describe("AppFrame admin surface gating after login (#563)", () => {
-  it("reveals admin-only surfaces right after saving a key, without reload", async () => {
+describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
+  it("gates the whole app behind a login screen until a key is saved", async () => {
     renderApp();
 
-    // Bootstrap loaded, protected server, no key yet: admin nav hidden.
-    expect(await screen.findByRole("link", { name: /Chat/ })).toBeTruthy();
-    await waitFor(() => expect(whoami.getWhoami).toHaveBeenCalled());
+    // Protected server, no key: only the login screen — no dashboard nav.
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Chat/ })).toBeNull();
     expect(screen.queryByRole("link", { name: /Users/ })).toBeNull();
 
-    // Operator pastes an admin key and saves.
+    // Operator enters an admin key and signs in.
     fireEvent.change(screen.getByLabelText("MIMIR_API_KEY"), {
       target: { value: "admin-key-123" }
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
 
-    // whoami refetches with the new key -> isAdmin -> admin nav appears.
+    // Signed in -> dashboard renders; whoami refetches with the key -> admin nav
+    // appears immediately, without a reload.
+    expect(await screen.findByRole("link", { name: /Chat/ })).toBeTruthy();
     expect(await screen.findByRole("link", { name: /Users/ })).toBeTruthy();
   });
 
-  it("hides admin-only surfaces again after clearing the key", async () => {
+  it("returns to the login screen after clearing the key", async () => {
     window.localStorage.setItem(STORAGE_KEY, "admin-key-123");
     renderApp();
 
@@ -128,8 +138,23 @@ describe("AppFrame admin surface gating after login (#563)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Details" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
 
+    // Key gone -> gated again: dashboard nav disappears, login screen returns.
     await waitFor(() =>
       expect(screen.queryByRole("link", { name: /Users/ })).toBeNull()
     );
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeTruthy();
+  });
+
+  it("does not gate when the server allows unauthenticated access", async () => {
+    bootstrapOverride = {
+      ...protectedBootstrap,
+      auth: { ...protectedBootstrap.auth, required: false },
+      server: { ...protectedBootstrap.server, public_bind: false, unauthenticated_allowed: true }
+    };
+    renderApp();
+
+    // No key, but the open server renders the dashboard directly (no login gate).
+    expect(await screen.findByRole("link", { name: /Chat/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
   });
 });
