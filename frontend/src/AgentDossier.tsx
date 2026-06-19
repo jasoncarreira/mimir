@@ -35,19 +35,22 @@ export function AgentDossier() {
   const agentName = bootstrap?.ui?.agent_name || "Mimir";
   const model = bootstrap?.model || "";
 
-  // Turn total: seed from the bootstrap (latest record's seq) and tick up live
-  // as turn.lifecycle events complete. Reloads re-sync from the bootstrap.
-  const [completedSinceLoad, setCompletedSinceLoad] = React.useState(0);
+  // Turn total: seed from the bootstrap (latest record's seq) and track the
+  // highest lifecycle seq seen live. Using max() — not a counter — means the
+  // SSE's initial backfill of historical finished turns can't inflate the count
+  // (their seq <= turns_total); only a genuinely newer turn bumps it.
+  const [maxLiveSeq, setMaxLiveSeq] = React.useState(0);
   const lastEventId = React.useRef("");
   React.useEffect(() => {
     const item = liveEvents.lastEvent;
     if (!item || item.id === lastEventId.current) return;
     lastEventId.current = item.id;
-    if (item.event.kind === "turn.lifecycle" && item.event.phase !== "started") {
-      setCompletedSinceLoad((current) => current + 1);
+    if (item.event.kind === "turn.lifecycle" && typeof item.event.seq === "number") {
+      const seq = item.event.seq;
+      setMaxLiveSeq((current) => (seq > current ? seq : current));
     }
   }, [liveEvents.lastEvent]);
-  const turns = (bootstrap?.turns_total ?? 0) + completedSinceLoad;
+  const turns = Math.max(bootstrap?.turns_total ?? 0, maxLiveSeq);
 
   return (
     <Panel aria-label="Agent dossier" className="agent-dossier" title="Agent Dossier">

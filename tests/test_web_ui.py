@@ -591,6 +591,17 @@ async def test_api_v1_live_events_cursor_is_monotonic_for_random_turn_ids(app):
     assert [item["event"]["turn_id"] for item in _sse_data_items(body)] == ["37387608ce3b"]
 
 
+def test_turn_record_to_live_items_carries_seq_on_lifecycle():
+    from mimir.live_events import turn_record_to_live_items
+
+    items = turn_record_to_live_items({"turn_id": "t1", "ts": "2026-01-01T00:00:00Z", "seq": 42})
+    lifecycle = next(i for i in items if i.event["kind"] == "turn.lifecycle")
+    assert lifecycle.event["seq"] == 42
+    # Records predating seq surface None (the dossier just ignores them).
+    legacy = turn_record_to_live_items({"turn_id": "t2", "ts": "2026-01-01T00:00:01Z"})
+    assert legacy[0].event["seq"] is None
+
+
 def test_read_live_event_items_since_stops_after_crossing_acknowledged_timestamp(tmp_path: Path):
     from mimir.live_events import read_live_event_items_since
 

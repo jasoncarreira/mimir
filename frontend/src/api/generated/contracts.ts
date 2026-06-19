@@ -606,6 +606,8 @@ export interface TurnLifecycleEvent {
   phase: "started" | "finished" | "failed";
   ts?: string;
   error?: string | null;
+  /** Monotonic turn seq — consumers show the running total as max(seq). */
+  seq?: number | null;
 }
 
 export type LiveEvent =
