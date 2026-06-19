@@ -75,7 +75,10 @@ export type SkinTokenName =
 export type SkinTokens = Record<SkinTokenName, string>;
 
 export interface SkinChromeMetadata {
-  layout: "centered-shell";
+  // Drives the app shell AppFrame renders: "top-nav" is a header strip over a
+  // horizontal tab bar (Neon Terminal / default); "sidebar" is a left rail with
+  // the brand, agent character, and a vertical nav (Cosmic Nebula).
+  layout: "top-nav" | "sidebar";
   density: "compact" | "comfortable";
   accentPlacement: "top-rule" | "side-rule" | "none";
 }

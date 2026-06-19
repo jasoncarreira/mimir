@@ -71,7 +71,7 @@ export const cosmicNebulaSkin = {
     motionDurationNormal: "200ms"
   },
   chrome: {
-    layout: "centered-shell",
+    layout: "sidebar",
     density: "comfortable",
     accentPlacement: "side-rule"
   },

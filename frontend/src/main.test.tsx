@@ -51,6 +51,9 @@ const protectedBootstrap = {
 // Per-test override so a single test can render against an open server.
 let bootstrapOverride: typeof protectedBootstrap | null = null;
 
+// Per-test skin shell layout (the real skin drives this via chrome.layout).
+let skinLayout: "top-nav" | "sidebar" = "top-nav";
+
 vi.mock("./api/whoami", () => ({ getWhoami: (...args: unknown[]) => whoami.getWhoami(...args) }));
 
 vi.mock("./api", async (orig) => ({
@@ -72,7 +75,7 @@ vi.mock("./live-events", () => ({
 }));
 vi.mock("./skins/SkinProvider", () => ({
   SkinProvider: ({ children }: { children: ReactNode }) => children,
-  useSkin: () => ({ skin: { name: "Test Skin" } })
+  useSkin: () => ({ skin: { id: "test-skin", name: "Test Skin", version: "0.0.0", chrome: { layout: skinLayout } } })
 }));
 vi.mock("./agent-character", () => ({
   AgentCharacter: () => null,
@@ -103,6 +106,7 @@ afterEach(() => {
   cleanup();
   window.localStorage.clear();
   bootstrapOverride = null;
+  skinLayout = "top-nav";
   vi.clearAllMocks();
 });
 
@@ -159,5 +163,29 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
     // No key, but the open server renders the dashboard directly (no login gate).
     expect(await screen.findByRole("link", { name: /Chat/ })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+  });
+});
+
+describe("AppFrame shell layout follows the skin (#788)", () => {
+  it("renders the sidebar console when chrome.layout is 'sidebar'", async () => {
+    skinLayout = "sidebar";
+    window.localStorage.setItem(STORAGE_KEY, "admin-key-123");
+    renderApp();
+
+    // Sidebar-only chrome: the "Agent Console" eyebrow and the skin version line.
+    expect(await screen.findByText("Agent Console")).toBeTruthy();
+    expect(screen.getByText(/test-skin · v0\.0\.0/)).toBeTruthy();
+    // The same nav surfaces are present, just stacked.
+    expect(screen.getByRole("link", { name: /Chat/ })).toBeTruthy();
+  });
+
+  it("renders the top-nav shell otherwise", async () => {
+    skinLayout = "top-nav";
+    window.localStorage.setItem(STORAGE_KEY, "admin-key-123");
+    renderApp();
+
+    expect(await screen.findByRole("link", { name: /Chat/ })).toBeTruthy();
+    // The sidebar-only brand eyebrow must not render.
+    expect(screen.queryByText("Agent Console")).toBeNull();
   });
 });

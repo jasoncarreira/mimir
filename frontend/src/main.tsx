@@ -28,7 +28,8 @@ import { SchedulerRoute } from "./routes/SchedulerRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { TurnsRoute } from "./routes/TurnsRoute";
 import { useRouteState } from "./routeState";
-import { SkinProvider } from "./skins/SkinProvider";
+import { SkinProvider, useSkin } from "./skins/SkinProvider";
+import type { AgentCharacterState } from "./skins/types";
 import {
   Badge,
   Button,
@@ -509,6 +510,118 @@ function LoginScreen({ bootstrap, error, isError, isLoading }: {
   );
 }
 
+// Hardcoded until agent identity is configurable (chat composer notes, #578).
+const AGENT_NAME = "Mimir";
+
+const AGENT_STATE_LABELS: Record<AgentCharacterState, string> = {
+  idle: "Ready",
+  thinking: "Thinking",
+  typing: "Typing",
+  tool: "Working",
+  error: "Alert",
+  bored: "Idle",
+  listening: "Listening"
+};
+
+interface ShellProps {
+  surfaces: DashboardSurface[];
+  firstRoute: string;
+  agentState: AgentCharacterState;
+  bootstrap?: WebBootstrapData;
+  error: Error | null;
+  isError: boolean;
+  isLoading: boolean;
+}
+
+// Routed surfaces — identical across shells; only the surrounding chrome differs.
+function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[]; firstRoute: string }) {
+  return (
+    <Routes>
+      <Route element={<Navigate replace to={firstRoute} />} path="/" />
+      {surfaces.map((surface) => (
+        <Route
+          element={
+            surface.id === "saga"
+              ? <SagaDashboard />
+              : surface.id === "ops"
+                ? <OpsRoute />
+                : surface.id === "chainlink-board"
+                  ? <ChainlinkBoardRoute />
+                  : surface.id === "turns"
+                    ? <TurnsRoute />
+                    : surface.id === "admin-config"
+                      ? <AdminConfigRoute />
+                      : surface.id === "admin-users"
+                        ? <UsersRoute />
+                        : surface.id === "scheduler"
+                          ? <SchedulerRoute />
+                          : <SurfaceRoute surface={surface} />
+          }
+          key={surface.id}
+          path={surface.path}
+        />
+      ))}
+      <Route element={<Navigate replace to={firstRoute} />} path="*" />
+    </Routes>
+  );
+}
+
+// github #577: header strip over a horizontal tab bar (Neon Terminal / default).
+function TopNavShell({ surfaces, firstRoute, agentState, bootstrap, error, isError, isLoading }: ShellProps) {
+  return (
+    <div className="app-frame">
+      <header className="app-header">
+        <Link className="app-brand" to="/chat">MIMIR://OPS</Link>
+        <div className="app-header__status">
+          <AgentCharacter className="app-header__character" state={agentState} />
+          <AuthPanel bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
+        </div>
+      </header>
+      <div className="app-topnav">
+        <AppNavigation surfaces={surfaces} />
+      </div>
+      <main className="app-main" id="main-content">
+        <DashboardRoutes surfaces={surfaces} firstRoute={firstRoute} />
+      </main>
+      <AppStatus />
+    </div>
+  );
+}
+
+// Skin-driven sidebar console (Cosmic Nebula): a left rail holds the brand, the
+// agent character card, and a vertical nav; the server/status panel sits in a
+// bar above the routed content.
+function SidebarShell({ surfaces, firstRoute, agentState, bootstrap, error, isError, isLoading }: ShellProps) {
+  const { skin } = useSkin();
+  return (
+    <div className="app-frame app-frame--sidebar">
+      <aside className="app-sidebar">
+        <Link className="app-brand app-brand--stacked" to="/chat">
+          <span className="app-brand__eyebrow">Agent Console</span>
+          <span className="app-brand__name">{AGENT_NAME}</span>
+        </Link>
+        <div className="agent-card">
+          <AgentCharacter className="agent-card__character" state={agentState} />
+          <div className="agent-card__meta">
+            <span className="agent-card__name">{AGENT_NAME}</span>
+            <span className="agent-card__state">{AGENT_STATE_LABELS[agentState]}</span>
+          </div>
+        </div>
+        <AppNavigation surfaces={surfaces} />
+        <p className="app-sidebar__version">{skin.id} · v{skin.version}</p>
+      </aside>
+      <div className="app-sidebar-main">
+        <div className="app-statusbar">
+          <AuthPanel bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
+        </div>
+        <main className="app-main" id="main-content">
+          <DashboardRoutes surfaces={surfaces} firstRoute={firstRoute} />
+        </main>
+      </div>
+    </div>
+  );
+}
+
 export function AppFrame() {
   const liveEvents = useLiveEvents();
   const { data: bootstrap, error, isError, isLoading } = useBootstrap();
@@ -535,6 +648,9 @@ export function AppFrame() {
       ? "error"
       : characterStateFromLiveEvent(liveEvents.lastEvent?.event);
   const agentState = withComposerListening(eventState, composerActive);
+  // The active skin picks the shell layout (top-nav vs sidebar). useSkin runs
+  // before the gate's early return to keep hook order stable.
+  const { skin } = useSkin();
 
   // Protected + not signed in (or still resolving the policy): show a focused
   // login screen instead of a dashboard full of 401 error panels.
@@ -544,51 +660,19 @@ export function AppFrame() {
     );
   }
 
-  return (
-    <div className="app-frame">
-      <header className="app-header">
-        <Link className="app-brand" to="/chat">MIMIR://OPS</Link>
-        <div className="app-header__status">
-          <AgentCharacter className="app-header__character" state={agentState} />
-          <AuthPanel bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
-        </div>
-      </header>
-      <div className="app-topnav">
-        <AppNavigation surfaces={surfaces} />
-      </div>
-      <main className="app-main" id="main-content">
-          {/* isLoading/isError are handled by the login-screen gate above, so by
-              here bootstrap has resolved and we render the routed surfaces. */}
-          <Routes>
-            <Route element={<Navigate replace to={firstRoute} />} path="/" />
-            {surfaces.map((surface) => (
-              <Route
-                element={
-                  surface.id === "saga"
-                    ? <SagaDashboard />
-                    : surface.id === "ops"
-                      ? <OpsRoute />
-                      : surface.id === "chainlink-board"
-                        ? <ChainlinkBoardRoute />
-                        : surface.id === "turns"
-                          ? <TurnsRoute />
-                          : surface.id === "admin-config"
-                            ? <AdminConfigRoute />
-                            : surface.id === "admin-users"
-                              ? <UsersRoute />
-                              : surface.id === "scheduler"
-                                ? <SchedulerRoute />
-                                : <SurfaceRoute surface={surface} />
-                }
-                key={surface.id}
-                path={surface.path}
-              />
-            ))}
-            <Route element={<Navigate replace to={firstRoute} />} path="*" />
-          </Routes>
-        </main>
-      <AppStatus />
-    </div>
+  const shellProps: ShellProps = {
+    surfaces,
+    firstRoute,
+    agentState,
+    bootstrap,
+    error,
+    isError,
+    isLoading
+  };
+  return skin.chrome.layout === "sidebar" ? (
+    <SidebarShell {...shellProps} />
+  ) : (
+    <TopNavShell {...shellProps} />
   );
 }
 
