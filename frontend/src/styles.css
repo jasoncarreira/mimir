@@ -580,6 +580,13 @@ textarea {
   min-width: 0;
 }
 
+/* Keep "Sign in" on one line — the input takes the flex space, the button sizes
+   to its content. */
+.login-screen__form button {
+  flex: none;
+  white-space: nowrap;
+}
+
 .login-screen__hint {
   margin: 0;
   color: var(--mimir-color-text-muted, #58685f);
