@@ -553,7 +553,7 @@ export interface WebBootstrapData {
     header: "X-API-Key";
     native_eventsource_supported_when_auth_required: false;
   };
-  /** Agent-owned UI config (<home>/web_ui.json), editable by the agent. */
+  /** Agent-owned UI config (<home>/state/web_ui.json), editable by the agent. */
   ui: {
     agent_name: string;
     skin: string;
