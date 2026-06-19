@@ -1,3 +1,4 @@
+import React from "react";
 import {
   AgentCharacter,
   characterStateFromLiveEvent,
@@ -34,6 +35,20 @@ export function AgentDossier() {
   const agentName = bootstrap?.ui?.agent_name || "Mimir";
   const model = bootstrap?.model || "";
 
+  // Turn total: seed from the bootstrap (latest record's seq) and tick up live
+  // as turn.lifecycle events complete. Reloads re-sync from the bootstrap.
+  const [completedSinceLoad, setCompletedSinceLoad] = React.useState(0);
+  const lastEventId = React.useRef("");
+  React.useEffect(() => {
+    const item = liveEvents.lastEvent;
+    if (!item || item.id === lastEventId.current) return;
+    lastEventId.current = item.id;
+    if (item.event.kind === "turn.lifecycle" && item.event.phase !== "started") {
+      setCompletedSinceLoad((current) => current + 1);
+    }
+  }, [liveEvents.lastEvent]);
+  const turns = (bootstrap?.turns_total ?? 0) + completedSinceLoad;
+
   return (
     <Panel aria-label="Agent dossier" className="agent-dossier" title="Agent Dossier">
       <div className="agent-dossier__body">
@@ -41,6 +56,7 @@ export function AgentDossier() {
         <dl className="agent-dossier__facts">
           <div><dt>Agent</dt><dd>{agentName}</dd></div>
           {model ? <div><dt>Model</dt><dd>{model}</dd></div> : null}
+          <div><dt>Turns</dt><dd>{turns.toLocaleString()}</dd></div>
           <div><dt>State</dt><dd>{STATE_LABELS[agentState]}</dd></div>
         </dl>
       </div>

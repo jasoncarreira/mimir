@@ -540,6 +540,8 @@ export interface WebBootstrapData {
   version: string;
   /** The model the agent is running on (e.g. "gpt-5.5"), for the dossier. */
   model: string;
+  /** Running turn total (latest turn record's seq), for the dossier. */
+  turns_total: number;
   auth: {
     required: boolean;
     scheme: "x-api-key";

@@ -801,6 +801,8 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     assert body["data"]["version"]  # mimir build/release version surfaced
     # Running model = the model part of the provider:model spec.
     assert body["data"]["model"] == "gpt-5.5"
+    # No turns logged in this fixture -> running total is 0.
+    assert body["data"]["turns_total"] == 0
     # No home configured -> agent UI config falls back to defaults.
     assert body["data"]["ui"] == {"agent_name": "Mimir", "skin": "neon-terminal"}
     assert body["data"]["auth"]["required"] is True
@@ -845,6 +847,17 @@ def test_read_web_ui_config_falls_back_to_defaults(tmp_path: Path):
         "agent_name": "Solo",
         "skin": "neon-terminal",
     }
+
+
+def test_read_turns_total_uses_newest_seq(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    assert web_ui.read_turns_total(path) == 0  # missing file -> 0
+    path.write_text(
+        json.dumps({"turn_id": "a", "seq": 41}) + "\n"
+        + json.dumps({"turn_id": "b", "seq": 42}) + "\n",
+        encoding="utf-8",
+    )
+    assert web_ui.read_turns_total(path) == 42  # newest record's seq
 
 
 def test_ensure_web_ui_config_seeds_defaults_without_clobbering(tmp_path: Path):

@@ -490,6 +490,59 @@ class TurnLogger:
         self._lock: asyncio.Lock | None = None
         path.parent.mkdir(parents=True, exist_ok=True)
         self._line_count = count_lines_chunked(path)
+        # Monotonic turn counter. The newest retained record carries the
+        # high-water mark (trimming keeps the newest), so seed from it; if the
+        # records predate ``seq``, backfill them once so the count is populated.
+        self._seq = self._seed_seq()
+
+    def _seed_seq(self) -> int:
+        try:
+            for line in _tail_lines(self._path):  # newest-first
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    obj = json.loads(stripped)
+                except ValueError:
+                    break  # torn newest line — fall through to backfill
+                if isinstance(obj, dict) and isinstance(obj.get("seq"), int):
+                    return obj["seq"]
+                break  # newest record has no seq — backfill all records
+        except OSError:
+            return 0  # no file yet
+        return self._backfill_seq()
+
+    def _backfill_seq(self) -> int:
+        """Assign ``seq`` (1..N) to existing records that lack it, once."""
+        try:
+            raw = self._path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return 0
+        out: list[str] = []
+        seq = 0
+        for line in raw:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            seq += 1
+            try:
+                obj = json.loads(stripped)
+            except ValueError:
+                out.append(stripped)  # keep torn lines verbatim
+                continue
+            if isinstance(obj, dict):
+                obj.setdefault("seq", seq)
+                out.append(json.dumps(obj, ensure_ascii=True, default=str))
+            else:
+                out.append(stripped)
+        if out:
+            try:
+                tmp = self._path.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+                tmp.rename(self._path)
+            except OSError as exc:
+                log.warning("Failed to backfill turn seq: %s", exc)
+        return seq
 
     async def write(self, record: TurnRecord) -> None:
         if self._lock is None:
@@ -498,6 +551,8 @@ class TurnLogger:
             await self._write(record)
 
     async def _write(self, record: TurnRecord) -> None:
+        self._seq += 1
+        record.seq = self._seq
         line = json.dumps(asdict(record), ensure_ascii=True, default=str)
         try:
             await asyncio.to_thread(self._append_line, line)
