@@ -1,7 +1,18 @@
 import { describe, expect, it } from "vitest";
 import type { LiveEvent } from "../api/generated/contracts";
 import type { SkinCharacterRendererMetadata } from "../skins/types";
-import { characterStateFromLiveEvent, resolveAgentCharacterAsset } from "./state";
+import { characterStateFromLiveEvent, resolveAgentCharacterAsset, withComposerListening } from "./state";
+
+describe("withComposerListening (#580)", () => {
+  it("shows listening only when the composer is active and the agent is idle", () => {
+    expect(withComposerListening("idle", true)).toBe("listening");
+    expect(withComposerListening("idle", false)).toBe("idle");
+    // a busy agent wins over the composer signal
+    expect(withComposerListening("thinking", true)).toBe("thinking");
+    expect(withComposerListening("tool", true)).toBe("tool");
+    expect(withComposerListening("error", true)).toBe("error");
+  });
+});
 
 const renderer: SkinCharacterRendererMetadata = {
   kind: "dotlottie",

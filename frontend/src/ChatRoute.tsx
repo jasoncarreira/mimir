@@ -52,7 +52,11 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
   const setSelectedChatMessageId = useUiState((state) => state.setSelectedChatMessageId);
   const storedSelectedMessageId = useUiState((state) => state.selectedChatMessageId);
+  const setComposerActive = useUiState((state) => state.setComposerActive);
   const selectedMessageId = selectedTurn || storedSelectedMessageId;
+
+  // github #580: clear the listening signal when leaving the chat.
+  React.useEffect(() => () => setComposerActive(false), [setComposerActive]);
 
   React.useEffect(() => {
     const routeChannel = channel || filter;
@@ -229,6 +233,8 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
                   placeholder="Send a message"
                   value={composerText}
                   onChange={(event) => setComposerText(event.target.value)}
+                  onFocus={() => setComposerActive(true)}
+                  onBlur={() => setComposerActive(false)}
                 />
               </label>
               <Button disabled={!composerText.trim()} type="submit" variant="primary">Send</Button>

@@ -5,6 +5,7 @@ import typingUrl from "../assets/agent-character/typing.lottie?url";
 import toolUrl from "../assets/agent-character/tool.lottie?url";
 import errorUrl from "../assets/agent-character/error.lottie?url";
 import boredUrl from "../assets/agent-character/bored.lottie?url";
+import listeningUrl from "../assets/agent-character/listening.lottie?url";
 
 export const neonTerminalSkin = {
   id: "neon-terminal",
@@ -92,7 +93,8 @@ export const neonTerminalSkin = {
       { id: "neon-terminal-typing", type: "dotlottie", href: typingUrl },
       { id: "neon-terminal-tool", type: "dotlottie", href: toolUrl },
       { id: "neon-terminal-error", type: "dotlottie", href: errorUrl },
-      { id: "neon-terminal-bored", type: "dotlottie", href: boredUrl }
+      { id: "neon-terminal-bored", type: "dotlottie", href: boredUrl },
+      { id: "neon-terminal-listening", type: "dotlottie", href: listeningUrl }
     ],
     stateMap: {
       idle: "neon-terminal-idle",
@@ -100,7 +102,8 @@ export const neonTerminalSkin = {
       typing: "neon-terminal-typing",
       tool: "neon-terminal-tool",
       error: "neon-terminal-error",
-      bored: "neon-terminal-bored"
+      bored: "neon-terminal-bored",
+      listening: "neon-terminal-listening"
     },
     fallbackState: "idle",
     capabilities: {

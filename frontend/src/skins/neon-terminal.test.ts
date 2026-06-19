@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { neonTerminalSkin } from "./neon-terminal";
 import { loadSkin } from "./SkinProvider";
 
-const STATES = ["idle", "thinking", "typing", "tool", "error", "bored"] as const;
+const STATES = ["idle", "thinking", "typing", "tool", "error", "bored", "listening"] as const;
 
 describe("neon-terminal skin", () => {
   it("ships a dotlottie asset for every state, including bored", () => {

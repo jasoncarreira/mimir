@@ -15,7 +15,8 @@ export type AgentCharacterState =
   | "typing"
   | "tool"
   | "error"
-  | "bored";
+  | "bored"
+  | "listening";
 
 export type SkinTokenName =
   | "colorText"

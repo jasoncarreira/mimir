@@ -73,7 +73,8 @@ vi.mock("./skins/SkinProvider", () => ({
 }));
 vi.mock("./agent-character", () => ({
   AgentCharacter: () => null,
-  characterStateFromLiveEvent: () => "idle"
+  characterStateFromLiveEvent: () => "idle",
+  withComposerListening: (state: string) => state
 }));
 vi.mock("./ChatRoute", () => ({ ChatRoute: () => <div>chat-stub</div> }));
 

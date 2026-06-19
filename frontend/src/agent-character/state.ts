@@ -73,3 +73,12 @@ export function characterStateFromLiveEvent(
   return "idle";
 }
 
+// github #580: the agent "listens" while the user is engaging the composer, but
+// only when it isn't already busy doing something (thinking/tool/talk/error win).
+export function withComposerListening(
+  eventState: AgentCharacterState,
+  composerActive: boolean
+): AgentCharacterState {
+  return composerActive && eventState === "idle" ? "listening" : eventState;
+}
+
