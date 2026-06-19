@@ -561,7 +561,9 @@ textarea {
   min-width: 0;
 }
 
-.app-header__character {
+/* Compound selector so this beats the later base `.agent-character` width
+   (min(180px,100%)) — otherwise the header avatar squashes (#784 review). */
+.agent-character.app-header__character {
   width: 40px;
   height: 40px;
   flex: none;
@@ -2124,8 +2126,6 @@ textarea {
     grid-template-columns: 1fr;
   }
 
-  .app-chrome,
-  .app-body,
   .content-layout,
   .chat-identity-form,
   .chat-composer,
@@ -2141,22 +2141,9 @@ textarea {
   }
 
   .app-main,
-  .app-chrome {
-    padding: var(--mimir-space-md, 16px);
-  }
-
-  .app-sidebar {
-    border-right: 0;
-    border-bottom: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-chrome-border, #c9d7ce);
-  }
-
-  .app-nav {
-    position: static;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .app-nav__link {
-    min-height: 88px;
+  .app-header,
+  .app-topnav {
+    padding-inline: var(--mimir-space-md, 16px);
   }
 
   .memory-browser {
