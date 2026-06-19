@@ -530,88 +530,94 @@ textarea {
 
 .app-frame {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto auto 1fr auto;
   min-height: 100vh;
 }
 
-.app-chrome {
-  display: grid;
-  grid-template-columns: minmax(180px, 280px) minmax(0, 1fr);
-  gap: var(--mimir-space-lg, 24px);
-  align-items: start;
-  padding: var(--mimir-space-lg, 24px);
+/* github #577: compact one-line header strip (brand + status). */
+.app-header {
+  display: flex;
+  gap: var(--mimir-space-md, 16px);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--mimir-space-sm, 12px) var(--mimir-space-lg, 24px);
   border-bottom: var(--mimir-border-width-chrome, 2px) solid var(--mimir-color-chrome-border, #c9d7ce);
   background: var(--mimir-color-chrome-background, #edf3ef);
 }
 
 .app-brand {
   color: var(--mimir-color-text, #16201b);
-  font-size: 1.5rem;
+  font-size: 1.25rem;
   font-weight: var(--mimir-font-weight-strong, 700);
+  letter-spacing: 0.04em;
   line-height: 1.1;
   text-decoration: none;
 }
 
-.app-brand-block {
-  display: grid;
-  gap: var(--mimir-space-md, 16px);
-  align-content: start;
+.app-header__status {
+  display: flex;
+  gap: var(--mimir-space-sm, 12px);
+  align-items: center;
+  min-width: 0;
+}
+
+.app-header__character {
+  width: 40px;
+  height: 40px;
+  flex: none;
 }
 
 .app-status-card {
   min-width: 0;
-  padding: var(--mimir-space-md, 16px);
 }
 
-.app-body {
-  display: grid;
-  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
-  min-height: 0;
-}
-
-.app-sidebar {
-  padding: var(--mimir-space-md, 16px);
-  border-right: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-chrome-border, #c9d7ce);
-  background: var(--mimir-color-panel-background-muted, #f1f5f2);
+/* github #577: horizontal top-nav bar (was a left sidebar). */
+.app-topnav {
+  padding: 0 var(--mimir-space-lg, 24px);
+  border-bottom: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-chrome-border, #c9d7ce);
+  background: var(--mimir-color-chrome-background, #edf3ef);
+  overflow-x: auto;
 }
 
 .app-nav {
-  position: sticky;
-  top: var(--mimir-space-md, 16px);
-  display: grid;
+  display: flex;
   gap: var(--mimir-space-xs, 8px);
+  align-items: stretch;
+  min-width: max-content;
 }
 
 .app-nav__link {
   display: grid;
-  gap: var(--mimir-space-2xs, 4px);
-  min-height: 72px;
-  padding: var(--mimir-space-sm, 12px);
-  border: var(--mimir-border-width-hairline, 1px) solid transparent;
-  border-radius: var(--mimir-radius-control, 6px);
-  color: var(--mimir-color-text, #16201b);
+  align-content: center;
+  padding: var(--mimir-space-sm, 12px) var(--mimir-space-md, 16px);
+  border: 0;
+  border-bottom: var(--mimir-border-width-chrome, 2px) solid transparent;
+  color: var(--mimir-color-text-muted, #58685f);
+  white-space: nowrap;
   text-decoration: none;
 }
 
 .app-nav__link:hover,
 .app-nav__link:focus-visible,
 .app-nav__link--active {
-  border-color: var(--mimir-color-panel-border-hover, #60786a);
-  background: var(--mimir-color-panel-background, #fff);
+  border-bottom-color: var(--mimir-color-chrome-accent, #60786a);
+  color: var(--mimir-color-text, #16201b);
+  background: transparent;
 }
 
 .app-nav__link span {
   font-weight: var(--mimir-font-weight-strong, 700);
 }
 
+/* The sub-label was sidebar-era detail; hide it in the compact top nav. */
 .app-nav__link small {
-  color: var(--mimir-color-text-muted, #58685f);
-  font-size: var(--mimir-font-size-sm, 0.875rem);
+  display: none;
 }
 
 .app-main {
   width: min(1280px, 100%);
   min-width: 0;
+  margin: 0 auto;
   padding: var(--mimir-space-xl, 32px);
 }
 
@@ -1925,7 +1931,8 @@ textarea {
   display: flex;
   gap: var(--mimir-space-xs, 8px);
   align-items: center;
-  padding: var(--mimir-space-sm, 12px) var(--mimir-space-md, 16px);
+  justify-content: space-between;
+  padding: var(--mimir-space-sm, 12px) var(--mimir-space-lg, 24px);
   border-top: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-chrome-border, #c9d7ce);
   background: var(--mimir-color-chrome-background, #edf3ef);
   color: var(--mimir-color-text-muted, #58685f);

@@ -28,7 +28,7 @@ import { SchedulerRoute } from "./routes/SchedulerRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { TurnsRoute } from "./routes/TurnsRoute";
 import { useRouteState } from "./routeState";
-import { SkinProvider, useSkin } from "./skins/SkinProvider";
+import { SkinProvider } from "./skins/SkinProvider";
 import {
   Badge,
   Button,
@@ -433,14 +433,13 @@ function AppStatus() {
   const location = useLocation();
   return (
     <footer aria-live="polite" className="app-status">
-      <span>Route</span>
-      <code>{location.pathname}{location.search}</code>
+      <code className="app-status__route">{location.pathname}{location.search}</code>
+      <span className="app-status__tag">PROPERTY OF MIMIR OPS</span>
     </footer>
   );
 }
 
 export function AppFrame() {
-  const { skin } = useSkin();
   const liveEvents = useLiveEvents();
   const { data: bootstrap, error, isError, isLoading } = useBootstrap();
   const { data: whoami } = useWhoami();
@@ -466,19 +465,17 @@ export function AppFrame() {
 
   return (
     <div className="app-frame">
-      <header className="app-chrome">
-        <div className="app-brand-block">
-          <p className="ui-eyebrow">{skin.name}</p>
-          <Link className="app-brand" to="/chat">Mimir App</Link>
-          <AgentCharacter state={agentState} />
+      <header className="app-header">
+        <Link className="app-brand" to="/chat">MIMIR://OPS</Link>
+        <div className="app-header__status">
+          <AgentCharacter className="app-header__character" state={agentState} />
+          <AuthPanel bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
         </div>
-        <AuthPanel bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
       </header>
-      <div className="app-body">
-        <aside className="app-sidebar">
-          <AppNavigation surfaces={surfaces} />
-        </aside>
-        <main className="app-main" id="main-content">
+      <div className="app-topnav">
+        <AppNavigation surfaces={surfaces} />
+      </div>
+      <main className="app-main" id="main-content">
           {isLoading ? <LoadingState label="Loading dashboard extensions" /> : null}
           {isError ? (
             <ErrorState title="Bootstrap failed">
@@ -515,7 +512,6 @@ export function AppFrame() {
             </Routes>
           ) : null}
         </main>
-      </div>
       <AppStatus />
     </div>
   );
