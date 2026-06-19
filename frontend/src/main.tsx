@@ -69,11 +69,46 @@ function useBootstrap() {
   });
 }
 
-function useWhoami() {
+function useWhoami(enabled: boolean) {
   return useQuery({
     queryKey: ["whoami"],
-    queryFn: async () => (await getWhoami()).data
+    queryFn: async () => (await getWhoami()).data,
+    // Don't call /api/v1/whoami until the user is signed in — a protected server
+    // with no key would otherwise issue an unauthenticated request pre-login.
+    enabled
   });
+}
+
+// Whether the dashboard (and its authenticated clients) may run: the auth policy
+// must be known, and either the server is open or a key is stored. Bootstrap
+// itself is public, so it's allowed to load before this is true.
+function isSignedIn(
+  bootstrap: WebBootstrapData | undefined,
+  apiKeyPresent: boolean
+): boolean {
+  if (!bootstrap) return false;
+  return !bootstrap.auth.required || apiKeyPresent;
+}
+
+// Writes/clears the API key + flips the shared store flag (so AppFrame's login
+// gate + the header status react) + refetches identity with the new key (#563).
+function useSetApiKey() {
+  const client = useQueryClient();
+  const setApiKeyPresent = useUiState((state) => state.setApiKeyPresent);
+  return React.useCallback(
+    (value: string) => {
+      const trimmed = value.trim();
+      try {
+        if (trimmed) window.localStorage.setItem(MIMIR_API_KEY_STORAGE_KEY, trimmed);
+        else window.localStorage.removeItem(MIMIR_API_KEY_STORAGE_KEY);
+      } catch {
+        // Storage can be blocked by browser policy; the in-memory flag still updates.
+      }
+      setApiKeyPresent(Boolean(trimmed));
+      void client.invalidateQueries({ queryKey: ["whoami"] });
+    },
+    [client, setApiKeyPresent]
+  );
 }
 
 function AuthPanel({ bootstrap, error, isError, isLoading }: {
@@ -82,27 +117,11 @@ function AuthPanel({ bootstrap, error, isError, isLoading }: {
   isError: boolean;
   isLoading: boolean;
 }) {
-  const client = useQueryClient();
   const [entry, setEntry] = React.useState("");
-  const [apiKeyPresent, setApiKeyPresent] = React.useState(Boolean(readStoredKey()));
+  const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
+  const setApiKey = useSetApiKey();
   const requiresKey = bootstrap?.auth.required ?? false;
   const signedIn = !requiresKey || apiKeyPresent;
-
-  function setApiKey(value: string) {
-    const trimmed = value.trim();
-    try {
-      if (trimmed) window.localStorage.setItem(MIMIR_API_KEY_STORAGE_KEY, trimmed);
-      else window.localStorage.removeItem(MIMIR_API_KEY_STORAGE_KEY);
-    } catch {
-      // Storage can be blocked by browser policy; the visible state still updates.
-    }
-    setApiKeyPresent(Boolean(trimmed));
-    // The signed-in identity just changed: refetch whoami so role-gated surfaces
-    // (admin Users/Config) appear right after login and disappear on logout,
-    // without a page reload (github #563). whoami reads the new key from
-    // localStorage via apiFetchEnvelope.
-    void client.invalidateQueries({ queryKey: ["whoami"] });
-  }
 
   const [override, setOverride] = React.useState<boolean | null>(null);
   // github #571: keep the status box from dominating the header. Auto-expand
@@ -439,10 +458,64 @@ function AppStatus() {
   );
 }
 
+function LoginScreen({ bootstrap, error, isError, isLoading }: {
+  bootstrap?: WebBootstrapData;
+  error: Error | null;
+  isError: boolean;
+  isLoading: boolean;
+}) {
+  const [entry, setEntry] = React.useState("");
+  const setApiKey = useSetApiKey();
+  const host = bootstrap?.server.web_host || "this server";
+
+  return (
+    <div className="login-screen">
+      <div className="login-screen__card">
+        <p className="login-screen__brand">MIMIR://OPS</p>
+        {isLoading ? (
+          <p className="app-copy">Loading server auth policy…</p>
+        ) : isError ? (
+          <ErrorState title="Couldn't reach the server">
+            {error instanceof Error ? error.message : String(error)}
+          </ErrorState>
+        ) : (
+          <>
+            <p className="login-screen__subtitle">
+              Protected server on {host}. Enter your API key to continue.
+            </p>
+            <form
+              className="login-screen__form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                setApiKey(entry);
+                setEntry("");
+              }}
+            >
+              <TextInput
+                aria-label="MIMIR_API_KEY"
+                autoComplete="off"
+                placeholder="MIMIR_API_KEY"
+                type="password"
+                value={entry}
+                onChange={(event) => setEntry(event.target.value)}
+              />
+              <Button disabled={!entry.trim()} type="submit" variant="primary">Sign in</Button>
+            </form>
+            <p className="login-screen__hint">Your key is stored only in this browser.</p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function AppFrame() {
   const liveEvents = useLiveEvents();
   const { data: bootstrap, error, isError, isLoading } = useBootstrap();
-  const { data: whoami } = useWhoami();
+  const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
+  const signedIn = isSignedIn(bootstrap, apiKeyPresent);
+  // Gate identity on sign-in so a protected server doesn't fetch whoami pre-login.
+  const { data: whoami } = useWhoami(signedIn);
   // Open/dev mode (auth not required) doesn't gate /api/v1/admin/ server-side,
   // so surface admin sections there; in a gated server, hide them unless the
   // resolved identity is an admin (server still 403s either way — this is UX).
@@ -463,6 +536,14 @@ export function AppFrame() {
       : characterStateFromLiveEvent(liveEvents.lastEvent?.event);
   const agentState = withComposerListening(eventState, composerActive);
 
+  // Protected + not signed in (or still resolving the policy): show a focused
+  // login screen instead of a dashboard full of 401 error panels.
+  if (isLoading || isError || !signedIn) {
+    return (
+      <LoginScreen bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
+    );
+  }
+
   return (
     <div className="app-frame">
       <header className="app-header">
@@ -476,41 +557,35 @@ export function AppFrame() {
         <AppNavigation surfaces={surfaces} />
       </div>
       <main className="app-main" id="main-content">
-          {isLoading ? <LoadingState label="Loading dashboard extensions" /> : null}
-          {isError ? (
-            <ErrorState title="Bootstrap failed">
-              {error instanceof Error ? error.message : String(error)}
-            </ErrorState>
-          ) : null}
-          {!isLoading && !isError ? (
-            <Routes>
-              <Route element={<Navigate replace to={firstRoute} />} path="/" />
-              {surfaces.map((surface) => (
-                <Route
-                  element={
-                    surface.id === "saga"
-                      ? <SagaDashboard />
-                      : surface.id === "ops"
-                        ? <OpsRoute />
-                        : surface.id === "chainlink-board"
-                          ? <ChainlinkBoardRoute />
-                          : surface.id === "turns"
-                            ? <TurnsRoute />
-                            : surface.id === "admin-config"
-                              ? <AdminConfigRoute />
-                              : surface.id === "admin-users"
-                                ? <UsersRoute />
-                                : surface.id === "scheduler"
-                                  ? <SchedulerRoute />
-                                  : <SurfaceRoute surface={surface} />
-                  }
-                  key={surface.id}
-                  path={surface.path}
-                />
-              ))}
-              <Route element={<Navigate replace to={firstRoute} />} path="*" />
-            </Routes>
-          ) : null}
+          {/* isLoading/isError are handled by the login-screen gate above, so by
+              here bootstrap has resolved and we render the routed surfaces. */}
+          <Routes>
+            <Route element={<Navigate replace to={firstRoute} />} path="/" />
+            {surfaces.map((surface) => (
+              <Route
+                element={
+                  surface.id === "saga"
+                    ? <SagaDashboard />
+                    : surface.id === "ops"
+                      ? <OpsRoute />
+                      : surface.id === "chainlink-board"
+                        ? <ChainlinkBoardRoute />
+                        : surface.id === "turns"
+                          ? <TurnsRoute />
+                          : surface.id === "admin-config"
+                            ? <AdminConfigRoute />
+                            : surface.id === "admin-users"
+                              ? <UsersRoute />
+                              : surface.id === "scheduler"
+                                ? <SchedulerRoute />
+                                : <SurfaceRoute surface={surface} />
+                }
+                key={surface.id}
+                path={surface.path}
+              />
+            ))}
+            <Route element={<Navigate replace to={firstRoute} />} path="*" />
+          </Routes>
         </main>
       <AppStatus />
     </div>
@@ -520,10 +595,18 @@ export function AppFrame() {
 function RoutedLiveEventsProvider({ children }: { children: React.ReactNode }) {
   const [searchParams] = useSearchParams();
   const selectedTurnId = searchParams.get("turn") || null;
+  // Re-render on sign-in/out so the stream connects/reconnects with the new key.
+  const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
+  // Shares the cached ["web-bootstrap"] query with AppFrame (public, no auth).
+  const { data: bootstrap } = useBootstrap();
+  const signedIn = isSignedIn(bootstrap, apiKeyPresent);
 
   return (
     <LiveEventsProvider
-      apiKey={readStoredKey() || undefined}
+      apiKey={apiKeyPresent ? readStoredKey() || undefined : undefined}
+      // Don't open the authenticated SSE stream until signed in — otherwise a
+      // protected server fetches /api/v1/live-events while the login screen shows.
+      enabled={signedIn}
       cachePolicy={{
         aggregateQueryKeys: [["web-bootstrap"], ["turns"]],
         selectedTurnId,
