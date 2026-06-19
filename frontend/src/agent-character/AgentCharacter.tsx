@@ -1,6 +1,19 @@
 import React from "react";
 import "@lottiefiles/dotlottie-wc";
+import { setWasmUrl } from "@lottiefiles/dotlottie-wc";
+import wasmUrl from "@lottiefiles/dotlottie-web/dotlottie-player.wasm?url";
 import { useSkin } from "../skins/SkinProvider";
+
+// Self-host the dotLottie renderer WASM. By default @lottiefiles/dotlottie-web
+// fetches dotlottie-player.wasm from a CDN (jsdelivr/unpkg) at runtime, so the
+// character animation silently fails on a self-hosted dashboard whenever the
+// browser can't reach the CDN (restricted/offline network or a CSP). Point it
+// at the same-origin asset Vite emits under /app/assets/. setWasmUrl is
+// re-exported by dotlottie-wc, so this configures the exact DotLottie instance
+// the web component uses (dotlottie-web is pinned to dotlottie-wc's version to
+// keep them deduped). github #565.
+setWasmUrl(wasmUrl);
+
 import type { AgentCharacterState } from "../skins/types";
 import { resolveAgentCharacterAsset } from "./state";
 
