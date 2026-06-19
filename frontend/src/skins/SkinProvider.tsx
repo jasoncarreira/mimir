@@ -5,11 +5,17 @@ import {
   type PropsWithChildren
 } from "react";
 import { defaultRetroSkin } from "./default-retro";
+import { neonTerminalSkin } from "./neon-terminal";
 import type { SkinCssVariables, SkinId, SkinManifest } from "./types";
 
 const localSkins = {
-  "default-retro": defaultRetroSkin
+  "default-retro": defaultRetroSkin,
+  "neon-terminal": neonTerminalSkin
 } satisfies Record<SkinId, SkinManifest>;
+
+// Active skin until per-user skin selection ships (#562). neon-terminal is the
+// current dark-retro theme; default-retro remains registered as a fallback.
+const DEFAULT_SKIN_ID: SkinId = "neon-terminal";
 
 const tokenCssVariableNames = {
   colorText: "--mimir-color-text",
@@ -73,7 +79,7 @@ interface SkinContextValue {
 
 const SkinContext = createContext<SkinContextValue | null>(null);
 
-export function loadSkin(skinId: SkinId = "default-retro"): SkinManifest {
+export function loadSkin(skinId: SkinId = DEFAULT_SKIN_ID): SkinManifest {
   return localSkins[skinId];
 }
 
@@ -97,7 +103,7 @@ interface SkinProviderProps extends PropsWithChildren {
 
 export function SkinProvider({
   children,
-  skinId = "default-retro"
+  skinId = DEFAULT_SKIN_ID
 }: SkinProviderProps) {
   const skin = loadSkin(skinId);
   const cssVariables = useMemo(() => skinTokensToCssVariables(skin), [skin]);
