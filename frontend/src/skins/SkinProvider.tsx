@@ -1,6 +1,7 @@
 import {
   createContext,
   useContext,
+  useEffect,
   useMemo,
   type PropsWithChildren
 } from "react";
@@ -97,6 +98,45 @@ export function skinTokensToCssVariables(
   );
 }
 
+// Register a skin's self-hosted webfonts via the FontFace API while it's active,
+// removing them when the skin changes or unmounts. Guarded for non-DOM / jsdom
+// environments — the font is decorative, so the fontFamily token falls back to a
+// system stack if it can't load.
+function useSkinFonts(skin: SkinManifest) {
+  useEffect(() => {
+    const fonts = skin.fonts ?? [];
+    if (
+      fonts.length === 0 ||
+      typeof document === "undefined" ||
+      typeof FontFace === "undefined" ||
+      !document.fonts
+    ) {
+      return;
+    }
+    const faces = fonts.map((font) => {
+      const source = font.src
+        .map((s) => `url(${s.url}) format("${s.format}")`)
+        .join(", ");
+      const face = new FontFace(font.family, source, {
+        weight: String(font.weight ?? "400"),
+        style: font.style ?? "normal",
+        display: (font.display ?? "swap") as FontDisplay,
+        ...(font.unicodeRange ? { unicodeRange: font.unicodeRange } : {})
+      });
+      document.fonts.add(face);
+      void face.load().catch(() => {
+        /* decorative — fall back to the token's system stack */
+      });
+      return face;
+    });
+    return () => {
+      for (const face of faces) {
+        document.fonts.delete(face);
+      }
+    };
+  }, [skin]);
+}
+
 interface SkinProviderProps extends PropsWithChildren {
   skinId?: SkinId;
 }
@@ -106,6 +146,7 @@ export function SkinProvider({
   skinId = DEFAULT_SKIN_ID
 }: SkinProviderProps) {
   const skin = loadSkin(skinId);
+  useSkinFonts(skin);
   const cssVariables = useMemo(() => skinTokensToCssVariables(skin), [skin]);
   const contextValue = useMemo(
     () => ({ skin, cssVariables }),

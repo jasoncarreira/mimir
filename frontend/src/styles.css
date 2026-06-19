@@ -634,7 +634,7 @@ textarea {
 
 /* github #577: horizontal top-nav bar (was a left sidebar). */
 .app-topnav {
-  padding: 0 var(--mimir-space-lg, 24px);
+  padding: var(--mimir-space-sm, 12px) var(--mimir-space-lg, 24px);
   border-bottom: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-chrome-border, #c9d7ce);
   background: var(--mimir-color-chrome-background, #edf3ef);
   overflow-x: auto;
@@ -647,23 +647,37 @@ textarea {
   min-width: max-content;
 }
 
+/* Outlined tab boxes: each link reads as a discrete tab (the bottom-rule-only
+   styling left them looking like bare links). Idle = hairline outline; hover =
+   accent outline; active = filled accent chip. */
 .app-nav__link {
   display: grid;
   align-content: center;
-  padding: var(--mimir-space-sm, 12px) var(--mimir-space-md, 16px);
-  border: 0;
-  border-bottom: var(--mimir-border-width-chrome, 2px) solid transparent;
+  padding: var(--mimir-space-xs, 8px) var(--mimir-space-md, 16px);
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #c9d7ce);
+  border-radius: var(--mimir-radius-control, 6px);
   color: var(--mimir-color-text-muted, #58685f);
   white-space: nowrap;
   text-decoration: none;
+  background: var(--mimir-color-panel-background-muted, transparent);
+  transition: border-color var(--mimir-motion-duration-fast, 120ms) ease,
+    color var(--mimir-motion-duration-fast, 120ms) ease,
+    background var(--mimir-motion-duration-fast, 120ms) ease;
 }
 
 .app-nav__link:hover,
-.app-nav__link:focus-visible,
-.app-nav__link--active {
-  border-bottom-color: var(--mimir-color-chrome-accent, #60786a);
+.app-nav__link:focus-visible {
+  border-color: var(--mimir-color-panel-border-hover, #60786a);
   color: var(--mimir-color-text, #16201b);
-  background: transparent;
+  background: var(--mimir-interaction-hover-background, transparent);
+}
+
+.app-nav__link--active,
+.app-nav__link--active:hover,
+.app-nav__link--active:focus-visible {
+  border-color: var(--mimir-color-chrome-accent, #60786a);
+  color: var(--mimir-color-chrome-accent-text, #ffffff);
+  background: var(--mimir-color-chrome-accent, #60786a);
 }
 
 .app-nav__link span {
@@ -851,7 +865,7 @@ textarea {
 
 .saga-cluster h3 span {
   color: var(--mimir-color-text-muted, #58685f);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: var(--mimir-font-family-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
   font-size: var(--mimir-font-size-sm, 0.875rem);
   font-weight: 400;
 }
@@ -863,7 +877,7 @@ textarea {
 .saga-sql-form textarea {
   width: 100%;
   resize: vertical;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: var(--mimir-font-family-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
 }
 
 .saga-inline-panel {
@@ -1691,7 +1705,7 @@ textarea {
 
 .turn-row__time {
   color: var(--mimir-color-text-muted, #58685f);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--mimir-font-family-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
   font-size: var(--mimir-font-size-sm, 0.875rem);
 }
 

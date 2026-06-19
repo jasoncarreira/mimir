@@ -6,13 +6,13 @@ import toolUrl from "../assets/agent-character/tool.lottie?url";
 import errorUrl from "../assets/agent-character/error.lottie?url";
 import boredUrl from "../assets/agent-character/bored.lottie?url";
 import listeningUrl from "../assets/agent-character/listening.lottie?url";
+import shareTechMonoUrl from "../assets/neon-terminal/fonts/share-tech-mono-400.woff2?url";
 
 export const neonTerminalSkin = {
   id: "neon-terminal",
   name: "Neon Terminal",
   version: "0.1.0",
   tokens: {
-    // --- core surfaces: bright phosphor on near-black green ---
     colorText: "#5be88f",
     colorTextMuted: "#2f7d4f",
     colorBackground: "#05110b",
@@ -26,7 +26,6 @@ export const neonTerminalSkin = {
     colorPanelBorderHover: "#2fe070",
     colorPanelShadow:
       "inset 0 0 40px rgb(0 40 20 / 45%), 0 0 18px rgb(47 224 112 / 14%)",
-    // --- status: kept legible on CRT; success/info read green, warn amber, danger red ---
     colorStatusInfo: "#6fe0c0",
     colorStatusInfoBackground: "#0a2620",
     colorStatusSuccess: "#3fe07a",
@@ -38,7 +37,6 @@ export const neonTerminalSkin = {
     colorCodeBackground: "#040f09",
     colorCodeText: "#9dffc0",
     colorFocusRing: "#2fe070",
-    // --- type: monospace terminal throughout ---
     fontFamilyBase:
       '"Share Tech Mono", ui-monospace, "SFMono-Regular", Consolas, monospace',
     fontFamilyMono:
@@ -110,5 +108,16 @@ export const neonTerminalSkin = {
       supportsExpressions: true,
       supportsMotion: false
     }
-  }
+  },
+  fonts: [
+    {
+      family: "Share Tech Mono",
+      weight: 400,
+      style: "normal",
+      display: "swap",
+      unicodeRange:
+        "U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD",
+      src: [{ url: shareTechMonoUrl, format: "woff2" }]
+    }
+  ]
 } satisfies SkinManifest;
