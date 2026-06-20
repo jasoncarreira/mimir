@@ -285,12 +285,48 @@ class WebChatBridge(Bridge):
                     self._subscribers.remove(q)
         return resp
 
+    async def _handle_history(self, request: web.Request) -> web.Response:
+        """GET /api/v1/chat/history?channel_id=web-default&limit=50.
+
+        Restore a web channel's prior conversation (user + assistant messages,
+        oldest→newest) so re-opening the chat reloads it instead of starting
+        empty. Auth-gated by the shared middleware like every /api/v1 route.
+        """
+        from ..history import get_global_buffer
+
+        channel_id = (request.query.get("channel_id") or DEFAULT_CHANNEL).strip()
+        if not channel_id.startswith("web-"):
+            channel_id = "web-" + channel_id
+        try:
+            limit = int(request.query.get("limit", "50"))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 200))
+
+        buffer = get_global_buffer()
+        records = buffer.recent_in_channel(channel_id, limit) if buffer is not None else []
+        messages = [
+            {
+                "message_id": m.msg_id or "",
+                "role": "assistant" if m.kind == "assistant_message" else "user",
+                "channel_id": m.channel_id,
+                "author": m.author_display or m.author,
+                "text": m.content,
+                "ts": m.ts,
+            }
+            for m in records
+            if m.kind in ("user_message", "assistant_message")
+        ]
+        return json_success({"channel_id": channel_id, "messages": messages})
+
     def register_routes(self, app: web.Application) -> None:
-        """Mount /chat (POST) + /chat/stream (GET) on the shared app."""
+        """Mount /chat (POST) + /chat/stream (GET) + history on the shared app."""
         existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
         if ("POST", "/chat") not in existing:
             app.router.add_post("/chat", self._handle_post)
         if ("POST", "/api/v1/chat") not in existing:
             app.router.add_post("/api/v1/chat", self._handle_post_v1)
+        if ("GET", "/api/v1/chat/history") not in existing:
+            app.router.add_get("/api/v1/chat/history", self._handle_history)
         if ("GET", "/chat/stream") not in existing:
             app.router.add_get("/chat/stream", self._handle_stream)

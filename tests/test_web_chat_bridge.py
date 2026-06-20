@@ -219,3 +219,54 @@ async def test_disconnect_drains_subscribers(tmp_path: Path):
     bridge._subscribers.append(q)
     await bridge.disconnect()
     assert q.get_nowait() is None  # sentinel pushed
+
+
+@pytest.mark.asyncio
+async def test_chat_history_returns_channel_conversation(bridge_app, tmp_path):
+    """GET /api/v1/chat/history restores a web channel's prior conversation —
+    this channel only, user+assistant only, oldest→newest."""
+    import mimir.history as history_mod
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    _, a, _ = bridge_app
+    (tmp_path / "hist").mkdir()
+    buf = MessageBuffer(history_path=tmp_path / "hist" / "chat_history.jsonl")
+    await buf.append(buf.make_message(channel_id="web-default", kind="user_message", content="hello", author="alice"))
+    await buf.append(buf.make_message(channel_id="web-default", kind="assistant_message", content="hi alice", author="mimir"))
+    await buf.append(buf.make_message(channel_id="web-other", kind="user_message", content="elsewhere", author="bob"))
+    await buf.append(buf.make_message(channel_id="web-default", kind="system_note", content="note", author=None))
+
+    prev = history_mod.get_global_buffer()
+    set_global_buffer(buf)
+    try:
+        async with TestClient(TestServer(a)) as client:
+            resp = await client.get("/api/v1/chat/history?channel_id=web-default")
+            body = await resp.json()
+    finally:
+        history_mod._global_buffer = prev
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    msgs = body["data"]["messages"]
+    assert [m["text"] for m in msgs] == ["hello", "hi alice"]  # web-default, no system_note, in order
+    assert [m["role"] for m in msgs] == ["user", "assistant"]
+    assert all(m["channel_id"] == "web-default" for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_chat_history_empty_without_buffer(bridge_app):
+    """No global buffer registered (test paths) → empty history, not a 500."""
+    import mimir.history as history_mod
+
+    _, a, _ = bridge_app
+    prev = history_mod.get_global_buffer()
+    history_mod._global_buffer = None
+    try:
+        async with TestClient(TestServer(a)) as client:
+            resp = await client.get("/api/v1/chat/history")
+            body = await resp.json()
+    finally:
+        history_mod._global_buffer = prev
+
+    assert resp.status == 200
+    assert body["data"] == {"channel_id": "web-default", "messages": []}

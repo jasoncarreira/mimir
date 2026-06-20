@@ -761,3 +761,19 @@ async def test_outbound_source_none_excluded_by_allowlist(tmp_path: Path):
         "source=None should be excluded by the allowlist. "
         "If this fails the filter logic changed."
     )
+
+
+@pytest.mark.asyncio
+async def test_recent_in_channel_is_channel_scoped_and_ordered(tmp_path: Path):
+    """recent_in_channel returns ONLY that channel's messages (oldest→newest),
+    unlike recent_for_channel's cross-channel recency pool."""
+    buf = _make_buffer(tmp_path)
+    await buf.append(buf.make_message(channel_id="web-a", kind="user_message", content="a1", author="x"))
+    await buf.append(buf.make_message(channel_id="web-b", kind="user_message", content="b1", author="y"))
+    await buf.append(buf.make_message(channel_id="web-a", kind="assistant_message", content="a2", author="mimir"))
+    await buf.append(buf.make_message(channel_id="web-a", kind="user_message", content="a3", author="x"))
+
+    assert [m.content for m in buf.recent_in_channel("web-a", 2)] == ["a2", "a3"]
+    assert [m.content for m in buf.recent_in_channel("web-a", 50)] == ["a1", "a2", "a3"]
+    assert buf.recent_in_channel("web-a", 0) == []
+    assert buf.recent_in_channel("web-missing", 5) == []
