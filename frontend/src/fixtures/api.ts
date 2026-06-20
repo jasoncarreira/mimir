@@ -149,7 +149,12 @@ export const opsDashboardFixture: OpsDashboardResponse = {
       output_tokens: 300,
       total_cost_usd: null
     }
-  ]
+  ],
+  algedonic_signals: {
+    title: "Recent feedback signals",
+    window_hours: 24,
+    block: "Negative (last 24h):\n- 2026-06-17 12:01 — tool_error (×2 in 24h) [web-default]\n\nPositive (last 24h):\n- 2026-06-17 12:03 — git push to mimirbot-state succeeded"
+  }
 };
 
 export const sagaStatsFixture: SagaStatsResponse = {

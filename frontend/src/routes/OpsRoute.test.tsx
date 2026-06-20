@@ -62,5 +62,16 @@ describe("OpsRoute", () => {
     expect(screen.queryByRole("tab", { name: "Resources" })).toBeNull();
     expect(screen.queryByRole("tab", { name: "Chainlink" })).toBeNull();
     expect(await screen.findByRole("tab", { name: "Overview" })).toBeTruthy();
+    expect(await screen.findByRole("tab", { name: "Signals" })).toBeTruthy();
+  });
+
+  it("renders the Signals sub-page from the agent feedback block", async () => {
+    renderOpsRoute("/ops?tab=signals");
+
+    expect(await screen.findByRole("tabpanel", { name: "Signals" })).toBeTruthy();
+    expect(screen.getByText("Recent feedback signals")).toBeTruthy();
+    expect(screen.getByText(/Negative \(last 24h\):/)).toBeTruthy();
+    expect(screen.getByText(/tool_error \(×2 in 24h\) \[web-default\]/)).toBeTruthy();
+    expect(screen.getByText(/Positive \(last 24h\):/)).toBeTruthy();
   });
 });

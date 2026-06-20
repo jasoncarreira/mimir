@@ -394,6 +394,11 @@ export interface OpsDashboardData {
   };
   usage_history: Record<string, Record<string, OpsUsagePoint[]>>;
   token_usage_history: OpsTokenUsagePoint[];
+  algedonic_signals: {
+    title: string;
+    window_hours: number;
+    block: string;
+  };
 }
 
 export interface ChainlinkBoardIssue {

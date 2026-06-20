@@ -31,6 +31,12 @@ export type OpsQuotaRow = {
   latestPressure: string;
 };
 
+export type OpsAlgedonicSignals = {
+  title: string;
+  windowHours: number;
+  block: string;
+};
+
 const summaryLabels: Record<string, string> = {
   total_events: "Total events",
   events_queued: "Events queued",
@@ -171,6 +177,7 @@ export type SafeOpsDashboardData = Omit<OpsDashboardResponse,
   | "chainlink_issues"
   | "usage_history"
   | "token_usage_history"
+  | "algedonic_signals"
 > & {
   summary: Record<string, number>;
   by_event: Record<string, number>;
@@ -210,12 +217,14 @@ export type SafeOpsDashboardData = Omit<OpsDashboardResponse,
   };
   usage_history: OpsDashboardResponse["usage_history"];
   token_usage_history: OpsDashboardResponse["token_usage_history"];
+  algedonic_signals: OpsAlgedonicSignals;
 };
 
 export function safeOpsDashboardData(data: unknown): SafeOpsDashboardData {
   const source = recordFrom(data);
   const shellJobs = recordFrom(source.shell_jobs);
   const chainlinkIssues = recordFrom(source.chainlink_issues);
+  const algedonicSignals = recordFrom(source.algedonic_signals);
   return {
     ...(source as unknown as OpsDashboardResponse),
     generated_at: stringFrom(source.generated_at),
@@ -272,6 +281,11 @@ export function safeOpsDashboardData(data: unknown): SafeOpsDashboardData {
     ) as OpsDashboardResponse["usage_history"],
     token_usage_history: Array.isArray(source.token_usage_history)
       ? source.token_usage_history as OpsDashboardResponse["token_usage_history"]
-      : []
+      : [],
+    algedonic_signals: {
+      title: stringFrom(algedonicSignals.title, "Recent feedback signals"),
+      windowHours: numberFrom(algedonicSignals.window_hours) || 24,
+      block: stringFrom(algedonicSignals.block)
+    }
   };
 }

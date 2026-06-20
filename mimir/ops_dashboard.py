@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from ._jsonl_tail import tail_jsonl_records
+from .feedback import FeedbackLog
 
 log = logging.getLogger(__name__)
 
@@ -503,6 +504,7 @@ def build_dashboard_payload(
     turns_log = events_log.parent / "turns.jsonl"
     turns = _load_turns(turns_log, days)
     stats["token_usage_history"] = compute_token_usage_history(turns)
+    stats["algedonic_signals"] = _build_algedonic_signals(events_log, turns_log)
     return stats
 
 
@@ -524,6 +526,26 @@ async def build_dashboard_payload_async(
     if home is not None:
         stats["chainlink_issues"] = await _load_chainlink_issues(home)
     return stats
+
+
+def _build_algedonic_signals(events_log: Path, turns_log: Path) -> dict[str, Any]:
+    """Render the same recent feedback-signal body used in agent prompts.
+
+    The prompt block is intentionally a 24h algedonic window, independent of
+    the dashboard's broader analytics ``days`` filter. Keeping this as the
+    rendered Markdown body makes the Ops > Signals page match what the agent
+    sees instead of introducing a second formatter with drift risk.
+    """
+    window_hours = 24
+    block = FeedbackLog(
+        events_path=events_log,
+        turns_path=turns_log,
+    ).recent_block(window_hours=window_hours)
+    return {
+        "title": "Recent feedback signals",
+        "window_hours": window_hours,
+        "block": block or "",
+    }
 
 
 def render_dashboard_html(stats: dict[str, Any] | None = None) -> str:
