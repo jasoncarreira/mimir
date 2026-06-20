@@ -276,6 +276,8 @@ export function TurnDetailsPanel({
   }
 
   const normalized = safeTurn(turn);
+  // `events` is recorded in canonical emission order; render that order directly
+  // so the Timeline mirrors what happened instead of re-sorting by optional t_ms.
   const timelineEvents = normalized.events.filter((event) => (
     event.type === "reasoning" || event.type === "tool_call" || event.type === "tool_result"
   ));
