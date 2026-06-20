@@ -1631,11 +1631,6 @@ textarea {
   stroke-linejoin: round;
 }
 
-.ops-quota-line__point {
-  stroke: var(--mimir-color-panel-background, #fff);
-  stroke-width: 1px;
-}
-
 .ops-quota-line-labels {
   position: relative;
   z-index: 1;

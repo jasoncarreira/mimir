@@ -4,7 +4,6 @@ import { Link, useSearchParams } from "react-router-dom";
 import { getOpsDashboard } from "../api";
 import { drilldownHref } from "../routeState";
 import {
-  Badge,
   Button,
   CodeBlock,
   DataTable,
@@ -14,7 +13,8 @@ import {
   Panel,
   TextInput
 } from "../ui";
-import type { OpsQuotaRow, OpsTokenUsageRow } from "./opsViewModel";
+import type { OpsUsagePoint } from "../api/ops";
+import type { OpsTokenUsageRow } from "./opsViewModel";
 import {
   buildOpsSummaryMetrics,
   formatCost,
@@ -74,9 +74,41 @@ function formatDateLabel(value: string) {
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(parsed);
 }
 
-function latestQuotaSummary(row: OpsQuotaRow) {
-  const provider = usageProviderLabels[row.provider] || row.provider;
-  return `${provider} ${row.window}: ${formatPercent(row.latestUtilization)} → ${formatPercent(row.latestProjection)} projected · ${row.latestPressure}`;
+function formatTimestamp(value: string) {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return value;
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(parsed);
+}
+
+// Smallest "nice" round number (1/2/2.5/5 × 10ⁿ) at or above the data max, so the
+// token axis scales to the data instead of flooring at a fixed 50M.
+function niceAxisMax(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return 1;
+  const exponent = Math.floor(Math.log10(value));
+  const base = 10 ** exponent;
+  const fraction = value / base;
+  const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 2.5 ? 2.5 : fraction <= 5 ? 5 : 10;
+  return niceFraction * base;
+}
+
+// Split a window's samples into contiguous segments, breaking where the quota
+// window resets (resets_at changes). Without this the line draws a vertical drop
+// across a rollover (e.g. the seven-day series each week).
+function splitOnReset(points: OpsUsagePoint[]): OpsUsagePoint[][] {
+  const segments: OpsUsagePoint[][] = [];
+  let current: OpsUsagePoint[] = [];
+  let prevReset: number | null = null;
+  for (const point of points) {
+    const reset = typeof point.resets_at === "number" ? point.resets_at : null;
+    if (current.length && reset != null && prevReset != null && reset !== prevReset) {
+      segments.push(current);
+      current = [];
+    }
+    current.push(point);
+    if (reset != null) prevReset = reset;
+  }
+  if (current.length) segments.push(current);
+  return segments;
 }
 
 function chartTicks(maxValue: number, steps = 4) {
@@ -139,9 +171,13 @@ function QuotaTrendChart({ data }: { data: SafeOpsDashboardData }) {
         const series = Object.entries(windows).map(([window, points]) => ({ window, points }));
         const dates = Array.from(new Set(series.flatMap(({ points }) => points.map((point) => point.ts)))).sort();
         const latestRows = quotaRows({ [provider]: windows });
-        const xForDate = (ts: string) => {
-          const index = Math.max(0, dates.indexOf(ts));
-          return dates.length > 1 ? (index / (dates.length - 1)) * 100 : 50;
+        const tsValues = dates.map((value) => Date.parse(value)).filter((value) => Number.isFinite(value));
+        const minTs = tsValues.length ? Math.min(...tsValues) : 0;
+        const maxTs = tsValues.length ? Math.max(...tsValues) : 0;
+        const xForTs = (ts: string) => {
+          const value = Date.parse(ts);
+          if (!Number.isFinite(value) || maxTs <= minTs) return 50;
+          return ((value - minTs) / (maxTs - minTs)) * 100;
         };
         return (
           <div className="ops-chart-card ops-chart-card--wide" key={provider}>
@@ -161,31 +197,26 @@ function QuotaTrendChart({ data }: { data: SafeOpsDashboardData }) {
                   {series.map(({ window, points }) => {
                     const color = usageWindowColors[window] || "#9ca3af";
                     const valid = points.filter((point) => point.utilization != null);
-                    const linePoints = valid
-                      .map((point) => `${xForDate(point.ts)},${100 - clamp01(point.utilization ?? 0) * 100}`)
-                      .join(" ");
+                    const yFor = (point: OpsUsagePoint) => 100 - clamp01(point.utilization ?? 0) * 100;
                     return (
                       <g key={window}>
-                        {valid.length > 1 ? (
-                          <polyline
-                            className="ops-quota-line"
-                            fill="none"
-                            points={linePoints}
-                            stroke={color}
-                            vectorEffect="non-scaling-stroke"
-                          />
-                        ) : null}
-                        {valid.map((point, index) => (
-                          <circle
-                            className="ops-quota-line__point"
-                            cx={xForDate(point.ts)}
-                            cy={100 - clamp01(point.utilization ?? 0) * 100}
-                            fill={color}
-                            key={`${window}-${point.ts}-${index}`}
-                            r="1.7"
-                            vectorEffect="non-scaling-stroke"
-                          />
-                        ))}
+                        {splitOnReset(valid).map((segment, segmentIndex) => {
+                          // A lone sample (e.g. between two resets) can't draw a
+                          // line, so render a short dash to keep it visible.
+                          const linePoints = segment.length === 1
+                            ? `${xForTs(segment[0].ts) - 0.6},${yFor(segment[0])} ${xForTs(segment[0].ts) + 0.6},${yFor(segment[0])}`
+                            : segment.map((point) => `${xForTs(point.ts)},${yFor(point)}`).join(" ");
+                          return (
+                            <polyline
+                              className="ops-quota-line"
+                              fill="none"
+                              key={`${window}-${segmentIndex}`}
+                              points={linePoints}
+                              stroke={color}
+                              vectorEffect="non-scaling-stroke"
+                            />
+                          );
+                        })}
                       </g>
                     );
                   })}
@@ -217,7 +248,7 @@ function TokenUsageChart({ rows }: { rows: OpsTokenUsageRow[] }) {
     return <EmptyState title="No token usage rows in this window" />;
   }
   const maxTotal = Math.max(1, ...rows.map((row) => row.input + row.cacheCreation + row.cacheRead + row.output));
-  const axisMax = Math.ceil(maxTotal / 50_000_000) * 50_000_000 || maxTotal;
+  const axisMax = niceAxisMax(maxTotal);
   const totalCost = rows.reduce((sum, row) => sum + (row.cost ?? 0), 0);
   const costDays = rows.filter((row) => row.cost !== null).length;
   return (
@@ -275,7 +306,6 @@ function TokenUsageChart({ rows }: { rows: OpsTokenUsageRow[] }) {
 
 
 function UsagePanel({ data }: { data: SafeOpsDashboardData }) {
-  const quotas = quotaRows(data.usage_history);
   const tokens = tokenUsageRows(data.token_usage_history);
 
   return (
@@ -283,7 +313,6 @@ function UsagePanel({ data }: { data: SafeOpsDashboardData }) {
       <Panel
         title="Quota Utilization"
         subtitle="Subscription-window utilization trends from the ops payload."
-        actions={quotas.length ? <Badge tone="info">{quotas.map(latestQuotaSummary).join(" | ")}</Badge> : undefined}
       >
         <QuotaTrendChart data={data} />
       </Panel>
@@ -563,7 +592,7 @@ export function UsageRoute() {
           <p className="ui-eyebrow">Usage</p>
           <h1>Usage Dashboard</h1>
           <p className="app-copy">
-            Window: {validDays} days{query.data ? ` | Generated ${query.data.generated_at}` : ""}
+            Window: {validDays} days{query.data ? ` | Generated ${formatTimestamp(query.data.generated_at)}` : ""}
           </p>
         </div>
         <form
@@ -616,7 +645,7 @@ export function OpsRoute() {
           <p className="ui-eyebrow">Ops</p>
           <h1>Ops Dashboard</h1>
           <p className="app-copy">
-            Window: {validDays} days{query.data ? ` | Generated ${query.data.generated_at}` : ""}
+            Window: {validDays} days{query.data ? ` | Generated ${formatTimestamp(query.data.generated_at)}` : ""}
           </p>
         </div>
         <form

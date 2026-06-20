@@ -46,7 +46,9 @@ describe("UsageRoute dashboard (#573)", () => {
     expect(await screen.findByText("Token Usage")).toBeTruthy();
     expect(screen.getByLabelText("Daily token volume by token type with token-count axis")).toBeTruthy();
     expect(screen.getByLabelText("codex_plus quota utilization line chart with percent axis")).toBeTruthy();
-    expect(screen.getByText(/Codex Plus seven_day: 42\.0% → 84\.0% projected · tight/)).toBeTruthy();
+    // Per-window projection lives in the legend below the chart (the redundant
+    // header summary was removed in #584).
+    expect(screen.getByText(/seven day: 42\.0% · projected 84\.0% · tight/)).toBeTruthy();
     expect(screen.queryByText("Scheduler, Poller, and Job Signals")).toBeNull();
   });
 });
