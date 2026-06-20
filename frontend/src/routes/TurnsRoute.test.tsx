@@ -154,6 +154,17 @@ describe("TurnsRoute", () => {
       expect.stringMatching(/shell_exec#5.*shell_exec/),
       expect.stringMatching(/Tool result#6.*shell_exec.*B result/)
     ]);
+    expect(cards.map((card) => card.getAttribute("data-event-tone"))).toEqual([
+      "reasoning",
+      "tool",
+      "success",
+      "reasoning",
+      "tool",
+      "success"
+    ]);
+    expect(cards[0].classList.contains("turn-event-card--reasoning")).toBe(true);
+    expect(cards[1].classList.contains("turn-event-card--tool")).toBe(true);
+    expect(cards[2].classList.contains("turn-event-card--success")).toBe(true);
     expect(timeline.getByText("Reasoning between tools.")).toBeTruthy();
   });
 

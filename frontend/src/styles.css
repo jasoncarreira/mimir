@@ -2637,6 +2637,26 @@ textarea {
   background: var(--mimir-color-panel-background-muted, #f1f5f2);
 }
 
+.turn-event-card--reasoning {
+  border-color: var(--mimir-color-timeline-reasoning, var(--mimir-color-status-info, #315f7d));
+  background: var(--mimir-color-timeline-reasoning-background, var(--mimir-color-status-info-background, #e4f1f8));
+}
+
+.turn-event-card--tool {
+  border-color: var(--mimir-color-timeline-tool-call, var(--mimir-color-status-warning, #7a5b1d));
+  background: var(--mimir-color-timeline-tool-call-background, var(--mimir-color-status-warning-background, #fbf1d8));
+}
+
+.turn-event-card--success {
+  border-color: var(--mimir-color-timeline-tool-result, var(--mimir-color-status-success, #326b48));
+  background: var(--mimir-color-timeline-tool-result-background, var(--mimir-color-status-success-background, #e4f4e9));
+}
+
+.turn-event-card--danger {
+  border-color: var(--mimir-color-status-danger, #8b3a3a);
+  background: var(--mimir-color-status-danger-background, #f8e4e4);
+}
+
 .turn-message-stack {
   display: grid;
   grid-template-columns: minmax(0, 1fr);

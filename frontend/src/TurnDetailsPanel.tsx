@@ -146,8 +146,9 @@ function EventBody({ event }: { event: TurnEvent }) {
 
 function EventCard({ event, index }: { event: TurnEvent; index: number }) {
   const id = typeof event.id === "string" ? event.id.slice(0, 12) : "";
+  const tone = eventTone(event);
   return (
-    <div className="turn-event-card">
+    <div className={`turn-event-card turn-event-card--${tone}`} data-event-tone={tone}>
       <div className="turn-event-title">
         <Badge tone={toneForEvent(event)}>{eventLabel(event)}</Badge>
         <span>#{index + 1}</span>
