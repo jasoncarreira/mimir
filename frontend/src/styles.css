@@ -538,8 +538,12 @@ textarea {
 
 .app-frame {
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
-  min-height: 100vh;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  /* Bound the shell to the viewport so the routed content (app-main) scrolls
+     internally instead of growing the page — the chat console relies on this
+     to keep its transcript + field log inside the window. */
+  height: 100vh;
+  height: 100dvh;
 }
 
 /* github #577: full-screen login gate — shown when the server is protected and
@@ -743,8 +747,10 @@ textarea {
 .app-main {
   width: min(1280px, 100%);
   min-width: 0;
+  min-height: 0;
   margin: 0 auto;
   padding: var(--mimir-space-xl, 32px);
+  overflow-y: auto;
 }
 
 /* ===== github #788: sidebar shell (skin.chrome.layout === "sidebar") ===== */
@@ -883,7 +889,8 @@ textarea {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   min-width: 0;
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
 }
 
 .app-statusbar {
@@ -1138,6 +1145,9 @@ textarea {
   align-items: stretch;
   min-height: 0;
   height: 100%;
+  /* app-main already provides the top inset (padding) + scrolls; drop the
+     extra content-layout margin so the console fits the viewport exactly. */
+  margin-top: 0;
 }
 
 .chat-panel {

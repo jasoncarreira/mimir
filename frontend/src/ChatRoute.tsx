@@ -251,7 +251,12 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     }
   }
 
-  const visibleMessages = messages.filter((message) => message.channelId === channelId);
+  // Keep the transcript bounded — render only the most recent 100 messages for
+  // this channel (full history lives in the Turns viewer). The box scrolls
+  // internally (CSS) so it never grows past the window.
+  const visibleMessages = messages
+    .filter((message) => message.channelId === channelId)
+    .slice(-100);
 
   // Scroll to the newest message whenever the timeline grows or the streaming
   // reply updates, so the bottom-anchored transcript stays pinned to the latest.
