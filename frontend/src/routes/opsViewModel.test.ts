@@ -59,6 +59,11 @@ describe("ops view-model helpers", () => {
     expect(schedulerEventRows(opsDashboardFixture)).toEqual([
       { key: "event_queued", value: 3 }
     ]);
+    expect(safeOpsDashboardData(opsDashboardFixture).algedonic_signals).toEqual({
+      title: "Recent feedback signals",
+      windowHours: 24,
+      block: opsDashboardFixture.algedonic_signals.block
+    });
   });
 
   it("sorts numeric map rows by descending value then key", () => {
@@ -97,6 +102,11 @@ describe("ops view-model helpers", () => {
     expect(safe.timeseries).toEqual([]);
     expect(safe.recent_failures).toEqual([]);
     expect(safe.backlog).toEqual([]);
+    expect(safe.algedonic_signals).toEqual({
+      title: "Recent feedback signals",
+      windowHours: 24,
+      block: ""
+    });
     expect(safe.chainlink_issues).toMatchObject({
       available: true,
       issues: [{ id: 530, title: "Port ops" }],

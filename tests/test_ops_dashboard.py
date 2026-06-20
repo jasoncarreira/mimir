@@ -97,6 +97,25 @@ def test_build_dashboard_payload_skips_malformed_lines(tmp_path: Path):
     assert payload["summary"]["messages_sent"] == 1
 
 
+def test_build_dashboard_payload_includes_agent_feedback_signals(tmp_path: Path):
+    log = tmp_path / "events.jsonl"
+    _write_events(log, [
+        {"timestamp": _ts(0.1), "type": "tool_error", "tool": "shell_exec", "error": "boom", "channel_id": "web-default"},
+        {"timestamp": _ts(0.1), "type": "tool_error", "tool": "shell_exec", "error": "boom", "channel_id": "web-default"},
+        {"timestamp": _ts(0.1), "type": "git_push_ok", "branch": "main", "remote": "origin"},
+    ])
+
+    payload = build_dashboard_payload(log, days=1)
+
+    signals = payload["algedonic_signals"]
+    assert signals["title"] == "Recent feedback signals"
+    assert signals["window_hours"] == 24
+    assert "Negative (last 24h):" in signals["block"]
+    assert "tool_error" in signals["block"]
+    assert "(×2 in 24h)" in signals["block"]
+    assert "Positive (last 24h):" in signals["block"]
+
+
 def test_build_dashboard_payload_respects_cutoff(tmp_path: Path):
     """Events older than the cutoff are dropped. File ordering is
     chronological (oldest first) per production reality verified by

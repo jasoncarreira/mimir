@@ -454,6 +454,28 @@ function HealthPanel({ data }: { data: SafeOpsDashboardData }) {
   );
 }
 
+function SignalsPanel({ data }: { data: SafeOpsDashboardData }) {
+  const signals = data.algedonic_signals;
+  return (
+    <div className="ops-panel-stack">
+      <Panel
+        title="Signals"
+        subtitle={`Rendered from the same recent feedback-signals block the agent sees (${signals.windowHours}h window).`}
+      >
+        {signals.block ? (
+          <CodeBlock
+            code={signals.block}
+            language="markdown"
+            title={signals.title}
+          />
+        ) : (
+          <EmptyState title="No recent feedback signals" />
+        )}
+      </Panel>
+    </div>
+  );
+}
+
 function RawPanel({ data }: { data: SafeOpsDashboardData }) {
   return (
     <div className="ops-panel-stack">
@@ -473,6 +495,7 @@ function OpsContent({ data: rawData }: { data: unknown }) {
   const tabs = [
     ["overview", "Overview"],
     ["scheduler", "Scheduler"],
+    ["signals", "Signals"],
     ["async", "Async jobs"],
     ["health", "Health"],
     ["raw", "Raw"]
@@ -533,6 +556,7 @@ function OpsContent({ data: rawData }: { data: unknown }) {
             </div>
           ) : null}
           {activeTab === "scheduler" ? <SchedulerPanel data={data} /> : null}
+          {activeTab === "signals" ? <SignalsPanel data={data} /> : null}
           {activeTab === "async" ? <AsyncJobsPanel data={data} /> : null}
           {activeTab === "health" ? <HealthPanel data={data} /> : null}
           {activeTab === "raw" ? <RawPanel data={data} /> : null}
