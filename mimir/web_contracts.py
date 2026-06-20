@@ -336,6 +336,9 @@ export interface EventsData {
 export interface OpsUsagePoint {
   ts: string;
   utilization?: number | null;
+  resets_at?: number | null;
+  projection?: number | null;
+  pressure?: string;
   [key: string]: unknown;
 }
 

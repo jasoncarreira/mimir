@@ -8,6 +8,7 @@ same agent), and the downsample-to-max-points behavior.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import time
 
 import pytest
 
@@ -26,6 +27,10 @@ def _ts(minutes_ago: int) -> str:
     ).isoformat()
 
 
+def _future_epoch(hours: float) -> int:
+    return int(time.time() + hours * 3600)
+
+
 def _minimax_event(ts: str, five_h: float, seven_d: float) -> dict:
     return {
         "timestamp": ts,
@@ -33,12 +38,12 @@ def _minimax_event(ts: str, five_h: float, seven_d: float) -> dict:
         "recorded": {
             "minimax_five_hour": {
                 "utilization": five_h,
-                "resets_at": 1779408000,
+                "resets_at": _future_epoch(1),
                 "status": "allowed",
             },
             "minimax_seven_day": {
                 "utilization": seven_d,
-                "resets_at": 1779667200,
+                "resets_at": _future_epoch(24),
                 "status": "allowed",
             },
         },
@@ -54,17 +59,17 @@ def _anthropic_event(
         "recorded": {
             "five_hour": {
                 "utilization": five_h,
-                "resets_at": 1779406800,
+                "resets_at": _future_epoch(1),
                 "status": "allowed",
             },
             "seven_day": {
                 "utilization": seven_d,
-                "resets_at": 1779908400,
+                "resets_at": _future_epoch(24),
                 "status": "allowed",
             },
             "seven_day_sonnet": {
                 "utilization": sonnet,
-                "resets_at": 1779908400,
+                "resets_at": _future_epoch(24),
                 "status": "allowed",
             },
         },
@@ -78,12 +83,12 @@ def _codex_event(ts: str, five_h: float, seven_d: float) -> dict:
         "recorded": {
             "five_hour": {
                 "utilization": five_h,
-                "resets_at": 1779406800,
+                "resets_at": _future_epoch(1),
                 "status": "allowed",
             },
             "seven_day": {
                 "utilization": seven_d,
-                "resets_at": 1779908400,
+                "resets_at": _future_epoch(24),
                 "status": "allowed",
             },
         },
@@ -102,7 +107,7 @@ def test_normalize_minimax_strips_provider_prefix():
     assert set(out["minimax"].keys()) == {"five_hour", "seven_day"}
     pt = out["minimax"]["five_hour"][0]
     assert pt.utilization == pytest.approx(0.27)
-    assert pt.resets_at == 1779408000
+    assert pt.resets_at is not None
 
 
 def test_normalize_anthropic_keeps_all_subwindows():
@@ -133,6 +138,28 @@ def test_normalize_multi_provider_deployment():
     assert set(out.keys()) == {"anthropic", "codex_plus"}
     assert len(out["anthropic"]["five_hour"]) == 2
     assert len(out["codex_plus"]["five_hour"]) == 1
+
+
+def test_normalize_computes_projection_and_pressure():
+    now = datetime.now(timezone.utc)
+    events = [
+        {
+            "timestamp": now.isoformat(),
+            "type": "codex_plus_usage_ok",
+            "recorded": {
+                "seven_day": {
+                    "utilization": 0.50,
+                    "resets_at": int((now + timedelta(days=5)).timestamp()),
+                    "status": "allowed",
+                }
+            },
+        }
+    ]
+
+    point = normalize_subscription_events(events)["codex_plus"]["seven_day"][0]
+
+    assert point.projection == pytest.approx(1.75, rel=0.02)
+    assert point.pressure == "tight"
 
 
 # ---- active_provider_for_spec + filter_history_to_provider (#280) --------
@@ -254,7 +281,9 @@ def test_compute_usage_history_emits_serializable_json():
     point = out["minimax"]["five_hour"][0]
     assert isinstance(point, dict)
     assert point["utilization"] == pytest.approx(0.27)
-    assert point["resets_at"] == 1779408000
+    assert point["resets_at"] is not None
+    assert point["projection"] is not None
+    assert point["pressure"] in {"clear", "elevated", "tight"}
     assert isinstance(point["ts"], str)
 
 

@@ -838,8 +838,8 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     assert body["data"]["server"]["public_bind"] is True
     assert [item["id"] for item in body["data"]["dashboard_extensions"]][:3] == [
         "chat",
-        "turns",
         "ops",
+        "turns",
     ]
     ops_manifest = next(
         item for item in body["data"]["dashboard_extensions"] if item["id"] == "ops"

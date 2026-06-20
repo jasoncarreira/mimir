@@ -31,9 +31,9 @@ describe("dashboard surface metadata", () => {
       label: "Usage",
       title: "Usage",
       path: "/ops",
-      detail: "Operational metrics, quota pressure, and resource charts"
+      detail: "First-class usage, quota pressure, and operational metrics"
     });
-    expect(usage.tabs).toEqual(["overview", "usage", "scheduler", "async", "health", "raw"]);
+    expect(usage.tabs).toEqual(["usage", "scheduler", "async", "health", "raw"]);
     expect(usage.tabs).not.toContain("chainlink");
   });
 });

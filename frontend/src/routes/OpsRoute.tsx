@@ -76,7 +76,22 @@ function formatDateLabel(value: string) {
 
 function latestQuotaSummary(row: OpsQuotaRow) {
   const provider = usageProviderLabels[row.provider] || row.provider;
-  return `${provider} ${row.window}: ${formatPercent(row.latestUtilization)} (${row.points.toLocaleString()} pts)`;
+  return `${provider} ${row.window}: ${formatPercent(row.latestUtilization)} → ${formatPercent(row.latestProjection)} projected · ${row.latestPressure}`;
+}
+
+function chartTicks(maxValue: number, steps = 4) {
+  return Array.from({ length: steps + 1 }, (_, index) => maxValue - (maxValue / steps) * index);
+}
+
+function dateRangeLabel(values: string[]) {
+  if (!values.length) return "";
+  const first = formatDateLabel(values[0]);
+  const last = formatDateLabel(values[values.length - 1]);
+  return first === last ? first : `${first} → ${last}`;
+}
+
+function windowLabel(value: string) {
+  return value.replaceAll("_", " ");
 }
 
 function RowsTable({
@@ -118,34 +133,62 @@ function QuotaTrendChart({ data }: { data: SafeOpsDashboardData }) {
     <div className="ops-chart-grid">
       {providers.map(([provider, windows]) => {
         const series = Object.entries(windows).map(([window, points]) => ({ window, points }));
-        const allValues = series.flatMap(({ points }) => points.map((point) => point.utilization ?? 0));
-        const maxValue = Math.max(1, ...allValues);
+        const dates = series.flatMap(({ points }) => points.map((point) => point.ts));
+        const latestRows = quotaRows({ [provider]: windows });
         return (
-          <div className="ops-chart-card" key={provider}>
-            <h3>{usageProviderLabels[provider] || provider}</h3>
-            <div className="ops-line-chart" role="img" aria-label={`${provider} quota utilization trend`}>
-              {series.map(({ window, points }) => {
-                const color = usageWindowColors[window] || "#9ca3af";
-                return (
-                  <div className="ops-line-series" key={window}>
-                    <span className="ops-line-series__label" style={{ color }}>{window}</span>
-                    <div className="ops-sparkline" aria-hidden="true">
-                      {points.map((point, index) => {
-                        const value = point.utilization;
-                        const height = value == null ? 6 : Math.max(6, (value / maxValue) * 100);
-                        return (
-                          <span
-                            className={`ops-sparkline__bar${value == null ? " ops-sparkline__bar--gap" : ""}`}
-                            key={`${point.ts}-${index}`}
-                            style={{ height: `${height}%`, backgroundColor: value == null ? undefined : color }}
-                            title={`${formatDateLabel(point.ts)}: ${value == null ? "n/a" : formatPercent(value)}`}
-                          />
-                        );
-                      })}
+          <div className="ops-chart-card ops-chart-card--wide" key={provider}>
+            <div className="ops-chart-card__header">
+              <h3>{usageProviderLabels[provider] || provider}</h3>
+              <span>{dateRangeLabel(dates)}</span>
+            </div>
+            <div className="ops-axis-chart ops-axis-chart--quota" role="img" aria-label={`${provider} quota utilization trend with percent axis`}>
+              <div className="ops-axis-chart__y" aria-hidden="true">
+                {chartTicks(1).map((tick) => <span key={tick}>{formatPercent(tick)}</span>)}
+              </div>
+              <div className="ops-axis-chart__plot">
+                <div className="ops-axis-chart__grid" aria-hidden="true">
+                  {chartTicks(1).map((tick) => <span key={tick} />)}
+                </div>
+                {series.map(({ window, points }) => {
+                  const color = usageWindowColors[window] || "#9ca3af";
+                  const valid = points.filter((point) => point.utilization != null);
+                  return (
+                    <div className="ops-line-series" key={window}>
+                      <span className="ops-line-series__label" style={{ color }}>{windowLabel(window)}</span>
+                      <div className="ops-line-points" aria-hidden="true">
+                        {points.map((point, index) => {
+                          const value = point.utilization;
+                          return (
+                            <span
+                              className={`ops-line-point${value == null ? " ops-line-point--gap" : ""}`}
+                              key={`${point.ts}-${index}`}
+                              style={{
+                                left: points.length > 1 ? `${(index / (points.length - 1)) * 100}%` : "50%",
+                                bottom: value == null ? "0%" : `${Math.max(0, Math.min(1, value)) * 100}%`,
+                                backgroundColor: value == null ? undefined : color
+                              }}
+                              title={`${formatDateLabel(point.ts)}: ${value == null ? "n/a" : formatPercent(value)}${point.projection == null ? "" : ` → ${formatPercent(point.projection)} projected`} · ${point.pressure || "clear"}`}
+                            />
+                          );
+                        })}
+                      </div>
+                      {valid.length ? (
+                        <span className="ops-line-series__latest" style={{ color }}>
+                          {formatPercent(valid[valid.length - 1].utilization ?? null)}
+                        </span>
+                      ) : null}
                     </div>
-                  </div>
-                );
-              })}
+                  );
+                })}
+              </div>
+            </div>
+            <div className="ops-chart-legend ops-chart-legend--cards">
+              {latestRows.map((row) => (
+                <span key={`${row.provider}-${row.window}`}>
+                  <i style={{ backgroundColor: usageWindowColors[row.window] || "#9ca3af" }} />
+                  {windowLabel(row.window)}: {formatPercent(row.latestUtilization)} · projected {formatPercent(row.latestProjection)} · {row.latestPressure}
+                </span>
+              ))}
             </div>
           </div>
         );
@@ -154,43 +197,56 @@ function QuotaTrendChart({ data }: { data: SafeOpsDashboardData }) {
   );
 }
 
+
 function TokenUsageChart({ rows }: { rows: OpsTokenUsageRow[] }) {
   if (!rows.length) {
     return <EmptyState title="No token usage rows in this window" />;
   }
   const maxTotal = Math.max(1, ...rows.map((row) => row.input + row.cacheCreation + row.cacheRead + row.output));
+  const axisMax = Math.ceil(maxTotal / 50_000_000) * 50_000_000 || maxTotal;
   const totalCost = rows.reduce((sum, row) => sum + (row.cost ?? 0), 0);
   const costDays = rows.filter((row) => row.cost !== null).length;
   return (
-    <div className="ops-token-chart" role="img" aria-label="Daily token volume by token type">
-      <div className="ops-token-chart__bars">
-        {rows.map((row) => {
-          const segments = [
-            ["input", row.input],
-            ["cacheCreation", row.cacheCreation],
-            ["cacheRead", row.cacheRead],
-            ["output", row.output]
-          ] as const;
-          const total = segments.reduce((sum, [, value]) => sum + value, 0);
-          return (
-            <div className="ops-token-day" key={row.date} title={`${row.date}: ${total.toLocaleString()} tokens · ${row.turns.toLocaleString()} turns`}>
-              <div className="ops-token-day__stack" style={{ height: `${Math.max(8, (total / maxTotal) * 100)}%` }}>
-                {segments.map(([key, value]) => value > 0 ? (
-                  <span
-                    className="ops-token-day__segment"
-                    key={key}
-                    style={{
-                      backgroundColor: tokenLayerColors[key],
-                      flexGrow: value,
-                      flexBasis: 0
-                    }}
-                  />
-                ) : null)}
-              </div>
-              <span className="ops-token-day__label">{formatDateLabel(row.date)}</span>
-            </div>
-          );
-        })}
+    <div className="ops-token-chart" role="img" aria-label="Daily token volume by token type with token-count axis">
+      <div className="ops-axis-chart ops-axis-chart--tokens">
+        <div className="ops-axis-chart__y" aria-hidden="true">
+          {chartTicks(axisMax).map((tick) => <span key={tick}>{compactNumber(tick)}</span>)}
+        </div>
+        <div className="ops-axis-chart__plot">
+          <div className="ops-axis-chart__grid" aria-hidden="true">
+            {chartTicks(axisMax).map((tick) => <span key={tick} />)}
+          </div>
+          <div className="ops-token-chart__bars">
+            {rows.map((row) => {
+              const segments = [
+                ["input", row.input],
+                ["cacheCreation", row.cacheCreation],
+                ["cacheRead", row.cacheRead],
+                ["output", row.output]
+              ] as const;
+              const total = segments.reduce((sum, [, value]) => sum + value, 0);
+              return (
+                <div className="ops-token-day" key={row.date} title={`${row.date}: ${total.toLocaleString()} tokens · ${row.turns.toLocaleString()} turns`}>
+                  <span className="ops-token-day__value">{compactNumber(total)}</span>
+                  <div className="ops-token-day__stack" style={{ height: `${Math.max(8, (total / axisMax) * 100)}%` }}>
+                    {segments.map(([key, value]) => value > 0 ? (
+                      <span
+                        className="ops-token-day__segment"
+                        key={key}
+                        style={{
+                          backgroundColor: tokenLayerColors[key],
+                          flexGrow: value,
+                          flexBasis: 0
+                        }}
+                      />
+                    ) : null)}
+                  </div>
+                  <span className="ops-token-day__label">{formatDateLabel(row.date)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
       </div>
       <div className="ops-chart-legend">
         <span><i style={{ backgroundColor: tokenLayerColors.input }} />Input</span>
@@ -202,6 +258,7 @@ function TokenUsageChart({ rows }: { rows: OpsTokenUsageRow[] }) {
     </div>
   );
 }
+
 
 function ResourceQuotaPanel({ data }: { data: SafeOpsDashboardData }) {
   const quotas = quotaRows(data.usage_history);
@@ -441,32 +498,7 @@ function OpsContent({ data: rawData }: { data: unknown }) {
           ))}
         </div>
         <section aria-labelledby={`ops-${activeTab}-tab`} className="ui-tabs__panel" id={`ops-${activeTab}-panel`} role="tabpanel">
-          {activeTab === "overview" ? (
-            <div className="ops-panel-grid">
-              <Panel title="Event Mix">
-                <RowsTable caption="Top event types" empty="No events in this window" rows={mapToRows(data.by_event).slice(0, 12)} />
-              </Panel>
-              <Panel title="Events vs Queued">
-                {data.timeseries.length ? (
-                  <DataTable
-                    columns={[
-                      { key: "day", header: "Day" },
-                      { key: "events", header: "Events" },
-                      { key: "queued", header: "Queued" }
-                    ]}
-                    rows={data.timeseries.map((point) => ({
-                      day: point.day,
-                      events: point.events.toLocaleString(),
-                      queued: point.queued.toLocaleString()
-                    }))}
-                  />
-                ) : (
-                  <EmptyState title="No time-series points in this window" />
-                )}
-              </Panel>
-            </div>
-          ) : null}
-          {activeTab === "usage" ? <ResourceQuotaPanel data={data} /> : null}
+          {activeTab === "overview" ? <ResourceQuotaPanel data={data} /> : null}
           {activeTab === "scheduler" ? <SchedulerPanel data={data} /> : null}
           {activeTab === "async" ? <AsyncJobsPanel data={data} /> : null}
           {activeTab === "health" ? <HealthPanel data={data} /> : null}

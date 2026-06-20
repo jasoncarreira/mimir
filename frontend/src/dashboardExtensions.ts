@@ -27,8 +27,8 @@ const firstPartySurfaceMetadata: Record<
     filterLabel: "status"
   },
   ops: {
-    detail: "Operational metrics, quota pressure, and resource charts",
-    tabs: ["overview", "usage", "scheduler", "async", "health", "raw"],
+    detail: "First-class usage, quota pressure, and operational metrics",
+    tabs: ["usage", "scheduler", "async", "health", "raw"],
     filterLabel: "scope"
   },
   "chainlink-board": {

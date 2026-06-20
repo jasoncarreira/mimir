@@ -27,6 +27,8 @@ export type OpsQuotaRow = {
   window: string;
   points: number;
   latestUtilization: number | null;
+  latestProjection: number | null;
+  latestPressure: string;
 };
 
 const summaryLabels: Record<string, string> = {
@@ -132,7 +134,9 @@ export function quotaRows(
         provider,
         window,
         points: points.length,
-        latestUtilization: latest ? nullableNumberFrom(latest.utilization) : null
+        latestUtilization: latest ? nullableNumberFrom(latest.utilization) : null,
+        latestProjection: latest ? nullableNumberFrom(latest.projection) : null,
+        latestPressure: latest ? stringFrom(latest.pressure, "clear") : "clear"
       };
     })
   );
