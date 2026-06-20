@@ -21,14 +21,19 @@ const firstPartySurfaceMetadata: Record<
     tabs: ["compose", "history", "context"],
     filterLabel: "channel"
   },
+  usage: {
+    detail: "Quota pressure and token usage",
+    tabs: ["quota", "tokens"],
+    filterLabel: "window"
+  },
   turns: {
     detail: "Inspect selected turns",
     tabs: ["summary", "prompt", "events"],
     filterLabel: "status"
   },
   ops: {
-    detail: "First-class usage, quota pressure, and operational metrics",
-    tabs: ["usage", "scheduler", "async", "health", "raw"],
+    detail: "Operational overview",
+    tabs: ["overview", "scheduler", "async", "health", "raw"],
     filterLabel: "scope"
   },
   "chainlink-board": {

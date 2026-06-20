@@ -140,6 +140,13 @@ def first_party_dashboard_extensions(
                 nav_position=10,
             ),
             DashboardExtensionManifest(
+                id="usage",
+                route_path="/usage",
+                label="Usage",
+                icon="activity",
+                nav_position=11,
+            ),
+            DashboardExtensionManifest(
                 id="turns",
                 route_path="/turns",
                 label="Turn Viewer",
@@ -150,9 +157,9 @@ def first_party_dashboard_extensions(
             DashboardExtensionManifest(
                 id="ops",
                 route_path="/ops",
-                label="Usage",
+                label="Ops",
                 icon="activity",
-                nav_position=11,
+                nav_position=30,
                 api_namespace="ops",
             ),
             DashboardExtensionManifest(

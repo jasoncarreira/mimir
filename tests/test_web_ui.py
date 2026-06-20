@@ -836,15 +836,22 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     assert body["data"]["ui"] == {"agent_name": "Mimir", "skin": "neon-terminal"}
     assert body["data"]["auth"]["required"] is True
     assert body["data"]["server"]["public_bind"] is True
-    assert [item["id"] for item in body["data"]["dashboard_extensions"]][:3] == [
+    assert [item["id"] for item in body["data"]["dashboard_extensions"]][:4] == [
         "chat",
-        "ops",
+        "usage",
         "turns",
+        "ops",
     ]
+    usage_manifest = next(
+        item for item in body["data"]["dashboard_extensions"] if item["id"] == "usage"
+    )
+    assert usage_manifest["label"] == "Usage"
+    assert usage_manifest["route_path"] == "/usage"
+    assert usage_manifest["api_namespace"] is None
     ops_manifest = next(
         item for item in body["data"]["dashboard_extensions"] if item["id"] == "ops"
     )
-    assert ops_manifest["label"] == "Usage"
+    assert ops_manifest["label"] == "Ops"
     assert ops_manifest["api_namespace"] == "ops"
     assert ops_manifest["trusted_first_party"] is True
 

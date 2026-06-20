@@ -23,18 +23,29 @@ function manifest(id: string, label = id): DashboardExtensionManifest {
 }
 
 describe("dashboard surface metadata", () => {
-  it("labels the ops surface as first-class Usage navigation without Chainlink tabs", () => {
-    const [usage] = getDashboardSurfaces([manifest("ops", "Usage")]);
+  it("models Usage as its own first-class surface, separate from Ops", () => {
+    const [usage, ops] = getDashboardSurfaces([
+      { ...manifest("usage", "Usage"), route_path: "/usage", api_namespace: null, nav_position: 11 },
+      { ...manifest("ops", "Ops"), route_path: "/ops", nav_position: 30 }
+    ]);
 
     expect(usage).toMatchObject({
-      id: "ops",
+      id: "usage",
       label: "Usage",
       title: "Usage",
-      path: "/ops",
-      detail: "First-class usage, quota pressure, and operational metrics"
+      path: "/usage",
+      detail: "Quota pressure and token usage"
     });
-    expect(usage.tabs).toEqual(["usage", "scheduler", "async", "health", "raw"]);
-    expect(usage.tabs).not.toContain("chainlink");
+    expect(usage.tabs).toEqual(["quota", "tokens"]);
+    expect(ops).toMatchObject({
+      id: "ops",
+      label: "Ops",
+      path: "/ops",
+      detail: "Operational overview"
+    });
+    expect(ops.tabs).toEqual(["overview", "scheduler", "async", "health", "raw"]);
+    expect(ops.tabs).not.toContain("usage");
+    expect(ops.tabs).not.toContain("chainlink");
   });
 });
 

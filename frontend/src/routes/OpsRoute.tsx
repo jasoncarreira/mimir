@@ -119,6 +119,10 @@ function RowsTable({
   );
 }
 
+function clamp01(value: number) {
+  return Math.max(0, Math.min(1, value));
+}
+
 function QuotaTrendChart({ data }: { data: SafeOpsDashboardData }) {
   const providers = Object.entries(data.usage_history);
   if (!providers.length) {
@@ -133,15 +137,19 @@ function QuotaTrendChart({ data }: { data: SafeOpsDashboardData }) {
     <div className="ops-chart-grid">
       {providers.map(([provider, windows]) => {
         const series = Object.entries(windows).map(([window, points]) => ({ window, points }));
-        const dates = series.flatMap(({ points }) => points.map((point) => point.ts));
+        const dates = Array.from(new Set(series.flatMap(({ points }) => points.map((point) => point.ts)))).sort();
         const latestRows = quotaRows({ [provider]: windows });
+        const xForDate = (ts: string) => {
+          const index = Math.max(0, dates.indexOf(ts));
+          return dates.length > 1 ? (index / (dates.length - 1)) * 100 : 50;
+        };
         return (
           <div className="ops-chart-card ops-chart-card--wide" key={provider}>
             <div className="ops-chart-card__header">
               <h3>{usageProviderLabels[provider] || provider}</h3>
               <span>{dateRangeLabel(dates)}</span>
             </div>
-            <div className="ops-axis-chart ops-axis-chart--quota" role="img" aria-label={`${provider} quota utilization trend with percent axis`}>
+            <div className="ops-axis-chart ops-axis-chart--quota" role="img" aria-label={`${provider} quota utilization line chart with percent axis`}>
               <div className="ops-axis-chart__y" aria-hidden="true">
                 {chartTicks(1).map((tick) => <span key={tick}>{formatPercent(tick)}</span>)}
               </div>
@@ -149,37 +157,44 @@ function QuotaTrendChart({ data }: { data: SafeOpsDashboardData }) {
                 <div className="ops-axis-chart__grid" aria-hidden="true">
                   {chartTicks(1).map((tick) => <span key={tick} />)}
                 </div>
-                {series.map(({ window, points }) => {
-                  const color = usageWindowColors[window] || "#9ca3af";
-                  const valid = points.filter((point) => point.utilization != null);
-                  return (
-                    <div className="ops-line-series" key={window}>
-                      <span className="ops-line-series__label" style={{ color }}>{windowLabel(window)}</span>
-                      <div className="ops-line-points" aria-hidden="true">
-                        {points.map((point, index) => {
-                          const value = point.utilization;
-                          return (
-                            <span
-                              className={`ops-line-point${value == null ? " ops-line-point--gap" : ""}`}
-                              key={`${point.ts}-${index}`}
-                              style={{
-                                left: points.length > 1 ? `${(index / (points.length - 1)) * 100}%` : "50%",
-                                bottom: value == null ? "0%" : `${Math.max(0, Math.min(1, value)) * 100}%`,
-                                backgroundColor: value == null ? undefined : color
-                              }}
-                              title={`${formatDateLabel(point.ts)}: ${value == null ? "n/a" : formatPercent(value)}${point.projection == null ? "" : ` → ${formatPercent(point.projection)} projected`} · ${point.pressure || "clear"}`}
-                            />
-                          );
-                        })}
-                      </div>
-                      {valid.length ? (
-                        <span className="ops-line-series__latest" style={{ color }}>
-                          {formatPercent(valid[valid.length - 1].utilization ?? null)}
-                        </span>
-                      ) : null}
-                    </div>
-                  );
-                })}
+                <svg className="ops-quota-line-chart" preserveAspectRatio="none" viewBox="0 0 100 100" aria-hidden="true">
+                  {series.map(({ window, points }) => {
+                    const color = usageWindowColors[window] || "#9ca3af";
+                    const valid = points.filter((point) => point.utilization != null);
+                    const linePoints = valid
+                      .map((point) => `${xForDate(point.ts)},${100 - clamp01(point.utilization ?? 0) * 100}`)
+                      .join(" ");
+                    return (
+                      <g key={window}>
+                        {valid.length > 1 ? (
+                          <polyline
+                            className="ops-quota-line"
+                            fill="none"
+                            points={linePoints}
+                            stroke={color}
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        ) : null}
+                        {valid.map((point, index) => (
+                          <circle
+                            className="ops-quota-line__point"
+                            cx={xForDate(point.ts)}
+                            cy={100 - clamp01(point.utilization ?? 0) * 100}
+                            fill={color}
+                            key={`${window}-${point.ts}-${index}`}
+                            r="1.7"
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        ))}
+                      </g>
+                    );
+                  })}
+                </svg>
+                <div className="ops-quota-line-labels" aria-hidden="true">
+                  {dates.length ? <span>{formatDateLabel(dates[0])}</span> : <span />}
+                  {dates.length > 2 ? <span>{formatDateLabel(dates[Math.floor(dates.length / 2)])}</span> : null}
+                  {dates.length > 1 ? <span>{formatDateLabel(dates[dates.length - 1])}</span> : <span />}
+                </div>
               </div>
             </div>
             <div className="ops-chart-legend ops-chart-legend--cards">
@@ -196,7 +211,6 @@ function QuotaTrendChart({ data }: { data: SafeOpsDashboardData }) {
     </div>
   );
 }
-
 
 function TokenUsageChart({ rows }: { rows: OpsTokenUsageRow[] }) {
   if (!rows.length) {
@@ -260,16 +274,9 @@ function TokenUsageChart({ rows }: { rows: OpsTokenUsageRow[] }) {
 }
 
 
-function ResourceQuotaPanel({ data }: { data: SafeOpsDashboardData }) {
+function UsagePanel({ data }: { data: SafeOpsDashboardData }) {
   const quotas = quotaRows(data.usage_history);
   const tokens = tokenUsageRows(data.token_usage_history);
-  const resourceRows = mapToRows(
-    Object.fromEntries(
-      Object.entries(data.by_event).filter(([key]) =>
-        key.includes("resource") || key.includes("quota") || key.includes("usage")
-      )
-    )
-  );
 
   return (
     <div className="ops-panel-stack">
@@ -304,9 +311,6 @@ function ResourceQuotaPanel({ data }: { data: SafeOpsDashboardData }) {
             }))}
           />
         ) : null}
-      </Panel>
-      <Panel title="Resource Signals">
-        <RowsTable caption="Resource and quota event counts" empty="No resource events in this window" rows={resourceRows} />
       </Panel>
     </div>
   );
@@ -462,7 +466,6 @@ function OpsContent({ data: rawData }: { data: unknown }) {
   const data = safeOpsDashboardData(rawData);
   const tabs = [
     ["overview", "Overview"],
-    ["usage", "Usage"],
     ["scheduler", "Scheduler"],
     ["async", "Async jobs"],
     ["health", "Health"],
@@ -498,7 +501,31 @@ function OpsContent({ data: rawData }: { data: unknown }) {
           ))}
         </div>
         <section aria-labelledby={`ops-${activeTab}-tab`} className="ui-tabs__panel" id={`ops-${activeTab}-panel`} role="tabpanel">
-          {activeTab === "overview" ? <ResourceQuotaPanel data={data} /> : null}
+          {activeTab === "overview" ? (
+            <div className="ops-panel-grid">
+              <Panel title="Event Mix">
+                <RowsTable caption="Top event types" empty="No events in this window" rows={mapToRows(data.by_event).slice(0, 12)} />
+              </Panel>
+              <Panel title="Events vs Queued">
+                {data.timeseries.length ? (
+                  <DataTable
+                    columns={[
+                      { key: "day", header: "Day" },
+                      { key: "events", header: "Events" },
+                      { key: "queued", header: "Queued" }
+                    ]}
+                    rows={data.timeseries.map((point) => ({
+                      day: point.day,
+                      events: point.events.toLocaleString(),
+                      queued: point.queued.toLocaleString()
+                    }))}
+                  />
+                ) : (
+                  <EmptyState title="No time-series points in this window" />
+                )}
+              </Panel>
+            </div>
+          ) : null}
           {activeTab === "scheduler" ? <SchedulerPanel data={data} /> : null}
           {activeTab === "async" ? <AsyncJobsPanel data={data} /> : null}
           {activeTab === "health" ? <HealthPanel data={data} /> : null}
@@ -506,6 +533,69 @@ function OpsContent({ data: rawData }: { data: unknown }) {
         </section>
       </div>
     </div>
+  );
+}
+
+
+function UsageContent({ data: rawData }: { data: unknown }) {
+  const data = safeOpsDashboardData(rawData);
+  return (
+    <div className="ops-route">
+      <UsagePanel data={data} />
+    </div>
+  );
+}
+
+export function UsageRoute() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const daysParam = searchParams.get("days") || "7";
+  const days = Number.parseInt(daysParam, 10);
+  const validDays = Number.isFinite(days) && days > 0 ? days : 7;
+  const query = useQuery({
+    queryKey: ["usage-dashboard", validDays],
+    queryFn: async () => (await getOpsDashboard({ days: validDays }, { cache: "no-store" })).data
+  });
+
+  return (
+    <>
+      <div className="ops-header-row">
+        <div>
+          <p className="ui-eyebrow">Usage</p>
+          <h1>Usage Dashboard</h1>
+          <p className="app-copy">
+            Window: {validDays} days{query.data ? ` | Generated ${query.data.generated_at}` : ""}
+          </p>
+        </div>
+        <form
+          className="ops-controls"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const form = new FormData(event.currentTarget);
+            const nextDays = String(form.get("days") || "7");
+            const params = new URLSearchParams(searchParams);
+            params.set("days", nextDays);
+            setSearchParams(params, { replace: false });
+          }}
+        >
+          <label>
+            <span>Days</span>
+            <TextInput defaultValue={String(validDays)} inputMode="numeric" min={1} name="days" type="number" />
+          </label>
+          <Button type="submit" variant="primary">Apply</Button>
+          <Button disabled={query.isFetching} onClick={() => void query.refetch()} type="button">
+            {query.isFetching ? "Refreshing" : "Refresh"}
+          </Button>
+          <a className="ui-button ui-button--secondary ops-json-link" href={`/api/ops?days=${validDays}`}>JSON</a>
+        </form>
+      </div>
+      {query.isLoading ? <LoadingState label="Loading usage dashboard" /> : null}
+      {query.isError ? (
+        <ErrorState title="Usage endpoint failed">
+          {query.error instanceof Error ? query.error.message : String(query.error)}
+        </ErrorState>
+      ) : null}
+      {query.data ? <UsageContent data={query.data} /> : null}
+    </>
   );
 }
 
@@ -523,8 +613,8 @@ export function OpsRoute() {
     <>
       <div className="ops-header-row">
         <div>
-          <p className="ui-eyebrow">Usage</p>
-          <h1>Usage Dashboard</h1>
+          <p className="ui-eyebrow">Ops</p>
+          <h1>Ops Dashboard</h1>
           <p className="app-copy">
             Window: {validDays} days{query.data ? ` | Generated ${query.data.generated_at}` : ""}
           </p>

@@ -24,7 +24,7 @@ import { UsersRoute } from "./routes/UsersRoute";
 import { LiveEventsProvider, useLiveEvents } from "./live-events";
 import { SagaDashboard } from "./SagaDashboard";
 import { AdminConfigRoute } from "./routes/AdminConfigRoute";
-import { OpsRoute } from "./routes/OpsRoute";
+import { OpsRoute, UsageRoute } from "./routes/OpsRoute";
 import { SchedulerRoute } from "./routes/SchedulerRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { TurnsRoute } from "./routes/TurnsRoute";
@@ -537,9 +537,11 @@ function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[
           element={
             surface.id === "saga"
               ? <SagaDashboard />
-              : surface.id === "ops"
-                ? <OpsRoute />
-                : surface.id === "chainlink-board"
+              : surface.id === "usage"
+                ? <UsageRoute />
+                : surface.id === "ops"
+                  ? <OpsRoute />
+                  : surface.id === "chainlink-board"
                   ? <ChainlinkBoardRoute />
                   : surface.id === "turns"
                     ? <TurnsRoute />
