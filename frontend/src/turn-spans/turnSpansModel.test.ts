@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { TurnStreamEvent } from "../api/generated/contracts";
-import { EMPTY_TURN_SPANS, applyTurnEvent, type TurnSpansState } from "./turnSpansModel";
+import { EMPTY_TURN_SPANS, MAX_SPANS, applyTurnEvent, type TurnSpansState } from "./turnSpansModel";
 
 let seq = 0;
 function ev(partial: Partial<TurnStreamEvent>): TurnStreamEvent {
@@ -106,5 +106,16 @@ describe("applyTurnEvent — span assembly", () => {
   it("shows error when the turn ends in error", () => {
     const state = reduce([ev({ type: "turn", phase: "end", status: "error" })]);
     expect(state.characterState).toBe("error");
+  });
+
+  it("caps retained spans at MAX_SPANS, dropping the oldest", () => {
+    const events = Array.from({ length: MAX_SPANS + 25 }, (_, i) =>
+      ev({ type: "tool_call", phase: "start", id: `c${i}`, tool_name: "noop" })
+    );
+    const state = reduce(events);
+    expect(state.spans).toHaveLength(MAX_SPANS);
+    // The newest survive; the oldest (c0) fell off the top.
+    expect(state.spans[state.spans.length - 1].key).toBe(`tool_call:c${MAX_SPANS + 24}`);
+    expect(state.spans[0].key).toBe(`tool_call:c25`);
   });
 });

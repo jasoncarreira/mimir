@@ -28,6 +28,10 @@ export const EMPTY_TURN_SPANS: TurnSpansState = {
   characterState: "idle"
 };
 
+// Cap retained spans so a pathologically long turn can't grow the Field Log
+// unbounded; the oldest fall off the top while the live ones stay.
+export const MAX_SPANS = 100;
+
 function deltaText(e: TurnStreamEvent): string {
   if (typeof e.text === "string") return e.text;
   if (typeof e.content_delta === "string") return e.content_delta;
@@ -109,7 +113,7 @@ export function applyTurnEvent(state: TurnSpansState, e: TurnStreamEvent): TurnS
   spans[idx] = span;
   return {
     turnId: state.turnId ?? e.turn_id,
-    spans,
+    spans: spans.length > MAX_SPANS ? spans.slice(-MAX_SPANS) : spans,
     characterState: characterForSpan(span)
   };
 }

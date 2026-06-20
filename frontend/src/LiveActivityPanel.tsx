@@ -48,27 +48,46 @@ function clockTime(ts: string): string {
 export function LiveActivityPanel() {
   const { spans, status } = useTurnSpans();
   const [openKey, setOpenKey] = React.useState<string | null>(null);
+  const listRef = React.useRef<HTMLUListElement | null>(null);
+  // Stick-to-bottom: keep the newest span (at the bottom) in view as it fills
+  // in, but stop following the moment the user scrolls up to read an older one.
+  const pinnedRef = React.useRef(true);
+
+  const latest = spans.length ? spans[spans.length - 1] : null;
+  const latestKey = latest?.key ?? null;
 
   // Auto-follow: whenever a new span arrives it becomes the open one (the others
   // collapse). A manual click (below) stays put until the next span arrives.
-  const latestKey = spans.length ? spans[spans.length - 1].key : null;
   React.useEffect(() => {
     if (latestKey) setOpenKey(latestKey);
   }, [latestKey]);
+
+  // Re-pin to the bottom as spans arrive / the latest detail grows.
+  const scrollSignal = `${spans.length}:${latest?.detail.length ?? 0}:${openKey ?? ""}`;
+  React.useEffect(() => {
+    const el = listRef.current;
+    if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
+  }, [scrollSignal]);
+
+  const onScroll = () => {
+    const el = listRef.current;
+    if (!el) return;
+    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  };
 
   const toggle = (key: string) => setOpenKey((current) => (current === key ? null : key));
 
   const statusTone = status === "open" ? "success" : status === "error" ? "danger" : "info";
 
-  const latest = spans.length ? spans[spans.length - 1] : null;
   const subtitle = latest && !latest.done
     ? `Working — ${spanTitle(latest)}`
     : spans.length
       ? "Idle — last turn finished"
       : "Waiting for agent activity";
 
-  // Newest-first so the active span stays at the top, in view without scrolling.
-  const ordered = spans.slice().reverse();
+  // Oldest → newest, so the newest span lands at the bottom (the stick-to-bottom
+  // effect keeps it in view as it fills in).
+  const ordered = spans;
 
   return (
     <Panel
@@ -79,7 +98,12 @@ export function LiveActivityPanel() {
       title="Field Log"
     >
       {ordered.length ? (
-        <ul className="live-activity__accordion" aria-label="Recent agent activity">
+        <ul
+          aria-label="Recent agent activity"
+          className="live-activity__accordion"
+          onScroll={onScroll}
+          ref={listRef}
+        >
           {ordered.map((span) => {
             const open = openKey === span.key;
             return (
