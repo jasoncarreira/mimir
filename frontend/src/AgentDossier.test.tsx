@@ -5,6 +5,7 @@ import type { LiveEventStreamItem } from "./api/generated/contracts";
 
 // Controllable live event + bootstrap so we can simulate the SSE backfill.
 const live = vi.hoisted(() => ({ lastEvent: null as LiveEventStreamItem | null }));
+const turn = vi.hoisted(() => ({ state: "idle" as string }));
 
 vi.mock("./live-events", () => ({
   useLiveEvents: () => ({ status: "open", cursor: "", lastEvent: live.lastEvent, error: null })
@@ -14,7 +15,9 @@ vi.mock("./api/bootstrap", () => ({
 }));
 vi.mock("./agent-character", () => ({
   AgentCharacter: () => null,
-  characterStateFromLiveEvent: () => "idle",
+  // Character state comes from the live turn-event bus (chainlink #583); the
+  // durable live-events lifecycle still resets it (self-healing, #800 review).
+  useTurnEventState: () => ({ state: turn.state, status: "open" }),
   isChatLiveEvent: () => true,
   withComposerListening: (state: string) => state
 }));
@@ -35,6 +38,7 @@ function lifecycle(id: string, seq: number): LiveEventStreamItem {
 afterEach(() => {
   cleanup();
   live.lastEvent = null;
+  turn.state = "idle";
 });
 
 describe("AgentDossier turn count", () => {
@@ -55,5 +59,24 @@ describe("AgentDossier turn count", () => {
     live.lastEvent = lifecycle("t-new", 101);
     view.rerender(<AgentDossier />);
     expect(turns()).toBe("101");
+  });
+});
+
+describe("AgentDossier self-heals a stranded character (#800 review)", () => {
+  it("resets the character on a durable finished lifecycle even if the bus is stuck", () => {
+    const stateText = () =>
+      screen.getByText("State").closest("div")?.querySelector("dd")?.textContent;
+
+    // The ephemeral bus left the character mid-turn (e.g. tool) and then its
+    // terminal `turn end` was dropped — without the durable fallback this would
+    // stay "Tool" until the next web turn.
+    turn.state = "tool";
+    const view = render(<AgentDossier />);
+    expect(stateText()).toBe("Tool");
+
+    // The durable live-events finished lifecycle resets it to idle.
+    live.lastEvent = lifecycle("t-done", 50);
+    view.rerender(<AgentDossier />);
+    expect(stateText()).toBe("Idle");
   });
 });

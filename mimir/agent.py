@@ -112,6 +112,7 @@ from .sagatools import (
 )
 from .search import Indexer
 from .session_manager import SessionManager
+from .turn_event_bus import TurnEventEmitter
 from .turn_hooks import TurnHook, fire_hooks
 from .turn_logger import (
     TurnLogger,
@@ -699,6 +700,7 @@ class Agent:
         dispatcher: Any = None,
         commitments_store: Any = None,
         turn_hooks: list[Any] | None = None,
+        turn_event_bus: Any = None,
     ) -> None:
         self._config = config
         self._turn_logger = turn_logger
@@ -717,6 +719,12 @@ class Agent:
         self._inbox = subagent_inbox or SubagentInbox()
         self._channels = channel_registry
         self._dispatcher = dispatcher
+        # chainlink #583 slice 1: optional live turn-event bus. When wired
+        # (build_app passes one shared with the web SSE layer), run_turn
+        # brackets the turn and the model loop publishes reasoning/tool spans
+        # in real time so the dashboard character animates live instead of
+        # replaying post-hoc from turns.jsonl. None → feature off (no-op).
+        self._turn_event_bus = turn_event_bus
         # Phase 2b due-check poller (server.py:_on_startup) reads this
         # attribute via getattr. Pre-fix it was always None — every
         # commitment_complete / _snooze / _dismiss / _list tool call
@@ -1197,6 +1205,15 @@ class Agent:
         """Run one agent turn — preserves the SDK Agent.run_turn contract."""
         turn_id = make_turn_id()
         t_total_start = time.monotonic()
+        # chainlink #583 slice 1: bracket the whole turn on the live event bus
+        # (no-op when unwired). turn_started here pairs with turn_ended in the
+        # finally so every turn — even an early-phase crash — is bracketed.
+        emitter = TurnEventEmitter(
+            self._turn_event_bus, turn_id=turn_id, channel_id=event.channel_id
+        )
+        emitter.turn_started()
+        _turn_record = None
+        _turn_exc = None
         # chainlink #383: arm mid-turn injection before any slow setup work
         # (session touch, SAGA query, prompt/index assembly). The dispatcher
         # already marks the channel in-flight before invoking run_turn; keeping
@@ -1357,11 +1374,13 @@ class Agent:
             interactive_token = _set_interactive(
                 is_interactive_turn(event.channel_id, event.trigger, self._channels)
             )
-            return await self._run_turn_body(
+            _turn_record = await self._run_turn_body(
                 event, ctx, ctx_token, turn_id, session_id, saga_session_id,
-                t_total_start,
+                t_total_start, emitter,
             )
+            return _turn_record
         except Exception as exc:
+            _turn_exc = exc
             # chainlink #306 (+ #415): _run_turn_body's model-loop try/except emits
             # turn_failed/turn_completed only AFTER the early phase (prompt
             # build, agent construction, model resolution). A crash in that
@@ -1408,6 +1427,20 @@ class Agent:
                     log.exception("early-phase deliver notice failed")
             raise
         finally:
+            # chainlink #583: close the turn bracket on the live bus. Status
+            # reflects an exception or a returned record that carries an error.
+            try:
+                if _turn_exc is not None:
+                    emitter.turn_ended(
+                        status="error",
+                        error=f"{type(_turn_exc).__name__}: {_turn_exc}",
+                    )
+                elif _turn_record is not None and getattr(_turn_record, "error", None):
+                    emitter.turn_ended(status="error", error=str(_turn_record.error))
+                else:
+                    emitter.turn_ended(status="ok")
+            except Exception:  # noqa: BLE001 — never let emission break cleanup
+                pass
             if injection_registered:
                 # _run_turn_body normally deactivates once the model loop starts.
                 # This covers pre-body cancellations/exceptions that bypass that
@@ -1581,6 +1614,7 @@ class Agent:
         session_id: str,
         saga_session_id: str | None,
         t_total_start: float,
+        emitter: TurnEventEmitter,
     ) -> TurnRecord:
 
         # Persist the inbound event to the chat-history buffer + JSONL
@@ -1745,6 +1779,10 @@ class Agent:
                     stream_mode="values",
                 ):
                     messages = list(chunk.get("messages", []))
+                    # chainlink #583: publish new reasoning/tool spans live so
+                    # the dashboard character animates mid-turn (no-op when the
+                    # bus is unwired; never raises into the loop).
+                    emitter.blocks_from_messages(messages)
                 events, output = extract_turn_events(messages)
                 # Forgot-to-send recovery (opt-in, MIMIR_RESEND_NUDGE_CHANNELS):
                 # an interactive turn that produced text but never delivered gets

@@ -757,6 +757,12 @@ def build_app(config: Config) -> web.Application:
     from .commitments import CommitmentsStore
     commitments_store = CommitmentsStore(path=config.commitments_log)
 
+    # chainlink #583 slice 1: one live turn-event bus shared by the agent
+    # (producer) and the web SSE layer (consumer) so the dashboard character
+    # animates mid-turn instead of replaying post-hoc from turns.jsonl.
+    from .turn_event_bus import TurnEventBus
+    turn_event_bus = TurnEventBus()
+
     agent = Agent(
         config,
         turn_logger,
@@ -770,6 +776,7 @@ def build_app(config: Config) -> web.Application:
         channel_registry=channels,
         dispatcher=dispatcher,
         commitments_store=commitments_store,
+        turn_event_bus=turn_event_bus,
     )
     dispatcher.set_run_turn(agent.run_turn)
     # chainlink #376 (PR 4): record mid-turn injected messages in chat history at
@@ -1096,6 +1103,7 @@ def build_app(config: Config) -> web.Application:
             config.model_spec,
             getattr(config, "anthropic_base_url", ""),
         ),
+        turn_event_bus=turn_event_bus,
     )
     # Web chat bridge — POST /chat + GET /chat/stream for the local UI.
     web_chat.register_routes(app)

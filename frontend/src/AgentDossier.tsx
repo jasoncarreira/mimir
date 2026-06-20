@@ -1,8 +1,8 @@
 import React from "react";
 import {
   AgentCharacter,
-  characterStateFromLiveEvent,
   isChatLiveEvent,
+  useTurnEventState,
   withComposerListening
 } from "./agent-character";
 import { useBootstrap } from "./api/bootstrap";
@@ -31,28 +31,42 @@ export function AgentDossier() {
   const agentName = bootstrap?.ui?.agent_name || "Mimir";
   const model = bootstrap?.model || "";
 
-  // Character: reflects *chat* turns only (background poller/heartbeat turns
-  // don't drive it; characterStateFromLiveEvent returns "idle" on a finished
-  // lifecycle, so it resets when the chat turn completes — no stale state).
-  // Turn total: max(turns_total, highest live seq) — a counter would double-count
-  // the SSE's backfill of historical finished turns.
-  const [chatEventState, setChatEventState] = React.useState<AgentCharacterState>("idle");
+  // Character state: the LIVE turn-event bus (chainlink #583) drives it DURING
+  // the turn. That stream is ephemeral/no-backfill, so a dropped connection or
+  // a missed terminal `turn end` could otherwise strand the character mid-turn
+  // (mimir review on #800). The durable live-events `turn.lifecycle`
+  // finished/failed — which always lands ~1s after turn end via the cursor-based
+  // stream — resets it, so missed bus events self-heal via durable history.
+  const { state: busState } = useTurnEventState();
+  const [charState, setCharState] = React.useState<AgentCharacterState>("idle");
+  React.useEffect(() => {
+    setCharState(busState);
+  }, [busState]);
+
+  // Durable live-events drive the turn counter AND the self-healing reset.
+  // Turn total: max(turns_total, highest live seq) — a counter would
+  // double-count the SSE's backfill of historical finished turns.
   const [maxLiveSeq, setMaxLiveSeq] = React.useState(0);
   const lastEventId = React.useRef("");
   React.useEffect(() => {
     const item = liveEvents.lastEvent;
     if (!item || item.id === lastEventId.current) return;
     lastEventId.current = item.id;
-    if (item.event.kind === "turn.lifecycle" && typeof item.event.seq === "number") {
-      const seq = item.event.seq;
-      setMaxLiveSeq((current) => (seq > current ? seq : current));
-    }
-    if (isChatLiveEvent(item.event)) {
-      setChatEventState(characterStateFromLiveEvent(item.event));
+    const event = item.event;
+    if (event.kind === "turn.lifecycle") {
+      if (typeof event.seq === "number") {
+        const seq = event.seq;
+        setMaxLiveSeq((current) => (seq > current ? seq : current));
+      }
+      // Self-healing safety net: a definitive end resets the live character
+      // even if the ephemeral bus dropped or missed its terminal event.
+      if (isChatLiveEvent(event)) {
+        if (event.phase === "finished") setCharState("idle");
+        else if (event.phase === "failed") setCharState("error");
+      }
     }
   }, [liveEvents.lastEvent]);
-  const eventState = liveEvents.status === "error" ? "error" : chatEventState;
-  const agentState = withComposerListening(eventState, composerActive);
+  const agentState = withComposerListening(charState, composerActive);
   const turns = Math.max(bootstrap?.turns_total ?? 0, maxLiveSeq);
 
   return (

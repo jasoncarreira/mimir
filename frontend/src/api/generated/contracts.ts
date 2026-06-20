@@ -648,3 +648,50 @@ export interface LiveEventStreamItem {
   ts?: string | null;
   event: LiveEvent;
 }
+
+/**
+ * chainlink #583: live, ephemeral in-turn events from GET /api/v1/turn-events.
+ * Distinct from the post-hoc LiveEvent stream (derived from turns.jsonl at turn
+ * end) — these are published DURING the turn so the dashboard character can
+ * animate live. Every event is a uniform span bracket (phase ∈ start|chunk|end)
+ * with no atomic events: errors ride a terminal `status` on a `*` end, and a
+ * tool's execution is its own `tool_result` span that shares the `tool_call`'s
+ * `id` (join spans by (type, id)). On backends that can't token-stream
+ * (codex-plus, claude-code) a whole block arrives as one `chunk` between
+ * start/end; on streaming backends (anthropic, openai) `chunk` repeats.
+ */
+export type TurnStreamEventType =
+  | "turn"
+  | "reasoning"
+  | "text"
+  | "tool_call"
+  | "tool_result";
+
+export type TurnStreamPhase = "start" | "chunk" | "end";
+
+export interface TurnStreamEvent {
+  type: TurnStreamEventType;
+  phase: TurnStreamPhase;
+  turn_id: string;
+  channel_id: string;
+  /** Monotonic per-turn sequence for ordering / gap detection. */
+  seq: number;
+  ts: string;
+  /** Span id; a tool_call and its tool_result share it. */
+  id?: string;
+  /** Terminal status on a `turn` or `tool_result` end: "ok" | "error". */
+  status?: string;
+  error?: string;
+  /** tool_call / tool_result span: the tool name. */
+  tool_name?: string;
+  /** tool_call end: the complete args. */
+  args?: unknown;
+  /** tool_call chunk: partial args (whole args on non-streaming backends). */
+  args_delta?: unknown;
+  /** reasoning / text chunk: incremental (or whole-block) text. */
+  text?: string;
+  /** tool_result chunk: incremental (or whole) result content. */
+  content_delta?: string;
+  /** tool_result end: the result content. */
+  content?: string;
+}

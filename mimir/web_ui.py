@@ -289,6 +289,7 @@ def register_routes(
     active_usage_provider: str | None = None,
     react_app_dist: Path | None = None,
     dashboard_extensions: DashboardExtensionRegistry | None = None,
+    turn_event_bus: Any | None = None,
 ) -> None:
     """Add viewer + API routes to an existing aiohttp app.
 
@@ -597,6 +598,47 @@ def register_routes(
             pass
         finally:
             await _release_live_event_slot()
+        return resp
+
+    async def turn_events_stream(request: web.Request) -> web.StreamResponse:
+        """Live SSE stream of in-turn events (chainlink #583 slice 1).
+
+        Ephemeral — no backfill/cursor. ``?channel=web-foo`` subscribes to one
+        channel; omitted subscribes to all. The dossier character consumes this
+        so it animates DURING a turn, vs the post-hoc ``/api/v1/live-events``
+        stream (derived from turns.jsonl at turn end) used for history.
+        """
+        if turn_event_bus is None:
+            return web.json_response({"error": "turn events unavailable"}, status=503)
+        channel = request.query.get("channel") or "*"
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        await resp.prepare(request)
+        queue = turn_event_bus.subscribe(channel)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(
+                        queue.get(), timeout=LIVE_EVENTS_HEARTBEAT_S
+                    )
+                except asyncio.TimeoutError:
+                    await resp.write(b": heartbeat\n\n")
+                    continue
+                block = (
+                    "event: turn-event\n"
+                    "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+                )
+                await resp.write(block.encode("utf-8"))
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            turn_event_bus.unsubscribe(channel, queue)
         return resp
 
     async def react_app(request: web.Request) -> web.StreamResponse:
@@ -1029,6 +1071,8 @@ def register_routes(
         app.router.add_get("/api/v1/events", events_data_v1)
     if ("GET", "/api/v1/live-events") not in existing:
         app.router.add_get("/api/v1/live-events", live_events_stream)
+    if turn_event_bus is not None and ("GET", "/api/v1/turn-events") not in existing:
+        app.router.add_get("/api/v1/turn-events", turn_events_stream)
     if ("GET", "/app") not in existing:
         app.router.add_get("/app", react_app)
     if ("GET", "/app/auth.js") not in existing:

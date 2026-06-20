@@ -1,7 +1,25 @@
 import { describe, expect, it } from "vitest";
-import type { LiveEvent } from "../api/generated/contracts";
+import type { LiveEvent, TurnStreamEvent } from "../api/generated/contracts";
 import type { SkinCharacterRendererMetadata } from "../skins/types";
-import { characterStateFromLiveEvent, resolveAgentCharacterAsset, withComposerListening } from "./state";
+import {
+  characterStateFromLiveEvent,
+  characterStateFromTurnEvent,
+  isChatTurnEvent,
+  resolveAgentCharacterAsset,
+  withComposerListening
+} from "./state";
+
+function turnEvent(partial: Partial<TurnStreamEvent>): TurnStreamEvent {
+  return {
+    type: "turn",
+    phase: "start",
+    turn_id: "t1",
+    channel_id: "web-default",
+    seq: 1,
+    ts: "2026-06-20T00:00:00Z",
+    ...partial
+  };
+}
 
 describe("withComposerListening (#580)", () => {
   it("shows listening only when the composer is active and the agent is idle", () => {
@@ -70,5 +88,34 @@ describe("characterStateFromLiveEvent", () => {
 
   it("treats unknown event kinds as idle defensively", () => {
     expect(characterStateFromLiveEvent({ kind: "future.kind" } as unknown as LiveEvent)).toBe("idle");
+  });
+});
+
+describe("characterStateFromTurnEvent (#583 live bus)", () => {
+  it("maps span types to character states", () => {
+    expect(characterStateFromTurnEvent(turnEvent({ type: "turn", phase: "start" }))).toBe("thinking");
+    expect(characterStateFromTurnEvent(turnEvent({ type: "reasoning", phase: "chunk" }))).toBe("thinking");
+    expect(characterStateFromTurnEvent(turnEvent({ type: "text", phase: "chunk" }))).toBe("typing");
+    expect(characterStateFromTurnEvent(turnEvent({ type: "tool_call", phase: "start", tool_name: "saga_query" }))).toBe("tool");
+  });
+
+  it("treats the send_message tool call as talking (the reply rides on its args)", () => {
+    expect(
+      characterStateFromTurnEvent(turnEvent({ type: "tool_call", phase: "chunk", tool_name: "send_message" }))
+    ).toBe("typing");
+  });
+
+  it("resets to idle on turn end, and shows error on a failed turn or tool", () => {
+    expect(characterStateFromTurnEvent(turnEvent({ type: "turn", phase: "end", status: "ok" }))).toBe("idle");
+    expect(characterStateFromTurnEvent(turnEvent({ type: "turn", phase: "end", status: "error" }))).toBe("error");
+    expect(
+      characterStateFromTurnEvent(turnEvent({ type: "tool_result", phase: "end", status: "error", tool_name: "bash" }))
+    ).toBe("error");
+  });
+
+  it("scopes to web-* chat channels", () => {
+    expect(isChatTurnEvent(turnEvent({ channel_id: "web-default" }))).toBe(true);
+    expect(isChatTurnEvent(turnEvent({ channel_id: "discord-123" }))).toBe(false);
+    expect(isChatTurnEvent(null)).toBe(false);
   });
 });
