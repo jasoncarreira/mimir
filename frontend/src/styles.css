@@ -1532,6 +1532,11 @@ textarea {
 
 .ops-panel-stack {
   display: grid;
+  /* chainlink #582: an explicit minmax(0, 1fr) track drops the content-based
+     automatic minimum on the panels, so wide DataTables (e.g. the 10-column
+     scheduler table) scroll inside their own .ui-table-wrap instead of
+     expanding the column and overflowing the page. */
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--mimir-space-md, 16px);
 }
 
