@@ -498,39 +498,31 @@ def _fake_chainlink_script(
     return script
 
 
-def test_poller_imports_mimir_when_run_from_installed_skill_with_scrubbed_pythonpath(tmp_path: Path) -> None:
-    """Production poller subprocesses start in the installed skill directory.
+def test_poller_import_path_repair_uses_explicit_source_dir_without_editable_install(tmp_path: Path) -> None:
+    """Exercise the actual repair helper without relying on editable-install .pths."""
 
-    sys.path[0] is that skill dir, not the source checkout; the poller must repair
-    its own import path before importing WorklinkConfig.
-    """
-
-    home = tmp_path / "home"
-    home.mkdir()
     skill_dir = tmp_path / "skills" / "chainlink-orchestrator"
     skill_dir.mkdir(parents=True)
-    installed_poller = skill_dir / "poller.py"
-    installed_poller.write_text(POLLER.read_text(encoding="utf-8"), encoding="utf-8")
-    env = {
-        "MIMIR_HOME": str(home),
-        "STATE_DIR": str(tmp_path / "state"),
-        # No PYTHONPATH: this matches the failing live worklink-ready-queue shape.
-        "PATH": os.environ.get("PATH", ""),
-    }
+    source_dir = tmp_path / "source"
+    (source_dir / "mimir").mkdir(parents=True)
+    (source_dir / "mimir" / "__init__.py").write_text("", encoding="utf-8")
 
+    # Run only the helper prelude from the real poller under `python -S`, which
+    # disables site initialization and therefore the project's editable .pth. If
+    # the helper is a no-op, the source dir will not appear on sys.path.
+    prelude = POLLER.read_text(encoding="utf-8").split("\n_ensure_mimir_import_path()\n", 1)[0]
+    script = prelude + "\n_ensure_mimir_import_path()\nimport sys; print(sys.path[0])\n"
     proc = subprocess.run(
-        [sys.executable, "poller.py"],
+        [sys.executable, "-S", "-c", script],
         cwd=str(skill_dir),
-        env=env,
+        env={"MIMIR_SOURCE_DIR": str(source_dir), "PATH": os.environ.get("PATH", "")},
         capture_output=True,
         text=True,
         timeout=30,
     )
 
     assert proc.returncode == 0, proc.stderr
-    records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
-    assert records and records[0]["signal"] == "worklink_poller_degraded"
-    assert "ModuleNotFoundError" not in proc.stderr
+    assert proc.stdout.strip() == str(source_dir)
 
 
 def _fake_run_bin(tmp: Path) -> Path:
