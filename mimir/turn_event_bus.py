@@ -133,6 +133,11 @@ class TurnEventEmitter:
         self._seq = 0
         self._block_n = 0
         self._emitted = 0  # extract_turn_events items already bracketed
+        # chainlink #583 slice 2: dedup between token-streamed spans (token_chunk)
+        # and value-snapshot blocks (blocks_from_messages), keyed by tool id.
+        self._streamed_tool_ids: set[str] = set()  # started live via token_chunk
+        self._block_emitted_ids: set[str] = set()  # fully bracketed via blocks
+        self._tc_index_id: dict[int, str] = {}  # messages-mode index → tool id
 
     @property
     def enabled(self) -> bool:
@@ -164,6 +169,49 @@ class TurnEventEmitter:
         if error:
             payload["error"] = error[:240]
         self._emit("turn", "end", **payload)
+
+    def token_chunk(self, message_chunk: Any) -> None:
+        """Stream token-level tool-call arg deltas from a messages-mode chunk.
+
+        Slice 2: where the backend streams (codex-plus >=0.0.4, anthropic,
+        openai), LangGraph "messages" mode yields ``AIMessageChunk``s carrying
+        ``tool_call_chunks`` (partial args). The user-facing reply rides on the
+        send_message tool call, so streaming those args streams the reply. The
+        matching value-snapshot block then emits only the ``end`` (see
+        ``_bracket``), so a span is never double-bracketed. Content/reasoning
+        token deltas are left to slice-1 block brackets — the character already
+        animates from those, and avoiding them sidesteps text-span id matching.
+        """
+        if self._bus is None:
+            return
+        try:
+            pieces = getattr(message_chunk, "tool_call_chunks", None) or []
+            for piece in pieces:
+                index = piece.get("index")
+                tid = piece.get("id")
+                name = piece.get("name")
+                args = piece.get("args")
+                if tid:
+                    # An explicit id opens (or reopens) a span. (Re)bind the
+                    # index to it so a later tool call reusing the same index —
+                    # e.g. a second call also at index 0 — can't leak its chunks
+                    # into the previous call's span (#802 review).
+                    span_id = tid
+                    if index is not None:
+                        self._tc_index_id[index] = tid
+                elif index is not None and index in self._tc_index_id:
+                    span_id = self._tc_index_id[index]
+                else:
+                    continue  # can't correlate this fragment to a span yet
+                if span_id in self._block_emitted_ids:
+                    continue  # the value-snapshot block path already owns it
+                if span_id not in self._streamed_tool_ids:
+                    self._streamed_tool_ids.add(span_id)
+                    self._emit("tool_call", "start", id=span_id, tool_name=name or "unknown")
+                if args:
+                    self._emit("tool_call", "chunk", id=span_id, args_delta=args)
+        except Exception:  # noqa: BLE001 — emission is best-effort, never fatal
+            log.debug("turn-event token_chunk failed", exc_info=True)
 
     def blocks_from_messages(self, messages: list[Any]) -> None:
         """Bracket any new reasoning / tool_call / tool_result blocks.
@@ -206,10 +254,16 @@ class TurnEventEmitter:
             span_id = item.get("id") or f"{self._turn_id}:b{self._block_n}"
             name = item.get("name") or "unknown"
             args = item.get("args")
-            self._emit("tool_call", "start", id=span_id, tool_name=name)
-            if args is not None:
-                self._emit("tool_call", "chunk", id=span_id, args_delta=args)
-            self._emit("tool_call", "end", id=span_id, tool_name=name, args=args)
+            if span_id in self._streamed_tool_ids:
+                # token_chunk already streamed start + arg deltas live; just
+                # close the span with the authoritative full args (slice 2).
+                self._emit("tool_call", "end", id=span_id, tool_name=name, args=args)
+            else:
+                self._block_emitted_ids.add(span_id)
+                self._emit("tool_call", "start", id=span_id, tool_name=name)
+                if args is not None:
+                    self._emit("tool_call", "chunk", id=span_id, args_delta=args)
+                self._emit("tool_call", "end", id=span_id, tool_name=name, args=args)
         elif kind == "tool_result":
             self._block_n += 1
             # Reuse the tool_call id so consumers join call → result by (type,id).

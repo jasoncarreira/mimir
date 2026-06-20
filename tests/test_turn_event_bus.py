@@ -129,3 +129,100 @@ def test_emitter_only_brackets_new_blocks_across_snapshots():
     second = _drain(q)
     assert all(e["type"] != "tool_call" for e in second)  # not re-emitted
     assert any(e["type"] == "tool_result" for e in second)  # the new block only
+
+
+# ─── slice 2: token-level tool-call arg streaming + dedup ──────────────
+
+
+def test_token_chunk_streams_tool_call_arg_deltas():
+    from types import SimpleNamespace
+
+    bus = TurnEventBus()
+    q = bus.subscribe("web-default")
+    em = TurnEventEmitter(bus, turn_id="t1", channel_id="web-default")
+
+    # First fragment carries id + name; later fragments carry args by index.
+    em.token_chunk(SimpleNamespace(tool_call_chunks=[
+        {"index": 0, "id": "call_x", "name": "send_message", "args": ""}]))
+    em.token_chunk(SimpleNamespace(tool_call_chunks=[
+        {"index": 0, "id": None, "name": None, "args": '{"text":"hel'}]))
+    em.token_chunk(SimpleNamespace(tool_call_chunks=[
+        {"index": 0, "id": None, "name": None, "args": 'lo"}'}]))
+
+    events = _drain(q)
+    assert (events[0]["type"], events[0]["phase"]) == ("tool_call", "start")
+    assert events[0]["tool_name"] == "send_message" and events[0]["id"] == "call_x"
+    chunks = [e for e in events if e["phase"] == "chunk"]
+    # The reply text reassembles from the streamed arg fragments.
+    assert "".join(c["args_delta"] for c in chunks) == '{"text":"hello"}'
+
+
+def test_token_streamed_span_gets_only_end_from_blocks():
+    from types import SimpleNamespace
+
+    bus = TurnEventBus()
+    q = bus.subscribe("web-default")
+    em = TurnEventEmitter(bus, turn_id="t1", channel_id="web-default")
+
+    em.token_chunk(SimpleNamespace(tool_call_chunks=[
+        {"index": 0, "id": "call_x", "name": "send_message", "args": '{"content":"hi"}'}]))
+    _drain(q)  # discard the live start + chunk
+
+    # The value snapshot later surfaces the completed tool call.
+    em.blocks_from_messages([
+        AIMessage(content="", tool_calls=[
+            {"id": "call_x", "name": "send_message", "args": {"content": "hi"}}])
+    ])
+    events = _drain(q)
+    kinds = [(e["type"], e["phase"]) for e in events]
+    assert ("tool_call", "end") in kinds      # closed once
+    assert ("tool_call", "start") not in kinds  # NOT double-bracketed
+
+
+def test_block_bracketed_span_skips_late_token_chunk():
+    from types import SimpleNamespace
+
+    bus = TurnEventBus()
+    q = bus.subscribe("web-default")
+    em = TurnEventEmitter(bus, turn_id="t1", channel_id="web-default")
+
+    # Block path brackets the tool call first (non-streaming order).
+    em.blocks_from_messages([
+        AIMessage(content="", tool_calls=[{"id": "call_y", "name": "noop", "args": {}}])
+    ])
+    _drain(q)  # full start+chunk+end already emitted
+    # A late token chunk for the same id must not re-emit anything.
+    em.token_chunk(SimpleNamespace(tool_call_chunks=[
+        {"index": 0, "id": "call_y", "name": "noop", "args": "{}"}]))
+    assert _drain(q) == []
+
+
+def test_token_chunk_sequential_calls_reusing_index_dont_leak():
+    """#802 review: a second tool call reusing index 0 (after the first closed)
+    must open its OWN span, not leak chunks into the first call's id."""
+    from types import SimpleNamespace
+
+    bus = TurnEventBus()
+    q = bus.subscribe("web-default")
+    em = TurnEventEmitter(bus, turn_id="t1", channel_id="web-default")
+
+    # Call A streams at index 0, then closes via a value snapshot.
+    em.token_chunk(SimpleNamespace(tool_call_chunks=[
+        {"index": 0, "id": "call_a", "name": "send_message", "args": '{"text":"a"}'}]))
+    em.blocks_from_messages([
+        AIMessage(content="", tool_calls=[
+            {"id": "call_a", "name": "send_message", "args": {"text": "a"}}])
+    ])
+    _drain(q)
+
+    # Call B reuses index 0 with a NEW id — it must get its own start.
+    em.token_chunk(SimpleNamespace(tool_call_chunks=[
+        {"index": 0, "id": "call_b", "name": "send_message", "args": ""}]))
+    em.token_chunk(SimpleNamespace(tool_call_chunks=[
+        {"index": 0, "id": None, "name": None, "args": '{"text":"b"}'}]))
+
+    events = _drain(q)
+    starts = [e for e in events if e["type"] == "tool_call" and e["phase"] == "start"]
+    assert len(starts) == 1 and starts[0]["id"] == "call_b"  # NOT call_a
+    chunks = [e for e in events if e["type"] == "tool_call" and e["phase"] == "chunk"]
+    assert chunks and all(c["id"] == "call_b" for c in chunks)

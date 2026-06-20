@@ -2458,3 +2458,55 @@ async def test_run_turn_publishes_live_turn_events(tmp_path: Path):
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
     # The turn ended cleanly.
     assert received[-1]["status"] == "ok"
+
+
+async def test_run_turn_streams_tool_call_arg_deltas(tmp_path: Path):
+    """chainlink #583 slice 2: messages-mode token chunks stream the
+    send_message reply args live, and the value snapshot closes the span once
+    (no double-bracket)."""
+    from types import SimpleNamespace
+    from mimir.turn_event_bus import TurnEventBus
+
+    final_ai = AIMessage(
+        content="",
+        tool_calls=[{"id": "call_z", "name": "send_message", "args": {"text": "hi there"}}],
+    )
+
+    class _StreamingFake:
+        async def astream(self, state, *, config, stream_mode="values"):
+            human = list(state.get("messages") or [])
+            # messages-mode token chunks (tuples) — the reply args, fragmented.
+            yield ("messages", (SimpleNamespace(tool_call_chunks=[
+                {"index": 0, "id": "call_z", "name": "send_message", "args": ""}]), {}))
+            yield ("messages", (SimpleNamespace(tool_call_chunks=[
+                {"index": 0, "id": None, "name": None, "args": '{"text":"hi '}]), {}))
+            yield ("messages", (SimpleNamespace(tool_call_chunks=[
+                {"index": 0, "id": None, "name": None, "args": 'there"}'}]), {}))
+            # value snapshot with the completed message.
+            yield ("values", {"messages": human + [final_ai]})
+
+    agent = _build_agent(tmp_path, fake_agent=_StreamingFake())
+    bus = TurnEventBus()
+    agent._turn_event_bus = bus  # type: ignore[attr-defined]
+    queue = bus.subscribe("web-stream")
+
+    await agent.run_turn(
+        AgentEvent(trigger="user_message", channel_id="web-stream", content="hi"),
+    )
+
+    received: list[dict] = []
+    while True:
+        try:
+            received.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    tc = [e for e in received if e["type"] == "tool_call"]
+    starts = [e for e in tc if e["phase"] == "start"]
+    ends = [e for e in tc if e["phase"] == "end"]
+    chunks = [e for e in tc if e["phase"] == "chunk"]
+    assert len(starts) == 1  # streamed once via token_chunk, not re-bracketed
+    assert len(ends) == 1     # value snapshot closed it
+    assert starts[0]["tool_name"] == "send_message"
+    # The reply streamed token-by-token as tool-call arg deltas.
+    assert "".join(c["args_delta"] for c in chunks) == '{"text":"hi there"}'

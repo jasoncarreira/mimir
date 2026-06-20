@@ -1773,16 +1773,31 @@ class Agent:
                         "channel_id": event.channel_id,
                     },
                 }
-                async for chunk in agent.astream(
+                # chainlink #583 slice 2: request both stream modes. "values"
+                # gives the full-state snapshots the turn record is built from
+                # (block-level brackets, slice 1); "messages" gives token-level
+                # AIMessageChunks so tool-call args (the send_message reply)
+                # stream live where the backend supports it (codex-plus >=0.0.4,
+                # anthropic, openai). LangGraph yields (mode, payload) tuples
+                # when stream_mode is a list; the fallback keeps working if a
+                # backend ignores the list and yields bare snapshots.
+                async for item in agent.astream(
                     {"messages": [HumanMessage(content=turn_prompt)]},
                     config=invoke_config,
-                    stream_mode="values",
+                    stream_mode=["values", "messages"],
                 ):
-                    messages = list(chunk.get("messages", []))
-                    # chainlink #583: publish new reasoning/tool spans live so
-                    # the dashboard character animates mid-turn (no-op when the
-                    # bus is unwired; never raises into the loop).
-                    emitter.blocks_from_messages(messages)
+                    if isinstance(item, tuple) and len(item) == 2:
+                        mode, payload = item
+                    else:
+                        mode, payload = "values", item
+                    if mode == "values" and isinstance(payload, dict):
+                        messages = list(payload.get("messages", []))
+                        # Block-level brackets (slice 1): animate mid-turn,
+                        # no-op when the bus is unwired; never raises.
+                        emitter.blocks_from_messages(messages)
+                    elif mode == "messages" and isinstance(payload, tuple) and payload:
+                        # payload is (message_chunk, metadata); stream token deltas.
+                        emitter.token_chunk(payload[0])
                 events, output = extract_turn_events(messages)
                 # Forgot-to-send recovery (opt-in, MIMIR_RESEND_NUDGE_CHANNELS):
                 # an interactive turn that produced text but never delivered gets
