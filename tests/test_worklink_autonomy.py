@@ -498,6 +498,33 @@ def _fake_chainlink_script(
     return script
 
 
+def test_poller_import_path_repair_uses_explicit_source_dir_without_editable_install(tmp_path: Path) -> None:
+    """Exercise the actual repair helper without relying on editable-install .pths."""
+
+    skill_dir = tmp_path / "skills" / "chainlink-orchestrator"
+    skill_dir.mkdir(parents=True)
+    source_dir = tmp_path / "source"
+    (source_dir / "mimir").mkdir(parents=True)
+    (source_dir / "mimir" / "__init__.py").write_text("", encoding="utf-8")
+
+    # Run only the helper prelude from the real poller under `python -S`, which
+    # disables site initialization and therefore the project's editable .pth. If
+    # the helper is a no-op, the source dir will not appear on sys.path.
+    prelude = POLLER.read_text(encoding="utf-8").split("\n_ensure_mimir_import_path()\n", 1)[0]
+    script = prelude + "\n_ensure_mimir_import_path()\nimport sys; print(sys.path[0])\n"
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", script],
+        cwd=str(skill_dir),
+        env={"MIMIR_SOURCE_DIR": str(source_dir), "PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == str(source_dir)
+
+
 def _fake_run_bin(tmp: Path) -> Path:
     """A run-bin that records each `worklink run <id>` dispatch to a file."""
     record = tmp / "dispatched.txt"

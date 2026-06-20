@@ -45,6 +45,40 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def _ensure_mimir_import_path() -> None:
+    """Let an installed optional-skill poller import the source checkout.
+
+    Optional poller commands run as subprocesses from the installed skill dir, so
+    ``sys.path[0]`` is the skill directory rather than the mimir source checkout.
+    Prefer an explicit ``MIMIR_SOURCE_DIR`` supplied by the runtime; fall back to
+    the common editable-source layout where the interpreter lives in
+    ``<source>/.venv/bin``; finally accept mimirbot's container source path.
+    Pip-installed deployments do not need this repair because ``mimir`` is already
+    in site-packages.
+    """
+
+    exe = Path(sys.executable).resolve()
+    venv_root = exe.parent.parent
+    candidates = []
+    if source_dir := os.environ.get("MIMIR_SOURCE_DIR"):
+        candidates.append(Path(source_dir))
+    if venv_root.name in {".venv", "venv"}:
+        candidates.append(venv_root.parent)
+    # Mimirbot-specific editable-source fallback: the deployed optional skill is
+    # under /mimir-home/skills, while the source checkout is mounted here.
+    candidates.append(Path("/workspace/mimir"))
+
+    for candidate in candidates:
+        if (candidate / "mimir" / "__init__.py").is_file():
+            path = str(candidate)
+            if path not in sys.path:
+                sys.path.insert(0, path)
+            return
+
+
+_ensure_mimir_import_path()
+
 from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
