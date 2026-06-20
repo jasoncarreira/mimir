@@ -1142,12 +1142,29 @@ textarea {
    area's height; the transcript scrolls and the composer pins to the bottom. */
 .chat-layout {
   grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
+  /* Bound the single row to the viewport-fitted height so both columns scroll
+     internally instead of growing the page. */
+  grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
   min-height: 0;
   height: 100%;
   /* app-main already provides the top inset (padding) + scrolls; drop the
      extra content-layout margin so the console fits the viewport exactly. */
   margin-top: 0;
+}
+
+/* Chat main column: a bounded flex column so the panel — and its transcript —
+   fit the row height and the transcript scrolls internally. Without min-height:0
+   the column keeps its content size and stretches the row past the viewport,
+   dragging the dossier/field-log rail out of view. */
+.chat-main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.chat-main .chat-panel {
+  flex: 1 1 auto;
 }
 
 .chat-panel {
