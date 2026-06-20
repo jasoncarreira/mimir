@@ -96,11 +96,11 @@ describe("TurnsRoute", () => {
     expect(screen.getAllByText("Also include recent ops.").length).toBeGreaterThan(0);
     expect(screen.getByText("query")).toBeTruthy();
 
-    const toolResults = screen.getByRole("button", { name: /Tool results/ });
-    fireEvent.click(toolResults);
-    expect(toolResults.getAttribute("aria-expanded")).toBe("false");
-    fireEvent.click(toolResults);
-    expect(toolResults.getAttribute("aria-expanded")).toBe("true");
+    const timeline = screen.getByRole("button", { name: /Timeline/ });
+    fireEvent.click(timeline);
+    expect(timeline.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(timeline);
+    expect(timeline.getAttribute("aria-expanded")).toBe("true");
     expect(await screen.findByText("Loaded memory index.")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /Related context/ }));
@@ -108,6 +108,53 @@ describe("TurnsRoute", () => {
 
     fireEvent.click(screen.getByText("Metadata"));
     await waitFor(() => expect(screen.getByText(/input_tokens/)).toBeTruthy());
+  });
+
+  it("renders reasoning, tool calls, and tool results in event order", async () => {
+    turnsApi.listTurns.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: {
+        turns: [{
+          turn_id: "turn-interleaved",
+          ts: "2026-06-20T13:00:00Z",
+          trigger: "user_message",
+          channel_id: "web-default",
+          input: "Show the order.",
+          output: "Done.",
+          events: [
+            { type: "reasoning", content: "First reasoning.", t_ms: 100 },
+            { type: "tool_call", id: "call-a", name: "read_file", args: { file_path: "/a" }, t_ms: 200 },
+            { type: "tool_result", id: "call-a", name: "read_file", content: "A result", is_error: false, t_ms: 300 },
+            { type: "reasoning", content: "Reasoning between tools.", t_ms: 400 },
+            { type: "tool_call", id: "call-b", name: "shell_exec", args: { command: "echo b" }, t_ms: 500 },
+            { type: "tool_result", id: "call-b", name: "shell_exec", content: "B result", is_error: false, t_ms: 600 }
+          ]
+        }]
+      },
+      meta: { cursor: "turn-interleaved", limit: 200, total: 1, truncated: false }
+    });
+
+    renderTurns();
+
+    const list = await screen.findByRole("list", { name: "Turns" });
+    fireEvent.click(within(list).getByText("Show the order."));
+
+    const timelineContentId = screen.getByRole("button", { name: /Timeline/ }).getAttribute("aria-controls");
+    expect(timelineContentId).toBeTruthy();
+    const timelineNode = document.getElementById(timelineContentId as string) as HTMLElement;
+    const timeline = within(timelineNode);
+    const cards = Array.from(timelineNode.querySelectorAll(".turn-event-card"));
+
+    expect(cards.map((card) => card.textContent)).toEqual([
+      expect.stringMatching(/Reasoning#1.*First reasoning\./),
+      expect.stringMatching(/read_file#2.*read_file/),
+      expect.stringMatching(/Tool result#3.*read_file.*A result/),
+      expect.stringMatching(/Reasoning#4.*Reasoning between tools\./),
+      expect.stringMatching(/shell_exec#5.*shell_exec/),
+      expect.stringMatching(/Tool result#6.*shell_exec.*B result/)
+    ]);
+    expect(timeline.getByText("Reasoning between tools.")).toBeTruthy();
   });
 
   it("shows an empty state for missing payloads", async () => {

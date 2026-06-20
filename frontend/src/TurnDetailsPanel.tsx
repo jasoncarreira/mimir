@@ -6,7 +6,6 @@ import { Badge, CodeBlock, EmptyState, ErrorState, Panel } from "./ui";
 import { TriggerPill } from "./routes/triggerPill";
 import { useUiState } from "./uiState";
 import {
-  buildTimeline,
   eventLabel,
   eventTone,
   formatDuration,
@@ -19,9 +18,7 @@ import {
 
 type SectionKey =
   | "messages"
-  | "reasoning"
-  | "tool-calls"
-  | "tool-results"
+  | "timeline"
   | "feedback"
   | "related-context"
   | "events"
@@ -278,14 +275,13 @@ export function TurnDetailsPanel({
   }
 
   const normalized = safeTurn(turn);
-  const reasoning = normalized.events.filter((event) => event.type === "reasoning");
-  const toolCalls = normalized.events.filter((event) => event.type === "tool_call");
-  const toolResults = normalized.events.filter((event) => event.type === "tool_result");
+  const timelineEvents = normalized.events.filter((event) => (
+    event.type === "reasoning" || event.type === "tool_call" || event.type === "tool_result"
+  ));
   const feedback = normalized.events.filter(isFeedbackEvent);
-  const known = new Set([...reasoning, ...toolCalls, ...toolResults, ...feedback]);
+  const known = new Set([...timelineEvents, ...feedback]);
   const otherEvents = normalized.events.filter((event) => !known.has(event));
   const contextEntries = relatedContextEntries(normalized);
-  const timeline = buildTimeline(normalized);
   const turnId = normalized.turn_id;
 
   return (
@@ -311,26 +307,10 @@ export function TurnDetailsPanel({
         </CollapsibleSection>
       ) : null}
 
-      {reasoning.length ? (
-        <CollapsibleSection routeKey={routeKey} turnId={turnId} section="reasoning" title="Reasoning" count={reasoning.length}>
+      {timelineEvents.length ? (
+        <CollapsibleSection routeKey={routeKey} turnId={turnId} section="timeline" title="Timeline" count={timelineEvents.length}>
           <div className="turn-event-stack">
-            {reasoning.map((event, index) => <EventCard event={event} index={index} key={index} />)}
-          </div>
-        </CollapsibleSection>
-      ) : null}
-
-      {toolCalls.length ? (
-        <CollapsibleSection routeKey={routeKey} turnId={turnId} section="tool-calls" title="Tool calls" count={toolCalls.length}>
-          <div className="turn-event-stack">
-            {toolCalls.map((event, index) => <EventCard event={event} index={index} key={index} />)}
-          </div>
-        </CollapsibleSection>
-      ) : null}
-
-      {toolResults.length ? (
-        <CollapsibleSection routeKey={routeKey} turnId={turnId} section="tool-results" title="Tool results" count={toolResults.length}>
-          <div className="turn-event-stack">
-            {toolResults.map((event, index) => <EventCard event={event} index={index} key={index} />)}
+            {timelineEvents.map((event, index) => <EventCard event={event} index={index} key={`${event.type}-${event.id ?? "event"}-${index}`} />)}
           </div>
         </CollapsibleSection>
       ) : null}
@@ -377,7 +357,7 @@ export function TurnDetailsPanel({
         </CollapsibleSection>
       ) : null}
 
-      {!timeline.length && !normalized.input && !normalized.output ? <EmptyState title="No detail blocks recorded for this turn" /> : null}
+      {!timelineEvents.length && !normalized.input && !normalized.output ? <EmptyState title="No detail blocks recorded for this turn" /> : null}
     </aside>
   );
 }
