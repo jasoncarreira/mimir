@@ -5,6 +5,7 @@ import React from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChatStreamPayload } from "./api/chat";
+import type { ChatHistoryMessage } from "./api/generated/contracts";
 import { ChatRoute } from "./ChatRoute";
 import { useChatStore } from "./chatStore";
 import type { DashboardSurface } from "./dashboardExtensions";
@@ -19,7 +20,10 @@ const { chatApi, turnApi } = vi.hoisted(() => ({
       chatApi.activeError = options?.onError;
       return { close: chatApi.close };
     }),
-    sendChatMessage: vi.fn()
+    sendChatMessage: vi.fn(),
+    fetchChatHistory: vi.fn(async () => ({
+      ok: true, version: "v1", data: { channel_id: "web-default", messages: [] as ChatHistoryMessage[] }
+    }))
   },
   turnApi: {
     activeEvent: undefined as ((event: unknown) => void) | undefined,
@@ -33,7 +37,8 @@ const { chatApi, turnApi } = vi.hoisted(() => ({
 
 vi.mock("./api/chat", () => ({
   createChatStream: chatApi.createChatStream,
-  sendChatMessage: chatApi.sendChatMessage
+  sendChatMessage: chatApi.sendChatMessage,
+  fetchChatHistory: chatApi.fetchChatHistory
 }));
 
 // ChatRoute subscribes to the live turn-event bus for the streaming reply
@@ -106,6 +111,10 @@ afterEach(() => {
   chatApi.close.mockClear();
   chatApi.createChatStream.mockClear();
   chatApi.sendChatMessage.mockReset();
+  chatApi.fetchChatHistory.mockReset();
+  chatApi.fetchChatHistory.mockResolvedValue({
+    ok: true, version: "v1", data: { channel_id: "web-default", messages: [] as ChatHistoryMessage[] }
+  });
   turnApi.activeEvent = undefined;
   turnApi.close.mockClear();
   turnApi.createTurnEventStream.mockClear();
@@ -224,5 +233,76 @@ describe("ChatRoute streaming reply (#583 slice 2)", () => {
     await waitFor(() => {
       expect(document.querySelector(".chat-message--streaming")).toBeNull();
     });
+  });
+});
+
+describe("ChatRoute history reload (web chat history)", () => {
+  it("reloads prior messages for the channel on entry, in chronological order", async () => {
+    useChatStore.setState({ messages: [] });
+    chatApi.fetchChatHistory.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: {
+        channel_id: "web-default",
+        messages: [
+          { message_id: "h1", role: "user", channel_id: "web-default", text: "earlier question", ts: "2026-06-20T09:00:00Z" },
+          { message_id: "h2", role: "assistant", channel_id: "web-default", text: "earlier answer", ts: "2026-06-20T09:00:01Z" }
+        ]
+      }
+    });
+
+    renderChat();
+
+    expect(await screen.findByText("earlier question")).toBeTruthy();
+    const timeline = screen.getByRole("list", { name: "Messages" });
+    const texts = within(timeline).getAllByText(/earlier/).map((node) => node.textContent);
+    expect(texts).toEqual(["earlier question", "earlier answer"]);
+    expect(chatApi.fetchChatHistory).toHaveBeenCalledWith("web-default");
+  });
+
+  it("does not duplicate a message already in the timeline when history reloads", async () => {
+    useChatStore.setState({
+      messages: [
+        { id: "h1", role: "user", channelId: "web-default", text: "earlier question", timestamp: "2026-06-20T09:00:00Z", status: "done" }
+      ]
+    });
+    chatApi.fetchChatHistory.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: {
+        channel_id: "web-default",
+        messages: [
+          { message_id: "h1", role: "user", channel_id: "web-default", text: "earlier question", ts: "2026-06-20T09:00:00Z" }
+        ]
+      }
+    });
+
+    renderChat();
+
+    await waitFor(() => expect(chatApi.fetchChatHistory).toHaveBeenCalled());
+    const timeline = screen.getByRole("list", { name: "Messages" });
+    expect(within(timeline).getAllByText("earlier question")).toHaveLength(1);
+  });
+});
+
+describe("ChatRoute per-user channel adoption", () => {
+  it("adopts the per-user channel the backend resolves and shows its history", async () => {
+    useChatStore.setState({ messages: [] });
+    chatApi.fetchChatHistory.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: {
+        channel_id: "web-alice",
+        messages: [
+          { message_id: "a1", role: "user", channel_id: "web-alice", text: "alice question", ts: "2026-06-20T09:00:00Z" }
+        ]
+      }
+    });
+
+    renderChat();
+
+    // The message is on web-alice; it only renders if ChatRoute adopted that
+    // channel (visibleMessages filters by the active channel).
+    expect(await screen.findByText("alice question")).toBeTruthy();
   });
 });

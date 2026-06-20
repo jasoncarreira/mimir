@@ -604,6 +604,21 @@ export interface ChatAcceptedData {
   source_id: string;
 }
 
+/** One restored message from GET /api/v1/chat/history (oldest→newest). */
+export interface ChatHistoryMessage {
+  message_id: string;
+  role: "user" | "assistant";
+  channel_id: string;
+  author?: string | null;
+  text: string;
+  ts: string;
+}
+
+export interface ChatHistoryData {
+  channel_id: string;
+  messages: ChatHistoryMessage[];
+}
+
 export interface ChatMessageEvent {
   kind: "chat.message";
   channel_id: string;

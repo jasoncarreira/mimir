@@ -272,6 +272,21 @@ class MessageBuffer:
         ch = self._by_channel.get(channel_id)
         return len(ch) if ch is not None else 0
 
+    def recent_in_channel(self, channel_id: str, limit: int) -> list[Message]:
+        """Last ``limit`` messages for exactly ``channel_id``, oldest→newest.
+
+        Unlike ``recent_for_channel`` — a cross-channel recency POOL assembled
+        for agent context — this returns only this one channel's own messages.
+        Used by the web chat history endpoint to restore a conversation when the
+        user re-opens the chat.
+        """
+        if limit <= 0:
+            return []
+        ch = self._by_channel.get(channel_id)
+        if not ch:
+            return []
+        return list(ch)[-limit:]
+
     def total_count(self) -> int:
         return len(self._all)
 

@@ -1205,6 +1205,15 @@ textarea {
   list-style: none;
 }
 
+/* Bottom-anchored: messages start at the bottom of the box and older ones get
+   pushed up as new ones arrive. `margin-top: auto` on the first row consumes the
+   free space when the transcript underflows, pinning it to the bottom; once it
+   overflows the auto-margin collapses and it scrolls normally (newest in view
+   via the scroll-to-bottom effect). */
+.chat-timeline > :first-child {
+  margin-top: auto;
+}
+
 .chat-empty {
   display: grid;
   flex: 1 1 auto;

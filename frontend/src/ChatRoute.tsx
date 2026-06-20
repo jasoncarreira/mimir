@@ -1,6 +1,6 @@
 import React from "react";
 import { AgentDossier } from "./AgentDossier";
-import { createChatStream, sendChatMessage, type ChatStreamPayload } from "./api/chat";
+import { createChatStream, fetchChatHistory, sendChatMessage, type ChatStreamPayload } from "./api/chat";
 import { createTurnEventStream } from "./api/turn-events";
 import type { TurnStreamEvent } from "./api/generated/contracts";
 import { useBootstrap } from "./api/bootstrap";
@@ -51,6 +51,8 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   // the authoritative chat.message arrives on /chat/stream and replaces it.
   const [streamingReply, setStreamingReply] = React.useState("");
   const streamRawRef = React.useRef<{ spanId: string; raw: string } | null>(null);
+  // Bottom-anchored timeline: keep the newest message in view as the stack grows.
+  const timelineRef = React.useRef<HTMLOListElement | null>(null);
   // github #567: persisted across tab switches (route unmount) — see chatStore.
   const messages = useChatStore((state) => state.messages);
   const setMessages = useChatStore((state) => state.setMessages);
@@ -150,6 +152,48 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     return () => handle.close();
   }, [channelId]);
 
+  // chainlink: restore this channel's prior conversation on entry. Live messages
+  // still arrive via the SSE effect above; merge by id and order by timestamp so
+  // re-entry (tab switch / reload) is idempotent and the timeline stays
+  // chronological. Best-effort — the live stream works without it.
+  React.useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetchChatHistory(channelId);
+        if (cancelled) return;
+        // The backend may resolve us to a per-user channel (web-<id>); adopt it
+        // so send + the live stream + the timeline filter all use it.
+        const resolved = res.data.channel_id;
+        if (resolved && resolved !== channelId) {
+          setChannelId(resolved);
+          update({ channel: resolved, filter: resolved });
+        }
+        if (!res.data.messages.length) return;
+        const history = res.data.messages.map((m) => ({
+          id: m.message_id || `hist-${m.ts}-${m.role}`,
+          role: m.role,
+          channelId: m.channel_id,
+          text: m.text,
+          timestamp: m.ts,
+          status: "done" as const
+        }));
+        setMessages((current) => {
+          const byId = new Map(current.map((msg) => [msg.id, msg]));
+          for (const msg of history) {
+            if (!byId.has(msg.id)) byId.set(msg.id, msg);
+          }
+          return Array.from(byId.values()).sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+        });
+      } catch {
+        // History load is best-effort; ignore and rely on the live stream.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [channelId, setMessages]);
+
   function selectMessage(id: string) {
     // Highlights the message + deep-links it in the URL. The right panel now
     // shows live activity (github #572), so selecting no longer opens a details
@@ -208,6 +252,13 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
 
   const visibleMessages = messages.filter((message) => message.channelId === channelId);
 
+  // Scroll to the newest message whenever the timeline grows or the streaming
+  // reply updates, so the bottom-anchored transcript stays pinned to the latest.
+  React.useEffect(() => {
+    const node = timelineRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [visibleMessages.length, streamingReply]);
+
   return (
     <div className="content-layout chat-layout">
       <section aria-label="Chat timeline" className="content-layout__main chat-main">
@@ -220,7 +271,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
             </span>
           </header>
           {streamError ? <ErrorState title="Stream error">{streamError}</ErrorState> : null}
-          <ol aria-label="Messages" className="chat-timeline">
+          <ol aria-label="Messages" className="chat-timeline" ref={timelineRef}>
             {visibleMessages.length === 0 && !streamingReply ? (
               <li className="chat-empty">No messages in this channel yet.</li>
             ) : null}

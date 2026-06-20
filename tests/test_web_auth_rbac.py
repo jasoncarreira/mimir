@@ -220,7 +220,9 @@ async def test_chat_author_from_identity_not_client_body(tmp_path: Path) -> None
     assert err is None and event is not None
     assert event.author_id == "alice"  # from the authenticated key, NOT spoofed
     assert event.author == "alice"
-    assert channel_id == "web-default"
+    # An authenticated user's default-channel post routes to their own per-user
+    # web channel (chainlink: web-chat history scoping), not the shared default.
+    assert channel_id == "web-alice"
 
 
 async def test_chat_master_key_rejected(tmp_path: Path) -> None:
