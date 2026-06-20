@@ -32,6 +32,24 @@ export const EMPTY_TURN_SPANS: TurnSpansState = {
 // unbounded; the oldest fall off the top while the live ones stay.
 export const MAX_SPANS = 100;
 
+// Character-state decay (front-end safety net): the live bus is ephemeral and
+// can drop a turn's terminal event, stranding the character on a stale state.
+// Every event re-arms a 30s timer; when it fires the state decays one step.
+export const EVENT_DECAY_MS = 30_000; // re-armed on every event
+export const IDLE_DECAY_MS = 180_000; // active → idle, then idle → bored after this
+
+// Given the CURRENTLY displayed state when the decay timer fires, return the next
+// state and how long until the following decay (null = stop the timer):
+//   active → idle (re-arm 3 min) → bored (stop). idle/bored already at rest.
+export function decayCharacterState(current: AgentCharacterState): {
+  state: AgentCharacterState;
+  rearmMs: number | null;
+} {
+  if (current === "idle") return { state: "bored", rearmMs: null };
+  if (current === "bored") return { state: "bored", rearmMs: null };
+  return { state: "idle", rearmMs: IDLE_DECAY_MS };
+}
+
 function deltaText(e: TurnStreamEvent): string {
   if (typeof e.text === "string") return e.text;
   if (typeof e.content_delta === "string") return e.content_delta;
