@@ -1234,6 +1234,19 @@ textarea {
   color: var(--mimir-color-chrome-accent, #60786a);
 }
 
+/* chainlink #583 slice 2: the reply forming live from the turn-event bus. A
+   blinking caret cues that it's still streaming; the final message replaces it. */
+.chat-message--streaming .chat-message__text::after {
+  content: "▍";
+  margin-left: 2px;
+  opacity: 0.7;
+  animation: chat-stream-caret 1s steps(2, start) infinite;
+}
+
+@keyframes chat-stream-caret {
+  50% { opacity: 0; }
+}
+
 .chat-message__error {
   display: block;
   color: var(--mimir-color-status-danger, #8b3a3a);

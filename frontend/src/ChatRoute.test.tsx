@@ -6,9 +6,10 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChatStreamPayload } from "./api/chat";
 import { ChatRoute } from "./ChatRoute";
+import { useChatStore } from "./chatStore";
 import type { DashboardSurface } from "./dashboardExtensions";
 
-const { chatApi } = vi.hoisted(() => ({
+const { chatApi, turnApi } = vi.hoisted(() => ({
   chatApi: {
     activePayload: undefined as ((payload: ChatStreamPayload) => void) | undefined,
     activeError: undefined as ((error: unknown) => void) | undefined,
@@ -19,12 +20,26 @@ const { chatApi } = vi.hoisted(() => ({
       return { close: chatApi.close };
     }),
     sendChatMessage: vi.fn()
+  },
+  turnApi: {
+    activeEvent: undefined as ((event: unknown) => void) | undefined,
+    close: vi.fn(),
+    createTurnEventStream: vi.fn((onEvent: (event: unknown) => void) => {
+      turnApi.activeEvent = onEvent;
+      return { close: turnApi.close };
+    })
   }
 }));
 
 vi.mock("./api/chat", () => ({
   createChatStream: chatApi.createChatStream,
   sendChatMessage: chatApi.sendChatMessage
+}));
+
+// ChatRoute subscribes to the live turn-event bus for the streaming reply
+// (chainlink #583 slice 2); capture the callback so tests can drive it.
+vi.mock("./api/turn-events", () => ({
+  createTurnEventStream: turnApi.createTurnEventStream
 }));
 
 // ChatRoute's right rail (field log + agent dossier) consumes useLiveEvents;
@@ -91,6 +106,9 @@ afterEach(() => {
   chatApi.close.mockClear();
   chatApi.createChatStream.mockClear();
   chatApi.sendChatMessage.mockReset();
+  turnApi.activeEvent = undefined;
+  turnApi.close.mockClear();
+  turnApi.createTurnEventStream.mockClear();
 });
 
 describe("ChatRoute", () => {
@@ -161,5 +179,50 @@ describe("ChatRoute", () => {
     first.unmount();
     renderChat();
     expect(screen.getByText("still here after a tab switch")).toBeTruthy();
+  });
+});
+
+describe("ChatRoute streaming reply (#583 slice 2)", () => {
+  function turnEvent(partial: Record<string, unknown>) {
+    act(() => {
+      turnApi.activeEvent?.({
+        channel_id: "web-default",
+        turn_id: "t1",
+        seq: 1,
+        ts: "2026-06-20T00:00:00Z",
+        ...partial
+      });
+    });
+  }
+
+  it("shows the reply forming from the turn-event bus, then the final replaces the bubble", async () => {
+    useChatStore.setState({ messages: [] });
+    renderChat();
+
+    turnEvent({ type: "tool_call", phase: "start", id: "call_1", tool_name: "send_message" });
+    turnEvent({ type: "tool_call", phase: "chunk", id: "call_1", args_delta: '{"content":"stream' });
+    turnEvent({ type: "tool_call", phase: "chunk", id: "call_1", args_delta: 'ing hi"}' });
+
+    const forming = await screen.findByText("streaming hi");
+    expect(forming.closest(".chat-message--streaming")).toBeTruthy();
+
+    // The authoritative reply lands on /chat/stream → the provisional drops.
+    emitMessage("web-default", "streaming hi", "final-1");
+    await waitFor(() => {
+      expect(document.querySelector(".chat-message--streaming")).toBeNull();
+    });
+    expect(screen.getByText("streaming hi").closest(".chat-message--assistant")).toBeTruthy();
+  });
+
+  it("ignores tool-call deltas for tools other than send_message", async () => {
+    useChatStore.setState({ messages: [] });
+    renderChat();
+
+    turnEvent({ type: "tool_call", phase: "start", id: "call_2", tool_name: "saga_query" });
+    turnEvent({ type: "tool_call", phase: "chunk", id: "call_2", args_delta: '{"content":"nope"}' });
+
+    await waitFor(() => {
+      expect(document.querySelector(".chat-message--streaming")).toBeNull();
+    });
   });
 });

@@ -1,7 +1,10 @@
 import React from "react";
 import { AgentDossier } from "./AgentDossier";
 import { createChatStream, sendChatMessage, type ChatStreamPayload } from "./api/chat";
+import { createTurnEventStream } from "./api/turn-events";
+import type { TurnStreamEvent } from "./api/generated/contracts";
 import { useBootstrap } from "./api/bootstrap";
+import { extractStreamingContent } from "./streamingReply";
 import { useChatStore, type ChatMessageStatus } from "./chatStore";
 import type { DashboardSurface } from "./dashboardExtensions";
 import { LiveActivityPanel } from "./LiveActivityPanel";
@@ -43,6 +46,11 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const [composerText, setComposerText] = React.useState("");
   const [streamState, setStreamState] = React.useState<ChatStreamState>("connecting");
   const [streamError, setStreamError] = React.useState("");
+  // chainlink #583 slice 2: the reply forming live from the turn-event bus
+  // (send_message tool-call arg deltas), shown as a provisional bubble until
+  // the authoritative chat.message arrives on /chat/stream and replaces it.
+  const [streamingReply, setStreamingReply] = React.useState("");
+  const streamRawRef = React.useRef<{ spanId: string; raw: string } | null>(null);
   // github #567: persisted across tab switches (route unmount) — see chatStore.
   const messages = useChatStore((state) => state.messages);
   const setMessages = useChatStore((state) => state.setMessages);
@@ -90,6 +98,9 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
             }
           ];
         });
+        // The authoritative reply landed — drop the provisional streaming bubble.
+        setStreamingReply("");
+        streamRawRef.current = null;
       },
       {
         onError(error) {
@@ -101,6 +112,42 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     return () => {
       handle.close();
     };
+  }, [channelId]);
+
+  // chainlink #583 slice 2: stream the reply forming from the turn-event bus.
+  // We track the send_message tool-call span by its `start` (which carries the
+  // tool name) and accumulate its arg-chunk deltas into the forming content.
+  // On non-streaming backends no deltas arrive (args_delta isn't a string), so
+  // the bubble simply never shows and the reply appears via /chat/stream.
+  React.useEffect(() => {
+    setStreamingReply("");
+    streamRawRef.current = null;
+    const handle = createTurnEventStream(
+      (event: TurnStreamEvent) => {
+        if (event.type === "tool_call" && event.phase === "start") {
+          if (event.tool_name === "send_message") {
+            streamRawRef.current = { spanId: event.id || "", raw: "" };
+            setStreamingReply("");
+          }
+          return;
+        }
+        if (event.type === "tool_call" && event.phase === "chunk") {
+          const acc = streamRawRef.current;
+          if (!acc || event.id !== acc.spanId) return;
+          const delta = typeof event.args_delta === "string" ? event.args_delta : "";
+          if (!delta) return;
+          acc.raw += delta;
+          setStreamingReply(extractStreamingContent(acc.raw));
+          return;
+        }
+        if (event.type === "turn" && event.phase === "end") {
+          setStreamingReply("");
+          streamRawRef.current = null;
+        }
+      },
+      { channel: channelId }
+    );
+    return () => handle.close();
   }, [channelId]);
 
   function selectMessage(id: string) {
@@ -174,15 +221,25 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
           </header>
           {streamError ? <ErrorState title="Stream error">{streamError}</ErrorState> : null}
           <ol aria-label="Messages" className="chat-timeline">
-            {visibleMessages.length === 0 ? (
+            {visibleMessages.length === 0 && !streamingReply ? (
               <li className="chat-empty">No messages in this channel yet.</li>
-            ) : visibleMessages.map((message) => (
+            ) : null}
+            {visibleMessages.map((message) => (
               <li className={`chat-message chat-message--${message.role}`} key={message.id}>
                 <span className="chat-message__role">{message.role === "user" ? "You" : agentName}</span>
                 <span className="chat-message__text">{message.text}</span>
                 {message.error ? <span className="chat-message__error">{message.error}</span> : null}
               </li>
             ))}
+            {streamingReply ? (
+              <li
+                aria-live="polite"
+                className="chat-message chat-message--assistant chat-message--streaming"
+              >
+                <span className="chat-message__role">{agentName}</span>
+                <span className="chat-message__text">{streamingReply}</span>
+              </li>
+            ) : null}
           </ol>
           <form className="chat-composer" onSubmit={submitMessage}>
             <textarea
