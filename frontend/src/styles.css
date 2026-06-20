@@ -44,6 +44,26 @@ textarea {
   line-height: var(--mimir-line-height-body, 1.5);
 }
 
+/* ===== Cosmic Nebula: ambient purple glow + translucent chrome ===== */
+/* The skin reads as a nebula — a soft radial glow rises from the top over the
+   flat base color. The sidebar + status bar drop their opaque chrome fill so the
+   glow carries across the whole top edge; raised panels still float above it. */
+.skin-root[data-skin="cosmic-nebula"] {
+  background:
+    radial-gradient(
+      120% 80% at 50% -12%,
+      rgb(130 60 230 / 40%) 0%,
+      rgb(70 35 130 / 14%) 38%,
+      transparent 66%
+    ),
+    var(--mimir-color-background);
+}
+
+.skin-root[data-skin="cosmic-nebula"] .app-sidebar,
+.skin-root[data-skin="cosmic-nebula"] .app-statusbar {
+  background: transparent;
+}
+
 .ui-shell {
   width: min(1120px, calc(100% - (var(--mimir-space-shell-inline, 32px) * 2)));
   min-height: 100vh;
@@ -672,6 +692,19 @@ textarea {
 
 .app-status-card {
   min-width: 0;
+  /* Compact status header: tighter padding + a centered single-line header that
+     drops its trailing margin when collapsed (the body re-adds spacing when the
+     Details panel is expanded). */
+  padding: var(--mimir-space-sm, 12px) var(--mimir-space-lg, 24px);
+}
+
+.app-status-card .ui-panel__header {
+  margin-bottom: 0;
+  align-items: center;
+}
+
+.app-status-card #auth-panel-body {
+  margin-top: var(--mimir-space-md, 16px);
 }
 
 /* github #577: horizontal top-nav bar (was a left sidebar). No bottom padding so
@@ -843,8 +876,9 @@ textarea {
 }
 
 /* Vertical nav: stack the tabs, left-aligned, and reveal the sub-labels the
-   compact top nav hides. Idle tabs are plain text; the active one is a panel
-   box (not the filled accent chip the top nav uses). */
+   compact top nav hides. Idle tabs are plain text; the active (and hovered) tab
+   is a fully-rounded box — undo the top-nav's connected-tab geometry (top-only
+   radius, no bottom border, baseline overlap) so it reads as a discrete chip. */
 .app-sidebar .app-nav {
   flex-direction: column;
   align-items: stretch;
@@ -853,7 +887,9 @@ textarea {
 }
 
 .app-sidebar .app-nav__link {
-  border-color: transparent;
+  margin-bottom: 0;
+  border: var(--mimir-border-width-hairline, 1px) solid transparent;
+  border-radius: var(--mimir-radius-control, 10px);
   background: transparent;
 }
 
