@@ -13,7 +13,6 @@ import {
   Panel,
   TextInput
 } from "../ui";
-import type { OpsUsagePoint } from "../api/ops";
 import type { OpsTokenUsageRow } from "./opsViewModel";
 import {
   buildOpsSummaryMetrics,
@@ -89,26 +88,6 @@ function niceAxisMax(value: number) {
   const fraction = value / base;
   const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 2.5 ? 2.5 : fraction <= 5 ? 5 : 10;
   return niceFraction * base;
-}
-
-// Split a window's samples into contiguous segments, breaking where the quota
-// window resets (resets_at changes). Without this the line draws a vertical drop
-// across a rollover (e.g. the seven-day series each week).
-function splitOnReset(points: OpsUsagePoint[]): OpsUsagePoint[][] {
-  const segments: OpsUsagePoint[][] = [];
-  let current: OpsUsagePoint[] = [];
-  let prevReset: number | null = null;
-  for (const point of points) {
-    const reset = typeof point.resets_at === "number" ? point.resets_at : null;
-    if (current.length && reset != null && prevReset != null && reset !== prevReset) {
-      segments.push(current);
-      current = [];
-    }
-    current.push(point);
-    if (reset != null) prevReset = reset;
-  }
-  if (current.length) segments.push(current);
-  return segments;
 }
 
 function chartTicks(maxValue: number, steps = 4) {
@@ -197,27 +176,25 @@ function QuotaTrendChart({ data }: { data: SafeOpsDashboardData }) {
                   {series.map(({ window, points }) => {
                     const color = usageWindowColors[window] || "#9ca3af";
                     const valid = points.filter((point) => point.utilization != null);
-                    const yFor = (point: OpsUsagePoint) => 100 - clamp01(point.utilization ?? 0) * 100;
+                    if (!valid.length) return null;
+                    const coords = valid.map((point) => ({
+                      x: xForTs(point.ts),
+                      y: 100 - clamp01(point.utilization ?? 0) * 100
+                    }));
+                    // One continuous line per window across all samples. A single
+                    // sample can't draw a line, so render a short dash instead.
+                    const linePoints = coords.length === 1
+                      ? `${coords[0].x - 0.6},${coords[0].y} ${coords[0].x + 0.6},${coords[0].y}`
+                      : coords.map((point) => `${point.x},${point.y}`).join(" ");
                     return (
-                      <g key={window}>
-                        {splitOnReset(valid).map((segment, segmentIndex) => {
-                          // A lone sample (e.g. between two resets) can't draw a
-                          // line, so render a short dash to keep it visible.
-                          const linePoints = segment.length === 1
-                            ? `${xForTs(segment[0].ts) - 0.6},${yFor(segment[0])} ${xForTs(segment[0].ts) + 0.6},${yFor(segment[0])}`
-                            : segment.map((point) => `${xForTs(point.ts)},${yFor(point)}`).join(" ");
-                          return (
-                            <polyline
-                              className="ops-quota-line"
-                              fill="none"
-                              key={`${window}-${segmentIndex}`}
-                              points={linePoints}
-                              stroke={color}
-                              vectorEffect="non-scaling-stroke"
-                            />
-                          );
-                        })}
-                      </g>
+                      <polyline
+                        className="ops-quota-line"
+                        fill="none"
+                        key={window}
+                        points={linePoints}
+                        stroke={color}
+                        vectorEffect="non-scaling-stroke"
+                      />
                     );
                   })}
                 </svg>
