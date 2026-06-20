@@ -152,6 +152,26 @@ export interface EventsData {
   events: JsonObject[];
 }
 
+export interface OpsUsagePoint {
+  ts: string;
+  utilization?: number | null;
+  resets_at?: number | null;
+  projection?: number | null;
+  pressure?: string;
+  [key: string]: unknown;
+}
+
+export interface OpsTokenUsagePoint {
+  date: string;
+  turn_count?: number;
+  input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+  output_tokens?: number;
+  total_cost_usd?: number | null;
+  [key: string]: unknown;
+}
+
 export interface OpsDashboardData {
   generated_at: string;
   window_days: number;
@@ -191,8 +211,8 @@ export interface OpsDashboardData {
     truncated?: boolean;
     total_count?: number;
   };
-  usage_history: Record<string, Record<string, unknown[]>>;
-  token_usage_history: unknown[];
+  usage_history: Record<string, Record<string, OpsUsagePoint[]>>;
+  token_usage_history: OpsTokenUsagePoint[];
 }
 
 export interface ChainlinkBoardIssue {

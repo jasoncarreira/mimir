@@ -2,7 +2,6 @@ import { useQuery } from "@tanstack/react-query";
 import React from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { getOpsDashboard } from "../api";
-import type { ChainlinkIssue } from "../api/ops";
 import { drilldownHref } from "../routeState";
 import {
   Badge,
@@ -15,6 +14,7 @@ import {
   Panel,
   TextInput
 } from "../ui";
+import type { OpsQuotaRow, OpsTokenUsageRow } from "./opsViewModel";
 import {
   buildOpsSummaryMetrics,
   formatCost,
@@ -26,14 +26,6 @@ import {
   tokenUsageRows,
   type SafeOpsDashboardData
 } from "./opsViewModel";
-
-function asDisplay(value: unknown) {
-  if (value === null || value === undefined) return "";
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-  return JSON.stringify(value);
-}
 
 function SummaryGrid({ data }: { data: SafeOpsDashboardData }) {
   const metrics = buildOpsSummaryMetrics(data.summary);
@@ -47,6 +39,59 @@ function SummaryGrid({ data }: { data: SafeOpsDashboardData }) {
       ))}
     </section>
   );
+}
+
+const usageProviderLabels: Record<string, string> = {
+  anthropic: "Anthropic Max (OAuth)",
+  minimax: "Minimax",
+  codex_plus: "Codex Plus"
+};
+
+const usageWindowColors: Record<string, string> = {
+  five_hour: "#6c8ef7",
+  seven_day: "#fbbf24",
+  seven_day_sonnet: "#10b981",
+  seven_day_omelette: "#a78bfa",
+  seven_day_opus: "#f472b6"
+};
+
+const tokenLayerColors: Record<string, string> = {
+  input: "#6c8ef7",
+  cacheCreation: "#fbbf24",
+  cacheRead: "#10b981",
+  output: "#f472b6"
+};
+
+function compactNumber(value: number) {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${Math.round(value / 1_000)}k`;
+  return value.toLocaleString();
+}
+
+function formatDateLabel(value: string) {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return value;
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(parsed);
+}
+
+function latestQuotaSummary(row: OpsQuotaRow) {
+  const provider = usageProviderLabels[row.provider] || row.provider;
+  return `${provider} ${row.window}: ${formatPercent(row.latestUtilization)} → ${formatPercent(row.latestProjection)} projected · ${row.latestPressure}`;
+}
+
+function chartTicks(maxValue: number, steps = 4) {
+  return Array.from({ length: steps + 1 }, (_, index) => maxValue - (maxValue / steps) * index);
+}
+
+function dateRangeLabel(values: string[]) {
+  if (!values.length) return "";
+  const first = formatDateLabel(values[0]);
+  const last = formatDateLabel(values[values.length - 1]);
+  return first === last ? first : `${first} → ${last}`;
+}
+
+function windowLabel(value: string) {
+  return value.replaceAll("_", " ");
 }
 
 function RowsTable({
@@ -74,40 +119,176 @@ function RowsTable({
   );
 }
 
-function ResourceQuotaPanel({ data }: { data: SafeOpsDashboardData }) {
+function clamp01(value: number) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function QuotaTrendChart({ data }: { data: SafeOpsDashboardData }) {
+  const providers = Object.entries(data.usage_history);
+  if (!providers.length) {
+    return (
+      <EmptyState title="No subscription quota samples in this window">
+        Quota charts populate from provider usage pollers and quota-mode callbacks. Token-volume charts below still work on any deployment with turn usage data.
+      </EmptyState>
+    );
+  }
+
+  return (
+    <div className="ops-chart-grid">
+      {providers.map(([provider, windows]) => {
+        const series = Object.entries(windows).map(([window, points]) => ({ window, points }));
+        const dates = Array.from(new Set(series.flatMap(({ points }) => points.map((point) => point.ts)))).sort();
+        const latestRows = quotaRows({ [provider]: windows });
+        const xForDate = (ts: string) => {
+          const index = Math.max(0, dates.indexOf(ts));
+          return dates.length > 1 ? (index / (dates.length - 1)) * 100 : 50;
+        };
+        return (
+          <div className="ops-chart-card ops-chart-card--wide" key={provider}>
+            <div className="ops-chart-card__header">
+              <h3>{usageProviderLabels[provider] || provider}</h3>
+              <span>{dateRangeLabel(dates)}</span>
+            </div>
+            <div className="ops-axis-chart ops-axis-chart--quota" role="img" aria-label={`${provider} quota utilization line chart with percent axis`}>
+              <div className="ops-axis-chart__y" aria-hidden="true">
+                {chartTicks(1).map((tick) => <span key={tick}>{formatPercent(tick)}</span>)}
+              </div>
+              <div className="ops-axis-chart__plot">
+                <div className="ops-axis-chart__grid" aria-hidden="true">
+                  {chartTicks(1).map((tick) => <span key={tick} />)}
+                </div>
+                <svg className="ops-quota-line-chart" preserveAspectRatio="none" viewBox="0 0 100 100" aria-hidden="true">
+                  {series.map(({ window, points }) => {
+                    const color = usageWindowColors[window] || "#9ca3af";
+                    const valid = points.filter((point) => point.utilization != null);
+                    const linePoints = valid
+                      .map((point) => `${xForDate(point.ts)},${100 - clamp01(point.utilization ?? 0) * 100}`)
+                      .join(" ");
+                    return (
+                      <g key={window}>
+                        {valid.length > 1 ? (
+                          <polyline
+                            className="ops-quota-line"
+                            fill="none"
+                            points={linePoints}
+                            stroke={color}
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        ) : null}
+                        {valid.map((point, index) => (
+                          <circle
+                            className="ops-quota-line__point"
+                            cx={xForDate(point.ts)}
+                            cy={100 - clamp01(point.utilization ?? 0) * 100}
+                            fill={color}
+                            key={`${window}-${point.ts}-${index}`}
+                            r="1.7"
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        ))}
+                      </g>
+                    );
+                  })}
+                </svg>
+                <div className="ops-quota-line-labels" aria-hidden="true">
+                  {dates.length ? <span>{formatDateLabel(dates[0])}</span> : <span />}
+                  {dates.length > 2 ? <span>{formatDateLabel(dates[Math.floor(dates.length / 2)])}</span> : null}
+                  {dates.length > 1 ? <span>{formatDateLabel(dates[dates.length - 1])}</span> : <span />}
+                </div>
+              </div>
+            </div>
+            <div className="ops-chart-legend ops-chart-legend--cards">
+              {latestRows.map((row) => (
+                <span key={`${row.provider}-${row.window}`}>
+                  <i style={{ backgroundColor: usageWindowColors[row.window] || "#9ca3af" }} />
+                  {windowLabel(row.window)}: {formatPercent(row.latestUtilization)} · projected {formatPercent(row.latestProjection)} · {row.latestPressure}
+                </span>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function TokenUsageChart({ rows }: { rows: OpsTokenUsageRow[] }) {
+  if (!rows.length) {
+    return <EmptyState title="No token usage rows in this window" />;
+  }
+  const maxTotal = Math.max(1, ...rows.map((row) => row.input + row.cacheCreation + row.cacheRead + row.output));
+  const axisMax = Math.ceil(maxTotal / 50_000_000) * 50_000_000 || maxTotal;
+  const totalCost = rows.reduce((sum, row) => sum + (row.cost ?? 0), 0);
+  const costDays = rows.filter((row) => row.cost !== null).length;
+  return (
+    <div className="ops-token-chart" role="img" aria-label="Daily token volume by token type with token-count axis">
+      <div className="ops-axis-chart ops-axis-chart--tokens">
+        <div className="ops-axis-chart__y" aria-hidden="true">
+          {chartTicks(axisMax).map((tick) => <span key={tick}>{compactNumber(tick)}</span>)}
+        </div>
+        <div className="ops-axis-chart__plot">
+          <div className="ops-axis-chart__grid" aria-hidden="true">
+            {chartTicks(axisMax).map((tick) => <span key={tick} />)}
+          </div>
+          <div className="ops-token-chart__bars">
+            {rows.map((row) => {
+              const segments = [
+                ["input", row.input],
+                ["cacheCreation", row.cacheCreation],
+                ["cacheRead", row.cacheRead],
+                ["output", row.output]
+              ] as const;
+              const total = segments.reduce((sum, [, value]) => sum + value, 0);
+              return (
+                <div className="ops-token-day" key={row.date} title={`${row.date}: ${total.toLocaleString()} tokens · ${row.turns.toLocaleString()} turns`}>
+                  <span className="ops-token-day__value">{compactNumber(total)}</span>
+                  <div className="ops-token-day__stack" style={{ height: `${Math.max(8, (total / axisMax) * 100)}%` }}>
+                    {segments.map(([key, value]) => value > 0 ? (
+                      <span
+                        className="ops-token-day__segment"
+                        key={key}
+                        style={{
+                          backgroundColor: tokenLayerColors[key],
+                          flexGrow: value,
+                          flexBasis: 0
+                        }}
+                      />
+                    ) : null)}
+                  </div>
+                  <span className="ops-token-day__label">{formatDateLabel(row.date)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+      <div className="ops-chart-legend">
+        <span><i style={{ backgroundColor: tokenLayerColors.input }} />Input</span>
+        <span><i style={{ backgroundColor: tokenLayerColors.cacheCreation }} />Cache creation</span>
+        <span><i style={{ backgroundColor: tokenLayerColors.cacheRead }} />Cache read</span>
+        <span><i style={{ backgroundColor: tokenLayerColors.output }} />Output</span>
+        {costDays > 0 ? <strong>Total cost: {formatCost(totalCost)}</strong> : null}
+      </div>
+    </div>
+  );
+}
+
+
+function UsagePanel({ data }: { data: SafeOpsDashboardData }) {
   const quotas = quotaRows(data.usage_history);
   const tokens = tokenUsageRows(data.token_usage_history);
-  const resourceRows = mapToRows(
-    Object.fromEntries(
-      Object.entries(data.by_event).filter(([key]) =>
-        key.includes("resource") || key.includes("quota") || key.includes("usage")
-      )
-    )
-  );
 
   return (
     <div className="ops-panel-stack">
-      <Panel title="Quota Utilization" subtitle="Subscription-window utilization from the ops payload.">
-        {quotas.length ? (
-          <DataTable
-            columns={[
-              { key: "provider", header: "Provider" },
-              { key: "window", header: "Window" },
-              { key: "points", header: "Points" },
-              { key: "latest", header: "Latest" }
-            ]}
-            rows={quotas.map((row) => ({
-              provider: row.provider,
-              window: row.window,
-              points: row.points.toLocaleString(),
-              latest: formatPercent(row.latestUtilization)
-            }))}
-          />
-        ) : (
-          <EmptyState title="No quota samples in this window" />
-        )}
+      <Panel
+        title="Quota Utilization"
+        subtitle="Subscription-window utilization trends from the ops payload."
+        actions={quotas.length ? <Badge tone="info">{quotas.map(latestQuotaSummary).join(" | ")}</Badge> : undefined}
+      >
+        <QuotaTrendChart data={data} />
       </Panel>
       <Panel title="Token Usage" subtitle="Daily token/cost rollups from turns in the selected window.">
+        <TokenUsageChart rows={tokens} />
         {tokens.length ? (
           <DataTable
             columns={[
@@ -116,6 +297,7 @@ function ResourceQuotaPanel({ data }: { data: SafeOpsDashboardData }) {
               { key: "input", header: "Input" },
               { key: "cache", header: "Cache" },
               { key: "output", header: "Output" },
+              { key: "total", header: "Total" },
               { key: "cost", header: "Cost" }
             ]}
             rows={tokens.map((row) => ({
@@ -124,15 +306,11 @@ function ResourceQuotaPanel({ data }: { data: SafeOpsDashboardData }) {
               input: row.input.toLocaleString(),
               cache: (row.cacheCreation + row.cacheRead).toLocaleString(),
               output: row.output.toLocaleString(),
+              total: compactNumber(row.input + row.cacheCreation + row.cacheRead + row.output),
               cost: formatCost(row.cost)
             }))}
           />
-        ) : (
-          <EmptyState title="No token usage rows in this window" />
-        )}
-      </Panel>
-      <Panel title="Resource Signals">
-        <RowsTable caption="Resource and quota event counts" empty="No resource events in this window" rows={resourceRows} />
+        ) : null}
       </Panel>
     </div>
   );
@@ -270,60 +448,6 @@ function HealthPanel({ data }: { data: SafeOpsDashboardData }) {
   );
 }
 
-function ChainlinkPanel({ data }: { data: SafeOpsDashboardData }) {
-  const chainlink = data.chainlink_issues;
-  if (!chainlink.available) {
-    return <ErrorState title="Chainlink unavailable">{chainlink.error || "No Chainlink issue data for this home."}</ErrorState>;
-  }
-  return (
-    <div className="ops-panel-stack">
-      <Panel
-        actions={<Badge tone={chainlink.truncated ? "warning" : "info"}>{chainlink.issues.length} open</Badge>}
-        title="Chainlink"
-        subtitle={chainlink.truncated ? `Showing ${chainlink.issues.length} of ${chainlink.total_count ?? "unknown"}.` : "Open issues from this home."}
-      >
-        {chainlink.issues.length ? (
-          <DataTable
-            columns={[
-              { key: "id", header: "#" },
-              { key: "title", header: "Title" },
-              { key: "status", header: "Status" },
-              { key: "priority", header: "Priority" },
-              { key: "parent", header: "Parent" },
-              { key: "updated", header: "Updated" }
-            ]}
-            rows={(chainlink.issues as ChainlinkIssue[]).map((issue) => ({
-              id: asDisplay(issue.id),
-              title: asDisplay(issue.title),
-              status: asDisplay(issue.status),
-              priority: asDisplay(issue.priority),
-              parent: issue.parent_id ? `#${asDisplay(issue.parent_id)}` : "",
-              updated: asDisplay(issue.updated_at).slice(0, 19).replace("T", " ")
-            }))}
-          />
-        ) : (
-          <EmptyState title="No open Chainlink issues" />
-        )}
-      </Panel>
-      <Panel title="Backlog" subtitle="Instrumentation gaps tracked by the current ops payload.">
-        {data.backlog.length ? (
-          <div className="ops-backlog-list">
-            {data.backlog.map((item) => (
-              <article className="ops-backlog" key={item.id}>
-                <h3>{item.title}</h3>
-                <Badge tone="warning">{item.status}</Badge>
-                <p>{item.blocker}</p>
-              </article>
-            ))}
-          </div>
-        ) : (
-          <EmptyState title="No backlog items in payload" />
-        )}
-      </Panel>
-    </div>
-  );
-}
-
 function RawPanel({ data }: { data: SafeOpsDashboardData }) {
   return (
     <div className="ops-panel-stack">
@@ -342,11 +466,9 @@ function OpsContent({ data: rawData }: { data: unknown }) {
   const data = safeOpsDashboardData(rawData);
   const tabs = [
     ["overview", "Overview"],
-    ["resources", "Resources"],
     ["scheduler", "Scheduler"],
     ["async", "Async jobs"],
     ["health", "Health"],
-    ["chainlink", "Chainlink"],
     ["raw", "Raw"]
   ];
   const activeTab = tabs.some(([id]) => id === searchParams.get("tab")) ? searchParams.get("tab") || "overview" : "overview";
@@ -404,15 +526,76 @@ function OpsContent({ data: rawData }: { data: unknown }) {
               </Panel>
             </div>
           ) : null}
-          {activeTab === "resources" ? <ResourceQuotaPanel data={data} /> : null}
           {activeTab === "scheduler" ? <SchedulerPanel data={data} /> : null}
           {activeTab === "async" ? <AsyncJobsPanel data={data} /> : null}
           {activeTab === "health" ? <HealthPanel data={data} /> : null}
-          {activeTab === "chainlink" ? <ChainlinkPanel data={data} /> : null}
           {activeTab === "raw" ? <RawPanel data={data} /> : null}
         </section>
       </div>
     </div>
+  );
+}
+
+
+function UsageContent({ data: rawData }: { data: unknown }) {
+  const data = safeOpsDashboardData(rawData);
+  return (
+    <div className="ops-route">
+      <UsagePanel data={data} />
+    </div>
+  );
+}
+
+export function UsageRoute() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const daysParam = searchParams.get("days") || "7";
+  const days = Number.parseInt(daysParam, 10);
+  const validDays = Number.isFinite(days) && days > 0 ? days : 7;
+  const query = useQuery({
+    queryKey: ["usage-dashboard", validDays],
+    queryFn: async () => (await getOpsDashboard({ days: validDays }, { cache: "no-store" })).data
+  });
+
+  return (
+    <>
+      <div className="ops-header-row">
+        <div>
+          <p className="ui-eyebrow">Usage</p>
+          <h1>Usage Dashboard</h1>
+          <p className="app-copy">
+            Window: {validDays} days{query.data ? ` | Generated ${query.data.generated_at}` : ""}
+          </p>
+        </div>
+        <form
+          className="ops-controls"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const form = new FormData(event.currentTarget);
+            const nextDays = String(form.get("days") || "7");
+            const params = new URLSearchParams(searchParams);
+            params.set("days", nextDays);
+            setSearchParams(params, { replace: false });
+          }}
+        >
+          <label>
+            <span>Days</span>
+            <TextInput defaultValue={String(validDays)} inputMode="numeric" min={1} name="days" type="number" />
+          </label>
+          <Button type="submit" variant="primary">Apply</Button>
+          <Button disabled={query.isFetching} onClick={() => void query.refetch()} type="button">
+            {query.isFetching ? "Refreshing" : "Refresh"}
+          </Button>
+          <a className="ui-button ui-button--secondary ops-json-link" href={`/api/ops?days=${validDays}`}>JSON</a>
+        </form>
+      </div>
+      {query.isLoading ? <LoadingState label="Loading usage dashboard" /> : null}
+      {query.isError ? (
+        <ErrorState title="Usage endpoint failed">
+          {query.error instanceof Error ? query.error.message : String(query.error)}
+        </ErrorState>
+      ) : null}
+      {query.data ? <UsageContent data={query.data} /> : null}
+    </>
   );
 }
 
@@ -430,7 +613,7 @@ export function OpsRoute() {
     <>
       <div className="ops-header-row">
         <div>
-          <p className="ui-eyebrow">Operations</p>
+          <p className="ui-eyebrow">Ops</p>
           <h1>Ops Dashboard</h1>
           <p className="app-copy">
             Window: {validDays} days{query.data ? ` | Generated ${query.data.generated_at}` : ""}

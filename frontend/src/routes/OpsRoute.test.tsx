@@ -1,0 +1,64 @@
+// @vitest-environment jsdom
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { opsDashboardFixture } from "../fixtures/api";
+import { OpsRoute, UsageRoute } from "./OpsRoute";
+
+vi.mock("../api", () => ({
+  getOpsDashboard: vi.fn(async () => ({ ok: true, version: "v1", data: opsDashboardFixture }))
+}));
+
+function renderUsageRoute(initialEntry = "/usage") {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <UsageRoute />
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+}
+
+function renderOpsRoute(initialEntry = "/ops") {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <OpsRoute />
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+}
+
+afterEach(() => {
+  cleanup();
+});
+
+describe("UsageRoute dashboard (#573)", () => {
+  it("renders usage as its own top-level surface with only usage information", async () => {
+    renderUsageRoute("/usage");
+
+    expect(await screen.findByRole("heading", { name: "Usage Dashboard" })).toBeTruthy();
+    expect(screen.queryByRole("tab")).toBeNull();
+    expect(await screen.findByText("Token Usage")).toBeTruthy();
+    expect(screen.getByLabelText("Daily token volume by token type with token-count axis")).toBeTruthy();
+    expect(screen.getByLabelText("codex_plus quota utilization line chart with percent axis")).toBeTruthy();
+    expect(screen.getByText(/Codex Plus seven_day: 42\.0% → 84\.0% projected · tight/)).toBeTruthy();
+    expect(screen.queryByText("Scheduler, Poller, and Job Signals")).toBeNull();
+  });
+});
+
+describe("OpsRoute", () => {
+  it("keeps ops separate from Usage and omits usage and Chainlink tabs", async () => {
+    renderOpsRoute("/ops");
+
+    expect(await screen.findByRole("heading", { name: "Ops Dashboard" })).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: "Usage" })).toBeNull();
+    expect(screen.queryByRole("tab", { name: "Resources" })).toBeNull();
+    expect(screen.queryByRole("tab", { name: "Chainlink" })).toBeNull();
+    expect(await screen.findByRole("tab", { name: "Overview" })).toBeTruthy();
+  });
+});

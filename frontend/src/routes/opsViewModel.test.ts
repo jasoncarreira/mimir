@@ -30,9 +30,19 @@ describe("ops view-model helpers", () => {
     expect(quotaRows(opsDashboardFixture.usage_history)).toEqual([
       {
         provider: "codex_plus",
+        window: "five_hour",
+        points: 1,
+        latestUtilization: 0.12,
+        latestProjection: 0.2,
+        latestPressure: "clear"
+      },
+      {
+        provider: "codex_plus",
         window: "seven_day",
         points: 1,
-        latestUtilization: 0.42
+        latestUtilization: 0.42,
+        latestProjection: 0.84,
+        latestPressure: "tight"
       }
     ]);
     expect(tokenUsageRows(opsDashboardFixture.token_usage_history)).toEqual([

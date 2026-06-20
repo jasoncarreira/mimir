@@ -21,6 +21,11 @@ const firstPartySurfaceMetadata: Record<
     tabs: ["compose", "history", "context"],
     filterLabel: "channel"
   },
+  usage: {
+    detail: "Quota pressure and token usage",
+    tabs: ["quota", "tokens"],
+    filterLabel: "window"
+  },
   turns: {
     detail: "Inspect selected turns",
     tabs: ["summary", "prompt", "events"],
@@ -28,7 +33,7 @@ const firstPartySurfaceMetadata: Record<
   },
   ops: {
     detail: "Operational overview",
-    tabs: ["overview", "queues", "health"],
+    tabs: ["overview", "scheduler", "async", "health", "raw"],
     filterLabel: "scope"
   },
   "chainlink-board": {

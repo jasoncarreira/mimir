@@ -50,6 +50,18 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+
+from .billing import (
+    DEFAULT_BURST_ELEVATED,
+    DEFAULT_BURST_TIGHT,
+    DEFAULT_PACE_PROJECTION_FLOOR,
+    DEFAULT_RAMP_FRACTION,
+    DEFAULT_RAW_SUPPRESS_THRESHOLD,
+    Severity,
+    burst_multiple,
+)
+from .quota_windows import ALL_PROVIDERS
+from .rate_limits import RateLimitSnapshot, project_window_end
 from typing import Any, Iterable
 
 
@@ -130,6 +142,78 @@ def _normalize_window_key(provider: str, raw_key: str) -> str:
     return raw_key
 
 
+
+_QUOTA_PROVIDER_BY_USAGE_PROVIDER = {
+    "anthropic": "anthropic",
+    "minimax": "minimax",
+    "codex_plus": "openai",
+}
+
+
+def _window_hours(provider: str, window: str) -> float | None:
+    quota_provider = _QUOTA_PROVIDER_BY_USAGE_PROVIDER.get(provider, provider)
+    for spec in ALL_PROVIDERS:
+        if spec.provider != quota_provider:
+            continue
+        for candidate in spec.windows:
+            if candidate.key == window:
+                return candidate.hours
+    return None
+
+
+def _point_projection(
+    *,
+    utilization: float | None,
+    resets_at: int | None,
+    window_hours: float | None,
+    ts: str,
+) -> float | None:
+    if utilization is None or resets_at is None or window_hours is None:
+        return None
+    try:
+        reference_time = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+    projection = project_window_end(
+        RateLimitSnapshot(
+            status="allowed",
+            utilization=utilization,
+            resets_at=resets_at,
+            observed_at=ts,
+        ),
+        window_hours,
+        reference_time=reference_time,
+    )
+    return projection.on_pace_utilization if projection is not None else None
+
+
+def _pressure_label(
+    utilization: float | None,
+    projection: float | None,
+    *,
+    raw_threshold: float = DEFAULT_RAW_SUPPRESS_THRESHOLD,
+    burst_tight: float = DEFAULT_BURST_TIGHT,
+    burst_elevated: float = DEFAULT_BURST_ELEVATED,
+    ramp_fraction: float = DEFAULT_RAMP_FRACTION,
+    pace_floor: float = DEFAULT_PACE_PROJECTION_FLOOR,
+) -> str:
+    severity = Severity.CLEAR
+
+    if utilization is not None and utilization >= raw_threshold:
+        severity = Severity.TIGHT
+
+    if utilization is not None and projection is not None and projection >= pace_floor:
+        m = burst_multiple(utilization, projection)
+        if m is not None:
+            elapsed_fraction = utilization / projection
+            gamma = min(1.0, elapsed_fraction / ramp_fraction)
+            if m < burst_tight * gamma:
+                severity = max(severity, Severity.TIGHT)
+            elif m < burst_elevated * gamma:
+                severity = max(severity, Severity.ELEVATED)
+
+    return severity.name.lower()
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -137,17 +221,27 @@ def _normalize_window_key(provider: str, raw_key: str) -> str:
 
 @dataclass
 class UsagePoint:
-    """One sample of a quota window's state at a given timestamp."""
+    """One sample of a quota window's state at a given timestamp.
+
+    ``projection`` is the projected end-of-window utilization if the current
+    burn pace holds. ``pressure`` mirrors the arbiter's quota severity bands
+    (clear / elevated / tight) for this single provider window, so the Usage
+    dashboard can show the same categorical signal the scheduler uses.
+    """
 
     ts: str  # ISO 8601 with timezone
     utilization: float | None  # 0.0 → 1.0; None if the event reported null
     resets_at: int | None  # unix epoch seconds; None if absent
+    projection: float | None = None  # projected end-of-window utilization
+    pressure: str = "clear"
 
     def to_json(self) -> dict[str, Any]:
         return {
             "ts": self.ts,
             "utilization": self.utilization,
             "resets_at": self.resets_at,
+            "projection": self.projection,
+            "pressure": self.pressure,
         }
 
 
@@ -202,8 +296,18 @@ def normalize_subscription_events(
                     resets = int(resets)
                 except (TypeError, ValueError):
                     resets = None
+            window_hours = _window_hours(provider, window)
+            projection = _point_projection(
+                utilization=util, resets_at=resets, window_hours=window_hours, ts=ts,
+            )
             out[provider][window].append(
-                UsagePoint(ts=ts, utilization=util, resets_at=resets),
+                UsagePoint(
+                    ts=ts,
+                    utilization=util,
+                    resets_at=resets,
+                    projection=projection,
+                    pressure=_pressure_label(util, projection),
+                ),
             )
     # Convert nested defaultdicts to plain dicts for serialization.
     return {p: dict(w) for p, w in out.items()}
