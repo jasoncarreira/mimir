@@ -1,4 +1,4 @@
-import type { LiveEvent } from "../api/generated/contracts";
+import type { LiveEvent, TurnStreamEvent } from "../api/generated/contracts";
 import type {
   AgentCharacterState,
   SkinCharacterRendererMetadata
@@ -87,6 +87,41 @@ export function characterStateFromLiveEvent(
   }
 
   return "idle";
+}
+
+// chainlink #583: like isChatLiveEvent, but for the live turn-event bus. The bus
+// always stamps channel_id; treat web-* as chat so the dossier ignores
+// background poller/heartbeat turns.
+export function isChatTurnEvent(event: TurnStreamEvent | null | undefined): boolean {
+  if (!event) return false;
+  return typeof event.channel_id === "string" && event.channel_id.startsWith("web-");
+}
+
+// chainlink #583: map a LIVE turn-event to a character state. Unlike
+// characterStateFromLiveEvent (post-hoc, replays after the turn finishes), this
+// drives the character DURING the turn. The user-facing reply rides on the
+// send_message tool call (Q5: adapter policy), so that reads as "typing"
+// (talking); other tools read as "tool".
+export function characterStateFromTurnEvent(
+  event: TurnStreamEvent | null | undefined
+): AgentCharacterState {
+  if (!event) return "idle";
+  switch (event.type) {
+    case "turn":
+      if (event.phase === "end") return event.status === "error" ? "error" : "idle";
+      return "thinking";
+    case "reasoning":
+      return "thinking";
+    case "text":
+      return "typing";
+    case "tool_call":
+    case "tool_result":
+      if (event.tool_name === "send_message") return "typing";
+      if (event.type === "tool_result" && event.status === "error") return "error";
+      return "tool";
+    default:
+      return "thinking";
+  }
 }
 
 // github #580: the agent "listens" while the user is engaging the composer, but

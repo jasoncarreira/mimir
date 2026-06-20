@@ -37,7 +37,7 @@ vi.mock("./live-events", () => ({
 // the test doesn't need a real canvas/WASM.
 vi.mock("./agent-character", () => ({
   AgentCharacter: () => null,
-  characterStateFromLiveEvent: () => "idle",
+  useTurnEventState: () => ({ state: "idle", status: "open" }),
   withComposerListening: (state: string) => state
 }));
 

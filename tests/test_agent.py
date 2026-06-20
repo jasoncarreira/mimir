@@ -2414,3 +2414,47 @@ async def test_iteration_hard_stop_soft_send_failure_not_recorded(tmp_path: Path
     assert len(ch.sent) == 1                       # the send was attempted
     assert ctx.delivered_channel_ids == set()      # but NOT recorded as delivered
     assert ctx.send_message_count == 0
+
+
+async def test_run_turn_publishes_live_turn_events(tmp_path: Path):
+    """chainlink #583 slice 1: the model loop brackets the turn and its blocks
+    onto the live turn-event bus in real time (producer integration)."""
+    from langchain_core.messages import ToolMessage
+    from mimir.turn_event_bus import TurnEventBus
+
+    fake_agent = _FakeAgent(response_messages=[
+        AIMessage(
+            content="thinking it through",
+            tool_calls=[{"id": "call_1", "name": "send_message", "args": {"content": "hi"}}],
+        ),
+        ToolMessage(content="delivered", tool_call_id="call_1"),
+    ])
+    agent = _build_agent(tmp_path, fake_agent=fake_agent)
+    bus = TurnEventBus()
+    agent._turn_event_bus = bus  # wire the producer  # type: ignore[attr-defined]
+    queue = bus.subscribe("web-chat")
+
+    await agent.run_turn(
+        AgentEvent(trigger="user_message", channel_id="web-chat", content="hi"),
+    )
+
+    received: list[dict] = []
+    while True:
+        try:
+            received.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    kinds = [(e["type"], e["phase"]) for e in received]
+    assert kinds[0] == ("turn", "start")
+    assert kinds[-1] == ("turn", "end")
+    # The send_message tool call (the reply) + its result were bracketed live.
+    assert ("tool_call", "start") in kinds and ("tool_result", "end") in kinds
+    tc_end = next(e for e in received if e["type"] == "tool_call" and e["phase"] == "end")
+    assert tc_end["tool_name"] == "send_message"
+    # Every event carries the turn's channel + a monotonic seq.
+    assert all(e["channel_id"] == "web-chat" for e in received)
+    seqs = [e["seq"] for e in received]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+    # The turn ended cleanly.
+    assert received[-1]["status"] == "ok"

@@ -1,0 +1,223 @@
+"""In-process pub/sub for live, ephemeral turn events (chainlink #583, slice 1).
+
+The post-hoc ``/api/v1/live-events`` stream is derived from ``turns.jsonl``,
+which is written once at turn end — so the dashboard character *replays* a
+turn's phases after it finishes instead of animating live. This bus closes
+that gap: the turn loop publishes canonical, bracketed events as the turn
+progresses, and SSE consumers (the dossier character first) subscribe.
+
+Design notes:
+- **Ephemeral + drop-allowed.** A slow/dead subscriber's bounded queue drops
+  its OLDEST event rather than ever blocking the turn loop. Durable history
+  stays in ``turns.jsonl`` / the post-hoc live-events stream; this bus is
+  presentation-only. Missed events are self-healing — the final state is
+  always recoverable from the durable stream.
+- **Lock-free under asyncio.** ``publish`` is synchronous and never awaits, so
+  on a single-threaded event loop it runs atomically with respect to
+  ``subscribe``/``unsubscribe`` (which also never await mid-mutation). That is
+  why a custom ~queue bus beats a generic signal lib here: the part that
+  matters — bounded queues with drop-oldest backpressure — is ours either way,
+  and this keeps it dependency-free and consistent with the WebChatBridge
+  subscriber-queue pattern it generalizes.
+- **Canonical envelope.** Every event is ``{type, phase, turn_id, channel_id,
+  seq, ts, id?, ...payload}`` with ``phase ∈ {start, chunk, end}`` — see
+  ``mimir/web_contracts.py`` for the wire contract. There are no atomic events:
+  errors ride a terminal ``status`` on the relevant ``*`` end, and a tool's
+  *execution* is its own ``tool_result`` span distinct from the ``tool_call``
+  (the model emitting the call), sharing the same ``id`` so consumers join them.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+DEFAULT_QUEUE_MAX = 256
+WILDCARD = "*"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _offer(queue: "asyncio.Queue[dict[str, Any]]", event: dict[str, Any]) -> None:
+    """Enqueue ``event``, dropping the oldest if the queue is full.
+
+    Live state matters more than completeness, and the producer must never
+    block, so a saturated subscriber loses its stalest event rather than
+    backpressuring the turn loop.
+    """
+    try:
+        queue.put_nowait(event)
+        return
+    except asyncio.QueueFull:
+        pass
+    try:
+        queue.get_nowait()
+    except Exception:  # noqa: BLE001 — best-effort make-room
+        pass
+    try:
+        queue.put_nowait(event)
+    except Exception:  # noqa: BLE001 — never raise into the producer
+        pass
+
+
+class TurnEventBus:
+    """Channel-keyed fan-out of live turn events to subscriber queues."""
+
+    def __init__(self, *, queue_max: int = DEFAULT_QUEUE_MAX) -> None:
+        self._queue_max = queue_max
+        self._subscribers: dict[str, set["asyncio.Queue[dict[str, Any]]"]] = {}
+
+    def subscribe(self, channel_id: str = WILDCARD) -> "asyncio.Queue[dict[str, Any]]":
+        """Return a fresh bounded queue subscribed to ``channel_id``.
+
+        ``channel_id=WILDCARD`` ("*") receives every channel's events. Callers
+        MUST ``unsubscribe`` the returned queue when done.
+        """
+        queue: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue(maxsize=self._queue_max)
+        self._subscribers.setdefault(channel_id, set()).add(queue)
+        return queue
+
+    def unsubscribe(self, channel_id: str, queue: "asyncio.Queue[dict[str, Any]]") -> None:
+        subs = self._subscribers.get(channel_id)
+        if not subs:
+            return
+        subs.discard(queue)
+        if not subs:
+            self._subscribers.pop(channel_id, None)
+
+    def publish(self, event: dict[str, Any]) -> None:
+        """Fan ``event`` out to its channel's subscribers + wildcard subscribers.
+
+        Synchronous and non-blocking — safe to call from the hot turn loop.
+        Never raises: a bad event must not break a turn.
+        """
+        try:
+            channel_id = event.get("channel_id") or ""
+            for key in (channel_id, WILDCARD):
+                subs = self._subscribers.get(key)
+                if not subs:
+                    continue
+                # Snapshot: a subscriber's drained queue can't mutate the set
+                # here (no await), but copy defensively against re-entrancy.
+                for queue in list(subs):
+                    _offer(queue, event)
+        except Exception:  # noqa: BLE001 — publishing must never break the caller
+            log.debug("turn-event publish failed", exc_info=True)
+
+
+class TurnEventEmitter:
+    """Per-turn helper that brackets a turn's progress onto a :class:`TurnEventBus`.
+
+    Scoped to one turn (own ``seq``/block counters) so concurrent turns on
+    different channels never collide. Every method is a no-op when ``bus`` is
+    ``None`` (feature unwired) and swallows its own errors — emission must never
+    affect turn execution.
+    """
+
+    def __init__(
+        self,
+        bus: TurnEventBus | None,
+        *,
+        turn_id: str,
+        channel_id: str | None,
+    ) -> None:
+        self._bus = bus
+        self._turn_id = turn_id
+        self._channel_id = channel_id or ""
+        self._seq = 0
+        self._block_n = 0
+        self._emitted = 0  # extract_turn_events items already bracketed
+
+    @property
+    def enabled(self) -> bool:
+        return self._bus is not None
+
+    def _emit(self, type_: str, phase: str, **payload: Any) -> None:
+        if self._bus is None:
+            return
+        try:
+            self._seq += 1
+            event = {
+                "type": type_,
+                "phase": phase,
+                "turn_id": self._turn_id,
+                "channel_id": self._channel_id,
+                "seq": self._seq,
+                "ts": _now_iso(),
+                **payload,
+            }
+            self._bus.publish(event)
+        except Exception:  # noqa: BLE001 — emission is best-effort, never fatal
+            log.debug("turn-event emit failed", exc_info=True)
+
+    def turn_started(self) -> None:
+        self._emit("turn", "start")
+
+    def turn_ended(self, *, status: str = "ok", error: str | None = None) -> None:
+        payload: dict[str, Any] = {"status": status}
+        if error:
+            payload["error"] = error[:240]
+        self._emit("turn", "end", **payload)
+
+    def blocks_from_messages(self, messages: list[Any]) -> None:
+        """Bracket any new reasoning / tool_call / tool_result blocks.
+
+        Reuses ``extract_turn_events`` (all the backend-specific parsing) and
+        emits brackets only for items beyond what was already emitted, so it is
+        safe to call on every ``astream`` snapshot. Whole blocks arrive as a
+        single ``chunk`` between ``start``/``end`` — the same consumer code
+        works whether a backend streams token deltas (anthropic/openai) or
+        hands over whole blocks (codex-plus, claude-code).
+        """
+        if self._bus is None:
+            return
+        try:
+            from .turn_logger import extract_turn_events
+
+            events, _ = extract_turn_events(messages)
+        except Exception:  # noqa: BLE001 — parsing must never break the turn
+            log.debug("turn-event block parse failed", exc_info=True)
+            return
+        for item in events[self._emitted:]:
+            try:
+                self._bracket(item)
+            except Exception:  # noqa: BLE001
+                log.debug("turn-event bracket failed", exc_info=True)
+        self._emitted = len(events)
+
+    def _bracket(self, item: dict[str, Any]) -> None:
+        kind = item.get("type")
+        if kind == "reasoning":
+            self._block_n += 1
+            span_id = f"{self._turn_id}:b{self._block_n}"
+            text = item.get("content") or ""
+            self._emit("reasoning", "start", id=span_id)
+            if text:
+                self._emit("reasoning", "chunk", id=span_id, text=text)
+            self._emit("reasoning", "end", id=span_id)
+        elif kind == "tool_call":
+            self._block_n += 1
+            span_id = item.get("id") or f"{self._turn_id}:b{self._block_n}"
+            name = item.get("name") or "unknown"
+            args = item.get("args")
+            self._emit("tool_call", "start", id=span_id, tool_name=name)
+            if args is not None:
+                self._emit("tool_call", "chunk", id=span_id, args_delta=args)
+            self._emit("tool_call", "end", id=span_id, tool_name=name, args=args)
+        elif kind == "tool_result":
+            self._block_n += 1
+            # Reuse the tool_call id so consumers join call → result by (type,id).
+            span_id = item.get("id") or f"{self._turn_id}:b{self._block_n}"
+            name = item.get("name") or ""
+            content = item.get("content") or ""
+            status = "error" if item.get("is_error") else "ok"
+            self._emit("tool_result", "start", id=span_id, tool_name=name)
+            if content:
+                self._emit("tool_result", "chunk", id=span_id, content_delta=content)
+            self._emit("tool_result", "end", id=span_id, status=status, content=content)

@@ -1,8 +1,7 @@
 import React from "react";
 import {
   AgentCharacter,
-  characterStateFromLiveEvent,
-  isChatLiveEvent,
+  useTurnEventState,
   withComposerListening
 } from "./agent-character";
 import { useBootstrap } from "./api/bootstrap";
@@ -31,12 +30,16 @@ export function AgentDossier() {
   const agentName = bootstrap?.ui?.agent_name || "Mimir";
   const model = bootstrap?.model || "";
 
-  // Character: reflects *chat* turns only (background poller/heartbeat turns
-  // don't drive it; characterStateFromLiveEvent returns "idle" on a finished
-  // lifecycle, so it resets when the chat turn completes — no stale state).
-  // Turn total: max(turns_total, highest live seq) — a counter would double-count
-  // the SSE's backfill of historical finished turns.
-  const [chatEventState, setChatEventState] = React.useState<AgentCharacterState>("idle");
+  // Character state: driven by the LIVE turn-event bus (chainlink #583) so it
+  // animates DURING the turn, instead of replaying post-hoc from the
+  // log-derived live-events stream. The hook scopes to chat (web-*) turns and
+  // returns "idle" on turn end, so it resets cleanly — no stale state.
+  const { state: turnState } = useTurnEventState();
+  const agentState = withComposerListening(turnState, composerActive);
+
+  // Turn total still comes from the durable live-events seq: max(turns_total,
+  // highest live seq) — a counter would double-count the SSE's backfill of
+  // historical finished turns.
   const [maxLiveSeq, setMaxLiveSeq] = React.useState(0);
   const lastEventId = React.useRef("");
   React.useEffect(() => {
@@ -47,12 +50,7 @@ export function AgentDossier() {
       const seq = item.event.seq;
       setMaxLiveSeq((current) => (seq > current ? seq : current));
     }
-    if (isChatLiveEvent(item.event)) {
-      setChatEventState(characterStateFromLiveEvent(item.event));
-    }
   }, [liveEvents.lastEvent]);
-  const eventState = liveEvents.status === "error" ? "error" : chatEventState;
-  const agentState = withComposerListening(eventState, composerActive);
   const turns = Math.max(bootstrap?.turns_total ?? 0, maxLiveSeq);
 
   return (
