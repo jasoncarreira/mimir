@@ -498,6 +498,41 @@ def _fake_chainlink_script(
     return script
 
 
+def test_poller_imports_mimir_when_run_from_installed_skill_with_scrubbed_pythonpath(tmp_path: Path) -> None:
+    """Production poller subprocesses start in the installed skill directory.
+
+    sys.path[0] is that skill dir, not the source checkout; the poller must repair
+    its own import path before importing WorklinkConfig.
+    """
+
+    home = tmp_path / "home"
+    home.mkdir()
+    skill_dir = tmp_path / "skills" / "chainlink-orchestrator"
+    skill_dir.mkdir(parents=True)
+    installed_poller = skill_dir / "poller.py"
+    installed_poller.write_text(POLLER.read_text(encoding="utf-8"), encoding="utf-8")
+    env = {
+        "MIMIR_HOME": str(home),
+        "STATE_DIR": str(tmp_path / "state"),
+        # No PYTHONPATH: this matches the failing live worklink-ready-queue shape.
+        "PATH": os.environ.get("PATH", ""),
+    }
+
+    proc = subprocess.run(
+        [sys.executable, "poller.py"],
+        cwd=str(skill_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    assert records and records[0]["signal"] == "worklink_poller_degraded"
+    assert "ModuleNotFoundError" not in proc.stderr
+
+
 def _fake_run_bin(tmp: Path) -> Path:
     """A run-bin that records each `worklink run <id>` dispatch to a file."""
     record = tmp / "dispatched.txt"

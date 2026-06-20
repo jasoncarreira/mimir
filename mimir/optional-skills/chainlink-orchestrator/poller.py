@@ -45,6 +45,34 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def _ensure_mimir_import_path() -> None:
+    """Let an installed optional-skill poller import the source checkout.
+
+    Optional poller commands run as subprocesses from the installed skill dir. In
+    a production container that interpreter is normally the project venv's
+    ``python3``, but its default import path contains the skill dir rather than
+    the source checkout. Add the checkout root from the colocated ``mimir`` CLI
+    shim when available so ``import mimir`` works without requiring operators to
+    hand-set PYTHONPATH.
+    """
+
+    exe = Path(sys.executable).resolve()
+    candidates = [
+        exe.parent.parent,
+        Path(os.environ.get("MIMIR_SOURCE_DIR", "")) if os.environ.get("MIMIR_SOURCE_DIR") else None,
+        Path("/workspace/mimir"),
+    ]
+    for candidate in candidates:
+        if candidate and (candidate / "mimir" / "__init__.py").is_file():
+            path = str(candidate)
+            if path not in sys.path:
+                sys.path.insert(0, path)
+            return
+
+
+_ensure_mimir_import_path()
+
 from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
