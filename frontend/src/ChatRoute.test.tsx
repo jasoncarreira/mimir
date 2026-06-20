@@ -284,3 +284,25 @@ describe("ChatRoute history reload (web chat history)", () => {
     expect(within(timeline).getAllByText("earlier question")).toHaveLength(1);
   });
 });
+
+describe("ChatRoute per-user channel adoption", () => {
+  it("adopts the per-user channel the backend resolves and shows its history", async () => {
+    useChatStore.setState({ messages: [] });
+    chatApi.fetchChatHistory.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: {
+        channel_id: "web-alice",
+        messages: [
+          { message_id: "a1", role: "user", channel_id: "web-alice", text: "alice question", ts: "2026-06-20T09:00:00Z" }
+        ]
+      }
+    });
+
+    renderChat();
+
+    // The message is on web-alice; it only renders if ChatRoute adopted that
+    // channel (visibleMessages filters by the active channel).
+    expect(await screen.findByText("alice question")).toBeTruthy();
+  });
+});

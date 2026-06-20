@@ -161,7 +161,15 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     void (async () => {
       try {
         const res = await fetchChatHistory(channelId);
-        if (cancelled || !res.data.messages.length) return;
+        if (cancelled) return;
+        // The backend may resolve us to a per-user channel (web-<id>); adopt it
+        // so send + the live stream + the timeline filter all use it.
+        const resolved = res.data.channel_id;
+        if (resolved && resolved !== channelId) {
+          setChannelId(resolved);
+          update({ channel: resolved, filter: resolved });
+        }
+        if (!res.data.messages.length) return;
         const history = res.data.messages.map((m) => ({
           id: m.message_id || `hist-${m.ts}-${m.role}`,
           role: m.role,

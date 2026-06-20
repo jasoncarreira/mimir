@@ -270,3 +270,86 @@ async def test_chat_history_empty_without_buffer(bridge_app):
 
     assert resp.status == 200
     assert body["data"] == {"channel_id": "web-default", "messages": []}
+
+
+def test_web_channel_for_uses_canonical_verbatim():
+    """The canonical is the unique per-user key, so the channel uses it verbatim —
+    a lossy slug could collapse distinct ids onto one channel and leak history."""
+    from mimir.bridges.web_chat import DEFAULT_CHANNEL, _web_channel_for
+
+    assert _web_channel_for("alice") == "web-alice"
+    # distinct canonicals a slug would collapse must stay DISTINCT channels
+    assert _web_channel_for("a.b") != _web_channel_for("a_b")
+    assert _web_channel_for("Alice") != _web_channel_for("alice")
+    assert _web_channel_for("") == DEFAULT_CHANNEL
+
+
+@pytest.mark.asyncio
+async def test_authenticated_default_channel_routes_per_user(tmp_path):
+    """An authenticated user's default-channel post routes to web-<canonical>;
+    an explicit channel is respected as-is."""
+    from types import SimpleNamespace
+
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+    async with TestClient(TestServer(a)) as client:
+        r1 = await client.post("/api/v1/chat", json={"content": "hi"})  # default → per-user
+        b1 = await r1.json()
+        r2 = await client.post("/api/v1/chat", json={"content": "yo", "channel_id": "web-room"})
+        b2 = await r2.json()
+
+    assert b1["data"]["channel_id"] == "web-alice"
+    assert enqueued[0].channel_id == "web-alice" and enqueued[0].author == "Alice"
+    assert b2["data"]["channel_id"] == "web-room"  # explicit channel untouched
+    assert enqueued[1].channel_id == "web-room"
+
+
+@pytest.mark.asyncio
+async def test_history_authenticated_resolves_to_per_user_channel(tmp_path):
+    """GET /api/v1/chat/history with no channel resolves to the authed user's
+    channel and returns only their conversation, not another user's."""
+    from types import SimpleNamespace
+    import mimir.history as history_mod
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        return True
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    (tmp_path / "hist").mkdir()
+    buf = MessageBuffer(history_path=tmp_path / "hist" / "chat_history.jsonl")
+    await buf.append(buf.make_message(channel_id="web-alice", kind="user_message", content="alice question", author="Alice"))
+    await buf.append(buf.make_message(channel_id="web-alice", kind="assistant_message", content="alice answer", author="mimir"))
+    await buf.append(buf.make_message(channel_id="web-bob", kind="user_message", content="bob question", author="Bob"))
+
+    prev = history_mod.get_global_buffer()
+    set_global_buffer(buf)
+    try:
+        async with TestClient(TestServer(a)) as client:
+            resp = await client.get("/api/v1/chat/history")  # no channel_id
+            body = await resp.json()
+    finally:
+        history_mod._global_buffer = prev
+
+    assert body["data"]["channel_id"] == "web-alice"
+    assert [m["text"] for m in body["data"]["messages"]] == ["alice question", "alice answer"]

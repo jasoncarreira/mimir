@@ -48,6 +48,23 @@ log = logging.getLogger(__name__)
 EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
 
 DEFAULT_CHANNEL = "web-default"
+
+
+def _web_channel_for(canonical: str) -> str:
+    """Per-user web channel id derived from an identity canonical.
+
+    Authenticated users' default-channel traffic routes to ``web-<canonical>``
+    so a user's conversation — their messages plus the agent's replies (which go
+    to the turn's channel) — segregates per user and history is scoped
+    naturally. The canonical is the unique per-user matching key, so it's used
+    VERBATIM: slugifying it (lower-casing / collapsing punctuation) could map two
+    distinct canonicals onto one channel and leak history across users. Channel
+    ids are arbitrary strings here (cf. ``slack-U…`` / ``discord-…``); downstream
+    path derivation sanitizes them where needed (e.g. saga session ids). Falls
+    back to the shared default only when the canonical is empty.
+    """
+    canonical = (canonical or "").strip()
+    return f"web-{canonical}" if canonical else DEFAULT_CHANNEL
 SSE_HEARTBEAT_S = 15.0
 
 
@@ -193,6 +210,14 @@ class WebChatBridge(Bridge):
             author = body.get("author")
             author_id = body.get("author_id")
 
+        # Per-user web channel (chainlink): route an authenticated user's
+        # default-channel messages to their own ``web-<canonical>`` so the
+        # conversation segregates per user and history is scoped naturally. The
+        # agent replies to the turn's channel, so its replies land here too. An
+        # explicit non-default channel from the client is respected as-is.
+        if identity is not None and channel_id == DEFAULT_CHANNEL:
+            channel_id = _web_channel_for(identity.canonical)
+
         event = AgentEvent(
             trigger="user_message",
             channel_id=channel_id,
@@ -294,9 +319,15 @@ class WebChatBridge(Bridge):
         """
         from ..history import get_global_buffer
 
+        identity = request.get("auth_identity")
         channel_id = (request.query.get("channel_id") or DEFAULT_CHANNEL).strip()
         if not channel_id.startswith("web-"):
             channel_id = "web-" + channel_id
+        # Default channel + authenticated → that user's per-user web channel,
+        # matching the inbound routing in _build_inbound_event so the history
+        # endpoint returns exactly the conversation the user is posting into.
+        if identity is not None and channel_id == DEFAULT_CHANNEL:
+            channel_id = _web_channel_for(identity.canonical)
         try:
             limit = int(request.query.get("limit", "50"))
         except (TypeError, ValueError):
