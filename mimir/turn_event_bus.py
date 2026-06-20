@@ -191,12 +191,16 @@ class TurnEventEmitter:
                 tid = piece.get("id")
                 name = piece.get("name")
                 args = piece.get("args")
-                if index is not None and index in self._tc_index_id:
-                    span_id = self._tc_index_id[index]
-                elif tid:
+                if tid:
+                    # An explicit id opens (or reopens) a span. (Re)bind the
+                    # index to it so a later tool call reusing the same index —
+                    # e.g. a second call also at index 0 — can't leak its chunks
+                    # into the previous call's span (#802 review).
                     span_id = tid
                     if index is not None:
                         self._tc_index_id[index] = tid
+                elif index is not None and index in self._tc_index_id:
+                    span_id = self._tc_index_id[index]
                 else:
                     continue  # can't correlate this fragment to a span yet
                 if span_id in self._block_emitted_ids:

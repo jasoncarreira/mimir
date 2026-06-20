@@ -200,7 +200,7 @@ describe("ChatRoute streaming reply (#583 slice 2)", () => {
     renderChat();
 
     turnEvent({ type: "tool_call", phase: "start", id: "call_1", tool_name: "send_message" });
-    turnEvent({ type: "tool_call", phase: "chunk", id: "call_1", args_delta: '{"content":"stream' });
+    turnEvent({ type: "tool_call", phase: "chunk", id: "call_1", args_delta: '{"text":"stream' });
     turnEvent({ type: "tool_call", phase: "chunk", id: "call_1", args_delta: 'ing hi"}' });
 
     const forming = await screen.findByText("streaming hi");
@@ -219,7 +219,7 @@ describe("ChatRoute streaming reply (#583 slice 2)", () => {
     renderChat();
 
     turnEvent({ type: "tool_call", phase: "start", id: "call_2", tool_name: "saga_query" });
-    turnEvent({ type: "tool_call", phase: "chunk", id: "call_2", args_delta: '{"content":"nope"}' });
+    turnEvent({ type: "tool_call", phase: "chunk", id: "call_2", args_delta: '{"query":"nope"}' });
 
     await waitFor(() => {
       expect(document.querySelector(".chat-message--streaming")).toBeNull();

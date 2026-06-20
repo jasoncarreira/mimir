@@ -2469,7 +2469,7 @@ async def test_run_turn_streams_tool_call_arg_deltas(tmp_path: Path):
 
     final_ai = AIMessage(
         content="",
-        tool_calls=[{"id": "call_z", "name": "send_message", "args": {"content": "hi there"}}],
+        tool_calls=[{"id": "call_z", "name": "send_message", "args": {"text": "hi there"}}],
     )
 
     class _StreamingFake:
@@ -2479,7 +2479,7 @@ async def test_run_turn_streams_tool_call_arg_deltas(tmp_path: Path):
             yield ("messages", (SimpleNamespace(tool_call_chunks=[
                 {"index": 0, "id": "call_z", "name": "send_message", "args": ""}]), {}))
             yield ("messages", (SimpleNamespace(tool_call_chunks=[
-                {"index": 0, "id": None, "name": None, "args": '{"content":"hi '}]), {}))
+                {"index": 0, "id": None, "name": None, "args": '{"text":"hi '}]), {}))
             yield ("messages", (SimpleNamespace(tool_call_chunks=[
                 {"index": 0, "id": None, "name": None, "args": 'there"}'}]), {}))
             # value snapshot with the completed message.
@@ -2509,4 +2509,4 @@ async def test_run_turn_streams_tool_call_arg_deltas(tmp_path: Path):
     assert len(ends) == 1     # value snapshot closed it
     assert starts[0]["tool_name"] == "send_message"
     # The reply streamed token-by-token as tool-call arg deltas.
-    assert "".join(c["args_delta"] for c in chunks) == '{"content":"hi there"}'
+    assert "".join(c["args_delta"] for c in chunks) == '{"text":"hi there"}'
