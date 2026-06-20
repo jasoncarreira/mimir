@@ -2341,6 +2341,9 @@ async def test_scheduler_loop_lag_monitor_logs_blocking_delay(tmp_path: Path, mo
                 "interval_s": 0.1,
                 "active_turn_count": 0,
                 "active_turns": [],
+                # chainlink #587: empty here — no watchdog wired in this unit test
+                # (it calls _monitor_loop_lag directly, not via start()).
+                "blocking_stacks": [],
             },
         )
     ]

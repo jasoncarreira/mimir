@@ -283,6 +283,28 @@ def test_scheduler_loop_lag_surfaces_as_negative(tmp_path: Path):
     assert "scheduler event loop lag: 1.234s over threshold 1.000s" in block
 
 
+def test_scheduler_loop_lag_collapses_to_one_line_with_count(tmp_path: Path):
+    # chainlink #587: many lag events (each a different lag value, so
+    # content-dedup can't fold them) must collapse to ONE most-recent line with
+    # a ×N count — not N separate lines (the symptom Jason saw: same signal 3×).
+    log = _make_log(
+        tmp_path,
+        events=[  # chronological (oldest first); recent() reads tail-first
+            {"timestamp": _ts(0.5), "type": "scheduler_loop_lag", "lag_s": 5.922, "threshold_s": 1.0},
+            {"timestamp": _ts(0.3), "type": "scheduler_loop_lag", "lag_s": 3.191, "threshold_s": 1.0},
+            {"timestamp": _ts(0.1), "type": "scheduler_loop_lag", "lag_s": 3.100, "threshold_s": 1.0},
+        ],
+    )
+
+    block = log.recent_block()
+
+    assert block is not None
+    lines = [ln for ln in block.splitlines() if "scheduler event loop lag" in ln]
+    assert len(lines) == 1  # collapsed, not three
+    assert "3.100s" in lines[0]  # the most recent occurrence
+    assert "(×3 in 24h)" in lines[0]  # with the window count
+
+
 def test_scheduler_loop_lag_monitor_failure_surfaces_as_negative():
     from mimir.feedback import classify
 

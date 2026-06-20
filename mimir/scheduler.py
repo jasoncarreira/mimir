@@ -48,6 +48,7 @@ from .billing import normalize_priority
 from .core_blocks import read_text_lossy
 from .event_logger import log_event
 from ._context import active_turn_snapshots
+from .loop_watchdog import LoopStallWatchdog
 from .quota_windows import provider_store_keys
 from .models import AgentEvent
 from .pollers import POLLER_CHANNEL_PREFIX, PollerConfig, discover_pollers, run_poller
@@ -504,6 +505,9 @@ class Scheduler:
         self._mutate_lock = asyncio.Lock()
         self._started = False
         self._loop_lag_task: asyncio.Task[Any] | None = None
+        # chainlink #587: watchdog that captures the loop's stack DURING a stall.
+        self._loop_watchdog: LoopStallWatchdog | None = None
+        self._loop_watchdog_beat_task: asyncio.Task[Any] | None = None
         # Used to resolve ``SchedulerJob.prompt_file`` against
         # ``<home>/prompts/<file>`` at fire time. Optional for tests
         # and bench harnesses that construct Scheduler without a home.
@@ -2575,6 +2579,16 @@ class Scheduler:
         """
         if self._loop_lag_task is not None and not self._loop_lag_task.done():
             return
+        # chainlink #587: start the off-loop watchdog (records THIS — the loop —
+        # thread, started from start() which runs on the loop) + a loop-side
+        # heartbeat it watches. The watchdog captures the loop's stack while a
+        # stall is in progress; the monitor below attaches the captures.
+        self._loop_watchdog = LoopStallWatchdog(stall_threshold_s=1.0, poll_s=0.25)
+        self._loop_watchdog.start_thread()
+        self._loop_watchdog_beat_task = self._spawn(
+            self._loop_watchdog.heartbeat_loop(),
+            name="loop-stall-watchdog-heartbeat",
+        )
         self._loop_lag_task = self._spawn(
             self._monitor_loop_lag(),
             name="scheduler-loop-lag-monitor",
@@ -2601,6 +2615,11 @@ class Scheduler:
                 if lag_s <= threshold_s:
                     continue
                 active_turns = active_turn_snapshots(now=now)
+                # chainlink #587: attach the watchdog's in-stall stack capture(s)
+                # so the event names WHAT blocked, not just how long.
+                blocking_stacks = (
+                    self._loop_watchdog.drain() if self._loop_watchdog else []
+                )
                 await log_event(
                     "scheduler_loop_lag",
                     lag_s=round(lag_s, 3),
@@ -2608,6 +2627,7 @@ class Scheduler:
                     interval_s=interval_s,
                     active_turn_count=len(active_turns),
                     active_turns=active_turns[:8],
+                    blocking_stacks=blocking_stacks[:3],
                 )
         except asyncio.CancelledError:
             raise
@@ -2621,6 +2641,12 @@ class Scheduler:
         if self._loop_lag_task is not None:
             self._loop_lag_task.cancel()
             self._loop_lag_task = None
+        if self._loop_watchdog is not None:
+            self._loop_watchdog.stop()
+            self._loop_watchdog = None
+        if self._loop_watchdog_beat_task is not None:
+            self._loop_watchdog_beat_task.cancel()
+            self._loop_watchdog_beat_task = None
         if self._started:
             self._scheduler.shutdown(wait=False)
             self._started = False

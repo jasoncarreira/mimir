@@ -469,6 +469,13 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "bind_mount_stale",
     "bind_mount_persistent",
     "bind_mount_recovered",
+    # chainlink #587: the scheduler loop-lag monitor fires once per stall (up to
+    # ~once/sec during a bad burst). Each line embeds a different lag value, so
+    # content-dedup can't collapse them — without first-occurrence-only they take
+    # several recent slots and bury everything else (the symptom: the same signal
+    # shown 3× with the same ×N). Latest-only surfaces the most recent lag + the
+    # ×N count, which is the actionable signal.
+    "scheduler_loop_lag",
     # PR 4a (git_tracking): a stuck network outage / auth issue / dirty
     # tree will re-emit on every turn until resolved. Dedup so the
     # operator-visible signal is the *most recent* failure, not 50
