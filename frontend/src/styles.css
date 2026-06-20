@@ -1391,8 +1391,10 @@ textarea {
   color: var(--mimir-color-chrome-accent-text, #ffffff);
 }
 
-/* github #572/#579: field log feed (fills the panel) with colored type pills. */
-.live-activity__feed {
+/* github #572/#579 / chainlink #583: field log accordion — the current turn's
+   spans (reasoning, tool calls, results), each filling in progressively, latest
+   open by default and the rest collapsed (re-openable). */
+.live-activity__accordion {
   display: grid;
   flex: 1 1 auto;
   align-content: start;
@@ -1404,52 +1406,99 @@ textarea {
   list-style: none;
 }
 
-.live-activity__item {
+.live-activity__span {
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-control, 6px);
+  border-left-width: 3px;
+  overflow: hidden;
+}
+
+.live-activity__span-head {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: var(--mimir-space-xs, 8px);
-  align-items: baseline;
+  align-items: center;
+  width: 100%;
+  padding: var(--mimir-space-2xs, 4px) var(--mimir-space-xs, 8px);
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
 }
 
-.live-activity__type {
-  padding: 1px 6px;
-  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+.live-activity__span-head:hover {
+  background: var(--mimir-color-panel-background-muted, rgb(0 0 0 / 4%));
+}
+
+/* A live (not-yet-done) span pulses; done spans show a steady dot. */
+.live-activity__span-marker {
+  width: 8px;
+  height: 8px;
   border-radius: 999px;
-  color: var(--mimir-color-text-muted, #58685f);
-  font-family: var(--mimir-font-family-mono, monospace);
-  font-size: var(--mimir-font-size-xs, 0.75rem);
-  font-weight: var(--mimir-font-weight-strong, 700);
-  white-space: nowrap;
+  background: var(--mimir-color-text-muted, #58685f);
 }
 
-.live-activity__type[data-type="tool_result"] {
-  color: #5be8c0;
-  border-color: rgb(47 224 160 / 36%);
+.live-activity__span[data-state="active"] .live-activity__span-marker {
+  background: #7fb6ff;
+  animation: live-activity-pulse 1.1s ease-in-out infinite;
 }
 
-.live-activity__type[data-type="tool_call"] {
-  color: #7fb6ff;
-  border-color: rgb(90 150 255 / 38%);
+.live-activity__span[data-state="error"] .live-activity__span-marker {
+  background: #ff8d8d;
 }
 
-.live-activity__type[data-type="memory"] {
-  color: #c9a3ff;
-  border-color: rgb(160 90 255 / 38%);
+@keyframes live-activity-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
 }
 
-.live-activity__type[data-type="reasoning"] {
-  color: #e7b357;
-  border-color: rgb(224 178 74 / 38%);
+@media (prefers-reduced-motion: reduce) {
+  .live-activity__span[data-state="active"] .live-activity__span-marker {
+    animation: none;
+  }
 }
 
-.live-activity__label {
+.live-activity__span-title {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-family: var(--mimir-font-family-mono, monospace);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  font-weight: var(--mimir-font-weight-strong, 700);
 }
 
-.live-activity__time {
+.live-activity__span[data-type="tool_result"] { border-left-color: rgb(47 224 160 / 60%); }
+.live-activity__span[data-type="tool_result"] .live-activity__span-title { color: #5be8c0; }
+.live-activity__span[data-type="tool_call"] { border-left-color: rgb(90 150 255 / 60%); }
+.live-activity__span[data-type="tool_call"] .live-activity__span-title { color: #7fb6ff; }
+.live-activity__span[data-type="reasoning"] { border-left-color: rgb(224 178 74 / 60%); }
+.live-activity__span[data-type="reasoning"] .live-activity__span-title { color: #e7b357; }
+.live-activity__span[data-type="text"] { border-left-color: rgb(160 90 255 / 60%); }
+.live-activity__span[data-type="text"] .live-activity__span-title { color: #c9a3ff; }
+
+.live-activity__span-time {
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+}
+
+.live-activity__span-body {
+  padding: 0 var(--mimir-space-xs, 8px) var(--mimir-space-2xs, 4px) var(--mimir-space-xs, 8px);
+}
+
+.live-activity__span-detail {
+  max-height: 12em;
+  overflow: auto;
+  margin: 0;
+  font-family: var(--mimir-font-family-mono, monospace);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.live-activity__span-pending {
   color: var(--mimir-color-text-muted, #58685f);
   font-size: var(--mimir-font-size-xs, 0.75rem);
 }

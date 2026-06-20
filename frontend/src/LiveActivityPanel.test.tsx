@@ -1,52 +1,80 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { LiveEventStreamItem } from "./api/live-events";
+import type { TurnSpan } from "./turn-spans";
+import type { TurnSpansValue } from "./turn-spans";
 
-const { live } = vi.hoisted(() => ({
-  live: { value: { status: "open", cursor: "", lastEvent: null as LiveEventStreamItem | null, error: null } }
+const { spans } = vi.hoisted(() => ({
+  spans: { value: { turnId: "t1", spans: [] as TurnSpan[], characterState: "idle", status: "open" } as TurnSpansValue }
 }));
 
-vi.mock("./live-events", () => ({ useLiveEvents: () => live.value }));
+vi.mock("./turn-spans", () => ({ useTurnSpans: () => spans.value }));
 
 import { LiveActivityPanel } from "./LiveActivityPanel";
 
-function setEvent(item: LiveEventStreamItem | null) {
-  live.value = { ...live.value, lastEvent: item };
+function span(partial: Partial<TurnSpan>): TurnSpan {
+  return {
+    key: partial.key ?? `${partial.type}:${partial.toolName ?? "x"}`,
+    type: partial.type ?? "reasoning",
+    toolName: partial.toolName,
+    detail: partial.detail ?? "",
+    status: partial.status,
+    done: partial.done ?? false,
+    seq: partial.seq ?? 1,
+    ts: partial.ts ?? "2026-06-20T03:00:00Z"
+  };
+}
+
+function setSpans(next: TurnSpan[]) {
+  spans.value = { ...spans.value, spans: next };
 }
 
 afterEach(() => {
   cleanup();
-  live.value = { status: "open", cursor: "", lastEvent: null, error: null };
+  spans.value = { turnId: "t1", spans: [], characterState: "idle", status: "open" };
 });
 
-describe("LiveActivityPanel (#572)", () => {
-  it("shows a waiting state with no events", () => {
-    setEvent(null);
+describe("LiveActivityPanel (#583 accordion)", () => {
+  it("shows a waiting state with no spans", () => {
     render(<LiveActivityPanel />);
     expect(screen.getByText("Waiting for agent activity")).toBeTruthy();
     expect(screen.getByText("No recent activity")).toBeTruthy();
   });
 
-  it("renders the current turn status and tool activity from live events", () => {
-    setEvent({
-      id: "e1",
-      cursor: "1",
-      ts: "2026-06-19T03:00:00Z",
-      event: { kind: "turn.lifecycle", turn_id: "turn-9", phase: "started" }
-    });
+  it("renders spans as an accordion with the latest one open and progressive detail", () => {
+    setSpans([
+      span({ key: "reasoning:r1", type: "reasoning", detail: "weighing options", done: true }),
+      span({ key: "tool_call:c1", type: "tool_call", toolName: "send_message", detail: '{"text":"hi', done: false })
+    ]);
     const { rerender } = render(<LiveActivityPanel />);
-    expect(screen.getByText("Working on turn turn-9")).toBeTruthy();
 
-    setEvent({
-      id: "e2",
-      cursor: "2",
-      ts: "2026-06-19T03:00:01Z",
-      event: { kind: "turn.event", turn_id: "turn-9", event: { type: "tool_call", name: "shell_exec" } }
-    });
+    // Latest span (send_message) is open → its forming detail is visible.
+    expect(screen.getByText("send_message")).toBeTruthy();
+    expect(screen.getByText('{"text":"hi')).toBeTruthy();
+    // The active turn reads as "Working".
+    expect(screen.getByText("Working — send_message")).toBeTruthy();
+    // The older reasoning span is collapsed — its body is not rendered.
+    expect(screen.queryByText("weighing options")).toBeNull();
+
+    // The span fills in progressively as more chunk deltas arrive.
+    setSpans([
+      span({ key: "reasoning:r1", type: "reasoning", detail: "weighing options", done: true }),
+      span({ key: "tool_call:c1", type: "tool_call", toolName: "send_message", detail: '{"text":"hi there"}', done: false })
+    ]);
     rerender(<LiveActivityPanel />);
+    expect(screen.getByText('{"text":"hi there"}')).toBeTruthy();
+  });
 
-    expect(screen.getByText("tool_call")).toBeTruthy();
-    expect(screen.getByText("shell_exec")).toBeTruthy();
+  it("lets a collapsed span be re-opened (accordion control)", () => {
+    setSpans([
+      span({ key: "reasoning:r1", type: "reasoning", detail: "weighing options", done: true }),
+      span({ key: "tool_call:c1", type: "tool_call", toolName: "send_message", detail: "reply", done: true })
+    ]);
+    render(<LiveActivityPanel />);
+
+    // Reasoning starts collapsed; clicking its header opens it.
+    expect(screen.queryByText("weighing options")).toBeNull();
+    fireEvent.click(screen.getByText("Reasoning"));
+    expect(screen.getByText("weighing options")).toBeTruthy();
   });
 });

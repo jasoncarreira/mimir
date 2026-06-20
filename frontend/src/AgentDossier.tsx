@@ -1,13 +1,9 @@
 import React from "react";
-import {
-  AgentCharacter,
-  isChatLiveEvent,
-  useTurnEventState,
-  withComposerListening
-} from "./agent-character";
+import { AgentCharacter, isChatLiveEvent, withComposerListening } from "./agent-character";
 import { useBootstrap } from "./api/bootstrap";
 import { useLiveEvents } from "./live-events";
 import type { AgentCharacterState } from "./skins/types";
+import { useTurnSpans } from "./turn-spans";
 import { Panel } from "./ui";
 import { useUiState } from "./uiState";
 
@@ -32,12 +28,14 @@ export function AgentDossier() {
   const model = bootstrap?.model || "";
 
   // Character state: the LIVE turn-event bus (chainlink #583) drives it DURING
-  // the turn. That stream is ephemeral/no-backfill, so a dropped connection or
+  // the turn — derived from the latest span so a streaming send_message reply
+  // (whose chunk events carry no tool name of their own) still reads as
+  // "talking". That stream is ephemeral/no-backfill, so a dropped connection or
   // a missed terminal `turn end` could otherwise strand the character mid-turn
   // (mimir review on #800). The durable live-events `turn.lifecycle`
   // finished/failed — which always lands ~1s after turn end via the cursor-based
   // stream — resets it, so missed bus events self-heal via durable history.
-  const { state: busState } = useTurnEventState();
+  const { characterState: busState } = useTurnSpans();
   const [charState, setCharState] = React.useState<AgentCharacterState>("idle");
   React.useEffect(() => {
     setCharState(busState);

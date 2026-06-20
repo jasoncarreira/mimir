@@ -15,11 +15,13 @@ vi.mock("./api/bootstrap", () => ({
 }));
 vi.mock("./agent-character", () => ({
   AgentCharacter: () => null,
-  // Character state comes from the live turn-event bus (chainlink #583); the
-  // durable live-events lifecycle still resets it (self-healing, #800 review).
-  useTurnEventState: () => ({ state: turn.state, status: "open" }),
   isChatLiveEvent: () => true,
   withComposerListening: (state: string) => state
+}));
+// Character state comes from the live turn-event span model (chainlink #583); the
+// durable live-events lifecycle still resets it (self-healing, #800 review).
+vi.mock("./turn-spans", () => ({
+  useTurnSpans: () => ({ characterState: turn.state, spans: [], turnId: null, status: "open" })
 }));
 vi.mock("./uiState", () => ({
   useUiState: (selector: (s: { composerActive: boolean }) => unknown) => selector({ composerActive: false })

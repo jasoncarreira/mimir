@@ -9,6 +9,7 @@ import { useChatStore, type ChatMessageStatus } from "./chatStore";
 import type { DashboardSurface } from "./dashboardExtensions";
 import { LiveActivityPanel } from "./LiveActivityPanel";
 import { useRouteState } from "./routeState";
+import { TurnSpansProvider } from "./turn-spans";
 import { Badge, Button, ErrorState } from "./ui";
 import { useUiState } from "./uiState";
 
@@ -319,10 +320,12 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
           </form>
         </div>
       </section>
-      <aside aria-label="Agent" className="content-layout__details chat-rail">
-        <AgentDossier />
-        <LiveActivityPanel />
-      </aside>
+      <TurnSpansProvider channel={channelId}>
+        <aside aria-label="Agent" className="content-layout__details chat-rail">
+          <AgentDossier />
+          <LiveActivityPanel />
+        </aside>
+      </TurnSpansProvider>
     </div>
   );
 }
