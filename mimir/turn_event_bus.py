@@ -132,7 +132,12 @@ class TurnEventEmitter:
         self._channel_id = channel_id or ""
         self._seq = 0
         self._block_n = 0
-        self._emitted = 0  # extract_turn_events items already bracketed
+        # chainlink #587: parse only NEW messages per snapshot (incremental)
+        # instead of re-walking the full list each time (was O(N²) on the loop
+        # per turn). ``_tool_names`` carries tool_call id → name across snapshots
+        # so a tool_result parsed in a later snapshot than its call keeps its name.
+        self._parsed_count = 0  # messages already turned into events
+        self._tool_names: dict[str, str] = {}
         # chainlink #583 slice 2: dedup between token-streamed spans (token_chunk)
         # and value-snapshot blocks (blocks_from_messages), keyed by tool id.
         self._streamed_tool_ids: set[str] = set()  # started live via token_chunk
@@ -225,19 +230,27 @@ class TurnEventEmitter:
         """
         if self._bus is None:
             return
+        # Parse only the messages appended since the last snapshot. In
+        # stream_mode="values" each snapshot is the full accumulated list and
+        # messages are append-only + complete once present, so parsing the new
+        # tail yields exactly the new blocks — without re-walking the whole list
+        # (and re-deriving already-emitted events) on every snapshot.
+        new = messages[self._parsed_count:]
+        self._parsed_count = len(messages)
+        if not new:
+            return
         try:
             from .turn_logger import extract_turn_events
 
-            events, _ = extract_turn_events(messages)
+            events, _ = extract_turn_events(new)
         except Exception:  # noqa: BLE001 — parsing must never break the turn
             log.debug("turn-event block parse failed", exc_info=True)
             return
-        for item in events[self._emitted:]:
+        for item in events:
             try:
                 self._bracket(item)
             except Exception:  # noqa: BLE001
                 log.debug("turn-event bracket failed", exc_info=True)
-        self._emitted = len(events)
 
     def _bracket(self, item: dict[str, Any]) -> None:
         kind = item.get("type")
@@ -254,6 +267,7 @@ class TurnEventEmitter:
             span_id = item.get("id") or f"{self._turn_id}:b{self._block_n}"
             name = item.get("name") or "unknown"
             args = item.get("args")
+            self._tool_names[span_id] = name  # for the later tool_result span
             if span_id in self._streamed_tool_ids:
                 # token_chunk already streamed start + arg deltas live; just
                 # close the span with the authoritative full args (slice 2).
@@ -268,7 +282,7 @@ class TurnEventEmitter:
             self._block_n += 1
             # Reuse the tool_call id so consumers join call → result by (type,id).
             span_id = item.get("id") or f"{self._turn_id}:b{self._block_n}"
-            name = item.get("name") or ""
+            name = item.get("name") or self._tool_names.get(span_id, "")
             content = item.get("content") or ""
             status = "error" if item.get("is_error") else "ok"
             self._emit("tool_result", "start", id=span_id, tool_name=name)

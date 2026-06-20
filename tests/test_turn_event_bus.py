@@ -226,3 +226,24 @@ def test_token_chunk_sequential_calls_reusing_index_dont_leak():
     assert len(starts) == 1 and starts[0]["id"] == "call_b"  # NOT call_a
     chunks = [e for e in events if e["type"] == "tool_call" and e["phase"] == "chunk"]
     assert chunks and all(c["id"] == "call_b" for c in chunks)
+
+
+def test_tool_result_keeps_name_when_parsed_in_a_later_snapshot():
+    """chainlink #587: with incremental parsing the ToolMessage is parsed in a
+    later snapshot than its tool_call, so the tool_result name must come from the
+    cross-snapshot tool-name map rather than the (name-less) standalone parse."""
+    bus = TurnEventBus()
+    q = bus.subscribe("web-default")
+    em = TurnEventEmitter(bus, turn_id="t1", channel_id="web-default")
+
+    call = AIMessage(content="", tool_calls=[{"id": "c1", "name": "saga_query", "args": {"q": "x"}}])
+    em.blocks_from_messages([call])  # snapshot 1: the call
+    _drain(q)
+    em.blocks_from_messages([call, ToolMessage(content="ok", tool_call_id="c1")])  # snapshot 2: + result
+
+    events = _drain(q)
+    # tool_name rides the tool_result START (existing contract); it must be the
+    # name carried from snapshot 1's tool_call, not "" from the standalone parse.
+    tr_start = next(e for e in events if e["type"] == "tool_result" and e["phase"] == "start")
+    assert tr_start["id"] == "c1"
+    assert tr_start["tool_name"] == "saga_query"
