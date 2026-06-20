@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { neonTerminalSkin } from "./neon-terminal";
-import { loadSkin } from "./SkinProvider";
+import { loadSkin, skinTokensToCssVariables } from "./SkinProvider";
 
 const STATES = ["idle", "thinking", "typing", "tool", "error", "bored", "listening"] as const;
 
@@ -18,6 +18,13 @@ describe("neon-terminal skin", () => {
       expect(asset?.type).toBe("dotlottie");
       expect(asset?.href, `null href for ${state}`).toBeTruthy();
     }
+  });
+
+  it("exposes timeline event color tokens as CSS variables", () => {
+    const variables = skinTokensToCssVariables(neonTerminalSkin);
+    expect(variables["--mimir-color-timeline-reasoning"]).toBe(neonTerminalSkin.tokens.colorTimelineReasoning);
+    expect(variables["--mimir-color-timeline-tool-call"]).toBe(neonTerminalSkin.tokens.colorTimelineToolCall);
+    expect(variables["--mimir-color-timeline-tool-result"]).toBe(neonTerminalSkin.tokens.colorTimelineToolResult);
   });
 
   it("is the active default skin", () => {

@@ -25,11 +25,6 @@ export type SafeTurn = Omit<TurnRecord, "events" | "saga_calls" | "injected_inpu
   metadata: Record<string, unknown>;
 };
 
-export type TimelineEntry =
-  | { kind: "event"; t_ms: number | null; item: TurnEvent; index: number }
-  | { kind: "saga"; t_ms: number | null; item: SagaCall; index: number }
-  | { kind: "injected"; t_ms: number | null; item: InjectedInput; index: number };
-
 const knownTopLevel = new Set([
   "turn_id",
   "ts",
@@ -165,22 +160,6 @@ export function eventTone(event: TurnEvent): "reasoning" | "tool" | "success" | 
   return "neutral";
 }
 
-export function buildTimeline(turn: SafeTurn): TimelineEntry[] {
-  const allTimed = [...turn.events, ...turn.saga_calls, ...turn.injected_inputs]
-    .filter((item) => "t_ms" in item)
-    .every((item) => typeof item.t_ms === "number");
-  if (!allTimed) {
-    return [
-      ...turn.events.map((item, index) => ({ kind: "event" as const, t_ms: nullableNumberFrom(item.t_ms), item, index })),
-      ...turn.injected_inputs.map((item, index) => ({ kind: "injected" as const, t_ms: item.t_ms ?? null, item, index }))
-    ];
-  }
-  return [
-    ...turn.events.map((item, index) => ({ kind: "event" as const, t_ms: nullableNumberFrom(item.t_ms), item, index })),
-    ...turn.saga_calls.map((item, index) => ({ kind: "saga" as const, t_ms: nullableNumberFrom(item.t_ms), item, index })),
-    ...turn.injected_inputs.map((item, index) => ({ kind: "injected" as const, t_ms: item.t_ms ?? null, item, index }))
-  ].sort((a, b) => (a.t_ms ?? 0) - (b.t_ms ?? 0));
-}
 
 export function stringify(value: unknown): string {
   if (typeof value === "string") return value;

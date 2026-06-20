@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { turnsFixture } from "../fixtures/api";
 import {
-  buildTimeline,
   eventLabel,
   filterTurns,
   formatDuration,
@@ -10,14 +9,12 @@ import {
 } from "./turnsViewModel";
 
 describe("turns view-model", () => {
-  it("normalizes representative turns and builds an interleaved timeline", () => {
+  it("normalizes representative turns", () => {
     const [turn] = safeTurns(turnsFixture.turns);
-    const timeline = buildTimeline(turn);
 
     expect(turn.events).toHaveLength(3);
     expect(turn.saga_calls).toHaveLength(1);
     expect(turn.injected_inputs).toEqual([{ t_ms: 900, text: "Also include recent ops." }]);
-    expect(timeline.map((entry) => entry.kind)).toEqual(["event", "event", "event", "saga", "injected"]);
     expect(eventLabel(turn.events[1])).toBe("state_read");
     expect(formatDuration(turn.duration_ms)).toBe("1.8s");
   });
