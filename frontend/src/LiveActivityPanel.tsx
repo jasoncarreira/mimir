@@ -1,43 +1,37 @@
 import React from "react";
-import { isChatLiveEvent } from "./agent-character";
-import type { TurnEventBase } from "./api/generated/contracts";
-import { useLiveEvents } from "./live-events";
+import { useTurnSpans, type TurnSpan } from "./turn-spans";
 import { Badge, EmptyState, Panel } from "./ui";
 
-// github #572: the chat's right panel used to duplicate message history (already
-// shown in the main timeline). It now shows live process visibility instead —
-// the current turn's status and a feed of recent agent activity (tool calls,
-// reasoning, lifecycle), sourced from the turn.event / turn.lifecycle live
-// stream. Note: useLiveEvents exposes only the latest event, so the feed is a
-// best-effort rolling buffer of events observed while mounted, not a complete
-// transcript (that lives in the Turns viewer).
+// github #572 / chainlink #583: the chat's right panel shows live process
+// visibility — the current turn's spans (reasoning, tool calls, results) as a
+// progressive accordion sourced from the live turn-event bus. Each span fills in
+// as its chunk deltas arrive; the latest span is open by default and the others
+// collapse (re-openable). Spans persist after the turn ends until the next turn
+// starts, so the last turn's trace stays inspectable while idle.
 
-const MAX_ITEMS = 25;
-
-interface ActivityItem {
-  id: string;
-  turnId: string;
-  type: string;
-  label: string;
-  ts: string;
+function spanTitle(span: TurnSpan): string {
+  switch (span.type) {
+    case "reasoning":
+      return "Reasoning";
+    case "text":
+      return "Response";
+    case "tool_call":
+      return span.toolName || "Tool call";
+    case "tool_result":
+      return span.toolName ? `${span.toolName} result` : "Tool result";
+    default:
+      return span.type;
+  }
 }
 
-function asString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value : undefined;
+// Reuse the existing type-pill color scheme (tool_call/tool_result/reasoning).
+function spanTypeAttr(span: TurnSpan): string {
+  return span.type;
 }
 
-function truncate(value: string, max = 90): string {
-  return value.length > max ? `${value.slice(0, max)}…` : value;
-}
-
-// Pull a human label out of a turn event's open-ended payload (tool name,
-// reasoning/message snippet, role); fall back to nothing and let the type carry.
-function describeTurnEvent(event: TurnEventBase): { type: string; label: string } {
-  const type = asString(event.type) ?? "event";
-  const name = asString(event.name) ?? asString(event.tool) ?? asString(event.tool_name);
-  const content = asString(event.content) ?? asString(event.text) ?? asString(event.summary);
-  const label = name ?? (content ? truncate(content) : asString(event.role) ?? "");
-  return { type, label };
+function spanStateAttr(span: TurnSpan): "active" | "done" | "error" {
+  if (!span.done) return "active";
+  return span.status === "error" ? "error" : "done";
 }
 
 function clockTime(ts: string): string {
@@ -52,50 +46,29 @@ function clockTime(ts: string): string {
 }
 
 export function LiveActivityPanel() {
-  const { status, lastEvent } = useLiveEvents();
-  const [items, setItems] = React.useState<ActivityItem[]>([]);
-  const [turn, setTurn] = React.useState<{ id: string; phase: "started" | "finished" | "failed" } | null>(null);
-  const seenId = React.useRef<string>("");
+  const { spans, status } = useTurnSpans();
+  const [openKey, setOpenKey] = React.useState<string | null>(null);
 
+  // Auto-follow: whenever a new span arrives it becomes the open one (the others
+  // collapse). A manual click (below) stays put until the next span arrives.
+  const latestKey = spans.length ? spans[spans.length - 1].key : null;
   React.useEffect(() => {
-    if (!lastEvent || lastEvent.id === seenId.current) return;
-    seenId.current = lastEvent.id;
-    const event = lastEvent.event;
-    const ts = lastEvent.ts ?? "";
-    // Field Log is scoped to web-chat turns — skip background poller/heartbeat
-    // turns (live turn events carry the turn's channel_id).
-    if (!isChatLiveEvent(event)) return;
-    if (event.kind === "turn.lifecycle") {
-      setTurn({ id: event.turn_id, phase: event.phase });
-      setItems((current) => [
-        { id: lastEvent.id, turnId: event.turn_id, type: `turn ${event.phase}`, label: event.error ?? "", ts },
-        ...current
-      ].slice(0, MAX_ITEMS));
-    } else if (event.kind === "turn.event") {
-      const { type, label } = describeTurnEvent(event.event);
-      setItems((current) => [
-        { id: lastEvent.id, turnId: event.turn_id, type, label, ts },
-        ...current
-      ].slice(0, MAX_ITEMS));
-    }
-    // chat.message / chat.reaction live in the conversation timeline — skip here.
-  }, [lastEvent]);
+    if (latestKey) setOpenKey(latestKey);
+  }, [latestKey]);
 
-  const statusTone = status === "open"
-    ? "success"
-    : status === "error"
-      ? "danger"
-      : status === "closed"
-        ? "neutral"
-        : "info";
+  const toggle = (key: string) => setOpenKey((current) => (current === key ? null : key));
 
-  const subtitle = turn?.phase === "started"
-    ? `Working on turn ${turn.id}`
-    : turn?.phase === "failed"
-      ? `Last turn failed (${turn.id})`
-      : turn
-        ? "Idle — last turn finished"
-        : "Waiting for agent activity";
+  const statusTone = status === "open" ? "success" : status === "error" ? "danger" : "info";
+
+  const latest = spans.length ? spans[spans.length - 1] : null;
+  const subtitle = latest && !latest.done
+    ? `Working — ${spanTitle(latest)}`
+    : spans.length
+      ? "Idle — last turn finished"
+      : "Waiting for agent activity";
+
+  // Newest-first so the active span stays at the top, in view without scrolling.
+  const ordered = spans.slice().reverse();
 
   return (
     <Panel
@@ -105,21 +78,42 @@ export function LiveActivityPanel() {
       subtitle={subtitle}
       title="Field Log"
     >
-      {items.length ? (
-        <ol className="live-activity__feed" aria-label="Recent agent activity">
-          {items.map((item) => (
-            <li className="live-activity__item" key={item.id}>
-              <span
-                className="live-activity__type"
-                data-type={item.type.replace(/[^a-z0-9]+/gi, "_").toLowerCase()}
+      {ordered.length ? (
+        <ul className="live-activity__accordion" aria-label="Recent agent activity">
+          {ordered.map((span) => {
+            const open = openKey === span.key;
+            return (
+              <li
+                className="live-activity__span"
+                data-state={spanStateAttr(span)}
+                data-type={spanTypeAttr(span)}
+                key={span.key}
               >
-                {item.type}
-              </span>
-              {item.label ? <span className="live-activity__label">{item.label}</span> : null}
-              <time className="live-activity__time">{clockTime(item.ts)}</time>
-            </li>
-          ))}
-        </ol>
+                <button
+                  aria-expanded={open}
+                  className="live-activity__span-head"
+                  onClick={() => toggle(span.key)}
+                  type="button"
+                >
+                  <span aria-hidden className="live-activity__span-marker" />
+                  <span className="live-activity__span-title">{spanTitle(span)}</span>
+                  <time className="live-activity__span-time">{clockTime(span.ts)}</time>
+                </button>
+                {open ? (
+                  <div className="live-activity__span-body">
+                    {span.detail ? (
+                      <pre className="live-activity__span-detail">{span.detail}</pre>
+                    ) : (
+                      <span className="live-activity__span-pending">
+                        {span.done ? "(no output)" : "…"}
+                      </span>
+                    )}
+                  </div>
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
       ) : (
         <EmptyState title="No recent activity" />
       )}

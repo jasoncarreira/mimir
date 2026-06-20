@@ -54,10 +54,11 @@ vi.mock("./live-events", () => ({
 }));
 
 // The dossier renders the dotLottie character; stub the agent-character module so
-// the test doesn't need a real canvas/WASM.
+// the test doesn't need a real canvas/WASM. The real TurnSpansProvider (rendered
+// by ChatRoute) drives the dossier/field log via the mocked turn-event stream.
 vi.mock("./agent-character", () => ({
   AgentCharacter: () => null,
-  useTurnEventState: () => ({ state: "idle", status: "open" }),
+  isChatLiveEvent: () => true,
   withComposerListening: (state: string) => state
 }));
 
