@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from mimir.bridges.web_chat import DEFAULT_CHANNEL, WebChatBridge
+from mimir.bridges.web_chat import DEFAULT_CHANNEL, WebChatBridge, _Subscriber
 from mimir.models import AgentEvent
 from mimir.server import _make_auth_middleware
 from mimir.web_contracts import validate_api_envelope, validate_live_event
@@ -216,7 +217,7 @@ async def test_disconnect_drains_subscribers(tmp_path: Path):
     bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
     # Subscribe by hand to test the close path without an HTTP client.
     q: asyncio.Queue = asyncio.Queue(maxsize=4)
-    bridge._subscribers.append(q)
+    bridge._subscribers.append(_Subscriber(q))
     await bridge.disconnect()
     assert q.get_nowait() is None  # sentinel pushed
 
@@ -287,9 +288,7 @@ def test_web_channel_for_uses_canonical_verbatim():
 @pytest.mark.asyncio
 async def test_authenticated_default_channel_routes_per_user(tmp_path):
     """An authenticated user's default-channel post routes to web-<canonical>;
-    an explicit channel is respected as-is."""
-    from types import SimpleNamespace
-
+    an explicit self-channel is accepted."""
     enqueued: list[AgentEvent] = []
 
     async def fake_enqueue(event: AgentEvent) -> bool:
@@ -307,20 +306,19 @@ async def test_authenticated_default_channel_routes_per_user(tmp_path):
     async with TestClient(TestServer(a)) as client:
         r1 = await client.post("/api/v1/chat", json={"content": "hi"})  # default → per-user
         b1 = await r1.json()
-        r2 = await client.post("/api/v1/chat", json={"content": "yo", "channel_id": "web-room"})
+        r2 = await client.post("/api/v1/chat", json={"content": "yo", "channel_id": "web-alice"})
         b2 = await r2.json()
 
     assert b1["data"]["channel_id"] == "web-alice"
     assert enqueued[0].channel_id == "web-alice" and enqueued[0].author == "Alice"
-    assert b2["data"]["channel_id"] == "web-room"  # explicit channel untouched
-    assert enqueued[1].channel_id == "web-room"
+    assert b2["data"]["channel_id"] == "web-alice"
+    assert enqueued[1].channel_id == "web-alice"
 
 
 @pytest.mark.asyncio
 async def test_history_authenticated_resolves_to_per_user_channel(tmp_path):
     """GET /api/v1/chat/history with no channel resolves to the authed user's
     channel and returns only their conversation, not another user's."""
-    from types import SimpleNamespace
     import mimir.history as history_mod
     from mimir.history import MessageBuffer, set_global_buffer
 
@@ -353,3 +351,95 @@ async def test_history_authenticated_resolves_to_per_user_channel(tmp_path):
 
     assert body["data"]["channel_id"] == "web-alice"
     assert [m["text"] for m in body["data"]["messages"]] == ["alice question", "alice answer"]
+
+
+@pytest.mark.asyncio
+async def test_authenticated_user_cannot_post_to_other_web_channel(tmp_path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/api/v1/chat", json={"content": "yo", "channel_id": "web-bob"})
+        body = await resp.json()
+
+    assert resp.status == 403
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "forbidden_channel"
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_authenticated_user_cannot_read_other_web_channel_history(tmp_path):
+    import mimir.history as history_mod
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        return True
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    (tmp_path / "hist").mkdir()
+    buf = MessageBuffer(history_path=tmp_path / "hist" / "chat_history.jsonl")
+    await buf.append(buf.make_message(channel_id="web-bob", kind="user_message", content="bob question", author="Bob"))
+
+    prev = history_mod.get_global_buffer()
+    set_global_buffer(buf)
+    try:
+        async with TestClient(TestServer(a)) as client:
+            resp = await client.get("/api/v1/chat/history?channel_id=web-bob")
+            body = await resp.json()
+    finally:
+        history_mod._global_buffer = prev
+
+    assert resp.status == 403
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "forbidden_channel"
+
+
+@pytest.mark.asyncio
+async def test_authenticated_stream_only_receives_own_web_channel(tmp_path):
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/chat/stream")
+        assert resp.status == 200
+        await asyncio.sleep(0.05)
+
+        await bridge.send("web-bob", "bob secret")
+        await bridge.send("web-alice", "alice visible")
+        chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+        while chunk and not chunk.startswith(b"data:"):
+            chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+        payload = json.loads(chunk[len(b"data: "):].strip())
+
+    assert payload["channel_id"] == "web-alice"
+    assert payload["text"] == "alice visible"

@@ -15,11 +15,10 @@ vi.mock("./api/bootstrap", () => ({
 }));
 vi.mock("./agent-character", () => ({
   AgentCharacter: () => null,
-  isChatLiveEvent: () => true,
   withComposerListening: (state: string) => state
 }));
 // Character state comes from the live turn-event span model (chainlink #583); the
-// durable live-events lifecycle still resets it (self-healing, #800 review).
+// provider owns its decay (active → idle → bored), tested in TurnSpansProvider.
 vi.mock("./turn-spans", () => ({
   useTurnSpans: () => ({ characterState: turn.state, spans: [], turnId: null, status: "open" })
 }));
@@ -62,23 +61,12 @@ describe("AgentDossier turn count", () => {
     view.rerender(<AgentDossier />);
     expect(turns()).toBe("101");
   });
-});
 
-describe("AgentDossier self-heals a stranded character (#800 review)", () => {
-  it("resets the character on a durable finished lifecycle even if the bus is stuck", () => {
+  it("renders the character state from the span model", () => {
     const stateText = () =>
       screen.getByText("State").closest("div")?.querySelector("dd")?.textContent;
-
-    // The ephemeral bus left the character mid-turn (e.g. tool) and then its
-    // terminal `turn end` was dropped — without the durable fallback this would
-    // stay "Tool" until the next web turn.
     turn.state = "tool";
-    const view = render(<AgentDossier />);
+    render(<AgentDossier />);
     expect(stateText()).toBe("Tool");
-
-    // The durable live-events finished lifecycle resets it to idle.
-    live.lastEvent = lifecycle("t-done", 50);
-    view.rerender(<AgentDossier />);
-    expect(stateText()).toBe("Idle");
   });
 });
