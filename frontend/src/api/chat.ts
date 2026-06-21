@@ -61,6 +61,8 @@ export interface ChatStreamOptions {
   baseUrl?: string;
   apiKey?: string;
   fetchImpl?: typeof fetch;
+  reconnectDelayMs?: number;
+  onOpen?: () => void;
   onError?: (error: unknown) => void;
 }
 
@@ -111,40 +113,50 @@ export function createChatStream(
   onPayload: (payload: ChatStreamPayload) => void,
   options: ChatStreamOptions = {}
 ): ChatStreamHandle {
-  const { baseUrl = "", apiKey, fetchImpl = fetch, onError } = options;
+  const {
+    baseUrl = "",
+    apiKey,
+    fetchImpl = fetch,
+    reconnectDelayMs = 1000,
+    onOpen,
+    onError
+  } = options;
   const controller = new AbortController();
-  const headers = new Headers({ Accept: "text/event-stream" });
-  const key = apiKey ?? getStoredApiKey();
-  if (key) headers.set("X-API-Key", key);
 
   void (async () => {
-    try {
-      const response = await fetchImpl(`${baseUrl}/chat/stream`, {
-        headers,
-        signal: controller.signal
-      });
-      if (!response.ok || !response.body) {
-        onError?.(response);
-        return;
+    while (!controller.signal.aborted) {
+      const headers = new Headers({ Accept: "text/event-stream" });
+      const key = apiKey ?? getStoredApiKey();
+      if (key) headers.set("X-API-Key", key);
+      try {
+        const response = await fetchImpl(`${baseUrl}/chat/stream`, {
+          headers,
+          signal: controller.signal
+        });
+        if (!response.ok || !response.body) throw response;
+        onOpen?.();
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (!controller.signal.aborted) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buffer += decoder.decode(chunk.value, { stream: true });
+          const parts = buffer.split(/\r?\n\r?\n/);
+          buffer = parts.pop() ?? "";
+          for (const part of parts) dispatchSseBlock(part, onPayload);
+        }
+
+        buffer += decoder.decode();
+        if (buffer && !controller.signal.aborted) dispatchSseBlock(buffer, onPayload);
+      } catch (error) {
+        if (!controller.signal.aborted) onError?.(error);
       }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        buffer += decoder.decode(chunk.value, { stream: true });
-        const parts = buffer.split(/\r?\n\r?\n/);
-        buffer = parts.pop() ?? "";
-        for (const part of parts) dispatchSseBlock(part, onPayload);
+      if (!controller.signal.aborted) {
+        await new Promise((resolve) => setTimeout(resolve, reconnectDelayMs));
       }
-
-      buffer += decoder.decode();
-      if (buffer) dispatchSseBlock(buffer, onPayload);
-    } catch (error) {
-      if (!controller.signal.aborted) onError?.(error);
     }
   })();
 

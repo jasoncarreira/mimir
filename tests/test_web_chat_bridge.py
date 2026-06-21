@@ -157,6 +157,25 @@ async def test_send_fans_out_to_subscribers(bridge_app):
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_rejects_when_subscriber_cap_reached(bridge_app, monkeypatch):
+    from mimir.bridges import web_chat
+
+    monkeypatch.setattr(web_chat, "CHAT_STREAM_MAX_SUBSCRIBERS", 1)
+    bridge, a, _ = bridge_app
+
+    async with TestClient(TestServer(a)) as client:
+        resp1 = await client.get("/chat/stream")
+        assert resp1.status == 200
+        await asyncio.sleep(0.05)
+        assert len(bridge._subscribers) == 1
+
+        resp2 = await client.get("/chat/stream")
+        assert resp2.status == 429
+        assert await resp2.text() == "too many chat streams"
+        assert len(bridge._subscribers) == 1
+
+
+@pytest.mark.asyncio
 async def test_stream_auth_uses_header_not_query_param(authed_bridge_app):
     bridge, a, _ = authed_bridge_app
     async with TestClient(TestServer(a)) as client:

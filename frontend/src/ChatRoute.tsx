@@ -106,9 +106,13 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
         streamRawRef.current = null;
       },
       {
+        onOpen() {
+          setStreamState("open");
+          setStreamError("");
+        },
         onError(error) {
           setStreamState("error");
-          setStreamError(error instanceof Error ? error.message : "Chat stream unavailable");
+          setStreamError(error instanceof Error ? error.message : "Chat stream unavailable; reconnecting…");
         }
       }
     );
