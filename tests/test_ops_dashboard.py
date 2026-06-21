@@ -22,6 +22,7 @@ from aiohttp import web
 
 from mimir.ops_dashboard import (
     build_dashboard_payload,
+    build_dashboard_payload_async,
     compute_stats,
     parse_days_param,
     render_dashboard_html,
@@ -95,6 +96,37 @@ def test_build_dashboard_payload_skips_malformed_lines(tmp_path: Path):
     assert payload["summary"]["total_events"] == 2
     assert payload["summary"]["events_queued"] == 1
     assert payload["summary"]["messages_sent"] == 1
+
+
+
+@pytest.mark.asyncio
+async def test_build_dashboard_payload_async_offloads_sync_payload_build(monkeypatch, tmp_path: Path):
+    """The aiohttp /api/ops route must not parse the firehose on the loop."""
+    log = tmp_path / "events.jsonl"
+    _write_events(log, [
+        {
+            "timestamp": _ts(0.1),
+            "type": "event_queued",
+            "trigger": "user_message",
+            "channel_id": "c1",
+        },
+    ])
+    calls: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+    async def fake_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("mimir.ops_dashboard.asyncio.to_thread", fake_to_thread)
+
+    payload = await build_dashboard_payload_async(log, days=1, active_provider="openai")
+
+    assert payload["summary"]["events_queued"] == 1
+    assert calls
+    func, args, kwargs = calls[0]
+    assert func is build_dashboard_payload
+    assert args == (log, 1)
+    assert kwargs == {"active_provider": "openai"}
 
 
 def test_build_dashboard_payload_includes_agent_feedback_signals(tmp_path: Path):
