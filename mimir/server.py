@@ -338,13 +338,28 @@ def _is_auth_exempt(method: str, path: str) -> bool:
 # admin (#543), scheduler/poller/commitments admin (#544), and the user/key
 # management endpoints all live under ``/api/v1/admin/``. This is the SECURITY
 # gate; React section-hiding is UX only and must never be the sole control.
+#
+# SAGA and file-backed memory/state dashboards expose global cross-channel
+# history and raw markdown content. Until they have object-level ACL filtering,
+# treat the JSON APIs as admin surfaces too (chainlink #592).
 _ADMIN_REQUIRED_PREFIXES: tuple[str, ...] = (
     "/api/v1/admin/",
+    "/api/v1/saga",
+    "/api/v1/memory",
 )
 
 
+def _matches_admin_required_prefix(path: str, prefix: str) -> bool:
+    if prefix.endswith("/"):
+        return path == prefix[:-1] or path.startswith(prefix)
+    return path == prefix or path.startswith(prefix + "/")
+
+
 def _is_admin_required(path: str) -> bool:
-    return any(path.startswith(prefix) for prefix in _ADMIN_REQUIRED_PREFIXES)
+    return any(
+        _matches_admin_required_prefix(path, prefix)
+        for prefix in _ADMIN_REQUIRED_PREFIXES
+    )
 
 
 def _make_auth_middleware(expected_key: str):
