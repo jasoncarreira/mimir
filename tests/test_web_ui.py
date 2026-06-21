@@ -1122,6 +1122,8 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
         "https://user:raw-git-token@example.invalid/repo.git",
     )
     config = Config.from_env()
+    config.resend_nudge_channels = ("channel-with-secret-shaped-value",)
+    config.file_op_extra_roots = [tmp_path / "private-extra-root"]
 
     (tmp_path / "scheduler.yaml").write_text(
         "- name: heartbeat\n"
@@ -1174,12 +1176,16 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
     assert "sk-ant-admin-config-secret" not in serialized
     assert "nested-admin-config-secret" not in serialized
     assert "raw-git-token" not in serialized
+    assert "channel-with-secret-shaped-value" not in serialized
+    assert "private-extra-root" not in serialized
     assert data["raw_config"]["anthropic_api_key"] == "[REDACTED]"
     assert data["raw_config"]["mcp_servers"][0]["env"]["API_KEY"] == "[REDACTED]"
     assert (
         data["raw_config"]["git_state_repo"]
         == "https://[REDACTED]@example.invalid/repo.git"
     )
+    assert "resend_nudge_channels" not in data["raw_config"]
+    assert "file_op_extra_roots" not in data["raw_config"]
 
 
 @pytest.mark.asyncio
