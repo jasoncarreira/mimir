@@ -35,6 +35,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from ..models import AgentEvent
+from ..web_channels import DEFAULT_WEB_CHANNEL, web_channel_for_identity
 from ..web_contracts import (
     json_error,
     json_success,
@@ -47,7 +48,7 @@ log = logging.getLogger(__name__)
 
 EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
 
-DEFAULT_CHANNEL = "web-default"
+DEFAULT_CHANNEL = DEFAULT_WEB_CHANNEL
 
 
 @dataclass
@@ -69,15 +70,16 @@ def _web_channel_for(canonical: str) -> str:
     Authenticated users' default-channel traffic routes to ``web-<canonical>``
     so a user's conversation — their messages plus the agent's replies (which go
     to the turn's channel) — segregates per user and history is scoped
-    naturally. The canonical is the unique per-user matching key, so it's used
-    VERBATIM: slugifying it (lower-casing / collapsing punctuation) could map two
-    distinct canonicals onto one channel and leak history across users. Channel
-    ids are arbitrary strings here (cf. ``slack-U…`` / ``discord-…``); downstream
-    path derivation sanitizes them where needed (e.g. saga session ids). Falls
-    back to the shared default only when the canonical is empty.
+    naturally. The canonical is the unique per-user matching key, so normal
+    canonicals are used VERBATIM: slugifying them (lower-casing / collapsing
+    punctuation) could map two distinct canonicals onto one channel and leak
+    history across users. Reserved channel collisions are escaped by the shared
+    web-channel helper. Channel ids are arbitrary strings here (cf. ``slack-U…``
+    / ``discord-…``); downstream path derivation sanitizes them where needed
+    (e.g. saga session ids). Falls back to the shared default only when the
+    canonical is empty.
     """
-    canonical = (canonical or "").strip()
-    return f"web-{canonical}" if canonical else DEFAULT_CHANNEL
+    return web_channel_for_identity(canonical)
 SSE_HEARTBEAT_S = 15.0
 
 

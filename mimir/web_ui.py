@@ -66,6 +66,7 @@ from .scheduler_dashboard import (
     build_scheduler_dashboard_payload,
     parse_due_window,
 )
+from .web_channels import DEFAULT_WEB_CHANNEL, web_channel_for_identity
 from .file_memory_dashboard import (
     list_channel_dirs,
     list_trees,
@@ -279,8 +280,7 @@ def _whoami_payload(identity: Any, is_master: bool) -> dict[str, Any]:
 
 
 def _web_channel_for(canonical: str) -> str:
-    canonical = (canonical or "").strip()
-    return f"web-{canonical}" if canonical else "web-default"
+    return web_channel_for_identity(canonical)
 
 
 def _normalize_web_channel(raw: str, *, default_web: bool = True) -> str:
@@ -325,7 +325,7 @@ def _scoped_channel_from_query(
     if raw is None or not raw.strip():
         return allowed, None
     channel = _normalize_web_channel(raw)
-    if channel == "web-default":
+    if channel == DEFAULT_WEB_CHANNEL:
         return allowed, None
     if channel == allowed:
         return allowed, None
