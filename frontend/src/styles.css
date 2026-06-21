@@ -1458,18 +1458,22 @@ textarea {
    spans (reasoning, tool calls, results), each filling in progressively, latest
    open by default and the rest collapsed (re-openable). */
 .live-activity__accordion {
-  display: grid;
+  display: flex;
   flex: 1 1 auto;
-  align-content: start;
+  flex-direction: column;
   gap: var(--mimir-space-xs, 8px);
   min-height: 0;
-  overflow: auto;
+  overflow-y: auto;
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
 .live-activity__span {
+  /* Never shrink — keep each entry's natural height so the list scrolls instead
+     of compressing the rows (overflow:hidden below would otherwise let them
+     collapse to nothing). */
+  flex: 0 0 auto;
   border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
   border-radius: var(--mimir-radius-control, 6px);
   border-left-width: 3px;

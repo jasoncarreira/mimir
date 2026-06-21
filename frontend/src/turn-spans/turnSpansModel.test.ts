@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { TurnStreamEvent } from "../api/generated/contracts";
-import { EMPTY_TURN_SPANS, MAX_SPANS, applyTurnEvent, type TurnSpansState } from "./turnSpansModel";
+import {
+  EMPTY_TURN_SPANS,
+  EVENT_DECAY_MS,
+  IDLE_DECAY_MS,
+  MAX_SPANS,
+  applyTurnEvent,
+  decayCharacterState,
+  decayDelayFor,
+  type TurnSpansState
+} from "./turnSpansModel";
 
 let seq = 0;
 function ev(partial: Partial<TurnStreamEvent>): TurnStreamEvent {
@@ -106,6 +115,24 @@ describe("applyTurnEvent — span assembly", () => {
   it("shows error when the turn ends in error", () => {
     const state = reduce([ev({ type: "turn", phase: "end", status: "error" })]);
     expect(state.characterState).toBe("error");
+  });
+
+  it("decays one step: active → idle → bored (bored terminal)", () => {
+    for (const active of ["thinking", "typing", "tool", "error", "listening"] as const) {
+      expect(decayCharacterState(active)).toBe("idle");
+    }
+    expect(decayCharacterState("idle")).toBe("bored");
+    expect(decayCharacterState("bored")).toBe("bored");
+  });
+
+  it("rests active 30s, idle 3min, bored forever (decayDelayFor)", () => {
+    // The delay is keyed on the resulting state, so a clean turn-end (idle) waits
+    // the full 3 min before bored — not 30s.
+    for (const active of ["thinking", "typing", "tool", "error", "listening"] as const) {
+      expect(decayDelayFor(active)).toBe(EVENT_DECAY_MS);
+    }
+    expect(decayDelayFor("idle")).toBe(IDLE_DECAY_MS);
+    expect(decayDelayFor("bored")).toBeNull();
   });
 
   it("caps retained spans at MAX_SPANS, dropping the oldest", () => {
