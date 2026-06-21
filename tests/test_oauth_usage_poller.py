@@ -1412,6 +1412,145 @@ async def test_record_usage_writes_derived_5h_on_anomaly(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_record_usage_derive_uses_prior_7d_when_new_7d_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """If 5h and 7d are both anomalous in the same poll, the 5h
+    cost-derived estimate must not use the rejected fresh 7d basis.
+
+    The 7d absolute-coherence check can reject ``new_7d`` even when the
+    5h detector also fires because the 7d value stayed flat relative to
+    the prior.  Pre-fix, the derive path still used that rejected new_7d
+    utilization, laundering a known-bad quota basis into a derived 5h
+    snapshot.
+    """
+    from mimir.oauth_usage_poller import PollerConfig, record_usage
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op
+
+    # Ensure the 7d consecutive-confirmation escape hatch does not accept
+    # the anomalous 7d reading on this first poll.
+    monkeypatch.setenv("MIMIR_QUOTA_7D_ANOMALY_CONFIRM_THRESHOLD", "2")
+
+    turns_path = tmp_path / "turns.jsonl"
+    _seed_turns(turns_path, recent_costs=[20.0], older_costs=[480.0])
+
+    store = RateLimitStore(path=tmp_path / "rate_limits.json")
+    await store.record("five_hour", RateLimitSnapshot(
+        status="allowed", utilization=0.10, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day_sonnet", RateLimitSnapshot(
+        status="allowed", utilization=0.05, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+
+    payload = {
+        # 5h jumps +60pp while 7d overall is unchanged → 5h anomaly.
+        "five_hour": {"status": "allowed", "utilization": 0.70,
+                      "resets_at": 9999999999},
+        # 7d overall is internally incoherent with the observed sub-bucket
+        # (<10%), so the same poll rejects this 7d reading too.
+        "seven_day": {"status": "allowed", "utilization": 0.50,
+                      "resets_at": 9999999999},
+        "seven_day_sonnet": {"status": "allowed", "utilization": 0.05,
+                             "resets_at": 9999999999},
+    }
+    cfg = PollerConfig(
+        credentials_path=tmp_path / "creds.json",
+        turns_log_path=turns_path,
+    )
+
+    events: list[tuple[str, dict]] = []
+
+    async def _cap(et, **kw):
+        events.append((et, kw))
+
+    orig = op.log_event
+    op.log_event = _cap
+    try:
+        recorded = await record_usage(store, payload, cfg=cfg)
+    finally:
+        op.log_event = orig
+
+    assert recorded["seven_day"]["anomalous"] is True
+    assert recorded["five_hour"]["derived"] is True
+    # Regression guard: source is prior, not the same-poll reading that
+    # the seven_day path just rejected.
+    derived_events = [kw for et, kw in events if et == "quota_5h_derived"]
+    assert derived_events
+    assert derived_events[-1]["seven_day_utilization"] == pytest.approx(0.50)
+    assert derived_events[-1]["seven_day_source"] == "prior"
+    assert recorded["five_hour"]["utilization"] == pytest.approx(0.20)
+
+
+@pytest.mark.asyncio
+async def test_record_usage_derive_can_use_confirmed_new_7d(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A same-poll anomalous 7d reading that has reached the confirmation
+    threshold is accepted, so it remains eligible as the fresh derive basis.
+    """
+    from mimir.oauth_usage_poller import (
+        PollerConfig, record_usage,
+        _anomaly_confirm_state_path, _save_anomaly_confirm_state,
+    )
+    from mimir.rate_limits import RateLimitStore, RateLimitSnapshot
+    import mimir.oauth_usage_poller as op
+
+    monkeypatch.setenv("MIMIR_QUOTA_7D_ANOMALY_CONFIRM_THRESHOLD", "2")
+
+    turns_path = tmp_path / "turns.jsonl"
+    _seed_turns(turns_path, recent_costs=[20.0], older_costs=[480.0])
+
+    store = RateLimitStore(path=tmp_path / "rate_limits.json")
+    await store.record("five_hour", RateLimitSnapshot(
+        status="allowed", utilization=0.10, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+    await store.record("seven_day_sonnet", RateLimitSnapshot(
+        status="allowed", utilization=0.05, observed_at="2026-05-09T00:00:00+00:00",
+    ))
+
+    payload = {
+        "five_hour": {"status": "allowed", "utilization": 0.70,
+                      "resets_at": 9999999999},
+        "seven_day": {"status": "allowed", "utilization": 0.51,
+                      "resets_at": 9999999999},
+        "seven_day_sonnet": {"status": "allowed", "utilization": 0.05,
+                             "resets_at": 9999999999},
+    }
+    cfg = PollerConfig(
+        credentials_path=tmp_path / "creds.json",
+        turns_log_path=turns_path,
+    )
+    _save_anomaly_confirm_state(_anomaly_confirm_state_path(cfg), {"seven_day": 2})
+
+    events: list[tuple[str, dict]] = []
+
+    async def _cap(et, **kw):
+        events.append((et, kw))
+
+    orig = op.log_event
+    op.log_event = _cap
+    try:
+        recorded = await record_usage(store, payload, cfg=cfg)
+    finally:
+        op.log_event = orig
+
+    assert "anomalous" not in recorded.get("seven_day", {})
+    assert recorded["five_hour"]["derived"] is True
+    derived_events = [kw for et, kw in events if et == "quota_5h_derived"]
+    assert derived_events
+    assert derived_events[-1]["seven_day_utilization"] == pytest.approx(0.51)
+    assert derived_events[-1]["seven_day_source"] == "new"
+    assert recorded["five_hour"]["utilization"] == pytest.approx(0.20)
+
+
+@pytest.mark.asyncio
 async def test_record_usage_falls_back_when_no_turns_log(tmp_path: Path):
     """No cfg → no turns_log_path → derive can't run → prior
     trusted value persists (current layer-(a) behavior preserved)."""

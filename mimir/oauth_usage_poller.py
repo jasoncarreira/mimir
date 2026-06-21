@@ -1181,6 +1181,15 @@ async def record_usage(
         if _confirm_state_path is not None else {}
     )
     confirm_threshold = _resolve_anomaly_confirm_threshold()
+    # chainlink #610: ``seven_day_classification`` alone is not enough to
+    # decide whether the fresh 7d reading is safe as the quota basis for a
+    # cost-derived 5h estimate.  A reading may classify ANOMALOUS but still
+    # be accepted by the consecutive-confirmation path below; only the
+    # below-threshold rejection case must be excluded from 5h derivation.
+    seven_day_rejected_for_derive = (
+        seven_day_classification is SevenDayClassification.ANOMALOUS
+        and anomaly_confirm_state.get("seven_day", 0) < confirm_threshold
+    )
 
     for window_type, snapshot in new_snaps.items():
         if window_type == "seven_day" and seven_day_classification is SevenDayClassification.ANOMALOUS:
@@ -1267,17 +1276,21 @@ async def record_usage(
             # utilization), the prior trusted value persists — current
             # layer-(a) behavior.
             # Prefer the just-arrived 7d reading (Mimir's PR #89 nit
-            # #2): the layer-(a) cross-check above only fires when the
-            # 7d half moved <5pp, which means the 7d side of THIS
-            # poll's payload is presumed trustworthy — anomaly is
-            # specifically the 5h jump unmatched by 7d. Using the
-            # fresher reading gives a sharper back-derived quota.
-            # Fall back to prior_7d when new_7d is missing (rare —
-            # 7d-less response).
+            # #2) only when that reading is usable.  The 5h cross-check
+            # merely says the 7d reading did not move much relative to the
+            # prior; the independent 7d classifier may still have rejected
+            # it as internally incoherent in this same poll (chainlink
+            # #610).  In that case, derive from the prior trusted 7d value
+            # instead of laundering the rejected 7d glitch into a synthetic
+            # 5h snapshot.  If the 7d anomaly has reached the consecutive-
+            # confirmation threshold, ``seven_day_rejected_for_derive`` is
+            # false and the newly accepted value remains eligible.
             seven_day_for_derive = (
-                new_7d if (new_7d is not None
-                           and new_7d.utilization is not None)
-                else prior_7d
+                new_7d if (
+                    new_7d is not None
+                    and new_7d.utilization is not None
+                    and not seven_day_rejected_for_derive
+                ) else prior_7d
             )
             derived_util = None
             if (
