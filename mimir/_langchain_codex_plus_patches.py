@@ -19,12 +19,17 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 _STREAMING_RETRY_MARKER = "_mimir_codex_plus_transient_retry_patched"
 _SYNC_RETRY_MARKER = "_mimir_codex_plus_sync_transient_retry_patched"
+_PARTIAL_JSON_PATCH_MARKER = "_mimir_codex_plus_partial_json_fast_path_patched"
+_CODEX_STREAM_CHUNK_FAST_PATH: ContextVar[bool] = ContextVar(
+    "mimir_codex_plus_stream_chunk_fast_path", default=False
+)
 _DEFAULT_MAX_ATTEMPTS = 3
 _DEFAULT_BASE_DELAY_SECONDS = 0.5
 
@@ -106,8 +111,43 @@ def install_codex_plus_transient_retry_patch(ChatCodexPlus: type[Any] | None = N
         from langchain_codex_plus import ChatCodexPlus as _ChatCodexPlus  # type: ignore[import-untyped]
         ChatCodexPlus = _ChatCodexPlus
 
+    _ensure_partial_json_fast_path()
     _patch_astream(ChatCodexPlus)
     _patch_generate(ChatCodexPlus)
+
+
+def _ensure_partial_json_fast_path() -> None:
+    """Avoid per-delta JSON repair while Codex streams tool-call chunks.
+
+    ``langchain-codex-plus`` yields one ``AIMessageChunk`` for every Codex
+    ``response.function_call_arguments.delta`` event. LangChain eagerly runs
+    ``parse_partial_json`` inside the ``AIMessageChunk`` validator for each
+    incomplete args delta, which can burn CPU on the asyncio loop for every
+    tiny stream chunk. Mimir only needs the raw ``tool_call_chunks`` during
+    streaming; LangChain can parse the merged args after the provider yields the
+    chunk back to the caller.
+
+    Patch the module global that ``AIMessageChunk.init_tool_calls`` resolves,
+    but only short-circuit while ``_patch_astream`` is awaiting the provider
+    chunk construction. The context is reset before the chunk is yielded, so
+    downstream aggregation/final parsing keeps normal LangChain behavior.
+    """
+    try:
+        import langchain_core.messages.ai as ai_mod
+    except ImportError:  # pragma: no cover - langchain is always present here
+        return
+
+    current = ai_mod.parse_partial_json
+    if getattr(current, _PARTIAL_JSON_PATCH_MARKER, False):
+        return
+
+    def _mimir_parse_partial_json_fast_path(s: str, *args: Any, **kwargs: Any) -> Any:
+        if _CODEX_STREAM_CHUNK_FAST_PATH.get():
+            return None
+        return current(s, *args, **kwargs)
+
+    setattr(_mimir_parse_partial_json_fast_path, _PARTIAL_JSON_PATCH_MARKER, True)
+    ai_mod.parse_partial_json = _mimir_parse_partial_json_fast_path
 
 
 def _patch_astream(ChatCodexPlus: type[Any]) -> None:
@@ -123,11 +163,19 @@ def _patch_astream(ChatCodexPlus: type[Any]) -> None:
         base_delay = _retry_base_delay()
         for attempt in range(1, attempts + 1):
             yielded = False
+            stream = original(self, *args, **kwargs)
+            iterator = stream.__aiter__()
             try:
-                async for chunk in original(self, *args, **kwargs):
+                while True:
+                    token = _CODEX_STREAM_CHUNK_FAST_PATH.set(True)
+                    try:
+                        chunk = await iterator.__anext__()
+                    except StopAsyncIteration:
+                        return
+                    finally:
+                        _CODEX_STREAM_CHUNK_FAST_PATH.reset(token)
                     yielded = True
                     yield chunk
-                return
             except Exception as exc:
                 if yielded or attempt >= attempts or not _is_transient_connection_error(exc):
                     raise
