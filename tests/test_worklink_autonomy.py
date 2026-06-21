@@ -525,6 +525,37 @@ def test_poller_import_path_repair_uses_explicit_source_dir_without_editable_ins
     assert proc.stdout.strip() == str(source_dir)
 
 
+def test_poller_import_path_repair_adds_source_venv_site_packages(tmp_path: Path) -> None:
+    """System python plus source path also needs runtime deps from source .venv."""
+
+    skill_dir = tmp_path / "skills" / "chainlink-orchestrator"
+    skill_dir.mkdir(parents=True)
+    source_dir = tmp_path / "source"
+    (source_dir / "mimir").mkdir(parents=True)
+    (source_dir / "mimir" / "__init__.py").write_text("", encoding="utf-8")
+    site = source_dir / ".venv" / "lib" / "python3.11" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "fake_runtime_dep.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+    prelude = POLLER.read_text(encoding="utf-8").split("\n_ensure_mimir_import_path()\n", 1)[0]
+    script = (
+        prelude
+        + "\n_ensure_mimir_import_path()\n"
+        + "import fake_runtime_dep; print(fake_runtime_dep.VALUE)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", script],
+        cwd=str(skill_dir),
+        env={"MIMIR_SOURCE_DIR": str(source_dir), "PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "42"
+
+
 def _fake_run_bin(tmp: Path) -> Path:
     """A run-bin that records each `worklink run <id>` dispatch to a file."""
     record = tmp / "dispatched.txt"
