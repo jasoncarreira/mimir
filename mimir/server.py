@@ -343,6 +343,7 @@ def _is_auth_exempt(method: str, path: str) -> bool:
 # control.
 _ADMIN_REQUIRED_PREFIXES: tuple[str, ...] = (
     "/api/v1/admin",
+    "/api/ops",
     "/api/v1/ops",
     "/api/v1/scheduler",
     "/api/v1/chainlink-board",

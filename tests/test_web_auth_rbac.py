@@ -43,6 +43,7 @@ def _app(home: Path, master_key: str) -> web.Application:
     app.router.add_get("/api/saga", _echo)             # legacy auth + admin: global atoms
     app.router.add_post("/api/saga/sql", _echo)        # legacy auth + admin: global SQL
     app.router.add_get("/api/memory", _echo)           # legacy auth + admin: global files
+    app.router.add_get("/api/ops", _echo)              # legacy global ops dashboard
     app.router.add_get("/api/v1/ops", _echo)           # global ops dashboard
     app.router.add_get("/api/v1/scheduler", _echo)     # global scheduler dashboard
     app.router.add_get("/api/v1/chainlink-board", _echo)  # global task dashboard
@@ -92,6 +93,7 @@ async def test_global_dashboard_routes_are_admin_only(tmp_path: Path) -> None:
     user_key = issue_web_key(tmp_path, "alice", roles=["user"])
     admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
     admin_only_paths = (
+        "/api/ops",
         "/api/v1/ops",
         "/api/v1/scheduler",
         "/api/v1/chainlink-board",
@@ -113,6 +115,8 @@ def test_admin_required_prefix_matching_is_segment_aware() -> None:
     for path in (
         "/api/v1/admin",
         "/api/v1/admin/config",
+        "/api/ops",
+        "/api/ops/health",
         "/api/v1/ops",
         "/api/v1/ops/health",
         "/api/v1/scheduler",
@@ -132,6 +136,7 @@ def test_admin_required_prefix_matching_is_segment_aware() -> None:
 
     for path in (
         "/api/v1/adminish",
+        "/api/opsical",
         "/api/v1/opsical",
         "/api/v1/schedulerish",
         "/api/v1/chainlink-boardwalk",
