@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import struct
+import threading
 from pathlib import Path
 
 import pytest
@@ -319,6 +320,35 @@ async def test_scheduled_check_emits_ok_on_clean(
     kind, kw = events[0]
     assert kind == "index_integrity_ok"
     assert kw["checks"] == 9
+
+
+@pytest.mark.asyncio
+async def test_scheduled_check_runs_check_all_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    loop_thread = threading.get_ident()
+    worker_threads: list[int] = []
+    events: list[tuple[str, dict]] = []
+
+    def _check_all(home: Path) -> IntegrityReport:
+        assert home == tmp_path
+        worker_threads.append(threading.get_ident())
+        return IntegrityReport([
+            IntegrityCheck("sentinel", "index", True, "ran off-loop"),
+        ])
+
+    async def _capture(kind, **kw):
+        events.append((kind, kw))
+
+    monkeypatch.setattr("mimir.index_integrity.check_all", _check_all)
+    monkeypatch.setattr("mimir.event_logger.log_event", _capture)
+    from mimir.index_integrity import run_scheduled_integrity_check
+
+    await run_scheduled_integrity_check(tmp_path)
+
+    assert worker_threads
+    assert all(thread_id != loop_thread for thread_id in worker_threads)
+    assert events == [("index_integrity_ok", {"checks": 1})]
 
 
 @pytest.mark.asyncio

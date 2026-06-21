@@ -45,6 +45,7 @@ detect. Repair is the operator's call via ``rebuild_index`` (§8.3).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from dataclasses import dataclass, field
@@ -360,7 +361,11 @@ async def run_scheduled_integrity_check(home: Path) -> None:
     # synchronous CLI callers / test isolation.
     from .event_logger import log_event
     try:
-        report = check_all(home)
+        # The integrity probes perform synchronous SQLite PRAGMAs and FTS5
+        # checks. Keep the scheduled coroutine cheap on the event loop by
+        # running the full probe set in a worker thread; the CLI path remains
+        # synchronous via ``check_all`` / ``run_verify_index_cmd``.
+        report = await asyncio.to_thread(check_all, home)
     except Exception as exc:  # noqa: BLE001 — defensive scheduler boundary
         log.exception("index_integrity_check raised")
         await log_event(
