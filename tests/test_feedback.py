@@ -212,6 +212,87 @@ def test_turn_records_without_error_are_ignored(tmp_path: Path):
     assert log.recent_block() is None
 
 
+def test_turn_errors_surface_when_cross_turn_loops_fill_negative_bucket(tmp_path: Path):
+    """Always-surface cross-turn loop signals should bypass the display cap
+    without preventing turns.jsonl crash/error records from surfacing."""
+    repeated_sends = []
+    for idx in range(5):
+        for occurrence in range(3):
+            repeated_sends.append(
+                {
+                    "timestamp": _ts(0.9 - idx * 0.1 - occurrence * 0.01),
+                    "type": "send_message_sent",
+                    "channel_id": f"channel-{idx}",
+                    "content_hash": f"hash-{idx}",
+                }
+            )
+
+    log = _make_log(
+        tmp_path,
+        events=repeated_sends,
+        turns=[
+            {
+                "ts": _ts(0.1),
+                "turn_id": "crash-turn",
+                "channel_id": "discord-ops",
+                "error": "RuntimeError: agent crashed mid-turn",
+                "result_is_error": True,
+            }
+        ],
+    )
+
+    negatives, positives = log.recent(limit_per_polarity=5)
+
+    assert positives == []
+    assert len([sig for sig in negatives if sig.kind == "cross_turn_loop"]) == 5
+    assert any(
+        sig.kind == "turn_error" and "agent crashed mid-turn" in sig.content
+        for sig in negatives
+    )
+
+
+def test_turn_errors_surface_when_chain_signals_fill_negative_bucket(tmp_path: Path):
+    """Always-surface chain signals should not count against turns.jsonl
+    capacity either."""
+    events = []
+    chain_specs = [
+        ("git_push_ok", "git_push_failed"),
+        ("oauth_usage_ok", "oauth_usage_failed"),
+        ("bind_mount_recovered", "bind_mount_stale_detected"),
+        ("index_integrity_ok", "index_integrity_failed"),
+        ("git_pull_ok", "git_pull_blocked"),
+    ]
+    for idx, (ok_type, fail_type) in enumerate(chain_specs):
+        events.extend(
+            [
+                {"timestamp": _ts(2.0 - idx * 0.1), "type": ok_type},
+                {"timestamp": _ts(0.9 - idx * 0.1), "type": fail_type},
+            ]
+        )
+
+    log = _make_log(
+        tmp_path,
+        events=events,
+        turns=[
+            {
+                "ts": _ts(0.1),
+                "turn_id": "crash-turn",
+                "channel_id": "discord-ops",
+                "error": "ValueError: turn exploded",
+                "result_is_error": True,
+            }
+        ],
+    )
+
+    negatives, _ = log.recent(limit_per_polarity=5)
+
+    assert len([sig for sig in negatives if sig.kind.endswith("_chain")]) == 5
+    assert any(
+        sig.kind == "turn_error" and "turn exploded" in sig.content
+        for sig in negatives
+    )
+
+
 # ---- gave_up suffix convention (chainlink #299) -------------------------
 
 
