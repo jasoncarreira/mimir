@@ -346,6 +346,8 @@ _ADMIN_REQUIRED_PREFIXES: tuple[str, ...] = (
     "/api/v1/admin/",
     "/api/v1/saga",
     "/api/v1/memory",
+    "/api/saga",
+    "/api/memory",
 )
 
 
