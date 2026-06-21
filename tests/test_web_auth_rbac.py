@@ -295,6 +295,7 @@ async def test_user_turns_endpoint_filters_to_own_web_channel(tmp_path: Path) ->
 
 async def test_user_sessions_endpoint_filters_and_rejects_cross_channel(tmp_path: Path) -> None:
     alice_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
     app, turns_log, _ = _scoped_web_app(tmp_path, "master-secret")
     _jsonl(turns_log, [
         {
@@ -307,9 +308,16 @@ async def test_user_sessions_endpoint_filters_and_rejects_cross_channel(tmp_path
         {
             "turn_id": "b1",
             "ts": "2026-06-21T01:00:00Z",
-            "trigger": "user_message",
+            "trigger": "scheduled_tick",
             "channel_id": "web-bob",
             "input": "bob prompt",
+        },
+        {
+            "turn_id": "o1",
+            "ts": "2026-06-21T01:00:00Z",
+            "trigger": "ops_event",
+            "channel_id": "discord-ops",
+            "input": "ops prompt",
         },
     ])
 
@@ -319,12 +327,25 @@ async def test_user_sessions_endpoint_filters_and_rejects_cross_channel(tmp_path
         assert r.status == 200
         assert body["meta"]["total"] == 1
         assert body["data"]["sessions"][0]["channel_id"] == "web-alice"
+        # Facets are part of the API response too; they must be derived from the
+        # caller-visible session set rather than all sessions in the store.
+        assert body["data"]["channels"] == ["web-alice"]
+        assert body["data"]["triggers"] == ["user_message"]
 
         denied = await c.get(
             "/api/v1/sessions?channel=web-bob",
             headers={"X-API-Key": alice_key},
         )
         assert denied.status == 403
+
+        admin = await c.get(
+            "/api/v1/sessions?channel=discord-ops",
+            headers={"X-API-Key": admin_key},
+        )
+        admin_body = await admin.json()
+        assert admin.status == 200
+        assert admin_body["meta"]["total"] == 1
+        assert admin_body["data"]["sessions"][0]["channel_id"] == "discord-ops"
 
 
 async def test_user_events_endpoints_filter_to_own_channel(tmp_path: Path) -> None:

@@ -283,9 +283,9 @@ def _web_channel_for(canonical: str) -> str:
     return f"web-{canonical}" if canonical else "web-default"
 
 
-def _normalize_web_channel(raw: str) -> str:
+def _normalize_web_channel(raw: str, *, default_web: bool = True) -> str:
     channel = raw.strip()
-    if channel and channel != "*" and not channel.startswith("web-"):
+    if default_web and channel and channel != "*" and not channel.startswith("web-"):
         channel = "web-" + channel
     return channel
 
@@ -319,7 +319,7 @@ def _scoped_channel_from_query(
     if allowed is None:
         if raw is None or not raw.strip():
             return None, None
-        channel = _normalize_web_channel(raw)
+        channel = _normalize_web_channel(raw, default_web=False)
         return (None if channel == "*" else channel), None
 
     if raw is None or not raw.strip():
