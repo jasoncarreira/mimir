@@ -161,6 +161,7 @@ def first_party_dashboard_extensions(
                 icon="activity",
                 nav_position=30,
                 api_namespace="ops",
+                requires_role="admin",
             ),
             DashboardExtensionManifest(
                 id="chainlink-board",
@@ -169,6 +170,7 @@ def first_party_dashboard_extensions(
                 icon="kanban",
                 nav_position=35,
                 api_namespace="chainlink-board",
+                requires_role="admin",
             ),
             DashboardExtensionManifest(
                 id="scheduler",
@@ -177,6 +179,7 @@ def first_party_dashboard_extensions(
                 icon="calendar-clock",
                 nav_position=37,
                 api_namespace="scheduler",
+                requires_role="admin",
             ),
             DashboardExtensionManifest(
                 id="saga",

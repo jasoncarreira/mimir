@@ -13,7 +13,7 @@ from mimir.turn_event_bus import TurnEventBus
 from mimir.identities import IdentityResolver
 from mimir.identities_populator import issue_web_key
 from mimir import web_ui
-from mimir.server import _make_auth_middleware
+from mimir.server import _is_admin_required, _make_auth_middleware
 from mimir.web_ui import _whoami_payload, web_gate_active
 
 
@@ -43,6 +43,12 @@ def _app(home: Path, master_key: str) -> web.Application:
     app.router.add_get("/api/saga", _echo)             # legacy auth + admin: global atoms
     app.router.add_post("/api/saga/sql", _echo)        # legacy auth + admin: global SQL
     app.router.add_get("/api/memory", _echo)           # legacy auth + admin: global files
+    app.router.add_get("/api/v1/ops", _echo)           # global ops dashboard
+    app.router.add_get("/api/v1/scheduler", _echo)     # global scheduler dashboard
+    app.router.add_get("/api/v1/chainlink-board", _echo)  # global task dashboard
+    app.router.add_get(
+        "/api/v1/chainlink-board/artifact", _echo,
+    )  # Worklink artifacts
     app.router.add_get("/health", _echo)               # exempt
     return app
 
@@ -59,6 +65,7 @@ async def test_user_key_allowed_on_normal_route_but_403_on_admin(tmp_path: Path)
         assert body["canonical"] == "alice" and body["is_admin"] is False
         r2 = await c.get("/api/v1/admin/config", headers={"X-API-Key": user_key})
         assert r2.status == 403  # the RBAC boundary — server-side, not UI
+
 
 
 
@@ -81,22 +88,61 @@ async def test_saga_and_memory_routes_are_admin_only(tmp_path: Path) -> None:
             assert admin_sql.status == 200, path
 
 
-def test_admin_required_prefix_matching_is_segment_aware() -> None:
-    from mimir.server import _is_admin_required
+async def test_global_dashboard_routes_are_admin_only(tmp_path: Path) -> None:
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    admin_only_paths = (
+        "/api/v1/ops",
+        "/api/v1/scheduler",
+        "/api/v1/chainlink-board",
+        "/api/v1/chainlink-board/artifact",
+    )
+    async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
+        for path in admin_only_paths:
+            denied = await c.get(path, headers={"X-API-Key": user_key})
+            assert denied.status == 403, path
 
-    assert _is_admin_required("/api/v1/saga") is True
-    assert _is_admin_required("/api/v1/saga/sql") is True
-    assert _is_admin_required("/api/v1/memory") is True
-    assert _is_admin_required("/api/v1/memory/file") is True
-    assert _is_admin_required("/api/v1/admin/config") is True
-    assert _is_admin_required("/api/saga") is True
-    assert _is_admin_required("/api/saga/sql") is True
-    assert _is_admin_required("/api/memory") is True
-    assert _is_admin_required("/api/memory/file") is True
-    assert _is_admin_required("/api/v1/sagacity") is False
-    assert _is_admin_required("/api/v1/memoryless") is False
-    assert _is_admin_required("/api/sagacity") is False
-    assert _is_admin_required("/api/memoryless") is False
+            admin = await c.get(path, headers={"X-API-Key": admin_key})
+            assert admin.status == 200, path
+
+            master = await c.get(path, headers={"X-API-Key": "master-secret"})
+            assert master.status == 200, path
+
+
+def test_admin_required_prefix_matching_is_segment_aware() -> None:
+    for path in (
+        "/api/v1/admin",
+        "/api/v1/admin/config",
+        "/api/v1/ops",
+        "/api/v1/ops/health",
+        "/api/v1/scheduler",
+        "/api/v1/scheduler/jobs",
+        "/api/v1/chainlink-board",
+        "/api/v1/chainlink-board/artifact",
+        "/api/v1/saga",
+        "/api/v1/saga/sql",
+        "/api/v1/memory",
+        "/api/v1/memory/file",
+        "/api/saga",
+        "/api/saga/sql",
+        "/api/memory",
+        "/api/memory/file",
+    ):
+        assert _is_admin_required(path), path
+
+    for path in (
+        "/api/v1/adminish",
+        "/api/v1/opsical",
+        "/api/v1/schedulerish",
+        "/api/v1/chainlink-boardwalk",
+        "/api/v1/chainlink",
+        "/api/v1/sagacity",
+        "/api/v1/memoryless",
+        "/api/sagacity",
+        "/api/memoryless",
+        "/api/v1/turns",
+    ):
+        assert not _is_admin_required(path), path
 
 
 async def test_admin_key_allowed_on_admin_route(tmp_path: Path) -> None:
