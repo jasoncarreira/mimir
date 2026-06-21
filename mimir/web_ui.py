@@ -681,11 +681,10 @@ def register_routes(
         if not await _try_acquire_live_event_slot():
             return web.Response(text="too many live event streams", status=429)
 
-        await resp.prepare(request)
-
         delivered = request.query.get("since", "").strip() or None
         idle_for = 0.0
         try:
+            await resp.prepare(request)
             while True:
                 items = await _live_event_items(request, delivered, channel=channel)
                 for item in items:
