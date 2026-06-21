@@ -730,6 +730,41 @@ async def test_api_v1_live_events_rejects_when_stream_cap_exhausted(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_api_v1_live_events_releases_slot_when_prepare_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(web_ui, "LIVE_EVENTS_MAX_STREAMS", 1)
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+    )
+
+    original_prepare = web.StreamResponse.prepare
+    calls = 0
+
+    async def flaky_prepare(self, request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionResetError("client disconnected during SSE handshake")
+        return await original_prepare(self, request)
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", flaky_prepare)
+
+    async with TestClient(TestServer(a)) as client:
+        failed_resp = await client.get("/api/v1/live-events?once=1")
+        await failed_resp.text()
+
+        resp = await client.get("/api/v1/live-events?once=1")
+        body = await resp.text()
+
+    assert calls >= 2
+    assert resp.status == 200
+    assert "too many live event streams" not in body
+
+@pytest.mark.asyncio
 async def test_read_jsonl_caps_at_max_records(app):
     """Pattern A (2026-05-10): ``_read_jsonl`` is bounded by
     ``max_records`` (default 5000). Pre-2026-05-10 it forward-read
