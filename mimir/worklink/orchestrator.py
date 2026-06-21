@@ -638,7 +638,13 @@ class WorklinkRunner:
             review_ready=validation.review_ready,
             pr_url=pr_url,
         )
-        cleanup_worktree(lease, outcome=validation.status, runner=_list_runner(runner))
+        cleanup_error = _cleanup_worktree_after_transition(
+            lease,
+            outcome=validation.status,
+            runner=_list_runner(runner),
+            issue_id=issue.issue_id,
+            attempt=attempt,
+        )
         return WorklinkRunResult(
             issue.issue_id,
             attempt,
@@ -648,6 +654,7 @@ class WorklinkRunner:
             evidence_path=evidence_path,
             worktree=lease.path,
             branch=lease.branch,
+            reason=f"post-transition cleanup failed: {cleanup_error}" if cleanup_error else None,
         )
 
     async def reattach(self, issue_id: int) -> WorklinkRunResult:
@@ -809,6 +816,38 @@ class WorklinkRunner:
                 _remove_observation_worktree(self.repo, lease, runner=_list_runner(runner))
             claims.release_issue(issue_id)
             clear_run_state(self.home, issue_id)
+
+
+def _cleanup_worktree_after_transition(
+    lease: WorktreeLease,
+    *,
+    outcome: str,
+    runner: Runner,
+    issue_id: int,
+    attempt: int,
+) -> str | None:
+    """Best-effort cleanup after the Chainlink terminal transition is durable.
+
+    Cleanup failures must not re-enter the main failure handler: by this point
+    evidence has been written, the PR may be open, and Chainlink already reflects
+    the observed backend outcome. Reclassifying the issue as failed would corrupt
+    that success path and can re-dispatch duplicate work.
+    """
+    try:
+        cleanup_worktree(lease, outcome=outcome, runner=runner)
+    except Exception as exc:  # pragma: no cover - exact exception type is platform/git dependent.
+        error = str(exc)
+        _log_event(
+            "worklink_cleanup_failed",
+            issue_id=issue_id,
+            attempt=attempt,
+            outcome=outcome,
+            worktree=str(lease.path),
+            branch=lease.branch,
+            error=error,
+        )
+        return error
+    return None
 
 
 def run_worklink(

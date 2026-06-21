@@ -324,8 +324,16 @@ class FeedbackLog:
             negatives.sort(key=lambda s: s.ts, reverse=True)
 
         # 2) turns.jsonl — error / result_is_error are turn-level negatives
-        # the events stream might not capture.
-        if len(negatives) < limit:
+        # the events stream might not capture.  Capacity here is measured
+        # against only the limit-bounded event signals gathered above: chain
+        # signals and cross-turn loop signals intentionally bypass the
+        # per-polarity limit, so they must not starve crash/error records.
+        bounded_negative_count = sum(
+            1
+            for sig in negatives
+            if not sig.kind.endswith("_chain") and sig.kind != "cross_turn_loop"
+        )
+        if bounded_negative_count < limit:
             for rec in iter_window_records(self.turns_snapshot, self.turns_path):  # #498
                 ts = rec.get("ts")
                 if not isinstance(ts, str) or ts < cutoff_iso:
@@ -335,7 +343,7 @@ class FeedbackLog:
                 has_error = rec.get("error") or rec.get("result_is_error")
                 if not has_error:
                     continue
-                if len(negatives) >= limit:
+                if bounded_negative_count >= limit:
                     break
                 content = _render_turn_error(rec)
                 # Same content-level dedup as the events loop above:
@@ -353,6 +361,7 @@ class FeedbackLog:
                         content=content,
                     )
                 )
+                bounded_negative_count += 1
 
         return negatives, positives
 
