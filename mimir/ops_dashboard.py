@@ -519,9 +519,19 @@ async def build_dashboard_payload_async(
     chainlink subprocess call when ``home`` is given. The route
     handler uses this; tests that don't exercise chainlink can stick
     with the sync version. ``active_provider`` collapses the Usage chart
-    to that provider (see ``build_dashboard_payload``)."""
-    stats = build_dashboard_payload(
-        events_log, days, active_provider=active_provider,
+    to that provider (see ``build_dashboard_payload``).
+
+    Loading ``events.jsonl``/``turns.jsonl`` and rendering the algedonic
+    block are CPU-heavy when the retained firehose contains large records
+    (model/tool traces, blocking-stack captures, etc.). Keep that work off
+    the aiohttp event loop; the scheduler lag watchdog has caught this
+    route inside ``json.loads`` during multi-second stalls.
+    """
+    stats = await asyncio.to_thread(
+        build_dashboard_payload,
+        events_log,
+        days,
+        active_provider=active_provider,
     )
     if home is not None:
         stats["chainlink_issues"] = await _load_chainlink_issues(home)

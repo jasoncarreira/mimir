@@ -16,6 +16,7 @@ import { AgentCharacter, characterStateFromLiveEvent, withComposerListening } fr
 import { MIMIR_API_KEY_STORAGE_KEY } from "./api";
 import { useBootstrap } from "./api/bootstrap";
 import { ChatRoute } from "./ChatRoute";
+import { useChatStore } from "./chatStore";
 import { ChainlinkBoardRoute } from "./routes/ChainlinkBoardRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, visibleSurfaces, type DashboardSurface } from "./dashboardExtensions";
@@ -90,10 +91,32 @@ function isSignedIn(
   return !bootstrap.auth.required || apiKeyPresent;
 }
 
+// Clears browser-scoped authenticated state when the key changes. React Query
+// data and module-level stores can otherwise keep rendering user A's data after
+// the browser switches to user B in the same page session (#594). Bootstrap is
+// intentionally kept because it is public server policy, not per-user data.
+export function resetBrowserSessionStateForApiKeyChange(
+  client: QueryClient,
+  navigate?: (to: string, options: { replace: boolean }) => void
+) {
+  client.removeQueries({
+    predicate: (query) => query.queryKey[0] !== "web-bootstrap"
+  });
+  useChatStore.setState({ messages: [] });
+  useUiState.setState({
+    selectedChatMessageId: "",
+    composerActive: false,
+    collapsedRegions: {}
+  });
+  navigate?.("/chat", { replace: true });
+}
+
 // Writes/clears the API key + flips the shared store flag (so AppFrame's login
-// gate + the header status react) + refetches identity with the new key (#563).
+// gate + the header status react) + drops browser-scoped user data before the
+// dashboard reconnects with the new identity (#563, #594).
 function useSetApiKey() {
   const client = useQueryClient();
+  const navigate = useNavigate();
   const setApiKeyPresent = useUiState((state) => state.setApiKeyPresent);
   return React.useCallback(
     (value: string) => {
@@ -104,10 +127,11 @@ function useSetApiKey() {
       } catch {
         // Storage can be blocked by browser policy; the in-memory flag still updates.
       }
+      resetBrowserSessionStateForApiKeyChange(client, navigate);
       setApiKeyPresent(Boolean(trimmed));
-      void client.invalidateQueries({ queryKey: ["whoami"] });
+      if (trimmed) void client.invalidateQueries({ queryKey: ["whoami"] });
     },
-    [client, setApiKeyPresent]
+    [client, navigate, setApiKeyPresent]
   );
 }
 

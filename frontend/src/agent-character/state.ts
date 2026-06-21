@@ -101,10 +101,13 @@ export function isChatTurnEvent(event: TurnStreamEvent | null | undefined): bool
 
 // github #580: the agent "listens" while the user is engaging the composer, but
 // only when it isn't already busy doing something (thinking/tool/talk/error win).
+// Both restful states — idle and bored (#583 decay) — wake to listening, so
+// composer activity always interrupts an at-rest character.
 export function withComposerListening(
   eventState: AgentCharacterState,
   composerActive: boolean
 ): AgentCharacterState {
-  return composerActive && eventState === "idle" ? "listening" : eventState;
+  const atRest = eventState === "idle" || eventState === "bored";
+  return composerActive && atRest ? "listening" : eventState;
 }
 

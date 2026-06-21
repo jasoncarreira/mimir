@@ -24,6 +24,97 @@ SECRET_MARKERS = (
     "AUTH",
 )
 
+# ``raw_config`` is an operator-facing diagnostic surface, not a full config
+# dump. Keep it schema-aware so newly added Config fields are hidden by default
+# until they are explicitly classified here. That fail-closed posture avoids
+# depending on naming heuristics for fields that could carry deployment-local
+# paths, channels, tokens, or future secret-shaped structures.
+RAW_CONFIG_ALLOWED_FIELDS = frozenset({
+    "agent_id",
+    "allow_unauthenticated",
+    "attachments_max_bytes",
+    "billing_mode",
+    "capture_rate_limits",
+    "context_1m",
+    "cross_platform_pull",
+    "effort",
+    "embed_model",
+    "feedback_limit_per_polarity",
+    "feedback_window_hours",
+    "health_probe_cron",
+    "health_probe_max_restarts_per_hour",
+    "history_global_max",
+    "history_per_channel_max",
+    "identities_populate_cron",
+    "introspection_report_cron",
+    "introspection_report_days",
+    "introspection_report_emit_algedonic",
+    "introspection_report_health_threshold",
+    "liveness_beat_seconds",
+    "max_channel_queue",
+    "max_concurrent_turns",
+    "max_events_kept",
+    "max_turn_iterations",
+    "max_turns_kept",
+    "minimax_usage_model_name",
+    "minimax_usage_poll_cron",
+    "model",
+    "model_max_retries",
+    "model_max_tokens",
+    "model_reasoning_effort",
+    "model_spec",
+    "oauth_refresh_warn_days",
+    "oauth_usage_poll_cron",
+    "pairing_dm_auto_reply_enabled",
+    "pairing_dm_auto_reply_interval_seconds",
+    "pairing_operator_digest_delay_seconds",
+    "pairing_pending_max",
+    "recent_author_cross",
+    "recent_boundaries",
+    "recent_cross_hours",
+    "recent_message_chars",
+    "recent_per_channel",
+    "recent_sources",
+    "saga_consolidate_cron",
+    "saga_pre_message_min_tier",
+    "saga_session_idle_minutes",
+    "saga_session_max_turns",
+    "scheduler_tz",
+    "send_loop_hard_limit",
+    "send_loop_similarity",
+    "send_loop_soft_limit",
+    "tool_call_budget",
+    "turn_timeout_seconds",
+    "usage_5h_limit_usd",
+    "usage_block_enabled",
+    "usage_weekly_limit_usd",
+    "web_host",
+    "web_port",
+    "worker_idle_timeout_s",
+})
+
+RAW_CONFIG_SECRET_FIELDS = frozenset({
+    "anthropic_api_key",
+    "anthropic_auth_token",
+    "api_key",
+    "bsky_app_password",
+    "discord_token",
+    "git_state_token",
+    "operator_alert_channel",
+    "slack_app_token",
+    "slack_bot_token",
+})
+
+RAW_CONFIG_NESTED_REDACTED_FIELDS = frozenset({
+    "mcp_servers",
+})
+
+RAW_CONFIG_URL_REDACTED_FIELDS = frozenset({
+    "anthropic_base_url",
+    "git_state_repo",
+})
+
+
 _URL_USERINFO_RE = re.compile(
     r"(?P<prefix>\b[a-z][a-z0-9+.-]*://)(?P<userinfo>[^/@\s]+)@",
     re.IGNORECASE,
@@ -160,8 +251,20 @@ def _redacted_config(config: Config) -> dict[str, Any]:
     raw = _json_safe(dataclasses.asdict(config))
     if not isinstance(raw, dict):
         return {}
-    redacted = _redact_config_value(raw)
-    return redacted if isinstance(redacted, dict) else {}
+
+    out: dict[str, Any] = {}
+    for field in dataclasses.fields(config):
+        name = field.name
+        value = raw.get(name)
+        if name in RAW_CONFIG_ALLOWED_FIELDS:
+            out[name] = _redact_config_value(value, key=name)
+        elif name in RAW_CONFIG_SECRET_FIELDS:
+            out[name] = "[REDACTED]" if value else ""
+        elif name in RAW_CONFIG_NESTED_REDACTED_FIELDS:
+            out[name] = _redact_config_value(value, key=name)
+        elif name in RAW_CONFIG_URL_REDACTED_FIELDS:
+            out[name] = _redact_url_userinfo(value) if isinstance(value, str) else value
+    return out
 
 
 def _schema_sections() -> list[dict[str, Any]]:

@@ -85,7 +85,8 @@ vi.mock("./agent-character", () => ({
 vi.mock("./ChatRoute", () => ({ ChatRoute: () => <div>chat-stub</div> }));
 
 // Imported after mocks are registered.
-const { AppFrame } = await import("./main");
+const { AppFrame, resetBrowserSessionStateForApiKeyChange } = await import("./main");
+const { useChatStore } = await import("./chatStore");
 const { useUiState } = await import("./uiState");
 
 function renderApp() {
@@ -107,7 +108,53 @@ afterEach(() => {
   window.localStorage.clear();
   bootstrapOverride = null;
   skinLayout = "top-nav";
+  useChatStore.setState({ messages: [] });
+  useUiState.setState({
+    selectedChatMessageId: "",
+    composerActive: false,
+    collapsedRegions: {},
+    apiKeyPresent: false
+  });
   vi.clearAllMocks();
+});
+
+
+describe("API key changes reset browser-scoped user data (#594)", () => {
+  it("clears authenticated query cache, chat timeline, UI selection, and route state", () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["web-bootstrap"], protectedBootstrap);
+    qc.setQueryData(["whoami"], { canonical: "alice", is_admin: true });
+    qc.setQueryData(["turns", { channel: "web-alice" }], [{ id: "alice-turn" }]);
+    useChatStore.setState({
+      messages: [
+        {
+          id: "a1",
+          role: "assistant",
+          channelId: "web-alice",
+          text: "alice-only answer",
+          timestamp: "2026-06-21T08:00:00Z",
+          status: "done"
+        }
+      ]
+    });
+    useUiState.setState({
+      selectedChatMessageId: "a1",
+      composerActive: true,
+      collapsedRegions: { "alice-section": true }
+    });
+    const navigate = vi.fn();
+
+    resetBrowserSessionStateForApiKeyChange(qc, navigate);
+
+    expect(qc.getQueryData(["web-bootstrap"])).toEqual(protectedBootstrap);
+    expect(qc.getQueryData(["whoami"])).toBeUndefined();
+    expect(qc.getQueryData(["turns", { channel: "web-alice" }])).toBeUndefined();
+    expect(useChatStore.getState().messages).toEqual([]);
+    expect(useUiState.getState().selectedChatMessageId).toBe("");
+    expect(useUiState.getState().composerActive).toBe(false);
+    expect(useUiState.getState().collapsedRegions).toEqual({});
+    expect(navigate).toHaveBeenCalledWith("/chat", { replace: true });
+  });
 });
 
 describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
