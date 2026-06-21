@@ -224,6 +224,7 @@ def patch_deepagents_token_counter_tool_schema_cache() -> None:
         import copy
         import weakref
 
+        from langchain.agents.middleware import summarization as lc_summarization
         from langchain_core.messages import utils as message_utils
         from langchain_core.tools import BaseTool
         import deepagents.middleware.summarization as summarization
@@ -235,6 +236,16 @@ def patch_deepagents_token_counter_tool_schema_cache() -> None:
         return
 
     original_counter = current or message_utils.count_tokens_approximately
+    original_lc_counter = lc_summarization.count_tokens_approximately
+    # Stock DeepAgents imports LangChain Core's helper into its module and
+    # passes that exact function object through to LangChain's summarization
+    # middleware. LangChain then uses object identity to detect the default and
+    # replace it with a model-tuned partial. Keep the patched DeepAgents default
+    # and LangChain module global as the SAME wrapper object so that identity
+    # branch still fires.
+    counter_to_wrap = (
+        original_lc_counter if original_counter is original_lc_counter else original_counter
+    )
     cache: dict[int, tuple[weakref.ReferenceType[BaseTool], dict[str, Any]]] = {}
 
     def _drop_cached_tool(tool_id: int) -> None:
@@ -285,11 +296,12 @@ def patch_deepagents_token_counter_tool_schema_cache() -> None:
         tools=None,
         **kwargs,
     ):
-        return original_counter(messages, *args, tools=_cached_tools(tools), **kwargs)
+        return counter_to_wrap(messages, *args, tools=_cached_tools(tools), **kwargs)
 
     setattr(_patched_count_tokens_approximately, _DEEPAGENTS_TOKEN_COUNTER_PATCH_MARKER, True)
-    _patched_count_tokens_approximately.__wrapped__ = original_counter  # type: ignore[attr-defined]
+    _patched_count_tokens_approximately.__wrapped__ = counter_to_wrap  # type: ignore[attr-defined]
     summarization.count_tokens_approximately = _patched_count_tokens_approximately
+    lc_summarization.count_tokens_approximately = _patched_count_tokens_approximately
 
     # ``SummarizationMiddleware.__init__`` captured the module-level helper as
     # a keyword-only default when deepagents.middleware.summarization was
@@ -299,6 +311,14 @@ def patch_deepagents_token_counter_tool_schema_cache() -> None:
     kwdefaults = getattr(summarization.SummarizationMiddleware.__init__, "__kwdefaults__", None)
     if isinstance(kwdefaults, dict) and "token_counter" in kwdefaults:
         kwdefaults["token_counter"] = _patched_count_tokens_approximately
+    lc_kwdefaults = getattr(
+        lc_summarization.SummarizationMiddleware.__init__, "__kwdefaults__", None
+    )
+    if (
+        isinstance(lc_kwdefaults, dict)
+        and lc_kwdefaults.get("token_counter") is original_lc_counter
+    ):
+        lc_kwdefaults["token_counter"] = _patched_count_tokens_approximately
 
     log.debug("patched DeepAgents token counter to cache BaseTool schema conversion")
 
