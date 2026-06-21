@@ -74,4 +74,11 @@ describe("OpsRoute", () => {
     expect(screen.getByText(/tool_error \(×2 in 24h\) \[web-default\]/)).toBeTruthy();
     expect(screen.getByText(/Positive \(last 24h\):/)).toBeTruthy();
   });
+
+  it("links JSON to the admin-gated v1 ops endpoint", async () => {
+    renderOpsRoute("/ops?days=14");
+
+    const link = await screen.findByRole("link", { name: "JSON" });
+    expect(link.getAttribute("href")).toBe("/api/v1/ops?days=14");
+  });
 });

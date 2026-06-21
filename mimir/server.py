@@ -334,16 +334,19 @@ def _is_auth_exempt(method: str, path: str) -> bool:
 
 
 # Route prefixes that require the ``admin`` role (server-side RBAC boundary,
-# github #726). Any method on these paths is admin-only — config/model/env
-# admin (#543), scheduler/poller/commitments admin (#544), and the user/key
-# management endpoints all live under ``/api/v1/admin/``. This is the SECURITY
-# gate; React section-hiding is UX only and must never be the sole control.
-#
-# SAGA and file-backed memory/state dashboards expose global cross-channel
-# history and raw markdown content. Until they have object-level ACL filtering,
-# treat the JSON APIs as admin surfaces too (chainlink #592).
+# github #726). Any method on these paths is admin-only. The admin config/user
+# management endpoints live under ``/api/v1/admin``; the ops/scheduler/task
+# dashboards expose global operational/project state and Worklink artifacts
+# (chainlink #593). SAGA and file-backed memory/state dashboards expose global
+# cross-channel history and raw markdown content (chainlink #592). This is the
+# SECURITY gate; React section-hiding is UX only and must never be the sole
+# control.
 _ADMIN_REQUIRED_PREFIXES: tuple[str, ...] = (
-    "/api/v1/admin/",
+    "/api/v1/admin",
+    "/api/ops",
+    "/api/v1/ops",
+    "/api/v1/scheduler",
+    "/api/v1/chainlink-board",
     "/api/v1/saga",
     "/api/v1/memory",
     "/api/saga",
@@ -352,9 +355,8 @@ _ADMIN_REQUIRED_PREFIXES: tuple[str, ...] = (
 
 
 def _matches_admin_required_prefix(path: str, prefix: str) -> bool:
-    if prefix.endswith("/"):
-        return path == prefix[:-1] or path.startswith(prefix)
-    return path == prefix or path.startswith(prefix + "/")
+    prefix = prefix.rstrip("/")
+    return path == prefix or path.startswith(f"{prefix}/")
 
 
 def _is_admin_required(path: str) -> bool:

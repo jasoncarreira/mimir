@@ -46,6 +46,18 @@ def test_generated_typescript_contracts_are_current():
     assert generated == render_typescript_contracts()
 
 
+def test_global_dashboard_extensions_are_admin_only_in_nav_payload():
+    manifests = {
+        item["id"]: item
+        for item in first_party_dashboard_extensions().navigation_payload()
+    }
+
+    assert manifests["ops"]["requires_role"] == "admin"
+    assert manifests["chainlink-board"]["requires_role"] == "admin"
+    assert manifests["scheduler"]["requires_role"] == "admin"
+    assert manifests["chat"]["requires_role"] is None
+
+
 def test_dashboard_extension_registry_sorts_hides_and_validates_scope():
     registry = first_party_dashboard_extensions(
         [
