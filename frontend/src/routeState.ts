@@ -23,7 +23,7 @@ export type RouteStatePatch = Partial<Record<RouteStateKey, string | number | nu
 
 const SECRET_QUERY_KEY_RE = /(api[_-]?key|token|secret|password|credential|authorization|auth[_-]?key)/i;
 
-const SAFE_RELATIVE_PATH_RE = /^(?!.*(?:^|\/|\\)\.\.(?:\/|\\|$))\/(?!\/)/;
+const SAFE_RELATIVE_PATH_RE = /^(?!.*\\)(?!.*(?:^|\/)\.\.(?:\/|$))\/(?!\/)/;
 
 export function sanitizeHref(href: string | null | undefined): string | null {
   const value = (href || "").trim();

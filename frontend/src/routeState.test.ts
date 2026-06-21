@@ -18,6 +18,7 @@ describe("route-state helpers", () => {
     expect(sanitizeHref("javascript:alert(1)")).toBeNull();
     expect(sanitizeHref("data:text/html,hi")).toBeNull();
     expect(sanitizeHref("//evil.test/path")).toBeNull();
+    expect(sanitizeHref("/\\evil.test/path")).toBeNull();
     expect(sanitizeHref("/../secrets")).toBeNull();
   });
 
