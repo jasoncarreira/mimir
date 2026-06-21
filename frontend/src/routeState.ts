@@ -23,6 +23,38 @@ export type RouteStatePatch = Partial<Record<RouteStateKey, string | number | nu
 
 const SECRET_QUERY_KEY_RE = /(api[_-]?key|token|secret|password|credential|authorization|auth[_-]?key)/i;
 
+const SAFE_RELATIVE_PATH_RE = /^(?!.*(?:^|\/|\\)\.\.(?:\/|\\|$))\/(?!\/)/;
+
+export function sanitizeHref(href: string | null | undefined): string | null {
+  const value = (href || "").trim();
+  if (!value) return null;
+
+  if (SAFE_RELATIVE_PATH_RE.test(value)) return value;
+
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      return parsed.href;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+export function scrubSecretQueryParams(
+  location: Pick<Location, "pathname" | "search" | "hash"> = window.location
+): string | null {
+  const params = sanitizedSearchParams(location.search);
+  const nextSearch = params.toString();
+  const currentSearch = location.search.startsWith("?")
+    ? location.search.slice(1)
+    : location.search;
+  if (nextSearch === currentSearch) return null;
+  return `${location.pathname}${nextSearch ? `?${nextSearch}` : ""}${location.hash}`;
+}
+
 export function sanitizedSearchParams(
   base?: URLSearchParams | string,
   patch: RouteStatePatch = {}

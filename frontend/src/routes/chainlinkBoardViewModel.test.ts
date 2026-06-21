@@ -50,6 +50,25 @@ describe("chainlink board view-model", () => {
     expect(board.edges).toEqual([{ from: 540, to: 545, kind: "blocks" }]);
   });
 
+  it("drops unsafe Worklink artifact links", () => {
+    const board = safeChainlinkBoardData({
+      available: true,
+      issues: [{
+        id: 1,
+        title: "Unsafe",
+        worklink: {
+          pr_url: "javascript:alert(1)",
+          transcript_href: "//evil.test/transcript",
+          evidence_href: "/api/v1/chainlink-board/artifact?path=state/worklink/evidence/1.json"
+        }
+      }]
+    });
+
+    expect(board.issues[0].worklink?.pr_url).toBe("");
+    expect(board.issues[0].worklink?.transcript_href).toBe("");
+    expect(board.issues[0].worklink?.evidence_href).toBe("/api/v1/chainlink-board/artifact?path=state/worklink/evidence/1.json");
+  });
+
   it("degrades malformed payloads to an unavailable empty board", () => {
     const board = safeChainlinkBoardData({ available: "yes", issues: "bad", filters: null });
 

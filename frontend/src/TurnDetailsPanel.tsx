@@ -1,7 +1,7 @@
 import React from "react";
 import { Link } from "react-router-dom";
 import type { SagaCall, TurnEvent, TurnRecord } from "./api";
-import { drilldownHref } from "./routeState";
+import { drilldownHref, sanitizeHref } from "./routeState";
 import { Badge, CodeBlock, EmptyState, ErrorState, Panel } from "./ui";
 import { TriggerPill } from "./routes/triggerPill";
 import { useUiState } from "./uiState";
@@ -118,7 +118,7 @@ function PreviewText({ value, empty = "(empty)" }: { value: unknown; empty?: str
 
 function ResultBody({ event }: { event: TurnEvent }) {
   const placeholder = resultPlaceholder(event);
-  const link = placeholderLink(event);
+  const link = sanitizeHref(placeholderLink(event));
   const value = event.content ?? event.result;
 
   return (

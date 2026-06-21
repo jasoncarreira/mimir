@@ -28,7 +28,7 @@ import { OpsRoute, UsageRoute } from "./routes/OpsRoute";
 import { SchedulerRoute } from "./routes/SchedulerRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { TurnsRoute } from "./routes/TurnsRoute";
-import { useRouteState } from "./routeState";
+import { scrubSecretQueryParams, useRouteState } from "./routeState";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import type { AgentCharacterState } from "./skins/types";
 import {
@@ -49,6 +49,11 @@ const queryClient = new QueryClient();
 // Build-time mimir version from vite's define (vite.config). Guarded with typeof
 // so it's safe where the define isn't applied (e.g. vitest) — falls back to "".
 const APP_BUILD_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "";
+
+const scrubbedUrl = scrubSecretQueryParams();
+if (scrubbedUrl) {
+  window.history.replaceState(window.history.state, "", scrubbedUrl);
+}
 
 function appBasename() {
   const base = import.meta.env.BASE_URL.replace(/\/$/, "");

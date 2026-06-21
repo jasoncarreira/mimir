@@ -1,4 +1,5 @@
 import type { DashboardExtensionManifest } from "./api/generated/contracts";
+import { sanitizeHref } from "./routeState";
 
 export interface DashboardSurface extends DashboardExtensionManifest {
   path: `/${string}`;
@@ -69,10 +70,11 @@ const firstPartySurfaceMetadata: Record<
 };
 
 function toDashboardPath(routePath: string): `/${string}` {
-  if (!routePath.startsWith("/")) {
-    throw new Error(`dashboard extension route_path must start with /: ${routePath}`);
+  const safePath = sanitizeHref(routePath);
+  if (!safePath?.startsWith("/")) {
+    throw new Error(`dashboard extension route_path must be a safe same-origin path: ${routePath}`);
   }
-  return routePath as `/${string}`;
+  return safePath as `/${string}`;
 }
 
 function defaultMetadata(manifest: DashboardExtensionManifest) {
