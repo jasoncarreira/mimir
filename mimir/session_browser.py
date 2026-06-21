@@ -352,8 +352,8 @@ def build_sessions_payload(
 
     out.sort(key=lambda item: _parse_ts(item.get("last_activity_at")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     limited = out[: max(1, min(limit, 500))]
-    channels = sorted({str(s.get("channel_id")) for s in sessions.values() if s.get("channel_id")})
-    triggers = sorted({str(t) for s in sessions.values() for t in s.get("triggers", []) if t})
+    channels = sorted({str(s.get("channel_id")) for s in out if s.get("channel_id")})
+    triggers = sorted({str(t) for s in out for t in s.get("triggers", []) if t})
     return {
         "sessions": limited,
         "channels": channels,
