@@ -88,6 +88,10 @@ _lcc_patches.apply_patches()
 # "mimir's system_prompt is the only one." No-op when deepagents
 # isn't installed.
 _lcc_patches.strip_deepagents_base_prompt()
+# Cache BaseTool->OpenAI schema conversion in DeepAgents token counting;
+# otherwise summarization middleware can rebuild Pydantic tool schemas on
+# the asyncio loop at every model boundary (chainlink #600).
+_lcc_patches.patch_deepagents_token_counter_tool_schema_cache()
 # Preserve SDK ``ResultMessage`` fields (``stop_reason``, ``num_turns``,
 # ``is_error``) that langchain-claude-code's streaming wrapper drops —
 # without this patch ``derive_result_fields`` loses granular stop-reason
