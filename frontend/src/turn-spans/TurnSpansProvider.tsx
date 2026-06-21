@@ -5,9 +5,9 @@ import { createTurnEventStream } from "../api/turn-events";
 import type { AgentCharacterState } from "../skins/types";
 import {
   EMPTY_TURN_SPANS,
-  EVENT_DECAY_MS,
   applyTurnEvent,
   decayCharacterState,
+  decayDelayFor,
   type TurnSpansState
 } from "./turnSpansModel";
 
@@ -60,15 +60,18 @@ export function TurnSpansProvider({
         timerRef.current = null;
       }
     };
-    const arm = (ms: number) => {
+    // Arm the decay timer for however long the given state rests (or stop it if
+    // the state never decays). Used both after an event and after each decay step.
+    const armFor = (state: AgentCharacterState) => {
       clearTimer();
-      timerRef.current = setTimeout(onDecay, ms);
+      const ms = decayDelayFor(state);
+      if (ms != null) timerRef.current = setTimeout(onDecay, ms);
     };
     function onDecay() {
       timerRef.current = null;
-      const { state: next, rearmMs } = decayCharacterState(charRef.current);
+      const next = decayCharacterState(charRef.current);
       setChar(next);
-      if (rearmMs != null) arm(rearmMs);
+      armFor(next);
     }
 
     // Fresh state for this channel.
@@ -85,7 +88,9 @@ export function TurnSpansProvider({
         stateRef.current = next;
         setState(next);
         setChar(next.characterState);
-        arm(EVENT_DECAY_MS); // any event interrupts + re-arms the decay
+        // Any event interrupts + re-arms: an active result rests 30s before
+        // falling to idle; a clean turn-end (idle) rests 3 min before bored.
+        armFor(next.characterState);
       },
       {
         channel,

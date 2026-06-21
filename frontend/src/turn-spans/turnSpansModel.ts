@@ -34,20 +34,26 @@ export const MAX_SPANS = 100;
 
 // Character-state decay (front-end safety net): the live bus is ephemeral and
 // can drop a turn's terminal event, stranding the character on a stale state.
-// Every event re-arms a 30s timer; when it fires the state decays one step.
-export const EVENT_DECAY_MS = 30_000; // re-armed on every event
-export const IDLE_DECAY_MS = 180_000; // active → idle, then idle → bored after this
+// Decay ladder: active → idle (after 30s of silence) → bored (after 3 more min).
+export const EVENT_DECAY_MS = 30_000; // active rests this long before falling to idle
+export const IDLE_DECAY_MS = 180_000; // idle rests this long before drifting to bored
 
-// Given the CURRENTLY displayed state when the decay timer fires, return the next
-// state and how long until the following decay (null = stop the timer):
-//   active → idle (re-arm 3 min) → bored (stop). idle/bored already at rest.
-export function decayCharacterState(current: AgentCharacterState): {
-  state: AgentCharacterState;
-  rearmMs: number | null;
-} {
-  if (current === "idle") return { state: "bored", rearmMs: null };
-  if (current === "bored") return { state: "bored", rearmMs: null };
-  return { state: "idle", rearmMs: IDLE_DECAY_MS };
+// One decay step for the currently displayed state. active → idle → bored;
+// idle/bored are already at rest (bored is terminal).
+export function decayCharacterState(current: AgentCharacterState): AgentCharacterState {
+  if (current === "idle") return "bored";
+  if (current === "bored") return "bored";
+  return "idle";
+}
+
+// How long a state should rest before it decays one step (null = never decays).
+// This is keyed on the RESULTING state, so a clean turn-end — which maps straight
+// to idle — arms the 3-minute idle→bored timer rather than the 30s active timer
+// (otherwise a normal turn-end would flip to bored after only 30s).
+export function decayDelayFor(state: AgentCharacterState): number | null {
+  if (state === "idle") return IDLE_DECAY_MS;
+  if (state === "bored") return null;
+  return EVENT_DECAY_MS; // active states (thinking/typing/tool/error/listening)
 }
 
 function deltaText(e: TurnStreamEvent): string {

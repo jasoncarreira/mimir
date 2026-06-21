@@ -107,4 +107,28 @@ describe("TurnSpansProvider character decay (#583)", () => {
     act(() => vi.advanceTimersByTime(30_000));
     expect(state()).toBe("idle");
   });
+
+  it("a clean turn-end stays idle for 30s and only goes bored after 3 min", () => {
+    // mimir review: a terminal turn event maps to idle, so it must arm the
+    // 3-minute idle→bored timer — NOT the 30s active timer (which would make a
+    // normal turn-end go bored after only 30s).
+    vi.useFakeTimers();
+    const view = render(
+      <TurnSpansProvider channel="web-x">
+        <Probe />
+      </TurnSpansProvider>
+    );
+    const state = () => view.getByTestId("state").textContent;
+
+    emit({ type: "turn", phase: "end", status: "ok" });
+    expect(state()).toBe("idle");
+
+    // Past the 30s active threshold — a clean idle must NOT have gone bored.
+    act(() => vi.advanceTimersByTime(30_000));
+    expect(state()).toBe("idle");
+
+    // Only after the full 3-minute idle window does it drift to bored.
+    act(() => vi.advanceTimersByTime(180_000));
+    expect(state()).toBe("bored");
+  });
 });

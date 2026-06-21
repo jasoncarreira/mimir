@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { TurnStreamEvent } from "../api/generated/contracts";
 import {
   EMPTY_TURN_SPANS,
+  EVENT_DECAY_MS,
   IDLE_DECAY_MS,
   MAX_SPANS,
   applyTurnEvent,
   decayCharacterState,
+  decayDelayFor,
   type TurnSpansState
 } from "./turnSpansModel";
 
@@ -115,14 +117,22 @@ describe("applyTurnEvent — span assembly", () => {
     expect(state.characterState).toBe("error");
   });
 
-  it("decays an active state to idle (then bored), idle/bored at rest", () => {
-    // active states fall to idle and re-arm for the idle→bored step.
+  it("decays one step: active → idle → bored (bored terminal)", () => {
     for (const active of ["thinking", "typing", "tool", "error", "listening"] as const) {
-      expect(decayCharacterState(active)).toEqual({ state: "idle", rearmMs: IDLE_DECAY_MS });
+      expect(decayCharacterState(active)).toBe("idle");
     }
-    // idle decays to bored and stops; bored stays put.
-    expect(decayCharacterState("idle")).toEqual({ state: "bored", rearmMs: null });
-    expect(decayCharacterState("bored")).toEqual({ state: "bored", rearmMs: null });
+    expect(decayCharacterState("idle")).toBe("bored");
+    expect(decayCharacterState("bored")).toBe("bored");
+  });
+
+  it("rests active 30s, idle 3min, bored forever (decayDelayFor)", () => {
+    // The delay is keyed on the resulting state, so a clean turn-end (idle) waits
+    // the full 3 min before bored — not 30s.
+    for (const active of ["thinking", "typing", "tool", "error", "listening"] as const) {
+      expect(decayDelayFor(active)).toBe(EVENT_DECAY_MS);
+    }
+    expect(decayDelayFor("idle")).toBe(IDLE_DECAY_MS);
+    expect(decayDelayFor("bored")).toBeNull();
   });
 
   it("caps retained spans at MAX_SPANS, dropping the oldest", () => {
