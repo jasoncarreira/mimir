@@ -330,7 +330,7 @@ def register_routes(
             headers=_legacy_frontend_headers(),
         )
 
-    async def turns_data(request: web.Request) -> web.Response:
+    def _turns_response(request: web.Request) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         # Records are oldest-first (append order). The viewer reverses to
         # newest-first for display. Pagination params (progressive loading —
         # the viewer no longer pulls the whole — now 140MB+ — file up front):
@@ -339,6 +339,10 @@ def register_routes(
         #                                (scroll-back page)
         #   ?limit=N                   — newest N turns (initial page)
         #   (none)                     — all turns (back-compat)
+        #
+        # ``_read_jsonl`` tail-decodes retained turn records. That can be
+        # CPU-heavy when tool/model traces are large, so aiohttp handlers call
+        # this helper via ``asyncio.to_thread`` instead of blocking the loop.
         records = _read_jsonl(turns_log)
         after = request.query.get("after", "")
         before = request.query.get("before", "")
@@ -346,6 +350,8 @@ def register_routes(
             limit = int(request.query.get("limit") or 0)
         except ValueError:
             limit = 0
+
+        total = len(records)
         if after:
             # Return everything strictly after the named turn_id. If the id
             # isn't found we return the empty list (consistent with open-strix).
@@ -356,7 +362,9 @@ def register_routes(
                     cut.append(r)
                 elif r.get("turn_id") == after:
                     seen = True
-            return web.json_response({"turns": cut})
+            cursor = str(cut[-1].get("turn_id")) if cut and cut[-1].get("turn_id") else None
+            return cut, list_meta(cursor=cursor, limit=limit or None, total=total, truncated=False)
+
         if before:
             # The page of records immediately older than ``before``. Empty list
             # when the id isn't found (e.g. rotated out) — the viewer treats that
@@ -370,41 +378,6 @@ def register_routes(
             else:
                 start = max(0, idx - limit) if limit > 0 else 0
                 window = records[start:idx]
-            return web.json_response({"turns": window})
-        if limit > 0:
-            records = records[-limit:]
-        return web.json_response({"turns": records})
-
-    def _turns_window(request: web.Request) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        records = _read_jsonl(turns_log)
-        after = request.query.get("after", "")
-        before = request.query.get("before", "")
-        try:
-            limit = int(request.query.get("limit") or 0)
-        except ValueError:
-            limit = 0
-
-        total = len(records)
-        if after:
-            cut = []
-            seen = False
-            for r in records:
-                if seen:
-                    cut.append(r)
-                elif r.get("turn_id") == after:
-                    seen = True
-            cursor = str(cut[-1].get("turn_id")) if cut and cut[-1].get("turn_id") else None
-            return cut, list_meta(cursor=cursor, limit=limit or None, total=total, truncated=False)
-        if before:
-            idx = next(
-                (i for i, r in enumerate(records) if r.get("turn_id") == before),
-                None,
-            )
-            if idx is None:
-                window = []
-            else:
-                start = max(0, idx - limit) if limit > 0 else 0
-                window = records[start:idx]
             cursor = str(window[0].get("turn_id")) if window and window[0].get("turn_id") else None
             return window, list_meta(
                 cursor=cursor,
@@ -412,6 +385,7 @@ def register_routes(
                 total=total,
                 truncated=idx is not None and bool(limit > 0 and idx > limit),
             )
+
         window = records[-limit:] if limit > 0 else records
         cursor = str(window[-1].get("turn_id")) if window and window[-1].get("turn_id") else None
         return window, list_meta(
@@ -421,8 +395,12 @@ def register_routes(
             truncated=bool(limit > 0 and total > limit),
         )
 
+    async def turns_data(request: web.Request) -> web.Response:
+        records, _meta = await asyncio.to_thread(_turns_response, request)
+        return web.json_response({"turns": records})
+
     async def turns_data_v1(request: web.Request) -> web.Response:
-        turns, meta = _turns_window(request)
+        turns, meta = await asyncio.to_thread(_turns_response, request)
         return json_success({"turns": turns}, meta=meta)
 
     async def sessions_data_v1(request: web.Request) -> web.Response:

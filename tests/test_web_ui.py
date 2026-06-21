@@ -266,6 +266,30 @@ async def test_api_v1_turns_returns_envelope_and_list_metadata(app):
     }
 
 
+
+@pytest.mark.asyncio
+async def test_api_v1_turns_offloads_tail_read(monkeypatch, app):
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(5)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    calls = []
+    real_to_thread = web_ui.asyncio.to_thread
+
+    async def fake_to_thread(func, *args, **kwargs):
+        calls.append(func.__name__)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(web_ui.asyncio, "to_thread", fake_to_thread)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/turns?limit=2")
+        body = await resp.json()
+
+    assert resp.status == 200
+    assert [t["turn_id"] for t in body["data"]["turns"]] == ["t3", "t4"]
+    assert "_turns_response" in calls
+
+
 @pytest.mark.asyncio
 async def test_api_v1_sessions_groups_missing_saga_session_id_by_channel_time(tmp_path: Path):
     turns_log = tmp_path / "turns.jsonl"
