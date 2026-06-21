@@ -283,6 +283,8 @@ def test_web_channel_for_uses_canonical_verbatim():
     assert _web_channel_for("a.b") != _web_channel_for("a_b")
     assert _web_channel_for("Alice") != _web_channel_for("alice")
     assert _web_channel_for("") == DEFAULT_CHANNEL
+    # reserved shared default channel must not be reachable by a real identity
+    assert _web_channel_for("default") != DEFAULT_CHANNEL
 
 
 @pytest.mark.asyncio
@@ -354,6 +356,37 @@ async def test_history_authenticated_resolves_to_per_user_channel(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_authenticated_default_canonical_does_not_share_web_default(tmp_path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(
+            canonical="default",
+            display_name="Default User",
+        )
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/api/v1/chat", json={"content": "hi"})
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"]["channel_id"] != DEFAULT_CHANNEL
+    assert body["data"]["channel_id"].startswith("web-user:")
+    assert enqueued[0].channel_id == body["data"]["channel_id"]
+
+
+@pytest.mark.asyncio
 async def test_authenticated_user_cannot_post_to_other_web_channel(tmp_path):
     enqueued: list[AgentEvent] = []
 
@@ -378,6 +411,44 @@ async def test_authenticated_user_cannot_post_to_other_web_channel(tmp_path):
     validate_api_envelope(body, expect_ok=False)
     assert body["error"]["code"] == "forbidden_channel"
     assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_default_canonical_history_does_not_read_shared_web_default(tmp_path):
+    import mimir.history as history_mod
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(
+            canonical="default",
+            display_name="Default User",
+        )
+        return await handler(request)
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        return True
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    (tmp_path / "hist").mkdir()
+    buf = MessageBuffer(history_path=tmp_path / "hist" / "chat_history.jsonl")
+    await buf.append(buf.make_message(channel_id=DEFAULT_CHANNEL, kind="user_message", content="shared", author="curl"))
+
+    prev = history_mod.get_global_buffer()
+    set_global_buffer(buf)
+    try:
+        async with TestClient(TestServer(a)) as client:
+            resp = await client.get(f"/api/v1/chat/history?channel_id={DEFAULT_CHANNEL}")
+            body = await resp.json()
+    finally:
+        history_mod._global_buffer = prev
+
+    assert resp.status == 200
+    assert body["data"]["channel_id"] != DEFAULT_CHANNEL
+    assert body["data"]["messages"] == []
 
 
 @pytest.mark.asyncio
