@@ -70,7 +70,7 @@ from .prompts import build_system_prompt, build_turn_prompt
 from .rate_limits import RateLimitStore
 from .saga_client import SagaClient
 from .session_boundary_log import (
-    count_turns_since,
+    count_turns_since_many,
     render_session_summaries,
 )
 from .subagent_inbox import SubagentInbox, render_subagent_updates
@@ -2796,17 +2796,17 @@ class Agent:
                 boundaries = []
         turn_counts: dict[str, int] = {}
         if channel_id is not None and boundaries:
-            snapshot_records = self._turns_snapshot.records
-            for b in boundaries:
-                ts = str(b.get("ts") or b.get("timestamp") or "")
-                if not ts:
-                    continue
-                turn_counts[ts] = count_turns_since(
-                    self._config.turns_log,
-                    channel_id=channel_id,
-                    since_ts=ts,
-                    snapshot_records=snapshot_records,
-                )
+            boundary_timestamps = [
+                str(b.get("ts") or b.get("timestamp") or "")
+                for b in boundaries
+            ]
+            turn_counts = await asyncio.to_thread(
+                count_turns_since_many,
+                self._config.turns_log,
+                channel_id=channel_id,
+                since_timestamps=boundary_timestamps,
+                snapshot_records=self._turns_snapshot.records,
+            )
         now = datetime.now(tz=timezone.utc)
         return render_session_summaries(
             boundaries,

@@ -114,6 +114,7 @@ from mimir.session_boundary_log import (
     _format_relative_age,
     _format_turn_count,
     count_turns_since,
+    count_turns_since_many,
 )
 
 
@@ -652,6 +653,45 @@ def test_count_turns_since_uses_snapshot_callable_when_supplied(tmp_path: Path):
         snapshot_records=lambda: fake_records,
     )
     assert n == 2
+
+
+def test_count_turns_since_many_scans_records_once(tmp_path: Path):
+    """Multiple boundary headers should be annotated from one records pass.
+
+    The agent calls this helper inside ``asyncio.to_thread``; keeping all
+    cutoffs in one synchronous pass prevents one tail-drain per recent
+    boundary.
+    """
+    calls = 0
+
+    def fake_records():
+        nonlocal calls
+        calls += 1
+        return [
+            {"ts": "2026-05-09T17:00:00+00:00", "channel_id": "c"},
+            {"ts": "2026-05-09T15:00:00+00:00", "channel_id": "c"},
+            {"ts": "2026-05-09T13:00:00+00:00", "channel_id": "c"},
+            {"ts": "2026-05-09T16:00:00+00:00", "channel_id": "other"},
+        ]
+
+    counts = count_turns_since_many(
+        tmp_path / "does-not-exist.jsonl",
+        channel_id="c",
+        since_timestamps=[
+            "2026-05-09T12:00:00+00:00",
+            "2026-05-09T14:00:00+00:00",
+            "2026-05-09T16:00:00+00:00",
+            "",
+        ],
+        snapshot_records=fake_records,
+    )
+
+    assert calls == 1
+    assert counts == {
+        "2026-05-09T12:00:00+00:00": 3,
+        "2026-05-09T14:00:00+00:00": 2,
+        "2026-05-09T16:00:00+00:00": 1,
+    }
 
 
 # ---- end-to-end T0/T1/T2 acceptance scenario ---------------------------
