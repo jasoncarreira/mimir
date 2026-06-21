@@ -278,6 +278,102 @@ def _whoami_payload(identity: Any, is_master: bool) -> dict[str, Any]:
     }
 
 
+def _web_channel_for(canonical: str) -> str:
+    canonical = (canonical or "").strip()
+    return f"web-{canonical}" if canonical else "web-default"
+
+
+def _normalize_web_channel(raw: str) -> str:
+    channel = raw.strip()
+    if channel and channel != "*" and not channel.startswith("web-"):
+        channel = "web-" + channel
+    return channel
+
+
+def _request_user_web_channel(request: web.Request) -> str | None:
+    """Return the only channel a non-admin web identity may see, if scoped.
+
+    Admin/master and dev-open requests return None, which means unrestricted.
+    Per-user web keys are scoped to ``web-<canonical>`` so dashboard/log APIs do
+    not rely on React filtering as the security boundary (chainlink #591).
+    """
+    if request.get("auth_is_admin") or request.get("auth_is_master"):
+        return None
+    identity = request.get("auth_identity")
+    if identity is None:
+        return None
+    return _web_channel_for(str(getattr(identity, "canonical", "") or ""))
+
+
+def _scoped_channel_from_query(
+    request: web.Request,
+) -> tuple[str | None, web.Response | None]:
+    """Resolve an optional ``?channel=`` under per-user web RBAC.
+
+    ``None`` means unrestricted for admins/dev-open mode. For non-admin web keys,
+    omitted/default/self channel resolves to the caller's own channel; wildcard
+    or another user's channel is a 403.
+    """
+    raw = request.query.get("channel")
+    allowed = _request_user_web_channel(request)
+    if allowed is None:
+        if raw is None or not raw.strip():
+            return None, None
+        channel = _normalize_web_channel(raw)
+        return (None if channel == "*" else channel), None
+
+    if raw is None or not raw.strip():
+        return allowed, None
+    channel = _normalize_web_channel(raw)
+    if channel == "web-default":
+        return allowed, None
+    if channel == allowed:
+        return allowed, None
+    return None, json_error(
+        "forbidden",
+        "channel is not allowed for this web key",
+        status=403,
+        details={"channel": channel},
+    )
+
+
+def _filter_records_by_channel(
+    records: list[dict[str, Any]],
+    channel: str | None,
+) -> list[dict[str, Any]]:
+    if channel is None:
+        return records
+    return [r for r in records if str(r.get("channel_id") or "") == channel]
+
+
+def _event_record_matches_channel(record: dict[str, Any], channel: str) -> bool:
+    for key in ("channel_id", "source_channel_id"):
+        if str(record.get(key) or "") == channel:
+            return True
+    extra = record.get("extra")
+    if isinstance(extra, dict):
+        for key in ("channel_id", "source_channel_id"):
+            if str(extra.get(key) or "") == channel:
+                return True
+    return False
+
+
+def _filter_event_records_by_channel(
+    records: list[dict[str, Any]],
+    channel: str | None,
+) -> list[dict[str, Any]]:
+    if channel is None:
+        return records
+    return [r for r in records if _event_record_matches_channel(r, channel)]
+
+
+def _live_event_item_channel(item: dict[str, Any]) -> str:
+    event = item.get("event") if isinstance(item, dict) else None
+    if isinstance(event, dict):
+        return str(event.get("channel_id") or "")
+    return ""
+
+
 def register_routes(
     app: web.Application,
     *,
@@ -339,7 +435,10 @@ def register_routes(
         #                                (scroll-back page)
         #   ?limit=N                   — newest N turns (initial page)
         #   (none)                     — all turns (back-compat)
-        records = _read_jsonl(turns_log)
+        records = _filter_records_by_channel(
+            _read_jsonl(turns_log),
+            _request_user_web_channel(request),
+        )
         after = request.query.get("after", "")
         before = request.query.get("before", "")
         try:
@@ -375,8 +474,12 @@ def register_routes(
             records = records[-limit:]
         return web.json_response({"turns": records})
 
-    def _turns_window(request: web.Request) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        records = _read_jsonl(turns_log)
+    def _turns_window(
+        request: web.Request,
+        *,
+        channel: str | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        records = _filter_records_by_channel(_read_jsonl(turns_log), channel)
         after = request.query.get("after", "")
         before = request.query.get("before", "")
         try:
@@ -422,10 +525,16 @@ def register_routes(
         )
 
     async def turns_data_v1(request: web.Request) -> web.Response:
-        turns, meta = _turns_window(request)
+        channel, error = _scoped_channel_from_query(request)
+        if error is not None:
+            return error
+        turns, meta = _turns_window(request, channel=channel)
         return json_success({"turns": turns}, meta=meta)
 
     async def sessions_data_v1(request: web.Request) -> web.Response:
+        channel, error = _scoped_channel_from_query(request)
+        if error is not None:
+            return error
         try:
             limit = int(request.query.get("limit") or 200)
         except ValueError:
@@ -437,7 +546,11 @@ def register_routes(
             saga_db=_saga_db,
             limit=limit,
             query=request.query.get("q", ""),
-            channel=request.query.get("channel", "").strip() or None,
+            channel=(
+                channel
+                if channel is not None
+                else request.query.get("channel", "").strip() or None
+            ),
             trigger=request.query.get("trigger", "").strip() or None,
             date_from=request.query.get("from", "").strip() or None,
             date_to=request.query.get("to", "").strip() or None,
@@ -457,7 +570,10 @@ def register_routes(
         )
 
     async def events_data(request: web.Request) -> web.Response:
-        records = _read_jsonl(events_log)
+        records = _filter_event_records_by_channel(
+            _read_jsonl(events_log),
+            _request_user_web_channel(request),
+        )
         since = request.query.get("since", "").strip()
         types = request.query.getall("type", []) or []
         # ``type`` can also arrive as a single comma-joined string.
@@ -482,7 +598,10 @@ def register_routes(
         return web.json_response({"events": out})
 
     def _events_window(request: web.Request) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        records = _read_jsonl(events_log)
+        records = _filter_event_records_by_channel(
+            _read_jsonl(events_log),
+            _request_user_web_channel(request),
+        )
         since = request.query.get("since", "").strip()
         types = request.query.getall("type", []) or []
         type_filter: set[str] = set()
@@ -532,7 +651,12 @@ def register_routes(
         async with live_events_lock:
             live_events_active = max(0, live_events_active - 1)
 
-    async def _live_event_items(request: web.Request, since: str | None) -> list[dict[str, Any]]:
+    async def _live_event_items(
+        request: web.Request,
+        since: str | None,
+        *,
+        channel: str | None = None,
+    ) -> list[dict[str, Any]]:
         try:
             limit = int(request.query.get("limit") or 0)
         except ValueError:
@@ -541,9 +665,17 @@ def register_routes(
             read_live_event_items_since,
             turns_log,
             since=since,
-            limit=limit or None,
+            # Scope before applying the client limit. Otherwise a non-admin
+            # caller could receive an empty page whenever other channels have
+            # newer events than their own.
+            limit=None if channel is not None else limit or None,
         )
-        return [item.as_dict() for item in items]
+        out = [item.as_dict() for item in items]
+        if channel is not None:
+            out = [item for item in out if _live_event_item_channel(item) == channel]
+            if limit > 0:
+                out = out[-limit:]
+        return out
 
     async def live_events_stream(request: web.Request) -> web.StreamResponse:
         """Fetch-authenticated SSE stream for React live dashboards.
@@ -555,6 +687,9 @@ def register_routes(
         - backfill uses strict ``cursor > since`` comparison, so the last
           acknowledged event is not duplicated.
         """
+        channel, error = _scoped_channel_from_query(request)
+        if error is not None:
+            return error
         once = request.query.get("once") in {"1", "true", "yes"}
         resp = web.StreamResponse(
             status=200,
@@ -573,7 +708,7 @@ def register_routes(
         idle_for = 0.0
         try:
             while True:
-                items = await _live_event_items(request, delivered)
+                items = await _live_event_items(request, delivered, channel=channel)
                 for item in items:
                     delivered = str(item["cursor"])
                     block = (
@@ -610,7 +745,10 @@ def register_routes(
         """
         if turn_event_bus is None:
             return web.json_response({"error": "turn events unavailable"}, status=503)
-        channel = request.query.get("channel") or "*"
+        channel, error = _scoped_channel_from_query(request)
+        if error is not None:
+            return error
+        channel = channel if channel is not None else request.query.get("channel") or "*"
         resp = web.StreamResponse(
             status=200,
             headers={

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from mimir.bridges.web_chat import WebChatBridge
+from mimir.turn_event_bus import TurnEventBus
 from mimir.identities import IdentityResolver
 from mimir.identities_populator import issue_web_key
 from mimir import web_ui
@@ -237,3 +239,194 @@ async def test_chat_dev_mode_falls_back_to_client_asserted(tmp_path: Path) -> No
     event, _channel, err = await _bridge(tmp_path)._build_inbound_event(req)
     assert err is None and event is not None
     assert event.author == "alice" and event.author_id == "web-alice"
+
+
+# ── per-user data scoping for React log/session/live endpoints ───────────
+
+
+def _scoped_web_app(home: Path, master_key: str) -> tuple[web.Application, Path, Path]:
+    turns_log = home / "turns.jsonl"
+    events_log = home / "events.jsonl"
+    app = web.Application(middlewares=[_make_auth_middleware(master_key)])
+    app["identity_resolver"] = _resolver(home)
+    web_ui.register_routes(
+        app,
+        turns_log=turns_log,
+        events_log=events_log,
+        home=home,
+        react_app_dist=home / "missing-dist",
+        turn_event_bus=TurnEventBus(),
+    )
+    return app, turns_log, events_log
+
+
+def _jsonl(path: Path, rows: list[dict]) -> None:
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+
+async def test_user_turns_endpoint_filters_to_own_web_channel(tmp_path: Path) -> None:
+    alice_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    bob_key = issue_web_key(tmp_path, "bob", roles=["user"])
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    app, turns_log, _ = _scoped_web_app(tmp_path, "master-secret")
+    _jsonl(turns_log, [
+        {"turn_id": "a1", "channel_id": "web-alice"},
+        {"turn_id": "b1", "channel_id": "web-bob"},
+    ])
+
+    async with TestClient(TestServer(app)) as c:
+        r = await c.get("/api/v1/turns", headers={"X-API-Key": alice_key})
+        body = await r.json()
+        assert r.status == 200
+        assert [t["turn_id"] for t in body["data"]["turns"]] == ["a1"]
+
+        denied = await c.get(
+            "/api/v1/turns?channel=web-bob",
+            headers={"X-API-Key": alice_key},
+        )
+        assert denied.status == 403
+
+        bob = await c.get("/api/v1/turns", headers={"X-API-Key": bob_key})
+        assert [t["turn_id"] for t in (await bob.json())["data"]["turns"]] == ["b1"]
+
+        admin = await c.get("/api/v1/turns", headers={"X-API-Key": admin_key})
+        assert [t["turn_id"] for t in (await admin.json())["data"]["turns"]] == ["a1", "b1"]
+
+
+async def test_user_sessions_endpoint_filters_and_rejects_cross_channel(tmp_path: Path) -> None:
+    alice_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    app, turns_log, _ = _scoped_web_app(tmp_path, "master-secret")
+    _jsonl(turns_log, [
+        {
+            "turn_id": "a1",
+            "ts": "2026-06-21T01:00:00Z",
+            "trigger": "user_message",
+            "channel_id": "web-alice",
+            "input": "alice prompt",
+        },
+        {
+            "turn_id": "b1",
+            "ts": "2026-06-21T01:00:00Z",
+            "trigger": "user_message",
+            "channel_id": "web-bob",
+            "input": "bob prompt",
+        },
+    ])
+
+    async with TestClient(TestServer(app)) as c:
+        r = await c.get("/api/v1/sessions", headers={"X-API-Key": alice_key})
+        body = await r.json()
+        assert r.status == 200
+        assert body["meta"]["total"] == 1
+        assert body["data"]["sessions"][0]["channel_id"] == "web-alice"
+
+        denied = await c.get(
+            "/api/v1/sessions?channel=web-bob",
+            headers={"X-API-Key": alice_key},
+        )
+        assert denied.status == 403
+
+
+async def test_user_events_endpoints_filter_to_own_channel(tmp_path: Path) -> None:
+    alice_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    app, _, events_log = _scoped_web_app(tmp_path, "master-secret")
+    _jsonl(events_log, [
+        {"timestamp": "2026-06-21T01:00:00Z", "type": "tool", "channel_id": "web-alice"},
+        {"timestamp": "2026-06-21T01:00:01Z", "type": "tool", "channel_id": "web-bob"},
+        {
+            "timestamp": "2026-06-21T01:00:02Z",
+            "type": "alert",
+            "extra": {"source_channel_id": "web-alice"},
+        },
+    ])
+
+    async with TestClient(TestServer(app)) as c:
+        legacy = await c.get("/api/events", headers={"X-API-Key": alice_key})
+        assert [e["timestamp"] for e in (await legacy.json())["events"]] == [
+            "2026-06-21T01:00:00Z",
+            "2026-06-21T01:00:02Z",
+        ]
+
+        v1 = await c.get("/api/v1/events", headers={"X-API-Key": alice_key})
+        assert [e["timestamp"] for e in (await v1.json())["data"]["events"]] == [
+            "2026-06-21T01:00:00Z",
+            "2026-06-21T01:00:02Z",
+        ]
+
+        admin = await c.get("/api/v1/events", headers={"X-API-Key": admin_key})
+        assert len((await admin.json())["data"]["events"]) == 3
+
+
+async def test_user_live_events_endpoint_filters_backfill_to_own_channel(tmp_path: Path) -> None:
+    alice_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    app, turns_log, _ = _scoped_web_app(tmp_path, "master-secret")
+    _jsonl(turns_log, [
+        {
+            "turn_id": "a1",
+            "ts": "2026-06-21T01:00:00Z",
+            "channel_id": "web-alice",
+            "events": [
+                {
+                    "type": "text",
+                    "phase": "chunk",
+                    "turn_id": "a1",
+                    "channel_id": "web-alice",
+                    "seq": 1,
+                    "ts": "2026-06-21T01:00:00Z",
+                    "text": "a",
+                }
+            ],
+        },
+        {
+            "turn_id": "b1",
+            "ts": "2026-06-21T01:01:00Z",
+            "channel_id": "web-bob",
+            "events": [
+                {
+                    "type": "text",
+                    "phase": "chunk",
+                    "turn_id": "b1",
+                    "channel_id": "web-bob",
+                    "seq": 1,
+                    "ts": "2026-06-21T01:01:00Z",
+                    "text": "b",
+                }
+            ],
+        },
+    ])
+
+    async with TestClient(TestServer(app)) as c:
+        r = await c.get("/api/v1/live-events?once=1&limit=10", headers={"X-API-Key": alice_key})
+        text = await r.text()
+        assert r.status == 200
+        assert "web-alice" in text
+        assert "web-bob" not in text
+
+        denied = await c.get(
+            "/api/v1/live-events?channel=web-bob&once=1",
+            headers={"X-API-Key": alice_key},
+        )
+        assert denied.status == 403
+
+
+async def test_user_turn_events_rejects_wildcard_and_cross_channel(tmp_path: Path) -> None:
+    alice_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    app, _, _ = _scoped_web_app(tmp_path, "master-secret")
+
+    async with TestClient(TestServer(app)) as c:
+        wildcard = await c.get("/api/v1/turn-events?channel=*", headers={"X-API-Key": alice_key})
+        assert wildcard.status == 403
+
+        denied = await c.get(
+            "/api/v1/turn-events?channel=web-bob",
+            headers={"X-API-Key": alice_key},
+        )
+        assert denied.status == 403
+
+        allowed = await c.get(
+            "/api/v1/turn-events?channel=web-alice",
+            headers={"X-API-Key": alice_key},
+        )
+        assert allowed.status == 200
+        allowed.close()
