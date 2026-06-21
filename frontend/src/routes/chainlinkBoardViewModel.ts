@@ -1,4 +1,5 @@
 import type { ChainlinkBoardData, ChainlinkBoardIssue } from "../api";
+import { sanitizeHref } from "../routeState";
 
 export const chainlinkColumns = ["open", "ready", "blocked", "in-progress", "review", "done"] as const;
 
@@ -75,12 +76,12 @@ function safeIssue(raw: Record<string, unknown>): ChainlinkBoardIssue | null {
       finished_at: stringFrom(worklink.finished_at),
       diff_stat: stringFrom(worklink.diff_stat),
       tests: isRecord(worklink.tests) ? worklink.tests : null,
-      pr_url: stringFrom(worklink.pr_url),
+      pr_url: sanitizeHref(stringFrom(worklink.pr_url)) || "",
       blocked_reason: stringFrom(worklink.blocked_reason),
       transcript: stringFrom(worklink.transcript),
-      transcript_href: stringFrom(worklink.transcript_href),
+      transcript_href: sanitizeHref(stringFrom(worklink.transcript_href)) || "",
       evidence_path: stringFrom(worklink.evidence_path),
-      evidence_href: stringFrom(worklink.evidence_href)
+      evidence_href: sanitizeHref(stringFrom(worklink.evidence_href)) || ""
     } : null
   };
 }

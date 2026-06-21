@@ -65,6 +65,19 @@ describe("resolveAgentCharacterAsset", () => {
     expect(resolveAgentCharacterAsset(renderer, "error")).toMatchObject({ assetId: "error-asset", href: "/error.lottie", state: "error" });
   });
 
+  it("rejects unsafe renderer asset hrefs", () => {
+    const brokenHref = {
+      ...renderer,
+      assets: [{ id: "idle-asset", type: "dotlottie" as const, href: "javascript:alert(1)" }]
+    };
+
+    expect(resolveAgentCharacterAsset(brokenHref, "idle")).toMatchObject({
+      assetId: "idle-asset",
+      href: null,
+      state: "idle"
+    });
+  });
+
   it("falls back to the renderer fallback state when an asset is missing", () => {
     const broken = { ...renderer, stateMap: { ...renderer.stateMap, tool: "missing-asset" } };
     expect(resolveAgentCharacterAsset(broken, "tool")).toMatchObject({ assetId: "idle-asset", href: "/idle.lottie", state: "idle" });

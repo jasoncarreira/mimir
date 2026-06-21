@@ -3,6 +3,7 @@ import type {
   AgentCharacterState,
   SkinCharacterRendererMetadata
 } from "../skins/types";
+import { sanitizeHref } from "../routeState";
 
 export interface ResolvedAgentCharacterAsset {
   assetId: string;
@@ -23,7 +24,7 @@ export function resolveAgentCharacterAsset(
   if (asset) {
     return {
       assetId: asset.id,
-      href: asset.href,
+      href: sanitizeHref(asset.href),
       state: requestedState
     };
   }
@@ -35,7 +36,7 @@ export function resolveAgentCharacterAsset(
 
   return {
     assetId: fallbackAsset?.id ?? fallbackAssetId,
-    href: fallbackAsset?.href ?? null,
+    href: sanitizeHref(fallbackAsset?.href),
     state: renderer.fallbackState
   };
 }

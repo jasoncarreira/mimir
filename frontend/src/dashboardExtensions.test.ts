@@ -47,6 +47,15 @@ describe("dashboard surface metadata", () => {
     expect(ops.tabs).not.toContain("usage");
     expect(ops.tabs).not.toContain("chainlink");
   });
+
+  it("rejects unsafe dashboard routes before rendering navigation", () => {
+    expect(() => getDashboardSurfaces([
+      { ...manifest("bad"), route_path: "javascript:alert(1)" }
+    ])).toThrow(/safe same-origin path/);
+    expect(() => getDashboardSurfaces([
+      { ...manifest("bad"), route_path: "//evil.test/path" }
+    ])).toThrow(/safe same-origin path/);
+  });
 });
 
 describe("visibleSurfaces role-gating (#563)", () => {
