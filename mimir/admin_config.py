@@ -11,6 +11,7 @@ from typing import Any
 
 from .config import Config
 from .providers import provider_for_quota
+from .redaction import redact_text
 from .scheduler import load_jobs
 
 
@@ -173,12 +174,18 @@ def _is_secret_name(name: str) -> bool:
     return any(marker in upper for marker in SECRET_MARKERS)
 
 
+def _redact_public_value(value: str) -> str:
+    """Mask credential material in otherwise-public diagnostic strings."""
+
+    return redact_text(_redact_url_userinfo(value))
+
+
 def _redacted_value(name: str, value: str | None) -> str | None:
     if value is None:
         return None
     if _is_secret_name(name):
         return "[REDACTED]"
-    return _redact_url_userinfo(value)
+    return _redact_public_value(value)
 
 
 def _env_row(category: str, name: str) -> dict[str, Any]:
@@ -243,7 +250,7 @@ def _redact_config_value(value: Any, *, key: str | None = None) -> Any:
     if isinstance(value, list):
         return [_redact_config_value(item) for item in value]
     if isinstance(value, str):
-        return _redact_url_userinfo(value)
+        return _redact_public_value(value)
     return value
 
 
@@ -263,7 +270,7 @@ def _redacted_config(config: Config) -> dict[str, Any]:
         elif name in RAW_CONFIG_NESTED_REDACTED_FIELDS:
             out[name] = _redact_config_value(value, key=name)
         elif name in RAW_CONFIG_URL_REDACTED_FIELDS:
-            out[name] = _redact_url_userinfo(value) if isinstance(value, str) else value
+            out[name] = _redact_public_value(value) if isinstance(value, str) else value
     return out
 
 
