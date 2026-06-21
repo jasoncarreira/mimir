@@ -285,6 +285,18 @@ def _apply_closed_since(
     return kept
 
 
+def _turn_records(
+    turns_log_path: Path,
+    snapshot_records: Optional[Callable[[], Iterable[dict[str, Any]]]],
+) -> Iterable[dict[str, Any]]:
+    if snapshot_records is not None:
+        return snapshot_records()
+    try:
+        return tail_jsonl_records(turns_log_path)
+    except FileNotFoundError:
+        return []
+
+
 def count_turns_since(
     turns_log_path: Path, channel_id: str, since_ts: str,
     *,
@@ -307,24 +319,45 @@ def count_turns_since(
     """
     if not since_ts:
         return 0
-    records: Iterable[dict[str, Any]]
-    if snapshot_records is not None:
-        records = snapshot_records()
-    else:
-        try:
-            records = tail_jsonl_records(turns_log_path)
-        except FileNotFoundError:
-            return 0
-    count = 0
-    for rec in records:
+    return count_turns_since_many(
+        turns_log_path,
+        channel_id=channel_id,
+        since_timestamps=[since_ts],
+        snapshot_records=snapshot_records,
+    ).get(since_ts, 0)
+
+
+def count_turns_since_many(
+    turns_log_path: Path,
+    channel_id: str,
+    since_timestamps: Iterable[str],
+    *,
+    snapshot_records: Optional[Callable[[], Iterable[dict[str, Any]]]] = None,
+) -> dict[str, int]:
+    """Count channel turns after each timestamp in one records pass.
+
+    This is the prompt-session-summary helper used by
+    ``Agent._assemble_session_summaries``. It is intentionally
+    synchronous so the async caller can place the whole JSONL
+    snapshot/tail drain and comparison loop behind ``asyncio.to_thread``;
+    prompt assembly must not parse ``turns.jsonl`` on the scheduler event
+    loop.
+    """
+    cutoffs = [str(ts) for ts in since_timestamps if str(ts)]
+    if not cutoffs:
+        return {}
+    counts = dict.fromkeys(cutoffs, 0)
+    for rec in _turn_records(turns_log_path, snapshot_records):
         rec_ch = rec.get("channel_id")
         if rec_ch != channel_id:
             continue
         rec_ts = rec.get("ts")
         if not rec_ts:
             continue
-        if str(rec_ts) > since_ts:
-            count += 1
-    return count
+        rec_ts_s = str(rec_ts)
+        for cutoff in cutoffs:
+            if rec_ts_s > cutoff:
+                counts[cutoff] += 1
+    return counts
 
 

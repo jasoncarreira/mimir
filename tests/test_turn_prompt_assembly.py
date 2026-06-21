@@ -473,6 +473,62 @@ async def test_agent_build_turn_prompt_threads_all_helper_outputs(
 
 
 @pytest.mark.asyncio
+async def test_session_summaries_counts_turns_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for chainlink #597.
+
+    ``JsonlSnapshot.records`` can tail and parse ``turns.jsonl`` when its
+    cache is stale. Prompt assembly must invoke the turn-count helper via
+    ``asyncio.to_thread`` so scheduled turns do not do that file/CPU work
+    on the event loop.
+    """
+    agent = _make_agent(tmp_path)
+
+    class _StubSaga:
+        async def recent_session_boundaries(self, *, channel_id, count):
+            assert channel_id == "ch-1"
+            assert count == agent._config.recent_boundaries
+            return [
+                {
+                    "ts": "2026-06-21T09:00:00+00:00",
+                    "channel_id": "ch-1",
+                    "summary": "older",
+                },
+                {
+                    "ts": "2026-06-21T10:00:00+00:00",
+                    "channel_id": "ch-1",
+                    "summary": "newer",
+                },
+            ]
+
+    agent._saga = _StubSaga()
+    to_thread_calls: list[tuple[object, tuple, dict]] = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        to_thread_calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("mimir.agent.asyncio.to_thread", fake_to_thread)
+
+    block = await agent._assemble_session_summaries(channel_id="ch-1")
+
+    assert block is not None
+    assert len(to_thread_calls) == 1
+    func, args, kwargs = to_thread_calls[0]
+    assert func.__name__ == "count_turns_since_many"
+    assert args == (agent._config.turns_log,)
+    assert kwargs["channel_id"] == "ch-1"
+    assert kwargs["since_timestamps"] == [
+        "2026-06-21T09:00:00+00:00",
+        "2026-06-21T10:00:00+00:00",
+    ]
+    snapshot_records = kwargs["snapshot_records"]
+    assert snapshot_records.__self__ is agent._turns_snapshot
+    assert snapshot_records.__func__ is agent._turns_snapshot.records.__func__
+
+
+@pytest.mark.asyncio
 async def test_agent_build_turn_prompt_omits_blocks_for_none_helpers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
