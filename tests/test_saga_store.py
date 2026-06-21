@@ -85,6 +85,66 @@ async def test_client_store_dedupes(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_store_embedding_runs_outside_write_lock(client, monkeypatch):
+    """#602: slow provider embedding must not hold SagaStore's write lock."""
+    import time
+
+    _patch_provider(monkeypatch)
+    original_lock = client._write_lock
+    lock_acquired_at: list[float] = []
+    embed_started_at: list[float] = []
+
+    class _RecordingLock:
+        def acquire(self, *args, **kwargs):
+            lock_acquired_at.append(time.monotonic())
+            return original_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            return original_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.release()
+
+    def _recording_embed(_text):
+        embed_started_at.append(time.monotonic())
+        time.sleep(0.02)
+        return (b"\x00" * 16, "stub", "stub-4d", 4)
+
+    monkeypatch.setattr(client, "_write_lock", _RecordingLock())
+    monkeypatch.setattr("mimir.saga.client._embed_text_sync", _recording_embed)
+
+    result = await client.store("new content that needs embedding")
+
+    assert result["stored"] is True
+    assert embed_started_at
+    assert lock_acquired_at
+    assert embed_started_at[0] < lock_acquired_at[0], (
+        "provider embedding ran after the write lock was acquired"
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_exact_duplicate_fast_path_still_skips_embedding(client, monkeypatch):
+    """Exact content-hash duplicates still dedupe without another embed."""
+    _patch_provider(monkeypatch)
+
+    first = await client.store("duplicate content fast path")
+
+    def _unexpected_embed(_text):
+        raise AssertionError("exact duplicate path should not call embed")
+
+    monkeypatch.setattr("mimir.saga.client._embed_text_sync", _unexpected_embed)
+    second = await client.store("duplicate content fast path")
+
+    assert first["atom_id"] == second["atom_id"]
+    assert second["stored"] is False
+
+
+@pytest.mark.asyncio
 async def test_client_query_returns_two_tier_shape(client, monkeypatch):
     _patch_provider(monkeypatch)
     await client.store("Alice prefers concise replies")

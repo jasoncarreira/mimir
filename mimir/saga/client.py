@@ -43,6 +43,7 @@ log = logging.getLogger(__name__)
 from . import migrations as _migrations
 from .mark_access import AccessEvent, mark_access
 from .recall import recall as _recall
+from .store import _hash_content as _store_hash_content
 from .store import store as _store
 from .reflect import (
     reflect as _reflect,
@@ -56,7 +57,10 @@ from .vector_index import VectorIndex
 # ─── Provider/index adapters ─────────────────────────────────────────
 
 
-def _embed_text_sync(text: str) -> tuple[bytes, str, str, int]:
+EmbeddingTuple = tuple[bytes, str, str, int]
+
+
+def _embed_text_sync(text: str) -> EmbeddingTuple:
     """Adapt saga.embeddings.get_provider() to the store.EmbedFn shape.
 
     Returns (vec_bytes, provider_name, model, dim). Sync because the
@@ -881,13 +885,42 @@ class SagaStore:
         profile: str | None = None, source_type: str = "api",
         use_llm_annotate: bool = False,
         metadata: dict[str, Any] | None = None,
-        precomputed_embedding: tuple[bytes, str, str, int] | None = None,
+        precomputed_embedding: EmbeddingTuple | None = None,
         session_id: str | None = None,
         session_dedup_threshold: float | None = None,
     ) -> dict[str, Any]:
         # session_dedup_threshold is forwarded straight to store() — off
         # by default, opt-in by callers that want session-paraphrase
         # collapse. The bench harness leaves it None.
+        content = content.strip()
+        if not content:
+            raise ValueError("store: content cannot be empty")
+
+        # Compute provider embeddings before taking SagaStore's shared
+        # DB/write locks. ``store.py`` already kept embedding outside the
+        # sqlite transaction, but this facade wrapped the whole call in
+        # ``_write_locked``; slow provider retries therefore serialized every
+        # SAGA writer. Preserve the exact-duplicate fast path (no embed needed)
+        # by doing the same cheap content-hash check under only ``_db_lock``.
+        effective_embedding = precomputed_embedding
+        if effective_embedding is None:
+            content_hash = _store_hash_content(content)
+
+            def _exact_duplicate_exists() -> bool:
+                conn = self._ensure_conn()
+                row = conn.execute(
+                    "SELECT 1 FROM atoms WHERE content_hash = ? "
+                    "AND agent_id = ? AND tombstoned = 0",
+                    (content_hash, self._agent_id),
+                ).fetchone()
+                return row is not None
+
+            duplicate_exists = await self._db_locked(_exact_duplicate_exists)
+            if not duplicate_exists:
+                effective_embedding = await asyncio.to_thread(
+                    _embed_text_sync, content,
+                )
+
         def _do():
             conn = self._ensure_conn()
             result = _store(
@@ -898,7 +931,7 @@ class SagaStore:
                 metadata=metadata,
                 agent_id=self._agent_id,
                 session_id=session_id,
-                precomputed_embedding=precomputed_embedding,
+                precomputed_embedding=effective_embedding,
                 session_dedup_threshold=session_dedup_threshold,
             )
             if result.stored:
