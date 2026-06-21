@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -553,6 +554,7 @@ def _orchestrator_runner(
     *,
     files_stdout: str = "changed.txt\n",
     dirty_after_commit: bool = False,
+    cleanup_returncode: int = 0,
 ):
     calls: list[Sequence[str] | str] = []
     commit_seen = False
@@ -611,7 +613,11 @@ def _orchestrator_runner(
         if isinstance(args, list) and args[:3] == ["gh", "pr", "create"]:
             return cp(args, stdout="https://github.com/jasoncarreira/mimir/pull/999\n")
         if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "remove"]:
-            return cp(args)
+            return cp(
+                args,
+                returncode=cleanup_returncode,
+                stderr="worktree cleanup failed\n" if cleanup_returncode else "",
+            )
         return cp(args)
 
     return calls, runner
@@ -740,6 +746,39 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert "worklink_evidence" in body
     assert "worklink_transition" in body
     _reset_logger_for_tests()
+
+
+def test_post_success_cleanup_failure_does_not_retransition_review_ready_issue(
+    tmp_path: Path,
+) -> None:
+    _reset_logger_for_tests()
+    events = tmp_path / "logs" / "events.jsonl"
+    init_logger(events, session_id="test-worklink")
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree, cleanup_returncode=128)
+
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.review_ready is True
+    assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
+    assert result.reason == "post-transition cleanup failed: worktree cleanup failed"
+    assert ["chainlink", "issue", "label", "441", "worklink:review"] in calls
+    assert ["chainlink", "issue", "label", "441", "worklink:failed"] not in calls
+    assert ["chainlink", "issue", "label", "441", "worklink:ready"] not in calls
+    records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    assert any(record["type"] == "worklink_cleanup_failed" for record in records)
+    _reset_logger_for_tests()
+
 
 
 def test_worklink_runner_cuts_worktree_and_pr_from_configured_base(tmp_path: Path) -> None:
