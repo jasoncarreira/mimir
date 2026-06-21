@@ -1155,8 +1155,13 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
     )
     monkeypatch.setenv(
         "MIMIR_STATE_REPO",
-        "https://user:raw-git-token@example.invalid/repo.git",
+        "https://user:raw-git-token@example.invalid/repo.git?token=ghp_adminconfigquerytoken",
     )
+    monkeypatch.setenv(
+        "MIMIR_PUBLIC_CALLBACK_URL",
+        "https://example.invalid/hook?api_key=sk-public-admin-config-value",
+    )
+    monkeypatch.setenv("MIMIR_PUBLIC_BARE_VALUE", "ghp_adminconfigbaretoken")
     config = Config.from_env()
     config.resend_nudge_channels = ("channel-with-secret-shaped-value",)
     config.file_op_extra_roots = [tmp_path / "private-extra-root"]
@@ -1212,14 +1217,21 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
     assert "sk-ant-admin-config-secret" not in serialized
     assert "nested-admin-config-secret" not in serialized
     assert "raw-git-token" not in serialized
+    assert "ghp_adminconfigquerytoken" not in serialized
+    assert "sk-public-admin-config-value" not in serialized
+    assert "ghp_adminconfigbaretoken" not in serialized
     assert "channel-with-secret-shaped-value" not in serialized
     assert "private-extra-root" not in serialized
     assert data["raw_config"]["anthropic_api_key"] == "[REDACTED]"
     assert data["raw_config"]["mcp_servers"][0]["env"]["API_KEY"] == "[REDACTED]"
     assert (
         data["raw_config"]["git_state_repo"]
-        == "https://[REDACTED]@example.invalid/repo.git"
+        == "https://[REDACTED]@example.invalid/repo.git?token=[REDACTED]"
     )
+    assert env_by_name["MIMIR_PUBLIC_CALLBACK_URL"]["value"] == (
+        "https://example.invalid/hook?api_key=[REDACTED]"
+    )
+    assert env_by_name["MIMIR_PUBLIC_BARE_VALUE"]["value"] == "[REDACTED]"
     assert "resend_nudge_channels" not in data["raw_config"]
     assert "file_op_extra_roots" not in data["raw_config"]
 
