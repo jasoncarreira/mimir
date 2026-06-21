@@ -50,6 +50,19 @@ EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
 DEFAULT_CHANNEL = "web-default"
 
 
+@dataclass
+class _Subscriber:
+    queue: asyncio.Queue
+    allowed_channels: frozenset[str] | None = None
+
+
+def _normalize_web_channel(channel_id: str | None) -> str:
+    channel_id = (channel_id or DEFAULT_CHANNEL).strip()
+    if not channel_id.startswith("web-"):
+        channel_id = "web-" + channel_id
+    return channel_id
+
+
 def _web_channel_for(canonical: str) -> str:
     """Per-user web channel id derived from an identity canonical.
 
@@ -79,7 +92,7 @@ class WebChatBridge(Bridge):
 
     enqueue: EnqueueFn
     home: Path
-    _subscribers: list[asyncio.Queue] = field(default_factory=list, init=False)
+    _subscribers: list[_Subscriber] = field(default_factory=list, init=False)
     _lock: asyncio.Lock | None = field(default=None, init=False)
 
     prefixes = ("web-",)
@@ -100,9 +113,9 @@ class WebChatBridge(Bridge):
             self._lock = asyncio.Lock()
         async with self._lock:
             subscribers = list(self._subscribers)
-        for q in subscribers:
+        for subscriber in subscribers:
             try:
-                q.put_nowait(None)
+                subscriber.queue.put_nowait(None)
             except asyncio.QueueFull:
                 pass
 
@@ -138,9 +151,14 @@ class WebChatBridge(Bridge):
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
-            for q in list(self._subscribers):
+            for subscriber in list(self._subscribers):
+                if (
+                    subscriber.allowed_channels is not None
+                    and channel_id not in subscriber.allowed_channels
+                ):
+                    continue
                 try:
-                    q.put_nowait(payload)
+                    subscriber.queue.put_nowait(payload)
                 except asyncio.QueueFull:
                     # Slow consumer; drop silently rather than block sends.
                     pass
@@ -157,9 +175,14 @@ class WebChatBridge(Bridge):
         )
         payload["_event"] = "react"
         async with self._lock:
-            for q in list(self._subscribers):
+            for subscriber in list(self._subscribers):
+                if (
+                    subscriber.allowed_channels is not None
+                    and channel_id not in subscriber.allowed_channels
+                ):
+                    continue
                 try:
-                    q.put_nowait(payload)
+                    subscriber.queue.put_nowait(payload)
                 except asyncio.QueueFull:
                     pass
         return True
@@ -177,9 +200,7 @@ class WebChatBridge(Bridge):
         content = (body.get("content") or "").strip()
         if not content:
             return None, None, web.json_response({"error": "content required"}, status=400)
-        channel_id = (body.get("channel_id") or DEFAULT_CHANNEL).strip()
-        if not channel_id.startswith("web-"):
-            channel_id = "web-" + channel_id
+        channel_id = _normalize_web_channel(body.get("channel_id"))
         # #487: type-check, don't coerce — a truthy non-dict ``extra`` survives
         # ``or {}`` and later ``event.extra.get(...)`` raises.
         extra = body.get("extra")
@@ -212,11 +233,22 @@ class WebChatBridge(Bridge):
 
         # Per-user web channel (chainlink): route an authenticated user's
         # default-channel messages to their own ``web-<canonical>`` so the
-        # conversation segregates per user and history is scoped naturally. The
-        # agent replies to the turn's channel, so its replies land here too. An
-        # explicit non-default channel from the client is respected as-is.
-        if identity is not None and channel_id == DEFAULT_CHANNEL:
-            channel_id = _web_channel_for(identity.canonical)
+        # conversation segregates per user and history is scoped naturally. In
+        # authenticated user mode, reject arbitrary explicit web-* channels —
+        # client-side selection is not an authorization boundary. Admin/master
+        # automation remains unrestricted.
+        if identity is not None:
+            allowed_channel = _web_channel_for(identity.canonical)
+            if channel_id == DEFAULT_CHANNEL:
+                channel_id = allowed_channel
+            elif channel_id != allowed_channel:
+                return None, None, web.json_response(
+                    {
+                        "error": "forbidden_channel",
+                        "detail": "web users can only access their own channel",
+                    },
+                    status=403,
+                )
 
         event = AgentEvent(
             trigger="user_message",
@@ -251,7 +283,8 @@ class WebChatBridge(Bridge):
             except json.JSONDecodeError:
                 legacy = {"error": error.text or "invalid request"}
             message = str(legacy.get("error") or "invalid request")
-            return json_error("bad_request", message, status=error.status)
+            code = message if error.status == 403 else "bad_request"
+            return json_error(code, message, status=error.status)
         assert event is not None and channel_id is not None
         accepted = await self.enqueue(event)
         if not accepted:
@@ -262,6 +295,12 @@ class WebChatBridge(Bridge):
                 details={"channel_id": channel_id},
             )
         return json_success({"channel_id": channel_id, "source_id": event.source_id})
+
+    def _allowed_stream_channels(self, request: web.Request) -> frozenset[str] | None:
+        identity = request.get("auth_identity")
+        if identity is None:
+            return None
+        return frozenset({_web_channel_for(identity.canonical)})
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
         resp = web.StreamResponse(
@@ -286,10 +325,11 @@ class WebChatBridge(Bridge):
 
         # Subscribe — bounded queue so a stuck client doesn't grow unboundedly.
         q: asyncio.Queue = asyncio.Queue(maxsize=128)
+        subscriber = _Subscriber(q, self._allowed_stream_channels(request))
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
-            self._subscribers.append(q)
+            self._subscribers.append(subscriber)
         try:
             while True:
                 try:
@@ -306,8 +346,8 @@ class WebChatBridge(Bridge):
             pass
         finally:
             async with self._lock:
-                if q in self._subscribers:
-                    self._subscribers.remove(q)
+                if subscriber in self._subscribers:
+                    self._subscribers.remove(subscriber)
         return resp
 
     async def _handle_history(self, request: web.Request) -> web.Response:
@@ -320,14 +360,22 @@ class WebChatBridge(Bridge):
         from ..history import get_global_buffer
 
         identity = request.get("auth_identity")
-        channel_id = (request.query.get("channel_id") or DEFAULT_CHANNEL).strip()
-        if not channel_id.startswith("web-"):
-            channel_id = "web-" + channel_id
+        channel_id = _normalize_web_channel(request.query.get("channel_id"))
         # Default channel + authenticated → that user's per-user web channel,
         # matching the inbound routing in _build_inbound_event so the history
         # endpoint returns exactly the conversation the user is posting into.
-        if identity is not None and channel_id == DEFAULT_CHANNEL:
-            channel_id = _web_channel_for(identity.canonical)
+        # Explicit cross-user channels are rejected server-side; React-side
+        # filtering/selection is UX only.
+        if identity is not None:
+            allowed_channel = _web_channel_for(identity.canonical)
+            if channel_id == DEFAULT_CHANNEL:
+                channel_id = allowed_channel
+            elif channel_id != allowed_channel:
+                return json_error(
+                    "forbidden_channel",
+                    "web users can only access their own channel",
+                    status=403,
+                )
         try:
             limit = int(request.query.get("limit", "50"))
         except (TypeError, ValueError):

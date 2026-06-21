@@ -71,9 +71,24 @@ def _ensure_mimir_import_path() -> None:
 
     for candidate in candidates:
         if (candidate / "mimir" / "__init__.py").is_file():
+            # Source checkout first, so ``import mimir`` resolves to the checked-out
+            # code even when the poller is installed under <home>/skills.
             path = str(candidate)
             if path not in sys.path:
                 sys.path.insert(0, path)
+
+            # Production poller commands may run under system ``python3`` rather
+            # than the mimir venv interpreter. In editable-source deployments the
+            # checked-out repo's venv holds runtime deps such as PyYAML, so add
+            # its site-packages too. This is a best-effort repair: pip-installed
+            # deployments already have dependencies on sys.path, and missing venvs
+            # simply fall through to the normal ImportError if deps are absent.
+            venv = candidate / ".venv"
+            if venv.is_dir():
+                for site in sorted((venv / "lib").glob("python*/site-packages")):
+                    site_path = str(site)
+                    if site_path not in sys.path:
+                        sys.path.append(site_path)
             return
 
 

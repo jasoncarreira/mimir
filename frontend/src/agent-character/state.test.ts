@@ -21,9 +21,12 @@ function turnEvent(partial: Partial<TurnStreamEvent>): TurnStreamEvent {
 }
 
 describe("withComposerListening (#580)", () => {
-  it("shows listening only when the composer is active and the agent is idle", () => {
+  it("shows listening when the composer is active and the agent is at rest", () => {
     expect(withComposerListening("idle", true)).toBe("listening");
     expect(withComposerListening("idle", false)).toBe("idle");
+    // bored is also at rest (#583 decay) — composer activity wakes it
+    expect(withComposerListening("bored", true)).toBe("listening");
+    expect(withComposerListening("bored", false)).toBe("bored");
     // a busy agent wins over the composer signal
     expect(withComposerListening("thinking", true)).toBe("thinking");
     expect(withComposerListening("tool", true)).toBe("tool");

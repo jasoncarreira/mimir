@@ -1,5 +1,5 @@
 import React from "react";
-import { AgentCharacter, isChatLiveEvent, withComposerListening } from "./agent-character";
+import { AgentCharacter, withComposerListening } from "./agent-character";
 import { useBootstrap } from "./api/bootstrap";
 import { useLiveEvents } from "./live-events";
 import type { AgentCharacterState } from "./skins/types";
@@ -27,23 +27,17 @@ export function AgentDossier() {
   const agentName = bootstrap?.ui?.agent_name || "Mimir";
   const model = bootstrap?.model || "";
 
-  // Character state: the LIVE turn-event bus (chainlink #583) drives it DURING
-  // the turn — derived from the latest span so a streaming send_message reply
-  // (whose chunk events carry no tool name of their own) still reads as
-  // "talking". That stream is ephemeral/no-backfill, so a dropped connection or
-  // a missed terminal `turn end` could otherwise strand the character mid-turn
-  // (mimir review on #800). The durable live-events `turn.lifecycle`
-  // finished/failed — which always lands ~1s after turn end via the cursor-based
-  // stream — resets it, so missed bus events self-heal via durable history.
-  const { characterState: busState } = useTurnSpans();
-  const [charState, setCharState] = React.useState<AgentCharacterState>("idle");
-  React.useEffect(() => {
-    setCharState(busState);
-  }, [busState]);
+  // Character state: the LIVE turn-event span model (chainlink #583) drives it
+  // DURING the turn — derived from the latest span so a streaming send_message
+  // reply (whose chunk events carry no tool name of their own) reads as
+  // "talking". The provider also DECAYS it on an interruptible timer (active →
+  // idle after 30s of silence → bored after 3 min), so the character can't get
+  // stuck on a stale state if the ephemeral bus drops a turn's terminal event.
+  const { characterState } = useTurnSpans();
 
-  // Durable live-events drive the turn counter AND the self-healing reset.
-  // Turn total: max(turns_total, highest live seq) — a counter would
-  // double-count the SSE's backfill of historical finished turns.
+  // Durable live-events drive the turn counter. Turn total: max(turns_total,
+  // highest live seq) — a counter would double-count the SSE's backfill of
+  // historical finished turns.
   const [maxLiveSeq, setMaxLiveSeq] = React.useState(0);
   const lastEventId = React.useRef("");
   React.useEffect(() => {
@@ -51,20 +45,12 @@ export function AgentDossier() {
     if (!item || item.id === lastEventId.current) return;
     lastEventId.current = item.id;
     const event = item.event;
-    if (event.kind === "turn.lifecycle") {
-      if (typeof event.seq === "number") {
-        const seq = event.seq;
-        setMaxLiveSeq((current) => (seq > current ? seq : current));
-      }
-      // Self-healing safety net: a definitive end resets the live character
-      // even if the ephemeral bus dropped or missed its terminal event.
-      if (isChatLiveEvent(event)) {
-        if (event.phase === "finished") setCharState("idle");
-        else if (event.phase === "failed") setCharState("error");
-      }
+    if (event.kind === "turn.lifecycle" && typeof event.seq === "number") {
+      const seq = event.seq;
+      setMaxLiveSeq((current) => (seq > current ? seq : current));
     }
   }, [liveEvents.lastEvent]);
-  const agentState = withComposerListening(charState, composerActive);
+  const agentState = withComposerListening(characterState, composerActive);
   const turns = Math.max(bootstrap?.turns_total ?? 0, maxLiveSeq);
 
   return (
