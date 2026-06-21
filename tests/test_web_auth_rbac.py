@@ -37,6 +37,12 @@ def _app(home: Path, master_key: str) -> web.Application:
     app["identity_resolver"] = _resolver(home)
     app.router.add_get("/api/v1/turns", _echo)         # auth, non-admin
     app.router.add_get("/api/v1/admin/config", _echo)  # auth + admin
+    app.router.add_get("/api/v1/saga", _echo)          # auth + admin: global atoms
+    app.router.add_post("/api/v1/saga/sql", _echo)     # auth + admin: global SQL
+    app.router.add_get("/api/v1/memory", _echo)        # auth + admin: global files
+    app.router.add_get("/api/saga", _echo)             # legacy auth + admin: global atoms
+    app.router.add_post("/api/saga/sql", _echo)        # legacy auth + admin: global SQL
+    app.router.add_get("/api/memory", _echo)           # legacy auth + admin: global files
     app.router.add_get("/health", _echo)               # exempt
     return app
 
@@ -53,6 +59,44 @@ async def test_user_key_allowed_on_normal_route_but_403_on_admin(tmp_path: Path)
         assert body["canonical"] == "alice" and body["is_admin"] is False
         r2 = await c.get("/api/v1/admin/config", headers={"X-API-Key": user_key})
         assert r2.status == 403  # the RBAC boundary — server-side, not UI
+
+
+
+async def test_saga_and_memory_routes_are_admin_only(tmp_path: Path) -> None:
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
+        for path in ("/api/v1/saga", "/api/v1/memory", "/api/saga", "/api/memory"):
+            user_resp = await c.get(path, headers={"X-API-Key": user_key})
+            assert user_resp.status == 403, path
+            admin_resp = await c.get(path, headers={"X-API-Key": admin_key})
+            assert admin_resp.status == 200, path
+            master_resp = await c.get(path, headers={"X-API-Key": "master-secret"})
+            assert master_resp.status == 200, path
+
+        for path in ("/api/v1/saga/sql", "/api/saga/sql"):
+            user_sql = await c.post(path, headers={"X-API-Key": user_key})
+            assert user_sql.status == 403, path
+            admin_sql = await c.post(path, headers={"X-API-Key": admin_key})
+            assert admin_sql.status == 200, path
+
+
+def test_admin_required_prefix_matching_is_segment_aware() -> None:
+    from mimir.server import _is_admin_required
+
+    assert _is_admin_required("/api/v1/saga") is True
+    assert _is_admin_required("/api/v1/saga/sql") is True
+    assert _is_admin_required("/api/v1/memory") is True
+    assert _is_admin_required("/api/v1/memory/file") is True
+    assert _is_admin_required("/api/v1/admin/config") is True
+    assert _is_admin_required("/api/saga") is True
+    assert _is_admin_required("/api/saga/sql") is True
+    assert _is_admin_required("/api/memory") is True
+    assert _is_admin_required("/api/memory/file") is True
+    assert _is_admin_required("/api/v1/sagacity") is False
+    assert _is_admin_required("/api/v1/memoryless") is False
+    assert _is_admin_required("/api/sagacity") is False
+    assert _is_admin_required("/api/memoryless") is False
 
 
 async def test_admin_key_allowed_on_admin_route(tmp_path: Path) -> None:
