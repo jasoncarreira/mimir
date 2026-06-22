@@ -21,7 +21,7 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="codex",
         category="coding-cli",
-        pin="0.139.0",
+        pin="0.141.0",
         smoke="codex --version && env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_backends.py",
         source="npm",
         package="@openai/codex",
@@ -51,7 +51,7 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="claude-code",
         category="coding-cli",
-        pin="2.1.177",
+        pin="2.1.185",
         smoke="claude --version",
         source="npm",
         package="@anthropic-ai/claude-code",
@@ -61,7 +61,7 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="gogcli",
         category="integration-cli",
-        pin="v0.9.0",
+        pin="v0.30.0",
         smoke="gog --version",
         source="github-release",
         repo="steipete/gogcli",

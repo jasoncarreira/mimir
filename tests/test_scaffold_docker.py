@@ -177,7 +177,7 @@ def test_gmail_poller_fragment_pins_go_and_gogcli_versions():
         / "dockerfile.fragment"
     ).read_text()
     assert "go1.26.4.linux-${ARCH}.tar.gz" in fragment
-    assert "github.com/steipete/gogcli/cmd/gog@v0.9.0" in fragment
+    assert "github.com/steipete/gogcli/cmd/gog@v0.30.0" in fragment
     assert "@latest" not in fragment
 
 
@@ -333,8 +333,8 @@ def test_render_dockerfile_gates_claude_code_cli_on_build_arg():
         assert "RUN npm install -g @mermaid-js/mermaid-cli@11.15.0" in out, mode
         assert "RUN npm install -g @anthropic-ai/claude-code" not in out, mode
         assert 'if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \\' in out, mode
-        assert "npm install -g @anthropic-ai/claude-code@2.1.177" in out, mode
-        assert "@anthropic-ai/claude-code@2.1.177 @mermaid-js/mermaid-cli" not in out, mode
+        assert "npm install -g @anthropic-ai/claude-code@2.1.185" in out, mode
+        assert "@anthropic-ai/claude-code@2.1.185 @mermaid-js/mermaid-cli" not in out, mode
 
 
 def test_render_dockerfile_installs_jq_in_both_modes():
@@ -352,7 +352,7 @@ def test_render_dockerfile_installs_codex_when_enabled():
     """install_codex=True adds the codex CLI install to both modes."""
     for mode in ("workspace", "pypi"):
         out = render_dockerfile([], mode=mode, install_codex=True)
-        assert "npm install -g @openai/codex@0.139.0" in out, mode
+        assert "npm install -g @openai/codex@0.141.0" in out, mode
 
 
 def test_render_dockerfile_omits_codex_by_default():
@@ -370,7 +370,7 @@ def test_scaffold_installs_codex_for_codex_plus_extra(tmp_path: Path):
     home = tmp_path / "codex-home"
     home.mkdir()
     scaffold(home, mode="pypi", mimir_extras=["codex-plus", "discord"])
-    assert "npm install -g @openai/codex@0.139.0" in (home / "Dockerfile").read_text()
+    assert "npm install -g @openai/codex@0.141.0" in (home / "Dockerfile").read_text()
 
     plain = tmp_path / "plain-home"
     plain.mkdir()
@@ -384,7 +384,7 @@ def test_scaffold_installs_codex_for_workspace_uv_extra(tmp_path: Path):
     home = tmp_path / "ws-codex-home"
     home.mkdir()
     scaffold(home, mode="workspace", uv_extras=["codex-plus"])
-    assert "npm install -g @openai/codex@0.139.0" in (home / "Dockerfile").read_text()
+    assert "npm install -g @openai/codex@0.141.0" in (home / "Dockerfile").read_text()
 
     plain = tmp_path / "ws-plain-home"
     plain.mkdir()
