@@ -552,7 +552,12 @@ class Indexer:
         # benchmark cleanup or test-fixture rm doesn't crash the sweep loop;
         # next sweep just starts from an empty schema.
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self._db_path, isolation_level=None)
+        # Keep sqlite's transaction manager enabled.  Passing
+        # ``isolation_level=None`` puts the connection in autocommit mode,
+        # where ``with conn:`` does not roll back partially-applied DML on
+        # exception/crash.  Reindex and sweep updates must be all-or-nothing
+        # so ``files``, ``chunks``, and ``chunks_fts`` cannot diverge.
+        conn = sqlite3.connect(self._db_path, isolation_level="DEFERRED")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA foreign_keys = ON")
         return conn

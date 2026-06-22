@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -260,6 +261,86 @@ async def test_reindex_path_drops_deleted_file(tmp_path: Path):
     stats = await idx.stats()
     # Sweep would also drop it, but reindex_path should handle deletion directly.
     assert stats.files == 3
+
+
+@pytest.mark.asyncio
+async def test_reindex_update_rolls_back_partial_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A failed reindex must leave the previous index rows intact.
+
+    Regression coverage for Chainlink #612: sqlite autocommit made
+    ``with conn:`` blocks non-atomic, so an exception after deleting old
+    chunks but before inserting all replacements could commit a mixed
+    index state.
+    """
+    (tmp_path / "memory" / "topics").mkdir(parents=True)
+    rel = "memory/topics/atomic.md"
+    target = tmp_path / rel
+    old_content = "<!-- desc: atomic old -->\nold-token " * 2
+    target.write_text(old_content)
+
+    idx = Indexer(tmp_path, embedder=HashEmbedder(), chunk_size=40, chunk_overlap=0)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    db_path = tmp_path / ".mimir" / "index.db"
+    with sqlite3.connect(db_path) as conn:
+        before_files = conn.execute(
+            "SELECT mtime, size, chunk_count, description FROM files WHERE path = ?",
+            (rel,),
+        ).fetchone()
+        before_chunks = conn.execute(
+            "SELECT chunk_index, content FROM chunks WHERE path = ? ORDER BY chunk_index",
+            (rel,),
+        ).fetchall()
+        before_fts = conn.execute(
+            "SELECT chunk_index, content FROM chunks_fts WHERE path = ? ORDER BY chunk_index",
+            (rel,),
+        ).fetchall()
+
+    assert before_files is not None
+    assert before_chunks
+    assert before_fts
+
+    target.write_text("<!-- desc: atomic new -->\n" + "new-token " * 40)
+    new_mtime = time.time() + 5
+    os.utime(target, (new_mtime, new_mtime))
+
+    import mimir.search as search_mod
+
+    original_pack_vec = search_mod._pack_vec
+    calls = 0
+
+    def fail_after_first_vector(vec):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated mid-reindex failure")
+        return original_pack_vec(vec)
+
+    monkeypatch.setattr(search_mod, "_pack_vec", fail_after_first_vector)
+
+    with pytest.raises(RuntimeError, match="simulated mid-reindex failure"):
+        await idx.reindex_path(rel)
+
+    with sqlite3.connect(db_path) as conn:
+        after_files = conn.execute(
+            "SELECT mtime, size, chunk_count, description FROM files WHERE path = ?",
+            (rel,),
+        ).fetchone()
+        after_chunks = conn.execute(
+            "SELECT chunk_index, content FROM chunks WHERE path = ? ORDER BY chunk_index",
+            (rel,),
+        ).fetchall()
+        after_fts = conn.execute(
+            "SELECT chunk_index, content FROM chunks_fts WHERE path = ? ORDER BY chunk_index",
+            (rel,),
+        ).fetchall()
+
+    assert after_files == before_files
+    assert after_chunks == before_chunks
+    assert after_fts == before_fts
+    assert all("old-token" in row[1] for row in after_chunks)
 
 
 @pytest.mark.asyncio
