@@ -371,11 +371,14 @@ export function TurnsRoute() {
   const [sessionFrom, setSessionFrom] = React.useState(searchParams.get("from") || "");
   const [sessionTo, setSessionTo] = React.useState(searchParams.get("to") || "");
   const [sessionQuery, setSessionQuery] = React.useState(searchParams.get("q") || searchParams.get("filter") || "");
+  const [sessionBrowserOpen, setSessionBrowserOpen] = React.useState(false);
   const { turns, isLoading, isError, initialError, loadError, loadingOlder, allOlderLoaded, loadOlder, refetch } = useTurnPages();
   const selectedId = searchParams.get("turn");
   const selectedSessionId = searchParams.get("session");
   const channelParam = searchParams.get("channel") || "";
   const eventParam = searchParams.get("event") || "";
+  const hasSessionFilters = Boolean(sessionChannel || sessionTrigger || sessionFrom || sessionTo || sessionQuery);
+  const shouldLoadSessions = Boolean(sessionBrowserOpen || selectedSessionId || hasSessionFilters);
   const sessionsQuery = useQuery({
     queryKey: ["sessions", SESSION_PAGE_SIZE, sessionChannel, sessionTrigger, sessionFrom, sessionTo, sessionQuery],
     queryFn: async () => {
@@ -389,7 +392,8 @@ export function TurnsRoute() {
       }, { cache: "no-store" });
       return envelope.data;
     },
-    refetchInterval: 10000
+    enabled: shouldLoadSessions,
+    refetchInterval: shouldLoadSessions ? 10000 : false
   });
   const visibleTurns = React.useMemo(
     () => filterTurns(turns, { trigger, hidePollers, query }).filter((turn) => (
@@ -554,7 +558,7 @@ export function TurnsRoute() {
 
           <Panel
             title="Browse Sessions"
-            subtitle="Conversation-level grouping over turns, chat history, and SAGA summaries."
+            subtitle={shouldLoadSessions ? "Conversation-level grouping over turns, chat history, and SAGA summaries." : "Load only when opened or filtered, so the turn feed stays progressive."}
           >
             <div className="turns-controls turns-controls--sessions">
               <TextInput
@@ -606,13 +610,18 @@ export function TurnsRoute() {
                 value={isoDateOnly(sessionTo)}
               />
             </div>
+            {!shouldLoadSessions ? (
+              <div className="turn-list__footer">
+                <Button onClick={() => setSessionBrowserOpen(true)}>Load sessions</Button>
+              </div>
+            ) : null}
             {sessionsQuery.isLoading ? <LoadingState label="Loading sessions" /> : null}
             {sessionsQuery.isError ? (
               <ErrorState title="Could not load sessions">
                 {sessionsQuery.error instanceof Error ? sessionsQuery.error.message : String(sessionsQuery.error)}
               </ErrorState>
             ) : null}
-            {!sessionsQuery.isLoading && !sessionsQuery.isError ? (
+            {shouldLoadSessions && !sessionsQuery.isLoading && !sessionsQuery.isError ? (
               selectedSessionId && !selectedSession ? (
                 <ErrorState title="Session not found">No loaded session matches {selectedSessionId}. Adjust filters or the time range.</ErrorState>
               ) : (

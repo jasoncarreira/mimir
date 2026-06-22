@@ -273,7 +273,10 @@ async def test_api_v1_turns_returns_envelope_and_list_metadata(app):
     assert body["meta"] == {
         "cursor": "t4",
         "limit": 2,
-        "total": 5,
+        # Cursor-limited turn pages intentionally do not count the full log;
+        # exact totals require decoding every retained row and defeat
+        # progressive loading on large turns.jsonl files.
+        "total": None,
         "truncated": True,
     }
 
@@ -441,6 +444,34 @@ async def test_api_turns_limit_returns_newest_page(app):
         body = await resp.json()
     # Newest 2 (file is oldest-first; tail is t3, t4).
     assert [t["turn_id"] for t in body["turns"]] == ["t3", "t4"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/turns?limit=2", "/api/v1/turns?limit=2"])
+async def test_api_turns_limit_stops_tail_reading_after_page(monkeypatch, app, path):
+    """React/legacy progressive loads must not decode every retained turn."""
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(5)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    calls = 0
+    real_tail = web_ui.tail_jsonl_records
+
+    def counting_tail(path_arg):
+        nonlocal calls
+        for record in real_tail(path_arg):
+            calls += 1
+            yield record
+
+    monkeypatch.setattr(web_ui, "tail_jsonl_records", counting_tail)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(path)
+        body = await resp.json()
+
+    turns = body.get("turns") or body["data"]["turns"]
+    assert [t["turn_id"] for t in turns] == ["t3", "t4"]
+    assert calls == 2
 
 
 @pytest.mark.asyncio
