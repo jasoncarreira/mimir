@@ -8,6 +8,7 @@ import type { ChatStreamPayload } from "./api/chat";
 import type { ChatHistoryMessage } from "./api/generated/contracts";
 import { ChatRoute } from "./ChatRoute";
 import { useChatStore } from "./chatStore";
+import { useUiState } from "./uiState";
 import type { DashboardSurface } from "./dashboardExtensions";
 
 const { chatApi, turnApi } = vi.hoisted(() => ({
@@ -119,6 +120,7 @@ afterEach(() => {
   turnApi.activeEvent = undefined;
   turnApi.close.mockClear();
   turnApi.createTurnEventStream.mockClear();
+  useUiState.setState({ apiKeyEpoch: 0 });
 });
 
 describe("ChatRoute", () => {
@@ -185,6 +187,23 @@ describe("ChatRoute", () => {
 
     unmount();
     expect(chatApi.close).toHaveBeenCalledOnce();
+  });
+
+  it("reconnects the chat + turn-event streams when the API key changes (#616)", () => {
+    renderChat();
+    expect(chatApi.createChatStream).toHaveBeenCalledTimes(1);
+    const turnBefore = turnApi.createTurnEventStream.mock.calls.length;
+
+    // In-session key switch: apiKeyPresent stays true, only the epoch bumps.
+    act(() => {
+      useUiState.setState((s) => ({ apiKeyEpoch: s.apiKeyEpoch + 1 }));
+    });
+
+    // Old sockets closed and re-opened so they pick up the new key (and stop
+    // delivering the previous identity's data).
+    expect(chatApi.close).toHaveBeenCalled();
+    expect(chatApi.createChatStream).toHaveBeenCalledTimes(2);
+    expect(turnApi.createTurnEventStream.mock.calls.length).toBeGreaterThan(turnBefore);
   });
 
   it("keeps the conversation when the route unmounts and remounts (#567)", () => {

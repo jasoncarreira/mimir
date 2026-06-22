@@ -3,6 +3,7 @@ import { isChatTurnEvent } from "../agent-character/state";
 import type { TurnStreamEvent } from "../api/generated/contracts";
 import { createTurnEventStream } from "../api/turn-events";
 import type { AgentCharacterState } from "../skins/types";
+import { useUiState } from "../uiState";
 import {
   EMPTY_TURN_SPANS,
   applyTurnEvent,
@@ -48,6 +49,9 @@ export function TurnSpansProvider({
   const stateRef = React.useRef<TurnSpansState>(EMPTY_TURN_SPANS);
   const charRef = React.useRef<AgentCharacterState>("idle");
   const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  // chainlink #616: reconnect with the new key on an in-session key switch so
+  // the bus stops delivering the previous identity's turn events.
+  const apiKeyEpoch = useUiState((s) => s.apiKeyEpoch);
 
   React.useEffect(() => {
     const setChar = (next: AgentCharacterState) => {
@@ -102,7 +106,7 @@ export function TurnSpansProvider({
       handle.close();
       clearTimer();
     };
-  }, [channel]);
+  }, [channel, apiKeyEpoch]);
 
   const value = React.useMemo<TurnSpansValue>(
     () => ({ turnId: state.turnId, spans: state.spans, characterState, status }),

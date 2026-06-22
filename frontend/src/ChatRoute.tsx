@@ -59,6 +59,10 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const setMessages = useChatStore((state) => state.setMessages);
   const setSelectedChatMessageId = useUiState((state) => state.setSelectedChatMessageId);
   const setComposerActive = useUiState((state) => state.setComposerActive);
+  // chainlink #616: reconnect the chat + turn-event streams when the API key
+  // changes so they stop delivering the previous identity's data and pick up
+  // the new per-user channel. Bumps on any in-session key switch.
+  const apiKeyEpoch = useUiState((state) => state.apiKeyEpoch);
   const { data: bootstrap } = useBootstrap();
   const agentName = bootstrap?.ui?.agent_name || "Mimir";
 
@@ -76,6 +80,16 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   React.useEffect(() => {
     channelIdRef.current = channelId;
   }, [channelId]);
+
+  // chainlink #616: on a key change, drop the previous user's channel so the
+  // reconnected streams re-adopt the new identity's channel (otherwise the new
+  // user's messages — on a different channel — would be filtered out as "not
+  // mine"). No-op on mount (channelId already ""). The chat store itself is
+  // cleared separately by resetBrowserSessionStateForApiKeyChange (#594).
+  React.useEffect(() => {
+    channelIdRef.current = "";
+    setChannelId("");
+  }, [apiKeyEpoch]);
 
   React.useEffect(() => {
     setStreamState("connecting");
@@ -124,7 +138,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     return () => {
       handle.close();
     };
-  }, [setMessages, update]);
+  }, [setMessages, update, apiKeyEpoch]);
 
   // chainlink #583 slice 2: stream the reply forming from the turn-event bus.
   // We track the send_message tool-call span by its `start` (which carries the
@@ -160,7 +174,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
       { channel: channelId }
     );
     return () => handle.close();
-  }, [channelId]);
+  }, [channelId, apiKeyEpoch]);
 
   // chainlink: restore this channel's prior conversation on entry. Live messages
   // still arrive via the SSE effect above; merge by id and order by timestamp so
@@ -202,7 +216,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     return () => {
       cancelled = true;
     };
-  }, [setMessages]);
+  }, [setMessages, apiKeyEpoch]);
 
   function selectMessage(id: string) {
     // Highlights the message + deep-links it in the URL. The right panel now

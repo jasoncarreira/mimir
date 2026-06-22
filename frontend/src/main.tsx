@@ -729,13 +729,21 @@ function RoutedLiveEventsProvider({ children }: { children: React.ReactNode }) {
   const selectedTurnId = searchParams.get("turn") || null;
   // Re-render on sign-in/out so the stream connects/reconnects with the new key.
   const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
+  // chainlink #616: a switch between two valid keys keeps apiKeyPresent=true, so
+  // recompute the key off the epoch too — otherwise the live-events stream keeps
+  // the previous identity's key until the next drop/reconnect.
+  const apiKeyEpoch = useUiState((state) => state.apiKeyEpoch);
+  const apiKey = React.useMemo(
+    () => (apiKeyPresent ? readStoredKey() || undefined : undefined),
+    [apiKeyPresent, apiKeyEpoch]
+  );
   // Shares the cached ["web-bootstrap"] query with AppFrame (public, no auth).
   const { data: bootstrap } = useBootstrap();
   const signedIn = isSignedIn(bootstrap, apiKeyPresent);
 
   return (
     <LiveEventsProvider
-      apiKey={apiKeyPresent ? readStoredKey() || undefined : undefined}
+      apiKey={apiKey}
       // Don't open the authenticated SSE stream until signed in — otherwise a
       // protected server fetches /api/v1/live-events while the login screen shows.
       enabled={signedIn}
