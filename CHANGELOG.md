@@ -116,20 +116,6 @@ ready-queue fixes, and SAGA/search scheduler robustness.
   trees and kept the published runtime image aligned with the React/Worklink
   toolchain needs.
 
-### Fixed
-
-- **Autonomous Worklink runs couldn't open PRs (`gh` had no token)** (chainlink
-  #537 rail). The `chainlink-orchestrator` ready-queue poller spawns
-  `mimir worklink run` inheriting the *poller's* sanitized env, but its
-  `pass_env` listed `MIMIR_HOME`/`WORKLINK_*` and **not `GITHUB_TOKEN`** — so the
-  controller-side `_open_pr` (`gh pr create`, which runs in that subprocess, not
-  in the worker) failed `gh` auth and the run was marked failed → re-dispatched →
-  `worklink:blocked` after the attempt cap, despite the branch + tests passing.
-  (Manual/`bash -lc` dispatch worked because it inherits the container's
-  `GITHUB_TOKEN` — which is why the #540 smoke opened a PR but the poller couldn't.)
-  Added `GITHUB_TOKEN` to the poller's `pass_env`. Surfaced by the first
-  poller-dispatched leaf (#526).
-
 ## [0.5.1] — 2026-06-17
 
 ### Added
