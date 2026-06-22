@@ -375,19 +375,24 @@ class HomeostaticArbiter:
             )
             severity = result.severity
             reason = result.reason
-            # Backstop (#483): evaluate_quota_severity grades the configured
+            # Backstop (#483): evaluate_quota_severity grades configured
             # QuotaProvider windows, which return CLEAR when the provider is a
             # stub (MinimaxQuotaProvider) or cold (Codex/OpenAI before the first
             # response populates headers). Without this, QUOTA mode would run the
             # throttle wide open with no signal. The rate-limit STORE is a
             # separate source (per-response observed headers) and is populated
             # even when the provider list is empty, so consult its raw
-            # plan-window wall here too. Worst-signal-wins: only raises severity.
+            # plan-window wall here too. Apply the backstop only when the
+            # provider path produced no quota signal at all: if it already
+            # produced ELEVATED, that may be the deliberate coasting demotion
+            # from evaluate_quota_severity (raw wall over threshold, pace safe
+            # enough for normal-priority work), and re-raising it here would
+            # make that documented behavior unreachable in QUOTA mode.
             snap = self.snapshot(now=now)
             if (
-                snap.plan_window_max_utilization is not None
+                result.severity is Severity.CLEAR
+                and snap.plan_window_max_utilization is not None
                 and snap.plan_window_max_utilization >= self.plan_window_suppress_threshold
-                and Severity.TIGHT > severity
             ):
                 severity = Severity.TIGHT
                 reason = (

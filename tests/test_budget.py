@@ -187,6 +187,42 @@ def test_quota_mode_raw_wall_backstop_with_empty_provider(tmp_path: Path):
     assert arb2.should_fire(priority="low", now=NOW).severity.name == "CLEAR"
 
 
+def test_quota_mode_preserves_coasting_demotion_from_provider(tmp_path: Path):
+    """#615: the raw-wall backstop must not undo the provider path's
+    coasting demotion. A live non-derived window over the raw wall but on
+    a safe pace grades ELEVATED so normal-priority scheduled work keeps
+    running near the tail of a quota bucket."""
+    from mimir.billing import BillingMode, AnthropicQuotaProvider
+
+    real_now = datetime.now(tz=timezone.utc)
+    # Seven-day window: at 92% used and 93% projected by reset, the
+    # elapsed fraction is ~98.9%, so M ~= 8 and clears the ELEVATED edge.
+    hours_until_reset = 168.0 * (1.0 - 0.92 / 0.93)
+    reset = int((real_now + timedelta(hours=hours_until_reset)).timestamp())
+
+    arb = _arbiter(tmp_path, billing_mode=BillingMode.QUOTA)
+    arb.quota_providers = [AnthropicQuotaProvider(arb.rate_limit_store)]
+    arb.rate_limit_store._load = lambda: {  # type: ignore[method-assign]
+        "seven_day_opus": {
+            "status": "allowed_warning",
+            "utilization": 0.92,
+            "on_pace_utilization": 0.93,
+            "resets_at": reset,
+            "observed_at": real_now.isoformat(),
+        },
+    }
+
+    normal = arb.should_fire(priority="normal", now=NOW)
+    assert normal.fire is True
+    assert normal.severity.name == "ELEVATED"
+    assert "quota_saturated:anthropic:seven_day_opus@0.92" in normal.reason
+
+    low = arb.should_fire(priority="low", now=NOW)
+    assert low.fire is False
+    assert low.severity.name == "ELEVATED"
+    assert "quota_saturated:anthropic:seven_day_opus@0.92" in low.reason
+
+
 def test_quota_backstop_ignores_stale_no_reset_window(tmp_path: Path):
     """#692 review: the QUOTA raw-wall backstop (#483) must not trust a
     ``resets_at=None`` reading older than its own window. ``current()`` keeps
@@ -293,7 +329,7 @@ def test_render_includes_plan_window_when_present(tmp_path: Path):
     real_now = datetime.now(tz=timezone.utc)
     future = int((real_now + timedelta(days=2, hours=3)).timestamp())
     arb.rate_limit_store._load = lambda: {  # type: ignore[method-assign]
-        "7d_opus": {
+        "seven_day_opus": {
             "status": "allowed_warning",
             "utilization": 0.68,
             "resets_at": future,
@@ -302,7 +338,7 @@ def test_render_includes_plan_window_when_present(tmp_path: Path):
     }
     body = arb.render_self_state_block(now=real_now)
     assert body is not None
-    assert "7d_opus" in body
+    assert "seven_day_opus" in body
     assert "68%" in body
 
 
