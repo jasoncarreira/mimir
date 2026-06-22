@@ -19,6 +19,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 
+from .web_channels import WEB_CHANNEL_PREFIX
+
 from .jsonl_snapshot import iter_window_records
 
 #: The under-send signal the 24h tally counts — emitted by the forgot-to-send
@@ -29,10 +31,18 @@ _NO_SEND_EVENT = "interactive_turn_no_send_message"
 def nudge_enabled(channel_id: str | None, prefixes: Sequence[str]) -> bool:
     """True iff ``channel_id`` opts into resend-nudge recovery.
 
-    Mirrors the mid-turn-injection allow-list shape: a prefix list, with
-    ``"*"`` enabling all channels. Empty list (the default) disables it.
+    Web chat (``web-*``) is ALWAYS enabled, independent of
+    ``MIMIR_RESEND_NUDGE_CHANNELS``: it's single-user and interactive, so a
+    tool-shy model (e.g. minimax M3) silently dropping a reply is never
+    acceptable there. For all other channels it mirrors the mid-turn-injection
+    allow-list shape: a prefix list, with ``"*"`` enabling all channels; an
+    empty list (the default) disables it.
     """
-    if not channel_id or not prefixes:
+    if not channel_id:
+        return False
+    if channel_id.startswith(WEB_CHANNEL_PREFIX):
+        return True
+    if not prefixes:
         return False
     if "*" in prefixes:
         return True

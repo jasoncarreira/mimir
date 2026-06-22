@@ -6,6 +6,27 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Security
+
+- **The agent can no longer edit `state/identities.yaml` via its file tools.** That
+  file is the auth identity + role registry; with `state/` otherwise writable, a
+  prompt-injected chat user could talk the agent into adding an `admin` role alias
+  for themselves (privilege escalation, now that web RBAC gates saga/memory/ops/admin
+  on the admin role). `WriteGuardBackend` now denies writes/edits/uploads to it
+  unconditionally. Legitimate changes still go through the operator path
+  (`mimir identities …` CLI, the admin Users UI, or direct file edit) — none of which
+  route through the agent's tools.
+
+### Fixed
+
+- **Resend-nudge is on by default for web chat.** `web-*` channels are single-user and
+  interactive, so a tool-shy model (minimax M3) that answers in final text without
+  calling `send_message` now always gets the corrective re-prompt — previously web
+  replies could be silently dropped unless `MIMIR_RESEND_NUDGE_CHANNELS` listed `web-`.
+- **Admin-only dashboard tabs are hidden from non-admins.** `Usage`, `SAGA`, and
+  `State/Memory` are marked `requires_role="admin"` to match their already-admin-gated
+  endpoints, so a non-admin no longer sees tabs that only return `forbidden`.
+
 ## [0.6.2] — 2026-06-22
 
 ### Added

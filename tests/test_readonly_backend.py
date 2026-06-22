@@ -53,6 +53,36 @@ class TestWriteGuardBackend:
         r = b.write(file_path="/.mimir/db.sqlite", content="hi")
         assert "Write blocked" in (getattr(r, "error", "") or "")
 
+    def test_blocks_write_to_identities_yaml(self, home: Path) -> None:
+        # state/ is writable, but identities.yaml (the auth identity + role
+        # registry) is denied to the agent's file tools — a prompt-injected
+        # chat user must not be able to grant themselves an admin role.
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        r = b.write(file_path="/state/identities.yaml", content="people: []\n")
+        assert "identities.yaml" in (getattr(r, "error", "") or "")
+
+    def test_blocks_edit_to_identities_yaml(self, home: Path) -> None:
+        (home / "state" / "identities.yaml").write_text("people: []\n")
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        r = b.edit(
+            file_path="/state/identities.yaml",
+            old_string="people: []",
+            new_string="people: [{canonical: x, access: {roles: [admin]}}]",
+        )
+        assert "identities.yaml" in (getattr(r, "error", "") or "")
+
+    def test_blocks_upload_to_identities_yaml(self, home: Path) -> None:
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        results = b.upload_files([("/state/identities.yaml", b"people: []\n")])
+        assert results and results[0].error == "permission_denied"
+
+    def test_allows_other_state_files(self, home: Path) -> None:
+        # Only identities.yaml is protected; the rest of state/ stays writable
+        # (e.g. the agent's own web_ui.json name/skin config).
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        r = b.write(file_path="/state/web_ui.json", content="{}\n")
+        assert getattr(r, "error", None) is None
+
     def test_reads_unrestricted(self, home: Path) -> None:
         # Read tools must NOT be path-restricted — file_search and Grep
         # operate over the whole home, including ro dirs.

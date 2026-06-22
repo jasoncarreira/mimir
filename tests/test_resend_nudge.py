@@ -31,6 +31,16 @@ def test_nudge_enabled_prefix_star_and_empty():
     assert nudge_enabled(None, ("*",)) is False
 
 
+def test_nudge_enabled_web_channels_always_on():
+    # Web chat is single-user + interactive, so the nudge is on by DEFAULT for
+    # any web-* channel regardless of MIMIR_RESEND_NUDGE_CHANNELS.
+    assert nudge_enabled("web-jason", ()) is True
+    assert nudge_enabled("web-default", ("discord-",)) is True
+    assert nudge_enabled("web-", ()) is True
+    # Non-web channels still require the allow-list opt-in.
+    assert nudge_enabled("slack-1", ()) is False
+
+
 def test_build_nudge_text_includes_tally_only_on_repeat():
     first = build_nudge_text("discord-1", 1)
     assert "send_message" in first and "discord-1" in first
