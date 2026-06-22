@@ -465,8 +465,11 @@ posture — the options are now concrete (chainlink #452 / #454):
    fallback, not the default.
 
 
-The planner-supplied `Suggested test command` is executable shell input
-(`shell=True`) from Chainlink issue descriptions, within the same
+Planner-supplied `Suggested test command` text in Chainlink issue descriptions
+is advisory only. It is shown to the backend as part of the issue body, but the
+controller MUST NOT promote that planner-authored text into executable shell
+input. Controller-side test execution uses only the explicit CLI override or the
+operator-configured `worklink.yaml` default test command, which live in the same
 operator/agent-private trust boundary as poller commands.
 
 For non-shared-filesystem compute substrates, controller-side evidence

@@ -76,7 +76,7 @@ Review criteria:
 Worklink notes:
 - Scope: <files/subsystems expected to change, or "docs only">
 - Out of scope: <nearby work not included in this leaf>
-- Suggested test command: <command the executor should run>
+- Suggested test command: <advisory validation command for the backend to consider>
 ```
 
 ## When not to decompose

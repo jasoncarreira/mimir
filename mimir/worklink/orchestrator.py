@@ -32,7 +32,6 @@ from .evidence import (
 from .planning import (
     missing_leaf_template_parts,
     render_decompose_prompt,
-    suggested_test_command,
     uses_strict_leaf_validation,
 )
 from .run_state import (
@@ -237,11 +236,7 @@ class WorklinkRunner:
         )
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
         selected_name = backend.name
-        test_cmd = (
-            test_command
-            if test_command is not None
-            else suggested_test_command(issue.description) or config.defaults.test_command
-        )
+        test_cmd = test_command if test_command is not None else config.defaults.test_command
         template_path = _template_path(self.home)
         # Per-run override beats worklink.yaml, which beats the built-in "main".
         base = base_branch or config.defaults.base_branch

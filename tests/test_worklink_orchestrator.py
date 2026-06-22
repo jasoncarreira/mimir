@@ -471,7 +471,7 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
 
     result = asyncio.run(
         WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
-            441, backend_name="fake"
+            441, backend_name="fake", test_command="echo ok"
         )
     )
 
@@ -1313,19 +1313,25 @@ def test_skill_embeds_single_leaf_template_constant() -> None:
     assert LEAF_TEMPLATE_MARKDOWN in skill
 
 
-def test_worklink_uses_planner_suggested_test_command_by_default(
+def test_worklink_ignores_planner_suggested_test_command_by_default(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     calls: list[Sequence[str] | str] = []
 
+    issue_json = STRICT_ISSUE_JSON.replace(
+        "- Suggested test command: uv run pytest -q tests/test_worklink_orchestrator.py",
+        "- Suggested test command: echo planner-controlled; touch /tmp/owned",
+    )
+
     def runner(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:
         calls.append(args)
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "443"]:
-            return cp(args, stdout=STRICT_ISSUE_JSON)
+            return cp(args, stdout=issue_json)
         if isinstance(args, list) and args[:4] == ["git", "-C", str(tmp_path / "repo"), "config"]:
             return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
         return cp(args)
 
+    (tmp_path / "worklink.yaml").write_text("defaults:\n  test_command: echo safe\n", encoding="utf-8")
     backend = FakeBackend()
     registry = BackendRegistry(WorklinkConfig())
     registry.register(backend)
@@ -1338,7 +1344,9 @@ def test_worklink_uses_planner_suggested_test_command_by_default(
 
     out = capsys.readouterr().out
     assert result.dry_run is True
-    assert "uv run pytest -q tests/test_worklink_orchestrator.py" in out
+    assert "echo planner-controlled; touch /tmp/owned" in out
+    assert "orchestrator will independently run this operator-configured command" in out
+    assert "  echo safe" in out
 
 
 def test_decompose_prompt_teaches_chainlink_block_argument_order() -> None:
@@ -1351,23 +1359,8 @@ def test_decompose_prompt_teaches_chainlink_block_argument_order() -> None:
     assert "chainlink issue block <blocker> <blocked>" not in prompt
 
 
-def test_planner_suggested_test_command_strips_markdown_backticks() -> None:
-    from mimir.worklink.planning import suggested_test_command
 
-    description = """Acceptance criteria:
-- [ ] Focused validation passes.
-
-Worklink notes:
-- Suggested test command: `cd /workspace/mimir && pytest -q tests/test_identities.py`
-"""
-
-    assert (
-        suggested_test_command(description)
-        == "cd /workspace/mimir && pytest -q tests/test_identities.py"
-    )
-
-
-def test_worklink_prompt_does_not_wrap_suggested_test_command_in_backticks(
+def test_worklink_prompt_keeps_planner_suggestion_advisory(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     calls: list[Sequence[str] | str] = []
@@ -1385,6 +1378,7 @@ def test_worklink_prompt_does_not_wrap_suggested_test_command_in_backticks(
             return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
         return cp(args)
 
+    (tmp_path / "worklink.yaml").write_text("defaults:\n  test_command: echo safe\n", encoding="utf-8")
     backend = FakeBackend()
     registry = BackendRegistry(WorklinkConfig())
     registry.register(backend)
@@ -1397,9 +1391,10 @@ def test_worklink_prompt_does_not_wrap_suggested_test_command_in_backticks(
 
     out = capsys.readouterr().out
     assert result.dry_run is True
-    assert "orchestrator will independently run this command without Markdown delimiters" in out
-    assert "  cd /workspace/mimir && pytest -q tests/test_identities.py" in out
-    assert "``cd /workspace/mimir" not in out
+    assert "orchestrator will independently run this operator-configured command" in out
+    assert "Treat it as advisory only" in out
+    assert "  echo safe" in out
+    assert "  cd /workspace/mimir && pytest -q tests/test_identities.py" not in out
 
 def test_codex_local_subprocess_uses_isolated_checkout(tmp_path: Path) -> None:
     from mimir.worklink.orchestrator import _create_backend_checkout
