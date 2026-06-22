@@ -24,8 +24,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -615,6 +617,37 @@ def build_clusters_payload(
 # Maximum rows returned from a single SQL query.
 _SQL_MAX_ROWS = 1000
 
+# chainlink #611: the read-only passthrough's ONLY write protection is the
+# ``mode=ro`` connection — the keyword blacklist is brittle defense-in-depth and
+# does nothing to bound resource use. The row cap (above) limits rows *fetched*,
+# not work *performed* or a single value's size, so a recursive-CTE compute bomb
+# (CPU) or a huge ``zeroblob()``/``randomblob()`` scalar (memory) can hang or OOM
+# the ``asyncio.to_thread`` worker. These two limits close that availability gap:
+#   - ``_SQL_TIMEOUT_S``: wall-clock budget enforced via a progress handler that
+#     aborts the running statement (covers execute AND lazy row streaming).
+#   - ``_SQL_MAX_VALUE_BYTES``: caps any single string/blob/row via
+#     ``SQLITE_LIMIT_LENGTH`` so an oversized scalar raises before allocating.
+# Both are env-tunable for operators who knowingly enable the SQL console.
+_SQL_TIMEOUT_S = float(os.environ.get("MIMIR_SAGA_SQL_TIMEOUT_S") or 5.0)
+_SQL_MAX_VALUE_BYTES = int(os.environ.get("MIMIR_SAGA_SQL_MAX_VALUE_BYTES") or 10_000_000)
+# VM opcodes between progress-handler deadline checks (cheap; sub-ms cadence).
+_SQL_PROGRESS_OPS = 1000
+
+
+def _apply_sql_value_limit(conn: sqlite3.Connection) -> None:
+    """Cap the max size of any single string/blob/row (chainlink #611) so an
+    oversized ``zeroblob()``/``randomblob()`` scalar raises 'string or blob too
+    big' instead of allocating. ``setlimit`` + the constant are Python 3.11+;
+    degrade gracefully (no cap) if unavailable."""
+    setlimit = getattr(conn, "setlimit", None)
+    category = getattr(sqlite3, "SQLITE_LIMIT_LENGTH", None)
+    if setlimit is None or category is None:
+        return
+    try:
+        setlimit(category, _SQL_MAX_VALUE_BYTES)
+    except (sqlite3.Error, OverflowError, ValueError):
+        pass
+
 # Write keywords that must not appear anywhere in a "read-only" statement.
 # Covers DML (INSERT/UPDATE/DELETE/REPLACE), DDL (CREATE/DROP/ALTER),
 # plus ATTACH/DETACH (mounting external DBs) and PRAGMA (many mutate state).
@@ -686,6 +719,21 @@ def build_sql_payload(db_path: Path, sql: str) -> dict[str, Any]:
     if conn is None:
         return {"error": "saga db not found or unreadable", "rejected": False}
 
+    # chainlink #611: bound per-value memory + wall-clock CPU. mode=ro already
+    # prevents writes; these stop a compute/memory DoS the row cap can't.
+    _apply_sql_value_limit(conn)
+    deadline = time.monotonic() + _SQL_TIMEOUT_S
+    timed_out = False
+
+    def _abort_if_overtime() -> int:
+        nonlocal timed_out
+        if time.monotonic() > deadline:
+            timed_out = True
+            return 1
+        return 0
+
+    conn.set_progress_handler(_abort_if_overtime, _SQL_PROGRESS_OPS)
+
     try:
         cur = conn.execute(sql)
         columns = [desc[0] for desc in (cur.description or [])]
@@ -714,9 +762,16 @@ def build_sql_payload(db_path: Path, sql: str) -> dict[str, Any]:
             "truncated": truncated,
         }
     except sqlite3.Error as exc:
+        if timed_out:
+            log.warning("saga_dashboard: sql query exceeded %ss limit", _SQL_TIMEOUT_S)
+            return {
+                "error": f"query exceeded the {_SQL_TIMEOUT_S:g}s time limit",
+                "rejected": False,
+            }
         log.warning("saga_dashboard: sql query failed: %s", exc)
         return {"error": str(exc), "rejected": False}
     finally:
+        conn.set_progress_handler(None, 0)
         conn.close()
 
 
