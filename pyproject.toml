@@ -6,7 +6,7 @@
 # code keeps writing ``from mimir.agent import ...`` — only the
 # install incantation changes: ``pip install mimir-agent``.
 name = "mimir-agent"
-version = "0.6.3"
+version = "0.6.4"
 description = "Memory-centric agent harness on deepagents / LangGraph"
 requires-python = ">=3.11"
 authors = [{ name = "Jason Carreira" }]
