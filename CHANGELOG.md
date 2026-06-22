@@ -6,6 +6,8 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-06-22
+
 ### Added
 
 - **Chainlink store auto-init on startup.** If the `chainlink` CLI is installed and
