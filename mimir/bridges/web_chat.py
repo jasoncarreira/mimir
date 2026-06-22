@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +50,7 @@ log = logging.getLogger(__name__)
 EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
 
 DEFAULT_CHANNEL = DEFAULT_WEB_CHANNEL
+CHAT_STREAM_MAX_SUBSCRIBERS = int(os.environ.get("MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS", "8"))
 
 
 @dataclass
@@ -80,6 +82,8 @@ def _web_channel_for(canonical: str) -> str:
     canonical is empty.
     """
     return web_channel_for_identity(canonical)
+
+
 SSE_HEARTBEAT_S = 15.0
 
 
@@ -305,6 +309,19 @@ class WebChatBridge(Bridge):
         return frozenset({_web_channel_for(identity.canonical)})
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+
+        # Subscribe before prepare to reserve capacity under the lock. Otherwise
+        # concurrent connection attempts could all pass a separate len() check
+        # before any of them appended, overshooting the cap.
+        q: asyncio.Queue = asyncio.Queue(maxsize=128)
+        subscriber = _Subscriber(q, self._allowed_stream_channels(request))
+        async with self._lock:
+            if len(self._subscribers) >= CHAT_STREAM_MAX_SUBSCRIBERS:
+                return web.Response(text="too many chat streams", status=429)
+            self._subscribers.append(subscriber)
+
         resp = web.StreamResponse(
             status=200,
             headers={
@@ -323,16 +340,8 @@ class WebChatBridge(Bridge):
                 # CORS only restricts browsers.
             },
         )
-        await resp.prepare(request)
-
-        # Subscribe — bounded queue so a stuck client doesn't grow unboundedly.
-        q: asyncio.Queue = asyncio.Queue(maxsize=128)
-        subscriber = _Subscriber(q, self._allowed_stream_channels(request))
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        async with self._lock:
-            self._subscribers.append(subscriber)
         try:
+            await resp.prepare(request)
             while True:
                 try:
                     item = await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT_S)
