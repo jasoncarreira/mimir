@@ -6,6 +6,8 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-06-22
+
 ### Fixed
 
 - **Spurious "unclean restart" pages on deploy recreates.** `_on_cleanup` now writes
