@@ -85,6 +85,142 @@ def test_retrieval_geometry_regression_is_reported():
     assert bad.asi["retrieval_geometry"]["score"] < good.asi["retrieval_geometry"]["score"]
 
 
+def test_calibration_filters_regex_artifacts_without_hiding_real_unsupported_ids():
+    ex = {
+        "example_id": "calibration-artifacts",
+        "source_cluster": {
+            "evidence_atom_ids": ["a1", "a2"],
+            "atoms": [
+                {
+                    "atom_id": "a1",
+                    "content": (
+                        "arXiv:2606.13141 V-RAGBench / CARVE was judged relevant on "
+                        "2026-06-12; evaluate prompt/latency cost and downstream answer/action quality."
+                    ),
+                },
+                {
+                    "atom_id": "a2",
+                    "content": "Voyage-4-lite uses 1024d embeddings and OpenAI uses 1536d embeddings.",
+                },
+            ],
+        },
+        "evaluator_annotations": {
+            "required_identifiers_dates_numbers_names": {
+                "identifiers": ["arXiv:2606.13141", "V-RAGBench", "CARVE", "2026-06-12"],
+                "dates": ["2026-06-12"],
+                "numbers": ["2606.13141", "2026", "06", "12", "1024d", "1536d"],
+                "names": ["V-RAGBench", "CARVE", "Voyage"],
+            }
+        },
+        "strata": {"identifier_dense": True},
+    }
+
+    ev = score_candidate(
+        ex,
+        _raw(
+            "Several arXiv papers cover memory/retrieval and prompt/latency tradeoffs. "
+            "The V-RAGBench / CARVE item stayed relevant on 2026-06-12; "
+            "Voyage used 1024 dimensions and OpenAI used +1536 dimensions."
+        ),
+    )
+
+    assert ev.asi["hard_fail"] is None
+    high_spans = [u["candidate_span"] for u in ev.asi["support"]["unsupported_high_severity"]]
+    assert "arXiv papers" not in high_spans
+    assert "/retrieval" not in high_spans
+    assert "1024" not in high_spans
+    assert "1536" not in high_spans
+
+    pp = score_candidate(
+        {
+            "example_id": "pp",
+            "source_cluster": {
+                "atoms": [{"atom_id": "a1", "content": "Arm A scored 0.904 and Arm B scored 0.88."}],
+            },
+        },
+        _raw("Arm A led by a 2.4 percentage-point margin."),
+    )
+    assert pp.asi["support"]["unsupported_high_severity"] == []
+
+    bad = score_candidate(ex, _raw("PR #999 changed the V-RAGBench result."))
+    assert bad.asi["hard_fail"] == "unsupported_high_severity_claim"
+    assert "PR #999" in [u["candidate_span"] for u in bad.asi["support"]["unsupported_high_severity"]]
+
+
+def test_structural_indices_and_identifier_number_components_are_ignored():
+    ex = {
+        "example_id": "indices",
+        "source_cluster": {
+            "evidence_atom_ids": ["a1"],
+            "atoms": [
+                {
+                    "atom_id": "a1",
+                    "content": "arXiv:2606.20280 ELVA was reviewed on 2026-06-12.",
+                }
+            ],
+        },
+        "evaluator_annotations": {
+            "required_identifiers_dates_numbers_names": {
+                "identifiers": ["arXiv:2606.20280"],
+                "dates": ["2026-06-12"],
+                "numbers": ["2606.20280", "2026", "06", "12"],
+                "names": ["ELVA"],
+            }
+        },
+        "strata": {"identifier_dense": True},
+    }
+
+    ev = score_candidate(ex, _raw("[1] arXiv:2606.20280 ELVA was reviewed on 2026-06-12."))
+
+    assert ev.asi["hard_fail"] is None
+    assert ev.asi["support"]["unsupported_high_severity"] == []
+    assert ev.asi["symbolic_retention"]["required_count"] == 3
+
+
+def test_identifier_dense_hard_gate_spares_primary_id_covered_summary():
+    ex = {
+        "example_id": "primary-id-covered",
+        "source_cluster": {
+            "evidence_atom_ids": ["a1", "a2"],
+            "atoms": [
+                {"atom_id": "a1", "content": "arXiv:2606.10000 AlphaBench introduced an agent memory benchmark."},
+                {"atom_id": "a2", "content": "arXiv:2606.20000 BetaBench added retrieval hard negatives."},
+            ],
+        },
+        "evaluator_annotations": {
+            "required_identifiers_dates_numbers_names": {
+                "identifiers": [
+                    "arXiv:2606.10000",
+                    "AlphaBench",
+                    "BetaBench",
+                    "/concepts/agent-memory",
+                    "/retrieval/hard-negative",
+                    "/benchmark/corpus",
+                    "/source/modal/time",
+                    "/saga/observation",
+                    "/cluster/evidence",
+                    "/wiki/page",
+                    "/graph/path",
+                    "/eval/holdout",
+                    "/memory/index",
+                ],
+                "numbers": ["2606.10000", "2606.20000"],
+                "names": ["AlphaBench", "BetaBench"],
+            }
+        },
+        "strata": {"identifier_dense": True},
+    }
+
+    ev = score_candidate(
+        ex,
+        _raw("arXiv:2606.10000 AlphaBench introduced an agent memory benchmark."),
+    )
+
+    assert ev.asi["symbolic_retention"]["score"] < 0.20
+    assert ev.asi["coverage"]["score"] >= 0.50
+    assert ev.asi["hard_fail"] is None
+
+
 def test_adapter_evaluates_raw_outputs_and_returns_reflective_asi():
     ex = Example(id="ex-1", split="train", data=_example())
 

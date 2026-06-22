@@ -32,13 +32,18 @@ EmbeddingFn = Callable[[str], Sequence[float]]
 
 _HEADER_RE = re.compile(r"^\s*(OBSERVATION|TRIPLES|CONTRADICTIONS)\s*:\s*$", re.I | re.M)
 _ID_RE = re.compile(
-    r"\b(?:PR|Chainlink|issue|arXiv|RFC)\s*#?:?\s*[A-Za-z0-9][A-Za-z0-9._:-]*\b"
+    r"\b(?:PR|Chainlink|issue)\s*#\s*[A-Za-z0-9][A-Za-z0-9._:-]*\b"
+    r"|\bRFC\s*\d+[A-Za-z0-9._:-]*\b"
+    r"|\barXiv:\s*\d{4}\.\d{4,5}\b"
     r"|\b[a-f0-9]{12,16}\b"
     r"|\b\d{4}\.\d{4,5}\b"
-    r"|/[A-Za-z0-9._~:/#-]+"
+    r"|(?<![A-Za-z0-9])/[A-Za-z0-9._~:/#-]+"
 )
 _DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
-_NUMBER_RE = re.compile(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?(?:%|pp)?(?![A-Za-z])")
+_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9.])[-+]?\d+(?:\.\d+)?(?:\s*(?:dimensions?|d|%|pp))?(?![A-Za-z0-9])",
+    re.I,
+)
 _NAME_RE = re.compile(r"\b[A-Z][A-Za-z0-9]*(?:[- ][A-Z][A-Za-z0-9]*){0,4}\b")
 _GENERIC_NAMES = {
     "A", "An", "And", "Atom", "Atoms", "Candidate", "Contradictions",
@@ -96,7 +101,12 @@ def score_candidate(
     hard_fail = None
     if support["unsupported_high_severity"]:
         hard_fail = "unsupported_high_severity_claim"
-    elif _identifier_dense(example) and retention["required_count"] >= 3 and retention["score"] < 0.20:
+    elif (
+        _identifier_dense(example)
+        and retention["required_count"] >= 3
+        and retention["score"] < 0.20
+        and _identifier_collapse_should_hard_fail(retention, coverage)
+    ):
         hard_fail = "identifier_dense_symbolic_collapse"
 
     weighted = (
@@ -200,13 +210,40 @@ def _source_atoms(example: Mapping[str, Any]) -> list[dict[str, str]]:
 def _required_details(example: Mapping[str, Any]) -> dict[str, list[str]]:
     ann = example.get("evaluator_annotations") or {}
     req = ann.get("required_identifiers_dates_numbers_names") or ann.get("required_details") or {}
-    out: dict[str, list[str]] = {}
+    raw: dict[str, list[str]] = {}
     for key in ("identifiers", "dates", "numbers", "proper_names", "names"):
         vals = req.get(key) if isinstance(req, Mapping) else []
         if isinstance(vals, list):
-            out[key] = _dedupe(str(v) for v in vals if isinstance(v, (str, int, float)))
-    if "names" not in out and "proper_names" in out:
-        out["names"] = out["proper_names"]
+            raw[key] = [str(v) for v in vals if isinstance(v, (str, int, float))]
+
+    dates = _dedupe(v for v in raw.get("dates", []) if _DATE_RE.fullmatch(v))
+    identifiers = _dedupe(
+        ident
+        for value in raw.get("identifiers", [])
+        if (ident := _canonical_identifier(value)) is not None
+    )
+    numbers = _dedupe(
+        num
+        for value in raw.get("numbers", [])
+        if (num := _canonical_number(value)) is not None
+        and not _number_is_date_component(num, dates)
+        and not _number_is_identifier_component(num, identifiers)
+    )
+    names = _dedupe(
+        value
+        for value in (raw.get("names") or raw.get("proper_names") or [])
+        if value and value not in _GENERIC_NAMES
+    )
+
+    out: dict[str, list[str]] = {}
+    if identifiers:
+        out["identifiers"] = identifiers
+    if dates:
+        out["dates"] = dates
+    if numbers:
+        out["numbers"] = numbers
+    if names:
+        out["names"] = names
     return out
 
 
@@ -249,13 +286,15 @@ def _mutation_hint(expected: str, text: str) -> str | None:
     norm_expected = _loose_norm(expected)
     if len(norm_expected) < 3:
         return None
-    candidates = set(_ID_RE.findall(text)) | set(_DATE_RE.findall(text)) | set(_NUMBER_RE.findall(text))
-    candidates |= {m.group(0) for m in _NAME_RE.finditer(text) if m.group(0) not in _GENERIC_NAMES}
+    artifacts = _extract_supported_artifacts(text)
+    candidates = set().union(*artifacts.values())
     for cand in candidates:
         if cand == expected:
             continue
         norm_cand = _loose_norm(cand)
-        if norm_cand == norm_expected or SequenceMatcher(None, norm_expected, norm_cand).ratio() >= 0.88:
+        if _artifact_equivalent(expected, cand) or norm_cand == norm_expected:
+            return cand
+        if SequenceMatcher(None, norm_expected, norm_cand).ratio() >= 0.88:
             return cand
     return None
 
@@ -268,7 +307,11 @@ def _support_report(observation: str, source_atoms: list[dict[str, str]], source
         for val in values:
             if val in _GENERIC_NAMES:
                 continue
-            if val not in source_ids.get(kind, set()) and _mutation_hint(val, source_text) is None:
+            if (
+                val not in source_ids.get(kind, set())
+                and _mutation_hint(val, source_text) is None
+                and not (kind == "numbers" and _derived_number_supported(val, source_ids.get("numbers", set())))
+            ):
                 unsupported.append(
                     {
                         "kind": kind,
@@ -287,12 +330,188 @@ def _support_report(observation: str, source_atoms: list[dict[str, str]], source
 
 
 def _extract_supported_artifacts(text: str) -> dict[str, set[str]]:
+    raw = text or ""
+    identifier_matches = [
+        m for m in _ID_RE.finditer(raw)
+        if _canonical_identifier(m.group(0)) is not None
+    ]
+    date_matches = list(_DATE_RE.finditer(raw))
+    excluded = [(m.start(), m.end()) for m in identifier_matches + date_matches]
     return {
-        "identifiers": set(_ID_RE.findall(text or "")),
-        "dates": set(_DATE_RE.findall(text or "")),
-        "numbers": set(_NUMBER_RE.findall(text or "")),
-        "names": {m.group(0) for m in _NAME_RE.finditer(text or "") if m.group(0) not in _GENERIC_NAMES},
+        "identifiers": {
+            ident
+            for m in identifier_matches
+            if (ident := _canonical_identifier(m.group(0))) is not None
+        },
+        "dates": {m.group(0) for m in date_matches},
+        "numbers": set(_extract_numbers(raw, excluded_spans=excluded)),
+        "names": {m.group(0) for m in _NAME_RE.finditer(raw) if m.group(0) not in _GENERIC_NAMES},
     }
+
+
+def _canonical_identifier(value: str) -> str | None:
+    value = value.strip().strip("`'\"")
+    value = value.rstrip(".,;:)")
+    if not value or value in _GENERIC_NAMES or _DATE_RE.fullmatch(value):
+        return None
+    if " " in value and not re.search(r"(?i)\b(?:PR|Chainlink|issue)\s*#|\barXiv:\s*\d{4}\.\d{4,5}|\bRFC\s*\d+", value):
+        return None
+    if value.startswith("/"):
+        # Single-segment slash tokens are usually artifacts from ordinary
+        # compounds (``papers/arXiv`` -> ``/arXiv``). Keep only path-like
+        # values with hierarchy, an extension, or another structural marker.
+        if value.count("/") < 2 and "." not in value and "#" not in value:
+            return None
+    lowered = value.lower()
+    if lowered.startswith("arxiv") and not re.search(r"\d{4}\.\d{4,5}", value):
+        return None
+    if re.match(r"(?i)^(?:pr|chainlink|issue)\b", value) and "#" not in value:
+        return None
+    if not re.search(r"[A-Za-z0-9]", value):
+        return None
+    return re.sub(r"\s+", " ", value)
+
+
+def _canonical_number(value: str) -> str | None:
+    match = _NUMBER_RE.fullmatch(value.strip())
+    if not match:
+        return None
+    raw = re.sub(r"\s+", "", match.group(0).lower())
+    if raw.startswith("+"):
+        raw = raw[1:]
+    for suffix in ("dimensions", "dimension", "d"):
+        if raw.endswith(suffix):
+            raw = raw[: -len(suffix)]
+            break
+    return raw or None
+
+
+def _extract_numbers(text: str, *, excluded_spans: Sequence[tuple[int, int]]) -> list[str]:
+    out: list[str] = []
+    for match in _NUMBER_RE.finditer(text):
+        if _overlaps_any(match.start(), match.end(), excluded_spans):
+            continue
+        if _looks_like_structural_index(text, match.start(), match.end()):
+            continue
+        num = _canonical_number(match.group(0))
+        if num is None:
+            continue
+        if _looks_like_small_ordinal(text, match.start(), match.end()) and not ("." in num or "%" in num or "pp" in num):
+            continue
+        if num is not None:
+            out.append(num)
+    return _dedupe(out)
+
+
+def _overlaps_any(start: int, end: int, spans: Sequence[tuple[int, int]]) -> bool:
+    return any(start < span_end and end > span_start for span_start, span_end in spans)
+
+
+def _looks_like_structural_index(text: str, start: int, end: int) -> bool:
+    before = text[start - 1] if start > 0 else ""
+    after = text[end] if end < len(text) else ""
+    if before == "[" and after == "]":
+        return True
+    line_start = text.rfind("\n", 0, start) + 1
+    prefix = text[line_start:start]
+    if not prefix.strip() and after in {".", ")", "]"}:
+        return True
+    return False
+
+
+def _looks_like_small_ordinal(text: str, start: int, end: int) -> bool:
+    token = text[start:end].strip().lstrip("+")
+    if token not in {"1", "2", "3", "4", "5", "6", "7", "8", "9"}:
+        return False
+    before = text[max(0, start - 3):start]
+    after = text[end:min(len(text), end + 3)]
+    if any(ch in before[-1:] + after[:1] for ch in "-–—"):
+        return True
+    if any(ch.isdigit() for ch in before + after):
+        return False
+    return True
+
+
+def _number_is_date_component(number: str, dates: Sequence[str]) -> bool:
+    stripped = number.lstrip("+-")
+    for date in dates:
+        parts = date.split("-")
+        if stripped in parts or stripped.lstrip("0") in {part.lstrip("0") for part in parts}:
+            return True
+    return False
+
+
+def _number_is_identifier_component(number: str, identifiers: Sequence[str]) -> bool:
+    norm = _loose_norm(number)
+    return bool(norm and any(norm and norm in _loose_norm(identifier) for identifier in identifiers))
+
+
+def _artifact_equivalent(left: str, right: str) -> bool:
+    left_num = _canonical_number(left)
+    right_num = _canonical_number(right)
+    if left_num is not None and right_num is not None:
+        if left_num == right_num:
+            return True
+        left_core = left_num.rstrip("%pp")
+        right_core = right_num.rstrip("%pp")
+        if left_core == right_core:
+            return True
+        return _rounded_decimal_equivalent(left_core, right_core)
+    left_arxiv = re.search(r"\d{4}\.\d{4,5}", left)
+    right_arxiv = re.search(r"\d{4}\.\d{4,5}", right)
+    if left_arxiv and right_arxiv:
+        return left_arxiv.group(0) == right_arxiv.group(0)
+    return False
+
+
+def _rounded_decimal_equivalent(left: str, right: str) -> bool:
+    try:
+        lf = float(left)
+        rf = float(right)
+    except ValueError:
+        return False
+    return abs(lf - rf) < 0.051
+
+
+def _derived_number_supported(candidate: str, source_numbers: set[str]) -> bool:
+    candidate_num = _canonical_number(candidate)
+    if candidate_num is None:
+        return False
+    candidate_core = candidate_num.rstrip("%pp")
+    try:
+        candidate_float = abs(float(candidate_core))
+    except ValueError:
+        return False
+    source_floats: list[float] = []
+    for source in source_numbers:
+        source_num = _canonical_number(source)
+        if source_num is None:
+            continue
+        try:
+            source_floats.append(float(source_num.rstrip("%pp")))
+        except ValueError:
+            continue
+    for idx, left in enumerate(source_floats):
+        for right in source_floats[idx + 1:]:
+            if 0.0 <= left <= 1.0 and 0.0 <= right <= 1.0:
+                if abs(abs(left - right) * 100.0 - candidate_float) < 0.051:
+                    return True
+    return False
+
+
+def _identifier_collapse_should_hard_fail(retention: Mapping[str, Any], coverage: Mapping[str, Any]) -> bool:
+    retained = retention.get("retained", {}).get("identifiers", [])
+    missing = retention.get("missing", {}).get("identifiers", [])
+    mutated = retention.get("mutated", {}).get("identifiers", [])
+    identifier_total = len(retained) + len(missing) + len(mutated)
+    if identifier_total == 0:
+        identifier_score = 0.0
+    else:
+        identifier_score = (len(retained) + 0.25 * len(mutated)) / identifier_total
+    # The hard gate is meant to catch bland mush, not summaries that preserve a
+    # primary identifier and cover at least half the cluster while missing noisy
+    # secondary symbols from heuristic annotations.
+    return float(coverage.get("score", 0.0)) < 0.50 and identifier_score < 0.33
 
 
 def _coverage_report(observation: str, source_atoms: list[dict[str, str]]) -> dict[str, Any]:
