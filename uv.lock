@@ -1321,7 +1321,7 @@ wheels = [
 
 [[package]]
 name = "mimir-agent"
-version = "0.6.3"
+version = "0.6.4"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

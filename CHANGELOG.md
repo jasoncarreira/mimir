@@ -6,6 +6,17 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-06-22
+
+### Fixed
+
+- **Spurious "unclean restart" pages on deploy recreates.** `_on_cleanup` now writes
+  the clean-shutdown marker as its very first action, before `await log_event(…)` and
+  the drain. Previously a stalled await during an active turn could let the stop grace
+  period expire (SIGKILL) before the marker was written, so an intended stop looked
+  like a crash and paged the operator (seen on muninn's busy Discord/poller workload).
+  chainlink #507.
+
 ## [0.6.3] — 2026-06-22
 
 ### Security

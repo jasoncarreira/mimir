@@ -1744,14 +1744,19 @@ def build_app(config: Config) -> web.Application:
             )
 
     async def _on_cleanup(app: web.Application) -> None:
-        await log_event("shutdown", reason="cleanup")
-        # Mark this stop as clean BEFORE draining: reaching _on_cleanup means
-        # we received SIGTERM/SIGINT and are tearing down in order — an
-        # intended stop — even if a later drain step is slow. A hard kill
-        # never gets here, so its marker stays clean=false (→ unclean-restart
-        # notice on next boot). chainlink #507.
+        # Mark this stop as clean as the VERY FIRST action — before ANY await.
+        # Reaching _on_cleanup means we received SIGTERM/SIGINT and are tearing
+        # down in order (an intended stop). mark_clean_shutdown is a fast, sync,
+        # local file write; doing it ahead of `await log_event` and the drain
+        # means a stalled await during an active turn can't let the
+        # stop_grace_period expire (SIGKILL) before the clean marker lands. That
+        # ordering bug produced spurious "unclean restart" pages on deploy
+        # recreates of a busy agent (muninn). A hard kill never reaches here, so
+        # its marker stays clean=false (→ unclean-restart notice on next boot).
+        # chainlink #507.
         from .liveness import mark_clean_shutdown
         mark_clean_shutdown(config.home)
+        await log_event("shutdown", reason="cleanup")
         # chainlink #510: bounded graceful drain — finish in-flight turns up to
         # the configured timeout, then exit. Keeps a deploy SIGTERM from killing
         # live turns while staying within the compose stop_grace_period.
