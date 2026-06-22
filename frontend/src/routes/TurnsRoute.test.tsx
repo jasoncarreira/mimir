@@ -168,6 +168,22 @@ describe("TurnsRoute", () => {
     expect(timeline.getByText("Reasoning between tools.")).toBeTruthy();
   });
 
+  it("does not load sessions on the initial turn feed render", async () => {
+    turnsApi.listTurns.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: { turns: [turnsFixture.turns[0]] },
+      meta: { cursor: null, limit: 200, total: null, truncated: false }
+    });
+
+    renderTurns();
+
+    expect(await screen.findByRole("list", { name: "Turns" })).toBeTruthy();
+    expect(screen.getByText("Load sessions")).toBeTruthy();
+    expect(turnsApi.listTurns).toHaveBeenCalledTimes(1);
+    expect(turnsApi.listTurns).toHaveBeenCalledWith({ limit: 200 }, { cache: "no-store" });
+  });
+
   it("shows an empty state for missing payloads", async () => {
     turnsApi.listTurns.mockResolvedValue({
       ok: true,

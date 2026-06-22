@@ -337,13 +337,95 @@ def _scoped_channel_from_query(
     )
 
 
+def _record_matches_channel(record: dict[str, Any], channel: str | None) -> bool:
+    if channel is None:
+        return True
+    return str(record.get("channel_id") or "") == channel
+
+
 def _filter_records_by_channel(
     records: list[dict[str, Any]],
     channel: str | None,
 ) -> list[dict[str, Any]]:
     if channel is None:
         return records
-    return [r for r in records if str(r.get("channel_id") or "") == channel]
+    return [r for r in records if _record_matches_channel(r, channel)]
+
+
+def _turns_tail_page(
+    path: Path,
+    *,
+    limit: int,
+    channel: str | None = None,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        for record in tail_jsonl_records(path):
+            if not isinstance(record, dict) or not _record_matches_channel(record, channel):
+                continue
+            out.append(record)
+            if len(out) >= limit:
+                break
+    except OSError:
+        return []
+    out.reverse()
+    return out
+
+
+def _turns_after_page(
+    path: Path,
+    *,
+    after: str,
+    channel: str | None = None,
+) -> list[dict[str, Any]]:
+    if not after:
+        return []
+    newest_first: list[dict[str, Any]] = []
+    try:
+        for record in tail_jsonl_records(path):
+            if not isinstance(record, dict) or not _record_matches_channel(record, channel):
+                continue
+            if record.get("turn_id") == after:
+                newest_first.reverse()
+                return newest_first
+            newest_first.append(record)
+    except OSError:
+        return []
+    return []
+
+
+def _turns_before_page(
+    path: Path,
+    *,
+    before: str,
+    limit: int,
+    channel: str | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    if not before or limit <= 0:
+        return [], False
+    out: list[dict[str, Any]] = []
+    found = False
+    has_more = False
+    try:
+        for record in tail_jsonl_records(path):
+            if not isinstance(record, dict) or not _record_matches_channel(record, channel):
+                continue
+            if not found:
+                found = record.get("turn_id") == before
+                continue
+            if len(out) < limit:
+                out.append(record)
+            else:
+                has_more = True
+                break
+    except OSError:
+        return [], False
+    if not found:
+        return [], False
+    out.reverse()
+    return out, has_more
 
 
 def _event_record_matches_channel(record: dict[str, Any], channel: str) -> bool:
@@ -431,19 +513,18 @@ def register_routes(
         *,
         channel: str | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        # Records are oldest-first (append order). The viewer reverses to
-        # newest-first for display. Pagination params (progressive loading —
-        # the viewer no longer pulls the whole — now 140MB+ — file up front):
+        # Pagination params (progressive loading — the viewers must not pull
+        # the whole — now hundreds-of-MB — turns.jsonl up front):
         #   ?after=<turn_id>           — turns strictly newer than turn_id (live poll)
         #   ?before=<turn_id>&limit=N  — up to N turns immediately OLDER than turn_id
         #                                (scroll-back page)
         #   ?limit=N                   — newest N turns (initial page)
-        #   (none)                     — all turns (back-compat)
+        #   (none)                     — all retained turns (back-compat only)
         #
-        # ``_read_jsonl`` tail-decodes retained turn records. That can be
-        # CPU-heavy when tool/model traces are large, so aiohttp handlers call
-        # this helper via ``asyncio.to_thread`` instead of blocking the loop.
-        records = _filter_records_by_channel(_read_jsonl(turns_log), channel)
+        # Keep cursor pages streaming tail-first. The previous React-v1 path
+        # still called _read_jsonl(), which tail-decoded every retained record
+        # before slicing to 200 rows; on live logs that meant reparsing the
+        # whole turns.jsonl (~hundreds of MB) on every refresh.
         after = request.query.get("after", "")
         before = request.query.get("before", "")
         try:
@@ -451,49 +532,40 @@ def register_routes(
         except ValueError:
             limit = 0
 
-        total = len(records)
         if after:
-            # Return everything strictly after the named turn_id. If the id
-            # isn't found we return the empty list (consistent with open-strix).
-            cut: list[dict[str, Any]] = []
-            seen = False
-            for r in records:
-                if seen:
-                    cut.append(r)
-                elif r.get("turn_id") == after:
-                    seen = True
-            cursor = str(cut[-1].get("turn_id")) if cut and cut[-1].get("turn_id") else None
-            return cut, list_meta(cursor=cursor, limit=limit or None, total=total, truncated=False)
+            window = _turns_after_page(turns_log, after=after, channel=channel)
+            cursor = str(window[-1].get("turn_id")) if window and window[-1].get("turn_id") else None
+            return window, list_meta(cursor=cursor, limit=limit or None, total=None, truncated=False)
 
         if before:
-            # The page of records immediately older than ``before``. Empty list
-            # when the id isn't found (e.g. rotated out) — the viewer treats that
-            # as "no older page".
-            idx = next(
-                (i for i, r in enumerate(records) if r.get("turn_id") == before),
-                None,
+            window, has_more = _turns_before_page(
+                turns_log, before=before, limit=limit, channel=channel
             )
-            if idx is None:
-                window: list[dict[str, Any]] = []
-            else:
-                start = max(0, idx - limit) if limit > 0 else 0
-                window = records[start:idx]
             cursor = str(window[0].get("turn_id")) if window and window[0].get("turn_id") else None
             return window, list_meta(
                 cursor=cursor,
                 limit=limit or None,
-                total=total,
-                truncated=idx is not None and bool(limit > 0 and idx > limit),
+                total=None,
+                truncated=has_more,
             )
 
-        window = records[-limit:] if limit > 0 else records
-        cursor = str(window[-1].get("turn_id")) if window and window[-1].get("turn_id") else None
-        return window, list_meta(
-            cursor=cursor,
-            limit=limit or None,
-            total=total,
-            truncated=bool(limit > 0 and total > limit),
-        )
+        if limit > 0:
+            window = _turns_tail_page(turns_log, limit=limit, channel=channel)
+            cursor = str(window[-1].get("turn_id")) if window and window[-1].get("turn_id") else None
+            return window, list_meta(
+                cursor=cursor,
+                limit=limit,
+                total=None,
+                truncated=len(window) >= limit,
+            )
+
+        # Back-compat endpoint behavior for ad-hoc callers that omit a limit.
+        # This remains bounded by _read_jsonl's retained-record cap, but UI
+        # callers use explicit cursor/limit params and avoid this path.
+        records = _filter_records_by_channel(_read_jsonl(turns_log), channel)
+        total = len(records)
+        cursor = str(records[-1].get("turn_id")) if records and records[-1].get("turn_id") else None
+        return records, list_meta(cursor=cursor, limit=None, total=total, truncated=False)
 
     async def turns_data(request: web.Request) -> web.Response:
         records, _meta = await asyncio.to_thread(
