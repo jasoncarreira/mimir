@@ -157,6 +157,16 @@ class WriteGuardBackend:
         # writable-root check; this lets the deny message point at the proposal
         # flow (chainlink #344) instead of a generic "not writable".
         self._prompts_root: Path = (self._root / "prompts").resolve()
+        # Pre-resolved state/identities.yaml — the auth identity + role registry.
+        # The agent must NEVER edit this via its file tools: a prompt-injected
+        # chat user could otherwise talk the agent into adding an ``admin`` role
+        # alias for themselves (privilege escalation, now that web RBAC gates
+        # saga/memory/ops/admin on the admin role). Legitimate changes go through
+        # the server-side admin Users UI (``issue_web_key``/``revoke_web_key``,
+        # which write the file directly — not through this backend), so key
+        # issuance is unaffected. Unconditional deny: there is no legitimate
+        # agent-tool write to this file.
+        self._identities_path: Path = (self._root / "state" / "identities.yaml").resolve()
         self._enforce_core_memory_readonly: bool = enforce_core_memory_readonly
         # Recorded denials, one per blocked Write/Edit/upload. The agent
         # drains entries for its own turn at end-of-turn
@@ -297,6 +307,19 @@ class WriteGuardBackend:
         from ._context import get_current_turn
         return get_current_turn() is not None
 
+    def _is_identities_write_blocked(self, file_path: str) -> bool:
+        """True iff this write targets ``state/identities.yaml`` — the auth
+        identity + role registry. Blocked UNCONDITIONALLY for the agent's file
+        tools (no turn-context exception, unlike core memory) to prevent
+        prompt-injection privilege escalation: a chat user must not be able to
+        talk the agent into editing the file that decides who is an admin. The
+        admin Users UI mutates identities server-side (not through this
+        backend), so legitimate web-key issuance/revocation is unaffected."""
+        resolved = self._resolve_target(file_path)
+        if resolved is None:
+            return False
+        return resolved == self._identities_path
+
     def _is_prompts_path(self, file_path: str) -> bool:
         """True if ``file_path`` resolves under ``prompts/`` — used only to
         choose a more helpful deny message (point at the proposal flow) when a
@@ -325,6 +348,13 @@ class WriteGuardBackend:
         "reviews and merges the PR."
     )
 
+    _IDENTITIES_DENY_REASON = (
+        "Write blocked: state/identities.yaml is the auth identity + role "
+        "registry (it governs who is an admin) and is not editable via file "
+        "tools, by policy. Manage users and roles through the operator-only "
+        "admin Users UI / web-key endpoints — not by editing this file."
+    )
+
     def _allowed_dirs_label(self) -> str:
         return ", ".join(f"{label}/" for label in self._writable_labels)
 
@@ -340,6 +370,9 @@ class WriteGuardBackend:
         if self._is_core_memory_write_blocked(file_path):
             self._record_denial("write_core_memory_readonly", file_path)
             return WriteResult(error=self._CORE_MEMORY_DENY_REASON)
+        if self._is_identities_write_blocked(file_path):
+            self._record_denial("write_identities_protected", file_path)
+            return WriteResult(error=self._IDENTITIES_DENY_REASON)
         # Idempotent with the strip already applied inside
         # ``_resolve_target`` during the writable-root check — the
         # explicit call here keeps the forward to ``self._fs`` self-
@@ -370,6 +403,9 @@ class WriteGuardBackend:
         if self._is_core_memory_write_blocked(file_path):
             self._record_denial("edit_core_memory_readonly", file_path)
             return EditResult(error=self._CORE_MEMORY_DENY_REASON)
+        if self._is_identities_write_blocked(file_path):
+            self._record_denial("edit_identities_protected", file_path)
+            return EditResult(error=self._IDENTITIES_DENY_REASON)
         # Idempotent with ``_resolve_target`` — see ``write`` above.
         return self._fs.edit(
             file_path=self._canonicalize_path(file_path),
@@ -402,11 +438,14 @@ class WriteGuardBackend:
         # the batch cleanly.
         blocked_paths = {p for p, _ in files if not self._is_write_allowed(p)}
         core_blocked = {p for p, _ in files if self._is_core_memory_write_blocked(p)}
-        if blocked_paths or core_blocked:
+        identities_blocked = {p for p, _ in files if self._is_identities_write_blocked(p)}
+        if blocked_paths or core_blocked or identities_blocked:
             for p in blocked_paths:
                 self._record_denial("upload", p)
             for p in core_blocked - blocked_paths:
                 self._record_denial("upload_core_memory_readonly", p)
+            for p in identities_blocked - blocked_paths - core_blocked:
+                self._record_denial("upload_identities_protected", p)
             return [
                 FileUploadResponse(path=p, error="permission_denied")
                 for p, _ in files

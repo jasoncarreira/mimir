@@ -145,6 +145,7 @@ def first_party_dashboard_extensions(
                 label="Usage",
                 icon="activity",
                 nav_position=11,
+                requires_role="admin",
             ),
             DashboardExtensionManifest(
                 id="turns",
@@ -188,6 +189,7 @@ def first_party_dashboard_extensions(
                 icon="database",
                 nav_position=40,
                 api_namespace="saga",
+                requires_role="admin",
             ),
             DashboardExtensionManifest(
                 id="state-memory",
@@ -196,6 +198,7 @@ def first_party_dashboard_extensions(
                 icon="folder-tree",
                 nav_position=50,
                 api_namespace="memory",
+                requires_role="admin",
             ),
             DashboardExtensionManifest(
                 id="admin-config",

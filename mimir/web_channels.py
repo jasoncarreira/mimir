@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 
+WEB_CHANNEL_PREFIX = "web-"
 DEFAULT_WEB_CHANNEL = "web-default"
 _USER_CHANNEL_ESCAPE_PREFIX = "web-user:"
 

@@ -55,6 +55,11 @@ def test_global_dashboard_extensions_are_admin_only_in_nav_payload():
     assert manifests["ops"]["requires_role"] == "admin"
     assert manifests["chainlink-board"]["requires_role"] == "admin"
     assert manifests["scheduler"]["requires_role"] == "admin"
+    # Endpoints are admin-gated (_ADMIN_REQUIRED_PREFIXES), so these nav entries
+    # must be admin-only too or a non-admin sees a tab that only 403s.
+    assert manifests["usage"]["requires_role"] == "admin"
+    assert manifests["saga"]["requires_role"] == "admin"
+    assert manifests["state-memory"]["requires_role"] == "admin"
     assert manifests["chat"]["requires_role"] is None
 
 
