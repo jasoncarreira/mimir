@@ -6,7 +6,7 @@
 # code keeps writing ``from mimir.agent import ...`` — only the
 # install incantation changes: ``pip install mimir-agent``.
 name = "mimir-agent"
-version = "0.6.0"
+version = "0.6.1"
 description = "Memory-centric agent harness on deepagents / LangGraph"
 requires-python = ">=3.11"
 authors = [{ name = "Jason Carreira" }]
@@ -172,6 +172,18 @@ build-backend = "hatchling.build"
 packages = ["mimir"]
 
 [tool.hatch.build]
+# The built React app (mimir/react_app/dist/) is a VCS-IGNORED build artifact:
+# frontend bundles are gitignored, only mimir/react_app/.gitkeep is tracked.
+# hatchling's `include` is intersected with VCS-tracked files, so an `include`
+# glob alone matches nothing for the dist and silently drops it from the wheel
+# — which is exactly why 0.6.0 shipped with no `mimir/react_app/` at all and
+# `/app/` returned "React app build not found" on a fresh `pip install`.
+# `artifacts` is hatchling's escape hatch for force-including VCS-ignored paths.
+# The dist must EXIST at build time, so CI (publish.yml) runs `npm ci` +
+# `npm run build` before `uv build`, and asserts the wheel contains it.
+artifacts = [
+    "mimir/react_app/dist/**/*",
+]
 # chainlink #290: everything below the .py line is a runtime data file
 # read by the INSTALLED package — it MUST ship in the wheel. This include
 # list is an allowlist intersected with VCS-tracked files, so anything not

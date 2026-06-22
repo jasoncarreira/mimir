@@ -38,12 +38,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # The React app (mimir/react_app/dist/) is gitignored and force-included
+      # via [tool.hatch.build] artifacts — but it must EXIST before uv build
+      # packages it, so build it here first. (0.6.0 shipped without it because
+      # this step did not exist and the dist was never built in CI.)
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build React app
+        run: |
+          npm ci
+          npm run build
+          test -f mimir/react_app/dist/index.html
       - name: Install uv
         uses: astral-sh/setup-uv@v3
       - name: Set up Python
         run: uv python install 3.11
       - name: Build distributions
         run: uv build
+      - name: Assert the wheel ships the built React app
+        run: |
+          python3 - <<'PY'
+          import glob, zipfile, sys
+          whl = sorted(glob.glob("dist/*.whl"))[-1]
+          names = zipfile.ZipFile(whl).namelist()
+          if not any(n.endswith("mimir/react_app/dist/index.html") for n in names):
+              print("FAIL:", whl, "missing mimir/react_app/dist/index.html", file=sys.stderr)
+              sys.exit(1)
+          print("OK:", whl, "ships React dist:",
+                [n for n in names if "react_app/dist" in n][:5])
+          PY
       - name: List artifacts
         run: ls -la dist/
       - name: Upload distributions

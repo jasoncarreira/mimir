@@ -6,6 +6,20 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-06-22
+
+### Fixed
+
+- **`/app/` returned "React app build not found" on a fresh install** (packaging
+  regression). The 0.6.0 wheel shipped with no `mimir/react_app/` at all: the built
+  Vite/React bundle (`mimir/react_app/dist/`) is gitignored, and hatchling's `include`
+  allowlist is intersected with VCS-tracked files, so the `include` glob matched nothing
+  and the dist silently dropped from the wheel. Added a `[tool.hatch.build] artifacts`
+  entry that force-includes the VCS-ignored dist, plus a `publish.yml` step that runs
+  `npm ci && npm run build` before `uv build` and a post-build assertion that the wheel
+  contains `react_app/dist/index.html`. A fresh `pip install mimir-agent` now serves
+  `/app/` out of the box.
+
 ## [0.6.0] — 2026-06-22
 
 Headline: **React web console + identity-scoped web chat**. The browser UI
