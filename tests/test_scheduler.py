@@ -2774,7 +2774,12 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
         calls.append(home)
         return [Rec(476), Rec(477)]
 
+    def fake_prune(home: Path):
+        calls.append(home)
+        return [home / ".worklink" / "repo" / "613-1"]
+
     monkeypatch.setattr("mimir.worklink.autonomy.reap_stale_claims_for_home", fake_reap)
+    monkeypatch.setattr("mimir.worklink.autonomy.prune_stale_attempt_worktrees_for_home", fake_prune)
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
     assert sched.add_worklink_reaper_job(tmp_path, cron_expr="* * * * *") is True
     job = sched._scheduler.get_job("worklink-reaper")
@@ -2782,11 +2787,14 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
 
     await job.func()
 
-    assert calls == [tmp_path]
+    assert calls == [tmp_path, tmp_path]
     events = _read_event_types(tmp_path / "logs" / "events.jsonl")
     [ev] = [e for e in events if e["type"] == "worklink_claims_reaped"]
     assert ev["count"] == 2
     assert ev["issue_ids"] == [476, 477]
+    [pruned] = [e for e in events if e["type"] == "worklink_attempt_checkouts_pruned"]
+    assert pruned["count"] == 1
+    assert pruned["paths"] == [str(tmp_path / ".worklink" / "repo" / "613-1")]
 
 
 @pytest.mark.asyncio
@@ -2797,6 +2805,7 @@ async def test_worklink_reaper_job_silent_when_nothing_reaped(
         return True
 
     monkeypatch.setattr("mimir.worklink.autonomy.reap_stale_claims_for_home", lambda home: [])
+    monkeypatch.setattr("mimir.worklink.autonomy.prune_stale_attempt_worktrees_for_home", lambda home: [])
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
     assert sched.add_worklink_reaper_job(tmp_path, cron_expr="* * * * *") is True
     job = sched._scheduler.get_job("worklink-reaper")

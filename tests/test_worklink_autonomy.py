@@ -295,6 +295,37 @@ def test_worklink_priority_from_config(tmp_path: Path) -> None:
     assert autonomy.worklink_priority(tmp_path) == "high"
 
 
+
+def test_prune_stale_attempt_worktrees_for_home_uses_worklink_repo_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    old = tmp_path / ".worklink" / repo.name / "613-1"
+    old.mkdir(parents=True)
+    mtime = (datetime.now().timestamp() - 7200)
+    import os
+
+    os.utime(old, (mtime, mtime))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+
+    pruned = autonomy.prune_stale_attempt_worktrees_for_home(tmp_path)
+
+    assert pruned == [old]
+    assert not old.exists()
+
+
+def test_prune_stale_attempt_worktrees_for_home_silent_without_repo_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_worklink_yaml(tmp_path)
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
+
+    assert autonomy.prune_stale_attempt_worktrees_for_home(tmp_path) == []
+
+
 def test_reap_for_home_uses_config_ttl(tmp_path: Path) -> None:
     # reaper_ttl_s = 1h; a 3h-old claim is stale and gets reaped.
     _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)

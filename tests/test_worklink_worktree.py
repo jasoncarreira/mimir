@@ -104,10 +104,45 @@ def test_prune_attempt_worktrees_is_conservative(tmp_path: Path) -> None:
     pruned = prune_attempt_worktrees(tmp_path, older_than=timedelta(days=3), now=now, runner=runner)
 
     assert pruned == [old]
+    assert old.exists()  # fake git runner did not remove it; real git would
     assert calls == [
         ["git", "-C", str(tmp_path), "worktree", "remove", "--force", str(old)],
         ["git", "-C", str(tmp_path), "branch", "-D", "issue/439-a1"],
     ]
+
+
+def test_prune_attempt_worktrees_covers_relocated_isolated_checkouts(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root = tmp_path / ".worklink" / repo.name
+    old = root / "613-1"
+    young = root / "613-2"
+    ignored = root / "notes"
+    old.mkdir(parents=True)
+    young.mkdir()
+    ignored.mkdir()
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    now = datetime.now(UTC)
+    old_mtime = (now - timedelta(days=10)).timestamp()
+    young_mtime = now.timestamp()
+    for path, mtime in [(old, old_mtime), (young, young_mtime), (ignored, old_mtime)]:
+        path.touch()
+        import os
+
+        os.utime(path, (mtime, mtime))
+
+    pruned = prune_attempt_worktrees(repo, older_than=timedelta(days=3), now=now, runner=runner)
+
+    assert pruned == [old]
+    assert not old.exists()
+    assert young.exists()
+    assert ignored.exists()
+    assert calls == [["git", "-C", str(repo), "branch", "-D", "issue/613-a1"]]
 
 
 def _git(cwd: Path, *args: str) -> str:

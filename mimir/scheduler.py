@@ -2033,15 +2033,30 @@ class Scheduler:
         scheduler.yaml entry). Worklink is opt-in per home; non-Worklink
         deployments install nothing.
         """
-        from .worklink.autonomy import reap_stale_claims_for_home
+        from .worklink.autonomy import (
+            prune_stale_attempt_worktrees_for_home,
+            reap_stale_claims_for_home,
+        )
 
         async def _fire() -> None:
-            reaped = await asyncio.to_thread(reap_stale_claims_for_home, home)
+            def _reap() -> tuple[list[object], list[Path]]:
+                return (
+                    reap_stale_claims_for_home(home),
+                    prune_stale_attempt_worktrees_for_home(home),
+                )
+
+            reaped, pruned_paths = await asyncio.to_thread(_reap)
             if reaped:
                 await log_event(
                     "worklink_claims_reaped",
                     count=len(reaped),
                     issue_ids=[record.issue_id for record in reaped],
+                )
+            if pruned_paths:
+                await log_event(
+                    "worklink_attempt_checkouts_pruned",
+                    count=len(pruned_paths),
+                    paths=[str(path) for path in pruned_paths],
                 )
 
         return self.register_callable(

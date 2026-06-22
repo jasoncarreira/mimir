@@ -23,7 +23,7 @@ neither the cap nor the arbiter: ``mimir worklink run`` always proceeds.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import subprocess
@@ -32,6 +32,7 @@ from typing import Sequence
 from .backends import WorklinkConfig
 from .backends.registry import WorklinkDefaults
 from .claims import ChainlinkClaims, ClaimRecord
+from .worktree import prune_attempt_worktrees
 
 #: Chainlink agent identity the executor + reaper claim under. Mirrors
 #: ``WorklinkRunner.agent_id`` so reaped/dispatched records line up.
@@ -119,6 +120,27 @@ def check_concurrency(
     cl = claims or make_claims(home, agent_id=agent_id)
     active = cl.active_worklink_lock_count()
     return ConcurrencyCheck(allowed=active < cap, active=active, cap=cap)
+
+
+
+def prune_stale_attempt_worktrees_for_home(home: Path, *, repo: Path | str | None = None) -> list[Path]:
+    """Prune retained Worklink attempt checkouts past the reaper TTL (#613).
+
+    The claim reaper recovers Chainlink labels/locks, but failed or blocked
+    local attempts intentionally leave their checkout on disk for autopsy.  Run
+    the filesystem prune on the same TTL so retained attempts do not grow
+    without bound.  If no Worklink repo is configured, return silently; homes can
+    opt into claim reaping before they opt into autonomous dispatch.
+    """
+    defaults = worklink_defaults(home)
+    repo_raw = repo or os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    if not repo_raw:
+        return []
+    return prune_attempt_worktrees(
+        Path(repo_raw),
+        older_than=timedelta(seconds=defaults.reaper_ttl_s),
+        now=datetime.now(timezone.utc),
+    )
 
 
 def reap_stale_claims_for_home(
