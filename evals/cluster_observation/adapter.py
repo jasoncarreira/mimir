@@ -110,6 +110,7 @@ class ClusterObservationAdapter:
                     self.trajectories = trajectories
 
         prompt = candidate.get(COMPONENT_RICH_PROMPT, "")
+        prompt_overfit = metrics.score_prompt_candidate(prompt)
         examples = [ex if isinstance(ex, Example) else self._coerce_example(ex) for ex in batch]
 
         async def _run_all() -> list[str]:
@@ -120,7 +121,12 @@ class ClusterObservationAdapter:
         trajectories: list[dict] = []
         for ex, raw in zip(examples, raw_outputs):
             ev = metrics.score_candidate(ex.data, raw, embedding_fn=self.embedding_fn)
-            scores.append(ev.score)
+            raw_score = ev.score
+            adjusted_score = max(0.0, raw_score - float(prompt_overfit["penalty"]))
+            ev.asi.setdefault("score_breakdown", {})["raw_output_score"] = raw_score
+            ev.asi["score_breakdown"]["prompt_overfit_penalty"] = prompt_overfit["penalty"]
+            ev.asi["prompt_overfit"] = prompt_overfit
+            scores.append(adjusted_score)
             if capture_traces:
                 trajectories.append(
                     {

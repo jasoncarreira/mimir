@@ -52,6 +52,112 @@ _GENERIC_NAMES = {
 }
 
 
+_PROMPT_ARXIV_RE = re.compile(r"\barXiv:\s*\d{4}\.\d{4,5}\b")
+_PROMPT_ISSUE_RE = re.compile(
+    r"\b(?:PR|Chainlink|issue)\s*#\s*[A-Za-z0-9][A-Za-z0-9._:-]*\b", re.I
+)
+_PROMPT_PATH_RE = re.compile(
+    r"(?<!\w)(?:state/wiki|memory|/wiki|/use|/mimir-home|/workspace)/[A-Za-z0-9._~:/#-]+"
+)
+_PROMPT_OVERFIT_SECTION_MARKERS = (
+    "known compact aliases",
+    "known arxiv ids",
+    "known entity names",
+    "domain-specific guidance",
+    "concepts that may need compact triple objects",
+)
+
+
+def score_prompt_candidate(prompt: str) -> dict[str, Any]:
+    """Return candidate-prompt over-specification signals and a score penalty.
+
+    This regularizes GEPA candidates at the *prompt text* level. Generated
+    observations should preserve atom-specific IDs and paths when the atoms
+    contain them; the prompt itself should not arrive preloaded with a pilot
+    corpus glossary, hard-coded paper IDs, path aliases, or long entity lists.
+    """
+
+    text = prompt or ""
+    lower = text.lower()
+    char_count = len(text)
+    arxiv_ids = _dedupe(m.group(0).replace(" ", "") for m in _PROMPT_ARXIV_RE.finditer(text))
+    issue_ids = _dedupe(m.group(0) for m in _PROMPT_ISSUE_RE.finditer(text))
+    path_literals = _dedupe(m.group(0) for m in _PROMPT_PATH_RE.finditer(text))
+    marker_hits = [marker for marker in _PROMPT_OVERFIT_SECTION_MARKERS if marker in lower]
+    bullet_entity_lines = _prompt_entity_bullet_lines(text)
+
+    soft_limit = 5_000
+    hard_limit = 9_000
+    length_penalty = 0.0
+    if char_count > soft_limit:
+        length_penalty = min(
+            0.25, 0.25 * (char_count - soft_limit) / (hard_limit - soft_limit)
+        )
+
+    literal_penalty = min(0.25, 0.035 * max(0, len(arxiv_ids) - 2) + 0.03 * len(issue_ids))
+    path_penalty = min(0.15, 0.025 * max(0, len(path_literals) - 2))
+    section_penalty = min(0.20, 0.08 * len(marker_hits))
+    entity_list_penalty = min(0.15, 0.01 * max(0, len(bullet_entity_lines) - 8))
+    penalty = min(
+        0.60,
+        length_penalty
+        + literal_penalty
+        + path_penalty
+        + section_penalty
+        + entity_list_penalty,
+    )
+
+    signals = []
+    if length_penalty:
+        signals.append("too_long")
+    if literal_penalty:
+        signals.append("hardcoded_identifiers")
+    if path_penalty:
+        signals.append("hardcoded_paths")
+    if section_penalty:
+        signals.append("corpus_glossary_section")
+    if entity_list_penalty:
+        signals.append("large_entity_list")
+
+    return {
+        "char_count": char_count,
+        "soft_limit": soft_limit,
+        "hard_limit": hard_limit,
+        "penalty": penalty,
+        "signals": signals,
+        "counts": {
+            "arxiv_ids": len(arxiv_ids),
+            "issue_ids": len(issue_ids),
+            "path_literals": len(path_literals),
+            "glossary_markers": len(marker_hits),
+            "entity_bullet_lines": len(bullet_entity_lines),
+        },
+        "examples": {
+            "arxiv_ids": arxiv_ids[:8],
+            "issue_ids": issue_ids[:8],
+            "path_literals": path_literals[:8],
+            "glossary_markers": marker_hits,
+            "entity_bullet_lines": bullet_entity_lines[:8],
+        },
+    }
+
+
+def _prompt_entity_bullet_lines(text: str) -> list[str]:
+    out: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            continue
+        value = stripped[1:].strip().strip("`")
+        if not value or len(value) > 80:
+            continue
+        if re.fullmatch(r"[A-Z][A-Za-z0-9]*(?:[-_ ][A-Z0-9][A-Za-z0-9]*){0,4}", value):
+            out.append(value)
+        elif re.fullmatch(r"arXiv:\s*\d{4}\.\d{4,5}", value):
+            out.append(value)
+    return _dedupe(out)
+
+
 @dataclass
 class EvaluationResult:
     """Scalar + Actionable Side Information for one candidate/example pair."""

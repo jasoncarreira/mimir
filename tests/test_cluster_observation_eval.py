@@ -6,7 +6,7 @@ from evals.cluster_observation.adapter import (
     Example,
     render_candidate_prompt,
 )
-from evals.cluster_observation.metrics import score_candidate
+from evals.cluster_observation.metrics import score_candidate, score_prompt_candidate
 
 
 def _example() -> dict:
@@ -235,3 +235,78 @@ def test_adapter_evaluates_raw_outputs_and_returns_reflective_asi():
     assert batch.scores[0] > 0.0
     reflective = adapter.make_reflective_dataset({COMPONENT_RICH_PROMPT: "x"}, batch, [COMPONENT_RICH_PROMPT])
     assert "symbolic_retention" in reflective[COMPONENT_RICH_PROMPT][0]["Feedback"]
+
+
+def test_prompt_overfit_regularizer_penalizes_corpus_specific_glossaries():
+    generic = """You are consolidating {n} atoms.
+
+OBSERVATION:
+<one or two sentences>
+
+TRIPLES:
+(subject, predicate, object)
+[OR exactly: NONE]
+
+CONTRADICTIONS:
+[OR exactly: NONE]
+
+Preserve identifiers from the atoms, but do not invent them.
+Atoms:
+{indexed_atoms}
+"""
+    overfit = generic + """
+
+KNOWN ARXIV IDS:
+- arXiv:2606.06003
+- arXiv:2606.05901
+- arXiv:2606.11945
+- arXiv:2606.11350
+- arXiv:2606.13550
+- arXiv:2606.13141
+- arXiv:2606.16494
+- arXiv:2606.17910
+
+KNOWN COMPACT ALIASES:
+- state/wiki/concepts/cost-aware-evidence-selection.md -> cost-aware-evidence.md
+- state/wiki/concepts/admem-advanced-memory-task-solving-agents.md -> admem_memory_agents
+
+DOMAIN-SPECIFIC GUIDANCE:
+- OMAGR
+- TrafficOmni-RAG
+- ScoreGate
+- MRAgent
+- MARDoc
+- MemDreamer
+- HiMPO
+- EvoArena
+- StreamMemBench
+- ReGrad
+""" + ("\nAdditional domain-specific instruction." * 250)
+
+    generic_score = score_prompt_candidate(generic)
+    overfit_score = score_prompt_candidate(overfit)
+
+    assert generic_score["penalty"] == 0.0
+    assert overfit_score["penalty"] >= 0.30
+    assert "hardcoded_identifiers" in overfit_score["signals"]
+    assert "corpus_glossary_section" in overfit_score["signals"]
+    assert overfit_score["counts"]["arxiv_ids"] == 8
+
+
+def test_adapter_applies_prompt_overfit_penalty_to_scores_and_asi():
+    ex = Example(id="ex-1", split="train", data=_example())
+
+    async def synth(prompt: str, example: Example) -> str:
+        return _raw("Chainlink #614 fixed SAGA retrieval on 2026-06-12 for Muninn.")
+
+    prompt = "Atoms:\n{indexed_atoms}\nKNOWN ARXIV IDS:\n" + "\n".join(
+        f"- arXiv:2606.{i:05d}" for i in range(20)
+    )
+    adapter = ClusterObservationAdapter([ex], synth)
+    batch = adapter.evaluate([ex], {COMPONENT_RICH_PROMPT: prompt}, capture_traces=True)
+
+    raw = batch.trajectories[0]["asi"]["score_breakdown"]["raw_output_score"]
+    penalty = batch.trajectories[0]["asi"]["prompt_overfit"]["penalty"]
+    assert penalty > 0.0
+    assert batch.scores[0] == max(0.0, raw - penalty)
+    assert "hardcoded_identifiers" in batch.trajectories[0]["asi"]["prompt_overfit"]["signals"]
