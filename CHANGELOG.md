@@ -6,6 +6,116 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-06-22
+
+Headline: **React web console + identity-scoped web chat**. The browser UI
+moves from server-rendered dashboards to a typed Vite/React app with live chat,
+turn streaming, task/SAGA/memory/ops dashboards, themed shells, admin controls,
+and authenticated per-user channel scope. The release also includes the
+performance/reliability hardening found while dogfooding that UI: progressive
+turn loading, loop-stall reductions, stricter web redaction/RBAC, Worklink
+ready-queue fixes, and SAGA/search scheduler robustness.
+
+### Added
+
+- **React web app foundation and dashboard cutover.** Added the Vite/React
+  frontend, typed API clients/contracts, reusable dashboard components,
+  app-shell routing, extension/tab contracts, and static serving/build plumbing
+  for the new console.
+- **React parity dashboards and drilldowns.** Ported Ops, State/Memory, SAGA,
+  Turns, Scheduler/Pollers/Commitments, admin config/model/env, and
+  Chainlink/Worklink task views to React, including a Kanban-style task board,
+  session/conversation browser, cross-dashboard deep links, one-line turn rows,
+  pop-out/current-turn detail panels, and collapsible reasoning/tool blocks.
+- **New web chat experience.** Added a React chat UI over the existing web-chat
+  bridge with reload-on-entry history, bottom-anchored transcript behavior,
+  token-level reply streaming, live activity/field-log panels, chat-scoped
+  dossier context, and real-time turn-event updates.
+- **Live event and agent-character UI.** Added a unified live-event stream,
+  live turn-event bus, running turn counts, live accordion Field Log,
+  talking/listening/typing/thinking/tool/error character states, and
+  skinned Lottie-based agent character assets.
+- **Theming and UI configuration.** Added skin manifests, default retro / Neon
+  Terminal / Cosmic Nebula skins, skin-owned fonts, skin-driven shell layouts,
+  agent-owned `web_ui.json` configuration, build-version bootstrap data, and
+  onboarding docs for name/skin configuration.
+- **Web auth, users, and RBAC.** Added per-user web keys, backend RBAC
+  primitives, a protected-server login screen, admin Users UI, role-gated admin
+  surfaces, and centralized auth/bootstrap handling.
+- **Ops visibility.** Added an ops signals page, promoted the usage dashboard,
+  and added loop-stall instrumentation with collapsed-lag signals and
+  incremental event emission.
+- **Worklink autonomy support.** Added controller restart reattachment for
+  in-flight Worklink runs, optional-skill auto-refresh, and improved
+  published-runtime/deploy support including `jq` in the Docker image and
+  smoke-validated worker Dockerfile updates.
+
+### Changed
+
+- **Chat and live endpoints are identity-scoped.** Web chat channels and live
+  streams now derive from the authenticated web identity rather than
+  client-selected channel state, with a reserved shared default channel and
+  API-key-change handling that resets/reconnects browser state.
+- **Admin/dashboard APIs are more strictly gated and redacted.** Saga, memory,
+  ops, raw config, admin config/model/env, and token-shaped values are
+  admin-gated or fail-closed redacted where appropriate.
+- **React console layout and navigation were polished.** The dashboard gained
+  top-nav/header/footer shell polish, compact status, rounded/glowing skin
+  treatments, outlined nav tabs, redesigned Tasks dependency views,
+  collapsible status, scroll-contained tables and chat panes, fixed usage-chart
+  scales, and progressive turn rendering.
+- **Dashboard and loop performance moved off hot paths.** Ops payload parsing,
+  session-summary turn counts, scheduler index-integrity checks, Codex quota
+  callback writes, SAGA embedding preparation, and DeepAgents tool-schema token
+  counting were offloaded or cached to reduce event-loop stalls.
+- **Worklink dispatch rules are stricter and more observable.** Ready-queue
+  handling skips blocked leaves, rejects invalid ready leaves before dispatch,
+  tolerates text ready output, surfaces worker failure reasons, keeps cleanup
+  failures post-transition, and treats planner-provided test commands as
+  advisory rather than authoritative.
+- **Frontend tests and state isolation were expanded.** Added broad React
+  route/component/API coverage and reset Zustand UI state between tests to
+  remove collapse-state flakiness.
+
+### Fixed
+
+- **Vestigial chat URL params after identity-scoped chat** (#840). Removed and
+  cleaned obsolete `channel` and `filter` URL parameters from chat flows after
+  chat channel selection moved to authenticated identity scope, while preserving
+  unrelated params such as `tab`.
+- **Autonomous Worklink runs couldn't open PRs (`gh` had no token)** (chainlink
+  #537 rail). The `chainlink-orchestrator` ready-queue poller now passes
+  `GITHUB_TOKEN` through to controller-side `mimir worklink run`, so `_open_pr`
+  can use `gh pr create` after a poller-dispatched run passes.
+- **Web chat isolation and connection correctness.** Fixed authenticated-user
+  chat scoping, required an auth identity for chat, reconnected identity-scoped
+  SSE streams on API-key changes, capped/reconnected chat streams, released
+  live-event slots on prepare failure, and reset browser state when API keys
+  change.
+- **Web security hardening.** Fixed unsafe frontend href/query-param handling,
+  ensured admin raw config redaction fails closed, redacted token-shaped admin
+  config values, and admin-gated ops/SAGA/memory APIs.
+- **React UI correctness regressions.** Fixed turn viewer chronological ordering
+  and progressive loading, chat/field-log overflow and scroll anchoring, stuck
+  character-state decay, wide Ops table overflow, usage chart polish,
+  scheduler's confusing read-only Actions section, self-hosted dotLottie WASM
+  loading, and several high-priority chat history/turn-detail UI bugs.
+- **SAGA and search robustness.** Bounded SQL passthrough CPU and per-value
+  memory, moved SAGA store embedding computation outside the write lock, and
+  made reindex writes transactional.
+- **Agent, feedback, budget, and scheduler reliability.** Preserved quota
+  coasting demotion, kept turn errors visible past bypass signals, cached
+  expensive DeepAgents token schema counts, skipped per-delta partial JSON
+  parsing for Codex streams, and offloaded scheduler integrity/session-summary
+  work.
+- **Poller and Worklink reliability.** Repaired ready-queue poller imports and
+  installed-poller venv deps, avoided rejected 7-day bases for derived 5-hour
+  poller usage windows, pruned relocated Worklink attempt checkouts, and
+  blocked invalid or already-blocked Worklink leaves from dispatch.
+- **Runtime/build polish.** Suppressed ignored-note noise for marked artifact
+  trees and kept the published runtime image aligned with the React/Worklink
+  toolchain needs.
+
 ### Fixed
 
 - **Autonomous Worklink runs couldn't open PRs (`gh` had no token)** (chainlink
