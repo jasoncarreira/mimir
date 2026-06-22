@@ -591,10 +591,7 @@ export interface WebBootstrapData {
 }
 
 export interface ChatPostRequest {
-  channel_id?: string;
   content: string;
-  author?: string;
-  author_id?: string;
   msg_id?: string;
   extra?: Record<string, unknown>;
 }

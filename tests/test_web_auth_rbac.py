@@ -328,12 +328,13 @@ async def test_chat_master_key_rejected(tmp_path: Path) -> None:
     assert event is None and err is not None and err.status == 403
 
 
-async def test_chat_dev_mode_falls_back_to_client_asserted(tmp_path: Path) -> None:
-    # No auth attrs on the request (dev/open mode) → legacy client-asserted author.
+async def test_chat_dev_mode_rejected_without_identity(tmp_path: Path) -> None:
+    # Chat is always per-user state now: dev/open mode can leave non-chat routes
+    # unauthenticated, but chat may not fall back to client-asserted identity or
+    # a shared web-default channel.
     req = _FakeRequest({"content": "hi", "author": "alice", "author_id": "web-alice"})
     event, _channel, err = await _bridge(tmp_path)._build_inbound_event(req)
-    assert err is None and event is not None
-    assert event.author == "alice" and event.author_id == "web-alice"
+    assert event is None and err is not None and err.status == 401
 
 
 # ── per-user data scoping for React log/session/live endpoints ───────────
