@@ -1063,6 +1063,39 @@ class TestBuildSqlPayload:
         assert result["rows"] == []
         assert result["truncated"] is False
 
+    def test_recursive_cte_compute_bomb_times_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """chainlink #611: a CPU-bound recursive CTE (which the 1000-row cap
+        does NOT bound — it returns a single count()) is aborted by the
+        wall-clock budget instead of pinning a to_thread worker indefinitely."""
+        monkeypatch.setattr("mimir.saga_dashboard._SQL_TIMEOUT_S", 0.1)
+        db_path = tmp_path / "saga.db"
+        _make_db(db_path).close()
+        bomb = (
+            "WITH RECURSIVE c(x) AS ("
+            "  SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000000"
+            ") SELECT count(*) FROM c"
+        )
+        result = build_sql_payload(db_path, bomb)
+        assert result.get("rejected") is False
+        assert "time limit" in result["error"]
+
+    def test_oversized_scalar_value_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """chainlink #611: a single huge blob scalar (which the row cap also
+        doesn't bound) raises 'string or blob too big' before allocating,
+        rather than OOMing the worker."""
+        if not hasattr(sqlite3.Connection, "setlimit"):
+            pytest.skip("Connection.setlimit requires Python 3.11+")
+        monkeypatch.setattr("mimir.saga_dashboard._SQL_MAX_VALUE_BYTES", 1000)
+        db_path = tmp_path / "saga.db"
+        _make_db(db_path).close()
+        result = build_sql_payload(db_path, "SELECT zeroblob(5000000)")
+        assert result.get("rejected") is False
+        assert "big" in result["error"].lower()
+
     def test_truncation_flag(self, tmp_path: Path, monkeypatch) -> None:
         """Truncation flag is set when query returns more than the cap."""
         import mimir.saga_dashboard as sd
