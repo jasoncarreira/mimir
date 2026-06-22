@@ -77,6 +77,14 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   // github #580: clear the listening signal when leaving the chat.
   React.useEffect(() => () => setComposerActive(false), [setComposerActive]);
 
+  // chainlink #621: the chat channel is derived from the authenticated identity,
+  // not chosen by the client, so the legacy ?channel=/?filter= query params are
+  // vestigial (the server ignores them). Strip them on entry so the chat URL
+  // stays clean and isn't mistaken for a working channel selector.
+  React.useEffect(() => {
+    update({ channel: null, filter: null }, { replace: true });
+  }, [update]);
+
   React.useEffect(() => {
     channelIdRef.current = channelId;
   }, [channelId]);
@@ -102,7 +110,6 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
         if (!activeChannel) {
           channelIdRef.current = payload.channel_id;
           setChannelId(payload.channel_id);
-          update({ channel: payload.channel_id, filter: payload.channel_id });
         } else if (payload.channel_id !== activeChannel) {
           return;
         }
@@ -138,7 +145,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     return () => {
       handle.close();
     };
-  }, [setMessages, update, apiKeyEpoch]);
+  }, [setMessages, apiKeyEpoch]);
 
   // chainlink #583 slice 2: stream the reply forming from the turn-event bus.
   // We track the send_message tool-call span by its `start` (which carries the
@@ -191,7 +198,6 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
         const resolved = res.data.channel_id;
         if (resolved && resolved !== channelId) {
           setChannelId(resolved);
-          update({ channel: resolved, filter: resolved });
         }
         if (!res.data.messages.length) return;
         const history = res.data.messages.map((m) => ({
@@ -263,7 +269,6 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
       )));
       if (accepted.data.channel_id !== channelId) {
         setChannelId(accepted.data.channel_id);
-        update({ channel: accepted.data.channel_id, filter: accepted.data.channel_id });
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Message failed";
