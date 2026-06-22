@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChatStreamPayload } from "./api/chat";
 import type { ChatHistoryMessage } from "./api/generated/contracts";
@@ -187,6 +187,31 @@ describe("ChatRoute", () => {
 
     unmount();
     expect(chatApi.close).toHaveBeenCalledOnce();
+  });
+
+  it("strips the vestigial channel/filter query params on entry, keeping others (#621)", async () => {
+    const seen: string[] = [];
+    function Probe() {
+      seen.push(useLocation().search);
+      return null;
+    }
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={["/chat?channel=web-jason&filter=web-jason&tab=conversation"]}>
+          <Routes>
+            <Route element={<><ChatRoute surface={surface} /><Probe /></>} path="/chat" />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    await waitFor(() => {
+      const latest = seen[seen.length - 1];
+      expect(latest).not.toContain("channel=");
+      expect(latest).not.toContain("filter=");
+    });
+    // Unrelated params survive the strip.
+    expect(seen[seen.length - 1]).toContain("tab=conversation");
   });
 
   it("reconnects the chat + turn-event streams when the API key changes (#616)", () => {
