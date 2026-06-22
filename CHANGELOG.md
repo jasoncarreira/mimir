@@ -6,6 +6,8 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-06-22
+
 ### Security
 
 - **The agent can no longer edit `state/identities.yaml` via its file tools.** That
