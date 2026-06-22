@@ -67,6 +67,18 @@ def test_core_memory_learned_behaviors_default_contains_frame_check_procedure() 
     assert "how should we implement X" in text
 
 
+def test_core_memory_filing_rules_default_documents_channel_memory_semantics() -> None:
+    text = core_template_text("60-filing-rules.md")
+    normalized = " ".join(text.split())
+
+    assert "This is not a session journal" in text
+    assert "top-level files in `memory/channels/X/*.md`" in text
+    assert "Synthetic channels (`scheduler:*`, `poller:*`)" in normalized
+    assert "capped at ~8 KB" in text
+    assert "Episodic detail belongs in SAGA retrieval" in normalized
+    assert "or overgrown channel memory crowds out later facts" in normalized
+
+
 def test_backward_compatible_default_constants_read_template_files() -> None:
     assert DEFAULT_IDENTITY_MD == core_template_text("00-identity.md")
     assert DEFAULT_NON_GOALS == core_template_text("05-non-goals.md")
