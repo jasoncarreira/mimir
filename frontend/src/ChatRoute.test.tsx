@@ -170,6 +170,16 @@ describe("ChatRoute", () => {
     expect(screen.queryByText("not for this tab")).toBeNull();
   });
 
+  it("keeps the chat stream subscription stable across route-state re-renders", async () => {
+    renderChat("/chat?tab=conversation");
+
+    emitMessage("web-default", "for this tab");
+    await waitFor(() => expect(chatApi.createChatStream).toHaveBeenCalledTimes(1));
+    expect(screen.getByText("for this tab")).toBeTruthy();
+    expect(chatApi.createChatStream).toHaveBeenCalledTimes(1);
+    expect(chatApi.close).not.toHaveBeenCalled();
+  });
+
   it("closes the stream on unmount", () => {
     const { unmount } = renderChat();
 

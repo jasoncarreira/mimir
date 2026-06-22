@@ -1,3 +1,4 @@
+import React from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import type { DashboardSurface } from "./dashboardExtensions";
 
@@ -94,13 +95,20 @@ export function useRouteState(surface: DashboardSurface) {
   const target = searchParams.get("target") || "";
   const navigate = useNavigate();
 
-  function update(next: RouteStatePatch, options: { replace?: boolean } = {}) {
-    setSearchParams(sanitizedSearchParams(searchParams, next), { replace: options.replace ?? false });
-  }
+  const searchParamsRef = React.useRef(searchParams);
+  const setSearchParamsRef = React.useRef(setSearchParams);
+  React.useEffect(() => {
+    searchParamsRef.current = searchParams;
+    setSearchParamsRef.current = setSearchParams;
+  }, [searchParams, setSearchParams]);
 
-  function href(pathname: `/${string}`, patch: RouteStatePatch = {}) {
+  const update = React.useCallback((next: RouteStatePatch, options: { replace?: boolean } = {}) => {
+    setSearchParamsRef.current(sanitizedSearchParams(searchParamsRef.current, next), { replace: options.replace ?? false });
+  }, []);
+
+  const href = React.useCallback((pathname: `/${string}`, patch: RouteStatePatch = {}) => {
     return drilldownHref(pathname, patch);
-  }
+  }, []);
 
   return {
     activeTab,
