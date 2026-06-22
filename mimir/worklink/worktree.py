@@ -281,31 +281,49 @@ def prune_attempt_worktrees(
     worklink_dir: str = ".worklink",
     runner: Runner = _default_runner,
 ) -> list[Path]:
-    """Prune retained attempt worktrees older than ``older_than``.
+    """Prune retained attempt checkouts older than ``older_than``.
 
     This is intentionally conservative: only directories with ``<issue>-<attempt>``
-    numeric names under the configured worklink directory are eligible.
+    numeric names under known Worklink attempt roots are eligible.  Legacy git
+    worktrees live at ``repo/<worklink_dir>/<issue>-<attempt>``; isolated Codex
+    checkouts (#517) live outside the repo at
+    ``repo.parent/<worklink_dir>/<repo.name>/<issue>-<attempt>``.  Both shapes
+    retain failed/blocked attempts for autopsy, so both must be covered by the
+    TTL prune path (#613).
     """
-    root = repo / worklink_dir
-    if not root.exists():
-        return []
     pruned: list[Path] = []
-    for child in root.iterdir():
-        if not child.is_dir() or not _attempt_dir_name(child.name):
+    for root, isolated in _attempt_roots(repo, worklink_dir):
+        if not root.exists():
             continue
-        mtime = datetime.fromtimestamp(child.stat().st_mtime, tz=now.tzinfo)
-        if now - mtime <= older_than:
-            continue
-        result = runner(["git", "-C", str(repo), "worktree", "remove", "--force", str(child)])
-        if result.returncode != 0:
-            # If git no longer knows about it, remove the stale directory so the
-            # next attempt will not collide forever.
-            shutil.rmtree(child, ignore_errors=True)
-        branch = _attempt_branch_name(child.name)
-        if branch:
-            runner(["git", "-C", str(repo), "branch", "-D", branch])
-        pruned.append(child)
+        for child in root.iterdir():
+            if not child.is_dir() or not _attempt_dir_name(child.name):
+                continue
+            mtime = datetime.fromtimestamp(child.stat().st_mtime, tz=now.tzinfo)
+            if now - mtime <= older_than:
+                continue
+            if isolated:
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                result = runner(["git", "-C", str(repo), "worktree", "remove", "--force", str(child)])
+                if result.returncode != 0:
+                    # If git no longer knows about it, remove the stale directory
+                    # so the next attempt will not collide forever.
+                    shutil.rmtree(child, ignore_errors=True)
+            branch = _attempt_branch_name(child.name)
+            if branch:
+                runner(["git", "-C", str(repo), "branch", "-D", branch])
+            pruned.append(child)
     return pruned
+
+
+def _attempt_roots(repo: Path, worklink_dir: str) -> list[tuple[Path, bool]]:
+    """Return ``(root, isolated_checkout)`` attempt roots for ``repo`` (#613)."""
+    legacy_root = repo / worklink_dir
+    isolated_root = _isolated_checkout_path(repo, worklink_dir, 0, 0).parent
+    roots = [(legacy_root, False)]
+    if isolated_root != legacy_root:
+        roots.append((isolated_root, True))
+    return roots
 
 
 def _attempt_dir_name(name: str) -> bool:
