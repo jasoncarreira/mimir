@@ -45,6 +45,7 @@ from .skill_defs import (
     refresh_builtin_skills,
     seed_scheduler,
 )
+from .chainlink_bootstrap import ensure_chainlink_initialized
 from .prompt_templates import seed_prompts
 from .subagent_defs import seed_subagent_defs
 from .subagent_inbox import SubagentInbox
@@ -692,6 +693,10 @@ def build_app(config: Config) -> web.Application:
     # default updates are handled by the startup defaults-upgrade proposal path.
     seed_prompts(config.home)
     seed_scheduler(config.home)
+    # Initialize the Chainlink store if absent (+ the CLI is installed) so the
+    # Tasks board works out of the box instead of reporting "unavailable".
+    # Best-effort and gated on the binary, so plain pip installs are unaffected.
+    ensure_chainlink_initialized(config.home)
 
     init_logger(
         config.events_log,

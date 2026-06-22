@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ChatStreamPayload } from "./api/chat";
+import { ChatStreamError, type ChatStreamPayload } from "./api/chat";
 import type { ChatHistoryMessage } from "./api/generated/contracts";
 import { ChatRoute } from "./ChatRoute";
 import { useChatStore } from "./chatStore";
@@ -36,7 +36,10 @@ const { chatApi, turnApi } = vi.hoisted(() => ({
   }
 }));
 
-vi.mock("./api/chat", () => ({
+vi.mock("./api/chat", async (importOriginal) => ({
+  // Keep the real exports (notably ChatStreamError, which ChatRoute uses to map
+  // auth failures to actionable messages) and only stub the network functions.
+  ...(await importOriginal<typeof import("./api/chat")>()),
   createChatStream: chatApi.createChatStream,
   sendChatMessage: chatApi.sendChatMessage,
   fetchChatHistory: chatApi.fetchChatHistory
@@ -160,6 +163,19 @@ describe("ChatRoute", () => {
     fireEvent.submit(input.closest("form") as HTMLFormElement);
 
     await waitFor(() => expect(screen.getAllByText("queue full").length).toBeGreaterThan(0));
+  });
+
+  it("shows an actionable message when chat auth is rejected (master key)", async () => {
+    renderChat();
+    await waitFor(() => expect(chatApi.createChatStream).toHaveBeenCalled());
+
+    act(() => {
+      chatApi.activeError?.(new ChatStreamError(403, "master_key_not_chat_identity"));
+    });
+
+    expect(screen.getByText(/admin\/master key isn't a chat identity/i)).toBeTruthy();
+    // Not the generic transient "reconnecting" text — this failure is terminal.
+    expect(screen.queryByText(/reconnecting/i)).toBeNull();
   });
 
   it("adopts the first stream message channel and drops later messages for other channels", () => {

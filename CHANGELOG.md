@@ -6,6 +6,23 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **Chainlink store auto-init on startup.** If the `chainlink` CLI is installed and
+  `<home>/.chainlink` doesn't exist yet, `build_app` runs `chainlink init` so the
+  Tasks board works out of the box instead of reporting the tracker "unavailable".
+  Best-effort (never fails startup), gated on the binary (plain `pip install`s
+  without the CLI are unaffected), and disableable via `MIMIR_CHAINLINK_AUTOINIT=0`.
+
+### Fixed
+
+- **Clearer chat-stream auth error.** When `/chat/stream` is rejected because the
+  admin/master key isn't a chat identity (`master_key_not_chat_identity`, 403) or no
+  user is signed in (401), the chat panel now shows an actionable message ("sign in
+  with a per-user key (Admin → Users)…") instead of the generic "Chat stream
+  unavailable; reconnecting…", and **stops the reconnect loop** that otherwise re-sent
+  the same 401/403 every second. Transient failures (429/5xx/network) still retry.
+
 ## [0.6.1] — 2026-06-22
 
 ### Fixed

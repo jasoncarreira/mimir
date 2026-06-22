@@ -1,6 +1,6 @@
 import React from "react";
 import { AgentDossier } from "./AgentDossier";
-import { createChatStream, fetchChatHistory, sendChatMessage, type ChatStreamPayload } from "./api/chat";
+import { ChatStreamError, createChatStream, fetchChatHistory, sendChatMessage, type ChatStreamPayload } from "./api/chat";
 import { createTurnEventStream } from "./api/turn-events";
 import type { TurnStreamEvent } from "./api/generated/contracts";
 import { useBootstrap } from "./api/bootstrap";
@@ -37,6 +37,25 @@ function statusTone(status: ChatMessageStatus | ChatStreamState): "neutral" | "i
   if (status === "error") return "danger";
   if (status === "running" || status === "open" || status === "connecting") return "info";
   return "warning";
+}
+
+// Turn a chat-stream failure into an actionable message. Auth failures (the
+// admin/master key isn't a chat identity, or no login at all) are terminal —
+// the stream stops retrying — so we tell the operator what to do rather than
+// claim it's "reconnecting". Everything else is treated as transient.
+function chatStreamErrorMessage(error: unknown): string {
+  if (error instanceof ChatStreamError) {
+    if (error.status === 403 && error.code === "master_key_not_chat_identity") {
+      return "This login can't use chat — the admin/master key isn't a chat identity. Sign in with a per-user key (Admin → Users) to chat in your own channel.";
+    }
+    if (error.status === 401) {
+      return "Sign in to use chat.";
+    }
+    if (error.status === 403) {
+      return "Chat isn't available for this login.";
+    }
+  }
+  return "Chat stream unavailable; reconnecting…";
 }
 
 export function ChatRoute({ surface }: { surface: DashboardSurface }) {
@@ -138,7 +157,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
         },
         onError(error) {
           setStreamState("error");
-          setStreamError(error instanceof Error ? error.message : "Chat stream unavailable; reconnecting…");
+          setStreamError(chatStreamErrorMessage(error));
         },
       }
     );
