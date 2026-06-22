@@ -40,9 +40,8 @@ function statusTone(status: ChatMessageStatus | ChatStreamState): "neutral" | "i
 }
 
 export function ChatRoute({ surface }: { surface: DashboardSurface }) {
-  const { channel, filter, update } = useRouteState(surface);
-  const initialChannel = channel || filter || "web-default";
-  const [channelId, setChannelId] = React.useState(initialChannel);
+  const { update } = useRouteState(surface);
+  const [channelId, setChannelId] = React.useState("");
   const [sessionId] = React.useState(() => makeDefaultChatSessionId());
   const [composerText, setComposerText] = React.useState("");
   const [streamState, setStreamState] = React.useState<ChatStreamState>("connecting");
@@ -52,6 +51,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   // the authoritative chat.message arrives on /chat/stream and replaces it.
   const [streamingReply, setStreamingReply] = React.useState("");
   const streamRawRef = React.useRef<{ spanId: string; raw: string } | null>(null);
+  const channelIdRef = React.useRef(channelId);
   // Bottom-anchored timeline: keep the newest message in view as the stack grows.
   const timelineRef = React.useRef<HTMLOListElement | null>(null);
   // github #567: persisted across tab switches (route unmount) — see chatStore.
@@ -74,11 +74,8 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   React.useEffect(() => () => setComposerActive(false), [setComposerActive]);
 
   React.useEffect(() => {
-    const routeChannel = channel || filter;
-    if (routeChannel && routeChannel !== channelId) {
-      setChannelId(routeChannel);
-    }
-  }, [channel, channelId, filter]);
+    channelIdRef.current = channelId;
+  }, [channelId]);
 
   React.useEffect(() => {
     setStreamState("connecting");
@@ -86,7 +83,15 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     const handle = createChatStream(
       (payload: ChatStreamPayload) => {
         setStreamState("open");
-        if (payload.kind !== "chat.message" || payload.channel_id !== channelId) return;
+        if (payload.kind !== "chat.message") return;
+        const activeChannel = channelIdRef.current;
+        if (!activeChannel) {
+          channelIdRef.current = payload.channel_id;
+          setChannelId(payload.channel_id);
+          update({ channel: payload.channel_id, filter: payload.channel_id });
+        } else if (payload.channel_id !== activeChannel) {
+          return;
+        }
         setMessages((current) => {
           if (current.some((message) => message.id === payload.message_id)) return current;
           return [
@@ -113,13 +118,13 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
         onError(error) {
           setStreamState("error");
           setStreamError(error instanceof Error ? error.message : "Chat stream unavailable; reconnecting…");
-        }
+        },
       }
     );
     return () => {
       handle.close();
     };
-  }, [channelId]);
+  }, [setMessages, update]);
 
   // chainlink #583 slice 2: stream the reply forming from the turn-event bus.
   // We track the send_message tool-call span by its `start` (which carries the
@@ -165,7 +170,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     let cancelled = false;
     void (async () => {
       try {
-        const res = await fetchChatHistory(channelId);
+        const res = await fetchChatHistory();
         if (cancelled) return;
         // The backend may resolve us to a per-user channel (web-<id>); adopt it
         // so send + the live stream + the timeline filter all use it.
@@ -197,7 +202,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     return () => {
       cancelled = true;
     };
-  }, [channelId, setMessages]);
+  }, [setMessages]);
 
   function selectMessage(id: string) {
     // Highlights the message + deep-links it in the URL. The right panel now
@@ -233,7 +238,6 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
         message.id === clientId ? { ...message, status: "running" } : message
       )));
       const accepted = await sendChatMessage({
-        channel_id: channelId,
         content: text,
         msg_id: clientId,
         extra: { web_session_id: sessionId }
@@ -259,7 +263,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   // this channel (full history lives in the Turns viewer). The box scrolls
   // internally (CSS) so it never grows past the window.
   const visibleMessages = messages
-    .filter((message) => message.channelId === channelId)
+    .filter((message) => !channelId || message.channelId === channelId || message.status !== "done")
     .slice(-100);
 
   // Scroll to the newest message whenever the timeline grows or the streaming

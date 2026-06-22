@@ -7,9 +7,7 @@ Registers two routes onto the shared aiohttp app:
 
 Inbound payload:
   {
-    "channel_id": "web-<id>",       # optional; defaults to "web-default"
     "content":    "the message text",
-    "author":     "alice",            # optional
     "msg_id":     "client-side-id"    # optional
   }
 
@@ -18,8 +16,8 @@ every other inbound. Outbound SSE clients receive a JSON line per send:
 
   data: {"channel_id": "web-x", "text": "...", "message_id": "..."}
 
-Channel ids: anything starting with ``web-`` routes here. Default if the
-client doesn't specify one is ``web-default`` so a curl-style poke works.
+Channel ids: anything starting with ``web-`` routes here. Chat endpoints
+require a resolved per-user web identity and derive the channel from it.
 """
 
 from __future__ import annotations
@@ -59,13 +57,6 @@ class _Subscriber:
     allowed_channels: frozenset[str] | None = None
 
 
-def _normalize_web_channel(channel_id: str | None) -> str:
-    channel_id = (channel_id or DEFAULT_CHANNEL).strip()
-    if not channel_id.startswith("web-"):
-        channel_id = "web-" + channel_id
-    return channel_id
-
-
 def _web_channel_for(canonical: str) -> str:
     """Per-user web channel id derived from an identity canonical.
 
@@ -78,10 +69,30 @@ def _web_channel_for(canonical: str) -> str:
     history across users. Reserved channel collisions are escaped by the shared
     web-channel helper. Channel ids are arbitrary strings here (cf. ``slack-U…``
     / ``discord-…``); downstream path derivation sanitizes them where needed
-    (e.g. saga session ids). Falls back to the shared default only when the
-    canonical is empty.
+    (e.g. saga session ids).
     """
     return web_channel_for_identity(canonical)
+
+
+def _chat_identity(request: web.Request):
+    """Return the resolved per-user chat identity or a route-level auth error.
+
+    The global web auth gate intentionally stays open for non-chat routes in
+    dev/open mode, but chat is per-user state and must never fall back to an
+    anonymous shared channel.
+    """
+    if request.get("auth_is_master"):
+        return None, web.json_response(
+            {
+                "error": "master_key_not_chat_identity",
+                "detail": "the admin master key cannot use chat; use a per-user key",
+            },
+            status=403,
+        )
+    identity = request.get("auth_identity")
+    if identity is None:
+        return None, web.json_response({"error": "chat_login_required"}, status=401)
+    return identity, None
 
 
 SSE_HEARTBEAT_S = 15.0
@@ -206,7 +217,11 @@ class WebChatBridge(Bridge):
         content = (body.get("content") or "").strip()
         if not content:
             return None, None, web.json_response({"error": "content required"}, status=400)
-        channel_id = _normalize_web_channel(body.get("channel_id"))
+        identity, auth_error = _chat_identity(request)
+        if auth_error is not None:
+            return None, None, auth_error
+        assert identity is not None
+        channel_id = _web_channel_for(identity.canonical)
         # #487: type-check, don't coerce — a truthy non-dict ``extra`` survives
         # ``or {}`` and later ``event.extra.get(...)`` raises.
         extra = body.get("extra")
@@ -215,46 +230,12 @@ class WebChatBridge(Bridge):
                 {"error": "extra must be an object"}, status=400
             )
 
-        # Trusted attribution (github #726): when the auth middleware resolved a
-        # per-user identity, the author comes from the AUTHENTICATED key, not the
-        # client body (which is spoofable). The admin master key is NOT a chat
-        # identity — reject it so every chat message is attributable to a real
-        # person. Dev/open mode (no key configured) keeps the legacy
-        # client-asserted author.
-        identity = request.get("auth_identity")
-        if request.get("auth_is_master"):
-            return None, None, web.json_response(
-                {
-                    "error": "master_key_not_chat_identity",
-                    "detail": "the admin master key cannot post chat; use a per-user key",
-                },
-                status=403,
-            )
-        if identity is not None:
-            author = identity.display_name or identity.canonical
-            author_id = identity.canonical
-        else:
-            author = body.get("author")
-            author_id = body.get("author_id")
-
-        # Per-user web channel (chainlink): route an authenticated user's
-        # default-channel messages to their own ``web-<canonical>`` so the
-        # conversation segregates per user and history is scoped naturally. In
-        # authenticated user mode, reject arbitrary explicit web-* channels —
-        # client-side selection is not an authorization boundary. Admin/master
-        # automation remains unrestricted.
-        if identity is not None:
-            allowed_channel = _web_channel_for(identity.canonical)
-            if channel_id == DEFAULT_CHANNEL:
-                channel_id = allowed_channel
-            elif channel_id != allowed_channel:
-                return None, None, web.json_response(
-                    {
-                        "error": "forbidden_channel",
-                        "detail": "web users can only access their own channel",
-                    },
-                    status=403,
-                )
+        # Trusted attribution (github #726): the author comes from the
+        # AUTHENTICATED per-user key, not the client body (which is spoofable).
+        # The admin master key is not a chat identity, and dev/open anonymous
+        # chat is rejected above, so no shared web-default channel is reachable.
+        author = identity.display_name or identity.canonical
+        author_id = identity.canonical
 
         event = AgentEvent(
             trigger="user_message",
@@ -289,7 +270,7 @@ class WebChatBridge(Bridge):
             except json.JSONDecodeError:
                 legacy = {"error": error.text or "invalid request"}
             message = str(legacy.get("error") or "invalid request")
-            code = message if error.status == 403 else "bad_request"
+            code = message if error.status in (401, 403) else "bad_request"
             return json_error(code, message, status=error.status)
         assert event is not None and channel_id is not None
         accepted = await self.enqueue(event)
@@ -302,13 +283,16 @@ class WebChatBridge(Bridge):
             )
         return json_success({"channel_id": channel_id, "source_id": event.source_id})
 
-    def _allowed_stream_channels(self, request: web.Request) -> frozenset[str] | None:
+    def _allowed_stream_channels(self, request: web.Request) -> frozenset[str]:
         identity = request.get("auth_identity")
-        if identity is None:
-            return None
+        assert identity is not None
         return frozenset({_web_channel_for(identity.canonical)})
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
+        _, auth_error = _chat_identity(request)
+        if auth_error is not None:
+            return auth_error
+
         if self._lock is None:
             self._lock = asyncio.Lock()
 
@@ -364,29 +348,24 @@ class WebChatBridge(Bridge):
     async def _handle_history(self, request: web.Request) -> web.Response:
         """GET /api/v1/chat/history?channel_id=web-default&limit=50.
 
-        Restore a web channel's prior conversation (user + assistant messages,
-        oldest→newest) so re-opening the chat reloads it instead of starting
-        empty. Auth-gated by the shared middleware like every /api/v1 route.
+        Restore the authenticated user's prior conversation (user + assistant
+        messages, oldest→newest) so re-opening the chat reloads it instead of
+        starting empty. The channel is derived from auth identity; client
+        channel_id query parameters are ignored.
         """
         from ..history import get_global_buffer
 
-        identity = request.get("auth_identity")
-        channel_id = _normalize_web_channel(request.query.get("channel_id"))
-        # Default channel + authenticated → that user's per-user web channel,
-        # matching the inbound routing in _build_inbound_event so the history
-        # endpoint returns exactly the conversation the user is posting into.
-        # Explicit cross-user channels are rejected server-side; React-side
-        # filtering/selection is UX only.
-        if identity is not None:
-            allowed_channel = _web_channel_for(identity.canonical)
-            if channel_id == DEFAULT_CHANNEL:
-                channel_id = allowed_channel
-            elif channel_id != allowed_channel:
-                return json_error(
-                    "forbidden_channel",
-                    "web users can only access their own channel",
-                    status=403,
-                )
+        identity, auth_error = _chat_identity(request)
+        if auth_error is not None:
+            if auth_error.status == 401:
+                return json_error("chat_login_required", "chat login required", status=401)
+            return json_error(
+                "master_key_not_chat_identity",
+                "the admin master key cannot use chat; use a per-user key",
+                status=403,
+            )
+        assert identity is not None
+        channel_id = _web_channel_for(identity.canonical)
         try:
             limit = int(request.query.get("limit", "50"))
         except (TypeError, ValueError):

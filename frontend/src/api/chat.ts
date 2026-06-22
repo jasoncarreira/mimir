@@ -4,12 +4,17 @@ import type {
   ChatAcceptedData,
   ChatHistoryData,
   ChatMessageEvent as GeneratedChatMessageEvent,
-  ChatPostRequest,
   ChatReactionEvent as GeneratedChatReactionEvent,
   LiveEvent
 } from "./generated/contracts";
 
-export type { ChatHistoryData, ChatPostRequest, LiveEvent };
+export interface ChatPostRequest {
+  content: string;
+  msg_id?: string;
+  extra?: Record<string, unknown>;
+}
+
+export type { ChatHistoryData, LiveEvent };
 
 export type ChatPostAccepted = Omit<ChatAcceptedData, "source_id"> & {
   source_id?: string;
@@ -46,11 +51,10 @@ export function sendChatMessage(
 // chainlink: restore a web channel's prior conversation when the user re-opens
 // the chat (oldest→newest). Live messages still arrive via createChatStream.
 export function fetchChatHistory(
-  channelId: string,
   limit = 50,
   options?: RequestInit & ApiClientOptions
 ): Promise<ApiSuccessEnvelope<ChatHistoryData>> {
-  const params = new URLSearchParams({ channel_id: channelId, limit: String(limit) });
+  const params = new URLSearchParams({ limit: String(limit) });
   return apiFetchEnvelope<ChatHistoryData>(`/api/v1/chat/history?${params.toString()}`, {
     ...options,
     method: "GET"

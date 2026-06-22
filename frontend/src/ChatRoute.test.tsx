@@ -136,10 +136,10 @@ describe("ChatRoute", () => {
 
     expect((input as HTMLTextAreaElement).value).toBe("");
     expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
-      channel_id: "web-default",
       content: "hello mimir",
       extra: expect.objectContaining({ web_session_id: expect.stringMatching(/^session-/) })
     }));
+    expect(chatApi.sendChatMessage.mock.calls[0]?.[0]).not.toHaveProperty("channel_id");
 
     const timeline = screen.getByRole("list", { name: "Messages" });
     expect(within(timeline).getByText("hello mimir")).toBeTruthy();
@@ -160,21 +160,28 @@ describe("ChatRoute", () => {
     await waitFor(() => expect(screen.getAllByText("queue full").length).toBeGreaterThan(0));
   });
 
-  it("drops inbound chat messages for other channels", () => {
+  it("adopts the first stream message channel and drops later messages for other channels", () => {
     renderChat();
 
-    emitMessage("web-other", "not for this tab");
     emitMessage("web-default", "for this tab");
+    emitMessage("web-other", "not for this tab");
 
-    expect(screen.queryByText("not for this tab")).toBeNull();
     expect(screen.getByText("for this tab")).toBeTruthy();
+    expect(screen.queryByText("not for this tab")).toBeNull();
   });
 
-  it("closes the stream on unmount without clobbering stream error state", async () => {
-    const { unmount } = renderChat();
+  it("keeps the chat stream subscription stable across route-state re-renders", async () => {
+    renderChat("/chat?tab=conversation");
 
-    act(() => chatApi.activeError?.(new Error("stream broke")));
-    expect(await screen.findByText("stream broke")).toBeTruthy();
+    emitMessage("web-default", "for this tab");
+    await waitFor(() => expect(chatApi.createChatStream).toHaveBeenCalledTimes(1));
+    expect(screen.getByText("for this tab")).toBeTruthy();
+    expect(chatApi.createChatStream).toHaveBeenCalledTimes(1);
+    expect(chatApi.close).not.toHaveBeenCalled();
+  });
+
+  it("closes the stream on unmount", () => {
+    const { unmount } = renderChat();
 
     unmount();
     expect(chatApi.close).toHaveBeenCalledOnce();
@@ -258,7 +265,7 @@ describe("ChatRoute history reload (web chat history)", () => {
     const timeline = screen.getByRole("list", { name: "Messages" });
     const texts = within(timeline).getAllByText(/earlier/).map((node) => node.textContent);
     expect(texts).toEqual(["earlier question", "earlier answer"]);
-    expect(chatApi.fetchChatHistory).toHaveBeenCalledWith("web-default");
+    expect(chatApi.fetchChatHistory).toHaveBeenCalledWith();
   });
 
   it("does not duplicate a message already in the timeline when history reloads", async () => {
