@@ -2853,6 +2853,19 @@ class Agent:
             cross_hours=self._config.recent_cross_hours,
             source_allowlist=self._config.recent_sources,
         )
+        # Channel memory injection (chainlink #187): load per-channel fact
+        # files (operator name, preferences, patterns) from
+        # ``memory/channels/<channel_id>/``. Returns None for synthetic
+        # channels (scheduler:*, poller:*) and channels with no memory files.
+        #
+        # Load before Recent feedback so the over-cap algedonic signal emitted
+        # by load_channel_memory() is visible on the same turn, not the next.
+        from .core_blocks import load_channel_memory
+        channel_memory_block = await asyncio.to_thread(
+            load_channel_memory,
+            self._config.home,
+            event.channel_id or "",
+        )
         feedback_block = (
             self._feedback.recent_block()
             if self._config.feedback_limit_per_polarity > 0
@@ -2953,16 +2966,6 @@ class Agent:
             for _aid in _injected_ids:
                 if _aid not in ctx.injected_skill_atom_ids:
                     ctx.injected_skill_atom_ids.append(_aid)
-        # Channel memory injection (chainlink #187): load per-channel fact
-        # files (operator name, preferences, patterns) from
-        # ``memory/channels/<channel_id>/``.  Returns None for synthetic
-        # channels (scheduler:*, poller:*) and channels with no memory files.
-        from .core_blocks import load_channel_memory
-        channel_memory_block = await asyncio.to_thread(
-            load_channel_memory,
-            self._config.home,
-            event.channel_id or "",
-        )
         # chainlink #508: resolve an optional deliver: channel (poller / tick),
         # mapping the OPERATOR_CHANNEL sentinel → the operator alert channel.
         deliver_channel = resolve_deliver_channel(
