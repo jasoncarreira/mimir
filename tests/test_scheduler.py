@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json as _json
 from pathlib import Path
 
 import pytest
@@ -1183,9 +1184,6 @@ async def test_add_job_callable_with_empty_cron_disables(tmp_path: Path):
 # ---- pollers framework integration (chainlink #3) ----------------------
 
 
-import json as _json
-
-
 def _drop_pollers_skill(skills_dir: Path, name: str, cron: str = "* * * * *") -> Path:
     """Helper: build a minimal valid skill dir with a no-op poller."""
     skill = skills_dir / name
@@ -2098,6 +2096,62 @@ def test_build_trigger_threads_tz_through_to_cron():
     # APScheduler's CronTrigger stores its zone; str() round-trip
     # confirms the right zone landed.
     assert str(trigger.timezone) == "America/New_York"
+
+
+
+def test_build_trigger_honors_standard_crontab_day_of_week_numbers():
+    """Regression #658: standard crontab uses Sunday=0/7, while
+    APScheduler's numeric day-of-week uses Monday=0. Numeric DOW
+    fields must not shift weekly jobs by one day."""
+    from datetime import datetime, timezone
+
+    job = SchedulerJob(name="reflect", prompt="x", cron="0 6 * * 0")
+    trigger = _build_trigger(job)
+    next_fire = trigger.get_next_fire_time(
+        None, datetime(2026, 6, 20, tzinfo=timezone.utc),
+    )
+    assert next_fire == datetime(2026, 6, 21, 6, 0, tzinfo=timezone.utc)
+
+    job = SchedulerJob(name="commitments", prompt="x", cron="0 7 * * 1")
+    trigger = _build_trigger(job)
+    next_fire = trigger.get_next_fire_time(
+        None, datetime(2026, 6, 21, tzinfo=timezone.utc),
+    )
+    assert next_fire == datetime(2026, 6, 22, 7, 0, tzinfo=timezone.utc)
+
+
+def test_build_trigger_honors_standard_crontab_day_of_week_ranges_lists_and_steps():
+    from datetime import datetime, timezone
+
+    job = SchedulerJob(name="weekday", prompt="x", cron="0 9 * * 1-5")
+    trigger = _build_trigger(job)
+    first = trigger.get_next_fire_time(
+        None, datetime(2026, 6, 20, tzinfo=timezone.utc),
+    )
+    assert first == datetime(2026, 6, 22, 9, 0, tzinfo=timezone.utc)
+    second = trigger.get_next_fire_time(first, first)
+    assert second == datetime(2026, 6, 23, 9, 0, tzinfo=timezone.utc)
+
+    job = SchedulerJob(name="sun-tue-thu", prompt="x", cron="0 9 * * 0,2,4")
+    trigger = _build_trigger(job)
+    first = trigger.get_next_fire_time(
+        None, datetime(2026, 6, 20, tzinfo=timezone.utc),
+    )
+    assert first == datetime(2026, 6, 21, 9, 0, tzinfo=timezone.utc)
+
+    job = SchedulerJob(name="every-other", prompt="x", cron="0 9 * * */2")
+    trigger = _build_trigger(job)
+    first = trigger.get_next_fire_time(
+        None, datetime(2026, 6, 20, 9, 0, 1, tzinfo=timezone.utc),
+    )
+    assert first == datetime(2026, 6, 21, 9, 0, tzinfo=timezone.utc)
+
+    job = SchedulerJob(name="sunday-seven", prompt="x", cron="0 9 * * 7")
+    trigger = _build_trigger(job)
+    first = trigger.get_next_fire_time(
+        None, datetime(2026, 6, 20, tzinfo=timezone.utc),
+    )
+    assert first == datetime(2026, 6, 21, 9, 0, tzinfo=timezone.utc)
 
 
 def test_build_trigger_defaults_to_utc_when_tz_omitted():
