@@ -24,10 +24,18 @@ how urgent the cleanup is and what the right home looks like.
   Session-scoped notes, candidate learnings, raw source material → NOT
   here.
   *Severity if misfiled into core: system-breaking (prompt inflation).*
-- **`memory/channels/<id>/`** — per-channel facts. Operator name,
-  preferences, channel-specific patterns. Cross-channel content goes
+- **`memory/channels/<id>/`** — small curated facts for a real
+  channel: operator name, preferences, and recurring channel-specific
+  patterns. This is not a session journal. On turns for real channel
+  `X`, top-level files in `memory/channels/X/*.md` are concatenated in
+  lexical order, capped at ~8 KB; over-cap content is silently truncated
+  from the tail, so keep files compact and prefix durable summaries with
+  `00-` / `10-` when order matters. Synthetic channels (`scheduler:*`,
+  `poller:*`) and topic-shaped folders never auto-load. Episodic detail
+  belongs in SAGA retrieval, not channel files. Cross-channel content goes
   elsewhere.
-  *Severity if misfiled: drift-amplifier (channel injection misses it).*
+  *Severity if misfiled: drift-amplifier (channel injection misses it,
+  or overgrown channel memory crowds out later facts).*
 - **`memory/issues/`** — operational-gotcha fingerprints. Failure-mode
   notes, infra gotchas, runbook-shaped entries. Each entry surfaces in
   the every-turn `memory/INDEX.md` description list — its purpose is
@@ -64,17 +72,20 @@ how urgent the cleanup is and what the right home looks like.
   during implementation. **Post-merge**: archive under
   `state/spec/archive/` (historical) or promote to `state/wiki/topics/`
   (reusable architecture).
-- **`state/proposed-changes.md`** — operator-review queue. Append-only
-  by mimir; operator marks resolved inline or by deletion.
+- **`state/proposed-changes.md`** — legacy operator-review queue. Do
+  not use it for protected surfaces (`memory/core/*`, `prompts/*`);
+  those route through `open_proposal` / `submit_proposal` PRs. Treat
+  any existing entries as migration candidates to Chainlink, `state/spec/`,
+  or proposal PRs.
 - **`state/heartbeat-backlog.md`, `state/identities.yaml`,
   `state/INDEX.md`** — named singletons / operator-managed /
   auto-managed; healthy as-is.
 
 **Top-level `state/` rule:** nothing lives at top-level `state/` except
 auto-meta (INDEX.md), operator-managed yaml (identities.yaml), or named
-singletons with explicit purpose (heartbeat-backlog.md,
-proposed-changes.md). Free-form top-level state files =
-**drift-amplifier** misfiling.
+singletons with explicit purpose (heartbeat-backlog.md and legacy
+proposed-changes.md), or Chainlink-/spec-backed artifacts. Free-form
+top-level state files = **drift-amplifier** misfiling.
 
 ## Two filing questions
 
@@ -82,10 +93,11 @@ When uncertain, ask one of these binary questions and the answer routes
 you:
 
 **Q1: "Am I asking the operator to make a decision?"**
-- Yes → `state/proposed-changes.md` (append with date + topic +
-  decision-needed framing). A controversial spec that's effectively
-  an approval request: write spec to `state/spec/`, then add a
-  one-line pointer entry to `state/proposed-changes.md`.
+- Yes, and it touches `memory/core/*` or `prompts/*` → open a
+  protected-surface proposal PR with `open_proposal` / `submit_proposal`.
+- Yes, but it is not a protected-surface change → file a Chainlink issue
+  or write `state/spec/<feature>-decision.md` with a clear
+  decision-needed section. Use chat for urgent decisions.
 - No → `state/spec/<feature>-plan.md` (descriptive, "here's the plan").
 
 **Q2: "Is this an operational issue I might hit, that needs flagging
@@ -133,7 +145,8 @@ internal layer's discoverability rots.
 | Free-form file at top-level `state/<name>.md` (not a named singleton) | `state/wiki/topics/` or `state/raw/` | drift-amplifier |
 | Operational gotcha in `state/wiki/concepts/` | `memory/issues/` | drift-amplifier |
 | Concept synthesis in `memory/issues/` | `state/wiki/concepts/` | drift-amplifier |
-| Operator-decision-request in `state/spec/` (no proposed-changes pointer) | `state/proposed-changes.md` (or both, with pointer) | drift-amplifier |
+| Protected-surface proposal in `state/spec/` or `state/proposed-changes.md` | `open_proposal` / `submit_proposal` PR | drift-amplifier |
+| Non-protected operator-decision request buried in a descriptive `state/spec/` with no clear decision section | Chainlink issue or `state/spec/<feature>-decision.md` with explicit decision-needed section | drift-amplifier |
 | Channel-scoped fact in `memory/issues/` or `state/wiki/` | `memory/channels/<id>/` | drift-amplifier |
 | Session-scoped note in `memory/core/` | `memory/learnings-pending.md` or discard | **system-breaking** |
 | Candidate learning written directly to `memory/core/40-learned-behaviors.md` (core is read-only at runtime) | `memory/learnings-pending.md` | drift-amplifier |

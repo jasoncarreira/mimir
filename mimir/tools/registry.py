@@ -788,7 +788,7 @@ async def list_schedules() -> str:
             "cron": j.cron,
             # Priority-banded arbiter suppression (low|normal|high). Surfaced so
             # an operator can see/verify what a job is set to (chainlink #523).
-            "priority": getattr(j, "priority", "low"),
+            "priority": getattr(j, "priority", "normal"),
             "channel_id": j.channel_id,
         }
         # Surface whichever prompt-source field is populated (mutually
@@ -843,7 +843,7 @@ async def add_schedule(
         prompt: Inline prompt to fire on the cron tick.
         channel_id: Channel to dispatch the tick on. Defaults to
             ``scheduler:<name>`` synthetic.
-        priority: Arbiter suppression band — ``low`` (default), ``normal``, or
+        priority: Arbiter suppression band — ``low``, ``normal`` (default), or
             ``high``. Higher priority rides through more resource pressure before
             the arbiter sheds the tick (``high`` is shed only at the most extreme
             severity). To change an existing job's priority without rewriting its
@@ -852,7 +852,7 @@ async def add_schedule(
     scheduler = _STATE["scheduler"]
     if scheduler is None:
         return "add_schedule failed: no scheduler configured"
-    resolved_priority = "low"
+    resolved_priority = "normal"
     if priority is not None:
         resolved_priority = priority.strip().lower()
         if resolved_priority not in PRIORITY_LEVELS:

@@ -1,4 +1,10 @@
-"""Env-based configuration. Defaults match SPEC §14."""
+"""Env-based configuration. Defaults match SPEC §14.
+
+Runtime contract: ``Config.from_env`` loads ``<MIMIR_HOME>/.env`` as defaults
+before reading settings, and process environment values always win. This keeps
+fresh local homes runnable from the setup-written file while preserving
+operator-provided exports in managed deployments.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
+from dotenv import load_dotenv
+
 from .billing import BillingMode, detect_billing_mode
 
 
@@ -16,6 +24,33 @@ log = logging.getLogger(__name__)
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
+
+
+def _load_home_dotenv(home: Path) -> list[str]:
+    """Load ``<home>/.env`` as runtime defaults.
+
+    Process env wins: Docker/operator exports remain authoritative. The
+    returned key list is for startup observability only and never includes
+    values, so secret-bearing homes can still log the contract without leaking.
+    """
+    env_path = home / ".env"
+    if not env_path.is_file():
+        return []
+
+    before = set(os.environ)
+    load_dotenv(env_path, override=False)
+    loaded = sorted(
+        key for key in set(os.environ) - before
+        if os.environ.get(key, "") != ""
+    )
+    if loaded:
+        log.info(
+            "loaded %s env default(s) from %s: %s",
+            len(loaded),
+            env_path,
+            ", ".join(loaded),
+        )
+    return loaded
 
 
 def _env_int(name: str, default: int) -> int:
@@ -778,6 +813,7 @@ class Config:
                 "(%s). Set MIMIR_HOME to an explicit agent home.", Path.cwd(),
             )
         home = Path(raw_home or Path.cwd()).resolve()
+        _load_home_dotenv(home)
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
         # Resolve once — used by both ``billing_mode`` (to detect QUOTA

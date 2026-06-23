@@ -12,13 +12,15 @@ trust builds. Conservative defaults:
 - Promote / drop entries in memory/learnings-pending.md
 - Wiki orphan tagging (writes to state/wiki/index.md — flag, don't delete)
 
-## Propose-only (write to state/proposed-changes.md, operator reviews)
+## Propose-only (operator reviews before it takes effect)
 
 - ALL memory/core/ edits — cleanup, restructure, promote-to-core
   (including learned-behavior promotion), demote, persona blocks.
   Core memory is READ-ONLY at runtime; there is no autonomous core
-  write. Promotions land via the change-proposal PR flow
-  (open_proposal) the operator merges.
+  write. Promotions land via the protected-surface proposal PR flow
+  (``open_proposal`` / ``submit_proposal``) the operator merges.
+- Prompt edits (``prompts/*``) route through the same protected-surface
+  proposal PR flow.
 - Skill creation (skills/<name>/)
 - Wiki page deletions
 - Memory file deletions

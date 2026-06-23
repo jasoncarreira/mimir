@@ -297,11 +297,13 @@ work; new backlog items come from the work itself.
   `most_retrieved_atoms(contributed_only=True)` for promotion
   candidates, scans for consolidation gaps, drafts proposals.
 
-Both tracks write to `state/proposed-changes.md` (HITL-gated by
-default per `memory/core/30-reflection-policy.md`). The operator
-reviews, accepts/rejects, and the changes flow back into core
-memory or the codebase. Auto-apply mode exists for trusted
-proposal types but isn't the default.
+Both tracks are HITL-gated by default per
+`memory/core/30-reflection-policy.md`. Protected-surface changes
+(`memory/core/*` and `prompts/*`) use proposal PRs via
+`open_proposal` / `submit_proposal`; non-protected follow-ups use
+Chainlink or `state/spec/` notes. The legacy
+`state/proposed-changes.md` queue remains only for migration and
+historical applied-proposals audit records.
 
 **Frequency:** weekly.
 **Closes the loop:** human-in-the-loop. Skill produces text;
@@ -309,7 +311,7 @@ operator decides; mimir reads the merged result on next turn.
 **Call sites:** `mimir/skills/reflection/SKILL.md`,
 `mimir/skills/reflection/most_retrieved.py`,
 `memory/core/30-reflection-policy.md`,
-`state/proposed-changes.md`.
+proposal PRs / Chainlink follow-ups.
 
 ### 4.3 Saga consolidation — sleep-inspired memory consolidation
 
@@ -579,5 +581,5 @@ Useful when something seems off:
   `state/heartbeat-backlog.md`. The loop's signal is the backlog;
   empty backlog = empty heartbeat.
 - **Reflection produces nothing** → either the week was uneventful
-  or `state/proposed-changes.md` is full of unreviewed prior items
-  (the skill checks the inbox before drafting).
+  or existing proposal PR / Chainlink review items are still pending
+  (the skill should not pile on duplicate HITL requests).

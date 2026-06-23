@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json as _json
 from pathlib import Path
 
 import pytest
@@ -1183,9 +1184,6 @@ async def test_add_job_callable_with_empty_cron_disables(tmp_path: Path):
 # ---- pollers framework integration (chainlink #3) ----------------------
 
 
-import json as _json
-
-
 def _drop_pollers_skill(skills_dir: Path, name: str, cron: str = "* * * * *") -> Path:
     """Helper: build a minimal valid skill dir with a no-op poller."""
     skill = skills_dir / name
@@ -2100,6 +2098,62 @@ def test_build_trigger_threads_tz_through_to_cron():
     assert str(trigger.timezone) == "America/New_York"
 
 
+
+def test_build_trigger_honors_standard_crontab_day_of_week_numbers():
+    """Regression #658: standard crontab uses Sunday=0/7, while
+    APScheduler's numeric day-of-week uses Monday=0. Numeric DOW
+    fields must not shift weekly jobs by one day."""
+    from datetime import datetime, timezone
+
+    job = SchedulerJob(name="reflect", prompt="x", cron="0 6 * * 0")
+    trigger = _build_trigger(job)
+    next_fire = trigger.get_next_fire_time(
+        None, datetime(2026, 6, 20, tzinfo=timezone.utc),
+    )
+    assert next_fire == datetime(2026, 6, 21, 6, 0, tzinfo=timezone.utc)
+
+    job = SchedulerJob(name="commitments", prompt="x", cron="0 7 * * 1")
+    trigger = _build_trigger(job)
+    next_fire = trigger.get_next_fire_time(
+        None, datetime(2026, 6, 21, tzinfo=timezone.utc),
+    )
+    assert next_fire == datetime(2026, 6, 22, 7, 0, tzinfo=timezone.utc)
+
+
+def test_build_trigger_honors_standard_crontab_day_of_week_ranges_lists_and_steps():
+    from datetime import datetime, timezone
+
+    job = SchedulerJob(name="weekday", prompt="x", cron="0 9 * * 1-5")
+    trigger = _build_trigger(job)
+    first = trigger.get_next_fire_time(
+        None, datetime(2026, 6, 20, tzinfo=timezone.utc),
+    )
+    assert first == datetime(2026, 6, 22, 9, 0, tzinfo=timezone.utc)
+    second = trigger.get_next_fire_time(first, first)
+    assert second == datetime(2026, 6, 23, 9, 0, tzinfo=timezone.utc)
+
+    job = SchedulerJob(name="sun-tue-thu", prompt="x", cron="0 9 * * 0,2,4")
+    trigger = _build_trigger(job)
+    first = trigger.get_next_fire_time(
+        None, datetime(2026, 6, 20, tzinfo=timezone.utc),
+    )
+    assert first == datetime(2026, 6, 21, 9, 0, tzinfo=timezone.utc)
+
+    job = SchedulerJob(name="every-other", prompt="x", cron="0 9 * * */2")
+    trigger = _build_trigger(job)
+    first = trigger.get_next_fire_time(
+        None, datetime(2026, 6, 20, 9, 0, 1, tzinfo=timezone.utc),
+    )
+    assert first == datetime(2026, 6, 21, 9, 0, tzinfo=timezone.utc)
+
+    job = SchedulerJob(name="sunday-seven", prompt="x", cron="0 9 * * 7")
+    trigger = _build_trigger(job)
+    first = trigger.get_next_fire_time(
+        None, datetime(2026, 6, 20, tzinfo=timezone.utc),
+    )
+    assert first == datetime(2026, 6, 21, 9, 0, tzinfo=timezone.utc)
+
+
 def test_build_trigger_defaults_to_utc_when_tz_omitted():
     """Back-compat: bench/test call sites that haven't been updated
     to pass tz must still get a UTC-anchored trigger (matches pre-PR
@@ -2923,8 +2977,8 @@ async def test_fire_poller_fail_open_when_arbiter_raises(
 
 @pytest.mark.asyncio
 async def test_fire_consults_arbiter_with_job_priority(tmp_path: Path):
-    """_fire passes the SchedulerJob's declared priority (heartbeats
-    default ``low``; scheduler.yaml overrides per entry)."""
+    """_fire passes the SchedulerJob's declared priority (unspecified
+    jobs default ``normal``; scheduler.yaml overrides per entry)."""
     async def noop(_e):
         return True
 
@@ -2936,7 +2990,7 @@ async def test_fire_consults_arbiter_with_job_priority(tmp_path: Path):
     await sched._fire(job=SchedulerJob(
         name="digest", prompt="x", cron="* * * * *", priority="high",
     ))
-    assert arbiter.consulted_priorities == ["low", "high"]
+    assert arbiter.consulted_priorities == ["normal", "high"]
 
 
 @pytest.mark.asyncio
@@ -2959,7 +3013,7 @@ async def test_scheduled_tick_suppressed_event_carries_priority_severity(
     await sched._fire(job=SchedulerJob(name="hb", prompt="x", cron="* * * * *"))
     events = _read_event_types(tmp_path / "events.jsonl")
     [ev] = [e for e in events if e["type"] == "scheduled_tick_suppressed"]
-    assert ev["priority"] == "low"
+    assert ev["priority"] == "normal"
     assert ev["severity"] == "ELEVATED"
 
 
@@ -2970,18 +3024,25 @@ def test_scheduler_job_priority_yaml_round_trip(tmp_path: Path):
         SchedulerJob(name="digest", prompt="y", cron="0 9 * * *", priority="high"),
     ])
     jobs = {j.name: j for j in load_jobs(path)}
-    assert jobs["hb"].priority == "low"        # default, not serialized
+    assert jobs["hb"].priority == "normal"     # default, not serialized
     assert jobs["digest"].priority == "high"   # explicit, round-trips
     # Default priority isn't written to yaml (uncluttered).
     assert "priority" not in path.read_text().split("digest")[0]
 
+    low_path = tmp_path / "scheduler-low.yaml"
+    write_jobs(low_path, [
+        SchedulerJob(name="nice", prompt="z", cron="0 10 * * *", priority="low"),
+    ])
+    assert "priority: low" in low_path.read_text()
+    assert load_jobs(low_path)[0].priority == "low"
 
-def test_scheduler_job_invalid_priority_falls_back_to_low():
+
+def test_scheduler_job_invalid_priority_falls_back_to_normal():
     job = SchedulerJob.from_yaml_entry({
         "name": "hb", "prompt": "x", "cron": "0 8 * * *",
         "priority": "urgent",
     })
-    assert job.priority == "low"
+    assert job.priority == "normal"
 
 
 def test_scheduler_job_priority_case_insensitive():
