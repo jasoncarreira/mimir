@@ -70,7 +70,7 @@ openai = [
 # package and ships an own rate-limit-headers integration that wires
 # directly into ``OpenAIQuotaProvider`` via the agent's callback hook.
 codex-plus = [
-    "langchain-codex-plus>=0.0.4,<0.1",
+    "langchain-codex-plus>=0.0.5,<0.1",
 ]
 # Model Context Protocol — required if any ``MIMIR_MCP_SERVERS_*`` env
 # var is set. Pre-OSS hardening (review item #4 follow-on): this used
@@ -125,7 +125,7 @@ dev = [
     "slack-bolt>=1.18",
     "langchain-anthropic>=1.4",
     "langchain-openai>=1.2.1",
-    "langchain-codex-plus>=0.0.4,<0.1",
+    "langchain-codex-plus>=0.0.5,<0.1",
     "mcp>=1.27",
     # mimir.saga.vector_index uses FAISS for ANN search; without it
     # the index degrades to an empty-result stub and tests asserting
@@ -268,7 +268,7 @@ dev = [
     "slack-bolt>=1.18",
     "langchain-anthropic>=1.4",
     "langchain-openai>=1.2.1",
-    "langchain-codex-plus>=0.0.4,<0.1",
+    "langchain-codex-plus>=0.0.5,<0.1",
     "mcp>=1.27",
     "faiss-cpu>=1.13",
     "botocore>=1.35",

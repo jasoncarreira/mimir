@@ -6,6 +6,18 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **`turn_failed` events carry a `request_summary` for provider content
+  rejections.** When a model call fails with an error exposing a PII-light
+  request-content inventory (langchain-codex-plus ≥ 0.0.5 attaches one to
+  `CodexResponseError` — content-part type counts, image MIME/scheme, sizes;
+  never raw text), it's recorded on `turn_failed` so an `HTTP 400: Unsupported
+  content type` names which content types were in the request. Inert on
+  providers that don't surface it. This PR also bumps the `langchain-codex-plus`
+  dep floor to ≥ 0.0.5 (now published), so the diagnostic activates once this
+  version is deployed.
+
 ### Changed
 
 - **Runtime now loads `<home>/.env` as defaults (#447).** `Config.from_env()`
