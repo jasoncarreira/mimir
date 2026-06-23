@@ -90,6 +90,40 @@ def _event_detail(event: dict[str, Any]) -> str:
     return event_type
 
 
+def _prefer_newer_event(
+    current: dict[str, Any] | None,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    if current is None:
+        return candidate
+    if _event_ts(candidate) >= _event_ts(current):
+        return candidate
+    return current
+
+
+def _newest_event(*events: dict[str, Any] | None) -> dict[str, Any] | None:
+    newest: dict[str, Any] | None = None
+    for event in events:
+        if event is None:
+            continue
+        newest = _prefer_newer_event(newest, event)
+    return newest
+
+
+def _schedule_name_from_event(event: dict[str, Any]) -> str:
+    name = str(event.get("schedule_name") or event.get("job_id") or "")
+    if name.startswith(SCHEDULER_CHANNEL_PREFIX):
+        name = name[len(SCHEDULER_CHANNEL_PREFIX):]
+    return name
+
+
+def _poller_name_from_event(event: dict[str, Any]) -> str:
+    name = str(event.get("poller") or event.get("job_id") or "")
+    if name.startswith(POLLER_CHANNEL_PREFIX):
+        name = name[len(POLLER_CHANNEL_PREFIX):]
+    return name
+
+
 def _recent_schedule_events(
     events: list[dict[str, Any]],
 ) -> dict[str, dict[str, dict[str, Any]]]:
@@ -104,13 +138,11 @@ def _recent_schedule_events(
         event_type = str(event.get("type") or "")
         if event_type not in interesting:
             continue
-        name = str(event.get("schedule_name") or event.get("job_id") or "")
-        if name.startswith(SCHEDULER_CHANNEL_PREFIX):
-            name = name[len(SCHEDULER_CHANNEL_PREFIX):]
+        name = _schedule_name_from_event(event)
         if not name:
             continue
         slot = by_name.setdefault(name, {})
-        slot[event_type] = event
+        slot[event_type] = _prefer_newer_event(slot.get(event_type), event)
     return by_name
 
 
@@ -134,13 +166,11 @@ def _recent_poller_events(
         event_type = str(event.get("type") or "")
         if event_type not in interesting:
             continue
-        name = str(event.get("poller") or event.get("job_id") or "")
-        if name.startswith(POLLER_CHANNEL_PREFIX):
-            name = name[len(POLLER_CHANNEL_PREFIX):]
+        name = _poller_name_from_event(event)
         if not name:
             continue
         slot = by_name.setdefault(name, {})
-        slot[event_type] = event
+        slot[event_type] = _prefer_newer_event(slot.get(event_type), event)
     return by_name
 
 
@@ -182,7 +212,8 @@ def _schedule_rows(
         suppressed = recent.get(name, {}).get("scheduled_tick_suppressed")
         dropped = recent.get(name, {}).get("scheduled_tick_dropped")
         misfired = recent.get(name, {}).get("scheduled_job_misfired")
-        recent_error = dropped or misfired
+        recent_error = _newest_event(dropped, misfired)
+        last_event = _newest_event(last_ok, suppressed, dropped, misfired)
         rows.append({
             "id": aps_job.id,
             "name": name,
@@ -190,7 +221,7 @@ def _schedule_rows(
             "cron": getattr(config_job, "cron", None),
             "time_of_day": getattr(config_job, "time_of_day", None),
             "next_run_at": _iso(getattr(aps_job, "next_run_time", None)),
-            "last_run_at": _event_ts(last_ok) if last_ok else None,
+            "last_run_at": _event_ts(last_event) if last_event else None,
             "channel": getattr(config_job, "channel_id", None) or aps_job.id,
             "deliver": getattr(config_job, "deliver", None),
             "priority": getattr(config_job, "priority", "low"),
@@ -223,23 +254,20 @@ def _poller_rows(
         aps_job = aps_by_id.get(f"{POLLER_CHANNEL_PREFIX}{poller.name}")
         last_ok = recent.get(poller.name, {}).get("poller_complete")
         suppressed = recent.get(poller.name, {}).get("poller_fire_suppressed")
-        recent_error = next(
-            (
-                recent.get(poller.name, {}).get(kind)
-                for kind in (
-                    "poller_nonzero_exit",
-                    "poller_timeout",
-                    "poller_exec_error",
-                    "poller_enqueue_error",
-                    "poller_event_rejected",
-                    "poller_misfired",
-                    "poller_circuit_open",
-                    "poller_missing_required_env",
-                )
-                if recent.get(poller.name, {}).get(kind)
-            ),
-            None,
-        )
+        recent_error = _newest_event(*(
+            recent.get(poller.name, {}).get(kind)
+            for kind in (
+                "poller_nonzero_exit",
+                "poller_timeout",
+                "poller_exec_error",
+                "poller_enqueue_error",
+                "poller_event_rejected",
+                "poller_misfired",
+                "poller_circuit_open",
+                "poller_missing_required_env",
+            )
+        ))
+        last_event = _newest_event(last_ok, suppressed, recent_error)
         rows.append({
             "id": f"{POLLER_CHANNEL_PREFIX}{poller.name}",
             "name": poller.name,
@@ -247,7 +275,7 @@ def _poller_rows(
             "cron": poller.cron,
             "time_of_day": None,
             "next_run_at": _iso(getattr(aps_job, "next_run_time", None)) if aps_job else None,
-            "last_run_at": _event_ts(last_ok) if last_ok else None,
+            "last_run_at": _event_ts(last_event) if last_event else None,
             "channel": poller.channel_id(),
             "deliver": poller.deliver,
             "priority": poller.priority,
