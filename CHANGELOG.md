@@ -28,6 +28,13 @@ All notable changes will land here. Format loosely follows
 
 ### Fixed
 
+- **Oversized real channel memory now surfaces algedonically.**
+  When injected `memory/channels/<id>/*.md` content exceeds the channel-memory
+  prompt cap, mimir emits a negative `channel_memory_over_cap` signal naming the
+  channel/path/size so stale truncated context prompts a trim instead of hiding
+  inside the injected block. Synthetic scheduler/poller channels remain skipped.
+  chainlink #643.
+
 - **Scheduler cron day-of-week now follows standard crontab numbering.**
   Numeric day-of-week fields are interpreted as Sunday=0/7, Monday=1, and so on
   before APScheduler registration. Existing weekly jobs that used numeric weekdays

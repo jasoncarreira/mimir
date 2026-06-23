@@ -257,6 +257,12 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # but the stray byte (mojibake / cp1252 paste / mid-write artifact) silently
     # degrades the prompt — surface it so the agent cleans the file. chainlink #470.
     "non_utf8_home_file": ("negative", "non_utf8_home_file"),
+    # A real (non-synthetic) channel's injected memory exceeded the channel
+    # prompt cap. The prompt still truncates with an inline note, but that note
+    # is buried inside the context block and the truncation keeps the oldest
+    # lexicographic content. Negative so the agent/operator trims or refiles
+    # instead of silently running on stale channel context. chainlink #643.
+    "channel_memory_over_cap": ("negative", "channel_memory_over_cap"),
     # SPEC §16 items follow-up from the 2026-05-23 VSM eval. The weekly
     # viability report (mimir/viability_metrics.py) emits one event per
     # threshold-crossing it detects. Each is a distinct collapse /
