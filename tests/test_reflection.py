@@ -49,6 +49,11 @@ def test_reflection_prompt_documents_both_tracks():
     # Two tracks the workflow must teach.
     assert "behavioral" in body.lower()
     assert "memory architecture review" in body.lower()
+    # Memory-architecture guardrails added after channel-memory and
+    # memory/issues drift escaped the reflection pass.
+    assert "Channel memory audit" in body
+    assert "Operational issue-file review" in body
+    assert "memory/issues/*.md" in body
     # Promotion criteria — load-bearing for atom-to-core decisions.
     for criterion in ("Recurrence", "Generality", "Stability", "Cost of forgetting"):
         assert criterion in body, f"missing promotion criterion: {criterion}"

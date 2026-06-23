@@ -79,7 +79,7 @@ Before either track, gather inputs:
 - All `memory/core/*.md` files
 - `memory/learnings-pending.md` — candidate behaviors captured by
   `saga_session_end` synthesis turns since last reflection. Promote /
-  drop / keep per §B.4.
+  drop / keep per §B.6.
 - File-count and mtime distribution under `memory/<anywhere>/` and
   `state/wiki/` (Glob + `os.stat`; cheap)
 - **Applied-proposals audit** — invoke the bundled CLI subcommand:
@@ -131,9 +131,11 @@ every week — pick the 2-3 that have the strongest signal.
 
 ## Step 3 — Run track B (memory architecture review)
 
-Run all three sub-passes every week. This is the slow-compounding
+Run all five sub-passes every week. This is the slow-compounding
 work — most weeks produce only a small change, but over months the
-architecture stays tight.
+architecture stays tight. Keep the pass bounded: B.2/B.3/B.4 are the
+routine cleanup core, while B.5/B.6 are quick targeted audits that
+prevent quiet memory drift.
 
 ### B.1 — Core memory cleanup
 
@@ -152,7 +154,7 @@ not ready for a PR, file a Chainlink issue or leave a concise note in
 the reflection summary. Don't auto-apply — core edits are propose-only
 by policy default.
 
-### B.2 — Extended memory review
+### B.2 — Extended memory + wiki review
 
 Walk `memory/<anywhere>/` (everything outside `core/`) and
 `state/wiki/`. Two questions per file:
@@ -165,13 +167,71 @@ Walk `memory/<anywhere>/` (everything outside `core/`) and
 Volume-cap your attention: scan 20-30 files per reflection, not the
 whole tree. Mtime ordering helps — files unmodified for >30 days are
 either evergreen (no action) or obsolete (cleanup candidate). Ones
-edited recently are typically still active.
+edited recently are typically still active. Bias this scan toward the
+heaviest and newest files so large prompt-cost contributors do not hide
+behind directory breadth.
 
 Output: cleanup + promotion candidates as Chainlink issues or, when
 they touch protected surfaces and are ready to review, protected-surface
 proposal PRs.
 
-### B.3 — Atom-to-core promotion + demotion candidates (P47)
+### B.3 — Channel memory audit
+
+Channel memory is auto-injected only for matching channels and capped
+there; misfiling here silently creates dead weight that no turn reads.
+Run a bounded structural audit every reflection:
+
+```bash
+python - <<'PY'
+from pathlib import Path
+root = Path.home() / "memory" / "channels"
+for d in sorted(root.glob("*")):
+    if not d.is_dir():
+        continue
+    files = [p for p in d.rglob("*") if p.is_file()]
+    size = sum(p.stat().st_size for p in files)
+    print(size, len(files), d)
+PY
+```
+
+Flag, don't delete:
+
+- directories over the channel-memory cap (~8 KB injected) or with many
+  files whose first 8 KB probably crowd out the useful facts;
+- non-interactive / synthetic channels (`scheduler:*`, `poller:*`) whose
+  notes would fit better in `memory/issues/`, `state/wiki/`, or a
+  poller-specific runbook;
+- channel dirs that do not correspond to a real bridge channel or known
+  DM (`memory/channels/bluesky/`-style orphan topic dirs);
+- per-session journals or raw transcripts written into channel memory
+  instead of `state/raw/`, `state/wiki/`, or SAGA session boundaries.
+
+Output: Chainlink issues for consolidation/migration candidates. If the
+right fix is a protected filing-rule/prompt change, open a
+protected-surface proposal PR. Do not delete channel files during
+reflection without explicit operator approval.
+
+### B.4 — Operational issue-file review
+
+Review `memory/issues/*.md` as the operational-gotcha layer, not as an
+ever-growing attic. Each issue file earns its `memory/INDEX.md` line by
+being a future symptom fingerprint. Scan a bounded set (10-20 files),
+prioritizing old mtimes, resolved markers, and files whose titles look
+tied to code that has since changed.
+
+For each candidate, ask:
+
+- Is the fingerprint still actionable, or has the underlying bug shipped
+  a fix and the file should be marked resolved/archived by proposal?
+- Is this actually a concept/wiki synthesis misfiled as an issue?
+- Is it a stale workaround that now contradicts current behavior?
+- Is the desc-comment still specific enough to find by error text?
+
+Output: update live issue files only for additive clarifications; file
+Chainlink issues or protected proposals for deletes/restructures. Memory
+file deletion is propose/approval-boundary work.
+
+### B.5 — Atom-to-core promotion + demotion candidates (P47)
 
 Two passes — **promote** the atoms that are growing in usage,
 **flag for cleanup** the atoms that have gone stale.
@@ -218,7 +278,7 @@ consolidation has labeled them), fall back to the cumulative-
 retrieval signal — `--contributed-only` without `--trend`. The
 P47 trend filter is additive, not a hard gate.
 
-### B.4 — Pending-learnings buffer review
+### B.6 — Pending-learnings buffer review
 
 **Pre-step — size check + rotate if needed.** `memory/learnings-pending.md`
 is append-only between reflections. If it has grown past Read's single-call
@@ -295,7 +355,7 @@ Conservative defaults the policy ships with:
   - SAGA atom decay calls
   - SAGA triples linking (additive)
   - Promote/drop entries in `memory/learnings-pending.md` (the
-    weekly review pass — see §B.4 below)
+    weekly review pass — see §B.6 below)
   - Wiki orphan tagging (just flag, don't delete)
 
 - **Propose-only** (HITL — operator review before effect):
