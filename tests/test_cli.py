@@ -11,6 +11,12 @@ import pytest
 from mimir.cli import _print_setup_report, main, setup_home
 
 
+@pytest.fixture(autouse=True)
+def _clear_ambient_model_spec(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep setup-route tests independent from deployment MIMIR_MODEL_SPEC."""
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+
+
 def test_setup_creates_home_layout(tmp_path: Path):
     home = tmp_path / "agent"
     status = setup_home(home)
