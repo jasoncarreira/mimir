@@ -1168,9 +1168,17 @@ def build_app(config: Config) -> web.Application:
                 try:
                     from .defaults_upgrade import (
                         check_and_open_defaults_upgrade,
+                        enqueue_upgrade_prompt_turns,
                         enqueue_upgrade_reconciliation_turn,
+                        read_last_synced_version,
                     )
 
+                    # Capture the version we're upgrading FROM before the check
+                    # advances last-synced-version, so version-specific upgrade
+                    # prompts (chainlink #645) know the transition.
+                    prev_defaults_version = await asyncio.to_thread(
+                        read_last_synced_version, config.home,
+                    )
                     defaults_result = await asyncio.to_thread(
                         check_and_open_defaults_upgrade,
                         config.home,
@@ -1195,6 +1203,22 @@ def build_app(config: Config) -> web.Application:
                                 defaults_result.proposal.branch if defaults_result.proposal else None
                             ),
                             conflicts=defaults_result.conflicts,
+                        )
+                    # Version-specific upgrade prompts (chainlink #645): one-shot
+                    # migration nudges for the version(s) crossed in this bump.
+                    upgrade_prompts_enqueued = await enqueue_upgrade_prompt_turns(
+                        config.home,
+                        previous=prev_defaults_version,
+                        current=defaults_result.version,
+                        action=defaults_result.action,
+                        enqueue=dispatcher.enqueue,
+                    )
+                    if upgrade_prompts_enqueued:
+                        await log_event(
+                            "upgrade_prompts_enqueued",
+                            version=defaults_result.version,
+                            from_version=prev_defaults_version,
+                            count=upgrade_prompts_enqueued,
                         )
                 except Exception as exc:  # noqa: BLE001
                     await log_event(
