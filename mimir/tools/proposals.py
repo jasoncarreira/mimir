@@ -8,9 +8,10 @@ number of files across both surfaces), then submits, which commits + pushes +
 opens one PR. The operator reviews and merges on GitHub; the live files update
 only after the merge. **Merge is the approval event.**
 
-Reflection does NOT use these — it stays in the suggestion lane
-(``state/proposed-changes.md``). Change proposals are deliberate, agent- or
-operator-initiated.
+Reflection and other agent workflows use these for protected-surface
+changes. ``state/proposed-changes.md`` is legacy/migration-only; protected
+``memory/core/*`` and ``prompts/*`` changes should become proposal PRs through
+this tool flow. Change proposals are deliberate, agent- or operator-initiated.
 """
 
 from __future__ import annotations

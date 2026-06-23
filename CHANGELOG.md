@@ -6,6 +6,23 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Runtime now loads `<home>/.env` as defaults (#447).** `Config.from_env()`
+  reads the setup-written file before constructing configuration, while real
+  process environment values still win. This makes fresh setup homes runnable
+  without a one-key scaffold parser and establishes the durable contract:
+  exported deployment env overrides `<home>/.env`; absent `.env` is a no-op.
+
+### Fixed
+
+- **Scheduler cron day-of-week now follows standard crontab numbering.**
+  Numeric day-of-week fields are interpreted as Sunday=0/7, Monday=1, and so on
+  before APScheduler registration. Existing weekly jobs that used numeric weekdays
+  move by one day on upgrade to their standard-cron day (for example, a prior
+  `1` now fires Monday instead of APScheduler's old Tuesday interpretation).
+  chainlink #658.
+
 ## [0.6.4] — 2026-06-22
 
 ### Fixed
@@ -648,10 +665,9 @@ longer hard-codes container paths).
 - **The `claude-code:` model route is deprecated (#634).** Its tools
   execute inside the Claude Code subprocess, bypassing the per-turn tool
   budget and prohibited-action screen. `_resolve_model` refuses it unless
-  opted in via `MIMIR_ALLOW_CLAUDE_CODE=1` (env, or the `<home>/.env`
-  scaffold line that `mimir setup --subscription` now writes for
-  claude-code routes — informed consent at setup time, threaded through
-  every Config-based resolution path).
+  opted in via `MIMIR_ALLOW_CLAUDE_CODE=1`; fresh setup homes can carry
+  that opt-in in `<home>/.env`, which runtime config now loads as defaults
+  while process environment values remain authoritative.
 
 ### Added
 

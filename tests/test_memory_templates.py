@@ -57,6 +57,17 @@ def test_core_memory_non_goals_default_contains_frame_check() -> None:
     assert "Before I implement: is X the right thing?" in text
 
 
+def test_core_memory_non_goals_default_contains_over_filing_check() -> None:
+    text = core_template_text("05-non-goals.md")
+    normalized = " ".join(text.split())
+
+    assert "Don't hoard low-value memory" in text
+    assert "session summary" in text
+    assert "memory/channels/<id>/" in text
+    assert "stable, always-relevant fact for this layer" in normalized
+    assert "use SAGA retrieval instead of a memory file" in normalized
+
+
 def test_core_memory_learned_behaviors_default_contains_frame_check_procedure() -> None:
     text = core_template_text("40-learned-behaviors.md")
     normalized = " ".join(text.split())
@@ -65,6 +76,18 @@ def test_core_memory_learned_behaviors_default_contains_frame_check_procedure() 
     assert "procedural counterpart to the non-goal" in normalized
     assert "Does Y actually want X?" in text
     assert "how should we implement X" in text
+
+
+def test_core_memory_filing_rules_default_documents_channel_memory_semantics() -> None:
+    text = core_template_text("60-filing-rules.md")
+    normalized = " ".join(text.split())
+
+    assert "This is not a session journal" in text
+    assert "top-level files in `memory/channels/X/*.md`" in text
+    assert "Synthetic channels (`scheduler:*`, `poller:*`)" in normalized
+    assert "capped at ~8 KB" in text
+    assert "Episodic detail belongs in SAGA retrieval" in normalized
+    assert "or overgrown channel memory crowds out later facts" in normalized
 
 
 def test_backward_compatible_default_constants_read_template_files() -> None:
