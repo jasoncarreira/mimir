@@ -1167,6 +1167,7 @@ def build_app(config: Config) -> web.Application:
                 )
                 try:
                     from .defaults_upgrade import (
+                        UPGRADE_PROMPT_DISPATCH_ACTIONS,
                         check_and_open_defaults_upgrade,
                         enqueue_upgrade_prompt_turns,
                         enqueue_upgrade_reconciliation_turn,
@@ -1213,7 +1214,10 @@ def build_app(config: Config) -> web.Application:
                         action=defaults_result.action,
                         enqueue=dispatcher.enqueue,
                     )
-                    if upgrade_prompts_enqueued:
+                    if defaults_result.action in UPGRADE_PROMPT_DISPATCH_ACTIONS:
+                        # Log on every consumed bump, count=0 included, so a
+                        # "no upgrade prompt matched" run is observable (#645)
+                        # — not spammed on the common already_synced startup.
                         await log_event(
                             "upgrade_prompts_enqueued",
                             version=defaults_result.version,
