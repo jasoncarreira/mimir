@@ -23,9 +23,9 @@ just operate at different scopes.
 **Trigger**: Making a forward-looking claim with a checkable outcome
 (1-7 day horizon typical) — "the wiki cleanup will reduce orphan
 pages", "Tim will reply within 24h", "this prompt change will drop
-tool errors". Also fires when proposing a change in
-`state/proposed-changes.md` — attach a prediction so the
-applied-proposals audit can verify it.
+tool errors". Also fires when opening a protected-surface proposal PR
+through `open_proposal` / `submit_proposal` — attach the prediction to the
+proposal rationale or PR body so the applied-proposals audit can verify it.
 
 **Requires**: A specific check time / horizon; a claim narrow enough
 to be unambiguously right-or-wrong at horizon (not "things will go
@@ -52,8 +52,9 @@ prediction per claim).
 - You're about to surface something speculative to the operator
   (a Bluesky post, a research finding, a flagged anomaly) and
   there's a clear "did this land or not?" question 1-7 days out.
-- You're proposing a change in `state/proposed-changes.md` —
-  attach a prediction so the audit can verify it.
+- You're proposing a protected-surface change via `open_proposal` /
+  `submit_proposal` — include a prediction in the proposal rationale or PR
+  body so the audit can verify it after merge.
 - You're noticing a pattern and want to test whether it holds.
 
 Don't predict trivially-true or trivially-checkable things. The
