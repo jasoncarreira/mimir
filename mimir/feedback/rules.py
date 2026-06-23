@@ -257,6 +257,12 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # but the stray byte (mojibake / cp1252 paste / mid-write artifact) silently
     # degrades the prompt — surface it so the agent cleans the file. chainlink #470.
     "non_utf8_home_file": ("negative", "non_utf8_home_file"),
+    # A real (non-synthetic) channel's injected memory exceeded the channel
+    # prompt cap. The prompt still truncates with an inline note, but that note
+    # is buried inside the context block and the truncation keeps the oldest
+    # lexicographic content. Negative so the agent/operator trims or refiles
+    # instead of silently running on stale channel context. chainlink #643.
+    "channel_memory_over_cap": ("negative", "channel_memory_over_cap"),
     # SPEC §16 items follow-up from the 2026-05-23 VSM eval. The weekly
     # viability report (mimir/viability_metrics.py) emits one event per
     # threshold-crossing it detects. Each is a distinct collapse /
@@ -272,9 +278,10 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "viability_report_error": ("negative", "viability_error"),
     "applied_audit_ok": ("positive", "applied_audit_ok"),
     "applied_audit_error": ("negative", "applied_audit_error"),
-    # Daily proposed-changes backlog check (mimir/reflection/proposed_changes_health.py).
-    # Surfaces operator review backlog so the agent sees a between-reflection
-    # signal that the human-in-the-loop loop is broken. ``_error`` is the
+    # Daily legacy proposed-changes backlog check
+    # (mimir/reflection/proposed_changes_health.py). Surfaces legacy
+    # operator-review backlog so the agent sees a between-reflection signal
+    # that old HITL entries need migration/cleanup. ``_error`` is the
     # cron-callable's own failure path; the steady-state-healthy case emits
     # nothing (no positive event needed — silence IS the success signal).
     "proposed_changes_backlog": ("negative", "proposed_changes_backlog"),

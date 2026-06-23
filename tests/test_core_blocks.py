@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from mimir.core_blocks import (
+    _CHANNEL_MEMORY_OVER_CAP_REPORTED,
     check_core_blocks_health,
     describe_file,
     extract_desc_comment,
@@ -265,3 +266,65 @@ def test_load_channel_memory_truncates_at_cap(tmp_path: Path, monkeypatch):
     assert len(result.encode("utf-8")) > 50  # truncation note adds chars
     # The actual file content portion is capped
     assert result.startswith("x" * 10)  # at least some content came through
+
+
+def test_load_channel_memory_emits_over_cap_event_once(tmp_path: Path, monkeypatch):
+    import json
+
+    from mimir import core_blocks as cb
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    monkeypatch.setattr(cb, "_CHANNEL_MEMORY_MAX_BYTES", 50)
+    events = tmp_path / "events.jsonl"
+    init_logger(events, session_id="t-643")
+    try:
+        _CHANNEL_MEMORY_OVER_CAP_REPORTED.clear()
+        ch_dir = tmp_path / "memory" / "channels" / "discord-1"
+        ch_dir.mkdir(parents=True)
+        (ch_dir / "a.md").write_text("x" * 60)
+        (ch_dir / "b.md").write_text("y" * 10)
+
+        load_channel_memory(tmp_path, "discord-1")
+        load_channel_memory(tmp_path, "discord-1")
+    finally:
+        _reset_logger_for_tests()
+        _CHANNEL_MEMORY_OVER_CAP_REPORTED.clear()
+
+    lines = [
+        json.loads(line)
+        for line in events.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    emits = [e for e in lines if e.get("type") == "channel_memory_over_cap"]
+    assert len(emits) == 1
+    assert emits[0]["channel_id"] == "discord-1"
+    assert emits[0]["path"] == str(ch_dir)
+    assert emits[0]["bytes"] > emits[0]["cap_bytes"] == 50
+    assert emits[0]["file_count"] == 2
+
+
+def test_load_channel_memory_does_not_emit_for_synthetic_channel(
+    tmp_path: Path, monkeypatch
+):
+    import json
+
+    from mimir import core_blocks as cb
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    monkeypatch.setattr(cb, "_CHANNEL_MEMORY_MAX_BYTES", 50)
+    events = tmp_path / "events.jsonl"
+    init_logger(events, session_id="t-643-synthetic")
+    try:
+        _CHANNEL_MEMORY_OVER_CAP_REPORTED.clear()
+        ch_dir = tmp_path / "memory" / "channels" / "scheduler:heartbeat"
+        ch_dir.mkdir(parents=True)
+        (ch_dir / "notes.md").write_text("x" * 100)
+
+        assert load_channel_memory(tmp_path, "scheduler:heartbeat") is None
+    finally:
+        _reset_logger_for_tests()
+        _CHANNEL_MEMORY_OVER_CAP_REPORTED.clear()
+
+    content = events.read_text(encoding="utf-8") if events.exists() else ""
+    records = [json.loads(line) for line in content.splitlines() if line.strip()]
+    assert [e for e in records if e.get("type") == "channel_memory_over_cap"] == []

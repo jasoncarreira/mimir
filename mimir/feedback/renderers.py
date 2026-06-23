@@ -684,6 +684,25 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"replacement so the turn survives, but it degrades the prompt; "
             f"re-save the file as UTF-8 or remove the stray byte"
         )
+    if rule_kind == "channel_memory_over_cap":
+        channel = _sanitize_field(str(ev.get("channel_id") or "?"))
+        path = _sanitize_field(str(ev.get("path") or "?"))
+        total = ev.get("bytes")
+        cap = ev.get("cap_bytes")
+        files = ev.get("file_count")
+        total_str = str(total) if isinstance(total, int) else "?"
+        cap_str = str(cap) if isinstance(cap, int) else "?"
+        files_str = (
+            f" across {files} file{'' if files == 1 else 's'}"
+            if isinstance(files, int)
+            else ""
+        )
+        return (
+            f"channel memory over cap for {channel}: {total_str}/{cap_str} bytes"
+            f"{files_str} at {path} — injected context is truncated "
+            f"(oldest content wins); "
+            f"trim/refile memory/channels/{channel}"
+        )
     if rule_kind == "mimir_update_available":
         current = ev.get("current") or "?"
         latest = ev.get("latest") or "?"

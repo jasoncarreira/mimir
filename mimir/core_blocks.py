@@ -193,7 +193,8 @@ def load_core(home: Path) -> list[CoreBlock]:
 # - Cap at ``_CHANNEL_MEMORY_MAX_BYTES`` to defend against runaway file
 #   growth. When the cap fires the returned block is truncated with a note
 #   so the agent can see the truncation rather than silently losing tail
-#   content.
+#   content, and an algedonic event is emitted so over-filed real channels
+#   do not stay silently stale.
 
 _CHANNEL_MEMORY_MAX_BYTES: int = 8_000  # ~2k tokens; covers current files with headroom
 
@@ -202,6 +203,45 @@ _CHANNEL_MEMORY_MAX_BYTES: int = 8_000  # ~2k tokens; covers current files with 
 # injection. These channels process automated events (scheduled ticks, poller
 # notifications) where no human operator context is needed.
 _SYNTHETIC_PREFIXES: tuple[str, ...] = ("scheduler:", "poller:")
+
+
+#: Real channels already reported as over the injection cap this process.
+#: Channel memory loads during every turn on that channel, so one oversized
+#: directory would otherwise emit the same algedonic signal every turn.
+#: Re-armed on restart; fixing/trimming the channel simply stops emitting.
+_CHANNEL_MEMORY_OVER_CAP_REPORTED: set[str] = set()
+
+
+def _report_channel_memory_over_cap(
+    *,
+    channel_id: str,
+    channel_dir: Path,
+    total_bytes: int,
+    cap_bytes: int,
+    file_count: int,
+) -> None:
+    """Emit a one-shot ``channel_memory_over_cap`` algedonic signal.
+
+    Best-effort: prompt assembly must keep working even if the event logger is
+    not initialized (CLI helpers, unit tests) or the event sink fails.
+    """
+    key = str(channel_dir)
+    if key in _CHANNEL_MEMORY_OVER_CAP_REPORTED:
+        return
+    _CHANNEL_MEMORY_OVER_CAP_REPORTED.add(key)
+    try:
+        from .event_logger import log_event_sync
+
+        log_event_sync(
+            "channel_memory_over_cap",
+            channel_id=channel_id,
+            path=key,
+            bytes=total_bytes,
+            cap_bytes=cap_bytes,
+            file_count=file_count,
+        )
+    except Exception:  # noqa: BLE001 — signalling is best-effort
+        pass
 
 
 def load_channel_memory(home: Path, channel_id: str) -> str | None:
@@ -215,7 +255,9 @@ def load_channel_memory(home: Path, channel_id: str) -> str | None:
 
     Capped at ``_CHANNEL_MEMORY_MAX_BYTES``; truncated with a note when the
     cap fires so the agent sees the truncation rather than losing content
-    silently.
+    silently. For real (non-synthetic) channels, the cap also emits a
+    ``channel_memory_over_cap`` algedonic signal once per process so the
+    operator/agent sees that channel context has gone stale.
     """
     if not channel_id:
         return None
@@ -242,6 +284,13 @@ def load_channel_memory(home: Path, channel_id: str) -> str | None:
     combined = "\n\n---\n\n".join(parts)
     encoded = combined.encode("utf-8")
     if len(encoded) > _CHANNEL_MEMORY_MAX_BYTES:
+        _report_channel_memory_over_cap(
+            channel_id=channel_id,
+            channel_dir=channel_dir,
+            total_bytes=len(encoded),
+            cap_bytes=_CHANNEL_MEMORY_MAX_BYTES,
+            file_count=len(parts),
+        )
         # Truncate at byte boundary, add visible note.
         truncated = encoded[:_CHANNEL_MEMORY_MAX_BYTES].decode("utf-8", errors="replace")
         combined = truncated + f"\n\n…[channel memory truncated at {_CHANNEL_MEMORY_MAX_BYTES} bytes]"

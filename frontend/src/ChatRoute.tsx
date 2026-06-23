@@ -10,15 +10,66 @@ import type { DashboardSurface } from "./dashboardExtensions";
 import { LiveActivityPanel } from "./LiveActivityPanel";
 import { useRouteState } from "./routeState";
 import { TurnSpansProvider } from "./turn-spans";
-import { Badge, Button, ErrorState } from "./ui";
+import { Badge, Button, Dialog, ErrorState } from "./ui";
 import { useUiState } from "./uiState";
 
 type ChatStreamState = "connecting" | "open" | "error";
 
-// github #581: a glyph palette next to Send. Most insert their symbol into the
-// composer (terminal flavor); "⌫" clears it. Richer per-glyph commands (skills,
-// shortcuts, recall/history) are a follow-up.
-const COMPOSER_GLYPHS = ["/", "⌘", "↑", "↻", "§", "Δ", "⌫", "⇪", "◇", "×", "±", "⇄"] as const;
+// chainlink #581: composer actions are intentionally frontend-local: the
+// chat backend accepts text, so picker "invoke" sends slash-command text
+// through the normal message path while picker "insert" keeps composing.
+const COMPOSER_INSERT_GLYPHS = ["/", "§", "Δ", "◇", "±", "⇄"] as const;
+
+const SKILL_COMMANDS = [
+  { id: "memory", label: "Memory", command: "/memory", description: "Capture or update durable context." },
+  { id: "github", label: "GitHub", command: "/github", description: "Work with PRs, issues, and CI." },
+  { id: "review", label: "Review", command: "/review", description: "Review a pull request and post the result." },
+  { id: "chainlink", label: "Chainlink", command: "/chainlink", description: "Track durable tasks and follow-ups." },
+] as const;
+
+type ComposerShortcut = {
+  id: string;
+  label: string;
+  text: string;
+};
+
+// Single-operator browser convenience: shortcuts are intentionally global to
+// this browser, not keyed by identity/apiKeyEpoch. Chat auth still scopes the
+// actual transcript and send channel server-side.
+const SHORTCUTS_STORAGE_KEY = "mimir.chat.shortcuts";
+
+const DEFAULT_SHORTCUTS: ComposerShortcut[] = [
+  { id: "thanks", label: "Thanks", text: "Thanks — I’ll take a look." },
+  { id: "status", label: "Status", text: "What’s the current status and next blocker?" },
+];
+
+function loadComposerShortcuts(): ComposerShortcut[] {
+  try {
+    const raw = window.localStorage.getItem(SHORTCUTS_STORAGE_KEY);
+    if (!raw) return DEFAULT_SHORTCUTS;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return DEFAULT_SHORTCUTS;
+    const shortcuts = parsed.flatMap((item): ComposerShortcut[] => {
+      if (!item || typeof item !== "object") return [];
+      const id = typeof item.id === "string" ? item.id : "";
+      const label = typeof item.label === "string" ? item.label.trim() : "";
+      const text = typeof item.text === "string" ? item.text : "";
+      if (!id || !label || !text) return [];
+      return [{ id, label, text }];
+    });
+    return shortcuts.length ? shortcuts : DEFAULT_SHORTCUTS;
+  } catch {
+    return DEFAULT_SHORTCUTS;
+  }
+}
+
+function saveComposerShortcuts(shortcuts: ComposerShortcut[]) {
+  try {
+    window.localStorage.setItem(SHORTCUTS_STORAGE_KEY, JSON.stringify(shortcuts));
+  } catch {
+    // Best-effort browser convenience; composing still works without storage.
+  }
+}
 
 function makeDefaultChatSessionId() {
   const generated = `session-${Math.random().toString(36).slice(2, 10)}`;
@@ -63,6 +114,12 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const [channelId, setChannelId] = React.useState("");
   const [sessionId] = React.useState(() => makeDefaultChatSessionId());
   const [composerText, setComposerText] = React.useState("");
+  const [sendInFlight, setSendInFlight] = React.useState(false);
+  const [skillPickerOpen, setSkillPickerOpen] = React.useState(false);
+  const [shortcutPickerOpen, setShortcutPickerOpen] = React.useState(false);
+  const [shortcuts, setShortcuts] = React.useState<ComposerShortcut[]>(() => loadComposerShortcuts());
+  const [shortcutLabel, setShortcutLabel] = React.useState("");
+  const [shortcutText, setShortcutText] = React.useState("");
   const [streamState, setStreamState] = React.useState<ChatStreamState>("connecting");
   const [streamError, setStreamError] = React.useState("");
   // chainlink #583 slice 2: the reply forming live from the turn-event bus
@@ -71,6 +128,8 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const [streamingReply, setStreamingReply] = React.useState("");
   const streamRawRef = React.useRef<{ spanId: string; raw: string } | null>(null);
   const channelIdRef = React.useRef(channelId);
+  const composerInputRef = React.useRef<HTMLTextAreaElement | null>(null);
+  const sendInFlightRef = React.useRef(false);
   // Bottom-anchored timeline: keep the newest message in view as the stack grows.
   const timelineRef = React.useRef<HTMLOListElement | null>(null);
   // github #567: persisted across tab switches (route unmount) — see chatStore.
@@ -85,12 +144,35 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const { data: bootstrap } = useBootstrap();
   const agentName = bootstrap?.ui?.agent_name || "Mimir";
 
-  function applyGlyph(glyph: string) {
-    if (glyph === "⌫") {
-      setComposerText("");
-      return;
-    }
-    setComposerText((current) => current + glyph);
+  function insertComposerText(text: string) {
+    setComposerText((current) => `${current}${text}`);
+  }
+
+  function persistShortcuts(next: ComposerShortcut[]) {
+    setShortcuts(next);
+    saveComposerShortcuts(next);
+  }
+
+  function addShortcut(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const text = shortcutText.trim();
+    if (!text) return;
+    const label = shortcutLabel.trim() || text.slice(0, 28);
+    const next = [
+      ...shortcuts,
+      {
+        id: `custom-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        label,
+        text,
+      },
+    ];
+    persistShortcuts(next);
+    setShortcutLabel("");
+    setShortcutText("");
+  }
+
+  function deleteShortcut(id: string) {
+    persistShortcuts(shortcuts.filter((shortcut) => shortcut.id !== id));
   }
 
   // github #580: clear the listening signal when leaving the chat.
@@ -251,14 +333,17 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     update({ turn: id });
   }
 
-  async function submitMessage(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const text = composerText.trim();
-    if (!text) return;
+  async function sendComposerText(rawText: string, options: { clearComposer?: boolean } = {}) {
+    const text = rawText.trim();
+    if (!text || sendInFlightRef.current) return;
 
+    sendInFlightRef.current = true;
+    setSendInFlight(true);
     const clientId = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const timestamp = new Date().toISOString();
-    setComposerText("");
+    if (options.clearComposer) {
+      setComposerText("");
+    }
     setMessages((current) => [
       ...current,
       {
@@ -294,7 +379,21 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
       setMessages((current) => current.map((item) => (
         item.id === clientId ? { ...item, status: "error", error: message } : item
       )));
+    } finally {
+      sendInFlightRef.current = false;
+      setSendInFlight(false);
     }
+  }
+
+  async function submitMessage(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await sendComposerText(composerText, { clearComposer: true });
+  }
+
+  async function invokeCommand(command: string) {
+    if (sendInFlightRef.current) return;
+    setSkillPickerOpen(false);
+    await sendComposerText(command);
   }
 
   // Keep the transcript bounded — render only the most recent 100 messages for
@@ -349,26 +448,78 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
               aria-label="Message"
               className="ui-input chat-composer__input"
               placeholder="Send a message"
+              ref={composerInputRef}
               value={composerText}
               onChange={(event) => setComposerText(event.target.value)}
               onFocus={() => setComposerActive(true)}
               onBlur={() => setComposerActive(false)}
             />
-            <div className="chat-composer__glyphs" aria-label="Composer glyphs">
-              {COMPOSER_GLYPHS.map((glyph) => (
-                <button
-                  className="chat-composer__glyph"
-                  key={glyph}
-                  onClick={() => applyGlyph(glyph)}
-                  title={glyph === "⌫" ? "Clear" : `Insert ${glyph}`}
-                  type="button"
-                >
-                  {glyph}
-                </button>
+            <div className="chat-composer__actions" aria-label="Composer actions">
+              <button className="chat-composer__action" disabled={sendInFlight} onClick={() => setComposerText("")} type="button">Clear</button>
+              <button className="chat-composer__action" disabled={sendInFlight} onClick={() => setSkillPickerOpen(true)} type="button">Skills</button>
+              <button className="chat-composer__action" disabled={sendInFlight} onClick={() => setShortcutPickerOpen(true)} type="button">Shortcuts</button>
+              <div className="chat-composer__glyphs" aria-label="Composer glyphs">
+                {COMPOSER_INSERT_GLYPHS.map((glyph) => (
+                  <button
+                    aria-label={`Insert ${glyph}`}
+                    className="chat-composer__glyph"
+                    disabled={sendInFlight}
+                    key={glyph}
+                    onClick={() => insertComposerText(glyph)}
+                    title={`Insert ${glyph}`}
+                    type="button"
+                  >
+                    {glyph}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <Button className="chat-composer__send" disabled={!composerText.trim() || sendInFlight} type="submit" variant="primary">{sendInFlight ? "SENDING…" : "SEND"}</Button>
+          </form>
+          <Dialog open={skillPickerOpen} title="Skills" onClose={() => setSkillPickerOpen(false)}>
+            <div className="chat-picker" aria-label="Skill commands">
+              {SKILL_COMMANDS.map((skill) => (
+                <article className="chat-picker__row" key={skill.id}>
+                  <div>
+                    <strong>{skill.label}</strong>
+                    <code>{skill.command}</code>
+                    <p>{skill.description}</p>
+                  </div>
+                  <div className="chat-picker__actions">
+                    <Button disabled={sendInFlight} onClick={() => { insertComposerText(`${skill.command} `); setSkillPickerOpen(false); composerInputRef.current?.focus(); }} type="button" variant="secondary">Insert</Button>
+                    <Button disabled={sendInFlight} onClick={() => void invokeCommand(skill.command)} type="button" variant="primary">{sendInFlight ? "Invoking…" : "Invoke"}</Button>
+                  </div>
+                </article>
               ))}
             </div>
-            <Button className="chat-composer__send" disabled={!composerText.trim()} type="submit" variant="primary">Send</Button>
-          </form>
+          </Dialog>
+          <Dialog open={shortcutPickerOpen} title="Shortcuts" onClose={() => setShortcutPickerOpen(false)}>
+            <div className="chat-picker" aria-label="Composer shortcuts">
+              {shortcuts.map((shortcut) => (
+                <article className="chat-picker__row" key={shortcut.id}>
+                  <div>
+                    <strong>{shortcut.label}</strong>
+                    <p>{shortcut.text}</p>
+                  </div>
+                  <div className="chat-picker__actions">
+                    <Button disabled={sendInFlight} onClick={() => { insertComposerText(shortcut.text); setShortcutPickerOpen(false); composerInputRef.current?.focus(); }} type="button" variant="secondary">Insert</Button>
+                    <Button aria-label={`Delete ${shortcut.label}`} disabled={sendInFlight} onClick={() => deleteShortcut(shortcut.id)} type="button" variant="ghost">Delete</Button>
+                  </div>
+                </article>
+              ))}
+              <form className="chat-shortcut-form" onSubmit={addShortcut}>
+                <label>
+                  Label
+                  <input className="ui-input" onChange={(event) => setShortcutLabel(event.target.value)} value={shortcutLabel} />
+                </label>
+                <label>
+                  Text
+                  <textarea className="ui-input" onChange={(event) => setShortcutText(event.target.value)} value={shortcutText} />
+                </label>
+                <Button disabled={!shortcutText.trim() || sendInFlight} type="submit" variant="primary">Add shortcut</Button>
+              </form>
+            </div>
+          </Dialog>
         </div>
       </section>
       <TurnSpansProvider channel={channelId}>
