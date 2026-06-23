@@ -749,6 +749,36 @@ def _head_commit_date(repo: str, sha: str, token: str) -> str:
     return str(committer.get("date") or "")
 
 
+def _head_has_file_changes_since(
+    repo: str,
+    review_sha: str,
+    head_sha: str,
+    token: str,
+) -> bool | None:
+    """Return whether ``head_sha`` changes files relative to the reviewed
+    commit, or ``None`` when GitHub compare data is unavailable.
+
+    A content-free rebase can refresh the head commit's committer date
+    past a CHANGES_REQUESTED review without changing the tree.  In that
+    case the date-only freshness check would incorrectly suppress the
+    stale-review reminder.  The compare endpoint gives a cheap content
+    guard: an explicit empty ``files`` list means the new head did not
+    change reviewed content, even if the sha/date moved.
+    """
+    if not review_sha or review_sha == head_sha:
+        return False
+    data = _gh_api(f"repos/{repo}/compare/{review_sha}...{head_sha}", token)
+    if not isinstance(data, dict):
+        return None
+    files = data.get("files")
+    if isinstance(files, list):
+        return bool(files)
+    ahead_by = data.get("ahead_by")
+    if ahead_by == 0:
+        return False
+    return None
+
+
 def _check_own_changes_requested(
     repo: str,
     token: str,
@@ -821,20 +851,22 @@ def _check_own_changes_requested(
         # Latest substantive review per reviewer. COMMENTED/PENDING/
         # DISMISSED don't change the blocking state; a reviewer's later
         # APPROVED clears their earlier CHANGES_REQUESTED.
-        latest: dict[str, tuple[str, str]] = {}
+        latest: dict[str, tuple[str, str, str]] = {}
         for review in reviews:
             login = (review.get("user") or {}).get("login") or ""
             state = (review.get("state") or "").upper()
             submitted = review.get("submitted_at") or ""
+            commit_id = review.get("commit_id") or ""
             if not login or login == me or not submitted:
                 continue
             if state not in ("APPROVED", "CHANGES_REQUESTED"):
                 continue
             cur = latest.get(login)
             if cur is None or submitted > cur[0]:
-                latest[login] = (submitted, state)
+                latest[login] = (submitted, state, commit_id)
         blocking = {
-            login: ts for login, (ts, st) in latest.items()
+            login: (ts, commit_id)
+            for login, (ts, st, commit_id) in latest.items()
             if st == "CHANGES_REQUESTED"
         }
         if not blocking:
@@ -845,10 +877,16 @@ def _check_own_changes_requested(
         # Stale only when no commits landed after the newest blocking
         # review. An unknown head-commit date (API hiccup) counts as
         # stale — the per-sha dedupe caps the cost at one reminder.
-        newest_block_ts = max(blocking.values())
+        newest_block_ts, newest_block_sha = max(
+            blocking.values(), key=lambda item: item[0],
+        )
         head_date = _head_commit_date(repo, head_sha, token)
         if head_date and head_date >= newest_block_ts:
-            continue
+            changed = _head_has_file_changes_since(
+                repo, newest_block_sha, head_sha, token,
+            )
+            if changed is not False:
+                continue
         title = pr.get("title", "")
         url = pr.get("html_url", "")
         reviewers = ", ".join(f"@{login}" for login in sorted(blocking))

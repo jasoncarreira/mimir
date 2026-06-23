@@ -25,11 +25,17 @@ def _pr(number: int, sha: str, login: str = "mimir-bot",
     }
 
 
-def _review(login: str, state: str, submitted: str) -> dict:
+def _review(
+    login: str,
+    state: str,
+    submitted: str,
+    commit_id: str = "review-sha",
+) -> dict:
     return {
         "user": {"login": login},
         "state": state,
         "submitted_at": submitted,
+        "commit_id": commit_id,
     }
 
 
@@ -44,10 +50,18 @@ def captured_emits(monkeypatch):
     return events
 
 
-def _patch_api(monkeypatch, *, prs, reviews_by_pr=None, commit_dates=None):
-    """Route ``_gh_api`` calls: PR list, per-PR reviews, commit lookups."""
+def _patch_api(
+    monkeypatch,
+    *,
+    prs,
+    reviews_by_pr=None,
+    commit_dates=None,
+    compares=None,
+):
+    """Route ``_gh_api`` calls: PR list, reviews, commits, compare."""
     reviews_by_pr = reviews_by_pr or {}
     commit_dates = commit_dates or {}
+    compares = compares or {}
 
     def fake_api(endpoint: str, token: str):
         if "/reviews" in endpoint:
@@ -59,6 +73,9 @@ def _patch_api(monkeypatch, *, prs, reviews_by_pr=None, commit_dates=None):
             if date is None:
                 return None  # API failure shape
             return {"commit": {"committer": {"date": date}}}
+        if "/compare/" in endpoint:
+            spec = endpoint.rsplit("/compare/", 1)[1]
+            return compares.get(spec)
         return prs
 
     monkeypatch.setattr(poller, "_gh_api", fake_api)
@@ -115,6 +132,66 @@ def test_commits_after_review_are_not_stale(monkeypatch, captured_emits):
     assert cursor == {}
     assert captured_emits == []
 
+
+def test_content_free_rebase_after_review_is_still_stale(
+    monkeypatch, captured_emits,
+):
+    """A content-free rebase can make committer-date newer than the
+    blocking review without addressing feedback.  Empty compare files
+    keep the stale reminder armed."""
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(642, "rebased-head")],
+        reviews_by_pr={642: [
+            _review(
+                "jasoncarreira",
+                "CHANGES_REQUESTED",
+                "2026-06-11T12:00:00Z",
+                commit_id="reviewed-head",
+            ),
+        ]},
+        commit_dates={"rebased-head": "2026-06-11T13:00:00Z"},
+        compares={"reviewed-head...rebased-head": {"files": [], "ahead_by": 1}},
+    )
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", {},
+    )
+    assert count == 1
+    assert cursor == {"642": "rebased-head"}
+    [ev] = captured_emits
+    assert ev["event_type"] == "pr_changes_requested_stale"
+
+
+def test_real_fix_commit_after_review_suppresses_stale_reminder(
+    monkeypatch, captured_emits,
+):
+    """A newer head with a non-empty diff from the reviewed commit is
+    treated as fixes-pushed/awaiting re-review, so no stale reminder."""
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(643, "fixed-head")],
+        reviews_by_pr={643: [
+            _review(
+                "jasoncarreira",
+                "CHANGES_REQUESTED",
+                "2026-06-11T12:00:00Z",
+                commit_id="reviewed-head",
+            ),
+        ]},
+        commit_dates={"fixed-head": "2026-06-11T13:00:00Z"},
+        compares={
+            "reviewed-head...fixed-head": {
+                "files": [{"filename": "mimir/poller.py"}],
+                "ahead_by": 1,
+            },
+        },
+    )
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", {},
+    )
+    assert count == 0
+    assert cursor == {}
+    assert captured_emits == []
 
 def test_later_approval_clears_blocking_state(monkeypatch, captured_emits):
     """A reviewer's later APPROVED supersedes their earlier
