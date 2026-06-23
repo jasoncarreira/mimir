@@ -342,6 +342,32 @@ def test_non_utf8_home_file_is_negative_and_renders_actionably():
     assert "UTF-8" in line
 
 
+def test_channel_memory_over_cap_is_negative_and_renders_actionably():
+    """chainlink #643: oversized real channel memory surfaces as a negative
+    signal naming the channel/path and remediation target."""
+    from mimir.feedback import classify
+    from mimir.feedback.renderers import _render_event_line
+
+    assert classify("channel_memory_over_cap") == (
+        "negative",
+        "channel_memory_over_cap",
+    )
+    line = _render_event_line(
+        "channel_memory_over_cap",
+        {
+            "channel_id": "discord-1",
+            "path": "memory/channels/discord-1",
+            "bytes": 58000,
+            "cap_bytes": 8000,
+            "file_count": 3,
+        },
+    )
+    assert "discord-1" in line
+    assert "58000/8000 bytes" in line
+    assert "truncated" in line
+    assert "trim/refile" in line
+
+
 def test_scheduler_loop_lag_surfaces_as_negative(tmp_path: Path):
     from mimir.feedback import classify
 
