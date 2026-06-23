@@ -6,6 +6,8 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-06-23
+
 ### Added
 
 - **`turn_failed` events carry a `request_summary` for provider content
@@ -28,6 +30,21 @@ All notable changes will land here. Format loosely follows
   channel-memory review + a memory-hygiene pass. See `upgrades/README.md` for
   the authoring convention.
 
+- **Memory-hygiene scheduled tick (#644).** A weekly deterministic scan
+  (Tuesdays 08:00 UTC, `normal` priority) that surfaces channel-memory bloat,
+  stale/resolved `memory/issues/*`, missing descriptions, and obvious misfiles
+  as bounded cleanup candidates — keeping reflection focused instead of growing
+  more mandatory sub-passes. Flag, don't delete.
+
+- **Composer action buttons (#581).** The web-chat composer's inert glyph grid
+  is replaced with working Clear / Skills / Shortcuts / insert / SEND controls,
+  with an in-flight guard (no double-send) and per-user shortcut snippets.
+
+- **Cluster-observation GEPA evaluator (#626).** An ASI-rich evaluator + GEPA
+  adapter for the SAGA cluster→observation prompt pilot (parser-compatibility
+  gate, symbolic-retention scoring, support/overclaim checks, prompt-overfit
+  regularizer), under `evals/cluster_observation/`.
+
 ### Changed
 
 - **Runtime now loads `<home>/.env` as defaults (#447).** `Config.from_env()`
@@ -35,6 +52,25 @@ All notable changes will land here. Format loosely follows
   process environment values still win. This makes fresh setup homes runnable
   without a one-key scaffold parser and establishes the durable contract:
   exported deployment env overrides `<home>/.env`; absent `.env` is a no-op.
+
+- **Unspecified scheduled-job priority defaults to `normal` instead of `low`
+  (#656).** Periodic jobs are no longer the first thing shed at the mildest
+  quota signal (ELEVATED) — they yield only under real pressure (TIGHT).
+  Explicit `low` remains available for disposable jobs.
+
+- **`state/proposed-changes.md` retired as the protected-surface proposal path
+  (#638, #640).** `memory/core/*` and `prompts/*` changes now route through
+  `open_proposal` / `submit_proposal` PRs; proposed-changes is legacy/migration
+  only.
+
+- **Default channel-memory filing rules clarified + over-filing non-goal added
+  (#635, #636).** Bundled core memory now documents what auto-loads (top-level
+  `memory/channels/<id>/*.md`, ~8 KB cap, synthetic channels excluded) and warns
+  against hoarding low-value/episodic notes (use SAGA retrieval instead).
+
+- **External tool pins bumped (#632).** `@openai/codex` 0.139.0 → 0.141.0 and
+  `@anthropic-ai/claude-code` 2.1.177 → 2.1.185. `gogcli` held at v0.9.0 pending
+  an authenticated `gog` smoke (its smoke command + risk note were hardened).
 
 ### Fixed
 
@@ -51,6 +87,15 @@ All notable changes will land here. Format loosely follows
   move by one day on upgrade to their standard-cron day (for example, a prior
   `1` now fires Monday instead of APScheduler's old Tuesday interpretation).
   chainlink #658.
+
+- **github-poller detects stale reviews after a content-free rebase (#558).**
+  Compares the PR's own patch signature at review time vs. now (equal = a
+  content-free rebase) instead of the unreliable `compare.files` heuristic, so a
+  rebase that didn't address a `CHANGES_REQUESTED` review still re-nudges.
+
+- **Scheduler dashboard `LAST` shows the persistent all-time last fire (#657).**
+  Sourced from the event log (bounded scan) rather than only the current
+  process, so a job that fired before the last restart no longer shows `n/a`.
 
 ## [0.6.4] — 2026-06-22
 
