@@ -53,6 +53,7 @@ DEFAULT_ENV_TEMPLATE = dedent(
     # ``mimir setup --model <name>`` auto-detects the right prefix +
     # writes ANTHROPIC_BASE_URL when the provider needs one (Minimax,
     # Moonshot). Without --model, mimir uses ``anthropic:claude-sonnet-4-6``.
+    # Runtime loads this file as defaults; exported environment wins.
     MIMIR_MODEL_SPEC=
 
     # ---- LLM gateway (Anthropic-compatible) ------------------------------
@@ -692,16 +693,12 @@ def setup_home(
     """
     from ..model_registry import detect_route
     route = detect_route(model, subscription=subscription)
-    # The runtime (``mimir run`` → ``Config.from_env``) reads
-    # MIMIR_MODEL_SPEC from the process environment (compose.env in
-    # docker, or an exported var) — it does NOT load <home>/.env, and it
-    # ignores this --model/default once the env var is set. So when the
-    # env var is present, THAT is the agent's real model: report it in
-    # the setup banner (deriving provider/billing via the same
-    # detect_route), or the banner contradicts what ``mimir run`` does.
-    # setup still scaffolds <home>/.env from ``route`` (the --model /
-    # default) as a template — separate from what the runtime resolves.
-    # (chainlink #297)
+    # Runtime loads <home>/.env as defaults; exported environment still wins.
+    # When MIMIR_MODEL_SPEC is already in the process environment, that is
+    # the effective model for this setup run and for ``mimir run``. Setup
+    # still writes <home>/.env from ``route`` (the --model/default) so a
+    # fresh local quickstart works without manual exports.
+    # (chainlink #447)
     env_spec = os.environ.get("MIMIR_MODEL_SPEC", "").strip()
     effective_route = detect_route(env_spec) if env_spec else route
     model_spec_from_env = bool(env_spec)
@@ -1046,10 +1043,9 @@ def _print_setup_report(status: dict[str, object]) -> None:
             print(f"  model adapter: pip install mimir-agent[{adapter_extra}]")
         if status.get("model_spec_from_env"):
             print(
-                "                 ↑ from MIMIR_MODEL_SPEC in the environment "
-                "(e.g. compose.env) — this is what `mimir run` uses;"
+                "                 ↑ from exported MIMIR_MODEL_SPEC — this "
+                "overrides <home>/.env defaults and is what `mimir run` uses;"
             )
-            print("                   <home>/.env is NOT read at runtime.")
             _default_spec = status.get("setup_default_spec")
             if _default_spec and _default_spec != model_spec:
                 print(
@@ -1108,7 +1104,8 @@ def _print_setup_report(status: dict[str, object]) -> None:
     print(f"        (or `claude login` for an interactive session — same effect.)")
     print(f"     b. Anthropic API:    set ANTHROPIC_API_KEY in {home}/.env")
     print(f"     c. Gateway (e.g. LiteLLM, OpenRouter):")
-    print(f"        set ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN in .env")
+    print(f"        set ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN in {home}/.env")
+    print(f"     ({home}/.env is loaded as defaults; exported environment wins.)")
     # Embedding-provider-specific guidance — the saga.toml mimir setup
     # generated has provider=<preset>, so the step here surfaces the
     # matching env var. Falls back to fastembed automatically if the

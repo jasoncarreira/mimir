@@ -70,12 +70,11 @@ def test_setup_creates_home_layout(tmp_path: Path):
 def test_setup_banner_reports_effective_env_model_spec(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    """chainlink #297: the runtime (``mimir run`` → ``Config.from_env``)
-    resolves MIMIR_MODEL_SPEC from the environment — NOT <home>/.env or
-    the --model default. So when it's set, setup's status/banner must
-    report THAT, or it contradicts what the agent actually runs. (The
-    mimirbot Codex cutover hit exactly this: banner said anthropic while
-    the agent ran codex-plus.)"""
+    """chainlink #447: exported MIMIR_MODEL_SPEC beats <home>/.env defaults.
+
+    When it is set before setup, setup's status/banner must report THAT, or it
+    contradicts what the agent actually runs. (The mimirbot Codex cutover hit
+    exactly this: banner said anthropic while the agent ran codex-plus.)"""
     from mimir.model_registry import PROVIDER_OPENAI
 
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.4")

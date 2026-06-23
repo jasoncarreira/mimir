@@ -20,6 +20,7 @@ remaining surface.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -348,6 +349,40 @@ class TestConfigFromEnv:
         from mimir.config import Config
         cfg = Config.from_env()
         assert cfg.recent_sources is None
+
+    def test_home_dotenv_loads_defaults(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        (tmp_path / ".env").write_text(
+            "MIMIR_MODEL_SPEC=anthropic:claude-haiku-4-5\n"
+            "ANTHROPIC_API_KEY=from-dotenv\n",
+            encoding="utf-8",
+        )
+
+        from mimir.config import Config
+        cfg = Config.from_env()
+
+        assert cfg.model_spec == "anthropic:claude-haiku-4-5"
+        assert cfg.anthropic_api_key == "from-dotenv"
+        assert os.environ["ANTHROPIC_API_KEY"] == "from-dotenv"
+
+    def test_home_dotenv_does_not_override_exported_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:gpt-4.1-mini")
+        (tmp_path / ".env").write_text(
+            "MIMIR_MODEL_SPEC=anthropic:claude-haiku-4-5\n",
+            encoding="utf-8",
+        )
+
+        from mimir.config import Config
+        cfg = Config.from_env()
+
+        assert cfg.model_spec == "openai:gpt-4.1-mini"
 
 
 # ---------------------------------------------------------------------------
