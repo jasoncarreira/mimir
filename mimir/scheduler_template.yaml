@@ -1,7 +1,7 @@
 # mimir scheduler — APScheduler cron jobs that enqueue LLM ticks.
 # Each job triggers a turn on ``channel_id`` with ``trigger=scheduled_tick``.
 #
-# Four recurring LLM ticks are enabled by default:
+# Five recurring LLM ticks are enabled by default:
 #
 #   - heartbeat: hourly autonomous-work cadence. Pulls one item from
 #     state/heartbeat-backlog.md and does it. The §12.4 homeostat
@@ -11,6 +11,11 @@
 #     SAGA consolidation cron runs nightly at 04:00 UTC, so by the
 #     time reflection fires Sunday morning the most recent
 #     consolidation pass is two hours old.
+#   - memory-hygiene: weekly deterministic scan for memory filing
+#     drift (Tuesdays 08:00 UTC, normal priority). Surfaces bounded
+#     cleanup candidates for channel-memory bloat, stale/resolved
+#     issue files, missing descriptions, and obvious misfiles without
+#     turning reflection into a grab-bag audit runner.
 #   - issues-audit: monthly triage of the memory/issues/ gotcha layer
 #     (1st of month, 07:00 UTC). Retires resolved entries, files
 #     chainlink bugs for real code-level gotchas, escalates judgment
@@ -64,6 +69,12 @@
   cron: "0 6 * * 0"
   channel_id: null   # synthetic scheduler:reflect channel
   prompt_file: reflect.md
+
+- name: memory-hygiene
+  cron: "0 8 * * 2"   # Tuesdays 08:00 UTC
+  priority: normal
+  channel_id: null     # synthetic scheduler:memory-hygiene channel
+  prompt_file: memory-hygiene.md
 
 - name: issues-audit
   cron: "0 7 1 * *"   # 1st of month, 07:00 UTC
