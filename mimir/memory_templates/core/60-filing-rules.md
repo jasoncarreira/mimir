@@ -24,10 +24,18 @@ how urgent the cleanup is and what the right home looks like.
   Session-scoped notes, candidate learnings, raw source material → NOT
   here.
   *Severity if misfiled into core: system-breaking (prompt inflation).*
-- **`memory/channels/<id>/`** — per-channel facts. Operator name,
-  preferences, channel-specific patterns. Cross-channel content goes
+- **`memory/channels/<id>/`** — small curated facts for a real
+  channel: operator name, preferences, and recurring channel-specific
+  patterns. This is not a session journal. On turns for real channel
+  `X`, top-level files in `memory/channels/X/*.md` are concatenated in
+  lexical order, capped at ~8 KB; over-cap content is silently truncated
+  from the tail, so keep files compact and prefix durable summaries with
+  `00-` / `10-` when order matters. Synthetic channels (`scheduler:*`,
+  `poller:*`) and topic-shaped folders never auto-load. Episodic detail
+  belongs in SAGA retrieval, not channel files. Cross-channel content goes
   elsewhere.
-  *Severity if misfiled: drift-amplifier (channel injection misses it).*
+  *Severity if misfiled: drift-amplifier (channel injection misses it,
+  or overgrown channel memory crowds out later facts).*
 - **`memory/issues/`** — operational-gotcha fingerprints. Failure-mode
   notes, infra gotchas, runbook-shaped entries. Each entry surfaces in
   the every-turn `memory/INDEX.md` description list — its purpose is
