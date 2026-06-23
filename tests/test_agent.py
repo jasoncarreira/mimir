@@ -2180,7 +2180,7 @@ def test_resolve_model_claude_code_home_dotenv_opt_in(tmp_path, monkeypatch):
     )
     cfg = Config.from_env()
     try:
-        _resolve_model(cfg.model_spec, home=cfg.home)
+        _resolve_model(cfg.model_spec)
     except RuntimeError as exc:
         pytest.fail(f"deprecation gate fired despite home .env opt-in: {exc}")
     except ImportError:

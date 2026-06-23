@@ -384,6 +384,20 @@ class TestConfigFromEnv:
 
         assert cfg.model_spec == "openai:gpt-4.1-mini"
 
+    def test_home_dotenv_absent_is_noop(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+        assert not (tmp_path / ".env").exists()
+
+        from mimir.config import Config
+        cfg = Config.from_env()
+
+        assert cfg.model_spec == "claude-code:claude-sonnet-4-6"
+        assert not (tmp_path / ".env").exists()
+
 
 # ---------------------------------------------------------------------------
 # Config properties

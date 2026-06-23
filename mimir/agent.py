@@ -289,7 +289,6 @@ def _resolve_model(
     max_tokens: int = 0,
     reasoning_effort: str = "",
     rate_limit_callback: Callable[[Any], None] | None = None,
-    home: Path | None = None,
 ) -> BaseChatModel:
     """Translate a mimir-friendly model spec into a constructed BaseChatModel.
 
@@ -1120,10 +1119,6 @@ class Agent:
                         self._config, "model_reasoning_effort", ""
                     ),
                     rate_limit_callback=codex_plus_callback,
-                    # chainlink #426: lets the deprecation gate honor the
-                    # scaffolded opt-in in <home>/.env (setup-written
-                    # operator intent) — see the gate comment.
-                    home=getattr(self._config, "home", None),
                 )
 
             if self._agent_tools is None:

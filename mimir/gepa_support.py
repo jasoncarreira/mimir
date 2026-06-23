@@ -90,10 +90,5 @@ def reflection_lm_from_config(config: Any | None = None) -> Callable[[str], str]
         max_retries=getattr(cfg, "model_max_retries", 6),
         max_tokens=getattr(cfg, "model_max_tokens", 0),
         reasoning_effort=getattr(cfg, "model_reasoning_effort", ""),
-        # Config.from_env loads <home>/.env as defaults before Config-based
-        # model resolution. Keep passing home for custom callers that still
-        # want path-aware model adapters, but the claude-code opt-in itself is
-        # now read from os.environ rather than by a one-key scaffold parser.
-        home=getattr(cfg, "home", None),
     )
     return chat_model_as_reflection_lm(model)
