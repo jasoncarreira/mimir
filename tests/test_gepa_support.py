@@ -101,9 +101,6 @@ def test_reflection_lm_from_config_wires_resolved_model(monkeypatch):
         "max_retries": 4,
         "max_tokens": 1234,
         "reasoning_effort": "medium",
-        # chainlink #426: home threads through every Config-based
-        # resolution so the deprecation gate sees the scaffolded opt-in.
-        "home": None,
     }
 
 

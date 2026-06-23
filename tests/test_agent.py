@@ -1730,6 +1730,45 @@ async def test_run_turn_failed_event_includes_traceback_for_model_loop_errors(
     assert "tests/test_agent.py" in failed[0]["traceback"]
 
 
+async def test_run_turn_failed_event_includes_request_summary_when_present(
+    tmp_path: Path,
+):
+    """A provider error carrying ``request_summary`` (langchain-codex-plus
+    >= 0.0.5 sets it on CodexResponseError) surfaces that PII-light content
+    inventory onto ``turn_failed`` so a content rejection names itself."""
+    import json
+
+    class _ErrWithSummary(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__("HTTP 400: Unsupported content type")
+            self.request_summary = {
+                "unexpected_content_types": ["input_audio"],
+                "images": [{"role": "user", "mime": "image/svg+xml"}],
+            }
+
+    class ExplodingAgent:
+        async def astream(self, state, *, config, stream_mode="values"):
+            raise _ErrWithSummary()
+            yield  # pragma: no cover - makes this an async generator
+
+    agent = _build_agent(
+        tmp_path, fake_agent=ExplodingAgent(), fake_saga=None,
+        session_manager=_FakeSessionManager(),
+    )
+
+    await agent.run_turn(
+        AgentEvent(trigger="scheduled_tick", channel_id="scheduler:heartbeat", content="x")
+    )
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    failed = [e for e in evs if e.get("type") == "turn_failed"]
+    assert len(failed) == 1
+    summary = failed[0]["request_summary"]
+    assert summary["unexpected_content_types"] == ["input_audio"]
+    assert summary["images"][0]["mime"] == "image/svg+xml"
+
+
 async def test_early_phase_poller_crash_still_emits_turn_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -2163,72 +2202,26 @@ def test_resolve_model_claude_code_deprecated_by_default(monkeypatch):
         _resolve_model("claude-code:claude-sonnet-4-6")
 
 
-def test_resolve_model_claude_code_override_passes_gate(monkeypatch):
-    """With the opt-in set, the gate steps aside — resolution proceeds to
-    the normal import path (ImportError in envs without the fork, never
-    the deprecation RuntimeError)."""
+def test_resolve_model_claude_code_home_dotenv_opt_in(tmp_path, monkeypatch):
+    """chainlink #447: Config.from_env loads <home>/.env defaults, so the
+    setup-written claude-code opt-in reaches normal model resolution."""
     from mimir.agent import _resolve_model
+    from mimir.config import Config
 
-    monkeypatch.setenv("MIMIR_ALLOW_CLAUDE_CODE", "1")
-    try:
-        _resolve_model("claude-code:claude-sonnet-4-6")
-    except RuntimeError as exc:
-        pytest.fail(f"gate fired despite override: {exc}")
-    except ImportError:
-        pass  # fork not installed in this env — expected past the gate
-
-
-def test_resolve_model_claude_code_scaffold_opt_in(tmp_path, monkeypatch):
-    """chainlink #426 (review follow-up): Config.from_env reads os.environ
-    only, so 'mimir setup --subscription' writing MIMIR_ALLOW_CLAUDE_CODE=1
-    into <home>/.env never reaches a bare 'mimir run' through env. The gate
-    consumes the scaffold line directly — setup-written operator intent for
-    this home — so the supported Max quickstart works without a shell
-    export. Env absent + no scaffold still refuses."""
-    from mimir.agent import _resolve_model
-
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
     monkeypatch.delenv("MIMIR_ALLOW_CLAUDE_CODE", raising=False)
-
-    # No scaffold → still refused.
-    with pytest.raises(RuntimeError, match="deprecated"):
-        _resolve_model("claude-code:claude-sonnet-4-6", home=tmp_path)
-
-    # Scaffolded opt-in (what setup writes for claude-code routes) → gate
-    # steps aside; resolution proceeds to the import path.
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
     (tmp_path / ".env").write_text(
         "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6\n"
         "MIMIR_ALLOW_CLAUDE_CODE=1\n",
         encoding="utf-8",
     )
+    cfg = Config.from_env()
     try:
-        _resolve_model("claude-code:claude-sonnet-4-6", home=tmp_path)
+        _resolve_model(cfg.model_spec)
     except RuntimeError as exc:
-        pytest.fail(f"gate fired despite scaffolded opt-in: {exc}")
-    except ImportError:
-        pass  # fork not installed — expected past the gate
-
-
-def test_reflection_lm_honors_scaffold_opt_in(tmp_path, monkeypatch):
-    """chainlink #426 (review follow-up 3): every Config-based
-    _resolve_model caller must thread home= — gepa_support's
-    reflection-LM construction previously missed it, so a
-    subscription-scaffolded home worked for the main agent but the
-    reflection LM still refused the claude-code route."""
-    from types import SimpleNamespace
-    pytest.importorskip("gepa")
-    from mimir.gepa_support import reflection_lm_from_config
-
-    monkeypatch.delenv("MIMIR_ALLOW_CLAUDE_CODE", raising=False)
-    (tmp_path / ".env").write_text(
-        "MIMIR_ALLOW_CLAUDE_CODE=1\n", encoding="utf-8",
-    )
-    cfg = SimpleNamespace(
-        model_spec="claude-code:claude-sonnet-4-6", home=tmp_path,
-    )
-    try:
-        reflection_lm_from_config(cfg)
-    except RuntimeError as exc:
-        pytest.fail(f"deprecation gate fired despite scaffolded opt-in: {exc}")
+        pytest.fail(f"deprecation gate fired despite home .env opt-in: {exc}")
     except ImportError:
         pass  # langchain-claude-code fork not installed — past the gate
 

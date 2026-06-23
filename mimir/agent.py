@@ -289,7 +289,6 @@ def _resolve_model(
     max_tokens: int = 0,
     reasoning_effort: str = "",
     rate_limit_callback: Callable[[Any], None] | None = None,
-    home: Path | None = None,
 ) -> BaseChatModel:
     """Translate a mimir-friendly model spec into a constructed BaseChatModel.
 
@@ -337,33 +336,12 @@ def _resolve_model(
         # is being retired, so rather than maintain gating code for a
         # provider nobody exercises, the route is refused at resolve time
         # with an explicit opt-out for operators who accept the gap.
-        # The opt-in is honored from os.environ OR the home scaffold
-        # (``<home>/.env``). Config.from_env reads os.environ only —
-        # the runtime contract since #510/#297 — so ``mimir setup
-        # --subscription`` writing the allow flag into ``.env`` would
-        # never reach a bare ``mimir run`` through env alone, and the
-        # supported Max quickstart would crash at first resolution
-        # (caught in #634 review). The scaffold line IS durable
-        # operator intent for this home (setup writes it only when the
-        # operator explicitly chose a claude-code route), so the gate
-        # consumes it directly — narrowly scoped to this one key; the
-        # general env contract is unchanged.
-        def _scaffold_allows() -> bool:
-            if home is None:
-                return False
-            try:
-                from .skill_install import _read_env_file
-                value = _read_env_file(home / ".env").get(
-                    "MIMIR_ALLOW_CLAUDE_CODE", "",
-                )
-            except Exception:  # noqa: BLE001 — unreadable scaffold = no opt-in
-                return False
-            return value.strip() in ("1", "true", "yes")
-
-        if (
-            os.environ.get("MIMIR_ALLOW_CLAUDE_CODE", "").strip()
-            not in ("1", "true", "yes")
-            and not _scaffold_allows()
+        # The opt-in is honored from the runtime environment.
+        # Config.from_env loads ``<home>/.env`` as defaults before the agent
+        # resolves models, so setup-written operator intent reaches this gate
+        # without a one-key scaffold parser here.
+        if os.environ.get("MIMIR_ALLOW_CLAUDE_CODE", "").strip() not in (
+            "1", "true", "yes",
         ):
             raise RuntimeError(
                 "MIMIR_MODEL_SPEC=claude-code:* is deprecated and disabled: "
@@ -1141,10 +1119,6 @@ class Agent:
                         self._config, "model_reasoning_effort", ""
                     ),
                     rate_limit_callback=codex_plus_callback,
-                    # chainlink #426: lets the deprecation gate honor the
-                    # scaffolded opt-in in <home>/.env (setup-written
-                    # operator intent) — see the gate comment.
-                    home=getattr(self._config, "home", None),
                 )
 
             if self._agent_tools is None:
@@ -1741,6 +1715,11 @@ class Agent:
 
         error: str | None = None
         exception_traceback: str | None = None
+        # PII-light request-content inventory attached to provider errors
+        # (e.g. CodexResponseError on "HTTP 400: Unsupported content type")
+        # so a content rejection is queryable in events.jsonl. The getattr
+        # below keeps this inert on provider versions that don't surface it.
+        turn_error_request_summary: dict[str, Any] | None = None
         messages: list[Any] = []
         output = ""
         # chainlink #376 (PR 3/4): (event, fold_monotonic) for each message
@@ -1827,6 +1806,12 @@ class Agent:
             exception_traceback = "".join(
                 traceback.format_exception(type(exc), exc, exc.__traceback__, limit=16)
             )
+            # langchain-codex-plus >= 0.0.5 attaches a request-content summary
+            # to CodexResponseError; surface it on turn_failed so a content
+            # rejection (e.g. "Unsupported content type") names itself.
+            _req_summary = getattr(exc, "request_summary", None)
+            if isinstance(_req_summary, dict):
+                turn_error_request_summary = _req_summary
             events = []
             log.exception("agent.astream failed: %s", exc)
             # Mid-turn quota exhaustion handling (SPEC §4.9 / §16 item 18).
@@ -1953,6 +1938,10 @@ class Agent:
                 **(
                     {"traceback": exception_traceback[-4000:]}
                     if exception_traceback else {}
+                ),
+                **(
+                    {"request_summary": turn_error_request_summary}
+                    if turn_error_request_summary else {}
                 ),
                 **_turn_outcome_identity(event),
             )
@@ -2879,6 +2868,19 @@ class Agent:
             cross_hours=self._config.recent_cross_hours,
             source_allowlist=self._config.recent_sources,
         )
+        # Channel memory injection (chainlink #187): load per-channel fact
+        # files (operator name, preferences, patterns) from
+        # ``memory/channels/<channel_id>/``. Returns None for synthetic
+        # channels (scheduler:*, poller:*) and channels with no memory files.
+        #
+        # Load before Recent feedback so the over-cap algedonic signal emitted
+        # by load_channel_memory() is visible on the same turn, not the next.
+        from .core_blocks import load_channel_memory
+        channel_memory_block = await asyncio.to_thread(
+            load_channel_memory,
+            self._config.home,
+            event.channel_id or "",
+        )
         feedback_block = (
             self._feedback.recent_block()
             if self._config.feedback_limit_per_polarity > 0
@@ -2979,16 +2981,6 @@ class Agent:
             for _aid in _injected_ids:
                 if _aid not in ctx.injected_skill_atom_ids:
                     ctx.injected_skill_atom_ids.append(_aid)
-        # Channel memory injection (chainlink #187): load per-channel fact
-        # files (operator name, preferences, patterns) from
-        # ``memory/channels/<channel_id>/``.  Returns None for synthetic
-        # channels (scheduler:*, poller:*) and channels with no memory files.
-        from .core_blocks import load_channel_memory
-        channel_memory_block = await asyncio.to_thread(
-            load_channel_memory,
-            self._config.home,
-            event.channel_id or "",
-        )
         # chainlink #508: resolve an optional deliver: channel (poller / tick),
         # mapping the OPERATOR_CHANNEL sentinel → the operator alert channel.
         deliver_channel = resolve_deliver_channel(

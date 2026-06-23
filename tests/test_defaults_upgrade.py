@@ -427,3 +427,102 @@ async def test_upgrade_fallback_prompt_instructs_operator_notification(
     assert await du.enqueue_upgrade_reconciliation_turn(home, result, fake_enqueue) is True
     assert "send_message" in events[0].content
     assert "operator alert" in events[0].content.lower()
+
+
+# ── version-specific upgrade prompts (chainlink #645) ────────────────────
+
+
+def _fake_upgrade_prompts(monkeypatch: pytest.MonkeyPatch, mapping: dict[str, str]) -> None:
+    monkeypatch.setattr(du, "bundled_upgrade_prompts", lambda: dict(mapping))
+
+
+def test_pending_upgrade_prompts_exact_edge(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_upgrade_prompts(monkeypatch, {"0.6.5": "x", "0.7.0": "y"})
+    assert du.pending_upgrade_prompt_versions("0.6.4", "0.6.5") == ["0.6.5"]
+
+
+def test_pending_upgrade_prompts_cumulative_skip(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_upgrade_prompts(monkeypatch, {"0.6.5": "a", "0.6.6": "b", "0.6.7": "c", "0.7.0": "d"})
+    # 0.6.4 -> 0.6.7 runs every intermediate prompt in (prev, cur], oldest first
+    assert du.pending_upgrade_prompt_versions("0.6.4", "0.6.7") == ["0.6.5", "0.6.6", "0.6.7"]
+
+
+def test_pending_upgrade_prompts_absent_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_upgrade_prompts(monkeypatch, {"0.7.0": "later"})
+    assert du.pending_upgrade_prompt_versions("0.6.4", "0.6.5") == []
+
+
+def test_pending_upgrade_prompts_fresh_install_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_upgrade_prompts(monkeypatch, {"0.6.5": "x"})
+    assert du.pending_upgrade_prompt_versions(None, "0.6.5") == []
+
+
+def test_pending_upgrade_prompts_no_forward_movement(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_upgrade_prompts(monkeypatch, {"0.6.5": "x"})
+    assert du.pending_upgrade_prompt_versions("0.6.5", "0.6.5") == []
+    assert du.pending_upgrade_prompt_versions("0.7.0", "0.6.5") == []
+
+
+def test_bundled_upgrade_prompts_ships_065() -> None:
+    # The first real upgrade prompt is discoverable, keyed by target version.
+    prompts = du.bundled_upgrade_prompts()
+    assert "0.6.5" in prompts
+    assert "memory-hygiene" in prompts["0.6.5"]
+    assert "README" not in prompts  # the authoring doc is not a prompt
+
+
+async def test_enqueue_upgrade_prompts_dispatches_once_per_bump(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _fake_upgrade_prompts(monkeypatch, {"0.6.5": "---\nname: u\n---\nbody {from}->{to} ({version})"})
+    events = []
+
+    async def fake_enqueue(event):
+        events.append(event)
+        return True
+
+    n = await du.enqueue_upgrade_prompt_turns(
+        tmp_path, previous="0.6.4", current="0.6.5",
+        action="proposal_opened", enqueue=fake_enqueue,
+    )
+    assert n == 1
+    ev = events[0]
+    assert ev.channel_id == "upgrade-prompt:0.6.5"
+    assert ev.trigger == du.UPGRADE_TRIGGER
+    assert "body 0.6.4->0.6.5 (0.6.5)" in ev.content
+    assert ev.extra["from_version"] == "0.6.4"
+    assert ev.extra["to_version"] == "0.6.5"
+
+
+async def test_enqueue_upgrade_prompts_skips_non_bump_action(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _fake_upgrade_prompts(monkeypatch, {"0.6.5": "x"})
+    events = []
+
+    async def fake_enqueue(event):
+        events.append(event)
+        return True
+
+    # already_synced doesn't advance last-synced-version → no dispatch (once-only)
+    n = await du.enqueue_upgrade_prompt_turns(
+        tmp_path, previous="0.6.4", current="0.6.5",
+        action="already_synced", enqueue=fake_enqueue,
+    )
+    assert n == 0
+    assert events == []
+
+
+async def test_enqueue_upgrade_prompts_fresh_install_noop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _fake_upgrade_prompts(monkeypatch, {"0.6.5": "x"})
+
+    async def fake_enqueue(event):  # pragma: no cover - must not be called
+        raise AssertionError("fresh install should not dispatch upgrade prompts")
+
+    n = await du.enqueue_upgrade_prompt_turns(
+        tmp_path, previous=None, current="0.6.5",
+        action="baseline_initialized", enqueue=fake_enqueue,
+    )
+    assert n == 0

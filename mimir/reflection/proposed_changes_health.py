@@ -1,23 +1,23 @@
-"""Backlog health check for ``state/proposed-changes.md``.
+"""Legacy backlog health check for ``state/proposed-changes.md``.
 
-The reflection skill writes proposals to ``state/proposed-changes.md`` under
-the ``## Pending`` header. The operator reviews and applies them via
-``mimir reflection mark-applied <id>`` on their own cadence. If the operator
-falls behind, the pending list grows unbounded — the agent has no
-between-reflection signal that the human-in-the-loop loop is broken.
+``state/proposed-changes.md`` was the pre-proposal-PR HITL queue for
+reflection recommendations. Protected surfaces now route through
+``open_proposal`` / ``submit_proposal`` instead, but existing deployments may
+still carry legacy pending entries. This module surfaces that legacy backlog so
+it can be migrated or cleared instead of silently rotting.
 
-This module is the daily cron callable that surfaces backlog growth as an
-algedonic event. Cadence: 07:00 UTC daily (chosen to land before typical
+This module is the daily cron callable that surfaces legacy backlog growth as
+an algedonic event. Cadence: 07:00 UTC daily (chosen to land before typical
 operator work hours so the signal is visible at the start of the day).
 
 Thresholds (calibrated against early production data):
 - ``pending_threshold = 10`` — operator reviews have fallen behind enough
   to be visible at-a-glance.
 - ``oldest_age_threshold_days = 21`` — three weeks of inaction on the oldest
-  pending suggests it was de-facto dropped rather than waiting on review.
+  pending suggests it was de-facto dropped rather than waiting on migration/review.
 
 Either threshold crossing triggers an emit; the algedonic block then surfaces
-the count + oldest-age every turn until the operator reduces the backlog.
+the count + oldest-age every turn until the operator migrates or reduces the backlog.
 """
 
 from __future__ import annotations
