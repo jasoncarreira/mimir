@@ -146,8 +146,11 @@ Walk `memory/core/*.md` block by block. For each:
 - Is it overgrown (>~30 lines)? Should it be split?
 - Is the desc-comment first line still right?
 
-Output: per-block recommendations into `state/proposed-changes.md`.
-Don't auto-apply — core edits are propose-only by policy default.
+Output: for real core-memory changes, open a protected-surface
+proposal worktree and submit a proposal PR. For observations that are
+not ready for a PR, file a Chainlink issue or leave a concise note in
+the reflection summary. Don't auto-apply — core edits are propose-only
+by policy default.
 
 ### B.2 — Extended memory review
 
@@ -164,8 +167,9 @@ whole tree. Mtime ordering helps — files unmodified for >30 days are
 either evergreen (no action) or obsolete (cleanup candidate). Ones
 edited recently are typically still active.
 
-Output: cleanup + promotion proposals into
-`state/proposed-changes.md`.
+Output: cleanup + promotion candidates as Chainlink issues or, when
+they touch protected surfaces and are ready to review, protected-surface
+proposal PRs.
 
 ### B.3 — Atom-to-core promotion + demotion candidates (P47)
 
@@ -190,7 +194,8 @@ For each candidate:
   block, or does it need its own block?
 
 If yes: propose a new core block (or addition) with the atom's
-content, into `state/proposed-changes.md`.
+content via `open_proposal` / `submit_proposal`, or file a Chainlink
+issue if the candidate needs more evidence before PR review.
 
 **Demotion / cleanup pass.** Atoms whose `trend=stale` — the
 retrieval-side multiplier (×0.4) is already deprioritizing them, so
@@ -245,11 +250,10 @@ just rotated or is only one week old) entry-by-entry. For each:
   review (cross-check against session boundaries, recent failures,
   similar entries in `40-learned-behaviors.md`). Core memory is
   read-only at runtime, so you cannot write `40-learned-behaviors.md`
-  directly: write the promotion as a proposal in
-  `state/proposed-changes.md` (the operator reviews it and merges it as
-  a change-proposal PR — or open one yourself with
-  `open_proposal`). Leave the entry in
-  `learnings-pending.md` until the promotion lands.
+  directly: write the promotion in a protected-surface proposal
+  worktree, then call `submit_proposal` so the operator can review and
+  merge the PR. Leave the entry in `learnings-pending.md` until the
+  promotion lands.
 - **Drop** — was a one-off, contradicted by other evidence, no longer
   applies, or has sat ≥3 reflection cycles unpromoted (the file's
   Lifecycle section sets the default-drop after 3 cycles).
@@ -259,13 +263,13 @@ just rotated or is only one week old) entry-by-entry. For each:
 The autonomous part of this pass is the `learnings-pending.md`
 bookkeeping (drop / keep). Promotion to `40-learned-behaviors.md` is
 propose-only — core memory is read-only at runtime (see Step 4); route
-it through `state/proposed-changes.md`, never a direct write.
+it through `open_proposal` / `submit_proposal`, never a direct write.
 
 ### Promotion criteria (heuristic, not rigid)
 
 Use these to triage cleanup vs. promotion vs. leave-alone. They're
-guides, not gates — when in doubt, write the proposal and let the
-operator decide.
+guides, not gates — when in doubt, file a Chainlink note or write a
+proposal PR and let the operator decide.
 
 - **Recurrence** — Showed up across multiple sessions / channels /
   contexts? Promote-shaped. One-off? Leave it where it is.
@@ -281,8 +285,9 @@ operator decide.
 
 Read `memory/core/30-reflection-policy.md` at the start of every
 reflection turn. It draws the line between autonomous (apply directly)
-and propose-only (write to `state/proposed-changes.md`, operator
-reviews on their own cadence).
+and propose-only (operator reviews before it takes effect). Protected
+surfaces use `open_proposal` / `submit_proposal`; non-protected
+follow-ups use Chainlink or `state/spec/` notes.
 
 Conservative defaults the policy ships with:
 
@@ -293,13 +298,13 @@ Conservative defaults the policy ships with:
     weekly review pass — see §B.4 below)
   - Wiki orphan tagging (just flag, don't delete)
 
-- **Propose-only** (HITL — write to `state/proposed-changes.md`; the
-  operator merges the change-proposal PR, or you open one with
-  `open_proposal`):
+- **Propose-only** (HITL — operator review before effect):
   - ALL `memory/core/` edits — cleanup, restructure, promote-to-core,
     demote-from-core, persona edits, AND learned-behavior promotion.
     Core memory is read-only at runtime; there is no autonomous core
-    write.
+    write. Use `open_proposal` / `submit_proposal`.
+  - Prompt edits under `prompts/`. Use `open_proposal` /
+    `submit_proposal`.
   - Skill creation
   - Wiki page deletions
   - Memory file deletions
@@ -310,14 +315,14 @@ If the policy file is missing or unparseable, fall back to
 The operator can promote a propose-only action to autonomous as trust
 builds. They edit the policy file; you read it next reflection.
 
-### Writing proposals — include an `Expect:` line
+### Writing proposal PRs — include prediction text when measurable
 
-Every proposal you write to `state/proposed-changes.md` should carry a
-`Predicted effect:` paragraph (free-form prose explaining what you
-expect to happen) AND a final structured `Expect:` line the §12.2
-audit can parse. Without it, the audit emits "no parseable
-predicted-effect signal" 1-4 weeks later and the double-loop stays
-open — you proposed something, but no measurement closes back.
+Every protected-surface proposal PR should carry a `Predicted effect:`
+paragraph when the change has a measurable behavioral or event-log
+claim. If the legacy applied-proposals audit is still in use for a
+particular change, also include a final structured `Expect:` line that
+the audit can parse. Without a measurable prediction, the double-loop
+stays open — you proposed something, but no measurement closes back.
 
 Format:
 ```
@@ -339,49 +344,42 @@ When in doubt, pick the narrowest event type that captures what you're
 fixing. The audit window is the same N days before vs after the
 applied timestamp, so the prediction is falsifiable.
 
-## Step 4.5 — Send pending-proposals digest (when proposals were written)
+## Step 4.5 — Surface proposal PRs or follow-up issues
 
-After writing any proposals to `state/proposed-changes.md`, query the
-pending list and notify the operator if the backlog is non-empty:
-
-```bash
-mimir reflection list-pending --json
-```
-
-If the JSON output is a non-empty array, format a numbered digest and
-send it to the operator alert channel via `send_message`:
+If reflection opens proposal PRs or files Chainlink follow-ups, surface
+a tight digest to the operator channel when review is needed:
 
 ```
-Reflection complete — N pending proposals:
+Reflection complete — review needed:
 
-1. **<heading truncated to 60 chars>**: <first-line excerpt>
+1. **<PR or Chainlink #>**: <one-line decision needed>
 2. …
 
-Reply: `accept 1 3` to apply, `reject 2 "reason"` to decline, `defer 1`
-to re-surface at next reflection. Multiple items OK: `accept 1 3 / reject 2`.
 ```
 
-**Silent rule**: if you wrote NO proposals this reflection — only
-autonomous changes like `saga_feedback` or `learnings-pending.md`
-bookkeeping — skip this step entirely. No digest, no message.
+**Silent rule**: if you opened no proposal PRs and filed no operator-
+actionable follow-ups — only autonomous changes like `saga_feedback`
+or `learnings-pending.md` bookkeeping — skip this step entirely. No
+digest, no message.
 
-If `MIMIR_OPERATOR_ALERT_CHANNEL` is not set, log a one-line warning
-to stderr and skip silently.
+If `MIMIR_OPERATOR_ALERT_CHANNEL` is not set on a non-interactive turn,
+log a one-line warning to stderr and skip silently.
 
 ## Step 5 — End the turn
 
 Reflection turns end silently like heartbeats — no user-visible
 message. Output goes to:
 
-- `state/proposed-changes.md` — proposals (HITL items), including any
+- Proposal PRs — protected-surface HITL items, including any
   core-memory promotions (core is read-only at runtime)
+- Chainlink / `state/spec/` — non-protected follow-ups and decisions
 - `events.jsonl` — your tool calls and results (automatic)
 - The SAGA atom decay / triples-linking calls land in SAGA
 
 If you find something genuinely urgent that the operator should know
 about now (security, data loss, compliance), use the operator alert
 channel — but the bar is high. Reflection findings normally wait for
-the operator's next review of `state/proposed-changes.md`.
+the operator's next review cycle.
 
 ## Self-reminders
 
@@ -391,7 +389,7 @@ the operator's next review of `state/proposed-changes.md`.
   memory review pays off over months.
 - Propose-only is the default. Trust builds slowly; the operator will
   promote items as they see them work.
-- A clean week (nothing notable) is fine. Write a one-line
-  `proposed-changes.md` entry that says so, end the turn.
+- A clean week (nothing notable) is fine. Record no proposal; end the
+  turn silently.
 - The 5-whys terminal "I lack X" is gold. Skill / wiki / subagent
   proposals are the highest-leverage output of reflection.

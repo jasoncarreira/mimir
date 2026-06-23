@@ -337,8 +337,8 @@ class WriteGuardBackend:
         "Write blocked: memory/core/ is read-only at runtime by policy "
         "(memory/core/30-reflection-policy.md). To change core memory, open a "
         "proposal with open_proposal, edit it there, then submit_proposal — the "
-        "operator reviews and merges the PR. For a non-diff suggestion, write to "
-        "state/proposed-changes.md."
+        "operator reviews and merges the PR. For a non-diff suggestion, file a "
+        "Chainlink issue or state/spec note."
     )
 
     _PROMPTS_DENY_REASON = (

@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import pytest
 
@@ -25,7 +25,6 @@ from mimir.commitments.models import CommitmentStatus
 from mimir.scheduler import SchedulerJob
 from mimir.tools.registry import (
     _STATE,
-    _channel_from_config_or_state,
     add_schedule,
     commitment_complete,
     commitment_dismiss,
@@ -605,8 +604,8 @@ class TestAddSchedule:
         assert call["cron"] == "0 9 * * *"
         assert call["prompt"] == "Good morning"
         assert call["channel_id"] == "chan-1"
-        # #523: default priority is low when not specified.
-        assert call["priority"] == "low"
+        # #656: default priority is normal when not specified.
+        assert call["priority"] == "normal"
 
     @pytest.mark.asyncio
     async def test_priority_is_persisted(self) -> None:

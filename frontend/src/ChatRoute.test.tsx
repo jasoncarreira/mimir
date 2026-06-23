@@ -124,6 +124,7 @@ afterEach(() => {
   turnApi.close.mockClear();
   turnApi.createTurnEventStream.mockClear();
   useUiState.setState({ apiKeyEpoch: 0 });
+  window.localStorage.clear();
 });
 
 describe("ChatRoute", () => {
@@ -152,6 +153,120 @@ describe("ChatRoute", () => {
     // no per-message status badge anymore).
     await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalled());
     expect(within(timeline).getByText("hello mimir")).toBeTruthy();
+  });
+
+  it("supports composer action buttons for clear and glyph insertion", () => {
+    renderChat();
+    const input = screen.getByLabelText("Message") as HTMLTextAreaElement;
+
+    fireEvent.change(input, { target: { value: "draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Insert Δ" }));
+    expect(input.value).toBe("draftΔ");
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(input.value).toBe("");
+    expect(chatApi.sendChatMessage).not.toHaveBeenCalled();
+  });
+
+  it("opens the Skills picker to insert or invoke slash commands", async () => {
+    chatApi.sendChatMessage.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: { channel_id: "web-default", source_id: "client-1" }
+    });
+
+    renderChat();
+    const input = screen.getByLabelText("Message") as HTMLTextAreaElement;
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    const insert = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Insert" })[0];
+    fireEvent.click(insert);
+    expect(input.value).toBe("/memory ");
+    expect(chatApi.sendChatMessage).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
+    fireEvent.click(invoke);
+    await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
+      content: "/github"
+    })));
+  });
+
+  it("invokes a skill command without clearing an unsent draft", async () => {
+    chatApi.sendChatMessage.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: { channel_id: "web-default", source_id: "client-1" }
+    });
+
+    renderChat();
+    const input = screen.getByLabelText("Message") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "keep this draft" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
+    fireEvent.click(invoke);
+
+    await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
+      content: "/github"
+    })));
+    expect(input.value).toBe("keep this draft");
+  });
+
+  it("disables composer sends while an invoke is in flight", async () => {
+    let resolveSend: ((value: Awaited<ReturnType<typeof chatApi.sendChatMessage>>) => void) | undefined;
+    chatApi.sendChatMessage.mockReturnValue(new Promise((resolve) => {
+      resolveSend = resolve;
+    }));
+
+    renderChat();
+    const input = screen.getByLabelText("Message") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "draft" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
+    fireEvent.click(invoke);
+
+    await waitFor(() => expect((screen.getByRole("button", { name: "SENDING…" }) as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.submit(input.closest("form") as HTMLFormElement);
+    expect(chatApi.sendChatMessage).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveSend?.({
+        ok: true,
+        version: "v1",
+        data: { channel_id: "web-default", source_id: "client-1" }
+      });
+    });
+    await waitFor(() => expect((screen.getByRole("button", { name: "SEND" }) as HTMLButtonElement).disabled).toBe(false));
+  });
+
+  it("opens the Shortcuts picker with persisted user snippets", () => {
+    window.localStorage.setItem("mimir.chat.shortcuts", JSON.stringify([
+      { id: "custom", label: "Standup", text: "What changed since the last heartbeat?" }
+    ]));
+
+    renderChat();
+    const input = screen.getByLabelText("Message") as HTMLTextAreaElement;
+
+    fireEvent.click(screen.getByRole("button", { name: "Shortcuts" }));
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Shortcuts" })).getByRole("button", { name: "Insert" }));
+    expect(input.value).toBe("What changed since the last heartbeat?");
+  });
+
+  it("adds user-defined shortcuts and persists them", () => {
+    renderChat();
+
+    fireEvent.click(screen.getByRole("button", { name: "Shortcuts" }));
+    const dialog = screen.getByRole("dialog", { name: "Shortcuts" });
+    fireEvent.change(within(dialog).getByLabelText("Label"), { target: { value: "Triage" } });
+    fireEvent.change(within(dialog).getByLabelText("Text"), { target: { value: "Please triage this." } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add shortcut" }));
+
+    expect(within(dialog).getByText("Triage")).toBeTruthy();
+    expect(JSON.parse(window.localStorage.getItem("mimir.chat.shortcuts") || "[]")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ label: "Triage", text: "Please triage this." })
+    ]));
   });
 
   it("marks a send rejection as an error", async () => {

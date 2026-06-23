@@ -394,10 +394,12 @@ couple that *look* idempotent but aren't:
 - **`memory_store` is unique-key idempotent.** Same content twice → one
   atom (deduplicated at the atom layer). Synth turns firing twice on
   the same boundary don't create two atoms.
-- **`applied_proposals.jsonl` is the proposal-replay guard.** Before
-  re-applying a proposal from `state/proposed-changes.md`, check
-  whether its id is already in `state/applied_proposals.jsonl` — if so,
-  it landed already and re-applying is a foot-gun.
+- **`applied_proposals.jsonl` is the legacy proposal-replay guard.**
+  Before re-applying a historical `state/proposed-changes.md` entry,
+  check whether its id is already in `state/applied_proposals.jsonl` —
+  if so, it landed already and re-applying is a foot-gun. Protected
+  memory/prompt proposals now go through `open_proposal` /
+  `submit_proposal` PRs instead.
 - **`chainlink issue create` is *append-only*, not idempotent.**
   Re-running `issue create "Same title"` produces a *new* issue with a
   fresh id every time. **Always `chainlink issue search "<title-or-handle>"`
