@@ -22,7 +22,7 @@ so the next tick doesn't get behind.
   and bounded)
 - another single-edit backlog item from
   `state/heartbeat-backlog.md`
-- a propose-only draft that pairs with the just-completed work
+- a proposal-PR draft or Chainlink follow-up that pairs with the just-completed work
 
 If the first item produced something that needs operator review
 before its natural successor can run, **do not exit** — surface
@@ -33,8 +33,8 @@ and pivot. See §"Surfacing operator-attention items" and
 
 When heartbeat work reaches a point that needs operator attention
 — a draft requiring approval, a per-file migration list whose
-decisions load-bear, an overlap-pair resolution, a propose-only
-doc whose recommendations gate the next phase — **send a message
+decisions load-bear, an overlap-pair resolution, or a proposal
+artifact whose recommendations gate the next phase — **send a message
 to the operator channel before exiting or pivoting.** Heartbeats
 are silent by default but operator-gates are exactly the
 surface-it case; silently exiting leaves the operator to discover
@@ -66,7 +66,7 @@ under a clearly-marked "Reading backlog" section.
 
 Pivot precedence when current work is operator-gated:
 1. Reading-backlog item (in priority order).
-2. Librarian / propose-only audit (no-decision-output work).
+2. Librarian / no-decision-output audit work.
 3. Exit silently if neither is available — but log this in the
    heartbeat result so the operator notices.
 
