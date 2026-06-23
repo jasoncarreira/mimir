@@ -38,12 +38,12 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from aiohttp import web
 
 from . import __version__
-from ._jsonl_tail import count_lines_chunked, tail_jsonl_records
+from ._jsonl_tail import _tail_lines, count_lines_chunked, tail_jsonl_records
 from .admin_config import build_admin_config_payload
 from .admin_users import build_users_payload, roles_for_request
 from .dashboard_extensions import (
@@ -220,18 +220,45 @@ def _read_jsonl(path: Path, *, max_records: int = 5000) -> list[dict[str, Any]]:
 
     Returns [] for missing or unreadable files.
     """
+    return _read_jsonl_matching(path, max_records=max_records)
+
+
+def _read_jsonl_matching(
+    path: Path,
+    *,
+    max_records: int | None = 5000,
+    include: Callable[[dict[str, Any]], bool] | None = None,
+    stop_when: Callable[[list[dict[str, Any]]], bool] | None = None,
+) -> list[dict[str, Any]]:
+    """Read tail JSONL records until ``max_records`` scanned or ``stop_when``.
+
+    ``tail_jsonl_records`` yields decoded records newest-first but hides scan
+    progress. This helper uses the underlying line tailer directly so callers can
+    keep only relevant records and stop after finding a small set of persistent
+    state events even when those events are older than the generic dashboard
+    window. Output remains chronological.
+    """
     if not path.is_file():
         return []
-    out: list[dict[str, Any]] = []
+    out_newest_first: list[dict[str, Any]] = []
+    scanned = 0
     try:
-        for record in tail_jsonl_records(path):
-            out.append(record)
-            if len(out) >= max_records:
+        for line in _tail_lines(path):
+            scanned += 1
+            if max_records is not None and scanned > max_records:
+                break
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if include is not None and not include(record):
+                continue
+            out_newest_first.append(record)
+            if stop_when is not None and stop_when(out_newest_first):
                 break
     except OSError:
         return []
-    out.reverse()  # tail yields newest-first; restore chronological
-    return out
+    return list(reversed(out_newest_first))
 
 
 def web_gate_active(api_key: str | None, resolver: Any) -> bool:
@@ -991,10 +1018,84 @@ def register_routes(
             return json_error("invalid_due_window", str(exc), status=400)
 
         def _build_payload() -> dict[str, Any]:
+            scheduler = request.app.get("scheduler")
+            expected_schedule_names = set()
+            expected_poller_names = set()
+            if scheduler is not None:
+                scheduler_jobs = list(scheduler._scheduler.get_jobs())  # noqa: SLF001
+                if scheduler_jobs:
+                    expected_schedule_names = {
+                        str(getattr((job.kwargs or {}).get("job"), "name", ""))
+                        for job in scheduler_jobs
+                        if job.id.startswith("scheduler:") and (job.kwargs or {}).get("job") is not None
+                    }
+                    expected_schedule_names.discard("")
+                    expected_poller_names = set(scheduler._pollers)  # noqa: SLF001
+
+            scheduler_event_types = {
+                "scheduled_tick",
+                "scheduled_tick_suppressed",
+                "scheduled_tick_dropped",
+                "scheduled_job_misfired",
+            }
+            poller_event_types = {
+                "poller_complete",
+                "poller_fire_suppressed",
+                "poller_misfired",
+                "poller_nonzero_exit",
+                "poller_timeout",
+                "poller_exec_error",
+                "poller_enqueue_error",
+                "poller_event_rejected",
+                "poller_circuit_open",
+                "poller_missing_required_env",
+            }
+
+            def _scheduler_event_name(record: dict[str, Any]) -> str:
+                name = str(record.get("schedule_name") or record.get("job_id") or "")
+                if name.startswith("scheduler:"):
+                    name = name[len("scheduler:"):]
+                return name
+
+            def _poller_event_name(record: dict[str, Any]) -> str:
+                name = str(record.get("poller") or record.get("job_id") or "")
+                if name.startswith("poller:"):
+                    name = name[len("poller:"):]
+                return name
+
+            def _is_scheduler_state_event(record: dict[str, Any]) -> bool:
+                event_type = str(record.get("type") or "")
+                if event_type in scheduler_event_types:
+                    return _scheduler_event_name(record) in expected_schedule_names
+                if event_type in poller_event_types:
+                    return _poller_event_name(record) in expected_poller_names
+                return False
+
+            def _found_all_scheduler_state(records: list[dict[str, Any]]) -> bool:
+                found_schedules = {
+                    _scheduler_event_name(record)
+                    for record in records
+                    if str(record.get("type") or "") in scheduler_event_types
+                }
+                found_pollers = {
+                    _poller_event_name(record)
+                    for record in records
+                    if str(record.get("type") or "") in poller_event_types
+                }
+                return (
+                    found_schedules >= expected_schedule_names
+                    and found_pollers >= expected_poller_names
+                )
+
             return build_scheduler_dashboard_payload(
-                scheduler=request.app.get("scheduler"),
+                scheduler=scheduler,
                 commitments_store=commitments_store,
-                events=_read_jsonl(events_log),
+                events=_read_jsonl_matching(
+                    events_log,
+                    max_records=None,
+                    include=_is_scheduler_state_event,
+                    stop_when=_found_all_scheduler_state,
+                ),
                 due_window=due_window,
             )
 

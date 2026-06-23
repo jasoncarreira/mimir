@@ -1352,29 +1352,30 @@ async def test_api_v1_scheduler_lists_schedules_pollers_and_commitments(tmp_path
         priority="high",
     )
     events_log = tmp_path / "events.jsonl"
+    old_schedule_event = json.dumps({
+        "timestamp": "2026-06-15T08:00:00+00:00",
+        "type": "scheduled_tick",
+        "schedule_name": "morning-review",
+        "channel_id": "ops",
+    })
     events_log.write_text(
-        "\n".join([
+        old_schedule_event
+        + "\n"
+        + "\n".join(
             json.dumps({
-                "timestamp": "2026-06-18T08:00:00+00:00",
-                "type": "scheduled_tick",
-                "schedule_name": "morning-review",
-                "channel_id": "ops",
-            }),
-            json.dumps({
-                "timestamp": "2026-06-18T08:01:00+00:00",
-                "type": "scheduled_tick_suppressed",
-                "schedule_name": "morning-review",
-                "reason": "quota_pressure",
-                "severity": "ELEVATED",
-            }),
-            json.dumps({
-                "timestamp": "2026-06-18T08:02:00+00:00",
-                "type": "poller_complete",
-                "poller": "github",
-                "events_emitted": 2,
-                "events_rejected": 0,
-            }),
-        ])
+                "timestamp": f"2026-06-18T07:{minute:02d}:00+00:00",
+                "type": "noise",
+            })
+            for minute in range(5000)
+        )
+        + "\n"
+        + json.dumps({
+            "timestamp": "2026-06-18T08:02:00+00:00",
+            "type": "poller_complete",
+            "poller": "github",
+            "events_emitted": 2,
+            "events_rejected": 0,
+        })
         + "\n",
         encoding="utf-8",
     )
@@ -1410,7 +1411,8 @@ async def test_api_v1_scheduler_lists_schedules_pollers_and_commitments(tmp_path
     validate_list_meta(body["meta"])
     assert body["data"]["schedules"][0]["name"] == "morning-review"
     assert body["data"]["schedules"][0]["prompt_source"] == "file:morning.md"
-    assert body["data"]["schedules"][0]["suppression_reason"] == "quota_pressure"
+    assert body["data"]["schedules"][0]["last_run_at"] == "2026-06-15T08:00:00+00:00"
+    assert body["data"]["schedules"][0]["recent_result"] == "scheduled_tick"
     assert body["data"]["pollers"][0]["name"] == "github"
     assert body["data"]["pollers"][0]["priority"] == "high"
     assert body["data"]["pollers"][0]["recent_result"] == "emitted=2 rejected=0"
