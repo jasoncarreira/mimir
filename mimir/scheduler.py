@@ -131,11 +131,11 @@ class SchedulerJob:
     deliver: str | None = None
     # Priority-banded suppression: how much resource pressure this
     # tick rides through before the arbiter sheds it (low | normal |
-    # high). Heartbeat-style maintenance defaults to ``low`` — it
-    # yields at the first sign of pressure, preserving quota for
-    # interactive replies and higher-priority pollers. Operators
-    # override per-entry in scheduler.yaml.
-    priority: str = "low"
+    # high). Unspecified jobs default to ``normal`` so operator-added
+    # recurring work is not silently shed at the first ELEVATED
+    # pressure signal; operators can still opt disposable jobs into
+    # ``low`` per entry.
+    priority: str = "normal"
     # APScheduler misfire grace (seconds). Intentionally generous: these are
     # coalesced maintenance ticks (heartbeat hourly, reflection, …), so running
     # a bit late beats dropping the tick. Must NOT inherit APScheduler's 1s
@@ -159,7 +159,7 @@ class SchedulerJob:
             out["time_of_day"] = self.time_of_day
         # Only emit a non-default priority — keeps yaml uncluttered
         # (and callable entries never fire through the arbiter gate).
-        if self.priority != "low" and not self.callable_name:
+        if self.priority != "normal" and not self.callable_name:
             out["priority"] = self.priority
         # Callable entries don't carry a channel_id (they're not
         # dispatched as AgentEvents); only emit it for prompt entries
@@ -186,9 +186,9 @@ class SchedulerJob:
             channel_id = None
         deliver = str(raw.get("deliver", "")).strip() or None  # chainlink #508
         raw_priority = raw.get("priority")
-        priority = "low"
+        priority = "normal"
         if raw_priority is not None:
-            priority = normalize_priority(raw_priority, default="low")
+            priority = normalize_priority(raw_priority, default="normal")
             if not (
                 isinstance(raw_priority, str)
                 and raw_priority.strip().lower() == priority

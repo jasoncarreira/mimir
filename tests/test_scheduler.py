@@ -2977,8 +2977,8 @@ async def test_fire_poller_fail_open_when_arbiter_raises(
 
 @pytest.mark.asyncio
 async def test_fire_consults_arbiter_with_job_priority(tmp_path: Path):
-    """_fire passes the SchedulerJob's declared priority (heartbeats
-    default ``low``; scheduler.yaml overrides per entry)."""
+    """_fire passes the SchedulerJob's declared priority (unspecified
+    jobs default ``normal``; scheduler.yaml overrides per entry)."""
     async def noop(_e):
         return True
 
@@ -2990,7 +2990,7 @@ async def test_fire_consults_arbiter_with_job_priority(tmp_path: Path):
     await sched._fire(job=SchedulerJob(
         name="digest", prompt="x", cron="* * * * *", priority="high",
     ))
-    assert arbiter.consulted_priorities == ["low", "high"]
+    assert arbiter.consulted_priorities == ["normal", "high"]
 
 
 @pytest.mark.asyncio
@@ -3013,7 +3013,7 @@ async def test_scheduled_tick_suppressed_event_carries_priority_severity(
     await sched._fire(job=SchedulerJob(name="hb", prompt="x", cron="* * * * *"))
     events = _read_event_types(tmp_path / "events.jsonl")
     [ev] = [e for e in events if e["type"] == "scheduled_tick_suppressed"]
-    assert ev["priority"] == "low"
+    assert ev["priority"] == "normal"
     assert ev["severity"] == "ELEVATED"
 
 
@@ -3024,18 +3024,25 @@ def test_scheduler_job_priority_yaml_round_trip(tmp_path: Path):
         SchedulerJob(name="digest", prompt="y", cron="0 9 * * *", priority="high"),
     ])
     jobs = {j.name: j for j in load_jobs(path)}
-    assert jobs["hb"].priority == "low"        # default, not serialized
+    assert jobs["hb"].priority == "normal"     # default, not serialized
     assert jobs["digest"].priority == "high"   # explicit, round-trips
     # Default priority isn't written to yaml (uncluttered).
     assert "priority" not in path.read_text().split("digest")[0]
 
+    low_path = tmp_path / "scheduler-low.yaml"
+    write_jobs(low_path, [
+        SchedulerJob(name="nice", prompt="z", cron="0 10 * * *", priority="low"),
+    ])
+    assert "priority: low" in low_path.read_text()
+    assert load_jobs(low_path)[0].priority == "low"
 
-def test_scheduler_job_invalid_priority_falls_back_to_low():
+
+def test_scheduler_job_invalid_priority_falls_back_to_normal():
     job = SchedulerJob.from_yaml_entry({
         "name": "hb", "prompt": "x", "cron": "0 8 * * *",
         "priority": "urgent",
     })
-    assert job.priority == "low"
+    assert job.priority == "normal"
 
 
 def test_scheduler_job_priority_case_insensitive():
