@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import json
+
+import pytest
+
 from evals.cluster_observation.adapter import (
     COMPONENT_RICH_PROMPT,
     ClusterObservationAdapter,
@@ -234,7 +239,104 @@ def test_adapter_evaluates_raw_outputs_and_returns_reflective_asi():
     assert len(batch.scores) == 1
     assert batch.scores[0] > 0.0
     reflective = adapter.make_reflective_dataset({COMPONENT_RICH_PROMPT: "x"}, batch, [COMPONENT_RICH_PROMPT])
+    assert reflective[COMPONENT_RICH_PROMPT][0]["Inputs"] == {
+        "example_id": "ex-1",
+        "source_atom_ids": ["a1", "a2"],
+    }
     assert "symbolic_retention" in reflective[COMPONENT_RICH_PROMPT][0]["Feedback"]
+
+
+def test_render_candidate_prompt_allows_literal_braces_and_requires_atoms():
+    ex = Example(id="ex-1", split="train", data=_example())
+    prompt = 'Use this JSON example literally: {"kind": "observation"}.\nAtoms ({n}):\n{indexed_atoms}'
+
+    rendered = render_candidate_prompt(prompt, ex)
+
+    assert '{"kind": "observation"}' in rendered
+    assert "Atoms (2):" in rendered
+    assert "[1] Chainlink #614" in rendered
+
+    with pytest.raises(ValueError, match="indexed_atoms"):
+        render_candidate_prompt("No atom placeholder; literal { braces } stay inert.", ex)
+
+
+def test_adapter_penalizes_missing_indexed_atoms_without_calling_synth():
+    ex = Example(id="ex-1", split="train", data=_example())
+    called = False
+
+    async def synth(prompt: str, example: Example) -> str:
+        nonlocal called
+        called = True
+        return _raw("Chainlink #614 fixed SAGA retrieval on 2026-06-12 for Muninn.")
+
+    adapter = ClusterObservationAdapter([ex], synth)
+    batch = adapter.evaluate([ex], {COMPONENT_RICH_PROMPT: "Summarize the atoms."}, capture_traces=True)
+
+    assert called is False
+    assert batch.scores == [0.0]
+    asi = batch.trajectories[0]["asi"]
+    assert "missing_indexed_atoms_placeholder" in asi["prompt_overfit"]["gate"]["hard_fail_reasons"]
+    assert asi["score_breakdown"]["prompt_overfit_gate_passed"] is False
+
+
+def test_load_corpus_ignores_blank_lines_for_deterministic_split(tmp_path):
+    from evals.cluster_observation.adapter import load_corpus
+
+    path = tmp_path / "corpus.jsonl"
+    rows = [
+        {"example_id": "a", "source_cluster": {"atoms": []}},
+        {"example_id": "b", "source_cluster": {"atoms": []}},
+        {"example_id": "c", "source_cluster": {"atoms": []}},
+        {"example_id": "d", "source_cluster": {"atoms": []}},
+        {"example_id": "e", "source_cluster": {"atoms": []}},
+    ]
+    path.write_text("\n".join([json.dumps(rows[0]), "", *[json.dumps(row) for row in rows[1:]]]), encoding="utf-8")
+
+    examples = load_corpus(path)
+
+    assert [(ex.id, ex.split) for ex in examples] == [
+        ("a", "holdout"),
+        ("b", "train"),
+        ("c", "train"),
+        ("d", "train"),
+        ("e", "holdout"),
+    ]
+    assert [ex.id for ex in load_corpus(path, split="holdout")] == ["a", "e"]
+
+
+def test_adapter_coerces_mapping_examples_and_live_synth_fn(monkeypatch):
+    import mimir.saga._config_io as config_io
+    import mimir.saga._llm as llm
+    from evals.cluster_observation.adapter import make_saga_synth_fn
+
+    seen = {}
+
+    def fake_resolve(profile: str) -> dict:
+        seen["profile"] = profile
+        return {"provider": "fake"}
+
+    async def fake_call(cfg, *, prompt, max_tokens, temperature, system):
+        seen.update({
+            "cfg": cfg,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "system": system,
+        })
+        return _raw("Chainlink #614 fixed SAGA retrieval on 2026-06-12 for Muninn.")
+
+    monkeypatch.setattr(config_io, "resolve_llm_config", fake_resolve)
+    monkeypatch.setattr(llm, "call_llm", fake_call)
+
+    fn = make_saga_synth_fn(max_tokens=123)
+    result = asyncio.run(fn("Atoms:\n{indexed_atoms}", ClusterObservationAdapter._coerce_example(_example())))
+
+    assert "Chainlink #614" in result
+    assert seen["profile"] == "consolidation"
+    assert seen["max_tokens"] == 123
+    assert seen["temperature"] == 0.0
+    assert seen["system"] is None
+    assert "[1] Chainlink #614" in seen["prompt"]
 
 
 def test_prompt_overfit_regularizer_penalizes_corpus_specific_glossaries():

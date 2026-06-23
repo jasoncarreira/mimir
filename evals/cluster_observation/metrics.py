@@ -124,6 +124,8 @@ def score_prompt_candidate(prompt: str) -> dict[str, Any]:
     )
 
     hard_fail_reasons: list[str] = []
+    if "{indexed_atoms}" not in text:
+        hard_fail_reasons.append("missing_indexed_atoms_placeholder")
     if arxiv_ids:
         hard_fail_reasons.append("hardcoded_arxiv_ids")
     if issue_ids:
@@ -136,6 +138,8 @@ def score_prompt_candidate(prompt: str) -> dict[str, Any]:
         hard_fail_reasons.append("large_entity_glossary")
 
     signals = []
+    if "{indexed_atoms}" not in text:
+        signals.append("missing_indexed_atoms_placeholder")
     if length_penalty:
         signals.append("too_long")
     if literal_penalty:
@@ -467,9 +471,9 @@ def _support_report(observation: str, source_atoms: list[dict[str, str]], source
             if val in _GENERIC_NAMES:
                 continue
             if (
-                val not in source_ids.get(kind, set())
+                val not in source_ids.get(kind, [])
                 and _mutation_hint(val, source_text) is None
-                and not (kind == "numbers" and _derived_number_supported(val, source_ids.get("numbers", set())))
+                and not (kind == "numbers" and _derived_number_supported(val, source_ids.get("numbers", [])))
             ):
                 unsupported.append(
                     {
@@ -488,7 +492,7 @@ def _support_report(observation: str, source_atoms: list[dict[str, str]], source
     }
 
 
-def _extract_supported_artifacts(text: str) -> dict[str, set[str]]:
+def _extract_supported_artifacts(text: str) -> dict[str, list[str]]:
     raw = text or ""
     identifier_matches = [
         m for m in _ID_RE.finditer(raw)
@@ -497,14 +501,16 @@ def _extract_supported_artifacts(text: str) -> dict[str, set[str]]:
     date_matches = list(_DATE_RE.finditer(raw))
     excluded = [(m.start(), m.end()) for m in identifier_matches + date_matches]
     return {
-        "identifiers": {
-            ident
-            for m in identifier_matches
-            if (ident := _canonical_identifier(m.group(0))) is not None
-        },
-        "dates": {m.group(0) for m in date_matches},
-        "numbers": set(_extract_numbers(raw, excluded_spans=excluded)),
-        "names": {m.group(0) for m in _NAME_RE.finditer(raw) if m.group(0) not in _GENERIC_NAMES},
+        "identifiers": sorted(
+            {
+                ident
+                for m in identifier_matches
+                if (ident := _canonical_identifier(m.group(0))) is not None
+            }
+        ),
+        "dates": sorted({m.group(0) for m in date_matches}),
+        "numbers": sorted(set(_extract_numbers(raw, excluded_spans=excluded))),
+        "names": sorted({m.group(0) for m in _NAME_RE.finditer(raw) if m.group(0) not in _GENERIC_NAMES}),
     }
 
 
@@ -632,7 +638,7 @@ def _rounded_decimal_equivalent(left: str, right: str) -> bool:
     return abs(lf - rf) < 0.051
 
 
-def _derived_number_supported(candidate: str, source_numbers: set[str]) -> bool:
+def _derived_number_supported(candidate: str, source_numbers: Iterable[str]) -> bool:
     candidate_num = _canonical_number(candidate)
     if candidate_num is None:
         return False

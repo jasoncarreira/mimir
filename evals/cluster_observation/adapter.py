@@ -33,20 +33,21 @@ class Example:
 def load_corpus(path: Path = DEFAULT_CORPUS, *, split: str | None = None) -> list[Example]:
     """Load an exported cluster-observation JSONL corpus.
 
-    Splits are deterministic and simple for the first pilot: every fourth row is
-    holdout unless the row already carries a ``split`` field.
+    Splits are deterministic and simple for the first pilot: every fourth
+    non-blank row is holdout unless the row already carries a ``split`` field.
     """
     out: list[Example] = []
     if not path.exists():
         return out
-    for idx, raw in enumerate(path.read_text(encoding="utf-8").splitlines()):
+    row_idx = 0
+    for raw in path.read_text(encoding="utf-8").splitlines():
         if not raw.strip():
             continue
         data = json.loads(raw)
-        ex_split = str(data.get("split") or ("holdout" if idx % 4 == 0 else "train"))
-        if split is not None and ex_split != split:
-            continue
-        out.append(Example(id=str(data.get("example_id") or f"row-{idx}"), split=ex_split, data=data))
+        ex_split = str(data.get("split") or ("holdout" if row_idx % 4 == 0 else "train"))
+        if split is None or ex_split == split:
+            out.append(Example(id=str(data.get("example_id") or f"row-{row_idx}"), split=ex_split, data=data))
+        row_idx += 1
     return out
 
 
@@ -54,18 +55,32 @@ SynthFn = Callable[[str, Example], Awaitable[str]]
 
 
 def render_candidate_prompt(candidate_prompt: str, example: Example) -> str:
+    """Render source atoms into a GEPA-evolved prompt without ``str.format``.
+
+    GEPA mutates the candidate text freely, so literal braces in examples or
+    JSON snippets must remain inert.  Only the small set of fixed production
+    placeholders is replaced, and ``{indexed_atoms}`` is mandatory so candidates
+    cannot be scored against a contentless prompt.
+    """
+
     atoms = example.data.get("source_cluster", {}).get("atoms", [])
     indexed_atoms = "\n".join(
         f"[{i + 1}] {atom.get('content', '')}"
         for i, atom in enumerate(atoms)
         if isinstance(atom, Mapping)
     )
-    return candidate_prompt.format(
-        n=len(atoms),
-        indexed_atoms=indexed_atoms,
-        prior_block="",
-        vocab_block="",
-    )
+    if "{indexed_atoms}" not in candidate_prompt:
+        raise ValueError("candidate prompt must contain {indexed_atoms}")
+    replacements = {
+        "{n}": str(len(atoms)),
+        "{indexed_atoms}": indexed_atoms,
+        "{prior_block}": "",
+        "{vocab_block}": "",
+    }
+    rendered = candidate_prompt
+    for token, value in replacements.items():
+        rendered = rendered.replace(token, value)
+    return rendered
 
 
 def make_saga_synth_fn(*, llm_config: dict | None = None, max_tokens: int = 1500) -> SynthFn:
@@ -114,6 +129,15 @@ class ClusterObservationAdapter:
         examples = [ex if isinstance(ex, Example) else self._coerce_example(ex) for ex in batch]
 
         async def _run_all() -> list[str]:
+            hard_fail_reasons = prompt_overfit.get("gate", {}).get("hard_fail_reasons", [])
+            if (
+                not prompt_overfit.get("pass", True)
+                and "missing_indexed_atoms_placeholder" in hard_fail_reasons
+            ):
+                return [
+                    "OBSERVATION:\n\nTRIPLES:\nNONE\n\nCONTRADICTIONS:\nNONE\n"
+                    for _ in examples
+                ]
             return await asyncio.gather(*[self.synth_fn(prompt, ex) for ex in examples])
 
         raw_outputs = asyncio.run(_run_all())
@@ -152,13 +176,10 @@ class ClusterObservationAdapter:
         for comp in components_to_update:
             records[comp] = [
                 {
-                    "Inputs": json.dumps(
-                        {
-                            "example_id": traj["example_id"],
-                            "source_atom_ids": traj.get("source_atom_ids", []),
-                        },
-                        ensure_ascii=False,
-                    ),
+                    "Inputs": {
+                        "example_id": traj["example_id"],
+                        "source_atom_ids": traj.get("source_atom_ids", []),
+                    },
                     "Generated Outputs": traj["raw_output"],
                     "Feedback": json.dumps(traj["asi"], ensure_ascii=False, indent=2),
                 }
