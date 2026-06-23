@@ -339,6 +339,105 @@ def _resolve_prompt_file(home: Path | None, prompt_file: str) -> Path | None:
     return candidate
 
 
+_CRON_DOW_NAMES = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+
+
+def _standard_dow_number_to_name(value: int) -> str:
+    if value == 7:
+        value = 0
+    return _CRON_DOW_NAMES[value]
+
+
+def _expand_standard_dow_numeric_part(part: str) -> str:
+    """Translate one numeric crontab DOW part to APScheduler day names.
+
+    Standard crontab numbers are ordered Sunday=0 through Saturday=6
+    (with 7 also Sunday). APScheduler numbers start at Monday=0, so
+    numeric tokens must become names. Expanding ranges/steps to explicit
+    names preserves expressions like ``1-5/2`` and ``*/2`` without
+    relying on APScheduler's numeric base. Non-numeric parts (``mon`` or
+    ``mon-fri``) are returned unchanged.
+    """
+    if any(ch.isalpha() for ch in part):
+        return part
+    if "/" in part:
+        base, step_raw = part.split("/", 1)
+        step = int(step_raw)
+        if step < 1:
+            raise ValueError(f"invalid day-of-week step {step_raw!r}")
+    else:
+        base, step = part, 1
+
+    if base == "*":
+        if step == 1:
+            return part
+        values = range(0, 7, step)
+    elif "-" in base:
+        start_raw, end_raw = base.split("-", 1)
+        start = int(start_raw)
+        end = int(end_raw)
+        if not (0 <= start <= 7 and 0 <= end <= 7):
+            return part
+        if start > end:
+            # Standard cron wraparound ranges (for example, 5-1) stay
+            # unsupported here; let APScheduler raise the canonical
+            # invalid-range error rather than inventing local semantics.
+            return part
+        values = range(start, end + 1, step)
+    else:
+        value = int(base)
+        if not (0 <= value <= 7):
+            return part
+        if step == 1:
+            return _standard_dow_number_to_name(value)
+        values = range(value, 7, step)
+
+    names = []
+    seen = set()
+    for value in values:
+        if not (0 <= value <= 7):
+            continue
+        name = _standard_dow_number_to_name(value)
+        if name not in seen:
+            names.append(name)
+            seen.add(name)
+    return ",".join(names)
+
+
+def _cron_with_standard_dow(cron: str) -> str:
+    """Return a CronTrigger-compatible expression honoring crontab DOW.
+
+    APScheduler documents ``from_crontab`` as accepting crontab-shaped
+    expressions, but its day-of-week field keeps APScheduler's internal
+    numbering (Monday=0). Mimir's scheduler.yaml and pollers.json use
+    standard cron semantics (Sunday=0 or 7). Translate numeric parts in
+    the fifth field to day names before handing the expression to
+    APScheduler.
+    """
+    fields = str(cron).split()
+    if len(fields) != 5:
+        # Let APScheduler raise the canonical parse error.
+        return cron
+    dow = fields[4]
+    try:
+        fields[4] = ",".join(
+            _expand_standard_dow_numeric_part(part) for part in dow.split(",")
+        )
+    except (TypeError, ValueError):
+        # Let APScheduler raise the canonical parse error.
+        fields[4] = dow
+    return " ".join(fields)
+
+
+def _cron_trigger_from_standard_crontab(
+    cron: str, *, timezone: ZoneInfo | None = None,
+) -> CronTrigger:
+    """Build a CronTrigger from standard-cron day-of-week semantics."""
+    return CronTrigger.from_crontab(
+        _cron_with_standard_dow(cron), timezone=timezone,
+    )
+
+
 def _build_trigger(
     job: SchedulerJob, tz: ZoneInfo | None = None,
 ) -> CronTrigger:
@@ -355,7 +454,7 @@ def _build_trigger(
     if tz is None:
         tz = ZoneInfo("UTC")
     if job.cron:
-        return CronTrigger.from_crontab(job.cron, timezone=tz)
+        return _cron_trigger_from_standard_crontab(job.cron, timezone=tz)
     if job.time_of_day:
         try:
             hh, mm = str(job.time_of_day).split(":")
@@ -1063,7 +1162,9 @@ class Scheduler:
             # if non-empty.
             if job.cron:
                 try:
-                    CronTrigger.from_crontab(job.cron, timezone=self._tz)
+                    _cron_trigger_from_standard_crontab(
+                        job.cron, timezone=self._tz,
+                    )
                 except (ValueError, KeyError) as exc:
                     raise ValueError(
                         f"invalid cron expression {job.cron!r}: {exc}"
@@ -1169,7 +1270,9 @@ class Scheduler:
             return False
 
         try:
-            trigger = CronTrigger.from_crontab(effective_cron, timezone=self._tz)
+            trigger = _cron_trigger_from_standard_crontab(
+                effective_cron, timezone=self._tz,
+            )
         except (ValueError, KeyError) as exc:
             raise ValueError(
                 f"invalid cron expression {effective_cron!r} for "
@@ -1459,7 +1562,9 @@ class Scheduler:
         invalid_cron_events: list[dict[str, Any]] = []
         for poller in discovered:
             try:
-                trigger = CronTrigger.from_crontab(poller.cron, timezone=self._tz)
+                trigger = _cron_trigger_from_standard_crontab(
+                    poller.cron, timezone=self._tz,
+                )
             except (ValueError, KeyError) as exc:
                 log.warning(
                     "poller_invalid_cron: %s — cron=%r error=%s",

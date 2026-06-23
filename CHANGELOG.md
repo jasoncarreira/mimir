@@ -14,6 +14,15 @@ All notable changes will land here. Format loosely follows
   without a one-key scaffold parser and establishes the durable contract:
   exported deployment env overrides `<home>/.env`; absent `.env` is a no-op.
 
+### Fixed
+
+- **Scheduler cron day-of-week now follows standard crontab numbering.**
+  Numeric day-of-week fields are interpreted as Sunday=0/7, Monday=1, and so on
+  before APScheduler registration. Existing weekly jobs that used numeric weekdays
+  move by one day on upgrade to their standard-cron day (for example, a prior
+  `1` now fires Monday instead of APScheduler's old Tuesday interpretation).
+  chainlink #658.
+
 ## [0.6.4] — 2026-06-22
 
 ### Fixed
