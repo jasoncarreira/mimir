@@ -61,12 +61,15 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="gogcli",
         category="integration-cli",
-        pin="v0.30.0",
-        smoke="gog --version",
+        pin="v0.9.0",
+        smoke=(
+            "gog --version && gog gmail messages search 'in:inbox newer_than:1d' "
+            "--account \"$GOG_ACCOUNT\" --max 1 --json --no-input"
+        ),
         source="github-release",
         repo="steipete/gogcli",
         install="gmail-poller optional-skill dockerfile.fragment",
-        risk="Medium: Google Workspace helper CLI; drift can break Gmail/Calendar polling independently of Worklink coding backends.",
+        risk="High: Google Workspace helper CLI; pre-1.0 minor-version drift can break Gmail polling subcommands on Muninn, so version jumps need an authenticated smoke before merge.",
     ),
 )
 

@@ -177,7 +177,7 @@ def test_gmail_poller_fragment_pins_go_and_gogcli_versions():
         / "dockerfile.fragment"
     ).read_text()
     assert "go1.26.4.linux-${ARCH}.tar.gz" in fragment
-    assert "github.com/steipete/gogcli/cmd/gog@v0.30.0" in fragment
+    assert "github.com/steipete/gogcli/cmd/gog@v0.9.0" in fragment
     assert "@latest" not in fragment
 
 
