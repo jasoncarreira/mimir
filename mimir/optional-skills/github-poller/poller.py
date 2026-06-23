@@ -749,34 +749,109 @@ def _head_commit_date(repo: str, sha: str, token: str) -> str:
     return str(committer.get("date") or "")
 
 
-def _head_has_file_changes_since(
+def _compare_data(
+    repo: str,
+    base_sha: str,
+    head_sha: str,
+    token: str,
+) -> dict | None:
+    """GitHub compare payload for ``base_sha...head_sha``.
+
+    Kept as a tiny wrapper so the CHANGES_REQUESTED reconciliation can
+    name which compare shape it is using.  GitHub's ``files`` for a
+    three-dot compare are relative to the merge base, not directly to
+    ``base_sha``; callers must not treat a non-empty list here as
+    "content changed since base_sha" without considering that shape.
+    """
+    if not base_sha or not head_sha:
+        return None
+    data = _gh_api(f"repos/{repo}/compare/{base_sha}...{head_sha}", token)
+    return data if isinstance(data, dict) else None
+
+
+def _compare_file_signature(data: dict) -> tuple[tuple[str, str, str, str], ...] | None:
+    """Stable-enough signature of a compare payload's file patches.
+
+    For normal text diffs, ``patch`` is the important part.  For binary
+    or too-large diffs GitHub omits ``patch``; include the resulting blob
+    SHA and counters so such files still participate in the equality
+    check instead of being silently ignored.
+    """
+    files = data.get("files")
+    if not isinstance(files, list):
+        return None
+    sig: list[tuple[str, str, str, str]] = []
+    for file in files:
+        if not isinstance(file, dict):
+            return None
+        filename = str(file.get("filename") or "")
+        if not filename:
+            return None
+        previous = str(file.get("previous_filename") or "")
+        status = str(file.get("status") or "")
+        patch = file.get("patch")
+        if patch is None:
+            patch = "sha={sha};additions={additions};deletions={deletions};changes={changes}".format(
+                sha=file.get("sha") or "",
+                additions=file.get("additions") or 0,
+                deletions=file.get("deletions") or 0,
+                changes=file.get("changes") or 0,
+            )
+        sig.append((filename, previous, status, str(patch)))
+    return tuple(sorted(sig))
+
+
+def _head_changes_pr_diff_since_review(
     repo: str,
     review_sha: str,
     head_sha: str,
+    current_base_sha: str,
     token: str,
 ) -> bool | None:
-    """Return whether ``head_sha`` changes files relative to the reviewed
-    commit, or ``None`` when GitHub compare data is unavailable.
+    """Return whether the current PR diff changed since the reviewed head.
 
-    A content-free rebase can refresh the head commit's committer date
-    past a CHANGES_REQUESTED review without changing the tree.  In that
-    case the date-only freshness check would incorrectly suppress the
-    stale-review reminder.  The compare endpoint gives a cheap content
-    guard: an explicit empty ``files`` list means the new head did not
-    change reviewed content, even if the sha/date moved.
+    ``compare/{review_sha}...{head_sha}`` alone is not the answer: for a
+    content-free rebase, GitHub reports a non-empty ``files`` list because
+    the three-dot compare is from the merge base to the new head.  Instead:
+
+    * If the reviewed commit is the merge base of the new head, commits
+      really landed on top of the reviewed state, so suppress the stale
+      reminder.
+    * If the heads diverged, compare the PR patch signature at review
+      time (old merge base → reviewed head) with the current PR patch
+      signature (current base → current head).  Equal signatures mean the
+      head only moved by rebase/freshening and the review is still stale.
     """
     if not review_sha or review_sha == head_sha:
         return False
-    data = _gh_api(f"repos/{repo}/compare/{review_sha}...{head_sha}", token)
-    if not isinstance(data, dict):
+
+    head_compare = _compare_data(repo, review_sha, head_sha, token)
+    if head_compare is None:
         return None
-    files = data.get("files")
-    if isinstance(files, list):
-        return bool(files)
-    ahead_by = data.get("ahead_by")
-    if ahead_by == 0:
+
+    status = str(head_compare.get("status") or "").lower()
+    merge_base = (head_compare.get("merge_base_commit") or {}).get("sha") or ""
+    ahead_by = head_compare.get("ahead_by")
+    behind_by = head_compare.get("behind_by")
+
+    if status == "identical" or ahead_by == 0:
         return False
-    return None
+    if merge_base == review_sha and behind_by == 0:
+        return True
+
+    # Diverged/rebased: compare old PR diff to current PR diff.
+    old_base_sha = merge_base
+    if not old_base_sha or not current_base_sha:
+        return None
+    reviewed_diff = _compare_data(repo, old_base_sha, review_sha, token)
+    current_diff = _compare_data(repo, current_base_sha, head_sha, token)
+    if reviewed_diff is None or current_diff is None:
+        return None
+    reviewed_sig = _compare_file_signature(reviewed_diff)
+    current_sig = _compare_file_signature(current_diff)
+    if reviewed_sig is None or current_sig is None:
+        return None
+    return reviewed_sig != current_sig
 
 
 def _check_own_changes_requested(
@@ -838,6 +913,7 @@ def _check_own_changes_requested(
             continue
         number = pr.get("number")
         head_sha = (pr.get("head") or {}).get("sha") or ""
+        base_sha = (pr.get("base") or {}).get("sha") or ""
         if not number or not head_sha:
             continue
         key = str(number)
@@ -882,8 +958,8 @@ def _check_own_changes_requested(
         )
         head_date = _head_commit_date(repo, head_sha, token)
         if head_date and head_date >= newest_block_ts:
-            changed = _head_has_file_changes_since(
-                repo, newest_block_sha, head_sha, token,
+            changed = _head_changes_pr_diff_since_review(
+                repo, newest_block_sha, head_sha, base_sha, token,
             )
             if changed is not False:
                 continue

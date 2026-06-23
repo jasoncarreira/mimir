@@ -14,14 +14,20 @@ import pytest
 import poller
 
 
-def _pr(number: int, sha: str, login: str = "mimir-bot",
-        title: str = "My PR") -> dict:
+def _pr(
+    number: int,
+    sha: str,
+    login: str = "mimir-bot",
+    title: str = "My PR",
+    base_sha: str = "base-sha",
+) -> dict:
     return {
         "number": number,
         "title": title,
         "html_url": f"https://github.com/o/r/pull/{number}",
         "user": {"login": login},
         "head": {"sha": sha},
+        "base": {"sha": base_sha},
     }
 
 
@@ -137,11 +143,16 @@ def test_content_free_rebase_after_review_is_still_stale(
     monkeypatch, captured_emits,
 ):
     """A content-free rebase can make committer-date newer than the
-    blocking review without addressing feedback.  Empty compare files
-    keep the stale reminder armed."""
+    blocking review without addressing feedback.
+
+    The first compare fixture intentionally has non-empty ``files`` —
+    the real GitHub three-dot shape for a rebased PR is merge-base →
+    current head, not reviewed-head → current-head tree equality.
+    """
+    unchanged_patch = "@@ -1 +1 @@\n-old\n+new"
     _patch_api(
         monkeypatch,
-        prs=[_pr(642, "rebased-head")],
+        prs=[_pr(642, "rebased-head", base_sha="new-base")],
         reviews_by_pr={642: [
             _review(
                 "jasoncarreira",
@@ -151,7 +162,29 @@ def test_content_free_rebase_after_review_is_still_stale(
             ),
         ]},
         commit_dates={"rebased-head": "2026-06-11T13:00:00Z"},
-        compares={"reviewed-head...rebased-head": {"files": [], "ahead_by": 1}},
+        compares={
+            "reviewed-head...rebased-head": {
+                "status": "diverged",
+                "ahead_by": 1,
+                "behind_by": 1,
+                "merge_base_commit": {"sha": "old-base"},
+                "files": [{"filename": "poller.py", "patch": unchanged_patch}],
+            },
+            "old-base...reviewed-head": {
+                "files": [{
+                    "filename": "poller.py",
+                    "status": "modified",
+                    "patch": unchanged_patch,
+                }],
+            },
+            "new-base...rebased-head": {
+                "files": [{
+                    "filename": "poller.py",
+                    "status": "modified",
+                    "patch": unchanged_patch,
+                }],
+            },
+        },
     )
     count, cursor = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", {},
@@ -181,8 +214,11 @@ def test_real_fix_commit_after_review_suppresses_stale_reminder(
         commit_dates={"fixed-head": "2026-06-11T13:00:00Z"},
         compares={
             "reviewed-head...fixed-head": {
-                "files": [{"filename": "mimir/poller.py"}],
+                "status": "ahead",
                 "ahead_by": 1,
+                "behind_by": 0,
+                "merge_base_commit": {"sha": "reviewed-head"},
+                "files": [{"filename": "mimir/poller.py"}],
             },
         },
     )
