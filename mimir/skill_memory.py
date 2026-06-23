@@ -30,7 +30,7 @@ decays out (self-heal) without changing its ``kind``.
   a "memory" in an unrelated turn — it only appears via the skill-load
   injection.
 - **Operator surfacing** (#267): negative-kind learnings are counted per
-  skill to drive reflection refine/retire proposed-changes.
+  skill to drive reflection refine/retire recommendations.
 """
 
 from __future__ import annotations
