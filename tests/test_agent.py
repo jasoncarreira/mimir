@@ -2202,72 +2202,26 @@ def test_resolve_model_claude_code_deprecated_by_default(monkeypatch):
         _resolve_model("claude-code:claude-sonnet-4-6")
 
 
-def test_resolve_model_claude_code_override_passes_gate(monkeypatch):
-    """With the opt-in set, the gate steps aside — resolution proceeds to
-    the normal import path (ImportError in envs without the fork, never
-    the deprecation RuntimeError)."""
+def test_resolve_model_claude_code_home_dotenv_opt_in(tmp_path, monkeypatch):
+    """chainlink #447: Config.from_env loads <home>/.env defaults, so the
+    setup-written claude-code opt-in reaches normal model resolution."""
     from mimir.agent import _resolve_model
+    from mimir.config import Config
 
-    monkeypatch.setenv("MIMIR_ALLOW_CLAUDE_CODE", "1")
-    try:
-        _resolve_model("claude-code:claude-sonnet-4-6")
-    except RuntimeError as exc:
-        pytest.fail(f"gate fired despite override: {exc}")
-    except ImportError:
-        pass  # fork not installed in this env — expected past the gate
-
-
-def test_resolve_model_claude_code_scaffold_opt_in(tmp_path, monkeypatch):
-    """chainlink #426 (review follow-up): Config.from_env reads os.environ
-    only, so 'mimir setup --subscription' writing MIMIR_ALLOW_CLAUDE_CODE=1
-    into <home>/.env never reaches a bare 'mimir run' through env. The gate
-    consumes the scaffold line directly — setup-written operator intent for
-    this home — so the supported Max quickstart works without a shell
-    export. Env absent + no scaffold still refuses."""
-    from mimir.agent import _resolve_model
-
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
     monkeypatch.delenv("MIMIR_ALLOW_CLAUDE_CODE", raising=False)
-
-    # No scaffold → still refused.
-    with pytest.raises(RuntimeError, match="deprecated"):
-        _resolve_model("claude-code:claude-sonnet-4-6", home=tmp_path)
-
-    # Scaffolded opt-in (what setup writes for claude-code routes) → gate
-    # steps aside; resolution proceeds to the import path.
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
     (tmp_path / ".env").write_text(
         "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6\n"
         "MIMIR_ALLOW_CLAUDE_CODE=1\n",
         encoding="utf-8",
     )
+    cfg = Config.from_env()
     try:
-        _resolve_model("claude-code:claude-sonnet-4-6", home=tmp_path)
+        _resolve_model(cfg.model_spec)
     except RuntimeError as exc:
-        pytest.fail(f"gate fired despite scaffolded opt-in: {exc}")
-    except ImportError:
-        pass  # fork not installed — expected past the gate
-
-
-def test_reflection_lm_honors_scaffold_opt_in(tmp_path, monkeypatch):
-    """chainlink #426 (review follow-up 3): every Config-based
-    _resolve_model caller must thread home= — gepa_support's
-    reflection-LM construction previously missed it, so a
-    subscription-scaffolded home worked for the main agent but the
-    reflection LM still refused the claude-code route."""
-    from types import SimpleNamespace
-    pytest.importorskip("gepa")
-    from mimir.gepa_support import reflection_lm_from_config
-
-    monkeypatch.delenv("MIMIR_ALLOW_CLAUDE_CODE", raising=False)
-    (tmp_path / ".env").write_text(
-        "MIMIR_ALLOW_CLAUDE_CODE=1\n", encoding="utf-8",
-    )
-    cfg = SimpleNamespace(
-        model_spec="claude-code:claude-sonnet-4-6", home=tmp_path,
-    )
-    try:
-        reflection_lm_from_config(cfg)
-    except RuntimeError as exc:
-        pytest.fail(f"deprecation gate fired despite scaffolded opt-in: {exc}")
+        pytest.fail(f"deprecation gate fired despite home .env opt-in: {exc}")
     except ImportError:
         pass  # langchain-claude-code fork not installed — past the gate
 

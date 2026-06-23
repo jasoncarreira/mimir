@@ -100,6 +100,8 @@ def test_setup_writes_reflection_policy(tmp_path: Path):
     # promotion), skill creation, and deletions are HITL — core is read-only
     # at runtime, no autonomous core write.
     assert "persona blocks" in body
+    assert "submit_proposal" in body
+    assert "Prompt edits" in body
     assert "Skill creation" in body
     assert "Memory file deletions" in body
     assert "READ-ONLY at runtime" in body
@@ -115,14 +117,16 @@ def test_setup_writes_learned_behaviors_starter(tmp_path: Path):
     assert "# Learned Behaviors" in body
 
 
-def test_setup_writes_proposed_changes_starter(tmp_path: Path):
+def test_setup_writes_legacy_proposed_changes_starter(tmp_path: Path):
     home = tmp_path / "agent"
     setup_home(home)
     proposed = home / "state" / "proposed-changes.md"
     assert proposed.is_file()
     body = proposed.read_text()
-    assert "# Proposed Changes" in body
-    # The three buckets the skill writes into and the operator moves between.
+    assert "# Proposed Changes (Legacy)" in body
+    assert "Protected surfaces" in body
+    assert "open_proposal" in body
+    # The three buckets retained for migrating historical entries.
     assert "## Pending" in body
     assert "## Applied" in body
     assert "## Rejected" in body
@@ -172,3 +176,4 @@ def test_default_proposed_changes_documents_format():
     assert "Source:" in body
     assert "Proposal:" in body
     assert "Rationale:" in body
+    assert "proposal PR body" in body

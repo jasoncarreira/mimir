@@ -32,9 +32,9 @@ here or in ``30-reflection-policy.md``, fall back to
   and can silently distort behavior, so both are read-only during
   any turn (reflection included). To change either, open a proposal
   with ``open_proposal``, edit it there, and ``submit_proposal`` —
-  the operator reviews and merges the PR. For a non-diff suggestion,
-  route through ``state/proposed-changes.md``; the reflection skill's
-  applied-proposals loop can audit the effect.
+  the operator reviews and merges the PR. For non-protected async
+  decisions, file a Chainlink issue or a ``state/spec/`` note with
+  the decision needed.
 - Deletes under ``<home>`` — **escalate-first**. Drift is
   recoverable from git; deletion isn't.
 - Writes outside the path-confinement allowlist —
@@ -107,9 +107,11 @@ escalation itself is one of:
 
 1. **Ask in chat** with proposed action + alternatives
    (default for time-sensitive work mid-conversation).
-2. **Write a proposal to ``state/proposed-changes.md``** when
-   asynchronous review is OK (default for non-urgent
-   restructures).
+2. **Open a protected-surface proposal PR** with ``open_proposal``
+   / ``submit_proposal`` when the action touches ``memory/core/*`` or
+   ``prompts/*`` and asynchronous review is OK. For non-protected
+   async decisions, file a Chainlink issue or a ``state/spec/`` note
+   with the decision needed.
 3. **Flag to the operator-alert channel** when time-sensitive
    and chat isn't active.
 
