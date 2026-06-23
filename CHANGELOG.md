@@ -18,6 +18,16 @@ All notable changes will land here. Format loosely follows
   dep floor to ≥ 0.0.5 (now published), so the diagnostic activates once this
   version is deployed.
 
+- **Version-specific upgrade prompts (#645).** One-shot migration nudges that
+  run once when a home crosses a target mimir version during a defaults
+  upgrade. Authored as `mimir/prompt_templates/upgrades/<version>.md` (filename
+  = target version), dispatched cumulatively (`prev < v <= current`, oldest
+  first) on the synthetic `upgrade-prompt:<version>` channel, once per bump
+  (gated to the version-advancing upgrade actions, so a restart can't re-run
+  them). Absent prompt = clean no-op. The first one, `0.6.5.md`, nudges a
+  channel-memory review + a memory-hygiene pass. See `upgrades/README.md` for
+  the authoring convention.
+
 ### Changed
 
 - **Runtime now loads `<home>/.env` as defaults (#447).** `Config.from_env()`

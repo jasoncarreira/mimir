@@ -18,11 +18,16 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from packaging.version import InvalidVersion, Version
+
 from . import __version__
 from .git_bootstrap import _redact, _run
 from .memory_templates import bundled_defaults as bundled_core_defaults
 from .models import AgentEvent
-from .prompt_templates import bundled_defaults as bundled_prompt_defaults
+from .prompt_templates import (
+    bundled_defaults as bundled_prompt_defaults,
+    bundled_upgrade_prompts,
+)
 from .proposals import (
     OpenResult,
     ProposalResult,
@@ -46,6 +51,21 @@ UPGRADE_TRIGGER = "upgrade"
 UPGRADE_CHANNEL_PREFIX = "upgrade:"
 UPGRADE_PROMPT_TEMPLATE = "upgrade.md"
 AUTO_SUBMIT_CLEAN_ENV = "MIMIR_DEFAULTS_UPGRADE_AUTO_SUBMIT_CLEAN"
+
+# Version-specific upgrade prompts (chainlink #645): one-shot migration nudges
+# dispatched on the ``upgrade-prompt:<version>`` synthetic channel.
+UPGRADE_PROMPT_CHANNEL_PREFIX = "upgrade-prompt:"
+# ``check_and_open_defaults_upgrade`` actions that mean this run advanced
+# last-synced-version to the new version (a real bump was consumed). Upgrade
+# prompts dispatch ONLY on these, so they fire once per bump — never on
+# already_synced / proposal_exists / skip_* / baseline_initialized / error.
+UPGRADE_PROMPT_DISPATCH_ACTIONS = frozenset({
+    "no_changes",
+    "vendor_updated_no_home_diff",
+    "auto_submitted",
+    "proposal_opened",
+    "proposal_opened_conflicts",
+})
 
 
 @dataclass
@@ -118,6 +138,13 @@ def _write_last_synced_version(home: Path, version: str) -> None:
     path = _state_file(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"{version}\n", encoding="utf-8")
+
+
+def read_last_synced_version(home: Path) -> str | None:
+    """Public read of the recorded last-synced defaults version (``None`` if
+    unset). Callers capture this *before* ``check_and_open_defaults_upgrade``
+    advances it, to know the version being upgraded *from*."""
+    return _read_last_synced_version(home)
 
 
 def _env_bool_value(raw: str | None, *, default: bool = False) -> bool:
@@ -590,14 +617,100 @@ async def enqueue_upgrade_reconciliation_turn(
     return await enqueue(event)
 
 
+def pending_upgrade_prompt_versions(
+    previous: str | None, current: str | None
+) -> list[str]:
+    """Target versions whose upgrade prompt should run for ``previous -> current``.
+
+    Returns the bundled ``upgrades/<v>.md`` versions with ``previous < v <=
+    current``, ascending. Cumulative: a skip upgrade (0.6.4 -> 0.6.7) runs
+    every intermediate prompt that exists. Empty when ``previous`` is None
+    (fresh install — not an upgrade), a version is unparseable, or there is
+    no forward movement.
+    """
+    if not previous or not current:
+        return []
+    try:
+        prev_v = Version(previous)
+        cur_v = Version(current)
+    except InvalidVersion:
+        return []
+    if prev_v >= cur_v:
+        return []
+    matched: list[tuple[Version, str]] = []
+    for name in bundled_upgrade_prompts():
+        try:
+            v = Version(name)
+        except InvalidVersion:
+            continue
+        if prev_v < v <= cur_v:
+            matched.append((v, name))
+    return [name for _, name in sorted(matched)]
+
+
+async def enqueue_upgrade_prompt_turns(
+    home: Path,
+    *,
+    previous: str | None,
+    current: str,
+    action: str,
+    enqueue: Callable[[AgentEvent], Awaitable[bool]],
+) -> int:
+    """Dispatch version-specific upgrade prompts for a consumed version bump.
+
+    Fires only when ``action`` advanced last-synced-version (see
+    ``UPGRADE_PROMPT_DISPATCH_ACTIONS``), so each prompt runs once per bump.
+    Every matching ``upgrades/<v>.md`` becomes one turn on the
+    ``upgrade-prompt:<v>`` synthetic channel, oldest target first. Returns the
+    number enqueued; no match (or a non-bump action) is a clean no-op.
+    Idempotent across restart: the next startup sees ``last-synced == current``
+    and the bump action no longer fires.
+    """
+    if action not in UPGRADE_PROMPT_DISPATCH_ACTIONS:
+        return 0
+    versions = pending_upgrade_prompt_versions(previous, current)
+    if not versions:
+        return 0
+    prompts = bundled_upgrade_prompts()
+    enqueued = 0
+    for ver in versions:
+        text = (prompts.get(ver) or "").strip()
+        if not text:
+            continue
+        content = (
+            text.replace("{from}", previous or "(unknown)")
+            .replace("{to}", current)
+            .replace("{version}", ver)
+        )
+        event = AgentEvent(
+            trigger=UPGRADE_TRIGGER,
+            channel_id=f"{UPGRADE_PROMPT_CHANNEL_PREFIX}{ver}",
+            content=content,
+            source="system",
+            extra={
+                "upgrade_prompt_version": ver,
+                "from_version": previous,
+                "to_version": current,
+            },
+        )
+        if await enqueue(event):
+            enqueued += 1
+    return enqueued
+
+
 __all__ = (
     "AUTO_SUBMIT_CLEAN_ENV",
     "DEFAULTS_VENDOR_BRANCH",
     "LAST_SYNCED_VERSION_FILE",
     "UPGRADE_CHANNEL_PREFIX",
+    "UPGRADE_PROMPT_CHANNEL_PREFIX",
+    "UPGRADE_PROMPT_DISPATCH_ACTIONS",
     "UPGRADE_PROMPT_TEMPLATE",
     "UPGRADE_TRIGGER",
     "DefaultsUpgradeResult",
     "check_and_open_defaults_upgrade",
     "enqueue_upgrade_reconciliation_turn",
+    "enqueue_upgrade_prompt_turns",
+    "pending_upgrade_prompt_versions",
+    "read_last_synced_version",
 )

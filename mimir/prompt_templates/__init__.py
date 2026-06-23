@@ -65,6 +65,31 @@ def bundled_defaults() -> dict[str, str]:
     }
 
 
+# Version-specific upgrade prompts (chainlink #645) live one level down so the
+# flat seed/loader above ignores them (it only picks up top-level ``*.md``).
+_UPGRADE_ROOT = _TEMPLATES_ROOT / "upgrades"
+
+
+def bundled_upgrade_prompts() -> dict[str, str]:
+    """One-shot upgrade prompts keyed by *target* mimir version.
+
+    Files live at ``upgrades/<version>.md`` — the filename stem is the mimir
+    version this prompt runs *on arriving at*. Unlike the templates above
+    these are NOT seeded into ``<home>/prompts`` (they're framework migration
+    nudges read from package data at dispatch time, not operator-owned files).
+    The defaults-upgrade flow dispatches them once, cumulatively, for every
+    target version crossed in a single upgrade. ``upgrades/README.md`` is
+    skipped — it documents the authoring convention, it isn't a prompt.
+    """
+    if not _UPGRADE_ROOT.is_dir():
+        return {}
+    return {
+        entry.stem: entry.read_text(encoding="utf-8")
+        for entry in sorted(_UPGRADE_ROOT.iterdir())
+        if entry.is_file() and entry.suffix == ".md" and entry.stem != "README"
+    }
+
+
 def seed_prompts(home: Path) -> dict[str, str]:
     """Copy missing prompt templates to ``<home>/prompts/<name>.md``.
 
