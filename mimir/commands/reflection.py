@@ -35,7 +35,7 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     refl_ma_p = refl_sub.add_parser(
         "mark-applied",
         help=(
-            "Move a proposal from '## Pending' to '## Applied' in "
+            "Legacy: move a proposal from '## Pending' to '## Applied' in "
             "state/proposed-changes.md and append to applied-proposals.jsonl."
         ),
     )
@@ -60,7 +60,7 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     refl_lp_p = refl_sub.add_parser(
         "list-pending",
         help=(
-            "List pending proposals from state/proposed-changes.md "
+            "Legacy: list pending proposals from state/proposed-changes.md "
             "(numbered in chronological order)."
         ),
     )
@@ -77,7 +77,7 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     refl_resolve_p = refl_sub.add_parser(
         "resolve",
         help=(
-            "Apply operator accept/reject decisions to pending proposals. "
+            "Legacy: apply operator accept/reject decisions to pending proposals. "
             "Example: resolve \"accept 1 3 / reject 2 'not now'\""
         ),
     )

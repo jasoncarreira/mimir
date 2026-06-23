@@ -15,7 +15,7 @@ report computed once. Produces a markdown summary covering:
 - Skill refine/retire candidates (chainlink #267): per-skill objective
   signals — skill_outcomes success-rate, negative-kind skill_learning
   count, zero-recent-usage — surfaced so the reflection turn can author
-  operator-gated refine/retire proposed-changes (#226; surface, not
+  operator-gated refine/retire recommendations (#226; surface, not
   auto-act).
 
 Data sources: ``logs/turns.jsonl``, ``logs/events.jsonl``, and (for the
@@ -243,7 +243,7 @@ def _build_skill_health(
     """Per-skill refine/retire candidates from the objective signals
     (chainlink #267): skill_outcomes success-rate + negative-kind
     ``skill_learning`` count + zero-recent-usage. The reflection turn reads
-    these and authors operator-gated refine/retire proposed-changes.
+    these and authors operator-gated refine/retire recommendations.
 
     Best-effort: a missing input (no ``home``, no saga conn, an import or
     DB error) degrades to the signals available rather than failing the
@@ -716,7 +716,7 @@ def render_markdown(report: Report) -> str:
         lines.append("")
 
     # Skill refine/retire candidates (chainlink #267). The reflection turn
-    # reads this and authors operator-gated refine/retire proposed-changes
+    # reads this and authors operator-gated refine/retire recommendations
     # (#226 — surface, don't auto-act). Empty section is omitted.
     if report.skill_health:
         lines.append("## Skill refine/retire candidates")
