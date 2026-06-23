@@ -2639,16 +2639,18 @@ def test_bundled_scheduler_template_ships_audit_ticks():
     import mimir.prompt_templates as pt
 
     jobs = {j.name: j for j in load_jobs(_BUNDLED_SCHEDULER)}
-    for name in ("heartbeat", "reflect", "issues-audit", "commitments-review"):
+    for name in ("heartbeat", "reflect", "memory-hygiene", "issues-audit", "commitments-review"):
         assert name in jobs, f"{name} missing from bundled scheduler template"
 
     tpl_dir = Path(pt.__file__).parent
-    for name, expect_cron in (
-        ("issues-audit", "0 7 1 * *"),
-        ("commitments-review", "0 7 * * 1"),
+    for name, expect_cron, expect_priority in (
+        ("memory-hygiene", "0 8 * * 2", "normal"),
+        ("issues-audit", "0 7 1 * *", "normal"),
+        ("commitments-review", "0 7 * * 1", "normal"),
     ):
         job = jobs[name]
         assert job.cron == expect_cron, (name, job.cron)
+        assert job.priority == expect_priority, (name, job.priority)
         # cron must be valid for the scheduler's own from_crontab validation
         CronTrigger.from_crontab(job.cron)
         assert job.prompt_file, f"{name} has no prompt_file"
@@ -2667,6 +2669,7 @@ def test_audit_prompt_templates_have_frontmatter():
 
     tpl_dir = Path(pt.__file__).parent
     for fname, expect_name in (
+        ("memory-hygiene.md", "memory-hygiene"),
         ("issues-audit.md", "issues-audit"),
         ("commitments-review.md", "commitments-review"),
         ("upgrade.md", "upgrade"),
@@ -2677,9 +2680,14 @@ def test_audit_prompt_templates_have_frontmatter():
         assert f"name: {expect_name}" in frontmatter, fname
         assert "description:" in frontmatter, fname
         assert "allowed-tools:" not in frontmatter, f"{fname} still has vestigial allowed-tools"
-        if fname != "upgrade.md":
+        if fname == "issues-audit.md":
             # the audit's chainlink-log target id appears in the body
-            assert ("#164" in text) or ("#283" in text), fname
+            assert "#164" in text, fname
+        elif fname == "commitments-review.md":
+            assert "#283" in text, fname
+        elif fname == "memory-hygiene.md":
+            assert "reflection sub-pass" in text
+            assert "flag, don't delete" in text
 
 
 # ── quota-recovery wake (chainlink: quota-pause backoff) ──────────────
