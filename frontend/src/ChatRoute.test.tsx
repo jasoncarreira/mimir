@@ -192,6 +192,55 @@ describe("ChatRoute", () => {
     })));
   });
 
+  it("invokes a skill command without clearing an unsent draft", async () => {
+    chatApi.sendChatMessage.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: { channel_id: "web-default", source_id: "client-1" }
+    });
+
+    renderChat();
+    const input = screen.getByLabelText("Message") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "keep this draft" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
+    fireEvent.click(invoke);
+
+    await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
+      content: "/github"
+    })));
+    expect(input.value).toBe("keep this draft");
+  });
+
+  it("disables composer sends while an invoke is in flight", async () => {
+    let resolveSend: ((value: Awaited<ReturnType<typeof chatApi.sendChatMessage>>) => void) | undefined;
+    chatApi.sendChatMessage.mockReturnValue(new Promise((resolve) => {
+      resolveSend = resolve;
+    }));
+
+    renderChat();
+    const input = screen.getByLabelText("Message") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "draft" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
+    fireEvent.click(invoke);
+
+    await waitFor(() => expect((screen.getByRole("button", { name: "SENDING…" }) as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.submit(input.closest("form") as HTMLFormElement);
+    expect(chatApi.sendChatMessage).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveSend?.({
+        ok: true,
+        version: "v1",
+        data: { channel_id: "web-default", source_id: "client-1" }
+      });
+    });
+    await waitFor(() => expect((screen.getByRole("button", { name: "SEND" }) as HTMLButtonElement).disabled).toBe(false));
+  });
+
   it("opens the Shortcuts picker with persisted user snippets", () => {
     window.localStorage.setItem("mimir.chat.shortcuts", JSON.stringify([
       { id: "custom", label: "Standup", text: "What changed since the last heartbeat?" }

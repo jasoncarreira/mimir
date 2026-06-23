@@ -15,9 +15,9 @@ import { useUiState } from "./uiState";
 
 type ChatStreamState = "connecting" | "open" | "error";
 
-// github #581: composer actions are intentionally frontend-local: the chat
-// backend accepts text, so picker "invoke" sends slash-command text through the
-// normal message path while picker "insert" keeps composing.
+// chainlink #581: composer actions are intentionally frontend-local: the
+// chat backend accepts text, so picker "invoke" sends slash-command text
+// through the normal message path while picker "insert" keeps composing.
 const COMPOSER_INSERT_GLYPHS = ["/", "§", "Δ", "◇", "±", "⇄"] as const;
 
 const SKILL_COMMANDS = [
@@ -33,6 +33,9 @@ type ComposerShortcut = {
   text: string;
 };
 
+// Single-operator browser convenience: shortcuts are intentionally global to
+// this browser, not keyed by identity/apiKeyEpoch. Chat auth still scopes the
+// actual transcript and send channel server-side.
 const SHORTCUTS_STORAGE_KEY = "mimir.chat.shortcuts";
 
 const DEFAULT_SHORTCUTS: ComposerShortcut[] = [
@@ -111,6 +114,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const [channelId, setChannelId] = React.useState("");
   const [sessionId] = React.useState(() => makeDefaultChatSessionId());
   const [composerText, setComposerText] = React.useState("");
+  const [sendInFlight, setSendInFlight] = React.useState(false);
   const [skillPickerOpen, setSkillPickerOpen] = React.useState(false);
   const [shortcutPickerOpen, setShortcutPickerOpen] = React.useState(false);
   const [shortcuts, setShortcuts] = React.useState<ComposerShortcut[]>(() => loadComposerShortcuts());
@@ -124,6 +128,8 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const [streamingReply, setStreamingReply] = React.useState("");
   const streamRawRef = React.useRef<{ spanId: string; raw: string } | null>(null);
   const channelIdRef = React.useRef(channelId);
+  const composerInputRef = React.useRef<HTMLTextAreaElement | null>(null);
+  const sendInFlightRef = React.useRef(false);
   // Bottom-anchored timeline: keep the newest message in view as the stack grows.
   const timelineRef = React.useRef<HTMLOListElement | null>(null);
   // github #567: persisted across tab switches (route unmount) — see chatStore.
@@ -327,13 +333,17 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     update({ turn: id });
   }
 
-  async function sendComposerText(rawText: string) {
+  async function sendComposerText(rawText: string, options: { clearComposer?: boolean } = {}) {
     const text = rawText.trim();
-    if (!text) return;
+    if (!text || sendInFlightRef.current) return;
 
+    sendInFlightRef.current = true;
+    setSendInFlight(true);
     const clientId = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const timestamp = new Date().toISOString();
-    setComposerText("");
+    if (options.clearComposer) {
+      setComposerText("");
+    }
     setMessages((current) => [
       ...current,
       {
@@ -369,15 +379,19 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
       setMessages((current) => current.map((item) => (
         item.id === clientId ? { ...item, status: "error", error: message } : item
       )));
+    } finally {
+      sendInFlightRef.current = false;
+      setSendInFlight(false);
     }
   }
 
   async function submitMessage(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    await sendComposerText(composerText);
+    await sendComposerText(composerText, { clearComposer: true });
   }
 
   async function invokeCommand(command: string) {
+    if (sendInFlightRef.current) return;
     setSkillPickerOpen(false);
     await sendComposerText(command);
   }
@@ -434,20 +448,22 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
               aria-label="Message"
               className="ui-input chat-composer__input"
               placeholder="Send a message"
+              ref={composerInputRef}
               value={composerText}
               onChange={(event) => setComposerText(event.target.value)}
               onFocus={() => setComposerActive(true)}
               onBlur={() => setComposerActive(false)}
             />
             <div className="chat-composer__actions" aria-label="Composer actions">
-              <button className="chat-composer__action" onClick={() => setComposerText("")} type="button">Clear</button>
-              <button className="chat-composer__action" onClick={() => setSkillPickerOpen(true)} type="button">Skills</button>
-              <button className="chat-composer__action" onClick={() => setShortcutPickerOpen(true)} type="button">Shortcuts</button>
+              <button className="chat-composer__action" disabled={sendInFlight} onClick={() => setComposerText("")} type="button">Clear</button>
+              <button className="chat-composer__action" disabled={sendInFlight} onClick={() => setSkillPickerOpen(true)} type="button">Skills</button>
+              <button className="chat-composer__action" disabled={sendInFlight} onClick={() => setShortcutPickerOpen(true)} type="button">Shortcuts</button>
               <div className="chat-composer__glyphs" aria-label="Composer glyphs">
                 {COMPOSER_INSERT_GLYPHS.map((glyph) => (
                   <button
                     aria-label={`Insert ${glyph}`}
                     className="chat-composer__glyph"
+                    disabled={sendInFlight}
                     key={glyph}
                     onClick={() => insertComposerText(glyph)}
                     title={`Insert ${glyph}`}
@@ -458,7 +474,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
                 ))}
               </div>
             </div>
-            <Button className="chat-composer__send" disabled={!composerText.trim()} type="submit" variant="primary">SEND</Button>
+            <Button className="chat-composer__send" disabled={!composerText.trim() || sendInFlight} type="submit" variant="primary">{sendInFlight ? "SENDING…" : "SEND"}</Button>
           </form>
           <Dialog open={skillPickerOpen} title="Skills" onClose={() => setSkillPickerOpen(false)}>
             <div className="chat-picker" aria-label="Skill commands">
@@ -470,8 +486,8 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
                     <p>{skill.description}</p>
                   </div>
                   <div className="chat-picker__actions">
-                    <Button onClick={() => { insertComposerText(`${skill.command} `); setSkillPickerOpen(false); }} type="button" variant="secondary">Insert</Button>
-                    <Button onClick={() => void invokeCommand(skill.command)} type="button" variant="primary">Invoke</Button>
+                    <Button disabled={sendInFlight} onClick={() => { insertComposerText(`${skill.command} `); setSkillPickerOpen(false); composerInputRef.current?.focus(); }} type="button" variant="secondary">Insert</Button>
+                    <Button disabled={sendInFlight} onClick={() => void invokeCommand(skill.command)} type="button" variant="primary">{sendInFlight ? "Invoking…" : "Invoke"}</Button>
                   </div>
                 </article>
               ))}
@@ -486,8 +502,8 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
                     <p>{shortcut.text}</p>
                   </div>
                   <div className="chat-picker__actions">
-                    <Button onClick={() => { insertComposerText(shortcut.text); setShortcutPickerOpen(false); }} type="button" variant="secondary">Insert</Button>
-                    <Button aria-label={`Delete ${shortcut.label}`} onClick={() => deleteShortcut(shortcut.id)} type="button" variant="ghost">Delete</Button>
+                    <Button disabled={sendInFlight} onClick={() => { insertComposerText(shortcut.text); setShortcutPickerOpen(false); composerInputRef.current?.focus(); }} type="button" variant="secondary">Insert</Button>
+                    <Button aria-label={`Delete ${shortcut.label}`} disabled={sendInFlight} onClick={() => deleteShortcut(shortcut.id)} type="button" variant="ghost">Delete</Button>
                   </div>
                 </article>
               ))}
@@ -500,7 +516,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
                   Text
                   <textarea className="ui-input" onChange={(event) => setShortcutText(event.target.value)} value={shortcutText} />
                 </label>
-                <Button disabled={!shortcutText.trim()} type="submit" variant="primary">Add shortcut</Button>
+                <Button disabled={!shortcutText.trim() || sendInFlight} type="submit" variant="primary">Add shortcut</Button>
               </form>
             </div>
           </Dialog>
