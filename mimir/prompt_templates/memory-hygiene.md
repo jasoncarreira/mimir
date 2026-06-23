@@ -1,6 +1,6 @@
 ---
 name: memory-hygiene
-description: Scheduled deterministic scan for memory filing drift. Run when a turn fires with trigger=scheduled_tick on channel scheduler:memory-hygiene. Separate from weekly reflection: this pass surfaces bounded candidates for channel-memory bloat, stale/resolved/misfiled memory/issues files, missing descriptions, and wiki/memory hygiene drift without turning reflection into a grab-bag audit runner. Output should be a concise digest plus Chainlink/proposed-change follow-ups, not broad reflective reasoning.
+description: Scheduled deterministic scan for memory filing drift. Run when a turn fires with trigger=scheduled_tick on channel scheduler:memory-hygiene. Separate from weekly reflection: this pass surfaces bounded candidates for channel-memory bloat, stale/resolved/misfiled memory/issues files, missing descriptions, and wiki/memory hygiene drift without turning reflection into a grab-bag audit runner. Output should be a concise digest plus Chainlink/spec-decision follow-ups, not broad reflective reasoning.
 ---
 
 # Memory hygiene
@@ -24,15 +24,17 @@ Suggested shape:
 
 ```bash
 python - <<'PY'
+import os
 from pathlib import Path
-home = Path.home()
+home = Path(os.environ["MIMIR_HOME"])
 for root in [home / "memory" / "channels", home / "memory" / "issues", home / "state" / "wiki"]:
     print(f"## {root}")
     for p in sorted(root.rglob("*")) if root.exists() else []:
         if p.is_file():
             stat = p.stat()
-            first = p.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
-            desc = first[0] if first and first[0].startswith("<!-- desc:") else "NO_DESC"
+            with p.open("r", encoding="utf-8", errors="replace") as fh:
+                first = fh.readline().rstrip("\n")
+            desc = first if first.startswith("<!-- desc:") else "NO_DESC"
             print(stat.st_size, int(stat.st_mtime), p, desc)
 PY
 ```
@@ -72,7 +74,7 @@ looked suspicious.
 Use the smallest durable artifact that matches the action:
 
 - Chainlink issue for concrete cleanup work.
-- `state/proposed-changes.md` entry for operator decisions.
+- Chainlink issue or `state/spec/<topic>-decision.md` for operator decisions.
 - Protected-surface proposal PR only when the needed change is already
   clear and touches `memory/core/*` or `prompts/*`.
 - `rebuild_index(scope="memory" | "state" | "all")` if you made edits

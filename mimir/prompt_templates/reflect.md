@@ -79,7 +79,7 @@ Before either track, gather inputs:
 - All `memory/core/*.md` files
 - `memory/learnings-pending.md` — candidate behaviors captured by
   `saga_session_end` synthesis turns since last reflection. Promote /
-  drop / keep per §B.6.
+  drop / keep per §B.4.
 - File-count and mtime distribution under `memory/<anywhere>/` and
   `state/wiki/` (Glob + `os.stat`; cheap)
 - **Applied-proposals audit** — invoke the bundled CLI subcommand:

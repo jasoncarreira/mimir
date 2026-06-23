@@ -2688,6 +2688,23 @@ def test_audit_prompt_templates_have_frontmatter():
         elif fname == "memory-hygiene.md":
             assert "reflection sub-pass" in text
             assert "flag, don't delete" in text
+            assert 'os.environ["MIMIR_HOME"]' in text
+            assert "Path.home()" not in text
+            assert "state/proposed-changes.md" not in text
+            assert "state/spec/<topic>-decision.md" in text
+
+
+def test_reflect_prompt_pending_learning_cross_reference_is_current():
+    """The pending-learning pass still points at the section that exists.
+
+    PR #860 briefly changed this to §B.6 during an expand/revert cycle;
+    reflect.md's promote/drop/keep section is §B.4.
+    """
+    import mimir.prompt_templates as pt
+
+    text = (Path(pt.__file__).parent / "reflect.md").read_text(encoding="utf-8")
+    assert "drop / keep per §B.4" in text
+    assert "drop / keep per §B.6" not in text
 
 
 # ── quota-recovery wake (chainlink: quota-pause backoff) ──────────────
