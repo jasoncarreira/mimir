@@ -379,7 +379,9 @@ def _expand_standard_dow_numeric_part(part: str) -> str:
         if not (0 <= start <= 7 and 0 <= end <= 7):
             return part
         if start > end:
-            # Let APScheduler raise the canonical invalid-range error.
+            # Standard cron wraparound ranges (for example, 5-1) stay
+            # unsupported here; let APScheduler raise the canonical
+            # invalid-range error rather than inventing local semantics.
             return part
         values = range(start, end + 1, step)
     else:
