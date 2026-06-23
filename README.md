@@ -35,9 +35,10 @@ The name is from Norse myth — Mímir, the keeper of memory and counsel.
   names. (Social posting — e.g. Bluesky — is the `social-cli`
   optional skill, not a bridge.)
 - **Reflection + double-loop learning.** Weekly reflection skill
-  audits behavior + memory architecture, drafts proposals into
-  `state/proposed-changes.md`, and (via the §12.2 applied-proposals
-  audit) closes the loop on whether merged changes actually helped.
+  audits behavior + memory architecture, opens protected-surface
+  proposal PRs for core/prompt changes, and uses Chainlink or state/spec
+  notes for non-protected follow-ups. The legacy §12.2 applied-proposals
+  audit still covers historical `state/proposed-changes.md` entries.
 - **Predictions and calibration.** Agent writes structured
   predictions about future outcomes; CLI tracks them; weekly review
   compares predicted vs measured. Single source of operational

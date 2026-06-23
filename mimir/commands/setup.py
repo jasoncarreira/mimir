@@ -422,11 +422,12 @@ def _default_saga_toml(
 
 DEFAULT_PROPOSED_CHANGES = dedent(
     """\
-    # Proposed Changes
+    # Proposed Changes (Legacy)
 
-    Pending HITL items from the reflection skill. Operator reviews on
-    their own cadence; once an item is applied or rejected, move it
-    to a `## Applied` / `## Rejected` section below or remove it.
+    Legacy pending HITL items from the pre-proposal-PR reflection workflow.
+    Protected surfaces (`memory/core/*` and `prompts/*`) now use
+    `open_proposal` / `submit_proposal` instead. Keep this file only for
+    migration of existing entries or non-protected historical proposals.
 
     Format per item:
 
@@ -440,12 +441,11 @@ DEFAULT_PROPOSED_CHANGES = dedent(
                        or "Read tool would be invoked more often">
     ```
 
-    The `Predicted effect:` line is what the §12.2 audit pass measures
-    against. Phrase it as something the agent could verify by reading
-    events.jsonl / turns.jsonl: error-rate delta, tool-call frequency
-    delta, etc. When the operator merges a proposal, they run
-    `mimir reflection mark-applied "<heading substring>"` to move it
-    here and capture the predicted effect.
+    The `Predicted effect:` line is what the legacy §12.2 audit pass
+    measures against. Phrase it as something the agent could verify by
+    reading events.jsonl / turns.jsonl: error-rate delta, tool-call
+    frequency delta, etc. For new protected-surface changes, put this
+    prediction in the proposal PR body instead.
 
     ## Pending
 
