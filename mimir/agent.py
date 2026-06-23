@@ -1715,6 +1715,11 @@ class Agent:
 
         error: str | None = None
         exception_traceback: str | None = None
+        # PII-light request-content inventory attached to provider errors
+        # (e.g. CodexResponseError on "HTTP 400: Unsupported content type")
+        # so a content rejection is queryable in events.jsonl. The getattr
+        # below keeps this inert on provider versions that don't surface it.
+        turn_error_request_summary: dict[str, Any] | None = None
         messages: list[Any] = []
         output = ""
         # chainlink #376 (PR 3/4): (event, fold_monotonic) for each message
@@ -1801,6 +1806,12 @@ class Agent:
             exception_traceback = "".join(
                 traceback.format_exception(type(exc), exc, exc.__traceback__, limit=16)
             )
+            # langchain-codex-plus >= 0.0.5 attaches a request-content summary
+            # to CodexResponseError; surface it on turn_failed so a content
+            # rejection (e.g. "Unsupported content type") names itself.
+            _req_summary = getattr(exc, "request_summary", None)
+            if isinstance(_req_summary, dict):
+                turn_error_request_summary = _req_summary
             events = []
             log.exception("agent.astream failed: %s", exc)
             # Mid-turn quota exhaustion handling (SPEC §4.9 / §16 item 18).
@@ -1927,6 +1938,10 @@ class Agent:
                 **(
                     {"traceback": exception_traceback[-4000:]}
                     if exception_traceback else {}
+                ),
+                **(
+                    {"request_summary": turn_error_request_summary}
+                    if turn_error_request_summary else {}
                 ),
                 **_turn_outcome_identity(event),
             )
@@ -2853,6 +2868,19 @@ class Agent:
             cross_hours=self._config.recent_cross_hours,
             source_allowlist=self._config.recent_sources,
         )
+        # Channel memory injection (chainlink #187): load per-channel fact
+        # files (operator name, preferences, patterns) from
+        # ``memory/channels/<channel_id>/``. Returns None for synthetic
+        # channels (scheduler:*, poller:*) and channels with no memory files.
+        #
+        # Load before Recent feedback so the over-cap algedonic signal emitted
+        # by load_channel_memory() is visible on the same turn, not the next.
+        from .core_blocks import load_channel_memory
+        channel_memory_block = await asyncio.to_thread(
+            load_channel_memory,
+            self._config.home,
+            event.channel_id or "",
+        )
         feedback_block = (
             self._feedback.recent_block()
             if self._config.feedback_limit_per_polarity > 0
@@ -2953,16 +2981,6 @@ class Agent:
             for _aid in _injected_ids:
                 if _aid not in ctx.injected_skill_atom_ids:
                     ctx.injected_skill_atom_ids.append(_aid)
-        # Channel memory injection (chainlink #187): load per-channel fact
-        # files (operator name, preferences, patterns) from
-        # ``memory/channels/<channel_id>/``.  Returns None for synthetic
-        # channels (scheduler:*, poller:*) and channels with no memory files.
-        from .core_blocks import load_channel_memory
-        channel_memory_block = await asyncio.to_thread(
-            load_channel_memory,
-            self._config.home,
-            event.channel_id or "",
-        )
         # chainlink #508: resolve an optional deliver: channel (poller / tick),
         # mapping the OPERATOR_CHANNEL sentinel → the operator alert channel.
         deliver_channel = resolve_deliver_channel(

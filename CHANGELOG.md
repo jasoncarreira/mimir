@@ -8,6 +8,16 @@ All notable changes will land here. Format loosely follows
 
 ### Added
 
+- **`turn_failed` events carry a `request_summary` for provider content
+  rejections.** When a model call fails with an error exposing a PII-light
+  request-content inventory (langchain-codex-plus ≥ 0.0.5 attaches one to
+  `CodexResponseError` — content-part type counts, image MIME/scheme, sizes;
+  never raw text), it's recorded on `turn_failed` so an `HTTP 400: Unsupported
+  content type` names which content types were in the request. Inert on
+  providers that don't surface it. This PR also bumps the `langchain-codex-plus`
+  dep floor to ≥ 0.0.5 (now published), so the diagnostic activates once this
+  version is deployed.
+
 - **Version-specific upgrade prompts (#645).** One-shot migration nudges that
   run once when a home crosses a target mimir version during a defaults
   upgrade. Authored as `mimir/prompt_templates/upgrades/<version>.md` (filename
@@ -27,6 +37,13 @@ All notable changes will land here. Format loosely follows
   exported deployment env overrides `<home>/.env`; absent `.env` is a no-op.
 
 ### Fixed
+
+- **Oversized real channel memory now surfaces algedonically.**
+  When injected `memory/channels/<id>/*.md` content exceeds the channel-memory
+  prompt cap, mimir emits a negative `channel_memory_over_cap` signal naming the
+  channel/path/size so stale truncated context prompts a trim instead of hiding
+  inside the injected block. Synthetic scheduler/poller channels remain skipped.
+  chainlink #643.
 
 - **Scheduler cron day-of-week now follows standard crontab numbering.**
   Numeric day-of-week fields are interpreted as Sunday=0/7, Monday=1, and so on
