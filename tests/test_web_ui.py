@@ -1351,6 +1351,13 @@ async def test_api_v1_scheduler_lists_schedules_pollers_and_commitments(tmp_path
         skill_dir=home,
         priority="high",
     )
+    scheduler._pollers["never-fired"] = PollerConfig(  # noqa: SLF001
+        name="never-fired",
+        command="python poller.py",
+        cron="0 0 1 * *",
+        env={},
+        skill_dir=home,
+    )
     events_log = tmp_path / "events.jsonl"
     old_schedule_event = json.dumps({
         "timestamp": "2026-06-15T08:00:00+00:00",
@@ -1413,10 +1420,12 @@ async def test_api_v1_scheduler_lists_schedules_pollers_and_commitments(tmp_path
     assert body["data"]["schedules"][0]["prompt_source"] == "file:morning.md"
     assert body["data"]["schedules"][0]["last_run_at"] == "2026-06-15T08:00:00+00:00"
     assert body["data"]["schedules"][0]["recent_result"] == "scheduled_tick"
-    assert body["data"]["pollers"][0]["name"] == "github"
-    assert body["data"]["pollers"][0]["priority"] == "high"
-    assert body["data"]["pollers"][0]["recent_result"] == "emitted=2 rejected=0"
-    poller = body["data"]["pollers"][0]
+    pollers = {row["name"]: row for row in body["data"]["pollers"]}
+    assert pollers["github"]["priority"] == "high"
+    assert pollers["github"]["recent_result"] == "emitted=2 rejected=0"
+    assert pollers["never-fired"]["last_run_at"] is None
+    assert pollers["never-fired"]["recent_result"] is None
+    poller = pollers["github"]
     assert poller["pass_env"] == ["[REDACTED]", "PUBLIC_FLAG"]
     assert poller["env_required"] == ["[REDACTED]"]
     assert poller["config"]["env"]["API_KEY"] == "[REDACTED]"
@@ -1430,6 +1439,34 @@ async def test_api_v1_scheduler_lists_schedules_pollers_and_commitments(tmp_path
     assert body["data"]["commitments"][0]["id"] == "c-soon"
     assert body["data"]["actions"]["mutations_enabled"] is False
     assert "trigger" in body["data"]["actions"]["deferred"]
+
+
+def test_scheduler_state_event_scan_has_bounded_never_fired_path(tmp_path: Path):
+    events_log = tmp_path / "events.jsonl"
+    old_matching_event = json.dumps({
+        "timestamp": "2026-06-01T00:00:00+00:00",
+        "type": "scheduled_tick",
+        "schedule_name": "too-old",
+    })
+    events_log.write_text(
+        old_matching_event
+        + "\n"
+        + "\n".join(
+            json.dumps({"type": "noise", "i": i})
+            for i in range(web_ui.SCHEDULER_STATE_EVENT_SCAN_RECORDS + 5)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = web_ui._read_jsonl_matching(  # noqa: SLF001
+        events_log,
+        max_records=web_ui.SCHEDULER_STATE_EVENT_SCAN_RECORDS,
+        include=lambda record: record.get("type") == "scheduled_tick",
+        stop_when=lambda records: False,
+    )
+
+    assert records == []
 
 
 @pytest.mark.asyncio

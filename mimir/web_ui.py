@@ -100,6 +100,11 @@ DEFAULT_WEB_SKIN = "neon-terminal"
 LIVE_EVENTS_HEARTBEAT_S = 15.0
 LIVE_EVENTS_POLL_S = 1.0
 LIVE_EVENTS_MAX_STREAMS = int(os.environ.get("MIMIR_LIVE_EVENTS_MAX_STREAMS", "8"))
+# The scheduler dashboard needs older persisted state than the generic 5k event
+# tail, but it must stay bounded: newly-added or monthly jobs may have no event
+# yet, so "scan until every configured job is found" can otherwise become a
+# full-file scan on every dashboard request.
+SCHEDULER_STATE_EVENT_SCAN_RECORDS = 20_000
 
 
 def read_web_ui_config(home: Path | None) -> dict[str, str]:
@@ -1092,7 +1097,7 @@ def register_routes(
                 commitments_store=commitments_store,
                 events=_read_jsonl_matching(
                     events_log,
-                    max_records=None,
+                    max_records=SCHEDULER_STATE_EVENT_SCAN_RECORDS,
                     include=_is_scheduler_state_event,
                     stop_when=_found_all_scheduler_state,
                 ),
