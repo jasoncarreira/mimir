@@ -1730,6 +1730,45 @@ async def test_run_turn_failed_event_includes_traceback_for_model_loop_errors(
     assert "tests/test_agent.py" in failed[0]["traceback"]
 
 
+async def test_run_turn_failed_event_includes_request_summary_when_present(
+    tmp_path: Path,
+):
+    """A provider error carrying ``request_summary`` (langchain-codex-plus
+    >= 0.0.5 sets it on CodexResponseError) surfaces that PII-light content
+    inventory onto ``turn_failed`` so a content rejection names itself."""
+    import json
+
+    class _ErrWithSummary(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__("HTTP 400: Unsupported content type")
+            self.request_summary = {
+                "unexpected_content_types": ["input_audio"],
+                "images": [{"role": "user", "mime": "image/svg+xml"}],
+            }
+
+    class ExplodingAgent:
+        async def astream(self, state, *, config, stream_mode="values"):
+            raise _ErrWithSummary()
+            yield  # pragma: no cover - makes this an async generator
+
+    agent = _build_agent(
+        tmp_path, fake_agent=ExplodingAgent(), fake_saga=None,
+        session_manager=_FakeSessionManager(),
+    )
+
+    await agent.run_turn(
+        AgentEvent(trigger="scheduled_tick", channel_id="scheduler:heartbeat", content="x")
+    )
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    failed = [e for e in evs if e.get("type") == "turn_failed"]
+    assert len(failed) == 1
+    summary = failed[0]["request_summary"]
+    assert summary["unexpected_content_types"] == ["input_audio"]
+    assert summary["images"][0]["mime"] == "image/svg+xml"
+
+
 async def test_early_phase_poller_crash_still_emits_turn_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

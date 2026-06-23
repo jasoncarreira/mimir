@@ -6,6 +6,17 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **`turn_failed` events carry a `request_summary` for provider content
+  rejections.** When a model call fails with an error exposing a PII-light
+  request-content inventory (langchain-codex-plus ≥ 0.0.5 attaches one to
+  `CodexResponseError` — content-part type counts, image MIME/scheme, sizes;
+  never raw text), it's recorded on `turn_failed` so an `HTTP 400: Unsupported
+  content type` names which content types were in the request. Inert on
+  providers that don't surface it (the dep floor moves to ≥ 0.0.5 once that
+  release is published).
+
 ## [0.6.4] — 2026-06-22
 
 ### Fixed

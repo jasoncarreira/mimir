@@ -1741,6 +1741,11 @@ class Agent:
 
         error: str | None = None
         exception_traceback: str | None = None
+        # PII-light request-content inventory attached to provider errors
+        # (e.g. CodexResponseError on "HTTP 400: Unsupported content type")
+        # so a content rejection is queryable in events.jsonl. The getattr
+        # below keeps this inert on provider versions that don't surface it.
+        turn_error_request_summary: dict[str, Any] | None = None
         messages: list[Any] = []
         output = ""
         # chainlink #376 (PR 3/4): (event, fold_monotonic) for each message
@@ -1827,6 +1832,12 @@ class Agent:
             exception_traceback = "".join(
                 traceback.format_exception(type(exc), exc, exc.__traceback__, limit=16)
             )
+            # langchain-codex-plus >= 0.0.5 attaches a request-content summary
+            # to CodexResponseError; surface it on turn_failed so a content
+            # rejection (e.g. "Unsupported content type") names itself.
+            _req_summary = getattr(exc, "request_summary", None)
+            if isinstance(_req_summary, dict):
+                turn_error_request_summary = _req_summary
             events = []
             log.exception("agent.astream failed: %s", exc)
             # Mid-turn quota exhaustion handling (SPEC §4.9 / §16 item 18).
@@ -1953,6 +1964,10 @@ class Agent:
                 **(
                     {"traceback": exception_traceback[-4000:]}
                     if exception_traceback else {}
+                ),
+                **(
+                    {"request_summary": turn_error_request_summary}
+                    if turn_error_request_summary else {}
                 ),
                 **_turn_outcome_identity(event),
             )
