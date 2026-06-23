@@ -305,8 +305,89 @@ def test_adapter_applies_prompt_overfit_penalty_to_scores_and_asi():
     adapter = ClusterObservationAdapter([ex], synth)
     batch = adapter.evaluate([ex], {COMPONENT_RICH_PROMPT: prompt}, capture_traces=True)
 
-    raw = batch.trajectories[0]["asi"]["score_breakdown"]["raw_output_score"]
     penalty = batch.trajectories[0]["asi"]["prompt_overfit"]["penalty"]
     assert penalty > 0.0
-    assert batch.scores[0] == max(0.0, raw - penalty)
+    assert batch.scores[0] == 0.0
+    assert batch.trajectories[0]["asi"]["prompt_overfit"]["pass"] is False
+    assert batch.trajectories[0]["asi"]["score_breakdown"]["prompt_overfit_gate_passed"] is False
     assert "hardcoded_identifiers" in batch.trajectories[0]["asi"]["prompt_overfit"]["signals"]
+
+
+def test_prompt_overfit_gate_fails_undelimited_corpus_literals():
+    prompt = """You are consolidating {n} atoms.
+
+Known identifiers from the pilot corpus:
+- arXiv:2606.13141
+- PR #843
+- state/wiki/concepts/cost-aware-evidence-selection.md
+
+Atoms:
+{indexed_atoms}
+"""
+
+    score = score_prompt_candidate(prompt)
+
+    assert score["pass"] is False
+    assert score["gate"]["passed"] is False
+    assert "hardcoded_arxiv_ids" in score["gate"]["hard_fail_reasons"]
+    assert "hardcoded_pr_or_issue_ids" in score["gate"]["hard_fail_reasons"]
+    assert "hardcoded_paths" in score["gate"]["hard_fail_reasons"]
+
+
+def test_prompt_overfit_gate_ignores_deliberately_frozen_example_blocks():
+    prompt = """You are consolidating {n} atoms.
+Preserve identifiers from source atoms; do not preload pilot-corpus IDs.
+
+BEGIN FROZEN EXAMPLE
+Input atom: arXiv:2606.13141 is about state/wiki/concepts/example.md and PR #843.
+Output observation: arXiv:2606.13141 covered the example.
+END FROZEN EXAMPLE
+
+Atoms:
+{indexed_atoms}
+"""
+
+    score = score_prompt_candidate(prompt)
+
+    assert score["pass"] is True
+    assert score["frozen_example_blocks"] == 1
+    assert score["counts"]["arxiv_ids"] == 0
+    assert score["counts"]["issue_ids"] == 0
+    assert score["counts"]["path_literals"] == 0
+
+
+def test_adapter_zeroes_score_when_prompt_overfit_gate_fails():
+    ex = Example(id="ex-1", split="train", data=_example())
+
+    async def synth(prompt: str, example: Example) -> str:
+        return _raw("Chainlink #614 fixed SAGA retrieval on 2026-06-12 for Muninn.")
+
+    prompt = "Atoms:\n{indexed_atoms}\nKNOWN ARXIV IDS:\n- arXiv:2606.13141\n"
+    adapter = ClusterObservationAdapter([ex], synth)
+    batch = adapter.evaluate([ex], {COMPONENT_RICH_PROMPT: prompt}, capture_traces=True)
+
+    assert batch.scores == [0.0]
+    asi = batch.trajectories[0]["asi"]
+    assert asi["prompt_overfit"]["pass"] is False
+    assert asi["score_breakdown"]["prompt_overfit_gate_passed"] is False
+
+
+def test_meta_cluster_wrapper_is_hard_gate():
+    ev = score_candidate(
+        _example(),
+        _raw("These 2 atoms document that Chainlink #614 fixed SAGA retrieval on 2026-06-12."),
+    )
+
+    assert ev.score == 0.0
+    assert ev.asi["hard_fail"] == "meta_cluster_wrapper"
+    assert ev.asi["quality"]["meta_cluster_wrapper"]["hits"]
+
+
+def test_direct_observation_does_not_trip_meta_cluster_wrapper_gate():
+    ev = score_candidate(
+        _example(),
+        _raw("Chainlink #614 fixed SAGA retrieval on 2026-06-12 for Muninn."),
+    )
+
+    assert ev.asi["hard_fail"] is None
+    assert ev.asi["quality"]["meta_cluster_wrapper"]["hits"] == []

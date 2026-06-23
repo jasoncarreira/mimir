@@ -122,9 +122,13 @@ class ClusterObservationAdapter:
         for ex, raw in zip(examples, raw_outputs):
             ev = metrics.score_candidate(ex.data, raw, embedding_fn=self.embedding_fn)
             raw_score = ev.score
-            adjusted_score = max(0.0, raw_score - float(prompt_overfit["penalty"]))
+            prompt_gate_passed = bool(prompt_overfit.get("pass", True))
+            adjusted_score = 0.0 if not prompt_gate_passed else max(
+                0.0, raw_score - float(prompt_overfit["penalty"])
+            )
             ev.asi.setdefault("score_breakdown", {})["raw_output_score"] = raw_score
             ev.asi["score_breakdown"]["prompt_overfit_penalty"] = prompt_overfit["penalty"]
+            ev.asi["score_breakdown"]["prompt_overfit_gate_passed"] = prompt_gate_passed
             ev.asi["prompt_overfit"] = prompt_overfit
             scores.append(adjusted_score)
             if capture_traces:

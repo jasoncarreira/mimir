@@ -66,6 +66,18 @@ _PROMPT_OVERFIT_SECTION_MARKERS = (
     "domain-specific guidance",
     "concepts that may need compact triple objects",
 )
+_FROZEN_EXAMPLE_BLOCK_RE = re.compile(
+    r"^\s*(?:BEGIN|START) FROZEN EXAMPLE\s*$.*?^\s*(?:END|STOP) FROZEN EXAMPLE\s*$",
+    re.I | re.M | re.S,
+)
+_META_CLUSTER_WRAPPER_RE = re.compile(
+    r"\b(?:these|this|the|in these|in this)\s+"
+    r"(?:\d+\s+)?(?:source\s+)?(?:atoms?|cluster|clustered atoms?|atom set)\s+"
+    r"(?:document|documents|indicate|indicates|show|shows|suggest|suggests|record|records|describe|describes)\b"
+    r"|\b(?:this|the)\s+cluster\s+(?:is about|concerns|captures)\b"
+    r"|\bthe\s+atoms\s+(?:are about|concern|capture)\b",
+    re.I,
+)
 
 
 def score_prompt_candidate(prompt: str) -> dict[str, Any]:
@@ -78,13 +90,17 @@ def score_prompt_candidate(prompt: str) -> dict[str, Any]:
     """
 
     text = prompt or ""
-    lower = text.lower()
+    production_text, frozen_blocks = _strip_frozen_example_blocks(text)
+    lower = production_text.lower()
     char_count = len(text)
-    arxiv_ids = _dedupe(m.group(0).replace(" ", "") for m in _PROMPT_ARXIV_RE.finditer(text))
-    issue_ids = _dedupe(m.group(0) for m in _PROMPT_ISSUE_RE.finditer(text))
-    path_literals = _dedupe(m.group(0) for m in _PROMPT_PATH_RE.finditer(text))
+    production_char_count = len(production_text)
+    arxiv_ids = _dedupe(
+        m.group(0).replace(" ", "") for m in _PROMPT_ARXIV_RE.finditer(production_text)
+    )
+    issue_ids = _dedupe(m.group(0) for m in _PROMPT_ISSUE_RE.finditer(production_text))
+    path_literals = _dedupe(m.group(0) for m in _PROMPT_PATH_RE.finditer(production_text))
     marker_hits = [marker for marker in _PROMPT_OVERFIT_SECTION_MARKERS if marker in lower]
-    bullet_entity_lines = _prompt_entity_bullet_lines(text)
+    bullet_entity_lines = _prompt_entity_bullet_lines(production_text)
 
     soft_limit = 5_000
     hard_limit = 9_000
@@ -107,6 +123,18 @@ def score_prompt_candidate(prompt: str) -> dict[str, Any]:
         + entity_list_penalty,
     )
 
+    hard_fail_reasons: list[str] = []
+    if arxiv_ids:
+        hard_fail_reasons.append("hardcoded_arxiv_ids")
+    if issue_ids:
+        hard_fail_reasons.append("hardcoded_pr_or_issue_ids")
+    if path_literals:
+        hard_fail_reasons.append("hardcoded_paths")
+    if marker_hits:
+        hard_fail_reasons.append("corpus_glossary_section")
+    if len(bullet_entity_lines) > 8:
+        hard_fail_reasons.append("large_entity_glossary")
+
     signals = []
     if length_penalty:
         signals.append("too_long")
@@ -121,6 +149,13 @@ def score_prompt_candidate(prompt: str) -> dict[str, Any]:
 
     return {
         "char_count": char_count,
+        "production_char_count": production_char_count,
+        "frozen_example_blocks": len(frozen_blocks),
+        "pass": not hard_fail_reasons,
+        "gate": {
+            "passed": not hard_fail_reasons,
+            "hard_fail_reasons": hard_fail_reasons,
+        },
         "soft_limit": soft_limit,
         "hard_limit": hard_limit,
         "penalty": penalty,
@@ -140,6 +175,20 @@ def score_prompt_candidate(prompt: str) -> dict[str, Any]:
             "entity_bullet_lines": bullet_entity_lines[:8],
         },
     }
+
+
+def _strip_frozen_example_blocks(text: str) -> tuple[str, list[str]]:
+    """Remove deliberately frozen examples before prompt-overfit literal checks.
+
+    A candidate may include literal arXiv IDs, paths, or PR numbers inside a
+    frozen example block, but that block must be explicitly delimited so a
+    production prompt builder can strip it before deployment. Undelimited
+    corpus literals remain a prompt-overfit gate failure.
+    """
+
+    frozen_blocks = [m.group(0) for m in _FROZEN_EXAMPLE_BLOCK_RE.finditer(text)]
+    production_text = _FROZEN_EXAMPLE_BLOCK_RE.sub("", text)
+    return production_text, frozen_blocks
 
 
 def _prompt_entity_bullet_lines(text: str) -> list[str]:
@@ -203,9 +252,12 @@ def score_candidate(
     coverage = _coverage_report(observation, source_atoms)
     retrieval = _retrieval_geometry(example, observation, embedding_fn)
     concision = _concision_score(observation)
+    quality = _quality_report(observation)
 
     hard_fail = None
-    if support["unsupported_high_severity"]:
+    if quality["meta_cluster_wrapper"]["hits"]:
+        hard_fail = "meta_cluster_wrapper"
+    elif support["unsupported_high_severity"]:
         hard_fail = "unsupported_high_severity_claim"
     elif (
         _identifier_dense(example)
@@ -232,6 +284,7 @@ def score_candidate(
         "support": support,
         "coverage": coverage,
         "retrieval_geometry": retrieval,
+        "quality": quality,
         "concision": {"score": concision, "chars": len(observation)},
         "score_breakdown": {
             "retrieval_geometry": retrieval["score"],
@@ -696,6 +749,22 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     if na == 0 or nb == 0:
         return 0.0
     return dot / (na * nb)
+
+
+def _quality_report(observation: str) -> dict[str, Any]:
+    """Report generic quality failures independent of source-symbol retention."""
+
+    hits = _dedupe(m.group(0) for m in _META_CLUSTER_WRAPPER_RE.finditer(observation or ""))
+    return {
+        "score": 0.0 if hits else 1.0,
+        "meta_cluster_wrapper": {
+            "hits": hits,
+            "guidance": (
+                "State the remembered fact directly; do not describe the input "
+                "cluster or atom count (for example, avoid 'these 3 atoms document ...')."
+            ),
+        },
+    }
 
 
 def _concision_score(observation: str) -> float:
