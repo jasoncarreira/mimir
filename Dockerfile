@@ -51,7 +51,7 @@ FROM python:3.11-slim AS base
 ENV NODE_VERSION=22
 ARG MIMIR_ENABLE_CLAUDE_CODE=0
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg git jq xz-utils \
+        ca-certificates curl gnupg git jq ripgrep xz-utils \
         poppler-utils tesseract-ocr tesseract-ocr-eng \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
