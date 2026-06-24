@@ -59,6 +59,10 @@ def home(tmp_path: Path, upstream: Path) -> Path:
 def _defaults(monkeypatch: pytest.MonkeyPatch, *, identity: str, heartbeat: str) -> None:
     monkeypatch.setattr(du, "bundled_core_defaults", lambda: {"00-identity.md": identity})
     monkeypatch.setattr(du, "bundled_prompt_defaults", lambda: {"heartbeat.md": heartbeat})
+    # Neutralize the scheduler template by default so prompts/core-focused tests
+    # see an unchanged vendor tree. Scheduler-reconcile tests (#666) opt in by
+    # re-patching this after calling _defaults.
+    monkeypatch.setattr("mimir.scheduler.bundled_scheduler_template_text", lambda: "")
 
 
 def _cleanup_upgrade_proposal(home: Path) -> None:
@@ -526,3 +530,171 @@ async def test_enqueue_upgrade_prompts_fresh_install_noop(
         action="baseline_initialized", enqueue=fake_enqueue,
     )
     assert n == 0
+
+
+def test_bundled_upgrade_prompts_ships_066() -> None:
+    prompts = du.bundled_upgrade_prompts()
+    assert "0.6.6" in prompts
+    body = prompts["0.6.6"]
+    assert "add_schedule" in body and "memory-hygiene" in body
+
+
+# ── scheduler.yaml defaults reconciliation (chainlink #666) ───────────────
+
+from mimir.scheduler import load_jobs_from_text  # noqa: E402
+
+_HEARTBEAT = "- name: heartbeat\n  cron: '0 * * * *'\n  prompt_file: heartbeat.md\n"
+_MEMHYG = (
+    "- name: memory-hygiene\n  cron: '0 8 * * 2'\n  priority: normal\n"
+    "  prompt_file: memory-hygiene.md\n"
+)
+
+
+def test_merge_adds_new_default_tick() -> None:
+    base = _HEARTBEAT
+    theirs = _HEARTBEAT + _MEMHYG
+    home = _HEARTBEAT
+    new_text, added = du._merge_scheduler_defaults(
+        base_text=base, their_text=theirs, home_text=home, version="0.6.7"
+    )
+    assert added == ["memory-hygiene"]
+    assert new_text is not None
+    jobs = load_jobs_from_text(new_text)
+    assert [j.name for j in jobs] == ["heartbeat", "memory-hygiene"]
+    mh = jobs[1]
+    assert mh.prompt_file == "memory-hygiene.md"
+    assert mh.cron == "0 8 * * 2"
+    assert mh.priority == "normal"
+
+
+def test_merge_preserves_operator_customized_job() -> None:
+    base = "- name: reflect\n  cron: '0 6 * * 0'\n  prompt_file: reflect.md\n"
+    theirs = base + _MEMHYG
+    # operator changed reflect's cron + priority
+    home = "- name: reflect\n  cron: '30 5 * * 0'\n  priority: high\n  prompt_file: reflect.md\n"
+    new_text, added = du._merge_scheduler_defaults(
+        base_text=base, their_text=theirs, home_text=home, version="0.6.7"
+    )
+    assert added == ["memory-hygiene"]
+    by = {j.name: j for j in load_jobs_from_text(new_text)}
+    assert by["reflect"].cron == "30 5 * * 0"  # untouched
+    assert by["reflect"].priority == "high"
+    assert "memory-hygiene" in by
+
+
+def test_merge_preserves_operator_custom_job() -> None:
+    base = _HEARTBEAT
+    theirs = _HEARTBEAT + _MEMHYG
+    home = _HEARTBEAT + "- name: daily-journal\n  cron: '0 0 * * *'\n  prompt_file: daily-journal.md\n"
+    new_text, added = du._merge_scheduler_defaults(
+        base_text=base, their_text=theirs, home_text=home, version="0.6.7"
+    )
+    assert added == ["memory-hygiene"]
+    names = [j.name for j in load_jobs_from_text(new_text)]
+    assert "daily-journal" in names  # custom job preserved
+    assert "memory-hygiene" in names
+
+
+def test_merge_does_not_readd_dropped_default() -> None:
+    # issues-audit is a long-standing default (in the baseline template); the
+    # operator deliberately dropped it. It must NOT be re-added or deleted.
+    base = _HEARTBEAT + "- name: issues-audit\n  cron: '0 7 1 * *'\n  prompt_file: issues-audit.md\n"
+    theirs = base  # template still ships issues-audit
+    home = _HEARTBEAT  # operator removed issues-audit
+    new_text, added = du._merge_scheduler_defaults(
+        base_text=base, their_text=theirs, home_text=home, version="0.6.7"
+    )
+    assert added == []
+    assert new_text is None
+
+
+def test_merge_bootstrap_run_is_noop() -> None:
+    # No prior template baseline (the run that first ships scheduler.yaml into
+    # the vendor branch) → no-op, so a previously-dropped default isn't re-added.
+    new_text, added = du._merge_scheduler_defaults(
+        base_text=None, their_text=_HEARTBEAT + _MEMHYG, home_text=_HEARTBEAT, version="0.6.6"
+    )
+    assert (new_text, added) == (None, [])
+
+
+def test_merge_noop_when_nothing_new() -> None:
+    assert du._merge_scheduler_defaults(
+        base_text=_HEARTBEAT, their_text=_HEARTBEAT, home_text=_HEARTBEAT, version="0.6.7"
+    ) == (None, [])
+
+
+def test_merge_preserves_operator_comments_via_text_append() -> None:
+    base = _HEARTBEAT
+    theirs = _HEARTBEAT + _MEMHYG
+    home = "# operator notes\n- name: heartbeat\n  cron: '0 * * * *'  # hourly\n  prompt_file: heartbeat.md\n"
+    new_text, added = du._merge_scheduler_defaults(
+        base_text=base, their_text=theirs, home_text=home, version="0.6.7"
+    )
+    assert added == ["memory-hygiene"]
+    assert "# operator notes" in new_text  # append, not re-serialize
+    assert "# hourly" in new_text
+
+
+def test_scheduler_reconcile_proposes_new_default_tick(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # scheduler.yaml is gitignored by the fixture allowlist; force-track it once
+    # (real homes allowlist it). Thereafter it's a tracked file, so the
+    # reconcile's plain ``git add`` stages modifications normally.
+    (home / "scheduler.yaml").write_text(_HEARTBEAT, encoding="utf-8")
+    _git("add", "-f", "scheduler.yaml", cwd=home)
+    _git("commit", "-q", "-m", "add scheduler.yaml", cwd=home)
+    _git("push", "-q", cwd=home)
+
+    _defaults(monkeypatch, identity="identity v1\n", heartbeat="heartbeat v1\n")
+    monkeypatch.setattr("mimir.scheduler.bundled_scheduler_template_text", lambda: _HEARTBEAT)
+    assert du.check_and_open_defaults_upgrade(home, version="1.0.0").action == "baseline_initialized"
+
+    # Only the scheduler template changes (adds memory-hygiene); core/prompts same.
+    monkeypatch.setattr(
+        "mimir.scheduler.bundled_scheduler_template_text", lambda: _HEARTBEAT + _MEMHYG
+    )
+    result = du.check_and_open_defaults_upgrade(home, version="1.1.0")
+
+    assert result.ok and result.action == "proposal_opened"
+    assert result.detail and "memory-hygiene" in result.detail
+    wt = result.proposal.worktree
+    staged = _git("diff", "--cached", "--name-only", cwd=wt).stdout.splitlines()
+    assert "scheduler.yaml" in staged
+    jobs = load_jobs_from_text((wt / "scheduler.yaml").read_text(encoding="utf-8"))
+    assert [j.name for j in jobs] == ["heartbeat", "memory-hygiene"]
+    # Live home stays operator-owned until the proposal PR merges.
+    assert "memory-hygiene" not in (home / "scheduler.yaml").read_text(encoding="utf-8")
+    _cleanup_upgrade_proposal(home)
+
+
+def test_scheduler_introduction_run_does_not_add(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The version that first ships scheduler.yaml into the vendor branch must
+    # NOT add ticks (no prior baseline) — even though the template already has
+    # memory-hygiene and the home lacks it. The upgrade prompt delivers it.
+    (home / "scheduler.yaml").write_text(_HEARTBEAT, encoding="utf-8")
+    _git("add", "-f", "scheduler.yaml", cwd=home)
+    _git("commit", "-q", "-m", "add scheduler.yaml", cwd=home)
+    _git("push", "-q", cwd=home)
+
+    # v1 baseline WITHOUT a scheduler template (simulates pre-#666 vendor branch).
+    _defaults(monkeypatch, identity="identity v1\n", heartbeat="heartbeat v1\n")
+    monkeypatch.setattr("mimir.scheduler.bundled_scheduler_template_text", lambda: "")
+    assert du.check_and_open_defaults_upgrade(home, version="1.0.0").action == "baseline_initialized"
+
+    # v2 introduces the template (with memory-hygiene) AND bumps a prompt so a
+    # proposal opens for the prompt change — scheduler.yaml must be untouched.
+    _defaults(monkeypatch, identity="identity v1\n", heartbeat="heartbeat v2\n")
+    monkeypatch.setattr(
+        "mimir.scheduler.bundled_scheduler_template_text", lambda: _HEARTBEAT + _MEMHYG
+    )
+    result = du.check_and_open_defaults_upgrade(home, version="1.1.0")
+
+    assert result.ok and result.action == "proposal_opened"
+    wt = result.proposal.worktree
+    staged = _git("diff", "--cached", "--name-only", cwd=wt).stdout.splitlines()
+    assert "scheduler.yaml" not in staged  # introduction run is a no-op for scheduler
+    assert "memory-hygiene" not in (wt / "scheduler.yaml").read_text(encoding="utf-8")
+    _cleanup_upgrade_proposal(home)

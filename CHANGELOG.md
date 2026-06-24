@@ -10,6 +10,46 @@ All notable changes will land here. Format loosely follows
 
 ### Added
 
+- **Defaults-upgrade now reconciles `scheduler.yaml` (#666).** New default
+  scheduled ticks added to the bundled `scheduler_template.yaml` propagate to
+  existing homes through the upgrade-lane proposal, instead of needing a manual
+  per-home edit. The reconciliation is job-aware (matched by name), not a line
+  merge: it appends default ticks that are new in the current template (absent
+  from the previous-template baseline and from the home), preserves
+  operator-customized and operator-added jobs untouched, and never removes a job
+  — a default the home dropped is not re-added. Appends as text so operator
+  comments/formatting survive. The version that first ships the template into the
+  vendor branch is a deliberate no-op (no baseline to diff), so it can't double-add
+  a tick the same release's upgrade prompt installs.
+
+- **`add_schedule` accepts `prompt_file` (#666).** A scheduled tick can be
+  registered against a bundled/operator prompt file (e.g.
+  `prompt_file="memory-hygiene.md"`) instead of an inline `prompt` — the
+  canonical shape used by `scheduler_template.yaml`. Exactly one of
+  `prompt`/`prompt_file` is required (mirrors the scheduler.yaml load-side
+  validation); a `prompt_file` missing under `<home>/prompts/` is rejected up
+  front. This is the guardrail-respecting, live-and-durable way for an agent to
+  self-register a tick (it writes through the scheduler's reload/validate path).
+
+- **Upgrade prompt `0.6.6.md`.** One-shot nudge that checks for the
+  `memory-hygiene` tick and, if absent, registers it via the new
+  `add_schedule(prompt_file=…)` in the canonical shape (idempotent; no-op if
+  already present).
+
+### Changed
+
+- **Core memory: honor file-tool write refusals regardless of mechanism.**
+  `memory/core/06-action-boundaries.md` now states that a refused write (the
+  core/prompts runtime block or the path-confinement allowlist) is changed
+  through its sanctioned route — a proposal PR for `memory/core/*` and
+  `prompts/*`, the scheduler API for `scheduler.yaml` — not routed around with
+  `shell_exec` (which also skips the scheduler's reload/validation, landing an
+  edit on disk but not in the running scheduler).
+
+## [0.6.5] — 2026-06-23
+
+### Added
+
 - **`turn_failed` events carry a `request_summary` for provider content
   rejections.** When a model call fails with an error exposing a PII-light
   request-content inventory (langchain-codex-plus ≥ 0.0.5 attaches one to

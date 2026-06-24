@@ -261,13 +261,11 @@ class SchedulerJob:
         )
 
 
-def load_jobs(path: Path) -> list[SchedulerJob]:
-    """Read scheduler.yaml. Returns [] for missing/empty/invalid files —
+def load_jobs_from_text(text: str) -> list[SchedulerJob]:
+    """Parse scheduler.yaml *content*. Returns [] for empty/invalid text —
     one bad job shouldn't take the whole list down."""
-    if not path.is_file():
-        return []
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         log.warning("scheduler.yaml parse failed: %s", exc)
         return []
@@ -282,6 +280,26 @@ def load_jobs(path: Path) -> list[SchedulerJob]:
         except ValueError as exc:
             log.warning("invalid scheduler job: %s", exc)
     return out
+
+
+def load_jobs(path: Path) -> list[SchedulerJob]:
+    """Read scheduler.yaml. Returns [] for missing/empty/invalid files —
+    one bad job shouldn't take the whole list down."""
+    if not path.is_file():
+        return []
+    return load_jobs_from_text(path.read_text(encoding="utf-8"))
+
+
+_BUNDLED_TEMPLATE = Path(__file__).parent / "scheduler_template.yaml"
+
+
+def bundled_scheduler_template_text() -> str:
+    """The shipped ``scheduler_template.yaml`` content (the canonical default
+    tick set). Empty string if the bundled file is unreadable."""
+    try:
+        return _BUNDLED_TEMPLATE.read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 def write_jobs(path: Path, jobs: list[SchedulerJob]) -> None:

@@ -171,13 +171,28 @@ def _read_prompt_template(home: Path, name: str) -> str:
     return bundled.strip()
 
 
+SCHEDULER_YAML_REL = Path("scheduler.yaml")
+
+
 def _shipped_default_files() -> dict[Path, str]:
-    """Return shipped default files keyed by their home-relative paths."""
+    """Return shipped default files keyed by their home-relative paths.
+
+    ``scheduler.yaml`` rides along as the bundled *template* so the vendor
+    branch carries a per-version baseline of the default tick set. It is NOT
+    line-merged like the prompts/core surfaces (``_apply_defaults_three_way``
+    skips it); the job-aware ``_reconcile_scheduler_yaml`` uses those baselines
+    to detect newly-added default ticks.
+    """
+    from .scheduler import bundled_scheduler_template_text
+
     out: dict[Path, str] = {}
     for name, text in bundled_core_defaults().items():
         out[Path("memory") / "core" / name] = text
     for name, text in bundled_prompt_defaults().items():
         out[Path("prompts") / name] = text
+    template = bundled_scheduler_template_text()
+    if template:
+        out[SCHEDULER_YAML_REL] = template
     return dict(sorted(out.items(), key=lambda item: item[0].as_posix()))
 
 
@@ -424,6 +439,112 @@ def _apply_defaults_three_way(
     return diff.returncode != 0 or changed, conflicts, None
 
 
+def _merge_scheduler_defaults(
+    *, base_text: str | None, their_text: str, home_text: str, version: str
+) -> tuple[str | None, list[str]]:
+    """Job-aware reconciliation of NEW default scheduled ticks (chainlink #666).
+
+    ``scheduler.yaml`` is far more operator-customized than the prompt/core
+    surfaces (edited crons/priorities, operator-added jobs), so a line-based
+    3-way merge would clobber it. Instead, match jobs by ``name``:
+
+    - ADD default jobs that are *new in the current template* (present in
+      ``their_text``, absent from the previous-template ``base_text``) and not
+      already present in the home — the main goal (e.g. a new memory-hygiene
+      tick reaching an existing home).
+    - PRESERVE operator-customized existing jobs and operator-added custom
+      jobs: home entries are never modified or reordered.
+    - NEVER remove a job, including a default the home dropped (a dropped
+      default is in ``base_text``, so it is not "new" and is not re-added).
+
+    The home file is appended to as TEXT (not re-serialized) so operator
+    comments/formatting survive. Returns ``(new_home_text, added_names)``;
+    ``new_home_text`` is None when there is nothing to add.
+
+    ``base_text`` None means there is no prior template baseline (the run that
+    first ships ``scheduler.yaml`` into the vendor branch). That is a deliberate
+    no-op: without a baseline we cannot tell a genuinely-new default from one
+    the home dropped before this feature existed, and the same release's upgrade
+    prompt is the canonical first-delivery path. New ticks added in *future*
+    versions reconcile normally.
+    """
+    if base_text is None:
+        return None, []
+    from .scheduler import load_jobs_from_text
+
+    base_names = {j.name for j in load_jobs_from_text(base_text)}
+    their_jobs = load_jobs_from_text(their_text)
+    home_names = {j.name for j in load_jobs_from_text(home_text)}
+    to_add = [
+        j for j in their_jobs
+        if j.name not in base_names and j.name not in home_names
+    ]
+    if not to_add:
+        return None, []
+
+    import yaml
+
+    addition = yaml.safe_dump(
+        [j.to_yaml_entry() for j in to_add],
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+    )
+    banner = (
+        f"# --- added by mimir {version} defaults upgrade: new default "
+        f"tick(s) — edit cron/priority/channel or remove as needed ---\n"
+    )
+    stripped = home_text.rstrip("\n")
+    if not stripped or stripped == "[]":
+        new_text = banner + addition
+    else:
+        new_text = f"{stripped}\n\n{banner}{addition}"
+    return new_text, [j.name for j in to_add]
+
+
+def _reconcile_scheduler_yaml(
+    worktree: Path,
+    *,
+    previous_ref: str,
+    current_ref: str,
+    version: str,
+) -> tuple[bool, list[str]]:
+    """Stage new-default-tick additions to ``scheduler.yaml`` in ``worktree``.
+
+    Reads the previous/current bundled template from the vendor refs and the
+    home file from the proposal worktree, then applies ``_merge_scheduler_defaults``
+    and stages the result. Returns ``(changed, added_job_names)``.
+    """
+    rel = SCHEDULER_YAML_REL
+    home_path = worktree / rel
+    if not home_path.exists():
+        # scheduler.yaml is not tracked in this home — don't fabricate one.
+        return False, []
+    their_text = _git_file(worktree, current_ref, rel)
+    if their_text is None:
+        return False, []  # template not yet in the vendor branch
+    base_text = _git_file(worktree, previous_ref, rel)  # None on the introduction run
+    try:
+        home_text = home_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("scheduler reconcile: could not read %s: %s", home_path, exc)
+        return False, []
+    new_text, added = _merge_scheduler_defaults(
+        base_text=base_text, their_text=their_text, home_text=home_text, version=version,
+    )
+    if new_text is None or not added:
+        return False, []
+    home_path.write_text(new_text, encoding="utf-8")
+    add = _git(["add", rel.as_posix()], cwd=worktree)
+    if add.returncode != 0:
+        log.warning(
+            "scheduler reconcile: git add failed: %s",
+            _redact((add.stderr or add.stdout or "").strip()),
+        )
+        return False, []
+    return True, added
+
+
 def check_and_open_defaults_upgrade(
     home: Path,
     *,
@@ -504,6 +625,20 @@ def check_and_open_defaults_upgrade(
     if merge_error:
         abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE)
         return DefaultsUpgradeResult(ok=False, action="error", version=version, detail=merge_error, proposal=opened)
+
+    # Job-aware scheduler.yaml reconciliation (chainlink #666): propose any
+    # newly-added default ticks. Append-only and never conflicting, so it only
+    # feeds has_diff — it cannot turn a clean upgrade into a conflicted one.
+    sched_changed, sched_added = _reconcile_scheduler_yaml(
+        opened.worktree,
+        previous_ref=previous_ref,
+        current_ref=vendor.current_ref,
+        version=version,
+    )
+    if sched_added:
+        log.info("scheduler defaults reconciled: added ticks %s", ", ".join(sched_added))
+    has_diff = has_diff or sched_changed
+
     if not has_diff:
         abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE)
         _write_last_synced_version(home, version)
@@ -513,14 +648,19 @@ def check_and_open_defaults_upgrade(
     if auto_submit_clean is None:
         import os
         auto_submit_clean = _env_bool_value(os.environ.get(AUTO_SUBMIT_CLEAN_ENV), default=False)
+    sched_note = (
+        f" New default scheduled tick(s) added to scheduler.yaml: {', '.join(sched_added)}."
+        if sched_added
+        else ""
+    )
     if auto_submit_clean and not conflicts:
         submitted = finalize_proposal(
             home,
             title=f"Upgrade mimir defaults to {version}",
             rationale=(
                 "Automatically proposed a conflict-free shipped-defaults upgrade for "
-                "memory/core/ and prompts/. Approval remains operator-controlled: "
-                "merge the PR to apply these files to the live home."
+                "memory/core/ and prompts/." + sched_note + " Approval remains "
+                "operator-controlled: merge the PR to apply these files to the live home."
             ),
             lane=UPGRADE_PROPOSAL_LANE,
         )
@@ -553,6 +693,7 @@ def check_and_open_defaults_upgrade(
         ok=True,
         action="proposal_opened_conflicts" if conflicts else "proposal_opened",
         version=version,
+        detail=sched_note.strip() or None,
         proposal=opened,
         conflicts=conflicts,
     )
