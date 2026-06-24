@@ -55,6 +55,13 @@ tail -30 /path/to/output.log
 grep "EXIT_CODE=" /path/to/output.log
 ```
 
+Budget rule: poll sparingly. One or two progress checks are enough inside
+the same turn; after that, rely on the completion callback / `bash_async`
+wake-up unless the immediate result is required for a mandatory side
+effect. Do not spend the last tool calls repeatedly tailing a healthy job
+when you still need to submit a PR review, comment on a PR/Chainlink, push,
+or send the final status.
+
 ### Checking Completion
 
 When the command finishes, the last line of the output file will be `EXIT_CODE=N`:
