@@ -666,6 +666,92 @@ class TestBuildFileToolRoutes:
         assert isinstance(routes[str(rw) + "/"], _RootAwareFilesystemBackend)
         assert isinstance(routes[str(ro) + "/"], ReadOnlyFilesystemBackend)
 
+    def test_grep_skips_vendor_and_vcs_subtrees(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "src").mkdir()
+        (repo / "src" / "app.py").write_text("needle\n")
+        (repo / "node_modules").mkdir()
+        (repo / "node_modules" / "dep.py").write_text("needle\n")
+        (repo / ".git").mkdir()
+        (repo / ".git" / "packed-refs").write_text("needle\n")
+        backend = _RootAwareFilesystemBackend(root_dir=repo, virtual_mode=True)
+
+        result = backend.grep("needle", path="/")
+        paths = {m["path"] for m in (result.matches or [])}
+
+        assert "/src/app.py" in paths
+        assert "/node_modules/dep.py" not in paths
+        assert "/.git/packed-refs" not in paths
+
+    def test_grep_reports_match_truncation(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "a.txt").write_text("needle\n")
+        (repo / "b.txt").write_text("needle\n")
+        backend = _RootAwareFilesystemBackend(
+            root_dir=repo,
+            virtual_mode=True,
+            max_grep_matches=1,
+        )
+
+        result = backend.grep("needle", path="/")
+
+        assert len(result.matches or []) == 1
+        assert result.error and "truncated" in result.error
+
+    def test_glob_skips_worktrees_and_reports_match_truncation(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "src").mkdir()
+        (repo / "src" / "a.py").write_text("x\n")
+        (repo / "src" / "b.py").write_text("x\n")
+        (repo / ".worktrees").mkdir()
+        (repo / ".worktrees" / "ignored.py").write_text("x\n")
+        backend = _RootAwareFilesystemBackend(
+            root_dir=repo,
+            virtual_mode=True,
+            max_glob_matches=1,
+        )
+
+        result = backend.glob("**/*.py", path="/")
+        paths = [m["path"] for m in (result.matches or [])]
+
+        assert paths == ["/src/a.py"]
+        assert result.error and "truncated" in result.error
+
+    def test_glob_reports_scan_truncation_before_matching(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "a.txt").write_text("x\n")
+        (repo / "b.txt").write_text("x\n")
+        (repo / "c.py").write_text("x\n")
+        backend = _RootAwareFilesystemBackend(
+            root_dir=repo,
+            virtual_mode=True,
+            max_scan_files=2,
+        )
+
+        result = backend.glob("**/*.py", path="/")
+
+        assert result.matches == []
+        assert result.error and "scanned more than 2 files" in result.error
+
+    def test_ls_hides_expensive_traversal_roots(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "src").mkdir()
+        (repo / ".worktrees").mkdir()
+        (repo / "node_modules").mkdir()
+        backend = _RootAwareFilesystemBackend(root_dir=repo, virtual_mode=True)
+
+        entries = backend.ls("/").entries or []
+        names = {Path(e["path"].rstrip("/")).name for e in entries}
+
+        assert "src" in names
+        assert ".worktrees" not in names
+        assert "node_modules" not in names
+
 
 class TestFileToolRouter:
     @staticmethod
