@@ -155,14 +155,16 @@ describe("ChatRoute", () => {
     expect(within(timeline).getByText("hello mimir")).toBeTruthy();
   });
 
-  it("supports composer action buttons for clear and glyph insertion", () => {
+  it("supports compact composer utility controls without extra insert glyphs", () => {
     renderChat();
     const input = screen.getByLabelText("Message") as HTMLTextAreaElement;
 
-    fireEvent.change(input, { target: { value: "draft" } });
-    fireEvent.click(screen.getByRole("button", { name: "Insert Δ" }));
-    expect(input.value).toBe("draftΔ");
+    expect(screen.queryByRole("button", { name: "Insert Δ" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Clear" }).textContent).toBe("🗑");
+    expect(screen.getByRole("button", { name: "Skills" }).textContent).toBe("/");
+    expect(screen.getByRole("button", { name: "Shortcuts" }).textContent).toBe("⚡");
 
+    fireEvent.change(input, { target: { value: "draft" } });
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
     expect(input.value).toBe("");
     expect(chatApi.sendChatMessage).not.toHaveBeenCalled();
