@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -286,7 +287,6 @@ async def test_api_v1_turns_returns_envelope_and_list_metadata(app):
     }
 
 
-
 @pytest.mark.asyncio
 async def test_api_v1_turns_offloads_tail_read(monkeypatch, app):
     a, turns_log, _ = app
@@ -542,6 +542,40 @@ async def test_api_events_filters_by_type_and_limit(app):
         resp = await client.get("/api/events?since=2026-01-01T00:00:02Z")
         body = await resp.json()
         assert [e["type"] for e in body["events"]] == ["tool_call", "turn_finished"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/events?limit=2", "/api/v1/events?limit=2"])
+async def test_api_events_reads_jsonl_off_event_loop(monkeypatch, app, path):
+    """Dashboard polling must not tail/parse JSONL logs on the aiohttp loop."""
+    a, _, events_log = app
+    rows = [
+        {"timestamp": f"2026-01-01T00:00:0{i}Z", "type": "tool_call"}
+        for i in range(4)
+    ]
+    events_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    loop_thread = threading.get_ident()
+    real_read_jsonl = web_ui._read_jsonl
+    read_threads: list[int] = []
+
+    def recording_read_jsonl(*args, **kwargs):
+        read_threads.append(threading.get_ident())
+        return real_read_jsonl(*args, **kwargs)
+
+    monkeypatch.setattr(web_ui, "_read_jsonl", recording_read_jsonl)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(path)
+        body = await resp.json()
+
+    events = body.get("events") or body["data"]["events"]
+    assert resp.status == 200
+    assert [e["timestamp"] for e in events] == [
+        "2026-01-01T00:00:02Z",
+        "2026-01-01T00:00:03Z",
+    ]
+    assert read_threads
+    assert all(thread_id != loop_thread for thread_id in read_threads)
 
 
 @pytest.mark.asyncio
@@ -961,6 +995,36 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     assert ops_manifest["label"] == "Ops"
     assert ops_manifest["api_namespace"] == "ops"
     assert ops_manifest["trusted_first_party"] is True
+
+
+@pytest.mark.asyncio
+async def test_api_v1_web_bootstrap_reads_turn_total_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+
+    def recording_read_turns_total(path: Path) -> int:
+        read_threads.append(threading.get_ident())
+        return 123
+
+    monkeypatch.setattr(web_ui, "read_turns_total", recording_read_turns_total)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/web/bootstrap")
+        body = await resp.json()
+
+    assert resp.status == 200
+    assert body["data"]["turns_total"] == 123
+    assert read_threads
+    assert all(thread_id != loop_thread for thread_id in read_threads)
 
 
 def test_read_web_ui_config_reads_agent_file(tmp_path: Path):

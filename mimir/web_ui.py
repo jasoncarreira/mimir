@@ -652,11 +652,9 @@ def register_routes(
             ),
         )
 
-    async def events_data(request: web.Request) -> web.Response:
-        records = _filter_event_records_by_channel(
-            _read_jsonl(events_log),
-            _request_user_web_channel(request),
-        )
+    def _parse_events_query(
+        request: web.Request,
+    ) -> tuple[str, set[str], int, str | None]:
         since = request.query.get("since", "").strip()
         types = request.query.getall("type", []) or []
         # ``type`` can also arrive as a single comma-joined string.
@@ -670,33 +668,16 @@ def register_routes(
             limit = int(request.query.get("limit") or 0)
         except ValueError:
             limit = 0
+        return since, type_filter, limit, _request_user_web_channel(request)
 
-        out = records
-        if since:
-            out = [r for r in out if str(r.get("timestamp", "")) >= since]
-        if type_filter:
-            out = [r for r in out if r.get("type") in type_filter]
-        if limit > 0:
-            out = out[-limit:]
-        return web.json_response({"events": out})
-
-    def _events_window(request: web.Request) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        records = _filter_event_records_by_channel(
-            _read_jsonl(events_log),
-            _request_user_web_channel(request),
-        )
-        since = request.query.get("since", "").strip()
-        types = request.query.getall("type", []) or []
-        type_filter: set[str] = set()
-        for t in types:
-            for tok in t.split(","):
-                tok = tok.strip()
-                if tok:
-                    type_filter.add(tok)
-        try:
-            limit = int(request.query.get("limit") or 0)
-        except ValueError:
-            limit = 0
+    def _events_window(
+        *,
+        since: str,
+        type_filter: set[str],
+        limit: int,
+        channel: str | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        records = _filter_event_records_by_channel(_read_jsonl(events_log), channel)
 
         out = records
         if since:
@@ -714,8 +695,26 @@ def register_routes(
             truncated=bool(limit > 0 and total > limit),
         )
 
+    async def events_data(request: web.Request) -> web.Response:
+        since, type_filter, limit, channel = _parse_events_query(request)
+        out, _meta = await asyncio.to_thread(
+            _events_window,
+            since=since,
+            type_filter=type_filter,
+            limit=limit,
+            channel=channel,
+        )
+        return web.json_response({"events": out})
+
     async def events_data_v1(request: web.Request) -> web.Response:
-        events, meta = _events_window(request)
+        since, type_filter, limit, channel = _parse_events_query(request)
+        events, meta = await asyncio.to_thread(
+            _events_window,
+            since=since,
+            type_filter=type_filter,
+            limit=limit,
+            channel=channel,
+        )
         return json_success({"events": events}, meta=meta)
 
     live_events_active = 0
@@ -936,7 +935,7 @@ def register_routes(
             {
                 "version": __version__,
                 "model": model,
-                "turns_total": read_turns_total(turns_log),
+                "turns_total": await asyncio.to_thread(read_turns_total, turns_log),
                 "auth": {
                     "required": gate,
                     "scheme": "x-api-key",
