@@ -334,7 +334,7 @@ def _parse_file_tool_roots(
     raw: str,
     home: Path,
     *,
-    always_rw: tuple[str, ...] = _ALWAYS_RW_FILE_TOOL_ROOTS,
+    always_rw: tuple[str, ...] | None = None,
 ) -> tuple[tuple[str, str], ...]:
     """Parse ``MIMIR_FILE_TOOL_ROOTS`` into validated ``(abs_path, mode)`` pairs.
 
@@ -348,7 +348,11 @@ def _parse_file_tool_roots(
     ``/`` or ``/etc``; missing / non-directory; and any root that IS the home or
     overlaps it in either direction (which would shadow the home WriteGuard).
     Symlinks are resolved. De-duplicated by resolved path, insertion order, with
-    explicit entries taking precedence over ``always_rw``."""
+    explicit entries taking precedence over ``always_rw``. ``always_rw``
+    defaults to ``_ALWAYS_RW_FILE_TOOL_ROOTS`` (resolved at call time so an
+    unset env still gets ``/tmp``); pass ``()`` to disable it."""
+    if always_rw is None:
+        always_rw = _ALWAYS_RW_FILE_TOOL_ROOTS
     _log = logging.getLogger(__name__)
     home_resolved = Path(home).resolve()
     out: dict[str, str] = {}

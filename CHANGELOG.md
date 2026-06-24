@@ -16,7 +16,9 @@ All notable changes will land here. Format loosely follows
   added `rw` when present. Roots are routed via deepagents' `CompositeBackend`
   (the home stays the default); reads/writes hit real disk, `:ro` roots block
   writes. Validation rejects non-absolute, missing, `/`, `/etc`, `~`, `..`, and any
-  root overlapping the home. Unset → home-only (unchanged). This fixes the
+  root overlapping the home. With `MIMIR_FILE_TOOL_ROOTS` unset the agent still
+  gets `/tmp` rw (the always-on scratch root, when present) but no other roots —
+  every deployment thus gains `/tmp` file-tool access by default. This fixes the
   long-standing `/workspace/mimir` false-not-found (the file tools ran
   `virtual_mode` rooted at the home, silently remapping `/workspace/mimir/x` →
   `<home>/workspace/mimir/x` → "not found" while `shell_exec` saw the real file —

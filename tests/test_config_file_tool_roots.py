@@ -109,3 +109,19 @@ def test_explicit_entry_wins_over_always_rw(tmp_path: Path) -> None:
 
 def test_default_always_rw_is_tmp() -> None:
     assert _ALWAYS_RW_FILE_TOOL_ROOTS == ("/tmp",)
+
+
+def test_unset_env_still_appends_default_always_rw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The unset-env contract (mimir-carreira #869 review): an empty
+    # MIMIR_FILE_TOOL_ROOTS still appends the module default always-rw roots
+    # (``/tmp`` in prod) — "unset" is NOT "home-only". Patch the default to a
+    # controlled dir outside the home so the assertion is deterministic
+    # regardless of the CI temp-dir layout (where /tmp may contain the home).
+    home = _home(tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr("mimir.config._ALWAYS_RW_FILE_TOOL_ROOTS", (str(scratch),))
+    out = _parse_file_tool_roots("", home)  # no always_rw= → uses module default
+    assert out == ((str(scratch.resolve()), "rw"),)
