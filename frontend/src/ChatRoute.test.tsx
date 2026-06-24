@@ -160,9 +160,9 @@ describe("ChatRoute", () => {
     const input = screen.getByLabelText("Message") as HTMLTextAreaElement;
 
     expect(screen.queryByRole("button", { name: "Insert Δ" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Clear" }).textContent).toBe("🗑");
+    expect(screen.getByRole("button", { name: "Clear" }).textContent).toBe("⌫");
     expect(screen.getByRole("button", { name: "Skills" }).textContent).toBe("/");
-    expect(screen.getByRole("button", { name: "Shortcuts" }).textContent).toBe("⚡");
+    expect(screen.getByRole("button", { name: "Shortcuts" }).textContent).toBe("⌘");
 
     fireEvent.change(input, { target: { value: "draft" } });
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));

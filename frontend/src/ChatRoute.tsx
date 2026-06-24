@@ -461,7 +461,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
                 title="Clear"
                 type="button"
               >
-                🗑
+                ⌫
               </button>
               <button
                 aria-label="Skills"
@@ -481,7 +481,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
                 title="Shortcuts"
                 type="button"
               >
-                ⚡
+                ⌘
               </button>
             </div>
             <Button className="chat-composer__send" disabled={!composerText.trim() || sendInFlight} type="submit" variant="primary">{sendInFlight ? "SENDING…" : "SEND"}</Button>
