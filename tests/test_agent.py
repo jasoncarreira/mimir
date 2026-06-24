@@ -1603,6 +1603,44 @@ def test_turn_matched_expected_tool_call_discriminates_review_from_review_commen
     ) is True
 
 
+
+def test_count_expected_tool_calls_accepts_repo_before_number_review_order():
+    """github-poller markers include the common gh CLI ordering where
+    --repo/-R appears before the PR number. Local tool matching should not
+    false-fire a missed-review signal for valid documented invocations."""
+    from mimir.agent import _turn_matched_expected_tool_call
+
+    markers = {
+        "bash_substrings": [
+            "gh pr review 234",
+            "gh pr review --repo o/r 234",
+            "gh pr review -R o/r 234",
+        ],
+        "tool_names": [],
+        "signal_on_missing": "poller_review_missed_submission",
+    }
+    assert _turn_matched_expected_tool_call(
+        [{
+            "type": "tool_call",
+            "name": "shell_exec",
+            "args": {
+                "command": "gh pr review --repo o/r 234 --approve --body-file /tmp/rev",
+            },
+        }],
+        markers,
+    ) is True
+    assert _turn_matched_expected_tool_call(
+        [{
+            "type": "tool_call",
+            "name": "shell_exec",
+            "args": {
+                "command": "gh pr review -R o/r 234 --comment --body-file /tmp/rev",
+            },
+        }],
+        markers,
+    ) is True
+
+
 # ── missed-submission detector: shell_exec + batched markers (#299 f/u) ──
 
 
@@ -1653,6 +1691,62 @@ def test_expected_submission_markers_finds_top_level_and_items():
     assert _expected_submission_markers({}) == []
     assert _expected_submission_markers({"items": []}) == []
     assert _expected_submission_markers(None) == []  # type: ignore[arg-type]
+
+
+
+def test_gh_review_submitted_for_marker_reconciles_current_head(monkeypatch):
+    """Before emitting a missed-review signal, the detector can reconcile
+    a concrete repo/PR/reviewer marker against GitHub reviews API. This
+    suppresses false positives when the review did land but local tool-call
+    matching failed to recognize the submission."""
+    from mimir.agent import _gh_review_submitted_for_marker
+
+    class R:
+        returncode = 0
+        stdout = json.dumps([
+            {
+                "user": {"login": "mimir-carreira"},
+                "state": "APPROVED",
+                "commit_id": "abc123",
+            }
+        ])
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return R()
+
+    monkeypatch.setattr("mimir.agent.subprocess.run", fake_run)
+    assert _gh_review_submitted_for_marker({
+        "repo": "o/r",
+        "number": 234,
+        "reviewer": "mimir-carreira",
+        "head_sha": "abc123",
+    }) is True
+    assert calls == [["gh", "api", "repos/o/r/pulls/234/reviews", "--paginate"]]
+
+
+def test_gh_review_submitted_for_marker_requires_head_when_present(monkeypatch):
+    from mimir.agent import _gh_review_submitted_for_marker
+
+    class R:
+        returncode = 0
+        stdout = json.dumps([
+            {
+                "user": {"login": "mimir-carreira"},
+                "state": "APPROVED",
+                "commit_id": "oldsha",
+            }
+        ])
+
+    monkeypatch.setattr("mimir.agent.subprocess.run", lambda *a, **kw: R())
+    assert _gh_review_submitted_for_marker({
+        "repo": "o/r",
+        "number": 234,
+        "reviewer": "mimir-carreira",
+        "head_sha": "newsha",
+    }) is False
 
 
 async def test_run_turn_emits_missed_submission_for_unsubmitted_poller_review(

@@ -332,14 +332,30 @@ def _emit(prompt: str, **extras: object) -> None:
         marker = dict(_REVIEW_EXPECTED_TOOL_CALL)
         number = extras.get("number")
         url = extras.get("url")
+        repo = extras.get("repo")
+        reviewer = extras.get("requested_reviewer") or os.environ.get(
+            "MIMIR_GITHUB_SELF_LOGIN", ""
+        ).strip()
+        head_sha = extras.get("head_sha") or extras.get("new_head")
         pr_substrings: list[str] = []
         if number is not None:
             pr_substrings.append(f"gh pr review {number}")
+            if isinstance(repo, str) and repo:
+                pr_substrings.append(f"gh pr review --repo {repo} {number}")
+                pr_substrings.append(f"gh pr review -R {repo} {number}")
         if isinstance(url, str) and url:
             pr_substrings.append(url)
         if pr_substrings:
             marker["bash_substrings"] = pr_substrings
             marker["ref"] = url or f"#{number}"
+        if isinstance(repo, str) and repo:
+            marker["repo"] = repo
+        if number is not None:
+            marker["number"] = number
+        if isinstance(reviewer, str) and reviewer:
+            marker["reviewer"] = reviewer
+        if isinstance(head_sha, str) and head_sha:
+            marker["head_sha"] = head_sha
         extras["expected_tool_call"] = marker
     event = {
         "poller": POLLER_NAME,
@@ -434,7 +450,8 @@ def _check_prs(repo: str, since: str, token: str, me: str) -> int:
             prompt_parts.append(body)
         prompt_parts.append(url)
         _emit("\n".join(prompt_parts), event_type="pr_opened",
-              repo=repo, number=number, url=url)
+              repo=repo, number=number, url=url,
+              head_sha=(pr.get("head") or {}).get("sha"))
         count += 1
     return count
 
@@ -653,6 +670,7 @@ def _check_pr_pushes(
                     url=url,
                     previous_head=prev_sha,
                     new_head=current_sha,
+                    head_sha=current_sha,
                 )
                 count += 1
                 new_heads[key] = current_sha
@@ -716,6 +734,7 @@ def _check_pr_pushes(
                         author=pr_author,
                         attempt=attempt,
                         max_attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
+                        head_sha=current_sha,
                     )
                     count += 1
                     new_review_requests[key] = attempt

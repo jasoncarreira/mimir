@@ -35,9 +35,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
+import subprocess
 import time
 import traceback
 from dataclasses import dataclass, replace
@@ -599,6 +601,66 @@ def _turn_matched_expected_tool_call(events: list, markers: dict) -> bool:
     """Back-compat boolean: did the turn make at least one matching
     submission? (Equivalent to ``_count_expected_tool_calls(...) > 0``.)"""
     return _count_expected_tool_calls(events, markers) > 0
+
+
+def _gh_review_submitted_for_marker(markers: dict) -> bool:
+    """Best-effort GitHub API reconciliation for PR review expectations.
+
+    The github-poller missed-submission marker is intentionally noisy when a
+    turn drafts a review but never submits it. Tool-call matching is only local
+    to the current turn, though: if the tool transcript shape changes, a prior
+    retry already submitted, or the poller batches duplicates, local matching
+    can false-fire. When the marker names a concrete repo/PR and reviewer, ask
+    GitHub whether that reviewer has already submitted a substantive review on
+    the expected head before emitting algedonic noise. Fail closed (False) so
+    genuine misses remain noisy when GitHub is unavailable.
+    """
+    if not isinstance(markers, dict):
+        return False
+    repo = str(markers.get("repo") or "").strip()
+    number = markers.get("number")
+    reviewer = str(markers.get("reviewer") or "").strip()
+    head_sha = str(markers.get("head_sha") or "").strip()
+    if not repo or not number or not reviewer:
+        return False
+    try:
+        int_number = int(number)
+    except (TypeError, ValueError):
+        return False
+    cmd = [
+        "gh", "api",
+        f"repos/{repo}/pulls/{int_number}/reviews",
+        "--paginate",
+    ]
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    env = {**os.environ, "GH_TOKEN": token} if token else None
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15, env=env,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(data, list):
+        return False
+    substantive = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED"}
+    for review in data:
+        if not isinstance(review, dict):
+            continue
+        login = (review.get("user") or {}).get("login")
+        state = str(review.get("state") or "").upper()
+        commit_id = str(review.get("commit_id") or "")
+        if login != reviewer or state not in substantive:
+            continue
+        if head_sha and commit_id != head_sha:
+            continue
+        return True
+    return False
 
 
 def _expected_submission_markers(event_extra: dict) -> list[dict]:
@@ -2061,7 +2123,10 @@ class Agent:
             # positives, just no per-item attribution.
             missed = [
                 m for m in sub_markers
-                if _count_expected_tool_calls(events, m) == 0
+                if (
+                    _count_expected_tool_calls(events, m) == 0
+                    and not _gh_review_submitted_for_marker(m)
+                )
             ]
             if isinstance(signal_type, str) and signal_type.strip() and missed:
                 ext = event.extra or {}
