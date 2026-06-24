@@ -322,6 +322,98 @@ def _parse_folders(raw: str) -> dict[str, str]:
     return folders
 
 
+# Absolute roots OUTSIDE the home that the file tools may read/edit, declared by
+# the operator (chainlink #650). Distinct from ``folders`` (subdirs UNDER the
+# home). ``/tmp`` is always added rw when present so the agent has an ephemeral
+# scratch root without per-deployment config.
+_FILE_TOOL_FORBIDDEN_ROOTS: frozenset[str] = frozenset({"/", "/etc"})
+_ALWAYS_RW_FILE_TOOL_ROOTS: tuple[str, ...] = ("/tmp",)
+
+
+def _parse_file_tool_roots(
+    raw: str,
+    home: Path,
+    *,
+    always_rw: tuple[str, ...] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Parse ``MIMIR_FILE_TOOL_ROOTS`` into validated ``(abs_path, mode)`` pairs.
+
+    Each comma-separated entry is ``path`` (defaults to ``rw``) or ``path:ro`` /
+    ``path:rw``. These become ``CompositeBackend`` routes so the agent's file
+    tools can read/edit repos OUTSIDE the home (e.g. a source checkout it
+    develops). Roots in ``always_rw`` (default ``/tmp``) are appended ``rw`` when
+    they exist.
+
+    Rejected (logged + skipped): non-absolute; ``~`` or ``..`` (traversal);
+    ``/`` or ``/etc``; missing / non-directory; and any root that IS the home or
+    overlaps it in either direction (which would shadow the home WriteGuard).
+    Symlinks are resolved. De-duplicated by resolved path, insertion order, with
+    explicit entries taking precedence over ``always_rw``. ``always_rw``
+    defaults to ``_ALWAYS_RW_FILE_TOOL_ROOTS`` (resolved at call time so an
+    unset env still gets ``/tmp``); pass ``()`` to disable it."""
+    if always_rw is None:
+        always_rw = _ALWAYS_RW_FILE_TOOL_ROOTS
+    _log = logging.getLogger(__name__)
+    home_resolved = Path(home).resolve()
+    out: dict[str, str] = {}
+
+    def _consider(rawpath: str, mode: str) -> None:
+        rawpath = rawpath.strip()
+        if not rawpath:
+            return
+        if "~" in rawpath or ".." in Path(rawpath).parts:
+            _log.warning("MIMIR_FILE_TOOL_ROOTS: ignoring %r (~ or .. not allowed)", rawpath)
+            return
+        p = Path(rawpath)
+        if not p.is_absolute():
+            _log.warning("MIMIR_FILE_TOOL_ROOTS: ignoring %r (not an absolute path)", rawpath)
+            return
+        if rawpath.rstrip("/") in _FILE_TOOL_FORBIDDEN_ROOTS:
+            _log.warning("MIMIR_FILE_TOOL_ROOTS: ignoring forbidden root %r", rawpath)
+            return
+        try:
+            resolved = p.resolve()
+            is_dir = resolved.is_dir()
+        except OSError as exc:
+            _log.warning("MIMIR_FILE_TOOL_ROOTS: ignoring %r (%s)", rawpath, exc)
+            return
+        if not is_dir:
+            _log.warning("MIMIR_FILE_TOOL_ROOTS: ignoring %r (not an existing directory)", rawpath)
+            return
+        if str(resolved) in _FILE_TOOL_FORBIDDEN_ROOTS:
+            _log.warning("MIMIR_FILE_TOOL_ROOTS: ignoring forbidden root %r", rawpath)
+            return
+        if (
+            resolved == home_resolved
+            or resolved.is_relative_to(home_resolved)
+            or home_resolved.is_relative_to(resolved)
+        ):
+            _log.warning(
+                "MIMIR_FILE_TOOL_ROOTS: ignoring %r (overlaps the agent home %s)",
+                rawpath, home_resolved,
+            )
+            return
+        key = str(resolved)
+        if key not in out:  # first wins; explicit entries are parsed before always_rw
+            out[key] = mode
+
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        path_part, sep, mode_part = entry.rpartition(":")
+        if sep and mode_part.strip().lower() in ("ro", "rw"):
+            _consider(path_part, mode_part.strip().lower())
+        else:
+            _consider(entry, "rw")
+
+    for ap in always_rw:
+        if Path(ap).is_dir():
+            _consider(ap, "rw")
+
+    return tuple(out.items())
+
+
 def _parse_sources(raw: str) -> frozenset[str] | None:
     """Parse a comma-separated source allowlist for Recent activity.
 
@@ -798,6 +890,10 @@ class Config:
     # tool-shy models (minimax M3) that answer in final text instead of calling
     # the tool. ``MIMIR_RESEND_NUDGE_CHANNELS``.
     resend_nudge_channels: tuple[str, ...] = ()
+    # Operator-declared absolute roots OUTSIDE the home the file tools may
+    # read/edit, as ``(abs_path, "ro"|"rw")`` pairs (chainlink #650). Empty =
+    # home-only (today's behavior). ``MIMIR_FILE_TOOL_ROOTS``.
+    file_tool_roots: tuple[tuple[str, str], ...] = ()
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -887,6 +983,7 @@ class Config:
                 if p.strip()
             ],
             folders=_parse_folders(_env("MIMIR_FOLDERS", "") or ""),
+            file_tool_roots=_parse_file_tool_roots(_env("MIMIR_FILE_TOOL_ROOTS", ""), home),
             mcp_servers=_load_mcp_servers_from_env(),
 
             anthropic_api_key=_env("ANTHROPIC_API_KEY"),

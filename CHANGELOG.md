@@ -6,6 +6,32 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **Configurable file-tool roots outside the home (#650).** `MIMIR_FILE_TOOL_ROOTS`
+  lets an operator grant the agent's file tools (`read_file`/`ls`/`glob`/`edit_file`)
+  real access to absolute repos **outside** `<home>` — e.g. a source checkout the
+  agent develops, or a work codebase on a PyPI-wheel deployment. Format:
+  `path[:ro|:rw]`, comma-separated; bare `path` defaults to `rw`. `/tmp` is always
+  added `rw` when present. Roots are routed via deepagents' `CompositeBackend`
+  (the home stays the default); reads/writes hit real disk, `:ro` roots block
+  writes. Validation rejects non-absolute, missing, `/`, `/etc`, `~`, `..`, and any
+  root overlapping the home. With `MIMIR_FILE_TOOL_ROOTS` unset the agent still
+  gets `/tmp` rw (the always-on scratch root, when present) but no other roots —
+  every deployment thus gains `/tmp` file-tool access by default. This fixes the
+  long-standing `/workspace/mimir` false-not-found (the file tools ran
+  `virtual_mode` rooted at the home, silently remapping `/workspace/mimir/x` →
+  `<home>/workspace/mimir/x` → "not found" while `shell_exec` saw the real file —
+  746 such failures over 9 days in one deployment).
+
+### Changed
+
+- **File tools return an actionable error for unreachable absolute paths (#650).**
+  An absolute path that names a real file **outside** the file-tool root (and not
+  under any configured root) now returns "outside the file-tool root … use
+  shell_exec, or add its directory to MIMIR_FILE_TOOL_ROOTS" instead of a silent
+  false "not found"/empty listing.
+
 ## [0.6.6] — 2026-06-23
 
 ### Added

@@ -1136,7 +1136,11 @@ class Agent:
                     return self._agent
 
             from deepagents import create_deep_agent
-            from .readonly_backend import WriteGuardBackend
+            from .readonly_backend import (
+                WriteGuardBackend,
+                build_file_tool_routes,
+                FileToolRouter,
+            )
             from .tools import all_mimir_tools
 
             # Per-directory write-permission enforcement (Config.folders).
@@ -1144,11 +1148,27 @@ class Agent:
             # outside ``writable_dirs`` return a permission error instead of
             # mutating the filesystem. ``.mimir/`` (saga db, metrics) is
             # implicitly blocked because it's not in the folders dict.
+            #
+            # Operator-declared roots OUTSIDE the home (Config.file_tool_roots,
+            # chainlink #650) are routed to real-FS backends via a
+            # CompositeBackend; the home stays the default (guarding out-of-root
+            # absolute paths with a clear error instead of a false not-found).
             if self._backend is None:
-                self._backend = WriteGuardBackend(
+                home_backend = WriteGuardBackend(
                     root_dir=self._config.home,
                     writable_dirs=self._config.writable_dirs,
+                    guard_outside_root=True,
                 )
+                roots = getattr(self._config, "file_tool_roots", ()) or ()
+                routes = build_file_tool_routes(roots) if roots else {}
+                if routes:
+                    self._backend = FileToolRouter(default=home_backend, routes=routes)
+                    log.info(
+                        "file tools: %d extra root(s) routed beyond the home: %s",
+                        len(routes), ", ".join(sorted(routes)),
+                    )
+                else:
+                    self._backend = home_backend
 
             # Bridge ChatCodexPlus's per-response x-codex-* headers
             # into the same RateLimitStore that OpenAIQuotaProvider
