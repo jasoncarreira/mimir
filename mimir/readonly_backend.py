@@ -74,9 +74,9 @@ def _truncated_msg(op: str, reason: str) -> str:
 def _walk_files_bounded(root: Path, excludes: frozenset[str]) -> Iterator[Path]:
     """Yield files under ``root`` without descending into excluded directories."""
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in excludes]
+        dirnames[:] = sorted(d for d in dirnames if d not in excludes)
         base = Path(dirpath)
-        for filename in filenames:
+        for filename in sorted(filenames):
             yield base / filename
 
 
