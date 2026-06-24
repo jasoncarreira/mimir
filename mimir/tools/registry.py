@@ -880,16 +880,21 @@ async def add_schedule(
                 f"(expected one of {sorted(PRIORITY_LEVELS)})"
             )
     if pfile:
-        # Soft existence check so a prompt_file tick doesn't silently fire an
-        # empty prompt (fire-time resolution falls back to the inline prompt,
-        # which is empty here). Best-effort: skip when the home isn't known.
+        # Validate prompt_file with the SAME resolver the scheduler uses at fire
+        # time (_resolve_prompt_file), so a value can't pass here but get rejected
+        # when it fires — which would fall back to the empty inline prompt, i.e.
+        # the "silently empty tick" this check exists to prevent. The resolver
+        # rejects path traversal, absolute-path escapes, and symlinks; require a
+        # real regular file on top. Best-effort: skip when the home isn't known.
         home = getattr(scheduler, "_home", None)
         if home is not None:
-            candidate = Path(home) / "prompts" / pfile
-            if not candidate.is_file():
+            from ..scheduler import _resolve_prompt_file
+            resolved = _resolve_prompt_file(Path(home), pfile)
+            if resolved is None or not resolved.is_file():
                 return (
-                    f"add_schedule failed: prompt_file {pfile!r} not found under "
-                    f"{Path(home) / 'prompts'} — create the prompt file first"
+                    f"add_schedule failed: prompt_file {pfile!r} must be a regular "
+                    f"file under {Path(home) / 'prompts'} (basename only — no "
+                    f"'..', absolute paths, or symlinks; create the file first)"
                 )
     try:
         if pfile:

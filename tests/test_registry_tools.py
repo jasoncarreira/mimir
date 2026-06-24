@@ -702,6 +702,52 @@ class TestAddSchedule:
         assert "add_schedule ok:" in out
         assert sched.add_calls[0]["prompt_file"] == "memory-hygiene.md"
 
+    @pytest.mark.asyncio
+    async def test_prompt_file_traversal_rejected(self, tmp_path) -> None:
+        # mimir-carreira #865 review: validate with the fire-time resolver so a
+        # path that escapes <home>/prompts can't persist a tick that then fires
+        # an empty prompt. ``../state/x.md`` resolves outside prompts → rejected.
+        (tmp_path / "prompts").mkdir()
+        (tmp_path / "state").mkdir()
+        (tmp_path / "state" / "x.md").write_text("escaped\n", encoding="utf-8")
+        sched = _StubScheduler()
+        sched._home = tmp_path
+        _STATE["scheduler"] = sched
+        out = await add_schedule.ainvoke(
+            {"name": "x", "cron": "0 8 * * 2", "prompt_file": "../state/x.md"}
+        )
+        assert "add_schedule failed: prompt_file" in out
+        assert sched.add_calls == []
+
+    @pytest.mark.asyncio
+    async def test_prompt_file_absolute_path_rejected(self, tmp_path) -> None:
+        (tmp_path / "prompts").mkdir()
+        outside = tmp_path / "outside.md"
+        outside.write_text("nope\n", encoding="utf-8")
+        sched = _StubScheduler()
+        sched._home = tmp_path
+        _STATE["scheduler"] = sched
+        out = await add_schedule.ainvoke(
+            {"name": "x", "cron": "0 8 * * 2", "prompt_file": str(outside)}
+        )
+        assert "add_schedule failed: prompt_file" in out
+        assert sched.add_calls == []
+
+    @pytest.mark.asyncio
+    async def test_prompt_file_symlink_rejected(self, tmp_path) -> None:
+        (tmp_path / "prompts").mkdir()
+        real = tmp_path / "real.md"
+        real.write_text("real\n", encoding="utf-8")
+        (tmp_path / "prompts" / "link.md").symlink_to(real)
+        sched = _StubScheduler()
+        sched._home = tmp_path
+        _STATE["scheduler"] = sched
+        out = await add_schedule.ainvoke(
+            {"name": "x", "cron": "0 8 * * 2", "prompt_file": "link.md"}
+        )
+        assert "add_schedule failed: prompt_file" in out
+        assert sched.add_calls == []
+
 
 class TestSetSchedulePriority:
     @pytest.mark.asyncio
