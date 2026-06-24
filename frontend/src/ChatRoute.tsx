@@ -18,8 +18,6 @@ type ChatStreamState = "connecting" | "open" | "error";
 // chainlink #581: composer actions are intentionally frontend-local: the
 // chat backend accepts text, so picker "invoke" sends slash-command text
 // through the normal message path while picker "insert" keeps composing.
-const COMPOSER_INSERT_GLYPHS = ["/", "§", "Δ", "◇", "±", "⇄"] as const;
-
 const SKILL_COMMANDS = [
   { id: "memory", label: "Memory", command: "/memory", description: "Capture or update durable context." },
   { id: "github", label: "GitHub", command: "/github", description: "Work with PRs, issues, and CI." },
@@ -455,24 +453,36 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
               onBlur={() => setComposerActive(false)}
             />
             <div className="chat-composer__actions" aria-label="Composer actions">
-              <button className="chat-composer__action" disabled={sendInFlight} onClick={() => setComposerText("")} type="button">Clear</button>
-              <button className="chat-composer__action" disabled={sendInFlight} onClick={() => setSkillPickerOpen(true)} type="button">Skills</button>
-              <button className="chat-composer__action" disabled={sendInFlight} onClick={() => setShortcutPickerOpen(true)} type="button">Shortcuts</button>
-              <div className="chat-composer__glyphs" aria-label="Composer glyphs">
-                {COMPOSER_INSERT_GLYPHS.map((glyph) => (
-                  <button
-                    aria-label={`Insert ${glyph}`}
-                    className="chat-composer__glyph"
-                    disabled={sendInFlight}
-                    key={glyph}
-                    onClick={() => insertComposerText(glyph)}
-                    title={`Insert ${glyph}`}
-                    type="button"
-                  >
-                    {glyph}
-                  </button>
-                ))}
-              </div>
+              <button
+                aria-label="Clear"
+                className="chat-composer__action"
+                disabled={sendInFlight}
+                onClick={() => setComposerText("")}
+                title="Clear"
+                type="button"
+              >
+                🗑
+              </button>
+              <button
+                aria-label="Skills"
+                className="chat-composer__action"
+                disabled={sendInFlight}
+                onClick={() => setSkillPickerOpen(true)}
+                title="Skills"
+                type="button"
+              >
+                /
+              </button>
+              <button
+                aria-label="Shortcuts"
+                className="chat-composer__action"
+                disabled={sendInFlight}
+                onClick={() => setShortcutPickerOpen(true)}
+                title="Shortcuts"
+                type="button"
+              >
+                ⚡
+              </button>
             </div>
             <Button className="chat-composer__send" disabled={!composerText.trim() || sendInFlight} type="submit" variant="primary">{sendInFlight ? "SENDING…" : "SEND"}</Button>
           </form>
