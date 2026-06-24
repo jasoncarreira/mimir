@@ -669,12 +669,20 @@ def _check_pr_pushes(
             )
             if currently_requested:
                 # State reconciliation (chainlink #299): ``me`` being a
-                # requested reviewer is the authoritative "review still
-                # pending" signal — a submitted review clears ``me``, so a
-                # PR STILL requested on this poll means the prior attempt
-                # never landed (transient turn failure / still running /
-                # never ran). Re-emit up to the cap; on exhaustion emit a
-                # one-shot give-up signal and go dormant.
+                # requested reviewer is usually the authoritative "review
+                # still pending" signal. Exception (chainlink #669): an
+                # operator can re-request the reviewer after a completed
+                # review at the current head; in that case the request is
+                # already satisfied, so drop it from the retry cursor.
+                if current_sha and _has_current_head_review(
+                    repo, number, current_sha, me, token
+                ):
+                    continue
+
+                # Otherwise, a PR STILL requested on this poll means the
+                # prior attempt never landed (transient turn failure / still
+                # running / never ran). Re-emit up to the cap; on exhaustion
+                # emit a one-shot give-up signal and go dormant.
                 prior_attempts = prior_review_requests.get(key, 0)
                 title = pr.get("title", "")
                 url = pr.get("html_url", "")
@@ -736,6 +744,38 @@ def _check_pr_pushes(
                     new_review_requests[key] = prior_attempts
     return count, new_heads, new_review_requests
 
+
+def _has_current_head_review(
+    repo: str,
+    number: int,
+    head_sha: str,
+    reviewer: str,
+    token: str,
+) -> bool:
+    """Return whether ``reviewer`` has submitted a review at ``head_sha``.
+
+    GitHub normally clears a reviewer from ``requested_reviewers`` when they
+    submit a review, but an operator can re-request the same reviewer after a
+    completed current-head review. Treat APPROVED, CHANGES_REQUESTED, and
+    COMMENTED as substantive submitted reviews so the review-request retry
+    loop does not page on an already-completed review. API failures return
+    False so the existing retry path still recovers genuinely missed reviews.
+    """
+    if not head_sha or not reviewer:
+        return False
+    data = _gh_api(f"repos/{repo}/pulls/{number}/reviews", token)
+    if not isinstance(data, list):
+        return False
+    substantive = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED"}
+    for review in data:
+        if not isinstance(review, dict):
+            continue
+        login = (review.get("user") or {}).get("login")
+        state = str(review.get("state") or "").upper()
+        commit_id = review.get("commit_id")
+        if login == reviewer and commit_id == head_sha and state in substantive:
+            return True
+    return False
 
 def _head_commit_date(repo: str, sha: str, token: str) -> str:
     """Committer date of ``sha`` (ISO-8601), or ``""`` when the lookup
