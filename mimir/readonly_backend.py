@@ -23,13 +23,47 @@ mutator methods added by deepagents (``delete_file``, ``rename``,
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from deepagents.backends import FilesystemBackend
-from deepagents.backends.protocol import EditResult, FileUploadResponse, WriteResult
+from deepagents.backends.composite import CompositeBackend
+from deepagents.backends.protocol import (
+    EditResult,
+    FileUploadResponse,
+    LsResult,
+    ReadResult,
+    WriteResult,
+)
 
 log = logging.getLogger(__name__)
+
+
+def _real_path_outside_root(key: str, cwd: Path) -> Path | None:
+    """Return the resolved real path iff ``key`` names an EXISTING file/dir
+    whose real location is outside ``cwd``.
+
+    Distinguishes "the caller passed a literal absolute path that really exists
+    elsewhere" (so silently remapping it under ``cwd`` would hide it — the
+    false-not-found of chainlink #650) from a normal virtual path (which has no
+    literal real-disk existence). Returns ``None`` when the path doesn't exist
+    or already lives under ``cwd``."""
+    try:
+        literal = Path(key)
+        if not literal.exists():
+            return None
+        real = literal.resolve()
+        root = Path(cwd).resolve()  # resolve both sides so a symlinked home
+                                    # (e.g. macOS /var -> /private/var) can't
+                                    # false-flag a path that is really under it
+    except OSError:
+        return None
+    try:
+        real.relative_to(root)
+    except ValueError:
+        return real
+    return None
 
 
 class _RootAwareFilesystemBackend(FilesystemBackend):
@@ -49,6 +83,15 @@ class _RootAwareFilesystemBackend(FilesystemBackend):
     not affected.
     """
 
+    def __init__(self, *args: Any, guard_outside_root: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # When True, an absolute path naming a REAL file outside ``cwd`` raises a
+        # clear error instead of being silently remapped under ``cwd`` (the
+        # false-not-found of chainlink #650). Opt-in: only the home/default
+        # backend sets it; CompositeBackend route backends receive
+        # prefix-stripped keys, so the guard never misfires on them.
+        self._guard_outside_root = guard_outside_root
+
     def _resolve_path(self, key: str) -> Path:
         if self.virtual_mode and key.startswith("/"):
             root_str = str(self.cwd).rstrip("/")
@@ -57,6 +100,47 @@ class _RootAwareFilesystemBackend(FilesystemBackend):
             elif key.startswith(root_str + "/"):
                 key = "/" + key[len(root_str) + 1:]
         return super()._resolve_path(key)
+
+    # --- out-of-root guard (chainlink #650) ---------------------------------
+    # When ``guard_outside_root`` is set (the home/default backend), an absolute
+    # path naming a REAL file/dir outside ``cwd`` would otherwise be silently
+    # remapped under ``cwd`` and read back as "not found" (the 746-failure bug).
+    # Return a clear, actionable error RESULT instead. We return rather than
+    # raise: deepagents' middleware wraps only ``validate_path`` (not the backend
+    # call) in try/except, so a raise from ``_resolve_path`` would propagate
+    # uncaught. Scoped to read/ls (the documented false-not-found / empty-ls
+    # symptoms); writes are already handled by WriteGuardBackend.
+
+    def _outside_root_msg(self, key: str) -> str:
+        return (
+            f"Path '{key}' is outside the file-tool root '{self.cwd}'. It exists "
+            f"on disk but the file tools can't reach it — read or edit it with "
+            f"shell_exec, or have the operator add its directory to "
+            f"MIMIR_FILE_TOOL_ROOTS."
+        )
+
+    def _is_outside_root(self, key: str) -> bool:
+        return self._guard_outside_root and _real_path_outside_root(key, self.cwd) is not None
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        if self._is_outside_root(file_path):
+            return ReadResult(error=self._outside_root_msg(file_path))
+        return super().read(file_path, offset, limit)
+
+    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        if self._is_outside_root(file_path):
+            return ReadResult(error=self._outside_root_msg(file_path))
+        return await super().aread(file_path, offset, limit)
+
+    def ls(self, path: str) -> LsResult:
+        if self._is_outside_root(path):
+            return LsResult(error=self._outside_root_msg(path))
+        return super().ls(path)
+
+    async def als(self, path: str) -> LsResult:
+        if self._is_outside_root(path):
+            return LsResult(error=self._outside_root_msg(path))
+        return await super().als(path)
 
 
 def _normalize_writable_dir(name: str) -> str | None:
@@ -126,9 +210,12 @@ class WriteGuardBackend:
         writable_dirs: list[str],
         *,
         enforce_core_memory_readonly: bool = True,
+        guard_outside_root: bool = False,
     ) -> None:
         self._root = Path(root_dir).resolve()
-        self._fs = _RootAwareFilesystemBackend(root_dir=root_dir, virtual_mode=True)
+        self._fs = _RootAwareFilesystemBackend(
+            root_dir=root_dir, virtual_mode=True, guard_outside_root=guard_outside_root,
+        )
         cleaned: list[str] = []
         for d in writable_dirs:
             normalized = _normalize_writable_dir(d)
@@ -510,3 +597,38 @@ class ReadOnlyFilesystemBackend:
 
     async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         return self.upload_files(files)
+
+
+def build_file_tool_routes(roots: Iterable[tuple[str, str]]) -> dict[str, Any]:
+    """Build ``CompositeBackend`` routes from validated ``(abs_path, mode)`` pairs
+    (chainlink #650).
+
+    ``rw`` -> a real-FS backend rooted at the path (reads + writes hit real
+    disk); ``ro`` -> the same wrapped read-only. ``CompositeBackend`` strips the
+    route prefix before delegating, so each backend resolves the remainder under
+    its own root. Route keys are the absolute path with a trailing ``/`` (the
+    boundary form CompositeBackend matches on)."""
+    routes: dict[str, Any] = {}
+    for path, mode in roots:
+        prefix = str(Path(path)).rstrip("/") + "/"
+        if mode == "ro":
+            routes[prefix] = ReadOnlyFilesystemBackend(Path(path))
+        else:
+            routes[prefix] = _RootAwareFilesystemBackend(root_dir=Path(path), virtual_mode=True)
+    return routes
+
+
+class FileToolRouter(CompositeBackend):
+    """``CompositeBackend`` that also forwards mimir's ``drain_denials`` to the
+    default (home) backend.
+
+    The write-guard records permission denials on the home ``WriteGuardBackend``;
+    ``Agent.run_turn`` drains them for the turn's audit trail. A bare
+    ``CompositeBackend`` has no ``drain_denials``, so wrapping the home backend
+    in routes would silently drop that trail — this preserves it (chainlink #650)."""
+
+    def drain_denials(self, turn_id: str | None = None) -> list[dict[str, Any]]:
+        drain = getattr(self.default, "drain_denials", None)
+        if callable(drain):
+            return drain(turn_id=turn_id)
+        return []

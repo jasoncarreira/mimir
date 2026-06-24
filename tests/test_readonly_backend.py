@@ -14,8 +14,11 @@ from pathlib import Path
 import pytest
 
 from mimir.readonly_backend import (
+    FileToolRouter,
     ReadOnlyFilesystemBackend,
     WriteGuardBackend,
+    _RootAwareFilesystemBackend,
+    build_file_tool_routes,
 )
 
 
@@ -593,3 +596,123 @@ class TestReadOnlyFilesystemBackend:
         result = b.read(file_path="/logs/existing.txt")
         text = getattr(result, "content", None) or str(result)
         assert "preexisting" in text
+
+
+# ── configurable file-tool roots (#650) ──────────────────────────────────────
+
+
+def _split_home(tmp_path: Path) -> Path:
+    """A home that is a *subdir* of tmp_path, leaving room for sibling roots
+    that are genuinely OUTSIDE the home."""
+    h = tmp_path / "home"
+    (h / "state").mkdir(parents=True)
+    (h / "logs").mkdir()
+    return h
+
+
+class TestOutsideRootGuard:
+    """``guard_outside_root`` turns the silent false-not-found (chainlink #650)
+    into an actionable error, without disturbing home reads."""
+
+    def test_guard_off_gives_no_actionable_message(self, tmp_path: Path) -> None:
+        home = _split_home(tmp_path)
+        outside = tmp_path / "outside.txt"
+        outside.write_text("z\n")
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])  # guard off
+        r = b.read(file_path=str(outside))
+        assert "outside the file-tool root" not in (getattr(r, "error", "") or "")
+
+    def test_guard_on_clear_error_on_existing_outside_file(self, tmp_path: Path) -> None:
+        home = _split_home(tmp_path)
+        outside = tmp_path / "outside.txt"
+        outside.write_text("z\n")
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"], guard_outside_root=True)
+        r = b.read(file_path=str(outside))
+        assert "outside the file-tool root" in (r.error or "")
+        assert "MIMIR_FILE_TOOL_ROOTS" in (r.error or "")
+        assert "shell_exec" in (r.error or "")
+
+    def test_guard_on_ls_outside_clear_error(self, tmp_path: Path) -> None:
+        home = _split_home(tmp_path)
+        other = tmp_path / "other"
+        other.mkdir()
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"], guard_outside_root=True)
+        r = b.ls(path=str(other))
+        assert "outside the file-tool root" in (r.error or "")
+
+    def test_guard_on_allows_home_reads(self, tmp_path: Path) -> None:
+        home = _split_home(tmp_path)
+        (home / "state" / "s.txt").write_text("hi\n")
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"], guard_outside_root=True)
+        # both the virtual form and the container-absolute home path resolve
+        assert b.read(file_path="/state/s.txt").file_data["content"] == "hi\n"
+        assert b.read(file_path=str(home / "state" / "s.txt")).file_data["content"] == "hi\n"
+
+    def test_guard_only_fires_for_existing_paths(self, tmp_path: Path) -> None:
+        home = _split_home(tmp_path)
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"], guard_outside_root=True)
+        r = b.read(file_path=str(tmp_path / "ghost.txt"))  # outside but does NOT exist
+        assert "outside the file-tool root" not in (getattr(r, "error", "") or "")
+
+
+class TestBuildFileToolRoutes:
+    def test_route_shapes_and_keys(self, tmp_path: Path) -> None:
+        rw = tmp_path / "rw"
+        rw.mkdir()
+        ro = tmp_path / "ro"
+        ro.mkdir()
+        routes = build_file_tool_routes([(str(rw), "rw"), (str(ro), "ro")])
+        assert set(routes) == {str(rw) + "/", str(ro) + "/"}
+        assert isinstance(routes[str(rw) + "/"], _RootAwareFilesystemBackend)
+        assert isinstance(routes[str(ro) + "/"], ReadOnlyFilesystemBackend)
+
+
+class TestFileToolRouter:
+    @staticmethod
+    def _router(tmp_path: Path):
+        home = _split_home(tmp_path)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "x.py").write_text("CODE\n")
+        ref = tmp_path / "ref"
+        ref.mkdir()
+        (ref / "r.md").write_text("REF\n")
+        home_be = WriteGuardBackend(
+            root_dir=home, writable_dirs=["state"], guard_outside_root=True,
+        )
+        router = FileToolRouter(
+            default=home_be,
+            routes=build_file_tool_routes([(str(repo), "rw"), (str(ref), "ro")]),
+        )
+        return home, repo, ref, router
+
+    def test_rw_route_reads_and_writes_real_files(self, tmp_path: Path) -> None:
+        _home, repo, _ref, router = self._router(tmp_path)
+        assert router.read(f"{repo}/x.py").file_data["content"] == "CODE\n"
+        w = router.write(f"{repo}/new.py", "Y\n")
+        assert getattr(w, "error", None) is None
+        assert (repo / "new.py").read_text() == "Y\n"
+
+    def test_ro_route_blocks_writes_allows_reads(self, tmp_path: Path) -> None:
+        _home, _repo, ref, router = self._router(tmp_path)
+        assert router.read(f"{ref}/r.md").file_data["content"] == "REF\n"
+        w = router.write(f"{ref}/blocked.md", "no")
+        assert "read-only" in (w.error or "")
+        assert not (ref / "blocked.md").exists()
+
+    def test_home_default_still_works(self, tmp_path: Path) -> None:
+        _home, _repo, _ref, router = self._router(tmp_path)
+        assert getattr(router.write("/state/s.txt", "hi"), "error", None) is None
+        assert router.read("/state/s.txt").file_data["content"] == "hi"
+
+    def test_out_of_all_roots_clear_error(self, tmp_path: Path) -> None:
+        _home, _repo, _ref, router = self._router(tmp_path)
+        outside = tmp_path / "outside.txt"
+        outside.write_text("z\n")
+        assert "outside the file-tool root" in (router.read(str(outside)).error or "")
+
+    def test_drain_denials_forwards_to_home(self, tmp_path: Path) -> None:
+        _home, _repo, _ref, router = self._router(tmp_path)
+        # /logs is not a writable dir under the home → write denied + recorded
+        router.write("/logs/x.txt", "no")
+        assert any(d["op"] == "write" for d in router.drain_denials())
