@@ -129,6 +129,13 @@ after #395 merged).
 
 ## Pull requests
 
+Budget rule: perform required GitHub side effects before optional long
+validation or repeated polling consumes the turn. Once a PR comment,
+review, or status update is the next required durable action, do it first
+and then run extra checks if budget remains. When the tool-call count is
+visibly high, reserve roughly 10-15 calls for the side effect,
+verification (`gh pr view` / `gh pr checks`), and wrap-up.
+
 ```bash
 gh pr list --state open                       # open PRs on the current repo
 gh pr view 42                                  # view a PR

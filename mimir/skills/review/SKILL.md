@@ -104,6 +104,14 @@ Write a review that covers:
 
 ### 5. Submit — MANDATORY last step
 
+Reserve budget for submission. Once you know the verdict, stop optional
+exploration and submit before doing long validation, repeated polling, or
+extra context reads. If the tool-call counter is visibly high (around 90+
+on a 120-call budget), keep roughly 10-15 calls for the required side
+effect (`gh pr review`), submission verification, and wrap-up. A review
+with perfect extra evidence that never reaches GitHub is worse than a
+bounded review that lands with an honest validation note.
+
 ```bash
 # Approve
 gh pr review <num> --approve --body "$(cat <<'EOF'
@@ -163,7 +171,12 @@ and your verdict.
    note the failure in the review body, then call `gh pr review` anyway
    with what you have.
 
-3. **Never use only turn output as the delivery mechanism.** The operator
+3. **Budget exhaustion is not allowed to eat the submission step.** After
+   the verdict is known, `gh pr review` plus confirmation outranks optional
+   extra reads, broad test runs, or repeated async-job polling. When near
+   the tool-call ceiling, submit first with the evidence already gathered.
+
+4. **Never use only turn output as the delivery mechanism.** The operator
    reads GitHub, not `turns.jsonl`.
 
 ---
