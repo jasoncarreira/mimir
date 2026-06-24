@@ -831,16 +831,23 @@ async def list_schedules() -> str:
 async def add_schedule(
     name: str,
     cron: str,
-    prompt: str,
+    prompt: str = "",
     channel_id: Optional[str] = None,
     priority: Optional[str] = None,
+    prompt_file: Optional[str] = None,
 ) -> str:
     """Add a new scheduled tick (add-or-replace by name).
+
+    Provide exactly one of ``prompt`` or ``prompt_file``. Prefer ``prompt_file``
+    for anything beyond a one-liner — it's the canonical shape used by the
+    bundled ``scheduler_template.yaml`` (e.g. the memory-hygiene tick), so the
+    prompt body can grow without bloating ``scheduler.yaml``.
 
     Args:
         name: Unique job identifier.
         cron: 5-field cron expression (e.g. ``"0 9 * * *"`` for 9am daily).
-        prompt: Inline prompt to fire on the cron tick.
+        prompt: Inline prompt to fire on the cron tick. Mutually exclusive with
+            ``prompt_file``.
         channel_id: Channel to dispatch the tick on. Defaults to
             ``scheduler:<name>`` synthetic.
         priority: Arbiter suppression band — ``low``, ``normal`` (default), or
@@ -848,10 +855,22 @@ async def add_schedule(
             the arbiter sheds the tick (``high`` is shed only at the most extreme
             severity). To change an existing job's priority without rewriting its
             prompt, use ``set_schedule_priority``.
+        prompt_file: Basename of a prompt file under ``<home>/prompts/`` (e.g.
+            ``"memory-hygiene.md"``) to fire on the tick. Mutually exclusive
+            with ``prompt``; persisted as ``prompt_file:`` in scheduler.yaml.
     """
     scheduler = _STATE["scheduler"]
     if scheduler is None:
         return "add_schedule failed: no scheduler configured"
+    inline = (prompt or "").strip()
+    pfile = (prompt_file or "").strip()
+    if bool(inline) == bool(pfile):
+        return (
+            "add_schedule failed: provide exactly one of prompt / prompt_file "
+            "(got "
+            + ("both" if inline else "neither")
+            + ")"
+        )
     resolved_priority = "normal"
     if priority is not None:
         resolved_priority = priority.strip().lower()
@@ -860,15 +879,37 @@ async def add_schedule(
                 f"add_schedule failed: invalid priority {priority!r} "
                 f"(expected one of {sorted(PRIORITY_LEVELS)})"
             )
+    if pfile:
+        # Soft existence check so a prompt_file tick doesn't silently fire an
+        # empty prompt (fire-time resolution falls back to the inline prompt,
+        # which is empty here). Best-effort: skip when the home isn't known.
+        home = getattr(scheduler, "_home", None)
+        if home is not None:
+            candidate = Path(home) / "prompts" / pfile
+            if not candidate.is_file():
+                return (
+                    f"add_schedule failed: prompt_file {pfile!r} not found under "
+                    f"{Path(home) / 'prompts'} — create the prompt file first"
+                )
     try:
-        job = SchedulerJob(
-            name=name, cron=cron, prompt=prompt, channel_id=channel_id,
-            priority=resolved_priority,
-        )
+        if pfile:
+            job = SchedulerJob(
+                name=name, cron=cron, prompt_file=pfile, channel_id=channel_id,
+                priority=resolved_priority,
+            )
+        else:
+            job = SchedulerJob(
+                name=name, cron=cron, prompt=inline, channel_id=channel_id,
+                priority=resolved_priority,
+            )
         job = await scheduler.add_job(job)
     except Exception as exc:
         return f"add_schedule failed: {exc}"
-    return f"add_schedule ok: name={job.name} cron={job.cron} priority={job.priority}"
+    source = f"prompt_file={job.prompt_file}" if job.prompt_file else "prompt=inline"
+    return (
+        f"add_schedule ok: name={job.name} cron={job.cron} "
+        f"priority={job.priority} {source}"
+    )
 
 
 @tool

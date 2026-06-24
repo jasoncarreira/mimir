@@ -40,6 +40,16 @@ here or in ``30-reflection-policy.md``, fall back to
 - Writes outside the path-confinement allowlist —
   **prohibited** (filesystem-side enforcement, not just
   policy).
+- When a file tool refuses a write — the core/prompts runtime
+  block or the path-confinement allowlist — that refusal is a
+  deliberate guard, so honor it **regardless of mechanism**.
+  Change a refused path through its sanctioned route: a proposal
+  PR for ``memory/core/*`` and ``prompts/*``; the scheduler API
+  (``add_schedule`` / ``set_schedule_priority`` / ``remove_schedule``)
+  for ``scheduler.yaml``; otherwise escalate. Reaching for
+  ``shell_exec`` to route around the block is **prohibited** — it
+  also skips the scheduler's reload/validation, so an edit lands on
+  disk but not in the running scheduler.
 
 ## Send / outbound
 

@@ -629,6 +629,79 @@ class TestAddSchedule:
         assert "urgent" in out
         assert sched.add_calls == []  # rejected before persisting
 
+    @pytest.mark.asyncio
+    async def test_adds_with_prompt_file(self) -> None:
+        # chainlink #666: prompt_file persists as prompt_file (no fabricated
+        # inline prompt) so a tick can match the canonical bundled shape.
+        sched = _StubScheduler()
+        _STATE["scheduler"] = sched
+        out = await add_schedule.ainvoke(
+            {
+                "name": "memory-hygiene",
+                "cron": "0 8 * * 2",
+                "prompt_file": "memory-hygiene.md",
+            }
+        )
+        assert "add_schedule ok:" in out
+        assert "prompt_file=memory-hygiene.md" in out
+        call = sched.add_calls[0]
+        assert call["prompt_file"] == "memory-hygiene.md"
+        assert not call["prompt"]  # inline prompt not fabricated
+
+    @pytest.mark.asyncio
+    async def test_both_prompt_and_prompt_file_rejected(self) -> None:
+        sched = _StubScheduler()
+        _STATE["scheduler"] = sched
+        out = await add_schedule.ainvoke(
+            {
+                "name": "x",
+                "cron": "0 * * * *",
+                "prompt": "run",
+                "prompt_file": "x.md",
+            }
+        )
+        assert "exactly one of prompt / prompt_file" in out
+        assert "both" in out
+        assert sched.add_calls == []
+
+    @pytest.mark.asyncio
+    async def test_neither_prompt_nor_prompt_file_rejected(self) -> None:
+        sched = _StubScheduler()
+        _STATE["scheduler"] = sched
+        out = await add_schedule.ainvoke({"name": "x", "cron": "0 * * * *"})
+        assert "exactly one of prompt / prompt_file" in out
+        assert "neither" in out
+        assert sched.add_calls == []
+
+    @pytest.mark.asyncio
+    async def test_prompt_file_missing_under_home_rejected(self, tmp_path) -> None:
+        # When the scheduler knows the home, a prompt_file that doesn't exist
+        # under <home>/prompts/ is rejected up front (avoids a tick that fires
+        # an empty prompt via fire-time fallback).
+        (tmp_path / "prompts").mkdir()
+        sched = _StubScheduler()
+        sched._home = tmp_path
+        _STATE["scheduler"] = sched
+        out = await add_schedule.ainvoke(
+            {"name": "x", "cron": "0 8 * * 2", "prompt_file": "missing.md"}
+        )
+        assert "add_schedule failed: prompt_file" in out
+        assert "missing.md" in out
+        assert sched.add_calls == []
+
+    @pytest.mark.asyncio
+    async def test_prompt_file_present_under_home_ok(self, tmp_path) -> None:
+        (tmp_path / "prompts").mkdir()
+        (tmp_path / "prompts" / "memory-hygiene.md").write_text("scan\n", encoding="utf-8")
+        sched = _StubScheduler()
+        sched._home = tmp_path
+        _STATE["scheduler"] = sched
+        out = await add_schedule.ainvoke(
+            {"name": "memory-hygiene", "cron": "0 8 * * 2", "prompt_file": "memory-hygiene.md"}
+        )
+        assert "add_schedule ok:" in out
+        assert sched.add_calls[0]["prompt_file"] == "memory-hygiene.md"
+
 
 class TestSetSchedulePriority:
     @pytest.mark.asyncio
