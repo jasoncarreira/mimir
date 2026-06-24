@@ -684,7 +684,7 @@ class TestBuildFileToolRoutes:
         assert "/node_modules/dep.py" not in paths
         assert "/.git/packed-refs" not in paths
 
-    def test_grep_reports_match_truncation(self, tmp_path: Path) -> None:
+    def test_grep_caps_matches_without_result_error(self, tmp_path: Path, caplog) -> None:
         repo = tmp_path / "repo"
         repo.mkdir()
         (repo / "a.txt").write_text("needle\n")
@@ -698,9 +698,12 @@ class TestBuildFileToolRoutes:
         result = backend.grep("needle", path="/")
 
         assert len(result.matches or []) == 1
-        assert result.error and "truncated" in result.error
+        assert result.error is None
+        assert "Grep truncated" in caplog.text
 
-    def test_glob_skips_worktrees_and_reports_match_truncation(self, tmp_path: Path) -> None:
+    def test_glob_skips_worktrees_and_caps_matches_without_result_error(
+        self, tmp_path: Path, caplog,
+    ) -> None:
         repo = tmp_path / "repo"
         repo.mkdir()
         (repo / "src").mkdir()
@@ -718,9 +721,10 @@ class TestBuildFileToolRoutes:
         paths = [m["path"] for m in (result.matches or [])]
 
         assert paths == ["/src/a.py"]
-        assert result.error and "truncated" in result.error
+        assert result.error is None
+        assert "Glob truncated" in caplog.text
 
-    def test_glob_reports_scan_truncation_before_matching(self, tmp_path: Path) -> None:
+    def test_glob_reports_scan_truncation_before_matching(self, tmp_path: Path, caplog) -> None:
         repo = tmp_path / "repo"
         repo.mkdir()
         (repo / "a.txt").write_text("x\n")
@@ -735,7 +739,8 @@ class TestBuildFileToolRoutes:
         result = backend.glob("**/*.py", path="/")
 
         assert result.matches == []
-        assert result.error and "scanned more than 2 files" in result.error
+        assert result.error is None
+        assert "scanned more than 2 files" in caplog.text
 
     def test_ls_hides_expensive_traversal_roots(self, tmp_path: Path) -> None:
         repo = tmp_path / "repo"
@@ -802,3 +807,34 @@ class TestFileToolRouter:
         # /logs is not a writable dir under the home → write denied + recorded
         router.write("/logs/x.txt", "no")
         assert any(d["op"] == "write" for d in router.drain_denials())
+
+    @pytest.mark.asyncio
+    async def test_broad_grep_keeps_default_and_route_matches_when_later_route_caps(
+        self, tmp_path: Path,
+    ) -> None:
+        home = _split_home(tmp_path)
+        (home / "state" / "home.txt").write_text("needle in home\n")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "repo.txt").write_text("needle in repo\n")
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "a.txt").write_text("needle in data a\n")
+        (data / "b.txt").write_text("needle in data b\n")
+
+        home_be = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        routes = build_file_tool_routes([(str(repo), "rw"), (str(data), "ro")])
+        # Simulate a large data mount saturating its cap. Truncation must not be
+        # returned as GrepResult.error, because deepagents CompositeBackend treats
+        # route errors as fatal and discards matches already merged from home/repo.
+        data_route = routes[str(data) + "/"]
+        data_route._fs._max_grep_matches = 1
+        router = FileToolRouter(default=home_be, routes=routes)
+
+        result = await router.agrep("needle")
+        paths = {m["path"] for m in (result.matches or [])}
+
+        assert result.error is None
+        assert "/state/home.txt" in paths
+        assert f"{repo}/repo.txt" in paths
+        assert len([p for p in paths if p.startswith(str(data))]) == 1

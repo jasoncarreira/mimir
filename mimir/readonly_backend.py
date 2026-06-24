@@ -67,8 +67,8 @@ _DEFAULT_MAX_SCAN_FILES = 20_000
 _DEFAULT_GREP_TIMEOUT_SECONDS = 10
 
 
-def _truncated_msg(op: str, reason: str) -> str:
-    return f"{op} truncated: {reason}; narrow the path or pattern."
+def _log_truncation(op: str, reason: str) -> None:
+    log.warning("%s truncated: %s; narrow the path or pattern", op, reason)
 
 
 def _walk_files_bounded(root: Path, excludes: frozenset[str]) -> Iterator[Path]:
@@ -117,6 +117,12 @@ class _BoundedFilesystemBackend(FilesystemBackend):
     ``node_modules/`` for hundreds of seconds and starve the service. This
     subclass keeps read/write behavior intact while making recursive search
     safe by default: skip vendor/VCS/build trees and cap matches/files/time.
+
+    This is defense in depth on top of PR #875's Docker-level ripgrep install:
+    the ``rg`` path handles the normal case quickly, while the Python fallback
+    remains bounded for drifted images or shells without ``rg``. Revisit this
+    local fork if deepagents grows native traversal bounds or a non-error
+    truncation signal.
     """
 
     def __init__(
@@ -293,8 +299,9 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         for fpath, items in results.items():
             for line_num, line_text in items:
                 matches.append({"path": fpath, "line": int(line_num), "text": line_text})
-        error = _truncated_msg("Grep", truncated) if truncated else None
-        return GrepResult(error=error, matches=matches)
+        if truncated:
+            _log_truncation("Grep", truncated)
+        return GrepResult(matches=matches)
 
     def glob(self, pattern: str, path: str = "/") -> GlobResult:  # noqa: C901, PLR0912
         """Find files matching a glob pattern without walking excluded trees forever."""
@@ -369,8 +376,9 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             return GlobResult(error=msg, matches=results)
 
         results.sort(key=lambda x: x.get("path", ""))
-        error = _truncated_msg("Glob", truncated) if truncated else None
-        return GlobResult(error=error, matches=results)
+        if truncated:
+            _log_truncation("Glob", truncated)
+        return GlobResult(matches=results)
 
     def ls(self, path: str) -> LsResult:
         """List direct children, omitting excluded traversal roots by default."""
