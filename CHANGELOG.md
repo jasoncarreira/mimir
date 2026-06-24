@@ -32,6 +32,21 @@ All notable changes will land here. Format loosely follows
   shell_exec, or add its directory to MIMIR_FILE_TOOL_ROOTS" instead of a silent
   false "not found"/empty listing.
 
+### Documentation
+
+- **Non-Docker guide refreshed for 0.5.0→0.6.x.** `docs/mimir-nondocker-guide.md`
+  now covers the host tools mimir shells out to (`ripgrep`, `git`, `jq`,
+  `poppler-utils`/`tesseract-ocr`, Node for source builds) with per-OS install
+  commands, `MIMIR_FILE_TOOL_ROOTS` (with the Docker bind-mount caveat), the
+  React console build step for source installs, `<home>/.env` defaults loading
+  (#447), and the systemd/watchdog/graceful-drain service story; the stale
+  "upgrade to v0.4.0" section was removed. `.env.example` gains
+  `MIMIR_FILE_TOOL_ROOTS` and the reliability vars added since 0.5.0
+  (`MIMIR_MAX_TURN_ITERATIONS`, `MIMIR_DRAIN_TIMEOUT_SECONDS`,
+  `MIMIR_RESEND_NUDGE_CHANNELS`, `MIMIR_LIVENESS_BEAT_SECONDS`, watchdog sinks,
+  `MIMIR_CHAINLINK_AUTOINIT`). The README documents file-tool roots for both
+  Docker and non-Docker readers.
+
 ## [0.6.6] — 2026-06-23
 
 ### Added
