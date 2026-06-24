@@ -97,7 +97,11 @@ For each repo in `GITHUB_REPOS`:
   re-fired (observed on PR #511). On exhaustion it emits a one-shot
   `pr_review_request_gave_up` **signal** (no turn; surfaces as a *negative
   algedonic signal* via `feedback.classify`'s `*_gave_up` rule) and goes dormant
-  for that PR until you're removed and re-requested.
+  for that PR until you're removed and re-requested. If an operator re-requests
+  you after you already submitted a substantive review (`APPROVED`,
+  `CHANGES_REQUESTED`, or `COMMENTED`) at the current head SHA, the poller
+  treats that request as satisfied and suppresses both retry emits and give-up
+  signals.
 - **Stale changes-requested on your own PRs** (`pr_changes_requested_stale`) —
   state-reconciling reminder (chainlink #449), the reverse direction of the
   above: reviews ON your PRs are otherwise edge-triggered only, so a turn that

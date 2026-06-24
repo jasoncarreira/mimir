@@ -410,6 +410,26 @@ def test_review_skill_preload_explicit_path_override(monkeypatch, tmp_path):
 # ─── pr_review_requested detection (reviewer added to a PR) ─────────
 
 
+def _patch_api_with_reviews(monkeypatch, response, reviews_response):
+    def fake_api(endpoint: str, token: str):
+        if endpoint.endswith("/reviews"):
+            return reviews_response
+        if "compare/" in endpoint:
+            return None
+        return response
+
+    monkeypatch.setattr(poller, "_gh_api", fake_api)
+
+
+def _review(login: str, commit_id: str, state: str = "APPROVED") -> dict:
+    return {
+        "user": {"login": login},
+        "commit_id": commit_id,
+        "state": state,
+        "submitted_at": "2026-06-24T02:10:00Z",
+    }
+
+
 def test_review_requested_first_sighting_emits(captured_emits, monkeypatch):
     """Empty cursor + a PR where ``mimir-carreira`` is in
     ``requested_reviewers`` → emit ``pr_review_requested`` (attempt 1)."""
@@ -511,6 +531,127 @@ def test_review_requested_re_fires_after_being_removed(
     assert rr_events[0]["attempt"] == 1
     assert new_rr == {"42": 1}
 
+
+def test_review_requested_current_head_review_suppresses_rerequest(
+    captured_emits, monkeypatch,
+):
+    """Operator re-request after a current-head self review is satisfied."""
+    _patch_api_with_reviews(
+        monkeypatch,
+        [_pr(42, "sha", login="alice", requested_reviewers=["mimir-carreira"])],
+        [_review("mimir-carreira", "sha", state="APPROVED")],
+    )
+    count, _, new_rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"},
+        pr_review_requests={},
+    )
+    assert count == 0
+    assert [e for e in captured_emits if e.get("event_type") == "pr_review_requested"] == []
+    assert new_rr == {}
+
+
+def test_review_requested_current_head_review_suppresses_give_up(
+    monkeypatch,
+):
+    """Do not emit give-up after a substantive current-head self review."""
+    captured = _capture_emits(monkeypatch)
+    _patch_api_with_reviews(
+        monkeypatch,
+        [_pr(42, "sha", login="alice", requested_reviewers=["mimir-carreira"])],
+        [_review("mimir-carreira", "sha", state="CHANGES_REQUESTED")],
+    )
+    cap = poller.REVIEW_REQUEST_MAX_ATTEMPTS
+    count, _, new_rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"},
+        pr_review_requests={"42": cap},
+    )
+    assert count == 0
+    assert [e for e in captured if e.get("event_type") == "pr_review_requested"] == []
+    assert [e for e in captured if e.get("signal") == "pr_review_request_gave_up"] == []
+    assert new_rr == {}
+
+
+def test_review_requested_old_head_review_still_retries(
+    captured_emits, monkeypatch,
+):
+    """A stale self review does not satisfy a current review request."""
+    _patch_api_with_reviews(
+        monkeypatch,
+        [_pr(42, "new-sha", login="alice", requested_reviewers=["mimir-carreira"])],
+        [_review("mimir-carreira", "old-sha", state="APPROVED")],
+    )
+    count, _, new_rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "new-sha"},
+        pr_review_requests={},
+    )
+    assert count == 1
+    rr_events = [e for e in captured_emits if e.get("event_type") == "pr_review_requested"]
+    assert len(rr_events) == 1
+    assert rr_events[0]["attempt"] == 1
+    assert new_rr == {"42": 1}
+
+
+def test_review_requested_other_reviewer_current_head_review_still_retries(
+    captured_emits, monkeypatch,
+):
+    """Another reviewer's current-head review does not satisfy our request."""
+    _patch_api_with_reviews(
+        monkeypatch,
+        [_pr(42, "sha", login="alice", requested_reviewers=["mimir-carreira"])],
+        [_review("someone-else", "sha", state="APPROVED")],
+    )
+    count, _, new_rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"},
+        pr_review_requests={},
+    )
+    assert count == 1
+    rr_events = [e for e in captured_emits if e.get("event_type") == "pr_review_requested"]
+    assert len(rr_events) == 1
+    assert new_rr == {"42": 1}
+
+
+def test_review_requested_non_substantive_self_review_still_retries(
+    captured_emits, monkeypatch,
+):
+    """Pending/dismissed review states are not treated as submitted reviews."""
+    _patch_api_with_reviews(
+        monkeypatch,
+        [_pr(42, "sha", login="alice", requested_reviewers=["mimir-carreira"])],
+        [_review("mimir-carreira", "sha", state="PENDING")],
+    )
+    count, _, new_rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"},
+        pr_review_requests={},
+    )
+    assert count == 1
+    rr_events = [e for e in captured_emits if e.get("event_type") == "pr_review_requested"]
+    assert len(rr_events) == 1
+    assert new_rr == {"42": 1}
+
+
+def test_review_requested_reviews_api_failure_preserves_retry(
+    captured_emits, monkeypatch,
+):
+    """Reviews API failures fall back to the existing retry behavior."""
+    _patch_api_with_reviews(
+        monkeypatch,
+        [_pr(42, "sha", login="alice", requested_reviewers=["mimir-carreira"])],
+        None,
+    )
+    count, _, new_rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"},
+        pr_review_requests={},
+    )
+    assert count == 1
+    rr_events = [e for e in captured_emits if e.get("event_type") == "pr_review_requested"]
+    assert len(rr_events) == 1
+    assert new_rr == {"42": 1}
 
 def test_review_requested_other_reviewer_does_not_trigger(
     captured_emits, monkeypatch,
