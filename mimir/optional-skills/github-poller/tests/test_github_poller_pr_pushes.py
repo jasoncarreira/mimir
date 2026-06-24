@@ -263,8 +263,14 @@ def test_review_needed_event_carries_submission_rule_and_marker(monkeypatch):
     # PR number — ``gh pr review 234`` still discriminates a real submission
     # from ``gh pr review-comment`` (which has no ``review 234`` substring) —
     # and ``ref`` identifies the item in the emitted signal.
-    assert marker["bash_substrings"] == ["gh pr review 234"]
+    assert marker["bash_substrings"] == [
+        "gh pr review 234",
+        "gh pr review --repo o/r 234",
+        "gh pr review -R o/r 234",
+    ]
     assert marker["ref"] == "#234"
+    assert marker["repo"] == "o/r"
+    assert marker["number"] == 234
 
 
 def test_non_review_events_carry_no_marker(monkeypatch):
@@ -718,6 +724,9 @@ def test_review_requested_event_carries_submission_marker(monkeypatch):
     marker = ev.get("expected_tool_call")
     assert isinstance(marker, dict)
     assert marker["signal_on_missing"] == "poller_review_missed_submission"
+    assert marker["repo"] == "o/r"
+    assert marker["number"] == 42
+    assert marker["reviewer"] == "mimir-carreira"
 
 
 # ─── re-emit / wedge-guard / give-up (chainlink #299) ───────────────
