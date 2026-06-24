@@ -1349,11 +1349,10 @@ textarea {
   width: 34px;
   height: 34px;
   padding: 0;
-  border: var(--mimir-border-width-hairline, 1px) solid color-mix(in srgb, var(--mimir-color-panel-border, #d6ded9) 72%, transparent);
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--mimir-color-surface-raised, #ffffff) 70%, transparent);
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-control, 6px);
+  background: transparent;
   color: var(--mimir-color-text, #16201b);
-  box-shadow: 0 0 16px color-mix(in srgb, var(--mimir-color-accent, #7c3aed) 10%, transparent);
   font-family: var(--mimir-font-family-mono, monospace);
   font-size: var(--mimir-font-size-md, 1rem);
   line-height: 1;
@@ -1364,7 +1363,6 @@ textarea {
 .chat-composer__action:focus-visible {
   border-color: var(--mimir-color-panel-border-hover, #60786a);
   background: var(--mimir-interaction-hover-background, transparent);
-  box-shadow: 0 0 20px color-mix(in srgb, var(--mimir-color-accent, #7c3aed) 18%, transparent);
 }
 
 .chat-composer__send {
