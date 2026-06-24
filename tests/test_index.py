@@ -102,6 +102,26 @@ def test_build_state_index_lists_state_files(tmp_path: Path):
     assert "kickoff" in body
 
 
+def test_build_state_index_skips_runtime_package_artifacts(tmp_path: Path):
+    state = tmp_path / "state"
+    (state / "openclaw-tools" / "node_modules" / "openclaw").mkdir(parents=True)
+    (state / "openclaw-tools" / "node_modules" / "openclaw" / "README.md").write_text(
+        "<!-- desc: openclaw package readme -->\nbody"
+    )
+    (state / "hermes-npm-inspect" / "pkg").mkdir(parents=True)
+    (state / "hermes-npm-inspect" / "pkg" / "README.md").write_text(
+        "<!-- desc: hermes package readme -->\nbody"
+    )
+    (state / "reports").mkdir()
+    (state / "reports" / "kept.md").write_text("<!-- desc: durable report -->\nbody")
+
+    body = build_state_index(tmp_path)
+
+    assert "openclaw-tools" not in body
+    assert "hermes-npm-inspect" not in body
+    assert "reports/kept.md" in body
+
+
 def test_empty_tree_produces_none_marker(tmp_path: Path):
     body = build_memory_index(tmp_path)
     assert "(none)" in body

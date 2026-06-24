@@ -349,6 +349,12 @@ INDEX_SKIP_PREFIXES: tuple[str, ...] = (
     # (per-message processed manifests, inbox snapshots) would cause
     # constant reindex churn on social-active installs.
     "state/social/",
+    # Runtime package installs from local Hermes/OpenClaw experiments.
+    # These trees are ignored by mimirbot-state .gitignore; indexing
+    # their package docs makes state/INDEX.md and file_search noisy with
+    # third-party package internals rather than authored state.
+    "state/openclaw-tools/",
+    "state/hermes-npm-inspect/",
 )
 
 
