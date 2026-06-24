@@ -141,6 +141,10 @@ def test_classify_scope_excludes_skip_prefixes():
     assert (
         _classify_scope("state/pollers/social-cli-notifications/notes.md") is None
     )
+    # Ignored runtime package trees from local experiments should not
+    # pollute file_search or state/INDEX.md with third-party internals.
+    assert _classify_scope("state/openclaw-tools/node_modules/openclaw/README.md") is None
+    assert _classify_scope("state/hermes-npm-inspect/pkg/README.md") is None
     # Sibling state subtree unaffected.
     assert _classify_scope("state/seeds/x.md") == "state"
 
@@ -215,6 +219,20 @@ async def test_sweep_skips_workspace_paths(tmp_path: Path):
     (tmp_path / "state" / "pollers" / "social-cli-notifications" / "inbox.md").write_text(
         "<!-- desc: social inbox -->\ntokenmjzrtq social-cli artifact."
     )
+    # Ignored runtime package trees from local experiments.
+    (tmp_path / "state" / "openclaw-tools" / "node_modules" / "openclaw").mkdir(parents=True)
+    (
+        tmp_path
+        / "state"
+        / "openclaw-tools"
+        / "node_modules"
+        / "openclaw"
+        / "README.md"
+    ).write_text("<!-- desc: openclaw readme -->\ntokenmjzrtq package artifact.")
+    (tmp_path / "state" / "hermes-npm-inspect" / "pkg").mkdir(parents=True)
+    (tmp_path / "state" / "hermes-npm-inspect" / "pkg" / "README.md").write_text(
+        "<!-- desc: hermes readme -->\ntokenmjzrtq package artifact."
+    )
     # Adjacent state file that SHOULD index — control case.
     (tmp_path / "state" / "neighbor.md").write_text(
         "<!-- desc: neighbor -->\ntokenmjzrtq in a regular state file."
@@ -227,6 +245,8 @@ async def test_sweep_skips_workspace_paths(tmp_path: Path):
     assert "state/heartbeat-backlog.md" not in paths
     assert "state/proposed-changes.md" not in paths
     assert "state/pollers/social-cli-notifications/inbox.md" not in paths
+    assert "state/openclaw-tools/node_modules/openclaw/README.md" not in paths
+    assert "state/hermes-npm-inspect/pkg/README.md" not in paths
     assert "state/neighbor.md" in paths
 
 
