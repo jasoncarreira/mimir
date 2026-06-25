@@ -666,6 +666,97 @@ class TestBuildFileToolRoutes:
         assert isinstance(routes[str(rw) + "/"], _RootAwareFilesystemBackend)
         assert isinstance(routes[str(ro) + "/"], ReadOnlyFilesystemBackend)
 
+    def test_grep_skips_vendor_and_vcs_subtrees(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "src").mkdir()
+        (repo / "src" / "app.py").write_text("needle\n")
+        (repo / "node_modules").mkdir()
+        (repo / "node_modules" / "dep.py").write_text("needle\n")
+        (repo / ".git").mkdir()
+        (repo / ".git" / "packed-refs").write_text("needle\n")
+        backend = _RootAwareFilesystemBackend(root_dir=repo, virtual_mode=True)
+
+        result = backend.grep("needle", path="/")
+        paths = {m["path"] for m in (result.matches or [])}
+
+        assert "/src/app.py" in paths
+        assert "/node_modules/dep.py" not in paths
+        assert "/.git/packed-refs" not in paths
+
+    def test_grep_caps_matches_without_result_error(self, tmp_path: Path, caplog) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "a.txt").write_text("needle\n")
+        (repo / "b.txt").write_text("needle\n")
+        backend = _RootAwareFilesystemBackend(
+            root_dir=repo,
+            virtual_mode=True,
+            max_grep_matches=1,
+        )
+
+        result = backend.grep("needle", path="/")
+
+        assert len(result.matches or []) == 1
+        assert result.error is None
+        assert "Grep truncated" in caplog.text
+
+    def test_glob_skips_worktrees_and_caps_matches_without_result_error(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "src").mkdir()
+        (repo / "src" / "a.py").write_text("x\n")
+        (repo / "src" / "b.py").write_text("x\n")
+        (repo / ".worktrees").mkdir()
+        (repo / ".worktrees" / "ignored.py").write_text("x\n")
+        backend = _RootAwareFilesystemBackend(
+            root_dir=repo,
+            virtual_mode=True,
+            max_glob_matches=1,
+        )
+
+        result = backend.glob("**/*.py", path="/")
+        paths = [m["path"] for m in (result.matches or [])]
+
+        assert paths == ["/src/a.py"]
+        assert result.error is None
+        assert "Glob truncated" in caplog.text
+
+    def test_glob_reports_scan_truncation_before_matching(self, tmp_path: Path, caplog) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "a.txt").write_text("x\n")
+        (repo / "b.txt").write_text("x\n")
+        (repo / "c.py").write_text("x\n")
+        backend = _RootAwareFilesystemBackend(
+            root_dir=repo,
+            virtual_mode=True,
+            max_scan_files=2,
+        )
+
+        result = backend.glob("**/*.py", path="/")
+
+        assert result.matches == []
+        assert result.error is None
+        assert "scanned more than 2 files" in caplog.text
+
+    def test_ls_hides_expensive_traversal_roots(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "src").mkdir()
+        (repo / ".worktrees").mkdir()
+        (repo / "node_modules").mkdir()
+        backend = _RootAwareFilesystemBackend(root_dir=repo, virtual_mode=True)
+
+        entries = backend.ls("/").entries or []
+        names = {Path(e["path"].rstrip("/")).name for e in entries}
+
+        assert "src" in names
+        assert ".worktrees" not in names
+        assert "node_modules" not in names
+
 
 class TestFileToolRouter:
     @staticmethod
@@ -716,3 +807,34 @@ class TestFileToolRouter:
         # /logs is not a writable dir under the home → write denied + recorded
         router.write("/logs/x.txt", "no")
         assert any(d["op"] == "write" for d in router.drain_denials())
+
+    @pytest.mark.asyncio
+    async def test_broad_grep_keeps_default_and_route_matches_when_later_route_caps(
+        self, tmp_path: Path,
+    ) -> None:
+        home = _split_home(tmp_path)
+        (home / "state" / "home.txt").write_text("needle in home\n")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "repo.txt").write_text("needle in repo\n")
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "a.txt").write_text("needle in data a\n")
+        (data / "b.txt").write_text("needle in data b\n")
+
+        home_be = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        routes = build_file_tool_routes([(str(repo), "rw"), (str(data), "ro")])
+        # Simulate a large data mount saturating its cap. Truncation must not be
+        # returned as GrepResult.error, because deepagents CompositeBackend treats
+        # route errors as fatal and discards matches already merged from home/repo.
+        data_route = routes[str(data) + "/"]
+        data_route._fs._max_grep_matches = 1
+        router = FileToolRouter(default=home_be, routes=routes)
+
+        result = await router.agrep("needle")
+        paths = {m["path"] for m in (result.matches or [])}
+
+        assert result.error is None
+        assert "/state/home.txt" in paths
+        assert f"{repo}/repo.txt" in paths
+        assert len([p for p in paths if p.startswith(str(data))]) == 1

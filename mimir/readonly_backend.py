@@ -22,8 +22,13 @@ mutator methods added by deepagents (``delete_file``, ``rename``,
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Iterable
+import os
+import re
+import subprocess
+from collections.abc import Iterable, Iterator
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -32,12 +37,47 @@ from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.protocol import (
     EditResult,
     FileUploadResponse,
+    GlobResult,
+    GrepResult,
     LsResult,
     ReadResult,
     WriteResult,
 )
 
 log = logging.getLogger(__name__)
+
+_DEFAULT_TRAVERSAL_EXCLUDES = frozenset({
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".worktrees",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "dist",
+    "build",
+})
+_DEFAULT_MAX_GREP_MATCHES = 2_000
+_DEFAULT_MAX_GLOB_MATCHES = 2_000
+_DEFAULT_MAX_SCAN_FILES = 20_000
+_DEFAULT_GREP_TIMEOUT_SECONDS = 10
+
+
+def _log_truncation(op: str, reason: str) -> None:
+    log.warning("%s truncated: %s; narrow the path or pattern", op, reason)
+
+
+def _walk_files_bounded(root: Path, excludes: frozenset[str]) -> Iterator[Path]:
+    """Yield files under ``root`` without descending into excluded directories."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in excludes)
+        base = Path(dirpath)
+        for filename in sorted(filenames):
+            yield base / filename
 
 
 def _real_path_outside_root(key: str, cwd: Path) -> Path | None:
@@ -66,7 +106,292 @@ def _real_path_outside_root(key: str, cwd: Path) -> Path | None:
     return None
 
 
-class _RootAwareFilesystemBackend(FilesystemBackend):
+class _BoundedFilesystemBackend(FilesystemBackend):
+    """FilesystemBackend with bounded recursive grep/glob traversal.
+
+    DeepAgents' stock backend already runs async grep/glob through
+    ``asyncio.to_thread`` and gives ripgrep a 30s timeout, but the synchronous
+    call still walks every configured root recursively. Once mimir exposed
+    operator-configured multi-GB roots (chainlink #650), a broad grep over a
+    route such as ``/workspace/mimir`` could descend into ``.worktrees/`` or
+    ``node_modules/`` for hundreds of seconds and starve the service. This
+    subclass keeps read/write behavior intact while making recursive search
+    safe by default: skip vendor/VCS/build trees and cap matches/files/time.
+
+    This is defense in depth on top of PR #875's Docker-level ripgrep install:
+    the ``rg`` path handles the normal case quickly, while the Python fallback
+    remains bounded for drifted images or shells without ``rg``. Revisit this
+    local fork if deepagents grows native traversal bounds or a non-error
+    truncation signal.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        traversal_excludes: Iterable[str] = _DEFAULT_TRAVERSAL_EXCLUDES,
+        max_grep_matches: int = _DEFAULT_MAX_GREP_MATCHES,
+        max_glob_matches: int = _DEFAULT_MAX_GLOB_MATCHES,
+        max_scan_files: int = _DEFAULT_MAX_SCAN_FILES,
+        grep_timeout_seconds: int = _DEFAULT_GREP_TIMEOUT_SECONDS,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._traversal_excludes = frozenset(traversal_excludes)
+        self._max_grep_matches = max_grep_matches
+        self._max_glob_matches = max_glob_matches
+        self._max_scan_files = max_scan_files
+        self._grep_timeout_seconds = grep_timeout_seconds
+
+    def _is_excluded(self, path: Path) -> bool:
+        try:
+            rel_parts = path.resolve().relative_to(self.cwd.resolve()).parts
+        except (OSError, RuntimeError, ValueError):
+            rel_parts = path.parts
+        return any(part in self._traversal_excludes for part in rel_parts)
+
+    def _ripgrep_search(
+        self, pattern: str, base_full: Path, include_glob: str | None,
+    ) -> tuple[dict[str, list[tuple[int, str]]], str | None] | None:
+        """Search with ripgrep while excluding expensive dirs and bounding time."""
+        cmd = ["rg", "--json", "-F"]
+        for name in sorted(self._traversal_excludes):
+            cmd.extend(["--glob", f"!{name}/**"])
+        if include_glob:
+            cmd.extend(["--glob", include_glob])
+        cmd.extend(["--", pattern, str(base_full)])
+
+        try:
+            proc = subprocess.run(  # noqa: S603
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self._grep_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {}, f"ran longer than {self._grep_timeout_seconds}s"
+        except (FileNotFoundError, PermissionError):
+            return None
+
+        results: dict[str, list[tuple[int, str]]] = {}
+        match_count = 0
+        truncated: str | None = None
+        for line in proc.stdout.splitlines():
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if data.get("type") != "match":
+                continue
+            pdata = data.get("data", {})
+            ftext = pdata.get("path", {}).get("text")
+            if not ftext:
+                continue
+            p = Path(ftext)
+            if self._is_excluded(p):
+                continue
+            if self.virtual_mode:
+                try:
+                    virt = self._to_virtual_path(p)
+                except ValueError:
+                    log.debug("Skipping grep result outside root: %s", p)
+                    continue
+                except (OSError, RuntimeError):
+                    log.warning("Could not resolve grep result path: %s", p, exc_info=True)
+                    continue
+            else:
+                virt = str(p)
+            ln = pdata.get("line_number")
+            lt = pdata.get("lines", {}).get("text", "").rstrip("\n")
+            if ln is None:
+                continue
+            results.setdefault(virt, []).append((int(ln), lt))
+            match_count += 1
+            if match_count >= self._max_grep_matches:
+                truncated = f"matched more than {self._max_grep_matches} lines"
+                break
+        return results, truncated
+
+    def _python_search(
+        self, pattern: str, base_full: Path, include_glob: str | None,
+    ) -> tuple[dict[str, list[tuple[int, str]]], str | None]:  # noqa: C901, PLR0912
+        """Fallback search with excluded dirs and file/match caps."""
+        regex = re.compile(pattern)
+        results: dict[str, list[tuple[int, str]]] = {}
+        root = base_full if base_full.is_dir() else base_full.parent
+        candidates: Iterator[Path]
+        if base_full.is_file():
+            candidates = iter([base_full])
+        else:
+            candidates = _walk_files_bounded(root, self._traversal_excludes)
+        scanned = 0
+        matches = 0
+        truncated: str | None = None
+        for fp in candidates:
+            try:
+                if not fp.is_file():
+                    continue
+            except (PermissionError, OSError, RuntimeError):
+                continue
+            if include_glob and not fp.match(include_glob):
+                continue
+            scanned += 1
+            if scanned > self._max_scan_files:
+                truncated = f"scanned more than {self._max_scan_files} files"
+                break
+            try:
+                if fp.stat().st_size > self.max_file_size_bytes:
+                    continue
+            except (OSError, RuntimeError):
+                continue
+            try:
+                content = fp.read_text()
+            except (UnicodeDecodeError, PermissionError, OSError, RuntimeError):
+                continue
+            for line_num, line in enumerate(content.splitlines(), 1):
+                if regex.search(line):
+                    if self.virtual_mode:
+                        try:
+                            virt_path = self._to_virtual_path(fp)
+                        except ValueError:
+                            log.debug("Skipping grep result outside root: %s", fp)
+                            continue
+                        except (OSError, RuntimeError):
+                            log.warning("Could not resolve grep result path: %s", fp, exc_info=True)
+                            continue
+                    else:
+                        virt_path = str(fp)
+                    results.setdefault(virt_path, []).append((line_num, line))
+                    matches += 1
+                    if matches >= self._max_grep_matches:
+                        return results, f"matched more than {self._max_grep_matches} lines"
+        return results, truncated
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+    ) -> GrepResult:
+        """Search for literal text with bounded traversal and result caps."""
+        try:
+            base_full = self._resolve_path(path or ".")
+        except ValueError:
+            return GrepResult(matches=[])
+        except (OSError, RuntimeError) as e:
+            search_path = path or "."
+            return GrepResult(error=f"Error searching path '{search_path}': {e}", matches=[])
+
+        try:
+            if not base_full.exists():
+                return GrepResult(matches=[])
+        except OSError as e:
+            search_path = path or "."
+            return GrepResult(error=f"Error searching path '{search_path}': {e}", matches=[])
+
+        rg_results = self._ripgrep_search(pattern, base_full, glob)
+        if rg_results is None:
+            results, truncated = self._python_search(re.escape(pattern), base_full, glob)
+        else:
+            results, truncated = rg_results
+
+        matches = []
+        for fpath, items in results.items():
+            for line_num, line_text in items:
+                matches.append({"path": fpath, "line": int(line_num), "text": line_text})
+        if truncated:
+            _log_truncation("Grep", truncated)
+        return GrepResult(matches=matches)
+
+    def glob(self, pattern: str, path: str = "/") -> GlobResult:  # noqa: C901, PLR0912
+        """Find files matching a glob pattern without walking excluded trees forever."""
+        if pattern.startswith("/"):
+            pattern = pattern.lstrip("/")
+
+        if self.virtual_mode and ".." in Path(pattern).parts:
+            return GlobResult(error="Path traversal not allowed in glob pattern", matches=[])
+
+        try:
+            search_path = self.cwd if path == "/" else self._resolve_path(path)
+            if not search_path.exists():
+                return GlobResult(matches=[])
+        except (OSError, RuntimeError) as e:
+            return GlobResult(error=f"Error globbing path '{path}': {e}", matches=[])
+
+        results: list[dict[str, Any]] = []
+        scanned = 0
+        truncated: str | None = None
+        candidates: Iterator[Path]
+        if search_path.is_file():
+            candidates = iter([search_path])
+        else:
+            candidates = _walk_files_bounded(search_path, self._traversal_excludes)
+        try:
+            for candidate in candidates:
+                scanned += 1
+                if scanned > self._max_scan_files:
+                    truncated = f"scanned more than {self._max_scan_files} files"
+                    break
+                if not candidate.match(pattern):
+                    continue
+                matched_path = candidate
+                try:
+                    is_file = matched_path.is_file()
+                except (PermissionError, OSError, RuntimeError):
+                    continue
+                if not is_file:
+                    continue
+                if self.virtual_mode:
+                    try:
+                        matched_path.resolve().relative_to(self.cwd)
+                    except (OSError, RuntimeError, ValueError):
+                        continue
+                    try:
+                        out_path = self._to_virtual_path(matched_path)
+                    except ValueError:
+                        log.debug("Skipping glob result outside root: %s", matched_path)
+                        continue
+                    except (OSError, RuntimeError):
+                        log.warning("Could not resolve glob result path: %s", matched_path, exc_info=True)
+                        continue
+                else:
+                    out_path = str(matched_path)
+                try:
+                    st = matched_path.stat()
+                    results.append({
+                        "path": out_path,
+                        "is_dir": False,
+                        "size": int(st.st_size),
+                        "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                    })
+                except OSError:
+                    results.append({"path": out_path, "is_dir": False})
+                if len(results) >= self._max_glob_matches:
+                    truncated = f"matched more than {self._max_glob_matches} files"
+                    break
+        except (OSError, RuntimeError, ValueError) as e:
+            msg = f"Glob of '{path}' aborted partway: {e}"
+            log.warning("%s", msg, exc_info=True)
+            results.sort(key=lambda x: x.get("path", ""))
+            return GlobResult(error=msg, matches=results)
+
+        results.sort(key=lambda x: x.get("path", ""))
+        if truncated:
+            _log_truncation("Glob", truncated)
+        return GlobResult(matches=results)
+
+    def ls(self, path: str) -> LsResult:
+        """List direct children, omitting excluded traversal roots by default."""
+        result = super().ls(path)
+        entries = result.entries or []
+        filtered = [
+            entry for entry in entries
+            if Path(str(entry.get("path", "")).rstrip("/")).name not in self._traversal_excludes
+        ]
+        return LsResult(error=result.error, entries=filtered)
+
+
+class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     """FilesystemBackend that treats absolute paths under ``cwd`` as virtual.
 
     Upstream's ``virtual_mode=True`` resolves every incoming path as a
