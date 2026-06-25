@@ -10,6 +10,7 @@ crash and produces a hypothesis record in the right shape.
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -195,3 +196,95 @@ async def test_runner_no_consolidate_path(tmp_path, monkeypatch):
     assert err is None
     assert record is not None
     assert metrics["clusters_consolidated"] == 0
+
+
+@pytest.mark.asyncio
+async def test_generated_session_boundaries_persist_real_sessions(tmp_path, monkeypatch):
+    import mimir.saga.embeddings as _mm_embeddings
+    monkeypatch.setattr(_mm_embeddings, "get_provider", _stub_provider)
+    import mimir.saga._config_io as _mm_config
+
+    def _fake_cfg():
+        def cfg(section, key, default=None):
+            return {
+                ("embedding", "max_input_chars"): 2000,
+                ("embedding", "provider"): "stub",
+                ("embedding", "model"): "stub-4d",
+            }.get((section, key), default)
+        return cfg
+
+    monkeypatch.setattr(_mm_config, "get_config", _fake_cfg)
+
+    import saga.benchmarks.longmemeval.harness as _h
+    monkeypatch.setattr(_h, "read", lambda *a, **k: {
+        "hypothesis": "stub", "reader_latency_ms": 1,
+        "reader_prompt_tokens": 0, "reader_completion_tokens": 0,
+        "reader_model": "stub",
+    })
+
+    import mimir.saga._llm as _mm_llm
+
+    async def _fake_call_llm(*args, **kwargs):
+        return json.dumps({
+            "summary": "Generated boundary summary from stub LLM.",
+            "topics_discussed": ["reply preference"],
+            "decisions_made": ["keep replies concise"],
+            "unfinished": ["none"],
+            "emotional_state": "neutral",
+        })
+
+    monkeypatch.setattr(_mm_llm, "call_llm", _fake_call_llm)
+
+    from benchmarks.longmemeval_via_memory import runner as r
+
+    orig = r._make_client
+    monkeypatch.setattr(r, "_make_client",
+                        lambda db, *, embedding_dim=4: orig(db, embedding_dim=4))
+
+    q = _make_synthetic_question()
+    record, metrics, err = await r._run_one(
+        q=q,
+        work_dir=tmp_path,
+        keep_db=True,
+        consolidate_enabled=False,
+        session_boundary_treatment="generated",
+    )
+    assert err is None
+    assert record is not None
+    assert metrics["session_boundaries_written"] == 2
+
+    db_path = tmp_path / "q_synth_q1.db"
+    with sqlite3.connect(db_path) as conn:
+        atom_session_ids = {
+            row[0] for row in conn.execute(
+                """
+                SELECT DISTINCT session_id
+                  FROM atoms
+                 WHERE source_type = 'longmemeval'
+                """
+            ).fetchall()
+        }
+        assert atom_session_ids == {"s_0", "s_1"}
+
+        row = conn.execute(
+            """
+            SELECT summary, topics_discussed, decisions_made, unfinished,
+                   started_at, ended_at, reflected_at, embedding_dim
+              FROM sessions
+             WHERE id = 's_0'
+            """
+        ).fetchone()
+
+    assert row is not None
+    (
+        summary, topics, decisions, unfinished,
+        started_at, ended_at, reflected_at, emb_dim,
+    ) = row
+    assert summary == "Generated boundary summary from stub LLM."
+    assert json.loads(topics) == ["reply preference"]
+    assert json.loads(decisions) == ["keep replies concise"]
+    assert json.loads(unfinished) == ["none"]
+    assert started_at == "2026-05-01T10:00:00+00:00"
+    assert ended_at == "2026-05-01T10:00:00+00:00"
+    assert reflected_at == "2026-05-01T10:00:00+00:00"
+    assert emb_dim == 4
