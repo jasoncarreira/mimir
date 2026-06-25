@@ -290,9 +290,11 @@ async def test_session_boundary_rrf_lane_keeps_summaries_out_of_reader(
     assert err is None
     assert record is not None
     assert captured["retrieved"]["raws"]
+    assert metrics["session_boundary_rrf_enabled"] is True
     assert metrics["session_boundaries_written"] == 2
     assert metrics["session_boundary_indexed_sessions"] == 2
     assert len(metrics["session_boundary_matched_sessions"]) == 1
+    assert metrics["session_boundary_atom_candidates"] > 0
     assert metrics["session_boundary_atom_candidates"] <= 2
     assert metrics["session_boundary_weight"] == 0.5
 
