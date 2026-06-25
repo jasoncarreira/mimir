@@ -326,6 +326,84 @@ async def _write_generated_session_boundaries(client, q: dict) -> dict:
     return {"session_boundaries_total": total, "session_boundaries_written": written}
 
 
+# ─── Session-boundary atom promotion ────────────────────────────────
+
+
+async def _session_boundary_rrf_pathway(
+    client,
+    question: str,
+    *,
+    limit: int = 3,
+    alpha: float = 0.7,
+    atoms_per_session: int = 30,
+    weight: float = 0.5,
+) -> tuple[list[str], dict[str, Any]]:
+    """Resolve session-boundary matches into atom ids for an RRF lane.
+
+    The boundary text is used only for session search. The reader never
+    receives a rendered session-summary block; matched sessions promote
+    their own atoms via ``extra_atom_ranked_pathways``.
+    """
+    matched_sessions = await client.search_sessions(
+        question,
+        alpha=alpha,
+        limit=limit,
+    )
+    cap = max(0, int(atoms_per_session))
+
+    def _load_atom_ids_for_sessions() -> dict[str, list[str]]:
+        conn = client._ensure_conn()
+        by_session: dict[str, list[str]] = {}
+        for session in matched_sessions:
+            sid = session.get("session_id")
+            if not sid or cap <= 0:
+                by_session[str(sid)] = []
+                continue
+            rows = conn.execute(
+                """
+                SELECT id
+                  FROM atoms
+                 WHERE session_id = ?
+                   AND tombstoned = 0
+                 ORDER BY created_at, rowid
+                 LIMIT ?
+                """,
+                (sid, cap),
+            ).fetchall()
+            by_session[str(sid)] = [row[0] for row in rows]
+        return by_session
+
+    atoms_by_session = await asyncio.to_thread(_load_atom_ids_for_sessions)
+    atom_ids: list[str] = []
+    seen: set[str] = set()
+    for session in matched_sessions:
+        sid = session.get("session_id")
+        for atom_id in atoms_by_session.get(str(sid), []):
+            if atom_id not in seen:
+                atom_ids.append(atom_id)
+                seen.add(atom_id)
+
+    debug = {
+        "session_boundary_rrf_enabled": True,
+        "session_boundary_limit": limit,
+        "session_boundary_alpha": alpha,
+        "session_boundary_weight": weight,
+        "session_boundary_atoms_per_session": cap,
+        "session_boundary_matched_sessions": [
+            {
+                "session_id": s.get("session_id"),
+                "similarity_score": s.get("similarity_score"),
+                "recency_score": s.get("recency_score"),
+                "blended_score": s.get("blended_score"),
+            }
+            for s in matched_sessions
+        ],
+        "session_boundary_atoms_by_session": atoms_by_session,
+        "session_boundary_atom_candidates": len(atom_ids),
+    }
+    return atom_ids, debug
+
+
 # ─── Reader (reused from saga) ───────────────────────────────────────
 
 
@@ -399,6 +477,11 @@ async def _run_one(
     keep_db: bool,
     consolidate_enabled: bool,
     session_boundary_treatment: str = "none",
+    session_boundary_rrf_lane: bool = False,
+    session_boundary_limit: int = 3,
+    session_boundary_alpha: float = 0.7,
+    session_boundary_weight: float = 0.5,
+    session_boundary_atoms_per_session: int = 30,
 ) -> tuple[dict | None, dict, str | None]:
     """Returns (hypothesis_record, metrics, error_str)."""
     qid = q["question_id"]
@@ -424,7 +507,7 @@ async def _run_one(
         # rows for search_sessions(), but the retrieved session summaries are
         # not rendered to the reader in this leaf.
         t0 = time.time()
-        if session_boundary_treatment == "generated":
+        if session_boundary_treatment == "generated" or session_boundary_rrf_lane:
             boundary_stats = await _write_generated_session_boundaries(client, q)
         else:
             boundary_stats = {
@@ -433,6 +516,26 @@ async def _run_one(
             }
         metrics["session_boundaries_s"] = round(time.time() - t0, 2)
         metrics.update(boundary_stats)
+        try:
+            def _session_index_counts():
+                conn = client._ensure_conn()
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*),
+                           SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END)
+                      FROM sessions
+                    """
+                ).fetchone()
+                return int(row[0] or 0), int(row[1] or 0)
+
+            indexed_sessions, embedded_sessions = await asyncio.to_thread(
+                _session_index_counts,
+            )
+            metrics["session_boundary_indexed_sessions"] = indexed_sessions
+            metrics["session_boundary_embedded_sessions"] = embedded_sessions
+        except Exception:
+            metrics["session_boundary_indexed_sessions"] = 0
+            metrics["session_boundary_embedded_sessions"] = 0
 
         # Consolidate (LLM-backed; cross-session pass)
         n_clusters = 0
@@ -492,10 +595,37 @@ async def _run_one(
         # Query (two-tier shape — saga's reader handles either)
         t0 = time.time()
         ref_date = _parse_question_date(q["question_date"])
+        extra_atom_ranked_pathways = None
+        rrf_pathway_weights = None
+        if session_boundary_rrf_lane:
+            boundary_atom_ids, boundary_debug = await _session_boundary_rrf_pathway(
+                client,
+                q["question"],
+                limit=session_boundary_limit,
+                alpha=session_boundary_alpha,
+                atoms_per_session=session_boundary_atoms_per_session,
+                weight=session_boundary_weight,
+            )
+            extra_atom_ranked_pathways = {"session_boundary": boundary_atom_ids}
+            rrf_pathway_weights = {"session_boundary": session_boundary_weight}
+            metrics.update(boundary_debug)
+        else:
+            metrics.update({
+                "session_boundary_rrf_enabled": False,
+                "session_boundary_limit": session_boundary_limit,
+                "session_boundary_alpha": session_boundary_alpha,
+                "session_boundary_weight": session_boundary_weight,
+                "session_boundary_atoms_per_session": session_boundary_atoms_per_session,
+                "session_boundary_matched_sessions": [],
+                "session_boundary_atoms_by_session": {},
+                "session_boundary_atom_candidates": 0,
+            })
         retrieved = await client.query(
             q["question"],
             top_k=RETRIEVAL_TOP_K,
             reference_date=ref_date,
+            extra_atom_ranked_pathways=extra_atom_ranked_pathways,
+            rrf_pathway_weights=rrf_pathway_weights,
         )
         metrics["retrieve_s"] = round(time.time() - t0, 2)
         metrics["n_observations"] = len(retrieved.get("observations", []))
@@ -601,10 +731,14 @@ async def _amain(args) -> int:
 
     out_path = output_dir / f"hypotheses_{args.run_tag}.jsonl"
     met_path = output_dir / f"metrics_{args.run_tag}.jsonl"
+    debug_path = Path(args.retrieval_debug_jsonl) if args.retrieval_debug_jsonl else None
+    if debug_path is not None:
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
     done = _load_done(out_path) if args.resume else set()
     mode = "a" if args.resume and done else "w"
     out_f = out_path.open(mode, buffering=1)
     met_f = met_path.open(mode, buffering=1)
+    debug_f = debug_path.open(mode, buffering=1) if debug_path else None
 
     t_start = time.time()
     n_processed = 0
@@ -620,12 +754,52 @@ async def _amain(args) -> int:
             keep_db=args.keep_dbs,
             consolidate_enabled=not args.no_consolidate,
             session_boundary_treatment=args.session_boundary_treatment,
+            session_boundary_rrf_lane=args.session_boundary_rrf_lane,
+            session_boundary_limit=args.session_boundary_limit,
+            session_boundary_alpha=args.session_boundary_alpha,
+            session_boundary_weight=args.session_boundary_weight,
+            session_boundary_atoms_per_session=args.session_boundary_atoms_per_session,
         )
         if err is not None:
             errors += 1
         if record is not None:
             out_f.write(json.dumps(record) + "\n")
         met_f.write(json.dumps(metrics) + "\n")
+        if debug_f is not None:
+            debug_f.write(json.dumps({
+                "question_id": qid,
+                "question_type": q.get("question_type"),
+                "session_boundary_rrf_enabled": metrics.get(
+                    "session_boundary_rrf_enabled",
+                ),
+                "session_boundaries_written": metrics.get(
+                    "session_boundaries_written",
+                ),
+                "session_boundary_indexed_sessions": metrics.get(
+                    "session_boundary_indexed_sessions",
+                ),
+                "session_boundary_matched_sessions": metrics.get(
+                    "session_boundary_matched_sessions",
+                ),
+                "session_boundary_atoms_by_session": metrics.get(
+                    "session_boundary_atoms_by_session",
+                ),
+                "session_boundary_atom_candidates": metrics.get(
+                    "session_boundary_atom_candidates",
+                ),
+                "session_boundary_weight": metrics.get(
+                    "session_boundary_weight",
+                ),
+                "session_boundary_limit": metrics.get(
+                    "session_boundary_limit",
+                ),
+                "session_boundary_alpha": metrics.get(
+                    "session_boundary_alpha",
+                ),
+                "session_boundary_atoms_per_session": metrics.get(
+                    "session_boundary_atoms_per_session",
+                ),
+            }) + "\n")
         n_processed += 1
 
         elapsed = time.time() - t_start
@@ -645,6 +819,8 @@ async def _amain(args) -> int:
 
     out_f.close()
     met_f.close()
+    if debug_f is not None:
+        debug_f.close()
     print(
         f"\nDone. Processed {n_processed}, errors {errors}. "
         f"Total {(time.time() - t_start) / 60:.1f} min. "
@@ -713,6 +889,47 @@ def main() -> None:
             "structured fields with Saga's boundary LLM prompt and writes "
             "real sessions rows; default 'none' preserves the previous "
             "via-memory behavior."
+        ),
+    )
+    ap.add_argument(
+        "--session-boundary-rrf-lane",
+        action="store_true",
+        help=(
+            "enable bench-only session-boundary atom promotion: search "
+            "sessions, expand matched sessions to atoms by atoms.session_id, "
+            "and add them as a 'session_boundary' RRF pathway."
+        ),
+    )
+    ap.add_argument(
+        "--session-boundary-limit",
+        type=int,
+        default=3,
+        help="number of sessions to retrieve for the boundary RRF lane",
+    )
+    ap.add_argument(
+        "--session-boundary-alpha",
+        type=float,
+        default=0.7,
+        help="semantic-vs-recency alpha for SagaStore.search_sessions",
+    )
+    ap.add_argument(
+        "--session-boundary-weight",
+        type=float,
+        default=0.5,
+        help="RRF pathway weight for promoted session-boundary atoms",
+    )
+    ap.add_argument(
+        "--session-boundary-atoms-per-session",
+        type=int,
+        default=30,
+        help="maximum atoms promoted from each matched session",
+    )
+    ap.add_argument(
+        "--retrieval-debug-jsonl",
+        default=None,
+        help=(
+            "optional JSONL path with per-question session-boundary "
+            "retrieval debug details for smoke inspection"
         ),
     )
     ap.add_argument(

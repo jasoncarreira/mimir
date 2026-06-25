@@ -86,6 +86,66 @@ def _make_synthetic_question() -> dict:
 
 
 @pytest.mark.asyncio
+async def test_session_boundary_rrf_pathway_searches_sessions_and_expands_atoms():
+    from benchmarks.longmemeval_via_memory import runner as r
+
+    class _FakeClient:
+        def __init__(self):
+            self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self.conn.execute(
+                """
+                CREATE TABLE atoms (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    created_at TEXT,
+                    tombstoned INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            self.conn.executemany(
+                "INSERT INTO atoms (id, session_id, created_at) VALUES (?, ?, ?)",
+                [
+                    ("a_late", "s_a", "2026-05-01T10:02:00+00:00"),
+                    ("a_early", "s_a", "2026-05-01T10:01:00+00:00"),
+                    ("b_early", "s_b", "2026-05-02T10:01:00+00:00"),
+                    ("other", "s_other", "2026-05-03T10:01:00+00:00"),
+                ],
+            )
+            self.calls = []
+
+        async def search_sessions(self, question, *, alpha, limit):
+            self.calls.append({"question": question, "alpha": alpha, "limit": limit})
+            return [
+                {"session_id": "s_a", "blended_score": 0.9},
+                {"session_id": "s_b", "blended_score": 0.8},
+            ]
+
+        def _ensure_conn(self):
+            return self.conn
+
+    client = _FakeClient()
+    atom_ids, debug = await r._session_boundary_rrf_pathway(
+        client,
+        "What does Alice prefer?",
+        limit=2,
+        alpha=0.6,
+        atoms_per_session=1,
+        weight=0.4,
+    )
+
+    assert client.calls == [
+        {"question": "What does Alice prefer?", "alpha": 0.6, "limit": 2}
+    ]
+    assert atom_ids == ["a_early", "b_early"]
+    assert debug["session_boundary_atoms_by_session"] == {
+        "s_a": ["a_early"],
+        "s_b": ["b_early"],
+    }
+    assert debug["session_boundary_atom_candidates"] == 2
+    assert debug["session_boundary_weight"] == 0.4
+
+
+@pytest.mark.asyncio
 async def test_runner_completes_one_question(tmp_path, monkeypatch):
     # Stub embedding provider so we don't touch voyage / openai.
     import mimir.saga.embeddings as _mm_embeddings
@@ -155,6 +215,86 @@ async def test_runner_completes_one_question(tmp_path, monkeypatch):
     assert metrics["n_atoms_ingested"] == 6
     # At least the raws path returns something.
     assert metrics["n_atoms_retrieved"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_session_boundary_rrf_lane_keeps_summaries_out_of_reader(
+    tmp_path, monkeypatch,
+):
+    import mimir.saga.embeddings as _mm_embeddings
+    monkeypatch.setattr(_mm_embeddings, "get_provider", _stub_provider)
+    import mimir.saga._config_io as _mm_config
+
+    def _fake_cfg():
+        def cfg(section, key, default=None):
+            return {
+                ("embedding", "max_input_chars"): 2000,
+                ("embedding", "provider"): "stub",
+                ("embedding", "model"): "stub-4d",
+            }.get((section, key), default)
+        return cfg
+
+    monkeypatch.setattr(_mm_config, "get_config", _fake_cfg)
+
+    boundary_summary = "Generated boundary summary from stub LLM."
+    import mimir.saga._llm as _mm_llm
+
+    async def _fake_call_llm(*args, **kwargs):
+        return json.dumps({
+            "summary": boundary_summary,
+            "topics_discussed": ["reply preference"],
+            "decisions_made": ["keep replies concise"],
+            "unfinished": [],
+            "emotional_state": "neutral",
+        })
+
+    monkeypatch.setattr(_mm_llm, "call_llm", _fake_call_llm)
+
+    captured = {}
+    import saga.benchmarks.longmemeval.harness as _h
+
+    def _fake_read(question, question_date, retrieved):
+        captured["retrieved"] = retrieved
+        rendered = json.dumps(retrieved)
+        assert boundary_summary not in rendered
+        assert "session_boundary" not in retrieved
+        return {
+            "hypothesis": "stub",
+            "reader_latency_ms": 1,
+            "reader_prompt_tokens": 0,
+            "reader_completion_tokens": 0,
+            "reader_model": "stub",
+        }
+
+    monkeypatch.setattr(_h, "read", _fake_read)
+
+    from benchmarks.longmemeval_via_memory import runner as r
+
+    orig = r._make_client
+    monkeypatch.setattr(r, "_make_client",
+                        lambda db, *, embedding_dim=4: orig(db, embedding_dim=4))
+
+    q = _make_synthetic_question()
+    record, metrics, err = await r._run_one(
+        q=q,
+        work_dir=tmp_path,
+        keep_db=False,
+        consolidate_enabled=False,
+        session_boundary_rrf_lane=True,
+        session_boundary_limit=1,
+        session_boundary_alpha=0.7,
+        session_boundary_weight=0.5,
+        session_boundary_atoms_per_session=2,
+    )
+
+    assert err is None
+    assert record is not None
+    assert captured["retrieved"]["raws"]
+    assert metrics["session_boundaries_written"] == 2
+    assert metrics["session_boundary_indexed_sessions"] == 2
+    assert len(metrics["session_boundary_matched_sessions"]) == 1
+    assert metrics["session_boundary_atom_candidates"] <= 2
+    assert metrics["session_boundary_weight"] == 0.5
 
 
 @pytest.mark.asyncio
