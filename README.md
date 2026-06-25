@@ -235,7 +235,7 @@ in the same process (e.g., the `claude` CLI subprocess that saga's
 `claude_code` provider spawns). If you set this, configure saga.toml's
 `[llm]` to route through the same alternate provider rather than
 falling back to `claude_code` — see
-[`saga/saga.example.toml`](./saga/saga.example.toml) for the
+[`benchmarks/saga/saga.example.toml`](./benchmarks/saga/saga.example.toml) for the
 provider options + per-section documentation.
 
 ## Scheduler timezone
