@@ -65,7 +65,12 @@ is a separate bench shell that the LongMemEval runners under
 
 ## Quickstart
 
-Requires Python 3.11+.
+Requires Python 3.11+. mimir also shells out to a few host tools — install at
+least **`ripgrep`** (the file-search tool's backend), plus `git`/`jq`, and
+`poppler-utils`/`tesseract-ocr` if you ingest PDFs. The Docker image bundles
+these; off-Docker see
+[`docs/mimir-nondocker-guide.md`](./docs/mimir-nondocker-guide.md) for the full
+list and per-OS install commands.
 
 ### Install from PyPI
 
@@ -172,6 +177,26 @@ legacy HTML shells, bootstrap/auth helpers, and `/health` are exempt so browser
 code can load and prompt for the key); expose the port publicly only with
 `MIMIR_API_KEY` set.
 
+## File-tool access outside the home
+
+By default the agent's file tools (`read_file`/`ls`/`glob`/`edit_file`) are
+confined to `MIMIR_HOME`. To let them read/edit a repo **outside** the home — a
+source checkout the agent develops, a work codebase — set
+`MIMIR_FILE_TOOL_ROOTS` to a comma-separated list of `path[:ro|:rw]` entries
+(bare `path` = `rw`):
+
+```bash
+MIMIR_FILE_TOOL_ROOTS="/home/me/code/myrepo:rw,/srv/reference:ro"
+```
+
+`/tmp` is always granted `rw`. Roots must be absolute existing directories; `~`,
+`..`, `/`, `/etc`, and anything overlapping the home are rejected. A real file in
+no configured root now returns an actionable error instead of a silent "not
+found". **In Docker, also bind-mount the path into the container and point the
+variable at its in-container path** (the container can't reach host paths that
+aren't mounted). Full details + a compose example:
+[`docs/mimir-nondocker-guide.md` §4](./docs/mimir-nondocker-guide.md#4-file-tool-access-outside-the-home-mimir_file_tool_roots).
+
 ## Alternative providers (Minimax, Kimi, …)
 
 `MIMIR_MODEL_SPEC` picks the model and provider. Forms:
@@ -210,7 +235,7 @@ in the same process (e.g., the `claude` CLI subprocess that saga's
 `claude_code` provider spawns). If you set this, configure saga.toml's
 `[llm]` to route through the same alternate provider rather than
 falling back to `claude_code` — see
-[`saga/saga.example.toml`](./saga/saga.example.toml) for the
+[`benchmarks/saga/saga.example.toml`](./benchmarks/saga/saga.example.toml) for the
 provider options + per-section documentation.
 
 ## Scheduler timezone
