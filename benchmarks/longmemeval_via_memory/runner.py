@@ -265,8 +265,10 @@ async def _write_generated_session_boundaries(client, q: dict) -> dict:
 
     Synthesizes structured boundary fields with Saga's boundary prompt and
     persists them as real ``sessions`` rows through ``SagaStore.end_session``.
-    This is separate from the legacy deterministic session-summary lane used
-    by comparison runners.
+    This is separate from the closed PR #878 deterministic-summary rendering
+    design: this path writes searchable session rows, then promotes atoms from
+    matched sessions through retrieval rather than rendering summaries to the
+    reader.
     """
     from mimir.saga.synthesize import make_async_boundary_synth_fn
 
@@ -420,6 +422,8 @@ def _read_with_prompt(question: str, question_date: str, retrieved: dict) -> tup
     """Call saga's reader and return the exact reader messages used."""
     from saga.benchmarks.longmemeval.harness import build_prompt, call_reader
 
+    # Mirrors saga.benchmarks.longmemeval.harness.read(); keep in sync so
+    # prompt-capture smoke artifacts inspect the same reader path scored runs use.
     messages = build_prompt(question, question_date, retrieved)
     result = call_reader(messages)
     return {

@@ -430,3 +430,84 @@ async def test_generated_session_boundaries_persist_real_sessions(tmp_path, monk
     assert ended_at == "2026-05-01T10:00:00+00:00"
     assert reflected_at == "2026-05-01T10:00:00+00:00"
     assert emb_dim == 4
+
+
+@pytest.mark.asyncio
+async def test_capture_reader_prompt_writes_debug_without_bloating_metrics(
+    tmp_path, monkeypatch,
+):
+    import mimir.saga.embeddings as _mm_embeddings
+    monkeypatch.setattr(_mm_embeddings, "get_provider", _stub_provider)
+    import mimir.saga._config_io as _mm_config
+
+    def _fake_cfg():
+        def cfg(section, key, default=None):
+            return {
+                ("embedding", "max_input_chars"): 2000,
+                ("embedding", "provider"): "stub",
+                ("embedding", "model"): "stub-4d",
+            }.get((section, key), default)
+        return cfg
+
+    monkeypatch.setattr(_mm_config, "get_config", _fake_cfg)
+
+    import saga.benchmarks.longmemeval.harness as _h
+
+    prompt_messages = [
+        {"role": "system", "content": "reader system"},
+        {"role": "user", "content": "reader prompt"},
+    ]
+
+    monkeypatch.setattr(
+        _h,
+        "build_prompt",
+        lambda question, question_date, retrieved: prompt_messages,
+    )
+    monkeypatch.setattr(_h, "call_reader", lambda messages: {
+        "text": "stub hypothesis",
+        "latency_ms": 1,
+        "prompt_tokens": 12,
+        "completion_tokens": 3,
+        "model": "stub-reader",
+    })
+
+    from benchmarks.longmemeval_via_memory import runner as r
+
+    orig = r._make_client
+    monkeypatch.setattr(r, "_make_client",
+                        lambda db, *, embedding_dim=4: orig(db, embedding_dim=4))
+
+    dataset_path = tmp_path / "dataset.json"
+    dataset_path.write_text(json.dumps([_make_synthetic_question()]))
+    output_dir = tmp_path / "out"
+    debug_path = output_dir / "retrieval_debug.jsonl"
+    args = types.SimpleNamespace(
+        saga_config=None,
+        dataset=str(dataset_path),
+        question_types=None,
+        limit=None,
+        output_dir=str(output_dir),
+        work_dir=str(output_dir / "work"),
+        run_tag="capture_smoke",
+        resume=False,
+        keep_dbs=False,
+        no_consolidate=True,
+        session_boundary_treatment="none",
+        session_boundary_rrf_lane=False,
+        session_boundary_limit=3,
+        session_boundary_alpha=0.7,
+        session_boundary_weight=0.5,
+        session_boundary_atoms_per_session=30,
+        capture_reader_prompt=True,
+        retrieval_debug_jsonl=str(debug_path),
+    )
+
+    assert await r._amain(args) == 0
+
+    metric_row = json.loads(
+        (output_dir / "metrics_capture_smoke.jsonl").read_text().splitlines()[0]
+    )
+    debug_row = json.loads(debug_path.read_text().splitlines()[0])
+    assert "_reader_prompt_messages" not in metric_row
+    assert "reader_prompt_messages" not in metric_row
+    assert debug_row["reader_prompt_messages"] == prompt_messages

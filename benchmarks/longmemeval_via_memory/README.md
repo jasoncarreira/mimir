@@ -18,9 +18,10 @@ The corrected treatment is:
 - promote atoms from those matched sessions into retrieval through a
   `session_boundary` RRF pathway with `--session-boundary-rrf-lane`
 
-The legacy `--session-summary-lane` approach is not this treatment. It renders
-deterministic summaries as a separate prompt lane and should not be used for
-the adoption decision.
+An earlier deterministic-summary-rendering approach (PR #878, closed) was a
+different design. It would have rendered summaries as a separate reader prompt
+lane; this treatment instead writes generated boundaries as real session rows
+and promotes atoms from matched sessions into retrieval.
 
 ### Retrieval Debug / Prompt-Capture Smoke
 
