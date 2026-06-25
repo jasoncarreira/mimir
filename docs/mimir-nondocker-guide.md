@@ -225,10 +225,10 @@ lives under `frontend/` and builds into `mimir/react_app/dist`.
 - **PyPI / Docker installs ship the bundle prebuilt** (the wheel force-includes
   `react_app/dist` as of 0.6.1), so `/app` works out of the box.
 - **Source / clone runs must build it once**, or `/app` reports "React app build
-  not found":
+  not found". Run these from the **repo root** (`package.json` and
+  `vite.config.ts` live there; Vite is configured with `root: "frontend"`):
 
   ```bash
-  cd frontend
   npm ci
   npm run build      # writes mimir/react_app/dist; npm run dev for live frontend work
   ```
@@ -361,8 +361,8 @@ ships the pieces:
 4. To let the file tools reach repos outside the home, set
    `MIMIR_FILE_TOOL_ROOTS=/abs/path[:ro|:rw],…` (`/tmp` is always `rw`). In
    Docker, also bind-mount the path and use its in-container path.
-5. Source/clone install? Build the web console once: `cd frontend && npm ci &&
-   npm run build` (PyPI/Docker ship it prebuilt).
+5. Source/clone install? Build the web console once from the repo root:
+   `npm ci && npm run build` (PyPI/Docker ship it prebuilt).
 6. Keep the saga DB on a local disk; use `discord-<id>` (not bare numeric) for
    channel targets; `pip install 'mimir-agent[mcp]'` only if you want MCP; only
    install pollers/skills whose tools + env you've set up.
