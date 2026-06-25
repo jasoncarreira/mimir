@@ -13,7 +13,11 @@ import pytest
 
 from benchmarks.longmemeval_via_mimir.runner import (
     _LONGMEMEVAL_CATEGORIES,
+    _filter_question_types as _filter_mimir_question_types,
     _warn_category_skew,
+)
+from benchmarks.longmemeval_via_memory.runner import (
+    _filter_question_types as _filter_memory_question_types,
 )
 
 
@@ -31,6 +35,86 @@ def _capture_stderr(fn, *args, **kwargs) -> str:
     finally:
         sys.stderr = old
     return buf.getvalue()
+
+
+def _capture_stderr_and_result(fn, *args, **kwargs) -> tuple[str, object]:
+    """Run fn(*args, **kwargs) and return stderr plus the function result."""
+    buf = StringIO()
+    old, sys.stderr = sys.stderr, buf
+    try:
+        result = fn(*args, **kwargs)
+    finally:
+        sys.stderr = old
+    return buf.getvalue(), result
+
+
+@pytest.mark.parametrize(
+    "filter_fn",
+    [_filter_mimir_question_types, _filter_memory_question_types],
+)
+def test_question_types_two_category_slice_and_counts(filter_fn):
+    dataset = _make_dataset(
+        "single-session-user",
+        "single-session-preference",
+        "multi-session",
+        "knowledge-update",
+        "single-session-preference",
+        "multi-session",
+        "temporal-reasoning",
+    )
+    output, filtered = _capture_stderr_and_result(
+        filter_fn,
+        dataset,
+        " single-session-preference, multi-session ",
+    )
+
+    assert [item["question_id"] for item in filtered] == ["q1", "q2", "q4", "q5"]
+    assert "Selected question types:" in output
+    assert "single-session-preference=2" in output
+    assert "multi-session=2" in output
+
+
+@pytest.mark.parametrize(
+    "filter_fn",
+    [_filter_mimir_question_types, _filter_memory_question_types],
+)
+def test_question_types_unknown_type_rejected_with_valid_types(filter_fn):
+    dataset = _make_dataset(
+        "single-session-user",
+        "multi-session",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        filter_fn(dataset, "multi-session,missing-type")
+
+    msg = str(exc_info.value)
+    assert "unknown --question-types value(s): missing-type" in msg
+    assert "Valid dataset question types:" in msg
+    assert "single-session-user" in msg
+    assert "multi-session" in msg
+
+
+@pytest.mark.parametrize(
+    "filter_fn",
+    [_filter_mimir_question_types, _filter_memory_question_types],
+)
+def test_question_types_filter_applies_before_limit(filter_fn):
+    dataset = _make_dataset(
+        "single-session-user",
+        "single-session-user",
+        "single-session-preference",
+        "multi-session",
+        "multi-session",
+    )
+
+    _output, filtered = _capture_stderr_and_result(
+        filter_fn,
+        dataset,
+        "single-session-preference,multi-session",
+    )
+    limited = filtered[:2]
+
+    assert [item["question_id"] for item in limited] == ["q2", "q3"]
 
 
 # ---------------------------------------------------------------------------
