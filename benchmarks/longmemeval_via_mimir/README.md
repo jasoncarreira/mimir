@@ -5,6 +5,11 @@ End-to-end LongMemEval bench that exercises mimir's full dispatch path
 post_message_hook → mark_contributions). Complementary to saga's
 direct retrieval bench at `benchmarks/saga/saga/benchmarks/longmemeval/`.
 
+Note: the current review-before-run workflow for the session-boundary
+adoption slice lives in `benchmarks/longmemeval_via_memory/README.md`. Use
+that runner for the corrected `session_boundary` RRF treatment; this
+BenchBridge runner is retained for dispatch-path coverage.
+
 ## Why two benches
 
 The saga-direct bench is fast, deterministic, and the source of truth
