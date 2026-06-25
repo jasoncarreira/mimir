@@ -195,3 +195,66 @@ async def test_runner_no_consolidate_path(tmp_path, monkeypatch):
     assert err is None
     assert record is not None
     assert metrics["clusters_consolidated"] == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_session_summary_lane_indexes_and_renders(tmp_path, monkeypatch):
+    """The bench-only session lane should populate sessions and pass a
+    session_summaries block into the reader without changing production recall."""
+    import mimir.saga.embeddings as _mm_embeddings
+    monkeypatch.setattr(_mm_embeddings, "get_provider", _stub_provider)
+    import mimir.saga._config_io as _mm_config
+
+    def _fake_cfg():
+        def cfg(section, key, default=None):
+            return {
+                ("embedding", "max_input_chars"): 2000,
+                ("embedding", "provider"): "stub",
+                ("embedding", "model"): "stub-4d",
+            }.get((section, key), default)
+        return cfg
+
+    monkeypatch.setattr(_mm_config, "get_config", _fake_cfg)
+
+    captured: dict = {}
+    import saga.benchmarks.longmemeval.harness as _h
+
+    def _fake_call_reader(messages, *, max_tokens=None):
+        captured["user_prompt"] = messages[-1]["content"]
+        return {
+            "text": "concise replies",
+            "latency_ms": 1,
+            "prompt_tokens": 123,
+            "completion_tokens": 4,
+            "model": "stub-reader",
+        }
+
+    monkeypatch.setattr(_h, "call_reader", _fake_call_reader)
+
+    from benchmarks.longmemeval_via_memory import runner as r
+
+    orig = r._make_client
+    monkeypatch.setattr(
+        r,
+        "_make_client",
+        lambda db, *, embedding_dim=4: orig(db, embedding_dim=4),
+    )
+
+    q = _make_synthetic_question()
+    record, metrics, err = await r._run_one(
+        q=q,
+        work_dir=tmp_path,
+        keep_db=False,
+        consolidate_enabled=False,
+        session_summary_lane=True,
+        session_summary_limit=2,
+        session_summary_max_chars=1000,
+    )
+
+    assert err is None
+    assert record == {"question_id": "synth_q1", "hypothesis": "concise replies"}
+    assert metrics["n_sessions_indexed"] == 2
+    assert 1 <= metrics["n_session_summaries"] <= 2
+    assert "Relevant session context" in captured["user_prompt"]
+    assert "Session s_0" in captured["user_prompt"]
+    assert "I prefer concise replies" in captured["user_prompt"]

@@ -163,6 +163,36 @@ def _format_turn(date_iso: str, role: str, content: str) -> str:
     return f"[{date_tag} {role}] {content.strip()}"
 
 
+def _format_session_summary(
+    *,
+    session_id: str,
+    session_date_iso: str,
+    turns: list[dict],
+    max_chars: int,
+) -> str:
+    """Bench-only deterministic session summary for ``search_sessions()``.
+
+    Production sessions get LLM-synthesized boundary summaries. LongMemEval's
+    per-question DBs ingest independent haystack sessions but do not run the
+    lifecycle boundary writer, so the sessions table would otherwise be empty.
+    This summary is deliberately non-generative: a capped, role-tagged sketch
+    of the original session that lets the experiment test whether a retrieved
+    *session context lane* helps before adding generated scene traces.
+    """
+    date_tag = session_date_iso[:10]
+    lines = [f"Session {session_id} on {date_tag}:"]
+    for turn in turns:
+        role = turn.get("role", "user")
+        content = (turn.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"[{date_tag} {role}] {content}")
+    summary = "\n".join(lines)
+    if len(summary) <= max_chars:
+        return summary
+    return summary[: max(0, max_chars - 15)].rstrip() + "\n[...truncated]"
+
+
 def _iter_turns(q: dict):
     for sid, sdate, turns in zip(
         q["haystack_session_ids"],
@@ -185,7 +215,13 @@ def _iter_turns(q: dict):
             }
 
 
-async def _ingest_question(client, q: dict) -> dict:
+async def _ingest_question(
+    client,
+    q: dict,
+    *,
+    populate_sessions: bool = False,
+    session_summary_max_chars: int = 3000,
+) -> dict:
     """Ingest every haystack turn as a raw atom. Backdates
     ``created_at`` to the session date so temporal-reasoning probes
     work against the haystack's timeline rather than wall-clock now.
@@ -198,6 +234,11 @@ async def _ingest_question(client, q: dict) -> dict:
     OpenAI / Voyage round trip cost amortizes — single-call ingest
     was ~250s/q on text-embedding-3-small with ~500 atoms; batched
     drops to ~30s/q.
+
+    ``populate_sessions`` is the bench-only session-lane experiment hook:
+    insert deterministic session summary rows into ``sessions`` so
+    ``SagaStore.search_sessions()`` has material to retrieve. Production
+    lifecycle behavior is unchanged.
     """
     turns = list(_iter_turns(q))
     if not turns:
@@ -242,20 +283,181 @@ async def _ingest_question(client, q: dict) -> dict:
         conn.commit()
     await asyncio.to_thread(_backdate)
 
+    sessions_inserted = 0
+    if populate_sessions:
+        sessions_inserted = await _populate_session_summaries(
+            client,
+            q,
+            max_chars=session_summary_max_chars,
+        )
+
     return {
         "ingested": ingested,
         "total_turns": len(turns),
+        "sessions_inserted": sessions_inserted,
     }
+
+
+async def _populate_session_summaries(
+    client,
+    q: dict,
+    *,
+    max_chars: int,
+) -> int:
+    """Populate ``sessions`` rows for the runner-only session lane.
+
+    LongMemEval already has explicit haystack session ids/dates. We write one
+    deterministic summary per session, embed those summaries in one batch, and
+    leave normal atom recall untouched. The rows are scoped to the per-question
+    DB and disappear unless ``--keep-dbs`` is set.
+    """
+    session_rows: list[dict[str, Any]] = []
+    for sid, sdate, session_turns in zip(
+        q["haystack_session_ids"],
+        q["haystack_dates"],
+        q["haystack_sessions"],
+    ):
+        iso = _parse_session_date(sdate)
+        summary = _format_session_summary(
+            session_id=sid,
+            session_date_iso=iso,
+            turns=session_turns,
+            max_chars=max_chars,
+        )
+        if not summary.strip():
+            continue
+        session_rows.append({
+            "id": sid,
+            "started_at": iso,
+            "ended_at": iso,
+            "summary": summary,
+            "reflected_at": iso,
+        })
+    if not session_rows:
+        return 0
+
+    embeddings = await asyncio.to_thread(
+        _batch_embed_texts,
+        [row["summary"] for row in session_rows],
+    )
+
+    def _insert():
+        conn = client._ensure_conn()
+        conn.executemany(
+            """
+            INSERT INTO sessions
+                (id, channel_id, started_at, ended_at, summary, reflected_at,
+                 topics_discussed, decisions_made, unfinished, emotional_state,
+                 closed_since, embedding, embedding_dim)
+            VALUES (?, NULL, ?, ?, ?, ?, '[]', '[]', '[]', NULL, '[]', ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                started_at = excluded.started_at,
+                ended_at = excluded.ended_at,
+                summary = excluded.summary,
+                reflected_at = excluded.reflected_at,
+                embedding = excluded.embedding,
+                embedding_dim = excluded.embedding_dim
+            """,
+            [
+                (
+                    row["id"],
+                    row["started_at"],
+                    row["ended_at"],
+                    row["summary"],
+                    row["reflected_at"],
+                    emb[0],
+                    emb[3],
+                )
+                for row, emb in zip(session_rows, embeddings)
+            ],
+        )
+        conn.commit()
+
+    await asyncio.to_thread(_insert)
+    # Force the lazy session FAISS index to rebuild on first search if this
+    # SagaStore instance had already cached an empty sessions index.
+    client._sessions_index_built = False
+    client._sessions_index = None
+    return len(session_rows)
+
+
+async def _add_session_summary_lane(
+    client,
+    retrieved: dict,
+    query: str,
+    *,
+    limit: int,
+    alpha: float,
+    summary_max_chars: int,
+) -> dict:
+    """Return a copy of ``retrieved`` with a capped session-summary lane."""
+    if limit <= 0:
+        return retrieved
+    sessions = await client.search_sessions(query, alpha=alpha, limit=limit)
+    capped: list[dict[str, Any]] = []
+    for session in sessions:
+        summary = (session.get("summary") or "").strip()
+        if not summary:
+            continue
+        if len(summary) > summary_max_chars:
+            summary = summary[: max(0, summary_max_chars - 15)].rstrip() + "\n[...truncated]"
+        item = dict(session)
+        item["summary"] = summary
+        # Drop embedding/vector internals if future search_sessions adds them.
+        item.pop("embedding", None)
+        capped.append(item)
+    enriched = dict(retrieved)
+    enriched["session_summaries"] = capped
+    return enriched
 
 
 # ─── Reader (reused from saga) ───────────────────────────────────────
 
 
+def _format_session_summaries_for_reader(sessions: list[dict]) -> str:
+    lines: list[str] = []
+    for i, session in enumerate(sessions, 1):
+        summary = (session.get("summary") or "").strip()
+        if not summary:
+            continue
+        sid = session.get("session_id") or session.get("id") or "unknown"
+        score = session.get("blended_score")
+        score_part = f" score={score:.3f}" if isinstance(score, (int, float)) else ""
+        lines.append(f"[S{i} id={sid}{score_part}]\n{summary}")
+    return "\n\n".join(lines)
+
+
 def _read(question: str, question_date: str, retrieved: dict) -> dict:
-    """Call saga's reader. The reader prompt and provider plumbing are
-    independent of which memory backend produced the retrieved atoms,
-    so reuse is the right call here — keeps the reader factor constant
-    when comparing saga-baseline vs memory-baseline numbers."""
+    """Call saga's reader.
+
+    Baseline path delegates directly to saga's LongMemEval reader. The
+    session-summary experiment path needs one extra prompt block; build that
+    prompt here while still reusing saga's provider call so the reader model
+    factor stays constant.
+    """
+    sessions = retrieved.get("session_summaries") if isinstance(retrieved, dict) else None
+    if sessions:
+        from saga.benchmarks.longmemeval.harness import build_prompt, call_reader
+
+        messages = build_prompt(question, question_date, retrieved)
+        session_block = _format_session_summaries_for_reader(sessions)
+        if session_block:
+            messages = [dict(m) for m in messages]
+            messages[-1]["content"] = (
+                messages[-1]["content"]
+                + "\n\nRelevant session context (retrieved summaries; use as context, "
+                  "not direct evidence; raw Evidence still wins on specifics):\n"
+                + session_block
+            )
+        result = call_reader(messages)
+        return {
+            "hypothesis": result["text"],
+            "reader_latency_ms": result["latency_ms"],
+            "reader_prompt_tokens": result["prompt_tokens"],
+            "reader_completion_tokens": result["completion_tokens"],
+            "reader_model": result["model"],
+        }
+
     from saga.benchmarks.longmemeval.harness import read
     return read(question, question_date, retrieved)
 
@@ -269,6 +471,10 @@ async def _run_one(
     work_dir: Path,
     keep_db: bool,
     consolidate_enabled: bool,
+    session_summary_lane: bool = False,
+    session_summary_limit: int = 3,
+    session_summary_alpha: float = 0.7,
+    session_summary_max_chars: int = 3000,
 ) -> tuple[dict | None, dict, str | None]:
     """Returns (hypothesis_record, metrics, error_str)."""
     qid = q["question_id"]
@@ -286,9 +492,15 @@ async def _run_one(
     try:
         # Ingest
         t0 = time.time()
-        ingest_stats = await _ingest_question(client, q)
+        ingest_stats = await _ingest_question(
+            client,
+            q,
+            populate_sessions=session_summary_lane,
+            session_summary_max_chars=session_summary_max_chars,
+        )
         metrics["ingest_s"] = round(time.time() - t0, 2)
         metrics["n_atoms_ingested"] = ingest_stats["ingested"]
+        metrics["n_sessions_indexed"] = ingest_stats.get("sessions_inserted", 0)
 
         # Consolidate (LLM-backed; cross-session pass)
         n_clusters = 0
@@ -353,9 +565,19 @@ async def _run_one(
             top_k=RETRIEVAL_TOP_K,
             reference_date=ref_date,
         )
+        if session_summary_lane:
+            retrieved = await _add_session_summary_lane(
+                client,
+                retrieved,
+                q["question"],
+                limit=session_summary_limit,
+                alpha=session_summary_alpha,
+                summary_max_chars=session_summary_max_chars,
+            )
         metrics["retrieve_s"] = round(time.time() - t0, 2)
         metrics["n_observations"] = len(retrieved.get("observations", []))
         metrics["n_raws"] = len(retrieved.get("raws", []))
+        metrics["n_session_summaries"] = len(retrieved.get("session_summaries", []))
         metrics["n_atoms_retrieved"] = (
             metrics["n_observations"] + metrics["n_raws"]
         )
@@ -470,6 +692,10 @@ async def _amain(args) -> int:
             work_dir=work_dir,
             keep_db=args.keep_dbs,
             consolidate_enabled=not args.no_consolidate,
+            session_summary_lane=args.session_summary_lane,
+            session_summary_limit=args.session_summary_limit,
+            session_summary_alpha=args.session_summary_alpha,
+            session_summary_max_chars=args.session_summary_max_chars,
         )
         if err is not None:
             errors += 1
@@ -488,7 +714,8 @@ async def _amain(args) -> int:
             f"read={metrics.get('read_s', 0)}s "
             f"atoms={metrics.get('n_atoms_ingested', 0)}/"
             f"{metrics.get('n_observations', 0)}obs+"
-            f"{metrics.get('n_raws', 0)}raws "
+            f"{metrics.get('n_raws', 0)}raws+"
+            f"{metrics.get('n_session_summaries', 0)}sess "
             f"elapsed={elapsed:.0f}s",
             flush=True,
         )
@@ -546,6 +773,26 @@ def main() -> None:
         "--no-consolidate", action="store_true",
         help="skip the consolidate() pass — produces a raws-only baseline "
              "to compare against the two-tier number",
+    )
+    ap.add_argument(
+        "--session-summary-lane", action="store_true",
+        help="bench-only experiment: populate/search sessions summaries and "
+             "append a capped session-context block to the reader prompt",
+    )
+    ap.add_argument(
+        "--session-summary-limit", type=int, default=3,
+        help="number of session summaries to retrieve when "
+             "--session-summary-lane is enabled (default: 3)",
+    )
+    ap.add_argument(
+        "--session-summary-alpha", type=float, default=0.7,
+        help="semantic/recency blend for search_sessions() when "
+             "--session-summary-lane is enabled (default: 0.7)",
+    )
+    ap.add_argument(
+        "--session-summary-max-chars", type=int, default=3000,
+        help="max chars per stored/rendered session summary in the bench lane "
+             "(default: 3000)",
     )
     ap.add_argument(
         "--saga-config", default=None,
