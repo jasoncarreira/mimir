@@ -439,6 +439,9 @@ def _read(question: str, question_date: str, retrieved: dict) -> dict:
     if sessions:
         from saga.benchmarks.longmemeval.harness import build_prompt, call_reader
 
+        # Mirrors saga.benchmarks.longmemeval.harness.read(); keep this
+        # wrapper in sync so the session-lane experiment does not drift from
+        # the baseline reader path except for the appended session block.
         messages = build_prompt(question, question_date, retrieved)
         session_block = _format_session_summaries_for_reader(sessions)
         if session_block:
