@@ -265,8 +265,10 @@ async def _write_generated_session_boundaries(client, q: dict) -> dict:
 
     Synthesizes structured boundary fields with Saga's boundary prompt and
     persists them as real ``sessions`` rows through ``SagaStore.end_session``.
-    This is separate from the legacy deterministic session-summary lane used
-    by comparison runners.
+    This is separate from the closed PR #878 deterministic-summary rendering
+    design: this path writes searchable session rows, then promotes atoms from
+    matched sessions through retrieval rather than rendering summaries to the
+    reader.
     """
     from mimir.saga.synthesize import make_async_boundary_synth_fn
 
@@ -416,6 +418,23 @@ def _read(question: str, question_date: str, retrieved: dict) -> dict:
     return read(question, question_date, retrieved)
 
 
+def _read_with_prompt(question: str, question_date: str, retrieved: dict) -> tuple[dict, list[dict]]:
+    """Call saga's reader and return the exact reader messages used."""
+    from saga.benchmarks.longmemeval.harness import build_prompt, call_reader
+
+    # Mirrors saga.benchmarks.longmemeval.harness.read(); keep in sync so
+    # prompt-capture smoke artifacts inspect the same reader path scored runs use.
+    messages = build_prompt(question, question_date, retrieved)
+    result = call_reader(messages)
+    return {
+        "hypothesis": result["text"],
+        "reader_latency_ms": result["latency_ms"],
+        "reader_prompt_tokens": result["prompt_tokens"],
+        "reader_completion_tokens": result["completion_tokens"],
+        "reader_model": result["model"],
+    }, messages
+
+
 def _parse_question_types(raw: str | None) -> list[str]:
     if raw is None:
         return []
@@ -482,6 +501,7 @@ async def _run_one(
     session_boundary_alpha: float = 0.7,
     session_boundary_weight: float = 0.5,
     session_boundary_atoms_per_session: int = 30,
+    capture_reader_prompt: bool = False,
 ) -> tuple[dict | None, dict, str | None]:
     """Returns (hypothesis_record, metrics, error_str)."""
     qid = q["question_id"]
@@ -495,6 +515,7 @@ async def _run_one(
         "question_type": q.get("question_type"),
     }
     record: dict | None = None
+    reader_prompt_messages: list[dict] | None = None
 
     try:
         # Ingest
@@ -636,14 +657,21 @@ async def _run_one(
 
         # Reader
         t0 = time.time()
-        reader = await asyncio.to_thread(
-            _read, q["question"], q["question_date"], retrieved,
-        )
+        if capture_reader_prompt:
+            reader, reader_prompt_messages = await asyncio.to_thread(
+                _read_with_prompt, q["question"], q["question_date"], retrieved,
+            )
+        else:
+            reader = await asyncio.to_thread(
+                _read, q["question"], q["question_date"], retrieved,
+            )
         metrics["read_s"] = round(time.time() - t0, 2)
         metrics["reader_prompt_tokens"] = reader.get("reader_prompt_tokens")
         metrics["reader_completion_tokens"] = reader.get(
             "reader_completion_tokens",
         )
+        if capture_reader_prompt:
+            metrics["_reader_prompt_messages"] = reader_prompt_messages
 
         record = {"question_id": qid, "hypothesis": reader["hypothesis"]}
     except Exception as e:
@@ -759,14 +787,16 @@ async def _amain(args) -> int:
             session_boundary_alpha=args.session_boundary_alpha,
             session_boundary_weight=args.session_boundary_weight,
             session_boundary_atoms_per_session=args.session_boundary_atoms_per_session,
+            capture_reader_prompt=args.capture_reader_prompt,
         )
         if err is not None:
             errors += 1
         if record is not None:
             out_f.write(json.dumps(record) + "\n")
+        reader_prompt_messages = metrics.pop("_reader_prompt_messages", None)
         met_f.write(json.dumps(metrics) + "\n")
         if debug_f is not None:
-            debug_f.write(json.dumps({
+            debug_record = {
                 "question_id": qid,
                 "question_type": q.get("question_type"),
                 "session_boundary_rrf_enabled": metrics.get(
@@ -799,7 +829,10 @@ async def _amain(args) -> int:
                 "session_boundary_atoms_per_session": metrics.get(
                     "session_boundary_atoms_per_session",
                 ),
-            }) + "\n")
+            }
+            if args.capture_reader_prompt:
+                debug_record["reader_prompt_messages"] = reader_prompt_messages
+            debug_f.write(json.dumps(debug_record) + "\n")
         n_processed += 1
 
         elapsed = time.time() - t_start
@@ -930,6 +963,14 @@ def main() -> None:
         help=(
             "optional JSONL path with per-question session-boundary "
             "retrieval debug details for smoke inspection"
+        ),
+    )
+    ap.add_argument(
+        "--capture-reader-prompt",
+        action="store_true",
+        help=(
+            "include exact reader prompt messages in --retrieval-debug-jsonl. "
+            "Use only for small smoke runs; full-slice prompt capture is noisy."
         ),
     )
     ap.add_argument(
