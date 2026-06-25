@@ -14,6 +14,7 @@ import pytest
 
 from mimir.saga.mark_access import AccessEvent, mark_access
 from mimir.saga.recall import recall
+from mimir.saga.client import SagaStore
 from mimir.saga.store import store
 
 
@@ -43,6 +44,32 @@ def _fake_query_embed(text: str) -> list[float]:
     since query embeddings are usually kept in memory."""
     h = abs(hash(text)) % 1000
     return [float(h % 7), float(h % 11), float(h % 13), float(h % 17)]
+
+
+class _FakeProvider:
+    def embed(self, text: str, *, input_type: str = "passage") -> list[float]:
+        return _fake_query_embed(text)
+
+    def dimensions(self) -> int:
+        return 4
+
+
+def _patch_saga_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "mimir.saga.embeddings.get_provider",
+        lambda: _FakeProvider(),
+    )
+
+    def fake_get_config():
+        def cfg(section, key, default=None):
+            return {
+                ("embedding", "max_input_chars"): 2000,
+                ("embedding", "provider"): "fake",
+                ("embedding", "model"): "fake-model",
+            }.get((section, key), default)
+        return cfg
+
+    monkeypatch.setattr("mimir.saga._config_io.get_config", fake_get_config)
 
 
 # --- store ---
@@ -174,6 +201,128 @@ def test_recall_returns_stored_atom(conn):
     )
     raws_ids = [c.atom["id"] for c in result.raws]
     assert r.atom_id in raws_ids
+
+
+def test_recall_default_output_unchanged_with_no_extra_pathways(conn):
+    r1 = store(conn, "Alice prefers concise replies", embed_fn=_fake_embed)
+    r2 = store(conn, "Bob enjoys verbose explanations", embed_fn=_fake_embed)
+
+    kwargs = dict(
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(r1.atom_id, 0.9), (r2.atom_id, 0.8)],
+        fts_search_fn=lambda q, k: [(r2.atom_id, 7.0)],
+        fire_access_events=False,
+    )
+    baseline = recall(conn, "concise replies", **kwargs)
+    with_empty = recall(
+        conn, "concise replies",
+        extra_atom_ranked_pathways={},
+        **kwargs,
+    )
+
+    baseline_scores = [(c.atom["id"], c.rrf_score) for c in baseline.raws]
+    empty_scores = [(c.atom["id"], c.rrf_score) for c in with_empty.raws]
+    assert empty_scores == baseline_scores
+
+
+def test_recall_extra_pathway_can_admit_atom_absent_from_builtin_candidates(conn):
+    semantic = store(conn, "semantic candidate", embed_fn=_fake_embed)
+    extra = store(conn, "extra-only candidate", embed_fn=_fake_embed)
+
+    result = recall(
+        conn, "unmatched query",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(semantic.atom_id, 0.9)],
+        fts_search_fn=lambda q, k: [],
+        extra_atom_ranked_pathways={"session_boundary": [extra.atom_id]},
+        fire_access_events=False,
+    )
+
+    ids = [c.atom["id"] for c in result.raws]
+    assert extra.atom_id in ids
+    extra_candidate = next(c for c in result.raws if c.atom["id"] == extra.atom_id)
+    assert extra_candidate.semantic_rank == -1
+    assert extra_candidate.keyword_rank == -1
+
+
+def test_recall_extra_pathway_weight_changes_ordering_and_score(conn):
+    semantic = store(conn, "semantic candidate", embed_fn=_fake_embed)
+    extra = store(conn, "extra-only candidate", embed_fn=_fake_embed)
+    scoring_weights = {"w_rrf": 20.0, "w_topic": 0.0, "w_act": 0.0}
+
+    low_weight = recall(
+        conn, "ranking query",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(semantic.atom_id, 0.9)],
+        fts_search_fn=lambda q, k: [],
+        extra_atom_ranked_pathways={"session_boundary": [extra.atom_id]},
+        rrf_pathway_weights={"session_boundary": 0.5},
+        weights=scoring_weights,
+        fire_access_events=False,
+    )
+    high_weight = recall(
+        conn, "ranking query",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [(semantic.atom_id, 0.9)],
+        fts_search_fn=lambda q, k: [],
+        extra_atom_ranked_pathways={"session_boundary": [extra.atom_id]},
+        rrf_pathway_weights={"session_boundary": 2.0},
+        weights=scoring_weights,
+        fire_access_events=False,
+    )
+
+    low_extra = next(c for c in low_weight.raws if c.atom["id"] == extra.atom_id)
+    high_extra = next(c for c in high_weight.raws if c.atom["id"] == extra.atom_id)
+    assert low_extra.rrf_score < high_extra.rrf_score
+    assert [c.atom["id"] for c in low_weight.raws[:2]] == [
+        semantic.atom_id,
+        extra.atom_id,
+    ]
+    assert [c.atom["id"] for c in high_weight.raws[:2]] == [
+        extra.atom_id,
+        semantic.atom_id,
+    ]
+
+
+def test_recall_extra_pathway_still_applies_skill_and_confidence_filters(conn):
+    skill = store(
+        conn,
+        "skill-scoped memory",
+        embed_fn=_fake_embed,
+        source_type="skill_learning",
+    )
+    low_conf = store(conn, "extra-only low confidence", embed_fn=_fake_embed)
+
+    result = recall(
+        conn, "unmatched query",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [],
+        fts_search_fn=lambda q, k: [],
+        extra_atom_ranked_pathways={"extra": [skill.atom_id, low_conf.atom_id]},
+        min_confidence_tier="low",
+        fire_access_events=False,
+    )
+
+    assert [c.atom["id"] for c in result.raws] == []
+
+
+@pytest.mark.asyncio
+async def test_sagastore_query_accepts_extra_atom_ranked_pathways(
+    tmp_path, monkeypatch,
+):
+    _patch_saga_provider(monkeypatch)
+    client = SagaStore(db_path=tmp_path / "saga.db", embedding_dim=4)
+    stored = await client.store("extra pathway only atom")
+    monkeypatch.setattr(client, "_ensure_index", lambda conn: None)
+
+    result = await client.query(
+        "zzq-no-keyword-match",
+        top_k=5,
+        extra_atom_ranked_pathways={"session_boundary": [stored["atom_id"]]},
+        rrf_pathway_weights={"session_boundary": 0.5},
+    )
+
+    assert [a["id"] for a in result["raws"]] == [stored["atom_id"]]
 
 
 def test_recall_filters_below_activation_threshold(conn):
