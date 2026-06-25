@@ -185,6 +185,14 @@ def _iter_turns(q: dict):
             }
 
 
+def _iter_haystack_sessions(q: dict):
+    for sid, sdate in zip(q["haystack_session_ids"], q["haystack_dates"]):
+        yield {
+            "session_id": sid,
+            "session_date_iso": _parse_session_date(sdate),
+        }
+
+
 async def _ingest_question(client, q: dict) -> dict:
     """Ingest every haystack turn as a raw atom. Backdates
     ``created_at`` to the session date so temporal-reasoning probes
@@ -217,6 +225,7 @@ async def _ingest_question(client, q: dict) -> dict:
             t["text_for_atom"],
             stream=stream,
             source_type="longmemeval",
+            session_id=t["session_id"],
             metadata={
                 "session_id": t["session_id"],
                 "session_date": t["session_date_iso"],
@@ -246,6 +255,75 @@ async def _ingest_question(client, q: dict) -> dict:
         "ingested": ingested,
         "total_turns": len(turns),
     }
+
+
+# ─── Generated session boundaries ───────────────────────────────────
+
+
+async def _write_generated_session_boundaries(client, q: dict) -> dict:
+    """Bench-only LongMemEval session reflection path.
+
+    Synthesizes structured boundary fields with Saga's boundary prompt and
+    persists them as real ``sessions`` rows through ``SagaStore.end_session``.
+    This is separate from the legacy deterministic session-summary lane used
+    by comparison runners.
+    """
+    from mimir.saga.synthesize import make_async_boundary_synth_fn
+
+    synth_boundary = make_async_boundary_synth_fn()
+    written = 0
+    total = 0
+
+    for session in _iter_haystack_sessions(q):
+        total += 1
+        sid = session["session_id"]
+        session_date_iso = session["session_date_iso"]
+
+        def _load_atoms():
+            conn = client._ensure_conn()
+            cols = (
+                "id", "content", "stream", "memory_type",
+                "source_type", "created_at", "topics", "metadata",
+            )
+            rows = conn.execute(
+                f"SELECT {', '.join(cols)} FROM atoms "
+                "WHERE session_id = ? AND tombstoned = 0 "
+                "ORDER BY created_at, rowid",
+                (sid,),
+            ).fetchall()
+            return [dict(zip(cols, row)) for row in rows]
+
+        atoms = await asyncio.to_thread(_load_atoms)
+        fields = await synth_boundary(atoms, None)
+        result = await client.end_session(
+            sid,
+            fields.get("summary") or "",
+            topics_discussed=fields.get("topics_discussed") or [],
+            decisions_made=fields.get("decisions_made") or [],
+            unfinished=fields.get("unfinished") or [],
+            emotional_state=fields.get("emotional_state"),
+            channel_id="longmemeval",
+        )
+        if result.get("session_summary_written"):
+            written += 1
+
+        def _backdate_session():
+            conn = client._ensure_conn()
+            conn.execute(
+                """
+                UPDATE sessions
+                   SET started_at = ?,
+                       ended_at = ?,
+                       reflected_at = ?
+                 WHERE id = ?
+                """,
+                (session_date_iso, session_date_iso, session_date_iso, sid),
+            )
+            conn.commit()
+
+        await asyncio.to_thread(_backdate_session)
+
+    return {"session_boundaries_total": total, "session_boundaries_written": written}
 
 
 # ─── Reader (reused from saga) ───────────────────────────────────────
@@ -320,6 +398,7 @@ async def _run_one(
     work_dir: Path,
     keep_db: bool,
     consolidate_enabled: bool,
+    session_boundary_treatment: str = "none",
 ) -> tuple[dict | None, dict, str | None]:
     """Returns (hypothesis_record, metrics, error_str)."""
     qid = q["question_id"]
@@ -340,6 +419,20 @@ async def _run_one(
         ingest_stats = await _ingest_question(client, q)
         metrics["ingest_s"] = round(time.time() - t0, 2)
         metrics["n_atoms_ingested"] = ingest_stats["ingested"]
+
+        # Optional generated session-boundary lane. This writes real sessions
+        # rows for search_sessions(), but the retrieved session summaries are
+        # not rendered to the reader in this leaf.
+        t0 = time.time()
+        if session_boundary_treatment == "generated":
+            boundary_stats = await _write_generated_session_boundaries(client, q)
+        else:
+            boundary_stats = {
+                "session_boundaries_total": 0,
+                "session_boundaries_written": 0,
+            }
+        metrics["session_boundaries_s"] = round(time.time() - t0, 2)
+        metrics.update(boundary_stats)
 
         # Consolidate (LLM-backed; cross-session pass)
         n_clusters = 0
@@ -526,6 +619,7 @@ async def _amain(args) -> int:
             work_dir=work_dir,
             keep_db=args.keep_dbs,
             consolidate_enabled=not args.no_consolidate,
+            session_boundary_treatment=args.session_boundary_treatment,
         )
         if err is not None:
             errors += 1
@@ -609,6 +703,17 @@ def main() -> None:
         "--no-consolidate", action="store_true",
         help="skip the consolidate() pass — produces a raws-only baseline "
              "to compare against the two-tier number",
+    )
+    ap.add_argument(
+        "--session-boundary-treatment",
+        choices=("none", "generated"),
+        default="none",
+        help=(
+            "bench-only session boundary mode. 'generated' synthesizes "
+            "structured fields with Saga's boundary LLM prompt and writes "
+            "real sessions rows; default 'none' preserves the previous "
+            "via-memory behavior."
+        ),
     )
     ap.add_argument(
         "--saga-config", default=None,
