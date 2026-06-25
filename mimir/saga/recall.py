@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -202,13 +203,15 @@ def recall(
     faiss_search_fn: FaissSearchFn,
     fts_search_fn: FtsSearchFn,
     triple_search_fn: TripleSearchFn | None = None,
+    extra_atom_ranked_pathways: Mapping[str, Iterable[str]] | None = None,
+    rrf_pathway_weights: Mapping[str, float] | None = None,
     k: int = 12,
     thresholds: dict[str, float] | None = None,
     agent_id: str = "default",
     stream_filter: str | None = None,
     topic_filter: list[str] | None = None,
     session_id: str | None = None,
-    weights: dict[str, float] | None = None,
+    weights: dict[str, Any] | None = None,
     fire_access_events: bool = True,
     reference_date=None,
     min_confidence_tier: str | None = None,
@@ -257,7 +260,20 @@ def recall(
     semantic_rank_map = {aid: i + 1 for i, (aid, _) in enumerate(faiss_candidates)}
     keyword_rank_map = {aid: i + 1 for i, (aid, _) in enumerate(fts_candidates)}
     triple_rank_map = {aid: i + 1 for i, (aid, _) in enumerate(triple_candidates)}
-    candidate_ids = set(sim_map) | set(kw_map) | set(triple_sim_map)
+    extra_ranked_lists: dict[str, list[str]] = {}
+    for pathway, atom_ids in (extra_atom_ranked_pathways or {}).items():
+        if not pathway:
+            continue
+        extra_ranked_lists[pathway] = [
+            aid for aid in atom_ids
+            if isinstance(aid, str) and aid
+        ]
+    candidate_ids = (
+        set(sim_map)
+        | set(kw_map)
+        | set(triple_sim_map)
+        | {aid for ids in extra_ranked_lists.values() for aid in ids}
+    )
     if not candidate_ids:
         return RecallResult()
 
@@ -265,7 +281,11 @@ def recall(
     # Compute once, here, over the union of candidate IDs. Per-candidate
     # rrf_score lookups go into _score_candidates. We use the saga
     # canonical weights (semantic=keyword=triple=1.0) and k=60 by default.
-    rrf_weights = (weights and weights.get("rrf_pathway_weights")) or DEFAULT_RRF_WEIGHTS
+    rrf_weights = (
+        rrf_pathway_weights
+        or (weights and weights.get("rrf_pathway_weights"))
+        or DEFAULT_RRF_WEIGHTS
+    )
     rrf_k = (weights and weights.get("rrf_k")) or RRF_DEFAULT_K
     ranked_lists = {
         "semantic": [aid for aid, _ in faiss_candidates],
@@ -273,6 +293,13 @@ def recall(
     }
     if triple_candidates:
         ranked_lists["triple"] = [aid for aid, _ in triple_candidates]
+    for pathway, atom_ids in extra_ranked_lists.items():
+        if pathway in ranked_lists:
+            raise ValueError(
+                "extra RRF pathway collides with built-in pathway: "
+                f"{pathway}"
+            )
+        ranked_lists[pathway] = atom_ids
     rrf_fused = reciprocal_rank_fusion(
         ranked_lists,
         k=rrf_k, weights=rrf_weights,

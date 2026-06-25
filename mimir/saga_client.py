@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterable, Mapping
 from typing import Any, Protocol, runtime_checkable
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,8 @@ class SagaClient(Protocol):
         token_budget: int = 500, session_id: str | None = None,
         min_confidence_tier: str | None = None,
         context: list[dict[str, str]] | None = None,
+        extra_atom_ranked_pathways: Mapping[str, Iterable[str]] | None = None,
+        rrf_pathway_weights: Mapping[str, float] | None = None,
     ) -> dict[str, Any]: ...
 
     async def store(

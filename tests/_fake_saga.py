@@ -5,6 +5,7 @@ on the wire payloads without a network round-trip.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,11 +40,22 @@ class FakeSaga:
         session_id: str | None = None,
         min_confidence_tier: str | None = None,
         context: list[dict[str, str]] | None = None,
+        extra_atom_ranked_pathways: Mapping[str, Iterable[str]] | None = None,
+        rrf_pathway_weights: Mapping[str, float] | None = None,
     ) -> dict[str, Any]:
         self.calls.append(
-            _Call("query", {"query": query, "top_k": top_k, "session_id": session_id,
-                            "min_confidence_tier": min_confidence_tier,
-                            "context": context})
+            _Call(
+                "query",
+                {
+                    "query": query,
+                    "top_k": top_k,
+                    "session_id": session_id,
+                    "min_confidence_tier": min_confidence_tier,
+                    "context": context,
+                    "extra_atom_ranked_pathways": extra_atom_ranked_pathways,
+                    "rrf_pathway_weights": rrf_pathway_weights,
+                },
+            )
         )
         if "query" in self.fail_on:
             raise SagaError("synthetic query failure")

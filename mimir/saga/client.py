@@ -34,6 +34,7 @@ import json
 import logging
 import sqlite3
 import struct
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -641,6 +642,8 @@ class SagaStore:
         reference_date=None,
         enable_contextual_rewrite: bool | None = None,
         pre_rewritten_query: str | None = None,
+        extra_atom_ranked_pathways: Mapping[str, Iterable[str]] | None = None,
+        rrf_pathway_weights: Mapping[str, float] | None = None,
     ) -> dict[str, Any]:
         # Three paths into the rewrite:
         # 1. Caller pre-resolved the rewrite via ``contextual_rewrite()``
@@ -709,6 +712,8 @@ class SagaStore:
                 triple_search_fn=_make_triple_search_fn(
                     conn, dim=triple_dim, reference_date=reference_date,
                 ),
+                extra_atom_ranked_pathways=extra_atom_ranked_pathways,
+                rrf_pathway_weights=rrf_pathway_weights,
                 k=top_k,
                 session_id=session_id,
                 agent_id=self._agent_id,
