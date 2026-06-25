@@ -260,6 +260,57 @@ def _read(question: str, question_date: str, retrieved: dict) -> dict:
     return read(question, question_date, retrieved)
 
 
+def _parse_question_types(raw: str | None) -> list[str]:
+    if raw is None:
+        return []
+    requested: list[str] = []
+    for part in raw.split(","):
+        category = part.strip()
+        if category and category not in requested:
+            requested.append(category)
+    return requested
+
+
+def _category_counts(dataset: list[dict], categories: list[str]) -> dict[str, int]:
+    counts = {category: 0 for category in categories}
+    for item in dataset:
+        category = item.get("question_type")
+        if category in counts:
+            counts[category] += 1
+    return counts
+
+
+def _filter_question_types(dataset: list[dict], raw_question_types: str | None) -> list[dict]:
+    requested = _parse_question_types(raw_question_types)
+    if not requested:
+        return dataset
+
+    valid = sorted({
+        item.get("question_type")
+        for item in dataset
+        if isinstance(item.get("question_type"), str)
+    })
+    unknown = sorted(set(requested) - set(valid))
+    if unknown:
+        raise ValueError(
+            "unknown --question-types value(s): "
+            f"{', '.join(unknown)}. Valid dataset question types: {', '.join(valid)}"
+        )
+
+    requested_set = set(requested)
+    filtered = [
+        item for item in dataset
+        if item.get("question_type") in requested_set
+    ]
+    counts = _category_counts(filtered, requested)
+    print(
+        "Selected question types: "
+        + ", ".join(f"{category}={counts[category]}" for category in requested),
+        file=sys.stderr,
+    )
+    return filtered
+
+
 # ─── Per-question runner ─────────────────────────────────────────────
 
 
@@ -442,6 +493,11 @@ async def _amain(args) -> int:
         print(f"dataset not found: {dataset_path}", file=sys.stderr)
         return 2
     dataset = json.loads(dataset_path.read_text())
+    try:
+        dataset = _filter_question_types(dataset, args.question_types)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if args.limit:
         dataset = dataset[: args.limit]
 
@@ -514,6 +570,13 @@ def main() -> None:
     ap.add_argument(
         "--limit", type=int, default=None,
         help="cap number of questions (default: all 500)",
+    )
+    ap.add_argument(
+        "--question-types", default=None,
+        help=(
+            "comma-separated LongMemEval question_type values to run "
+            "(filter is applied before --limit)"
+        ),
     )
     ap.add_argument(
         "--run-tag", required=True,
