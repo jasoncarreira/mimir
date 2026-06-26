@@ -2,7 +2,7 @@
 
 Covers parsing of ``MIMIR_FILE_TOOL_ROOTS`` into validated ``(abs_path, mode)``
 pairs: rw-default, explicit ro/rw, the validation rejections (non-absolute,
-missing, non-dir, ``/`` / ``/etc``, ``~`` / ``..``, home-overlap), the
+missing, non-dir, common system roots, ``~`` / ``..``, home-overlap), the
 always-rw ``/tmp`` behavior, and dedupe.
 """
 from __future__ import annotations
@@ -11,7 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from mimir.config import _ALWAYS_RW_FILE_TOOL_ROOTS, _parse_file_tool_roots
+from mimir.config import (
+    _ALWAYS_RW_FILE_TOOL_ROOTS,
+    _FILE_TOOL_FORBIDDEN_ROOTS,
+    _parse_file_tool_roots,
+)
 
 
 def _home(tmp_path: Path) -> Path:
@@ -63,9 +67,26 @@ def test_rejects_file_not_dir(tmp_path: Path) -> None:
     assert _parse_file_tool_roots(str(f), home, always_rw=()) == ()
 
 
-@pytest.mark.parametrize("bad", ["/", "/etc", "/etc/"])
+@pytest.mark.parametrize(
+    "bad",
+    sorted(
+        candidate
+        for root in _FILE_TOOL_FORBIDDEN_ROOTS
+        for candidate in (root, f"{root}/")
+        if Path(root).exists()
+    ),
+)
 def test_rejects_forbidden_roots(bad: str, tmp_path: Path) -> None:
     assert _parse_file_tool_roots(bad, _home(tmp_path), always_rw=()) == ()
+
+
+def test_tmp_and_project_roots_still_allowed(tmp_path: Path) -> None:
+    home = Path("/__mimir_nonexistent_home_for_file_roots_test__")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    out = dict(_parse_file_tool_roots(str(repo), home, always_rw=("/tmp",)))
+    assert out[str(repo.resolve())] == "rw"
+    assert out[str(Path("/tmp").resolve())] == "rw"
 
 
 def test_rejects_tilde_and_traversal(tmp_path: Path) -> None:
