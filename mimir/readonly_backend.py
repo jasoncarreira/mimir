@@ -89,14 +89,26 @@ def _real_path_outside_root(key: str, cwd: Path) -> Path | None:
     false-not-found of chainlink #650) from a normal virtual path (which has no
     literal real-disk existence). Returns ``None`` when the path doesn't exist
     or already lives under ``cwd``."""
+    if key == "/":
+        return None
     try:
-        literal = Path(key)
-        if not literal.exists():
-            return None
-        real = literal.resolve()
         root = Path(cwd).resolve()  # resolve both sides so a symlinked home
                                     # (e.g. macOS /var -> /private/var) can't
                                     # false-flag a path that is really under it
+        virtual = (Path(cwd) / key.lstrip("/")).resolve()
+        if virtual.exists():
+            try:
+                virtual.relative_to(root)
+                return None
+            except ValueError:
+                pass
+
+        literal = Path(key)
+        if not literal.is_absolute():
+            return None
+        if not literal.exists():
+            return None
+        real = literal.resolve()
     except OSError:
         return None
     try:

@@ -640,6 +640,26 @@ class TestOutsideRootGuard:
         r = b.ls(path=str(other))
         assert "outside the file-tool root" in (r.error or "")
 
+    def test_guard_on_ls_root_lists_home_entries(self, tmp_path: Path) -> None:
+        home = _split_home(tmp_path)
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"], guard_outside_root=True)
+        r = b.ls(path="/")
+        names = {Path(e["path"].rstrip("/")).name for e in (r.entries or [])}
+        assert r.error is None
+        assert {"state", "logs"} <= names
+
+    def test_guard_on_allows_virtual_path_that_collides_with_real_root_dir(
+        self, tmp_path: Path,
+    ) -> None:
+        home = _split_home(tmp_path)
+        (home / "var").mkdir()
+        (home / "var" / "home-file.txt").write_text("home var\n")
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"], guard_outside_root=True)
+        r = b.ls(path="/var")
+        names = {Path(e["path"].rstrip("/")).name for e in (r.entries or [])}
+        assert r.error is None
+        assert "home-file.txt" in names
+
     def test_guard_on_allows_home_reads(self, tmp_path: Path) -> None:
         home = _split_home(tmp_path)
         (home / "state" / "s.txt").write_text("hi\n")
