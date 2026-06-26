@@ -876,22 +876,23 @@ class SagaStore:
         connection so default-on boundary recall does not double per-query
         sqlite connection churn.
         """
+        limit = max(0, int(limit))
+        cap = max(0, int(atoms_per_session))
+        if limit <= 0 or cap <= 0:
+            return []
+
         try:
             matched_sessions = self._search_sessions_with_conn(
                 conn,
                 query,
                 alpha=alpha,
-                limit=max(0, int(limit)),
+                limit=limit,
                 query_emb=query_emb,
             )
         except Exception:  # noqa: BLE001 — boundary recall is auxiliary
             log.warning("session-boundary RRF search failed", exc_info=True)
             return []
         if not matched_sessions:
-            return []
-
-        cap = max(0, int(atoms_per_session))
-        if cap <= 0:
             return []
 
         atom_ids: list[str] = []
