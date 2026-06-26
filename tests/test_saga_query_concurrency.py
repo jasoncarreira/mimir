@@ -71,7 +71,14 @@ async def test_saga_query_uses_independent_connections_for_concurrent_reads(
     monkeypatch.setattr(store, "_operation_conn", observed_operation_conn)
 
     results = await asyncio.gather(
-        *[store.query("concurrent query smoke term", top_k=3) for _ in range(8)]
+        *[
+            store.query(
+                "concurrent query smoke term",
+                top_k=3,
+                enable_session_boundary_rrf=False,
+            )
+            for _ in range(8)
+        ]
     )
 
     assert max_active > 1
