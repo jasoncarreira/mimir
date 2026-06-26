@@ -46,6 +46,8 @@ async def test_saga_query_uses_independent_connections_for_concurrent_reads(
     active = 0
     max_active = 0
     connections: list[sqlite3.Connection] = []
+    operation_wrappers: list[object] = []
+    boundary_connections: list[object] = []
     original_operation_conn = store._operation_conn
 
     def observed_operation_conn():
@@ -66,9 +68,20 @@ async def test_saga_query_uses_independent_connections_for_concurrent_reads(
                 finally:
                     active -= 1
 
-        return ObservedConnection(), should_close
+        wrapper = ObservedConnection()
+        operation_wrappers.append(wrapper)
+        return wrapper, should_close
+
+    def observed_boundary_pathway(conn, *_args, **_kwargs):
+        boundary_connections.append(conn)
+        return []
 
     monkeypatch.setattr(store, "_operation_conn", observed_operation_conn)
+    monkeypatch.setattr(
+        store,
+        "_session_boundary_atom_pathway_with_conn",
+        observed_boundary_pathway,
+    )
 
     results = await asyncio.gather(
         *[store.query("concurrent query smoke term", top_k=3) for _ in range(8)]
@@ -76,4 +89,10 @@ async def test_saga_query_uses_independent_connections_for_concurrent_reads(
 
     assert max_active > 1
     assert len({id(conn) for conn in connections}) == 8
+    # The production default path includes session-boundary RRF. It must run on
+    # each query's existing operation connection, not open a second connection.
+    assert len(boundary_connections) == 8
+    assert {id(conn) for conn in boundary_connections} == {
+        id(conn) for conn in operation_wrappers
+    }
     assert all(result["items_returned"] >= 1 for result in results)
