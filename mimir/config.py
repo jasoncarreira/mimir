@@ -326,7 +326,24 @@ def _parse_folders(raw: str) -> dict[str, str]:
 # the operator (chainlink #650). Distinct from ``folders`` (subdirs UNDER the
 # home). ``/tmp`` is always added rw when present so the agent has an ephemeral
 # scratch root without per-deployment config.
-_FILE_TOOL_FORBIDDEN_ROOTS: frozenset[str] = frozenset({"/", "/etc"})
+#
+# These exact roots are footgun guardrails, not a security boundary: an operator
+# can still choose a narrower project/data directory beneath a system prefix.
+_FILE_TOOL_FORBIDDEN_ROOTS: frozenset[str] = frozenset(
+    {
+        "/",
+        "/bin",
+        "/boot",
+        "/dev",
+        "/etc",
+        "/proc",
+        "/root",
+        "/sbin",
+        "/sys",
+        "/usr",
+        "/var",
+    }
+)
 _ALWAYS_RW_FILE_TOOL_ROOTS: tuple[str, ...] = ("/tmp",)
 
 
@@ -345,8 +362,8 @@ def _parse_file_tool_roots(
     they exist.
 
     Rejected (logged + skipped): non-absolute; ``~`` or ``..`` (traversal);
-    ``/`` or ``/etc``; missing / non-directory; and any root that IS the home or
-    overlaps it in either direction (which would shadow the home WriteGuard).
+    common system roots; missing / non-directory; and any root that IS the home
+    or overlaps it in either direction (which would shadow the home WriteGuard).
     Symlinks are resolved. De-duplicated by resolved path, insertion order, with
     explicit entries taking precedence over ``always_rw``. ``always_rw``
     defaults to ``_ALWAYS_RW_FILE_TOOL_ROOTS`` (resolved at call time so an
