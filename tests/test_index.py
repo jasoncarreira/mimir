@@ -102,7 +102,7 @@ def test_build_state_index_lists_state_files(tmp_path: Path):
     assert "kickoff" in body
 
 
-def test_build_state_index_skips_runtime_package_artifacts(tmp_path: Path):
+def test_build_state_index_does_not_skip_operator_paths_by_default(tmp_path: Path):
     state = tmp_path / "state"
     (state / "openclaw-tools" / "node_modules" / "openclaw").mkdir(parents=True)
     (state / "openclaw-tools" / "node_modules" / "openclaw" / "README.md").write_text(
@@ -114,6 +114,34 @@ def test_build_state_index_skips_runtime_package_artifacts(tmp_path: Path):
     )
     (state / "reports").mkdir()
     (state / "reports" / "kept.md").write_text("<!-- desc: durable report -->\nbody")
+
+    body = build_state_index(tmp_path)
+
+    assert "openclaw-tools/node_modules/openclaw/README.md" in body
+    assert "hermes-npm-inspect/pkg/README.md" in body
+    assert "reports/kept.md" in body
+
+
+def test_build_state_index_honors_deployment_index_skip_file(tmp_path: Path):
+    state = tmp_path / "state"
+    (state / "openclaw-tools" / "node_modules" / "openclaw").mkdir(parents=True)
+    (state / "openclaw-tools" / "node_modules" / "openclaw" / "README.md").write_text(
+        "<!-- desc: openclaw package readme -->\nbody"
+    )
+    (state / "hermes-npm-inspect" / "pkg").mkdir(parents=True)
+    (state / "hermes-npm-inspect" / "pkg" / "README.md").write_text(
+        "<!-- desc: hermes package readme -->\nbody"
+    )
+    (state / "reports").mkdir()
+    (state / "reports" / "kept.md").write_text("<!-- desc: durable report -->\nbody")
+    skip_file = tmp_path / ".mimir" / "index-skip.txt"
+    skip_file.parent.mkdir()
+    skip_file.write_text(
+        "# local operator experiments\n"
+        "state/openclaw-tools/\n"
+        "\n"
+        "state/hermes-npm-inspect/\n"
+    )
 
     body = build_state_index(tmp_path)
 

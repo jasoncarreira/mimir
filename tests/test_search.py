@@ -24,6 +24,7 @@ from mimir.search import (
     _classify_scope,
     _to_fts_query,
 )
+from mimir.index_skip import INDEX_SKIP_PATHS, INDEX_SKIP_PREFIXES
 
 # ``mimir.hooks`` and ``mimir.searchtools`` were retired in the
 # deepagents migration (post-PR #185 merge target). Tests that use
@@ -141,12 +142,39 @@ def test_classify_scope_excludes_skip_prefixes():
     assert (
         _classify_scope("state/pollers/social-cli-notifications/notes.md") is None
     )
-    # Ignored runtime package trees from local experiments should not
-    # pollute file_search or state/INDEX.md with third-party internals.
-    assert _classify_scope("state/openclaw-tools/node_modules/openclaw/README.md") is None
-    assert _classify_scope("state/hermes-npm-inspect/pkg/README.md") is None
     # Sibling state subtree unaffected.
     assert _classify_scope("state/seeds/x.md") == "state"
+
+
+def test_framework_defaults_do_not_include_operator_experiment_paths():
+    defaults = set(INDEX_SKIP_PATHS) | set(INDEX_SKIP_PREFIXES)
+    assert not any("openclaw-tools" in path for path in defaults)
+    assert not any("hermes-npm-inspect" in path for path in defaults)
+    assert (
+        _classify_scope("state/openclaw-tools/node_modules/openclaw/README.md")
+        == "state"
+    )
+    assert _classify_scope("state/hermes-npm-inspect/pkg/README.md") == "state"
+
+
+def test_classify_scope_honors_deployment_index_skip_file(tmp_path: Path):
+    skip_file = tmp_path / ".mimir" / "index-skip.txt"
+    skip_file.parent.mkdir()
+    skip_file.write_text(
+        "# local operator experiments\n"
+        "state/openclaw-tools/\n"
+        "\n"
+        "state/hermes-npm-inspect/\n"
+    )
+
+    assert (
+        _classify_scope(
+            "state/openclaw-tools/node_modules/openclaw/README.md", tmp_path
+        )
+        is None
+    )
+    assert _classify_scope("state/hermes-npm-inspect/pkg/README.md", tmp_path) is None
+    assert _classify_scope("state/seeds/x.md", tmp_path) == "state"
 
 
 # ---- FTS sanitization ----------------------------------------------------
@@ -219,7 +247,14 @@ async def test_sweep_skips_workspace_paths(tmp_path: Path):
     (tmp_path / "state" / "pollers" / "social-cli-notifications" / "inbox.md").write_text(
         "<!-- desc: social inbox -->\ntokenmjzrtq social-cli artifact."
     )
-    # Ignored runtime package trees from local experiments.
+    # Deployment-local skip file for operator experiment trees.
+    skip_file = tmp_path / ".mimir" / "index-skip.txt"
+    skip_file.parent.mkdir()
+    skip_file.write_text(
+        "# local operator experiments\n"
+        "state/openclaw-tools/\n"
+        "state/hermes-npm-inspect/\n"
+    )
     (tmp_path / "state" / "openclaw-tools" / "node_modules" / "openclaw").mkdir(parents=True)
     (
         tmp_path

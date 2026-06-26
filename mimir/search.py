@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Iterable, Protocol
 
 from .core_blocks import describe_file
+from .index_skip import INDEX_SKIP_PATHS, INDEX_SKIP_PREFIXES, is_index_skipped
 
 log = logging.getLogger(__name__)
 
@@ -322,46 +323,8 @@ def _bm25_norm(raw: float) -> float:
     """SQLite returns a negative bm25 score; lower is better. Map to (0, 1]."""
     return 1.0 / (1.0 + abs(raw))
 
-
-# Paths under state/ that look like operator/agent shared workspace, not
-# knowledge worth retrieving via file_search. Embedding these is waste
-# (frequent rewrites trigger reindexes) and pollution (results leak as
-# "knowledge" hits). Per-deployment customization can come later via a
-# <home>/.mimir/index-skip.txt; not needed for v0.4.
-INDEX_SKIP_PATHS: frozenset[str] = frozenset(
-    {
-        "state/heartbeat-backlog.md",  # operator/agent shared todo
-        "state/proposed-changes.md",  # pending HITL items
-        "state/identities.yaml",  # operator config; not .md but defensive
-    }
-)
-INDEX_SKIP_PREFIXES: tuple[str, ...] = (
-    # Poller working directories — non-content state (cursors, inboxes,
-    # credentials, processed-message manifests). Nothing under here is
-    # authored knowledge the agent should retrieve. Belt-and-suspenders
-    # since the indexer is already .md-only and pollers write .json /
-    # .yaml / .env, but protects against accidental .md drops (e.g. a
-    # poller logging a notes file) and against future indexer expansion
-    # to non-.md formats.
-    "state/pollers/",
-    # Social-CLI artifacts — operator-managed social graph / inbox
-    # state; not authored knowledge the agent retrieves. Frequent writes
-    # (per-message processed manifests, inbox snapshots) would cause
-    # constant reindex churn on social-active installs.
-    "state/social/",
-    # Runtime package installs from local Hermes/OpenClaw experiments.
-    # These trees are ignored by mimirbot-state .gitignore; indexing
-    # their package docs makes state/INDEX.md and file_search noisy with
-    # third-party package internals rather than authored state.
-    "state/openclaw-tools/",
-    "state/hermes-npm-inspect/",
-)
-
-
-def _classify_scope(rel: str) -> str | None:
-    if rel in INDEX_SKIP_PATHS:
-        return None
-    if any(rel.startswith(p) for p in INDEX_SKIP_PREFIXES):
+def _classify_scope(rel: str, home: Path | None = None) -> str | None:
+    if is_index_skipped(rel, home):
         return None
     if rel.startswith("memory/"):
         if rel.startswith("memory/core/") or rel == "memory/INDEX.md":
@@ -596,13 +559,13 @@ class Indexer:
                 rel = self._resolve_rel(p)
                 if rel is None:
                     continue
-                if _classify_scope(rel) is None:
+                if _classify_scope(rel, self._home) is None:
                     continue
                 out.append(p)
         return sorted(out)
 
     def _reindex_sync(self, rel_path: str) -> bool:
-        scope = _classify_scope(rel_path)
+        scope = _classify_scope(rel_path, self._home)
         if scope is None:
             return False
         abs_path = self._abs_path(rel_path)
