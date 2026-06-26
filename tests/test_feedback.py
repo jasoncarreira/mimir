@@ -415,6 +415,64 @@ def test_scheduler_loop_lag_host_is_not_a_negative_signal(tmp_path: Path):
     assert block is None or "loop lag" not in block
 
 
+def test_scheduler_loop_lag_host_escalates_only_when_chronic(tmp_path: Path):
+    """chainlink #685: host deschedules remain per-event silent, but a chronic
+    burst emits one escalation event so operator-visible reporting is not blind."""
+    from mimir.event_logger import init_logger, _reset_logger_for_tests
+    from mimir.feedback import _ESCALATION_ONLY_EVENT_THRESHOLDS, classify
+
+    assert classify("scheduler_loop_lag_host") is None
+    kind, threshold = _ESCALATION_ONLY_EVENT_THRESHOLDS["scheduler_loop_lag_host"]
+    assert kind == "scheduler_loop_lag_host"
+
+    events_path = tmp_path / "logs" / "events.jsonl"
+    events_path.parent.mkdir(parents=True)
+    _write_jsonl(
+        events_path,
+        [
+            {
+                "timestamp": _ts(0.1 + idx * 0.1),
+                "type": "scheduler_loop_lag_host",
+                "lag_s": 3.0,
+                "threshold_s": 1.0,
+                "cause": "host_scheduling",
+                "loop_cpu_s": 0.0,
+            }
+            for idx in range(threshold)
+        ],
+    )
+
+    init_logger(events_path, session_id="test-host-lag-escalation")
+    try:
+        feedback_log = FeedbackLog(
+            events_path=events_path,
+            turns_path=tmp_path / "logs" / "turns.jsonl",
+        )
+        feedback_log.recent()
+
+        records = [
+            json.loads(line)
+            for line in events_path.read_text().splitlines()
+            if line.strip()
+        ]
+        escalations = [
+            rec
+            for rec in records
+            if rec.get("type") == "algedonic_escalation"
+            and rec.get("kind") == "scheduler_loop_lag_host"
+        ]
+        assert len(escalations) == 1
+        assert escalations[0]["count"] == threshold
+        assert escalations[0]["threshold"] == threshold
+
+        block = feedback_log.recent_block()
+        assert block is not None
+        assert "algedonic escalation: scheduler_loop_lag_host crossed threshold" in block
+        assert "scheduler event loop lag" not in block
+    finally:
+        _reset_logger_for_tests()
+
+
 def test_scheduler_loop_lag_collapses_to_one_line_with_count(tmp_path: Path):
     # chainlink #587: many lag events (each a different lag value, so
     # content-dedup can't fold them) must collapse to ONE most-recent line with

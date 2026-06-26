@@ -68,6 +68,7 @@ DEFAULT_RRF_WEIGHTS = {
                        # when a triple_search_fn is wired in. Matches
                        # saga's rrf_triple_augment_weight default.
 }
+_RESERVED_RRF_PATHWAYS = frozenset(DEFAULT_RRF_WEIGHTS)
 
 #: Per-atom confidence_tier thresholds. Saga bench TOML defaults:
 #: ``confidence_sim_high = 0.45``, ``_medium = 0.30``, ``_low = 0.10``.
@@ -264,10 +265,18 @@ def recall(
     for pathway, atom_ids in (extra_atom_ranked_pathways or {}).items():
         if not pathway:
             continue
-        extra_ranked_lists[pathway] = [
-            aid for aid in atom_ids
-            if isinstance(aid, str) and aid
-        ]
+        if pathway in _RESERVED_RRF_PATHWAYS:
+            raise ValueError(
+                "extra RRF pathway collides with built-in pathway: "
+                f"{pathway}"
+            )
+        seen_atom_ids: set[str] = set()
+        extra_ranked_lists[pathway] = []
+        for aid in atom_ids:
+            if not isinstance(aid, str) or not aid or aid in seen_atom_ids:
+                continue
+            seen_atom_ids.add(aid)
+            extra_ranked_lists[pathway].append(aid)
     candidate_ids = (
         set(sim_map)
         | set(kw_map)
@@ -294,11 +303,6 @@ def recall(
     if triple_candidates:
         ranked_lists["triple"] = [aid for aid, _ in triple_candidates]
     for pathway, atom_ids in extra_ranked_lists.items():
-        if pathway in ranked_lists:
-            raise ValueError(
-                "extra RRF pathway collides with built-in pathway: "
-                f"{pathway}"
-            )
         ranked_lists[pathway] = atom_ids
     rrf_fused = reciprocal_rank_fusion(
         ranked_lists,
