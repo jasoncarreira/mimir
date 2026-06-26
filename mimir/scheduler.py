@@ -48,7 +48,7 @@ from .billing import normalize_priority
 from .core_blocks import read_text_lossy
 from .event_logger import log_event
 from ._context import active_turn_snapshots
-from .loop_watchdog import LoopStallWatchdog
+from .loop_watchdog import LoopStallWatchdog, stack_is_idle
 from .quota_windows import provider_store_keys
 from .models import AgentEvent
 from .pollers import POLLER_CHANNEL_PREFIX, PollerConfig, discover_pollers, run_poller
@@ -84,6 +84,12 @@ def _resolve_tz(name: str) -> ZoneInfo:
 #: literal — see :data:`mimir.pollers.POLLER_CHANNEL_PREFIX` for the
 #: sibling convention.
 SCHEDULER_CHANNEL_PREFIX = "scheduler:"
+
+# Loop-lag cause classification (chainlink #682): a stall counts as a real
+# on-loop block when the loop thread burned at least this share of the lag on
+# CPU. Below it (and with no non-idle stack captured) the loop was idle/parked
+# while the host failed to schedule us — a VM hiccup, not a mimir hot path.
+_LOOP_LAG_CPU_RATIO = 0.5
 
 EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
 
@@ -2738,18 +2744,27 @@ class Scheduler:
         interval_s: float = 1.0,
         threshold_s: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
+        cpu_clock: Callable[[], float] = time.thread_time,
         sleeper: Callable[[float], Awaitable[Any]] = asyncio.sleep,
     ) -> None:
         next_wake = clock() + interval_s
+        cpu_prev = cpu_clock()
         try:
             while True:
                 await sleeper(interval_s)
                 now = clock()
+                cpu_now = cpu_clock()
                 lag_s = now - next_wake
+                # Loop-thread CPU consumed across the wake window. ``cpu_clock``
+                # defaults to ``time.thread_time`` and this coroutine runs ON the
+                # loop thread, so the delta is exactly how much CPU the loop
+                # itself burned — including any blocking on-loop callback.
+                loop_cpu_s = max(0.0, cpu_now - cpu_prev)
                 # Anchor the next expected wake to *now*, not the old target,
                 # so a single long stall produces one bounded event instead of
                 # a catch-up burst of gradually shrinking lag reports.
                 next_wake = now + interval_s
+                cpu_prev = cpu_now
                 if lag_s <= threshold_s:
                     continue
                 active_turns = active_turn_snapshots(now=now)
@@ -2758,11 +2773,33 @@ class Scheduler:
                 blocking_stacks = (
                     self._loop_watchdog.drain() if self._loop_watchdog else []
                 )
+                # chainlink #682: tell a real on-loop stall apart from the process
+                # being descheduled (Docker-Desktop / VM scheduling hiccups, which
+                # dominate the count but aren't a mimir hot path). It's an on-loop
+                # block if either the watchdog caught a non-idle frame (covers a
+                # sync-I/O block that burns no CPU) OR the loop thread spent a
+                # meaningful share of the lag on CPU. Otherwise the loop was merely
+                # parked/idle while the host failed to schedule us.
+                non_idle_stack = any(
+                    not stack_is_idle(s.get("stack", "")) for s in blocking_stacks
+                )
+                cpu_bound = loop_cpu_s >= _LOOP_LAG_CPU_RATIO * lag_s
+                on_loop = non_idle_stack or cpu_bound
+                cause = "on_loop" if on_loop else "host_scheduling"
+                # Real stalls keep the negative ``scheduler_loop_lag`` signal.
+                # Host/VM deschedules go to an informational type the feedback
+                # rules table deliberately doesn't classify, so they stay
+                # queryable without inflating the algedonic ×N count.
+                event_type = (
+                    "scheduler_loop_lag" if on_loop else "scheduler_loop_lag_host"
+                )
                 await log_event(
-                    "scheduler_loop_lag",
+                    event_type,
                     lag_s=round(lag_s, 3),
                     threshold_s=threshold_s,
                     interval_s=interval_s,
+                    loop_cpu_s=round(loop_cpu_s, 3),
+                    cause=cause,
                     active_turn_count=len(active_turns),
                     active_turns=active_turns[:8],
                     blocking_stacks=blocking_stacks[:3],

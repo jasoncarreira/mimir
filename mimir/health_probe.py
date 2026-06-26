@@ -491,7 +491,11 @@ async def probe_once(cfg: HealthProbeConfig) -> ProbeResult:
             detail=f"uptime {uptime:.1f}s < {STARTUP_GRACE_S}s grace",
         )
 
-    stale, detail = probe_pwd(cfg.home)
+    # Offloaded to a worker thread: probe_pwd forks a subprocess, and fork()'s
+    # cost scales with the parent's resident memory — on a multi-GB agent this
+    # stalled the event loop ~1s+ per probe (chainlink #682). The subprocess
+    # call is bounded by PROBE_SUBPROCESS_TIMEOUT_S, so the thread can't leak.
+    stale, detail = await asyncio.to_thread(probe_pwd, cfg.home)
 
     # Healthy path: record recovery if we were stale last tick.
     if not stale:

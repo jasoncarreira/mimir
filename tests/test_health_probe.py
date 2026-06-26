@@ -361,6 +361,31 @@ async def test_probe_skipped_on_non_virtiofs(
     assert "bind_mount_stale_detected" not in types
 
 
+@pytest.mark.asyncio
+async def test_probe_once_offloads_probe_pwd_off_the_loop_thread(
+    cfg: HealthProbeConfig, monkeypatch: pytest.MonkeyPatch,
+    _capture_events: list[tuple[str, dict]],
+) -> None:
+    """chainlink #682: probe_pwd forks a subprocess; fork() cost scales with the
+    parent's RSS, so it must run in a worker thread, not on the event loop."""
+    import threading
+
+    main_tid = threading.get_ident()
+    seen: dict[str, int] = {}
+
+    def fake_probe_pwd(_home, *_a, **_kw):
+        seen["tid"] = threading.get_ident()
+        return (False, "ok")
+
+    monkeypatch.setattr(hp, "probe_pwd", fake_probe_pwd)
+
+    result = await probe_once(cfg)
+
+    assert result.stale is False
+    assert "tid" in seen
+    assert seen["tid"] != main_tid  # ran off the loop thread
+
+
 def test_is_virtiofs_environment_reads_mountinfo(tmp_path: Path) -> None:
     """Sanity-check the mountinfo parser. Real mountinfo lines look
     like '... - virtiofs mac rw' from the field after ' - '."""

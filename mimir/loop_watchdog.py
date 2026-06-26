@@ -31,6 +31,28 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
+def stack_is_idle(stack: str) -> bool:
+    """True when a captured loop-stall stack shows the loop parked in the
+    selector (idle, waiting for I/O) rather than stuck in a real callback.
+
+    An idle-parked capture means the loop wasn't running on-loop work when it
+    was sampled, so the late wake came from the process being descheduled (e.g.
+    a Docker-Desktop / VM scheduling hiccup) rather than a mimir hot path. An
+    empty capture is treated as idle too: during a whole-process stall the
+    watchdog thread (same process) is frozen as well and only samples after the
+    loop resumes, so it has nothing — or a post-resume ``select`` frame — to
+    show. Used by the scheduler's loop-lag monitor to route those to an
+    informational event instead of the negative algedonic signal.
+    """
+    if not stack:
+        return True
+    file_lines = [ln for ln in stack.splitlines() if ln.lstrip().startswith("File ")]
+    if not file_lines:
+        return True
+    leaf = file_lines[-1]
+    return "selectors.py" in leaf and " in select" in leaf
+
+
 class LoopStallWatchdog:
     def __init__(
         self,

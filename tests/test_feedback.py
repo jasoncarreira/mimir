@@ -390,6 +390,31 @@ def test_scheduler_loop_lag_surfaces_as_negative(tmp_path: Path):
     assert "scheduler event loop lag: 1.234s over threshold 1.000s" in block
 
 
+def test_scheduler_loop_lag_host_is_not_a_negative_signal(tmp_path: Path):
+    """chainlink #682: host/VM deschedules are informational only — classify()
+    returns None so they never surface in the algedonic block or its ×N count."""
+    from mimir.feedback import classify
+
+    assert classify("scheduler_loop_lag_host") is None
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "timestamp": _ts(0.1),
+                "type": "scheduler_loop_lag_host",
+                "lag_s": 61.0,
+                "threshold_s": 1.0,
+                "cause": "host_scheduling",
+                "loop_cpu_s": 0.0,
+            }
+        ],
+    )
+
+    block = log.recent_block()
+
+    assert block is None or "loop lag" not in block
+
+
 def test_scheduler_loop_lag_collapses_to_one_line_with_count(tmp_path: Path):
     # chainlink #587: many lag events (each a different lag value, so
     # content-dedup can't fold them) must collapse to ONE most-recent line with

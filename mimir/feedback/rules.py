@@ -32,6 +32,11 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "tool_error": ("negative", "tool_error"),
     "background_task_failed": ("negative", "background_task_failed"),
     "scheduler_loop_lag": ("negative", "scheduler_loop_lag"),
+    # chainlink #682: ``scheduler_loop_lag_host`` (the loop was woken late while
+    # idle/descheduled — a VM/host scheduling hiccup, not a mimir hot path) is
+    # deliberately ABSENT here. classify() returns None for it, so every feedback
+    # read-path skips it: host hiccups stay queryable in the event log but don't
+    # inflate the negative algedonic ×N count.
     "scheduler_loop_lag_monitor_failed": ("negative", "scheduler_loop_lag_monitor_failed"),
     "worklink_claimed": ("positive", "worklink_claimed"),
     "worklink_evidence": ("positive", "worklink_evidence"),
