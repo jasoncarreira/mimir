@@ -164,13 +164,13 @@ async def test_query_enables_session_boundary_rrf_by_default(tmp_path, monkeypat
     await client.end_session("s1", "Alice reply preferences")
     await client.end_session("s2", "Bob reply preferences")
 
-    async def fake_search_sessions(query, *, channel_id=None, alpha=0.7, limit=10):
+    def fake_search_sessions(conn, query, **kwargs):
         assert query == "unmatched-query"
-        assert alpha == 0.7
-        assert limit == 3
+        assert kwargs["alpha"] == 0.7
+        assert kwargs["limit"] == 3
         return [{"session_id": "s1", "blended_score": 1.0}]
 
-    monkeypatch.setattr(client, "search_sessions", fake_search_sessions)
+    monkeypatch.setattr(client, "_search_sessions_with_conn", fake_search_sessions)
     monkeypatch.setattr(client, "_ensure_index", lambda conn: None)
 
     result = await client.query("unmatched-query", top_k=5)
