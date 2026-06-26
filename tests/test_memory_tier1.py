@@ -245,6 +245,39 @@ def test_recall_extra_pathway_can_admit_atom_absent_from_builtin_candidates(conn
     assert extra_candidate.keyword_rank == -1
 
 
+def test_recall_extra_pathway_rejects_reserved_triple_without_triples(conn):
+    extra = store(conn, "extra-only candidate", embed_fn=_fake_embed)
+
+    with pytest.raises(ValueError, match="built-in pathway: triple"):
+        recall(
+            conn, "unmatched query",
+            query_embed_fn=_fake_query_embed,
+            faiss_search_fn=lambda emb, k: [],
+            fts_search_fn=lambda q, k: [],
+            triple_search_fn=None,
+            extra_atom_ranked_pathways={"triple": [extra.atom_id]},
+            fire_access_events=False,
+        )
+
+
+def test_recall_extra_pathway_dedupes_duplicate_atom_ids_before_rrf(conn):
+    extra = store(conn, "extra-only candidate", embed_fn=_fake_embed)
+
+    result = recall(
+        conn, "unmatched query",
+        query_embed_fn=_fake_query_embed,
+        faiss_search_fn=lambda emb, k: [],
+        fts_search_fn=lambda q, k: [],
+        extra_atom_ranked_pathways={
+            "session_boundary": [extra.atom_id, extra.atom_id, extra.atom_id],
+        },
+        fire_access_events=False,
+    )
+
+    extra_candidate = next(c for c in result.raws if c.atom["id"] == extra.atom_id)
+    assert extra_candidate.rrf_score == pytest.approx(1 / 61)
+
+
 def test_recall_extra_pathway_weight_changes_ordering_and_score(conn):
     semantic = store(conn, "semantic candidate", embed_fn=_fake_embed)
     extra = store(conn, "extra-only candidate", embed_fn=_fake_embed)
