@@ -880,6 +880,12 @@ class SagaStore:
         cap = max(0, int(atoms_per_session))
         if limit <= 0 or cap <= 0:
             return []
+        # New / cold homes have no session boundaries yet. Avoid the session
+        # vector-search/index path entirely in that common case; query() already
+        # computes one embedding for atom recall, and the boundary lane must not
+        # add an empty-session round trip on top.
+        if conn.execute("SELECT 1 FROM sessions LIMIT 1").fetchone() is None:
+            return []
 
         try:
             matched_sessions = self._search_sessions_with_conn(
