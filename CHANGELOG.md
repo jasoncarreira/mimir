@@ -6,6 +6,29 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Loop-lag monitor distinguishes host/VM deschedules from real on-loop stalls
+  (#682).** The scheduler's loop-lag monitor now samples loop-thread CPU
+  (`time.thread_time`) across the wake window and combines it with the watchdog's
+  stall stack: a late wake counts as a real on-loop stall when a non-idle frame
+  was captured (covers a sync-I/O block that burns no CPU) **or** the loop thread
+  spent ≥ 50% of the lag on CPU. Otherwise the loop was merely parked/idle while
+  the host failed to schedule us (e.g. a Docker-Desktop / VM scheduling hiccup),
+  and it's emitted as an informational `scheduler_loop_lag_host` event instead of
+  the negative `scheduler_loop_lag`. `scheduler_loop_lag_host` is deliberately
+  absent from the feedback rules table, so it stays queryable in the event log
+  without inflating the algedonic `(×N in 24h)` count. The `scheduler_loop_lag`
+  event also gains `cause` and `loop_cpu_s` fields.
+
+### Fixed
+
+- **Health probe no longer stalls the event loop (#682).** `health_probe.probe_once`
+  ran `probe_pwd` — which forks a `pwd` subprocess — synchronously on the event
+  loop. `fork()` cost scales with the parent's resident memory, so on a multi-GB
+  agent each probe stalled the loop ~1s+ (a recurring `scheduler_loop_lag` source
+  on VirtioFS/Docker-Desktop deployments). It now runs via `asyncio.to_thread`.
+
 ### Added
 
 - **Configurable file-tool roots outside the home (#650).** `MIMIR_FILE_TOOL_ROOTS`

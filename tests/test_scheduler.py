@@ -2360,12 +2360,18 @@ async def test_dispatch_poller_reload_events_task_is_held_in_background_tasks(
 async def test_scheduler_loop_lag_monitor_logs_blocking_delay(tmp_path: Path, monkeypatch):
     logged: list[tuple[str, dict]] = []
     ticks = iter([0.0, 0.11, 0.34])
+    # Loop-thread CPU mirrors wall-clock during the stall window (0.13s of CPU
+    # burned over the 0.13s lag) → cpu_bound → classified as a real on-loop stall.
+    cpu_ticks = iter([0.0, 0.0, 0.13])
 
     async def fake_sleep(_delay: float) -> None:
         await asyncio.sleep(0)
 
     def fake_monotonic() -> float:
         return next(ticks)
+
+    def fake_thread_time() -> float:
+        return next(cpu_ticks)
 
     async def fake_log_event(event_type: str, **payload):
         logged.append((event_type, payload))
@@ -2383,6 +2389,7 @@ async def test_scheduler_loop_lag_monitor_logs_blocking_delay(tmp_path: Path, mo
             interval_s=0.1,
             threshold_s=0.05,
             clock=fake_monotonic,
+            cpu_clock=fake_thread_time,
             sleeper=fake_sleep,
         )
 
@@ -2393,6 +2400,8 @@ async def test_scheduler_loop_lag_monitor_logs_blocking_delay(tmp_path: Path, mo
                 "lag_s": 0.13,
                 "threshold_s": 0.05,
                 "interval_s": 0.1,
+                "loop_cpu_s": 0.13,
+                "cause": "on_loop",
                 "active_turn_count": 0,
                 "active_turns": [],
                 # chainlink #587: empty here — no watchdog wired in this unit test
@@ -2401,6 +2410,97 @@ async def test_scheduler_loop_lag_monitor_logs_blocking_delay(tmp_path: Path, mo
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_loop_lag_monitor_routes_host_deschedule(tmp_path: Path, monkeypatch):
+    """chainlink #682: a late wake with no on-loop CPU and no captured frame is a
+    host/VM deschedule — emitted as the informational ``scheduler_loop_lag_host``
+    type (not the negative ``scheduler_loop_lag``) so it doesn't inflate the count."""
+    logged: list[tuple[str, dict]] = []
+    ticks = iter([0.0, 0.11, 0.34])
+    cpu_ticks = iter([0.0, 0.0, 0.0])  # loop burned ~no CPU across the lag window
+
+    async def fake_sleep(_delay: float) -> None:
+        await asyncio.sleep(0)
+
+    async def fake_log_event(event_type: str, **payload):
+        logged.append((event_type, payload))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("mimir.scheduler.log_event", fake_log_event)
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    with pytest.raises(asyncio.CancelledError):
+        await sched._monitor_loop_lag(
+            interval_s=0.1,
+            threshold_s=0.05,
+            clock=lambda: next(ticks),
+            cpu_clock=lambda: next(cpu_ticks),
+            sleeper=fake_sleep,
+        )
+
+    assert len(logged) == 1
+    event_type, payload = logged[0]
+    assert event_type == "scheduler_loop_lag_host"
+    assert payload["cause"] == "host_scheduling"
+    assert payload["loop_cpu_s"] == 0.0
+    assert payload["lag_s"] == 0.13
+
+
+@pytest.mark.asyncio
+async def test_scheduler_loop_lag_monitor_flags_low_cpu_block_with_real_frame(
+    tmp_path: Path, monkeypatch
+):
+    """A sync-I/O block (e.g. subprocess fork) burns little loop CPU but is still a
+    real on-loop stall — the non-idle captured frame must keep it ``scheduler_loop_lag``."""
+    logged: list[tuple[str, dict]] = []
+    ticks = iter([0.0, 0.11, 0.34])
+    cpu_ticks = iter([0.0, 0.0, 0.0])  # near-zero CPU: blocked in a syscall, not on CPU
+
+    async def fake_sleep(_delay: float) -> None:
+        await asyncio.sleep(0)
+
+    async def fake_log_event(event_type: str, **payload):
+        logged.append((event_type, payload))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("mimir.scheduler.log_event", fake_log_event)
+
+    class _FakeWatchdog:
+        def drain(self):
+            return [{
+                "stall_s": 0.13,
+                "stack": (
+                    '  File "/app/mimir/health_probe.py", line 351, in probe_pwd\n'
+                    '  File "/usr/local/lib/python3.11/subprocess.py", line 1885, in _execute_child\n'
+                ),
+            }]
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched._loop_watchdog = _FakeWatchdog()
+
+    with pytest.raises(asyncio.CancelledError):
+        await sched._monitor_loop_lag(
+            interval_s=0.1,
+            threshold_s=0.05,
+            clock=lambda: next(ticks),
+            cpu_clock=lambda: next(cpu_ticks),
+            sleeper=fake_sleep,
+        )
+
+    assert len(logged) == 1
+    event_type, payload = logged[0]
+    assert event_type == "scheduler_loop_lag"
+    assert payload["cause"] == "on_loop"
+    assert payload["blocking_stacks"]
 
 
 def test_scheduler_start_and_stop_manage_loop_lag_monitor(tmp_path: Path, monkeypatch):

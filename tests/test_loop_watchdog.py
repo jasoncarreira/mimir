@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 
-from mimir.loop_watchdog import LoopStallWatchdog
+from mimir.loop_watchdog import LoopStallWatchdog, stack_is_idle
 
 
 def _wd() -> LoopStallWatchdog:
@@ -12,6 +12,32 @@ def _wd() -> LoopStallWatchdog:
     # Capture THIS thread's stack so the test exercises the real path.
     wd._loop_thread_id = threading.get_ident()
     return wd
+
+
+# ─── stack_is_idle (chainlink #682) ──────────────────────────────────
+
+
+def test_stack_is_idle_true_for_selector_parked_loop():
+    stack = (
+        '  File "/app/mimir/server.py", line 1873, in main\n'
+        '  File "/usr/local/lib/python3.11/asyncio/base_events.py", line 1898, in _run_once\n'
+        '  File "/usr/local/lib/python3.11/selectors.py", line 468, in select\n'
+    )
+    assert stack_is_idle(stack) is True
+
+
+def test_stack_is_idle_false_for_real_on_loop_frame():
+    stack = (
+        '  File "/app/mimir/health_probe.py", line 351, in probe_pwd\n'
+        '  File "/usr/local/lib/python3.11/subprocess.py", line 1885, in _execute_child\n'
+    )
+    assert stack_is_idle(stack) is False
+
+
+def test_stack_is_idle_true_for_empty_capture():
+    # The watchdog (same process) is frozen through a whole-process stall and
+    # samples nothing — treated as idle/host, not a real on-loop block.
+    assert stack_is_idle("") is True
 
 
 def test_no_capture_under_threshold():
