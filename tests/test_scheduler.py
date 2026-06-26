@@ -2503,6 +2503,59 @@ async def test_scheduler_loop_lag_monitor_flags_low_cpu_block_with_real_frame(
     assert payload["blocking_stacks"]
 
 
+@pytest.mark.asyncio
+async def test_scheduler_loop_lag_monitor_flags_sub_cpu_block_just_over_threshold(
+    tmp_path: Path, monkeypatch
+):
+    """chainlink #685: a low-CPU on-loop block just over the lag threshold must
+    still classify as on_loop when the sub-threshold watchdog caught its frame."""
+    logged: list[tuple[str, dict]] = []
+    ticks = iter([0.0, 1.0, 3.01])
+    cpu_ticks = iter([0.0, 0.0, 0.0])
+
+    async def fake_sleep(_delay: float) -> None:
+        await asyncio.sleep(0)
+
+    async def fake_log_event(event_type: str, **payload):
+        logged.append((event_type, payload))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("mimir.scheduler.log_event", fake_log_event)
+
+    class _FakeWatchdog:
+        def drain(self):
+            return [{
+                "stall_s": 0.6,
+                "stack": (
+                    '  File "/app/mimir/scheduler.py", line 123, in run_job\n'
+                    '  File "/usr/local/lib/python3.11/subprocess.py", line 1885, in _execute_child\n'
+                ),
+            }]
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched._loop_watchdog = _FakeWatchdog()
+
+    with pytest.raises(asyncio.CancelledError):
+        await sched._monitor_loop_lag(
+            interval_s=1.0,
+            threshold_s=1.0,
+            clock=lambda: next(ticks),
+            cpu_clock=lambda: next(cpu_ticks),
+            sleeper=fake_sleep,
+        )
+
+    assert len(logged) == 1
+    event_type, payload = logged[0]
+    assert event_type == "scheduler_loop_lag"
+    assert payload["cause"] == "on_loop"
+    assert payload["loop_cpu_s"] == 0.0
+    assert payload["lag_s"] == 1.01
+    assert payload["blocking_stacks"][0]["stall_s"] == 0.6
+
+
 def test_scheduler_start_and_stop_manage_loop_lag_monitor(tmp_path: Path, monkeypatch):
     async def noop(event: AgentEvent) -> bool:
         return True
@@ -2535,6 +2588,8 @@ def test_scheduler_start_and_stop_manage_loop_lag_monitor(tmp_path: Path, monkey
     assert started == ["scheduler"]
     assert sched._started is True
     assert sched._loop_lag_task is task
+    assert sched._loop_watchdog is not None
+    assert sched._loop_watchdog._threshold == 0.5
 
     sched.stop()
 

@@ -52,12 +52,14 @@ from .rules import (  # noqa: F401
     _EVENT_RULES,
     classify,
     _ESCALATION_THRESHOLDS,
+    _ESCALATION_ONLY_EVENT_THRESHOLDS,
     _AROUSAL_THRESHOLDS,
     _VALENCE_GROUPS,
     _FIRST_OCCURRENCE_ONLY_KINDS,
     _POLARITY_DYNAMIC_KINDS,
     _build_valence_groups,
     _count_kinds_in_window,
+    _count_escalation_only_events_in_window,
     _escalated_kinds_in_window,
     _emit_new_escalations,
 )
@@ -184,7 +186,21 @@ class FeedbackLog:
             _already_escalated = _escalated_kinds_in_window(
                 self.events_snapshot, self.events_path, cutoff_iso
             )
-            _emit_new_escalations(kind_counts, _already_escalated, _esc_thresholds)
+            escalation_counts = dict(kind_counts)
+            for kind, count in _count_escalation_only_events_in_window(
+                self.events_snapshot, self.events_path, cutoff_iso
+            ).items():
+                escalation_counts[kind] = escalation_counts.get(kind, 0) + count
+            escalation_thresholds = dict(_esc_thresholds)
+            escalation_thresholds.update(
+                {
+                    kind: threshold
+                    for kind, threshold in _ESCALATION_ONLY_EVENT_THRESHOLDS.values()
+                }
+            )
+            _emit_new_escalations(
+                escalation_counts, _already_escalated, escalation_thresholds
+            )
 
         # Temporal run detection (Alg-2 enhancement): scan for valence-group
         # polarity transitions (recovery / degradation) and synthesize one

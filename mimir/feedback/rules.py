@@ -647,6 +647,14 @@ _ESCALATION_THRESHOLDS: dict[str, int] = {
 }
 
 
+# Raw event types that are deliberately absent from _EVENT_RULES but should
+# still emit a one-shot escalation when they become chronic. These do not
+# render individually and do not participate in algedonic ×N counts.
+_ESCALATION_ONLY_EVENT_THRESHOLDS: dict[str, tuple[str, int]] = {
+    "scheduler_loop_lag_host": ("scheduler_loop_lag_host", 5),
+}
+
+
 # ---------------------------------------------------------------------------
 # Valence groups — define success/failure spaces for run detection.
 # Each group key maps to a ValenceGroup; the kind tags used here are the
@@ -841,6 +849,29 @@ def _count_kinds_in_window(
         if rule is None:
             continue
         _, kind = rule
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def _count_escalation_only_events_in_window(
+    snapshot: "JsonlSnapshot | None",
+    events_path: Path,
+    cutoff_iso: str,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for ev in iter_window_records(snapshot, events_path):  # #498: complete window
+        ts = ev.get("timestamp")
+        if not isinstance(ts, str) or ts < cutoff_iso:
+            if isinstance(ts, str):
+                break
+            continue
+        evtype = ev.get("type")
+        if not isinstance(evtype, str):
+            continue
+        escalation = _ESCALATION_ONLY_EVENT_THRESHOLDS.get(evtype)
+        if escalation is None:
+            continue
+        kind, _threshold = escalation
         counts[kind] = counts.get(kind, 0) + 1
     return counts
 

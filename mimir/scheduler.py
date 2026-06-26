@@ -2727,7 +2727,10 @@ class Scheduler:
         # thread, started from start() which runs on the loop) + a loop-side
         # heartbeat it watches. The watchdog captures the loop's stack while a
         # stall is in progress; the monitor below attaches the captures.
-        self._loop_watchdog = LoopStallWatchdog(stall_threshold_s=1.0, poll_s=0.25)
+        # Keep the watchdog threshold strictly below the monitor threshold
+        # (1.0s by default) so borderline on-loop blocking syscalls are sampled
+        # before the lag monitor wakes and drains captures.
+        self._loop_watchdog = LoopStallWatchdog(stall_threshold_s=0.5, poll_s=0.25)
         self._loop_watchdog.start_thread()
         self._loop_watchdog_beat_task = self._spawn(
             self._loop_watchdog.heartbeat_loop(),
