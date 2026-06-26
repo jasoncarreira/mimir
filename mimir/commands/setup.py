@@ -8,6 +8,7 @@ them for backward compatibility.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import re
@@ -393,6 +394,14 @@ def _default_saga_toml(
         # Confidence gating with low floor (drops sub-0.15 noise).
         enable_confidence_gating = true
         default_min_confidence_tier = "low"
+        # Session-boundary summaries are a secondary routing lane into atoms:
+        # search top 3 sessions, expand to up to 30 atoms/session, fuse at
+        # half-weight so semantic/keyword remain primary.
+        enable_session_boundary_rrf = true
+        session_boundary_weight = 0.5
+        session_boundary_limit = 3
+        session_boundary_alpha = 0.7
+        session_boundary_atoms_per_session = 30
 
         [retrieval_v2]
         # P12 (synonym expansion on the keyword pathway). The only

@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import sys
 import types
-from pathlib import Path
 
 import pytest
 
@@ -83,6 +81,43 @@ def _make_synthetic_question() -> dict:
             ],
         ],
     }
+
+
+def test_runner_parser_defaults_to_boundary_rrf_adoption_settings():
+    from benchmarks.longmemeval_via_memory import runner as r
+
+    parser = r.build_arg_parser()
+    args = parser.parse_args(["--run-tag", "defaults_smoke"])
+
+    assert args.session_boundary_treatment == "generated"
+    assert args.no_session_boundary_rrf_lane is False
+    assert args.session_boundary_weight == 0.5
+    assert args.session_boundary_limit == 3
+    assert args.session_boundary_alpha == 0.7
+    assert args.session_boundary_atoms_per_session == 30
+
+
+def test_runner_parser_preserves_boundary_ablation_flags():
+    from benchmarks.longmemeval_via_memory import runner as r
+
+    parser = r.build_arg_parser()
+    args = parser.parse_args([
+        "--run-tag", "ablation_smoke",
+        "--session-boundary-treatment", "none",
+        "--no-session-boundary-rrf-lane",
+        "--session-boundary-weight", "0.25",
+        "--session-boundary-limit", "5",
+        "--session-boundary-alpha", "0.4",
+        "--session-boundary-atoms-per-session", "10",
+    ])
+
+    assert args.session_boundary_treatment == "none"
+    assert args.no_session_boundary_rrf_lane is True
+    assert args.session_boundary_weight == 0.25
+    assert args.session_boundary_limit == 5
+    assert args.session_boundary_alpha == 0.4
+    assert args.session_boundary_atoms_per_session == 10
+
 
 
 @pytest.mark.asyncio
@@ -185,10 +220,18 @@ async def test_runner_completes_one_question(tmp_path, monkeypatch):
     # uses mimir.saga._llm.call_llm; replace with a deterministic stub.
     import mimir.saga._llm as _mm_llm
     async def _fake_call_llm(*args, **kwargs):
+        text = kwargs.get("prompt") or json.dumps(args)
+        if "summary" in text:
+            return json.dumps({
+                "summary": "Alice reply preference session.",
+                "topics_discussed": ["reply preference"],
+                "decisions_made": ["keep replies concise"],
+                "unfinished": [],
+                "emotional_state": "neutral",
+            })
         return "OBSERVATION:\nAlice consistently prefers concise replies."
     monkeypatch.setattr(_mm_llm, "call_llm", _fake_call_llm)
 
-    from mimir.saga.client import SagaStore
     from benchmarks.longmemeval_via_memory import runner as r
 
     # Override the default embedding_dim to match the stub (4d).
@@ -493,7 +536,7 @@ async def test_capture_reader_prompt_writes_debug_without_bloating_metrics(
         keep_dbs=False,
         no_consolidate=True,
         session_boundary_treatment="none",
-        session_boundary_rrf_lane=False,
+        no_session_boundary_rrf_lane=True,
         session_boundary_limit=3,
         session_boundary_alpha=0.7,
         session_boundary_weight=0.5,

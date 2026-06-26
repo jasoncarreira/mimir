@@ -5,18 +5,19 @@ This is the current LongMemEval bench runner for the in-repo
 per-question SQLite DB, runs retrieval, writes hypotheses and metrics JSONL,
 and can optionally exercise the corrected session-boundary treatment.
 
-Do not launch the 163-question adoption slice until the review smoke below has
-been inspected.
+Session-boundary RRF is now the default treatment. Keep the flags below for
+ablation and weighting sweeps when running a more comprehensive benchmark.
 
 ## Review Before Run: Session-Boundary Treatment
 
 The corrected treatment is:
 
-- write generated session boundaries as real `sessions` rows with
-  `--session-boundary-treatment generated`
+- write generated session boundaries as real `sessions` rows (default
+  `--session-boundary-treatment generated`)
 - retrieve matching sessions with `SagaStore.search_sessions()`
 - promote atoms from those matched sessions into retrieval through a
-  `session_boundary` RRF pathway with `--session-boundary-rrf-lane`
+  default-on `session_boundary` RRF pathway; use
+  `--no-session-boundary-rrf-lane` only for ablations
 
 An earlier deterministic-summary-rendering approach (PR #878, closed) was a
 different design. It would have rendered summaries as a separate reader prompt
@@ -37,7 +38,6 @@ uv run python -m benchmarks.longmemeval_via_memory.runner \
   --work-dir results/longmemeval_via_memory/session_boundary_review_smoke/work \
   --keep-dbs \
   --session-boundary-treatment generated \
-  --session-boundary-rrf-lane \
   --session-boundary-weight 0.5 \
   --session-boundary-limit 3 \
   --session-boundary-alpha 0.7 \
@@ -67,10 +67,12 @@ uv run python -m benchmarks.longmemeval_via_memory.runner \
   --run-tag session_boundary_163_baseline \
   --output-dir results/longmemeval_via_memory/session_boundary_163_baseline \
   --work-dir results/longmemeval_via_memory/session_boundary_163_baseline/work \
-  --session-boundary-treatment none
+  --session-boundary-treatment none \
+  --no-session-boundary-rrf-lane
 ```
 
-Treatment command shape:
+Treatment command shape (now the default settings; flags shown so sweeps can
+change one dial at a time):
 
 ```sh
 uv run python -m benchmarks.longmemeval_via_memory.runner \
@@ -79,7 +81,6 @@ uv run python -m benchmarks.longmemeval_via_memory.runner \
   --output-dir results/longmemeval_via_memory/session_boundary_163_treatment \
   --work-dir results/longmemeval_via_memory/session_boundary_163_treatment/work \
   --session-boundary-treatment generated \
-  --session-boundary-rrf-lane \
   --session-boundary-weight 0.5 \
   --session-boundary-limit 3 \
   --session-boundary-alpha 0.7 \

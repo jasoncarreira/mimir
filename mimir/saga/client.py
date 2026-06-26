@@ -39,8 +39,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-log = logging.getLogger(__name__)
-
 from . import migrations as _migrations
 from .mark_access import AccessEvent, mark_access
 from .recall import recall as _recall
@@ -50,9 +48,10 @@ from .reflect import (
     reflect as _reflect,
     recent_session_boundaries as _recent_boundaries,
 )
-from .forget import forget as _forget
 from .fts import fts_search
 from .vector_index import VectorIndex
+
+log = logging.getLogger(__name__)
 
 
 # ─── Provider/index adapters ─────────────────────────────────────────
@@ -644,6 +643,11 @@ class SagaStore:
         pre_rewritten_query: str | None = None,
         extra_atom_ranked_pathways: Mapping[str, Iterable[str]] | None = None,
         rrf_pathway_weights: Mapping[str, float] | None = None,
+        enable_session_boundary_rrf: bool | None = None,
+        session_boundary_limit: int | None = None,
+        session_boundary_alpha: float | None = None,
+        session_boundary_weight: float | None = None,
+        session_boundary_atoms_per_session: int | None = None,
     ) -> dict[str, Any]:
         # Three paths into the rewrite:
         # 1. Caller pre-resolved the rewrite via ``contextual_rewrite()``
@@ -687,7 +691,88 @@ class SagaStore:
                 rewritten_query = None
         effective_query = rewritten_query or query
 
+        cfg = None
+        if enable_session_boundary_rrf is None:
+            from ._config_io import get_config
+            cfg = get_config()
+            enable_session_boundary_rrf = bool(
+                cfg("retrieval", "enable_session_boundary_rrf", True)
+            )
+
+        extra_pathways_base = (
+            dict(extra_atom_ranked_pathways)
+            if extra_atom_ranked_pathways is not None
+            else None
+        )
+        pathway_weights_base = (
+            dict(rrf_pathway_weights)
+            if rrf_pathway_weights is not None
+            else None
+        )
+        boundary_limit = boundary_alpha = boundary_weight = None
+        boundary_atoms_per_session = None
+        should_add_boundary_pathway = bool(
+            enable_session_boundary_rrf
+            and (
+                extra_pathways_base is None
+                or "session_boundary" not in extra_pathways_base
+            )
+        )
+        if should_add_boundary_pathway:
+            if cfg is None:
+                from ._config_io import get_config
+                cfg = get_config()
+            boundary_limit = int(
+                session_boundary_limit
+                if session_boundary_limit is not None
+                else cfg("retrieval", "session_boundary_limit", 3)
+            )
+            boundary_alpha = float(
+                session_boundary_alpha
+                if session_boundary_alpha is not None
+                else cfg("retrieval", "session_boundary_alpha", 0.7)
+            )
+            boundary_weight = float(
+                session_boundary_weight
+                if session_boundary_weight is not None
+                else cfg("retrieval", "session_boundary_weight", 0.5)
+            )
+            boundary_atoms_per_session = int(
+                session_boundary_atoms_per_session
+                if session_boundary_atoms_per_session is not None
+                else cfg("retrieval", "session_boundary_atoms_per_session", 30)
+            )
+
         def _do_with_conn(conn: sqlite3.Connection) -> dict[str, Any]:
+            # Compute the query embedding ONCE per query() call — both recall
+            # and session-boundary routing can use it. The underlying provider
+            # call (~50-300ms on voyage) is the heaviest non-LLM step.
+            query_emb = _query_embed_sync(effective_query)
+            extra_pathways = (
+                dict(extra_pathways_base)
+                if extra_pathways_base is not None
+                else None
+            )
+            pathway_weights = (
+                dict(pathway_weights_base)
+                if pathway_weights_base is not None
+                else None
+            )
+            if should_add_boundary_pathway:
+                boundary_atom_ids = self._session_boundary_atom_pathway_with_conn(
+                    conn,
+                    effective_query,
+                    limit=boundary_limit or 0,
+                    alpha=boundary_alpha or 0.0,
+                    atoms_per_session=boundary_atoms_per_session or 0,
+                    query_emb=query_emb,
+                )
+                if boundary_atom_ids:
+                    extra_pathways = extra_pathways or {}
+                    extra_pathways["session_boundary"] = boundary_atom_ids
+                    pathway_weights = pathway_weights or {}
+                    pathway_weights["session_boundary"] = boundary_weight or 0.5
+
             with self._index_lock:
                 index = self._ensure_index(conn)
             # Triple-augment pathway uses the SAME embedding dim as the
@@ -695,12 +780,6 @@ class SagaStore:
             # same provider). Pass dim through so triples with a stale
             # dim get filtered.
             triple_dim = self._embedding_dim
-            # Compute the query embedding ONCE per query() call —
-            # both _recall and top_triples_with_payload need it, and
-            # the underlying provider call (~50-300ms on voyage) is
-            # the heaviest non-LLM step. Cache it locally and feed
-            # both consumers from the same value.
-            query_emb = _query_embed_sync(effective_query)
             result = _recall(
                 conn, effective_query,
                 query_embed_fn=lambda _q: query_emb,
@@ -712,8 +791,8 @@ class SagaStore:
                 triple_search_fn=_make_triple_search_fn(
                     conn, dim=triple_dim, reference_date=reference_date,
                 ),
-                extra_atom_ranked_pathways=extra_atom_ranked_pathways,
-                rrf_pathway_weights=rrf_pathway_weights,
+                extra_atom_ranked_pathways=extra_pathways,
+                rrf_pathway_weights=pathway_weights,
                 k=top_k,
                 session_id=session_id,
                 agent_id=self._agent_id,
@@ -778,6 +857,99 @@ class SagaStore:
         if self._db_path is None:
             return await self._db_locked(_do)
         return await asyncio.to_thread(_do)
+
+    def _session_boundary_atom_pathway_with_conn(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        *,
+        limit: int = 3,
+        alpha: float = 0.7,
+        atoms_per_session: int = 30,
+        query_emb: list[float] | None = None,
+    ) -> list[str]:
+        """Search session boundaries and expand matched sessions to atom ids.
+
+        Session summaries are routing signals only: they are not rendered to
+        the reader/prompt. Matched sessions contribute their member atoms as a
+        bounded extra RRF pathway. This helper deliberately uses the caller's
+        connection so default-on boundary recall does not double per-query
+        sqlite connection churn.
+        """
+        limit = max(0, int(limit))
+        cap = max(0, int(atoms_per_session))
+        if limit <= 0 or cap <= 0:
+            return []
+        # New / cold homes have no session boundaries yet. Avoid the session
+        # vector-search/index path entirely in that common case; query() already
+        # computes one embedding for atom recall, and the boundary lane must not
+        # add an empty-session round trip on top.
+        if conn.execute("SELECT 1 FROM sessions LIMIT 1").fetchone() is None:
+            return []
+
+        try:
+            matched_sessions = self._search_sessions_with_conn(
+                conn,
+                query,
+                alpha=alpha,
+                limit=limit,
+                query_emb=query_emb,
+            )
+        except Exception:  # noqa: BLE001 — boundary recall is auxiliary
+            log.warning("session-boundary RRF search failed", exc_info=True)
+            return []
+        if not matched_sessions:
+            return []
+
+        atom_ids: list[str] = []
+        seen: set[str] = set()
+        for session in matched_sessions:
+            sid = session.get("session_id")
+            if not sid:
+                continue
+            rows = conn.execute(
+                """
+                SELECT id
+                  FROM atoms
+                 WHERE session_id = ?
+                   AND tombstoned = 0
+                 ORDER BY created_at, rowid
+                 LIMIT ?
+                """,
+                (sid, cap),
+            ).fetchall()
+            for (atom_id,) in rows:
+                if atom_id not in seen:
+                    atom_ids.append(atom_id)
+                    seen.add(atom_id)
+        return atom_ids
+
+    async def _session_boundary_atom_pathway(
+        self,
+        query: str,
+        *,
+        limit: int = 3,
+        alpha: float = 0.7,
+        atoms_per_session: int = 30,
+    ) -> list[str]:
+        def _do():
+            conn, should_close = self._operation_conn()
+            try:
+                return self._session_boundary_atom_pathway_with_conn(
+                    conn,
+                    query,
+                    limit=limit,
+                    alpha=alpha,
+                    atoms_per_session=atoms_per_session,
+                )
+            finally:
+                if should_close:
+                    conn.close()
+
+        if self._db_path is None:
+            return await self._db_locked(_do)
+        return await asyncio.to_thread(_do)
+
 
     async def get_atoms(self, ids: list[str]) -> dict[str, Any]:
         """Batch-load atoms by exact id. Pure read — no semantic search, no
@@ -1215,8 +1387,7 @@ class SagaStore:
         # Re-fetches raws so the tombstoned duplicates from pass 1
         # don't appear as candidates for thematic clustering.
         from .consolidate import (
-            _candidate_raws, MIN_CLUSTER_SIZE_FOR_OBSERVATION,
-            MAX_OBSERVATIONS_PER_RUN,
+            _candidate_raws, MAX_OBSERVATIONS_PER_RUN,
         )
         # chainlink #386: shared-connection reads run under _db_lock so a
         # concurrent turn's write (also _db_lock-guarded) never touches the same
@@ -1811,6 +1982,127 @@ class SagaStore:
             return await self._db_locked(_do)
         return await asyncio.to_thread(_do)
 
+    def _search_sessions_with_conn(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        *,
+        channel_id: str | None = None,
+        alpha: float = 0.7,
+        limit: int = 10,
+        query_emb: list[float] | None = None,
+    ) -> list[dict]:
+        """Connection-scoped implementation for :meth:`search_sessions`.
+
+        Keeping this synchronous helper separate lets default-on query() run
+        boundary routing on the same short-lived per-query connection as atom
+        recall, preserving the one-connection-per-read invariant.
+        """
+        import math
+
+        if query_emb is None:
+            query_emb = _query_embed_sync(query) if alpha > 0.0 else []
+
+        # ── Step 1: build similarity map from sessions FAISS index ──
+        sim_map: dict[str, float] = {}  # session_id → cosine similarity
+
+        if query_emb:
+            with self._sessions_index_lock:
+                index = self._ensure_sessions_index(conn)
+            if index is not None:
+                for sess_id, score in index.search(
+                    query_emb, top_k=min(limit * 4, 200)
+                ):
+                    sim_map[sess_id] = float(score)
+
+            if not sim_map:
+                # Python cosine fallback (FAISS unavailable or empty).
+                import struct as _struct
+                q_norm = math.sqrt(sum(x * x for x in query_emb)) + 1e-9
+                dim = len(query_emb)
+                for (sess_id, emb_blob) in conn.execute(
+                    "SELECT id, embedding FROM sessions WHERE embedding IS NOT NULL"
+                ).fetchall():
+                    if not emb_blob:
+                        continue
+                    # #432: a stored embedding from a different-dim provider
+                    # (after a provider switch) must not be unpacked at the
+                    # QUERY dim — ``emb_blob[:dim*4]`` would silently truncate
+                    # a larger vector into a clean-but-meaningless similarity,
+                    # precisely when the FAISS path is empty due to dim
+                    # filtering. Require an exact byte-length match (mirrors
+                    # the dim guard in store.py's cosine path).
+                    if len(emb_blob) != dim * 4:
+                        continue
+                    try:
+                        e_arr = _struct.unpack(f"{dim}f", emb_blob)
+                        dot = sum(a * b for a, b in zip(query_emb, e_arr))
+                        e_norm = math.sqrt(sum(x * x for x in e_arr)) + 1e-9
+                        sim_map[sess_id] = dot / (q_norm * e_norm)
+                    except Exception:
+                        continue
+
+        # ── Step 2: fetch sessions rows ──
+        channel_clause = "WHERE channel_id = ?" if channel_id else ""
+        params: list = [channel_id] if channel_id else []
+
+        rows = conn.execute(
+            f"""
+            SELECT id, channel_id, started_at, ended_at, summary, reflected_at
+            FROM sessions
+            {channel_clause}
+            ORDER BY COALESCE(ended_at, reflected_at) DESC
+            LIMIT 500
+            """,
+            params,
+        ).fetchall()
+
+        # ── Step 3: score each session ──
+        now_ts = datetime.now(tz=timezone.utc).timestamp()
+        results: list[dict] = []
+        for (sess_id, ch_id, started_at, ended_at, summary, reflected_at) in rows:
+            sim = sim_map.get(sess_id, 0.0)
+
+            # Recency reference: ended_at, falling back to reflected_at —
+            # mirrors the SQL ``ORDER BY COALESCE(ended_at, reflected_at)``.
+            # chainlink #253: previously this used ``ended_at`` only and,
+            # on a NULL/empty value, ``fromisoformat("")`` raised → except
+            # set ref_ts = now → recency 1.0 (scored NEWEST). That inverted
+            # the ranking for any session row with a NULL ended_at (e.g.
+            # the migration-2 backfill path) — a never-properly-ended
+            # session out-ranked genuinely recent ones. Now: consult
+            # reflected_at too, and when there's NO usable timestamp at
+            # all, score recency 0.0 (rank LAST), matching SQLite's
+            # NULLS-LAST ordering for the same COALESCE.
+            ref_str = ended_at or reflected_at or ""
+            ref_ts: float | None
+            try:
+                if ref_str.endswith("Z"):
+                    ref_str = ref_str[:-1] + "+00:00"
+                ref_ts = datetime.fromisoformat(ref_str).timestamp()
+            except (ValueError, AttributeError):
+                ref_ts = None
+            if ref_ts is None:
+                recency = 0.0
+            else:
+                age_days = max(0.0, (now_ts - ref_ts) / 86400.0)
+                recency = math.exp(-math.log(2) / 30.0 * age_days)
+
+            blended = alpha * sim + (1.0 - alpha) * recency
+            results.append({
+                "session_id": sess_id,
+                "channel_id": ch_id,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "summary": summary or "",
+                "similarity_score": round(sim, 6),
+                "recency_score": round(recency, 6),
+                "blended_score": round(blended, 6),
+            })
+
+        results.sort(key=lambda r: r["blended_score"], reverse=True)
+        return results[:limit]
+
     async def search_sessions(
         self,
         query: str,
@@ -1847,121 +2139,25 @@ class SagaStore:
                 similarity_score, recency_score, blended_score
             Sorted descending by blended_score.
         """
-        import math
-
         # Skip the embed round-trip when alpha=0 (pure recency — cosine score
-        # is never consulted).  The downstream _do() handles query_emb==[] via
+        # is never consulted).  The downstream helper handles query_emb==[] via
         # the existing ``if query_emb:`` guard, so the recency path still works.
         if alpha > 0.0:
             query_emb: list[float] = await asyncio.to_thread(_query_embed_sync, query)
         else:
             query_emb = []
 
-        def _do_with_conn(conn: sqlite3.Connection) -> list[dict]:
-            # ── Step 1: build similarity map from sessions FAISS index ──
-            sim_map: dict[str, float] = {}  # session_id → cosine similarity
-
-            if query_emb:
-                with self._sessions_index_lock:
-                    index = self._ensure_sessions_index(conn)
-                if index is not None:
-                    for sess_id, score in index.search(
-                        query_emb, top_k=min(limit * 4, 200)
-                    ):
-                        sim_map[sess_id] = float(score)
-
-                if not sim_map:
-                    # Python cosine fallback (FAISS unavailable or empty).
-                    import struct as _struct
-                    q_norm = math.sqrt(sum(x * x for x in query_emb)) + 1e-9
-                    dim = len(query_emb)
-                    for (sess_id, emb_blob) in conn.execute(
-                        "SELECT id, embedding FROM sessions WHERE embedding IS NOT NULL"
-                    ).fetchall():
-                        if not emb_blob:
-                            continue
-                        # #432: a stored embedding from a different-dim provider
-                        # (after a provider switch) must not be unpacked at the
-                        # QUERY dim — ``emb_blob[:dim*4]`` would silently truncate
-                        # a larger vector into a clean-but-meaningless similarity,
-                        # precisely when the FAISS path is empty due to dim
-                        # filtering. Require an exact byte-length match (mirrors
-                        # the dim guard in store.py's cosine path).
-                        if len(emb_blob) != dim * 4:
-                            continue
-                        try:
-                            e_arr = _struct.unpack(f"{dim}f", emb_blob)
-                            dot = sum(a * b for a, b in zip(query_emb, e_arr))
-                            e_norm = math.sqrt(sum(x * x for x in e_arr)) + 1e-9
-                            sim_map[sess_id] = dot / (q_norm * e_norm)
-                        except Exception:
-                            continue
-
-            # ── Step 2: fetch sessions rows ──
-            channel_clause = "WHERE channel_id = ?" if channel_id else ""
-            params: list = [channel_id] if channel_id else []
-
-            rows = conn.execute(
-                f"""
-                SELECT id, channel_id, started_at, ended_at, summary, reflected_at
-                FROM sessions
-                {channel_clause}
-                ORDER BY COALESCE(ended_at, reflected_at) DESC
-                LIMIT 500
-                """,
-                params,
-            ).fetchall()
-
-            # ── Step 3: score each session ──
-            now_ts = datetime.now(tz=timezone.utc).timestamp()
-            results: list[dict] = []
-            for (sess_id, ch_id, started_at, ended_at, summary, reflected_at) in rows:
-                sim = sim_map.get(sess_id, 0.0)
-
-                # Recency reference: ended_at, falling back to reflected_at —
-                # mirrors the SQL ``ORDER BY COALESCE(ended_at, reflected_at)``.
-                # chainlink #253: previously this used ``ended_at`` only and,
-                # on a NULL/empty value, ``fromisoformat("")`` raised → except
-                # set ref_ts = now → recency 1.0 (scored NEWEST). That inverted
-                # the ranking for any session row with a NULL ended_at (e.g.
-                # the migration-2 backfill path) — a never-properly-ended
-                # session out-ranked genuinely recent ones. Now: consult
-                # reflected_at too, and when there's NO usable timestamp at
-                # all, score recency 0.0 (rank LAST), matching SQLite's
-                # NULLS-LAST ordering for the same COALESCE.
-                ref_str = ended_at or reflected_at or ""
-                ref_ts: float | None
-                try:
-                    if ref_str.endswith("Z"):
-                        ref_str = ref_str[:-1] + "+00:00"
-                    ref_ts = datetime.fromisoformat(ref_str).timestamp()
-                except (ValueError, AttributeError):
-                    ref_ts = None
-                if ref_ts is None:
-                    recency = 0.0
-                else:
-                    age_days = max(0.0, (now_ts - ref_ts) / 86400.0)
-                    recency = math.exp(-math.log(2) / 30.0 * age_days)
-
-                blended = alpha * sim + (1.0 - alpha) * recency
-                results.append({
-                    "session_id": sess_id,
-                    "channel_id": ch_id,
-                    "started_at": started_at,
-                    "ended_at": ended_at,
-                    "summary": summary or "",
-                    "similarity_score": round(sim, 6),
-                    "recency_score": round(recency, 6),
-                    "blended_score": round(blended, 6),
-                })
-
-            results.sort(key=lambda r: r["blended_score"], reverse=True)
-            return results[:limit]
-
         def _do() -> list[dict]:
             conn, should_close = self._operation_conn()
             try:
-                return _do_with_conn(conn)
+                return self._search_sessions_with_conn(
+                    conn,
+                    query,
+                    channel_id=channel_id,
+                    alpha=alpha,
+                    limit=limit,
+                    query_emb=query_emb,
+                )
             finally:
                 if should_close:
                     conn.close()
