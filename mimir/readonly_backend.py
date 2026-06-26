@@ -433,8 +433,9 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     # Return a clear, actionable error RESULT instead. We return rather than
     # raise: deepagents' middleware wraps only ``validate_path`` (not the backend
     # call) in try/except, so a raise from ``_resolve_path`` would propagate
-    # uncaught. Scoped to read/ls (the documented false-not-found / empty-ls
-    # symptoms); writes are already handled by WriteGuardBackend.
+    # uncaught. Route backends are plain ``_RootAwareFilesystemBackend`` instances
+    # (no WriteGuard wrapper), so read/ls/write/edit all catch the ValueError that
+    # ``_resolve_path`` raises when a ..-free symlink resolves outside ``cwd``.
 
     def _outside_root_msg(self, key: str) -> str:
         return (
@@ -444,13 +445,21 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
             f"MIMIR_FILE_TOOL_ROOTS."
         )
 
+    def _path_value_error_msg(self, key: str, exc: ValueError) -> str:
+        if "outside root directory" in str(exc):
+            return self._outside_root_msg(key)
+        return str(exc)
+
     def _is_outside_root(self, key: str) -> bool:
         return self._guard_outside_root and _real_path_outside_root(key, self.cwd) is not None
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
             return ReadResult(error=self._outside_root_msg(file_path))
-        return super().read(file_path, offset, limit)
+        try:
+            return super().read(file_path, offset, limit)
+        except ValueError as e:
+            return ReadResult(error=self._path_value_error_msg(file_path, e))
 
     async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
@@ -460,12 +469,45 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     def ls(self, path: str) -> LsResult:
         if self._is_outside_root(path):
             return LsResult(error=self._outside_root_msg(path))
-        return super().ls(path)
+        try:
+            return super().ls(path)
+        except ValueError as e:
+            return LsResult(error=self._path_value_error_msg(path, e))
 
     async def als(self, path: str) -> LsResult:
         if self._is_outside_root(path):
             return LsResult(error=self._outside_root_msg(path))
         return await super().als(path)
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        try:
+            return super().write(file_path, content)
+        except ValueError as e:
+            return WriteResult(error=self._path_value_error_msg(file_path, e))
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        return await super().awrite(file_path, content)
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        try:
+            return super().edit(file_path, old_string, new_string, replace_all)
+        except ValueError as e:
+            return EditResult(error=self._path_value_error_msg(file_path, e))
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        return await super().aedit(file_path, old_string, new_string, replace_all)
 
 
 def _normalize_writable_dir(name: str) -> str | None:
