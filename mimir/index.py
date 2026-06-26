@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .core_blocks import describe_file, read_text_lossy
-from .index_skip import is_index_skipped
+from .index_skip import deployment_index_skip_entries, is_index_skipped
 
 log = logging.getLogger(__name__)
 
@@ -271,11 +271,12 @@ def build_state_index(home: Path) -> str:
     file in INDEX.md while the indexer skips it is a misleading promise
     to the agent."""
     state_root = home / "state"
+    deployment_entries = deployment_index_skip_entries(home)
     files = _walk_tree(state_root, exclude_names={"INDEX.md"})
     files = [
         p for p in files
         if (rel := f"state/{p.relative_to(state_root).as_posix()}")
-        and not is_index_skipped(rel, home)
+        and not is_index_skipped(rel, home, deployment_entries)
     ]
     entries = _build_entries(state_root, files)
     return render_state_index(entries)

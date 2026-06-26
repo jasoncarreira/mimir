@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Iterable, Protocol
 
 from .core_blocks import describe_file
-from .index_skip import INDEX_SKIP_PATHS, INDEX_SKIP_PREFIXES, is_index_skipped
+from .index_skip import is_index_skipped
 
 log = logging.getLogger(__name__)
 

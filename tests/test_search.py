@@ -24,7 +24,7 @@ from mimir.search import (
     _classify_scope,
     _to_fts_query,
 )
-from mimir.index_skip import INDEX_SKIP_PATHS, INDEX_SKIP_PREFIXES
+from mimir.index_skip import INDEX_SKIP_PATHS, INDEX_SKIP_PREFIXES, is_index_skipped
 
 # ``mimir.hooks`` and ``mimir.searchtools`` were retired in the
 # deepagents migration (post-PR #185 merge target). Tests that use
@@ -162,7 +162,7 @@ def test_classify_scope_honors_deployment_index_skip_file(tmp_path: Path):
     skip_file.parent.mkdir()
     skip_file.write_text(
         "# local operator experiments\n"
-        "state/openclaw-tools/\n"
+        "state/openclaw-tools\n"
         "\n"
         "state/hermes-npm-inspect/\n"
     )
@@ -174,7 +174,19 @@ def test_classify_scope_honors_deployment_index_skip_file(tmp_path: Path):
         is None
     )
     assert _classify_scope("state/hermes-npm-inspect/pkg/README.md", tmp_path) is None
+    assert _classify_scope("state/openclaw-tools-notes.md", tmp_path) == "state"
+    assert _classify_scope("state/hermes-npm-inspect-notes.md", tmp_path) == "state"
     assert _classify_scope("state/seeds/x.md", tmp_path) == "state"
+
+
+def test_deployment_index_skip_file_matches_exact_file_entries(tmp_path: Path):
+    skip_file = tmp_path / ".mimir" / "index-skip.txt"
+    skip_file.parent.mkdir()
+    skip_file.write_text("state/local-notes.md\n")
+
+    assert is_index_skipped("state/local-notes.md", tmp_path)
+    assert not is_index_skipped("state/local-notes.md.bak", tmp_path)
+    assert not is_index_skipped("state/local-notes-other.md", tmp_path)
 
 
 # ---- FTS sanitization ----------------------------------------------------

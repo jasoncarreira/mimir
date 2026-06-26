@@ -132,21 +132,29 @@ def test_build_state_index_honors_deployment_index_skip_file(tmp_path: Path):
     (state / "hermes-npm-inspect" / "pkg" / "README.md").write_text(
         "<!-- desc: hermes package readme -->\nbody"
     )
+    (state / "openclaw-tools-notes.md").write_text(
+        "<!-- desc: openclaw sibling notes -->\nbody"
+    )
+    (state / "hermes-npm-inspect-notes.md").write_text(
+        "<!-- desc: hermes sibling notes -->\nbody"
+    )
     (state / "reports").mkdir()
     (state / "reports" / "kept.md").write_text("<!-- desc: durable report -->\nbody")
     skip_file = tmp_path / ".mimir" / "index-skip.txt"
     skip_file.parent.mkdir()
     skip_file.write_text(
         "# local operator experiments\n"
-        "state/openclaw-tools/\n"
+        "state/openclaw-tools\n"
         "\n"
         "state/hermes-npm-inspect/\n"
     )
 
     body = build_state_index(tmp_path)
 
-    assert "openclaw-tools" not in body
-    assert "hermes-npm-inspect" not in body
+    assert "openclaw-tools/node_modules/openclaw/README.md" not in body
+    assert "hermes-npm-inspect/pkg/README.md" not in body
+    assert "openclaw-tools-notes.md" in body
+    assert "hermes-npm-inspect-notes.md" in body
     assert "reports/kept.md" in body
 
 

@@ -32,21 +32,21 @@ INDEX_SKIP_PREFIXES: tuple[str, ...] = (
 )
 
 
-def _normalize_skip_prefix(line: str) -> str | None:
-    prefix = line.strip().replace("\\", "/")
-    if not prefix or prefix.startswith("#"):
+def _normalize_skip_entry(line: str) -> str | None:
+    entry = line.strip().replace("\\", "/")
+    if not entry or entry.startswith("#"):
         return None
-    prefix = prefix.removeprefix("./").lstrip("/")
-    while "//" in prefix:
-        prefix = prefix.replace("//", "/")
-    parts = Path(prefix).parts
-    if ".." in parts or prefix in {"", "."}:
+    entry = entry.removeprefix("./").lstrip("/")
+    while "//" in entry:
+        entry = entry.replace("//", "/")
+    parts = Path(entry).parts
+    if ".." in parts or entry in {"", "."}:
         return None
-    return prefix
+    return entry.rstrip("/")
 
 
-def deployment_index_skip_prefixes(home: Path | None) -> tuple[str, ...]:
-    """Read ``<home>/.mimir/index-skip.txt`` as home-relative prefixes."""
+def deployment_index_skip_entries(home: Path | None) -> tuple[str, ...]:
+    """Read ``<home>/.mimir/index-skip.txt`` as home-relative entries."""
     if home is None:
         return ()
     path = home / ".mimir" / "index-skip.txt"
@@ -54,18 +54,25 @@ def deployment_index_skip_prefixes(home: Path | None) -> tuple[str, ...]:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return ()
-    prefixes = [
-        prefix
-        for line in lines
-        if (prefix := _normalize_skip_prefix(line)) is not None
-    ]
-    return tuple(prefixes)
+    entries = [entry for line in lines if (entry := _normalize_skip_entry(line)) is not None]
+    return tuple(entries)
 
 
-def is_index_skipped(rel: str, home: Path | None = None) -> bool:
+def _matches_skip_entry(rel: str, entry: str) -> bool:
+    return rel == entry or rel.startswith(f"{entry}/")
+
+
+def is_index_skipped(
+    rel: str, home: Path | None = None, deployment_entries: tuple[str, ...] | None = None
+) -> bool:
     """Return whether a home-relative path is excluded from search/index."""
+    entries = (
+        deployment_index_skip_entries(home)
+        if deployment_entries is None
+        else deployment_entries
+    )
     return (
         rel in INDEX_SKIP_PATHS
         or any(rel.startswith(prefix) for prefix in INDEX_SKIP_PREFIXES)
-        or any(rel.startswith(prefix) for prefix in deployment_index_skip_prefixes(home))
+        or any(_matches_skip_entry(rel, entry) for entry in entries)
     )
