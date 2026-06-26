@@ -2967,7 +2967,7 @@ class Agent:
             event.channel_id or "",
         )
         feedback_block = (
-            self._feedback.recent_block()
+            await asyncio.to_thread(self._feedback.recent_block)
             if self._config.feedback_limit_per_polarity > 0
             else None
         )

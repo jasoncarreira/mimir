@@ -473,6 +473,54 @@ async def test_agent_build_turn_prompt_threads_all_helper_outputs(
 
 
 @pytest.mark.asyncio
+async def test_feedback_block_renders_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for chainlink #681.
+
+    ``FeedbackLog.recent_block`` can refresh and parse events/turns JSONL
+    snapshots. Prompt assembly must not do that synchronous file/CPU work
+    on the dispatcher event loop.
+    """
+    agent = _make_agent(tmp_path)
+    calls: list[str] = []
+
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda: (None, []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda: None)
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id: None)
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda **_kw: None)
+
+    async def _none_summaries(*, channel_id):
+        return None
+
+    monkeypatch.setattr(agent, "_assemble_session_summaries", _none_summaries)
+
+    def recent_block_stub():
+        return "FEEDBACK_SENTINEL"
+
+    monkeypatch.setattr(agent._feedback, "recent_block", recent_block_stub)
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        calls.append(getattr(func, "__name__", repr(func)))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("mimir.agent.asyncio.to_thread", fake_to_thread)
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-feedback",
+        content="hello",
+        author="user-a",
+    )
+    turn_prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, saga_block=None, subagent_block=None,
+    )
+
+    assert "FEEDBACK_SENTINEL" in turn_prompt
+    assert "recent_block_stub" in calls
+
+
+@pytest.mark.asyncio
 async def test_session_summaries_counts_turns_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
