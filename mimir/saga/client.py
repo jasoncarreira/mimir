@@ -39,8 +39,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-log = logging.getLogger(__name__)
-
 from . import migrations as _migrations
 from .mark_access import AccessEvent, mark_access
 from .recall import recall as _recall
@@ -50,9 +48,10 @@ from .reflect import (
     reflect as _reflect,
     recent_session_boundaries as _recent_boundaries,
 )
-from .forget import forget as _forget
 from .fts import fts_search
 from .vector_index import VectorIndex
+
+log = logging.getLogger(__name__)
 
 
 # ─── Provider/index adapters ─────────────────────────────────────────
@@ -644,6 +643,11 @@ class SagaStore:
         pre_rewritten_query: str | None = None,
         extra_atom_ranked_pathways: Mapping[str, Iterable[str]] | None = None,
         rrf_pathway_weights: Mapping[str, float] | None = None,
+        enable_session_boundary_rrf: bool | None = None,
+        session_boundary_limit: int | None = None,
+        session_boundary_alpha: float | None = None,
+        session_boundary_weight: float | None = None,
+        session_boundary_atoms_per_session: int | None = None,
     ) -> dict[str, Any]:
         # Three paths into the rewrite:
         # 1. Caller pre-resolved the rewrite via ``contextual_rewrite()``
@@ -687,6 +691,62 @@ class SagaStore:
                 rewritten_query = None
         effective_query = rewritten_query or query
 
+        cfg = None
+        if enable_session_boundary_rrf is None:
+            from ._config_io import get_config
+            cfg = get_config()
+            enable_session_boundary_rrf = bool(
+                cfg("retrieval", "enable_session_boundary_rrf", True)
+            )
+
+        extra_pathways = (
+            dict(extra_atom_ranked_pathways)
+            if extra_atom_ranked_pathways is not None
+            else None
+        )
+        pathway_weights = (
+            dict(rrf_pathway_weights)
+            if rrf_pathway_weights is not None
+            else None
+        )
+        if enable_session_boundary_rrf and (
+            extra_pathways is None or "session_boundary" not in extra_pathways
+        ):
+            if cfg is None:
+                from ._config_io import get_config
+                cfg = get_config()
+            limit = int(
+                session_boundary_limit
+                if session_boundary_limit is not None
+                else cfg("retrieval", "session_boundary_limit", 3)
+            )
+            alpha = float(
+                session_boundary_alpha
+                if session_boundary_alpha is not None
+                else cfg("retrieval", "session_boundary_alpha", 0.7)
+            )
+            weight = float(
+                session_boundary_weight
+                if session_boundary_weight is not None
+                else cfg("retrieval", "session_boundary_weight", 0.5)
+            )
+            atoms_per_session = int(
+                session_boundary_atoms_per_session
+                if session_boundary_atoms_per_session is not None
+                else cfg("retrieval", "session_boundary_atoms_per_session", 30)
+            )
+            boundary_atom_ids = await self._session_boundary_atom_pathway(
+                effective_query,
+                limit=limit,
+                alpha=alpha,
+                atoms_per_session=atoms_per_session,
+            )
+            if boundary_atom_ids:
+                extra_pathways = extra_pathways or {}
+                extra_pathways["session_boundary"] = boundary_atom_ids
+                pathway_weights = pathway_weights or {}
+                pathway_weights["session_boundary"] = weight
+
         def _do_with_conn(conn: sqlite3.Connection) -> dict[str, Any]:
             with self._index_lock:
                 index = self._ensure_index(conn)
@@ -712,8 +772,8 @@ class SagaStore:
                 triple_search_fn=_make_triple_search_fn(
                     conn, dim=triple_dim, reference_date=reference_date,
                 ),
-                extra_atom_ranked_pathways=extra_atom_ranked_pathways,
-                rrf_pathway_weights=rrf_pathway_weights,
+                extra_atom_ranked_pathways=extra_pathways,
+                rrf_pathway_weights=pathway_weights,
                 k=top_k,
                 session_id=session_id,
                 agent_id=self._agent_id,
@@ -778,6 +838,71 @@ class SagaStore:
         if self._db_path is None:
             return await self._db_locked(_do)
         return await asyncio.to_thread(_do)
+
+    async def _session_boundary_atom_pathway(
+        self,
+        query: str,
+        *,
+        limit: int = 3,
+        alpha: float = 0.7,
+        atoms_per_session: int = 30,
+    ) -> list[str]:
+        """Search session boundaries and expand matched sessions to atom ids.
+
+        Session summaries are routing signals only: they are not rendered to
+        the reader/prompt.  Matched sessions contribute their member atoms as
+        a bounded extra RRF pathway.
+        """
+        try:
+            matched_sessions = await self.search_sessions(
+                query, alpha=alpha, limit=max(0, int(limit)),
+            )
+        except Exception:  # noqa: BLE001 — boundary recall is auxiliary
+            log.warning("session-boundary RRF search failed", exc_info=True)
+            return []
+        if not matched_sessions:
+            return []
+
+        cap = max(0, int(atoms_per_session))
+        if cap <= 0:
+            return []
+
+        def _load_atom_ids_for_sessions(conn: sqlite3.Connection) -> list[str]:
+            atom_ids: list[str] = []
+            seen: set[str] = set()
+            for session in matched_sessions:
+                sid = session.get("session_id")
+                if not sid:
+                    continue
+                rows = conn.execute(
+                    """
+                    SELECT id
+                      FROM atoms
+                     WHERE session_id = ?
+                       AND tombstoned = 0
+                     ORDER BY created_at, rowid
+                     LIMIT ?
+                    """,
+                    (sid, cap),
+                ).fetchall()
+                for (atom_id,) in rows:
+                    if atom_id not in seen:
+                        atom_ids.append(atom_id)
+                        seen.add(atom_id)
+            return atom_ids
+
+        def _do():
+            conn, should_close = self._operation_conn()
+            try:
+                return _load_atom_ids_for_sessions(conn)
+            finally:
+                if should_close:
+                    conn.close()
+
+        if self._db_path is None:
+            return await self._db_locked(lambda: _load_atom_ids_for_sessions(self._ensure_conn()))
+        return await asyncio.to_thread(_do)
+
 
     async def get_atoms(self, ids: list[str]) -> dict[str, Any]:
         """Batch-load atoms by exact id. Pure read — no semantic search, no
@@ -1215,8 +1340,7 @@ class SagaStore:
         # Re-fetches raws so the tombstoned duplicates from pass 1
         # don't appear as candidates for thematic clustering.
         from .consolidate import (
-            _candidate_raws, MIN_CLUSTER_SIZE_FOR_OBSERVATION,
-            MAX_OBSERVATIONS_PER_RUN,
+            _candidate_raws, MAX_OBSERVATIONS_PER_RUN,
         )
         # chainlink #386: shared-connection reads run under _db_lock so a
         # concurrent turn's write (also _db_lock-guarded) never touches the same

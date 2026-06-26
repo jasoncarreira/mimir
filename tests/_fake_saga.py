@@ -4,7 +4,6 @@ on the wire payloads without a network round-trip.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -42,6 +41,11 @@ class FakeSaga:
         context: list[dict[str, str]] | None = None,
         extra_atom_ranked_pathways: Mapping[str, Iterable[str]] | None = None,
         rrf_pathway_weights: Mapping[str, float] | None = None,
+        enable_session_boundary_rrf: bool | None = None,
+        session_boundary_limit: int | None = None,
+        session_boundary_alpha: float | None = None,
+        session_boundary_weight: float | None = None,
+        session_boundary_atoms_per_session: int | None = None,
     ) -> dict[str, Any]:
         self.calls.append(
             _Call(
@@ -54,6 +58,11 @@ class FakeSaga:
                     "context": context,
                     "extra_atom_ranked_pathways": extra_atom_ranked_pathways,
                     "rrf_pathway_weights": rrf_pathway_weights,
+                    "enable_session_boundary_rrf": enable_session_boundary_rrf,
+                    "session_boundary_limit": session_boundary_limit,
+                    "session_boundary_alpha": session_boundary_alpha,
+                    "session_boundary_weight": session_boundary_weight,
+                    "session_boundary_atoms_per_session": session_boundary_atoms_per_session,
                 },
             )
         )

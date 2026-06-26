@@ -11,8 +11,6 @@ port in tier 5 v2.
 from __future__ import annotations
 
 import sqlite3
-import struct
-from pathlib import Path
 
 import pytest
 
@@ -26,7 +24,7 @@ def client(tmp_path):
     yield c
 
 
-def _patch_provider(monkeypatch):
+def _patch_provider(monkeypatch, *, enable_session_boundary_rrf: bool = False):
     """Replace saga.embeddings.get_provider with a deterministic stub
     so tests don't need real voyage credentials.
 
@@ -51,6 +49,7 @@ def _patch_provider(monkeypatch):
                 ("embedding", "max_input_chars"): 2000,
                 ("embedding", "provider"): "stub",
                 ("embedding", "model"): "stub-4d",
+                ("retrieval", "enable_session_boundary_rrf"): enable_session_boundary_rrf,
             }.get((section, key), default)
         return cfg
 
@@ -154,6 +153,49 @@ async def test_client_query_returns_two_tier_shape(client, monkeypatch):
     assert "raws" in result
     assert "items_returned" in result
     assert "two_tier" in result
+
+
+@pytest.mark.asyncio
+async def test_query_enables_session_boundary_rrf_by_default(tmp_path, monkeypatch):
+    _patch_provider(monkeypatch, enable_session_boundary_rrf=True)
+    client = SagaStore(db_path=tmp_path / "mimir.saga.db", embedding_dim=4)
+    boundary_atom = await client.store("Alice prefers concise replies", session_id="s1")
+    await client.store("Bob likes verbose explanations", session_id="s2")
+    await client.end_session("s1", "Alice reply preferences")
+    await client.end_session("s2", "Bob reply preferences")
+
+    async def fake_search_sessions(query, *, channel_id=None, alpha=0.7, limit=10):
+        assert query == "unmatched-query"
+        assert alpha == 0.7
+        assert limit == 3
+        return [{"session_id": "s1", "blended_score": 1.0}]
+
+    monkeypatch.setattr(client, "search_sessions", fake_search_sessions)
+    monkeypatch.setattr(client, "_ensure_index", lambda conn: None)
+
+    result = await client.query("unmatched-query", top_k=5)
+
+    assert [a["id"] for a in result["raws"]] == [boundary_atom["atom_id"]]
+
+
+@pytest.mark.asyncio
+async def test_query_can_disable_session_boundary_rrf(tmp_path, monkeypatch):
+    _patch_provider(monkeypatch)
+    client = SagaStore(db_path=tmp_path / "mimir.saga.db", embedding_dim=4)
+    await client.store("Alice prefers concise replies", session_id="s1")
+    await client.end_session("s1", "Alice reply preferences")
+
+    async def unexpected_search_sessions(*args, **kwargs):
+        raise AssertionError("session boundary lane should be disabled")
+
+    monkeypatch.setattr(client, "search_sessions", unexpected_search_sessions)
+    monkeypatch.setattr(client, "_ensure_index", lambda conn: None)
+
+    result = await client.query(
+        "unmatched-query", top_k=5, enable_session_boundary_rrf=False,
+    )
+
+    assert result["raws"] == []
 
 
 @pytest.mark.asyncio
@@ -338,7 +380,7 @@ async def test_client_forget_dry_run(client, monkeypatch):
 async def test_client_most_retrieved_atoms(client, monkeypatch):
     """The mapping to access_events for "what got retrieved most"."""
     _patch_provider(monkeypatch)
-    r = await client.store("atom to retrieve")
+    await client.store("atom to retrieve")
     # Fire a few retrievals.
     for _ in range(3):
         await client.query("atom to retrieve")

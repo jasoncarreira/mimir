@@ -142,6 +142,11 @@ def test_setup_writes_saga_toml(tmp_path: Path):
     body = saga_toml.read_text()
     # mimir-prod overrides — contextual rewrite + two-tier + extraction on.
     assert "enable_contextual_rewrite = true" in body
+    assert "enable_session_boundary_rrf = true" in body
+    assert "session_boundary_weight = 0.5" in body
+    assert "session_boundary_limit = 3" in body
+    assert "session_boundary_alpha = 0.7" in body
+    assert "session_boundary_atoms_per_session = 30" in body
     assert "two_tier_enabled = true" in body
     assert "enable_extraction = true" in body
     # db_path lives under <home>/.mimir/.

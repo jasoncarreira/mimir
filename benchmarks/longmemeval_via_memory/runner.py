@@ -496,7 +496,7 @@ async def _run_one(
     keep_db: bool,
     consolidate_enabled: bool,
     session_boundary_treatment: str = "none",
-    session_boundary_rrf_lane: bool = False,
+    session_boundary_rrf_lane: bool = True,
     session_boundary_limit: int = 3,
     session_boundary_alpha: float = 0.7,
     session_boundary_weight: float = 0.5,
@@ -647,6 +647,10 @@ async def _run_one(
             reference_date=ref_date,
             extra_atom_ranked_pathways=extra_atom_ranked_pathways,
             rrf_pathway_weights=rrf_pathway_weights,
+            # The benchmark manages the session-boundary lane explicitly so
+            # no-boundary ablations stay clean even though production query()
+            # defaults the lane on.
+            enable_session_boundary_rrf=False,
         )
         metrics["retrieve_s"] = round(time.time() - t0, 2)
         metrics["n_observations"] = len(retrieved.get("observations", []))
@@ -782,7 +786,7 @@ async def _amain(args) -> int:
             keep_db=args.keep_dbs,
             consolidate_enabled=not args.no_consolidate,
             session_boundary_treatment=args.session_boundary_treatment,
-            session_boundary_rrf_lane=args.session_boundary_rrf_lane,
+            session_boundary_rrf_lane=not getattr(args, "no_session_boundary_rrf_lane", False),
             session_boundary_limit=args.session_boundary_limit,
             session_boundary_alpha=args.session_boundary_alpha,
             session_boundary_weight=args.session_boundary_weight,
@@ -862,7 +866,7 @@ async def _amain(args) -> int:
     return 0 if errors == 0 else 1
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="benchmarks.longmemeval_via_memory.runner",
         description=(
@@ -916,21 +920,31 @@ def main() -> None:
     ap.add_argument(
         "--session-boundary-treatment",
         choices=("none", "generated"),
-        default="none",
+        default="generated",
         help=(
             "bench-only session boundary mode. 'generated' synthesizes "
             "structured fields with Saga's boundary LLM prompt and writes "
-            "real sessions rows; default 'none' preserves the previous "
-            "via-memory behavior."
+            "real sessions rows; default 'generated' is the adopted "
+            "session-boundary RRF treatment. Use 'none' for no-boundary "
+            "ablation runs."
+        ),
+    )
+    ap.add_argument(
+        "--no-session-boundary-rrf-lane",
+        action="store_true",
+        help=(
+            "disable session-boundary atom promotion for ablation runs. "
+            "The default searches sessions, expands matched sessions to "
+            "atoms by atoms.session_id, and adds them as a 'session_boundary' "
+            "RRF pathway."
         ),
     )
     ap.add_argument(
         "--session-boundary-rrf-lane",
         action="store_true",
         help=(
-            "enable bench-only session-boundary atom promotion: search "
-            "sessions, expand matched sessions to atoms by atoms.session_id, "
-            "and add them as a 'session_boundary' RRF pathway."
+            "deprecated no-op: session-boundary atom promotion is now on by "
+            "default; use --no-session-boundary-rrf-lane to disable it."
         ),
     )
     ap.add_argument(
@@ -979,7 +993,11 @@ def main() -> None:
              "this directory (OpenAI text-embedding-3-small + "
              "gpt-5.4-nano consolidation LLM).",
     )
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
     sys.exit(asyncio.run(_amain(args)))
 
 

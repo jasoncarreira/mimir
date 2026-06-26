@@ -34,7 +34,6 @@ Usage:
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -93,6 +92,16 @@ _DEFAULTS = {
         # prior turns. No-op when context is None/empty regardless of
         # this flag, so the bench harness pays nothing.
         "enable_contextual_rewrite": False,
+        # Session-boundary RRF lane. Session summaries are used as a
+        # secondary routing signal: search matching sessions, expand those
+        # sessions to their member atoms, and feed that ranked atom list into
+        # RRF at half-weight. Bench adoption slice (2026-06-26) showed +4.91pp
+        # overall / +6.02pp multi-session vs no boundary lane.
+        "enable_session_boundary_rrf": True,
+        "session_boundary_weight": 0.5,
+        "session_boundary_limit": 3,
+        "session_boundary_alpha": 0.7,
+        "session_boundary_atoms_per_session": 30,
         # P38: confidence-gated HyDE. Re-runs the semantic pathway with
         # an LLM-generated hypothetical answer when the cheap path's max
         # similarity is below the trigger. Free when off; one extra LLM

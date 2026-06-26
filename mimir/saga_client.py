@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 log = logging.getLogger(__name__)
@@ -50,6 +51,11 @@ class SagaClient(Protocol):
         context: list[dict[str, str]] | None = None,
         extra_atom_ranked_pathways: Mapping[str, Iterable[str]] | None = None,
         rrf_pathway_weights: Mapping[str, float] | None = None,
+        enable_session_boundary_rrf: bool | None = None,
+        session_boundary_limit: int | None = None,
+        session_boundary_alpha: float | None = None,
+        session_boundary_weight: float | None = None,
+        session_boundary_atoms_per_session: int | None = None,
     ) -> dict[str, Any]: ...
 
     async def store(
@@ -375,7 +381,7 @@ def _summarize_result(
 
 def make_saga_client(
     *,
-    db_path: "Path | None" = None,
+    db_path: Path | None = None,
     embedding_dim: int | None = None,
     record_calls: bool = True,
 ) -> SagaClient:
@@ -392,7 +398,6 @@ def make_saga_client(
     client without recording overhead.
     """
     import os
-    from pathlib import Path
     from .saga.client import SagaStore
     if db_path is not None:
         resolved_db = Path(db_path)
