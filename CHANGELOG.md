@@ -6,8 +6,57 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.7] — 2026-06-26
+
+### Added
+
+- **Session-boundary retrieval lane, on by default (#880, #882, #886).** Session
+  summaries now act as a routing signal during recall: `SagaStore.query` searches
+  matching session boundaries, expands the top matches to their member atoms, and
+  feeds those as a secondary `session_boundary` RRF pathway (default weight 0.5,
+  top-3 sessions, ≤30 atoms/session). It re-ranks retrieval toward the right
+  conversational episode without rendering summaries to the reader, reuses the
+  query's connection, and short-circuits cheaply on homes that have no sessions
+  yet. Validated on the two weakest LongMemEval categories from the prior 500q
+  baseline (+6.02pp multi-session; single-session-preference flat). Tunable via
+  `[retrieval]` `enable_session_boundary_rrf` / `session_boundary_weight` /
+  `_limit` / `_alpha` / `_atoms_per_session`. Built on a new generic
+  `extra_atom_ranked_pathways` / `rrf_pathway_weights` API on `query`/`recall`;
+  injected lanes are still subject to every normal tombstoned/agent/skill/
+  confidence filter and are de-duplicated before fusion.
+- **Configurable file-tool roots outside the home (#650).** `MIMIR_FILE_TOOL_ROOTS`
+  lets an operator grant the agent's file tools (`read_file`/`ls`/`glob`/`edit_file`)
+  real access to absolute repos **outside** `<home>` — e.g. a source checkout the
+  agent develops, or a work codebase on a PyPI-wheel deployment. Format:
+  `path[:ro|:rw]`, comma-separated; bare `path` defaults to `rw`. `/tmp` is always
+  added `rw` when present. Roots are routed via deepagents' `CompositeBackend`
+  (the home stays the default); reads/writes hit real disk, `:ro` roots block
+  writes. Validation rejects non-absolute, missing, `~`, `..`, system roots
+  (`/`, `/etc`, `/proc`, `/sys`, `/dev`, `/root`, `/boot`, `/usr`, `/var`, …), and
+  any root overlapping the home. With `MIMIR_FILE_TOOL_ROOTS` unset the agent
+  still gets `/tmp` rw (the always-on scratch root, when present). This fixes the
+  long-standing `/workspace/mimir` false-not-found (the file tools ran
+  `virtual_mode` rooted at the home, silently remapping `/workspace/mimir/x` →
+  `<home>/workspace/mimir/x` → "not found" while `shell_exec` saw the real file —
+  746 such failures over 9 days in one deployment).
+- **ripgrep installed by default in the runtime image (#673).** The agent's
+  file-search/grep tool uses the fast, `.gitignore`-aware, GIL-free `rg`
+  subprocess; shipping it by default avoids falling back to the unbounded
+  pure-Python walk that, on large file-tool roots, ran for minutes and starved
+  the event loop into an unclean restart.
+- **LongMemEval session-boundary bench harness (#674, #676–#680).**
+  `--question-types` category targeting, `--session-boundary-treatment generated`
+  (real boundary synthesis), `--session-boundary-rrf-lane`,
+  `--retrieval-debug-jsonl` + `--capture-reader-prompt`, and a review-before-run
+  runbook for the adoption slice.
+
 ### Changed
 
+- **Bounded recursive grep/glob (#673).** The file-search tool skips vendor/VCS/
+  build trees (`.git`, `node_modules`, `.venv`, `.worktrees`, `dist`, `build`,
+  caches) and caps matches / scanned files / runtime; truncation is logged
+  server-side rather than surfaced as a result error, so a broad multi-root grep
+  keeps the matches it already merged.
 - **Loop-lag monitor distinguishes host/VM deschedules from real on-loop stalls
   (#682).** The scheduler's loop-lag monitor now samples loop-thread CPU
   (`time.thread_time`) across the wake window and combines it with the watchdog's
@@ -16,10 +65,28 @@ All notable changes will land here. Format loosely follows
   spent ≥ 50% of the lag on CPU. Otherwise the loop was merely parked/idle while
   the host failed to schedule us (e.g. a Docker-Desktop / VM scheduling hiccup),
   and it's emitted as an informational `scheduler_loop_lag_host` event instead of
-  the negative `scheduler_loop_lag`. `scheduler_loop_lag_host` is deliberately
-  absent from the feedback rules table, so it stays queryable in the event log
-  without inflating the algedonic `(×N in 24h)` count. The `scheduler_loop_lag`
-  event also gains `cause` and `loop_cpu_s` fields.
+  the negative `scheduler_loop_lag` — kept out of the algedonic `(×N in 24h)`
+  count but escalated if it goes chronic. The watchdog now captures below the
+  monitor threshold so a sub-CPU on-loop block isn't misclassified, and
+  `scheduler_loop_lag` gains `cause` and `loop_cpu_s` fields.
+- **File tools return an actionable error for unreachable absolute paths (#650).**
+  An absolute path that names a real file **outside** the file-tool root (and not
+  under any configured root) now returns "outside the file-tool root … use
+  shell_exec, or add its directory to MIMIR_FILE_TOOL_ROOTS" instead of a silent
+  false "not found"/empty listing.
+- **Off-loop offloads for dispatcher responsiveness (#867, #681).** Web-UI
+  event-log reads and the per-turn algedonic feedback-block render now run via
+  `asyncio.to_thread` instead of blocking the event loop during prompt assembly.
+- **Index-skip is configurable per deployment (#648, #688).** Search + state
+  `INDEX.md` generation share one skip list: framework defaults skip runtime
+  package/build artifacts and known noisy `state/` trees, and a deployment can add
+  home-relative paths in `<home>/.mimir/index-skip.txt` (matched on a path
+  boundary, comments allowed). Operator-specific experiment dirs moved out of the
+  framework default — upgrading operators who want those trees kept out of the
+  index should add them to their `index-skip.txt`.
+- **Web-chat composer controls (#667).** The composer's inert glyph grid is
+  replaced with working Clear / Skills / Shortcuts controls plus an in-flight
+  send guard.
 
 ### Fixed
 
@@ -28,47 +95,25 @@ All notable changes will land here. Format loosely follows
   loop. `fork()` cost scales with the parent's resident memory, so on a multi-GB
   agent each probe stalled the loop ~1s+ (a recurring `scheduler_loop_lag` source
   on VirtioFS/Docker-Desktop deployments). It now runs via `asyncio.to_thread`.
-
-### Added
-
-- **Configurable file-tool roots outside the home (#650).** `MIMIR_FILE_TOOL_ROOTS`
-  lets an operator grant the agent's file tools (`read_file`/`ls`/`glob`/`edit_file`)
-  real access to absolute repos **outside** `<home>` — e.g. a source checkout the
-  agent develops, or a work codebase on a PyPI-wheel deployment. Format:
-  `path[:ro|:rw]`, comma-separated; bare `path` defaults to `rw`. `/tmp` is always
-  added `rw` when present. Roots are routed via deepagents' `CompositeBackend`
-  (the home stays the default); reads/writes hit real disk, `:ro` roots block
-  writes. Validation rejects non-absolute, missing, `/`, `/etc`, `~`, `..`, and any
-  root overlapping the home. With `MIMIR_FILE_TOOL_ROOTS` unset the agent still
-  gets `/tmp` rw (the always-on scratch root, when present) but no other roots —
-  every deployment thus gains `/tmp` file-tool access by default. This fixes the
-  long-standing `/workspace/mimir` false-not-found (the file tools ran
-  `virtual_mode` rooted at the home, silently remapping `/workspace/mimir/x` →
-  `<home>/workspace/mimir/x` → "not found" while `shell_exec` saw the real file —
-  746 such failures over 9 days in one deployment).
-
-### Changed
-
-- **File tools return an actionable error for unreachable absolute paths (#650).**
-  An absolute path that names a real file **outside** the file-tool root (and not
-  under any configured root) now returns "outside the file-tool root … use
-  shell_exec, or add its directory to MIMIR_FILE_TOOL_ROOTS" instead of a silent
-  false "not found"/empty listing.
+- **github-poller review detection + retry suppression (#868, #870).** Detects a
+  `gh pr review` submission even when a `--repo`/`-R` flag is interposed (no more
+  false "missed submission" signals), and suppresses re-request retries once the
+  same reviewer already has a substantive review at the PR's current head.
 
 ### Documentation
 
-- **Non-Docker guide refreshed for 0.5.0→0.6.x.** `docs/mimir-nondocker-guide.md`
+- **Non-Docker guide refreshed for 0.5.0→0.6.x (#650).** `docs/mimir-nondocker-guide.md`
   now covers the host tools mimir shells out to (`ripgrep`, `git`, `jq`,
   `poppler-utils`/`tesseract-ocr`, Node for source builds) with per-OS install
   commands, `MIMIR_FILE_TOOL_ROOTS` (with the Docker bind-mount caveat), the
   React console build step for source installs, `<home>/.env` defaults loading
-  (#447), and the systemd/watchdog/graceful-drain service story; the stale
-  "upgrade to v0.4.0" section was removed. `.env.example` gains
-  `MIMIR_FILE_TOOL_ROOTS` and the reliability vars added since 0.5.0
+  (#447), and the systemd/watchdog/graceful-drain service story. `.env.example`
+  gains `MIMIR_FILE_TOOL_ROOTS` and the reliability vars added since 0.5.0
   (`MIMIR_MAX_TURN_ITERATIONS`, `MIMIR_DRAIN_TIMEOUT_SECONDS`,
   `MIMIR_RESEND_NUDGE_CHANNELS`, `MIMIR_LIVENESS_BEAT_SECONDS`, watchdog sinks,
-  `MIMIR_CHAINLINK_AUTOINIT`). The README documents file-tool roots for both
-  Docker and non-Docker readers.
+  `MIMIR_CHAINLINK_AUTOINIT`). README documents file-tool roots for both Docker
+  and non-Docker readers.
+- **Skills doc: reserve tool-call budget for required side effects (#646).**
 
 ## [0.6.6] — 2026-06-23
 
