@@ -79,6 +79,25 @@ function formatTimestamp(value: string) {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(parsed);
 }
 
+function formatResetTime(value: number | null) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "reset n/a";
+  const resetMs = value * 1000;
+  const absolute = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(resetMs);
+  const deltaMs = resetMs - Date.now();
+  const absMs = Math.abs(deltaMs);
+  const totalMinutes = Math.max(0, Math.round(absMs / 60_000));
+  const days = Math.floor(totalMinutes / 1_440);
+  const hours = Math.floor((totalMinutes % 1_440) / 60);
+  const minutes = totalMinutes % 60;
+  const relativeParts = days > 0
+    ? [`${days}d`, `${hours}h`]
+    : hours > 0
+      ? [`${hours}h`, `${minutes}m`]
+      : [`${minutes}m`];
+  const relative = relativeParts.join(" ");
+  return deltaMs >= 0 ? `resets in ${relative} (${absolute})` : `reset ${relative} ago (${absolute})`;
+}
+
 // Smallest "nice" round number (1/2/2.5/5 × 10ⁿ) at or above the data max, so the
 // token axis scales to the data instead of flooring at a fixed 50M.
 function niceAxisMax(value: number) {
@@ -209,7 +228,7 @@ function QuotaTrendChart({ data }: { data: SafeOpsDashboardData }) {
               {latestRows.map((row) => (
                 <span key={`${row.provider}-${row.window}`}>
                   <i style={{ backgroundColor: usageWindowColors[row.window] || "#9ca3af" }} />
-                  {windowLabel(row.window)}: {formatPercent(row.latestUtilization)} · projected {formatPercent(row.latestProjection)} · {row.latestPressure}
+                  {windowLabel(row.window)}: {formatPercent(row.latestUtilization)} · projected {formatPercent(row.latestProjection)} · {formatResetTime(row.latestResetAt)} · {row.latestPressure}
                 </span>
               ))}
             </div>

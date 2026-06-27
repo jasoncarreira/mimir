@@ -34,7 +34,8 @@ describe("ops view-model helpers", () => {
         points: 1,
         latestUtilization: 0.12,
         latestProjection: 0.2,
-        latestPressure: "clear"
+        latestPressure: "clear",
+        latestResetAt: 1781715600
       },
       {
         provider: "codex_plus",
@@ -42,7 +43,8 @@ describe("ops view-model helpers", () => {
         points: 1,
         latestUtilization: 0.42,
         latestProjection: 0.84,
-        latestPressure: "tight"
+        latestPressure: "tight",
+        latestResetAt: 1782230400
       }
     ]);
     expect(tokenUsageRows(opsDashboardFixture.token_usage_history)).toEqual([

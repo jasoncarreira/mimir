@@ -135,8 +135,8 @@ export const opsDashboardFixture: OpsDashboardResponse = {
   },
   usage_history: {
     codex_plus: {
-      five_hour: [{ ts: "2026-06-17T12:00:00Z", utilization: 0.12, projection: 0.2, pressure: "clear" }],
-      seven_day: [{ ts: "2026-06-17T12:00:00Z", utilization: 0.42, projection: 0.84, pressure: "tight" }]
+      five_hour: [{ ts: "2026-06-17T12:00:00Z", utilization: 0.12, resets_at: 1781715600, projection: 0.2, pressure: "clear" }],
+      seven_day: [{ ts: "2026-06-17T12:00:00Z", utilization: 0.42, resets_at: 1782230400, projection: 0.84, pressure: "tight" }]
     }
   },
   token_usage_history: [
