@@ -881,6 +881,38 @@ print(json.dumps({"poller": "x", "prompt": "second"}))
 
 
 @pytest.mark.asyncio
+async def test_run_poller_invalid_line_redacts_exact_pass_env_values(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """Invalid stdout lines also pass through exact-env-value redaction.
+
+    This covers the non-JSON diagnostic path: a poller can accidentally print a
+    bare pass_env secret to stdout, fail JSON parsing, and otherwise leak it via
+    the durable poller_invalid_line event.
+    """
+    monkeypatch.setenv("DATABASE_PASSWORD", "correct-horse-battery-staple")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(f"not-json password={os.environ['DATABASE_PASSWORD']}")
+print(json.dumps({"poller": "x", "prompt": "ok"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("DATABASE_PASSWORD",),
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 1
+    events = _read_events(home)
+    invalid = [e for e in events if e["type"] == "poller_invalid_line"]
+    assert len(invalid) == 1
+    assert "correct-horse-battery-staple" not in invalid[0]["line"]
+    assert "password=[REDACTED]" in invalid[0]["line"]
+
+
+@pytest.mark.asyncio
 async def test_run_poller_skips_lines_without_prompt_field(
     tmp_path: Path, home: Path,
 ) -> None:
@@ -961,6 +993,37 @@ print(json.dumps({"poller": "x", "prompt": "ok"}))
     assert "checking external service" in stderr[0]["stderr"]
     # exit_code=0: progress noise on a successful run (e.g. gh auth output)
     assert stderr[0].get("exit_code") == 0
+
+
+@pytest.mark.asyncio
+async def test_run_poller_stderr_redacts_exact_pass_env_values(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """chainlink #437: pass_env values can be bare secrets with no token shape.
+
+    If a poller accidentally echoes such a value to stderr, the framework masks
+    the exact env value before writing the durable poller_stderr event.
+    """
+    monkeypatch.setenv("DATABASE_PASSWORD", "correct-horse-battery-staple")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os, sys
+print(f"db failed password={os.environ['DATABASE_PASSWORD']}", file=sys.stderr)
+print(json.dumps({"poller": "x", "prompt": "ok"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("DATABASE_PASSWORD",),
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 1
+    events = _read_events(home)
+    stderr = [e for e in events if e["type"] == "poller_stderr"]
+    assert len(stderr) == 1
+    assert "correct-horse-battery-staple" not in stderr[0]["stderr"]
+    assert "password=[REDACTED]" in stderr[0]["stderr"]
 
 
 @pytest.mark.asyncio

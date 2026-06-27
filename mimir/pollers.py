@@ -83,6 +83,7 @@ from typing import Any, Awaitable, Callable
 from .billing import normalize_priority
 from .event_logger import log_event, get_events_path
 from .models import AgentEvent
+from .redaction import redact_text
 from . import poller_recovery
 
 log = logging.getLogger(__name__)
@@ -237,6 +238,36 @@ def _poller_env_available_at_discovery(
     )
     available.update(injected_keys)
     return available
+
+
+def _redact_poller_env_values(text: str, env: dict[str, str]) -> str:
+    """Redact exact secret-named subprocess env values from poller diagnostics.
+
+    Token-shaped redaction is global in ``event_logger``, but ``pass_env`` can
+    forward secrets with no recognizable shape (bare DB passwords, shared HMACs,
+    etc.). Poller stdout/stderr is the place those values are most likely to be
+    echoed. Redact exact values for secret-named keys before line/length
+    truncation so a long leaked value cannot leave its prefix behind in durable
+    events.
+    """
+    if not text:
+        return text
+    out = redact_text(text)
+    secret_names = {suffix.removeprefix("_") for suffix in _DENY_ENV_SUFFIXES}
+    secret_values = {
+        value
+        for key, value in env.items()
+        if any(key.endswith(suffix) for suffix in _DENY_ENV_SUFFIXES)
+        or key in secret_names
+    }
+    # Longest first prevents a short value from partially masking inside a
+    # longer one and leaving the suffix visible. Skip tiny values to avoid
+    # shredding ordinary diagnostics like PATH separators or boolean flags.
+    for value in sorted(secret_values, key=len, reverse=True):
+        if len(value) < 6:
+            continue
+        out = out.replace(value, "[REDACTED]")
+    return out
 
 # Pollers manifest schema version history:
 #
@@ -1373,7 +1404,10 @@ async def run_poller(
         await log_event(
             "poller_stderr",
             poller=poller.name,
-            stderr=stderr_text[:POLLER_STDERR_LOG_CHARS],
+            stderr=_redact_poller_env_values(
+                stderr_text,
+                env,
+            )[:POLLER_STDERR_LOG_CHARS],
             exit_code=proc.returncode if proc is not None else None,
         )
 
@@ -1431,7 +1465,10 @@ async def run_poller(
             await log_event(
                 "poller_invalid_line",
                 poller=poller.name,
-                line=line[:POLLER_INVALID_LINE_CHARS],
+                line=_redact_poller_env_values(
+                    line,
+                    env,
+                )[:POLLER_INVALID_LINE_CHARS],
             )
             continue
 
