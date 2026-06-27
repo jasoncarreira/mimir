@@ -29,6 +29,7 @@ export type OpsQuotaRow = {
   latestUtilization: number | null;
   latestProjection: number | null;
   latestPressure: string;
+  latestResetAt: number | null;
 };
 
 export type OpsAlgedonicSignals = {
@@ -142,7 +143,8 @@ export function quotaRows(
         points: points.length,
         latestUtilization: latest ? nullableNumberFrom(latest.utilization) : null,
         latestProjection: latest ? nullableNumberFrom(latest.projection) : null,
-        latestPressure: latest ? stringFrom(latest.pressure, "clear") : "clear"
+        latestPressure: latest ? stringFrom(latest.pressure, "clear") : "clear",
+        latestResetAt: latest ? nullableNumberFrom(latest.resets_at) : null
       };
     })
   );
