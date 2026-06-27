@@ -40,7 +40,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from .event_logger import init_logger, log_event
 
@@ -79,6 +79,23 @@ def _posix(rel_path: Path) -> str:
     backslashes on Windows runs would split a single logical page
     into two entries."""
     return rel_path.as_posix()
+
+
+def _title_from_markdown(text: str, fallback_slug: str) -> str:
+    """Return the first H1 title from markdown, falling back to the slug.
+
+    The dashboard-facing payload should be useful without rendering the
+    full page body. Wiki pages conventionally start with ``# Title``; if
+    they do not, keep the stable slug rather than guessing a prettified
+    title that could obscure the underlying filename.
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            title = stripped[2:].strip()
+            if title:
+                return title
+    return fallback_slug
 
 
 def find_pages(wiki_dir: Path) -> dict[str, Path]:
@@ -271,6 +288,87 @@ def build_graph(wiki_dir: Path) -> BacklinksGraph:
         pages=page_data, orphans=orphans, dangling=dangling,
         collisions=collisions,
     )
+
+
+def build_wiki_payload(wiki_dir: Path) -> dict[str, Any]:
+    """Return a JSON-friendly read-only wiki index + graph payload.
+
+    This is the non-mutating dashboard/API path for the wiki viewer. It
+    reuses ``build_graph`` for the canonical page discovery, wikilink
+    resolution, generated-report exclusion, orphan detection, dangling
+    links, and slug-collision semantics, but it does not write markdown
+    reports and does not emit events. It is synchronous filesystem work
+    by design: aiohttp route handlers should run it with
+    ``asyncio.to_thread`` rather than calling it on the event loop.
+    """
+    graph = build_graph(wiki_dir)
+    pages: list[dict[str, Any]] = []
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, str]] = []
+    collision_paths = {
+        path_str
+        for paths in graph.collisions.values()
+        for path_str in (_posix(path) for path in paths)
+    }
+
+    for path_str in sorted(graph.pages):
+        data = graph.pages[path_str]
+        rel_path = Path(path_str)
+        full_path = wiki_dir / rel_path
+        try:
+            stat = full_path.stat()
+        except OSError:
+            mtime = None
+        else:
+            mtime = datetime.fromtimestamp(
+                stat.st_mtime, tz=timezone.utc,
+            ).isoformat(timespec="seconds")
+        try:
+            text = full_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        title = _title_from_markdown(text, data["slug"])
+        page = {
+            "slug": data["slug"],
+            "title": title,
+            "category": _category_of(rel_path),
+            "path": path_str,
+            "mtime": mtime,
+            "outbound": list(data["outbound"]),
+            "inbound": list(data["inbound"]),
+            "is_orphan": path_str in graph.orphans,
+            "has_slug_collision": path_str in collision_paths,
+        }
+        pages.append(page)
+        nodes.append({
+            "id": path_str,
+            "slug": page["slug"],
+            "title": page["title"],
+            "category": page["category"],
+            "is_orphan": page["is_orphan"],
+            "has_slug_collision": page["has_slug_collision"],
+        })
+
+    for target_path in sorted(graph.pages):
+        target = graph.pages[target_path]
+        for source_path in target["inbound"]:
+            edges.append({
+                "source": source_path,
+                "target": target_path,
+                "target_slug": target["slug"],
+            })
+
+    return {
+        "page_count": len(pages),
+        "pages": pages,
+        "graph": {"nodes": nodes, "edges": edges},
+        "orphans": list(graph.orphans),
+        "dangling_links": [dict(item) for item in graph.dangling],
+        "slug_collisions": {
+            slug: [_posix(path) for path in paths]
+            for slug, paths in sorted(graph.collisions.items())
+        },
+    }
 
 
 # ─── Renderers ──────────────────────────────────────────────────────

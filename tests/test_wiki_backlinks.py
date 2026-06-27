@@ -10,6 +10,7 @@ import pytest
 from mimir.event_logger import init_logger
 from mimir.wiki_backlinks import (
     build_graph,
+    build_wiki_payload,
     extract_links,
     find_pages,
     render_backlinks_index_md,
@@ -293,6 +294,95 @@ def test_build_graph_collision_pages_can_link_to_each_other(wiki: Path):
     assert graph.pages["concepts/foo.md"]["inbound"] == []  # self-link
     assert graph.pages["topics/foo.md"]["inbound"] == [
         "concepts/foo.md",
+    ]
+
+
+def test_build_wiki_payload_returns_json_friendly_page_and_graph_shape(wiki: Path):
+    _write(wiki, "concepts/source.md", "# Source Page\n\nSee [[target]] and [[ghost]].")
+    _write(wiki, "topics/target.md", "# Target Page\n")
+    _write(wiki, "orphans.md", "# generated report should be excluded")
+
+    payload = build_wiki_payload(wiki)
+
+    assert payload["page_count"] == 2
+    assert {p["path"] for p in payload["pages"]} == {
+        "concepts/source.md",
+        "topics/target.md",
+    }
+    source = next(p for p in payload["pages"] if p["path"] == "concepts/source.md")
+    target = next(p for p in payload["pages"] if p["path"] == "topics/target.md")
+    assert source == {
+        "slug": "source",
+        "title": "Source Page",
+        "category": "concepts",
+        "path": "concepts/source.md",
+        "mtime": source["mtime"],
+        "outbound": ["ghost", "target"],
+        "inbound": [],
+        "is_orphan": True,
+        "has_slug_collision": False,
+    }
+    assert isinstance(source["mtime"], str)
+    assert target["title"] == "Target Page"
+    assert target["inbound"] == ["concepts/source.md"]
+    assert payload["orphans"] == ["concepts/source.md"]
+    assert payload["dangling_links"] == [
+        {"target": "ghost", "source": "concepts/source.md", "line": 3}
+    ]
+    assert payload["graph"] == {
+        "nodes": [
+            {
+                "id": "concepts/source.md",
+                "slug": "source",
+                "title": "Source Page",
+                "category": "concepts",
+                "is_orphan": True,
+                "has_slug_collision": False,
+            },
+            {
+                "id": "topics/target.md",
+                "slug": "target",
+                "title": "Target Page",
+                "category": "topics",
+                "is_orphan": False,
+                "has_slug_collision": False,
+            },
+        ],
+        "edges": [
+            {
+                "source": "concepts/source.md",
+                "target": "topics/target.md",
+                "target_slug": "target",
+            }
+        ],
+    }
+
+
+def test_build_wiki_payload_surfaces_slug_collisions(wiki: Path):
+    _write(wiki, "concepts/foo.md", "# Foo Concept")
+    _write(wiki, "topics/foo.md", "# Foo Topic")
+    _write(wiki, "entities/linker.md", "# Linker\n\nSee [[foo]].")
+
+    payload = build_wiki_payload(wiki)
+
+    assert payload["slug_collisions"] == {
+        "foo": ["concepts/foo.md", "topics/foo.md"],
+    }
+    collision_pages = {
+        p["path"]: p for p in payload["pages"] if p["has_slug_collision"]
+    }
+    assert set(collision_pages) == {"concepts/foo.md", "topics/foo.md"}
+    assert payload["graph"]["edges"] == [
+        {
+            "source": "entities/linker.md",
+            "target": "concepts/foo.md",
+            "target_slug": "foo",
+        },
+        {
+            "source": "entities/linker.md",
+            "target": "topics/foo.md",
+            "target_slug": "foo",
+        },
     ]
 
 
