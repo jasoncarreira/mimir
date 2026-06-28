@@ -16,7 +16,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-POST_CREATING_ACTIONS = {"post", "reply"}
+POST_CREATING_ACTIONS = {"post", "reply", "thread"}
 
 
 def _eprint(*args: object) -> None:
@@ -185,7 +185,7 @@ def _parser() -> argparse.ArgumentParser:
         default="post",
         help=(
             "Action class to count. Default 'post' means post-creating "
-            "ledger actions: post and reply."
+            "ledger actions: post, reply, and thread."
         ),
     )
     p.add_argument(

@@ -24,6 +24,7 @@ def test_counts_post_creating_actions_and_excludes_non_posts(tmp_path):
     _write_ledger(poller / "sent_ledger-bsky.yaml", [
         {"action": "post", "platform": "bsky", "timestamp": "2026-06-28T01:00:00Z"},
         {"action": "reply", "platform": "bsky", "timestamp": "2026-06-28T02:00:00Z"},
+        {"action": "thread", "platform": "bsky", "timestamp": "2026-06-28T02:30:00Z", "textHash": "thread-1"},
         {"action": "like", "platform": "bsky", "timestamp": "2026-06-28T03:00:00Z"},
         {"action": "repost", "platform": "bsky", "timestamp": "2026-06-28T04:00:00Z"},
         {"action": "ignore", "platform": "bsky", "timestamp": "2026-06-28T05:00:00Z"},
@@ -38,7 +39,31 @@ def test_counts_post_creating_actions_and_excludes_non_posts(tmp_path):
         state_dirs=[],
     )
 
-    assert total == 2
+    assert total == 3
+
+
+def test_counts_thread_as_one_post_creating_ledger_entry(tmp_path):
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    _write_ledger(poller / "sent_ledger-bsky.yaml", [
+        {
+            "action": "thread",
+            "platform": "bsky",
+            "timestamp": "2026-06-28T12:00:00Z",
+            "textHash": "hash-of-whole-thread",
+        },
+    ])
+
+    total = mod.count_ledgers(
+        platform="bsky",
+        action="post",
+        since=mod._parse_dt("2026-06-28"),
+        until=mod._parse_dt("2026-06-29"),
+        state_root=tmp_path,
+        state_dirs=[],
+    )
+
+    assert total == 1
 
 
 def test_excludes_mixed_dates_and_dry_runs(tmp_path):
