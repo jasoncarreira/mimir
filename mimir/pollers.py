@@ -498,6 +498,10 @@ _OVERRIDE_BOOL_TRUE = frozenset({"true", "yes", "on", "1"})
 _OVERRIDE_BOOL_FALSE = frozenset({"false", "no", "off", "0"})
 
 
+class PollerOverridesValidationError(ValueError):
+    """Raised when agent-authored ``pollers-overrides.yaml`` is invalid."""
+
+
 def _parse_override_bool(value: object) -> bool | None:
     """Strict bool coercion for an override value, or ``None`` if unparseable.
 
@@ -518,6 +522,70 @@ def _parse_override_bool(value: object) -> bool | None:
     return None
 
 
+def _parse_poller_overrides_raw(
+    raw: object,
+    *,
+    path: Path,
+    strict: bool,
+) -> dict[str, dict]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        msg = (
+            f"poller_overrides_invalid: {path} — root must be a mapping of "
+            "poller name → overrides"
+        )
+        if strict:
+            raise PollerOverridesValidationError(msg)
+        log.warning("%s; ignoring file", msg)
+        return {}
+    out: dict[str, dict] = {}
+    for name, entry in raw.items():
+        if not isinstance(entry, dict):
+            msg = (
+                f"poller_overrides_invalid_entry: {path} — {name!r} must map "
+                "to a dict of fields"
+            )
+            if strict:
+                raise PollerOverridesValidationError(msg)
+            log.warning("%s; skipping", msg)
+            continue
+        kept = {}
+        for key, value in entry.items():
+            if key not in POLLER_OVERRIDE_KEYS:
+                msg = (
+                    f"poller_overrides_unknown_field: {path} — {name}.{key} "
+                    "is not overridable (allowed: "
+                    f"{', '.join(sorted(POLLER_OVERRIDE_KEYS))})"
+                )
+                if strict:
+                    raise PollerOverridesValidationError(msg)
+                log.warning("%s; dropping", msg)
+                continue
+            kept[str(key)] = value
+        if kept:
+            out[str(name)] = kept
+    return out
+
+
+def validate_poller_overrides_text(text: str, *, path: Path) -> dict[str, dict]:
+    """Strictly validate agent-authored ``pollers-overrides.yaml`` content.
+
+    Discovery deliberately uses fail-safe parsing so a bad operator edit cannot
+    kill all pollers. The agent-facing write path needs the same schema but a
+    hard failure before persistence, so unknown fields or malformed roots cannot
+    be committed.
+    """
+    try:
+        import yaml
+        raw = yaml.safe_load(text)
+    except Exception as exc:  # noqa: BLE001 - surface parser diagnostics to tool
+        raise PollerOverridesValidationError(
+            f"poller_overrides_invalid: {path} — {exc}",
+        ) from exc
+    return _parse_poller_overrides_raw(raw, path=path, strict=True)
+
+
 def load_poller_overrides(path: Path | None) -> dict[str, dict]:
     """Parse ``pollers-overrides.yaml`` → ``{poller_name: {field: value}}``.
 
@@ -536,35 +604,7 @@ def load_poller_overrides(path: Path | None) -> dict[str, dict]:
     except Exception as exc:  # noqa: BLE001 — config parse must never abort discovery
         log.warning("poller_overrides_invalid: %s — %s; ignoring file", path, exc)
         return {}
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        log.warning(
-            "poller_overrides_invalid: %s — root must be a mapping of "
-            "poller name → overrides; ignoring file", path,
-        )
-        return {}
-    out: dict[str, dict] = {}
-    for name, entry in raw.items():
-        if not isinstance(entry, dict):
-            log.warning(
-                "poller_overrides_invalid_entry: %s — %r must map to a "
-                "dict of fields; skipping", path, name,
-            )
-            continue
-        kept = {}
-        for key, value in entry.items():
-            if key not in POLLER_OVERRIDE_KEYS:
-                log.warning(
-                    "poller_overrides_unknown_field: %s — %s.%s is not "
-                    "overridable (allowed: %s); dropping",
-                    path, name, key, ", ".join(sorted(POLLER_OVERRIDE_KEYS)),
-                )
-                continue
-            kept[str(key)] = value
-        if kept:
-            out[str(name)] = kept
-    return out
+    return _parse_poller_overrides_raw(raw, path=path, strict=False)
 
 
 def _apply_poller_overrides(

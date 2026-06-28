@@ -30,10 +30,12 @@ from mimir.pollers import (
     POLLER_MANIFEST_SCHEMA_VERSION,
     POLLER_TIMEOUT_SECONDS,
     PollerConfig,
+    PollerOverridesValidationError,
     _CircuitBreakerState,
     _circuit_breakers,
     discover_pollers,
     run_poller,
+    validate_poller_overrides_text,
 )
 
 
@@ -3398,6 +3400,23 @@ def test_overrides_absent_or_malformed_are_noops(tmp_path: Path, caplog):
     assert p.cron == "0 * * * *"
     assert any("poller_overrides_invalid" in r.getMessage()
                for r in caplog.records)
+
+
+def test_validate_poller_overrides_text_rejects_unknown_fields(tmp_path: Path):
+    path = tmp_path / "pollers-overrides.yaml"
+    with pytest.raises(PollerOverridesValidationError) as exc:
+        validate_poller_overrides_text(
+            "gmail-inbox:\n  command: 'rm -rf /'\n",
+            path=path,
+        )
+    assert "poller_overrides_unknown_field" in str(exc.value)
+
+
+def test_validate_poller_overrides_text_rejects_non_mapping_root(tmp_path: Path):
+    path = tmp_path / "pollers-overrides.yaml"
+    with pytest.raises(PollerOverridesValidationError) as exc:
+        validate_poller_overrides_text("- just\n- a list\n", path=path)
+    assert "root must be a mapping" in str(exc.value)
 
 
 def test_overrides_env_and_pass_env(tmp_path: Path):

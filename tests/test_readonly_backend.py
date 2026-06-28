@@ -56,6 +56,21 @@ class TestWriteGuardBackend:
         r = b.write(file_path="/.mimir/db.sqlite", content="hi")
         assert "Write blocked" in (getattr(r, "error", "") or "")
 
+    @pytest.mark.parametrize(
+        "file_path",
+        [
+            "/pollers-overrides.yaml",
+            "/saga.toml",
+            "/compose.env",
+        ],
+    )
+    def test_blocks_top_level_home_files(self, home: Path, file_path: str) -> None:
+        # pollers-overrides.yaml is agent-managed through its dedicated validated
+        # tool, not by widening the generic file tool's top-level write access.
+        b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        r = b.write(file_path=file_path, content="x\n")
+        assert "Write blocked" in (getattr(r, "error", "") or "")
+
     def test_blocks_write_to_identities_yaml(self, home: Path) -> None:
         # state/ is writable, but identities.yaml (the auth identity + role
         # registry) is denied to the agent's file tools — a prompt-injected

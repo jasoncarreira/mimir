@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -42,6 +43,7 @@ from mimir.tools.registry import (
     set_current_channel_id,
     set_current_turn_interactive,
     set_dispatcher,
+    set_poller_overrides,
     set_schedule_priority,
     set_scheduler,
 )
@@ -136,13 +138,14 @@ class _StubRegistry:
 class _StubScheduler:
     """Minimal scheduler stub for add_schedule / remove_schedule / reload_pollers."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, home: Path | None = None) -> None:
         self.add_calls: list[dict] = []
         self.remove_calls: list[str] = []
         self.reload_count: int = 0
         self.raise_on: str | None = None
         self._removed: bool = True  # default: job found and removed
         self._jobs: list[SchedulerJob] = []  # for list_jobs / set_schedule_priority
+        self._home = home
 
     async def add_job(self, job: SchedulerJob) -> SchedulerJob:
         if self.raise_on == "add":
@@ -946,6 +949,47 @@ class TestReloadPollers:
         assert "total=3" in out
         assert "fresh=2" in out
         assert sched.reload_count == 1
+
+
+class TestSetPollerOverrides:
+    @pytest.mark.asyncio
+    async def test_no_scheduler_returns_error(self) -> None:
+        _STATE["scheduler"] = None
+        out = await set_poller_overrides.ainvoke(
+            {"poller_name": "gmail-inbox", "overrides": {"pass_env": ["GOG_ACCOUNT"]}},
+        )
+        assert "set_poller_overrides failed: no scheduler configured" in out
+
+    @pytest.mark.asyncio
+    async def test_writes_validated_home_file(self, tmp_path: Path) -> None:
+        _STATE["scheduler"] = _StubScheduler(home=tmp_path)
+        out = await set_poller_overrides.ainvoke(
+            {
+                "poller_name": "gmail-inbox",
+                "overrides": {"pass_env": ["GOG_ACCOUNT"], "batch_size": 3},
+            },
+        )
+        assert "set_poller_overrides ok: updated gmail-inbox" in out
+        body = (tmp_path / "pollers-overrides.yaml").read_text(encoding="utf-8")
+        assert "gmail-inbox:" in body
+        assert "pass_env:" in body
+        assert "GOG_ACCOUNT" in body
+
+    @pytest.mark.asyncio
+    async def test_rejects_unknown_override_field_without_writing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _STATE["scheduler"] = _StubScheduler(home=tmp_path)
+        out = await set_poller_overrides.ainvoke(
+            {
+                "poller_name": "gmail-inbox",
+                "overrides": {"command": "rm -rf /"},
+            },
+        )
+        assert "set_poller_overrides failed:" in out
+        assert "poller_overrides_unknown_field" in out
+        assert not (tmp_path / "pollers-overrides.yaml").exists()
 
 
 # ────────────────────────────────────────────────────────────────────
