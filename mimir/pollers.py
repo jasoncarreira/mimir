@@ -1510,7 +1510,9 @@ async def run_poller(
         signal_type = parsed.get("signal")
         if isinstance(signal_type, str) and signal_type.strip():
             payload = {
-                k: v for k, v in parsed.items()
+                k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
+                if isinstance(v, str) else v
+                for k, v in parsed.items()
                 if k not in ("signal", "poller", "prompt", "event_type")
             }
             try:
@@ -1658,7 +1660,11 @@ async def run_poller(
             await log_event(
                 "poller_event_rejected",
                 poller=poller.name,
-                prompt_preview=content[:POLLER_REJECTION_PREVIEW_CHARS],
+                prompt_preview=_redact_poller_env_values(
+                    content,
+                    env,
+                    explicit_env_redact_keys,
+                )[:POLLER_REJECTION_PREVIEW_CHARS],
                 batch_index=batch_idx,
             )
 

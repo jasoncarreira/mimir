@@ -1357,6 +1357,37 @@ print(json.dumps({"poller": "x", "prompt": "rejected payload"}))
 
 
 @pytest.mark.asyncio
+async def test_run_poller_event_rejected_redacts_exact_pass_env_values(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """Rejected-event prompt previews are durable diagnostics; redact them."""
+    monkeypatch.setenv("WEBHOOK_HMAC", "correct-horse-battery-staple")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({
+    "poller": "x",
+    "prompt": f"rejecting hmac={os.environ['WEBHOOK_HMAC']}",
+}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("WEBHOOK_HMAC",),
+    )
+    enq = _CapturingEnqueue(accept=False)
+    await run_poller(cfg, enqueue=enq)
+
+    events = _read_events(home)
+    rejections = [
+        e for e in events if e["type"] == "poller_event_rejected"
+    ]
+    assert len(rejections) == 1
+    assert "correct-horse-battery-staple" not in rejections[0]["prompt_preview"]
+    assert rejections[0]["prompt_preview"] == "rejecting hmac=[REDACTED]"
+
+
+@pytest.mark.asyncio
 async def test_run_poller_complete_carries_both_counts_on_silence(
     tmp_path: Path, home: Path,
 ) -> None:
@@ -2508,6 +2539,44 @@ print(json.dumps({
     assert sig["poller"] == "gmail-inbox"
     assert sig["account"] == "agent@example.com"
     assert sig["detail"] == "token refresh failed (invalid_grant)"
+
+
+@pytest.mark.asyncio
+async def test_signal_payload_redacts_exact_pass_env_values(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """Signal payloads are durable events.jsonl entries too.
+
+    A poller can echo an explicitly forwarded secret in a string payload field;
+    redact exact pass_env values before handing the payload to log_event.
+    """
+    monkeypatch.setenv("WEBHOOK_HMAC", "correct-horse-battery-staple")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({
+    "poller": "x",
+    "signal": "poller_signal",
+    "detail": f"forwarded hmac={os.environ['WEBHOOK_HMAC']}",
+    "retry_after_s": 60,
+}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("WEBHOOK_HMAC",),
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+
+    assert n == 0
+    assert enq.events == []
+    events = _read_events(home)
+    signal = [e for e in events if e["type"] == "poller_signal"]
+    assert len(signal) == 1
+    assert "correct-horse-battery-staple" not in json.dumps(signal[0])
+    assert signal[0]["detail"] == "forwarded hmac=[REDACTED]"
+    assert signal[0]["retry_after_s"] == 60
 
 
 def test_signal_event_types_classified_algedonically():
