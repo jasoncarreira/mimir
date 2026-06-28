@@ -4,7 +4,10 @@
 # `social-cli` from PATH unless SOCIAL_CLI_BIN overrides.
 #
 # social-cli is a Node project; we clone, pnpm install + build, then
-# symlink the binary to /usr/local/bin. The base image is expected to
+# symlink the upstream binary to /usr/local/bin/social-cli-upstream, then
+# install a tiny wrapper at /usr/local/bin/social-cli so this skill can add
+# local helper commands (currently ``count``) without forking upstream. The
+# base image is expected to
 # have Node 20 + npm already (the scaffolder bakes that into the base
 # Dockerfile when ANY poller is installed). pnpm is installed via
 # corepack which ships with Node 20.
@@ -34,4 +37,19 @@ RUN corepack enable && corepack prepare pnpm@latest --activate \
  && git -C /opt/social-cli checkout 4c8aab8393a6c04568f8017f176d3d24055e3cc6 \
  && cd /opt/social-cli && pnpm install --frozen-lockfile && pnpm build \
  && chmod +x /opt/social-cli/dist/cli.js \
- && ln -sf /opt/social-cli/dist/cli.js /usr/local/bin/social-cli
+ && ln -sf /opt/social-cli/dist/cli.js /usr/local/bin/social-cli-upstream \
+ && printf '%s\n' \
+      '#!/bin/sh' \
+      'if [ "$1" = "count" ]; then' \
+      '    shift' \
+      '    for helper in "${SOCIAL_CLI_COUNT_HELPER:-}" /mimir-home/skills/social-cli/count.py /mimir-home/.mimir_builtin_skills/social-cli/count.py /workspace/mimir/optional-skills/social-cli/count.py; do' \
+      '        if [ -n "$helper" ] && [ -f "$helper" ]; then' \
+      '            exec python3 "$helper" "$@"' \
+      '        fi' \
+      '    done' \
+      '    echo "social-cli count: count.py helper not found" >&2' \
+      '    exit 127' \
+      'fi' \
+      'exec /usr/local/bin/social-cli-upstream "$@"' \
+      > /usr/local/bin/social-cli \
+ && chmod +x /usr/local/bin/social-cli
