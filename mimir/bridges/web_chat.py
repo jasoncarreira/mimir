@@ -312,6 +312,8 @@ class WebChatBridge(Bridge):
                 "Content-Type": "text/event-stream",
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
+                # Ask nginx-style reverse proxies not to buffer the SSE stream.
+                "X-Accel-Buffering": "no",
                 # No ``Access-Control-Allow-Origin: *`` (was set pre-PR
                 # #104). With the auth middleware now gating /chat/stream,
                 # a malicious cross-origin page can't open the stream
