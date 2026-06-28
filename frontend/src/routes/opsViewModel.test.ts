@@ -84,7 +84,14 @@ describe("ops view-model helpers", () => {
       shell_jobs: { spawned: 2, spawn_by_channel: { web: 2, bad: "x" } },
       tools: [{ tool: "grep", calls: 3, errors: "bad", failure_rate: Number.NaN }],
       token_usage_history: [{ date: "2026-06-18", turn_count: "bad", output_tokens: 5 }],
-      chainlink_issues: { available: true, issues: [{ id: 530, title: "Port ops" }] }
+      chainlink_issues: { available: true, issues: [{ id: 530, title: "Port ops" }] },
+      pr_board: {
+        available: true,
+        repo: "owner/repo",
+        pull_requests: [
+          { number: 9, title: "Review me", url: "javascript:alert(1)", created_at: "2026-06-18T00:00:00Z", is_draft: true }
+        ]
+      }
     });
 
     expect(safe.summary).toEqual({ total_events: 4 });
@@ -114,6 +121,17 @@ describe("ops view-model helpers", () => {
       issues: [{ id: 530, title: "Port ops" }],
       truncated: false
     });
+    expect(safe.pr_board.pull_requests).toEqual([
+      {
+        number: 9,
+        title: "Review me",
+        url: "",
+        author: "",
+        createdAt: "2026-06-18T00:00:00Z",
+        reviewDecision: "",
+        isDraft: true
+      }
+    ]);
 
     expect(tokenUsageRows(safe.token_usage_history)).toEqual([
       {

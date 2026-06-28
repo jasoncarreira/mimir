@@ -133,6 +133,24 @@ export const opsDashboardFixture: OpsDashboardResponse = {
     truncated: false,
     total_count: 1
   },
+  pr_board: {
+    available: true,
+    error: null,
+    repo: "example/mimir-home",
+    pull_requests: [
+      {
+        number: 17,
+        title: "Proposal: tighten Worklink evidence",
+        url: "https://github.com/example/mimir-home/pull/17",
+        author: "agent",
+        created_at: "2026-06-16T12:00:00Z",
+        review_decision: "REVIEW_REQUIRED",
+        is_draft: false
+      }
+    ],
+    truncated: false,
+    total_count: 1
+  },
   usage_history: {
     codex_plus: {
       five_hour: [{ ts: "2026-06-17T12:00:00Z", utilization: 0.12, resets_at: 1781715600, projection: 0.2, pressure: "clear" }],

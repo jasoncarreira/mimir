@@ -33,6 +33,7 @@ from typing import Any
 
 from ._jsonl_tail import tail_jsonl_records
 from .feedback import FeedbackLog
+from .pr_board import build_pr_board_payload
 
 log = logging.getLogger(__name__)
 
@@ -485,6 +486,14 @@ def build_dashboard_payload(
     stats["chainlink_issues"] = {
         "available": False, "issues": [], "error": None,
     }
+    stats["pr_board"] = {
+        "available": False,
+        "error": None,
+        "repo": None,
+        "pull_requests": [],
+        "truncated": False,
+        "total_count": 0,
+    }
     # Per-provider subscription-quota history for the ops chart. Collapse to
     # the ACTIVE provider (chainlink #301, dashboard side) so stale windows
     # from a prior subscription — e.g. Anthropic OAuth keys still in the store
@@ -534,7 +543,12 @@ async def build_dashboard_payload_async(
         active_provider=active_provider,
     )
     if home is not None:
-        stats["chainlink_issues"] = await _load_chainlink_issues(home)
+        chainlink_issues, pr_board = await asyncio.gather(
+            _load_chainlink_issues(home),
+            build_pr_board_payload(home),
+        )
+        stats["chainlink_issues"] = chainlink_issues
+        stats["pr_board"] = pr_board
     return stats
 
 

@@ -16,6 +16,8 @@ set_memory_client pattern; ``server.py:build_app`` wires them at startup.
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
@@ -270,6 +272,42 @@ _SHELL_STATE: dict[str, Any] = {
 }
 
 
+def _initial_shell_cwd() -> Path | None:
+    """Return the startup cwd for shell_exec, independent of process cwd."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return None
+    return Path(home).expanduser().resolve()
+
+
+def _effective_shell_cwd() -> Path | None:
+    cwd = _SHELL_STATE["cwd"]
+    if cwd is not None:
+        return Path(cwd)
+    return _initial_shell_cwd()
+
+
+def _cd_target(command: str, cwd: Path | None) -> Path | None:
+    """Detect simple stateful `cd <dir>` calls after bash succeeds.
+
+    Compound commands still execute normally in their subprocess; only a
+    standalone successful cd updates the cwd used by later shell_exec calls.
+    """
+    try:
+        parts = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not parts or parts[0] != "cd" or len(parts) > 2:
+        return None
+    raw_target = parts[1] if len(parts) == 2 else os.environ.get("HOME", "")
+    if raw_target == "-":
+        return None
+    target = Path(raw_target).expanduser()
+    if not target.is_absolute():
+        target = (cwd or Path.cwd()) / target
+    return target.resolve()
+
+
 @tool
 def shell_exec(command: str) -> str:
     """Execute a shell command and return stdout + stderr + exit code.
@@ -297,13 +335,14 @@ def shell_exec(command: str) -> str:
     """
     if not command or not command.strip():
         return "shell_exec failed: command is required"
+    cwd = _effective_shell_cwd()
     try:
         from ._shell_env import login_shell_command
         proc = subprocess.run(  # noqa: S603 — shell exec by design; trusted container (#226), guard middleware screens the command
             ["bash", "-lc", login_shell_command(command)],
             capture_output=True,
             timeout=_SHELL_STATE["timeout_s"],
-            cwd=_SHELL_STATE["cwd"],
+            cwd=cwd,
         )
     except subprocess.TimeoutExpired:
         return f"shell_exec timed out after {_SHELL_STATE['timeout_s']}s"
@@ -313,6 +352,10 @@ def shell_exec(command: str) -> str:
     parts = [f"exit={proc.returncode}"]
     stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
     stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
+    if proc.returncode == 0:
+        target = _cd_target(command, cwd)
+        if target is not None and target.is_dir():
+            _SHELL_STATE["cwd"] = target
     if stdout:
         parts.append(f"stdout:\n{stdout[:4000]}")
     if stderr:

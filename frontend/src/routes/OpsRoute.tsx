@@ -23,6 +23,7 @@ import {
   safeOpsDashboardData,
   schedulerEventRows,
   tokenUsageRows,
+  type OpsPullRequestRow,
   type SafeOpsDashboardData
 } from "./opsViewModel";
 
@@ -77,6 +78,23 @@ function formatTimestamp(value: string) {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) return value;
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(parsed);
+}
+
+function formatAge(value: string) {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return "unknown";
+  const ageMs = Math.max(0, Date.now() - parsed);
+  const days = Math.floor(ageMs / 86_400_000);
+  if (days > 0) return `${days}d`;
+  const hours = Math.floor(ageMs / 3_600_000);
+  if (hours > 0) return `${hours}h`;
+  const minutes = Math.max(0, Math.floor(ageMs / 60_000));
+  return `${minutes}m`;
+}
+
+function prStateLabel(pr: OpsPullRequestRow) {
+  if (pr.isDraft) return "Draft";
+  return pr.reviewDecision ? pr.reviewDecision.replaceAll("_", " ").toLowerCase() : "Review pending";
 }
 
 function formatResetTime(value: number | null) {
@@ -495,6 +513,51 @@ function SignalsPanel({ data }: { data: SafeOpsDashboardData }) {
   );
 }
 
+function OpenPullRequestsPanel({ data }: { data: SafeOpsDashboardData }) {
+  const board = data.pr_board;
+  if (!board.available) {
+    return (
+      <Panel title="Open PRs" subtitle={board.repo || undefined}>
+        <EmptyState title="PR view unavailable">
+          {board.error || "gh not configured"}
+        </EmptyState>
+      </Panel>
+    );
+  }
+  return (
+    <Panel
+      title="Open PRs"
+      subtitle={board.repo ? `${board.repo}${board.truncated ? ` | showing ${board.pull_requests.length} of ${board.total_count ?? "many"}` : ""}` : undefined}
+    >
+      {board.pull_requests.length ? (
+        <DataTable
+          caption="Open GitHub pull requests"
+          columns={[
+            { key: "number", header: "PR" },
+            { key: "title", header: "Title" },
+            { key: "state", header: "State" },
+            { key: "age", header: "Age" },
+            { key: "link", header: "Link" }
+          ]}
+          rows={board.pull_requests.map((pr) => ({
+            number: `#${pr.number}`,
+            title: pr.title,
+            state: prStateLabel(pr),
+            age: formatAge(pr.createdAt),
+            link: pr.url ? (
+              <a href={pr.url} rel="noopener noreferrer" target="_blank">Open</a>
+            ) : (
+              "n/a"
+            )
+          }))}
+        />
+      ) : (
+        <EmptyState title="No open PRs" />
+      )}
+    </Panel>
+  );
+}
+
 function RawPanel({ data }: { data: SafeOpsDashboardData }) {
   return (
     <div className="ops-panel-stack">
@@ -572,6 +635,7 @@ function OpsContent({ data: rawData }: { data: unknown }) {
                   <EmptyState title="No time-series points in this window" />
                 )}
               </Panel>
+              <OpenPullRequestsPanel data={data} />
             </div>
           ) : null}
           {activeTab === "scheduler" ? <SchedulerPanel data={data} /> : null}

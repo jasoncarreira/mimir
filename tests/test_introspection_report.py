@@ -161,6 +161,73 @@ def test_recurring_errors_group_volatile_numbers(tmp_path: Path):
     assert rep.error_recurrence[0].occurrences == 3
 
 
+def test_recurring_read_file_not_found_keeps_path_identity(tmp_path: Path):
+    turns = tmp_path / "turns.jsonl"
+    events = tmp_path / "events.jsonl"
+    _write_turn(
+        turns, ts=NOW - timedelta(hours=1),
+        tool_calls=[(
+            "read_file", True,
+            "Error: File '/mimir-home/state/wiki/concepts/old.md' not found",
+        )],
+    )
+    _write_turn(
+        turns, ts=NOW - timedelta(hours=2),
+        tool_calls=[(
+            "read_file", True,
+            "Error: File '/mimir-home/state/wiki/concepts/other.md' not found",
+        )],
+    )
+    _write_turn(
+        turns, ts=NOW - timedelta(hours=3),
+        tool_calls=[(
+            "read_file", True,
+            "Error: File '/mimir-home/state/wiki/concepts/old.md' not found",
+        )],
+    )
+
+    rep = aggregate(turns, events, days=7, now=NOW)
+
+    by_preview = {r.preview: r.occurrences for r in rep.error_recurrence}
+    assert by_preview[
+        "Error: File '/mimir-home/state/wiki/concepts/old.md' not found"
+    ] == 2
+    assert by_preview[
+        "Error: File '/mimir-home/state/wiki/concepts/other.md' not found"
+    ] == 1
+
+
+def test_recurring_read_file_not_found_uses_full_content_for_long_paths(tmp_path: Path):
+    turns = tmp_path / "turns.jsonl"
+    events = tmp_path / "events.jsonl"
+    base = "/mimir-home/state/wiki/concepts/" + ("deeply-nested-" * 5)
+    old_path = base + "old.md"
+    other_path = base + "other.md"
+    assert len(old_path) > 88
+
+    old_msg = f"Error: File '{old_path}' not found"
+    other_msg = f"Error: File '{other_path}' not found"
+    assert "not found" not in old_msg[:100]
+    _write_turn(
+        turns, ts=NOW - timedelta(hours=1),
+        tool_calls=[("read_file", True, old_msg)],
+    )
+    _write_turn(
+        turns, ts=NOW - timedelta(hours=2),
+        tool_calls=[("read_file", True, other_msg)],
+    )
+    _write_turn(
+        turns, ts=NOW - timedelta(hours=3),
+        tool_calls=[("read_file", True, old_msg)],
+    )
+
+    rep = aggregate(turns, events, days=7, now=NOW)
+
+    rows = [r for r in rep.error_recurrence if r.tool_name == "read_file"]
+    assert len(rows) == 2
+    assert sorted(r.occurrences for r in rows) == [1, 2]
+
+
 def test_recent_errors_capped_to_24h(tmp_path: Path):
     turns = tmp_path / "turns.jsonl"
     events = tmp_path / "events.jsonl"

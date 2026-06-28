@@ -34,6 +34,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -43,6 +44,7 @@ from langchain_core.runnables import RunnableConfig
 
 from ..bridges._directives import parse_directives, ReactDirective, resolve_react_target
 from ..billing import PRIORITY_LEVELS
+from ..poller_budget import aggregate_poller_turn_usage
 from ..pollers import (
     PollerOverridesValidationError,
     validate_poller_overrides_text,
@@ -812,15 +814,33 @@ async def list_schedules() -> str:
         out.append(entry)
     # Skill pollers (chainlink #522): a separate registry from the yaml jobs.
     # Surface them in the same view so the schedule isn't misleadingly empty.
+    poller_usage = {}
+    scheduler_home = getattr(scheduler, "_home", None)
+    if scheduler_home is not None:
+        try:
+            poller_usage = await asyncio.to_thread(
+                partial(
+                    aggregate_poller_turn_usage,
+                    Path(scheduler_home) / "logs" / "turns.jsonl",
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive; listing must not fail
+            log.warning("list_schedules poller usage aggregation failed: %s", exc)
+            poller_usage = {}
+
     poller_details = getattr(scheduler, "registered_poller_details", None)
     if callable(poller_details):
         for p in poller_details():
-            out.append({
+            name = p.get("name")
+            entry = {
                 "type": "poller",
-                "name": p.get("name"),
+                "name": name,
                 "cron": p.get("cron"),
                 "priority": p.get("priority"),
-            })
+            }
+            if name in poller_usage:
+                entry["usage"] = poller_usage[name].to_dict()
+            out.append(entry)
     # Empty only when there is NO scheduled work of either kind — checked after
     # pollers are appended so a poller-only deployment isn't reported as empty
     # (the #522 visibility gap; mimir-carreira review on PR #728).

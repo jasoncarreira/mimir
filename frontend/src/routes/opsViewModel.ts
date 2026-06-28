@@ -38,6 +38,16 @@ export type OpsAlgedonicSignals = {
   block: string;
 };
 
+export type OpsPullRequestRow = {
+  number: number;
+  title: string;
+  url: string;
+  author: string;
+  createdAt: string;
+  reviewDecision: string;
+  isDraft: boolean;
+};
+
 const summaryLabels: Record<string, string> = {
   total_events: "Total events",
   events_queued: "Events queued",
@@ -88,6 +98,15 @@ function nullableNumberFrom(value: unknown): number | null {
 
 function stringFrom(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
+}
+
+export function safeExternalHref(value: string): string {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : "";
+  } catch {
+    return "";
+  }
 }
 
 export function formatPercent(value: number | null) {
@@ -177,6 +196,7 @@ export type SafeOpsDashboardData = Omit<OpsDashboardResponse,
   | "recent_failures"
   | "backlog"
   | "chainlink_issues"
+  | "pr_board"
   | "usage_history"
   | "token_usage_history"
   | "algedonic_signals"
@@ -217,6 +237,14 @@ export type SafeOpsDashboardData = Omit<OpsDashboardResponse,
     truncated?: boolean;
     total_count?: number;
   };
+  pr_board: {
+    available: boolean;
+    error?: string | null;
+    repo?: string | null;
+    pull_requests: OpsPullRequestRow[];
+    truncated?: boolean;
+    total_count?: number;
+  };
   usage_history: OpsDashboardResponse["usage_history"];
   token_usage_history: OpsDashboardResponse["token_usage_history"];
   algedonic_signals: OpsAlgedonicSignals;
@@ -226,6 +254,7 @@ export function safeOpsDashboardData(data: unknown): SafeOpsDashboardData {
   const source = recordFrom(data);
   const shellJobs = recordFrom(source.shell_jobs);
   const chainlinkIssues = recordFrom(source.chainlink_issues);
+  const prBoard = recordFrom(source.pr_board);
   const algedonicSignals = recordFrom(source.algedonic_signals);
   return {
     ...(source as unknown as OpsDashboardResponse),
@@ -277,6 +306,22 @@ export function safeOpsDashboardData(data: unknown): SafeOpsDashboardData {
       error: typeof chainlinkIssues.error === "string" ? chainlinkIssues.error : null,
       truncated: typeof chainlinkIssues.truncated === "boolean" ? chainlinkIssues.truncated : false,
       total_count: typeof chainlinkIssues.total_count === "number" ? chainlinkIssues.total_count : undefined
+    },
+    pr_board: {
+      available: typeof prBoard.available === "boolean" ? prBoard.available : false,
+      error: typeof prBoard.error === "string" ? prBoard.error : null,
+      repo: typeof prBoard.repo === "string" ? prBoard.repo : null,
+      pull_requests: recordArrayFrom(prBoard.pull_requests).map((item) => ({
+        number: numberFrom(item.number),
+        title: stringFrom(item.title, "Untitled PR"),
+        url: safeExternalHref(stringFrom(item.url)),
+        author: stringFrom(item.author),
+        createdAt: stringFrom(item.created_at),
+        reviewDecision: stringFrom(item.review_decision),
+        isDraft: typeof item.is_draft === "boolean" ? item.is_draft : false
+      })).filter((item) => item.number > 0),
+      truncated: typeof prBoard.truncated === "boolean" ? prBoard.truncated : false,
+      total_count: typeof prBoard.total_count === "number" ? prBoard.total_count : undefined
     },
     usage_history: Object.fromEntries(
       Object.entries(recordFrom(source.usage_history)).map(([provider, windows]) => [provider, recordFrom(windows)])

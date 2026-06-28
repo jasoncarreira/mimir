@@ -81,4 +81,15 @@ describe("OpsRoute", () => {
     const link = await screen.findByRole("link", { name: "JSON" });
     expect(link.getAttribute("href")).toBe("/api/v1/ops?days=14");
   });
+
+  it("renders open PR links from the ops payload safely", async () => {
+    renderOpsRoute("/ops");
+
+    expect(await screen.findByText("Open PRs")).toBeTruthy();
+    expect(screen.getByText("Proposal: tighten Worklink evidence")).toBeTruthy();
+    const link = screen.getByRole("link", { name: "Open" });
+    expect(link.getAttribute("href")).toBe("https://github.com/example/mimir-home/pull/17");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+  });
 });

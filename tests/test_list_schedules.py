@@ -17,6 +17,8 @@ path.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -30,9 +32,10 @@ class _StubScheduler:
     list of :class:`SchedulerJob` (and, for #522, poller details) we set up.
     The real scheduler's ``list_jobs`` is ``async``; we mirror that."""
 
-    def __init__(self, jobs: list[SchedulerJob], pollers=()) -> None:
+    def __init__(self, jobs: list[SchedulerJob], pollers=(), home=None) -> None:
         self._jobs = jobs
         self._pollers = [dict(p) for p in pollers]
+        self._home = home
 
     async def list_jobs(self) -> list[SchedulerJob]:
         return list(self._jobs)
@@ -46,8 +49,8 @@ def stub_scheduler():
     """Install a stub Scheduler in the tool's _STATE for the test,
     restore on teardown so other tests don't inherit it."""
     prev = _STATE.get("scheduler")
-    yield lambda jobs, pollers=(): _STATE.__setitem__(
-        "scheduler", _StubScheduler(jobs, pollers)
+    yield lambda jobs, pollers=(), home=None: _STATE.__setitem__(
+        "scheduler", _StubScheduler(jobs, pollers, home=home)
     )
     _STATE["scheduler"] = prev
 
@@ -195,6 +198,61 @@ async def test_list_schedules_surfaces_pollers(stub_scheduler):
     assert poller["name"] == "worklink-ready-queue"
     assert poller["cron"] == "*/10 * * * *"
     assert poller["priority"] == "normal"
+
+
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_surfaces_poller_usage(tmp_path: Path, stub_scheduler):
+    """#696: registered pollers include read-only agent-turn usage from turns.jsonl."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "turns.jsonl").write_text(
+        json.dumps({
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "channel_id": "poller:github-activity",
+            "total_cost_usd": 0.125,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    stub_scheduler(
+        [],
+        pollers=[{"name": "github-activity", "cron": "*/5 * * * *", "priority": "normal"}],
+        home=tmp_path,
+    )
+
+    parsed = json.loads(await list_schedules.ainvoke({}))
+
+    assert parsed[0]["type"] == "poller"
+    assert parsed[0]["usage"]["poller"] == "github-activity"
+    assert parsed[0]["usage"]["windows"]["1h"]["agent_turns"] == 1
+    assert parsed[0]["usage"]["windows"]["1h"]["total_cost_usd"] == 0.125
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_serializes_missing_poller_cost_as_null(tmp_path: Path, stub_scheduler):
+    """Non-Anthropic gateways record no cost; list_schedules must not call it $0.00."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "turns.jsonl").write_text(
+        json.dumps({
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "channel_id": "poller:github-activity",
+            "total_cost_usd": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    stub_scheduler(
+        [],
+        pollers=[{"name": "github-activity", "cron": "*/5 * * * *", "priority": "normal"}],
+        home=tmp_path,
+    )
+
+    parsed = json.loads(await list_schedules.ainvoke({}))
+
+    window = parsed[0]["usage"]["windows"]["1h"]
+    assert window["agent_turns"] == 1
+    assert window["total_cost_usd"] is None
 
 
 @pytest.mark.asyncio
