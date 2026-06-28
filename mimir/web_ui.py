@@ -1249,8 +1249,11 @@ def register_routes(
                 _saga_db, channel=channel, limit=limit,  # type: ignore[arg-type]
             )
 
-        if "error" in payload and not payload.get("atoms") and view not in ("recent", "clusters", "activation_hist"):
-            return web.json_response(payload, status=404 if "not found" in str(payload["error"]) else 503)
+        if "error" in payload:
+            return web.json_response(
+                payload,
+                status=404 if "not found" in str(payload["error"]) else 503,
+            )
         return web.json_response(payload)
 
     async def saga_data_v1(request: web.Request) -> web.Response:
