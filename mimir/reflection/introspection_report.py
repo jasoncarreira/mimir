@@ -170,6 +170,8 @@ class Report:
 # contain numbers) and numbers before short hex (longer hex first).
 import re as _re
 
+_READ_FILE_NOT_FOUND_RE = _re.compile(r"^Error: File '[^']+' not found\b")
+
 _NORMALIZE_PATTERNS: list[tuple["_re.Pattern[str]", str]] = [
     # Filesystem paths (absolute and home-relative).
     (_re.compile(r"(?:/[A-Za-z0-9_.-]+)+"), "<path>"),
@@ -195,7 +197,7 @@ def _normalize_error_for_grouping(text: str) -> str:
     attribute unrelated missing files to whichever path happened to be
     latest in the bucket.
     """
-    if _re.match(r"^Error: File '[^']+' not found\b", text):
+    if _READ_FILE_NOT_FOUND_RE.match(text):
         return " ".join(text.split())
 
     out = text
@@ -458,8 +460,11 @@ def aggregate(
                     preview = content[:100].replace("\n", " ")
                     # Normalize for grouping — strip volatile tokens
                     # (paths, hex ids, line numbers, IPs) so similar
-                    # errors cluster instead of fragmenting per-call.
-                    norm = _normalize_error_for_grouping(preview)
+                    # errors cluster instead of fragmenting per-call. Use
+                    # full content for the read_file missing-path exception:
+                    # long paths can push " not found" beyond the preview cap.
+                    norm_source = content if _READ_FILE_NOT_FOUND_RE.match(content) else preview
+                    norm = _normalize_error_for_grouping(norm_source)
                     error_recurrence[(tool_name, norm)].append((ts, preview))
                     if ts >= recent_errors_cutoff:
                         recent_errors.append(RecentError(
