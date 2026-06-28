@@ -161,6 +161,42 @@ def test_recurring_errors_group_volatile_numbers(tmp_path: Path):
     assert rep.error_recurrence[0].occurrences == 3
 
 
+def test_recurring_read_file_not_found_keeps_path_identity(tmp_path: Path):
+    turns = tmp_path / "turns.jsonl"
+    events = tmp_path / "events.jsonl"
+    _write_turn(
+        turns, ts=NOW - timedelta(hours=1),
+        tool_calls=[(
+            "read_file", True,
+            "Error: File '/mimir-home/state/wiki/concepts/old.md' not found",
+        )],
+    )
+    _write_turn(
+        turns, ts=NOW - timedelta(hours=2),
+        tool_calls=[(
+            "read_file", True,
+            "Error: File '/mimir-home/state/wiki/concepts/other.md' not found",
+        )],
+    )
+    _write_turn(
+        turns, ts=NOW - timedelta(hours=3),
+        tool_calls=[(
+            "read_file", True,
+            "Error: File '/mimir-home/state/wiki/concepts/old.md' not found",
+        )],
+    )
+
+    rep = aggregate(turns, events, days=7, now=NOW)
+
+    by_preview = {r.preview: r.occurrences for r in rep.error_recurrence}
+    assert by_preview[
+        "Error: File '/mimir-home/state/wiki/concepts/old.md' not found"
+    ] == 2
+    assert by_preview[
+        "Error: File '/mimir-home/state/wiki/concepts/other.md' not found"
+    ] == 1
+
+
 def test_recent_errors_capped_to_24h(tmp_path: Path):
     turns = tmp_path / "turns.jsonl"
     events = tmp_path / "events.jsonl"

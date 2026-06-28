@@ -187,7 +187,17 @@ _NORMALIZE_PATTERNS: list[tuple["_re.Pattern[str]", str]] = [
 def _normalize_error_for_grouping(text: str) -> str:
     """Collapse volatile tokens so similar errors group. Used as the
     dict key in error_recurrence — the rendered preview still shows
-    the raw form."""
+    the raw form.
+
+    Read-file missing-path errors are the exception: the path is the
+    actionable identity, not volatile decoration. Grouping every
+    ``Error: File '<path>' not found`` row together makes the report
+    attribute unrelated missing files to whichever path happened to be
+    latest in the bucket.
+    """
+    if _re.match(r"^Error: File '[^']+' not found\b", text):
+        return " ".join(text.split())
+
     out = text
     for pat, repl in _NORMALIZE_PATTERNS:
         out = pat.sub(repl, out)
