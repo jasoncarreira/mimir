@@ -17,3 +17,4 @@ export * from "./ops";
 export * from "./saga";
 export * from "./scheduler";
 export * from "./turns";
+export * from "./wiki";
