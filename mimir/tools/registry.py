@@ -1,22 +1,19 @@
 """All remaining tool ports — completes migration coverage.
 
-Translates the 12 tools across mimir/{channeltools,scheduletools,
-committools,spawn}.py to LangChain @tool. Patterns are identical to
+Translates mimir's registry-backed tools to LangChain @tool. Patterns are identical to
 extra_tools.py — same translation rule applies (decorator + type
 hints + docstring → schema).
 
-Tools ported (12 total):
+Tools ported:
   channeltools.py:    send_message, react, fetch_channel_history
   scheduletools.py:   list_schedules, add_schedule, remove_schedule,
-                       reload_pollers
+                       set_poller_overrides, reload_pollers
   committools.py:     commitment_complete, commitment_snooze,
                        commitment_dismiss, commitment_list
   spawn.py:           spawn_claude_code
 
-Plus combined with extra_tools.py (file_search, mimir_get_turn,
-shell_exec) and existing memory_tool.py (memory_query) + store_tool.py
-(memory_store), that's **17 tools** ported total — complete coverage
-of mimir's existing agent-facing surface.
+Plus combined with extra_tools.py, memory_tool.py, store_tool.py, and the
+other split-out tool modules, this is mimir's agent-facing surface.
 
 Each tool's dependencies (channel registry, scheduler, commitments
 store, spawn config) are injected via module-state setters parallel
@@ -32,6 +29,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -45,6 +43,10 @@ from langchain_core.runnables import RunnableConfig
 
 from ..bridges._directives import parse_directives, ReactDirective, resolve_react_target
 from ..billing import PRIORITY_LEVELS
+from ..pollers import (
+    PollerOverridesValidationError,
+    validate_poller_overrides_text,
+)
 from ..scheduler import SchedulerJob
 
 # Per-task ContextVar for channel_id — isolated across concurrent asyncio
@@ -969,6 +971,88 @@ async def remove_schedule(name: str) -> str:
     return f"remove_schedule ok: name={name}"
 
 
+def _atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_str = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+    )
+    tmp = Path(tmp_str)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+@tool
+async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> str:
+    """Create or replace one poller's operator overrides.
+
+    Writes ``<home>/pollers-overrides.yaml`` through a narrow validated path.
+    ``overrides`` may contain only poller override keys such as ``cron``,
+    ``priority``, ``batch_size``, ``env``, and ``pass_env``. Passing an empty
+    dict removes that poller's override entry. Call ``reload_pollers`` after a
+    successful write to apply the new values to the running scheduler.
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "set_poller_overrides failed: no scheduler configured"
+    home = getattr(scheduler, "_home", None)
+    if home is None:
+        return "set_poller_overrides failed: scheduler has no home configured"
+    name = (poller_name or "").strip()
+    if not name:
+        return "set_poller_overrides failed: poller_name is required"
+    if not isinstance(overrides, dict):
+        return "set_poller_overrides failed: overrides must be a dict"
+
+    path = Path(home) / "pollers-overrides.yaml"
+    try:
+        current_text = path.read_text(encoding="utf-8") if path.exists() else ""
+        current = validate_poller_overrides_text(current_text, path=path)
+        proposed = dict(current)
+        if overrides:
+            proposed[name] = dict(overrides)
+        else:
+            proposed.pop(name, None)
+
+        import yaml
+        body = yaml.safe_dump(
+            proposed,
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=True,
+        )
+        validate_poller_overrides_text(body, path=path)
+        _atomic_write_text(path, body)
+    except PollerOverridesValidationError as exc:
+        return f"set_poller_overrides failed: {exc}"
+    except Exception as exc:
+        return f"set_poller_overrides failed: {exc}"
+    action = "removed" if not overrides else "updated"
+    return (
+        f"set_poller_overrides ok: {action} {name} in {path.name}; "
+        "call reload_pollers to apply"
+    )
+
+
 @tool
 async def reload_pollers() -> str:
     """Re-read pollers.yaml and re-register all pollers.
@@ -1840,7 +1924,8 @@ def all_mimir_tools() -> list:
         # follow-up to its own turn instead of answering it in this one.
         defer_injected_message,
         # Scheduler
-        list_schedules, add_schedule, set_schedule_priority, remove_schedule, reload_pollers,
+        list_schedules, add_schedule, set_schedule_priority, remove_schedule,
+        set_poller_overrides, reload_pollers,
         # Commitments
         commitment_complete, commitment_snooze,
         commitment_dismiss, commitment_list,

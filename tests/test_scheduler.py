@@ -1246,6 +1246,28 @@ async def test_reload_pollers_picks_up_new_skill(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_reload_pollers_applies_home_poller_overrides(tmp_path: Path):
+    """pollers-overrides.yaml becomes live through the existing reload path."""
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, home=tmp_path)
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "gmail-inbox", cron="0 * * * *")
+    sched.add_poller_jobs(skills)
+    assert sched._pollers["gmail-inbox"].pass_env == ()
+
+    (tmp_path / "pollers-overrides.yaml").write_text(
+        "gmail-inbox:\n  pass_env: [GOG_ACCOUNT]\n  batch_size: 5\n",
+        encoding="utf-8",
+    )
+    n = await sched.reload_pollers()
+
+    assert n["total"] == 1
+    assert sched._pollers["gmail-inbox"].pass_env == ("GOG_ACCOUNT",)
+    assert sched._pollers["gmail-inbox"].batch_size == 5
+
+
+@pytest.mark.asyncio
 async def test_reload_pollers_drops_removed_skills(tmp_path: Path):
     """Removing a skill's pollers.json (or the whole skill) and
     reloading must drop the corresponding APScheduler job — otherwise
