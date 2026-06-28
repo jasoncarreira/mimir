@@ -38,6 +38,6 @@ deployment tuning creates skill-source drift and can be lost on skill updates.
 What works: Put per-deployment poller tuning in
 `<home>/pollers-overrides.yaml`, not in the skill's `pollers.json`.
 Overridable fields are `cron`, `priority`, `env`, `pass_env`,
-`batch_size`, and `recover_failed_turns`.
+`batch_size`, `recover_failed_turns`, and `deliver`.
 Trigger: Changing a poller's schedule, priority, environment passthrough,
-static env, batch size, or failed-turn recovery for one deployment.
+static env, batch size, failed-turn recovery, or delivery routing for one deployment.

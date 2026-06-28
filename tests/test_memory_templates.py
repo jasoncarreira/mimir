@@ -91,6 +91,7 @@ def test_core_memory_learned_behaviors_default_contains_poller_override_guidance
         "`pass_env`",
         "`batch_size`",
         "`recover_failed_turns`",
+        "`deliver`",
     ):
         assert field in text
 
