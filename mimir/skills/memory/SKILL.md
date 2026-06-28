@@ -49,7 +49,7 @@ Three tiers, in order of how much each costs you in prompt budget:
 ### `memory/core/` — always-in-context
 
 Files in `memory/core/` are dumped into every system prompt, ordered by their
-numeric prefix (`00-persona.md`, `10-procedures.md`, `20-style.md`, …). They
+numeric prefix (`00-identity.md`, `10-procedures.md`, `20-style.md`, …). They
 are highly visible and must be succinct + information-rich. Aim for facts,
 identifiers, and references — not prose. A bloated core block wastes prompt
 budget for everything else.

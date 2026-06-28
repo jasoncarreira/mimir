@@ -117,7 +117,7 @@ every week — pick the 2-3 that have the strongest signal.
   If three different sessions ended with "follow up on heap config"
   or similar, that's a topic the operator is dropping or you're
   failing to close out. Surface it.
-- **Drift indicators** — Re-read `00-persona.md` and a recent sample
+- **Drift indicators** — Re-read `00-identity.md` and a recent sample
   of your replies. Are you still speaking as the persona, or have you
   drifted into generic-assistant patterns? See the librarian-protocol
   reference in the heartbeat skill.

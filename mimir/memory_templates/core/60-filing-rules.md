@@ -157,8 +157,9 @@ internal layer's discoverability rots.
 
 - **Append-only**: `state/raw/`, `state/wiki/log.md`,
   `memory/learnings-pending.md` (capture only — reflection edits via
-  promote/drop), `memory/core/40-learned-behaviors.md` (reflection
-  writes only).
+  promote/drop). `memory/core/40-learned-behaviors.md` remains
+  append-shaped, but edits land only through protected-surface proposal
+  PRs merged by the operator.
 - **Edit-in-place**: most other layers — channels, issues, wiki
   concepts/topics/entities, spec docs in flight.
 - **Auto-managed**: `memory/INDEX.md`, `state/INDEX.md`,

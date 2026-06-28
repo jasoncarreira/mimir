@@ -61,7 +61,7 @@ counted against the tool-call budget).
 - ``send_message`` to the inbound channel (no ``channel_id``) —
   **autonomous**. The normal reply path on an interactive turn.
 - ``send_message`` cross-channel (explicit ``channel_id``) —
-  **autonomous for the surface-attention pattern** (e.g., a
+  **autonomous for the surfacing-attention pattern** (e.g., a
   heartbeat surfacing an alert via the operator-alert channel);
   **escalate-first for everything else**. Non-interactive turns
   (heartbeat / poller / synthesis / upgrade) have no default
@@ -75,10 +75,9 @@ counted against the tool-call budget).
 
 ## Spawned processes
 
-- ``spawn_claude_code`` within operator-documented budget caps
-  — **autonomous**.
-- ``spawn_claude_code`` with elevated budget —
-  **escalate-first**.
+- Spawn tools (``spawn_claude_code`` / ``spawn_codex``) within
+  operator-documented budget caps — **autonomous**.
+- Spawn tools with elevated budget — **escalate-first**.
 - Async shell jobs for read / observe shapes (test runs, log
   scans, build watches) — **autonomous**. For write / mutate
   shapes touching shared state outside the path-confinement

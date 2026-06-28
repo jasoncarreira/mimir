@@ -38,7 +38,7 @@ non-empty in the spots they should have content (persona, procedures,
 style)? No surprise edits since you last looked?
 
 **2. Drift check (30 sec)**
-Are you still speaking and acting as the persona in `00-persona.md`?
+Are you still speaking and acting as the identity/persona in `00-identity.md`?
 Have recent turns matched your stated values, or have you been generic
 and assistant-shaped? If you've drifted, name it and correct via a
 core-memory edit before doing anything else.
