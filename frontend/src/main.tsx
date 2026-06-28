@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
-import React from "react";
+import React, { Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import {
   BrowserRouter,
@@ -29,7 +29,6 @@ import { OpsRoute, UsageRoute } from "./routes/OpsRoute";
 import { SchedulerRoute } from "./routes/SchedulerRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { TurnsRoute } from "./routes/TurnsRoute";
-import { WikiRoute } from "./routes/WikiRoute";
 import { scrubSecretQueryParams, useRouteState } from "./routeState";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import type { AgentCharacterState } from "./skins/types";
@@ -47,6 +46,10 @@ import "./styles.css";
 
 
 const queryClient = new QueryClient();
+const LazyWikiRoute = React.lazy(async () => {
+  const module = await import("./routes/WikiRoute");
+  return { default: module.WikiRoute };
+});
 
 // Build-time mimir version from vite's define (vite.config). Guarded with typeof
 // so it's safe where the define isn't applied (e.g. vitest) — falls back to "".
@@ -582,7 +585,11 @@ function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[
                         : surface.id === "scheduler"
                           ? <SchedulerRoute />
                           : surface.id === "wiki"
-                            ? <WikiRoute surface={surface} />
+                            ? (
+                              <Suspense fallback={<LoadingState label="Loading wiki" />}>
+                                <LazyWikiRoute surface={surface} />
+                              </Suspense>
+                            )
                             : <SurfaceRoute surface={surface} />
           }
           key={surface.id}

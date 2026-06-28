@@ -80,6 +80,7 @@ describe("visibleSurfaces role-gating (#563)", () => {
     surface("ops", "admin"),
     surface("chainlink-board", "admin"),
     surface("scheduler", "admin"),
+    surface("wiki", "admin"),
     surface("admin-config", "admin"),
     surface("admin-users", "admin")
   ];
@@ -94,6 +95,7 @@ describe("visibleSurfaces role-gating (#563)", () => {
       "ops",
       "chainlink-board",
       "scheduler",
+      "wiki",
       "admin-config",
       "admin-users"
     ]);
