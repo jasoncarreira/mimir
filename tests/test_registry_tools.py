@@ -1396,7 +1396,7 @@ class TestSendMessageSkiplistGuard:
         _ctx, tok, reset = self._turn_ctx("scheduled_tick")
         try:
             out = await send_message.ainvoke({
-                "text": "Batch complete. No operator alert.",
+                "text": "Batch complete.",
                 "channel_id": "operator",
             })
         finally:
@@ -1404,6 +1404,27 @@ class TestSendMessageSkiplistGuard:
 
         assert "send_message rejected" in out
         assert bridge.send_calls == []
+
+    @pytest.mark.asyncio
+    async def test_poller_escalation_containing_stop_phrase_sends(self) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        _ctx, tok, reset = self._turn_ctx("poller")
+        try:
+            out = await send_message.ainvoke({
+                "text": "No action needed from you, but heads up: your TLS cert expires tomorrow.",
+                "channel_id": "operator",
+            })
+        finally:
+            reset(tok)
+
+        assert "send_message ok" in out
+        assert bridge.send_calls == [
+            {
+                "cid": "operator",
+                "text": "No action needed from you, but heads up: your TLS cert expires tomorrow.",
+            },
+        ]
 
     @pytest.mark.asyncio
     async def test_interactive_turn_allows_skip_words(self) -> None:
@@ -1443,6 +1464,33 @@ class TestSendMessageSkiplistGuard:
                 "text": "Vendor SkipperCo reported a production outage.",
             },
         ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Recommend we skip this release; CI is red on main.",
+            "The filtered alert queue still has 2 P1s awaiting triage.",
+            "Reminder: no operator alert is configured for the prod DB pager.",
+            "The poller found 3 failed jobs; skip bucket cleanup can wait.",
+        ],
+    )
+    async def test_poller_escalation_with_ambiguous_or_embedded_phrase_sends(
+        self, message: str,
+    ) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        _ctx, tok, reset = self._turn_ctx("poller")
+        try:
+            out = await send_message.ainvoke({
+                "text": message,
+                "channel_id": "operator",
+            })
+        finally:
+            reset(tok)
+
+        assert "send_message ok" in out
+        assert bridge.send_calls == [{"cid": "operator", "text": message}]
 
 
 # ────────────────────────────────────────────────────────────────────
