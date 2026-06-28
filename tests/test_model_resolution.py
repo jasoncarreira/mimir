@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 from langchain_core.language_models import BaseChatModel
 
-from mimir.agent import _resolve_model, _supports_responses_api
+from mimir.agent import _resolve_model, _supports_responses_api, resolve_model_from_config
 
 
 # ─── Responses API heuristic ────────────────────────────────────────
@@ -217,6 +217,68 @@ class TestResolveModelClaudeCode:
 
 
 # ─── Config integration ────────────────────────────────────────────
+
+
+def test_resolve_model_from_config_threads_all_config_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _fake_init(spec: str, **kwargs: Any) -> str:
+        captured["spec"] = spec
+        captured["kwargs"] = kwargs
+        return "MODEL"
+
+    class _Cfg:
+        model_spec = "openai:gpt-5.4"
+        model_max_retries = 4
+        model_max_tokens = 2048
+        model_reasoning_effort = "high"
+
+    monkeypatch.setattr("langchain.chat_models.init_chat_model", _fake_init)
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("MIMIR_USE_RESPONSES_API", raising=False)
+
+    out = resolve_model_from_config(_Cfg())
+
+    assert out == "MODEL"
+    assert captured == {
+        "spec": "openai:gpt-5.4",
+        "kwargs": {
+            "max_retries": 4,
+            "max_tokens": 2048,
+            "use_responses_api": True,
+            "reasoning_effort": "high",
+        },
+    }
+
+
+def test_resolve_model_from_config_honors_env_spec_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _fake_init(spec: str, **kwargs: Any) -> str:
+        captured["spec"] = spec
+        captured["kwargs"] = kwargs
+        return "MODEL"
+
+    class _Cfg:
+        model_spec = "anthropic:claude-haiku-4-5"
+        model_max_retries = 2
+        model_max_tokens = 0
+        model_reasoning_effort = ""
+
+    monkeypatch.setattr("langchain.chat_models.init_chat_model", _fake_init)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:gpt-5.4-nano")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("MIMIR_USE_RESPONSES_API", raising=False)
+
+    resolve_model_from_config(_Cfg())
+
+    assert captured["spec"] == "openai:gpt-5.4-nano"
+    assert captured["kwargs"] == {"max_retries": 2, "use_responses_api": True}
 
 
 def test_config_default_max_retries(monkeypatch: pytest.MonkeyPatch) -> None:
