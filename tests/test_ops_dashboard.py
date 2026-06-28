@@ -851,12 +851,17 @@ async def test_build_dashboard_payload_async_includes_chainlink(tmp_path: Path, 
         return _FakeProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    async def fake_pr_board(home):
+        return {"available": True, "repo": "owner/home", "pull_requests": [], "error": None}
+
+    monkeypatch.setattr(ops_dashboard, "build_pr_board_payload", fake_pr_board)
     payload = await ops_dashboard.build_dashboard_payload_async(
         log, days=7, home=tmp_path,
     )
     assert payload["summary"]["events_queued"] == 1
     assert payload["chainlink_issues"]["available"] is True
     assert payload["chainlink_issues"]["issues"][0]["id"] == 1
+    assert payload["pr_board"]["repo"] == "owner/home"
 
 
 @pytest.mark.asyncio
@@ -872,6 +877,7 @@ async def test_build_dashboard_payload_async_home_none_skips_chainlink(tmp_path:
     payload = await ops_dashboard.build_dashboard_payload_async(log, days=7, home=None)
     assert payload["summary"]["events_queued"] == 1
     assert payload["chainlink_issues"]["available"] is False
+    assert payload["pr_board"]["available"] is False
 
 
 # ─── /ops route renders chainlink data ───────────────────────────────
