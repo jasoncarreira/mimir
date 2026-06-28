@@ -52,8 +52,9 @@ class EventLogger:
         # by the asyncio lock and awaits its own _trim, so it never races.)
         self._io_lock = threading.Lock()
         self._line_count = 0
+        self._dir_ready = False
 
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_dir(force=True)
         # CR2-#6: pre-2026-05-10 this read the entire file via
         # ``read_text()`` then ``splitlines()``. events.jsonl is bounded
         # at ~300 MB (750k events × ~400 B); every process start paid
@@ -67,22 +68,48 @@ class EventLogger:
             self._lock = asyncio.Lock()
         return self._lock
 
-    def _ensure_dir(self) -> None:
-        """Recreate the parent dir if it was removed out-of-band (e.g. a
-        sloppy benchmark cleanup deleted logs/ while we were running)."""
+    def _ensure_dir(self, *, force: bool = False) -> None:
+        """Ensure the parent directory exists without a per-event mkdir.
+
+        The hot path trusts the directory created during initialization. If an
+        out-of-band cleanup removes it, the append helper forces a one-shot
+        recreation after the first ``FileNotFoundError``.
+        """
+        if self._dir_ready and not force:
+            return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._dir_ready = True
         except OSError as exc:
+            self._dir_ready = False
             log.warning("events.jsonl mkdir failed: %s", exc)
+
+    def _append_record_sync(self, record: dict[str, Any]) -> None:
+        """Append a pre-built record using synchronous file IO.
+
+        Called from ``log_sync`` directly and from ``log`` via
+        ``asyncio.to_thread`` so ordinary awaited event logging does not do
+        mkdir/open/write work on the event loop.
+        """
+        with self._io_lock:
+            for attempt in range(2):
+                self._ensure_dir(force=attempt > 0)
+                try:
+                    with self._path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
+                    self._line_count += 1
+                    return
+                except FileNotFoundError:
+                    self._dir_ready = False
+                    if attempt == 0:
+                        continue
+                    raise
 
     async def log(self, event_type: str, **payload: Any) -> None:
         record = self._record(event_type, payload)
         async with self._ensure_lock():
             try:
-                self._ensure_dir()
-                with self._path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
-                self._line_count += 1
+                await asyncio.to_thread(self._append_record_sync, record)
                 # Hysteresis: trim only when over cap by ≥10%. Without the
                 # buffer, every event past the cap triggers an O(file)
                 # rewrite — a high-throughput agent under a small cap pays
@@ -104,13 +131,10 @@ class EventLogger:
         primary work path."""
         record = self._record(event_type, payload)
         try:
-            # chainlink #393: hold _io_lock so this append can't interleave with
-            # _trim_sync's tail-read + rename on the worker thread.
-            with self._io_lock:
-                self._ensure_dir()
-                with self._path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
-                self._line_count += 1
+            # chainlink #393: _append_record_sync holds _io_lock so this append
+            # can't interleave with _trim_sync's tail-read + rename on the worker
+            # thread.
+            self._append_record_sync(record)
             # Trim deferred to the async path — see comment in log().
         except OSError as exc:
             log.warning("events.jsonl sync write failed: %s", exc)

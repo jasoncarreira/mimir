@@ -314,25 +314,27 @@ return await self._normal_enqueue(event)
 4. **Checkpointer / park-and-resume.** Deferred, but the design leaves room: the
    `thread_id` is already plumbed, so adding a `MemorySaver`/SQLite checkpointer
    later enables both park-and-resume and full session resumption.
-5. **Saga retrieval for folded messages** (chainlink #381). A *normal* turn runs
-   a saga retrieval pass for the inbound message at turn start
-   (`_build_turn_prompt`, agent.py ~1314, with contextual-rewrite) → relevant
-   atoms pre-injected into the prompt and recorded in `saga_atom_ids`. A *folded*
-   message currently gets none of that — the middleware folds the raw
-   `HumanMessage` only; the agent relies on the original turn's atoms and can call
-   `memory_query` mid-turn (credited via `saga_atom_ids` = pre-injected ∪
-   mid-turn-queried). Decide whether to auto-retrieve per fold-in:
-   - **(a) fold raw + agent-driven `memory_query`** (current) — simple; the model
-     decides when fresh memory is needed; no wasted retrieval on trivial
-     follow-ups ("yes, do that" / "thanks").
-   - **(b) auto-retrieve** — the middleware uses the async `abefore_model` hook to
-     run a saga query for the folded text and fold its atoms in too, mirroring
-     turn-start. Parity with normal turns, but duplicates the retrieval path and
-     risks noise on low-value follow-ups.
+5. **Saga retrieval for folded messages** (chainlink #381) — **decided
+   2026-06-28: keep fold-raw + agent-driven `memory_query` for v1; do not
+   auto-retrieve per fold-in.** A *normal* turn runs a saga retrieval pass for
+   the inbound message at turn start (`_build_turn_prompt`, agent.py ~1314,
+   with contextual-rewrite) → relevant atoms pre-injected into the prompt and
+   recorded in `saga_atom_ids`. A *folded* message gets the raw `HumanMessage`
+   only; the agent relies on the original turn's atoms and can call
+   `memory_query` mid-turn when the follow-up actually needs fresh memory
+   (credited via `saga_atom_ids` = pre-injected ∪ mid-turn-queried).
 
-   Lean **(a)** for the rollout; **(b)** is a clean drop-in later via
-   `abefore_model` if folded follow-ups routinely need memory the agent doesn't
-   proactively fetch. **Settle before / with PR 3** (durable visibility).
+   Rationale: folded messages are disproportionately low-information steering
+   inputs ("yes", "actually do B", "thanks", small course corrections). Running
+   saga retrieval on every fold would add a second retrieval path inside the
+   middleware, duplicate turn-start contextual-rewrite plumbing, and inject
+   noisy atoms into the ongoing reasoning step for trivial follow-ups. The
+   current design already preserves the escape hatch: the agent can call
+   `memory_query` after reading the folded message, and those queried atoms are
+   credited in the same turn. Revisit only if observed folded follow-ups
+   repeatedly need memory that the agent fails to fetch proactively; the
+   implementation hook would be `abefore_model`, but that is intentionally a
+   later measured change, not v1 parity work.
 
 ## Rollout plan (sequenced PRs)
 

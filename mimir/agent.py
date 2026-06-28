@@ -157,6 +157,22 @@ IMMEDIATE_SESSION_END_TRIGGERS: frozenset[str] = frozenset(
 # ────────────────────────────────────────────────────────────────────
 
 
+def _turn_record_ts(rec: dict) -> datetime | None:
+    """Return the timestamp for a turns.jsonl record, if parseable.
+
+    Older code looked only for ``timestamp`` even though turn records are
+    written with ``ts``. Keep the ``timestamp`` fallback for compatibility
+    with tests or historical records that used the expanded field name.
+    """
+    ts_str = rec.get("ts") or rec.get("timestamp")
+    if not isinstance(ts_str, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _filter_session_turns(
     turns_path: Path,
     saga_session_id: str,
@@ -181,31 +197,16 @@ def _filter_session_turns(
     newest_match_ts: datetime | None = None
     try:
         for rec in tail_jsonl_records(turns_path):
+            rec_ts = _turn_record_ts(rec)
             if rec.get("saga_session_id") == saga_session_id:
                 out.append(rec)
-                ts_str = rec.get("timestamp")
-                if isinstance(ts_str, str):
-                    try:
-                        rec_ts = datetime.fromisoformat(
-                            ts_str.replace("Z", "+00:00")
-                        )
-                        if newest_match_ts is None or rec_ts > newest_match_ts:
-                            newest_match_ts = rec_ts
-                    except ValueError:
-                        pass
-            elif newest_match_ts is not None:
-                ts_str = rec.get("timestamp")
-                if isinstance(ts_str, str):
-                    try:
-                        rec_ts = datetime.fromisoformat(
-                            ts_str.replace("Z", "+00:00")
-                        )
-                        if (newest_match_ts - rec_ts).total_seconds() > margin_seconds:
-                            break
-                    except ValueError:
-                        # Malformed ts on a non-match — keep scanning;
-                        # don't break on a record we can't reason about.
-                        pass
+                if rec_ts is not None and (
+                    newest_match_ts is None or rec_ts > newest_match_ts
+                ):
+                    newest_match_ts = rec_ts
+            elif newest_match_ts is not None and rec_ts is not None:
+                if (newest_match_ts - rec_ts).total_seconds() > margin_seconds:
+                    break
     except OSError:
         return []
     out.reverse()  # tail yields newest-first; restore chronological
@@ -282,6 +283,34 @@ def _validate_effort(provider: str, effort: str) -> str:
             f"effort for provider {provider!r}; choose one of {sorted(valid)}"
         )
     return effort
+
+
+def resolve_model_from_config(
+    config: Any,
+    *,
+    rate_limit_callback: Callable[[Any], None] | None = None,
+) -> BaseChatModel:
+    """Resolve the chat model described by a mimir ``Config``-like object.
+
+    This is the single Config → model-kwargs mapping. Callers that already
+    have a Config should use this helper rather than re-threading
+    ``model_spec`` / retry / token / reasoning fields by hand; that keeps
+    provider-specific gates (notably the claude-code opt-in/home dotenv path)
+    and future model knobs in one place. ``MIMIR_MODEL_SPEC`` remains an
+    ad-hoc bench/smoke override for callers whose Config was not built from
+    the current environment.
+    """
+    model_spec = os.environ.get(
+        "MIMIR_MODEL_SPEC",
+        getattr(config, "model_spec", "claude-code:claude-sonnet-4-6"),
+    )
+    return _resolve_model(
+        model_spec,
+        max_retries=getattr(config, "model_max_retries", 6),
+        max_tokens=getattr(config, "model_max_tokens", 0),
+        reasoning_effort=getattr(config, "model_reasoning_effort", ""),
+        rate_limit_callback=rate_limit_callback,
+    )
 
 
 def _resolve_model(
@@ -1181,25 +1210,8 @@ class Agent:
                 codex_plus_callback = make_codex_plus_rate_limit_callback(
                     self._rate_limits
                 )
-                # Config carries the operator-set model spec; env override
-                # exists for ad-hoc bench / smoke runs that don't go through
-                # Config.from_env. See Config.model_spec for the format
-                # (``claude-code:<model>`` or ``<provider>:<model>``).
-                model_spec = os.environ.get(
-                    "MIMIR_MODEL_SPEC",
-                    getattr(
-                        self._config,
-                        "model_spec",
-                        "claude-code:claude-sonnet-4-6",
-                    ),
-                )
-                self._agent_model = _resolve_model(
-                    model_spec,
-                    max_retries=getattr(self._config, "model_max_retries", 6),
-                    max_tokens=getattr(self._config, "model_max_tokens", 0),
-                    reasoning_effort=getattr(
-                        self._config, "model_reasoning_effort", ""
-                    ),
+                self._agent_model = resolve_model_from_config(
+                    self._config,
                     rate_limit_callback=codex_plus_callback,
                 )
 

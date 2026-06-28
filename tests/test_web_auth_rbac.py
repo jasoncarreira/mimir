@@ -546,4 +546,5 @@ async def test_user_turn_events_rejects_wildcard_and_cross_channel(tmp_path: Pat
             headers={"X-API-Key": alice_key},
         )
         assert allowed.status == 200
+        assert allowed.headers["X-Accel-Buffering"] == "no"
         allowed.close()
