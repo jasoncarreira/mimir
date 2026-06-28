@@ -8,6 +8,7 @@ from typing import Any
 
 from .commitments.models import CommitmentRecord, CommitmentStatus
 from .commitments.store import CommitmentsStore
+from .poller_budget import aggregate_poller_turn_usage
 from .pollers import POLLER_CHANNEL_PREFIX
 from .scheduler import SCHEDULER_CHANNEL_PREFIX, Scheduler
 
@@ -249,6 +250,9 @@ def _poller_rows(
         return []
     aps_by_id = _job_lookup(scheduler)
     recent = _recent_poller_events(events)
+    usage = {}
+    if getattr(scheduler, "_home", None) is not None:  # noqa: SLF001
+        usage = aggregate_poller_turn_usage(scheduler._home / "logs" / "turns.jsonl")  # noqa: SLF001
     rows: list[dict[str, Any]] = []
     for poller in sorted(scheduler._pollers.values(), key=lambda item: item.name):  # noqa: SLF001
         aps_job = aps_by_id.get(f"{POLLER_CHANNEL_PREFIX}{poller.name}")
@@ -268,6 +272,7 @@ def _poller_rows(
             )
         ))
         last_event = _newest_event(last_ok, suppressed, recent_error)
+        row_usage = usage.get(poller.name)
         rows.append({
             "id": f"{POLLER_CHANNEL_PREFIX}{poller.name}",
             "name": poller.name,
@@ -294,6 +299,7 @@ def _poller_rows(
             "suppression_reason": _event_detail(suppressed) if suppressed else None,
             "suppression_severity": str(suppressed.get("severity")) if suppressed and suppressed.get("severity") else None,
             "manifest_path": str(poller.manifest_path) if poller.manifest_path else None,
+            "usage": row_usage.to_dict() if row_usage is not None else None,
         })
     return rows
 
