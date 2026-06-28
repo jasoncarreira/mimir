@@ -54,13 +54,9 @@ _current_channel_id_var: contextvars.ContextVar[str | None] = contextvars.Contex
 )
 
 # Per-task ContextVar: is the active turn an interactive (user-facing) one?
-# Set by the dispatcher at turn start, paired with the channel id. Governs
-# whether ``send_message`` may DEFAULT to the turn's channel: on a non-
-# interactive turn (heartbeat / poller / synthesis / upgrade) there is no
-# user to default a reply to, so a channel-less send_message errors and the
-# agent must pass an explicit channel_id. Default ``True`` is permissive for
-# non-agent callers (tests / bench / direct invocation) — the dispatcher is
-# authoritative and always sets the real value for production turns.
+# Set by the dispatcher at turn start, paired with the channel id. Retained
+# for callers that still thread turn interactivity through the tool registry;
+# send_message itself now requires an explicit deliverable channel_id.
 _current_turn_interactive_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "mimir_current_turn_interactive", default=True
 )
@@ -90,7 +86,40 @@ def _channel_from_config_or_state(
             return from_config
     return (_current_channel_id_var.get() or "").strip()
 
-from langchain_core.tools import InjectedToolArg, tool
+from langchain_core.tools import InjectedToolArg, ToolException, tool
+
+
+_NON_DELIVERABLE_CHANNEL_PREFIXES = ("poller:", "scheduler:")
+_NON_DELIVERABLE_CHANNEL_LITERALS = {"system"}
+
+
+async def _reject_send_message(channel_id: str | None, reason: str) -> None:
+    from ..event_logger import safe_log_event
+
+    await safe_log_event(
+        "send_message_blocked",
+        tool="send_message",
+        channel_id=channel_id,
+        reason=reason,
+    )
+    if reason == "empty_message":
+        raise ToolException(
+            "send_message rejected: empty message. The message text is empty "
+            "or whitespace-only; end the turn or send non-empty text."
+        )
+    raise ToolException(
+        "send_message rejected: not a deliverable channel. Provide a real "
+        "bridge channel_id such as discord-<id>, dm-discord-<id>, or web-*; "
+        f"got {channel_id!r}."
+    )
+
+
+def _is_non_deliverable_channel(channel_id: str) -> bool:
+    lowered = channel_id.lower()
+    return (
+        lowered in _NON_DELIVERABLE_CHANNEL_LITERALS
+        or lowered.startswith(_NON_DELIVERABLE_CHANNEL_PREFIXES)
+    )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -165,9 +194,7 @@ def reset_current_channel_id(token: contextvars.Token) -> None:
 
 def set_current_turn_interactive(interactive: bool) -> contextvars.Token:
     """Set whether the active turn is interactive (user-facing). Paired with
-    ``set_current_channel_id`` at turn start; reset in a finally block.
-    Governs ``send_message``'s default-channel behavior (see the ContextVar
-    docstring)."""
+    ``set_current_channel_id`` at turn start; reset in a finally block."""
     return _current_turn_interactive_var.set(interactive)
 
 
@@ -189,34 +216,27 @@ async def send_message(
 ) -> str:
     """Emit a message to a channel.
 
-    If channel_id is omitted, uses the current turn's channel. Subject
-    to a per-turn loop-detection circuit breaker — repeated near-
-    duplicates first warn, then refuse.
+    Requires an explicit deliverable bridge channel_id. Subject to a
+    per-turn loop-detection circuit breaker — repeated near-duplicates
+    first warn, then refuse.
 
     Args:
         text: The message body to send.
-        channel_id: Target channel ID. Defaults to current turn's.
+        channel_id: Target deliverable bridge channel ID.
     """
+    if not text or not text.strip():
+        await _reject_send_message(channel_id, "empty_message")
+    explicit_channel = bool((channel_id or "").strip())
+    if not explicit_channel:
+        await _reject_send_message(channel_id, "not_deliverable_channel")
+    if _is_non_deliverable_channel((channel_id or "").strip()):
+        await _reject_send_message(channel_id, "not_deliverable_channel")
     channels = _STATE["channel_registry"]
     if channels is None:
         return "send_message failed: no channel registry configured"
-    if not text or not text.strip():
-        return "send_message failed: text is required"
-    explicit_channel = bool((channel_id or "").strip())
     cid = _channel_from_config_or_state(channel_id, config)
     if not cid:
         return "send_message failed: no channel_id and no current channel"
-    # Non-interactive turns (heartbeat / poller / synthesis / upgrade) have no
-    # user to default a reply to. A channel-less send_message on such a turn is
-    # almost always a mistake (the agent talking to itself), so refuse it and
-    # require an explicit channel_id. An explicit channel_id always works —
-    # that's how a heartbeat reaches the operator alert channel.
-    if not explicit_channel and not _current_turn_interactive_var.get():
-        return (
-            "send_message failed: non-interactive turn — there is no channel to "
-            "default to. Pass an explicit channel_id (e.g. the operator alert "
-            "channel) if this turn genuinely needs to send a message."
-        )
 
     # Loop-detection circuit breaker (SPEC §7.2.4). The per-turn
     # LoopDetector lives on the active TurnContext; agent.run_turn
@@ -510,6 +530,9 @@ async def send_message(
     # so downstream parses/greps (e.g. a later react(message_id=...)) work.
     _mid = getattr(result, "message_id", None) if result else None
     return f"send_message ok: channel={cid} message_id={_mid}"
+
+
+send_message.handle_tool_error = True
 
 
 def _resolve_recent_message_id(channel_id: str) -> Optional[str]:

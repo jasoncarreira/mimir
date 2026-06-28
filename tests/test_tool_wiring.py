@@ -123,7 +123,7 @@ def test_agent_init_accepts_commitments_store(tmp_path: Path) -> None:
     # Build a minimal Config via from_env-equivalent path.
     import os
 
-    os.environ.setdefault("MIMIR_HOME", str(tmp_path))
+    os.environ["MIMIR_HOME"] = str(tmp_path)
     cfg = Config.from_env()
 
     fake_store = object()
@@ -147,7 +147,7 @@ def _minimal_agent(tmp_path: Path, saga_client=None):
     from mimir.turn_logger import TurnLogger
     import os
 
-    os.environ.setdefault("MIMIR_HOME", str(tmp_path))
+    os.environ["MIMIR_HOME"] = str(tmp_path)
     cfg = Config.from_env()
     return Agent(
         cfg,
@@ -480,7 +480,9 @@ class TestChannelToolsInjectedToolArg:
 
         set_channel_registry(ChannelRegistry())
         set_current_channel_id("test-chan")
-        result = await send_message.ainvoke({"text": "hello"})
+        result = await send_message.ainvoke(
+            {"text": "hello", "channel_id": "test-chan"}
+        )
         # Tool returns a string result (no bridge configured → diagnostic msg)
         assert isinstance(result, str)
 
@@ -498,7 +500,7 @@ class TestChannelToolsInjectedToolArg:
         # was trained on the old schema). Must not collide with LangChain's
         # internal config injection in StructuredTool.arun.
         result = await send_message.ainvoke(
-            {"text": "hello", "config": None},
+            {"text": "hello", "channel_id": "test-chan", "config": None},
             config=RunnableConfig(),
         )
         assert isinstance(result, str)
