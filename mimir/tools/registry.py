@@ -65,6 +65,62 @@ _current_turn_interactive_var: contextvars.ContextVar[bool] = contextvars.Contex
     "mimir_current_turn_interactive", default=True
 )
 
+SEND_MESSAGE_SKIPLIST_TRIGGERS: frozenset[str] = frozenset(
+    {"poller", "scheduled_tick"}
+)
+
+# Tunable list of phrases that indicate the model is narrating a
+# non-delivery decision instead of ending an autonomous turn silently.
+# Keep this list conservative: a false positive drops a real poller /
+# scheduled escalation, so ambiguous words like ``skip`` / ``filtered`` /
+# ``no action`` deliberately stay out of the matcher.
+SEND_MESSAGE_SKIPLIST_PHRASES: tuple[str, ...] = (
+    "end silent",
+    "end silently",
+    "end-silent",
+    "skip bucket",
+    "batch complete",
+    "routed to skip",
+)
+SEND_MESSAGE_SKIPLIST_SHORT_MAX_WORDS = 8
+
+
+def _compile_skiplist_phrase_pattern(phrase: str) -> re.Pattern[str]:
+    escaped = r"\s+".join(re.escape(part) for part in phrase.split())
+    return re.compile(
+        rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+
+
+_SEND_MESSAGE_SKIPLIST_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (phrase, _compile_skiplist_phrase_pattern(phrase))
+    for phrase in SEND_MESSAGE_SKIPLIST_PHRASES
+)
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+", text))
+
+
+def _matched_send_message_skiplist_phrase(text: str) -> str | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    # Narration sends that should have been silent are short one-liners. A
+    # substantive escalation may mention a stop phrase in passing, so only block
+    # when the stop phrase dominates the message: either the entire message is
+    # short, or the phrase is at the tail of a short narration sentence.
+    text_word_count = _word_count(stripped)
+    for phrase, pattern in _SEND_MESSAGE_SKIPLIST_PATTERNS:
+        for match in pattern.finditer(stripped):
+            trailing = stripped[match.end() :].strip()
+            phrase_is_tail = not trailing or not re.search(r"[A-Za-z0-9]", trailing)
+            if text_word_count <= SEND_MESSAGE_SKIPLIST_SHORT_MAX_WORDS or phrase_is_tail:
+                return phrase
+    return None
+
 
 def _channel_from_config_or_state(
     channel_id: str | None, config: RunnableConfig | None
@@ -258,6 +314,27 @@ async def send_message(
     decision = None
     undelivered_decision = None
     ctx = get_current_turn()
+    trigger = (getattr(ctx, "trigger", "") if ctx is not None else "").strip()
+    matched_skiplist_phrase = (
+        _matched_send_message_skiplist_phrase(text)
+        if trigger in SEND_MESSAGE_SKIPLIST_TRIGGERS
+        else None
+    )
+    if matched_skiplist_phrase is not None:
+        try:
+            await _log_event(
+                "send_message_blocked_skiplist",
+                channel_id=cid,
+                trigger=trigger,
+                matched_phrase=matched_skiplist_phrase,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        raise ToolException(
+            "send_message rejected: this autonomous turn found only "
+            "skip-bucket / no-action narration. The correct action is to end "
+            "the turn with no message."
+        )
     if ctx is not None:
         detector = getattr(ctx, "loop_detector", None)
 
