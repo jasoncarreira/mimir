@@ -12,7 +12,10 @@ import type { ReactNode } from "react";
 
 const STORAGE_KEY = "mimir.api_key";
 
-const { whoami } = vi.hoisted(() => ({ whoami: { getWhoami: (..._a: unknown[]): Promise<unknown> => Promise.resolve() } }));
+const { whoami, wikiRouteLoads } = vi.hoisted(() => ({
+  whoami: { getWhoami: (..._a: unknown[]): Promise<unknown> => Promise.resolve() },
+  wikiRouteLoads: { count: 0 }
+}));
 
 // whoami reflects the *current* stored key, exactly as the real client would:
 // admin when a key is present, anonymous (non-admin) when not.
@@ -88,20 +91,26 @@ vi.mock("./agent-character", () => ({
   withComposerListening: (state: string) => state
 }));
 vi.mock("./ChatRoute", () => ({ ChatRoute: () => <div>chat-stub</div> }));
+vi.mock("./routes/WikiRoute", () => {
+  wikiRouteLoads.count += 1;
+  return {
+    WikiRoute: ({ surface }: { surface: { title: string } }) => `wiki-route-stub:${surface.title}`
+  };
+});
 
 // Imported after mocks are registered.
 const { AppFrame, resetBrowserSessionStateForApiKeyChange } = await import("./main");
 const { useChatStore } = await import("./chatStore");
 const { useUiState } = await import("./uiState");
 
-function renderApp() {
+function renderApp(initialEntries = ["/"]) {
   // The store seeds apiKeyPresent from localStorage at import (when it's empty);
   // mirror a fresh page load by syncing it to the current key before each render.
   useUiState.setState({ apiKeyPresent: Boolean(window.localStorage.getItem(STORAGE_KEY)) });
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={["/"]}>
+      <MemoryRouter initialEntries={initialEntries}>
         <AppFrame />
       </MemoryRouter>
     </QueryClientProvider>
@@ -120,6 +129,7 @@ afterEach(() => {
     collapsedRegions: {},
     apiKeyPresent: false
   });
+  wikiRouteLoads.count = 0;
   vi.clearAllMocks();
 });
 
@@ -170,6 +180,7 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
     expect(await screen.findByRole("button", { name: "Sign in" })).toBeTruthy();
     expect(screen.queryByRole("link", { name: /Chat/ })).toBeNull();
     expect(screen.queryByRole("link", { name: /Users/ })).toBeNull();
+    expect(screen.queryByRole("link", { name: /Wiki/ })).toBeNull();
     // ...and no authenticated client runs pre-login: whoami stays disabled until
     // signed in (the live-events stream gate is covered in LiveEventsProvider.test).
     expect(whoami.getWhoami).not.toHaveBeenCalled();
@@ -184,6 +195,7 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
     // appears immediately, without a reload.
     expect(await screen.findByRole("link", { name: /Chat/ })).toBeTruthy();
     expect(await screen.findByRole("link", { name: /Users/ })).toBeTruthy();
+    expect(await screen.findByRole("link", { name: /Wiki/ })).toBeTruthy();
   });
 
   it("returns to the login screen after clearing the key", async () => {
@@ -244,5 +256,18 @@ describe("AppFrame shell layout follows the skin (#788)", () => {
     renderApp();
 
     expect((await screen.findByRole("link", { name: /Wiki/ })).getAttribute("href")).toBe("/wiki");
+  });
+
+  it("lazy-loads the wiki route only after the wiki surface is visited", async () => {
+    window.localStorage.setItem(STORAGE_KEY, "admin-key-123");
+    renderApp();
+
+    expect(await screen.findByText("chat-stub")).toBeTruthy();
+    expect(wikiRouteLoads.count).toBe(0);
+
+    fireEvent.click(screen.getByRole("link", { name: /Wiki/ }));
+
+    expect(await screen.findByText("wiki-route-stub:Wiki")).toBeTruthy();
+    expect(wikiRouteLoads.count).toBe(1);
   });
 });
