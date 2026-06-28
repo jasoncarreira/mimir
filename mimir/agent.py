@@ -157,6 +157,22 @@ IMMEDIATE_SESSION_END_TRIGGERS: frozenset[str] = frozenset(
 # ────────────────────────────────────────────────────────────────────
 
 
+def _turn_record_ts(rec: dict) -> datetime | None:
+    """Return the timestamp for a turns.jsonl record, if parseable.
+
+    Older code looked only for ``timestamp`` even though turn records are
+    written with ``ts``. Keep the ``timestamp`` fallback for compatibility
+    with tests or historical records that used the expanded field name.
+    """
+    ts_str = rec.get("ts") or rec.get("timestamp")
+    if not isinstance(ts_str, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _filter_session_turns(
     turns_path: Path,
     saga_session_id: str,
@@ -181,31 +197,16 @@ def _filter_session_turns(
     newest_match_ts: datetime | None = None
     try:
         for rec in tail_jsonl_records(turns_path):
+            rec_ts = _turn_record_ts(rec)
             if rec.get("saga_session_id") == saga_session_id:
                 out.append(rec)
-                ts_str = rec.get("timestamp")
-                if isinstance(ts_str, str):
-                    try:
-                        rec_ts = datetime.fromisoformat(
-                            ts_str.replace("Z", "+00:00")
-                        )
-                        if newest_match_ts is None or rec_ts > newest_match_ts:
-                            newest_match_ts = rec_ts
-                    except ValueError:
-                        pass
-            elif newest_match_ts is not None:
-                ts_str = rec.get("timestamp")
-                if isinstance(ts_str, str):
-                    try:
-                        rec_ts = datetime.fromisoformat(
-                            ts_str.replace("Z", "+00:00")
-                        )
-                        if (newest_match_ts - rec_ts).total_seconds() > margin_seconds:
-                            break
-                    except ValueError:
-                        # Malformed ts on a non-match — keep scanning;
-                        # don't break on a record we can't reason about.
-                        pass
+                if rec_ts is not None and (
+                    newest_match_ts is None or rec_ts > newest_match_ts
+                ):
+                    newest_match_ts = rec_ts
+            elif newest_match_ts is not None and rec_ts is not None:
+                if (newest_match_ts - rec_ts).total_seconds() > margin_seconds:
+                    break
     except OSError:
         return []
     out.reverse()  # tail yields newest-first; restore chronological

@@ -16,13 +16,14 @@ silently shipping an empty-block prompt to the model.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
 
 import pytest
 
-from mimir.agent import Agent
+from mimir.agent import Agent, _filter_session_turns
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
@@ -155,6 +156,52 @@ async def test_build_turn_prompt_routes_synthesis_to_dedicated_template(
 
 
 # ─── Direct synthesis prompt builder ────────────────────────────────
+
+
+def test_filter_session_turns_uses_turn_record_ts_for_window_break(
+    tmp_path: Path,
+) -> None:
+    """Session-window filtering must use turns.jsonl's canonical ``ts``
+    field. A regression that looks only for ``timestamp`` still returns the
+    matching records, but never hits the time-based break and scans the full
+    file tail on every synthesis turn.
+    """
+    turns_path = tmp_path / "turns.jsonl"
+    records = [
+        {
+            "turn_id": "too-old-match",
+            "ts": "2026-06-28T05:00:00+00:00",
+            "saga_session_id": "sess-1",
+        },
+        {
+            "turn_id": "old-nonmatch",
+            "ts": "2026-06-28T05:05:00+00:00",
+            "saga_session_id": "other",
+        },
+        {
+            "turn_id": "recent-match-1",
+            "ts": "2026-06-28T05:30:00+00:00",
+            "saga_session_id": "sess-1",
+        },
+        {
+            "turn_id": "recent-match-2",
+            "ts": "2026-06-28T05:31:00+00:00",
+            "saga_session_id": "sess-1",
+        },
+        {
+            "turn_id": "newest-nonmatch",
+            "ts": "2026-06-28T05:32:00+00:00",
+            "saga_session_id": "other",
+        },
+    ]
+    turns_path.write_text("\n".join(json.dumps(r) for r in records))
+
+    filtered = _filter_session_turns(turns_path, "sess-1", idle_minutes=10)
+
+    assert [rec["turn_id"] for rec in filtered] == [
+        "recent-match-1",
+        "recent-match-2",
+    ]
 
 
 @pytest.mark.asyncio
