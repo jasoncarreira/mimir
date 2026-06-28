@@ -132,7 +132,7 @@ async def test_sends_below_soft_limit_pass_through(
     _set_channel("ch-1")
     token = set_current_turn(ctx)
     try:
-        out = await send_message.ainvoke({"text": "first send"})
+        out = await send_message.ainvoke({"text": "first send", "channel_id": "ch-1"})
     finally:
         reset_current_turn(token)
     assert "ok" in out.lower()
@@ -160,9 +160,9 @@ async def test_hard_stop_refuses_and_logs_event(
         # First two sends: streak 1, 2 — both should pass through with
         # SOFT_WARN at streak=2 (>=soft_limit=2). Third send: streak=3
         # >= hard_limit=3 → HARD_STOP.
-        await send_message.ainvoke({"text": "duplicate"})
-        await send_message.ainvoke({"text": "duplicate"})
-        out = await send_message.ainvoke({"text": "duplicate"})
+        await send_message.ainvoke({"text": "duplicate", "channel_id": "ch-1"})
+        await send_message.ainvoke({"text": "duplicate", "channel_id": "ch-1"})
+        out = await send_message.ainvoke({"text": "duplicate", "channel_id": "ch-1"})
     finally:
         reset_current_turn(token)
 
@@ -195,9 +195,9 @@ async def test_soft_warn_logs_once_and_still_sends(
     _set_channel("ch-1")
     token = set_current_turn(ctx)
     try:
-        await send_message.ainvoke({"text": "match"})
-        out2 = await send_message.ainvoke({"text": "match"})
-        out3 = await send_message.ainvoke({"text": "match"})
+        await send_message.ainvoke({"text": "match", "channel_id": "ch-1"})
+        out2 = await send_message.ainvoke({"text": "match", "channel_id": "ch-1"})
+        out3 = await send_message.ainvoke({"text": "match", "channel_id": "ch-1"})
     finally:
         reset_current_turn(token)
 
@@ -227,9 +227,9 @@ async def test_undelivered_send_does_not_advance_loop_detector_streak(
     _set_channel("ch-1")
     token = set_current_turn(ctx)
     try:
-        out1 = await send_message.ainvoke({"text": "retry me"})
-        out2 = await send_message.ainvoke({"text": "retry me"})
-        out3 = await send_message.ainvoke({"text": "retry me"})
+        out1 = await send_message.ainvoke({"text": "retry me", "channel_id": "ch-1"})
+        out2 = await send_message.ainvoke({"text": "retry me", "channel_id": "ch-1"})
+        out3 = await send_message.ainvoke({"text": "retry me", "channel_id": "ch-1"})
     finally:
         reset_current_turn(token)
 
@@ -258,10 +258,10 @@ async def test_repeated_undelivered_sends_trip_separate_hard_stop_backstop(
     _set_channel("ch-1")
     token = set_current_turn(ctx)
     try:
-        out1 = await send_message.ainvoke({"text": "retry me"})
-        out2 = await send_message.ainvoke({"text": "retry me"})
-        out3 = await send_message.ainvoke({"text": "retry me"})
-        out4 = await send_message.ainvoke({"text": "retry me"})
+        out1 = await send_message.ainvoke({"text": "retry me", "channel_id": "ch-1"})
+        out2 = await send_message.ainvoke({"text": "retry me", "channel_id": "ch-1"})
+        out3 = await send_message.ainvoke({"text": "retry me", "channel_id": "ch-1"})
+        out4 = await send_message.ainvoke({"text": "retry me", "channel_id": "ch-1"})
     finally:
         reset_current_turn(token)
 
@@ -294,9 +294,9 @@ async def test_raised_send_does_not_advance_loop_detector_streak(
     _set_channel("ch-1")
     token = set_current_turn(ctx)
     try:
-        out1 = await send_message.ainvoke({"text": "retry me"})
-        out2 = await send_message.ainvoke({"text": "retry me"})
-        out3 = await send_message.ainvoke({"text": "retry me"})
+        out1 = await send_message.ainvoke({"text": "retry me", "channel_id": "ch-1"})
+        out2 = await send_message.ainvoke({"text": "retry me", "channel_id": "ch-1"})
+        out3 = await send_message.ainvoke({"text": "retry me", "channel_id": "ch-1"})
     finally:
         reset_current_turn(token)
 
@@ -319,9 +319,9 @@ async def test_directive_only_without_target_does_not_advance_loop_detector(
     _set_channel("ch-1")
     token = set_current_turn(ctx)
     try:
-        await send_message.ainvoke({"text": '<actions><react emoji="👍" /></actions>'})
-        await send_message.ainvoke({"text": '<actions><react emoji="👍" /></actions>'})
-        out = await send_message.ainvoke({"text": "first real send"})
+        await send_message.ainvoke({"text": '<actions><react emoji="👍" /></actions>', "channel_id": "ch-1"})
+        await send_message.ainvoke({"text": '<actions><react emoji="👍" /></actions>', "channel_id": "ch-1"})
+        out = await send_message.ainvoke({"text": "first real send", "channel_id": "ch-1"})
     finally:
         reset_current_turn(token)
 
@@ -360,13 +360,13 @@ async def test_distinct_text_resets_streak(
     _set_channel("ch-1")
     token = set_current_turn(ctx)
     try:
-        await send_message.ainvoke({"text": "same text"})
-        await send_message.ainvoke({"text": "same text"})
+        await send_message.ainvoke({"text": "same text", "channel_id": "ch-1"})
+        await send_message.ainvoke({"text": "same text", "channel_id": "ch-1"})
         # Distinct: similarity < 0.9 → streak resets to 1.
-        await send_message.ainvoke({"text": "completely different content here"})
+        await send_message.ainvoke({"text": "completely different content here", "channel_id": "ch-1"})
         # Now back to "same text" — streak should be 1 again, NOT
         # the previous 2+1=3 HARD_STOP.
-        out = await send_message.ainvoke({"text": "same text"})
+        out = await send_message.ainvoke({"text": "same text", "channel_id": "ch-1"})
     finally:
         reset_current_turn(token)
     assert "ok" in out.lower()

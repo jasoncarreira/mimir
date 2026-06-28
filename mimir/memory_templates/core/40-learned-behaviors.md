@@ -31,3 +31,13 @@ non-goal; it makes frame-checking an action, not just a value.
 Trigger: Any request shaped like "how should we implement X", "let's add
 X to subsystem Y", "evaluate/review/decide on X", or any design task
 where a premise is plausible but not obviously true.
+
+## 2026-06-28 — tune pollers through overrides
+What I noticed: Editing an installed skill's `pollers.json` for local
+deployment tuning creates skill-source drift and can be lost on skill updates.
+What works: Put per-deployment poller tuning in
+`<home>/pollers-overrides.yaml`, not in the skill's `pollers.json`.
+Overridable fields are `cron`, `priority`, `env`, `pass_env`,
+`batch_size`, `recover_failed_turns`, and `deliver`.
+Trigger: Changing a poller's schedule, priority, environment passthrough,
+static env, batch size, failed-turn recovery, or delivery routing for one deployment.

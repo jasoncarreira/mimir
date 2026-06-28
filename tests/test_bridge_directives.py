@@ -374,7 +374,8 @@ async def test_send_message_strips_actions_and_reacts():
                     'Done.\n\n<actions>'
                     '<react emoji="✅" message="999" />'
                     '</actions>'
-                )
+                ),
+                "channel_id": "cap-test",
             }
         )
 
@@ -407,7 +408,8 @@ async def test_send_message_react_defaults_to_sent_message_id():
                     'ACK.\n\n<actions>'
                     '<react emoji="👍" />'
                     '</actions>'
-                )
+                ),
+                "channel_id": "cap-test",
             }
         )
 
@@ -425,7 +427,9 @@ async def test_send_message_without_actions_unchanged():
     set_channel_registry(_make_registry(bridge))
     cid_token = set_current_channel_id("cap-test")
     try:
-        await send_message.ainvoke({"text": "just a normal reply"})
+        await send_message.ainvoke(
+            {"text": "just a normal reply", "channel_id": "cap-test"}
+        )
 
         assert bridge.sent[0][1] == "just a normal reply"
         assert bridge.reacted == []
@@ -459,7 +463,9 @@ async def test_send_message_records_bridge_name_as_source(tmp_path):
     set_channel_registry(_make_registry(bridge))
     cid_token = set_current_channel_id("discord-test-chan")
     try:
-        result = await send_message.ainvoke({"text": "hello from poller turn"})
+        result = await send_message.ainvoke(
+            {"text": "hello from poller turn", "channel_id": "discord-test-chan"}
+        )
         assert "send_message ok" in result
 
         # Buffer should have one assistant message with source="discord".

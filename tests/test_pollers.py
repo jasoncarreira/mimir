@@ -30,10 +30,12 @@ from mimir.pollers import (
     POLLER_MANIFEST_SCHEMA_VERSION,
     POLLER_TIMEOUT_SECONDS,
     PollerConfig,
+    PollerOverridesValidationError,
     _CircuitBreakerState,
     _circuit_breakers,
     discover_pollers,
     run_poller,
+    validate_poller_overrides_text,
 )
 
 
@@ -881,6 +883,38 @@ print(json.dumps({"poller": "x", "prompt": "second"}))
 
 
 @pytest.mark.asyncio
+async def test_run_poller_invalid_line_redacts_exact_pass_env_values(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """Invalid stdout lines also pass through exact-env-value redaction.
+
+    This covers the non-JSON diagnostic path: a poller can accidentally print a
+    bare pass_env secret to stdout, fail JSON parsing, and otherwise leak it via
+    the durable poller_invalid_line event.
+    """
+    monkeypatch.setenv("WEBHOOK_HMAC", "correct-horse-battery-staple")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(f"not-json hmac={os.environ['WEBHOOK_HMAC']}")
+print(json.dumps({"poller": "x", "prompt": "ok"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("WEBHOOK_HMAC",),
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 1
+    events = _read_events(home)
+    invalid = [e for e in events if e["type"] == "poller_invalid_line"]
+    assert len(invalid) == 1
+    assert "correct-horse-battery-staple" not in invalid[0]["line"]
+    assert "hmac=[REDACTED]" in invalid[0]["line"]
+
+
+@pytest.mark.asyncio
 async def test_run_poller_skips_lines_without_prompt_field(
     tmp_path: Path, home: Path,
 ) -> None:
@@ -961,6 +995,90 @@ print(json.dumps({"poller": "x", "prompt": "ok"}))
     assert "checking external service" in stderr[0]["stderr"]
     # exit_code=0: progress noise on a successful run (e.g. gh auth output)
     assert stderr[0].get("exit_code") == 0
+
+
+@pytest.mark.asyncio
+async def test_run_poller_stderr_redacts_exact_pass_env_values(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """chainlink #437: pass_env values can be bare secrets with no token shape.
+
+    If a poller accidentally echoes such a value to stderr, the framework masks
+    the exact env value before writing the durable poller_stderr event.
+    """
+    monkeypatch.setenv("WEBHOOK_HMAC", "correct-horse-battery-staple")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os, sys
+print(f"webhook failed hmac={os.environ['WEBHOOK_HMAC']}", file=sys.stderr)
+print(json.dumps({"poller": "x", "prompt": "ok"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("WEBHOOK_HMAC",),
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 1
+    events = _read_events(home)
+    stderr = [e for e in events if e["type"] == "poller_stderr"]
+    assert len(stderr) == 1
+    assert "correct-horse-battery-staple" not in stderr[0]["stderr"]
+    assert "hmac=[REDACTED]" in stderr[0]["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_run_poller_stderr_redacts_exact_poller_env_values(
+    tmp_path: Path, home: Path,
+) -> None:
+    """Manifest ``env`` is also an explicit forwarding surface for redaction."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os, sys
+print(f"db dsn={os.environ['DB_DSN']}", file=sys.stderr)
+print(json.dumps({"poller": "x", "prompt": "ok"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"DB_DSN": "postgres://user:pw@db.example/app"},
+        skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 1
+    events = _read_events(home)
+    stderr = [e for e in events if e["type"] == "poller_stderr"]
+    assert len(stderr) == 1
+    assert "postgres://user:pw@db.example/app" not in stderr[0]["stderr"]
+    assert "dsn=[REDACTED]" in stderr[0]["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_run_poller_stderr_does_not_redact_globally_allowlisted_deny_name(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """Deny-named ordinary values are not shredded just because of the name."""
+    monkeypatch.setenv("MIMIR_POLLER_ENV_ALLOWLIST", "TOKEN")
+    monkeypatch.setenv("TOKEN", "github")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os, sys
+print(f"status={os.environ['TOKEN']} ok", file=sys.stderr)
+print(json.dumps({"poller": "x", "prompt": "ok"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 1
+    events = _read_events(home)
+    stderr = [e for e in events if e["type"] == "poller_stderr"]
+    assert len(stderr) == 1
+    assert stderr[0]["stderr"] == "status=github ok"
 
 
 @pytest.mark.asyncio
@@ -1238,6 +1356,37 @@ print(json.dumps({"poller": "x", "prompt": "rejected payload"}))
     assert len(rejections) == 1
     assert rejections[0]["poller"] == "x"
     assert "rejected payload" in rejections[0]["prompt_preview"]
+
+
+@pytest.mark.asyncio
+async def test_run_poller_event_rejected_redacts_exact_pass_env_values(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """Rejected-event prompt previews are durable diagnostics; redact them."""
+    monkeypatch.setenv("WEBHOOK_HMAC", "correct-horse-battery-staple")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({
+    "poller": "x",
+    "prompt": f"rejecting hmac={os.environ['WEBHOOK_HMAC']}",
+}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("WEBHOOK_HMAC",),
+    )
+    enq = _CapturingEnqueue(accept=False)
+    await run_poller(cfg, enqueue=enq)
+
+    events = _read_events(home)
+    rejections = [
+        e for e in events if e["type"] == "poller_event_rejected"
+    ]
+    assert len(rejections) == 1
+    assert "correct-horse-battery-staple" not in rejections[0]["prompt_preview"]
+    assert rejections[0]["prompt_preview"] == "rejecting hmac=[REDACTED]"
 
 
 @pytest.mark.asyncio
@@ -2053,12 +2202,13 @@ print('{"poller": "x", "prompt": "ok"}')
         for e in events if e.get("type") == "poller_stderr"
     ]
     combined_stderr = "|".join(stderr_payloads)
-    # The pass_env token reached the subprocess (TOKEN_PRESENT=True), but the
-    # event sink redacts the token-shaped value before events.jsonl.
+    # The pass_env token reached the subprocess (TOKEN_PRESENT=True), but
+    # diagnostics redact exact values for all pass_env keys before events.jsonl.
     assert "TOKEN_PRESENT=True" in combined_stderr
     assert "ghp_test_pass_env_value" not in combined_stderr
+    assert "mimir-bot" not in combined_stderr
     assert "TOKEN=[REDACTED]" in combined_stderr
-    assert "LOGIN=mimir-bot" in combined_stderr
+    assert "LOGIN=[REDACTED]" in combined_stderr
 
 
 @pytest.mark.asyncio
@@ -2391,6 +2541,44 @@ print(json.dumps({
     assert sig["poller"] == "gmail-inbox"
     assert sig["account"] == "agent@example.com"
     assert sig["detail"] == "token refresh failed (invalid_grant)"
+
+
+@pytest.mark.asyncio
+async def test_signal_payload_redacts_exact_pass_env_values(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """Signal payloads are durable events.jsonl entries too.
+
+    A poller can echo an explicitly forwarded secret in a string payload field;
+    redact exact pass_env values before handing the payload to log_event.
+    """
+    monkeypatch.setenv("WEBHOOK_HMAC", "correct-horse-battery-staple")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({
+    "poller": "x",
+    "signal": "poller_signal",
+    "detail": f"forwarded hmac={os.environ['WEBHOOK_HMAC']}",
+    "retry_after_s": 60,
+}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("WEBHOOK_HMAC",),
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+
+    assert n == 0
+    assert enq.events == []
+    events = _read_events(home)
+    signal = [e for e in events if e["type"] == "poller_signal"]
+    assert len(signal) == 1
+    assert "correct-horse-battery-staple" not in json.dumps(signal[0])
+    assert signal[0]["detail"] == "forwarded hmac=[REDACTED]"
+    assert signal[0]["retry_after_s"] == 60
 
 
 def test_signal_event_types_classified_algedonically():
@@ -3212,6 +3400,23 @@ def test_overrides_absent_or_malformed_are_noops(tmp_path: Path, caplog):
     assert p.cron == "0 * * * *"
     assert any("poller_overrides_invalid" in r.getMessage()
                for r in caplog.records)
+
+
+def test_validate_poller_overrides_text_rejects_unknown_fields(tmp_path: Path):
+    path = tmp_path / "pollers-overrides.yaml"
+    with pytest.raises(PollerOverridesValidationError) as exc:
+        validate_poller_overrides_text(
+            "gmail-inbox:\n  command: 'rm -rf /'\n",
+            path=path,
+        )
+    assert "poller_overrides_unknown_field" in str(exc.value)
+
+
+def test_validate_poller_overrides_text_rejects_non_mapping_root(tmp_path: Path):
+    path = tmp_path / "pollers-overrides.yaml"
+    with pytest.raises(PollerOverridesValidationError) as exc:
+        validate_poller_overrides_text("- just\n- a list\n", path=path)
+    assert "root must be a mapping" in str(exc.value)
 
 
 def test_overrides_env_and_pass_env(tmp_path: Path):

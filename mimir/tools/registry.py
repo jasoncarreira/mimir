@@ -1,22 +1,19 @@
 """All remaining tool ports — completes migration coverage.
 
-Translates the 12 tools across mimir/{channeltools,scheduletools,
-committools,spawn}.py to LangChain @tool. Patterns are identical to
+Translates mimir's registry-backed tools to LangChain @tool. Patterns are identical to
 extra_tools.py — same translation rule applies (decorator + type
 hints + docstring → schema).
 
-Tools ported (12 total):
+Tools ported:
   channeltools.py:    send_message, react, fetch_channel_history
   scheduletools.py:   list_schedules, add_schedule, remove_schedule,
-                       reload_pollers
+                       set_poller_overrides, reload_pollers
   committools.py:     commitment_complete, commitment_snooze,
                        commitment_dismiss, commitment_list
   spawn.py:           spawn_claude_code
 
-Plus combined with extra_tools.py (file_search, mimir_get_turn,
-shell_exec) and existing memory_tool.py (memory_query) + store_tool.py
-(memory_store), that's **17 tools** ported total — complete coverage
-of mimir's existing agent-facing surface.
+Plus combined with extra_tools.py, memory_tool.py, store_tool.py, and the
+other split-out tool modules, this is mimir's agent-facing surface.
 
 Each tool's dependencies (channel registry, scheduler, commitments
 store, spawn config) are injected via module-state setters parallel
@@ -32,6 +29,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -47,6 +45,10 @@ from langchain_core.runnables import RunnableConfig
 from ..bridges._directives import parse_directives, ReactDirective, resolve_react_target
 from ..billing import PRIORITY_LEVELS
 from ..poller_budget import aggregate_poller_turn_usage
+from ..pollers import (
+    PollerOverridesValidationError,
+    validate_poller_overrides_text,
+)
 from ..scheduler import SchedulerJob
 
 # Per-task ContextVar for channel_id — isolated across concurrent asyncio
@@ -56,13 +58,9 @@ _current_channel_id_var: contextvars.ContextVar[str | None] = contextvars.Contex
 )
 
 # Per-task ContextVar: is the active turn an interactive (user-facing) one?
-# Set by the dispatcher at turn start, paired with the channel id. Governs
-# whether ``send_message`` may DEFAULT to the turn's channel: on a non-
-# interactive turn (heartbeat / poller / synthesis / upgrade) there is no
-# user to default a reply to, so a channel-less send_message errors and the
-# agent must pass an explicit channel_id. Default ``True`` is permissive for
-# non-agent callers (tests / bench / direct invocation) — the dispatcher is
-# authoritative and always sets the real value for production turns.
+# Set by the dispatcher at turn start, paired with the channel id. Retained
+# for callers that still thread turn interactivity through the tool registry;
+# send_message itself now requires an explicit deliverable channel_id.
 _current_turn_interactive_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "mimir_current_turn_interactive", default=True
 )
@@ -133,7 +131,40 @@ def _channel_from_config_or_state(
             return from_config
     return (_current_channel_id_var.get() or "").strip()
 
-from langchain_core.tools import InjectedToolArg, tool
+from langchain_core.tools import InjectedToolArg, ToolException, tool
+
+
+_NON_DELIVERABLE_CHANNEL_PREFIXES = ("poller:", "scheduler:")
+_NON_DELIVERABLE_CHANNEL_LITERALS = {"system"}
+
+
+async def _reject_send_message(channel_id: str | None, reason: str) -> None:
+    from ..event_logger import safe_log_event
+
+    await safe_log_event(
+        "send_message_blocked",
+        tool="send_message",
+        channel_id=channel_id,
+        reason=reason,
+    )
+    if reason == "empty_message":
+        raise ToolException(
+            "send_message rejected: empty message. The message text is empty "
+            "or whitespace-only; end the turn or send non-empty text."
+        )
+    raise ToolException(
+        "send_message rejected: not a deliverable channel. Provide a real "
+        "bridge channel_id such as discord-<id>, dm-discord-<id>, or web-*; "
+        f"got {channel_id!r}."
+    )
+
+
+def _is_non_deliverable_channel(channel_id: str) -> bool:
+    lowered = channel_id.lower()
+    return (
+        lowered in _NON_DELIVERABLE_CHANNEL_LITERALS
+        or lowered.startswith(_NON_DELIVERABLE_CHANNEL_PREFIXES)
+    )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -208,9 +239,7 @@ def reset_current_channel_id(token: contextvars.Token) -> None:
 
 def set_current_turn_interactive(interactive: bool) -> contextvars.Token:
     """Set whether the active turn is interactive (user-facing). Paired with
-    ``set_current_channel_id`` at turn start; reset in a finally block.
-    Governs ``send_message``'s default-channel behavior (see the ContextVar
-    docstring)."""
+    ``set_current_channel_id`` at turn start; reset in a finally block."""
     return _current_turn_interactive_var.set(interactive)
 
 
@@ -232,34 +261,27 @@ async def send_message(
 ) -> str:
     """Emit a message to a channel.
 
-    If channel_id is omitted, uses the current turn's channel. Subject
-    to a per-turn loop-detection circuit breaker — repeated near-
-    duplicates first warn, then refuse.
+    Requires an explicit deliverable bridge channel_id. Subject to a
+    per-turn loop-detection circuit breaker — repeated near-duplicates
+    first warn, then refuse.
 
     Args:
         text: The message body to send.
-        channel_id: Target channel ID. Defaults to current turn's.
+        channel_id: Target deliverable bridge channel ID.
     """
+    if not text or not text.strip():
+        await _reject_send_message(channel_id, "empty_message")
+    explicit_channel = bool((channel_id or "").strip())
+    if not explicit_channel:
+        await _reject_send_message(channel_id, "not_deliverable_channel")
+    if _is_non_deliverable_channel((channel_id or "").strip()):
+        await _reject_send_message(channel_id, "not_deliverable_channel")
     channels = _STATE["channel_registry"]
     if channels is None:
         return "send_message failed: no channel registry configured"
-    if not text or not text.strip():
-        return "send_message failed: text is required"
-    explicit_channel = bool((channel_id or "").strip())
     cid = _channel_from_config_or_state(channel_id, config)
     if not cid:
         return "send_message failed: no channel_id and no current channel"
-    # Non-interactive turns (heartbeat / poller / synthesis / upgrade) have no
-    # user to default a reply to. A channel-less send_message on such a turn is
-    # almost always a mistake (the agent talking to itself), so refuse it and
-    # require an explicit channel_id. An explicit channel_id always works —
-    # that's how a heartbeat reaches the operator alert channel.
-    if not explicit_channel and not _current_turn_interactive_var.get():
-        return (
-            "send_message failed: non-interactive turn — there is no channel to "
-            "default to. Pass an explicit channel_id (e.g. the operator alert "
-            "channel) if this turn genuinely needs to send a message."
-        )
 
     # Loop-detection circuit breaker (SPEC §7.2.4). The per-turn
     # LoopDetector lives on the active TurnContext; agent.run_turn
@@ -574,6 +596,9 @@ async def send_message(
     # so downstream parses/greps (e.g. a later react(message_id=...)) work.
     _mid = getattr(result, "message_id", None) if result else None
     return f"send_message ok: channel={cid} message_id={_mid}"
+
+
+send_message.handle_tool_error = True
 
 
 def _resolve_recent_message_id(channel_id: str) -> Optional[str]:
@@ -1049,6 +1074,88 @@ async def remove_schedule(name: str) -> str:
     if not removed:
         return f"remove_schedule: no job named {name!r}"
     return f"remove_schedule ok: name={name}"
+
+
+def _atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_str = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+    )
+    tmp = Path(tmp_str)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+@tool
+async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> str:
+    """Create or replace one poller's operator overrides.
+
+    Writes ``<home>/pollers-overrides.yaml`` through a narrow validated path.
+    ``overrides`` may contain only poller override keys such as ``cron``,
+    ``priority``, ``batch_size``, ``env``, and ``pass_env``. Passing an empty
+    dict removes that poller's override entry. Call ``reload_pollers`` after a
+    successful write to apply the new values to the running scheduler.
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "set_poller_overrides failed: no scheduler configured"
+    home = getattr(scheduler, "_home", None)
+    if home is None:
+        return "set_poller_overrides failed: scheduler has no home configured"
+    name = (poller_name or "").strip()
+    if not name:
+        return "set_poller_overrides failed: poller_name is required"
+    if not isinstance(overrides, dict):
+        return "set_poller_overrides failed: overrides must be a dict"
+
+    path = Path(home) / "pollers-overrides.yaml"
+    try:
+        current_text = path.read_text(encoding="utf-8") if path.exists() else ""
+        current = validate_poller_overrides_text(current_text, path=path)
+        proposed = dict(current)
+        if overrides:
+            proposed[name] = dict(overrides)
+        else:
+            proposed.pop(name, None)
+
+        import yaml
+        body = yaml.safe_dump(
+            proposed,
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=True,
+        )
+        validate_poller_overrides_text(body, path=path)
+        _atomic_write_text(path, body)
+    except PollerOverridesValidationError as exc:
+        return f"set_poller_overrides failed: {exc}"
+    except Exception as exc:
+        return f"set_poller_overrides failed: {exc}"
+    action = "removed" if not overrides else "updated"
+    return (
+        f"set_poller_overrides ok: {action} {name} in {path.name}; "
+        "call reload_pollers to apply"
+    )
 
 
 @tool
@@ -1922,7 +2029,8 @@ def all_mimir_tools() -> list:
         # follow-up to its own turn instead of answering it in this one.
         defer_injected_message,
         # Scheduler
-        list_schedules, add_schedule, set_schedule_priority, remove_schedule, reload_pollers,
+        list_schedules, add_schedule, set_schedule_priority, remove_schedule,
+        set_poller_overrides, reload_pollers,
         # Commitments
         commitment_complete, commitment_snooze,
         commitment_dismiss, commitment_list,

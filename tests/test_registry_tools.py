@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -42,6 +43,7 @@ from mimir.tools.registry import (
     set_current_channel_id,
     set_current_turn_interactive,
     set_dispatcher,
+    set_poller_overrides,
     set_schedule_priority,
     set_scheduler,
 )
@@ -136,13 +138,14 @@ class _StubRegistry:
 class _StubScheduler:
     """Minimal scheduler stub for add_schedule / remove_schedule / reload_pollers."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, home: Path | None = None) -> None:
         self.add_calls: list[dict] = []
         self.remove_calls: list[str] = []
         self.reload_count: int = 0
         self.raise_on: str | None = None
         self._removed: bool = True  # default: job found and removed
         self._jobs: list[SchedulerJob] = []  # for list_jobs / set_schedule_priority
+        self._home = home
 
     async def add_job(self, job: SchedulerJob) -> SchedulerJob:
         if self.raise_on == "add":
@@ -263,38 +266,115 @@ class TestSendMessage:
     @pytest.mark.asyncio
     async def test_no_registry_returns_error(self) -> None:
         _STATE["channel_registry"] = None
-        out = await send_message.ainvoke({"text": "hello"})
+        out = await send_message.ainvoke(
+            {"text": "hello", "channel_id": "discord-123"}
+        )
         assert "no channel registry configured" in out
 
     @pytest.mark.asyncio
-    async def test_empty_text_returns_error(self) -> None:
+    async def test_empty_text_returns_error(self, tmp_path) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
         bridge = _StubBridge()
         set_channel_registry(_StubRegistry(bridge))
         tok = set_current_channel_id("chan-1")
         try:
             out = await send_message.ainvoke({"text": ""})
-            assert "text is required" in out
+            assert "send_message rejected" in out
+            assert "empty message" in out
         finally:
             reset_current_channel_id(tok)
 
     @pytest.mark.asyncio
-    async def test_whitespace_text_returns_error(self) -> None:
+    async def test_whitespace_text_returns_tool_error_and_event(self, tmp_path) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
         bridge = _StubBridge()
         set_channel_registry(_StubRegistry(bridge))
         tok = set_current_channel_id("chan-1")
         try:
-            out = await send_message.ainvoke({"text": "   "})
-            assert "text is required" in out
+            out = await send_message.ainvoke(
+                {
+                    "type": "tool_call",
+                    "id": "call-1",
+                    "name": "send_message",
+                    "args": {"text": "   ", "channel_id": "chan-1"},
+                }
+            )
+            assert out.status == "error"
+            assert "send_message rejected" in out.content
+            assert "empty message" in out.content
         finally:
             reset_current_channel_id(tok)
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        ]
+        [event] = [e for e in events if e["type"] == "send_message_blocked"]
+        assert event["tool"] == "send_message"
+        assert event["channel_id"] == "chan-1"
+        assert event["reason"] == "empty_message"
 
     @pytest.mark.asyncio
-    async def test_no_channel_id_returns_error(self) -> None:
+    async def test_no_channel_id_returns_tool_error_and_event(self, tmp_path) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
         bridge = _StubBridge()
         set_channel_registry(_StubRegistry(bridge))
         # no contextvar set, no explicit channel_id
-        out = await send_message.ainvoke({"text": "hello"})
-        assert "no channel_id" in out
+        out = await send_message.ainvoke(
+            {
+                "type": "tool_call",
+                "id": "call-1",
+                "name": "send_message",
+                "args": {"text": "hello"},
+            }
+        )
+        assert out.status == "error"
+        assert "send_message rejected" in out.content
+        assert "not a deliverable channel" in out.content
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        ]
+        [event] = [e for e in events if e["type"] == "send_message_blocked"]
+        assert event["tool"] == "send_message"
+        assert event["channel_id"] is None
+        assert event["reason"] == "not_deliverable_channel"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_id", ["poller:gmail-inbox", "scheduler:daily", "system", ""])
+    async def test_non_deliverable_channel_returns_tool_error_and_event(
+        self, tmp_path, channel_id,
+    ) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id=channel_id))
+        out = await send_message.ainvoke(
+            {
+                "type": "tool_call",
+                "id": "call-1",
+                "name": "send_message",
+                "args": {"text": "hello", "channel_id": channel_id},
+            }
+        )
+        assert out.status == "error"
+        assert "send_message rejected" in out.content
+        assert "not a deliverable channel" in out.content
+        assert bridge.send_calls == []
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        ]
+        [event] = [e for e in events if e["type"] == "send_message_blocked"]
+        assert event["tool"] == "send_message"
+        assert event["channel_id"] == channel_id
+        assert event["reason"] == "not_deliverable_channel"
 
     @pytest.mark.asyncio
     async def test_no_bridge_returns_error(self) -> None:
@@ -302,7 +382,7 @@ class TestSendMessage:
         set_channel_registry(_StubRegistry(bridge=None, channel_id="chan-1"))
         tok = set_current_channel_id("chan-1")
         try:
-            out = await send_message.ainvoke({"text": "hello"})
+            out = await send_message.ainvoke({"text": "hello", "channel_id": "chan-1"})
             assert "no bridge" in out
         finally:
             reset_current_channel_id(tok)
@@ -314,7 +394,7 @@ class TestSendMessage:
         set_channel_registry(_StubRegistry(bridge))
         tok = set_current_channel_id("chan-1")
         try:
-            out = await send_message.ainvoke({"text": "hello"})
+            out = await send_message.ainvoke({"text": "hello", "channel_id": "chan-1"})
             assert "send_message failed" in out
             assert "boom" in out
         finally:
@@ -326,7 +406,7 @@ class TestSendMessage:
         set_channel_registry(_StubRegistry(bridge))
         tok = set_current_channel_id("chan-1")
         try:
-            out = await send_message.ainvoke({"text": "Hello world"})
+            out = await send_message.ainvoke({"text": "Hello world", "channel_id": "chan-1"})
             assert "send_message ok:" in out
             assert len(bridge.send_calls) == 1
             assert bridge.send_calls[0]["cid"] == "chan-1"
@@ -343,6 +423,17 @@ class TestSendMessage:
         )
         assert "send_message ok:" in out
         assert bridge.send_calls[0]["cid"] == "explicit-chan"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_id", ["discord-123", "dm-discord-456", "web-jason"])
+    async def test_bridge_channel_ids_are_unaffected(self, channel_id) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id=channel_id))
+        out = await send_message.ainvoke(
+            {"text": "Hi", "channel_id": channel_id}
+        )
+        assert out == f"send_message ok: channel={channel_id} message_id=msg-42"
+        assert bridge.send_calls == [{"cid": channel_id, "text": "Hi"}]
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -860,6 +951,47 @@ class TestReloadPollers:
         assert sched.reload_count == 1
 
 
+class TestSetPollerOverrides:
+    @pytest.mark.asyncio
+    async def test_no_scheduler_returns_error(self) -> None:
+        _STATE["scheduler"] = None
+        out = await set_poller_overrides.ainvoke(
+            {"poller_name": "gmail-inbox", "overrides": {"pass_env": ["GOG_ACCOUNT"]}},
+        )
+        assert "set_poller_overrides failed: no scheduler configured" in out
+
+    @pytest.mark.asyncio
+    async def test_writes_validated_home_file(self, tmp_path: Path) -> None:
+        _STATE["scheduler"] = _StubScheduler(home=tmp_path)
+        out = await set_poller_overrides.ainvoke(
+            {
+                "poller_name": "gmail-inbox",
+                "overrides": {"pass_env": ["GOG_ACCOUNT"], "batch_size": 3},
+            },
+        )
+        assert "set_poller_overrides ok: updated gmail-inbox" in out
+        body = (tmp_path / "pollers-overrides.yaml").read_text(encoding="utf-8")
+        assert "gmail-inbox:" in body
+        assert "pass_env:" in body
+        assert "GOG_ACCOUNT" in body
+
+    @pytest.mark.asyncio
+    async def test_rejects_unknown_override_field_without_writing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _STATE["scheduler"] = _StubScheduler(home=tmp_path)
+        out = await set_poller_overrides.ainvoke(
+            {
+                "poller_name": "gmail-inbox",
+                "overrides": {"command": "rm -rf /"},
+            },
+        )
+        assert "set_poller_overrides failed:" in out
+        assert "poller_overrides_unknown_field" in out
+        assert not (tmp_path / "pollers-overrides.yaml").exists()
+
+
 # ────────────────────────────────────────────────────────────────────
 # Commitment tools
 # ────────────────────────────────────────────────────────────────────
@@ -1140,14 +1272,13 @@ class TestCommitmentList:
 
 
 # ────────────────────────────────────────────────────────────────────
-# send_message interactivity guard (0.3.0)
+# send_message explicit-channel guard
 # ────────────────────────────────────────────────────────────────────
 
 
 class TestSendMessageInteractivityGuard:
-    """0.3.0: a channel-less send_message defaults to the turn's channel only
-    on interactive turns; on non-interactive turns it errors and requires an
-    explicit channel_id. Explicit channel always works."""
+    """send_message rejects channel-less sends regardless of turn interactivity.
+    Explicit channel_id delivery still works."""
 
     @pytest.mark.asyncio
     async def test_non_interactive_no_channel_errors(self) -> None:
@@ -1160,7 +1291,8 @@ class TestSendMessageInteractivityGuard:
         finally:
             reset_current_turn_interactive(int_tok)
             reset_current_channel_id(cid_tok)
-        assert "non-interactive" in out
+        assert "send_message rejected" in out
+        assert "not a deliverable channel" in out
         assert bridge.send_calls == []  # nothing was sent
 
     @pytest.mark.asyncio
@@ -1176,7 +1308,7 @@ class TestSendMessageInteractivityGuard:
         assert bridge.send_calls == [{"cid": "chan-1", "text": "hi"}]
 
     @pytest.mark.asyncio
-    async def test_interactive_no_channel_defaults_and_sends(self) -> None:
+    async def test_interactive_no_channel_is_rejected(self) -> None:
         bridge = _StubBridge()
         set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
         cid_tok = set_current_channel_id("chan-1")
@@ -1186,8 +1318,9 @@ class TestSendMessageInteractivityGuard:
         finally:
             reset_current_turn_interactive(int_tok)
             reset_current_channel_id(cid_tok)
-        assert "send_message ok" in out
-        assert bridge.send_calls == [{"cid": "chan-1", "text": "hi"}]
+        assert "send_message rejected" in out
+        assert "not a deliverable channel" in out
+        assert bridge.send_calls == []
 
     @pytest.mark.asyncio
     async def test_directives_only_send_skips_targetless_react(self) -> None:
