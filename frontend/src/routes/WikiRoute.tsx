@@ -14,6 +14,7 @@ import type { DashboardSurface } from "../dashboardExtensions";
 import { Badge, Button, DashboardHeader, EmptyState, ErrorState, LoadingState, Panel, TextInput } from "../ui";
 
 const CATEGORY_PREFIXES = ["concepts/", "entities/", "topics/"];
+const WikiGraphView = React.lazy(() => import("./WikiGraphView"));
 
 function ApiErrorBlock({ error, title }: { error: unknown; title: string }) {
   let detail = error instanceof Error ? error.message : String(error);
@@ -342,6 +343,7 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
   const [query, setQuery] = React.useState(searchParams.get("q") || "");
   const [category, setCategory] = React.useState(searchParams.get("category") || "");
   const selectedParam = searchParams.get("slug") || "";
+  const view = searchParams.get("view") === "graph" ? "graph" : "reader";
   const indexQuery = useQuery({
     queryKey: ["wiki-index"],
     queryFn: async () => (await getWikiIndex()).data
@@ -362,10 +364,25 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
   function selectPage(page: WikiPageSummary) {
     const params = new URLSearchParams(searchParams);
     params.set("slug", pageKey(page));
+    params.set("view", "reader");
     if (query.trim()) params.set("q", query.trim());
     else params.delete("q");
     if (category) params.set("category", category);
     else params.delete("category");
+    setSearchParams(params);
+  }
+
+  function openPage(slug: string) {
+    const params = new URLSearchParams(searchParams);
+    params.set("slug", slug);
+    params.set("view", "reader");
+    setSearchParams(params);
+  }
+
+  function setView(nextView: "reader" | "graph") {
+    const params = new URLSearchParams(searchParams);
+    params.set("view", nextView);
+    if (!params.get("slug") && selected) params.set("slug", selected);
     setSearchParams(params);
   }
 
@@ -424,6 +441,8 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
               <dl className="wiki-browser__counts">
                 <div><dt>Pages</dt><dd>{index.page_count}</dd></div>
                 <div><dt>Shown</dt><dd>{filteredPages.length}</dd></div>
+                <div><dt>Edges</dt><dd>{index.graph.edges.length}</dd></div>
+                <div><dt>Dangling</dt><dd>{index.dangling_links.length}</dd></div>
               </dl>
               <HealthBadges index={index} />
             </>
@@ -452,9 +471,24 @@ export function WikiRoute({ surface }: { surface: DashboardSurface }) {
             </nav>
           ) : null}
         </Panel>
-        <Panel className="wiki-browser__detail" title="Reader">
+        <Panel
+          className="wiki-browser__detail"
+          title={view === "graph" ? "Graph" : "Reader"}
+          actions={index ? (
+            <div className="wiki-view-toggle" aria-label="Wiki view">
+              <Button onClick={() => setView("reader")} variant={view === "reader" ? "primary" : "secondary"}>Reader</Button>
+              <Button onClick={() => setView("graph")} variant={view === "graph" ? "primary" : "secondary"}>Graph</Button>
+            </div>
+          ) : null}
+        >
           {index ? (
-            <WikiPageReader index={index} selected={selected} />
+            view === "graph" ? (
+              <React.Suspense fallback={<LoadingState label="Loading wiki graph" />}>
+                <WikiGraphView index={index} onOpenPage={openPage} selected={selected} />
+              </React.Suspense>
+            ) : (
+              <WikiPageReader index={index} selected={selected} />
+            )
           ) : indexQuery.isLoading ? (
             <LoadingState label="Loading wiki reader" />
           ) : indexQuery.isError ? null : (
