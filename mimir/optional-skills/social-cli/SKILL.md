@@ -129,6 +129,27 @@ The poller surfaces notifications. The agent responds:
    The platform arg is optional (omit to dispatch all configured
    platforms); it honors `SOCIAL_CLI_BIN`.
 
+4. **Check daily post count from the dispatch ledgers:**
+   ```bash
+   social-cli count --platform bsky --action post --since today
+   ```
+   This is the canonical daily-post-count check. It scans the
+   `sent_ledger-*.yaml` files across the social-cli poller state
+   directories and counts post-creating ledger entries for the UTC
+   window: original `post` actions and `reply` actions. It excludes
+   `like`, `repost`, `ignore`, and entries with `dryRun: true`.
+
+   The default output is just the number, suitable for cron or an
+   agent guard. Add `--json` for compact machine-readable metadata:
+   ```bash
+   social-cli count --platform bsky --action post --since today --json
+   ```
+
+   Do not maintain a separate daily counter file for Bluesky caps.
+   Thresholds such as "how many posts per day are allowed" are
+   deployment policy; `social-cli count` only reports ledger-derived
+   facts.
+
 ### Thread context — depth and your own prior contributions
 
 For Bluesky `reply` / `mention` / `quote` notifications, `social-cli
