@@ -3351,11 +3351,43 @@ textarea {
   text-transform: uppercase;
 }
 
+.wiki-graph__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mimir-space-2xs, 4px);
+  align-items: center;
+}
+
+.wiki-graph__toolbar button {
+  min-width: 2rem;
+  min-height: 2rem;
+  padding: 0 var(--mimir-space-xs, 8px);
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
+  border-radius: var(--mimir-radius-control, 6px);
+  background: var(--mimir-color-panel-background, #ffffff);
+  color: inherit;
+  font: inherit;
+  font-weight: var(--mimir-font-weight-strong, 700);
+  cursor: pointer;
+}
+
+.wiki-graph__toolbar button:hover,
+.wiki-graph__toolbar button:focus-visible {
+  background: var(--mimir-interaction-hover-background, #e8f0eb);
+}
+
+.wiki-graph__toolbar output {
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-sm, 0.875rem);
+  font-weight: var(--mimir-font-weight-strong, 700);
+}
+
 .wiki-graph__canvas {
-  overflow: auto;
+  overflow: hidden;
   border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
   border-radius: var(--mimir-radius-panel, 8px);
   background: var(--mimir-color-panel-background-muted, #f1f5f2);
+  touch-action: none;
 }
 
 .wiki-graph__canvas svg {
@@ -3363,6 +3395,15 @@ textarea {
   width: 100%;
   min-width: 640px;
   aspect-ratio: 16 / 9;
+}
+
+.wiki-graph__svg {
+  cursor: grab;
+  user-select: none;
+}
+
+.wiki-graph__svg--dragging {
+  cursor: grabbing;
 }
 
 .wiki-graph__edge {
@@ -3374,6 +3415,15 @@ textarea {
 .wiki-graph__edge--dangling {
   stroke: var(--mimir-color-status-warning, #8a6116);
   stroke-dasharray: 1.4 1.1;
+}
+
+.wiki-graph__edge--related {
+  stroke-opacity: 0.9;
+  stroke-width: 0.65;
+}
+
+.wiki-graph__edge--dimmed {
+  stroke-opacity: 0.08;
 }
 
 .wiki-graph__node circle:not(.wiki-graph__hit) {
@@ -3399,6 +3449,15 @@ textarea {
   stroke-width: 1.8;
 }
 
+.wiki-graph__node--active circle:not(.wiki-graph__hit) {
+  stroke: var(--mimir-color-chrome-accent, #60786a);
+  stroke-width: 2;
+}
+
+.wiki-graph__node--dimmed {
+  opacity: 0.18;
+}
+
 .wiki-graph__hit {
   fill: transparent;
   cursor: pointer;
@@ -3411,13 +3470,33 @@ textarea {
   vector-effect: non-scaling-stroke;
 }
 
-.wiki-graph__node text {
+.wiki-graph__label {
   fill: var(--mimir-color-text, #16201b);
-  font-size: 2.5px;
+  font-size: 2.4px;
   paint-order: stroke;
   pointer-events: none;
   stroke: var(--mimir-color-panel-background-muted, #f1f5f2);
-  stroke-width: 0.5;
+  stroke-linejoin: round;
+  stroke-width: 0.65;
+}
+
+.wiki-graph__label--active {
+  font-weight: var(--mimir-font-weight-strong, 700);
+  stroke-width: 0.9;
+}
+
+.wiki-graph__focus-label {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mimir-space-xs, 8px);
+  align-items: baseline;
+  min-height: 1.5rem;
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-sm, 0.875rem);
+}
+
+.wiki-graph__focus-label strong {
+  color: var(--mimir-color-text, #16201b);
 }
 
 .wiki-graph__legend {

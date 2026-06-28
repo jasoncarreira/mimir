@@ -60,6 +60,48 @@ function graphIndex(): WikiIndexData {
   };
 }
 
+function largeGraphIndex(): WikiIndexData {
+  const pages = Array.from({ length: 42 }, (_, index) => {
+    const category = index < 21 ? "concepts" : "topics";
+    const slug = `page-${index}`;
+    return {
+      slug,
+      title: index === 0 ? "Hub Page With A Very Long Title That Needs Truncation" : `Node ${index}`,
+      category,
+      path: `${category}/${slug}.md`,
+      mtime: null,
+      outbound: [],
+      inbound: [],
+      is_orphan: index % 13 === 0,
+      has_slug_collision: false
+    };
+  });
+  const edges = pages.slice(1).map((page, index) => ({
+    source: pages[0].path,
+    target: page.path,
+    target_slug: page.slug
+  }));
+  return {
+    page_count: pages.length,
+    pages,
+    graph: {
+      nodes: pages.map((page) => ({
+        id: page.path,
+        slug: page.slug,
+        title: page.title,
+        category: page.category,
+        is_orphan: page.is_orphan,
+        has_slug_collision: page.has_slug_collision
+      })),
+      edges
+    },
+    orphans: [],
+    dangling_links: [],
+    slug_collisions: {},
+    health: { has_orphans: true, has_dangling_links: false, has_slug_collisions: false }
+  };
+}
+
 afterEach(() => {
   cleanup();
 });
@@ -98,5 +140,49 @@ describe("WikiGraphView", () => {
     expect(within(collision).getByText("collision")).toBeTruthy();
     expect(within(dangling).getAllByText("dangling").length).toBeGreaterThan(0);
     expect(dangling).toHaveProperty("disabled", true);
+  });
+
+  it("declutters labels and truncates long default labels", () => {
+    render(<WikiGraphView index={largeGraphIndex()} onOpenPage={vi.fn()} selected="" />);
+
+    const graph = screen.getByLabelText("Wiki pages and wikilinks graph");
+    const labels = graph.querySelectorAll(".wiki-graph__label");
+
+    expect(labels.length).toBeGreaterThan(0);
+    expect(labels.length).toBeLessThan(largeGraphIndex().pages.length);
+    expect([...labels].some((label) => label.textContent?.endsWith("…"))).toBe(true);
+    labels.forEach((label) => {
+      expect(Number(label.getAttribute("x"))).toBeGreaterThanOrEqual(2);
+      expect(Number(label.getAttribute("x"))).toBeLessThanOrEqual(98);
+      expect(Number(label.getAttribute("y"))).toBeGreaterThanOrEqual(4);
+      expect(Number(label.getAttribute("y"))).toBeLessThanOrEqual(97);
+    });
+  });
+
+  it("zooms with controls and resets the graph transform", () => {
+    render(<WikiGraphView index={graphIndex()} onOpenPage={vi.fn()} selected="" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+
+    expect(screen.getByLabelText("Graph zoom level").textContent).toBe("125%");
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset graph view" }));
+
+    expect(screen.getByLabelText("Graph zoom level").textContent).toBe("100%");
+  });
+
+  it("isolates hovered node links and shows the full focused label", () => {
+    render(<WikiGraphView index={largeGraphIndex()} onOpenPage={vi.fn()} selected="" />);
+
+    fireEvent.mouseEnter(screen.getByRole("button", { name: /Open Hub Page With A Very Long Title/ }));
+
+    expect(document.querySelector(".wiki-graph__focus-label")?.textContent).toContain("Hub Page With A Very Long Title That Needs Truncation");
+    expect(document.querySelectorAll(".wiki-graph__edge--dimmed").length).toBe(0);
+
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "Open Node 10" }));
+
+    expect(document.querySelector(".wiki-graph__focus-label")?.textContent).toContain("Node 10");
+    expect(document.querySelectorAll(".wiki-graph__edge--dimmed").length).toBeGreaterThan(0);
+    expect(document.querySelectorAll(".wiki-graph__node--dimmed").length).toBeGreaterThan(0);
   });
 });
