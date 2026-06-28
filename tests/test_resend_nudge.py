@@ -16,7 +16,12 @@ from mimir.config import Config
 from mimir.models import AgentEvent
 import json
 
-from mimir.resend_nudge import build_nudge_text, count_recent_no_sends, nudge_enabled
+from mimir.resend_nudge import (
+    build_nudge_text,
+    channel_prefix_enabled,
+    count_recent_no_sends,
+    nudge_enabled,
+)
 
 UTC = timezone.utc
 
@@ -29,6 +34,14 @@ def test_nudge_enabled_prefix_star_and_empty():
     assert nudge_enabled("anything", ("*",)) is True
     assert nudge_enabled("discord-1", ()) is False  # default off
     assert nudge_enabled(None, ("*",)) is False
+
+
+def test_channel_prefix_enabled_prefix_star_and_empty():
+    assert channel_prefix_enabled("discord-1", ("discord-",)) is True
+    assert channel_prefix_enabled("slack-1", ("discord-",)) is False
+    assert channel_prefix_enabled("anything", ("*",)) is True
+    assert channel_prefix_enabled("discord-1", ()) is False
+    assert channel_prefix_enabled(None, ("*",)) is False
 
 
 def test_nudge_enabled_web_channels_always_on():
@@ -82,10 +95,20 @@ def test_count_recent_no_sends_missing_log_returns_zero(tmp_path):
 def test_config_resend_nudge_channels_env(monkeypatch):
     monkeypatch.setenv("MIMIR_HOME", "/tmp/resend-nudge-test-home")
     monkeypatch.setenv("MIMIR_RESEND_NUDGE_CHANNELS", "discord-, slack-")
+    monkeypatch.delenv("MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS", raising=False)
     cfg = Config.from_env()
     assert cfg.resend_nudge_channels == ("discord-", "slack-")
     monkeypatch.delenv("MIMIR_RESEND_NUDGE_CHANNELS")
     assert Config.from_env().resend_nudge_channels == ()  # default off
+
+
+def test_config_auto_deliver_final_text_channels_env(monkeypatch):
+    monkeypatch.setenv("MIMIR_HOME", "/tmp/auto-deliver-test-home")
+    monkeypatch.setenv("MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS", "discord-, slack-")
+    cfg = Config.from_env()
+    assert cfg.auto_deliver_final_text_channels == ("discord-", "slack-")
+    monkeypatch.delenv("MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS")
+    assert Config.from_env().auto_deliver_final_text_channels == ()
 
 
 # ─── _maybe_resend_nudge behavior (fake graph) ─────────────────────────
@@ -109,7 +132,11 @@ class _FakeGraph:
 
 def _fake_self(tmp_path, channels=("discord-",)):
     return SimpleNamespace(
-        _config=SimpleNamespace(resend_nudge_channels=channels, home=tmp_path)
+        _config=SimpleNamespace(
+            resend_nudge_channels=channels,
+            auto_deliver_final_text_channels=(),
+            home=tmp_path,
+        )
     )
 
 
@@ -137,6 +164,20 @@ async def test_noop_when_channel_not_allowlisted(tmp_path):
         turn_id="t", turn_is_interactive=True, messages=[], events=[], output="reply",
     )
     assert g.astream_calls == 0  # slack-1 not in allowlist → no re-prompt
+
+
+@pytest.mark.asyncio
+async def test_noop_when_auto_deliver_enabled_for_channel(tmp_path, capture_events):
+    ctx = SimpleNamespace(delivered_channel_ids=set())
+    g = _FakeGraph(ctx, "discord-1", deliver=True)
+    fake_self = _fake_self(tmp_path, channels=("discord-",))
+    fake_self._config.auto_deliver_final_text_channels = ("discord-",)
+    await Agent._maybe_resend_nudge(
+        fake_self, g, {}, ctx, _event(),
+        turn_id="t", turn_is_interactive=True, messages=[], events=[], output="reply",
+    )
+    assert g.astream_calls == 0
+    assert "resend_nudge_issued" not in capture_events
 
 
 @pytest.mark.asyncio

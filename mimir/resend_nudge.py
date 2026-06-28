@@ -19,13 +19,27 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 
-from .web_channels import WEB_CHANNEL_PREFIX
-
 from .jsonl_snapshot import iter_window_records
+from .web_channels import WEB_CHANNEL_PREFIX
 
 #: The under-send signal the 24h tally counts — emitted by the forgot-to-send
 #: guard (#423) on every interactive turn that produced text but didn't deliver.
 _NO_SEND_EVENT = "interactive_turn_no_send_message"
+
+
+def channel_prefix_enabled(channel_id: str | None, prefixes: Sequence[str]) -> bool:
+    """True iff ``channel_id`` matches a prefix allow-list.
+
+    Shared config shape: ``"*"`` enables every channel, an empty tuple disables
+    the feature, and all other entries are literal channel-id prefixes.
+    """
+    if not channel_id:
+        return False
+    if not prefixes:
+        return False
+    if "*" in prefixes:
+        return True
+    return any(channel_id.startswith(p) for p in prefixes)
 
 
 def nudge_enabled(channel_id: str | None, prefixes: Sequence[str]) -> bool:
@@ -42,11 +56,7 @@ def nudge_enabled(channel_id: str | None, prefixes: Sequence[str]) -> bool:
         return False
     if channel_id.startswith(WEB_CHANNEL_PREFIX):
         return True
-    if not prefixes:
-        return False
-    if "*" in prefixes:
-        return True
-    return any(channel_id.startswith(p) for p in prefixes)
+    return channel_prefix_enabled(channel_id, prefixes)
 
 
 def build_nudge_text(channel_id: str, count: int) -> str:

@@ -1633,12 +1633,22 @@ class Agent:
         ``resend_nudge_failed`` and gives up (no recursion). Every failure path is
         swallowed so the nudge can never fail the turn.
         """
-        from .resend_nudge import build_nudge_text, count_recent_no_sends, nudge_enabled
+        from .resend_nudge import (
+            build_nudge_text,
+            channel_prefix_enabled,
+            count_recent_no_sends,
+            nudge_enabled,
+        )
 
         if not (turn_is_interactive and (output or "").strip()):
             return messages, events, output
         delivered = getattr(ctx, "delivered_channel_ids", None) or set()
         if event.channel_id in delivered:
+            return messages, events, output
+        if channel_prefix_enabled(
+            event.channel_id,
+            getattr(self._config, "auto_deliver_final_text_channels", ()),
+        ):
             return messages, events, output
         if not nudge_enabled(event.channel_id, self._config.resend_nudge_channels):
             return messages, events, output
@@ -1676,6 +1686,100 @@ class Agent:
                 channel_id=event.channel_id, turn_id=turn_id, no_send_count_24h=count,
             )
         return messages, events, output
+
+    @staticmethod
+    def _substantive_final_text(text: str | None) -> str | None:
+        """Return stripped text only when it is substantial enough to ship."""
+        stripped = (text or "").strip()
+        if len(stripped) < 20:
+            return None
+        if len(re.findall(r"[A-Za-z0-9]+", stripped)) < 3:
+            return None
+        return stripped
+
+    async def _maybe_auto_deliver_final_text(
+        self,
+        ctx: Any,
+        event: AgentEvent,
+        *,
+        turn_id: str,
+        turn_is_interactive: bool,
+        output: str,
+    ) -> None:
+        """Opt-in deterministic recovery for user_message turns.
+
+        If a tool-shy model finished with a user-addressed final reply but did
+        not call ``send_message``, deliver that captured final text directly to
+        the triggering channel. This is intentionally narrower than
+        ``turn_is_interactive``: ``shell_job_complete`` is interactive for
+        normal send defaults, but silence is often correct there.
+        """
+        from .resend_nudge import channel_prefix_enabled
+
+        text = self._substantive_final_text(output)
+        if text is None:
+            return
+        if event.trigger != "user_message" or not turn_is_interactive:
+            return
+        delivered = getattr(ctx, "delivered_channel_ids", None) or set()
+        if event.channel_id in delivered:
+            return
+        if not channel_prefix_enabled(
+            event.channel_id,
+            getattr(self._config, "auto_deliver_final_text_channels", ()),
+        ):
+            return
+        if self._channels is None or not event.channel_id:
+            return
+        bridge = self._channels.find(event.channel_id)
+        if bridge is None:
+            return
+
+        try:
+            result = await self._channels.send(event.channel_id, text, final=False)
+        except Exception:  # noqa: BLE001 — auto-recovery must not fail the turn
+            log.exception("auto-deliver final text send failed")
+            return
+        if not getattr(result, "sent", True):
+            try:
+                await safe_log_event(
+                    "send_message_failed",
+                    channel_id=event.channel_id,
+                    error=str(getattr(result, "error", None) or "")[:200] or None,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        try:
+            ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
+            ctx.delivered_channel_ids.add(event.channel_id)
+        except Exception:  # noqa: BLE001
+            log.debug("auto-deliver bookkeeping failed", exc_info=True)
+
+        norm = re.sub(r"\s+", " ", text.strip()).lower()[:500]
+        content_hash = hashlib.md5(norm.encode()).hexdigest()[:16]
+        await safe_log_event(
+            "send_message_sent", channel_id=event.channel_id, content_hash=content_hash,
+        )
+        try:
+            msg = self._buffer.make_message(
+                channel_id=event.channel_id,
+                kind="assistant_message",
+                content=text,
+                msg_id=getattr(result, "message_id", None),
+                source=getattr(bridge, "name", None),
+            )
+            await self._buffer.append(msg)
+        except Exception:  # noqa: BLE001
+            log.warning("auto-deliver final text history append failed", exc_info=True)
+
+        await safe_log_event(
+            "interactive_turn_auto_delivered",
+            channel_id=event.channel_id,
+            turn_id=turn_id,
+            output_chars=len(text),
+        )
 
     async def _run_turn_body(
         self,
@@ -2307,6 +2411,12 @@ class Agent:
         # totally-silent from answered-in-the-wrong-room. Emit a negative
         # signal so the next turn's feedback panel surfaces it
         # (feedback.classify maps it to a negative ``no_reply``).
+        await self._maybe_auto_deliver_final_text(
+            ctx, event,
+            turn_id=turn_id,
+            turn_is_interactive=turn_is_interactive,
+            output=output,
+        )
         _delivered = getattr(ctx, "delivered_channel_ids", None) or set()
         if (
             turn_is_interactive
