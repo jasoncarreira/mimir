@@ -392,6 +392,22 @@ export interface OpsDashboardData {
     truncated?: boolean;
     total_count?: number;
   };
+  pr_board: {
+    available: boolean;
+    error?: string | null;
+    repo?: string | null;
+    pull_requests: Array<{
+      number: number;
+      title: string;
+      url: string;
+      author: string;
+      created_at: string;
+      review_decision: string;
+      is_draft: boolean;
+    }>;
+    truncated?: boolean;
+    total_count?: number;
+  };
   usage_history: Record<string, Record<string, OpsUsagePoint[]>>;
   token_usage_history: OpsTokenUsagePoint[];
   algedonic_signals: {
