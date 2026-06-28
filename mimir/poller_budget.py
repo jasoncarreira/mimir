@@ -25,14 +25,30 @@ class PollerUsageWindow:
     label: str
     hours: float
     agent_turns: int = 0
-    total_cost_usd: float = 0.0
+    total_cost_usd: float | None = None
+    cost_samples: int = 0
 
-    def to_dict(self) -> dict[str, float | int | str]:
+    def record_turn(self, cost_usd: float | None) -> None:
+        self.agent_turns += 1
+        if cost_usd is None:
+            return
+        if self.total_cost_usd is None:
+            self.total_cost_usd = 0.0
+        self.total_cost_usd += cost_usd
+        self.cost_samples += 1
+
+    def to_dict(self) -> dict[str, float | int | str | None]:
+        if self.agent_turns == 0:
+            total_cost_usd = 0.0
+        elif self.cost_samples == 0:
+            total_cost_usd = None
+        else:
+            total_cost_usd = round(self.total_cost_usd or 0.0, 6)
         return {
             "label": self.label,
             "hours": self.hours,
             "agent_turns": self.agent_turns,
-            "total_cost_usd": round(self.total_cost_usd, 6),
+            "total_cost_usd": total_cost_usd,
         }
 
 
@@ -75,11 +91,13 @@ def _poller_name_from_channel(channel_id: object) -> str | None:
     return name or None
 
 
-def _coerce_cost(raw: object) -> float:
+def _coerce_cost(raw: object) -> float | None:
+    if raw is None:
+        return None
     try:
-        return float(raw or 0.0)
+        return float(raw)
     except (TypeError, ValueError):
-        return 0.0
+        return None
 
 
 def aggregate_poller_turn_usage(
@@ -133,8 +151,6 @@ def aggregate_poller_turn_usage(
         cost = _coerce_cost(rec.get("total_cost_usd"))
         for label, _hours in window_defs:
             if ts >= cutoffs[label]:
-                window = summary.windows[label]
-                window.agent_turns += 1
-                window.total_cost_usd += cost
+                summary.windows[label].record_turn(cost)
 
     return out

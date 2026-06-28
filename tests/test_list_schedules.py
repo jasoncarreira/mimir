@@ -230,6 +230,32 @@ async def test_list_schedules_surfaces_poller_usage(tmp_path: Path, stub_schedul
 
 
 @pytest.mark.asyncio
+async def test_list_schedules_serializes_missing_poller_cost_as_null(tmp_path: Path, stub_scheduler):
+    """Non-Anthropic gateways record no cost; list_schedules must not call it $0.00."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "turns.jsonl").write_text(
+        json.dumps({
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "channel_id": "poller:github-activity",
+            "total_cost_usd": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    stub_scheduler(
+        [],
+        pollers=[{"name": "github-activity", "cron": "*/5 * * * *", "priority": "normal"}],
+        home=tmp_path,
+    )
+
+    parsed = json.loads(await list_schedules.ainvoke({}))
+
+    window = parsed[0]["usage"]["windows"]["1h"]
+    assert window["agent_turns"] == 1
+    assert window["total_cost_usd"] is None
+
+
+@pytest.mark.asyncio
 async def test_list_schedules_no_scheduler_configured():
     prev = _STATE.get("scheduler")
     _STATE["scheduler"] = None

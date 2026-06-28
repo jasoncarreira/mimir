@@ -58,9 +58,41 @@ def test_aggregate_poller_turn_usage_attributes_by_poller_channel(tmp_path: Path
 
     worklink = usage["worklink-ready-queue"].windows
     assert worklink["1h"].agent_turns == 0
+    assert worklink["1h"].to_dict()["total_cost_usd"] == 0.0
     assert worklink["24h"].agent_turns == 1
-    assert worklink["24h"].total_cost_usd == 0.0
+    assert worklink["24h"].total_cost_usd is None
+    assert worklink["24h"].to_dict()["total_cost_usd"] is None
     assert "scheduler:heartbeat" not in usage
+
+
+def test_aggregate_poller_turn_usage_distinguishes_none_from_zero_cost(tmp_path: Path):
+    now = datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc)
+    turns = tmp_path / "logs" / "turns.jsonl"
+    _write_jsonl(
+        turns,
+        [
+            {
+                "ts": (now - timedelta(minutes=30)).isoformat(),
+                "channel_id": "poller:no-cost-recorded",
+                "total_cost_usd": None,
+            },
+            {
+                "ts": (now - timedelta(minutes=30)).isoformat(),
+                "channel_id": "poller:genuinely-zero",
+                "total_cost_usd": 0.0,
+            },
+        ],
+    )
+
+    usage = aggregate_poller_turn_usage(turns, now=now)
+
+    no_cost = usage["no-cost-recorded"].windows["1h"].to_dict()
+    assert no_cost["agent_turns"] == 1
+    assert no_cost["total_cost_usd"] is None
+
+    zero_cost = usage["genuinely-zero"].windows["1h"].to_dict()
+    assert zero_cost["agent_turns"] == 1
+    assert zero_cost["total_cost_usd"] == 0.0
 
 
 def test_aggregate_poller_turn_usage_missing_log_is_empty(tmp_path: Path):
