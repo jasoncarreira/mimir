@@ -75,20 +75,16 @@ def chat_model_as_reflection_lm(model: Any) -> Callable[[str], str]:
 def reflection_lm_from_config(config: Any | None = None) -> Callable[[str], str]:
     """Build a gepa ``reflection_lm`` from mimir's configured model.
 
-    Reuses :func:`mimir.agent._resolve_model` so the reflection LM is the
-    same provider/model the agent already runs on — no extra credentials.
-    Pass an explicit ``config`` to override; defaults to
+    Reuses :func:`mimir.agent.resolve_model_from_config` so the reflection
+    LM is the same provider/model the agent already runs on — no extra
+    credentials, and no separate hand-threaded Config field mapping. Pass an
+    explicit ``config`` to override; defaults to
     :meth:`mimir.config.Config.from_env`. Imports are lazy to avoid a
     circular import at module load and to keep importing this module cheap.
     """
-    from .agent import _resolve_model
+    from .agent import resolve_model_from_config
     from .config import Config
 
     cfg = config if config is not None else Config.from_env()
-    model = _resolve_model(
-        cfg.model_spec,
-        max_retries=getattr(cfg, "model_max_retries", 6),
-        max_tokens=getattr(cfg, "model_max_tokens", 0),
-        reasoning_effort=getattr(cfg, "model_reasoning_effort", ""),
-    )
+    model = resolve_model_from_config(cfg)
     return chat_model_as_reflection_lm(model)

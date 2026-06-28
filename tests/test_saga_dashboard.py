@@ -948,6 +948,37 @@ async def test_api_saga_search_no_db_configured(tmp_path: Path) -> None:
         assert resp.status == 503
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("view", "builder_name", "empty_key"),
+    [
+        ("recent", "build_recent_atoms_payload", "atoms"),
+        ("clusters", "build_clusters_payload", "clusters"),
+        ("activation_hist", "build_activation_hist_payload", "buckets"),
+    ],
+)
+async def test_api_saga_soft_fail_views_use_error_status(
+    monkeypatch: pytest.MonkeyPatch,
+    saga_app_phase2: web.Application,
+    view: str,
+    builder_name: str,
+    empty_key: str,
+) -> None:
+    """Legacy /api/saga should not return HTTP 200 for embedded error payloads."""
+
+    def failing_builder(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"error": "synthetic db failure", empty_key: []}
+
+    monkeypatch.setattr(web_ui, builder_name, failing_builder)
+
+    async with TestClient(TestServer(saga_app_phase2)) as client:
+        resp = await client.get(f"/api/saga?view={view}")
+        body = await resp.json()
+
+    assert resp.status == 503
+    assert body["error"] == "synthetic db failure"
+
+
 # ─── Phase 3: SQL passthrough ─────────────────────────────────────
 
 

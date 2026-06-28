@@ -73,19 +73,18 @@ def test_reflection_lm_flattens_block_content():
 # ── reflection_lm_from_config ────────────────────────────────────────
 
 
-def test_reflection_lm_from_config_wires_resolved_model(monkeypatch):
-    """``reflection_lm_from_config`` threads mimir's config into
-    ``_resolve_model`` and returns a working callable — no real
-    credentials or live model needed."""
+def test_reflection_lm_from_config_uses_config_model_helper(monkeypatch):
+    """``reflection_lm_from_config`` uses the same Config-based model helper
+    as the main agent instead of re-deriving model kwargs locally."""
     stub = _StubModel("from-config")
     captured: dict = {}
 
-    def fake_resolve(spec, **kwargs):
-        captured["spec"] = spec
+    def fake_resolve(config, **kwargs):
+        captured["config"] = config
         captured["kwargs"] = kwargs
         return stub
 
-    monkeypatch.setattr("mimir.agent._resolve_model", fake_resolve)
+    monkeypatch.setattr("mimir.agent.resolve_model_from_config", fake_resolve)
 
     class _Cfg:
         model_spec = "codex-plus:gpt-5.5"
@@ -93,15 +92,11 @@ def test_reflection_lm_from_config_wires_resolved_model(monkeypatch):
         model_max_tokens = 1234
         model_reasoning_effort = "medium"
 
-    lm = reflection_lm_from_config(config=_Cfg())
+    cfg = _Cfg()
+    lm = reflection_lm_from_config(config=cfg)
 
     assert lm("hi") == "from-config"
-    assert captured["spec"] == "codex-plus:gpt-5.5"
-    assert captured["kwargs"] == {
-        "max_retries": 4,
-        "max_tokens": 1234,
-        "reasoning_effort": "medium",
-    }
+    assert captured == {"config": cfg, "kwargs": {}}
 
 
 # ── packaging: gepa is opt-in, version-pinned, never core ─────────────

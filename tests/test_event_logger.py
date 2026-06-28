@@ -67,6 +67,51 @@ async def test_max_events_trims(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_async_log_offloads_append_io_to_worker_thread(tmp_path: Path):
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1")
+    loop_thread_id = None
+    append_thread_id = None
+    original_append = logger._append_record_sync
+
+    async def capture_loop_thread():
+        nonlocal loop_thread_id
+        import threading
+
+        loop_thread_id = threading.get_ident()
+
+    def wrapped_append(record):
+        nonlocal append_thread_id
+        import threading
+
+        append_thread_id = threading.get_ident()
+        original_append(record)
+
+    await capture_loop_thread()
+    logger._append_record_sync = wrapped_append
+
+    await logger.log("tool_call", i=1)
+
+    assert append_thread_id is not None
+    assert append_thread_id != loop_thread_id
+    assert json.loads(path.read_text().strip())["i"] == 1
+
+
+def test_log_sync_does_not_mkdir_after_initialization(tmp_path: Path, monkeypatch):
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1")
+
+    def fail_mkdir(*args, **kwargs):
+        raise AssertionError("mkdir should not run on the hot append path")
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+
+    logger.log_sync("startup", ok=True)
+
+    assert json.loads(path.read_text().strip())["ok"] is True
+
+
+@pytest.mark.asyncio
 async def test_safe_log_event_writes_when_logger_is_initialized(tmp_path: Path):
     """safe_log_event delegates to log_event when the logger is initialized."""
     path = tmp_path / "events.jsonl"

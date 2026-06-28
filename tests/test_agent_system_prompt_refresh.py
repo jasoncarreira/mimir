@@ -58,7 +58,7 @@ def _stub_deepagent_build(monkeypatch: pytest.MonkeyPatch) -> _PromptCapture:
         "deepagents",
         types.SimpleNamespace(create_deep_agent=capture.create_deep_agent),
     )
-    monkeypatch.setattr("mimir.agent._resolve_model", lambda *a, **kw: object())
+    monkeypatch.setattr("mimir.agent.resolve_model_from_config", lambda *a, **kw: object())
     monkeypatch.setattr("mimir.tools.all_mimir_tools", lambda: [])
     return capture
 
