@@ -1246,6 +1246,196 @@ async def test_api_v1_memory_file_errors_are_enveloped(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_api_v1_wiki_index_and_page_detail(tmp_path: Path):
+    home = tmp_path / "home"
+    wiki = home / "state" / "wiki"
+    (wiki / "concepts").mkdir(parents=True)
+    (wiki / "topics").mkdir()
+    (wiki / "concepts" / "alpha.md").write_text(
+        "# Alpha\n\nSee [[beta]] and [[ghost]].\n",
+        encoding="utf-8",
+    )
+    (wiki / "topics" / "beta.md").write_text(
+        "# Beta\n\nBack to [[alpha]].\n",
+        encoding="utf-8",
+    )
+
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        index_resp = await client.get("/api/v1/wiki")
+        index_body = await index_resp.json()
+        page_resp = await client.get("/api/v1/wiki/concepts/alpha")
+        page_body = await page_resp.json()
+
+    assert index_resp.status == 200
+    validate_api_envelope(index_body, expect_ok=True)
+    assert index_body["data"]["page_count"] == 2
+    assert {p["path"] for p in index_body["data"]["pages"]} == {
+        "concepts/alpha.md",
+        "topics/beta.md",
+    }
+    assert index_body["data"]["graph"]["nodes"]
+    assert index_body["data"]["graph"]["edges"]
+    assert index_body["data"]["health"] == {
+        "has_orphans": False,
+        "has_dangling_links": True,
+        "has_slug_collisions": False,
+    }
+
+    assert page_resp.status == 200
+    validate_api_envelope(page_body, expect_ok=True)
+    assert page_body["data"]["slug"] == "alpha"
+    assert page_body["data"]["title"] == "Alpha"
+    assert page_body["data"]["path"] == "concepts/alpha.md"
+    assert page_body["data"]["markdown"].startswith("# Alpha")
+    assert page_body["data"]["backlinks"] == ["topics/beta.md"]
+    assert page_body["data"]["outlinks"] == ["beta", "ghost"]
+    assert page_body["data"]["dangling_links"] == [
+        {"target": "ghost", "source": "concepts/alpha.md", "line": 3}
+    ]
+    assert page_body["data"]["flags"] == {
+        "is_orphan": False,
+        "has_dangling_links": True,
+        "has_slug_collision": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_api_v1_wiki_errors_are_enveloped(tmp_path: Path):
+    app_without_home = web.Application()
+    web_ui.register_routes(
+        app_without_home,
+        turns_log=tmp_path / "t1.jsonl",
+        events_log=tmp_path / "e1.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    home_without_wiki = tmp_path / "home-without-wiki"
+    home_without_wiki.mkdir()
+    app_without_wiki = web.Application()
+    web_ui.register_routes(
+        app_without_wiki,
+        turns_log=tmp_path / "t2.jsonl",
+        events_log=tmp_path / "e2.jsonl",
+        home=home_without_wiki,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    home = tmp_path / "home-with-wiki"
+    wiki = home / "state" / "wiki"
+    wiki.mkdir(parents=True)
+    app_with_wiki = web.Application()
+    web_ui.register_routes(
+        app_with_wiki,
+        turns_log=tmp_path / "t3.jsonl",
+        events_log=tmp_path / "e3.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(app_without_home)) as client:
+        no_home_resp = await client.get("/api/v1/wiki")
+        no_home_body = await no_home_resp.json()
+    async with TestClient(TestServer(app_without_wiki)) as client:
+        no_wiki_resp = await client.get("/api/v1/wiki")
+        no_wiki_body = await no_wiki_resp.json()
+    async with TestClient(TestServer(app_with_wiki)) as client:
+        missing_page_resp = await client.get("/api/v1/wiki/missing")
+        missing_page_body = await missing_page_resp.json()
+
+    assert no_home_resp.status == 503
+    validate_api_envelope(no_home_body, expect_ok=False)
+    assert no_home_body["error"]["code"] == "home_not_configured"
+
+    assert no_wiki_resp.status == 404
+    validate_api_envelope(no_wiki_body, expect_ok=False)
+    assert no_wiki_body["error"]["code"] == "wiki_not_found"
+
+    assert missing_page_resp.status == 404
+    validate_api_envelope(missing_page_body, expect_ok=False)
+    assert missing_page_body["error"]["code"] == "wiki_page_not_found"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_wiki_filesystem_reads_are_off_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    wiki = home / "state" / "wiki"
+    wiki.mkdir(parents=True)
+    main_thread = threading.get_ident()
+    worker_threads: list[int] = []
+
+    def fake_index_payload(wiki_dir: Path) -> dict:
+        worker_threads.append(threading.get_ident())
+        assert wiki_dir == wiki
+        return {
+            "page_count": 0,
+            "pages": [],
+            "graph": {"nodes": [], "edges": []},
+            "orphans": [],
+            "dangling_links": [],
+            "slug_collisions": {},
+            "health": {
+                "has_orphans": False,
+                "has_dangling_links": False,
+                "has_slug_collisions": False,
+            },
+        }
+
+    def fake_page_payload(wiki_dir: Path, slug: str) -> dict:
+        worker_threads.append(threading.get_ident())
+        assert wiki_dir == wiki
+        assert slug == "alpha"
+        return {
+            "slug": "alpha",
+            "title": "Alpha",
+            "category": "_root",
+            "path": "alpha.md",
+            "mtime": None,
+            "markdown": "# Alpha\n",
+            "backlinks": [],
+            "outlinks": [],
+            "dangling_links": [],
+            "flags": {
+                "is_orphan": True,
+                "has_dangling_links": False,
+                "has_slug_collision": False,
+            },
+        }
+
+    monkeypatch.setattr(web_ui, "_build_wiki_index_payload", fake_index_payload)
+    monkeypatch.setattr(web_ui, "_build_wiki_page_payload", fake_page_payload)
+
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        index_resp = await client.get("/api/v1/wiki")
+        page_resp = await client.get("/api/v1/wiki/alpha")
+
+    assert index_resp.status == 200
+    assert page_resp.status == 200
+    assert len(worker_threads) == 2
+    assert all(thread_id != main_thread for thread_id in worker_threads)
+
+
+@pytest.mark.asyncio
 async def test_api_v1_web_bootstrap_auth_exempt_with_middleware(tmp_path: Path):
     from mimir.server import _make_auth_middleware
 

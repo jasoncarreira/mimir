@@ -86,6 +86,13 @@ from .saga_dashboard import (
 )
 from .session_browser import build_sessions_payload
 from .web_contracts import json_error, json_success, list_meta
+from .wiki_backlinks import (
+    _category_of,
+    _posix,
+    _title_from_markdown,
+    build_graph,
+    build_wiki_payload,
+)
 
 log = logging.getLogger(__name__)
 
@@ -105,6 +112,94 @@ LIVE_EVENTS_MAX_STREAMS = int(os.environ.get("MIMIR_LIVE_EVENTS_MAX_STREAMS", "8
 # yet, so "scan until every configured job is found" can otherwise become a
 # full-file scan on every dashboard request.
 SCHEDULER_STATE_EVENT_SCAN_RECORDS = 20_000
+
+
+def _wiki_dir_for_home(home: Path | None) -> tuple[Path | None, web.Response | None]:
+    if home is None:
+        return None, json_error(
+            "home_not_configured", "home path not configured", status=503
+        )
+    wiki_dir = home / "state" / "wiki"
+    if not wiki_dir.is_dir():
+        return None, json_error(
+            "wiki_not_found", "wiki directory not found", status=404
+        )
+    return wiki_dir, None
+
+
+def _wiki_health_flags(payload: dict[str, Any]) -> dict[str, bool]:
+    return {
+        "has_orphans": bool(payload.get("orphans")),
+        "has_dangling_links": bool(payload.get("dangling_links")),
+        "has_slug_collisions": bool(payload.get("slug_collisions")),
+    }
+
+
+def _build_wiki_index_payload(wiki_dir: Path) -> dict[str, Any]:
+    payload = build_wiki_payload(wiki_dir)
+    payload["health"] = _wiki_health_flags(payload)
+    return payload
+
+
+def _build_wiki_page_payload(wiki_dir: Path, slug: str) -> dict[str, Any] | None:
+    """Return one wiki page detail payload, resolving by slug or wiki path."""
+    graph = build_graph(wiki_dir)
+    requested = slug.strip().strip("/")
+    if requested.endswith(".md"):
+        requested = requested[:-3]
+
+    matches: list[tuple[str, dict[str, Any]]] = []
+    for path_str, data in graph.pages.items():
+        path_without_ext = path_str[:-3] if path_str.endswith(".md") else path_str
+        if requested in {str(data.get("slug") or ""), path_str, path_without_ext}:
+            matches.append((path_str, data))
+    if not matches:
+        return None
+
+    path_str, data = sorted(matches, key=lambda item: item[0])[0]
+    rel_path = Path(path_str)
+    full_path = wiki_dir / rel_path
+    try:
+        stat = full_path.stat()
+    except OSError:
+        mtime = None
+    else:
+        from datetime import datetime, timezone
+
+        mtime = datetime.fromtimestamp(
+            stat.st_mtime, tz=timezone.utc,
+        ).isoformat(timespec="seconds")
+    try:
+        markdown = full_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        markdown = ""
+
+    collision_paths = {
+        _posix(path)
+        for paths in graph.collisions.values()
+        for path in paths
+    }
+    dangling_links = [
+        dict(item) for item in graph.dangling if item.get("source") == path_str
+    ]
+    backlinks = list(data.get("inbound") or [])
+    outlinks = list(data.get("outbound") or [])
+    return {
+        "slug": str(data.get("slug") or rel_path.stem),
+        "title": _title_from_markdown(markdown, str(data.get("slug") or rel_path.stem)),
+        "category": _category_of(rel_path),
+        "path": path_str,
+        "mtime": mtime,
+        "markdown": markdown,
+        "backlinks": backlinks,
+        "outlinks": outlinks,
+        "dangling_links": dangling_links,
+        "flags": {
+            "is_orphan": path_str in graph.orphans,
+            "has_dangling_links": bool(dangling_links),
+            "has_slug_collision": path_str in collision_paths,
+        },
+    }
 
 
 def read_web_ui_config(home: Path | None) -> dict[str, str]:
@@ -1355,6 +1450,27 @@ def register_routes(
             )
         )
 
+    async def wiki_index_v1(_request: web.Request) -> web.Response:
+        wiki_dir, error = _wiki_dir_for_home(home)
+        if error is not None:
+            return error
+        assert wiki_dir is not None
+        payload = await asyncio.to_thread(_build_wiki_index_payload, wiki_dir)
+        return json_success(payload)
+
+    async def wiki_page_v1(request: web.Request) -> web.Response:
+        wiki_dir, error = _wiki_dir_for_home(home)
+        if error is not None:
+            return error
+        assert wiki_dir is not None
+        slug = request.match_info.get("slug", "").strip()
+        if not slug:
+            return json_error("missing_wiki_slug", "wiki slug required", status=400)
+        payload = await asyncio.to_thread(_build_wiki_page_payload, wiki_dir, slug)
+        if payload is None:
+            return json_error("wiki_page_not_found", "wiki page not found", status=404)
+        return json_success(payload)
+
     if ("GET", "/turns") not in existing:
         app.router.add_get("/turns", turns_page)
     if ("GET", "/api/turns") not in existing:
@@ -1381,6 +1497,10 @@ def register_routes(
         app.router.add_get("/api/v1/web/bootstrap", web_bootstrap_v1)
     if ("GET", "/api/v1/whoami") not in existing:
         app.router.add_get("/api/v1/whoami", whoami_v1)
+    if ("GET", "/api/v1/wiki") not in existing:
+        app.router.add_get("/api/v1/wiki", wiki_index_v1)
+    if ("GET", "/api/v1/wiki/{slug}") not in existing:
+        app.router.add_get("/api/v1/wiki/{slug:.+}", wiki_page_v1)
     if ("GET", "/app/") not in existing and ("GET", "/app/{path}") not in existing:
         app.router.add_get("/app/{path:.*}", react_app)
     if ("GET", "/ops") not in existing:

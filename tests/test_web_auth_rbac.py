@@ -40,6 +40,8 @@ def _app(home: Path, master_key: str) -> web.Application:
     app.router.add_get("/api/v1/saga", _echo)          # auth + admin: global atoms
     app.router.add_post("/api/v1/saga/sql", _echo)     # auth + admin: global SQL
     app.router.add_get("/api/v1/memory", _echo)        # auth + admin: global files
+    app.router.add_get("/api/v1/wiki", _echo)          # auth + admin: global wiki files
+    app.router.add_get("/api/v1/wiki/{slug:.+}", _echo)
     app.router.add_get("/api/saga", _echo)             # legacy auth + admin: global atoms
     app.router.add_post("/api/saga/sql", _echo)        # legacy auth + admin: global SQL
     app.router.add_get("/api/memory", _echo)           # legacy auth + admin: global files
@@ -70,11 +72,18 @@ async def test_user_key_allowed_on_normal_route_but_403_on_admin(tmp_path: Path)
 
 
 
-async def test_saga_and_memory_routes_are_admin_only(tmp_path: Path) -> None:
+async def test_saga_memory_and_wiki_routes_are_admin_only(tmp_path: Path) -> None:
     user_key = issue_web_key(tmp_path, "alice", roles=["user"])
     admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
     async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
-        for path in ("/api/v1/saga", "/api/v1/memory", "/api/saga", "/api/memory"):
+        for path in (
+            "/api/v1/saga",
+            "/api/v1/memory",
+            "/api/v1/wiki",
+            "/api/v1/wiki/alpha",
+            "/api/saga",
+            "/api/memory",
+        ):
             user_resp = await c.get(path, headers={"X-API-Key": user_key})
             assert user_resp.status == 403, path
             admin_resp = await c.get(path, headers={"X-API-Key": admin_key})
@@ -127,6 +136,8 @@ def test_admin_required_prefix_matching_is_segment_aware() -> None:
         "/api/v1/saga/sql",
         "/api/v1/memory",
         "/api/v1/memory/file",
+        "/api/v1/wiki",
+        "/api/v1/wiki/alpha",
         "/api/saga",
         "/api/saga/sql",
         "/api/memory",
@@ -143,6 +154,7 @@ def test_admin_required_prefix_matching_is_segment_aware() -> None:
         "/api/v1/chainlink",
         "/api/v1/sagacity",
         "/api/v1/memoryless",
+        "/api/v1/wikilinks",
         "/api/sagacity",
         "/api/memoryless",
         "/api/v1/turns",

@@ -339,8 +339,9 @@ def _is_auth_exempt(method: str, path: str) -> bool:
 # management endpoints live under ``/api/v1/admin``; the ops/scheduler/task
 # dashboards expose global operational/project state and Worklink artifacts
 # (chainlink #593). SAGA and file-backed memory/state dashboards expose global
-# cross-channel history and raw markdown content (chainlink #592). This is the
-# SECURITY gate; React section-hiding is UX only and must never be the sole
+# cross-channel history and raw markdown content (chainlink #592); wiki viewer
+# APIs expose global markdown state and graph health (chainlink #690). This is
+# the SECURITY gate; React section-hiding is UX only and must never be the sole
 # control.
 _ADMIN_REQUIRED_PREFIXES: tuple[str, ...] = (
     "/api/v1/admin",
@@ -350,6 +351,7 @@ _ADMIN_REQUIRED_PREFIXES: tuple[str, ...] = (
     "/api/v1/chainlink-board",
     "/api/v1/saga",
     "/api/v1/memory",
+    "/api/v1/wiki",
     "/api/saga",
     "/api/memory",
 )
