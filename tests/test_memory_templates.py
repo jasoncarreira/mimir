@@ -78,6 +78,23 @@ def test_core_memory_learned_behaviors_default_contains_frame_check_procedure() 
     assert "how should we implement X" in text
 
 
+def test_core_memory_learned_behaviors_default_contains_poller_override_guidance() -> None:
+    text = core_template_text("40-learned-behaviors.md")
+    normalized = " ".join(text.split())
+
+    assert "tune pollers through overrides" in text
+    assert "`<home>/pollers-overrides.yaml`, not in the skill's `pollers.json`" in normalized
+    for field in (
+        "`cron`",
+        "`priority`",
+        "`env`",
+        "`pass_env`",
+        "`batch_size`",
+        "`recover_failed_turns`",
+    ):
+        assert field in text
+
+
 def test_core_memory_filing_rules_default_documents_channel_memory_semantics() -> None:
     text = core_template_text("60-filing-rules.md")
     normalized = " ".join(text.split())
