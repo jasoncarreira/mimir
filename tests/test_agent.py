@@ -2299,7 +2299,7 @@ def test_resolve_model_claude_code_deprecated_by_default(monkeypatch):
 def test_resolve_model_claude_code_home_dotenv_opt_in(tmp_path, monkeypatch):
     """chainlink #447: Config.from_env loads <home>/.env defaults, so the
     setup-written claude-code opt-in reaches normal model resolution."""
-    from mimir.agent import _resolve_model
+    from mimir.agent import resolve_model_from_config
     from mimir.config import Config
 
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
@@ -2313,7 +2313,7 @@ def test_resolve_model_claude_code_home_dotenv_opt_in(tmp_path, monkeypatch):
     )
     cfg = Config.from_env()
     try:
-        _resolve_model(cfg.model_spec)
+        resolve_model_from_config(cfg)
     except RuntimeError as exc:
         pytest.fail(f"deprecation gate fired despite home .env opt-in: {exc}")
     except ImportError:
