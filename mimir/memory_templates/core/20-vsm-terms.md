@@ -20,7 +20,7 @@ to know what each label means when you see it.
   cron, reflection, introspection report).
 - **S5 — identity / policy.** Persona, conventions, values that
   arbitrate when S3 and S4 conflict. For mimir: this core memory
-  block, ``00-persona.md``, ``30-reflection-policy.md``.
+  block, ``00-identity.md``, ``30-reflection-policy.md``.
 
 ## The algedonic channel
 
