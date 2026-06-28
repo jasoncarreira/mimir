@@ -890,17 +890,17 @@ async def test_run_poller_invalid_line_redacts_exact_pass_env_values(
     bare pass_env secret to stdout, fail JSON parsing, and otherwise leak it via
     the durable poller_invalid_line event.
     """
-    monkeypatch.setenv("DATABASE_PASSWORD", "correct-horse-battery-staple")
+    monkeypatch.setenv("WEBHOOK_HMAC", "correct-horse-battery-staple")
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", """
 import json, os
-print(f"not-json password={os.environ['DATABASE_PASSWORD']}")
+print(f"not-json hmac={os.environ['WEBHOOK_HMAC']}")
 print(json.dumps({"poller": "x", "prompt": "ok"}))
 """)
     cfg = PollerConfig(
         name="x", command=f"{sys.executable} poller.py",
         cron="* * * * *", env={}, skill_dir=skill_dir,
-        pass_env=("DATABASE_PASSWORD",),
+        pass_env=("WEBHOOK_HMAC",),
     )
     enq = _CapturingEnqueue()
     n = await run_poller(cfg, enqueue=enq)
@@ -909,7 +909,7 @@ print(json.dumps({"poller": "x", "prompt": "ok"}))
     invalid = [e for e in events if e["type"] == "poller_invalid_line"]
     assert len(invalid) == 1
     assert "correct-horse-battery-staple" not in invalid[0]["line"]
-    assert "password=[REDACTED]" in invalid[0]["line"]
+    assert "hmac=[REDACTED]" in invalid[0]["line"]
 
 
 @pytest.mark.asyncio
@@ -1004,17 +1004,17 @@ async def test_run_poller_stderr_redacts_exact_pass_env_values(
     If a poller accidentally echoes such a value to stderr, the framework masks
     the exact env value before writing the durable poller_stderr event.
     """
-    monkeypatch.setenv("DATABASE_PASSWORD", "correct-horse-battery-staple")
+    monkeypatch.setenv("WEBHOOK_HMAC", "correct-horse-battery-staple")
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", """
 import json, os, sys
-print(f"db failed password={os.environ['DATABASE_PASSWORD']}", file=sys.stderr)
+print(f"webhook failed hmac={os.environ['WEBHOOK_HMAC']}", file=sys.stderr)
 print(json.dumps({"poller": "x", "prompt": "ok"}))
 """)
     cfg = PollerConfig(
         name="x", command=f"{sys.executable} poller.py",
         cron="* * * * *", env={}, skill_dir=skill_dir,
-        pass_env=("DATABASE_PASSWORD",),
+        pass_env=("WEBHOOK_HMAC",),
     )
     enq = _CapturingEnqueue()
     n = await run_poller(cfg, enqueue=enq)
@@ -1023,7 +1023,60 @@ print(json.dumps({"poller": "x", "prompt": "ok"}))
     stderr = [e for e in events if e["type"] == "poller_stderr"]
     assert len(stderr) == 1
     assert "correct-horse-battery-staple" not in stderr[0]["stderr"]
-    assert "password=[REDACTED]" in stderr[0]["stderr"]
+    assert "hmac=[REDACTED]" in stderr[0]["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_run_poller_stderr_redacts_exact_poller_env_values(
+    tmp_path: Path, home: Path,
+) -> None:
+    """Manifest ``env`` is also an explicit forwarding surface for redaction."""
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os, sys
+print(f"db dsn={os.environ['DB_DSN']}", file=sys.stderr)
+print(json.dumps({"poller": "x", "prompt": "ok"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={"DB_DSN": "postgres://user:pw@db.example/app"},
+        skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 1
+    events = _read_events(home)
+    stderr = [e for e in events if e["type"] == "poller_stderr"]
+    assert len(stderr) == 1
+    assert "postgres://user:pw@db.example/app" not in stderr[0]["stderr"]
+    assert "dsn=[REDACTED]" in stderr[0]["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_run_poller_stderr_does_not_redact_globally_allowlisted_deny_name(
+    tmp_path: Path, home: Path, monkeypatch,
+) -> None:
+    """Deny-named ordinary values are not shredded just because of the name."""
+    monkeypatch.setenv("MIMIR_POLLER_ENV_ALLOWLIST", "TOKEN")
+    monkeypatch.setenv("TOKEN", "github")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os, sys
+print(f"status={os.environ['TOKEN']} ok", file=sys.stderr)
+print(json.dumps({"poller": "x", "prompt": "ok"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+    assert n == 1
+    events = _read_events(home)
+    stderr = [e for e in events if e["type"] == "poller_stderr"]
+    assert len(stderr) == 1
+    assert stderr[0]["stderr"] == "status=github ok"
 
 
 @pytest.mark.asyncio
@@ -2116,12 +2169,13 @@ print('{"poller": "x", "prompt": "ok"}')
         for e in events if e.get("type") == "poller_stderr"
     ]
     combined_stderr = "|".join(stderr_payloads)
-    # The pass_env token reached the subprocess (TOKEN_PRESENT=True), but the
-    # event sink redacts the token-shaped value before events.jsonl.
+    # The pass_env token reached the subprocess (TOKEN_PRESENT=True), but
+    # diagnostics redact exact values for all pass_env keys before events.jsonl.
     assert "TOKEN_PRESENT=True" in combined_stderr
     assert "ghp_test_pass_env_value" not in combined_stderr
+    assert "mimir-bot" not in combined_stderr
     assert "TOKEN=[REDACTED]" in combined_stderr
-    assert "LOGIN=mimir-bot" in combined_stderr
+    assert "LOGIN=[REDACTED]" in combined_stderr
 
 
 @pytest.mark.asyncio

@@ -240,25 +240,31 @@ def _poller_env_available_at_discovery(
     return available
 
 
-def _redact_poller_env_values(text: str, env: dict[str, str]) -> str:
-    """Redact exact secret-named subprocess env values from poller diagnostics.
+def _redact_poller_env_values(
+    text: str,
+    env: dict[str, str],
+    redact_keys: set[str] | frozenset[str],
+) -> str:
+    """Redact exact explicitly-forwarded subprocess env values from diagnostics.
 
-    Token-shaped redaction is global in ``event_logger``, but ``pass_env`` can
-    forward secrets with no recognizable shape (bare DB passwords, shared HMACs,
-    etc.). Poller stdout/stderr is the place those values are most likely to be
-    echoed. Redact exact values for secret-named keys before line/length
-    truncation so a long leaked value cannot leave its prefix behind in durable
-    events.
+    Token-shaped redaction is global in ``event_logger``, but pollers can receive
+    secrets with no recognizable shape (bare DB passwords, shared HMACs, DSNs,
+    etc.) through explicit ``pass_env`` passthrough or manifest ``env`` entries.
+    Poller stdout/stderr is the place those values are most likely to be echoed.
+    Redact exact values for those explicit keys before line/length truncation so
+    a long leaked value cannot leave its prefix behind in durable events.
+
+    This intentionally does *not* infer secrecy from env-key deny suffixes: the
+    subprocess still receives the assembled env unchanged, while diagnostics only
+    mask values that came from per-poller explicit forwarding surfaces.
     """
     if not text:
         return text
     out = redact_text(text)
-    secret_names = {suffix.removeprefix("_") for suffix in _DENY_ENV_SUFFIXES}
     secret_values = {
-        value
-        for key, value in env.items()
-        if any(key.endswith(suffix) for suffix in _DENY_ENV_SUFFIXES)
-        or key in secret_names
+        env[key]
+        for key in redact_keys
+        if key in env
     }
     # Longest first prevents a short value from partially masking inside a
     # longer one and leaving the suffix visible. Skip tiny values to avoid
@@ -1150,6 +1156,7 @@ async def run_poller(
     # global ``MIMIR_POLLER_ENV_ALLOWLIST``. Keep this path in sync with
     # ``_poller_env_available_at_discovery``.
     env = {k: v for k, v in os.environ.items() if _allowed_poller_env_key(k)}
+    explicit_env_redact_keys: set[str] = set()
     # Per-poller pass_env (chainlink #82 sub #83/#85): explicit
     # whitelist of env keys that bypass the deny-suffix/deny-prefix
     # filter AND the built-in allowlist. This is how pollers get
@@ -1195,6 +1202,7 @@ async def run_poller(
         if key not in os.environ:
             continue
         env[key] = os.environ[key]
+        explicit_env_redact_keys.add(key)
         if any(key.endswith(s) for s in _DENY_ENV_SUFFIXES) or any(
             key.startswith(p) for p in _DENY_ENV_PREFIXES
         ):
@@ -1221,6 +1229,7 @@ async def run_poller(
             )
             continue
         env[key] = value
+        explicit_env_redact_keys.add(key)
     # chainlink #95: warn when poller.env re-introduces a key whose name
     # matches the deny-list patterns.  ``pass_env`` is the documented path
     # for forwarding live secrets from os.environ; ``poller.env`` is the
@@ -1407,6 +1416,7 @@ async def run_poller(
             stderr=_redact_poller_env_values(
                 stderr_text,
                 env,
+                explicit_env_redact_keys,
             )[:POLLER_STDERR_LOG_CHARS],
             exit_code=proc.returncode if proc is not None else None,
         )
@@ -1468,6 +1478,7 @@ async def run_poller(
                 line=_redact_poller_env_values(
                     line,
                     env,
+                    explicit_env_redact_keys,
                 )[:POLLER_INVALID_LINE_CHARS],
             )
             continue
