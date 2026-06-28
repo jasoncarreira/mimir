@@ -29,6 +29,7 @@ import { OpsRoute, UsageRoute } from "./routes/OpsRoute";
 import { SchedulerRoute } from "./routes/SchedulerRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { TurnsRoute } from "./routes/TurnsRoute";
+import { WikiRoute } from "./routes/WikiRoute";
 import { scrubSecretQueryParams, useRouteState } from "./routeState";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import type { AgentCharacterState } from "./skins/types";
@@ -580,7 +581,9 @@ function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[
                         ? <UsersRoute />
                         : surface.id === "scheduler"
                           ? <SchedulerRoute />
-                          : <SurfaceRoute surface={surface} />
+                          : surface.id === "wiki"
+                            ? <WikiRoute surface={surface} />
+                            : <SurfaceRoute surface={surface} />
           }
           key={surface.id}
           path={surface.path}

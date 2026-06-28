@@ -201,6 +201,15 @@ def first_party_dashboard_extensions(
                 requires_role="admin",
             ),
             DashboardExtensionManifest(
+                id="wiki",
+                route_path="/wiki",
+                label="Wiki",
+                icon="book-open",
+                nav_position=55,
+                api_namespace="wiki",
+                requires_role="admin",
+            ),
+            DashboardExtensionManifest(
                 id="admin-config",
                 route_path="/admin",
                 label="Admin",

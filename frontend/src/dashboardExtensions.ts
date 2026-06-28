@@ -57,6 +57,11 @@ const firstPartySurfaceMetadata: Record<
     tabs: ["state", "memory", "files"],
     filterLabel: "tier"
   },
+  wiki: {
+    detail: "Browse read-only wiki pages",
+    tabs: ["pages", "links", "health"],
+    filterLabel: "category"
+  },
   "admin-config": {
     detail: "Config, model, and redacted env",
     tabs: ["model", "config", "env"],

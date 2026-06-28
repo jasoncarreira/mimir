@@ -48,6 +48,22 @@ describe("dashboard surface metadata", () => {
     expect(ops.tabs).not.toContain("chainlink");
   });
 
+  it("models Wiki as a first-party dashboard surface", () => {
+    const [wiki] = getDashboardSurfaces([
+      { ...manifest("wiki", "Wiki"), route_path: "/wiki", api_namespace: "wiki", nav_position: 55 }
+    ]);
+
+    expect(wiki).toMatchObject({
+      id: "wiki",
+      label: "Wiki",
+      title: "Wiki",
+      path: "/wiki",
+      detail: "Browse read-only wiki pages",
+      tabs: ["pages", "links", "health"],
+      filterLabel: "category"
+    });
+  });
+
   it("rejects unsafe dashboard routes before rendering navigation", () => {
     expect(() => getDashboardSurfaces([
       { ...manifest("bad"), route_path: "javascript:alert(1)" }

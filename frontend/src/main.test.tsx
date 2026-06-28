@@ -44,6 +44,11 @@ const protectedBootstrap = {
       id: "admin-users", route_path: "/admin/users", label: "Users", icon: null, nav_position: 90,
       enabled: true, bundle: null, css: [], api_namespace: null, trusted_first_party: true,
       requires_role: "admin"
+    },
+    {
+      id: "wiki", route_path: "/wiki", label: "Wiki", icon: null, nav_position: 55,
+      enabled: true, bundle: null, css: [], api_namespace: "wiki", trusted_first_party: true,
+      requires_role: "admin"
     }
   ]
 };
@@ -232,5 +237,12 @@ describe("AppFrame shell layout follows the skin (#788)", () => {
     expect(await screen.findByRole("link", { name: /Chat/ })).toBeTruthy();
     // The sidebar-only brand eyebrow must not render.
     expect(screen.queryByText("Agent Console")).toBeNull();
+  });
+
+  it("registers the first-party wiki dashboard route", async () => {
+    window.localStorage.setItem(STORAGE_KEY, "admin-key-123");
+    renderApp();
+
+    expect((await screen.findByRole("link", { name: /Wiki/ })).getAttribute("href")).toBe("/wiki");
   });
 });

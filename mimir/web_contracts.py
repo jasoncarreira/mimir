@@ -713,6 +713,60 @@ export interface SagaSqlData {
   rejected?: boolean;
 }
 
+export interface WikiPageSummary {
+  slug: string;
+  title: string;
+  category: string;
+  path: string;
+  mtime: string | null;
+  outbound: string[];
+  inbound: string[];
+  is_orphan: boolean;
+  has_slug_collision: boolean;
+}
+
+export interface WikiGraphNode {
+  id: string;
+  slug: string;
+  title: string;
+  category: string;
+  is_orphan: boolean;
+  has_slug_collision: boolean;
+}
+
+export interface WikiGraphEdge {
+  source: string;
+  target: string;
+  target_slug: string;
+}
+
+export interface WikiDanglingLink {
+  target: string;
+  source: string;
+  line: number;
+}
+
+export interface WikiIndexData {
+  page_count: number;
+  pages: WikiPageSummary[];
+  graph: {
+    nodes: WikiGraphNode[];
+    edges: WikiGraphEdge[];
+  };
+  orphans: string[];
+  dangling_links: WikiDanglingLink[];
+  slug_collisions: Record<string, string[]>;
+  health?: {
+    has_orphans: boolean;
+    has_dangling_links: boolean;
+    has_slug_collisions: boolean;
+  };
+}
+
+export interface WikiPageData extends WikiPageSummary {
+  markdown: string;
+}
+
 export interface DashboardExtensionManifest {
   id: string;
   route_path: string;
