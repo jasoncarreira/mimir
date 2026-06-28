@@ -86,6 +86,27 @@ function indexPayload() {
   };
 }
 
+function graphPayload() {
+  const payload = indexPayload();
+  return {
+    ...payload,
+    graph: {
+      nodes: payload.pages.map((page) => ({
+        id: page.path,
+        slug: page.slug,
+        title: page.title,
+        category: page.category,
+        is_orphan: page.is_orphan,
+        has_slug_collision: page.has_slug_collision
+      })),
+      edges: [
+        { source: "concepts/alpha.md", target: "topics/beta.md", target_slug: "beta" },
+        { source: "topics/beta.md", target: "concepts/alpha.md", target_slug: "alpha" }
+      ]
+    }
+  };
+}
+
 function pagePayload(slugOrPath: string) {
   if (slugOrPath.includes("topics%2Fbeta") || slugOrPath.includes("topics/beta") || slugOrPath.endsWith("/beta")) {
     return {
@@ -202,6 +223,24 @@ describe("WikiRoute", () => {
     expect(screen.getByRole("button", { name: /Beta/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: /Alpha Collision/ })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /^Alpha alpha/ })).toBeNull();
+  });
+
+  it("lazy-loads graph mode and opens clicked nodes in the reader", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.endsWith("/api/v1/wiki")) return jsonResponse(envelope(graphPayload()));
+      if (url.includes("/api/v1/wiki/")) return jsonResponse(envelope(pagePayload(url)));
+      return jsonResponse(envelope({}));
+    }));
+
+    renderRoute("/wiki?view=graph&slug=concepts/alpha");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Graph" }));
+    expect(await screen.findByLabelText("Wiki graph view")).toBeTruthy();
+    expect(screen.getByLabelText("Wiki graph legend")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Beta" }));
+    await waitFor(() => expect(screen.getAllByRole("heading", { name: "Beta" }).length).toBeGreaterThan(0));
+    expect(screen.getByText("topics/beta.md")).toBeTruthy();
   });
 
   it("renders empty and error states", async () => {

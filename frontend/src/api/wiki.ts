@@ -2,6 +2,8 @@ import { apiFetchEnvelope, type ApiClientOptions } from "./http";
 import type {
   ApiSuccessEnvelope,
   WikiDanglingLink,
+  WikiGraphEdge,
+  WikiGraphNode,
   WikiIndexData,
   WikiPageData,
   WikiPageSummary
@@ -9,6 +11,8 @@ import type {
 
 export type {
   WikiDanglingLink,
+  WikiGraphEdge,
+  WikiGraphNode,
   WikiIndexData,
   WikiPageData,
   WikiPageSummary
