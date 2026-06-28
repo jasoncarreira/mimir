@@ -647,6 +647,7 @@ async def test_api_v1_live_events_backfill_orders_and_dedups(app):
 
     assert resp.status == 200
     assert resp.content_type == "text/event-stream"
+    assert resp.headers["X-Accel-Buffering"] == "no"
     items = _sse_data_items(body)
     assert [item["cursor"] for item in items] == [
         "2026-01-01T00:00:01Z:t1:000000",

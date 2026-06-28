@@ -779,6 +779,7 @@ def register_routes(
                 "Content-Type": "text/event-stream",
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
             },
         )
         if not await _try_acquire_live_event_slot():
@@ -836,6 +837,7 @@ def register_routes(
                 "Content-Type": "text/event-stream",
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
             },
         )
         await resp.prepare(request)

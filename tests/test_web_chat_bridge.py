@@ -186,6 +186,7 @@ async def test_send_fans_out_to_authenticated_subscribers(authed_bridge_app):
         resp = await client.get("/chat/stream", headers={"X-API-Key": "stream-secret"})
         assert resp.status == 200
         assert resp.content_type == "text/event-stream"
+        assert resp.headers["X-Accel-Buffering"] == "no"
 
         await asyncio.sleep(0.05)
         await bridge.send("web-other", "not for this user")
