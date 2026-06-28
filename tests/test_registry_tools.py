@@ -1210,6 +1210,108 @@ class TestSendMessageInteractivityGuard:
         assert "send_message ok" in out
 
 
+class TestSendMessageSkiplistGuard:
+    def _turn_ctx(self, trigger: str):
+        from mimir._context import reset_current_turn, set_current_turn
+        from mimir.models import TurnContext
+
+        ctx = TurnContext(
+            turn_id=f"t-{trigger}",
+            session_id="s1",
+            trigger=trigger,
+            channel_id="chan-1",
+            started_at=0.0,
+            agent_id="test",
+        )
+        tok = set_current_turn(ctx)
+        return ctx, tok, reset_current_turn
+
+    @pytest.mark.asyncio
+    async def test_poller_skiplist_narration_is_rejected_and_logged(
+        self, tmp_path,
+    ) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        _ctx, tok, reset = self._turn_ctx("poller")
+        try:
+            out = await send_message.ainvoke({
+                "text": "jira weekly update is automated. skip bucket. end silently.",
+                "channel_id": "operator",
+            })
+        finally:
+            reset(tok)
+
+        assert "send_message rejected" in out
+        assert "end the turn with no message" in out
+        assert bridge.send_calls == []
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        ]
+        [ev] = [e for e in events if e["type"] == "send_message_blocked_skiplist"]
+        assert ev["channel_id"] == "operator"
+        assert ev["trigger"] == "poller"
+        assert ev["matched_phrase"] == "end silently"
+
+    @pytest.mark.asyncio
+    async def test_scheduled_tick_skiplist_narration_is_rejected(self) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        _ctx, tok, reset = self._turn_ctx("scheduled_tick")
+        try:
+            out = await send_message.ainvoke({
+                "text": "Batch complete. No operator alert.",
+                "channel_id": "operator",
+            })
+        finally:
+            reset(tok)
+
+        assert "send_message rejected" in out
+        assert bridge.send_calls == []
+
+    @pytest.mark.asyncio
+    async def test_interactive_turn_allows_skip_words(self) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        _ctx, tok, reset = self._turn_ctx("user_message")
+        try:
+            out = await send_message.ainvoke({
+                "text": "You can skip that step if needed.",
+                "channel_id": "chan-1",
+            })
+        finally:
+            reset(tok)
+
+        assert "send_message ok" in out
+        assert bridge.send_calls == [
+            {"cid": "chan-1", "text": "You can skip that step if needed."},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_poller_escalation_without_skiplist_phrase_sends(self) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        _ctx, tok, reset = self._turn_ctx("poller")
+        try:
+            out = await send_message.ainvoke({
+                "text": "Vendor SkipperCo reported a production outage.",
+                "channel_id": "operator",
+            })
+        finally:
+            reset(tok)
+
+        assert "send_message ok" in out
+        assert bridge.send_calls == [
+            {
+                "cid": "operator",
+                "text": "Vendor SkipperCo reported a production outage.",
+            },
+        ]
+
+
 # ────────────────────────────────────────────────────────────────────
 # send_message delivery semantics (0.3.0)
 # ────────────────────────────────────────────────────────────────────

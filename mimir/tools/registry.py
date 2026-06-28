@@ -67,6 +67,47 @@ _current_turn_interactive_var: contextvars.ContextVar[bool] = contextvars.Contex
     "mimir_current_turn_interactive", default=True
 )
 
+SEND_MESSAGE_SKIPLIST_TRIGGERS: frozenset[str] = frozenset(
+    {"poller", "scheduled_tick"}
+)
+
+# Tunable list of phrases that indicate the model is narrating a
+# non-delivery decision instead of ending an autonomous turn silently.
+SEND_MESSAGE_SKIPLIST_PHRASES: tuple[str, ...] = (
+    "end silent",
+    "end silently",
+    "end-silent",
+    "skip bucket",
+    "skip",
+    "filtered",
+    "no action",
+    "no reply needed",
+    "no operator alert",
+    "batch complete",
+    "routed to skip",
+)
+
+
+def _compile_skiplist_phrase_pattern(phrase: str) -> re.Pattern[str]:
+    escaped = r"\s+".join(re.escape(part) for part in phrase.split())
+    return re.compile(
+        rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+
+
+_SEND_MESSAGE_SKIPLIST_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (phrase, _compile_skiplist_phrase_pattern(phrase))
+    for phrase in SEND_MESSAGE_SKIPLIST_PHRASES
+)
+
+
+def _matched_send_message_skiplist_phrase(text: str) -> str | None:
+    for phrase, pattern in _SEND_MESSAGE_SKIPLIST_PATTERNS:
+        if pattern.search(text):
+            return phrase
+    return None
+
 
 def _channel_from_config_or_state(
     channel_id: str | None, config: RunnableConfig | None
@@ -236,6 +277,27 @@ async def send_message(
     decision = None
     undelivered_decision = None
     ctx = get_current_turn()
+    trigger = (getattr(ctx, "trigger", "") if ctx is not None else "").strip()
+    matched_skiplist_phrase = (
+        _matched_send_message_skiplist_phrase(text)
+        if trigger in SEND_MESSAGE_SKIPLIST_TRIGGERS
+        else None
+    )
+    if matched_skiplist_phrase is not None:
+        try:
+            await _log_event(
+                "send_message_blocked_skiplist",
+                channel_id=cid,
+                trigger=trigger,
+                matched_phrase=matched_skiplist_phrase,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return (
+            "send_message rejected: this autonomous turn found only "
+            "skip-bucket / no-action items. The correct action is to end "
+            "the turn with no message."
+        )
     if ctx is not None:
         detector = getattr(ctx, "loop_detector", None)
 
