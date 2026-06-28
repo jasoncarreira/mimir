@@ -76,8 +76,8 @@ class _BridgeStub:
         self.cancels: list[str] = []
         self.typing_starts: list[str] = []
 
-    async def send(self, channel_id: str, text: str, *,
-                   final: bool = True, attachment_paths=None):
+    async def send(self, channel_id: str, text: str, attachment_paths=None, *,
+                   final: bool = True):
         self.sends.append((channel_id, text, final))
         class _R:
             sent = True
@@ -918,6 +918,83 @@ async def test_run_turn_interactive_no_send_message_emits_no_reply_signal(
     )
     assert no_reply[0].get("channel_id") == "ch-1"
     assert no_reply[0].get("output_chars", 0) > 0
+
+
+async def test_run_turn_auto_delivers_final_text_when_enabled(tmp_path: Path):
+    import json
+    from mimir.channel_registry import ChannelRegistry
+
+    final_text = "Found it. The missing setting is enabled in the project config."
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content=final_text)])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+    agent._config.auto_deliver_final_text_channels = ("ch-",)
+    agent._config.resend_nudge_channels = ("ch-",)
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    record = await agent.run_turn(event)
+
+    assert record.error is None
+    assert bridge.sends == [("ch-1", final_text, False)]
+    outbound = [m for m in agent._buffer._all if m.kind == "assistant_message"]
+    assert [m.content for m in outbound] == [final_text]
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    assert [e for e in evs if e.get("type") == "interactive_turn_no_send_message"] == []
+    assert [e for e in evs if e.get("type") == "resend_nudge_issued"] == []
+    [auto] = [e for e in evs if e.get("type") == "interactive_turn_auto_delivered"]
+    assert auto["channel_id"] == "ch-1"
+    assert auto["turn_id"] == record.turn_id
+    assert auto["output_chars"] == len(final_text)
+    assert [e for e in evs if e.get("type") == "send_message_sent"]
+
+
+async def test_run_turn_auto_deliver_ignores_trivial_final_text(tmp_path: Path):
+    import json
+    from mimir.channel_registry import ChannelRegistry
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+    agent._config.auto_deliver_final_text_channels = ("*",)
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    await agent.run_turn(event)
+
+    assert bridge.sends == []
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    assert [e for e in evs if e.get("type") == "interactive_turn_auto_delivered"] == []
+    assert [e for e in evs if e.get("type") == "interactive_turn_no_send_message"]
+
+
+async def test_run_turn_auto_deliver_user_message_only(tmp_path: Path):
+    import json
+    from mimir.channel_registry import ChannelRegistry
+
+    final_text = "The shell job finished and produced this summary for review."
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content=final_text)])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+    agent._config.auto_deliver_final_text_channels = ("*",)
+
+    event = AgentEvent(trigger="shell_job_complete", channel_id="ch-1", content="")
+    await agent.run_turn(event)
+
+    assert bridge.sends == []
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    assert [e for e in evs if e.get("type") == "interactive_turn_auto_delivered"] == []
 
 
 async def test_run_turn_successful_send_suppresses_no_reply_signal(

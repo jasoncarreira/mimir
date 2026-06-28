@@ -907,6 +907,12 @@ class Config:
     # tool-shy models (minimax M3) that answer in final text instead of calling
     # the tool. ``MIMIR_RESEND_NUDGE_CHANNELS``.
     resend_nudge_channels: tuple[str, ...] = ()
+    # Optional deterministic forgot-to-send recovery: channels (prefix
+    # allow-list, ``*`` = all) where a user_message turn that produced
+    # substantive final text but never delivered to the triggering channel
+    # auto-delivers that final text directly. Empty default = off.
+    # ``MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS``.
+    auto_deliver_final_text_channels: tuple[str, ...] = ()
     # Operator-declared absolute roots OUTSIDE the home the file tools may
     # read/edit, as ``(abs_path, "ro"|"rw")`` pairs (chainlink #650). Empty =
     # home-only (today's behavior). ``MIMIR_FILE_TOOL_ROOTS``.
@@ -1044,6 +1050,11 @@ class Config:
             ),
             resend_nudge_channels=tuple(
                 p.strip() for p in _env("MIMIR_RESEND_NUDGE_CHANNELS", "").split(",")
+                if p.strip()
+            ),
+            auto_deliver_final_text_channels=tuple(
+                p.strip()
+                for p in _env("MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS", "").split(",")
                 if p.strip()
             ),
             api_key=_env("MIMIR_API_KEY"),

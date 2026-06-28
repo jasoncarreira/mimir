@@ -415,6 +415,13 @@ def test_scheduler_loop_lag_host_is_not_a_negative_signal(tmp_path: Path):
     assert block is None or "loop lag" not in block
 
 
+def test_interactive_turn_auto_delivered_is_informational_only():
+    from mimir.feedback import _EVENT_RULES, classify
+
+    assert classify("interactive_turn_auto_delivered") is None
+    assert "interactive_turn_auto_delivered" not in _EVENT_RULES
+
+
 def test_scheduler_loop_lag_host_escalates_only_when_chronic(tmp_path: Path):
     """chainlink #685: host deschedules remain per-event silent, but a chronic
     burst emits one escalation event so operator-visible reporting is not blind."""
