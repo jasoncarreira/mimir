@@ -17,7 +17,22 @@ from __future__ import annotations
 
 import pytest
 
+import mimir.tools.extra as extra
 from mimir.tools.extra import shell_exec
+
+
+@pytest.fixture(autouse=True)
+def reset_shell_state(monkeypatch, tmp_path):
+    old_cwd = extra._SHELL_STATE["cwd"]
+    old_timeout = extra._SHELL_STATE["timeout_s"]
+    extra._SHELL_STATE["cwd"] = None
+    extra._SHELL_STATE["timeout_s"] = 60.0
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    try:
+        yield
+    finally:
+        extra._SHELL_STATE["cwd"] = old_cwd
+        extra._SHELL_STATE["timeout_s"] = old_timeout
 
 
 def test_shell_exec_runs_arbitrary_command_in_default_state():
@@ -99,6 +114,40 @@ def test_shell_exec_supports_cd_chains_and_pipes():
     piped = shell_exec.invoke({"command": "echo hello | tr a-z A-Z"})
     assert "exit=0" in piped
     assert "HELLO" in piped
+
+
+def test_shell_exec_initial_cwd_defaults_to_mimir_home(monkeypatch, tmp_path):
+    """Relative commands start in MIMIR_HOME, not the server process cwd."""
+    home = tmp_path / "home"
+    launch_cwd = tmp_path / "s6-service-dir"
+    script = home / "scripts" / "show_home_cwd.py"
+    script.parent.mkdir(parents=True)
+    launch_cwd.mkdir()
+    script.write_text(
+        "from pathlib import Path\n"
+        "print('script-cwd=' + Path.cwd().name)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.chdir(launch_cwd)
+
+    result = shell_exec.invoke({"command": "python3 scripts/show_home_cwd.py"})
+
+    assert "exit=0" in result
+    assert "script-cwd=home" in result
+
+
+def test_shell_exec_standalone_cd_persists_for_later_calls(tmp_path):
+    """A successful standalone cd updates the cwd used by later shell calls."""
+    target = tmp_path / "workspace"
+    target.mkdir()
+
+    cd_out = shell_exec.invoke({"command": f"cd {target}"})
+    pwd_out = shell_exec.invoke({"command": "pwd"})
+
+    assert "exit=0" in cd_out
+    assert "exit=0" in pwd_out
+    assert str(target) in pwd_out
 
 
 def test_shell_exec_supports_redirects(tmp_path):
