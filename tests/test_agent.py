@@ -1115,7 +1115,9 @@ async def test_send_message_tool_appends_outbound_via_global_buffer(tmp_path: Pa
     try:
         send_message = tools_reg.send_message
         # Call the @tool wrapper's underlying coro directly.
-        result = await send_message.ainvoke({"text": "outbound from tool"})
+        result = await send_message.ainvoke(
+            {"text": "outbound from tool", "channel_id": "ch-tool"}
+        )
         assert "send_message ok" in result
         # Buffer got the append.
         msgs = list(buf._all)
