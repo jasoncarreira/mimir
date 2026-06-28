@@ -8,6 +8,53 @@ import { normalizeWikiIndexPayload } from "../api/wiki";
 import type { DashboardSurface } from "../dashboardExtensions";
 import { WikiRoute } from "./WikiRoute";
 
+vi.mock("reagraph", async () => {
+  const ReactModule = await import("react");
+  const lightTheme = {
+    canvas: {},
+    node: {
+      fill: "",
+      activeFill: "",
+      opacity: 1,
+      selectedOpacity: 1,
+      inactiveOpacity: 0.2,
+      label: {},
+      subLabel: {}
+    },
+    ring: { fill: "", activeFill: "" },
+    edge: {
+      fill: "",
+      activeFill: "",
+      opacity: 1,
+      selectedOpacity: 1,
+      inactiveOpacity: 0.1,
+      label: {},
+      subLabel: {}
+    },
+    arrow: { fill: "", activeFill: "" },
+    lasso: { background: "", border: "" },
+    cluster: { label: {} }
+  };
+  return {
+    lightTheme,
+    GraphCanvas: (props: Record<string, any>) => ReactModule.createElement(
+      "div",
+      { "aria-label": "Mock reagraph canvas" },
+      props.nodes
+        .filter((node: { data?: { kind?: string } }) => node.data?.kind === "page")
+        .map((node: { id: string; label: string }) => ReactModule.createElement(
+          "button",
+          {
+            key: node.id,
+            onClick: () => props.onNodeClick({ id: node.id, data: {} }),
+            type: "button"
+          },
+          `Open ${node.label}`
+        ))
+    )
+  };
+});
+
 const surface: DashboardSurface = {
   id: "wiki",
   label: "Wiki",
