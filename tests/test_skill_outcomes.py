@@ -345,6 +345,27 @@ def test_aggregate_accumulates_across_turns(tmp_path):
     assert aggs["memory"].success_rate == pytest.approx(2 / 3)
 
 
+def test_aggregate_treats_naive_turn_timestamp_as_utc(tmp_path):
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    turns = tmp_path / "turns.jsonl"
+    record = {
+        # Older or hand-authored turn records may omit the UTC offset. These
+        # still represent UTC turns and should not crash the whole aggregate.
+        "ts": "2026-05-02T11:55:00",
+        "events": [
+            {"type": "tool_call", "id": "1", "name": "task",
+             "args": {"subagent_type": "memory"}},
+            {"type": "tool_result", "id": "1", "is_error": False},
+        ],
+    }
+    turns.write_text(json.dumps(record) + "\n")
+
+    aggs = aggregate(turns, now=base)
+
+    assert aggs["memory"].success == 1
+    assert aggs["memory"].failure == 0
+
+
 def test_aggregate_chatclaudecode_gap_infers_from_result_is_error(tmp_path):
     """Turn records with result_is_error=False but no tool_results
     (ChatClaudeCode streaming gap) should count skill invocations as
