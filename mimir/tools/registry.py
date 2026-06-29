@@ -922,6 +922,7 @@ async def list_schedules() -> str:
                 partial(
                     aggregate_poller_turn_usage,
                     Path(scheduler_home) / "logs" / "turns.jsonl",
+                    events_path=Path(scheduler_home) / "logs" / "events.jsonl",
                 )
             )
         except Exception as exc:  # pragma: no cover - defensive; listing must not fail

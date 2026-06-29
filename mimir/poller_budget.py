@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
+from ._jsonl_tail import tail_jsonl_records
+
 from .jsonl_snapshot import JsonlSnapshot, iter_window_records
 
 
@@ -183,13 +185,16 @@ def parse_poller_budget_config(
 
 @dataclass
 class PollerUsageWindow:
-    """Read-only LLM turn usage attributed to one poller in one window."""
+    """Read-only usage attributed to one poller in one window."""
 
     label: str
     hours: float
     agent_turns: int = 0
     total_cost_usd: float | None = None
     cost_samples: int = 0
+    api_calls: float | int = 0
+    api_bytes: float | int = 0
+    estimated_external_cost_usd: float | int = 0
 
     def record_turn(self, cost_usd: float | None) -> None:
         self.agent_turns += 1
@@ -199,6 +204,17 @@ class PollerUsageWindow:
             self.total_cost_usd = 0.0
         self.total_cost_usd += cost_usd
         self.cost_samples += 1
+
+    def record_external_usage(
+        self,
+        *,
+        api_calls: float | int,
+        api_bytes: float | int,
+        estimated_cost_usd: float | int,
+    ) -> None:
+        self.api_calls += api_calls
+        self.api_bytes += api_bytes
+        self.estimated_external_cost_usd += estimated_cost_usd
 
     def to_dict(self) -> dict[str, float | int | str | None]:
         if self.agent_turns == 0:
@@ -212,6 +228,11 @@ class PollerUsageWindow:
             "hours": self.hours,
             "agent_turns": self.agent_turns,
             "total_cost_usd": total_cost_usd,
+            "api_calls": self.api_calls,
+            "api_bytes": self.api_bytes,
+            "estimated_external_cost_usd": round(
+                float(self.estimated_external_cost_usd), 6,
+            ),
         }
 
 
@@ -328,13 +349,15 @@ def aggregate_poller_turn_usage(
     now: datetime | None = None,
     windows: Iterable[tuple[str, float]] = POLLER_USAGE_WINDOWS,
     snapshot: JsonlSnapshot | None = None,
+    events_path: Path | None = None,
 ) -> dict[str, PollerUsage]:
     """Aggregate poller-triggered agent turns from ``turns.jsonl``.
 
     Records are attributed when ``channel_id`` is exactly ``poller:<name>``.
-    The scan is newest-first and stops once it reaches the oldest requested
-    cutoff, matching the bounded/tail pattern used by usage aggregation.
-    Missing or unreadable logs yield an empty mapping.
+    External usage is attributed from ``poller_usage`` events in ``events.jsonl``
+    when ``events_path`` is provided. Both scans are newest-first and stop once
+    they reach the oldest requested cutoff, matching the bounded/tail pattern
+    used by usage aggregation. Missing or unreadable logs yield an empty mapping.
     """
 
     window_defs = [(label, float(hours)) for label, hours in windows]
@@ -351,16 +374,8 @@ def aggregate_poller_turn_usage(
     oldest_cutoff = min(cutoffs.values())
     out: dict[str, PollerUsage] = {}
 
-    for rec in iter_window_records(snapshot, turns_path):
-        ts = _parse_ts(rec.get("ts"))
-        if ts is None:
-            continue
-        if ts < oldest_cutoff:
-            break
-        poller = _poller_name_from_channel(rec.get("channel_id"))
-        if poller is None:
-            continue
-        summary = out.setdefault(
+    def ensure_summary(poller: str) -> PollerUsage:
+        return out.setdefault(
             poller,
             PollerUsage(
                 poller=poller,
@@ -370,9 +385,46 @@ def aggregate_poller_turn_usage(
                 },
             ),
         )
+
+    for rec in iter_window_records(snapshot, turns_path):
+        ts = _parse_ts(rec.get("ts") or rec.get("timestamp"))
+        if ts is None:
+            continue
+        if ts < oldest_cutoff:
+            break
+        poller = _poller_name_from_channel(rec.get("channel_id"))
+        if poller is None:
+            continue
+        summary = ensure_summary(poller)
         cost = _coerce_cost(rec.get("total_cost_usd"))
         for label, _hours in window_defs:
             if ts >= cutoffs[label]:
                 summary.windows[label].record_turn(cost)
+
+    if events_path is not None:
+        for rec in tail_jsonl_records(events_path):
+            ts = _parse_ts(rec.get("ts") or rec.get("timestamp"))
+            if ts is None:
+                continue
+            if ts < oldest_cutoff:
+                break
+            if rec.get("type") != "poller_usage":
+                continue
+            poller_raw = rec.get("poller")
+            if not isinstance(poller_raw, str) or not poller_raw.strip():
+                continue
+            api_calls = _coerce_usage_metric(rec.get("api_calls"))
+            api_bytes = _coerce_usage_metric(rec.get("api_bytes"))
+            estimated_cost_usd = _coerce_usage_metric(rec.get("estimated_cost_usd"))
+            if api_calls is None or api_bytes is None or estimated_cost_usd is None:
+                continue
+            summary = ensure_summary(poller_raw.strip())
+            for label, _hours in window_defs:
+                if ts >= cutoffs[label]:
+                    summary.windows[label].record_external_usage(
+                        api_calls=api_calls,
+                        api_bytes=api_bytes,
+                        estimated_cost_usd=estimated_cost_usd,
+                    )
 
     return out

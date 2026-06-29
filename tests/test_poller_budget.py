@@ -68,6 +68,59 @@ def test_aggregate_poller_turn_usage_attributes_by_poller_channel(tmp_path: Path
     assert "scheduler:heartbeat" not in usage
 
 
+
+def test_aggregate_poller_usage_includes_external_usage_signals(tmp_path: Path):
+    now = datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc)
+    turns = tmp_path / "logs" / "turns.jsonl"
+    events = tmp_path / "logs" / "events.jsonl"
+    _write_jsonl(turns, [])
+    _write_jsonl(
+        events,
+        [
+            {
+                "ts": (now - timedelta(hours=25)).isoformat(),
+                "type": "poller_usage",
+                "poller": "github-activity",
+                "api_calls": 99,
+                "api_bytes": 99,
+                "estimated_cost_usd": 99.0,
+            },
+            {
+                "ts": (now - timedelta(minutes=45)).isoformat(),
+                "type": "poller_usage",
+                "poller": "github-activity",
+                "api_calls": 4,
+                "api_bytes": 1200,
+                "estimated_cost_usd": 0.02,
+            },
+            {
+                "ts": (now - timedelta(hours=2)).isoformat(),
+                "type": "poller_usage",
+                "poller": "github-activity",
+                "api_calls": 3,
+                "api_bytes": 800,
+                "estimated_cost_usd": 0.01,
+            },
+            {
+                "ts": (now - timedelta(minutes=20)).isoformat(),
+                "type": "other",
+                "poller": "github-activity",
+                "api_calls": 100,
+            },
+        ],
+    )
+
+    usage = aggregate_poller_turn_usage(turns, events_path=events, now=now)
+
+    github = usage["github-activity"].windows
+    assert github["1h"].api_calls == 4
+    assert github["1h"].api_bytes == 1200
+    assert github["1h"].estimated_external_cost_usd == pytest.approx(0.02)
+    assert github["24h"].api_calls == 7
+    assert github["24h"].api_bytes == 2000
+    assert github["24h"].estimated_external_cost_usd == pytest.approx(0.03)
+
+
 def test_aggregate_poller_turn_usage_distinguishes_none_from_zero_cost(tmp_path: Path):
     now = datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc)
     turns = tmp_path / "logs" / "turns.jsonl"
