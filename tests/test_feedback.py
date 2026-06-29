@@ -1022,6 +1022,94 @@ def test_scheduled_tick_suppressed_renders_in_feedback(tmp_path: Path):
     assert "plan_window_saturated" in block
 
 
+def test_repeated_tick_suppression_collapses_numeric_quota_drift(tmp_path: Path):
+    # chainlink #708: the same quota/off-pace condition drifted from @0.86 to
+    # @0.87 to @0.88 and rendered as three algedonic rows. Stable
+    # fingerprinting should keep the newest representative and show one count.
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.5),
+            "type": "scheduled_tick_suppressed",
+            "channel_id": "scheduler:heartbeat",
+            "reason": "quota_off_pace:openai:seven_day@0.86",
+        },
+        {
+            "timestamp": _ts(0.3),
+            "type": "scheduled_tick_suppressed",
+            "channel_id": "scheduler:heartbeat",
+            "reason": "quota_off_pace:openai:seven_day@0.87",
+        },
+        {
+            "timestamp": _ts(0.1),
+            "type": "scheduled_tick_suppressed",
+            "channel_id": "scheduler:heartbeat",
+            "reason": "quota_off_pace:openai:seven_day@0.88",
+        },
+    ])
+
+    block = log.recent_block()
+
+    assert block is not None
+    lines = [ln for ln in block.splitlines() if "scheduled_tick suppressed" in ln]
+    assert len(lines) == 1
+    assert "quota_off_pace:openai:seven_day@0.88" in lines[0]
+    assert "(×3 in 24h)" in lines[0]
+    assert "[scheduler:heartbeat]" in lines[0]
+
+
+def test_poller_and_tick_suppressions_stay_distinct(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.5),
+            "type": "scheduled_tick_suppressed",
+            "channel_id": "scheduler:heartbeat",
+            "reason": "quota_off_pace:openai:seven_day@0.86",
+        },
+        {
+            "timestamp": _ts(0.4),
+            "type": "poller_fire_suppressed",
+            "poller": "strix-cybernetics",
+            "severity": "TIGHT",
+            "priority": "normal",
+            "reason": "quota_off_pace:openai:seven_day@0.87",
+        },
+    ])
+
+    block = log.recent_block()
+
+    assert block is not None
+    assert block.count("quota_off_pace:openai:seven_day") == 2
+    assert "scheduled_tick suppressed" in block
+    assert "poller strix-cybernetics suppressed" in block
+
+
+def test_escalation_rows_collapse_by_escalated_kind(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.4),
+            "type": "algedonic_escalation",
+            "kind": "scheduler_loop_lag_host",
+            "count": 35,
+            "threshold": 5,
+        },
+        {
+            "timestamp": _ts(0.1),
+            "type": "algedonic_escalation",
+            "kind": "scheduler_loop_lag_host",
+            "count": 37,
+            "threshold": 5,
+        },
+    ])
+
+    block = log.recent_block()
+
+    assert block is not None
+    lines = [ln for ln in block.splitlines() if "algedonic escalation" in ln]
+    assert len(lines) == 1
+    assert "37× ≥ 5×" in lines[0]
+    assert "(×2 in 24h)" in lines[0]
+
+
 def test_poller_reload_invalid_cron_classified_negative():
     """chainlink #419: the invalid-cron reload event must be in
     _EVENT_RULES so the operator sees a broken poller schedule
