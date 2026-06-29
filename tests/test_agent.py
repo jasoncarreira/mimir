@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from mimir import mid_turn_injection as _mti
 from mimir.agent import Agent
@@ -107,10 +107,21 @@ class _FakeSaga:
     """Tiny saga_client double — record query/feedback calls, return
     canned payloads."""
 
-    def __init__(self, query_hits: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        query_hits: list[dict[str, Any]] | None = None,
+        *,
+        query_triples: list[dict[str, Any]] | None = None,
+        resolvable_atom_ids: set[str] | None = None,
+        raise_on_get_atoms: bool = False,
+    ) -> None:
         self._hits = query_hits or []
+        self._triples = query_triples or []
+        self._resolvable_atom_ids = resolvable_atom_ids
+        self._raise_on_get_atoms = raise_on_get_atoms
         self.query_calls: list[dict[str, Any]] = []
         self.feedback_calls: list[dict[str, Any]] = []
+        self.get_atoms_calls: list[list[str]] = []
 
     async def query(
         self, content: str, *, top_k: int = 12,
@@ -124,7 +135,20 @@ class _FakeSaga:
                 "session_id": session_id, "context": context,
             },
         )
-        return {"atoms": self._hits, "triples": []}
+        return {"atoms": self._hits, "triples": self._triples}
+
+    async def get_atoms(self, ids: list[str]):
+        self.get_atoms_calls.append(list(ids))
+        if self._raise_on_get_atoms:
+            raise RuntimeError("saga unavailable")
+        resolvable = (
+            set(self._resolvable_atom_ids)
+            if self._resolvable_atom_ids is not None
+            else {str(a.get("id") or a.get("atom_id")) for a in self._hits}
+        )
+        atoms = [{"id": aid, "content": "resolved"} for aid in ids if aid in resolvable]
+        found = {a["id"] for a in atoms}
+        return {"atoms": atoms, "missing": [aid for aid in ids if aid not in found]}
 
     async def feedback(self, atom_ids, output, *, session_id=None, feedback="positive"):
         self.feedback_calls.append({
@@ -2066,6 +2090,78 @@ async def test_run_turn_folds_injected_skill_atoms_into_record_no_autofeedback(
     assert "a" * 16 in record.saga_atom_ids
     # ...but NOT auto-credited (per-turn feedback removed).
     assert fake_saga.feedback_calls == []
+
+
+async def test_run_turn_validates_heuristic_saga_atom_ids_before_recording(
+    tmp_path: Path,
+):
+    real_query_atom = "a" * 16
+    real_triple_atom = "b" * 16
+    real_tool_atom = "c" * 16
+    phantom_triple = "19e930af23d0bf61"
+    phantom_tool = "d" * 16
+    fake_agent = _FakeAgent(response_messages=[
+        ToolMessage(
+            content=f"memory_get result mentions {real_tool_atom} and {phantom_tool}",
+            tool_call_id="call_1",
+            name="memory_get",
+        ),
+        AIMessage(content="done"),
+    ])
+    fake_saga = _FakeSaga(
+        query_hits=[
+            {
+                "atom_id": real_query_atom,
+                "content": "prior memory",
+                "stream": "semantic",
+            },
+        ],
+        query_triples=[
+            {"subject": "x", "predicate": "from", "object": "y",
+             "source_atom_id": real_triple_atom},
+            {"subject": "mail", "predicate": "message_id", "object": "z",
+             "source_atom_id": phantom_triple},
+        ],
+        resolvable_atom_ids={real_triple_atom, real_tool_atom},
+    )
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=fake_saga)
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hello")
+    record = await agent.run_turn(event)
+
+    assert record.saga_atom_ids == [real_query_atom, real_triple_atom, real_tool_atom]
+    assert phantom_triple not in record.saga_atom_ids
+    assert phantom_tool not in record.saga_atom_ids
+    assert fake_saga.get_atoms_calls == [
+        [real_triple_atom, phantom_triple],
+        [real_tool_atom, phantom_tool],
+    ]
+
+    turns_log = tmp_path / "home" / "logs" / "turns.jsonl"
+    [row] = [json.loads(ln) for ln in turns_log.read_text().splitlines() if ln.strip()]
+    assert row["saga_atom_ids"] == [real_query_atom, real_triple_atom, real_tool_atom]
+
+
+async def test_run_turn_heuristic_saga_atom_validation_fails_open(
+    tmp_path: Path,
+):
+    phantom_tool = "19e930af23d0bf61"
+    fake_agent = _FakeAgent(response_messages=[
+        ToolMessage(
+            content=f"tool payload included {phantom_tool}",
+            tool_call_id="call_1",
+            name="memory_get",
+        ),
+        AIMessage(content="done"),
+    ])
+    fake_saga = _FakeSaga(raise_on_get_atoms=True)
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=fake_saga)
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hello")
+    record = await agent.run_turn(event)
+
+    assert phantom_tool in record.saga_atom_ids
+    assert fake_saga.get_atoms_calls == [[phantom_tool]]
 
 
 async def test_run_turn_arms_injection_before_saga_setup(tmp_path: Path):

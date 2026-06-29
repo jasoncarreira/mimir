@@ -504,6 +504,36 @@ def _extract_atom_ids_from_tool_results(messages: list[Any]) -> list[str]:
     return out
 
 
+async def _resolve_heuristic_atom_ids(
+    saga_client: SagaClient,
+    atom_ids: list[str],
+) -> list[str]:
+    """Keep only heuristic ids that resolve to live SAGA atoms.
+
+    Query-response ids are already known-real; this is only for ids
+    discovered by shape in tool output or source_atom_id fields. Validation
+    is best-effort: if the exact-id lookup is unavailable or fails, fail open
+    so turn assembly never raises.
+    """
+    clean = [aid for aid in atom_ids if isinstance(aid, str) and aid]
+    if not clean:
+        return []
+    get_atoms = getattr(saga_client, "get_atoms", None)
+    if not callable(get_atoms):
+        return clean
+    try:
+        payload = await get_atoms(clean)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("heuristic saga atom id validation failed: %s", exc)
+        return clean
+    found = {
+        str(atom.get("id") or atom.get("atom_id"))
+        for atom in (payload.get("atoms") or [])
+        if isinstance(atom, dict) and (atom.get("id") or atom.get("atom_id"))
+    }
+    return [aid for aid in clean if aid in found]
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1860,7 +1890,14 @@ class Agent:
                 ids = _atom_ids_from_response(payload)
                 triple_ids = _source_atom_ids_from_triples(payload)
                 seen: set[str] = set()
-                for aid in list(ids) + list(triple_ids):
+                # Atom ids returned as atoms are already known-real. Triple
+                # source ids are heuristic payload references and must resolve
+                # before they can become turn citations.
+                for aid in ids:
+                    if aid not in seen:
+                        seen.add(aid)
+                        saga_atom_ids.append(aid)
+                for aid in await _resolve_heuristic_atom_ids(self._saga, triple_ids):
                     if aid not in seen:
                         seen.add(aid)
                         saga_atom_ids.append(aid)
@@ -2191,7 +2228,10 @@ class Agent:
         # over (it reaches the synthesis prompt via the TurnRecord's
         # ``saga_atom_ids`` → turns.jsonl → ``_atom_feedback_lines``).
         if self._saga is not None:
-            tool_atom_ids = _extract_atom_ids_from_tool_results(messages)
+            tool_atom_ids = await _resolve_heuristic_atom_ids(
+                self._saga,
+                _extract_atom_ids_from_tool_results(messages),
+            )
             for aid in tool_atom_ids:
                 if aid not in saga_atom_ids:
                     saga_atom_ids.append(aid)
