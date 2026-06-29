@@ -42,14 +42,14 @@ vi.mock("reagraph", async () => {
       { "aria-label": "Mock reagraph canvas" },
       props.nodes
         .filter((node: { data?: { kind?: string } }) => node.data?.kind === "page")
-        .map((node: { id: string; label: string }) => ReactModule.createElement(
+        .map((node: { id: string; data?: { title?: string } }) => ReactModule.createElement(
           "button",
           {
             key: node.id,
             onClick: () => props.onNodeClick({ id: node.id, data: {} }),
             type: "button"
           },
-          `Open ${node.label}`
+          `Open ${node.data?.title?.split(" - ")[0] ?? node.id}`
         ))
     )
   };
