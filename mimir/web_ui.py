@@ -365,11 +365,81 @@ def _validate_operator_skin_manifest(
             log.warning("skipping operator skin %s: %s must be an object", path, field)
             return None
     fonts = raw.get("fonts")
-    if fonts is not None and not isinstance(fonts, list):
-        log.warning(
-            "skipping operator skin %s: fonts must be an array when present", path
-        )
-        return None
+    if fonts is not None:
+        if not isinstance(fonts, list):
+            log.warning(
+                "skipping operator skin %s: fonts must be an array when present", path
+            )
+            return None
+        for index, font in enumerate(fonts):
+            if not isinstance(font, dict):
+                log.warning(
+                    "skipping operator skin %s: fonts[%s] must be an object",
+                    path,
+                    index,
+                )
+                return None
+            family = font.get("family")
+            if not isinstance(family, str) or not family.strip():
+                log.warning(
+                    "skipping operator skin %s: fonts[%s].family must be a non-empty string",
+                    path,
+                    index,
+                )
+                return None
+            src = font.get("src")
+            if not isinstance(src, list) or not src:
+                log.warning(
+                    "skipping operator skin %s: fonts[%s].src must be a non-empty array",
+                    path,
+                    index,
+                )
+                return None
+            for src_index, source in enumerate(src):
+                if not isinstance(source, dict):
+                    log.warning(
+                        "skipping operator skin %s: fonts[%s].src[%s] must be an object",
+                        path,
+                        index,
+                        src_index,
+                    )
+                    return None
+                url = source.get("url")
+                fmt = source.get("format")
+                if not isinstance(url, str) or not url.strip():
+                    log.warning(
+                        "skipping operator skin %s: fonts[%s].src[%s].url must be a non-empty string",
+                        path,
+                        index,
+                        src_index,
+                    )
+                    return None
+                if fmt not in {"woff2", "woff", "truetype"}:
+                    log.warning(
+                        "skipping operator skin %s: fonts[%s].src[%s].format is unsupported",
+                        path,
+                        index,
+                        src_index,
+                    )
+                    return None
+            weight = font.get("weight")
+            if weight is not None and not isinstance(weight, (int, str)):
+                log.warning(
+                    "skipping operator skin %s: fonts[%s].weight must be a string or integer",
+                    path,
+                    index,
+                )
+                return None
+            for field in ("style", "display", "unicodeRange"):
+                value = font.get(field)
+                if value is not None and not isinstance(value, str):
+                    log.warning(
+                        "skipping operator skin %s: fonts[%s].%s must be a string",
+                        path,
+                        index,
+                        field,
+                    )
+                    return None
     manifest = dict(raw)
     manifest["id"] = skin_id
     seen_ids.add(skin_id)

@@ -1149,6 +1149,21 @@ def test_operator_skin_discovery_validates_and_skips_bad_files(
         json.dumps({"id": "missing-fields"}),
         encoding="utf-8",
     )
+    font_manifest = _operator_skin_manifest("operator-fonts")
+    font_manifest["fonts"] = [
+        {
+            "family": "Operator Sans",
+            "src": [{"url": "/skins/operator/operator.woff2", "format": "woff2"}],
+            "weight": "400 700",
+            "style": "normal",
+            "display": "swap",
+            "unicodeRange": "U+000-5FF",
+        }
+    ]
+    (skins / "fonts.json").write_text(
+        json.dumps(font_manifest),
+        encoding="utf-8",
+    )
     (skins / "collide.json").write_text(
         json.dumps(_operator_skin_manifest("neon-terminal")),
         encoding="utf-8",
@@ -1162,10 +1177,16 @@ def test_operator_skin_discovery_validates_and_skips_bad_files(
     (skins / "forbidden-token.json").write_text(
         json.dumps(forbidden), encoding="utf-8"
     )
+    bad_font = _operator_skin_manifest("operator-bad-font")
+    bad_font["fonts"] = [{"family": "Operator Sans", "src": [{"url": 42}]}]
+    (skins / "bad-font.json").write_text(json.dumps(bad_font), encoding="utf-8")
 
     manifests = web_ui.read_operator_skin_manifests(tmp_path)
 
-    assert [manifest["id"] for manifest in manifests] == ["operator-mint"]
+    assert sorted(manifest["id"] for manifest in manifests) == [
+        "operator-fonts",
+        "operator-mint",
+    ]
     assert "skipping operator skin" in caplog.text
 
 
