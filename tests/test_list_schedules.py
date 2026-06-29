@@ -185,8 +185,12 @@ async def test_list_schedules_surfaces_pollers(stub_scheduler):
     stub_scheduler(
         [SchedulerJob(name="heartbeat", prompt_file="heartbeat.md",
                       cron="0 * * * *", channel_id=None)],
-        pollers=[{"name": "worklink-ready-queue", "cron": "*/10 * * * *",
-                  "priority": "normal"}],
+        pollers=[{
+            "name": "worklink-ready-queue",
+            "cron": "*/10 * * * *",
+            "priority": "normal",
+            "budget": {"windows": {"1h": {"max_agent_turns": 2}}, "on_exceed": "suppress"},
+        }],
     )
     parsed = json.loads(await list_schedules.ainvoke({}))
     by_type: dict[str, list] = {}
@@ -198,6 +202,7 @@ async def test_list_schedules_surfaces_pollers(stub_scheduler):
     assert poller["name"] == "worklink-ready-queue"
     assert poller["cron"] == "*/10 * * * *"
     assert poller["priority"] == "normal"
+    assert poller["budget"]["windows"]["1h"]["max_agent_turns"] == 2
 
 
 

@@ -7,6 +7,7 @@ configuration, external usage signals, and suppression gates.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,7 +16,164 @@ from typing import Iterable
 from .jsonl_snapshot import JsonlSnapshot, iter_window_records
 
 
+log = logging.getLogger(__name__)
+
 POLLER_USAGE_WINDOWS: tuple[tuple[str, float], ...] = (("1h", 1.0), ("24h", 24.0))
+
+
+@dataclass(frozen=True)
+class PollerBudgetWindowConfig:
+    """Configured caps for one poller budget window.
+
+    All fields are optional. A configured window may cap one or more of the
+    dimensions the poller-budget aggregator can later measure.
+    """
+
+    max_agent_turns: int | None = None
+    max_agent_usd: float | None = None
+    max_api_calls: int | None = None
+    max_api_bytes: int | None = None
+    max_external_usd: float | None = None
+
+    def to_dict(self) -> dict[str, int | float]:
+        out: dict[str, int | float] = {}
+        for key in (
+            "max_agent_turns",
+            "max_agent_usd",
+            "max_api_calls",
+            "max_api_bytes",
+            "max_external_usd",
+        ):
+            value = getattr(self, key)
+            if value is not None:
+                out[key] = value
+        return out
+
+
+@dataclass(frozen=True)
+class PollerBudgetConfig:
+    """Fail-open per-poller budget configuration.
+
+    ``on_exceed`` is intentionally narrow for v1: the only runtime behavior
+    planned by #107 is ``suppress``. The dataclass still carries it so future
+    warn-only/report-only modes have an obvious extension point.
+    """
+
+    windows: dict[str, PollerBudgetWindowConfig] = field(default_factory=dict)
+    on_exceed: str = "suppress"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "windows": {
+                label: window.to_dict()
+                for label, window in sorted(self.windows.items())
+            },
+            "on_exceed": self.on_exceed,
+        }
+
+
+_BUDGET_INT_CAPS = frozenset({"max_agent_turns", "max_api_calls", "max_api_bytes"})
+_BUDGET_FLOAT_CAPS = frozenset({"max_agent_usd", "max_external_usd"})
+_BUDGET_CAPS = _BUDGET_INT_CAPS | _BUDGET_FLOAT_CAPS
+
+
+def _coerce_budget_int(raw: object) -> int | None:
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def _coerce_budget_float(raw: object) -> float | None:
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value < 0 or value != value or value in (float("inf"), float("-inf")):
+        return None
+    return value
+
+
+def parse_poller_budget_config(
+    raw: object,
+    *,
+    source: Path | str,
+    poller_name: str,
+) -> PollerBudgetConfig | None:
+    """Parse one poller's ``budget`` block, returning ``None`` on invalid input.
+
+    Budget config is operator/deployment policy. It must be fail-open: a typo
+    warns and drops only the budget for that poller, never the poller itself.
+    """
+
+    if raw is None:
+        return None
+    prefix = f"poller_budget_invalid: {source} — {poller_name}.budget"
+    if not isinstance(raw, dict):
+        log.warning("%s must be a mapping; ignoring budget", prefix)
+        return None
+
+    on_exceed = str(raw.get("on_exceed", "suppress")).strip().lower()
+    if on_exceed != "suppress":
+        log.warning(
+            "%s.on_exceed=%r unsupported (expected 'suppress'); ignoring budget",
+            prefix, raw.get("on_exceed"),
+        )
+        return None
+
+    windows_raw = raw.get("windows")
+    if not isinstance(windows_raw, dict) or not windows_raw:
+        log.warning("%s.windows must be a non-empty mapping; ignoring budget", prefix)
+        return None
+
+    windows: dict[str, PollerBudgetWindowConfig] = {}
+    for label_raw, window_raw in windows_raw.items():
+        label = str(label_raw).strip()
+        if not label:
+            log.warning("%s.windows has an empty window label; ignoring budget", prefix)
+            return None
+        if not isinstance(window_raw, dict):
+            log.warning(
+                "%s.windows.%s must be a mapping; ignoring budget",
+                prefix, label,
+            )
+            return None
+        unknown = set(window_raw) - _BUDGET_CAPS
+        if unknown:
+            log.warning(
+                "%s.windows.%s has unknown cap(s): %s; ignoring budget",
+                prefix, label, ", ".join(sorted(str(k) for k in unknown)),
+            )
+            return None
+        parsed: dict[str, int | float] = {}
+        for key, value in window_raw.items():
+            if key in _BUDGET_INT_CAPS:
+                coerced = _coerce_budget_int(value)
+            else:
+                coerced = _coerce_budget_float(value)
+            if coerced is None:
+                log.warning(
+                    "%s.windows.%s.%s=%r is invalid; ignoring budget",
+                    prefix, label, key, value,
+                )
+                return None
+            parsed[str(key)] = coerced
+        if not parsed:
+            log.warning(
+                "%s.windows.%s must configure at least one cap; ignoring budget",
+                prefix, label,
+            )
+            return None
+        windows[label] = PollerBudgetWindowConfig(**parsed)
+
+    return PollerBudgetConfig(windows=windows, on_exceed=on_exceed)
 
 
 @dataclass

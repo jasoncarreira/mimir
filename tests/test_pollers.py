@@ -3327,23 +3327,88 @@ def _write_overrides(path: Path, content: str) -> Path:
     return path
 
 
-def test_overrides_apply_cron_and_priority(tmp_path: Path):
+def test_overrides_apply_cron_priority_and_budget(tmp_path: Path):
     """The operator overrides file wins over the skill-shipped manifest
     for tunable keys — and lives outside the skill dir, so updates and
     drift detection can never touch it."""
     skills = tmp_path / "skills"
     _write_pollers_json(skills / "skill", [
-        {"name": "p", "command": "echo", "cron": "0 * * * *"},
+        {
+            "name": "p", "command": "echo", "cron": "0 * * * *",
+            "budget": {"windows": {"1h": {"max_agent_turns": 10}}},
+        },
     ])
     ov = _write_overrides(tmp_path / "pollers-overrides.yaml", (
-        "p:\n  cron: '*/5 * * * *'\n  priority: high\n  batch_size: 7\n"
+        "p:\n"
+        "  cron: '*/5 * * * *'\n"
+        "  priority: high\n"
+        "  batch_size: 7\n"
+        "  budget:\n"
+        "    windows:\n"
+        "      1h:\n"
+        "        max_agent_turns: 2\n"
+        "        max_agent_usd: 0.5\n"
     ))
     [p] = discover_pollers(skills, overrides_path=ov)
     assert p.cron == "*/5 * * * *"
     assert p.priority == "high"
     assert p.batch_size == 7
+    assert p.budget is not None
+    assert p.budget.to_dict()["windows"] == {
+        "1h": {"max_agent_turns": 2, "max_agent_usd": 0.5},
+    }
     # Non-overridden fields keep manifest values.
     assert p.command == "echo"
+
+
+def test_discover_parses_manifest_budget(tmp_path: Path):
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {
+            "name": "p",
+            "command": "echo",
+            "cron": "0 * * * *",
+            "budget": {
+                "windows": {
+                    "1h": {"max_agent_turns": 2, "max_api_calls": 30},
+                    "24h": {"max_agent_usd": 3.0},
+                },
+            },
+        },
+    ])
+
+    [p] = discover_pollers(skills)
+
+    assert p.budget is not None
+    assert p.budget.to_dict() == {
+        "on_exceed": "suppress",
+        "windows": {
+            "1h": {"max_agent_turns": 2, "max_api_calls": 30},
+            "24h": {"max_agent_usd": 3.0},
+        },
+    }
+
+
+def test_manifest_invalid_budget_keeps_poller_without_budget(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {
+            "name": "p",
+            "command": "echo",
+            "cron": "0 * * * *",
+            "budget": {"windows": {"1h": {"max_agent_turns": -1}}},
+        },
+    ])
+
+    with caplog.at_level(logging.WARNING, logger="mimir.poller_budget"):
+        [p] = discover_pollers(skills)
+
+    assert p.name == "p"
+    assert p.budget is None
+    assert "poller_budget_invalid" in caplog.text
 
 
 def test_overrides_invalid_cron_keeps_manifest_cron(tmp_path: Path, caplog):
@@ -3410,6 +3475,19 @@ def test_validate_poller_overrides_text_rejects_unknown_fields(tmp_path: Path):
             path=path,
         )
     assert "poller_overrides_unknown_field" in str(exc.value)
+
+
+def test_validate_poller_overrides_text_accepts_budget(tmp_path: Path):
+    path = tmp_path / "pollers-overrides.yaml"
+    parsed = validate_poller_overrides_text(
+        "github-activity:\n"
+        "  budget:\n"
+        "    windows:\n"
+        "      1h:\n"
+        "        max_agent_turns: 2\n",
+        path=path,
+    )
+    assert parsed["github-activity"]["budget"]["windows"]["1h"]["max_agent_turns"] == 2
 
 
 def test_validate_poller_overrides_text_rejects_non_mapping_root(tmp_path: Path):
