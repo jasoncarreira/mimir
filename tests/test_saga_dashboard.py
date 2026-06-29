@@ -741,6 +741,30 @@ def test_activation_hist_single_activation_produces_one_bucket(tmp_path: Path) -
     assert total_bucketed + result.get("never_accessed", 0) == 1
 
 
+def test_activation_hist_malformed_summary_does_not_error(tmp_path: Path) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    now_dt = datetime.now(timezone.utc)
+    now_ts = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    _insert_atom(conn, "good", created_at=now_ts)
+    _insert_access_summary(
+        conn,
+        "good",
+        recent_ts=[(now_dt - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")],
+        recent_weights=[1.0],
+    )
+    _insert_atom(conn, "bad", created_at=now_ts)
+    _insert_access_summary(conn, "bad", recent_ts=["not-a-timestamp"])
+    conn.close()
+
+    result = build_activation_hist_payload(db_path, days=7)
+
+    assert "error" not in result
+    assert result["total"] == 1
+    assert result["never_accessed"] == 1
+    assert result["malformed_summaries"] == 1
+
+
 # ─── build_clusters_payload ───────────────────────────────────────
 
 
