@@ -97,6 +97,10 @@ _SEND_MESSAGE_SKIPLIST_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple
     (phrase, _compile_skiplist_phrase_pattern(phrase))
     for phrase in SEND_MESSAGE_SKIPLIST_PHRASES
 )
+_SEND_MESSAGE_SKIPLIST_LEADING_MARKER_PATTERN = re.compile(
+    r"^\s*\[\s*skip(ped)?\s*\]",
+    re.IGNORECASE,
+)
 
 
 def _word_count(text: str) -> int:
@@ -107,6 +111,10 @@ def _matched_send_message_skiplist_phrase(text: str) -> str | None:
     stripped = text.strip()
     if not stripped:
         return None
+
+    marker_match = _SEND_MESSAGE_SKIPLIST_LEADING_MARKER_PATTERN.match(stripped)
+    if marker_match is not None:
+        return "[skipped]" if marker_match.group(1) else "[skip]"
 
     # Narration sends that should have been silent are short one-liners. A
     # substantive escalation may mention a stop phrase in passing, so only block
