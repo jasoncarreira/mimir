@@ -517,10 +517,10 @@ content verbatim into acceptance criteria.
 
   | Tool | Category | Source lookup | Current pin | Install surface | Smoke command | Risk surface |
   |------|----------|---------------|-------------|-----------------|---------------|--------------|
-  | codex | `coding-cli` | npm package `@openai/codex` | `0.141.0` | scaffold Dockerfiles when `codex-plus` is selected | `codex --version && env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_backends.py` | High: first Worklink coding backend; CLI drift can affect prompt execution, sandbox flags, transcript shape, and quota use. |
+  | codex | `coding-cli` | npm package `@openai/codex` | `0.142.4` | scaffold Dockerfiles when `codex-plus` is selected | `codex --version && env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_backends.py` | High: first Worklink coding backend; CLI drift can affect prompt execution, sandbox flags, transcript shape, and quota use. |
   | chainlink | `issue-cli` | GitHub release/tag `dollspace-gay/chainlink` | `chainlink-1.6.0` | bundled Chainlink skill `dockerfile.fragment` | `chainlink --version && chainlink issue ready` | High: Worklink coordination depends on issue, lock, comment, and dependency semantics. |
   | mermaid-cli | `renderer` | npm package `@mermaid-js/mermaid-cli` | `11.15.0` | scaffold Dockerfiles | `mmdc --version` | Low: renderer/Chromium drift affects diagram generation, not coding execution. |
-  | claude-code | `coding-cli` | npm package `@anthropic-ai/claude-code` | `2.1.185` | root/scaffold Dockerfiles when `MIMIR_ENABLE_CLAUDE_CODE=1` | `claude --version` | Medium: optional second coding backend; real smoke requires a deployment with `claude` installed. |
+  | claude-code | `coding-cli` | npm package `@anthropic-ai/claude-code` | `2.1.195` | root/scaffold Dockerfiles when `MIMIR_ENABLE_CLAUDE_CODE=1` | `claude --version` | Medium: optional second coding backend; real smoke requires a deployment with `claude` installed. |
   | gogcli | `integration-cli` | GitHub release/tag `steipete/gogcli` | `v0.9.0` | gmail-poller optional-skill `dockerfile.fragment` | `gog --version && gog gmail messages search 'in:inbox newer_than:1d' --account "$GOG_ACCOUNT" --max 1 --json --no-input` | High: pre-1.0 Gmail/Calendar helper drift can break polling subcommands on Muninn; large version jumps need an authenticated smoke before merge. |
 
 ## 6.5 Compute-backend autonomy policy (#460)
