@@ -8,6 +8,7 @@ configuration, external usage signals, and suppression gates.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,10 @@ from .jsonl_snapshot import JsonlSnapshot, iter_window_records
 
 
 log = logging.getLogger(__name__)
+
+POLLER_USAGE_SOURCE_CHARS = 120
+POLLER_USAGE_METRICS = ("api_calls", "api_bytes", "estimated_cost_usd")
+
 
 POLLER_USAGE_WINDOWS: tuple[tuple[str, float], ...] = (("1h", 1.0), ("24h", 24.0))
 
@@ -256,6 +261,65 @@ def _coerce_cost(raw: object) -> float | None:
         return float(raw)
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_usage_metric(raw: object) -> float | int | None:
+    """Coerce a poller usage metric, or return ``None`` if invalid.
+
+    ``bool`` is rejected even though it is an ``int`` subclass; usage records
+    should not silently treat ``true`` as one API call. Accepted ints remain
+    ints for cleaner JSON, while floats must be finite and non-negative.
+    """
+
+    if raw is None:
+        return 0
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    if isinstance(raw, float):
+        return raw if math.isfinite(raw) and raw >= 0 else None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return 0
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+        if not math.isfinite(value) or value < 0:
+            return None
+        return int(value) if value.is_integer() else value
+    return None
+
+
+def validate_poller_usage_signal(
+    parsed: dict[str, object],
+    *,
+    poller_name: str,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Validate a ``signal: poller_usage`` stdout record.
+
+    Accepted telemetry is returned as a payload ready for ``log_event`` (without
+    the redundant ``poller``/``signal`` keys). Invalid records return a compact
+    reason suitable for ``poller_invalid_usage_signal``.
+    """
+
+    raw_poller = parsed.get("poller")
+    if raw_poller != poller_name:
+        return None, "poller_mismatch"
+
+    payload: dict[str, object] = {}
+    for metric in POLLER_USAGE_METRICS:
+        value = _coerce_usage_metric(parsed.get(metric))
+        if value is None:
+            return None, f"invalid_{metric}"
+        payload[metric] = value
+
+    source = parsed.get("source")
+    if source is not None:
+        payload["source"] = str(source)[:POLLER_USAGE_SOURCE_CHARS]
+    return payload, None
 
 
 def aggregate_poller_turn_usage(
