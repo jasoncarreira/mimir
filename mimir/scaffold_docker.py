@@ -492,7 +492,7 @@ def _claude_code_install_block() -> str:
         "# Same gate as the langchain-claude-code Python provider below.\n"
         "ARG MIMIR_ENABLE_CLAUDE_CODE=0\n"
         "RUN if [ \"$MIMIR_ENABLE_CLAUDE_CODE\" = \"1\" ]; then \\\n"
-        "        npm install -g @anthropic-ai/claude-code@2.1.185 ; \\\n"
+        "        npm install -g @anthropic-ai/claude-code@2.1.195 ; \\\n"
         "    fi"
     )
 
@@ -511,7 +511,7 @@ def _codex_install_block(install_codex: bool) -> str:
         "# Codex CLI — codex-subscription deployments (codex-plus extra).\n"
         "# spawn_codex shells out to ``codex exec``; Codex Plus auth lives\n"
         "# at ~/.codex/auth.json. npm-global, like the claude-code CLI above.\n"
-        "RUN npm install -g @openai/codex@0.141.0"
+        "RUN npm install -g @openai/codex@0.142.4"
     )
 
 
