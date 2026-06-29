@@ -6,6 +6,35 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.8] — 2026-06-29
+
+### Added
+- **Wiki viewer in the React dashboard** — an auth-gated, read-only wiki browser: a non-mutating payload/graph builder (`build_wiki_payload`), admin-gated `GET /api/v1/wiki` + `/api/v1/wiki/{slug}` routes, a lazy-loaded React reader with `[[wikilink]]` navigation + backlinks, and an interactive wikilink graph view built on reagraph (force-directed community clusters, visible edges, pan/zoom, hover-isolate, bounded panel, theme-matched colors derived from the dashboard's design tokens).
+- **`send_message` delivery guards** — opt-in auto-delivery of an interactive turn's final text when the model didn't call `send_message` (`MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS`; emits an informational `interactive_turn_auto_delivered` and supersedes the resend-nudge per channel); rejection of `send_message` to non-deliverable channels (`poller:`/`scheduler:`/`system`/empty/blank); and rejection of poller/scheduled-turn sends whose text matches a non-delivery "skip-list" (e.g. "skip bucket", "end silently"), keeping silence-narration out of operator channels.
+- `set_poller_overrides` tool so the agent can self-manage `<home>/pollers-overrides.yaml` (schema-validated against `POLLER_OVERRIDE_KEYS`; other top-level home files stay write-blocked).
+- Read-only per-poller LLM usage attribution.
+- `social-cli count` command — derive the daily Bluesky post count from the dispatch ledger (retires the hand-maintained counter).
+- Ops dashboard "Open PRs" panel — the agent's home-repo open PRs with links (fail-soft, admin-gated).
+- Quota reset times in the usage view.
+
+### Changed
+- Centralized `Config` → model-kwargs resolution into a single helper.
+- `shell_exec` now defaults its working directory to `MIMIR_HOME` instead of the s6 service dir, so relative-path commands run from the home.
+- Refreshed default memory-template references (`00-persona.md` → `00-identity.md`, document `spawn_codex` alongside `spawn_claude_code`, corrected the learned-behaviors lifecycle); added a core-memory lesson that per-deployment poller tuning belongs in `<home>/pollers-overrides.yaml`.
+
+### Fixed
+- Offload async event-logging append IO off the loop thread (cache the events.jsonl dir creation), reducing residual scheduler loop-lag.
+- Keep missing-file (introspection) recurrences path-specific — key off the full path instead of a 100-char-truncated preview.
+- Add anti-buffering headers to SSE streams.
+- Fix synthesis session-window timestamp parsing.
+- Return non-2xx statuses from the legacy `/api/saga` endpoints on embedded error payloads.
+
+### Security
+- Redact forwarded `pass_env` / `poller.env` secret **values** (by value, regardless of the env-var name) across all durable poller event sinks — stderr, invalid-line, signal payloads, and prompt previews — closing a leak where non-standard-named secrets bypassed the name-pattern redaction.
+
+### Documentation
+- Record the folded-message saga-retrieval decision (v1 keeps raw fold-in + agent-driven `memory_query`).
+
 ## [0.6.7] — 2026-06-26
 
 ### Added
