@@ -87,6 +87,68 @@ from .resolved import (  # noqa: F401
 log = logging.getLogger(__name__)
 
 
+_QUOTA_RATIO_RE = re.compile(r"@\d+(?:\.\d+)?")
+_TOOL_BUDGET_RE = re.compile(r"\(\d+/\d+\)")
+_ESCALATION_RE = re.compile(
+    r"algedonic escalation: ([\w:-]+) crossed threshold "
+    r"\(\d+× ≥ \d+× in \d+h\)"
+)
+
+
+def _stable_feedback_fingerprint(sig: FeedbackSignal) -> tuple[str, str, str | None]:
+    """Return a display-dedup key that ignores incidental payload drift.
+
+    Exact line matching keeps unrelated payloads separate, but several feedback
+    families encode time-varying measurements (quota ratios, budget use, escalation
+    counts) in their rendered line. Those are the *same* operator signal across
+    the window: keep the newest representative line and count the whole
+    fingerprint group instead of spending multiple algedonic rows.
+    """
+    content = sig.content
+    if sig.kind in {"tick_suppressed", "poller_suppressed"}:
+        content = _QUOTA_RATIO_RE.sub("@<ratio>", content)
+    elif sig.kind == "tool_budget":
+        content = _TOOL_BUDGET_RE.sub("(<used>/<cap>)", content)
+    elif sig.kind == "algedonic_escalation":
+        match = _ESCALATION_RE.fullmatch(content)
+        if match:
+            content = f"algedonic escalation: {match.group(1)} crossed threshold"
+    return sig.kind, content, sig.channel_id
+
+
+def _collapse_feedback_signals(signals: list[FeedbackSignal]) -> list[FeedbackSignal]:
+    """Collapse equivalent recurring signals after rendering.
+
+    ``FeedbackLog.recent`` walks newest-first before sorting chain injections, so
+    sort first and keep the newest signal per stable fingerprint. Count becomes
+    the number of matching rendered signals in this window/fingerprint, except
+    when a kind-level arousal count is already larger.
+    """
+    if not signals:
+        return []
+    collapsed: dict[tuple[str, str, str | None], FeedbackSignal] = {}
+    counts: dict[tuple[str, str, str | None], int] = {}
+    for sig in sorted(signals, key=lambda s: s.ts, reverse=True):
+        key = _stable_feedback_fingerprint(sig)
+        counts[key] = counts.get(key, 0) + 1
+        if key not in collapsed:
+            collapsed[key] = sig
+    return sorted(
+        (
+            FeedbackSignal(
+                ts=sig.ts,
+                polarity=sig.polarity,
+                kind=sig.kind,
+                channel_id=sig.channel_id,
+                content=sig.content,
+                count=max(sig.count, counts[key]),
+            )
+            for key, sig in collapsed.items()
+        ),
+        key=lambda s: s.ts,
+        reverse=True,
+    )
+
 
 @dataclass
 class FeedbackLog:
@@ -379,7 +441,7 @@ class FeedbackLog:
                 )
                 bounded_negative_count += 1
 
-        return negatives, positives
+        return _collapse_feedback_signals(negatives), _collapse_feedback_signals(positives)
 
     def recent_block(
         self,
