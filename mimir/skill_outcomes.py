@@ -617,6 +617,10 @@ def aggregate(
             ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
         except ValueError:
             continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = ts.astimezone(timezone.utc)
         if ts < cutoff:
             continue
         events = record.get("events") or []
