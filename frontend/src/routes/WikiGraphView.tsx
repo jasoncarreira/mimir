@@ -1,7 +1,6 @@
 import React from "react";
 import {
   GraphCanvas,
-  lightTheme,
   type GraphCanvasRef,
   type GraphEdge as ReagraphEdge,
   type GraphNode as ReagraphNode,
@@ -42,82 +41,35 @@ interface GraphNodeData {
   title: string;
 }
 
-const CATEGORY_COLORS = [
-  "#4466a3",
-  "#2f7d61",
-  "#9a6a24",
-  "#8b4c7a",
-  "#5f6f31",
-  "#7a5642"
-];
+interface GraphThemeTokens {
+  background: string;
+  text: string;
+  textMuted: string;
+  panelBorder: string;
+  accent: string;
+  success: string;
+  warning: string;
+  danger: string;
+}
 
-const COMMUNITY_COLORS = [
-  "#2f6f9f",
-  "#3f7d55",
-  "#9a6a24",
-  "#8d4d6f",
-  "#6a6f2f",
-  "#7a5642",
-  "#4f668f",
-  "#a64f3c"
-];
+interface WikiGraphTheme {
+  categoryColors: string[];
+  communityColors: string[];
+  danglingColor: string;
+  edgeColor: string;
+  reagraphTheme: Theme;
+  signature: string;
+}
 
-const GRAPH_THEME: Theme = {
-  ...lightTheme,
-  canvas: { background: "#f1f5f2", fog: null },
-  node: {
-    ...lightTheme.node,
-    fill: "#4466a3",
-    activeFill: "#16201b",
-    inactiveOpacity: 0.22,
-    label: {
-      ...lightTheme.node.label,
-      color: "#16201b",
-      stroke: "#f1f5f2",
-      activeColor: "#16201b",
-      backgroundColor: "#f1f5f2",
-      backgroundOpacity: 0.8,
-      padding: 1.5,
-      strokeColor: "#f1f5f2",
-      strokeWidth: 0.35
-    }
-  },
-  edge: {
-    ...lightTheme.edge,
-    fill: "rgba(22, 32, 27, 0.46)",
-    activeFill: "#16201b",
-    inactiveOpacity: 0.12,
-    opacity: 0.72,
-    selectedOpacity: 0.95,
-    label: {
-      ...lightTheme.edge.label,
-      color: "#16201b",
-      stroke: "#f1f5f2",
-      activeColor: "#16201b",
-      fontSize: 5
-    }
-  },
-  arrow: {
-    fill: "rgba(22, 32, 27, 0.46)",
-    activeFill: "#16201b"
-  },
-  cluster: {
-    stroke: "rgba(22, 32, 27, 0.18)",
-    fill: "rgba(255, 255, 255, 0.18)",
-    opacity: 0.5,
-    selectedOpacity: 0.75,
-    inactiveOpacity: 0.12,
-    label: {
-      color: "#58685f",
-      stroke: "#f1f5f2",
-      fontSize: 8
-    }
-  },
-  ring: {
-    fill: "#f1f5f2",
-    activeFill: "#16201b"
-  },
-  lasso: lightTheme.lasso
+const FALLBACK_GRAPH_TOKENS: GraphThemeTokens = {
+  background: "#f1f5f2",
+  text: "#16201b",
+  textMuted: "#58685f",
+  panelBorder: "#d6ded9",
+  accent: "#60786a",
+  success: "#326b48",
+  warning: "#7a5b1d",
+  danger: "#8b3a3a"
 };
 
 function pageKey(page: WikiPageSummary): string {
@@ -132,15 +84,196 @@ function pageForNode(nodeId: string, pages: WikiPageSummary[]): WikiPageSummary 
   return pages.find((page) => page.path === nodeId || pageKey(page) === nodeId || page.slug === nodeId);
 }
 
-function categoryColor(category: string, categories: string[]): string {
-  const index = Math.max(0, categories.indexOf(category));
-  return CATEGORY_COLORS[index % CATEGORY_COLORS.length];
+function readCssToken(style: CSSStyleDeclaration, name: string, fallback: string): string {
+  const value = style.getPropertyValue(name).trim();
+  return value && !value.startsWith("var(") ? value : fallback;
 }
 
-function communityColor(community: string): string {
+function parseColor(color: string): [number, number, number] | null {
+  const hex = color.trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  if (hex) {
+    const value = hex[1].length === 3
+      ? hex[1].split("").map((character) => character + character).join("")
+      : hex[1];
+    return [
+      Number.parseInt(value.slice(0, 2), 16),
+      Number.parseInt(value.slice(2, 4), 16),
+      Number.parseInt(value.slice(4, 6), 16)
+    ];
+  }
+
+  const rgb = color.trim().match(/^rgba?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)/i);
+  if (rgb) {
+    return [Number(rgb[1]), Number(rgb[2]), Number(rgb[3])].map((channel) => Math.max(0, Math.min(255, Math.round(channel)))) as [
+      number,
+      number,
+      number
+    ];
+  }
+
+  return null;
+}
+
+function toHex([red, green, blue]: [number, number, number]): string {
+  return `#${[red, green, blue].map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function mixColors(color: string, target: string, targetWeight: number): string {
+  const sourceRgb = parseColor(color);
+  const targetRgb = parseColor(target);
+  if (!sourceRgb || !targetRgb) return color;
+  const sourceWeight = 1 - targetWeight;
+  return toHex([
+    Math.round(sourceRgb[0] * sourceWeight + targetRgb[0] * targetWeight),
+    Math.round(sourceRgb[1] * sourceWeight + targetRgb[1] * targetWeight),
+    Math.round(sourceRgb[2] * sourceWeight + targetRgb[2] * targetWeight)
+  ]);
+}
+
+function withAlpha(color: string, alpha: number): string {
+  const rgb = parseColor(color);
+  if (!rgb) return color;
+  return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
+}
+
+function readGraphThemeTokens(element: HTMLElement | null): GraphThemeTokens {
+  if (typeof window === "undefined") return FALLBACK_GRAPH_TOKENS;
+  const style = window.getComputedStyle(element ?? document.documentElement);
+  return {
+    background: readCssToken(style, "--mimir-color-panel-background-muted", FALLBACK_GRAPH_TOKENS.background),
+    text: readCssToken(style, "--mimir-color-text", FALLBACK_GRAPH_TOKENS.text),
+    textMuted: readCssToken(style, "--mimir-color-text-muted", FALLBACK_GRAPH_TOKENS.textMuted),
+    panelBorder: readCssToken(style, "--mimir-color-panel-border", FALLBACK_GRAPH_TOKENS.panelBorder),
+    accent: readCssToken(style, "--mimir-color-chrome-accent", FALLBACK_GRAPH_TOKENS.accent),
+    success: readCssToken(style, "--mimir-color-status-success", FALLBACK_GRAPH_TOKENS.success),
+    warning: readCssToken(style, "--mimir-color-status-warning", FALLBACK_GRAPH_TOKENS.warning),
+    danger: readCssToken(style, "--mimir-color-status-danger", FALLBACK_GRAPH_TOKENS.danger)
+  };
+}
+
+function createWikiGraphTheme(tokens: GraphThemeTokens): WikiGraphTheme {
+  const edgeColor = withAlpha(tokens.text, 0.48);
+  const clusterColors = [
+    tokens.accent,
+    tokens.success,
+    tokens.warning,
+    mixColors(tokens.textMuted, tokens.accent, 0.35),
+    mixColors(tokens.warning, tokens.success, 0.35),
+    tokens.danger,
+    mixColors(tokens.accent, tokens.warning, 0.45),
+    mixColors(tokens.text, tokens.success, 0.28)
+  ];
+  const categoryColors = [
+    tokens.success,
+    tokens.accent,
+    tokens.warning,
+    mixColors(tokens.textMuted, tokens.success, 0.3),
+    mixColors(tokens.warning, tokens.accent, 0.42),
+    tokens.danger
+  ];
+  const reagraphTheme = {
+    canvas: { background: tokens.background, fog: null },
+    node: {
+      fill: tokens.accent,
+      activeFill: tokens.text,
+      opacity: 1,
+      selectedOpacity: 1,
+      inactiveOpacity: 0.22,
+      label: {
+        color: tokens.text,
+        stroke: tokens.background,
+        activeColor: tokens.text,
+        backgroundColor: tokens.background,
+        backgroundOpacity: 0.82,
+        padding: 1.5,
+        strokeColor: tokens.background,
+        strokeWidth: 0.35
+      },
+      subLabel: {
+        color: tokens.textMuted,
+        stroke: tokens.background,
+        activeColor: tokens.text,
+        backgroundColor: tokens.background,
+        backgroundOpacity: 0.82,
+        padding: 1.5,
+        strokeColor: tokens.background,
+        strokeWidth: 0.35
+      }
+    },
+    edge: {
+      fill: withAlpha(tokens.text, 0.46),
+      activeFill: tokens.text,
+      opacity: 0.72,
+      selectedOpacity: 0.95,
+      inactiveOpacity: 0.12,
+      label: {
+        color: tokens.text,
+        stroke: tokens.background,
+        activeColor: tokens.text,
+        fontSize: 5
+      },
+      subLabel: {
+        color: tokens.textMuted,
+        stroke: tokens.background,
+        activeColor: tokens.text,
+        fontSize: 5
+      }
+    },
+    arrow: {
+      fill: withAlpha(tokens.text, 0.46),
+      activeFill: tokens.text
+    },
+    cluster: {
+      stroke: withAlpha(tokens.text, 0.18),
+      fill: withAlpha(tokens.panelBorder, 0.22),
+      opacity: 0.5,
+      selectedOpacity: 0.75,
+      inactiveOpacity: 0.12,
+      label: {
+        color: tokens.textMuted,
+        stroke: tokens.background,
+        fontSize: 8
+      }
+    },
+    ring: {
+      fill: tokens.background,
+      activeFill: tokens.text
+    },
+    lasso: {
+      background: withAlpha(tokens.accent, 0.08),
+      border: tokens.accent
+    }
+  } as Theme;
+  return {
+    categoryColors,
+    communityColors: clusterColors,
+    danglingColor: tokens.warning,
+    edgeColor,
+    reagraphTheme,
+    signature: Object.values(tokens).join("|")
+  };
+}
+
+function useWikiGraphTheme(rootRef: React.RefObject<HTMLElement | null>): WikiGraphTheme {
+  const [theme, setTheme] = React.useState(() => createWikiGraphTheme(FALLBACK_GRAPH_TOKENS));
+
+  React.useLayoutEffect(() => {
+    const nextTheme = createWikiGraphTheme(readGraphThemeTokens(rootRef.current));
+    setTheme((current) => (current.signature === nextTheme.signature ? current : nextTheme));
+  });
+
+  return theme;
+}
+
+function categoryColor(category: string, categories: string[], palette: string[]): string {
+  const index = Math.max(0, categories.indexOf(category));
+  return palette[index % palette.length];
+}
+
+function communityColor(community: string, palette: string[]): string {
   const index = Number(community.replace("community-", ""));
-  if (Number.isFinite(index)) return COMMUNITY_COLORS[index % COMMUNITY_COLORS.length];
-  return COMMUNITY_COLORS[0];
+  if (Number.isFinite(index)) return palette[index % palette.length];
+  return palette[0];
 }
 
 function danglingNodeId(target: string): string {
@@ -299,7 +432,7 @@ function buildDegreeMap(edges: GraphEdge[]): Map<string, number> {
   return degreeByNode;
 }
 
-function toReagraphNode(node: GraphNode, degree: number, labeledNodeIds: Set<string>): ReagraphNode {
+function toReagraphNode(node: GraphNode, degree: number, labeledNodeIds: Set<string>, graphTheme: WikiGraphTheme): ReagraphNode {
   const showLabel = labeledNodeIds.has(node.id);
   const labelParts = [
     node.title,
@@ -311,7 +444,7 @@ function toReagraphNode(node: GraphNode, degree: number, labeledNodeIds: Set<str
     id: node.id,
     label: showLabel ? graphLabel(node.title) : "",
     subLabel: showLabel ? graphLabel(node.kind === "dangling" ? "dangling target" : node.category) : "",
-    fill: node.kind === "dangling" ? "#8a6116" : communityColor(node.community),
+    fill: node.kind === "dangling" ? graphTheme.danglingColor : communityColor(node.community, graphTheme.communityColors),
     cluster: node.community,
     labelVisible: showLabel,
     size: nodeSize(node, degree),
@@ -327,12 +460,12 @@ function toReagraphNode(node: GraphNode, degree: number, labeledNodeIds: Set<str
   };
 }
 
-function toReagraphEdge(edge: GraphEdge): ReagraphEdge {
+function toReagraphEdge(edge: GraphEdge, graphTheme: WikiGraphTheme): ReagraphEdge {
   return {
     id: edge.id,
     source: edge.source,
     target: edge.target,
-    fill: edge.isDangling ? "#8a6116" : "rgba(22, 32, 27, 0.48)",
+    fill: edge.isDangling ? graphTheme.danglingColor : graphTheme.edgeColor,
     dashed: edge.isDangling,
     dashArray: [4, 2],
     arrowPlacement: "none",
@@ -349,7 +482,9 @@ export default function WikiGraphView({
   selected: string;
   onOpenPage: (slug: string) => void;
 }) {
+  const rootRef = React.useRef<HTMLElement | null>(null);
   const { nodes, edges, categories, communities } = React.useMemo(() => buildGraph(index), [index]);
+  const graphTheme = useWikiGraphTheme(rootRef);
   const nodeById = React.useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
   const pagesByPath = React.useMemo(() => new Map(index.pages.map((page) => [page.path, page])), [index.pages]);
   const graphRef = React.useRef<GraphCanvasRef | null>(null);
@@ -363,10 +498,10 @@ export default function WikiGraphView({
     return new Set([activeNodeId, selectedNodeId].filter((id): id is string => Boolean(id)));
   }, [activeNodeId, selectedNodeId]);
   const reagraphNodes = React.useMemo(
-    () => nodes.map((node) => toReagraphNode(node, degreeByNode.get(node.id) ?? 0, labeledNodeIds)),
-    [degreeByNode, labeledNodeIds, nodes]
+    () => nodes.map((node) => toReagraphNode(node, degreeByNode.get(node.id) ?? 0, labeledNodeIds, graphTheme)),
+    [degreeByNode, graphTheme, labeledNodeIds, nodes]
   );
-  const reagraphEdges = React.useMemo(() => edges.map(toReagraphEdge), [edges]);
+  const reagraphEdges = React.useMemo(() => edges.map((edge) => toReagraphEdge(edge, graphTheme)), [edges, graphTheme]);
   const selections = React.useMemo(() => (selectedNodeId ? [selectedNodeId] : []), [selectedNodeId]);
   const actives = React.useMemo(() => (activeNodeId ? [activeNodeId] : []), [activeNodeId]);
   const focusedNode = (activeNodeId ? nodeById.get(activeNodeId) : undefined) ?? (selectedNodeId ? nodeById.get(selectedNodeId) : undefined);
@@ -395,7 +530,7 @@ export default function WikiGraphView({
   }
 
   return (
-    <section aria-label="Wiki graph view" className="wiki-graph">
+    <section aria-label="Wiki graph view" className="wiki-graph" ref={rootRef}>
       <div className="wiki-graph__summary">
         <div>
           <strong>{nodes.filter((node) => node.kind === "page").length}</strong>
@@ -451,7 +586,7 @@ export default function WikiGraphView({
           onNodePointerOver={(node) => setActiveNodeId(node.id)}
           selections={selections}
           sizingType="default"
-          theme={GRAPH_THEME}
+          theme={graphTheme.reagraphTheme}
         />
       </div>
       <div className="wiki-graph__focus-label" aria-live="polite">
@@ -467,13 +602,13 @@ export default function WikiGraphView({
       <div aria-label="Wiki graph legend" className="wiki-graph__legend">
         {communities.map((community) => (
           <span key={community}>
-            <i style={{ background: communityColor(community) }} />
+            <i style={{ background: communityColor(community, graphTheme.communityColors) }} />
             {community}
           </span>
         ))}
         {categories.map((category) => (
           <span key={category}>
-            <i style={{ background: category === "dangling" ? "#8a6116" : categoryColor(category, categories) }} />
+            <i style={{ background: category === "dangling" ? graphTheme.danglingColor : categoryColor(category, categories, graphTheme.categoryColors) }} />
             {category}
           </span>
         ))}

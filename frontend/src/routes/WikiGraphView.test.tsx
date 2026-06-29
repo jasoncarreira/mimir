@@ -187,6 +187,16 @@ function latestGraphProps() {
 
 afterEach(() => {
   cleanup();
+  [
+    "--mimir-color-panel-background-muted",
+    "--mimir-color-text",
+    "--mimir-color-text-muted",
+    "--mimir-color-panel-border",
+    "--mimir-color-chrome-accent",
+    "--mimir-color-status-success",
+    "--mimir-color-status-warning",
+    "--mimir-color-status-danger"
+  ].forEach((token) => document.documentElement.style.removeProperty(token));
   graphCanvasMock.fitNodesInView.mockClear();
   graphCanvasMock.props = [];
   graphCanvasMock.zoomIn.mockClear();
@@ -225,6 +235,36 @@ describe("WikiGraphView", () => {
       ["concepts/alpha.md", "dangling:ghost"]
     ]);
     expect(props.nodes.every((node: { data?: { community?: string } }) => node.data?.community)).toBe(true);
+  });
+
+  it("derives reagraph and cluster colors from the active mimir CSS tokens", () => {
+    document.documentElement.style.setProperty("--mimir-color-panel-background-muted", "#edf6ee");
+    document.documentElement.style.setProperty("--mimir-color-text", "#123456");
+    document.documentElement.style.setProperty("--mimir-color-text-muted", "#52665b");
+    document.documentElement.style.setProperty("--mimir-color-panel-border", "#c8d8ce");
+    document.documentElement.style.setProperty("--mimir-color-chrome-accent", "#4d7056");
+    document.documentElement.style.setProperty("--mimir-color-status-success", "#2f6b44");
+    document.documentElement.style.setProperty("--mimir-color-status-warning", "#80621f");
+    document.documentElement.style.setProperty("--mimir-color-status-danger", "#8a3d35");
+
+    render(<WikiGraphView index={graphIndex()} onOpenPage={vi.fn()} selected="concepts/alpha" />);
+
+    const props = latestGraphProps();
+    expect(props.theme.canvas.background).toBe("#edf6ee");
+    expect(props.theme.node.fill).toBe("#4d7056");
+    expect(props.theme.node.activeFill).toBe("#123456");
+    expect(props.theme.node.label.backgroundColor).toBe("#edf6ee");
+    expect(props.theme.edge.fill).toBe("rgba(18, 52, 86, 0.46)");
+    expect(props.theme.cluster.fill).toBe("rgba(200, 216, 206, 0.22)");
+
+    expect(props.nodes.find((node: { id: string }) => node.id === "dangling:ghost")?.fill).toBe("#80621f");
+    expect(props.edges.find((edge: { dashed?: boolean }) => edge.dashed)?.fill).toBe("#80621f");
+    expect(props.edges.find((edge: { dashed?: boolean }) => !edge.dashed)?.fill).toBe("rgba(18, 52, 86, 0.48)");
+    expect(props.nodes.map((node: { fill: string }) => node.fill)).not.toContain("#4466a3");
+
+    const legendSwatches = Array.from(document.querySelectorAll<HTMLElement>(".wiki-graph__legend i")).map((swatch) => swatch.style.background);
+    expect(legendSwatches).toContain("rgb(128, 98, 31)");
+    expect(legendSwatches).not.toContain("rgb(68, 102, 163)");
   });
 
   it("declutters labels to selected and hovered nodes instead of zoom-driven auto labels", () => {
