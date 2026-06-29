@@ -388,6 +388,7 @@ def _whoami_payload(identity: Any, is_master: bool) -> dict[str, Any]:
             "roles": ["admin"],
             "is_admin": True,
             "is_master": True,
+            "prefs": {},
         }
     if identity is not None:
         return {
@@ -396,6 +397,7 @@ def _whoami_payload(identity: Any, is_master: bool) -> dict[str, Any]:
             "roles": list(identity.access.roles),
             "is_admin": identity.access.is_admin,
             "is_master": False,
+            "prefs": dict(identity.prefs),
         }
     return {
         "canonical": None,
@@ -403,6 +405,7 @@ def _whoami_payload(identity: Any, is_master: bool) -> dict[str, Any]:
         "roles": [],
         "is_admin": False,
         "is_master": False,
+        "prefs": {},
     }
 
 
@@ -1450,6 +1453,40 @@ def register_routes(
             )
         )
 
+    async def user_prefs_v1(request: web.Request) -> web.Response:
+        identity = request.get("auth_identity")
+        if identity is None or request.get("auth_is_master"):
+            return json_error(
+                "identity_required",
+                "per-user preferences require a user web key",
+                status=403,
+            )
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return json_error("bad_request", "invalid json", status=400)
+        if not isinstance(body, dict):
+            return json_error("bad_request", "json object required", status=400)
+        prefs = body.get("prefs", body)
+        if not isinstance(prefs, dict):
+            return json_error("bad_request", "prefs must be an object", status=400)
+        allowed: dict[str, Any] = {}
+        if "skin" in prefs:
+            skin = prefs.get("skin")
+            if skin is not None and not isinstance(skin, str):
+                return json_error("bad_request", "skin must be a string or null", status=400)
+            allowed["skin"] = skin.strip() if isinstance(skin, str) and skin.strip() else None
+        if not allowed:
+            return json_error("bad_request", "no supported preferences supplied", status=400)
+        from .identities_populator import set_user_prefs
+
+        await asyncio.to_thread(set_user_prefs, home, identity.canonical, allowed)
+        resolver = request.app.get("identity_resolver")
+        if resolver is not None:
+            await asyncio.to_thread(resolver.reload)
+            identity = resolver.identity(identity.canonical) or identity
+        return json_success(_whoami_payload(identity, False), headers=_no_store_headers())
+
     async def wiki_index_v1(_request: web.Request) -> web.Response:
         wiki_dir, error = _wiki_dir_for_home(home)
         if error is not None:
@@ -1497,6 +1534,8 @@ def register_routes(
         app.router.add_get("/api/v1/web/bootstrap", web_bootstrap_v1)
     if ("GET", "/api/v1/whoami") not in existing:
         app.router.add_get("/api/v1/whoami", whoami_v1)
+    if ("POST", "/api/v1/user/prefs") not in existing:
+        app.router.add_post("/api/v1/user/prefs", user_prefs_v1)
     if ("GET", "/api/v1/wiki") not in existing:
         app.router.add_get("/api/v1/wiki", wiki_index_v1)
     if ("GET", "/api/v1/wiki/{slug}") not in existing:

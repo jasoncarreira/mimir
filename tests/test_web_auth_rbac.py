@@ -228,11 +228,15 @@ def test_whoami_payload_master() -> None:
 
 def test_whoami_payload_user(tmp_path: Path) -> None:
     issue_web_key(tmp_path, "alice", roles=["user"])
+    from mimir.identities_populator import set_user_prefs
+
+    set_user_prefs(tmp_path, "alice", {"skin": "cosmic-nebula"})
     ident = _resolver(tmp_path).identity("alice")
     p = _whoami_payload(ident, False)
     assert p == {
         "canonical": "alice", "display_name": None,
         "roles": ["user"], "is_admin": False, "is_master": False,
+        "prefs": {"skin": "cosmic-nebula"},
     }
 
 
@@ -240,6 +244,7 @@ def test_whoami_payload_empty() -> None:
     assert _whoami_payload(None, False) == {
         "canonical": None, "display_name": None,
         "roles": [], "is_admin": False, "is_master": False,
+        "prefs": {},
     }
 
 

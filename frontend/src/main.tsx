@@ -31,7 +31,7 @@ import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { TurnsRoute } from "./routes/TurnsRoute";
 import { scrubSecretQueryParams, useRouteState } from "./routeState";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
-import type { AgentCharacterState } from "./skins/types";
+import type { AgentCharacterState, SkinId } from "./skins/types";
 import {
   Badge,
   Button,
@@ -226,6 +226,26 @@ function AuthPanel({ bootstrap, error, isError, isLoading }: {
         </div>
       ) : null}
     </Panel>
+  );
+}
+
+function SkinPicker() {
+  const { availableSkins, selectedSkinId, setUserSkin, isSavingUserSkin } = useSkin();
+  return (
+    <label className="skin-picker">
+      <span>Skin</span>
+      <select
+        aria-label="Skin"
+        className="ui-input"
+        disabled={isSavingUserSkin}
+        value={selectedSkinId}
+        onChange={(event) => setUserSkin(event.target.value as SkinId)}
+      >
+        {availableSkins.map((skin) => (
+          <option key={skin.id} value={skin.id}>{skin.name}</option>
+        ))}
+      </select>
+    </label>
   );
 }
 
@@ -631,6 +651,7 @@ function TopNavShell({ surfaces, firstRoute, bootstrap }: ShellProps) {
           ) : (
             <span className="app-status-chip">READY</span>
           )}
+          <SkinPicker />
           <span className="app-header__signal" aria-hidden="true">◇ MEM-LINKED · SIGNAL ▮▮▯ LOW</span>
         </div>
       </header>
@@ -665,6 +686,7 @@ function SidebarShell({ surfaces, firstRoute, agentState, bootstrap, error, isEr
             <span className="agent-card__state">{AGENT_STATE_LABELS[agentState]}</span>
           </div>
         </div>
+        <SkinPicker />
         <AppNavigation surfaces={surfaces} />
         <p className="app-sidebar__version">{skin.id} · v{skin.version}</p>
       </aside>

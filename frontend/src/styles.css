@@ -675,6 +675,24 @@ textarea {
   letter-spacing: 0.08em;
 }
 
+
+.skin-picker {
+  align-items: center;
+  display: inline-flex;
+  gap: var(--mimir-space-xs);
+  white-space: nowrap;
+}
+
+.skin-picker span {
+  color: var(--mimir-color-text-muted);
+  font-size: var(--mimir-font-size-xs);
+  text-transform: uppercase;
+}
+
+.skin-picker .ui-input {
+  min-width: 10rem;
+}
+
 .app-header__signal {
   color: var(--mimir-color-text-muted, #58685f);
   font-size: var(--mimir-font-size-xs, 0.75rem);

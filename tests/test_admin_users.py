@@ -129,3 +129,33 @@ async def test_issue_key_bad_role_400(tmp_path: Path) -> None:
         assert r.status == 400
         r2 = await c.post("/api/v1/admin/users/key", headers={"X-API-Key": MASTER}, json={})
         assert r2.status == 400  # canonical required
+
+
+async def test_user_prefs_endpoint_persists_skin_and_refreshes_whoami(tmp_path: Path) -> None:
+    key = issue_web_key(tmp_path, "alice", roles=["user"])
+    async with TestClient(TestServer(_app(tmp_path))) as c:
+        r = await c.post(
+            "/api/v1/user/prefs",
+            headers={"X-API-Key": key},
+            json={"prefs": {"skin": "cosmic-nebula"}},
+        )
+        assert r.status == 200
+        data = _data(await r.json())
+        assert data["canonical"] == "alice"
+        assert data["prefs"] == {"skin": "cosmic-nebula"}
+
+        who = _data(await (await c.get("/api/v1/whoami", headers={"X-API-Key": key})).json())
+        assert who["prefs"] == {"skin": "cosmic-nebula"}
+        listing = _data(await (await c.get("/api/v1/admin/users", headers={"X-API-Key": MASTER})).json())
+        alice = next(u for u in listing["users"] if u["canonical"] == "alice")
+        assert alice["prefs"] == {"skin": "cosmic-nebula"}
+
+
+async def test_user_prefs_endpoint_requires_user_identity(tmp_path: Path) -> None:
+    async with TestClient(TestServer(_app(tmp_path))) as c:
+        r = await c.post(
+            "/api/v1/user/prefs",
+            headers={"X-API-Key": MASTER},
+            json={"prefs": {"skin": "cosmic-nebula"}},
+        )
+        assert r.status == 403

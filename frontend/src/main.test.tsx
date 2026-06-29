@@ -83,7 +83,16 @@ vi.mock("./live-events", () => ({
 }));
 vi.mock("./skins/SkinProvider", () => ({
   SkinProvider: ({ children }: { children: ReactNode }) => children,
-  useSkin: () => ({ skin: { id: "test-skin", name: "Test Skin", version: "0.0.0", chrome: { layout: skinLayout } } })
+  useSkin: () => ({
+    skin: { id: "test-skin", name: "Test Skin", version: "0.0.0", chrome: { layout: skinLayout } },
+    availableSkins: [
+      { id: "default-retro", name: "Default Retro" },
+      { id: "neon-terminal", name: "Neon Terminal" }
+    ],
+    selectedSkinId: "neon-terminal",
+    setUserSkin: vi.fn(),
+    isSavingUserSkin: false
+  })
 }));
 vi.mock("./agent-character", () => ({
   AgentCharacter: () => null,
