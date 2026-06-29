@@ -472,20 +472,35 @@ def build_activation_hist_payload(
 
         activations = []
         never_accessed = 0
+        malformed_summaries = 0
         for row in rows:
-            act = _petrov(row)
+            try:
+                act = _petrov(row)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                atom_id = row["id"] if "id" in row.keys() else "<unknown>"
+                log.warning(
+                    "saga_dashboard: skipping malformed activation summary for atom %s: %s",
+                    atom_id,
+                    exc,
+                )
+                malformed_summaries += 1
+                never_accessed += 1
+                continue
             if _math.isfinite(act):
                 activations.append(act)
             else:
                 never_accessed += 1
 
         if not activations:
-            return {
+            payload = {
                 "buckets": [],
                 "total": 0,
                 "never_accessed": never_accessed,
                 "days": days,
             }
+            if malformed_summaries:
+                payload["malformed_summaries"] = malformed_summaries
+            return payload
 
         min_act = min(activations)
         max_act = max(activations)
@@ -515,12 +530,15 @@ def build_activation_hist_payload(
                 for i in range(n_buckets)
             ]
 
-        return {
+        payload = {
             "buckets": buckets,
             "total": len(activations),
             "never_accessed": never_accessed,
             "days": days,
         }
+        if malformed_summaries:
+            payload["malformed_summaries"] = malformed_summaries
+        return payload
     except sqlite3.Error as exc:
         log.warning("saga_dashboard: activation_hist query failed: %s", exc)
         return {"error": str(exc), "buckets": [], "total": 0}
