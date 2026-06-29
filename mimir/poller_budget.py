@@ -82,6 +82,7 @@ class PollerBudgetConfig:
 _BUDGET_INT_CAPS = frozenset({"max_agent_turns", "max_api_calls", "max_api_bytes"})
 _BUDGET_FLOAT_CAPS = frozenset({"max_agent_usd", "max_external_usd"})
 _BUDGET_CAPS = _BUDGET_INT_CAPS | _BUDGET_FLOAT_CAPS
+_SUPPORTED_BUDGET_WINDOWS = frozenset(label for label, _hours in POLLER_USAGE_WINDOWS)
 
 
 def _coerce_budget_int(raw: object) -> int | None:
@@ -146,6 +147,14 @@ def parse_poller_budget_config(
         if not label:
             log.warning("%s.windows has an empty window label; ignoring budget", prefix)
             return None
+        if label not in _SUPPORTED_BUDGET_WINDOWS:
+            log.warning(
+                "%s.windows.%s is unsupported (supported: %s); ignoring window",
+                prefix,
+                label,
+                ", ".join(sorted(_SUPPORTED_BUDGET_WINDOWS)),
+            )
+            continue
         if not isinstance(window_raw, dict):
             log.warning(
                 "%s.windows.%s must be a mapping; ignoring budget",
@@ -179,6 +188,10 @@ def parse_poller_budget_config(
             )
             return None
         windows[label] = PollerBudgetWindowConfig(**parsed)
+
+    if not windows:
+        log.warning("%s.windows has no supported windows; ignoring budget", prefix)
+        return None
 
     return PollerBudgetConfig(windows=windows, on_exceed=on_exceed)
 

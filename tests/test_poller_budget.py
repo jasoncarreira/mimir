@@ -192,6 +192,40 @@ def test_parse_poller_budget_config_accepts_window_caps(tmp_path: Path):
     }
 
 
+def test_parse_poller_budget_config_warns_and_drops_unsupported_windows(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+    from mimir.poller_budget import parse_poller_budget_config
+
+    with caplog.at_level(logging.WARNING, logger="mimir.poller_budget"):
+        budget = parse_poller_budget_config(
+            {
+                "windows": {
+                    "1h": {"max_agent_turns": 2},
+                    "6h": {"max_agent_turns": 6},
+                    "7d": {"max_external_usd": 0.25},
+                    "24h": {"max_api_calls": 200},
+                },
+                "on_exceed": "suppress",
+            },
+            source=tmp_path / "pollers.json",
+            poller_name="github-activity",
+        )
+
+    assert budget is not None
+    assert budget.to_dict() == {
+        "on_exceed": "suppress",
+        "windows": {
+            "1h": {"max_agent_turns": 2},
+            "24h": {"max_api_calls": 200},
+        },
+    }
+    assert "poller_budget_invalid" in caplog.text
+    assert "windows.6h is unsupported" in caplog.text
+    assert "windows.7d is unsupported" in caplog.text
+
+
 @pytest.mark.parametrize(
     "raw",
     [
@@ -201,6 +235,8 @@ def test_parse_poller_budget_config_accepts_window_caps(tmp_path: Path):
         {"windows": {"1h": {"max_agent_turns": -1}}},
         {"windows": {"1h": {"max_agent_turns": True}}},
         {"windows": {"1h": {"unknown": 1}}},
+        {"windows": {"6h": {"max_agent_turns": 2}}},
+        {"windows": {"7d": {"max_external_usd": 0.25}}},
         {"windows": {"1h": {"max_agent_usd": "NaN"}}},
         {"windows": {"1h": {"max_agent_turns": 1}}, "on_exceed": "warn"},
     ],
