@@ -6,6 +6,26 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.9] — 2026-06-29
+
+### Added
+- **Per-poller cost budgets (#925, #934, #935).** Config-driven per-poller budgets — `max_api_calls` / `max_api_bytes` / `max_external_usd` caps over `1h` / `24h` windows, declared in `<home>/pollers-overrides.yaml`. Poller subprocesses may emit validated `poller_usage` signal records (API calls / bytes / estimated external $), which the scheduler aggregates alongside agent-turn usage. Inside the existing global `HomeostaticArbiter`, only an over-budget poller is suppressed (others keep firing under the same CLEAR pressure), via a `poller_budget_suppressed` event; the subprocess is skipped so cursor state is untouched. Unsupported window labels are warn-dropped at parse time, and budget aggregation fails open (a telemetry/read error never halts a poller).
+- **Per-user UI skins (#931).** Users select a skin that is persisted server-side keyed to their authenticated identity (`POST /api/v1/user/prefs`), with no cross-user write.
+- **Operator-installable skins + server-side skin validation (#936).** A deployment can drop `SkinManifest` JSON into `<home>/skins/` — discovered and validated fail-open (required fields, unique non-colliding id, token-key allow-list, font-entry shape) — without rebuilding the frontend. The bootstrap exposes built-in ids plus operator manifests; the frontend merges them into its runtime skin registry. `POST /api/v1/user/prefs` now validates the requested skin against the built-in ∪ operator set (400 on an unknown id) instead of trusting the client, and a parity test keeps the server's built-in id list in sync with the bundle.
+
+### Changed
+- Bumped pinned external coding-CLI tool versions (#932).
+
+### Fixed
+- **Block leading `[skip]` / `[skipped]` marker on poller/scheduled `send_message` (#937).** A non-interactive (`poller` / `scheduled_tick`) turn whose send begins with a `[skip]` / `[skipped]` narration marker is rejected through the existing skip-list block path (tool error + `send_message_blocked_skiplist` event), keeping non-delivery narration out of operator/chat channels even when the message is too long to trip the short-message dominance gate.
+- **Validate heuristic `saga_atom_ids` against the SAGA store (#933).** Atom ids collected by shape from tool results / triples are checked against the store (a single batched, fail-open lookup) before being recorded, so phantom 16-hex tokens (e.g. a gmail message_id) no longer render as unresolvable "Atoms cited" citations or pollute synthesis credit. Query-response atoms are treated as known-real and not re-validated.
+- **Collapse repeated algedonic signal fingerprints (#928).** Repeated feedback signals are deduplicated on a stable fingerprint (kind + normalized content + channel) while preserving count and recency, so numeric-drift variants of the same suppression/escalation no longer flood the feedback block.
+- Tolerate naive (timezone-less) turn timestamps in skill-outcomes rather than raising (#930).
+- Tolerate malformed activation summaries in the saga dashboard (#929).
+
+### Documentation
+- Document `MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS` in `.env.example`, with a recommendation to enable it for weaker / tool-shy models (e.g. Minimax M3) where the final-text-without-`send_message` action-seam failure is common (#924).
+
 ## [0.6.8] — 2026-06-29
 
 ### Added
