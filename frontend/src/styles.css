@@ -3387,102 +3387,14 @@ textarea {
   border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
   border-radius: var(--mimir-radius-panel, 8px);
   background: var(--mimir-color-panel-background-muted, #f1f5f2);
+  min-height: 520px;
   touch-action: none;
 }
 
-.wiki-graph__canvas svg {
+.wiki-graph__canvas canvas {
   display: block;
   width: 100%;
-  min-width: 640px;
-  aspect-ratio: 16 / 9;
-}
-
-.wiki-graph__svg {
-  cursor: grab;
-  user-select: none;
-}
-
-.wiki-graph__svg--dragging {
-  cursor: grabbing;
-}
-
-.wiki-graph__edge {
-  stroke: rgba(22, 32, 27, 0.35);
-  stroke-width: 0.35;
-  vector-effect: non-scaling-stroke;
-}
-
-.wiki-graph__edge--dangling {
-  stroke: var(--mimir-color-status-warning, #8a6116);
-  stroke-dasharray: 1.4 1.1;
-}
-
-.wiki-graph__edge--related {
-  stroke-opacity: 0.9;
-  stroke-width: 0.65;
-}
-
-.wiki-graph__edge--dimmed {
-  stroke-opacity: 0.08;
-}
-
-.wiki-graph__node circle:not(.wiki-graph__hit) {
-  stroke: #fff;
-  stroke-width: 0.75;
-  vector-effect: non-scaling-stroke;
-}
-
-.wiki-graph__node--orphan circle:not(.wiki-graph__hit) {
-  stroke: var(--mimir-color-status-warning, #8a6116);
-  stroke-width: 1.4;
-}
-
-.wiki-graph__node--collision rect {
-  fill: none;
-  stroke: var(--mimir-color-status-danger, #a33b3b);
-  stroke-width: 0.8;
-  vector-effect: non-scaling-stroke;
-}
-
-.wiki-graph__node--selected circle:not(.wiki-graph__hit) {
-  stroke: var(--mimir-color-text, #16201b);
-  stroke-width: 1.8;
-}
-
-.wiki-graph__node--active circle:not(.wiki-graph__hit) {
-  stroke: var(--mimir-color-chrome-accent, #60786a);
-  stroke-width: 2;
-}
-
-.wiki-graph__node--dimmed {
-  opacity: 0.18;
-}
-
-.wiki-graph__hit {
-  fill: transparent;
-  cursor: pointer;
-  outline: none;
-}
-
-.wiki-graph__hit:focus-visible {
-  stroke: var(--mimir-color-chrome-accent, #60786a);
-  stroke-width: 1.5;
-  vector-effect: non-scaling-stroke;
-}
-
-.wiki-graph__label {
-  fill: var(--mimir-color-text, #16201b);
-  font-size: 2.4px;
-  paint-order: stroke;
-  pointer-events: none;
-  stroke: var(--mimir-color-panel-background-muted, #f1f5f2);
-  stroke-linejoin: round;
-  stroke-width: 0.65;
-}
-
-.wiki-graph__label--active {
-  font-weight: var(--mimir-font-weight-strong, 700);
-  stroke-width: 0.9;
+  min-height: 520px;
 }
 
 .wiki-graph__focus-label {

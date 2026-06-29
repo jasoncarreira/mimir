@@ -1,8 +1,68 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WikiIndexData } from "../api";
 import WikiGraphView from "./WikiGraphView";
+
+const graphCanvasMock = vi.hoisted(() => ({
+  props: [] as Array<Record<string, any>>
+}));
+
+vi.mock("reagraph", () => {
+  const lightTheme = {
+    canvas: {},
+    node: {
+      fill: "",
+      activeFill: "",
+      opacity: 1,
+      selectedOpacity: 1,
+      inactiveOpacity: 0.2,
+      label: {},
+      subLabel: {}
+    },
+    ring: { fill: "", activeFill: "" },
+    edge: {
+      fill: "",
+      activeFill: "",
+      opacity: 1,
+      selectedOpacity: 1,
+      inactiveOpacity: 0.1,
+      label: {},
+      subLabel: {}
+    },
+    arrow: { fill: "", activeFill: "" },
+    lasso: { background: "", border: "" },
+    cluster: { label: {} }
+  };
+  return {
+    lightTheme,
+    GraphCanvas: (props: Record<string, any>) => {
+      graphCanvasMock.props.push(props);
+      return React.createElement(
+        "div",
+        {
+          "aria-label": "Mock reagraph canvas",
+          "data-edge-count": props.edges.length,
+          "data-node-count": props.nodes.length,
+          "data-testid": "reagraph-canvas"
+        },
+        props.nodes
+          .filter((node: { data?: { kind?: string } }) => node.data?.kind === "page")
+          .map((node: { id: string; label: string }) => (
+            React.createElement(
+              "button",
+              {
+                key: node.id,
+                onClick: () => props.onNodeClick({ id: node.id, data: {} })
+              },
+              `Mock open ${node.label}`
+            )
+          ))
+      );
+    }
+  };
+});
 
 function graphIndex(): WikiIndexData {
   return {
@@ -60,27 +120,35 @@ function graphIndex(): WikiIndexData {
   };
 }
 
-function largeGraphIndex(): WikiIndexData {
-  const pages = Array.from({ length: 42 }, (_, index) => {
-    const category = index < 21 ? "concepts" : "topics";
+function denseGraphIndex(): WikiIndexData {
+  const pages = Array.from({ length: 142 }, (_, index) => {
     const slug = `page-${index}`;
+    const category = index < 101 ? "concepts" : index < 122 ? "topics" : "entities";
     return {
       slug,
-      title: index === 0 ? "Hub Page With A Very Long Title That Needs Truncation" : `Node ${index}`,
+      title: `Node ${index}`,
       category,
       path: `${category}/${slug}.md`,
       mtime: null,
       outbound: [],
       inbound: [],
-      is_orphan: index % 13 === 0,
+      is_orphan: false,
       has_slug_collision: false
     };
   });
-  const edges = pages.slice(1).map((page, index) => ({
-    source: pages[0].path,
-    target: page.path,
-    target_slug: page.slug
-  }));
+  const edges: Array<{ source: string; target: string; target_slug: string }> = [];
+  for (const [start, end] of [[0, 71], [71, 142]]) {
+    for (let sourceIndex = start; sourceIndex < end && edges.length < 924; sourceIndex += 1) {
+      for (let offset = 1; offset < end - start && edges.length < 924; offset += 1) {
+        const target = pages[start + ((sourceIndex - start + offset) % (end - start))];
+        edges.push({
+          source: pages[sourceIndex].path,
+          target: target.path,
+          target_slug: target.slug
+        });
+      }
+    }
+  }
   return {
     page_count: pages.length,
     pages,
@@ -98,37 +166,63 @@ function largeGraphIndex(): WikiIndexData {
     orphans: [],
     dangling_links: [],
     slug_collisions: {},
-    health: { has_orphans: true, has_dangling_links: false, has_slug_collisions: false }
+    health: { has_orphans: false, has_dangling_links: false, has_slug_collisions: false }
   };
+}
+
+function latestGraphProps() {
+  return graphCanvasMock.props.at(-1) as Record<string, any>;
 }
 
 afterEach(() => {
   cleanup();
+  graphCanvasMock.props = [];
 });
 
 describe("WikiGraphView", () => {
-  it("renders page nodes, wikilink edges, and category legend", () => {
+  it("passes wiki nodes, wikilink edges, and bundled rendering configuration to reagraph", () => {
     render(<WikiGraphView index={graphIndex()} onOpenPage={vi.fn()} selected="concepts/alpha" />);
 
     expect(screen.getByLabelText("Wiki graph view")).toBeTruthy();
-    expect(screen.getByLabelText("Wiki pages and wikilinks graph")).toBeTruthy();
+    expect(screen.getByTestId("reagraph-canvas").getAttribute("data-node-count")).toBe("4");
+    expect(screen.getByTestId("reagraph-canvas").getAttribute("data-edge-count")).toBe("3");
     expect(screen.getByText("pages")).toBeTruthy();
     expect(screen.getByText("wikilinks")).toBeTruthy();
-    expect(screen.getByText("concepts")).toBeTruthy();
-    expect(screen.getByText("topics")).toBeTruthy();
-    expect(screen.getAllByText("dangling").length).toBeGreaterThan(0);
+    expect(screen.getByText("communities")).toBeTruthy();
+
+    const props = latestGraphProps();
+    expect(props.layoutType).toBe("forceDirected2d");
+    expect(props.clusterAttribute).toBe("community");
+    expect(props.aggregateEdges).toBe(false);
+    expect(props.edgeArrowPosition).toBe("none");
+    expect(props.edgeInterpolation).toBe("curved");
+    expect(props.labelType).toBe("auto");
+    expect(props.labelFontUrl).toContain("kenpixel.ttf");
+    expect(props.labelFontUrl).not.toMatch(/^https?:\/\//);
+    expect(props.nodes.map((node: { id: string }) => node.id)).toEqual([
+      "concepts/alpha.md",
+      "topics/beta.md",
+      "topics/alpha.md",
+      "dangling:ghost"
+    ]);
+    expect(props.edges.map((edge: { source: string; target: string }) => [edge.source, edge.target])).toEqual([
+      ["concepts/alpha.md", "topics/beta.md"],
+      ["topics/beta.md", "concepts/alpha.md"],
+      ["concepts/alpha.md", "dangling:ghost"]
+    ]);
+    expect(props.nodes.every((node: { data?: { community?: string } }) => node.data?.community)).toBe(true);
   });
 
   it("opens page nodes through the reader callback", () => {
     const onOpenPage = vi.fn();
     render(<WikiGraphView index={graphIndex()} onOpenPage={onOpenPage} selected="" />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Beta" }));
+    fireEvent.click(screen.getByRole("button", { name: "Mock open Beta" }));
 
     expect(onOpenPage).toHaveBeenCalledWith("topics/beta");
   });
 
-  it("distinguishes orphans, dangling targets, and slug collisions", () => {
+  it("distinguishes orphans, dangling targets, and slug collisions in the health list", () => {
     render(<WikiGraphView index={graphIndex()} onOpenPage={vi.fn()} selected="" />);
 
     const healthList = screen.getByLabelText("Wiki graph node health");
@@ -142,47 +236,27 @@ describe("WikiGraphView", () => {
     expect(dangling).toHaveProperty("disabled", true);
   });
 
-  it("declutters labels and truncates long default labels", () => {
-    render(<WikiGraphView index={largeGraphIndex()} onOpenPage={vi.fn()} selected="" />);
+  it("passes all live-scale resolved edges to the WebGL graph without aggregation", () => {
+    render(<WikiGraphView index={denseGraphIndex()} onOpenPage={vi.fn()} selected="" />);
 
-    const graph = screen.getByLabelText("Wiki pages and wikilinks graph");
-    const labels = graph.querySelectorAll(".wiki-graph__label");
-
-    expect(labels.length).toBeGreaterThan(0);
-    expect(labels.length).toBeLessThan(largeGraphIndex().pages.length);
-    expect([...labels].some((label) => label.textContent?.endsWith("…"))).toBe(true);
-    labels.forEach((label) => {
-      expect(Number(label.getAttribute("x"))).toBeGreaterThanOrEqual(2);
-      expect(Number(label.getAttribute("x"))).toBeLessThanOrEqual(98);
-      expect(Number(label.getAttribute("y"))).toBeGreaterThanOrEqual(4);
-      expect(Number(label.getAttribute("y"))).toBeLessThanOrEqual(97);
-    });
+    const props = latestGraphProps();
+    expect(props.nodes).toHaveLength(142);
+    expect(props.edges).toHaveLength(924);
+    expect(props.aggregateEdges).toBe(false);
+    expect(props.edges.every((edge: { arrowPlacement?: string; interpolation?: string }) => (
+      edge.arrowPlacement === "none" && edge.interpolation === "curved"
+    ))).toBe(true);
   });
 
-  it("zooms with controls and resets the graph transform", () => {
-    render(<WikiGraphView index={graphIndex()} onOpenPage={vi.fn()} selected="" />);
+  it("uses link-derived communities instead of file categories for cluster layout", () => {
+    render(<WikiGraphView index={denseGraphIndex()} onOpenPage={vi.fn()} selected="" />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+    const props = latestGraphProps();
+    const categoryCount = new Set(props.nodes.map((node: { data: { category: string } }) => node.data.category)).size;
+    const communityCount = new Set(props.nodes.map((node: { data: { community: string } }) => node.data.community)).size;
 
-    expect(screen.getByLabelText("Graph zoom level").textContent).toBe("125%");
-
-    fireEvent.click(screen.getByRole("button", { name: "Reset graph view" }));
-
-    expect(screen.getByLabelText("Graph zoom level").textContent).toBe("100%");
-  });
-
-  it("isolates hovered node links and shows the full focused label", () => {
-    render(<WikiGraphView index={largeGraphIndex()} onOpenPage={vi.fn()} selected="" />);
-
-    fireEvent.mouseEnter(screen.getByRole("button", { name: /Open Hub Page With A Very Long Title/ }));
-
-    expect(document.querySelector(".wiki-graph__focus-label")?.textContent).toContain("Hub Page With A Very Long Title That Needs Truncation");
-    expect(document.querySelectorAll(".wiki-graph__edge--dimmed").length).toBe(0);
-
-    fireEvent.mouseEnter(screen.getByRole("button", { name: "Open Node 10" }));
-
-    expect(document.querySelector(".wiki-graph__focus-label")?.textContent).toContain("Node 10");
-    expect(document.querySelectorAll(".wiki-graph__edge--dimmed").length).toBeGreaterThan(0);
-    expect(document.querySelectorAll(".wiki-graph__node--dimmed").length).toBeGreaterThan(0);
+    expect(props.clusterAttribute).toBe("community");
+    expect(categoryCount).toBe(3);
+    expect(communityCount).toBeGreaterThan(1);
   });
 });

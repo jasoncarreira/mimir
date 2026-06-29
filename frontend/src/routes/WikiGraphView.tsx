@@ -1,4 +1,6 @@
 import React from "react";
+import { GraphCanvas, lightTheme, type GraphEdge as ReagraphEdge, type GraphNode as ReagraphNode, type InternalGraphNode, type Theme } from "reagraph";
+import wikiLabelFontUrl from "../assets/wiki/kenpixel.ttf";
 import { type WikiIndexData, type WikiPageSummary } from "../api";
 import { Badge, EmptyState } from "../ui";
 
@@ -12,8 +14,7 @@ interface GraphNode {
   isOrphan: boolean;
   hasSlugCollision: boolean;
   kind: GraphNodeKind;
-  x: number;
-  y: number;
+  community: string;
 }
 
 interface GraphEdge {
@@ -23,27 +24,14 @@ interface GraphEdge {
   isDangling: boolean;
 }
 
-interface LabelPlacement {
-  id: string;
-  text: string;
-  x: number;
-  y: number;
-  width: number;
-  active: boolean;
-}
-
-interface ViewTransform {
-  scale: number;
-  x: number;
-  y: number;
-}
-
-interface DragState {
-  pointerId: number;
-  startClientX: number;
-  startClientY: number;
-  startX: number;
-  startY: number;
+interface GraphNodeData {
+  category: string;
+  community: string;
+  hasSlugCollision: boolean;
+  isOrphan: boolean;
+  kind: GraphNodeKind;
+  pageSlug: string | null;
+  title: string;
 }
 
 const CATEGORY_COLORS = [
@@ -55,14 +43,74 @@ const CATEGORY_COLORS = [
   "#7a5642"
 ];
 
-const VIEWPORT_SIZE = 100;
-const GRAPH_MIN = 6;
-const GRAPH_MAX = 94;
-const LAYOUT_ITERATIONS = 80;
-const LABEL_FONT_SIZE = 2.4;
-const LABEL_CHAR_WIDTH = 1.18;
-const MAX_DEFAULT_LABELS = 18;
-const MAX_LABEL_CHARS = 20;
+const COMMUNITY_COLORS = [
+  "#2f6f9f",
+  "#3f7d55",
+  "#9a6a24",
+  "#8d4d6f",
+  "#6a6f2f",
+  "#7a5642",
+  "#4f668f",
+  "#a64f3c"
+];
+
+const GRAPH_THEME: Theme = {
+  ...lightTheme,
+  canvas: { background: "#f1f5f2", fog: null },
+  node: {
+    ...lightTheme.node,
+    fill: "#4466a3",
+    activeFill: "#16201b",
+    inactiveOpacity: 0.22,
+    label: {
+      ...lightTheme.node.label,
+      color: "#16201b",
+      stroke: "#f1f5f2",
+      activeColor: "#16201b",
+      backgroundColor: "#f1f5f2",
+      backgroundOpacity: 0.8,
+      padding: 1.5,
+      strokeColor: "#f1f5f2",
+      strokeWidth: 0.35
+    }
+  },
+  edge: {
+    ...lightTheme.edge,
+    fill: "rgba(22, 32, 27, 0.46)",
+    activeFill: "#16201b",
+    inactiveOpacity: 0.12,
+    opacity: 0.72,
+    selectedOpacity: 0.95,
+    label: {
+      ...lightTheme.edge.label,
+      color: "#16201b",
+      stroke: "#f1f5f2",
+      activeColor: "#16201b",
+      fontSize: 5
+    }
+  },
+  arrow: {
+    fill: "rgba(22, 32, 27, 0.46)",
+    activeFill: "#16201b"
+  },
+  cluster: {
+    stroke: "rgba(22, 32, 27, 0.18)",
+    fill: "rgba(255, 255, 255, 0.18)",
+    opacity: 0.5,
+    selectedOpacity: 0.75,
+    inactiveOpacity: 0.12,
+    label: {
+      color: "#58685f",
+      stroke: "#f1f5f2",
+      fontSize: 8
+    }
+  },
+  ring: {
+    fill: "#f1f5f2",
+    activeFill: "#16201b"
+  },
+  lasso: lightTheme.lasso
+};
 
 function pageKey(page: WikiPageSummary): string {
   return page.path.endsWith(".md") ? page.path.slice(0, -3) : page.path || page.slug;
@@ -81,122 +129,81 @@ function categoryColor(category: string, categories: string[]): string {
   return CATEGORY_COLORS[index % CATEGORY_COLORS.length];
 }
 
+function communityColor(community: string): string {
+  const index = Number(community.replace("community-", ""));
+  if (Number.isFinite(index)) return COMMUNITY_COLORS[index % COMMUNITY_COLORS.length];
+  return COMMUNITY_COLORS[0];
+}
+
 function danglingNodeId(target: string): string {
   return `dangling:${target}`;
 }
 
-function labelForEdgeTarget(target: string): string {
-  return target.startsWith("dangling:") ? target.slice("dangling:".length) : target;
+function nodeSize(node: GraphNode, degree: number): number {
+  if (node.kind === "dangling") return 5;
+  return Math.min(14, 7 + Math.sqrt(degree) * 1.2 + (node.hasSlugCollision ? 1.5 : 0));
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
+function graphLabel(text: string): string {
+  return text
+    .normalize("NFKD")
+    .replace(/[^\x20-\x7e]/g, "")
+    .trim() || "untitled";
 }
 
-function truncateLabel(label: string, maxChars: number): string {
-  if (label.length <= maxChars) return label;
-  if (maxChars <= 1) return "…";
-  return `${label.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
-}
+function buildCommunityIds(nodes: GraphNode[], edges: GraphEdge[]): Map<string, string> {
+  const neighborsByNode = new Map<string, Set<string>>();
+  nodes.forEach((node) => neighborsByNode.set(node.id, new Set()));
+  edges.forEach((edge) => {
+    neighborsByNode.get(edge.source)?.add(edge.target);
+    neighborsByNode.get(edge.target)?.add(edge.source);
+  });
 
-function nodeRadius(node: GraphNode): number {
-  return node.kind === "dangling" ? 2.7 : 3.6;
-}
-
-function nodePriority(node: GraphNode, degree: number): number {
-  return degree * 10 + (node.hasSlugCollision ? 8 : 0) + (node.isOrphan ? 4 : 0) + (node.kind === "page" ? 2 : 0);
-}
-
-function layoutGraph(nodes: GraphNode[], edges: GraphEdge[], categories: string[]): GraphNode[] {
-  const categoryCenters = new Map<string, { x: number; y: number }>();
-  const layoutCategories = categories.filter((category) => category !== "dangling");
-  const categoryCount = Math.max(1, layoutCategories.length);
-  layoutCategories.forEach((category, categoryIndex) => {
-    const angle = (Math.PI * 2 * categoryIndex) / categoryCount - Math.PI / 2;
-    categoryCenters.set(category, {
-      x: 50 + Math.cos(angle) * 26,
-      y: 50 + Math.sin(angle) * 22
+  let labels = new Map(nodes.map((node) => [node.id, node.id]));
+  for (let iteration = 0; iteration < 24; iteration += 1) {
+    let changed = false;
+    const nextLabels = new Map(labels);
+    const orderedNodes = [...nodes].sort((a, b) => {
+      const degreeDelta = (neighborsByNode.get(b.id)?.size ?? 0) - (neighborsByNode.get(a.id)?.size ?? 0);
+      return degreeDelta || a.id.localeCompare(b.id);
     });
-  });
-  categoryCenters.set("dangling", { x: 50, y: 82 });
 
-  const groups = new Map<string, GraphNode[]>();
-  nodes.forEach((node) => {
-    const group = groups.get(node.category) ?? [];
-    group.push(node);
-    groups.set(node.category, group);
-  });
-
-  const laidOut = nodes.map((node) => ({ ...node }));
-  const nodeById = new Map(laidOut.map((node) => [node.id, node]));
-  const orderById = new Map(nodes.map((node, index) => [node.id, index]));
-
-  for (const [category, group] of groups) {
-    const center = categoryCenters.get(category) ?? { x: 50, y: 50 };
-    group
-      .map((node) => nodeById.get(node.id))
-      .filter((node): node is GraphNode => Boolean(node))
-      .forEach((node, indexInGroup) => {
-        const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-        const radius = Math.sqrt(indexInGroup + 0.5) * 4.1;
-        const angle = indexInGroup * goldenAngle;
-        node.x = clamp(center.x + Math.cos(angle) * radius, GRAPH_MIN, GRAPH_MAX);
-        node.y = clamp(center.y + Math.sin(angle) * radius, GRAPH_MIN, GRAPH_MAX);
+    orderedNodes.forEach((node) => {
+      const counts = new Map<string, number>();
+      neighborsByNode.get(node.id)?.forEach((neighborId) => {
+        const label = labels.get(neighborId);
+        if (label) counts.set(label, (counts.get(label) ?? 0) + 1);
       });
-  }
-
-  for (let iteration = 0; iteration < LAYOUT_ITERATIONS; iteration += 1) {
-    for (const edge of edges) {
-      const source = nodeById.get(edge.source);
-      const target = nodeById.get(edge.target);
-      if (!source || !target) continue;
-      const dx = target.x - source.x;
-      const dy = target.y - source.y;
-      const distance = Math.max(0.01, Math.hypot(dx, dy));
-      const desired = edge.isDangling ? 12 : 15;
-      const force = (distance - desired) * 0.012;
-      const moveX = (dx / distance) * force;
-      const moveY = (dy / distance) * force;
-      source.x += moveX;
-      source.y += moveY;
-      target.x -= moveX;
-      target.y -= moveY;
-    }
-
-    for (let a = 0; a < laidOut.length; a += 1) {
-      for (let b = a + 1; b < laidOut.length; b += 1) {
-        const first = laidOut[a];
-        const second = laidOut[b];
-        const dx = second.x - first.x;
-        const dy = second.y - first.y;
-        const distance = Math.max(0.01, Math.hypot(dx, dy));
-        const sameCategory = first.category === second.category;
-        const minimum = sameCategory ? nodeRadius(first) + nodeRadius(second) + 1.8 : 5.4;
-        if (distance >= minimum) continue;
-        const push = (minimum - distance) * 0.5;
-        const jitter = ((orderById.get(first.id) ?? 0) - (orderById.get(second.id) ?? 0)) * 0.0007;
-        const moveX = (dx / distance + jitter) * push;
-        const moveY = (dy / distance - jitter) * push;
-        first.x -= moveX;
-        first.y -= moveY;
-        second.x += moveX;
-        second.y += moveY;
+      if (!counts.size) return;
+      const current = labels.get(node.id) ?? node.id;
+      const best = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0][0];
+      if (best !== current) {
+        nextLabels.set(node.id, best);
+        changed = true;
       }
-    }
+    });
 
-    for (const node of laidOut) {
-      const center = categoryCenters.get(node.category) ?? { x: 50, y: 50 };
-      node.x += (center.x - node.x) * 0.01;
-      node.y += (center.y - node.y) * 0.01;
-      node.x = clamp(node.x, GRAPH_MIN, GRAPH_MAX);
-      node.y = clamp(node.y, GRAPH_MIN, GRAPH_MAX);
-    }
+    labels = nextLabels;
+    if (!changed) break;
   }
 
-  return laidOut;
+  const groups = new Map<string, string[]>();
+  nodes.forEach((node) => {
+    const label = labels.get(node.id) ?? node.id;
+    const group = groups.get(label) ?? [];
+    group.push(node.id);
+    groups.set(label, group);
+  });
+
+  const communityByLabel = new Map<string, string>();
+  [...groups.entries()]
+    .sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]))
+    .forEach(([label], index) => communityByLabel.set(label, `community-${index + 1}`));
+
+  return new Map(nodes.map((node) => [node.id, communityByLabel.get(labels.get(node.id) ?? node.id) ?? "community-1"]));
 }
 
-function buildGraph(index: WikiIndexData): { nodes: GraphNode[]; edges: GraphEdge[]; categories: string[] } {
+function buildGraph(index: WikiIndexData): { nodes: GraphNode[]; edges: GraphEdge[]; categories: string[]; communities: string[] } {
   const sourceNodes = index.graph.nodes.length
     ? index.graph.nodes
     : index.pages.map((page) => ({
@@ -217,8 +224,7 @@ function buildGraph(index: WikiIndexData): { nodes: GraphNode[]; edges: GraphEdg
       isOrphan: node.is_orphan,
       hasSlugCollision: node.has_slug_collision,
       kind: "page",
-      x: 50,
-      y: 50
+      community: "community-1"
     };
   });
   const nodeIds = new Set(nodes.map((node) => node.id));
@@ -245,8 +251,7 @@ function buildGraph(index: WikiIndexData): { nodes: GraphNode[]; edges: GraphEdg
         isOrphan: false,
         hasSlugCollision: false,
         kind: "dangling",
-        x: 50,
-        y: 82 + linkIndex
+        community: "community-1"
       });
       nodeIds.add(id);
     }
@@ -258,95 +263,71 @@ function buildGraph(index: WikiIndexData): { nodes: GraphNode[]; edges: GraphEdg
     });
   });
 
-  const layoutCategories = [...categories, "dangling"];
-  return { nodes: layoutGraph(nodes, edges, layoutCategories), edges, categories: layoutCategories };
-}
-
-function buildNeighborSets(edges: GraphEdge[]): { neighborsByNode: Map<string, Set<string>>; connectedEdgeIdsByNode: Map<string, Set<string>> } {
-  const neighborsByNode = new Map<string, Set<string>>();
-  const connectedEdgeIdsByNode = new Map<string, Set<string>>();
-  edges.forEach((edge) => {
-    const sourceNeighbors = neighborsByNode.get(edge.source) ?? new Set<string>();
-    const targetNeighbors = neighborsByNode.get(edge.target) ?? new Set<string>();
-    sourceNeighbors.add(edge.target);
-    targetNeighbors.add(edge.source);
-    neighborsByNode.set(edge.source, sourceNeighbors);
-    neighborsByNode.set(edge.target, targetNeighbors);
-
-    const sourceEdges = connectedEdgeIdsByNode.get(edge.source) ?? new Set<string>();
-    const targetEdges = connectedEdgeIdsByNode.get(edge.target) ?? new Set<string>();
-    sourceEdges.add(edge.id);
-    targetEdges.add(edge.id);
-    connectedEdgeIdsByNode.set(edge.source, sourceEdges);
-    connectedEdgeIdsByNode.set(edge.target, targetEdges);
+  const communityByNode = buildCommunityIds(nodes, edges);
+  nodes.forEach((node) => {
+    node.community = communityByNode.get(node.id) ?? "community-1";
   });
-  return { neighborsByNode, connectedEdgeIdsByNode };
+
+  const communities = Array.from(new Set(nodes.map((node) => node.community))).sort((a, b) => {
+    const aIndex = Number(a.replace("community-", ""));
+    const bIndex = Number(b.replace("community-", ""));
+    return aIndex - bIndex;
+  });
+
+  return {
+    nodes,
+    edges: edges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target)),
+    categories: categories.includes("dangling") || !nodes.some((node) => node.kind === "dangling") ? categories : [...categories, "dangling"],
+    communities
+  };
 }
 
-function labelWidth(text: string): number {
-  return text.length * LABEL_CHAR_WIDTH;
-}
-
-function labelBoxOverlaps(
-  box: { x: number; y: number; width: number; height: number },
-  boxes: Array<{ x: number; y: number; width: number; height: number }>
-): boolean {
-  return boxes.some((other) => (
-    box.x < other.x + other.width
-    && box.x + box.width > other.x
-    && box.y < other.y + other.height
-    && box.y + box.height > other.y
-  ));
-}
-
-function labelPlacementForNode(node: GraphNode, text: string, active: boolean): LabelPlacement {
-  const width = labelWidth(text);
-  let x = node.x + nodeRadius(node) + 1.8;
-  if (x + width > GRAPH_MAX) x = node.x - width - nodeRadius(node) - 1.8;
-  x = clamp(x, 2, Math.max(2, VIEWPORT_SIZE - width - 2));
-  const y = clamp(node.y + 0.9, 4, VIEWPORT_SIZE - 3);
-  return { id: node.id, text, x, y, width, active };
-}
-
-function buildLabelPlacements(nodes: GraphNode[], edges: GraphEdge[], selectedId: string | null, activeId: string | null): LabelPlacement[] {
+function buildDegreeMap(edges: GraphEdge[]): Map<string, number> {
   const degreeByNode = new Map<string, number>();
   edges.forEach((edge) => {
     degreeByNode.set(edge.source, (degreeByNode.get(edge.source) ?? 0) + 1);
     degreeByNode.set(edge.target, (degreeByNode.get(edge.target) ?? 0) + 1);
   });
-
-  const requiredIds = new Set([selectedId, activeId].filter((id): id is string => Boolean(id)));
-  const candidates = [...nodes]
-    .filter((node) => node.kind === "page" || requiredIds.has(node.id))
-    .sort((a, b) => (
-      nodePriority(b, degreeByNode.get(b.id) ?? 0) - nodePriority(a, degreeByNode.get(a.id) ?? 0)
-      || a.title.localeCompare(b.title)
-      || a.id.localeCompare(b.id)
-    ));
-
-  const boxes: Array<{ x: number; y: number; width: number; height: number }> = [];
-  const labels: LabelPlacement[] = [];
-  for (const node of candidates) {
-    const active = node.id === activeId;
-    const required = requiredIds.has(node.id);
-    const text = truncateLabel(node.title, MAX_LABEL_CHARS);
-    const placement = labelPlacementForNode(node, text, active);
-    const box = { x: placement.x - 0.8, y: placement.y - LABEL_FONT_SIZE, width: placement.width + 1.6, height: LABEL_FONT_SIZE + 1.2 };
-    if (!required && (labels.length >= MAX_DEFAULT_LABELS || labelBoxOverlaps(box, boxes))) continue;
-    labels.push(placement);
-    boxes.push(box);
-  }
-
-  return labels;
+  return degreeByNode;
 }
 
-function clampTransform(transform: ViewTransform): ViewTransform {
-  const scale = clamp(transform.scale, 1, 4);
-  const minPan = VIEWPORT_SIZE - VIEWPORT_SIZE * scale;
+function toReagraphNode(node: GraphNode, degree: number, selectedNodeId: string | null): ReagraphNode {
+  const labelParts = [
+    node.title,
+    node.kind === "dangling" ? "dangling target" : node.category,
+    node.isOrphan ? "orphan" : "",
+    node.hasSlugCollision ? "slug collision" : ""
+  ].filter(Boolean);
   return {
-    scale,
-    x: clamp(transform.x, minPan, 0),
-    y: clamp(transform.y, minPan, 0)
+    id: node.id,
+    label: graphLabel(node.title),
+    subLabel: graphLabel(node.kind === "dangling" ? "dangling target" : node.category),
+    fill: node.kind === "dangling" ? "#8a6116" : communityColor(node.community),
+    cluster: node.community,
+    labelVisible: node.id === selectedNodeId || degree >= 8 || node.hasSlugCollision,
+    size: nodeSize(node, degree),
+    data: {
+      category: node.category,
+      community: node.community,
+      hasSlugCollision: node.hasSlugCollision,
+      isOrphan: node.isOrphan,
+      kind: node.kind,
+      pageSlug: node.kind === "page" ? node.slug : null,
+      title: labelParts.join(" - ")
+    } satisfies GraphNodeData
+  };
+}
+
+function toReagraphEdge(edge: GraphEdge): ReagraphEdge {
+  return {
+    id: edge.id,
+    source: edge.source,
+    target: edge.target,
+    fill: edge.isDangling ? "#8a6116" : "rgba(22, 32, 27, 0.48)",
+    dashed: edge.isDangling,
+    dashArray: [4, 2],
+    arrowPlacement: "none",
+    interpolation: "curved"
   };
 }
 
@@ -359,77 +340,29 @@ export default function WikiGraphView({
   selected: string;
   onOpenPage: (slug: string) => void;
 }) {
-  const { nodes, edges, categories } = React.useMemo(() => buildGraph(index), [index]);
+  const { nodes, edges, categories, communities } = React.useMemo(() => buildGraph(index), [index]);
   const nodeById = React.useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
   const pagesByPath = React.useMemo(() => new Map(index.pages.map((page) => [page.path, page])), [index.pages]);
   const [activeNodeId, setActiveNodeId] = React.useState<string | null>(null);
-  const [transform, setTransform] = React.useState<ViewTransform>({ scale: 1, x: 0, y: 0 });
-  const [dragState, setDragState] = React.useState<DragState | null>(null);
-  const svgRef = React.useRef<SVGSVGElement | null>(null);
-  const { neighborsByNode, connectedEdgeIdsByNode } = React.useMemo(() => buildNeighborSets(edges), [edges]);
   const selectedNodeId = React.useMemo(() => {
     const selectedPage = index.pages.find((page) => selected === page.slug || selected === page.path || selected === pageKey(page));
     return selectedPage?.path ?? null;
   }, [index.pages, selected]);
-  const activeNode = activeNodeId ? nodeById.get(activeNodeId) : undefined;
-  const activeNeighborIds = activeNodeId ? neighborsByNode.get(activeNodeId) ?? new Set<string>() : new Set<string>();
-  const activeEdgeIds = activeNodeId ? connectedEdgeIdsByNode.get(activeNodeId) ?? new Set<string>() : new Set<string>();
-  const labelPlacements = React.useMemo(
-    () => buildLabelPlacements(nodes, edges, selectedNodeId, activeNodeId),
-    [activeNodeId, edges, nodes, selectedNodeId]
+  const degreeByNode = React.useMemo(() => buildDegreeMap(edges), [edges]);
+  const reagraphNodes = React.useMemo(
+    () => nodes.map((node) => toReagraphNode(node, degreeByNode.get(node.id) ?? 0, selectedNodeId)),
+    [degreeByNode, nodes, selectedNodeId]
   );
+  const reagraphEdges = React.useMemo(() => edges.map(toReagraphEdge), [edges]);
+  const selections = React.useMemo(() => (selectedNodeId ? [selectedNodeId] : []), [selectedNodeId]);
+  const actives = React.useMemo(() => (activeNodeId ? [activeNodeId] : []), [activeNodeId]);
+  const activeNode = activeNodeId ? nodeById.get(activeNodeId) : undefined;
 
-  function zoomBy(delta: number) {
-    setTransform((current) => clampTransform({ ...current, scale: current.scale * delta }));
-  }
-
-  function resetView() {
-    setTransform({ scale: 1, x: 0, y: 0 });
-  }
-
-  function panBy(dx: number, dy: number) {
-    setTransform((current) => clampTransform({ ...current, x: current.x + dx, y: current.y + dy }));
-  }
-
-  function handleWheel(event: React.WheelEvent<SVGSVGElement>) {
-    event.preventDefault();
-    const nextScale = clamp(transform.scale * (event.deltaY > 0 ? 0.88 : 1.14), 1, 4);
-    const rect = svgRef.current?.getBoundingClientRect();
-    const viewportX = rect && rect.width ? ((event.clientX - rect.left) / rect.width) * VIEWPORT_SIZE : VIEWPORT_SIZE / 2;
-    const viewportY = rect && rect.height ? ((event.clientY - rect.top) / rect.height) * VIEWPORT_SIZE : VIEWPORT_SIZE / 2;
-    const worldX = (viewportX - transform.x) / transform.scale;
-    const worldY = (viewportY - transform.y) / transform.scale;
-    setTransform(clampTransform({
-      scale: nextScale,
-      x: viewportX - worldX * nextScale,
-      y: viewportY - worldY * nextScale
-    }));
-  }
-
-  function handlePointerDown(event: React.PointerEvent<SVGSVGElement>) {
-    if (event.button !== 0) return;
-    event.currentTarget.setPointerCapture(event.pointerId);
-    setDragState({
-      pointerId: event.pointerId,
-      startClientX: event.clientX,
-      startClientY: event.clientY,
-      startX: transform.x,
-      startY: transform.y
-    });
-  }
-
-  function handlePointerMove(event: React.PointerEvent<SVGSVGElement>) {
-    if (!dragState || dragState.pointerId !== event.pointerId) return;
-    const rect = svgRef.current?.getBoundingClientRect();
-    const width = rect?.width || 1;
-    const height = rect?.height || 1;
-    const dx = ((event.clientX - dragState.startClientX) / width) * VIEWPORT_SIZE;
-    const dy = ((event.clientY - dragState.startClientY) / height) * VIEWPORT_SIZE;
-    setTransform(clampTransform({ scale: transform.scale, x: dragState.startX + dx, y: dragState.startY + dy }));
-  }
-
-  function handlePointerEnd(event: React.PointerEvent<SVGSVGElement>) {
-    if (dragState?.pointerId === event.pointerId) setDragState(null);
+  function openGraphNode(node: InternalGraphNode) {
+    const graphNode = nodeById.get(node.id);
+    if (!graphNode || graphNode.kind !== "page") return;
+    const page = pageForNode(graphNode.id, index.pages);
+    if (page) onOpenPage(linkSlugForPage(page));
   }
 
   if (!nodes.length) {
@@ -448,151 +381,73 @@ export default function WikiGraphView({
           <span>wikilinks</span>
         </div>
         <div>
-          <strong>{nodes.filter((node) => node.kind === "dangling").length}</strong>
-          <span>dangling</span>
+          <strong>{communities.length}</strong>
+          <span>communities</span>
         </div>
       </div>
-      <div className="wiki-graph__toolbar" aria-label="Wiki graph controls">
-        <button aria-label="Zoom in" onClick={() => zoomBy(1.25)} type="button">+</button>
-        <button aria-label="Zoom out" onClick={() => zoomBy(0.8)} type="button">-</button>
-        <button aria-label="Pan left" onClick={() => panBy(8, 0)} type="button">&lt;</button>
-        <button aria-label="Pan right" onClick={() => panBy(-8, 0)} type="button">&gt;</button>
-        <button aria-label="Pan up" onClick={() => panBy(0, 8)} type="button">^</button>
-        <button aria-label="Pan down" onClick={() => panBy(0, -8)} type="button">v</button>
-        <button aria-label="Reset graph view" onClick={resetView} type="button">Reset</button>
-        <output aria-label="Graph zoom level">{Math.round(transform.scale * 100)}%</output>
-      </div>
-      <div className="wiki-graph__canvas">
-        <svg
-          aria-label="Wiki pages and wikilinks graph"
-          className={dragState ? "wiki-graph__svg wiki-graph__svg--dragging" : "wiki-graph__svg"}
-          onPointerCancel={handlePointerEnd}
-          onPointerDown={handlePointerDown}
-          onPointerLeave={handlePointerEnd}
-          onPointerMove={handlePointerMove}
-          onPointerUp={handlePointerEnd}
-          onWheel={handleWheel}
-          ref={svgRef}
-          role="img"
-          viewBox="0 0 100 100"
-        >
-          <clipPath id="wiki-graph-viewport">
-            <rect height="100" width="100" x="0" y="0" />
-          </clipPath>
-          <g clipPath="url(#wiki-graph-viewport)">
-            <g transform={`translate(${transform.x} ${transform.y}) scale(${transform.scale})`}>
-              <g className="wiki-graph__edges">
-                {edges.map((edge) => {
-                  const source = nodeById.get(edge.source);
-                  const target = nodeById.get(edge.target);
-                  if (!source || !target) return null;
-                  const related = !activeNodeId || activeEdgeIds.has(edge.id);
-                  return (
-                    <line
-                      className={[
-                        "wiki-graph__edge",
-                        edge.isDangling ? "wiki-graph__edge--dangling" : "",
-                        related ? "wiki-graph__edge--related" : "wiki-graph__edge--dimmed"
-                      ].filter(Boolean).join(" ")}
-                      key={edge.id}
-                      x1={source.x}
-                      x2={target.x}
-                      y1={source.y}
-                      y2={target.y}
-                    >
-                      <title>{`${source.title} -> ${labelForEdgeTarget(target.id)}`}</title>
-                    </line>
-                  );
-                })}
-              </g>
-              <g className="wiki-graph__nodes">
-                {nodes.map((node) => {
-                  const page = pageForNode(node.id, index.pages);
-                  const selectedNode = node.id === selectedNodeId;
-                  const related = !activeNodeId || node.id === activeNodeId || activeNeighborIds.has(node.id);
-                  const color = node.kind === "dangling" ? "#8a6116" : categoryColor(node.category, categories);
-                  const classes = [
-                    "wiki-graph__node",
-                    node.kind === "dangling" ? "wiki-graph__node--dangling" : "",
-                    node.isOrphan ? "wiki-graph__node--orphan" : "",
-                    node.hasSlugCollision ? "wiki-graph__node--collision" : "",
-                    selectedNode ? "wiki-graph__node--selected" : "",
-                    node.id === activeNodeId ? "wiki-graph__node--active" : "",
-                    related ? "wiki-graph__node--related" : "wiki-graph__node--dimmed"
-                  ].filter(Boolean).join(" ");
-                  return (
-                    <g
-                      className={classes}
-                      key={node.id}
-                      onMouseEnter={() => setActiveNodeId(node.id)}
-                      onMouseLeave={() => setActiveNodeId((current) => (current === node.id ? null : current))}
-                      transform={`translate(${node.x} ${node.y})`}
-                    >
-                      <circle fill={color} r={nodeRadius(node)} />
-                      {node.hasSlugCollision ? <rect height="8.4" width="8.4" x="-4.2" y="-4.2" /> : null}
-                      {node.kind === "page" && page ? (
-                        <circle
-                          aria-label={`Open ${node.title}`}
-                          className="wiki-graph__hit"
-                          onBlur={() => setActiveNodeId((current) => (current === node.id ? null : current))}
-                          onFocus={() => setActiveNodeId(node.id)}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === " ") {
-                              event.preventDefault();
-                              onOpenPage(linkSlugForPage(page));
-                            }
-                          }}
-                          onClick={() => onOpenPage(linkSlugForPage(page))}
-                          r="6"
-                          role="button"
-                          tabIndex={0}
-                        />
-                      ) : null}
-                      <title>
-                        {node.title} ({node.category})
-                        {node.isOrphan ? " - orphan" : ""}
-                        {node.hasSlugCollision ? " - slug collision" : ""}
-                        {node.kind === "dangling" ? " - dangling target" : ""}
-                      </title>
-                    </g>
-                  );
-                })}
-              </g>
-              <g className="wiki-graph__labels" aria-hidden="true">
-                {labelPlacements.map((label) => (
-                  <text
-                    className={label.active ? "wiki-graph__label wiki-graph__label--active" : "wiki-graph__label"}
-                    key={label.id}
-                    x={label.x}
-                    y={label.y}
-                  >
-                    {label.text}
-                  </text>
-                ))}
-              </g>
-            </g>
-          </g>
-        </svg>
+      <div aria-label="Wiki pages and wikilinks graph" className="wiki-graph__canvas" role="img">
+        <GraphCanvas
+          actives={actives}
+          aggregateEdges={false}
+          animated
+          cameraMode="pan"
+          clusterAttribute="community"
+          defaultNodeSize={7}
+          draggable
+          edgeArrowPosition="none"
+          edgeInterpolation="curved"
+          edges={reagraphEdges}
+          labelFontUrl={wikiLabelFontUrl}
+          labelType="auto"
+          layoutOverrides={{
+            clusterStrength: 0.72,
+            clusterType: "force",
+            forceCharge: -1050,
+            forceLinkDistance: 110,
+            forceLinkStrength: 0.14,
+            linkStrengthInterCluster: 0.02,
+            linkStrengthIntraCluster: 0.52,
+            nodeStrength: -420
+          }}
+          layoutType="forceDirected2d"
+          maxNodeSize={15}
+          maxZoom={140}
+          minNodeSize={5}
+          minZoom={0.25}
+          nodes={reagraphNodes}
+          onNodeClick={openGraphNode}
+          onNodePointerOut={(node) => setActiveNodeId((current) => (current === node.id ? null : current))}
+          onNodePointerOver={(node) => setActiveNodeId(node.id)}
+          selections={selections}
+          sizingType="default"
+          theme={GRAPH_THEME}
+        />
       </div>
       <div className="wiki-graph__focus-label" aria-live="polite">
         {activeNode ? (
           <>
             <strong>{activeNode.title}</strong>
-            <span>{activeNode.kind === "dangling" ? "dangling target" : activeNode.category}</span>
+            <span>{activeNode.kind === "dangling" ? "dangling target" : `${activeNode.category} / ${activeNode.community}`}</span>
           </>
         ) : (
-          <span>Hover or focus a node to isolate its links.</span>
+          <span>Zoom, pan, drag, or hover nodes to inspect link communities.</span>
         )}
       </div>
       <div aria-label="Wiki graph legend" className="wiki-graph__legend">
+        {communities.map((community) => (
+          <span key={community}>
+            <i style={{ background: communityColor(community) }} />
+            {community}
+          </span>
+        ))}
         {categories.map((category) => (
           <span key={category}>
             <i style={{ background: category === "dangling" ? "#8a6116" : categoryColor(category, categories) }} />
             {category}
           </span>
         ))}
-        <Badge tone="warning">ring = orphan</Badge>
-        <Badge tone="danger">square = collision</Badge>
+        <Badge tone="warning">orphan</Badge>
+        <Badge tone="danger">collision</Badge>
         <Badge tone="warning">dashed = dangling</Badge>
       </div>
       <div className="wiki-graph__list" aria-label="Wiki graph node health">
@@ -613,6 +468,7 @@ export default function WikiGraphView({
             >
               <span>{node.title}</span>
               <small>{node.kind === "dangling" ? "dangling target" : node.id}</small>
+              <small>{node.community}</small>
               {node.kind === "dangling" ? <Badge tone="warning">dangling</Badge> : null}
               {node.isOrphan ? <Badge tone="warning">orphan</Badge> : null}
               {node.hasSlugCollision ? <Badge tone="danger">collision</Badge> : null}
