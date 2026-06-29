@@ -20,6 +20,8 @@ export const localSkins = {
   "cosmic-nebula": cosmicNebulaSkin,
 } satisfies Record<string, SkinManifest>;
 
+const localSkinRegistry: Record<string, SkinManifest> = localSkins;
+
 // Active skin until per-user skin selection ships (#562). neon-terminal is the
 // current dark-retro theme; default-retro remains registered as a fallback.
 const DEFAULT_SKIN_ID: SkinId = "neon-terminal";
@@ -138,7 +140,7 @@ function skinRegistry(
 
 export function isSkinId(
   value: unknown,
-  registry: Record<string, SkinManifest> = localSkins,
+  registry: Record<string, SkinManifest> = localSkinRegistry,
 ): value is SkinId {
   return (
     typeof value === "string" &&
@@ -148,16 +150,18 @@ export function isSkinId(
 
 export function loadSkin(
   skinId: SkinId = DEFAULT_SKIN_ID,
-  registry: Record<string, SkinManifest> = localSkins,
+  registry: Record<string, SkinManifest> = localSkinRegistry,
 ): SkinManifest {
   return (
-    registry[skinId] ?? registry[DEFAULT_SKIN_ID] ?? localSkins[DEFAULT_SKIN_ID]
+    registry[skinId] ??
+    registry[DEFAULT_SKIN_ID] ??
+    localSkinRegistry[DEFAULT_SKIN_ID]
   );
 }
 
 export function skinIdFromPrefs(
   prefs: Record<string, unknown> | undefined,
-  registry: Record<string, SkinManifest> = localSkins,
+  registry: Record<string, SkinManifest> = localSkinRegistry,
 ): SkinId | null {
   const skin = prefs?.skin;
   return isSkinId(skin, registry) ? skin : null;
@@ -168,7 +172,7 @@ export function skinIdFromPrefs(
 // previewable without a rebuild. Unknown/absent → the default skin.
 export function resolveSkinId(
   fallback: SkinId = DEFAULT_SKIN_ID,
-  registry: Record<string, SkinManifest> = localSkins,
+  registry: Record<string, SkinManifest> = localSkinRegistry,
 ): SkinId {
   if (typeof window === "undefined") {
     return fallback;
