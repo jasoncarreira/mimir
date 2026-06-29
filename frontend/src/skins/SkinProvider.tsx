@@ -14,11 +14,11 @@ import { defaultRetroSkin } from "./default-retro";
 import { neonTerminalSkin } from "./neon-terminal";
 import type { SkinCssVariables, SkinId, SkinManifest } from "./types";
 
-export const localSkins: Record<string, SkinManifest> = {
+export const localSkins = {
   "default-retro": defaultRetroSkin,
   "neon-terminal": neonTerminalSkin,
   "cosmic-nebula": cosmicNebulaSkin,
-};
+} satisfies Record<string, SkinManifest>;
 
 // Active skin until per-user skin selection ships (#562). neon-terminal is the
 // current dark-retro theme; default-retro remains registered as a fallback.
