@@ -29,6 +29,7 @@ def build_users_payload(resolver: IdentityResolver) -> dict[str, Any]:
                 "display_name": ident.display_name,
                 "roles": list(ident.access.roles),
                 "is_admin": ident.access.is_admin,
+                "prefs": dict(ident.prefs),
                 "has_web_key": any(
                     alias.startswith(WEB_KEY_ALIAS_PREFIX) for alias in ident.aliases
                 ),

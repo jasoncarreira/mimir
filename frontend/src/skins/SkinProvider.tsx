@@ -5,13 +5,16 @@ import {
   useMemo,
   type PropsWithChildren
 } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useBootstrap } from "../api/bootstrap";
+import { getWhoami, updateUserPrefs } from "../api/whoami";
+import { useUiState } from "../uiState";
 import { cosmicNebulaSkin } from "./cosmic-nebula";
 import { defaultRetroSkin } from "./default-retro";
 import { neonTerminalSkin } from "./neon-terminal";
 import type { SkinCssVariables, SkinId, SkinManifest } from "./types";
 
-const localSkins = {
+export const localSkins = {
   "default-retro": defaultRetroSkin,
   "neon-terminal": neonTerminalSkin,
   "cosmic-nebula": cosmicNebulaSkin
@@ -85,12 +88,25 @@ const tokenCssVariableNames = {
 interface SkinContextValue {
   skin: SkinManifest;
   cssVariables: SkinCssVariables;
+  availableSkins: SkinManifest[];
+  selectedSkinId: SkinId;
+  setUserSkin: (skinId: SkinId) => void;
+  isSavingUserSkin: boolean;
 }
 
 const SkinContext = createContext<SkinContextValue | null>(null);
 
+export function isSkinId(value: unknown): value is SkinId {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(localSkins, value);
+}
+
 export function loadSkin(skinId: SkinId = DEFAULT_SKIN_ID): SkinManifest {
-  return localSkins[skinId];
+  return localSkins[skinId] ?? localSkins[DEFAULT_SKIN_ID];
+}
+
+export function skinIdFromPrefs(prefs: Record<string, unknown> | undefined): SkinId | null {
+  const skin = prefs?.skin;
+  return isSkinId(skin) ? skin : null;
 }
 
 // Interim skin selection until the picker ships (#562): a `?skin=<id>` query
@@ -175,18 +191,43 @@ export function SkinProvider({
   // Precedence: explicit prop (tests/embeds) > ?skin= override > the agent's
   // configured skin (bootstrap.ui.skin) > default. Bootstrap loads async, so the
   // configured skin applies once it arrives (default until then).
+  const queryClient = useQueryClient();
+  const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
   const { data: bootstrap } = useBootstrap();
+  const signedIn = Boolean(bootstrap && (!bootstrap.auth.required || apiKeyPresent));
+  const { data: whoami } = useQuery({
+    queryKey: ["whoami"],
+    queryFn: async () => (await getWhoami()).data,
+    enabled: signedIn
+  });
+  const userSkin = skinIdFromPrefs(whoami?.prefs);
   const configured = bootstrap?.ui?.skin;
-  const fallback =
-    configured && Object.prototype.hasOwnProperty.call(localSkins, configured)
-      ? (configured as SkinId)
-      : DEFAULT_SKIN_ID;
-  const skin = loadSkin(skinId ?? resolveSkinId(fallback));
+  const fallback = isSkinId(configured) ? configured : DEFAULT_SKIN_ID;
+  const selectedSkinId = skinId ?? resolveSkinId(userSkin ?? fallback);
+  const skin = loadSkin(selectedSkinId);
   useSkinFonts(skin);
   const cssVariables = useMemo(() => skinTokensToCssVariables(skin), [skin]);
+  const skinMutation = useMutation({
+    mutationFn: (nextSkinId: SkinId) => updateUserPrefs({ skin: nextSkinId }),
+    onSuccess: (res) => {
+      queryClient.setQueryData(["whoami"], res.data);
+    }
+  });
+  const setUserSkin = useMemo(
+    () => (nextSkinId: SkinId) => skinMutation.mutate(nextSkinId),
+    [skinMutation.mutate]
+  );
+  const availableSkins = useMemo(() => Object.values(localSkins), []);
   const contextValue = useMemo(
-    () => ({ skin, cssVariables }),
-    [cssVariables, skin]
+    () => ({
+      skin,
+      cssVariables,
+      availableSkins,
+      selectedSkinId,
+      setUserSkin,
+      isSavingUserSkin: skinMutation.isPending
+    }),
+    [availableSkins, cssVariables, selectedSkinId, setUserSkin, skin, skinMutation.isPending]
   );
 
   return (

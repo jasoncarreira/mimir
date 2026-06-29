@@ -131,6 +131,9 @@ class Identity:
     aliases: list[str] = field(default_factory=list)
     notes: str | None = None
     access: AccessMetadata = field(default_factory=AccessMetadata)
+    # User-facing web preferences. Kept deliberately generic so new frontend
+    # preferences can ride the same identities.yaml field without schema churn.
+    prefs: dict[str, object] = field(default_factory=dict)
     # Captured DM channels, keyed by platform (e.g. {"slack": "dm-slack-D…",
     # "discord": "dm-discord-…"}). Auto-populated on first contact per bridge
     # (see ``capture_dm_channel`` in identities_populator) so the agent can
@@ -338,6 +341,14 @@ class IdentityResolver:
 
             access = self._parse_access(raw.get("access"), canonical)
 
+            raw_prefs = raw.get("prefs") or {}
+            prefs: dict[str, object] = raw_prefs if isinstance(raw_prefs, dict) else {}
+            if raw_prefs and not isinstance(raw_prefs, dict):
+                log.warning(
+                    "identities.yaml: %s prefs is not a map, ignoring",
+                    canonical,
+                )
+
             # dm_channels: platform → mimir channel_id. Liberal-on-read —
             # a malformed map is dropped, not fatal.
             raw_dm = raw.get("dm_channels") or {}
@@ -363,6 +374,7 @@ class IdentityResolver:
                 aliases=aliases,
                 notes=notes,
                 access=access,
+                prefs=dict(prefs),
                 dm_channels=dm_channels,
             )
             if display_name:

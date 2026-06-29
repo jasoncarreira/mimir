@@ -606,6 +606,7 @@ export interface WhoamiData {
   roles: string[];
   is_admin: boolean;
   is_master: boolean;
+  prefs: Record<string, unknown>;
 }
 
 export interface AdminUser {
@@ -613,6 +614,7 @@ export interface AdminUser {
   display_name: string | null;
   roles: string[];
   is_admin: boolean;
+  prefs: Record<string, unknown>;
   has_web_key: boolean;
 }
 

@@ -43,7 +43,7 @@ import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
 import yaml
 
@@ -279,6 +279,54 @@ def revoke_web_key(home: Path, canonical: str) -> bool:
         log_event_sync("identity_web_key_revoked", canonical=canonical)
     except Exception:  # noqa: BLE001 — telemetry must never fail a key operation
         pass
+    return True
+
+
+@_serialized_identities_write
+def set_user_prefs(home: Path, canonical: str, prefs: Mapping[str, Any]) -> bool:
+    """Merge web/UI preferences into ``canonical``'s identities.yaml entry.
+
+    Existing aliases, roles, display fields, and unrelated prefs are preserved.
+    Returns True when the file changed. Unknown canonicals are not created here —
+    preference writes are tied to an authenticated existing identity.
+    """
+    key = (canonical or "").strip()
+    if not key or not isinstance(prefs, Mapping):
+        return False
+
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+    people = doc.get("people")
+    if not isinstance(people, list):
+        return False
+    entry = _find_person(people, key)
+    if entry is None:
+        return False
+
+    current = entry.get("prefs")
+    if not isinstance(current, dict):
+        current = {}
+    merged = dict(current)
+    changed = False
+    for pref_key, pref_value in prefs.items():
+        if not isinstance(pref_key, str) or not pref_key.strip():
+            continue
+        clean_key = pref_key.strip()
+        if pref_value is None:
+            if clean_key in merged:
+                merged.pop(clean_key, None)
+                changed = True
+        elif merged.get(clean_key) != pref_value:
+            merged[clean_key] = pref_value
+            changed = True
+
+    if not changed:
+        return False
+    if merged:
+        entry["prefs"] = merged
+    else:
+        entry.pop("prefs", None)
+    _atomic_write_identities(yaml_path, header, doc)
     return True
 
 
