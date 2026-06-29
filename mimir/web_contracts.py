@@ -803,6 +803,82 @@ export interface AdminUsersData {
   users: AdminUser[];
 }
 
+export type SkinTokenName =
+  | "colorText"
+  | "colorTextMuted"
+  | "colorBackground"
+  | "colorChromeBackground"
+  | "colorChromeBorder"
+  | "colorChromeAccent"
+  | "colorChromeAccentText"
+  | "colorPanelBackground"
+  | "colorPanelBackgroundMuted"
+  | "colorPanelBorder"
+  | "colorPanelBorderHover"
+  | "colorPanelShadow"
+  | "colorStatusInfo"
+  | "colorStatusInfoBackground"
+  | "colorStatusSuccess"
+  | "colorStatusSuccessBackground"
+  | "colorStatusWarning"
+  | "colorStatusWarningBackground"
+  | "colorStatusDanger"
+  | "colorStatusDangerBackground"
+  | "colorTimelineReasoning"
+  | "colorTimelineReasoningBackground"
+  | "colorTimelineToolCall"
+  | "colorTimelineToolCallBackground"
+  | "colorTimelineToolResult"
+  | "colorTimelineToolResultBackground"
+  | "colorCodeBackground"
+  | "colorCodeText"
+  | "colorFocusRing"
+  | "fontFamilyBase"
+  | "fontFamilyMono"
+  | "fontSizeXs"
+  | "fontSizeSm"
+  | "fontSizeMd"
+  | "fontSizeLg"
+  | "fontWeightRegular"
+  | "fontWeightStrong"
+  | "lineHeightTight"
+  | "lineHeightBody"
+  | "radiusPanel"
+  | "radiusControl"
+  | "space2xs"
+  | "spaceXs"
+  | "spaceSm"
+  | "spaceMd"
+  | "spaceLg"
+  | "spaceXl"
+  | "spaceShellInline"
+  | "spaceShellBlock"
+  | "elevationPanel"
+  | "elevationOverlay"
+  | "borderWidthHairline"
+  | "borderWidthChrome"
+  | "interactionHoverBackground"
+  | "interactionActiveBackground"
+  | "interactionDisabledOpacity"
+  | "motionDurationFast"
+  | "motionDurationNormal";
+
+export interface SkinManifestData {
+  id: string;
+  name: string;
+  version: string;
+  tokens: Partial<Record<SkinTokenName, string>>;
+  chrome: JsonObject;
+  panel: JsonObject;
+  characterRenderer: JsonObject;
+  fonts?: JsonObject[];
+}
+
+export interface WebSkinsData {
+  built_in_ids: string[];
+  operator: SkinManifestData[];
+}
+
 export interface IssueKeyData {
   canonical: string;
   key: string;
@@ -840,6 +916,8 @@ export interface WebBootstrapData {
     agent_name: string;
     skin: string;
   };
+  /** Available skins: built-in ids plus full operator-installed manifests. */
+  skins: WebSkinsData;
   dashboard_extensions: DashboardExtensionManifest[];
 }
 

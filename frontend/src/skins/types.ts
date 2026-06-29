@@ -1,6 +1,6 @@
 import type React from "react";
 
-export type SkinId = "default-retro" | "neon-terminal" | "cosmic-nebula";
+export type SkinId = string;
 
 export type CharacterRendererKind =
   | "static-image"
@@ -10,13 +10,7 @@ export type CharacterRendererKind =
   | "react-placeholder";
 
 export type AgentCharacterState =
-  | "idle"
-  | "thinking"
-  | "typing"
-  | "tool"
-  | "error"
-  | "bored"
-  | "listening";
+  "idle" | "thinking" | "typing" | "tool" | "error" | "bored" | "listening";
 
 export type SkinTokenName =
   | "colorText"
@@ -78,7 +72,7 @@ export type SkinTokenName =
   | "motionDurationFast"
   | "motionDurationNormal";
 
-export type SkinTokens = Record<SkinTokenName, string>;
+export type SkinTokens = Partial<Record<SkinTokenName, string>>;
 
 export interface SkinChromeMetadata {
   // Drives the app shell AppFrame renders: "top-nav" is a header strip over a
