@@ -940,6 +940,8 @@ async def list_schedules() -> str:
             }
             if name in poller_usage:
                 entry["usage"] = poller_usage[name].to_dict()
+            if p.get("budget") is not None:
+                entry["budget"] = p.get("budget")
             out.append(entry)
     # Empty only when there is NO scheduled work of either kind — checked after
     # pollers are appended so a poller-only deployment isn't reported as empty
@@ -1127,7 +1129,7 @@ async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> s
 
     Writes ``<home>/pollers-overrides.yaml`` through a narrow validated path.
     ``overrides`` may contain only poller override keys such as ``cron``,
-    ``priority``, ``batch_size``, ``env``, and ``pass_env``. Passing an empty
+    ``priority``, ``batch_size``, ``env``, ``pass_env``, and ``budget``. Passing an empty
     dict removes that poller's override entry. Call ``reload_pollers`` after a
     successful write to apply the new values to the running scheduler.
     """

@@ -85,6 +85,7 @@ from .event_logger import log_event, get_events_path
 from .models import AgentEvent
 from .redaction import redact_text
 from . import poller_recovery
+from .poller_budget import PollerBudgetConfig, parse_poller_budget_config
 
 log = logging.getLogger(__name__)
 
@@ -463,6 +464,10 @@ class PollerConfig:
     #: alert channel. Unset → today's silent behavior. Does NOT change the
     #: event's own ``channel_id`` (the poller keeps its per-poller queue).
     deliver: str | None = None
+    #: Optional per-poller budget caps parsed from ``pollers.json`` and/or
+    #: ``<home>/pollers-overrides.yaml``. Malformed budget config is ignored
+    #: fail-open so a tuning typo cannot drop the poller itself.
+    budget: PollerBudgetConfig | None = None
 
     def channel_id(self) -> str:
         """Synthetic channel for emitted events. Mirrors the
@@ -486,7 +491,7 @@ class PollerConfig:
 #: overrides shipped defaults at load time).
 POLLER_OVERRIDE_KEYS = frozenset(
     {"cron", "priority", "batch_size", "recover_failed_turns", "env", "pass_env",
-     "deliver"}
+     "deliver", "budget"}
 )
 
 #: Recognized string spellings for boolean overrides. YAML 1.1 already maps
@@ -699,6 +704,14 @@ def _apply_poller_overrides(
                 "string (channel id or OPERATOR_CHANNEL) or null; keeping %r",
                 source, poller.name, poller.deliver,
             )
+    if "budget" in overrides:
+        budget = parse_poller_budget_config(
+            overrides["budget"],
+            source=source,
+            poller_name=poller.name,
+        )
+        if budget is not None:
+            updates["budget"] = budget
     if not updates:
         return poller
     log.info(
@@ -984,6 +997,11 @@ def discover_pollers(
                         "(expected low|normal|high); using %r",
                         pollers_file, name, raw_priority, priority,
                     )
+            budget = parse_poller_budget_config(
+                entry.get("budget"),
+                source=pollers_file,
+                poller_name=name,
+            )
             seen_names[name] = pollers_file
             pollers.append(
                 PollerConfig(
@@ -1000,6 +1018,7 @@ def discover_pollers(
                     env_required=tuple(env_required_clean),
                     manifest_path=pollers_file,
                     deliver=deliver,
+                    budget=budget,
                 ),
             )
 

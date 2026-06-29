@@ -293,6 +293,7 @@ def _poller_rows(
                 "env_required": _redacted_env_names(poller.env_required),
                 "batch_size": poller.batch_size,
                 "recover_failed_turns": poller.recover_failed_turns,
+                "budget": poller.budget.to_dict() if poller.budget is not None else None,
             }),
             "recent_result": _event_detail(last_ok) if last_ok else None,
             "recent_error": _event_detail(recent_error) if recent_error else None,

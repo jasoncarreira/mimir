@@ -97,3 +97,70 @@ def test_aggregate_poller_turn_usage_distinguishes_none_from_zero_cost(tmp_path:
 
 def test_aggregate_poller_turn_usage_missing_log_is_empty(tmp_path: Path):
     assert aggregate_poller_turn_usage(tmp_path / "missing.jsonl") == {}
+
+
+def test_parse_poller_budget_config_accepts_window_caps(tmp_path: Path):
+    from mimir.poller_budget import parse_poller_budget_config
+
+    budget = parse_poller_budget_config(
+        {
+            "windows": {
+                "1h": {
+                    "max_agent_turns": 2,
+                    "max_agent_usd": "0.5",
+                    "max_api_calls": 30,
+                    "max_api_bytes": 2_000_000,
+                    "max_external_usd": 0.25,
+                },
+                "24h": {"max_agent_turns": 12},
+            },
+            "on_exceed": "suppress",
+        },
+        source=tmp_path / "pollers.json",
+        poller_name="github-activity",
+    )
+
+    assert budget is not None
+    assert budget.to_dict() == {
+        "on_exceed": "suppress",
+        "windows": {
+            "1h": {
+                "max_agent_turns": 2,
+                "max_agent_usd": 0.5,
+                "max_api_calls": 30,
+                "max_api_bytes": 2_000_000,
+                "max_external_usd": 0.25,
+            },
+            "24h": {"max_agent_turns": 12},
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        [],
+        {"windows": {}},
+        {"windows": {"1h": {}}},
+        {"windows": {"1h": {"max_agent_turns": -1}}},
+        {"windows": {"1h": {"max_agent_turns": True}}},
+        {"windows": {"1h": {"unknown": 1}}},
+        {"windows": {"1h": {"max_agent_usd": "NaN"}}},
+        {"windows": {"1h": {"max_agent_turns": 1}}, "on_exceed": "warn"},
+    ],
+)
+def test_parse_poller_budget_config_rejects_invalid_shapes_fail_open(
+    tmp_path: Path, raw: object, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+    from mimir.poller_budget import parse_poller_budget_config
+
+    with caplog.at_level(logging.WARNING, logger="mimir.poller_budget"):
+        budget = parse_poller_budget_config(
+            raw,
+            source=tmp_path / "pollers.json",
+            poller_name="github-activity",
+        )
+
+    assert budget is None
+    assert "poller_budget_invalid" in caplog.text
