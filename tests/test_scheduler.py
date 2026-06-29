@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -2980,16 +2981,23 @@ def test_minimax_poll_job_default_model_matches_poller_default():
 
 
 def _drop_priority_poller(
-    skills_dir: Path, name: str, priority: str, cron: str = "* * * * *",
+    skills_dir: Path,
+    name: str,
+    priority: str,
+    cron: str = "* * * * *",
+    budget: dict | None = None,
 ) -> Path:
-    """_drop_pollers_skill variant with an explicit priority field."""
+    """_drop_pollers_skill variant with explicit priority/budget fields."""
     skill = skills_dir / name
     skill.mkdir(parents=True, exist_ok=True)
+    poller = {
+        "name": name, "command": "true", "cron": cron,
+        "priority": priority,
+    }
+    if budget is not None:
+        poller["budget"] = budget
     (skill / "pollers.json").write_text(_json.dumps({
-        "pollers": [{
-            "name": name, "command": "true", "cron": cron,
-            "priority": priority,
-        }],
+        "pollers": [poller],
     }), encoding="utf-8")
     return skill
 
@@ -3114,6 +3122,149 @@ async def test_fire_poller_suppressed_skips_subprocess_and_emits(
     assert ev["priority"] == "normal"
     assert ev["severity"] == "TIGHT"
     assert "quota_off_pace" in ev["reason"]
+
+
+@pytest.mark.asyncio
+async def test_fire_poller_budget_suppressed_skips_subprocess_and_emits(
+    tmp_path: Path, monkeypatch,
+):
+    from mimir.event_logger import init_logger
+    init_logger(tmp_path / "logs" / "events.jsonl", session_id="test-session")
+
+    async def noop(_e):
+        return True
+
+    arbiter = _StubArbiter(fire=True)
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml",
+        enqueue=noop,
+        arbiter=arbiter,
+        home=tmp_path,
+    )
+    skills = tmp_path / "skills"
+    _drop_priority_poller(
+        skills,
+        "p1",
+        priority="normal",
+        budget={"windows": {"1h": {"max_agent_turns": 1}}},
+    )
+    sched.add_poller_jobs(skills)
+    (tmp_path / "logs" / "turns.jsonl").write_text(_json.dumps({
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
+        "channel_id": "poller:p1",
+        "total_cost_usd": 0.01,
+    }) + "\n", encoding="utf-8")
+
+    ran: list[str] = []
+
+    async def fake_run_poller(poller, enqueue, home=None):
+        ran.append(poller.name)
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    await sched._fire_poller(poller_name="p1")
+
+    assert ran == []
+    assert arbiter.consulted_priorities == ["normal"]
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    [ev] = [e for e in events if e["type"] == "poller_budget_suppressed"]
+    assert ev["poller"] == "p1"
+    assert ev["window"] == "1h"
+    assert ev["metric"] == "agent_turns"
+    assert ev["used"] == 1.0
+    assert ev["limit"] == 1
+    assert "poller_budget_exceeded:1h:agent_turns" in ev["reason"]
+
+
+@pytest.mark.asyncio
+async def test_fire_poller_budget_under_limit_still_runs(tmp_path: Path, monkeypatch):
+    from mimir.event_logger import init_logger
+    init_logger(tmp_path / "logs" / "events.jsonl", session_id="test-session")
+
+    async def noop(_e):
+        return True
+
+    arbiter = _StubArbiter(fire=True)
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml",
+        enqueue=noop,
+        arbiter=arbiter,
+        home=tmp_path,
+    )
+    skills = tmp_path / "skills"
+    _drop_priority_poller(
+        skills,
+        "p1",
+        priority="normal",
+        budget={"windows": {"1h": {"max_agent_turns": 2}}},
+    )
+    sched.add_poller_jobs(skills)
+    (tmp_path / "logs" / "turns.jsonl").write_text(_json.dumps({
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
+        "channel_id": "poller:p1",
+        "total_cost_usd": 0.01,
+    }) + "\n", encoding="utf-8")
+
+    ran: list[str] = []
+
+    async def fake_run_poller(poller, enqueue, home=None):
+        ran.append(poller.name)
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    await sched._fire_poller(poller_name="p1")
+
+    assert ran == ["p1"]
+    assert arbiter.consulted_priorities == ["normal", "normal"]
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    assert not [e for e in events if e["type"] == "poller_budget_suppressed"]
+
+
+@pytest.mark.asyncio
+async def test_fire_poller_budget_suppresses_on_external_usage(
+    tmp_path: Path, monkeypatch,
+):
+    from mimir.event_logger import init_logger, log_event
+    init_logger(tmp_path / "logs" / "events.jsonl", session_id="test-session")
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml",
+        enqueue=noop,
+        arbiter=_StubArbiter(fire=True),
+        home=tmp_path,
+    )
+    skills = tmp_path / "skills"
+    _drop_priority_poller(
+        skills,
+        "p1",
+        priority="normal",
+        budget={"windows": {"1h": {"max_api_calls": 4}}},
+    )
+    sched.add_poller_jobs(skills)
+    (tmp_path / "logs" / "turns.jsonl").write_text("", encoding="utf-8")
+    await log_event(
+        "poller_usage",
+        poller="p1",
+        api_calls=4,
+        api_bytes=1000,
+        estimated_cost_usd=0.01,
+    )
+
+    ran: list[str] = []
+
+    async def fake_run_poller(poller, enqueue, home=None):
+        ran.append(poller.name)
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    await sched._fire_poller(poller_name="p1")
+
+    assert ran == []
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    [ev] = [e for e in events if e["type"] == "poller_budget_suppressed"]
+    assert ev["metric"] == "api_calls"
+    assert ev["used"] == 4.0
+    assert ev["limit"] == 4
 
 
 @pytest.mark.asyncio

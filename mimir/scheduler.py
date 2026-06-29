@@ -46,12 +46,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .billing import normalize_priority
 from .core_blocks import read_text_lossy
-from .event_logger import log_event
+from .event_logger import get_events_path, log_event
 from ._context import active_turn_snapshots
 from .loop_watchdog import LoopStallWatchdog, stack_is_idle
 from .quota_windows import provider_store_keys
 from .models import AgentEvent
 from .pollers import POLLER_CHANNEL_PREFIX, PollerConfig, discover_pollers, run_poller
+from .poller_budget import aggregate_poller_turn_usage
 from .saga_client import SagaClient, SagaError
 
 log = logging.getLogger(__name__)
@@ -1743,6 +1744,64 @@ class Scheduler:
                 name="scheduler-poller-reload-event",
             )
 
+
+    def _poller_budget_exceeded(
+        self, poller: PollerConfig, *, now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Return suppression payload when ``poller`` is over budget.
+
+        Budget checks are fail-open: missing home, missing logs, unknown windows,
+        or unavailable cost samples do not suppress. Caps are inclusive: a poller
+        at its configured limit is suppressed before it can exceed it.
+        """
+        if poller.budget is None or self._home is None:
+            return None
+        try:
+            usage = aggregate_poller_turn_usage(
+                self._home / "logs" / "turns.jsonl",
+                events_path=get_events_path(),
+                now=now,
+            ).get(poller.name)
+        except Exception as exc:  # noqa: BLE001 - fail-open on accounting issues
+            log.warning("poller budget check failed for %s: %s", poller.name, exc)
+            return None
+        if usage is None:
+            return None
+
+        cap_fields = (
+            ("max_agent_turns", "agent_turns"),
+            ("max_agent_usd", "total_cost_usd"),
+            ("max_api_calls", "api_calls"),
+            ("max_api_bytes", "api_bytes"),
+            ("max_external_usd", "estimated_external_cost_usd"),
+        )
+        for window_label, budget_window in sorted(poller.budget.windows.items()):
+            usage_window = usage.windows.get(window_label)
+            if usage_window is None:
+                continue
+            for cap_field, usage_field in cap_fields:
+                limit = getattr(budget_window, cap_field)
+                if limit is None:
+                    continue
+                used = getattr(usage_window, usage_field)
+                if used is None:
+                    continue
+                if used >= limit:
+                    metric = usage_field
+                    reason = (
+                        f"poller_budget_exceeded:{window_label}:{metric} "
+                        f"used={used} limit={limit}"
+                    )
+                    return {
+                        "poller": poller.name,
+                        "window": window_label,
+                        "metric": metric,
+                        "used": round(float(used), 6),
+                        "limit": limit,
+                        "reason": reason,
+                    }
+        return None
+
     async def _fire_poller(self, *, poller_name: str) -> None:
         """APScheduler-side cron callback. Looks up the live PollerConfig
         (re-fetched on each fire to reflect any reloads) and runs it
@@ -1797,6 +1856,11 @@ class Scheduler:
             )
             return
 
+        budget_exceeded = self._poller_budget_exceeded(poller)
+        if budget_exceeded is not None:
+            await log_event("poller_budget_suppressed", **budget_exceeded)
+            return
+
         # Acquire under a 5s timeout; emit the throttle event once if
         # we time out, then re-acquire without a timeout. Single
         # ``wait_for`` instead of locked()-probe-then-acquire avoids
@@ -1838,6 +1902,11 @@ class Scheduler:
                         if recheck.burst_multiple is not None else {}
                     ),
                 )
+                return
+            budget_exceeded = self._poller_budget_exceeded(poller)
+            if budget_exceeded is not None:
+                budget_exceeded["stage"] = "post_acquire"
+                await log_event("poller_budget_suppressed", **budget_exceeded)
                 return
             await run_poller(poller, enqueue=self._enqueue, home=self._home)
         finally:
