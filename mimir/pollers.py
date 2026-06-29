@@ -83,6 +83,7 @@ from typing import Any, Awaitable, Callable
 from .billing import normalize_priority
 from .event_logger import log_event, get_events_path
 from .models import AgentEvent
+from .poller_budget import validate_poller_usage_signal
 from .redaction import redact_text
 from . import poller_recovery
 
@@ -1549,15 +1550,35 @@ async def run_poller(
         #                     silently. Mimir PR #235 nit.
         signal_type = parsed.get("signal")
         if isinstance(signal_type, str) and signal_type.strip():
-            payload = {
-                k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
-                if isinstance(v, str) else v
-                for k, v in parsed.items()
-                if k not in ("signal", "poller", "prompt", "event_type")
-            }
+            signal_name = signal_type.strip()
+            if signal_name == "poller_usage":
+                payload, invalid_reason = validate_poller_usage_signal(
+                    parsed,
+                    poller_name=poller.name,
+                )
+                if payload is None:
+                    await log_event(
+                        "poller_invalid_usage_signal",
+                        poller=poller.name,
+                        reason=invalid_reason or "invalid_usage_signal",
+                    )
+                    signals_emitted += 1
+                    continue
+                payload = {
+                    k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
+                    if isinstance(v, str) else v
+                    for k, v in payload.items()
+                }
+            else:
+                payload = {
+                    k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
+                    if isinstance(v, str) else v
+                    for k, v in parsed.items()
+                    if k not in ("signal", "poller", "prompt", "event_type")
+                }
             try:
                 await log_event(
-                    signal_type.strip(),
+                    signal_name,
                     poller=poller.name,
                     **payload,
                 )

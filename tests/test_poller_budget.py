@@ -6,7 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from mimir.poller_budget import aggregate_poller_turn_usage
+from mimir.poller_budget import (
+    aggregate_poller_turn_usage,
+    validate_poller_usage_signal,
+)
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -97,3 +100,56 @@ def test_aggregate_poller_turn_usage_distinguishes_none_from_zero_cost(tmp_path:
 
 def test_aggregate_poller_turn_usage_missing_log_is_empty(tmp_path: Path):
     assert aggregate_poller_turn_usage(tmp_path / "missing.jsonl") == {}
+
+
+def test_validate_poller_usage_signal_accepts_and_defaults_metrics():
+    payload, reason = validate_poller_usage_signal(
+        {
+            "poller": "github-activity",
+            "signal": "poller_usage",
+            "api_calls": "4",
+            "api_bytes": 183242,
+            "estimated_cost_usd": 0.0,
+            "source": "github-rest",
+        },
+        poller_name="github-activity",
+    )
+
+    assert reason is None
+    assert payload == {
+        "api_calls": 4,
+        "api_bytes": 183242,
+        "estimated_cost_usd": 0.0,
+        "source": "github-rest",
+    }
+
+    payload, reason = validate_poller_usage_signal(
+        {"poller": "github-activity", "signal": "poller_usage"},
+        poller_name="github-activity",
+    )
+    assert reason is None
+    assert payload == {"api_calls": 0, "api_bytes": 0, "estimated_cost_usd": 0}
+
+
+def test_validate_poller_usage_signal_rejects_mismatch_and_bad_metrics():
+    payload, reason = validate_poller_usage_signal(
+        {"poller": "other", "signal": "poller_usage", "api_calls": 1},
+        poller_name="github-activity",
+    )
+    assert payload is None
+    assert reason == "poller_mismatch"
+
+    for metric in ("api_calls", "api_bytes", "estimated_cost_usd"):
+        payload, reason = validate_poller_usage_signal(
+            {"poller": "github-activity", "signal": "poller_usage", metric: -1},
+            poller_name="github-activity",
+        )
+        assert payload is None
+        assert reason == f"invalid_{metric}"
+
+    payload, reason = validate_poller_usage_signal(
+        {"poller": "github-activity", "signal": "poller_usage", "api_calls": True},
+        poller_name="github-activity",
+    )
+    assert payload is None
+    assert reason == "invalid_api_calls"
