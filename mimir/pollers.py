@@ -349,6 +349,20 @@ def _cb_record_success(name: str) -> None:
         state.disabled_until = 0.0
 
 
+def forget_circuit_breakers_except(active_names: set[str]) -> None:
+    """Drop circuit-breaker state for pollers no longer registered.
+
+    The circuit-breaker map is intentionally module-level so a still-installed
+    poller that trips remains suppressed across ``reload_pollers``. A poller
+    that has been removed or renamed, however, no longer has a future success
+    path to reset its state; pruning it during scheduler reload prevents stale
+    keys from accumulating for the lifetime of the process.
+    """
+    for name in list(_circuit_breakers):
+        if name not in active_names:
+            del _circuit_breakers[name]
+
+
 @dataclass
 class PollerConfig:
     """One poller declared in a skill's ``pollers.json``.

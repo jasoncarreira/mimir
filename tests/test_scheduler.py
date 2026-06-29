@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from mimir.event_logger import init_logger
+from mimir.pollers import _CircuitBreakerState, _circuit_breakers
 from mimir.models import AgentEvent
 from mimir.scheduler import (
     Scheduler,
@@ -3079,6 +3080,27 @@ async def test_worklink_reaper_job_silent_when_nothing_reaped(
 
     events = _read_event_types(tmp_path / "logs" / "events.jsonl")
     assert not [e for e in events if e["type"] == "worklink_claims_reaped"]
+
+
+def test_poller_reload_prunes_circuit_breakers_for_removed_pollers(tmp_path: Path):
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    skills = tmp_path / "skills"
+    _drop_priority_poller(skills, "kept", priority="normal")
+    _drop_priority_poller(skills, "removed", priority="normal")
+    sched.add_poller_jobs(skills)
+
+    _circuit_breakers["kept"] = _CircuitBreakerState(consecutive_failures=2)
+    _circuit_breakers["removed"] = _CircuitBreakerState(consecutive_failures=2)
+
+    # Simulate operator/skill update removing one poller from its manifest.
+    (skills / "removed" / "pollers.json").unlink()
+    sched.add_poller_jobs(skills)
+
+    assert "kept" in _circuit_breakers
+    assert "removed" not in _circuit_breakers
 
 
 @pytest.mark.asyncio
