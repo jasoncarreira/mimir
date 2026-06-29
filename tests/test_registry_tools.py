@@ -1406,6 +1406,56 @@ class TestSendMessageSkiplistGuard:
         assert bridge.send_calls == []
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("trigger", "message", "matched_phrase"),
+        [
+            (
+                "poller",
+                '[skip] Nextdoor digest: "Unfortunately, there is no news about Oliver." - automated neighborhood email, not actionable.',
+                "[skip]",
+            ),
+            (
+                "scheduled_tick",
+                "[ SKIPPED ] DLCC state-Democrats activation email from staff@dlcc.org - mass political fundraising outreach, not actionable, not in notify list. Filtered.",
+                "[skipped]",
+            ),
+            (
+                "poller",
+                "   [ SkIp ] long autonomous narration that exceeds the short-message word gate and should still be blocked",
+                "[skip]",
+            ),
+        ],
+    )
+    async def test_autonomous_leading_skip_marker_is_rejected_and_logged(
+        self, tmp_path, trigger: str, message: str, matched_phrase: str,
+    ) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        _ctx, tok, reset = self._turn_ctx(trigger)
+        try:
+            out = await send_message.ainvoke({
+                "text": message,
+                "channel_id": "operator",
+            })
+        finally:
+            reset(tok)
+
+        assert "send_message rejected" in out
+        assert "end the turn with no message" in out
+        assert bridge.send_calls == []
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        ]
+        [ev] = [e for e in events if e["type"] == "send_message_blocked_skiplist"]
+        assert ev["channel_id"] == "operator"
+        assert ev["trigger"] == trigger
+        assert ev["matched_phrase"] == matched_phrase
+
+    @pytest.mark.asyncio
     async def test_poller_escalation_containing_stop_phrase_sends(self) -> None:
         bridge = _StubBridge()
         set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
@@ -1433,7 +1483,7 @@ class TestSendMessageSkiplistGuard:
         _ctx, tok, reset = self._turn_ctx("user_message")
         try:
             out = await send_message.ainvoke({
-                "text": "You can skip that step if needed.",
+                "text": "[skip] You can skip that step if needed.",
                 "channel_id": "chan-1",
             })
         finally:
@@ -1441,7 +1491,7 @@ class TestSendMessageSkiplistGuard:
 
         assert "send_message ok" in out
         assert bridge.send_calls == [
-            {"cid": "chan-1", "text": "You can skip that step if needed."},
+            {"cid": "chan-1", "text": "[skip] You can skip that step if needed."},
         ]
 
     @pytest.mark.asyncio
@@ -1473,6 +1523,8 @@ class TestSendMessageSkiplistGuard:
             "The filtered alert queue still has 2 P1s awaiting triage.",
             "Reminder: no operator alert is configured for the prod DB pager.",
             "The poller found 3 failed jobs; skip bucket cleanup can wait.",
+            "FYI [skip] appears in the middle of this escalation.",
+            "decisions_made=[skip digest item, notify operator about outage]",
         ],
     )
     async def test_poller_escalation_with_ambiguous_or_embedded_phrase_sends(
