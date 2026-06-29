@@ -657,6 +657,84 @@ print(json.dumps({
     assert "poller" not in item
 
 
+@pytest.mark.asyncio
+async def test_run_poller_accepts_usage_signal_without_agent_event(
+    tmp_path: Path, home: Path,
+) -> None:
+    """``poller_usage`` is telemetry only: it lands in events.jsonl and must
+    not enqueue a poller turn."""
+
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({
+    "poller": "x",
+    "signal": "poller_usage",
+    "api_calls": 4,
+    "api_bytes": 12345,
+    "estimated_cost_usd": 0.01,
+    "source": "example-api",
+}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+
+    assert n == 0
+    assert enq.events == []
+    events = _read_events(home)
+    usage = [e for e in events if e["type"] == "poller_usage"]
+    assert len(usage) == 1
+    assert usage[0]["poller"] == "x"
+    assert usage[0]["api_calls"] == 4
+    assert usage[0]["api_bytes"] == 12345
+    assert usage[0]["estimated_cost_usd"] == 0.01
+    assert usage[0]["source"] == "example-api"
+    complete = [e for e in events if e["type"] == "poller_complete"][-1]
+    assert complete["signals_emitted"] == 1
+    assert complete["events_emitted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_poller_invalid_usage_signal_logs_diagnostic_only(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({
+    "poller": "other",
+    "signal": "poller_usage",
+    "api_calls": 1,
+}))
+print(json.dumps({
+    "poller": "x",
+    "signal": "poller_usage",
+    "api_calls": -1,
+}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    n = await run_poller(cfg, enqueue=enq)
+
+    assert n == 0
+    assert enq.events == []
+    events = _read_events(home)
+    assert [e["type"] for e in events if "usage_signal" in e["type"]] == [
+        "poller_invalid_usage_signal",
+        "poller_invalid_usage_signal",
+    ]
+    invalid = [e for e in events if e["type"] == "poller_invalid_usage_signal"]
+    assert [e["reason"] for e in invalid] == ["poller_mismatch", "invalid_api_calls"]
+    assert not [e for e in events if e["type"] == "poller_usage"]
+
+
 # ─── poller_recovery framework wiring (chainlink #314) ────────────────
 
 
