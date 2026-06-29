@@ -2853,13 +2853,15 @@ class Scheduler:
                 # chainlink #682: tell a real on-loop stall apart from the process
                 # being descheduled (Docker-Desktop / VM scheduling hiccups, which
                 # dominate the count but aren't a mimir hot path). It's an on-loop
-                # block if either the watchdog caught a non-idle frame (covers a
-                # sync-I/O block that burns no CPU) OR the loop thread spent a
-                # meaningful share of the lag on CPU. Otherwise the loop was merely
-                # parked/idle while the host failed to schedule us.
-                non_idle_stack = any(
-                    not stack_is_idle(s.get("stack", "")) for s in blocking_stacks
+                # block if either non-idle watchdog captures dominate the full
+                # drained sample set (covers a sync-I/O block that burns no CPU)
+                # OR the loop thread spent a meaningful share of the lag on CPU.
+                # Otherwise the loop was mostly parked/idle while the host failed
+                # to schedule us.
+                non_idle_stack_count = sum(
+                    1 for s in blocking_stacks if not stack_is_idle(s.get("stack", ""))
                 )
+                non_idle_stack = non_idle_stack_count > len(blocking_stacks) / 2
                 cpu_bound = loop_cpu_s >= _LOOP_LAG_CPU_RATIO * lag_s
                 on_loop = non_idle_stack or cpu_bound
                 cause = "on_loop" if on_loop else "host_scheduling"
