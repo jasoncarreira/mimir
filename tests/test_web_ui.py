@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -21,6 +22,8 @@ from mimir.chainlink_board import build_chainlink_board_payload
 from mimir import web_ui
 from mimir.commitments.models import CommitmentRecord
 from mimir.commitments.store import CommitmentsStore
+from mimir.identities import IdentityResolver
+from mimir.identities_populator import issue_web_key
 from mimir.pollers import PollerConfig
 from mimir.scheduler import Scheduler, SchedulerJob
 from mimir.web_contracts import (
@@ -45,6 +48,14 @@ def test_generated_typescript_contracts_are_current():
         encoding="utf-8"
     )
     assert generated == render_typescript_contracts()
+
+
+def test_server_builtin_skin_ids_match_frontend_registry():
+    source = Path("frontend/src/skins/SkinProvider.tsx").read_text(encoding="utf-8")
+    match = re.search(r"export const localSkins = \{(?P<body>.*?)\n\}", source, re.S)
+    assert match is not None
+    frontend_ids = set(re.findall(r'"([^"]+)":\s+\w+Skin', match.group("body")))
+    assert frontend_ids == set(web_ui.BUILT_IN_WEB_SKIN_IDS)
 
 
 def test_global_dashboard_extensions_are_admin_only_in_nav_payload():
@@ -1078,11 +1089,204 @@ def test_ensure_web_ui_config_seeds_defaults_without_clobbering(tmp_path: Path):
         "skin": "neon-terminal",
     }
     # Existing -> left untouched (agent edits survive restarts).
-    path.write_text(json.dumps({"agent_name": "Nebula-9", "skin": "cosmic-nebula"}), encoding="utf-8")
+    path.write_text(
+        json.dumps({"agent_name": "Nebula-9", "skin": "cosmic-nebula"}),
+        encoding="utf-8",
+    )
     web_ui.ensure_web_ui_config(tmp_path)
     assert json.loads(path.read_text(encoding="utf-8"))["agent_name"] == "Nebula-9"
     # No home is a no-op (doesn't raise).
     web_ui.ensure_web_ui_config(None)
+
+
+def _operator_skin_manifest(skin_id: str = "operator-mint") -> dict:
+    return {
+        "id": skin_id,
+        "name": "Operator Mint",
+        "version": "1.0.0",
+        "tokens": {
+            "colorText": "#eefbf3",
+            "colorBackground": "#06120d",
+            "fontFamilyBase": "system-ui, sans-serif",
+        },
+        "chrome": {
+            "layout": "top-nav",
+            "density": "compact",
+            "accentPlacement": "top-rule",
+        },
+        "panel": {
+            "surface": "flat",
+            "borderStyle": "solid",
+            "hoverBehavior": "border-accent",
+        },
+        "characterRenderer": {
+            "kind": "react-placeholder",
+            "componentSlot": "agent-character",
+            "variant": "operator",
+            "assets": [],
+            "stateMap": {},
+            "fallbackState": "idle",
+            "capabilities": {
+                "supportsExpressions": False,
+                "supportsMotion": False,
+            },
+        },
+    }
+
+
+def test_operator_skin_discovery_validates_and_skips_bad_files(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    skins = tmp_path / "skins"
+    skins.mkdir()
+    (skins / "valid.json").write_text(
+        json.dumps(_operator_skin_manifest("operator-mint")),
+        encoding="utf-8",
+    )
+    (skins / "malformed.json").write_text("{ not json", encoding="utf-8")
+    (skins / "missing.json").write_text(
+        json.dumps({"id": "missing-fields"}),
+        encoding="utf-8",
+    )
+    font_manifest = _operator_skin_manifest("operator-fonts")
+    font_manifest["fonts"] = [
+        {
+            "family": "Operator Sans",
+            "src": [{"url": "/skins/operator/operator.woff2", "format": "woff2"}],
+            "weight": "400 700",
+            "style": "normal",
+            "display": "swap",
+            "unicodeRange": "U+000-5FF",
+        }
+    ]
+    (skins / "fonts.json").write_text(
+        json.dumps(font_manifest),
+        encoding="utf-8",
+    )
+    (skins / "collide.json").write_text(
+        json.dumps(_operator_skin_manifest("neon-terminal")),
+        encoding="utf-8",
+    )
+    (skins / "dupe.json").write_text(
+        json.dumps(_operator_skin_manifest("operator-mint")),
+        encoding="utf-8",
+    )
+    forbidden = _operator_skin_manifest("operator-bad-token")
+    forbidden["tokens"]["backgroundImage"] = "url(javascript:alert(1))"
+    (skins / "forbidden-token.json").write_text(
+        json.dumps(forbidden), encoding="utf-8"
+    )
+    bad_font = _operator_skin_manifest("operator-bad-font")
+    bad_font["fonts"] = [{"family": "Operator Sans", "src": [{"url": 42}]}]
+    (skins / "bad-font.json").write_text(json.dumps(bad_font), encoding="utf-8")
+
+    manifests = web_ui.read_operator_skin_manifests(tmp_path)
+
+    assert sorted(manifest["id"] for manifest in manifests) == [
+        "operator-fonts",
+        "operator-mint",
+    ]
+    assert "skipping operator skin" in caplog.text
+
+
+def test_operator_skin_missing_directory_is_empty(tmp_path: Path):
+    assert web_ui.read_operator_skin_manifests(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_exposes_operator_skins(tmp_path: Path):
+    home = tmp_path / "home"
+    skins = home / "skins"
+    skins.mkdir(parents=True)
+    (skins / "operator-mint.json").write_text(
+        json.dumps(_operator_skin_manifest("operator-mint")),
+        encoding="utf-8",
+    )
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/web/bootstrap")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert set(body["data"]["skins"]["built_in_ids"]) == set(
+        web_ui.BUILT_IN_WEB_SKIN_IDS
+    )
+    assert [skin["id"] for skin in body["data"]["skins"]["operator"]] == [
+        "operator-mint"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_user_prefs_skin_validation_accepts_builtin_operator_and_null(
+    tmp_path: Path,
+):
+    home = tmp_path / "home"
+    skins = home / "skins"
+    skins.mkdir(parents=True)
+    (skins / "operator-mint.json").write_text(
+        json.dumps(_operator_skin_manifest("operator-mint")),
+        encoding="utf-8",
+    )
+    issue_web_key(home, "alice", roles=["user"])
+    resolver = IdentityResolver(home)
+    resolver.reload()
+    identity = resolver.identity("alice")
+    assert identity is not None
+
+    @web.middleware
+    async def identity_middleware(request: web.Request, handler):
+        request["auth_identity"] = identity
+        request["auth_is_master"] = False
+        return await handler(request)
+
+    a = web.Application(middlewares=[identity_middleware])
+    a["identity_resolver"] = resolver
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        built_in = await client.post(
+            "/api/v1/user/prefs",
+            json={"prefs": {"skin": "neon-terminal"}},
+        )
+        operator = await client.post(
+            "/api/v1/user/prefs",
+            json={"prefs": {"skin": "operator-mint"}},
+        )
+        unknown = await client.post(
+            "/api/v1/user/prefs",
+            json={"prefs": {"skin": "missing-skin"}},
+        )
+        cleared = await client.post(
+            "/api/v1/user/prefs",
+            json={"prefs": {"skin": None}},
+        )
+        unknown_body = await unknown.json()
+        cleared_body = await cleared.json()
+
+    assert built_in.status == 200
+    assert operator.status == 200
+    assert unknown.status == 400
+    validate_api_envelope(unknown_body, expect_ok=False)
+    assert unknown_body["error"]["message"] == "unknown skin 'missing-skin'"
+    assert cleared.status == 200
+    validate_api_envelope(cleared_body, expect_ok=True)
+    assert cleared_body["data"]["prefs"].get("skin") is None
 
 
 @pytest.mark.asyncio

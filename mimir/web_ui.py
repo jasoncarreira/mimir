@@ -104,6 +104,70 @@ _WEB_AUTH_JS: str | None = None
 WEB_UI_CONFIG_RELPATH = ("state", "web_ui.json")
 DEFAULT_AGENT_NAME = "Mimir"
 DEFAULT_WEB_SKIN = "neon-terminal"
+BUILT_IN_WEB_SKIN_IDS = frozenset({"default-retro", "neon-terminal", "cosmic-nebula"})
+OPERATOR_SKINS_RELPATH = ("skins",)
+SKIN_TOKEN_NAMES = frozenset(
+    {
+        "colorText",
+        "colorTextMuted",
+        "colorBackground",
+        "colorChromeBackground",
+        "colorChromeBorder",
+        "colorChromeAccent",
+        "colorChromeAccentText",
+        "colorPanelBackground",
+        "colorPanelBackgroundMuted",
+        "colorPanelBorder",
+        "colorPanelBorderHover",
+        "colorPanelShadow",
+        "colorStatusInfo",
+        "colorStatusInfoBackground",
+        "colorStatusSuccess",
+        "colorStatusSuccessBackground",
+        "colorStatusWarning",
+        "colorStatusWarningBackground",
+        "colorStatusDanger",
+        "colorStatusDangerBackground",
+        "colorTimelineReasoning",
+        "colorTimelineReasoningBackground",
+        "colorTimelineToolCall",
+        "colorTimelineToolCallBackground",
+        "colorTimelineToolResult",
+        "colorTimelineToolResultBackground",
+        "colorCodeBackground",
+        "colorCodeText",
+        "colorFocusRing",
+        "fontFamilyBase",
+        "fontFamilyMono",
+        "fontSizeXs",
+        "fontSizeSm",
+        "fontSizeMd",
+        "fontSizeLg",
+        "fontWeightRegular",
+        "fontWeightStrong",
+        "lineHeightTight",
+        "lineHeightBody",
+        "radiusPanel",
+        "radiusControl",
+        "space2xs",
+        "spaceXs",
+        "spaceSm",
+        "spaceMd",
+        "spaceLg",
+        "spaceXl",
+        "spaceShellInline",
+        "spaceShellBlock",
+        "elevationPanel",
+        "elevationOverlay",
+        "borderWidthHairline",
+        "borderWidthChrome",
+        "interactionHoverBackground",
+        "interactionActiveBackground",
+        "interactionDisabledOpacity",
+        "motionDurationFast",
+        "motionDurationNormal",
+    }
+)
 LIVE_EVENTS_HEARTBEAT_S = 15.0
 LIVE_EVENTS_POLL_S = 1.0
 LIVE_EVENTS_MAX_STREAMS = int(os.environ.get("MIMIR_LIVE_EVENTS_MAX_STREAMS", "8"))
@@ -215,7 +279,9 @@ def read_web_ui_config(home: Path | None) -> dict[str, str]:
     skin = DEFAULT_WEB_SKIN
     if home is not None:
         try:
-            raw = json.loads((home.joinpath(*WEB_UI_CONFIG_RELPATH)).read_text(encoding="utf-8"))
+            raw = json.loads(
+                (home.joinpath(*WEB_UI_CONFIG_RELPATH)).read_text(encoding="utf-8")
+            )
         except (OSError, ValueError):
             raw = None
         if isinstance(raw, dict):
@@ -226,6 +292,199 @@ def read_web_ui_config(home: Path | None) -> dict[str, str]:
             if isinstance(configured_skin, str) and configured_skin.strip():
                 skin = configured_skin.strip()
     return {"agent_name": agent_name, "skin": skin}
+
+
+def _validate_operator_skin_manifest(
+    path: Path,
+    raw: Any,
+    seen_ids: set[str],
+) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        log.warning("skipping operator skin %s: manifest must be a json object", path)
+        return None
+    required = {
+        "id",
+        "name",
+        "version",
+        "tokens",
+        "chrome",
+        "panel",
+        "characterRenderer",
+    }
+    missing = sorted(required - raw.keys())
+    if missing:
+        log.warning(
+            "skipping operator skin %s: missing required fields %s", path, missing
+        )
+        return None
+    skin_id = raw.get("id")
+    if not isinstance(skin_id, str) or not skin_id.strip():
+        log.warning("skipping operator skin %s: id must be a non-empty string", path)
+        return None
+    skin_id = skin_id.strip()
+    if skin_id in BUILT_IN_WEB_SKIN_IDS:
+        log.warning(
+            "skipping operator skin %s: id %r collides with a built-in skin",
+            path,
+            skin_id,
+        )
+        return None
+    if skin_id in seen_ids:
+        log.warning("skipping operator skin %s: duplicate skin id %r", path, skin_id)
+        return None
+    for field in ("name", "version"):
+        if not isinstance(raw.get(field), str) or not raw[field].strip():
+            log.warning(
+                "skipping operator skin %s: %s must be a non-empty string",
+                path,
+                field,
+            )
+            return None
+    tokens = raw.get("tokens")
+    if not isinstance(tokens, dict) or not tokens:
+        log.warning("skipping operator skin %s: tokens must be a non-empty object", path)
+        return None
+    unknown_tokens = sorted(
+        str(key) for key in tokens.keys() if key not in SKIN_TOKEN_NAMES
+    )
+    if unknown_tokens:
+        log.warning(
+            "skipping operator skin %s: unknown token keys %s", path, unknown_tokens
+        )
+        return None
+    non_string_tokens = sorted(
+        str(key)
+        for key, value in tokens.items()
+        if not isinstance(key, str) or not isinstance(value, str)
+    )
+    if non_string_tokens:
+        log.warning("skipping operator skin %s: token values must be strings", path)
+        return None
+    for field in ("chrome", "panel", "characterRenderer"):
+        if not isinstance(raw.get(field), dict):
+            log.warning("skipping operator skin %s: %s must be an object", path, field)
+            return None
+    fonts = raw.get("fonts")
+    if fonts is not None:
+        if not isinstance(fonts, list):
+            log.warning(
+                "skipping operator skin %s: fonts must be an array when present", path
+            )
+            return None
+        for index, font in enumerate(fonts):
+            if not isinstance(font, dict):
+                log.warning(
+                    "skipping operator skin %s: fonts[%s] must be an object",
+                    path,
+                    index,
+                )
+                return None
+            family = font.get("family")
+            if not isinstance(family, str) or not family.strip():
+                log.warning(
+                    "skipping operator skin %s: fonts[%s].family must be a non-empty string",
+                    path,
+                    index,
+                )
+                return None
+            src = font.get("src")
+            if not isinstance(src, list) or not src:
+                log.warning(
+                    "skipping operator skin %s: fonts[%s].src must be a non-empty array",
+                    path,
+                    index,
+                )
+                return None
+            for src_index, source in enumerate(src):
+                if not isinstance(source, dict):
+                    log.warning(
+                        "skipping operator skin %s: fonts[%s].src[%s] must be an object",
+                        path,
+                        index,
+                        src_index,
+                    )
+                    return None
+                url = source.get("url")
+                fmt = source.get("format")
+                if not isinstance(url, str) or not url.strip():
+                    log.warning(
+                        "skipping operator skin %s: fonts[%s].src[%s].url must be a non-empty string",
+                        path,
+                        index,
+                        src_index,
+                    )
+                    return None
+                if fmt not in {"woff2", "woff", "truetype"}:
+                    log.warning(
+                        "skipping operator skin %s: fonts[%s].src[%s].format is unsupported",
+                        path,
+                        index,
+                        src_index,
+                    )
+                    return None
+            weight = font.get("weight")
+            if weight is not None and not isinstance(weight, (int, str)):
+                log.warning(
+                    "skipping operator skin %s: fonts[%s].weight must be a string or integer",
+                    path,
+                    index,
+                )
+                return None
+            for field in ("style", "display", "unicodeRange"):
+                value = font.get(field)
+                if value is not None and not isinstance(value, str):
+                    log.warning(
+                        "skipping operator skin %s: fonts[%s].%s must be a string",
+                        path,
+                        index,
+                        field,
+                    )
+                    return None
+    manifest = dict(raw)
+    manifest["id"] = skin_id
+    seen_ids.add(skin_id)
+    return manifest
+
+
+def read_operator_skin_manifests(home: Path | None) -> list[dict[str, Any]]:
+    """Read ``<home>/skins/*.json`` manifests, skipping invalid files.
+
+    Operator skins are deployment-owned config. A bad manifest should never
+    prevent the built-in UI from loading, so validation is per-file and
+    fail-open for missing/unreadable directories.
+    """
+    if home is None:
+        return []
+    skins_dir = home.joinpath(*OPERATOR_SKINS_RELPATH)
+    try:
+        paths = sorted(skins_dir.glob("*.json"))
+    except OSError:
+        log.warning(
+            "could not read operator skins directory %s", skins_dir, exc_info=True
+        )
+        return []
+    seen_ids: set[str] = set()
+    manifests: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            log.warning(
+                "skipping operator skin %s: invalid json or unreadable file",
+                path,
+                exc_info=True,
+            )
+            continue
+        manifest = _validate_operator_skin_manifest(path, raw, seen_ids)
+        if manifest is not None:
+            manifests.append(manifest)
+    return manifests
+
+
+def available_web_skin_ids(home: Path | None) -> set[str]:
+    return set(BUILT_IN_WEB_SKIN_IDS) | {
+        str(manifest["id"]) for manifest in read_operator_skin_manifests(home)
+    }
 
 
 def read_turns_total(turns_log: Path) -> int:
@@ -1052,6 +1311,10 @@ def register_routes(
                     "native_eventsource_supported_when_auth_required": False,
                 },
                 "ui": read_web_ui_config(home),
+                "skins": {
+                    "built_in_ids": sorted(BUILT_IN_WEB_SKIN_IDS),
+                    "operator": read_operator_skin_manifests(home),
+                },
                 "dashboard_extensions": _dashboard_extensions.navigation_payload(),
             },
             headers=_no_store_headers(),
@@ -1475,7 +1738,17 @@ def register_routes(
             skin = prefs.get("skin")
             if skin is not None and not isinstance(skin, str):
                 return json_error("bad_request", "skin must be a string or null", status=400)
-            allowed["skin"] = skin.strip() if isinstance(skin, str) and skin.strip() else None
+            if isinstance(skin, str) and skin.strip():
+                skin = skin.strip()
+                if skin not in await asyncio.to_thread(available_web_skin_ids, home):
+                    return json_error(
+                        "bad_request",
+                        f"unknown skin '{skin}'",
+                        status=400,
+                    )
+                allowed["skin"] = skin
+            else:
+                allowed["skin"] = None
         if not allowed:
             return json_error("bad_request", "no supported preferences supplied", status=400)
         from .identities_populator import set_user_prefs
