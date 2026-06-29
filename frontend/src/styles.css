@@ -3383,6 +3383,10 @@ textarea {
 }
 
 .wiki-graph__canvas {
+  /* reagraph renders its WebGL canvas as position:absolute inset:0, so it must
+     have a positioned ancestor or it escapes this box and fills the viewport
+     (the bounded height alone does nothing without this). */
+  position: relative;
   height: clamp(420px, 70vh, 760px);
   overflow: hidden;
   border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
