@@ -3383,18 +3383,19 @@ textarea {
 }
 
 .wiki-graph__canvas {
+  height: clamp(420px, 70vh, 760px);
   overflow: hidden;
   border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
   border-radius: var(--mimir-radius-panel, 8px);
   background: var(--mimir-color-panel-background-muted, #f1f5f2);
-  min-height: 520px;
+  overscroll-behavior: contain;
   touch-action: none;
 }
 
 .wiki-graph__canvas canvas {
   display: block;
   width: 100%;
-  min-height: 520px;
+  height: 100%;
 }
 
 .wiki-graph__focus-label {

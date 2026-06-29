@@ -6,7 +6,10 @@ import type { WikiIndexData } from "../api";
 import WikiGraphView from "./WikiGraphView";
 
 const graphCanvasMock = vi.hoisted(() => ({
-  props: [] as Array<Record<string, any>>
+  fitNodesInView: vi.fn(),
+  props: [] as Array<Record<string, any>>,
+  zoomIn: vi.fn(),
+  zoomOut: vi.fn()
 }));
 
 vi.mock("reagraph", () => {
@@ -37,8 +40,13 @@ vi.mock("reagraph", () => {
   };
   return {
     lightTheme,
-    GraphCanvas: (props: Record<string, any>) => {
+    GraphCanvas: React.forwardRef((props: Record<string, any>, ref) => {
       graphCanvasMock.props.push(props);
+      React.useImperativeHandle(ref, () => ({
+        fitNodesInView: graphCanvasMock.fitNodesInView,
+        zoomIn: graphCanvasMock.zoomIn,
+        zoomOut: graphCanvasMock.zoomOut
+      }));
       return React.createElement(
         "div",
         {
@@ -49,18 +57,21 @@ vi.mock("reagraph", () => {
         },
         props.nodes
           .filter((node: { data?: { kind?: string } }) => node.data?.kind === "page")
-          .map((node: { id: string; label: string }) => (
+          .map((node: { id: string; data?: { title?: string } }) => (
             React.createElement(
               "button",
               {
                 key: node.id,
-                onClick: () => props.onNodeClick({ id: node.id, data: {} })
+                onClick: () => props.onNodeClick({ id: node.id, data: {} }),
+                onPointerOut: () => props.onNodePointerOut({ id: node.id, data: {} }),
+                onPointerOver: () => props.onNodePointerOver({ id: node.id, data: {} }),
+                type: "button"
               },
-              `Mock open ${node.label}`
+              `Mock open ${node.data?.title?.split(" - ")[0] ?? node.id}`
             )
           ))
       );
-    }
+    })
   };
 });
 
@@ -176,7 +187,10 @@ function latestGraphProps() {
 
 afterEach(() => {
   cleanup();
+  graphCanvasMock.fitNodesInView.mockClear();
   graphCanvasMock.props = [];
+  graphCanvasMock.zoomIn.mockClear();
+  graphCanvasMock.zoomOut.mockClear();
 });
 
 describe("WikiGraphView", () => {
@@ -196,7 +210,7 @@ describe("WikiGraphView", () => {
     expect(props.aggregateEdges).toBe(false);
     expect(props.edgeArrowPosition).toBe("none");
     expect(props.edgeInterpolation).toBe("curved");
-    expect(props.labelType).toBe("auto");
+    expect(props.labelType).toBe("nodes");
     expect(props.labelFontUrl).toContain("kenpixel.ttf");
     expect(props.labelFontUrl).not.toMatch(/^https?:\/\//);
     expect(props.nodes.map((node: { id: string }) => node.id)).toEqual([
@@ -211,6 +225,38 @@ describe("WikiGraphView", () => {
       ["concepts/alpha.md", "dangling:ghost"]
     ]);
     expect(props.nodes.every((node: { data?: { community?: string } }) => node.data?.community)).toBe(true);
+  });
+
+  it("declutters labels to selected and hovered nodes instead of zoom-driven auto labels", () => {
+    render(<WikiGraphView index={graphIndex()} onOpenPage={vi.fn()} selected="alpha" />);
+
+    let props = latestGraphProps();
+    expect(props.labelType).toBe("nodes");
+    expect(props.nodes.filter((node: { label?: string }) => node.label)).toEqual([
+      expect.objectContaining({ id: "concepts/alpha.md", label: "Alpha" })
+    ]);
+    expect(screen.getAllByText("Alpha").length).toBeGreaterThan(0);
+
+    fireEvent.pointerOver(screen.getByRole("button", { name: "Mock open Beta" }));
+
+    props = latestGraphProps();
+    expect(props.nodes.filter((node: { label?: string }) => node.label)).toEqual([
+      expect.objectContaining({ id: "concepts/alpha.md", label: "Alpha" }),
+      expect.objectContaining({ id: "topics/beta.md", label: "Beta" })
+    ]);
+    expect(screen.getAllByText("Beta").length).toBeGreaterThan(0);
+  });
+
+  it("exposes fit and zoom controls through the reagraph camera ref", () => {
+    render(<WikiGraphView index={graphIndex()} onOpenPage={vi.fn()} selected="" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Fit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+    fireEvent.click(screen.getByRole("button", { name: "Zoom out" }));
+
+    expect(graphCanvasMock.fitNodesInView).toHaveBeenCalledTimes(1);
+    expect(graphCanvasMock.zoomIn).toHaveBeenCalledTimes(1);
+    expect(graphCanvasMock.zoomOut).toHaveBeenCalledTimes(1);
   });
 
   it("opens page nodes through the reader callback", () => {

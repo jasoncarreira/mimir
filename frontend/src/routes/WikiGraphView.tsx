@@ -1,5 +1,13 @@
 import React from "react";
-import { GraphCanvas, lightTheme, type GraphEdge as ReagraphEdge, type GraphNode as ReagraphNode, type InternalGraphNode, type Theme } from "reagraph";
+import {
+  GraphCanvas,
+  lightTheme,
+  type GraphCanvasRef,
+  type GraphEdge as ReagraphEdge,
+  type GraphNode as ReagraphNode,
+  type InternalGraphNode,
+  type Theme
+} from "reagraph";
 import wikiLabelFontUrl from "../assets/wiki/kenpixel.ttf";
 import { type WikiIndexData, type WikiPageSummary } from "../api";
 import { Badge, EmptyState } from "../ui";
@@ -291,7 +299,8 @@ function buildDegreeMap(edges: GraphEdge[]): Map<string, number> {
   return degreeByNode;
 }
 
-function toReagraphNode(node: GraphNode, degree: number, selectedNodeId: string | null): ReagraphNode {
+function toReagraphNode(node: GraphNode, degree: number, labeledNodeIds: Set<string>): ReagraphNode {
+  const showLabel = labeledNodeIds.has(node.id);
   const labelParts = [
     node.title,
     node.kind === "dangling" ? "dangling target" : node.category,
@@ -300,11 +309,11 @@ function toReagraphNode(node: GraphNode, degree: number, selectedNodeId: string 
   ].filter(Boolean);
   return {
     id: node.id,
-    label: graphLabel(node.title),
-    subLabel: graphLabel(node.kind === "dangling" ? "dangling target" : node.category),
+    label: showLabel ? graphLabel(node.title) : "",
+    subLabel: showLabel ? graphLabel(node.kind === "dangling" ? "dangling target" : node.category) : "",
     fill: node.kind === "dangling" ? "#8a6116" : communityColor(node.community),
     cluster: node.community,
-    labelVisible: node.id === selectedNodeId || degree >= 8 || node.hasSlugCollision,
+    labelVisible: showLabel,
     size: nodeSize(node, degree),
     data: {
       category: node.category,
@@ -343,26 +352,42 @@ export default function WikiGraphView({
   const { nodes, edges, categories, communities } = React.useMemo(() => buildGraph(index), [index]);
   const nodeById = React.useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
   const pagesByPath = React.useMemo(() => new Map(index.pages.map((page) => [page.path, page])), [index.pages]);
+  const graphRef = React.useRef<GraphCanvasRef | null>(null);
   const [activeNodeId, setActiveNodeId] = React.useState<string | null>(null);
   const selectedNodeId = React.useMemo(() => {
     const selectedPage = index.pages.find((page) => selected === page.slug || selected === page.path || selected === pageKey(page));
     return selectedPage?.path ?? null;
   }, [index.pages, selected]);
   const degreeByNode = React.useMemo(() => buildDegreeMap(edges), [edges]);
+  const labeledNodeIds = React.useMemo(() => {
+    return new Set([activeNodeId, selectedNodeId].filter((id): id is string => Boolean(id)));
+  }, [activeNodeId, selectedNodeId]);
   const reagraphNodes = React.useMemo(
-    () => nodes.map((node) => toReagraphNode(node, degreeByNode.get(node.id) ?? 0, selectedNodeId)),
-    [degreeByNode, nodes, selectedNodeId]
+    () => nodes.map((node) => toReagraphNode(node, degreeByNode.get(node.id) ?? 0, labeledNodeIds)),
+    [degreeByNode, labeledNodeIds, nodes]
   );
   const reagraphEdges = React.useMemo(() => edges.map(toReagraphEdge), [edges]);
   const selections = React.useMemo(() => (selectedNodeId ? [selectedNodeId] : []), [selectedNodeId]);
   const actives = React.useMemo(() => (activeNodeId ? [activeNodeId] : []), [activeNodeId]);
-  const activeNode = activeNodeId ? nodeById.get(activeNodeId) : undefined;
+  const focusedNode = (activeNodeId ? nodeById.get(activeNodeId) : undefined) ?? (selectedNodeId ? nodeById.get(selectedNodeId) : undefined);
 
   function openGraphNode(node: InternalGraphNode) {
     const graphNode = nodeById.get(node.id);
     if (!graphNode || graphNode.kind !== "page") return;
     const page = pageForNode(graphNode.id, index.pages);
     if (page) onOpenPage(linkSlugForPage(page));
+  }
+
+  function fitGraph() {
+    graphRef.current?.fitNodesInView();
+  }
+
+  function zoomIn() {
+    graphRef.current?.zoomIn();
+  }
+
+  function zoomOut() {
+    graphRef.current?.zoomOut();
   }
 
   if (!nodes.length) {
@@ -385,8 +410,14 @@ export default function WikiGraphView({
           <span>communities</span>
         </div>
       </div>
+      <div aria-label="Wiki graph controls" className="wiki-graph__toolbar">
+        <button onClick={fitGraph} type="button">Fit</button>
+        <button aria-label="Zoom in" onClick={zoomIn} type="button">+</button>
+        <button aria-label="Zoom out" onClick={zoomOut} type="button">-</button>
+      </div>
       <div aria-label="Wiki pages and wikilinks graph" className="wiki-graph__canvas" role="img">
         <GraphCanvas
+          ref={graphRef}
           actives={actives}
           aggregateEdges={false}
           animated
@@ -398,7 +429,7 @@ export default function WikiGraphView({
           edgeInterpolation="curved"
           edges={reagraphEdges}
           labelFontUrl={wikiLabelFontUrl}
-          labelType="auto"
+          labelType="nodes"
           layoutOverrides={{
             clusterStrength: 0.72,
             clusterType: "force",
@@ -424,10 +455,10 @@ export default function WikiGraphView({
         />
       </div>
       <div className="wiki-graph__focus-label" aria-live="polite">
-        {activeNode ? (
+        {focusedNode ? (
           <>
-            <strong>{activeNode.title}</strong>
-            <span>{activeNode.kind === "dangling" ? "dangling target" : `${activeNode.category} / ${activeNode.community}`}</span>
+            <strong>{focusedNode.title}</strong>
+            <span>{focusedNode.kind === "dangling" ? "dangling target" : `${focusedNode.category} / ${focusedNode.community}`}</span>
           </>
         ) : (
           <span>Zoom, pan, drag, or hover nodes to inspect link communities.</span>
