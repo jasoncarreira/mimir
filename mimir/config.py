@@ -685,7 +685,7 @@ class Config:
     allow_unauthenticated: bool
 
     # Per-turn wall-clock timeout in seconds. 0 = no timeout (bench/dev).
-    # Default 1800 (30 min) catches indefinitely hung turns while
+    # Default 3600 (60 min) catches indefinitely hung turns while
     # allowing legitimate long heartbeat or reflection work.
     turn_timeout_seconds: int
 

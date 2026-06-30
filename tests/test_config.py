@@ -280,6 +280,22 @@ class TestConfigFromEnv:
         cfg = Config.from_env()
         assert cfg.tool_call_budget == 120
 
+    def test_turn_timeout_default_matches_documented_default(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_TURN_TIMEOUT_SECONDS", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.turn_timeout_seconds == 3600
+
+    def test_turn_timeout_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_TURN_TIMEOUT_SECONDS", "1800")
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.turn_timeout_seconds == 1800
+
     def test_tool_call_budget_zero_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Setting MIMIR_TOOL_CALL_BUDGET=0 disables the cap entirely."""
         self._base(monkeypatch)
