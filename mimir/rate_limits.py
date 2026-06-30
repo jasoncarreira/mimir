@@ -485,17 +485,24 @@ _KNOWN_WINDOW_TYPES = {
 }
 
 
-def _coerce_utilization(raw: Any) -> float | None:
-    """apiUsage may report utilization as 0-1, 0-100, or as a string.
-    Normalize to 0-1 floats; return None on unparseable."""
+def _coerce_utilization(raw: Any, *, percent: bool = False) -> float | None:
+    """Normalize a utilization value to a 0-1 float.
+
+    Most ``apiUsage`` fields report a fraction (0-1), but percent-named
+    fields report 0-100. Keep the field-name hint explicit so an exact
+    1% value from ``usage_pct``/``percentage`` does not get mistaken for
+    a saturated 1.0 fraction.
+    """
     if raw is None:
         return None
     try:
         v = float(raw)
     except (TypeError, ValueError):
         return None
-    if v > 1.0:
-        # Looks like a percentage; rescale.
+    if percent or v > 1.0:
+        # Explicit percent fields are 0-100 even at exact boundary values
+        # like 1 (1%, not 100%). Bare utilization keeps the historical
+        # heuristic: values >1 look percentage-shaped and are rescaled.
         v = v / 100.0
     if v < 0.0 or v > 1.5:  # >1.5 means we're past 150% — store anyway but
                             # likely indicates a parse error, log it.
@@ -523,11 +530,12 @@ def snapshot_from_api_usage_bucket(bucket: dict[str, Any]) -> RateLimitSnapshot 
     ``ClaudeSDKClient.get_context_usage()``. Returns None if the
     bucket is too malformed to be useful (no resets_at AND no
     utilization)."""
-    util = _coerce_utilization(
-        bucket.get("utilization")
-        or bucket.get("usage_pct")
-        or bucket.get("percentage"),
-    )
+    if "utilization" in bucket:
+        util = _coerce_utilization(bucket.get("utilization"))
+    elif "usage_pct" in bucket:
+        util = _coerce_utilization(bucket.get("usage_pct"), percent=True)
+    else:
+        util = _coerce_utilization(bucket.get("percentage"), percent=True)
     resets = _coerce_resets_at(
         bucket.get("resets_at")
         or bucket.get("reset_at")

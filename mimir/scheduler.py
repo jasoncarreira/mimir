@@ -51,7 +51,13 @@ from ._context import active_turn_snapshots
 from .loop_watchdog import LoopStallWatchdog, stack_is_idle
 from .quota_windows import provider_store_keys
 from .models import AgentEvent
-from .pollers import POLLER_CHANNEL_PREFIX, PollerConfig, discover_pollers, run_poller
+from .pollers import (
+    POLLER_CHANNEL_PREFIX,
+    PollerConfig,
+    discover_pollers,
+    forget_circuit_breakers_except,
+    run_poller,
+)
 from .poller_budget import aggregate_poller_turn_usage
 from .saga_client import SagaClient, SagaError
 
@@ -1658,14 +1664,17 @@ class Scheduler:
                 self._scheduler.remove_job(job.id)
             except Exception:  # noqa: BLE001 — JobLookupError, fine
                 pass
+        retained_names = new_names | preserved_names | cron_preserved_names
         for name in list(self._pollers):
-            if (
-                name in new_names
-                or name in preserved_names
-                or name in cron_preserved_names
-            ):
+            if name in retained_names:
                 continue
             del self._pollers[name]
+
+        # Keep the module-level poller circuit-breaker map aligned with
+        # the live poller registry. Circuit state intentionally survives
+        # reloads for still-installed pollers, but removed/renamed pollers
+        # should not leave stale keys in a long-running process.
+        forget_circuit_breakers_except(retained_names)
 
         # Phase 3: register the cron-validated entries. Pre-populate
         # the dict entry BEFORE add_job so a fire landing during job
@@ -2853,13 +2862,15 @@ class Scheduler:
                 # chainlink #682: tell a real on-loop stall apart from the process
                 # being descheduled (Docker-Desktop / VM scheduling hiccups, which
                 # dominate the count but aren't a mimir hot path). It's an on-loop
-                # block if either the watchdog caught a non-idle frame (covers a
-                # sync-I/O block that burns no CPU) OR the loop thread spent a
-                # meaningful share of the lag on CPU. Otherwise the loop was merely
-                # parked/idle while the host failed to schedule us.
-                non_idle_stack = any(
-                    not stack_is_idle(s.get("stack", "")) for s in blocking_stacks
+                # block if either non-idle watchdog captures dominate the full
+                # drained sample set (covers a sync-I/O block that burns no CPU)
+                # OR the loop thread spent a meaningful share of the lag on CPU.
+                # Otherwise the loop was mostly parked/idle while the host failed
+                # to schedule us.
+                non_idle_stack_count = sum(
+                    1 for s in blocking_stacks if not stack_is_idle(s.get("stack", ""))
                 )
+                non_idle_stack = non_idle_stack_count > len(blocking_stacks) / 2
                 cpu_bound = loop_cpu_s >= _LOOP_LAG_CPU_RATIO * lag_s
                 on_loop = non_idle_stack or cpu_bound
                 cause = "on_loop" if on_loop else "host_scheduling"
