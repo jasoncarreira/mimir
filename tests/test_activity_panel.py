@@ -151,6 +151,27 @@ async def test_panel_debounces_span_updates_and_finalizes_from_outbound_signal()
 
 
 @pytest.mark.asyncio
+async def test_panel_first_edit_does_not_depend_on_monotonic_clock_base(monkeypatch):
+    panel, bridge = _panel(debounce=60.0)
+    loop = __import__("asyncio").get_running_loop()
+    monkeypatch.setattr(loop, "time", lambda: 0.1)
+
+    await panel.handle_event(
+        {"type": "turn", "phase": "start", "turn_id": "t1", "channel_id": "slack-C01"}
+    )
+    await panel.handle_event(
+        {"type": "reasoning", "phase": "start", "turn_id": "t1", "channel_id": "slack-C01"}
+    )
+    await panel.handle_event(
+        {"type": "turn", "phase": "end", "turn_id": "t1", "channel_id": "slack-C01", "status": "ok"}
+    )
+
+    assert len(bridge.edits) == 2
+    assert bridge.edits[0].text == "*Working*\n◌ Thought"
+    assert bridge.edits[-1].text == "✓ 1 steps"
+
+
+@pytest.mark.asyncio
 async def test_panel_does_not_infer_outbound_from_send_message_tool_args():
     panel, bridge = _panel()
 
