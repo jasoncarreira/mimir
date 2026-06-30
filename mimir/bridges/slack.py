@@ -551,6 +551,51 @@ class SlackBridge(Bridge):
         events back to the agent and adds its own UX wrinkles."""
         return None
 
+    async def edit_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        text: str,
+        *,
+        blocks: Any | None = None,
+        embed: Any | None = None,
+    ) -> SendResult:
+        """Update a prior Slack message in place via ``chat.update``.
+
+        ``message_id`` must be the Slack ``ts`` returned by ``send()``.
+        Optional ``blocks`` is passed through as a Block Kit payload.
+        ``embed`` is ignored; it exists for the cross-bridge method shape.
+        Throttling/debounce is the caller's responsibility.
+        """
+        del embed
+        if self._app is None:
+            return SendResult(sent=False, error="slack app not connected")
+        slack_channel = _channel_id_to_slack(channel_id)
+        if slack_channel is None:
+            return SendResult(sent=False, error=f"bad channel_id: {channel_id!r}")
+        if not message_id:
+            return SendResult(sent=False, error="missing message_id")
+
+        kwargs: dict[str, Any] = {
+            "channel": slack_channel,
+            "ts": message_id,
+            "text": text,
+        }
+        if blocks is not None:
+            kwargs["blocks"] = blocks
+        try:
+            resp = await self._app.client.chat_update(**kwargs)
+        except SlackApiError as exc:
+            return SendResult(sent=False, message_id=message_id, error=f"slack edit error: {exc}")
+        except Exception as exc:  # noqa: BLE001 — best-effort bridge edit
+            return SendResult(sent=False, message_id=message_id, error=f"slack edit error: {exc}")
+
+        return SendResult(
+            sent=True,
+            message_id=str(resp.get("ts") or message_id),
+            chunks=1,
+        )
+
     async def fetch_history(
         self,
         channel_id: str,

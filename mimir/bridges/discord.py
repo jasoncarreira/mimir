@@ -674,6 +674,55 @@ class DiscordBridge(Bridge):
             # loop without us blocking here. Awaiting would slow down
             # send() by a tick on the common path.
 
+    async def edit_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        text: str,
+        *,
+        blocks: Any | None = None,
+        embed: Any | None = None,
+    ) -> SendResult:
+        """Update a prior Discord message in place via ``message.edit``.
+
+        ``message_id`` must be the Discord message id returned by
+        ``send()``. Optional ``embed`` is passed through to discord.py.
+        ``blocks`` is ignored; it exists for the cross-bridge method
+        shape. Throttling/debounce is the caller's responsibility.
+        """
+        del blocks
+        if self._client is None or self._client.is_closed():
+            return SendResult(sent=False, error="discord client not connected")
+        cid_int = _channel_id_to_int(channel_id)
+        if cid_int is None:
+            return SendResult(sent=False, error=f"bad channel_id: {channel_id!r}")
+        try:
+            mid_int = int(message_id)
+        except (TypeError, ValueError):
+            return SendResult(sent=False, error=f"bad message_id: {message_id!r}")
+
+        try:
+            channel = self._client.get_channel(cid_int)
+            if channel is None:
+                channel = await self._client.fetch_channel(cid_int)
+            if not hasattr(channel, "fetch_message"):
+                return SendResult(sent=False, error=f"channel {cid_int} cannot fetch messages")
+            message = await channel.fetch_message(mid_int)
+            kwargs: dict[str, Any] = {"content": text}
+            if embed is not None:
+                kwargs["embed"] = embed
+            edited = await message.edit(**kwargs)
+        except discord.DiscordException as exc:
+            return SendResult(sent=False, message_id=message_id, error=f"discord edit error: {exc}")
+        except Exception as exc:  # noqa: BLE001 — best-effort bridge edit
+            return SendResult(sent=False, message_id=message_id, error=f"discord edit error: {exc}")
+
+        return SendResult(
+            sent=True,
+            message_id=str(getattr(edited, "id", "") or message_id),
+            chunks=1,
+        )
+
     async def fetch_history(
         self,
         channel_id: str,

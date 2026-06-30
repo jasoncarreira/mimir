@@ -17,7 +17,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 
 @dataclass
@@ -73,6 +73,34 @@ class Bridge(ABC):
         """Add a reaction to a prior message. Returns False when the bridge
         has no native reaction support (e.g. Bluesky) — caller logs and
         moves on."""
+
+    async def edit_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        text: str,
+        *,
+        blocks: Any | None = None,
+        embed: Any | None = None,
+    ) -> SendResult:
+        """Best-effort in-place update of a prior ``send()`` result.
+
+        ``message_id`` is the id returned by ``send()`` for the same
+        backend/channel. Bridges with native support override this
+        method (Slack ``chat.update`` with optional Block Kit ``blocks``;
+        Discord ``message.edit`` with optional ``embed``). Bridges without
+        edit support inherit this soft no-op so callers can fall back to
+        posting a replacement message.
+
+        This is a single platform edit operation with no throttling or
+        debounce policy; callers that stream or repeatedly refresh a UI are
+        responsible for pacing calls. Implementations must never raise into
+        the caller for deleted messages, missing scope/permissions, rate
+        limits, or other platform failures; return ``sent=False`` with an
+        ``error`` string instead.
+        """
+        del channel_id, message_id, text, blocks, embed
+        return SendResult(sent=False, error="edit unsupported")
 
     async def resolve_dm_channel(self, author_id: str) -> str | None:
         """Resolve the mimir DM `channel_id` for a user on this bridge,
