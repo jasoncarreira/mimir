@@ -51,7 +51,13 @@ from ._context import active_turn_snapshots
 from .loop_watchdog import LoopStallWatchdog, stack_is_idle
 from .quota_windows import provider_store_keys
 from .models import AgentEvent
-from .pollers import POLLER_CHANNEL_PREFIX, PollerConfig, discover_pollers, run_poller
+from .pollers import (
+    POLLER_CHANNEL_PREFIX,
+    PollerConfig,
+    discover_pollers,
+    forget_circuit_breakers_except,
+    run_poller,
+)
 from .poller_budget import aggregate_poller_turn_usage
 from .saga_client import SagaClient, SagaError
 
@@ -1658,14 +1664,17 @@ class Scheduler:
                 self._scheduler.remove_job(job.id)
             except Exception:  # noqa: BLE001 — JobLookupError, fine
                 pass
+        retained_names = new_names | preserved_names | cron_preserved_names
         for name in list(self._pollers):
-            if (
-                name in new_names
-                or name in preserved_names
-                or name in cron_preserved_names
-            ):
+            if name in retained_names:
                 continue
             del self._pollers[name]
+
+        # Keep the module-level poller circuit-breaker map aligned with
+        # the live poller registry. Circuit state intentionally survives
+        # reloads for still-installed pollers, but removed/renamed pollers
+        # should not leave stale keys in a long-running process.
+        forget_circuit_breakers_except(retained_names)
 
         # Phase 3: register the cron-validated entries. Pre-populate
         # the dict entry BEFORE add_job so a fire landing during job
