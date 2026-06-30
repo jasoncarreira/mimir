@@ -1139,6 +1139,7 @@ def build_app(config: Config) -> web.Application:
             turn_event_bus,
             channels,
             config.activity_panel_channels,
+            detail_levels=config.activity_panel_detail,
         )
         app["activity_panel"] = activity_panel
     # Web chat bridge — POST /chat + GET /chat/stream for the local UI.

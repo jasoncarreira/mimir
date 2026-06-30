@@ -8,6 +8,7 @@ a coarse cadence as safe step summaries accumulate.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -18,6 +19,27 @@ from ..turn_event_bus import TurnEventBus
 from .base import MessageUpdate
 
 log = logging.getLogger(__name__)
+DETAIL_LIMIT = 360
+SECRET_RE = re.compile(
+    r"(?i)(api[_-]?key|token|secret|password|authorization|bearer)\s*[:=]\s*['\"]?[^'\"\s,}]+"
+)
+PATH_RE = re.compile(r"(?<![\w.-])(?:/[^\s,;:]+|[A-Za-z]:\\[^\s,;:]+)")
+REDACTED_KEYS = {
+    "attachment",
+    "attachment_names",
+    "attachment_path",
+    "attachment_paths",
+    "body",
+    "content",
+    "file",
+    "file_path",
+    "message",
+    "path",
+    "password",
+    "secret",
+    "text",
+    "token",
+}
 
 
 def channel_enabled(channel_id: str, allowlist: tuple[str, ...]) -> bool:
@@ -60,10 +82,37 @@ def trigger_enabled(trigger: Any) -> bool:
     return cleaned in ACTIVITY_PANEL_INCLUDED_TRIGGERS
 
 
+def _parse_detail_levels(raw: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    parsed: list[tuple[str, str]] = []
+    for item in raw:
+        prefix, sep, level = item.partition(":")
+        if not sep:
+            continue
+        prefix = prefix.strip()
+        level = level.strip().lower()
+        if prefix and level in {"coarse", "detailed"}:
+            parsed.append((prefix, level))
+    return tuple(parsed)
+
+
+def _detail_level_for(channel_id: str, detail_levels: tuple[tuple[str, str], ...]) -> str:
+    best = ""
+    level = "coarse"
+    for prefix, candidate in detail_levels:
+        if prefix == "*" or channel_id.startswith(prefix):
+            if prefix == "*" or len(prefix) >= len(best):
+                best = prefix
+                level = candidate
+    return level
+
+
 @dataclass
 class ActivityStep:
     label: str
     status: str = "running"
+    span_id: str | None = None
+    kind: str | None = None
+    detail: str | None = None
 
 
 @dataclass
@@ -84,6 +133,8 @@ class ActivityPanelModel:
     posted: bool = False
     finalized: bool = False
     outbound_message_sent: bool = False
+    status: str = "running"
+    detail_level: str = "coarse"
     steps: list[ActivityStep] = field(default_factory=list)
     in_flight: ActivityStep | None = None
     folded_inputs: list[FoldedInput] = field(default_factory=list)
@@ -103,11 +154,15 @@ class ActivityPanel:
         allowlist: tuple[str, ...],
         *,
         debounce_seconds: float = 1.0,
+        detail_levels: tuple[str, ...] = (),
+        delete_grace_seconds: float = 2.0,
     ) -> None:
         self._bus = bus
         self._channels = channels
         self._allowlist = allowlist
         self._debounce_seconds = max(0.0, debounce_seconds)
+        self._detail_levels = _parse_detail_levels(detail_levels)
+        self._delete_grace_seconds = max(0.0, delete_grace_seconds)
         self._queue: asyncio.Queue[dict[str, Any]] | None = None
         self._task: asyncio.Task[Any] | None = None
         self._models: dict[str, ActivityPanelModel] = {}
@@ -171,8 +226,9 @@ class ActivityPanel:
                 channel_id=channel_id,
                 reply_to_message_id=_clean(event.get("reply_to_message_id")),
                 thread_ts=_clean(event.get("thread_ts")),
+                detail_level=_detail_level_for(channel_id, self._detail_levels),
             )
-            model.in_flight = ActivityStep("Working")
+            model.in_flight = ActivityStep("Working", kind="turn")
             self._models[turn_id] = model
             await self._post(model)
             return
@@ -185,7 +241,7 @@ class ActivityPanel:
         phase = event.get("phase")
         if typ in ("reasoning", "tool_call", "tool_result"):
             self._apply_span(model, event)
-            if phase != "chunk":
+            if phase != "chunk" or model.detail_level == "detailed":
                 await self._schedule_edit(model)
         elif typ == "injected_input":
             for item in event.get("inputs") or []:
@@ -204,36 +260,88 @@ class ActivityPanel:
         elif typ == "turn" and phase == "end":
             if event.get("outbound_message_sent"):
                 model.outbound_message_sent = True
+            model.status = _clean(event.get("status")) or "ok"
             final_folded = event.get("injected_input_count")
             if isinstance(final_folded, int) and final_folded > len(model.folded_inputs):
                 for _ in range(final_folded - len(model.folded_inputs)):
                     model.folded_inputs.append(FoldedInput())
-            self._complete_in_flight(model)
+            if model.in_flight is not None:
+                self._complete_in_flight(model)
             model.finalized = True
             await self._flush(model)
+            if model.status == "ok" and model.outbound_message_sent:
+                self._pending[f"{turn_id}:delete"] = asyncio.create_task(
+                    self._delete_later(turn_id),
+                    name=f"mimir-activity-panel-delete-{turn_id}",
+                )
 
     def _apply_span(self, model: ActivityPanelModel, event: dict[str, Any]) -> None:
         phase = event.get("phase")
         if phase == "chunk":
+            _append_detail(model, event)
             return
         label = _step_label(event)
+        span_id = _clean(event.get("id"))
+        kind = _clean(event.get("type"))
         if phase == "start":
-            model.in_flight = ActivityStep(label)
+            model.in_flight = ActivityStep(label, span_id=span_id, kind=kind)
+            _append_detail(model, event)
         elif phase == "end":
-            self._complete_in_flight(model, fallback=label)
+            _append_detail(model, event)
+            if kind == "tool_call":
+                if model.in_flight is not None and model.in_flight.span_id == span_id:
+                    if label:
+                        model.in_flight.label = label
+                    return
+                self._complete_in_flight(model, fallback=label, span_id=span_id, kind=kind)
+                return
+            self._complete_in_flight(model, fallback=label, span_id=span_id, kind=kind)
 
     def _complete_in_flight(
         self,
         model: ActivityPanelModel,
         *,
         fallback: str | None = None,
+        span_id: str | None = None,
+        kind: str | None = None,
     ) -> None:
         step = model.in_flight or ActivityStep(fallback or "Working")
-        if fallback:
+        if fallback and not (step.kind == "tool_result" and fallback == "Ran skill"):
             step.label = fallback
+        if span_id and not step.span_id:
+            step.span_id = span_id
+        if kind and not step.kind:
+            step.kind = kind
         step.status = "done"
-        model.steps.append(step)
+        model.steps.append(
+            ActivityStep(
+                step.label,
+                status=step.status,
+                span_id=step.span_id,
+                kind=step.kind,
+            )
+        )
         model.in_flight = None
+
+    async def _delete_later(self, turn_id: str) -> None:
+        try:
+            if self._delete_grace_seconds > 0:
+                await asyncio.sleep(self._delete_grace_seconds)
+            model = self._models.get(turn_id)
+            if model is None or not model.message_id:
+                return
+            bridge = self._channels.find(model.channel_id)
+            if bridge is None:
+                return
+            result = await bridge.delete_message(model.channel_id, model.message_id)
+            if not getattr(result, "sent", False):
+                log.debug("activity panel delete failed: %s", getattr(result, "error", None))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.debug("activity panel delete failed", exc_info=True)
+        finally:
+            self._pending.pop(f"{turn_id}:delete", None)
 
     async def _post(self, model: ActivityPanelModel) -> None:
         bridge = self._channels.find(model.channel_id)
@@ -350,6 +458,8 @@ def render_discord_panel_description(model: ActivityPanelModel) -> str:
         lines.append(f"[x] {step.label}")
     if model.in_flight is not None:
         lines.append(f"[ ] {model.in_flight.label}")
+        if model.detail_level == "detailed" and model.in_flight.detail:
+            lines.append(_indent_detail(model.in_flight.detail))
     folded = _folded_live_lines(model)
     if folded:
         lines.extend(folded)
@@ -368,6 +478,8 @@ def render_panel_text(model: ActivityPanelModel) -> str:
         lines.append(f"✓ {step.label}")
     if model.in_flight is not None:
         lines.append(f"◌ {model.in_flight.label}")
+        if model.detail_level == "detailed" and model.in_flight.detail:
+            lines.append(_indent_detail(model.in_flight.detail))
     folded = _folded_live_lines(model)
     if folded:
         lines.extend(folded)
@@ -402,12 +514,86 @@ def _step_label(event: dict[str, Any]) -> str:
     if typ == "tool_call":
         name = _tool_name(event.get("tool_name"))
         if phase == "start":
-            return f"Working {name}" if name else "Working"
-        return f"Skill {name}" if name else "Skill"
+            return f"Calling {name}" if name else "Calling tool"
+        return f"Calling {name}" if name else "Calling tool"
     if typ == "tool_result":
         name = _tool_name(event.get("tool_name"))
         return f"Ran {name}" if name else "Ran skill"
     return "Working"
+
+
+def _append_detail(model: ActivityPanelModel, event: dict[str, Any]) -> None:
+    if model.detail_level != "detailed" or model.in_flight is None:
+        return
+    detail = _event_detail(event)
+    if not detail:
+        return
+    existing = model.in_flight.detail
+    combined = f"{existing}\n{detail}" if existing else detail
+    model.in_flight.detail = _sanitize_detail(combined)
+
+
+def _event_detail(event: dict[str, Any]) -> str | None:
+    typ = event.get("type")
+    phase = event.get("phase")
+    if typ == "reasoning":
+        text = event.get("text") or event.get("content")
+        return f"reasoning: {_stringify_safe(text)}" if text else None
+    if typ == "tool_call":
+        args = event.get("args_delta") if phase == "chunk" else event.get("args")
+        return f"args: {_stringify_safe(args)}" if args is not None else None
+    if typ == "tool_result":
+        content = event.get("content_delta") if phase == "chunk" else event.get("content")
+        status = _clean(event.get("status"))
+        parts = []
+        if status:
+            parts.append(f"status: {status}")
+        if content:
+            parts.append(f"result: {_stringify_safe(content)}")
+        return "\n".join(parts) or None
+    return None
+
+
+def _stringify_safe(value: Any) -> str:
+    try:
+        scrubbed = _scrub_value(value)
+        if isinstance(scrubbed, str):
+            return scrubbed
+        return json.dumps(scrubbed, sort_keys=True, ensure_ascii=True)
+    except Exception:  # noqa: BLE001
+        return str(value)
+
+
+def _scrub_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text.lower() in REDACTED_KEYS:
+                out[key_text] = "[redacted]"
+            else:
+                out[key_text] = _scrub_value(item)
+        return out
+    if isinstance(value, list):
+        return [_scrub_value(item) for item in value[:8]]
+    if isinstance(value, tuple):
+        return [_scrub_value(item) for item in value[:8]]
+    if isinstance(value, str):
+        return _sanitize_detail(value)
+    return value
+
+
+def _sanitize_detail(value: str) -> str:
+    text = SECRET_RE.sub(lambda m: f"{m.group(1)}=[redacted]", value)
+    text = PATH_RE.sub("[path]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > DETAIL_LIMIT:
+        return text[: DETAIL_LIMIT - 3].rstrip() + "..."
+    return text
+
+
+def _indent_detail(detail: str) -> str:
+    return "\n".join(f"  {line}" for line in detail.splitlines()[:6])
 
 
 def _tool_name(value: Any) -> str:
