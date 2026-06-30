@@ -142,6 +142,7 @@ async def test_panel_posts_in_slack_thread_and_renders_sanitized_blocks():
             "phase": "start",
             "turn_id": "t1",
             "channel_id": "slack-C01",
+            "trigger": "user_message",
             "thread_ts": "111.222",
         }
     )
@@ -190,7 +191,13 @@ async def test_panel_debounces_span_updates_and_finalizes_from_outbound_signal()
     panel, bridge = _panel(debounce=60.0)
 
     await panel.handle_event(
-        {"type": "turn", "phase": "start", "turn_id": "t1", "channel_id": "slack-C01"}
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
     )
     await panel.handle_event(
         {"type": "reasoning", "phase": "start", "turn_id": "t1", "channel_id": "slack-C01"}
@@ -216,7 +223,13 @@ async def test_panel_first_edit_does_not_depend_on_monotonic_clock_base(monkeypa
     monkeypatch.setattr(loop, "time", lambda: 0.1)
 
     await panel.handle_event(
-        {"type": "turn", "phase": "start", "turn_id": "t1", "channel_id": "slack-C01"}
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
     )
     await panel.handle_event(
         {"type": "reasoning", "phase": "start", "turn_id": "t1", "channel_id": "slack-C01"}
@@ -235,7 +248,13 @@ async def test_panel_does_not_infer_outbound_from_send_message_tool_args():
     panel, bridge = _panel()
 
     await panel.handle_event(
-        {"type": "turn", "phase": "start", "turn_id": "t1", "channel_id": "slack-C01"}
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
     )
     await panel.handle_event(
         {
@@ -260,7 +279,13 @@ async def test_panel_reconciles_from_turn_end_summary_fields():
     panel, bridge = _panel()
 
     await panel.handle_event(
-        {"type": "turn", "phase": "start", "turn_id": "t1", "channel_id": "slack-C01"}
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
     )
     await panel.handle_event(
         {
@@ -278,16 +303,112 @@ async def test_panel_reconciles_from_turn_end_summary_fields():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trigger",
+    ["user_message", "poller", "scheduled_tick", "shell_job_complete"],
+)
+async def test_panel_posts_for_classified_work_triggers(trigger: str):
+    panel, bridge = _panel()
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": f"t-{trigger}",
+            "channel_id": "slack-C01",
+            "trigger": trigger,
+        }
+    )
+
+    assert len(bridge.sends) == 1
+    assert f"t-{trigger}" in panel.models
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        "saga_session_end",
+        "upgrade",
+        "claude_code_spawn",
+        "react_received",
+        "reflect",
+        "unknown",
+        "new_framework_trigger",
+    ],
+)
+async def test_panel_skips_internal_and_unclassified_triggers_without_model(trigger: str):
+    panel, bridge = _panel()
+    turn_id = f"t-{trigger}"
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": turn_id,
+            "channel_id": "slack-C01",
+            "trigger": trigger,
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_call",
+            "phase": "end",
+            "turn_id": turn_id,
+            "channel_id": "slack-C01",
+            "tool_name": "shell_exec",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "end",
+            "turn_id": turn_id,
+            "channel_id": "slack-C01",
+            "status": "ok",
+        }
+    )
+
+    assert bridge.sends == []
+    assert bridge.edits == []
+    assert turn_id not in panel.models
+
+
+@pytest.mark.asyncio
+async def test_panel_skips_start_event_without_trigger_metadata():
+    panel, bridge = _panel()
+
+    await panel.handle_event(
+        {"type": "turn", "phase": "start", "turn_id": "t-missing", "channel_id": "slack-C01"}
+    )
+
+    assert bridge.sends == []
+    assert "t-missing" not in panel.models
+
+
+@pytest.mark.asyncio
 async def test_panel_off_by_default_and_channel_allowlist():
     panel, bridge = _panel(allowlist=())
     await panel.handle_event(
-        {"type": "turn", "phase": "start", "turn_id": "t1", "channel_id": "slack-C01"}
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
     )
     assert bridge.sends == []
 
     panel, bridge = _panel(allowlist=("discord-",))
     await panel.handle_event(
-        {"type": "turn", "phase": "start", "turn_id": "t1", "channel_id": "slack-C01"}
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
     )
     assert bridge.sends == []
 
@@ -302,6 +423,7 @@ async def test_discord_panel_uses_embed_renderer_and_shared_lifecycle():
             "phase": "start",
             "turn_id": "t1",
             "channel_id": "discord-101",
+            "trigger": "user_message",
             "reply_to_message_id": "555",
         }
     )
@@ -354,7 +476,13 @@ async def test_discord_panel_inert_when_channel_not_allowlisted():
     panel, bridge = _discord_panel(allowlist=("slack-",))
 
     await panel.handle_event(
-        {"type": "turn", "phase": "start", "turn_id": "t1", "channel_id": "discord-101"}
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "discord-101",
+            "trigger": "user_message",
+        }
     )
 
     assert bridge.sends == []
