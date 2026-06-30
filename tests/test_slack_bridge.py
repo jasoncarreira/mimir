@@ -13,6 +13,7 @@ import pytest
 # Skip the whole module if slack-bolt isn't installed in the test env.
 pytest.importorskip("slack_bolt")
 
+from mimir.bridges.base import Bridge, MessageUpdate, SendResult
 from mimir.bridges.slack import (
     SLACK_MESSAGE_CHAR_LIMIT,
     SlackBridge,
@@ -136,6 +137,7 @@ def bridge_with_fake_app():
     )
 
     sent: list[dict] = []
+    updated: list[dict] = []
     users_info_calls: list[str] = []
 
     async def fake_post(*, channel: str, text: str):
@@ -145,6 +147,10 @@ def bridge_with_fake_app():
     async def fake_reactions_add(*, channel: str, timestamp: str, name: str):
         sent.append({"reaction": name, "channel": channel, "ts": timestamp})
         return {"ok": True}
+
+    async def fake_chat_update(**kwargs):
+        updated.append(kwargs)
+        return {"ok": True, "ts": kwargs["ts"]}
 
     # Plausible users.info response shape — tests that want a different
     # response can override `fake_client.users_info`.
@@ -172,12 +178,17 @@ def bridge_with_fake_app():
 
     fake_client = SimpleNamespace(
         chat_postMessage=fake_post,
+        chat_update=fake_chat_update,
         reactions_add=fake_reactions_add,
         auth_test=AsyncMock(return_value={"user_id": "UBOT123"}),
         files_upload_v2=AsyncMock(return_value={"file": {}}),
         users_info=fake_users_info,
     )
-    fake_app = SimpleNamespace(client=fake_client, _users_info_calls=users_info_calls)
+    fake_app = SimpleNamespace(
+        client=fake_client,
+        _users_info_calls=users_info_calls,
+        _updates=updated,
+    )
     bridge._app = fake_app  # type: ignore[assignment]
     bridge._bot_user_id = "UBOT123"
     return bridge, enqueued, sent
@@ -218,6 +229,79 @@ async def test_send_returns_message_ts(bridge_with_fake_app):
     assert result.sent is True
     assert result.message_id is not None
     assert "." in result.message_id  # Slack ts format: epoch.microseconds
+
+
+@pytest.mark.asyncio
+async def test_bridge_default_edit_message_is_soft_noop():
+    class _NoEditBridge(Bridge):
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def send(
+            self,
+            channel_id: str,
+            text: str,
+            attachment_paths: list[Path] | None = None,
+            *,
+            final: bool = True,
+        ) -> SendResult:
+            del channel_id, text, attachment_paths, final
+            return SendResult(sent=True, message_id="m1", chunks=1)
+
+        async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:
+            del channel_id, message_id, emoji
+            return False
+
+    result = await _NoEditBridge().edit_message("c1", "m1", MessageUpdate(text="updated"))
+    assert result.sent is False
+    assert result.error == "edit unsupported"
+
+
+@pytest.mark.asyncio
+async def test_edit_message_calls_chat_update_with_blocks(bridge_with_fake_app):
+    bridge, _, _ = bridge_with_fake_app
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*hi*"}}]
+
+    result = await bridge.edit_message(
+        "slack-C01ABC",
+        "1234567890.000001",
+        MessageUpdate(text="updated", blocks=blocks, embed=object()),
+    )
+
+    assert result.sent is True
+    assert result.message_id == "1234567890.000001"
+    assert bridge._app._updates == [  # type: ignore[union-attr]
+        {
+            "channel": "C01ABC",
+            "ts": "1234567890.000001",
+            "text": "updated",
+            "blocks": blocks,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_edit_message_slack_error_is_soft(bridge_with_fake_app):
+    from slack_sdk.errors import SlackApiError
+
+    bridge, _, _ = bridge_with_fake_app
+
+    async def boom(**kwargs):
+        del kwargs
+        raise SlackApiError(
+            "message_not_found",
+            response={"ok": False, "error": "message_not_found"},
+        )
+
+    bridge._app.client.chat_update = boom  # type: ignore[union-attr]
+
+    result = await bridge.edit_message("slack-C01ABC", "1234567890.000001", MessageUpdate(text="updated"))
+    assert result.sent is False
+    assert result.message_id == "1234567890.000001"
+    assert "slack edit error" in (result.error or "")
 
 
 @pytest.mark.asyncio

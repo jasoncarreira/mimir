@@ -13,6 +13,7 @@ import pytest
 # Skip the whole module if discord-py isn't installed in the test env.
 pytest.importorskip("discord")
 
+from mimir.bridges.base import MessageUpdate
 from mimir.bridges.discord import (
     DISCORD_MESSAGE_CHAR_LIMIT,
     DiscordBridge,
@@ -136,6 +137,7 @@ def bridge_with_fake_client(tmp_path: Path):
     bridge = DiscordBridge(token="TEST", enqueue=fake_enqueue)
 
     sent: list[tuple[int, str, list]] = []
+    edited: list[dict] = []
 
     class FakeChannel:
         def __init__(self, cid: int):
@@ -152,6 +154,12 @@ def bridge_with_fake_client(tmp_path: Path):
         async def fetch_message(self, mid: int):
             msg = SimpleNamespace(id=mid)
             msg.add_reaction = AsyncMock()
+
+            async def fake_edit(**kwargs):
+                edited.append({"channel_id": self.id, "message_id": mid, **kwargs})
+                return SimpleNamespace(id=mid)
+
+            msg.edit = fake_edit
             return msg
 
     # The bridge duck-types the messageable check (callable .send), so the
@@ -162,6 +170,7 @@ def bridge_with_fake_client(tmp_path: Path):
 
         def __init__(self):
             self._channels = {1: FakeChannel(1), 2: FakeChannel(2)}
+            self._edits = edited
 
         def is_closed(self):
             return False
@@ -206,6 +215,44 @@ async def test_send_returns_message_id(bridge_with_fake_client):
     assert result.sent is True
     assert result.message_id is not None
     assert result.chunks == 1
+
+
+@pytest.mark.asyncio
+async def test_edit_message_calls_message_edit_with_embed(bridge_with_fake_client):
+    bridge, _, _ = bridge_with_fake_client
+    embed = SimpleNamespace(title="Activity")
+
+    result = await bridge.edit_message("discord-1", "1001", MessageUpdate(text="updated", blocks=[{"type": "ignored"}], embed=embed))
+
+    assert result.sent is True
+    assert result.message_id == "1001"
+    assert bridge._client._edits == [  # type: ignore[union-attr]
+        {
+            "channel_id": 1,
+            "message_id": 1001,
+            "content": "updated",
+            "embed": embed,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_edit_message_discord_error_is_soft(bridge_with_fake_client):
+    import discord
+
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels[1]  # type: ignore[union-attr]
+
+    async def boom(mid: int):
+        del mid
+        raise discord.DiscordException("message deleted")
+
+    channel.fetch_message = boom
+
+    result = await bridge.edit_message("discord-1", "1001", MessageUpdate(text="updated"))
+    assert result.sent is False
+    assert result.message_id == "1001"
+    assert "discord edit error" in (result.error or "")
 
 
 @pytest.mark.asyncio

@@ -45,7 +45,7 @@ from ..models import AgentEvent
 from ._attachments import _SLACK_CDN_HOSTS, build_inbound_path, download_to_path
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
-from .base import Bridge, SendResult
+from .base import Bridge, MessageUpdate, SendResult
 
 log = logging.getLogger(__name__)
 
@@ -550,6 +550,47 @@ class SlackBridge(Bridge):
         remove it when the response goes out, but that fires reaction
         events back to the agent and adds its own UX wrinkles."""
         return None
+
+    async def edit_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        update: MessageUpdate,
+    ) -> SendResult:
+        """Update a prior Slack message in place via ``chat.update``.
+
+        ``message_id`` must be the Slack ``ts`` returned by ``send()``.
+        ``update.text`` is the text fallback and ``update.blocks`` is passed
+        through as an optional Block Kit payload. ``update.embed`` is ignored.
+        Throttling/debounce is the caller's responsibility.
+        """
+        if self._app is None:
+            return SendResult(sent=False, error="slack app not connected")
+        slack_channel = _channel_id_to_slack(channel_id)
+        if slack_channel is None:
+            return SendResult(sent=False, error=f"bad channel_id: {channel_id!r}")
+        if not message_id:
+            return SendResult(sent=False, error="missing message_id")
+
+        kwargs: dict[str, Any] = {
+            "channel": slack_channel,
+            "ts": message_id,
+            "text": update.text or "",
+        }
+        if update.blocks is not None:
+            kwargs["blocks"] = update.blocks
+        try:
+            resp = await self._app.client.chat_update(**kwargs)
+        except SlackApiError as exc:
+            return SendResult(sent=False, message_id=message_id, error=f"slack edit error: {exc}")
+        except Exception as exc:  # noqa: BLE001 — best-effort bridge edit
+            return SendResult(sent=False, message_id=message_id, error=f"slack edit error: {exc}")
+
+        return SendResult(
+            sent=True,
+            message_id=str(resp.get("ts") or message_id),
+            chunks=1,
+        )
 
     async def fetch_history(
         self,

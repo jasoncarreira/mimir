@@ -39,7 +39,7 @@ from ..models import AgentEvent
 from ._emoji import resolve_for_discord
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
-from .base import Bridge, SendResult
+from .base import Bridge, MessageUpdate, SendResult
 
 log = logging.getLogger(__name__)
 
@@ -673,6 +673,52 @@ class DiscordBridge(Bridge):
             # Don't await — the task's finally/aexit runs on the event
             # loop without us blocking here. Awaiting would slow down
             # send() by a tick on the common path.
+
+    async def edit_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        update: MessageUpdate,
+    ) -> SendResult:
+        """Update a prior Discord message in place via ``message.edit``.
+
+        ``message_id`` must be the Discord message id returned by
+        ``send()``. ``update.text`` is used as message content and
+        ``update.embed`` is passed through to discord.py when present.
+        ``update.blocks`` is ignored. Throttling/debounce is the caller's
+        responsibility.
+        """
+        if self._client is None or self._client.is_closed():
+            return SendResult(sent=False, error="discord client not connected")
+        cid_int = _channel_id_to_int(channel_id)
+        if cid_int is None:
+            return SendResult(sent=False, error=f"bad channel_id: {channel_id!r}")
+        try:
+            mid_int = int(message_id)
+        except (TypeError, ValueError):
+            return SendResult(sent=False, error=f"bad message_id: {message_id!r}")
+
+        try:
+            channel = self._client.get_channel(cid_int)
+            if channel is None:
+                channel = await self._client.fetch_channel(cid_int)
+            if not hasattr(channel, "fetch_message"):
+                return SendResult(sent=False, error=f"channel {cid_int} cannot fetch messages")
+            message = await channel.fetch_message(mid_int)
+            kwargs: dict[str, Any] = {"content": update.text or ""}
+            if update.embed is not None:
+                kwargs["embed"] = update.embed
+            edited = await message.edit(**kwargs)
+        except discord.DiscordException as exc:
+            return SendResult(sent=False, message_id=message_id, error=f"discord edit error: {exc}")
+        except Exception as exc:  # noqa: BLE001 — best-effort bridge edit
+            return SendResult(sent=False, message_id=message_id, error=f"discord edit error: {exc}")
+
+        return SendResult(
+            sent=True,
+            message_id=str(getattr(edited, "id", "") or message_id),
+            chunks=1,
+        )
 
     async def fetch_history(
         self,

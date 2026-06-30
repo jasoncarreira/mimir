@@ -17,7 +17,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 
 @dataclass
@@ -26,6 +26,15 @@ class SendResult:
     message_id: str | None = None
     chunks: int = 0
     error: str | None = None
+
+
+@dataclass
+class MessageUpdate:
+    """Bridge-agnostic payload for editing a prior message in place."""
+
+    text: str | None = None
+    blocks: list[dict[str, Any]] | None = None
+    embed: Any | None = None
 
 
 class Bridge(ABC):
@@ -73,6 +82,32 @@ class Bridge(ABC):
         """Add a reaction to a prior message. Returns False when the bridge
         has no native reaction support (e.g. Bluesky) — caller logs and
         moves on."""
+
+    async def edit_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        update: MessageUpdate,
+    ) -> SendResult:
+        """Best-effort in-place update of a prior ``send()`` result.
+
+        ``message_id`` is the id returned by ``send()`` for the same
+        backend/channel. ``update`` carries the bridge-agnostic edit payload:
+        plain-text fallback/content plus optional rich platform variants
+        (Slack Block Kit ``blocks`` and Discord ``embed``). Bridges should
+        use the fields they support and ignore unsupported rich fields.
+        Bridges without edit support inherit this soft no-op so callers can
+        fall back to posting a replacement message.
+
+        This is a single platform edit operation with no throttling or
+        debounce policy; callers that stream or repeatedly refresh a UI are
+        responsible for pacing calls. Implementations must never raise into
+        the caller for deleted messages, missing scope/permissions, rate
+        limits, or other platform failures; return ``sent=False`` with an
+        ``error`` string instead.
+        """
+        del channel_id, message_id, update
+        return SendResult(sent=False, error="edit unsupported")
 
     async def resolve_dm_channel(self, author_id: str) -> str | None:
         """Resolve the mimir DM `channel_id` for a user on this bridge,
