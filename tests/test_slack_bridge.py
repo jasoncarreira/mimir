@@ -13,7 +13,7 @@ import pytest
 # Skip the whole module if slack-bolt isn't installed in the test env.
 pytest.importorskip("slack_bolt")
 
-from mimir.bridges.base import Bridge, SendResult
+from mimir.bridges.base import Bridge, MessageUpdate, SendResult
 from mimir.bridges.slack import (
     SLACK_MESSAGE_CHAR_LIMIT,
     SlackBridge,
@@ -255,7 +255,7 @@ async def test_bridge_default_edit_message_is_soft_noop():
             del channel_id, message_id, emoji
             return False
 
-    result = await _NoEditBridge().edit_message("c1", "m1", "updated")
+    result = await _NoEditBridge().edit_message("c1", "m1", MessageUpdate(text="updated"))
     assert result.sent is False
     assert result.error == "edit unsupported"
 
@@ -268,8 +268,7 @@ async def test_edit_message_calls_chat_update_with_blocks(bridge_with_fake_app):
     result = await bridge.edit_message(
         "slack-C01ABC",
         "1234567890.000001",
-        "updated",
-        blocks=blocks,
+        MessageUpdate(text="updated", blocks=blocks, embed=object()),
     )
 
     assert result.sent is True
@@ -299,7 +298,7 @@ async def test_edit_message_slack_error_is_soft(bridge_with_fake_app):
 
     bridge._app.client.chat_update = boom  # type: ignore[union-attr]
 
-    result = await bridge.edit_message("slack-C01ABC", "1234567890.000001", "updated")
+    result = await bridge.edit_message("slack-C01ABC", "1234567890.000001", MessageUpdate(text="updated"))
     assert result.sent is False
     assert result.message_id == "1234567890.000001"
     assert "slack edit error" in (result.error or "")

@@ -45,7 +45,7 @@ from ..models import AgentEvent
 from ._attachments import _SLACK_CDN_HOSTS, build_inbound_path, download_to_path
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
-from .base import Bridge, SendResult
+from .base import Bridge, MessageUpdate, SendResult
 
 log = logging.getLogger(__name__)
 
@@ -555,19 +555,15 @@ class SlackBridge(Bridge):
         self,
         channel_id: str,
         message_id: str,
-        text: str,
-        *,
-        blocks: Any | None = None,
-        embed: Any | None = None,
+        update: MessageUpdate,
     ) -> SendResult:
         """Update a prior Slack message in place via ``chat.update``.
 
         ``message_id`` must be the Slack ``ts`` returned by ``send()``.
-        Optional ``blocks`` is passed through as a Block Kit payload.
-        ``embed`` is ignored; it exists for the cross-bridge method shape.
+        ``update.text`` is the text fallback and ``update.blocks`` is passed
+        through as an optional Block Kit payload. ``update.embed`` is ignored.
         Throttling/debounce is the caller's responsibility.
         """
-        del embed
         if self._app is None:
             return SendResult(sent=False, error="slack app not connected")
         slack_channel = _channel_id_to_slack(channel_id)
@@ -579,10 +575,10 @@ class SlackBridge(Bridge):
         kwargs: dict[str, Any] = {
             "channel": slack_channel,
             "ts": message_id,
-            "text": text,
+            "text": update.text or "",
         }
-        if blocks is not None:
-            kwargs["blocks"] = blocks
+        if update.blocks is not None:
+            kwargs["blocks"] = update.blocks
         try:
             resp = await self._app.client.chat_update(**kwargs)
         except SlackApiError as exc:

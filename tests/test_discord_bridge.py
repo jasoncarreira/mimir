@@ -13,6 +13,7 @@ import pytest
 # Skip the whole module if discord-py isn't installed in the test env.
 pytest.importorskip("discord")
 
+from mimir.bridges.base import MessageUpdate
 from mimir.bridges.discord import (
     DISCORD_MESSAGE_CHAR_LIMIT,
     DiscordBridge,
@@ -221,7 +222,7 @@ async def test_edit_message_calls_message_edit_with_embed(bridge_with_fake_clien
     bridge, _, _ = bridge_with_fake_client
     embed = SimpleNamespace(title="Activity")
 
-    result = await bridge.edit_message("discord-1", "1001", "updated", embed=embed)
+    result = await bridge.edit_message("discord-1", "1001", MessageUpdate(text="updated", blocks=[{"type": "ignored"}], embed=embed))
 
     assert result.sent is True
     assert result.message_id == "1001"
@@ -248,7 +249,7 @@ async def test_edit_message_discord_error_is_soft(bridge_with_fake_client):
 
     channel.fetch_message = boom
 
-    result = await bridge.edit_message("discord-1", "1001", "updated")
+    result = await bridge.edit_message("discord-1", "1001", MessageUpdate(text="updated"))
     assert result.sent is False
     assert result.message_id == "1001"
     assert "discord edit error" in (result.error or "")

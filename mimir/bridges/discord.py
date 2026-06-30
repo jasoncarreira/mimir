@@ -39,7 +39,7 @@ from ..models import AgentEvent
 from ._emoji import resolve_for_discord
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
-from .base import Bridge, SendResult
+from .base import Bridge, MessageUpdate, SendResult
 
 log = logging.getLogger(__name__)
 
@@ -678,19 +678,16 @@ class DiscordBridge(Bridge):
         self,
         channel_id: str,
         message_id: str,
-        text: str,
-        *,
-        blocks: Any | None = None,
-        embed: Any | None = None,
+        update: MessageUpdate,
     ) -> SendResult:
         """Update a prior Discord message in place via ``message.edit``.
 
         ``message_id`` must be the Discord message id returned by
-        ``send()``. Optional ``embed`` is passed through to discord.py.
-        ``blocks`` is ignored; it exists for the cross-bridge method
-        shape. Throttling/debounce is the caller's responsibility.
+        ``send()``. ``update.text`` is used as message content and
+        ``update.embed`` is passed through to discord.py when present.
+        ``update.blocks`` is ignored. Throttling/debounce is the caller's
+        responsibility.
         """
-        del blocks
         if self._client is None or self._client.is_closed():
             return SendResult(sent=False, error="discord client not connected")
         cid_int = _channel_id_to_int(channel_id)
@@ -708,9 +705,9 @@ class DiscordBridge(Bridge):
             if not hasattr(channel, "fetch_message"):
                 return SendResult(sent=False, error=f"channel {cid_int} cannot fetch messages")
             message = await channel.fetch_message(mid_int)
-            kwargs: dict[str, Any] = {"content": text}
-            if embed is not None:
-                kwargs["embed"] = embed
+            kwargs: dict[str, Any] = {"content": update.text or ""}
+            if update.embed is not None:
+                kwargs["embed"] = update.embed
             edited = await message.edit(**kwargs)
         except discord.DiscordException as exc:
             return SendResult(sent=False, message_id=message_id, error=f"discord edit error: {exc}")

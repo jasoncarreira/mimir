@@ -28,6 +28,15 @@ class SendResult:
     error: str | None = None
 
 
+@dataclass
+class MessageUpdate:
+    """Bridge-agnostic payload for editing a prior message in place."""
+
+    text: str | None = None
+    blocks: list[dict[str, Any]] | None = None
+    embed: Any | None = None
+
+
 class Bridge(ABC):
     """Single-source bridge between mimir and one channel backend."""
 
@@ -78,19 +87,17 @@ class Bridge(ABC):
         self,
         channel_id: str,
         message_id: str,
-        text: str,
-        *,
-        blocks: Any | None = None,
-        embed: Any | None = None,
+        update: MessageUpdate,
     ) -> SendResult:
         """Best-effort in-place update of a prior ``send()`` result.
 
         ``message_id`` is the id returned by ``send()`` for the same
-        backend/channel. Bridges with native support override this
-        method (Slack ``chat.update`` with optional Block Kit ``blocks``;
-        Discord ``message.edit`` with optional ``embed``). Bridges without
-        edit support inherit this soft no-op so callers can fall back to
-        posting a replacement message.
+        backend/channel. ``update`` carries the bridge-agnostic edit payload:
+        plain-text fallback/content plus optional rich platform variants
+        (Slack Block Kit ``blocks`` and Discord ``embed``). Bridges should
+        use the fields they support and ignore unsupported rich fields.
+        Bridges without edit support inherit this soft no-op so callers can
+        fall back to posting a replacement message.
 
         This is a single platform edit operation with no throttling or
         debounce policy; callers that stream or repeatedly refresh a UI are
@@ -99,7 +106,7 @@ class Bridge(ABC):
         limits, or other platform failures; return ``sent=False`` with an
         ``error`` string instead.
         """
-        del channel_id, message_id, text, blocks, embed
+        del channel_id, message_id, update
         return SendResult(sent=False, error="edit unsupported")
 
     async def resolve_dm_channel(self, author_id: str) -> str | None:
