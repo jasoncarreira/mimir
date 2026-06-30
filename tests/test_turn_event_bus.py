@@ -166,6 +166,7 @@ def test_emitter_brackets_tool_call_and_result_sharing_id():
     # The reply text rides on the send_message tool-call args (Q5: adapter policy).
     assert tool_call_end["tool_name"] == "send_message"
     assert tool_call_end["args"] == {"content": "hello"}
+    assert tool_result_end["tool_name"] == "send_message"
     # tool_call and tool_result share the LangChain tool id → consumers join them.
     assert tool_call_end["id"] == tool_result_end["id"] == "call_abc"
     assert tool_result_end["status"] == "ok"

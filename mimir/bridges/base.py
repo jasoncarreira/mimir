@@ -118,6 +118,20 @@ class Bridge(ABC):
         del channel_id, message_id, update
         return SendResult(sent=False, error="edit unsupported")
 
+    async def delete_message(
+        self,
+        channel_id: str,
+        message_id: str,
+    ) -> SendResult:
+        """Best-effort deletion of a prior ``send()`` result.
+
+        Bridges without delete support inherit this soft no-op. Implementations
+        must not raise into callers for missing permissions, already-deleted
+        messages, bad ids, rate limits, or other platform failures.
+        """
+        del channel_id, message_id
+        return SendResult(sent=False, error="delete unsupported")
+
     async def resolve_dm_channel(self, author_id: str) -> str | None:
         """Resolve the mimir DM `channel_id` for a user on this bridge,
         given their raw platform user id (``AgentEvent.author_id``).
