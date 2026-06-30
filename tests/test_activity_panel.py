@@ -583,6 +583,7 @@ async def test_detailed_mode_renders_arg_keys_not_raw_values():
         ('{"password": "hunter2", "path": "attachments/secret.png"}', ["hunter2", "attachments/secret.png"]),
         ("{'API_KEY': 'sk-1234567890', 'file': 'C:\\\\Users\\\\Jason\\\\secret.txt'}", ["sk-1234567890", "C:\\\\Users\\\\Jason\\\\secret.txt"]),
         ("Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456", ["ghp_abcdefghijklmnopqrstuvwxyz123456"]),
+        ("Authorization: Bearer eyJhbGciOiJ.payload.sig123ABCdef", ["eyJhbGciOiJ.payload.sig123ABCdef"]),
         ("aws AKIA1234567890ABCDEF and relative memory/core/00-identity.md", ["AKIA1234567890ABCDEF", "memory/core/00-identity.md"]),
         ("opaque Aa1234567890Bb1234567890Cc1234567890Dd1234567890", ["Aa1234567890Bb1234567890Cc1234567890Dd1234567890"]),
     ],

@@ -527,13 +527,15 @@ def _clean_arg_key(value: Any) -> str | None:
 
 
 _SECRET_PATTERNS = (
+    # Authorization: Bearer value and bare Bearer value shapes. Keep this before
+    # the generic authorization key/value pattern so it consumes the token, not
+    # just the literal "Bearer" prefix.
+    re.compile(r"(?i)\b(authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/=-]+"),
     # key=value, key: value, JSON, and Python dict-repr secret values.
     re.compile(
         r"(?i)(['\"]?[A-Za-z0-9_.:-]*(?:token|api[_-]?key|secret|password|authorization)['\"]?\s*[:=]\s*)"
         r"(?:['\"][^'\"]*['\"]|[^,\s}]+)"
     ),
-    # Authorization: Bearer value and bare Bearer value shapes.
-    re.compile(r"(?i)\b(authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/=-]+"),
     # Common provider / GitHub / AWS token prefixes.
     re.compile(r"\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{16})\b"),
     # Conservative high-entropy fallback for long unbroken credential-like blobs.
