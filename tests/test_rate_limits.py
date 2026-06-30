@@ -142,6 +142,19 @@ def test_api_usage_bucket_rescales_percentage():
     assert snap.utilization == 0.75
 
 
+def test_api_usage_bucket_rescales_exact_one_percent_field():
+    """Percent-named fields use 0-100 semantics even at boundary values.
+
+    An exact 1% reading must normalize to 0.01, not saturate the plan
+    window as 1.0.
+    """
+    from mimir.rate_limits import snapshot_from_api_usage_bucket
+
+    snap = snapshot_from_api_usage_bucket({"usage_pct": 1})
+    assert snap is not None
+    assert snap.utilization == 0.01
+
+
 def test_api_usage_bucket_iso_resets_at_string():
     """``resets_at`` may arrive as an ISO timestamp string; parser
     converts to unix seconds."""
