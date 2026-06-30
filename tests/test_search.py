@@ -125,6 +125,9 @@ def test_classify_scope_excludes_skip_paths():
     assert _classify_scope("state/heartbeat-backlog.md") is None
     assert _classify_scope("state/proposed-changes.md") is None
     assert _classify_scope("state/identities.yaml") is None
+    assert _classify_scope("state/wiki/orphans.md") is None
+    assert _classify_scope("state/wiki/dangling-links.md") is None
+    assert _classify_scope("state/wiki/backlinks-index.md") is None
     # Adjacent files in state/ still index normally.
     assert _classify_scope("state/transcripts/kickoff.md") == "state"
 
@@ -142,6 +145,8 @@ def test_classify_scope_excludes_skip_prefixes():
     assert (
         _classify_scope("state/pollers/social-cli-notifications/notes.md") is None
     )
+    # Editor-local wiki settings are workspace state, not retrievable knowledge.
+    assert _classify_scope("state/wiki/.obsidian/workspace.md") is None
     # Sibling state subtree unaffected.
     assert _classify_scope("state/seeds/x.md") == "state"
 
