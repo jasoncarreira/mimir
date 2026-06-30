@@ -475,18 +475,20 @@ def _step_label(event: dict[str, Any], *, tool_name: str = "") -> str:
 def _step_detail(event: dict[str, Any]) -> str | None:
     typ = event.get("type")
     if typ == "reasoning":
-        value = event.get("text")
-    elif typ == "tool_call":
+        detail = _scrub_detail(event.get("text"))
+        return f"thought: {detail}" if detail else None
+    if typ == "tool_call":
         value = event.get("args_delta") if event.get("phase") == "chunk" else event.get("args")
-    elif typ == "tool_result":
+        return _tool_args_detail(value)
+    if typ == "tool_result":
         value = (
             event.get("content_delta")
             if event.get("phase") == "chunk"
             else event.get("content", event.get("result"))
         )
-    else:
-        value = None
-    return _scrub_detail(value)
+        detail = _scrub_detail(value)
+        return f"result: {detail}" if detail else None
+    return None
 
 
 def _merge_detail(existing: str | None, new: str | None, *, limit: int = 420) -> str | None:
@@ -501,11 +503,46 @@ def _detail_lines(detail: str) -> list[str]:
     return [f"  {line}" for line in detail.splitlines()[:4] if line]
 
 
+def _tool_args_detail(value: Any, *, limit: int = 320) -> str | None:
+    if isinstance(value, dict):
+        keys = [_clean_arg_key(key) for key in value.keys()]
+        keys = [key for key in keys if key]
+        if not keys:
+            return None
+        rendered = ", ".join(keys[:12])
+        if len(keys) > 12:
+            rendered = f"{rendered}, +{len(keys) - 12} more"
+        return f"args: {rendered}"
+    if isinstance(value, (list, tuple)):
+        return f"args: {len(value)} items"
+    detail = _scrub_detail(value, limit=limit)
+    return f"args: {detail}" if detail else None
+
+
+def _clean_arg_key(value: Any) -> str | None:
+    text = _clean(value, limit=48)
+    if not text:
+        return None
+    return re.sub(r"[^A-Za-z0-9_.:-]", "", text)[:48] or None
+
+
 _SECRET_PATTERNS = (
-    re.compile(r"(?i)\b(bearer|token|api[_-]?key|secret|password)\s*[:=]\s*[^,\s}]+"),
-    re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(TOKEN|KEY|SECRET|PASSWORD)\s*=\s*[^,\s}]+"),
+    # key=value, key: value, JSON, and Python dict-repr secret values.
+    re.compile(
+        r"(?i)(['\"]?[A-Za-z0-9_.:-]*(?:token|api[_-]?key|secret|password|authorization)['\"]?\s*[:=]\s*)"
+        r"(?:['\"][^'\"]*['\"]|[^,\s}]+)"
+    ),
+    # Authorization: Bearer value and bare Bearer value shapes.
+    re.compile(r"(?i)\b(authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/=-]+"),
+    # Common provider / GitHub / AWS token prefixes.
+    re.compile(r"\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{16})\b"),
+    # Conservative high-entropy fallback for long unbroken credential-like blobs.
+    re.compile(r"\b(?=[A-Za-z0-9_+/=-]{40,}\b)(?=.*[A-Z])(?=.*[a-z])(?=.*\d)[A-Za-z0-9_+/=-]+\b"),
 )
-_PATH_PATTERN = re.compile(r"(?<!\w)(?:/[^\s,'\"}]+|~\/[^\s,'\"}]+)")
+_PATH_PATTERN = re.compile(
+    r"(?<![\w:])(?:/[^\s,'\"}]+|~/[^\s,'\"}]+|[A-Za-z]:\\[^\s,'\"}]+|"
+    r"(?:attachments|scratch|state|memory|mimir|tests|frontend|docs|uploads|tmp|workspace)[/\\][^\s,'\"}]+)"
+)
 
 
 def _scrub_detail(value: Any, *, limit: int = 320) -> str | None:

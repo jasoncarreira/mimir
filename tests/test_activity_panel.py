@@ -476,7 +476,8 @@ async def test_detailed_mode_shows_only_inflight_scrubbed_detail_then_drops_it()
     )
     live_text = bridge.edits[-1].text or ""
     assert "Calling shell_exec" in live_text
-    assert "cat [path]" in live_text
+    assert "args: cmd" in live_text
+    assert "cat" not in live_text
     assert "/secret/path" not in live_text
     assert "TOKEN=abc" not in live_text
 
@@ -535,6 +536,94 @@ async def test_detailed_mode_shows_only_inflight_scrubbed_detail_then_drops_it()
     assert final_text == "✓ 1 steps"
     assert "ok [redacted]" not in final_text
     assert "/tmp/result.txt" not in final_text
+
+
+@pytest.mark.asyncio
+async def test_detailed_mode_renders_arg_keys_not_raw_values():
+    panel, bridge = _panel(detail_levels=(("slack-C01", "detailed"),))
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_call",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "tool_name": "shell_exec",
+            "args": {
+                "cmd": "cat attachments/secret.png",
+                "password": "hunter2",
+                "Authorization": "Bearer sk-live-secret-value",
+                "file_path": "C:\\Users\\Jason\\secret.txt",
+            },
+        }
+    )
+
+    live_text = bridge.edits[-1].text or ""
+    assert "args: cmd, password, Authorization, file_path" in live_text
+    assert "hunter2" not in live_text
+    assert "sk-live-secret-value" not in live_text
+    assert "attachments/secret.png" not in live_text
+    assert "C:\\Users\\Jason\\secret.txt" not in live_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content, leaked",
+    [
+        ('{"password": "hunter2", "path": "attachments/secret.png"}', ["hunter2", "attachments/secret.png"]),
+        ("{'API_KEY': 'sk-1234567890', 'file': 'C:\\\\Users\\\\Jason\\\\secret.txt'}", ["sk-1234567890", "C:\\\\Users\\\\Jason\\\\secret.txt"]),
+        ("Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456", ["ghp_abcdefghijklmnopqrstuvwxyz123456"]),
+        ("aws AKIA1234567890ABCDEF and relative memory/core/00-identity.md", ["AKIA1234567890ABCDEF", "memory/core/00-identity.md"]),
+        ("opaque Aa1234567890Bb1234567890Cc1234567890Dd1234567890", ["Aa1234567890Bb1234567890Cc1234567890Dd1234567890"]),
+    ],
+)
+async def test_detailed_mode_scrubs_realistic_result_secret_and_path_shapes(content: str, leaked: list[str]):
+    panel, bridge = _panel(detail_levels=(("slack-C01", "detailed"),))
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_result",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "tool_name": "shell_exec",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_result",
+            "phase": "chunk",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "content_delta": content,
+        }
+    )
+
+    rendered = bridge.edits[-1].text or ""
+    assert "result:" in rendered
+    for value in leaked:
+        assert value not in rendered
 
 
 @pytest.mark.asyncio
