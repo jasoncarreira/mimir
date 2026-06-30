@@ -2435,6 +2435,148 @@ async def test_scheduler_loop_lag_monitor_logs_blocking_delay(tmp_path: Path, mo
     ]
 
 
+_IDLE_LOOP_STACK = (
+    '  File "/app/mimir/server.py", line 1873, in main\n'
+    '  File "/usr/local/lib/python3.11/asyncio/base_events.py", line 1898, in _run_once\n'
+    '  File "/usr/local/lib/python3.11/selectors.py", line 468, in select\n'
+)
+_REAL_LOOP_STACK = (
+    '  File "/app/mimir/health_probe.py", line 351, in probe_pwd\n'
+    '  File "/usr/local/lib/python3.11/subprocess.py", line 1885, in _execute_child\n'
+)
+
+
+async def _run_loop_lag_monitor_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stacks: list[str],
+    cpu_ticks: list[float],
+) -> tuple[str, dict]:
+    logged: list[tuple[str, dict]] = []
+    ticks = iter([0.0, 0.11, 0.34])
+    cpu_iter = iter(cpu_ticks)
+
+    async def fake_sleep(_delay: float) -> None:
+        await asyncio.sleep(0)
+
+    async def fake_log_event(event_type: str, **payload):
+        logged.append((event_type, payload))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("mimir.scheduler.log_event", fake_log_event)
+
+    class _FakeWatchdog:
+        def drain(self):
+            return [
+                {
+                    "stall_s": 0.13,
+                    "stack": stack,
+                }
+                for stack in stacks
+            ]
+
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched._loop_watchdog = _FakeWatchdog()
+
+    with pytest.raises(asyncio.CancelledError):
+        await sched._monitor_loop_lag(
+            interval_s=0.1,
+            threshold_s=0.05,
+            clock=lambda: next(ticks),
+            cpu_clock=lambda: next(cpu_iter),
+            sleeper=fake_sleep,
+        )
+
+    assert len(logged) == 1
+    return logged[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stacks", "cpu_ticks", "expected_event_type", "expected_cause"),
+    [
+        (
+            [_IDLE_LOOP_STACK, _IDLE_LOOP_STACK, _IDLE_LOOP_STACK, _REAL_LOOP_STACK],
+            [0.0, 0.0, 0.0],
+            "scheduler_loop_lag_host",
+            "host_scheduling",
+        ),
+        (
+            [_REAL_LOOP_STACK, _REAL_LOOP_STACK, _REAL_LOOP_STACK, _IDLE_LOOP_STACK],
+            [0.0, 0.0, 0.0],
+            "scheduler_loop_lag",
+            "on_loop",
+        ),
+        (
+            [_IDLE_LOOP_STACK, _IDLE_LOOP_STACK],
+            [0.0, 0.0, 0.0],
+            "scheduler_loop_lag_host",
+            "host_scheduling",
+        ),
+        (
+            [],
+            [0.0, 0.0, 0.0],
+            "scheduler_loop_lag_host",
+            "host_scheduling",
+        ),
+        (
+            [_IDLE_LOOP_STACK, _IDLE_LOOP_STACK],
+            [0.0, 0.0, 0.13],
+            "scheduler_loop_lag",
+            "on_loop",
+        ),
+    ],
+)
+async def test_scheduler_loop_lag_monitor_uses_sample_dominance_for_cause(
+    tmp_path: Path,
+    monkeypatch,
+    stacks: list[str],
+    cpu_ticks: list[float],
+    expected_event_type: str,
+    expected_cause: str,
+):
+    event_type, payload = await _run_loop_lag_monitor_once(
+        tmp_path,
+        monkeypatch,
+        stacks=stacks,
+        cpu_ticks=cpu_ticks,
+    )
+
+    assert event_type == expected_event_type
+    assert payload["cause"] == expected_cause
+
+
+@pytest.mark.asyncio
+async def test_scheduler_loop_lag_monitor_dominance_uses_full_drained_capture_list(
+    tmp_path: Path, monkeypatch
+):
+    stacks = [
+        _IDLE_LOOP_STACK,
+        _IDLE_LOOP_STACK,
+        _IDLE_LOOP_STACK,
+        _REAL_LOOP_STACK,
+        _REAL_LOOP_STACK,
+        _REAL_LOOP_STACK,
+        _REAL_LOOP_STACK,
+    ]
+
+    event_type, payload = await _run_loop_lag_monitor_once(
+        tmp_path,
+        monkeypatch,
+        stacks=stacks,
+        cpu_ticks=[0.0, 0.0, 0.0],
+    )
+
+    assert event_type == "scheduler_loop_lag"
+    assert payload["cause"] == "on_loop"
+    assert len(payload["blocking_stacks"]) == 3
+    assert all("selectors.py" in capture["stack"] for capture in payload["blocking_stacks"])
+
+
 @pytest.mark.asyncio
 async def test_scheduler_loop_lag_monitor_routes_host_deschedule(tmp_path: Path, monkeypatch):
     """chainlink #682: a late wake with no on-loop CPU and no captured frame is a
