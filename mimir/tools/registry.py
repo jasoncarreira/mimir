@@ -464,6 +464,12 @@ async def send_message(
             try:
                 ctx.send_message_count += 1
                 ctx.delivered_channel_ids.add(cid)
+                emitter = getattr(ctx, "turn_event_emitter", None)
+                if emitter is not None:
+                    emitter.outbound_message(
+                        channel_id=cid,
+                        message_id=getattr(result, "message_id", None),
+                    )
             except Exception:  # noqa: BLE001
                 pass
         if detector is not None:

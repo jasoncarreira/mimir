@@ -23,7 +23,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage
@@ -63,6 +63,7 @@ class _Inflight:
     queue: list["AgentEvent"] = field(default_factory=list)
     folded: list[tuple["AgentEvent", float]] = field(default_factory=list)
     deferred: dict[str, str] = field(default_factory=dict)
+    emitter: Any | None = None
     active: bool = True
 
 
@@ -73,7 +74,7 @@ _REGISTRY: dict[str, _Inflight] = {}
 _LOCK = threading.Lock()
 
 
-def register_inflight(channel_id: str | None) -> None:
+def register_inflight(channel_id: str | None, *, emitter: Any | None = None) -> None:
     """Mark a turn in-flight for ``channel_id`` (called at ``run_turn`` start).
 
     Overwrites any prior entry for the channel — the dispatcher serializes per
@@ -82,7 +83,7 @@ def register_inflight(channel_id: str | None) -> None:
     if not channel_id:
         return
     with _LOCK:
-        _REGISTRY[channel_id] = _Inflight()
+        _REGISTRY[channel_id] = _Inflight(emitter=emitter)
 
 
 def deactivate(
@@ -185,7 +186,13 @@ def _drain(channel_id: str | None) -> list["AgentEvent"]:
         inflight.queue.clear()
         now = time.monotonic()
         inflight.folded.extend((e, now) for e in drained)
-        return drained
+        emitter = inflight.emitter
+    if emitter is not None:
+        try:
+            emitter.injected_input(drained)
+        except Exception:  # noqa: BLE001 — panel telemetry is best-effort
+            log.debug("turn-event injected-input emit failed", exc_info=True)
+    return drained
 
 
 def folded_records(channel_id: str | None) -> list[tuple["AgentEvent", float]]:

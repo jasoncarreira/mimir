@@ -242,6 +242,35 @@ def test_before_model_folds_queued_messages_fifo(monkeypatch):
     assert mw.before_model(state={}, runtime=None) is None  # drained → no-op
 
 
+def test_before_model_emits_sanitized_folded_input_event(monkeypatch):
+    _patch_channel(monkeypatch, "ch1")
+    seen: list[list[AgentEvent]] = []
+
+    class _Emitter:
+        def injected_input(self, events):
+            seen.append(list(events))
+
+    mti.register_inflight("ch1", emitter=_Emitter())
+    mti.inject_message(
+        "ch1",
+        AgentEvent(
+            trigger="user_message",
+            channel_id="ch1",
+            content="do not render this body",
+            author="slack-U1",
+            author_display="Jason",
+            source_id="m123",
+            source="slack",
+            attachment_names=["/secret/path.png"],
+        ),
+    )
+
+    out = mti.MidTurnInjectionMiddleware().before_model(state={}, runtime=None)
+
+    assert out is not None
+    assert seen and seen[0][0].source_id == "m123"
+
+
 def test_before_model_reads_channel_id_from_get_config(monkeypatch):
     """Guards mimir's finding #1: the hook keys off get_config()'s channel_id,
     not the runtime, and only drains that channel's queue."""

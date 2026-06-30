@@ -913,6 +913,9 @@ class Config:
     # auto-delivers that final text directly. Empty default = off.
     # ``MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS``.
     auto_deliver_final_text_channels: tuple[str, ...] = ()
+    # Passive live activity panel channel-prefix allowlist. Empty = off.
+    # ``MIMIR_ACTIVITY_PANEL_CHANNELS``.
+    activity_panel_channels: tuple[str, ...] = ()
     # Operator-declared absolute roots OUTSIDE the home the file tools may
     # read/edit, as ``(abs_path, "ro"|"rw")`` pairs (chainlink #650). Empty =
     # home-only (today's behavior). ``MIMIR_FILE_TOOL_ROOTS``.
@@ -1055,6 +1058,11 @@ class Config:
             auto_deliver_final_text_channels=tuple(
                 p.strip()
                 for p in _env("MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS", "").split(",")
+                if p.strip()
+            ),
+            activity_panel_channels=tuple(
+                p.strip()
+                for p in _env("MIMIR_ACTIVITY_PANEL_CHANNELS", "").split(",")
                 if p.strip()
             ),
             api_key=_env("MIMIR_API_KEY"),
