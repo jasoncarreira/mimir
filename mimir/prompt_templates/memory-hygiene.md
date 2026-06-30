@@ -47,8 +47,11 @@ Candidate buckets:
 - `memory/issues/*.md` files that say `RESOLVED`, `FIXED`, name merged
   PRs, lack fingerprint/runbook shape, or look like concept synthesis
   that belongs in `state/wiki/concepts/`.
-- memory/wiki files missing a first-line `<!-- desc: ... -->`, because
-  INDEX descriptions become less useful without it.
+- memory/wiki markdown content files missing a first-line `<!-- desc: ... -->`, because
+  INDEX descriptions become less useful without it. Exclude generated wiki reports
+  (`state/wiki/{orphans,dangling-links,backlinks-index}.md`) and hidden/editor
+  artifacts (`.DS_Store`, `.obsidian/`) from this bucket; those should be fixed
+  by generator/indexer/ignore rules rather than hand-written descriptions.
 - obvious filing-rule mismatches from `memory/core/60-filing-rules.md`:
   session-scoped notes in core, operational gotchas in wiki, concept
   synthesis in `memory/issues/`, free-form top-level `state/*.md` files.

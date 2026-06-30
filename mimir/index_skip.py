@@ -13,6 +13,9 @@ INDEX_SKIP_PATHS: frozenset[str] = frozenset(
         "state/heartbeat-backlog.md",  # operator/agent shared todo
         "state/proposed-changes.md",  # pending HITL items
         "state/identities.yaml",  # operator config; not .md but defensive
+        "state/wiki/backlinks-index.md",  # generated backlink map; searchable source is content pages
+        "state/wiki/dangling-links.md",  # generated wiki health report, not durable knowledge
+        "state/wiki/orphans.md",  # generated wiki health report, not durable knowledge
     }
 )
 INDEX_SKIP_PREFIXES: tuple[str, ...] = (
@@ -29,6 +32,9 @@ INDEX_SKIP_PREFIXES: tuple[str, ...] = (
     # (per-message processed manifests, inbox snapshots) would cause
     # constant reindex churn on social-active installs.
     "state/social/",
+    # Obsidian/editor-local wiki settings are useful workspace state, but
+    # not wiki content and not something file_search should retrieve.
+    "state/wiki/.obsidian/",
 )
 
 

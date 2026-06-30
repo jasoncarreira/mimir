@@ -11,8 +11,9 @@ wikilinks, and writes three derived reports:
 - ``state/wiki/backlinks-index.md`` — full inbound map, one section per
   page. Grep ``## <path>`` to find what links to a specific page.
 
-All three are regenerated each run with a ``_Generated <ts>_`` header
-— no partial updates, no diff noise from manual edits, no risk of
+All three are regenerated each run with a first-line ``<!-- desc: ... -->``
+comment followed by a ``_Generated <ts>_`` header — no partial updates, no
+manual desc-header drift, no diff noise from manual edits, no risk of
 clobbering the agent's own page edits.
 
 When the wiki has any orphans or dangling links, emits a
@@ -378,6 +379,11 @@ _GENERATED_HEADER = (
     "_Generated {ts} by `mimir wiki backlinks` — regenerated on each "
     "run; don't hand-edit (your changes will be overwritten)._"
 )
+_DESC_HEADERS = {
+    "orphans": "<!-- desc: generated wiki health report — orphan pages with no inbound wikilinks -->",
+    "dangling": "<!-- desc: generated wiki health report — wikilinks whose target page is missing -->",
+    "backlinks": "<!-- desc: generated wiki backlinks index — inbound wikilink map for each page -->",
+}
 
 
 def render_orphans_md(graph: BacklinksGraph, generated_at: str) -> str:
@@ -386,7 +392,13 @@ def render_orphans_md(graph: BacklinksGraph, generated_at: str) -> str:
         rel = Path(path_str)
         by_category[_category_of(rel)].append(path_str)
 
-    lines = ["# Orphan Pages", "", _GENERATED_HEADER.format(ts=generated_at), ""]
+    lines = [
+        _DESC_HEADERS["orphans"],
+        "# Orphan Pages",
+        "",
+        _GENERATED_HEADER.format(ts=generated_at),
+        "",
+    ]
     if not graph.orphans:
         lines.append(
             "(none — every page has at least one inbound `[[link]]`.)"
@@ -412,6 +424,7 @@ def render_orphans_md(graph: BacklinksGraph, generated_at: str) -> str:
 
 def render_dangling_md(graph: BacklinksGraph, generated_at: str) -> str:
     lines = [
+        _DESC_HEADERS["dangling"],
         "# Dangling Wikilinks",
         "",
         _GENERATED_HEADER.format(ts=generated_at),
@@ -447,6 +460,7 @@ def render_backlinks_index_md(
     graph: BacklinksGraph, generated_at: str,
 ) -> str:
     lines = [
+        _DESC_HEADERS["backlinks"],
         "# Backlinks Index",
         "",
         _GENERATED_HEADER.format(ts=generated_at),

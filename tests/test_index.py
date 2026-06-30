@@ -102,6 +102,23 @@ def test_build_state_index_lists_state_files(tmp_path: Path):
     assert "kickoff" in body
 
 
+def test_build_state_index_skips_generated_wiki_reports(tmp_path: Path):
+    wiki = tmp_path / "state" / "wiki"
+    wiki.mkdir(parents=True)
+    (wiki / "orphans.md").write_text("<!-- desc: generated orphans -->\n# Orphans")
+    (wiki / "dangling-links.md").write_text("<!-- desc: generated dangling -->\n# Dangling")
+    (wiki / "backlinks-index.md").write_text("<!-- desc: generated backlinks -->\n# Backlinks")
+    (wiki / "topics").mkdir()
+    (wiki / "topics" / "kept.md").write_text("<!-- desc: real wiki page -->\n# Kept")
+
+    body = build_state_index(tmp_path)
+
+    assert "wiki/orphans.md" not in body
+    assert "wiki/dangling-links.md" not in body
+    assert "wiki/backlinks-index.md" not in body
+    assert "wiki/topics/kept.md" in body
+
+
 def test_build_state_index_does_not_skip_operator_paths_by_default(tmp_path: Path):
     state = tmp_path / "state"
     (state / "openclaw-tools" / "node_modules" / "openclaw").mkdir(parents=True)

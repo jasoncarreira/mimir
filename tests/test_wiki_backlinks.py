@@ -394,6 +394,7 @@ def test_render_orphans_clean_wiki(wiki: Path):
     _write(wiki, "concepts/b.md", "[[a]]")
     graph = build_graph(wiki)
     out = render_orphans_md(graph, "2026-05-09T00:00:00+00:00")
+    assert out.startswith("<!-- desc: generated wiki health report")
     assert "(none — every page has at least one inbound" in out
 
 
@@ -414,6 +415,7 @@ def test_render_dangling_groups_by_source(wiki: Path):
     _write(wiki, "concepts/foo.md", "[[ghost-1]]\n\n[[ghost-2]]")
     graph = build_graph(wiki)
     out = render_dangling_md(graph, "2026-05-09T00:00:00+00:00")
+    assert out.startswith("<!-- desc: generated wiki health report")
     assert "## `concepts/foo.md`" in out
     assert "[[ghost-1]]" in out and "(line 1)" in out
     assert "[[ghost-2]]" in out and "(line 3)" in out
@@ -425,6 +427,7 @@ def test_render_backlinks_index_marks_orphans(wiki: Path):
     _write(wiki, "concepts/source.md", "[[popular]]")
     graph = build_graph(wiki)
     out = render_backlinks_index_md(graph, "2026-05-09T00:00:00+00:00")
+    assert out.startswith("<!-- desc: generated wiki backlinks index")
     # Path-keyed sections (was slug-keyed pre-refactor).
     assert "## concepts/lonely.md" in out
     assert "_(orphan — no inbound links)_" in out
@@ -443,10 +446,13 @@ async def test_run_writes_three_files_and_emits_event(home: Path):
 
     summary = await run(home)
 
-    # Outputs land at the expected paths.
+    # Outputs land at the expected paths with desc headers for index/search hygiene.
     assert (wiki / "orphans.md").exists()
     assert (wiki / "dangling-links.md").exists()
     assert (wiki / "backlinks-index.md").exists()
+    for output in ("orphans.md", "dangling-links.md", "backlinks-index.md"):
+        first = (wiki / output).read_text(encoding="utf-8").splitlines()[0]
+        assert first.startswith("<!-- desc: ")
 
     assert summary["page_count"] == 2
     assert summary["orphan_count"] == 1  # foo has no inbound
