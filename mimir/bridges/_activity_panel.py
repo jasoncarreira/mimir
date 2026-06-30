@@ -28,6 +28,38 @@ def channel_enabled(channel_id: str, allowlist: tuple[str, ...]) -> bool:
     return any(channel_id.startswith(prefix) for prefix in allowlist)
 
 
+# Activity panels are user-facing bridge UI, so start events must opt into a
+# documented set of work-producing triggers. Unknown triggers are skipped by
+# default: adding a new framework/session-management trigger must not surface a
+# panel until it is classified here.
+ACTIVITY_PANEL_INCLUDED_TRIGGERS = frozenset(
+    {
+        "user_message",  # Direct user interaction; always show progress.
+        "poller",  # Autonomous external work operators may allow-list.
+        "scheduled_tick",  # Scheduled autonomous work on allow-listed channels.
+        "shell_job_complete",  # Async job continuation the user/work initiated.
+    }
+)
+
+ACTIVITY_PANEL_EXCLUDED_TRIGGERS = frozenset(
+    {
+        "saga_session_end",  # Idle-session synthesis; internal housekeeping.
+        "upgrade",  # Defaults/version maintenance; framework-owned.
+        "claude_code_spawn",  # Spawn bookkeeping; not a user-facing turn.
+        "react_received",  # Reaction bookkeeping/follow-up routing.
+        "reflect",  # Internal reflection/introspection work.
+        "unknown",  # Missing/unclean trigger metadata is not user-facing.
+    }
+)
+
+
+def trigger_enabled(trigger: Any) -> bool:
+    cleaned = _clean(trigger, limit=80) or "unknown"
+    if cleaned in ACTIVITY_PANEL_EXCLUDED_TRIGGERS:
+        return False
+    return cleaned in ACTIVITY_PANEL_INCLUDED_TRIGGERS
+
+
 @dataclass
 class ActivityStep:
     label: str
@@ -132,6 +164,8 @@ class ActivityPanel:
         if not turn_id:
             return
         if event.get("type") == "turn" and event.get("phase") == "start":
+            if not trigger_enabled(event.get("trigger")):
+                return
             model = ActivityPanelModel(
                 turn_id=turn_id,
                 channel_id=channel_id,
