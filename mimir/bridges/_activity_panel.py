@@ -228,7 +228,11 @@ class ActivityPanel:
         if model.finalized:
             return
         loop = asyncio.get_running_loop()
-        elapsed = loop.time() - self._last_edit_by_channel.get(model.channel_id, 0.0)
+        last_edit = self._last_edit_by_channel.get(model.channel_id)
+        if last_edit is None:
+            await self._flush(model)
+            return
+        elapsed = loop.time() - last_edit
         if elapsed >= self._debounce_seconds:
             await self._flush(model)
             return
