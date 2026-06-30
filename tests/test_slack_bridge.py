@@ -140,8 +140,8 @@ def bridge_with_fake_app():
     updated: list[dict] = []
     users_info_calls: list[str] = []
 
-    async def fake_post(*, channel: str, text: str):
-        sent.append({"channel": channel, "text": text})
+    async def fake_post(**kwargs):
+        sent.append(kwargs)
         return {"ts": f"1234567890.{len(sent):06d}"}
 
     async def fake_reactions_add(*, channel: str, timestamp: str, name: str):
@@ -229,6 +229,25 @@ async def test_send_returns_message_ts(bridge_with_fake_app):
     assert result.sent is True
     assert result.message_id is not None
     assert "." in result.message_id  # Slack ts format: epoch.microseconds
+
+
+@pytest.mark.asyncio
+async def test_send_can_post_threaded_block_kit_panel(bridge_with_fake_app):
+    bridge, _, sent = bridge_with_fake_app
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*Working*"}}]
+
+    result = await bridge.send(
+        "slack-C01ABC",
+        "Working",
+        final=False,
+        reply_to_message_id="111.222",
+        blocks=blocks,
+    )
+
+    assert result.sent is True
+    assert sent[0]["channel"] == "C01ABC"
+    assert sent[0]["thread_ts"] == "111.222"
+    assert sent[0]["blocks"] == blocks
 
 
 @pytest.mark.asyncio

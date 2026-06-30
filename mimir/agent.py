@@ -1313,7 +1313,7 @@ class Agent:
         emitter = TurnEventEmitter(
             self._turn_event_bus, turn_id=turn_id, channel_id=event.channel_id
         )
-        emitter.turn_started()
+        emitter.turn_started(event)
         _turn_record = None
         _turn_exc = None
         # chainlink #383: arm mid-turn injection before any slow setup work
@@ -1328,7 +1328,7 @@ class Agent:
         # stale active entry.
         injection_registered = False
         if event.channel_id and event.trigger == "user_message":
-            mid_turn_injection.register_inflight(event.channel_id)
+            mid_turn_injection.register_inflight(event.channel_id, emitter=emitter)
             injection_registered = True
         # chainlink #415: cleanup obligations accrue across the setup phase
         # (typing-indicator hold, _active_turns registration, channel /
@@ -1437,6 +1437,7 @@ class Agent:
                 identity_resolver=getattr(self, "_identity_resolver", None),
                 access_control_enforced=self._config.access_control_enforced,
             )
+            ctx.turn_event_emitter = emitter
             # WikiBacklinksHook pre-snapshot — capture mtimes of every
             # state/wiki/ content page BEFORE the model loop runs so the
             # finalize step can tell if any wiki page was edited this turn.
@@ -1532,15 +1533,34 @@ class Agent:
             # chainlink #583: close the turn bracket on the live bus. Status
             # reflects an exception or a returned record that carries an error.
             try:
+                _outbound_sent = (
+                    (getattr(ctx, "send_message_count", 0) or 0) > 0
+                    if ctx is not None else None
+                )
+                _injected_count = (
+                    len(getattr(_turn_record, "injected_inputs", []) or [])
+                    if _turn_record is not None else None
+                )
                 if _turn_exc is not None:
                     emitter.turn_ended(
                         status="error",
                         error=f"{type(_turn_exc).__name__}: {_turn_exc}",
+                        outbound_message_sent=_outbound_sent,
+                        injected_input_count=_injected_count,
                     )
                 elif _turn_record is not None and getattr(_turn_record, "error", None):
-                    emitter.turn_ended(status="error", error=str(_turn_record.error))
+                    emitter.turn_ended(
+                        status="error",
+                        error=str(_turn_record.error),
+                        outbound_message_sent=_outbound_sent,
+                        injected_input_count=_injected_count,
+                    )
                 else:
-                    emitter.turn_ended(status="ok")
+                    emitter.turn_ended(
+                        status="ok",
+                        outbound_message_sent=_outbound_sent,
+                        injected_input_count=_injected_count,
+                    )
             except Exception:  # noqa: BLE001 — never let emission break cleanup
                 pass
             if injection_registered:
@@ -1784,6 +1804,12 @@ class Agent:
         try:
             ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
             ctx.delivered_channel_ids.add(event.channel_id)
+            emitter = getattr(ctx, "turn_event_emitter", None)
+            if emitter is not None:
+                emitter.outbound_message(
+                    channel_id=event.channel_id,
+                    message_id=getattr(result, "message_id", None),
+                )
         except Exception:  # noqa: BLE001
             log.debug("auto-deliver bookkeeping failed", exc_info=True)
 

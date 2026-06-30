@@ -32,7 +32,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .models import AgentEvent
 
 log = logging.getLogger(__name__)
 
@@ -166,14 +169,49 @@ class TurnEventEmitter:
         except Exception:  # noqa: BLE001 — emission is best-effort, never fatal
             log.debug("turn-event emit failed", exc_info=True)
 
-    def turn_started(self) -> None:
-        self._emit("turn", "start")
+    def turn_started(self, trigger_event: "AgentEvent | None" = None) -> None:
+        self._emit("turn", "start", **_trigger_metadata(trigger_event))
 
-    def turn_ended(self, *, status: str = "ok", error: str | None = None) -> None:
+    def turn_ended(
+        self,
+        *,
+        status: str = "ok",
+        error: str | None = None,
+        outbound_message_sent: bool | None = None,
+        injected_input_count: int | None = None,
+    ) -> None:
         payload: dict[str, Any] = {"status": status}
         if error:
             payload["error"] = error[:240]
+        if outbound_message_sent is not None:
+            payload["outbound_message_sent"] = bool(outbound_message_sent)
+        if injected_input_count is not None:
+            payload["injected_input_count"] = max(0, int(injected_input_count))
         self._emit("turn", "end", **payload)
+
+    def injected_input(self, events: list["AgentEvent"]) -> None:
+        if not events:
+            return
+        items = [_folded_input_metadata(e) for e in events]
+        self._emit(
+            "injected_input",
+            "end",
+            count=len(items),
+            inputs=items,
+        )
+
+    def outbound_message(
+        self,
+        *,
+        channel_id: str | None = None,
+        message_id: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {"sent": True}
+        if channel_id:
+            payload["target_channel_id"] = channel_id
+        if message_id:
+            payload["message_id"] = message_id
+        self._emit("outbound_message", "end", **payload)
 
     def token_chunk(self, message_chunk: Any) -> None:
         """Stream token-level tool-call arg deltas from a messages-mode chunk.
@@ -289,3 +327,47 @@ class TurnEventEmitter:
             if content:
                 self._emit("tool_result", "chunk", id=span_id, content_delta=content)
             self._emit("tool_result", "end", id=span_id, status=status, content=content)
+
+
+def _clean_string(value: Any, *, limit: int = 240) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:limit]
+
+
+def _trigger_metadata(event: "AgentEvent | None") -> dict[str, Any]:
+    if event is None:
+        return {}
+    source_id = _clean_string(event.source_id)
+    extra = event.extra if isinstance(event.extra, dict) else {}
+    slack_thread_ts = _clean_string(extra.get("thread_ts")) or (
+        source_id if event.source == "slack" else None
+    )
+    reply_to_message_id = slack_thread_ts or source_id
+    payload: dict[str, Any] = {
+        "trigger": _clean_string(event.trigger) or "unknown",
+        "source": _clean_string(event.source),
+        "source_id": source_id,
+        "author": _clean_string(event.author),
+        "author_display": _clean_string(event.author_display),
+        "reply_to_message_id": reply_to_message_id,
+    }
+    if slack_thread_ts:
+        payload["thread_ts"] = slack_thread_ts
+    return {k: v for k, v in payload.items() if v is not None}
+
+
+def _folded_input_metadata(event: "AgentEvent") -> dict[str, Any]:
+    return {
+        k: v
+        for k, v in {
+            "source": _clean_string(event.source),
+            "source_id": _clean_string(event.source_id),
+            "author": _clean_string(event.author),
+            "author_display": _clean_string(event.author_display),
+        }.items()
+        if v is not None
+    }

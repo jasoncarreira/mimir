@@ -7,6 +7,7 @@ import asyncio
 from langchain_core.messages import AIMessage, ToolMessage
 
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
+from mimir.models import AgentEvent
 
 
 def _drain(queue: "asyncio.Queue[dict]") -> list[dict]:
@@ -69,7 +70,12 @@ def test_emitter_turn_bracket_envelope():
     q = bus.subscribe("web-default")
     emitter = TurnEventEmitter(bus, turn_id="t1", channel_id="web-default")
     emitter.turn_started()
-    emitter.turn_ended(status="error", error="boom")
+    emitter.turn_ended(
+        status="error",
+        error="boom",
+        outbound_message_sent=True,
+        injected_input_count=2,
+    )
 
     events = _drain(q)
     assert [(e["type"], e["phase"]) for e in events] == [("turn", "start"), ("turn", "end")]
@@ -80,6 +86,58 @@ def test_emitter_turn_bracket_envelope():
         assert isinstance(e["seq"], int) and e["ts"]
     assert start["seq"] < end["seq"]  # monotonic
     assert end["status"] == "error" and end["error"] == "boom"
+    assert end["outbound_message_sent"] is True
+    assert end["injected_input_count"] == 2
+
+
+def test_turn_start_includes_sanitized_trigger_metadata_for_slack_threading():
+    bus = TurnEventBus()
+    q = bus.subscribe("slack-C01")
+    emitter = TurnEventEmitter(bus, turn_id="t1", channel_id="slack-C01")
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-C01",
+        content="secret inbound body",
+        author="slack-U1",
+        author_display="Alice",
+        source_id="111.222",
+        source="slack",
+        attachment_names=["/tmp/secret.txt"],
+        extra={"thread_ts": "999.000", "raw": {"text": "nope"}},
+    )
+
+    emitter.turn_started(event)
+
+    start = _drain(q)[0]
+    assert start["trigger"] == "user_message"
+    assert start["source"] == "slack"
+    assert start["source_id"] == "111.222"
+    assert start["author"] == "slack-U1"
+    assert start["author_display"] == "Alice"
+    assert start["thread_ts"] == "999.000"
+    assert start["reply_to_message_id"] == "999.000"
+    assert "secret inbound body" not in str(start)
+    assert "/tmp/secret.txt" not in str(start)
+
+
+def test_turn_start_slack_thread_falls_back_to_source_ts():
+    bus = TurnEventBus()
+    q = bus.subscribe("slack-C01")
+    emitter = TurnEventEmitter(bus, turn_id="t1", channel_id="slack-C01")
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-C01",
+        content="body",
+        source_id="111.222",
+        source="slack",
+        extra={},
+    )
+
+    emitter.turn_started(event)
+
+    start = _drain(q)[0]
+    assert start["thread_ts"] == "111.222"
+    assert start["reply_to_message_id"] == "111.222"
 
 
 def test_emitter_brackets_tool_call_and_result_sharing_id():

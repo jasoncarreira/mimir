@@ -288,6 +288,19 @@ class TestConfigFromEnv:
         cfg = Config.from_env()
         assert cfg.tool_call_budget == 0
 
+    def test_activity_panel_channels_off_by_default_and_parsed(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_ACTIVITY_PANEL_CHANNELS", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.activity_panel_channels == ()
+
+        monkeypatch.setenv("MIMIR_ACTIVITY_PANEL_CHANNELS", "slack-C01, dm-slack-")
+        cfg = Config.from_env()
+        assert cfg.activity_panel_channels == ("slack-C01", "dm-slack-")
+
     def test_file_op_extra_roots_empty_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._base(monkeypatch)
         monkeypatch.delenv("MIMIR_FILE_OP_ROOTS", raising=False)

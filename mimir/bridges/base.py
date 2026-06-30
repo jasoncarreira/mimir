@@ -63,6 +63,8 @@ class Bridge(ABC):
         attachment_paths: list[Path] | None = None,
         *,
         final: bool = True,
+        reply_to_message_id: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
     ) -> SendResult:
         """Emit ``text`` to ``channel_id``. Returns a ``SendResult`` —
         ``sent=False`` plus an ``error`` string for soft failures the model
@@ -75,7 +77,12 @@ class Bridge(ABC):
         keep them held when ``final=False`` and only release on
         ``final=True`` (the default; matches the pre-streaming
         single-flush behavior). Bridges that don't have such
-        affordances ignore the kwarg."""
+        affordances ignore the kwarg.
+
+        ``reply_to_message_id`` is an optional bridge-native parent message id
+        for passive UI replies. ``blocks`` carries optional rich send payloads
+        such as Slack Block Kit. Bridges without support ignore them.
+        """
 
     @abstractmethod
     async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:

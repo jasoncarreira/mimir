@@ -58,13 +58,15 @@ class BenchBridge(Bridge):
         attachment_paths: list[Path] | None = None,
         *,
         final: bool = True,
+        reply_to_message_id: str | None = None,
+        blocks: list[dict] | None = None,
     ) -> SendResult:
         # bench has no typing-indicator affordance, so ``final`` is
         # informational only and ignored. As of 0.3.0 there is no
         # streaming/auto-dispatch at all — bench.send is reached only via the
         # send_message tool, and the bench harness reads the agent's answer
         # from TurnRecord.output (turns.jsonl), not from this stdout line.
-        del final
+        del final, reply_to_message_id, blocks
         message_id = uuid.uuid4().hex[:12]
         line = (
             f"[mimir:bench send_message channel={channel_id} "

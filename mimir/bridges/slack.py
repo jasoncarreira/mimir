@@ -490,6 +490,8 @@ class SlackBridge(Bridge):
         attachment_paths: list[Path] | None = None,
         *,
         final: bool = True,
+        reply_to_message_id: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
     ) -> SendResult:
         # chainlink #5: Slack has no public typing-indicator API for
         # bots (chat.assistant.threads.setStatus is App Assistant-only),
@@ -510,9 +512,12 @@ class SlackBridge(Bridge):
         sent_count = 0
         try:
             for chunk in chunks:
-                resp = await self._app.client.chat_postMessage(
-                    channel=slack_channel, text=chunk
-                )
+                kwargs: dict[str, Any] = {"channel": slack_channel, "text": chunk}
+                if reply_to_message_id:
+                    kwargs["thread_ts"] = reply_to_message_id
+                if blocks is not None and sent_count == 0:
+                    kwargs["blocks"] = blocks
+                resp = await self._app.client.chat_postMessage(**kwargs)
                 last_id = resp.get("ts") or last_id
                 sent_count += 1
             for path in attachment_paths or []:

@@ -1131,10 +1131,22 @@ def build_app(config: Config) -> web.Application:
         ),
         turn_event_bus=turn_event_bus,
     )
+    activity_panel = None
+    if config.activity_panel_channels:
+        from .bridges._activity_panel import ActivityPanel
+
+        activity_panel = ActivityPanel(
+            turn_event_bus,
+            channels,
+            config.activity_panel_channels,
+        )
+        app["activity_panel"] = activity_panel
     # Web chat bridge — POST /chat + GET /chat/stream for the local UI.
     web_chat.register_routes(app)
 
     async def _on_startup(app: web.Application) -> None:
+        if activity_panel is not None:
+            activity_panel.start()
         # PR 4b (docs/internal/MIMIR_HOME_GIT_TRACKING.md): idempotent bootstrap. Runs
         # before the agent starts processing turns so the post-turn
         # commit hook lands on a real repo. Sync function dispatched to
@@ -1795,6 +1807,9 @@ def build_app(config: Config) -> web.Application:
         await sessions.shutdown()
         await indexer.stop()
         await saga_client.close()
+        panel = app.get("activity_panel")
+        if panel is not None:
+            await panel.stop()
         await channels.disconnect_all()
         mcp_manager = app.get("mcp_manager")
         if mcp_manager is not None:

@@ -539,7 +539,10 @@ class DiscordBridge(Bridge):
         attachment_paths: list[Path] | None = None,
         *,
         final: bool = True,
+        reply_to_message_id: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
     ) -> SendResult:
+        del reply_to_message_id, blocks
         # Cancel any in-flight typing-hold task on this channel before
         # the actual reply goes out — but only on the FINAL flush.
         # Discord drops the indicator within ~10s of the last refresh,
