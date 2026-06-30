@@ -223,6 +223,33 @@ def _channel_id_to_int(channel_id: str) -> int | None:
     return None
 
 
+def _coerce_discord_embed(value: Any) -> Any | None:
+    """Convert the activity-panel's simple embed dict to discord.py's type."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        embed = discord.Embed(
+            title=value.get("title"),
+            description=value.get("description"),
+            color=value.get("color"),
+        )
+        fields = value.get("fields") or []
+        if isinstance(fields, list):
+            for field in fields:
+                if not isinstance(field, dict):
+                    continue
+                name = str(field.get("name") or "")
+                val = str(field.get("value") or "")
+                if name and val:
+                    embed.add_field(
+                        name=name,
+                        value=val,
+                        inline=bool(field.get("inline", False)),
+                    )
+        return embed
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Internal discord client — composition over inheritance
 # ---------------------------------------------------------------------------
@@ -541,8 +568,9 @@ class DiscordBridge(Bridge):
         final: bool = True,
         reply_to_message_id: str | None = None,
         blocks: list[dict[str, Any]] | None = None,
+        embed: Any | None = None,
     ) -> SendResult:
-        del reply_to_message_id, blocks
+        del blocks
         # Cancel any in-flight typing-hold task on this channel before
         # the actual reply goes out — but only on the FINAL flush.
         # Discord drops the indicator within ~10s of the last refresh,
@@ -579,23 +607,39 @@ class DiscordBridge(Bridge):
         if not callable(getattr(channel, "send", None)):
             return SendResult(sent=False, error=f"channel {cid_int} is not messageable")
 
+        discord_embed = _coerce_discord_embed(embed)
         chunks = [c for c in _chunk_message(text) if c.strip()]
         files = [discord.File(str(p)) for p in (attachment_paths or [])]
-        if files and not chunks:
+        if (files or discord_embed is not None) and not chunks:
             chunks = [""]
+
+        send_kwargs: dict[str, Any] = {}
+        if reply_to_message_id:
+            try:
+                reply_id = int(reply_to_message_id)
+                get_partial = getattr(channel, "get_partial_message", None)
+                if callable(get_partial):
+                    send_kwargs["reference"] = get_partial(reply_id)
+                else:
+                    send_kwargs["reference"] = discord.Object(id=reply_id)
+            except (TypeError, ValueError):
+                pass
 
         last_id: str | None = None
         sent_count = 0
         try:
             for i, chunk in enumerate(chunks):
+                chunk_kwargs = dict(send_kwargs) if i == 0 else {}
+                if i == 0 and discord_embed is not None:
+                    chunk_kwargs["embed"] = discord_embed
                 if i == 0 and files:
                     sent_msg = (
-                        await channel.send(chunk, files=files)
+                        await channel.send(chunk, files=files, **chunk_kwargs)
                         if chunk
-                        else await channel.send(files=files)
+                        else await channel.send(files=files, **chunk_kwargs)
                     )
                 else:
-                    sent_msg = await channel.send(chunk)
+                    sent_msg = await channel.send(chunk, **chunk_kwargs)
                 last_id = str(getattr(sent_msg, "id", "") or "") or last_id
                 sent_count += 1
         except discord.DiscordException as exc:
@@ -709,8 +753,9 @@ class DiscordBridge(Bridge):
                 return SendResult(sent=False, error=f"channel {cid_int} cannot fetch messages")
             message = await channel.fetch_message(mid_int)
             kwargs: dict[str, Any] = {"content": update.text or ""}
-            if update.embed is not None:
-                kwargs["embed"] = update.embed
+            embed = _coerce_discord_embed(update.embed)
+            if embed is not None:
+                kwargs["embed"] = embed
             edited = await message.edit(**kwargs)
         except discord.DiscordException as exc:
             return SendResult(sent=False, message_id=message_id, error=f"discord edit error: {exc}")
@@ -1056,4 +1101,5 @@ __all__ = [
     "_channel_id_to_int",
     "_channel_conversation_type",
     "_channel_visibility",
+    "_coerce_discord_embed",
 ]

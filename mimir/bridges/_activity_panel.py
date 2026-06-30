@@ -62,7 +62,7 @@ class ActivityPanelModel:
 
 
 class ActivityPanel:
-    """Bridge-agnostic TurnEventBus subscriber with Slack Block Kit rendering."""
+    """Bridge-agnostic TurnEventBus subscriber with platform renderers."""
 
     def __init__(
         self,
@@ -205,13 +205,15 @@ class ActivityPanel:
         bridge = self._channels.find(model.channel_id)
         if bridge is None:
             return
-        text, blocks = render_slack_panel(model)
+        text, blocks, embed = _render_for_bridge(bridge, model)
         kwargs: dict[str, Any] = {
             "final": False,
             "reply_to_message_id": model.thread_ts or model.reply_to_message_id,
         }
         if getattr(bridge, "name", "") == "slack":
             kwargs["blocks"] = blocks
+        elif getattr(bridge, "name", "") == "discord":
+            kwargs["embed"] = embed
         try:
             try:
                 result = await bridge.send(model.channel_id, text, **kwargs)
@@ -267,8 +269,8 @@ class ActivityPanel:
         bridge = self._channels.find(model.channel_id)
         if bridge is None:
             return
-        text, blocks = render_slack_panel(model)
-        update = MessageUpdate(text=text, blocks=blocks)
+        text, blocks, embed = _render_for_bridge(bridge, model)
+        update = MessageUpdate(text=text, blocks=blocks, embed=embed)
         try:
             await bridge.edit_message(model.channel_id, model.message_id, update)
             self._last_edit_by_channel[model.channel_id] = asyncio.get_running_loop().time()
@@ -276,9 +278,48 @@ class ActivityPanel:
             log.debug("activity panel edit failed", exc_info=True)
 
 
+def _render_for_bridge(
+    bridge: Any,
+    model: ActivityPanelModel,
+) -> tuple[str, list[dict[str, Any]] | None, Any | None]:
+    if getattr(bridge, "name", "") == "discord":
+        text, embed = render_discord_panel(model)
+        return text, None, embed
+    text, blocks = render_slack_panel(model)
+    return text, blocks, None
+
+
 def render_slack_panel(model: ActivityPanelModel) -> tuple[str, list[dict[str, Any]]]:
     text = render_panel_text(model)
     return text, [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+
+
+def render_discord_panel(model: ActivityPanelModel) -> tuple[str, dict[str, Any]]:
+    title = "Done" if model.finalized else "Working"
+    description = render_discord_panel_description(model)
+    return "", {
+        "title": title,
+        "description": description,
+        "color": 0x2ECC71 if model.finalized else 0x5865F2,
+    }
+
+
+def render_discord_panel_description(model: ActivityPanelModel) -> str:
+    if model.finalized:
+        if model.outbound_message_sent:
+            return "Done Reply posted"
+        suffix = _folded_summary(model)
+        return f"Done {model.completed_count} steps{suffix}"
+
+    lines: list[str] = []
+    for step in model.steps[-8:]:
+        lines.append(f"[x] {step.label}")
+    if model.in_flight is not None:
+        lines.append(f"[ ] {model.in_flight.label}")
+    folded = _folded_live_lines(model)
+    if folded:
+        lines.extend(folded)
+    return "\n".join(lines) or "[ ] Working"
 
 
 def render_panel_text(model: ActivityPanelModel) -> str:

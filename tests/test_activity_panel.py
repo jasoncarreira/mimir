@@ -10,6 +10,7 @@ from mimir.bridges._activity_panel import (
     ActivityPanelModel,
     ActivityStep,
     FoldedInput,
+    render_discord_panel,
     render_panel_text,
 )
 from mimir.bridges.base import Bridge, MessageUpdate, SendResult
@@ -65,10 +66,68 @@ class FakeSlackBridge(Bridge):
         return False
 
 
+class FakeDiscordBridge(Bridge):
+    prefixes = ("discord-",)
+    name = "discord"
+
+    def __init__(self) -> None:
+        self.sends: list[dict[str, Any]] = []
+        self.edits: list[MessageUpdate] = []
+
+    async def connect(self) -> None:
+        return None
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(
+        self,
+        channel_id: str,
+        text: str,
+        attachment_paths: list[Path] | None = None,
+        *,
+        final: bool = True,
+        reply_to_message_id: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
+        embed: Any | None = None,
+    ) -> SendResult:
+        self.sends.append(
+            {
+                "channel_id": channel_id,
+                "text": text,
+                "final": final,
+                "reply_to_message_id": reply_to_message_id,
+                "blocks": blocks,
+                "embed": embed,
+            }
+        )
+        return SendResult(sent=True, message_id=f"discord-panel-{len(self.sends)}", chunks=1)
+
+    async def edit_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        update: MessageUpdate,
+    ) -> SendResult:
+        self.edits.append(update)
+        return SendResult(sent=True, message_id=message_id, chunks=1)
+
+    async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:
+        return False
+
+
 def _panel(allowlist: tuple[str, ...] = ("slack-",), debounce: float = 0.0):
     bus = TurnEventBus()
     channels = ChannelRegistry()
     bridge = FakeSlackBridge()
+    channels.register(bridge)
+    return ActivityPanel(bus, channels, allowlist, debounce_seconds=debounce), bridge
+
+
+def _discord_panel(allowlist: tuple[str, ...] = ("discord-",), debounce: float = 0.0):
+    bus = TurnEventBus()
+    channels = ChannelRegistry()
+    bridge = FakeDiscordBridge()
     channels.register(bridge)
     return ActivityPanel(bus, channels, allowlist, debounce_seconds=debounce), bridge
 
@@ -233,6 +292,74 @@ async def test_panel_off_by_default_and_channel_allowlist():
     assert bridge.sends == []
 
 
+@pytest.mark.asyncio
+async def test_discord_panel_uses_embed_renderer_and_shared_lifecycle():
+    panel, bridge = _discord_panel(debounce=60.0)
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "discord-101",
+            "reply_to_message_id": "555",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_call",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "discord-101",
+            "tool_name": "shell_exec",
+            "args": {"cmd": "cat /secret/path TOKEN=abc"},
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_result",
+            "phase": "end",
+            "turn_id": "t1",
+            "channel_id": "discord-101",
+            "tool_name": "shell_exec",
+            "result": "TOKEN=abc /secret/path",
+        }
+    )
+    await panel.handle_event(
+        {"type": "turn", "phase": "end", "turn_id": "t1", "channel_id": "discord-101"}
+    )
+
+    assert bridge.sends[0]["text"] == ""
+    assert bridge.sends[0]["reply_to_message_id"] == "555"
+    assert bridge.sends[0]["embed"]["title"] == "Working"
+    assert bridge.sends[0]["embed"]["description"] == "[ ] Working"
+    assert bridge.sends[0]["blocks"] is None
+
+    assert len(bridge.edits) == 2
+    live_embed = bridge.edits[0].embed
+    assert live_embed["title"] == "Working"
+    assert "[ ] Working shell_exec" in live_embed["description"]
+
+    final_embed = bridge.edits[-1].embed
+    assert final_embed["title"] == "Done"
+    assert final_embed["description"] == "Done 2 steps"
+    rendered = "\n".join(str(update.embed) for update in bridge.edits)
+    assert "shell_exec" in rendered
+    assert "TOKEN=abc" not in rendered
+    assert "/secret/path" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_discord_panel_inert_when_channel_not_allowlisted():
+    panel, bridge = _discord_panel(allowlist=("slack-",))
+
+    await panel.handle_event(
+        {"type": "turn", "phase": "start", "turn_id": "t1", "channel_id": "discord-101"}
+    )
+
+    assert bridge.sends == []
+
+
 def test_render_final_summary_without_outbound_uses_folded_count():
     panel, _bridge = _panel()
     model = panel.models.setdefault(
@@ -243,3 +370,18 @@ def test_render_final_summary_without_outbound_uses_folded_count():
     model.folded_inputs.append(FoldedInput(source_id="m1"))
 
     assert render_panel_text(model) == "✓ 1 steps · +1 follow-up folded"
+
+
+def test_render_discord_final_reply_posted_title_and_description():
+    model = ActivityPanelModel(
+        turn_id="t1",
+        channel_id="discord-101",
+        finalized=True,
+        outbound_message_sent=True,
+    )
+
+    text, embed = render_discord_panel(model)
+
+    assert text == ""
+    assert embed["title"] == "Done"
+    assert embed["description"] == "Done Reply posted"

@@ -136,7 +136,7 @@ def bridge_with_fake_client(tmp_path: Path):
 
     bridge = DiscordBridge(token="TEST", enqueue=fake_enqueue)
 
-    sent: list[tuple[int, str, list]] = []
+    sent: list[dict] = []
     edited: list[dict] = []
 
     class FakeChannel:
@@ -146,8 +146,18 @@ def bridge_with_fake_client(tmp_path: Path):
             self.name = "test"
             self._next_msg_id = 1000
 
-        async def send(self, content: str = "", files=None):
-            sent.append((self.id, content, files or []))
+        def get_partial_message(self, mid: int):
+            return SimpleNamespace(id=mid)
+
+        async def send(self, content: str = "", files=None, **kwargs):
+            sent.append(
+                {
+                    "channel_id": self.id,
+                    "content": content,
+                    "files": files or [],
+                    **kwargs,
+                }
+            )
             self._next_msg_id += 1
             return SimpleNamespace(id=self._next_msg_id)
 
@@ -196,7 +206,7 @@ async def test_send_chunks_long_text(bridge_with_fake_client):
     assert result.sent is True
     assert result.chunks == 3  # 2*limit + 100 → 3 chunks under the limit
     # All chunks landed on the right channel.
-    assert all(channel_id == 1 for channel_id, _, _ in sent)
+    assert all(item["channel_id"] == 1 for item in sent)
 
 
 @pytest.mark.asyncio
@@ -218,6 +228,26 @@ async def test_send_returns_message_id(bridge_with_fake_client):
 
 
 @pytest.mark.asyncio
+async def test_send_passes_embed_and_reply_reference(bridge_with_fake_client):
+    bridge, _, sent = bridge_with_fake_client
+
+    result = await bridge.send(
+        "discord-1",
+        "",
+        final=False,
+        reply_to_message_id="999",
+        embed={"title": "Working", "description": "[ ] Working", "color": 0x5865F2},
+    )
+
+    assert result.sent is True
+    assert result.chunks == 1
+    assert sent[0]["content"] == ""
+    assert sent[0]["reference"].id == 999
+    assert sent[0]["embed"].title == "Working"
+    assert sent[0]["embed"].description == "[ ] Working"
+
+
+@pytest.mark.asyncio
 async def test_edit_message_calls_message_edit_with_embed(bridge_with_fake_client):
     bridge, _, _ = bridge_with_fake_client
     embed = SimpleNamespace(title="Activity")
@@ -234,6 +264,26 @@ async def test_edit_message_calls_message_edit_with_embed(bridge_with_fake_clien
             "embed": embed,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_edit_message_coerces_activity_panel_embed_dict(bridge_with_fake_client):
+    bridge, _, _ = bridge_with_fake_client
+
+    result = await bridge.edit_message(
+        "discord-1",
+        "1001",
+        MessageUpdate(
+            text="",
+            embed={"title": "Done", "description": "Done 1 steps", "color": 0x2ECC71},
+        ),
+    )
+
+    assert result.sent is True
+    edited = bridge._client._edits[0]  # type: ignore[union-attr]
+    assert edited["content"] == ""
+    assert edited["embed"].title == "Done"
+    assert edited["embed"].description == "Done 1 steps"
 
 
 @pytest.mark.asyncio
