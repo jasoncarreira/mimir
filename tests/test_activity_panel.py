@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,8 @@ class FakeSlackBridge(Bridge):
     def __init__(self) -> None:
         self.sends: list[dict[str, Any]] = []
         self.edits: list[MessageUpdate] = []
+        self.deletes: list[tuple[str, str]] = []
+        self.delete_result = SendResult(sent=True, message_id="deleted", chunks=1)
 
     async def connect(self) -> None:
         return None
@@ -62,6 +65,10 @@ class FakeSlackBridge(Bridge):
         self.edits.append(update)
         return SendResult(sent=True, message_id=message_id, chunks=1)
 
+    async def delete_message(self, channel_id: str, message_id: str) -> SendResult:
+        self.deletes.append((channel_id, message_id))
+        return self.delete_result
+
     async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:
         return False
 
@@ -73,6 +80,7 @@ class FakeDiscordBridge(Bridge):
     def __init__(self) -> None:
         self.sends: list[dict[str, Any]] = []
         self.edits: list[MessageUpdate] = []
+        self.deletes: list[tuple[str, str]] = []
 
     async def connect(self) -> None:
         return None
@@ -112,16 +120,32 @@ class FakeDiscordBridge(Bridge):
         self.edits.append(update)
         return SendResult(sent=True, message_id=message_id, chunks=1)
 
+    async def delete_message(self, channel_id: str, message_id: str) -> SendResult:
+        self.deletes.append((channel_id, message_id))
+        return SendResult(sent=True, message_id=message_id, chunks=1)
+
     async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:
         return False
 
 
-def _panel(allowlist: tuple[str, ...] = ("slack-",), debounce: float = 0.0):
+def _panel(
+    allowlist: tuple[str, ...] = ("slack-",),
+    debounce: float = 0.0,
+    detail_levels: tuple[tuple[str, str], ...] = (),
+    delete_grace: float = 2.0,
+):
     bus = TurnEventBus()
     channels = ChannelRegistry()
     bridge = FakeSlackBridge()
     channels.register(bridge)
-    return ActivityPanel(bus, channels, allowlist, debounce_seconds=debounce), bridge
+    return ActivityPanel(
+        bus,
+        channels,
+        allowlist,
+        debounce_seconds=debounce,
+        detail_levels=detail_levels,
+        delete_grace_seconds=delete_grace,
+    ), bridge
 
 
 def _discord_panel(allowlist: tuple[str, ...] = ("discord-",), debounce: float = 0.0):
@@ -148,13 +172,13 @@ async def test_panel_posts_in_slack_thread_and_renders_sanitized_blocks():
     )
     await panel.handle_event(
         {
-            "type": "tool_call",
+            "type": "tool_result",
             "phase": "end",
             "turn_id": "t1",
             "channel_id": "slack-C01",
             "id": "c1",
             "tool_name": "shell_exec",
-            "args": {"cmd": "cat /secret/path TOKEN=abc"},
+            "content": "TOKEN=abc /secret/path",
         }
     )
     await panel.handle_event(
@@ -188,7 +212,7 @@ async def test_panel_posts_in_slack_thread_and_renders_sanitized_blocks():
 
 @pytest.mark.asyncio
 async def test_panel_debounces_span_updates_and_finalizes_from_outbound_signal():
-    panel, bridge = _panel(debounce=60.0)
+    panel, bridge = _panel(debounce=60.0, delete_grace=60.0)
 
     await panel.handle_event(
         {
@@ -214,6 +238,7 @@ async def test_panel_debounces_span_updates_and_finalizes_from_outbound_signal()
 
     assert len(bridge.edits) == 2
     assert bridge.edits[-1].text == "✓ Reply posted"
+    assert bridge.deletes == []
 
 
 @pytest.mark.asyncio
@@ -272,6 +297,359 @@ async def test_panel_does_not_infer_outbound_from_send_message_tool_args():
 
     assert bridge.edits[-1].text != "✓ Reply posted"
     assert "steps" in (bridge.edits[-1].text or "")
+
+
+@pytest.mark.asyncio
+async def test_tool_result_end_uses_real_tool_name_and_call_row_is_not_completed():
+    panel, bridge = _panel()
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_call",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "tool_name": "shell_exec",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_call",
+            "phase": "end",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "tool_name": "shell_exec",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_result",
+            "phase": "end",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "tool_name": "shell_exec",
+            "status": "ok",
+        }
+    )
+    await panel.handle_event(
+        {"type": "turn", "phase": "end", "turn_id": "t1", "channel_id": "slack-C01"}
+    )
+
+    assert bridge.edits[-1].text == "✓ 1 steps"
+    assert panel.models["t1"].steps[0].label == "Ran shell_exec"
+    rendered = "\n".join(update.text or "" for update in bridge.edits)
+    assert "Skill shell_exec" not in rendered
+    assert "Ran skill" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_tool_result_name_falls_back_to_shared_span_id():
+    panel, _bridge = _panel()
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_result",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "tool_name": "memory_query",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_result",
+            "phase": "end",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "status": "ok",
+        }
+    )
+
+    assert panel.models["t1"].steps[-1].label == "Ran memory_query"
+
+
+@pytest.mark.asyncio
+async def test_tool_result_without_name_keeps_ran_skill_fallback():
+    panel, _bridge = _panel()
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_result",
+            "phase": "end",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "status": "ok",
+        }
+    )
+
+    assert panel.models["t1"].steps[-1].label == "Ran skill"
+
+
+@pytest.mark.asyncio
+async def test_coarse_default_redacts_detail_from_unopted_channel():
+    panel, bridge = _panel()
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_call",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "tool_name": "shell_exec",
+            "args": {"cmd": "cat /secret/path TOKEN=abc"},
+        }
+    )
+
+    text = "\n".join(update.text or "" for update in bridge.edits)
+    assert "Calling shell_exec" in text
+    assert "cat" not in text
+    assert "/secret/path" not in text
+    assert "TOKEN=abc" not in text
+
+
+@pytest.mark.asyncio
+async def test_detailed_mode_shows_only_inflight_scrubbed_detail_then_drops_it():
+    panel, bridge = _panel(detail_levels=(("slack-C01", "detailed"),))
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_call",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "tool_name": "shell_exec",
+            "args": {"cmd": "cat /secret/path TOKEN=abc"},
+        }
+    )
+    live_text = bridge.edits[-1].text or ""
+    assert "Calling shell_exec" in live_text
+    assert "cat [path]" in live_text
+    assert "/secret/path" not in live_text
+    assert "TOKEN=abc" not in live_text
+
+    await panel.handle_event(
+        {
+            "type": "tool_call",
+            "phase": "end",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "tool_name": "shell_exec",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_result",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "tool_name": "shell_exec",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "tool_result",
+            "phase": "chunk",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "content_delta": "ok SECRET=value /tmp/result.txt",
+        }
+    )
+    result_text = bridge.edits[-1].text or ""
+    assert "Running shell_exec" in result_text
+    assert "ok [redacted] [path]" in result_text
+    assert "Calling shell_exec" not in result_text
+    assert "/tmp/result.txt" not in result_text
+    assert "SECRET=value" not in result_text
+
+    await panel.handle_event(
+        {
+            "type": "tool_result",
+            "phase": "end",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "id": "c1",
+            "tool_name": "shell_exec",
+            "content": "ok SECRET=value /tmp/result.txt",
+        }
+    )
+    await panel.handle_event(
+        {"type": "turn", "phase": "end", "turn_id": "t1", "channel_id": "slack-C01"}
+    )
+    final_text = bridge.edits[-1].text or ""
+    assert final_text == "✓ 1 steps"
+    assert "ok [redacted]" not in final_text
+    assert "/tmp/result.txt" not in final_text
+
+
+@pytest.mark.asyncio
+async def test_panel_auto_deletes_after_real_reply():
+    panel, bridge = _panel(delete_grace=0.0)
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "outbound_message",
+            "phase": "end",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "sent": True,
+        }
+    )
+    await panel.handle_event(
+        {"type": "turn", "phase": "end", "turn_id": "t1", "channel_id": "slack-C01"}
+    )
+    await asyncio.sleep(0.01)
+
+    assert bridge.edits[-1].text == "✓ Reply posted"
+    assert bridge.deletes == [("slack-C01", "panel-1")]
+
+
+@pytest.mark.asyncio
+async def test_panel_delete_failure_leaves_compact_done_state(caplog):
+    panel, bridge = _panel(delete_grace=0.0)
+    bridge.delete_result = SendResult(sent=False, message_id="panel-1", error="delete unsupported")
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "outbound_message",
+            "phase": "end",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "sent": True,
+        }
+    )
+    with caplog.at_level("DEBUG", logger="mimir.bridges._activity_panel"):
+        await panel.handle_event(
+            {"type": "turn", "phase": "end", "turn_id": "t1", "channel_id": "slack-C01"}
+        )
+        await asyncio.sleep(0.01)
+
+    assert bridge.edits[-1].text == "✓ Reply posted"
+    assert bridge.deletes == [("slack-C01", "panel-1")]
+    assert "activity panel delete failed: delete unsupported" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_panel_does_not_auto_delete_failed_or_no_reply_turns():
+    panel, bridge = _panel(delete_grace=0.0)
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {"type": "turn", "phase": "end", "turn_id": "t1", "channel_id": "slack-C01"}
+    )
+    await asyncio.sleep(0)
+    assert bridge.deletes == []
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t2",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "outbound_message",
+            "phase": "end",
+            "turn_id": "t2",
+            "channel_id": "slack-C01",
+            "sent": True,
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "end",
+            "turn_id": "t2",
+            "channel_id": "slack-C01",
+            "status": "error",
+        }
+    )
+    await asyncio.sleep(0)
+    assert bridge.deletes == []
 
 
 @pytest.mark.asyncio
@@ -460,11 +838,11 @@ async def test_discord_panel_uses_embed_renderer_and_shared_lifecycle():
     assert len(bridge.edits) == 2
     live_embed = bridge.edits[0].embed
     assert live_embed["title"] == "Working"
-    assert "[ ] Working shell_exec" in live_embed["description"]
+    assert "[ ] Calling shell_exec" in live_embed["description"]
 
     final_embed = bridge.edits[-1].embed
     assert final_embed["title"] == "Done"
-    assert final_embed["description"] == "Done 2 steps"
+    assert final_embed["description"] == "Done 1 steps"
     rendered = "\n".join(str(update.embed) for update in bridge.edits)
     assert "shell_exec" in rendered
     assert "TOKEN=abc" not in rendered

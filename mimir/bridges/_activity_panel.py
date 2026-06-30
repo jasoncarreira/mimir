@@ -64,6 +64,7 @@ def trigger_enabled(trigger: Any) -> bool:
 class ActivityStep:
     label: str
     status: str = "running"
+    detail: str | None = None
 
 
 @dataclass
@@ -84,9 +85,12 @@ class ActivityPanelModel:
     posted: bool = False
     finalized: bool = False
     outbound_message_sent: bool = False
+    failed: bool = False
+    detail_level: str = "coarse"
     steps: list[ActivityStep] = field(default_factory=list)
     in_flight: ActivityStep | None = None
     folded_inputs: list[FoldedInput] = field(default_factory=list)
+    span_tool_names: dict[str, str] = field(default_factory=dict)
 
     @property
     def completed_count(self) -> int:
@@ -103,11 +107,15 @@ class ActivityPanel:
         allowlist: tuple[str, ...],
         *,
         debounce_seconds: float = 1.0,
+        detail_levels: tuple[tuple[str, str], ...] = (),
+        delete_grace_seconds: float = 2.0,
     ) -> None:
         self._bus = bus
         self._channels = channels
         self._allowlist = allowlist
         self._debounce_seconds = max(0.0, debounce_seconds)
+        self._detail_levels = detail_levels
+        self._delete_grace_seconds = max(0.0, delete_grace_seconds)
         self._queue: asyncio.Queue[dict[str, Any]] | None = None
         self._task: asyncio.Task[Any] | None = None
         self._models: dict[str, ActivityPanelModel] = {}
@@ -171,6 +179,7 @@ class ActivityPanel:
                 channel_id=channel_id,
                 reply_to_message_id=_clean(event.get("reply_to_message_id")),
                 thread_ts=_clean(event.get("thread_ts")),
+                detail_level=self._detail_level_for(channel_id),
             )
             model.in_flight = ActivityStep("Working")
             self._models[turn_id] = model
@@ -185,7 +194,7 @@ class ActivityPanel:
         phase = event.get("phase")
         if typ in ("reasoning", "tool_call", "tool_result"):
             self._apply_span(model, event)
-            if phase != "chunk":
+            if phase != "chunk" or model.detail_level == "detailed":
                 await self._schedule_edit(model)
         elif typ == "injected_input":
             for item in event.get("inputs") or []:
@@ -204,23 +213,53 @@ class ActivityPanel:
         elif typ == "turn" and phase == "end":
             if event.get("outbound_message_sent"):
                 model.outbound_message_sent = True
+            status = _clean(event.get("status")) or "ok"
+            model.failed = status != "ok"
             final_folded = event.get("injected_input_count")
             if isinstance(final_folded, int) and final_folded > len(model.folded_inputs):
                 for _ in range(final_folded - len(model.folded_inputs)):
                     model.folded_inputs.append(FoldedInput())
-            self._complete_in_flight(model)
+            if model.in_flight is not None or not model.steps:
+                self._complete_in_flight(model)
             model.finalized = True
             await self._flush(model)
+            if model.outbound_message_sent and not model.failed:
+                asyncio.create_task(
+                    self._delete_after_grace(model.turn_id),
+                    name=f"mimir-activity-panel-delete-{model.turn_id}",
+                )
 
     def _apply_span(self, model: ActivityPanelModel, event: dict[str, Any]) -> None:
         phase = event.get("phase")
+        span_id = _clean(event.get("id"), limit=120)
+        name = _tool_name(event.get("tool_name"))
+        if span_id and name:
+            model.span_tool_names[span_id] = name
+        elif span_id:
+            name = model.span_tool_names.get(span_id, "")
         if phase == "chunk":
+            if model.in_flight is not None and model.detail_level == "detailed":
+                model.in_flight.detail = _merge_detail(model.in_flight.detail, _step_detail(event))
             return
-        label = _step_label(event)
+        label = _step_label(event, tool_name=name)
         if phase == "start":
-            model.in_flight = ActivityStep(label)
+            model.in_flight = ActivityStep(
+                label,
+                detail=_step_detail(event) if model.detail_level == "detailed" else None,
+            )
         elif phase == "end":
+            if model.in_flight is not None and model.detail_level == "detailed":
+                model.in_flight.detail = _merge_detail(model.in_flight.detail, _step_detail(event))
+            if event.get("type") == "tool_call":
+                model.in_flight = None
+                return
             self._complete_in_flight(model, fallback=label)
+
+    def _detail_level_for(self, channel_id: str) -> str:
+        for prefix, level in self._detail_levels:
+            if prefix == "*" or channel_id.startswith(prefix):
+                return "detailed" if level == "detailed" else "coarse"
+        return "coarse"
 
     def _complete_in_flight(
         self,
@@ -231,6 +270,7 @@ class ActivityPanel:
         step = model.in_flight or ActivityStep(fallback or "Working")
         if fallback:
             step.label = fallback
+        step.detail = None
         step.status = "done"
         model.steps.append(step)
         model.in_flight = None
@@ -311,6 +351,24 @@ class ActivityPanel:
         except Exception:  # noqa: BLE001
             log.debug("activity panel edit failed", exc_info=True)
 
+    async def _delete_after_grace(self, turn_id: str) -> None:
+        await asyncio.sleep(self._delete_grace_seconds)
+        model = self._models.get(turn_id)
+        if model is None or not model.message_id or not model.outbound_message_sent or model.failed:
+            return
+        bridge = self._channels.find(model.channel_id)
+        if bridge is None:
+            return
+        try:
+            result = await bridge.delete_message(model.channel_id, model.message_id)
+            if not getattr(result, "sent", False):
+                log.debug(
+                    "activity panel delete failed: %s",
+                    getattr(result, "error", None) or "unknown error",
+                )
+        except Exception:  # noqa: BLE001
+            log.debug("activity panel delete failed", exc_info=True)
+
 
 def _render_for_bridge(
     bridge: Any,
@@ -350,6 +408,8 @@ def render_discord_panel_description(model: ActivityPanelModel) -> str:
         lines.append(f"[x] {step.label}")
     if model.in_flight is not None:
         lines.append(f"[ ] {model.in_flight.label}")
+        if model.detail_level == "detailed" and model.in_flight.detail:
+            lines.extend(_detail_lines(model.in_flight.detail))
     folded = _folded_live_lines(model)
     if folded:
         lines.extend(folded)
@@ -368,6 +428,8 @@ def render_panel_text(model: ActivityPanelModel) -> str:
         lines.append(f"✓ {step.label}")
     if model.in_flight is not None:
         lines.append(f"◌ {model.in_flight.label}")
+        if model.detail_level == "detailed" and model.in_flight.detail:
+            lines.extend(_detail_lines(model.in_flight.detail))
     folded = _folded_live_lines(model)
     if folded:
         lines.extend(folded)
@@ -394,20 +456,69 @@ def _folded_live_lines(model: ActivityPanelModel) -> list[str]:
     return [f"↳ +{count} mid-turn {label} folded"]
 
 
-def _step_label(event: dict[str, Any]) -> str:
+def _step_label(event: dict[str, Any], *, tool_name: str = "") -> str:
     typ = event.get("type")
     phase = event.get("phase")
     if typ == "reasoning":
         return "Thought"
     if typ == "tool_call":
-        name = _tool_name(event.get("tool_name"))
         if phase == "start":
-            return f"Working {name}" if name else "Working"
-        return f"Skill {name}" if name else "Skill"
+            return f"Calling {tool_name}" if tool_name else "Calling tool"
+        return f"Called {tool_name}" if tool_name else "Called tool"
     if typ == "tool_result":
-        name = _tool_name(event.get("tool_name"))
-        return f"Ran {name}" if name else "Ran skill"
+        if phase == "start":
+            return f"Running {tool_name}" if tool_name else "Running tool"
+        return f"Ran {tool_name}" if tool_name else "Ran skill"
     return "Working"
+
+
+def _step_detail(event: dict[str, Any]) -> str | None:
+    typ = event.get("type")
+    if typ == "reasoning":
+        value = event.get("text")
+    elif typ == "tool_call":
+        value = event.get("args_delta") if event.get("phase") == "chunk" else event.get("args")
+    elif typ == "tool_result":
+        value = (
+            event.get("content_delta")
+            if event.get("phase") == "chunk"
+            else event.get("content", event.get("result"))
+        )
+    else:
+        value = None
+    return _scrub_detail(value)
+
+
+def _merge_detail(existing: str | None, new: str | None, *, limit: int = 420) -> str | None:
+    if not new:
+        return existing
+    if not existing:
+        return new[:limit]
+    return f"{existing}\n{new}"[:limit]
+
+
+def _detail_lines(detail: str) -> list[str]:
+    return [f"  {line}" for line in detail.splitlines()[:4] if line]
+
+
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)\b(bearer|token|api[_-]?key|secret|password)\s*[:=]\s*[^,\s}]+"),
+    re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(TOKEN|KEY|SECRET|PASSWORD)\s*=\s*[^,\s}]+"),
+)
+_PATH_PATTERN = re.compile(r"(?<!\w)(?:/[^\s,'\"}]+|~\/[^\s,'\"}]+)")
+
+
+def _scrub_detail(value: Any, *, limit: int = 320) -> str | None:
+    text = _clean(value, limit=limit * 2)
+    if not text:
+        return None
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    text = _PATH_PATTERN.sub("[path]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[: limit - 3].rstrip() + "..."
+    return text
 
 
 def _tool_name(value: Any) -> str:

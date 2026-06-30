@@ -449,6 +449,37 @@ def _parse_sources(raw: str) -> frozenset[str] | None:
     return frozenset(tokens)
 
 
+def _parse_activity_panel_detail(raw: str) -> tuple[tuple[str, str], ...]:
+    """Parse ``MIMIR_ACTIVITY_PANEL_DETAIL`` into ``(channel_prefix, level)``.
+
+    Accepted forms:
+    - ``detailed`` / ``coarse`` applies to every allow-listed channel.
+    - ``slack-C01:detailed,discord-:coarse`` applies by prefix.
+    Unknown levels are ignored so the default remains coarse.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ()
+    out: list[tuple[str, str]] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" in entry:
+            prefix, level = entry.rsplit(":", 1)
+            prefix = prefix.strip() or "*"
+        else:
+            prefix, level = "*", entry
+        level = level.strip().lower()
+        if level not in ("coarse", "detailed"):
+            logging.getLogger(__name__).warning(
+                "MIMIR_ACTIVITY_PANEL_DETAIL: ignoring unknown level %r", level,
+            )
+            continue
+        out.append((prefix, level))
+    return tuple(out)
+
+
 @dataclass
 class Config:
     home: Path
@@ -916,6 +947,11 @@ class Config:
     # Passive live activity panel channel-prefix allowlist. Empty = off.
     # ``MIMIR_ACTIVITY_PANEL_CHANNELS``.
     activity_panel_channels: tuple[str, ...] = ()
+    # Optional activity panel detail level map. Empty/default = coarse for all
+    # channels. ``detailed`` opts every allow-listed channel into transient
+    # scrubbed in-flight detail; ``prefix:level`` entries opt specific prefixes.
+    # ``MIMIR_ACTIVITY_PANEL_DETAIL``.
+    activity_panel_detail: tuple[tuple[str, str], ...] = ()
     # Operator-declared absolute roots OUTSIDE the home the file tools may
     # read/edit, as ``(abs_path, "ro"|"rw")`` pairs (chainlink #650). Empty =
     # home-only (today's behavior). ``MIMIR_FILE_TOOL_ROOTS``.
@@ -1064,6 +1100,9 @@ class Config:
                 p.strip()
                 for p in _env("MIMIR_ACTIVITY_PANEL_CHANNELS", "").split(",")
                 if p.strip()
+            ),
+            activity_panel_detail=_parse_activity_panel_detail(
+                _env("MIMIR_ACTIVITY_PANEL_DETAIL", "")
             ),
             api_key=_env("MIMIR_API_KEY"),
             web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),
