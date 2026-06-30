@@ -597,6 +597,23 @@ class SlackBridge(Bridge):
             chunks=1,
         )
 
+    async def delete_message(self, channel_id: str, message_id: str) -> SendResult:
+        """Delete a prior Slack message via ``chat.delete``."""
+        if self._app is None:
+            return SendResult(sent=False, error="slack app not connected")
+        slack_channel = _channel_id_to_slack(channel_id)
+        if slack_channel is None:
+            return SendResult(sent=False, error=f"bad channel_id: {channel_id!r}")
+        if not message_id:
+            return SendResult(sent=False, error="missing message_id")
+        try:
+            await self._app.client.chat_delete(channel=slack_channel, ts=message_id)
+        except SlackApiError as exc:
+            return SendResult(sent=False, message_id=message_id, error=f"slack delete error: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            return SendResult(sent=False, message_id=message_id, error=f"slack delete error: {exc}")
+        return SendResult(sent=True, message_id=message_id, chunks=1)
+
     async def fetch_history(
         self,
         channel_id: str,

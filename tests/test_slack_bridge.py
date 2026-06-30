@@ -138,6 +138,7 @@ def bridge_with_fake_app():
 
     sent: list[dict] = []
     updated: list[dict] = []
+    deleted: list[dict] = []
     users_info_calls: list[str] = []
 
     async def fake_post(**kwargs):
@@ -151,6 +152,10 @@ def bridge_with_fake_app():
     async def fake_chat_update(**kwargs):
         updated.append(kwargs)
         return {"ok": True, "ts": kwargs["ts"]}
+
+    async def fake_chat_delete(**kwargs):
+        deleted.append(kwargs)
+        return {"ok": True}
 
     # Plausible users.info response shape — tests that want a different
     # response can override `fake_client.users_info`.
@@ -179,6 +184,7 @@ def bridge_with_fake_app():
     fake_client = SimpleNamespace(
         chat_postMessage=fake_post,
         chat_update=fake_chat_update,
+        chat_delete=fake_chat_delete,
         reactions_add=fake_reactions_add,
         auth_test=AsyncMock(return_value={"user_id": "UBOT123"}),
         files_upload_v2=AsyncMock(return_value={"file": {}}),
@@ -188,6 +194,7 @@ def bridge_with_fake_app():
         client=fake_client,
         _users_info_calls=users_info_calls,
         _updates=updated,
+        _deletes=deleted,
     )
     bridge._app = fake_app  # type: ignore[assignment]
     bridge._bot_user_id = "UBOT123"
@@ -321,6 +328,19 @@ async def test_edit_message_slack_error_is_soft(bridge_with_fake_app):
     assert result.sent is False
     assert result.message_id == "1234567890.000001"
     assert "slack edit error" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_delete_message_calls_chat_delete(bridge_with_fake_app):
+    bridge, _, _ = bridge_with_fake_app
+
+    result = await bridge.delete_message("slack-C01ABC", "1234567890.000001")
+
+    assert result.sent is True
+    assert result.message_id == "1234567890.000001"
+    assert bridge._app._deletes == [  # type: ignore[union-attr]
+        {"channel": "C01ABC", "ts": "1234567890.000001"}
+    ]
 
 
 @pytest.mark.asyncio

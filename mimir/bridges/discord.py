@@ -768,6 +768,33 @@ class DiscordBridge(Bridge):
             chunks=1,
         )
 
+    async def delete_message(self, channel_id: str, message_id: str) -> SendResult:
+        """Delete a prior Discord message via ``message.delete``."""
+        if self._client is None or self._client.is_closed():
+            return SendResult(sent=False, error="discord client not connected")
+        cid_int = _channel_id_to_int(channel_id)
+        if cid_int is None:
+            return SendResult(sent=False, error=f"bad channel_id: {channel_id!r}")
+        try:
+            mid_int = int(message_id)
+        except (TypeError, ValueError):
+            return SendResult(sent=False, error=f"bad message_id: {message_id!r}")
+
+        try:
+            channel = self._client.get_channel(cid_int)
+            if channel is None:
+                channel = await self._client.fetch_channel(cid_int)
+            if not hasattr(channel, "fetch_message"):
+                return SendResult(sent=False, error=f"channel {cid_int} cannot fetch messages")
+            message = await channel.fetch_message(mid_int)
+            await message.delete()
+        except discord.DiscordException as exc:
+            return SendResult(sent=False, message_id=message_id, error=f"discord delete error: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            return SendResult(sent=False, message_id=message_id, error=f"discord delete error: {exc}")
+
+        return SendResult(sent=True, message_id=message_id, chunks=1)
+
     async def fetch_history(
         self,
         channel_id: str,

@@ -138,6 +138,7 @@ def bridge_with_fake_client(tmp_path: Path):
 
     sent: list[dict] = []
     edited: list[dict] = []
+    deleted: list[dict] = []
 
     class FakeChannel:
         def __init__(self, cid: int):
@@ -169,7 +170,11 @@ def bridge_with_fake_client(tmp_path: Path):
                 edited.append({"channel_id": self.id, "message_id": mid, **kwargs})
                 return SimpleNamespace(id=mid)
 
+            async def fake_delete():
+                deleted.append({"channel_id": self.id, "message_id": mid})
+
             msg.edit = fake_edit
+            msg.delete = fake_delete
             return msg
 
     # The bridge duck-types the messageable check (callable .send), so the
@@ -181,6 +186,7 @@ def bridge_with_fake_client(tmp_path: Path):
         def __init__(self):
             self._channels = {1: FakeChannel(1), 2: FakeChannel(2)}
             self._edits = edited
+            self._deletes = deleted
 
         def is_closed(self):
             return False
@@ -303,6 +309,19 @@ async def test_edit_message_discord_error_is_soft(bridge_with_fake_client):
     assert result.sent is False
     assert result.message_id == "1001"
     assert "discord edit error" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_delete_message_calls_message_delete(bridge_with_fake_client):
+    bridge, _, _ = bridge_with_fake_client
+
+    result = await bridge.delete_message("discord-1", "1001")
+
+    assert result.sent is True
+    assert result.message_id == "1001"
+    assert bridge._client._deletes == [  # type: ignore[union-attr]
+        {"channel_id": 1, "message_id": 1001}
+    ]
 
 
 @pytest.mark.asyncio

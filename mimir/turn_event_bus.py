@@ -326,7 +326,14 @@ class TurnEventEmitter:
             self._emit("tool_result", "start", id=span_id, tool_name=name)
             if content:
                 self._emit("tool_result", "chunk", id=span_id, content_delta=content)
-            self._emit("tool_result", "end", id=span_id, status=status, content=content)
+            self._emit(
+                "tool_result",
+                "end",
+                id=span_id,
+                tool_name=name,
+                status=status,
+                content=content,
+            )
 
 
 def _clean_string(value: Any, *, limit: int = 240) -> str | None:

@@ -916,6 +916,10 @@ class Config:
     # Passive live activity panel channel-prefix allowlist. Empty = off.
     # ``MIMIR_ACTIVITY_PANEL_CHANNELS``.
     activity_panel_channels: tuple[str, ...] = ()
+    # Optional per-channel activity-panel detail level map, e.g.
+    # ``slack-C01:detailed,discord-:coarse,*:coarse``.
+    # ``MIMIR_ACTIVITY_PANEL_DETAIL``.
+    activity_panel_detail: tuple[str, ...] = ()
     # Operator-declared absolute roots OUTSIDE the home the file tools may
     # read/edit, as ``(abs_path, "ro"|"rw")`` pairs (chainlink #650). Empty =
     # home-only (today's behavior). ``MIMIR_FILE_TOOL_ROOTS``.
@@ -1063,6 +1067,11 @@ class Config:
             activity_panel_channels=tuple(
                 p.strip()
                 for p in _env("MIMIR_ACTIVITY_PANEL_CHANNELS", "").split(",")
+                if p.strip()
+            ),
+            activity_panel_detail=tuple(
+                p.strip()
+                for p in _env("MIMIR_ACTIVITY_PANEL_DETAIL", "").split(",")
                 if p.strip()
             ),
             api_key=_env("MIMIR_API_KEY"),
