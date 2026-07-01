@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from mimir._context import reset_current_turn, set_current_turn
+from mimir import _context
 from mimir.models import TurnContext
 from mimir.tools import saga_ops
 from mimir.tools.memory import _MEMORY_STATE
@@ -133,6 +134,19 @@ class TestResolveSessionId:
         result = _resolve_session_id(None)
         assert result is None
 
+    def test_none_uses_single_active_turn_when_contextvar_missing(
+        self, turn_with_session: TurnContext
+    ) -> None:
+        # MCP tool dispatch can run on a forked task where the contextvar is
+        # missing even though run_turn registered the active turn.  Simulate that
+        # boundary by clearing only the contextvar, not _active_turns.
+        token = _context._current_turn.set(None)
+        try:
+            result = _resolve_session_id(None)
+        finally:
+            _context._current_turn.reset(token)
+        assert result == "sess-abc"
+
 
 # ────────────────────────────────────────────────────────────────────
 # saga_feedback additional coverage
@@ -234,6 +248,25 @@ async def test_end_session_no_active_turn_channel_id_is_none(
     )
     assert "ok" in out.lower()
     assert store.end_session_calls[0]["channel_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_end_session_uses_active_registry_when_contextvar_missing(
+    store: _StubStore, turn_with_session: TurnContext,
+) -> None:
+    # MCP dispatch can lose the direct contextvar while _active_turns still has
+    # the turn.  saga_end_session must still thread channel_id and flip the ctx
+    # flag for the synthesis post-message hook.
+    token = _context._current_turn.set(None)
+    try:
+        out = await saga_ops.saga_end_session.ainvoke(
+            {"session_id": "sess-abc", "summary": "wrapping up"}
+        )
+    finally:
+        _context._current_turn.reset(token)
+    assert "ok" in out.lower()
+    assert store.end_session_calls[0]["channel_id"] == "ch-1"
+    assert turn_with_session.saga_end_session_called is True
 
 
 @pytest.mark.asyncio

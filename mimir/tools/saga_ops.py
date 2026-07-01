@@ -11,10 +11,10 @@ SAGA verbs the SDK build exposed:
 * ``saga_forget``             — preview/run the intentional-forgetting engine
 
 All four route to the SagaStore instance installed by
-``mimir.tools.memory.set_memory_client``. They reach the active
-TurnContext via ``_context.get_current_turn()`` so the
-``saga_session_id`` is threaded through transparently — the model
-doesn't have to remember to pass it explicitly.
+``mimir.tools.memory.set_memory_client``. They resolve the active
+TurnContext via ``_context.resolve_active_ctx()`` so MCP-dispatched
+tool calls that run on forked SDK tasks do not lose per-turn context;
+explicit ``session_id`` values still win.
 
 Best-effort failures: every tool surfaces SagaError + generic
 exception messages as a human-readable string. Failures never crash
@@ -41,14 +41,27 @@ _FEEDBACK_MAP: dict[str, str] = {
 }
 
 
+def _resolve_turn_ctx(session_id: str | None) -> tuple[Any | None, str]:
+    """Resolve the active turn for MCP-dispatched saga ops.
+
+    ``session_id`` is the SAGA session id for these tools, not the SDK
+    hook ``turn_id``.  ``resolve_active_ctx`` knows how to match that
+    against active turns, fall back to the single-active-turn heuristic,
+    and finally use the in-task contextvar for direct unit-test paths.
+    """
+    from .._context import resolve_active_ctx
+
+    return resolve_active_ctx({"session_id": (session_id or "").strip()})
+
+
 def _resolve_session_id(explicit: str | None) -> str | None:
     """Prefer the model-supplied ``session_id``; fall back to the
-    active TurnContext's ``saga_session_id``."""
+    active TurnContext's ``saga_session_id`` using the MCP-safe
+    active-context resolution chain."""
     explicit = (explicit or "").strip()
     if explicit:
         return explicit
-    from .._context import get_current_turn
-    ctx = get_current_turn()
+    ctx, _resolution = _resolve_turn_ctx(explicit)
     return getattr(ctx, "saga_session_id", None) if ctx is not None else None
 
 
@@ -186,8 +199,7 @@ async def saga_end_session(
         kept = [x for x in lst if x.strip()]
         return kept or None
 
-    from .._context import get_current_turn
-    ctx = get_current_turn()
+    ctx, _resolution = _resolve_turn_ctx(session_id)
     channel_id = getattr(ctx, "channel_id", None) if ctx is not None else None
 
     try:
