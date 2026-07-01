@@ -457,7 +457,7 @@ RUN pip install --no-cache-dir --upgrade pip \\
 # ``MIMIR_ENABLE_CLAUDE_CODE=1`` at build to include. Bump
 # ``LANGCHAIN_CLAUDE_CODE_REF`` when upstream rolls (tracked at
 # mimir-repo issue #268).
-ARG LANGCHAIN_CLAUDE_CODE_REF=c723d702dfac1ff6e2b22b8bde661cb17a17b0de
+ARG LANGCHAIN_CLAUDE_CODE_REF=c03f075c8b84fb0c718de1aabdd6493f5d191786
 RUN if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \\
         pip install --no-cache-dir \\
             "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@${LANGCHAIN_CLAUDE_CODE_REF}" ; \\
