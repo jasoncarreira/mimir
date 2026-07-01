@@ -42,7 +42,12 @@ log = logging.getLogger(__name__)
 
 from langchain_core.runnables import RunnableConfig
 
-from ..bridges._directives import parse_directives, ReactDirective, resolve_react_target
+from ..bridges._directives import (
+    Directive,
+    parse_directives,
+    ReactDirective,
+    resolve_react_target,
+)
 from ..billing import PRIORITY_LEVELS
 from ..poller_budget import aggregate_poller_turn_usage
 from ..pollers import (
@@ -105,6 +110,79 @@ _SEND_MESSAGE_SKIPLIST_LEADING_MARKER_PATTERN = re.compile(
 
 def _word_count(text: str) -> int:
     return len(re.findall(r"[A-Za-z0-9]+", text))
+
+
+async def dispatch_send_message_directives(
+    *,
+    directives: tuple[Directive, ...],
+    bridge: Any,
+    channel_id: str,
+    sent_message_id: str | None,
+    fallback_message_id: str | None = None,
+    ctx: Any | None = None,
+    detector: Any | None = None,
+) -> bool:
+    """Dispatch parsed ``send_message``-style directives.
+
+    Returns True when a directive produced a confirmed delivery. Failures are
+    logged and swallowed so callers can keep directive dispatch best-effort.
+    """
+    from ..event_logger import safe_log_event
+
+    delivered_by_directive = False
+    for directive in directives:
+        if isinstance(directive, ReactDirective):
+            # chainlink #394: resolve the target via the shared helper and
+            # skip on None rather than calling bridge.react(cid, None, emoji).
+            # The just-sent message is the natural target; directives-only
+            # sends may fall back to the triggering / recent message id.
+            target = resolve_react_target(
+                directive.message_id,
+                sent_message_id,
+                fallback_message_id,
+            )
+            if target is None:
+                log.debug(
+                    "send_message react directive skipped: no target message "
+                    "for emoji %r", directive.emoji,
+                )
+                continue
+            ok: object = False
+            try:
+                ok = await bridge.react(channel_id, target, directive.emoji)
+            except Exception as exc:  # noqa: BLE001 — non-fatal; don't abort the send
+                await safe_log_event(
+                    "send_message_directive_failed",
+                    channel_id=channel_id,
+                    directive="react",
+                    emoji=directive.emoji,
+                    message_id=target,
+                    error=f"{type(exc).__name__}: {exc}"[:200],
+                )
+            else:
+                if ok is False:
+                    await safe_log_event(
+                        "send_message_directive_failed",
+                        channel_id=channel_id,
+                        directive="react",
+                        emoji=directive.emoji,
+                        message_id=target,
+                        error="bridge declined",
+                    )
+            # Confirmed-delivery gate mirrors the react tool: only a
+            # non-False return counts toward the turn's reply accounting.
+            if ok is not False:
+                delivered_by_directive = True
+                if ctx is not None:
+                    try:
+                        ctx.react_count += 1
+                        ctx.delivered_channel_ids.add(channel_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if detector is not None:
+                    detector.clear_undelivered_attempts()
+        # SendFileDirective: not yet implemented via this path
+    return delivered_by_directive
 
 
 def _matched_send_message_skiplist_phrase(text: str) -> str | None:
@@ -526,65 +604,15 @@ async def send_message(
                     "send_message: chat_history append failed", exc_info=True,
                 )
 
-    for _directive in parsed.directives:
-        if isinstance(_directive, ReactDirective):
-            # chainlink #394: resolve the target via the shared helper and
-            # skip on None rather than calling bridge.react(cid, None, emoji).
-            # The just-sent message is the natural target; a directives-only
-            # send_message (empty clean_text → result None) has no target.
-            _target = resolve_react_target(
-                _directive.message_id,
-                result.message_id if result else None,
-            )
-            if _target is None:
-                log.debug(
-                    "send_message react directive skipped: no target message "
-                    "for emoji %r", _directive.emoji,
-                )
-                continue
-            # chainlink #408: a directive react is a real delivery — it
-            # feeds the same accounting as the standalone ``react`` tool
-            # (0.3.2's react_count fix covered only the tool; an
-            # actions-only body increments NO send count, so a delivered
-            # ack still tripped the forgot-to-send guard), and its
-            # failures surface algedonically (the prompt promises
-            # per-directive failures show up in the feedback block —
-            # false while this was a bare except-pass).
-            _ok: object = False
-            try:
-                _ok = await bridge.react(cid, _target, _directive.emoji)
-            except Exception as _exc:  # noqa: BLE001 — non-fatal; don't abort the send
-                await _log_event(
-                    "send_message_directive_failed",
-                    channel_id=cid,
-                    directive="react",
-                    emoji=_directive.emoji,
-                    message_id=_target,
-                    error=f"{type(_exc).__name__}: {_exc}"[:200],
-                )
-            else:
-                if _ok is False:
-                    await _log_event(
-                        "send_message_directive_failed",
-                        channel_id=cid,
-                        directive="react",
-                        emoji=_directive.emoji,
-                        message_id=_target,
-                        error="bridge declined",
-                    )
-            # Confirmed-delivery gate mirrors the react tool: only a
-            # non-False return counts toward the turn's reply accounting.
-            if _ok is not False:
-                delivered_by_directive = True
-                if ctx is not None:
-                    try:
-                        ctx.react_count += 1
-                        ctx.delivered_channel_ids.add(cid)
-                    except Exception:  # noqa: BLE001
-                        pass
-                if detector is not None:
-                    detector.clear_undelivered_attempts()
-        # SendFileDirective: not yet implemented via this path
+    delivered_by_directive = await dispatch_send_message_directives(
+        directives=parsed.directives,
+        bridge=bridge,
+        channel_id=cid,
+        sent_message_id=(getattr(result, "message_id", None) if result else None),
+        fallback_message_id=None,
+        ctx=ctx,
+        detector=detector,
+    )
 
     if (
         detector is not None

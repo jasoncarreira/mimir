@@ -1764,10 +1764,13 @@ class Agent:
         ``turn_is_interactive``: ``shell_job_complete`` is interactive for
         normal send defaults, but silence is often correct there.
         """
+        from .bridges._directives import parse_directives
         from .resend_nudge import channel_prefix_enabled
+        from .tools.registry import dispatch_send_message_directives
 
-        text = self._substantive_final_text(output)
-        if text is None:
+        parsed = parse_directives(output or "")
+        clean_text = self._substantive_final_text(parsed.clean_text)
+        if clean_text is None and not parsed.directives:
             return
         if event.trigger != "user_message" or not turn_is_interactive:
             return
@@ -1785,56 +1788,72 @@ class Agent:
         if bridge is None:
             return
 
-        try:
-            result = await self._channels.send(event.channel_id, text, final=False)
-        except Exception:  # noqa: BLE001 — auto-recovery must not fail the turn
-            log.exception("auto-deliver final text send failed")
-            return
-        if not getattr(result, "sent", True):
+        result = None
+        if clean_text:
             try:
-                await safe_log_event(
-                    "send_message_failed",
-                    channel_id=event.channel_id,
-                    error=str(getattr(result, "error", None) or "")[:200] or None,
-                )
+                result = await self._channels.send(event.channel_id, clean_text, final=False)
+            except Exception:  # noqa: BLE001 — auto-recovery must not fail the turn
+                log.exception("auto-deliver final text send failed")
+                return
+            if not getattr(result, "sent", True):
+                try:
+                    await safe_log_event(
+                        "send_message_failed",
+                        channel_id=event.channel_id,
+                        error=str(getattr(result, "error", None) or "")[:200] or None,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+
+            try:
+                ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
+                ctx.delivered_channel_ids.add(event.channel_id)
+                emitter = getattr(ctx, "turn_event_emitter", None)
+                if emitter is not None:
+                    emitter.outbound_message(
+                        channel_id=event.channel_id,
+                        message_id=getattr(result, "message_id", None),
+                    )
             except Exception:  # noqa: BLE001
-                pass
-            return
+                log.debug("auto-deliver bookkeeping failed", exc_info=True)
 
-        try:
-            ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
-            ctx.delivered_channel_ids.add(event.channel_id)
-            emitter = getattr(ctx, "turn_event_emitter", None)
-            if emitter is not None:
-                emitter.outbound_message(
-                    channel_id=event.channel_id,
-                    message_id=getattr(result, "message_id", None),
-                )
-        except Exception:  # noqa: BLE001
-            log.debug("auto-deliver bookkeeping failed", exc_info=True)
-
-        norm = re.sub(r"\s+", " ", text.strip()).lower()[:500]
-        content_hash = hashlib.md5(norm.encode()).hexdigest()[:16]
-        await safe_log_event(
-            "send_message_sent", channel_id=event.channel_id, content_hash=content_hash,
-        )
-        try:
-            msg = self._buffer.make_message(
-                channel_id=event.channel_id,
-                kind="assistant_message",
-                content=text,
-                msg_id=getattr(result, "message_id", None),
-                source=getattr(bridge, "name", None),
+            norm = re.sub(r"\s+", " ", clean_text.strip()).lower()[:500]
+            content_hash = hashlib.md5(norm.encode()).hexdigest()[:16]
+            await safe_log_event(
+                "send_message_sent", channel_id=event.channel_id, content_hash=content_hash,
             )
-            await self._buffer.append(msg)
-        except Exception:  # noqa: BLE001
-            log.warning("auto-deliver final text history append failed", exc_info=True)
+            try:
+                msg = self._buffer.make_message(
+                    channel_id=event.channel_id,
+                    kind="assistant_message",
+                    content=clean_text,
+                    msg_id=getattr(result, "message_id", None),
+                    source=getattr(bridge, "name", None),
+                )
+                await self._buffer.append(msg)
+            except Exception:  # noqa: BLE001
+                log.warning("auto-deliver final text history append failed", exc_info=True)
+
+        try:
+            await dispatch_send_message_directives(
+                directives=parsed.directives,
+                bridge=bridge,
+                channel_id=event.channel_id,
+                sent_message_id=(getattr(result, "message_id", None) if result else None),
+                fallback_message_id=(
+                    event.source_id or getattr(ctx, "last_assistant_message_id", None)
+                ),
+                ctx=ctx,
+            )
+        except Exception:  # noqa: BLE001 — directive recovery is best-effort
+            log.exception("auto-deliver directive dispatch failed")
 
         await safe_log_event(
             "interactive_turn_auto_delivered",
             channel_id=event.channel_id,
             turn_id=turn_id,
-            output_chars=len(text),
+            output_chars=len(clean_text or ""),
         )
 
     async def _run_turn_body(
