@@ -364,30 +364,22 @@ def test_direct_provider_routes_dont_override_base_url():
     no base-url override needed."""
     assert detect_route("claude-sonnet-4-6").env == {}
     assert detect_route("gpt-4.1-mini").env == {}
-    # The subscription Claude route carries the chainlink-#426 opt-in env
-    # (deliberate, not a base-url override) — assert specifically that no
-    # base URL is injected.
     _sub_env = detect_route("claude-sonnet-4-6", subscription=True).env
     assert "ANTHROPIC_BASE_URL" not in _sub_env
 
 
-def test_claude_code_routes_carry_allow_env():
-    """chainlink #426: any route that resolves to the deprecated
-    claude-code: spec must scaffold MIMIR_ALLOW_CLAUDE_CODE=1 — the
-    operator chose the route explicitly at setup time, and without the
-    env a fresh install crashes at first model resolution."""
+def test_claude_code_routes_do_not_scaffold_legacy_allow_env():
+    """claude-code availability is decided by the resolver's enforcement
+    hook check, not by the old unsafe MIMIR_ALLOW_CLAUDE_CODE opt-in."""
     from mimir.model_registry import detect_route
 
-    # Bare Claude name + --subscription (the supported Max setup path).
     route = detect_route("claude-sonnet-4-6", subscription=True)
     assert route.model_spec == "claude-code:claude-sonnet-4-6"
-    assert route.env.get("MIMIR_ALLOW_CLAUDE_CODE") == "1"
+    assert "MIMIR_ALLOW_CLAUDE_CODE" not in route.env
 
-    # Explicit claude-code: prefix.
     route = detect_route("claude-code:claude-sonnet-4-6")
-    assert route.env.get("MIMIR_ALLOW_CLAUDE_CODE") == "1"
+    assert "MIMIR_ALLOW_CLAUDE_CODE" not in route.env
 
-    # Non-claude-code routes must NOT carry the opt-in.
     route = detect_route("claude-sonnet-4-6", subscription=False)
     assert "MIMIR_ALLOW_CLAUDE_CODE" not in route.env
     route = detect_route("gpt-5.4", subscription=True)  # codex-plus flip

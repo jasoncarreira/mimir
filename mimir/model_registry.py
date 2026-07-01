@@ -164,14 +164,6 @@ def detect_route(
         if prefix_lower == "claude-code":
             return ModelRoute(
                 model_spec=name,
-                # chainlink #426: the claude-code route is deprecated and
-                # refused at model resolution unless this env is set. An
-                # operator who explicitly typed a ``claude-code:`` spec
-                # has chosen the protocol deliberately, so the scaffolded
-                # config carries the opt-in — informed consent at setup
-                # time instead of a first-run crash; the resolve-time
-                # deprecation warning still logs on every boot.
-                env={"MIMIR_ALLOW_CLAUDE_CODE": "1"},
                 provider_name=PROVIDER_ANTHROPIC_MAX,
                 billing_mode=BILLING_SUBSCRIPTION,
                 monitor_env=sub_monitor_env,
@@ -232,19 +224,8 @@ def detect_route(
         # provider label, and billing mode, surfaced with the provider's
         # own monitor label (Anthropic OAuth poller / Codex Plus headers).
         #
-        # chainlink #426: when the flip lands on the deprecated
-        # ``claude-code:`` route (Claude family + --subscription — the
-        # supported Max path), the scaffolded env carries the explicit
-        # opt-in the resolver requires; without it a fresh
-        # ``mimir setup --subscription`` install would crash at first
-        # model resolution. The deprecation warning still logs at boot.
-        flip_env = (
-            {"MIMIR_ALLOW_CLAUDE_CODE": "1"}
-            if prov.subscription_spec_prefix == "claude-code" else {}
-        )
         return ModelRoute(
             model_spec=f"{prov.subscription_spec_prefix}:{name}",
-            env=flip_env,
             provider_name=prov.subscription_provider or prov.name,
             billing_mode=BILLING_SUBSCRIPTION,
             monitor_env=sub_monitor_env,

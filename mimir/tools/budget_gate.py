@@ -103,13 +103,14 @@ _ADMIN_BUILTIN_TOOL_NAMES = frozenset(
 )
 
 
-def _resolve_budget_state() -> tuple[Any, int] | None:
+def _resolve_budget_state(ctx: Any | None = None) -> tuple[Any, int] | None:
     """Return ``(ctx, budget)`` if a TurnContext with a non-zero
     ``tool_call_budget`` is active. ``None`` means: no enforcement
     (no active ctx, or budget=0). Avoids hard-coupling this module
     to the import chain for tests."""
-    from .._context import get_current_turn
-    ctx = get_current_turn()
+    if ctx is None:
+        from .._context import get_current_turn
+        ctx = get_current_turn()
     if ctx is None:
         return None
     budget = getattr(ctx, "tool_call_budget", 0) or 0
@@ -152,7 +153,7 @@ def _budget_denied_message(tool_name: str, count: int, budget: int) -> str:
     )
 
 
-def _check_and_increment_or_deny(tool_name: str) -> str | None:
+def _check_and_increment_or_deny(tool_name: str, ctx: Any | None = None) -> str | None:
     """Returns a denial message (str) if the call should be refused,
     or ``None`` if the call should proceed. Shared between the sync
     and async middleware paths so the bookkeeping stays identical."""
@@ -161,7 +162,7 @@ def _check_and_increment_or_deny(tool_name: str) -> str | None:
     # docstring for why. Free passage, no bookkeeping.
     if tool_name in _BUDGET_EXEMPT_TOOLS:
         return None
-    state = _resolve_budget_state()
+    state = _resolve_budget_state(ctx)
     if state is None:
         return None
     ctx, budget = state
@@ -235,13 +236,13 @@ def _turn_has_internal_admin_authority(ctx: Any) -> bool:
     return source in _ADMIN_TRUSTED_INTERNAL_SOURCES
 
 
-def _check_admin_authorized(tool_name: str) -> str | None:
+def _check_admin_authorized(tool_name: str, ctx: Any | None = None) -> str | None:
     if not _is_admin_sensitive_tool(tool_name):
         return None
 
-    from .._context import get_current_turn
-
-    ctx = get_current_turn()
+    if ctx is None:
+        from .._context import get_current_turn
+        ctx = get_current_turn()
     if ctx is None:
         return None
     enforce = bool(getattr(ctx, "access_control_enforced", False))
