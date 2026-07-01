@@ -8,12 +8,29 @@ ChatClaudeCode only when present (skipped otherwise).
 
 from __future__ import annotations
 
+import sys
+import types
 from typing import Any
 
 import pytest
 from langchain_core.language_models import BaseChatModel
 
+from mimir import _langchain_claude_code_patches as lcc_patches
 from mimir.agent import _resolve_model, _supports_responses_api, resolve_model_from_config
+
+
+def _raise_package_not_found(name: str) -> None:
+    raise lcc_patches.importlib_metadata.PackageNotFoundError(name)
+
+
+class _FakeDirectUrlDistribution:
+    def __init__(self, commit_id: str) -> None:
+        self.commit_id = commit_id
+
+    def read_text(self, name: str) -> str | None:
+        if name != "direct_url.json":
+            return None
+        return '{"vcs_info": {"vcs": "git", "commit_id": "%s"}}' % self.commit_id
 
 
 # ─── Responses API heuristic ────────────────────────────────────────
@@ -214,6 +231,120 @@ class TestResolveModelClaudeCode:
         m = _resolve_model("claude-code:claude-sonnet-4-6", max_retries=12)
         assert isinstance(m, ChatClaudeCode)
         assert m.model == "claude-sonnet-4-6"
+
+    def test_rejects_stale_pypi_adapter(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_ALLOW_CLAUDE_CODE", "1")
+        fake_lcc = types.ModuleType("langchain_claude_code")
+        fake_lcc.ChatClaudeCode = lambda **_kwargs: "SHOULD_NOT_CONSTRUCT"
+        monkeypatch.setitem(sys.modules, "langchain_claude_code", fake_lcc)
+        monkeypatch.setattr(
+            lcc_patches.importlib_metadata,
+            "version",
+            lambda name: (
+                "0.1.0"
+                if name == lcc_patches.UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST
+                else (_raise_package_not_found(name))
+            ),
+        )
+        monkeypatch.setattr(
+            lcc_patches.importlib_metadata,
+            "distribution",
+            lambda name: _raise_package_not_found(name),
+        )
+
+        with pytest.raises(ImportError, match="stale PyPI adapter"):
+            _resolve_model("claude-code:claude-sonnet-4-6")
+
+    def test_accepts_pinned_fork_adapter_metadata(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_ALLOW_CLAUDE_CODE", "1")
+        captured: dict[str, Any] = {}
+        fake_lcc = types.ModuleType("langchain_claude_code")
+
+        def _fake_chat(**kwargs: Any) -> str:
+            captured.update(kwargs)
+            return "MODEL"
+
+        fake_lcc.ChatClaudeCode = _fake_chat
+        monkeypatch.setitem(sys.modules, "langchain_claude_code", fake_lcc)
+        monkeypatch.setattr(
+            lcc_patches.importlib_metadata,
+            "version",
+            lambda name: (
+                "0.1.0"
+                if name == lcc_patches.UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST
+                else (_raise_package_not_found(name))
+            ),
+        )
+        monkeypatch.setattr(
+            lcc_patches.importlib_metadata,
+            "distribution",
+            lambda name: _FakeDirectUrlDistribution(
+                lcc_patches.PINNED_LANGCHAIN_CLAUDE_CODE_REF
+            )
+            if name == lcc_patches.UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST
+            else _raise_package_not_found(name),
+        )
+
+        assert _resolve_model("claude-code:claude-sonnet-4-6") == "MODEL"
+        assert captured["model"] == "claude-sonnet-4-6"
+
+    def test_native_compatible_adapter_skips_mimir_monkeypatches(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake_lcc = types.ModuleType("langchain_claude_code")
+        fake_ccm = types.ModuleType("langchain_claude_code.claude_chat_model")
+        fake_lcc.MIMIR_COMPATIBILITY = {
+            "features": sorted(lcc_patches._REQUIRED_ADAPTER_FEATURES)
+        }
+
+        class _FakeChatClaudeCode:
+            def _get_tool_schema(self, tool: Any) -> dict[str, Any]:
+                return {"type": "object", "properties": {}}
+
+            def _wrap_langchain_tool(
+                self, tool: Any, schema: dict[str, Any]
+            ) -> Any:
+                return None
+
+            def _build_options(self, **_overrides: Any) -> Any:
+                return types.SimpleNamespace(hooks=None)
+
+            async def _aquery(self, *_args: Any, **_kwargs: Any) -> Any:
+                return "", [], {}
+
+            async def _astream(self, *_args: Any, **_kwargs: Any) -> Any:
+                if False:
+                    yield None
+
+        fake_ccm.ClaudeCodeChatModel = _FakeChatClaudeCode
+        fake_lcc.claude_chat_model = fake_ccm
+        monkeypatch.setitem(sys.modules, "langchain_claude_code", fake_lcc)
+        monkeypatch.setitem(
+            sys.modules, "langchain_claude_code.claude_chat_model", fake_ccm
+        )
+
+        original_schema = _FakeChatClaudeCode._get_tool_schema
+        original_wrap = _FakeChatClaudeCode._wrap_langchain_tool
+        original_build = _FakeChatClaudeCode._build_options
+        original_aquery = _FakeChatClaudeCode._aquery
+        original_astream = _FakeChatClaudeCode._astream
+
+        lcc_patches.apply_patches()
+        lcc_patches.enrich_streaming_metadata()
+        lcc_patches.install_tool_event_hooks()
+
+        assert _FakeChatClaudeCode._get_tool_schema is original_schema
+        assert _FakeChatClaudeCode._wrap_langchain_tool is original_wrap
+        assert _FakeChatClaudeCode._build_options is original_build
+        assert _FakeChatClaudeCode._aquery is original_aquery
+        assert _FakeChatClaudeCode._astream is original_astream
+        assert _FakeChatClaudeCode._mimir_arun_config_patched is True
+        assert _FakeChatClaudeCode._mimir_streaming_metadata_enriched is True
+        assert _FakeChatClaudeCode._mimir_tool_event_hooks_installed is True
 
 
 # ─── Config integration ────────────────────────────────────────────

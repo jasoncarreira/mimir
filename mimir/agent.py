@@ -389,6 +389,7 @@ def _resolve_model(
             "or prohibited-action gating (chainlink #426)"
         )
         try:
+            import langchain_claude_code as _lcc  # type: ignore[import-untyped]
             from langchain_claude_code import ChatClaudeCode  # type: ignore[import-untyped]
         except ImportError as exc:
             raise ImportError(
@@ -398,10 +399,11 @@ def _resolve_model(
                 "mimir-agent extra — install it directly:\n"
                 "  pip install \"langchain-claude-code @ git+"
                 "https://github.com/jasoncarreira/langchain-claude-code"
-                "@c723d702dfac1ff6e2b22b8bde661cb17a17b0de\"\n"
+                f"@{_lcc_patches.PINNED_LANGCHAIN_CLAUDE_CODE_REF}\"\n"
                 "Restored as an extra once upstream patches "
                 "(see issue #268) merge + a release is cut."
             ) from exc
+        _lcc_patches.assert_supported_langchain_claude_code_adapter(_lcc)
         model_name = spec.split(":", 1)[1]
         # ``permission_mode="bypassPermissions"`` matches SDK-era
         # mimir's ClaudeAgentOptions setting — without it the claude

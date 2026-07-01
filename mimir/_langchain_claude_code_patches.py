@@ -33,13 +33,163 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import importlib.metadata as importlib_metadata
+import json
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 _PATCH_MARKER = "_mimir_arun_config_patched"
+
+PINNED_LANGCHAIN_CLAUDE_CODE_REF = "c03f075c8b84fb0c718de1aabdd6493f5d191786"
+CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST = "mimir-langchain-claude-code"
+UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST = "langchain-claude-code"
+
+_REQUIRED_ADAPTER_FEATURES = frozenset(
+    {
+        "arun_config",
+        "tool_call_schema",
+        "streaming_result_metadata",
+        "sdk_tool_events",
+    }
+)
+
+
+@dataclass(frozen=True)
+class AdapterCompatibility:
+    supported: bool
+    reason: str
+
+
+def _module_declares_compatibility(module: Any) -> bool:
+    """Return True when the adapter package explicitly advertises fixes.
+
+    The controlled adapter can avoid all Mimir-side monkeypatches by exposing
+    either ``MIMIR_COMPATIBILITY`` or ``__mimir_compatibility__`` as a mapping
+    whose ``features`` iterable contains the required compatibility flags.
+    """
+    for attr in ("MIMIR_COMPATIBILITY", "__mimir_compatibility__"):
+        compat = getattr(module, attr, None)
+        if not isinstance(compat, dict):
+            continue
+        features = compat.get("features") or compat.get("adapter_features") or ()
+        try:
+            if _REQUIRED_ADAPTER_FEATURES.issubset(set(features)):
+                return True
+        except TypeError:
+            continue
+    return False
+
+
+def _distribution_version(dist_name: str) -> str | None:
+    try:
+        return importlib_metadata.version(dist_name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _distribution_direct_url_commit(dist_name: str) -> str | None:
+    try:
+        dist = importlib_metadata.distribution(dist_name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+    raw = dist.read_text("direct_url.json")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    vcs_info = data.get("vcs_info")
+    if not isinstance(vcs_info, dict):
+        return None
+    commit = vcs_info.get("commit_id") or vcs_info.get("requested_revision")
+    return commit if isinstance(commit, str) else None
+
+
+def langchain_claude_code_adapter_compatibility(module: Any | None = None) -> AdapterCompatibility:
+    """Validate that ``langchain_claude_code`` is a supported adapter build.
+
+    Upstream/PyPI ``langchain-claude-code==0.1.0`` is known stale for Mimir:
+    it lacks the LangChain Core 1.x ``_arun(config=...)`` fix, exposes
+    ``InjectedToolArg`` fields through schemas, and drops metadata/hook data
+    Mimir consumes. Supported paths are:
+
+    * a controlled distribution named ``mimir-langchain-claude-code``;
+    * an adapter module explicitly declaring all required compatibility
+      features; or
+    * the known fork commit from chainlink #733/#734.
+    """
+    if module is None:
+        try:
+            import langchain_claude_code as module  # type: ignore[import-untyped,no-redef]
+        except ImportError:
+            return AdapterCompatibility(False, "langchain_claude_code is not installed")
+
+    if _module_declares_compatibility(module):
+        return AdapterCompatibility(True, "adapter declares Mimir compatibility features")
+
+    controlled_version = _distribution_version(CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST)
+    if controlled_version is not None:
+        return AdapterCompatibility(
+            True,
+            f"{CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST}=={controlled_version} is installed",
+        )
+
+    upstream_version = _distribution_version(UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST)
+    commit = _distribution_direct_url_commit(UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST)
+    if commit == PINNED_LANGCHAIN_CLAUDE_CODE_REF:
+        version_text = f"=={upstream_version}" if upstream_version else ""
+        return AdapterCompatibility(
+            True,
+            f"{UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST}{version_text} is installed from pinned fork",
+        )
+
+    if upstream_version == "0.1.0":
+        return AdapterCompatibility(
+            False,
+            "langchain-claude-code==0.1.0 is the stale PyPI adapter and is unsupported",
+        )
+
+    if upstream_version is not None:
+        return AdapterCompatibility(
+            False,
+            f"{UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST}=={upstream_version} is not a verified Mimir adapter",
+        )
+
+    return AdapterCompatibility(
+        False,
+        "langchain_claude_code is importable but no supported distribution metadata was found",
+    )
+
+
+def assert_supported_langchain_claude_code_adapter(module: Any | None = None) -> None:
+    status = langchain_claude_code_adapter_compatibility(module)
+    if status.supported:
+        return
+    raise ImportError(
+        "MIMIR_MODEL_SPEC=claude-code:* requires a maintained "
+        "langchain_claude_code adapter. "
+        f"{status.reason}. Install the controlled adapter distribution "
+        f"``{CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST}`` when available, or the "
+        "known fork ref:\n"
+        "  pip install \"langchain-claude-code @ git+"
+        "https://github.com/jasoncarreira/langchain-claude-code"
+        f"@{PINNED_LANGCHAIN_CLAUDE_CODE_REF}\""
+    )
+
+
+def _adapter_has_native_mimir_compatibility() -> bool:
+    try:
+        import langchain_claude_code as lcc  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+    return _module_declares_compatibility(lcc) or (
+        _distribution_version(CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST) is not None
+    )
 
 
 # ContextVar carrying the per-call ``tool_events`` list. The hook
@@ -80,6 +230,10 @@ def apply_patches() -> None:
     except ImportError:
         # Operator hasn't installed the claude-code extra — nothing to
         # patch. Other model providers (anthropic, openai) are untouched.
+        return
+
+    if _adapter_has_native_mimir_compatibility():
+        setattr(ccm.ClaudeCodeChatModel, _PATCH_MARKER, True)
         return
 
     if getattr(ccm.ClaudeCodeChatModel, _PATCH_MARKER, False):
@@ -397,6 +551,10 @@ def enrich_streaming_metadata() -> None:
     except ImportError:
         return
 
+    if _adapter_has_native_mimir_compatibility():
+        setattr(ccm.ClaudeCodeChatModel, _STREAMING_METADATA_MARKER, True)
+        return
+
     if getattr(ccm.ClaudeCodeChatModel, _STREAMING_METADATA_MARKER, False):
         return
 
@@ -547,6 +705,14 @@ def install_tool_event_hooks() -> None:
     """
     try:
         from langchain_claude_code import claude_chat_model as ccm
+    except ImportError:
+        return
+
+    if _adapter_has_native_mimir_compatibility():
+        setattr(ccm.ClaudeCodeChatModel, _TOOL_EVENT_HOOKS_MARKER, True)
+        return
+
+    try:
         from claude_agent_sdk import HookMatcher
     except ImportError:
         return
