@@ -42,7 +42,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .rate_limits import (
     RateLimitSnapshot,
