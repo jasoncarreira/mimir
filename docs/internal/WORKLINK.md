@@ -22,6 +22,77 @@ entry point. The slice markers below are historical rollout notes — the poller
 the `worklink_run` tool path, and the planner contract are all live now.
 Owner issue: chainlink #380; leaf issues are subissues of #380.
 
+## Operator quickstart (TL;DR)
+
+You don't run anything by hand. You **file a well-formed leaf chainlink and label
+it `worklink:ready`**; the dispatcher claims it, builds it, and opens a review PR
+for you to merge. Everything below this section is the design/internals.
+
+### 1. File a leaf
+
+A leaf is one self-contained unit of work. Its description MUST use this
+plain-text template — **plain `Foo:` markers, not Markdown `##` headers**, or the
+validator auto-demotes it to `worklink:blocked` before it ever dispatches
+(§2.5 is the authoritative contract; the canonical text is
+`mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN`):
+
+```
+Problem:
+<what's wrong + where (file:line), and why it matters>
+
+Acceptance criteria:
+- [ ] <testable outcome>
+- [ ] <...>
+
+Review criteria:
+- <what a reviewer should check>
+
+Worklink notes:
+- Scope: <files / areas in scope>
+- Out of scope: <what must NOT change>
+- Suggested test command: <the command that proves it>
+```
+
+Create it from the chainlink store (the agent's home). For the docker deployment
+that means running inside the container, e.g. mimirbot:
+
+```
+docker exec -i -w /mimir-home mimirbot \
+  chainlink issue create "<title>" -d "<body>" -l worklink:ready [-l bug|feature] [--priority high]
+```
+
+For an epic with ordered slices — create subissues under a parent and record
+ordering (blocked id first, then the blocker):
+
+```
+chainlink issue subissue <parent> "<slice title>" -d "<body>" -l worklink:ready
+chainlink issue block <slice2-id> <slice1-id>     # slice2 waits until slice1 closes
+```
+
+### 2. What happens automatically
+
+`worklink:ready` → the ready-queue poller claims it (`WORKLINK_CLAIM`) → the
+executor builds it in a broker-isolated worktree via a coding CLI → pushes
+`issue/<id>-a1` and opens a **review PR** (`WORKLINK_EVIDENCE`), moving the leaf
+to `worklink:review`. Failure modes: a malformed template → `worklink:blocked`
+with a `WORKLINK_BLOCKED` reason (fix it, remove `worklink:blocked`, re-add
+`worklink:ready`); 3 failed build attempts → `worklink:blocked`
+(`attempts_exhausted`).
+
+### 3. Review + close
+
+Review the PR like any other. Merging it (or posting an approval-shaped event)
+closes the leaf, and any slices blocked on it unblock automatically.
+
+### Handy commands (`chainlink issue …`, run in the home / store)
+
+- `ready` — leaves ready to work (open, no open blockers)
+- `list --status open -l worklink:ready` — the queued worklink leaves
+- `show <id>` — full description + the `WORKLINK_*` activity trail
+- `tree` — the epic / subissue hierarchy
+- `comment <id> "<text>"`, then `close <id>` — note that `close` takes the **ID
+  only** (comment separately); pipe long `-d` bodies via a heredoc/env var
+
 ## 1. Roles
 
 The open-strix `chainlink-worker` pattern is split into two roles so a
