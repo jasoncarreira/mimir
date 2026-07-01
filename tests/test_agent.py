@@ -73,8 +73,10 @@ class _BridgeStub:
 
     def __init__(self) -> None:
         self.sends: list[tuple[str, str, bool]] = []
+        self.reacts: list[tuple[str, str | None, str]] = []
         self.cancels: list[str] = []
         self.typing_starts: list[str] = []
+        self.raise_on_react = False
 
     async def send(self, channel_id: str, text: str, attachment_paths=None, *,
                    final: bool = True):
@@ -82,9 +84,13 @@ class _BridgeStub:
         class _R:
             sent = True
             error = None
+            message_id = "sent-1"
         return _R()
 
-    async def react(self, *a, **kw):
+    async def react(self, channel_id: str, message_id: str | None, emoji: str):
+        if self.raise_on_react:
+            raise RuntimeError("react boom")
+        self.reacts.append((channel_id, message_id, emoji))
         return True
 
     async def cancel_typing(self, channel_id: str) -> None:
@@ -975,6 +981,105 @@ async def test_run_turn_auto_delivers_final_text_when_enabled(tmp_path: Path):
     assert auto["turn_id"] == record.turn_id
     assert auto["output_chars"] == len(final_text)
     assert [e for e in evs if e.get("type") == "send_message_sent"]
+
+
+async def test_run_turn_auto_deliver_strips_actions_and_dispatches_react(
+    tmp_path: Path,
+):
+    import json
+    from mimir.channel_registry import ChannelRegistry
+
+    clean_text = "Found it. The missing setting is enabled in the project config."
+    final_text = f'{clean_text}\n<actions><react emoji="X" /></actions>'
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content=final_text)])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+    agent._config.auto_deliver_final_text_channels = ("ch-",)
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    record = await agent.run_turn(event)
+
+    assert record.error is None
+    assert bridge.sends == [("ch-1", clean_text, False)]
+    assert bridge.reacts == [("ch-1", "sent-1", "X")]
+    outbound = [m for m in agent._buffer._all if m.kind == "assistant_message"]
+    assert [m.content for m in outbound] == [clean_text]
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    assert [e for e in evs if e.get("type") == "interactive_turn_no_send_message"] == []
+    [auto] = [e for e in evs if e.get("type") == "interactive_turn_auto_delivered"]
+    assert auto["output_chars"] == len(clean_text)
+
+
+async def test_run_turn_auto_deliver_actions_only_posts_no_blank_and_reacts(
+    tmp_path: Path,
+):
+    import json
+    from mimir.channel_registry import ChannelRegistry
+
+    final_text = '<actions><react emoji="X" /></actions>'
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content=final_text)])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+    agent._config.auto_deliver_final_text_channels = ("ch-",)
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-1",
+        content="hi",
+        source_id="incoming-1",
+    )
+    record = await agent.run_turn(event)
+
+    assert record.error is None
+    assert bridge.sends == []
+    assert bridge.reacts == [("ch-1", "incoming-1", "X")]
+    assert [m for m in agent._buffer._all if m.kind == "assistant_message"] == []
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    assert [e for e in evs if e.get("type") == "interactive_turn_no_send_message"] == []
+    [auto] = [e for e in evs if e.get("type") == "interactive_turn_auto_delivered"]
+    assert auto["output_chars"] == 0
+
+
+async def test_run_turn_auto_deliver_react_failure_is_best_effort(tmp_path: Path):
+    import json
+    from mimir.channel_registry import ChannelRegistry
+
+    clean_text = "Found it. The missing setting is enabled in the project config."
+    final_text = f'{clean_text}\n<actions><react emoji="X" /></actions>'
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content=final_text)])
+    bridge = _BridgeStub()
+    bridge.raise_on_react = True
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+    agent._config.auto_deliver_final_text_channels = ("ch-",)
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    record = await agent.run_turn(event)
+
+    assert record.error is None
+    assert bridge.sends == [("ch-1", clean_text, False)]
+    assert bridge.reacts == []
+    outbound = [m for m in agent._buffer._all if m.kind == "assistant_message"]
+    assert [m.content for m in outbound] == [clean_text]
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    assert [e for e in evs if e.get("type") == "interactive_turn_auto_delivered"]
+    [failed] = [e for e in evs if e.get("type") == "send_message_directive_failed"]
+    assert failed["directive"] == "react"
+    assert "react boom" in failed["error"]
 
 
 async def test_run_turn_auto_deliver_ignores_trivial_final_text(tmp_path: Path):
