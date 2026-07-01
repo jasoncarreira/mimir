@@ -5,9 +5,21 @@ decomposition and execution. Chainlink is the coordination surface and
 source of truth; mimir plans; pluggable coding/maintenance CLIs build;
 deterministic machinery connects them.
 
-Status: Slice 1 vertical implemented: manual `mimir worklink run` can claim a
-ready leaf, spawn Codex, observe evidence, push a branch, and open a review PR.
-Slice 2 adds the planner/decomposer contract (prompt + skill + executor refusal). Later slices still need poller/tool autonomy and additional backends.
+Status: **Live and autonomous** (as of 2026-07-01; the original #380 slices have
+all shipped). In production the flow runs end-to-end with no manual invocation:
+the **ready-queue poller** auto-discovers `worklink:ready` leaves, the executor
+spawns a coding CLI (Codex today), observes evidence, pushes an `issue/<id>-a1`
+branch, and opens a **review PR** — posting `WORKLINK_CLAIM` / `WORKLINK_EVIDENCE`
+and moving the leaf `worklink:ready → worklink:review`. The **planner/decomposer
+contract** (the leaf template in §2.5) is enforced: a leaf missing the required
+sections is auto-demoted to `worklink:blocked` with a `WORKLINK_BLOCKED` reason
+before dispatch (re-plan → re-add `worklink:ready`). Execution is isolated in a
+per-issue worktree via the docker-sibling **broker** (§5; containment hardening
+in chainlink #517). Operator review/merge of the PR (or an approval-shaped event)
+closes the leaf; a failed attempt re-enters `worklink:ready` up to 3 times, then
+`worklink:blocked`. `mimir worklink run <issue-id>` remains as a manual / dry-run
+entry point. The slice markers below are historical rollout notes — the poller,
+the `worklink_run` tool path, and the planner contract are all live now.
 Owner issue: chainlink #380; leaf issues are subissues of #380.
 
 ## 1. Roles
