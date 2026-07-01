@@ -42,10 +42,12 @@ def _make_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Agent:
 class _PromptCapture:
     def __init__(self) -> None:
         self.prompts: list[str] = []
+        self.kwargs: list[dict] = []
         self.graphs: list[object] = []
 
     def create_deep_agent(self, **kwargs):
         self.prompts.append(kwargs["system_prompt"])
+        self.kwargs.append(kwargs)
         graph = object()
         self.graphs.append(graph)
         return graph
@@ -77,6 +79,20 @@ async def test_build_agent_reuses_graph_when_prompt_unchanged(
     assert capture.graphs == [first]
     assert len(capture.prompts) == 1
     assert "INITIAL CORE BODY" in capture.prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_build_agent_registers_structured_subagents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path, monkeypatch)
+    capture = _stub_deepagent_build(monkeypatch)
+
+    await agent._build_agent_if_needed()
+
+    subagents = capture.kwargs[0]["subagents"]
+    assert [spec["name"] for spec in subagents] == ["critic-structured"]
+    assert all(spec["name"] != "general-purpose" for spec in subagents)
 
 
 @pytest.mark.asyncio

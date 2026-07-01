@@ -1291,6 +1291,8 @@ class Agent:
                     MidTurnInjectionMiddleware(),
                 )
 
+            from .subagents import build_mimir_subagents
+
             self._agent = create_deep_agent(
                 model=self._agent_model,
                 tools=self._agent_tools,
@@ -1298,6 +1300,7 @@ class Agent:
                 backend=self._backend,
                 skills=skill_sources or None,
                 middleware=self._agent_middleware,
+                subagents=build_mimir_subagents(),
             )
             self._cached_system_prompt = system_prompt
             self._cached_skill_catalog_fingerprint = skill_catalog_fingerprint
