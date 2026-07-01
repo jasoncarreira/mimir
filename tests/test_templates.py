@@ -368,6 +368,19 @@ class TestRenderSagaSessionEnd:
             assert "{idle_minutes}" in tmpl
             assert "{turn_summary_block}" in tmpl
 
+    def test_default_templates_include_session_summary_confabulation_guardrails(self) -> None:
+        """chainlink #730: synthesis summaries feed future prompts, so the
+        default prompt must explicitly guard against laundering invented rule
+        names or stale artifact-status claims into later turns."""
+        for tmpl in (SAGA_SESSION_END_DEFAULT, SAGA_SESSION_END_LEAN_DEFAULT):
+            assert "anti-confabulation" in tmpl
+            assert "formal rule / pattern / heuristic names" in tmpl
+            assert "durable source" in tmpl
+            assert "artifact-status claims" in tmpl
+            assert "canonical source" in tmpl
+            assert "[verify before quoting]" in tmpl
+            assert "`closed_since` is only for refs you confirmed resolved" in tmpl
+
 
 # ─── chainlink #388: malformed operator template must not crash synthesis ──
 

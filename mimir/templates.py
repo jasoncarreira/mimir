@@ -140,6 +140,22 @@ Skip atoms that were neutral / not applicable — silence is a valid signal.
 
 ### 3. Record the session boundary
 
+Before calling `saga_end_session`, apply these anti-confabulation
+laundering guardrails:
+
+- Do not coin or cite formal rule / pattern / heuristic names as if
+  they are durable doctrine unless the name appears in a durable source
+  you verified this turn (`memory/core/`, `memory/issues/`, `state/wiki/`,
+  Chainlink, or a PR / issue comment). If you did not verify it, describe
+  the behavior plainly instead of naming it.
+- For artifact-status claims in `summary`, `unfinished`, or `closed_since`
+  — PRs, Chainlink IDs, branches, files, jobs, proposals — verify the
+  canonical source in this turn when the status matters. If you cannot
+  verify cheaply, mark the claim with `[verify before quoting]` rather
+  than presenting it as known-live state.
+- `closed_since` is only for refs you confirmed resolved during this
+  session; do not use it to tidy old summaries based on memory alone.
+
 Synthesize and call:
 
   saga_end_session(
@@ -302,6 +318,22 @@ thing to leave for the next run. One learning per call. Skip entirely if
 no skill taught you anything this session — don't manufacture entries.
 
 ### 2. Record the session boundary
+
+Before calling `saga_end_session`, apply these anti-confabulation
+laundering guardrails:
+
+- Do not coin or cite formal rule / pattern / heuristic names as if
+  they are durable doctrine unless the name appears in a durable source
+  you verified this turn (`memory/core/`, `memory/issues/`, `state/wiki/`,
+  Chainlink, or a PR / issue comment). If you did not verify it, describe
+  the behavior plainly instead of naming it.
+- For artifact-status claims in `summary`, `unfinished`, or `closed_since`
+  — PRs, Chainlink IDs, branches, files, jobs, proposals — verify the
+  canonical source in this turn when the status matters. If you cannot
+  verify cheaply, mark the claim with `[verify before quoting]` rather
+  than presenting it as known-live state.
+- `closed_since` is only for refs you confirmed resolved during this
+  session; do not use it to tidy old summaries based on memory alone.
 
 Synthesize and call:
 
