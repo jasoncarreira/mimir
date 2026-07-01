@@ -317,6 +317,58 @@ def test_tool_events_path_captures_built_in_tool_results():
     assert tcs[0]["id"] == trs[0]["id"] == "toolu_bash1"
 
 
+def test_tool_events_path_preserves_bridged_mimir_tool_pairing():
+    """LangChain-bridged tools arrive through Claude Code as MCP-prefixed
+    names. The logger must preserve that exact call/result name and pair by
+    ``tool_use_id`` rather than falling back to the bare tool name."""
+    msg = AIMessage(
+        content="Sent.",
+        response_metadata={
+            "tool_events": [
+                {"type": "tool_call", "tool_use_id": "toolu_bridge",
+                 "name": "mcp__langchain-tools__send_message",
+                 "input": {"channel": "discord", "text": "hi"}},
+                {"type": "tool_result", "tool_use_id": "toolu_bridge",
+                 "name": "mcp__langchain-tools__send_message",
+                 "result": {"message_id": "123"}, "is_error": False},
+            ],
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    tc = next(e for e in events if e["type"] == "tool_call")
+    tr = next(e for e in events if e["type"] == "tool_result")
+    assert tc["id"] == tr["id"] == "toolu_bridge"
+    assert tc["name"] == tr["name"] == "mcp__langchain-tools__send_message"
+    assert tc["args"] == {"channel": "discord", "text": "hi"}
+    assert "123" in tr["content"]
+
+
+def test_tool_events_path_preserves_external_mcp_tool_pairing():
+    """External MCP tools use the same Claude Code hook shape as built-ins
+    and bridged tools. Keep the full MCP-style name and stable id pairing."""
+    msg = AIMessage(
+        content="Fetched.",
+        response_metadata={
+            "tool_events": [
+                {"type": "tool_call", "tool_use_id": "toolu_mcp",
+                 "name": "mcp__github__get_issue",
+                 "input": {"owner": "acme", "repo": "widget", "number": 736}},
+                {"type": "tool_result", "tool_use_id": "toolu_mcp",
+                 "name": "mcp__github__get_issue",
+                 "result": {"title": "Bring Claude Code parity"},
+                 "is_error": False},
+            ],
+        },
+    )
+    events, _ = extract_turn_events([msg])
+    tc = next(e for e in events if e["type"] == "tool_call")
+    tr = next(e for e in events if e["type"] == "tool_result")
+    assert tc["id"] == tr["id"] == "toolu_mcp"
+    assert tc["name"] == tr["name"] == "mcp__github__get_issue"
+    assert tc["args"]["number"] == 736
+    assert "Bring Claude Code parity" in tr["content"]
+
+
 def test_tool_events_path_preserves_is_error_for_failures():
     """``PostToolUseFailure`` hook records produce events with
     ``is_error=True`` and an ``error`` string instead of ``result``.
