@@ -651,7 +651,11 @@ _ESCALATION_THRESHOLDS: dict[str, int] = {
 # still emit a one-shot escalation when they become chronic. These do not
 # render individually and do not participate in algedonic ×N counts.
 _ESCALATION_ONLY_EVENT_THRESHOLDS: dict[str, tuple[str, int]] = {
-    "scheduler_loop_lag_host": ("scheduler_loop_lag_host", 5),
+    # Host/VM deschedules are per-event silent. A handful per day is normal for
+    # laptop/VM/container hosts; escalate only when the operational surface is
+    # chronic enough to deserve investigation as host pressure instead of
+    # reintroducing per-event loop-lag noise.
+    "scheduler_loop_lag_host": ("scheduler_loop_lag_host", 25),
 }
 
 

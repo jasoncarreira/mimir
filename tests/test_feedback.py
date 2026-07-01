@@ -423,14 +423,15 @@ def test_interactive_turn_auto_delivered_is_informational_only():
 
 
 def test_scheduler_loop_lag_host_escalates_only_when_chronic(tmp_path: Path):
-    """chainlink #685: host deschedules remain per-event silent, but a chronic
-    burst emits one escalation event so operator-visible reporting is not blind."""
+    """chainlink #685/#727: host deschedules remain per-event silent, but a
+    genuinely chronic burst emits one escalation event so reporting is not blind."""
     from mimir.event_logger import init_logger, _reset_logger_for_tests
     from mimir.feedback import _ESCALATION_ONLY_EVENT_THRESHOLDS, classify
 
     assert classify("scheduler_loop_lag_host") is None
     kind, threshold = _ESCALATION_ONLY_EVENT_THRESHOLDS["scheduler_loop_lag_host"]
     assert kind == "scheduler_loop_lag_host"
+    assert threshold == 25
 
     events_path = tmp_path / "logs" / "events.jsonl"
     events_path.parent.mkdir(parents=True)
@@ -476,6 +477,54 @@ def test_scheduler_loop_lag_host_escalates_only_when_chronic(tmp_path: Path):
         assert block is not None
         assert "algedonic escalation: scheduler_loop_lag_host crossed threshold" in block
         assert "scheduler event loop lag" not in block
+    finally:
+        _reset_logger_for_tests()
+
+
+def test_scheduler_loop_lag_host_below_chronic_threshold_stays_silent(tmp_path: Path):
+    """chainlink #727: 20-ish laptop/VM deschedules/day should not create an
+    algedonic escalation row; that proved too sensitive in production."""
+    from mimir.event_logger import init_logger, _reset_logger_for_tests
+    from mimir.feedback import _ESCALATION_ONLY_EVENT_THRESHOLDS
+
+    _kind, threshold = _ESCALATION_ONLY_EVENT_THRESHOLDS["scheduler_loop_lag_host"]
+    events_path = tmp_path / "logs" / "events.jsonl"
+    events_path.parent.mkdir(parents=True)
+    _write_jsonl(
+        events_path,
+        [
+            {
+                "timestamp": _ts(0.1 + idx * 0.1),
+                "type": "scheduler_loop_lag_host",
+                "lag_s": 1.6,
+                "threshold_s": 1.0,
+                "cause": "host_scheduling",
+                "loop_cpu_s": 0.0,
+            }
+            for idx in range(threshold - 1)
+        ],
+    )
+
+    init_logger(events_path, session_id="test-host-lag-below-threshold")
+    try:
+        feedback_log = FeedbackLog(
+            events_path=events_path,
+            turns_path=tmp_path / "logs" / "turns.jsonl",
+        )
+        feedback_log.recent()
+
+        records = [
+            json.loads(line)
+            for line in events_path.read_text().splitlines()
+            if line.strip()
+        ]
+        assert not [
+            rec
+            for rec in records
+            if rec.get("type") == "algedonic_escalation"
+            and rec.get("kind") == "scheduler_loop_lag_host"
+        ]
+        assert feedback_log.recent_block() is None
     finally:
         _reset_logger_for_tests()
 
