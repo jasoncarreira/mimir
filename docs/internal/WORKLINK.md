@@ -995,6 +995,36 @@ defaults:
                             # refuses the unsandboxed local_subprocess substrate unless this
                             # is true. The operator CLI is never gated. See §6.5.
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
+  epic_branch_prefix: "epic/"       # prefix for integrated-epic branches
+  max_review_retries: 3             # reviewer-requested rebuild attempts before blocking a leaf
+  reviewer_backend: codex           # defaults to the configured `backend` when omitted
+  tiered_review:
+    # Glob patterns matched against any scope path with fnmatch; `**` is supported.
+    # If set, this list REPLACES the framework defaults below; it is not merged.
+    high_risk_scope_patterns:
+      - "**/migrations/**"
+      - "**/*migration*"
+      - "**/schema.sql"
+      - "**/*auth*"
+      - "**/*oauth*"
+      - "**/*credential*"
+      - "**/*secret*"
+      - "**/generated/**"
+      - "**/*_pb2.py"
+      - "*.lock"
+      - "**/*.lock"
+      - ".github/workflows/**"
+      - "**/Dockerfile*"
+      - "**/*.tf"
+    high_risk_labels:
+      - "risk:high"
+      - "security"
+      - "auth"
+      - "migration"
+      - "prod-data"
+      - "generated-code"
+      - "hotspot"
+    multi_vote_reviewer_count: 3     # reviewer count for high-risk leaves
 
 routes:                     # first match wins
   - label: "docs"
@@ -1033,12 +1063,35 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454)
     # definition, and grant the task/execution roles permission to read them.
     # Worklink's generated RunTask request carries only worker metadata, safe
     # environment values, role overrides, network config, and tags.
+```
 
 `compute_backend` also accepts the legacy spelling `compute`; backend names are
 normalized so `docker-sibling`/`docker_sibling` and `ecs-runtask`/`ecs_runtask`
 select the same Python registry keys. Invalid or unknown compute-backend fields
 fail closed during config load instead of falling back to local execution.
 
+Integrated-epic settings live under `defaults`. `reviewer_backend` defaults to
+the configured `backend`; set it only when review should run through a different
+backend adapter. `tiered_review.high_risk_scope_patterns` uses `fnmatch`
+matching against scope paths, including a leading-root variant, so patterns can
+match anywhere in a scope path and `**` works for nested paths. The framework
+defaults are intentionally ecosystem-agnostic: migrations/schema, auth,
+OAuth/secrets/credentials, generated code, lockfiles, and CI/CD or infra files.
+A deployment should add its own sensitive surfaces here, such as access-control
+or production-specific config paths.
+
+Known limitation: setting `tiered_review.high_risk_scope_patterns` replaces the
+framework defaults instead of merging with them. To keep the generic defaults
+while adding deployment-specific patterns, list both the defaults and the local
+patterns in `worklink.yaml`.
+
+Multi-review is selected when any high-risk signal matches: the decomposer
+assigns `risk="high"`, a leaf has one of `high_risk_labels`, or a scope path
+matches one of `high_risk_scope_patterns`. These signals are OR-combined; an
+assigned high-risk leaf is never downgraded, and a pattern hit remains high-risk
+even if another signal is absent.
+
+```yaml
 tool_pins:
   - name: codex                  # required: stable local tool name
     category: coding-cli         # required: coding-cli | renderer | tracker | helper
