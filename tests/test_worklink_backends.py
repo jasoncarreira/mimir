@@ -448,10 +448,6 @@ defaults:
     high_risk_labels:
       - risk:high
       - production-data
-    multi_vote_scope_prefixes:
-      - mimir/security/keys.py
-    multi_vote_labels:
-      - requires:multi-review
     multi_vote_reviewer_count: 4
 """.strip(),
         encoding="utf-8",
@@ -466,10 +462,22 @@ defaults:
     assert defaults.tiered_review == TieredReviewConfig(
         high_risk_scope_prefixes=("mimir/security/", "migrations/prod/"),
         high_risk_labels=("risk:high", "production-data"),
-        multi_vote_scope_prefixes=("mimir/security/keys.py",),
-        multi_vote_labels=("requires:multi-review",),
         multi_vote_reviewer_count=4,
     )
+
+
+def test_worklink_config_rejects_unknown_merge_strategy(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  merge_strategy: noff
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="defaults.merge_strategy"):
+        WorklinkConfig.load(config_path)
 
 
 def test_worklink_config_builds_docker_sibling_compute_backend(tmp_path: Path) -> None:

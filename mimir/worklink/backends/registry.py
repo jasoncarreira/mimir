@@ -22,6 +22,7 @@ from .codex import CodexBackend
 
 
 WORKLINK_MERGED_LABEL = "worklink:merged"
+VALID_MERGE_STRATEGIES = frozenset({"no-ff", "squash", "ff-only"})
 
 
 @dataclass(frozen=True)
@@ -51,8 +52,9 @@ class TieredReviewConfig:
         "generated-code",
         "hotspot",
     )
-    multi_vote_scope_prefixes: tuple[str, ...] = ()
-    multi_vote_labels: tuple[str, ...] = ("risk:multi-vote",)
+    # High-risk slices get multi-vote review using this reviewer count; all
+    # other slices get one adversarial pass. Do not add a second trigger list
+    # unless a real third tier appears.
     multi_vote_reviewer_count: int = 3
 
 
@@ -193,7 +195,7 @@ class WorklinkConfig:
                 default=WorklinkDefaults.max_review_retries,
             ),
             reviewer_backend=str(defaults_data.get("reviewer_backend", backend_name)),
-            merge_strategy=str(
+            merge_strategy=_parse_merge_strategy(
                 defaults_data.get("merge_strategy", default_values.merge_strategy)
             ),
             tiered_review=_parse_tiered_review_config(defaults_data.get("tiered_review")),
@@ -305,6 +307,14 @@ def _normalize_compute_backend_name(name: str) -> str:
     return name.strip().replace("-", "_")
 
 
+def _parse_merge_strategy(value: Any) -> str:
+    strategy = str(value)
+    if strategy not in VALID_MERGE_STRATEGIES:
+        valid = ", ".join(sorted(VALID_MERGE_STRATEGIES))
+        raise ValueError(f"worklink defaults.merge_strategy must be one of: {valid}")
+    return strategy
+
+
 def _expect_mapping(value: Any, label: str) -> Mapping[str, Any]:
     if value is None:
         return {}
@@ -385,16 +395,6 @@ def _parse_tiered_review_config(value: Any) -> TieredReviewConfig:
             value.get("high_risk_labels"),
             default=defaults.high_risk_labels,
             field_name="worklink defaults.tiered_review.high_risk_labels",
-        ),
-        multi_vote_scope_prefixes=_string_tuple_config(
-            value.get("multi_vote_scope_prefixes"),
-            default=defaults.multi_vote_scope_prefixes,
-            field_name="worklink defaults.tiered_review.multi_vote_scope_prefixes",
-        ),
-        multi_vote_labels=_string_tuple_config(
-            value.get("multi_vote_labels"),
-            default=defaults.multi_vote_labels,
-            field_name="worklink defaults.tiered_review.multi_vote_labels",
         ),
         multi_vote_reviewer_count=_positive_int(
             value.get("multi_vote_reviewer_count"),
