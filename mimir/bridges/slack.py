@@ -42,6 +42,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
 
 from ..background_tasks import spawn_background
 from ..models import AgentEvent
+from ..redaction import redact_text
 from ._attachments import _SLACK_CDN_HOSTS, build_inbound_path, download_to_path
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
@@ -543,7 +544,17 @@ class SlackBridge(Bridge):
                 sent=sent_count > 0,
                 message_id=last_id,
                 chunks=sent_count,
-                error=f"slack api error after {sent_count} chunk(s): {exc}",
+                error=redact_text(f"slack api error after {sent_count} chunk(s): {exc}"),
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort bridge send
+            return SendResult(
+                sent=sent_count > 0,
+                message_id=last_id,
+                chunks=sent_count,
+                error=redact_text(
+                    f"slack send error after {sent_count} chunk(s): "
+                    f"{type(exc).__name__}: {exc}"
+                ),
             )
         return SendResult(sent=True, message_id=last_id, chunks=sent_count)
 
