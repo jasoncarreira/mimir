@@ -22,6 +22,7 @@ from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
     WorklinkRunner,
+    _demote_template_invalid_ready_leaf,
     _run_remote_test_job,
     render_decomposition_prompt,
     validate_leaf,
@@ -1288,6 +1289,31 @@ def test_worklink_runner_demotes_template_invalid_ready_leaf_before_claim(tmp_pa
         isinstance(call, list) and call[:3] == ["chainlink", "locks", "claim"]
         for call in calls
     )
+
+
+def test_worklink_runner_does_not_demote_epic_brief_for_leaf_template(tmp_path: Path) -> None:
+    issue = IssueContext(
+        774,
+        "epic brief",
+        "Build integrated epic mode as the default routing path.",
+        {"worklink:ready", "worklink:epic"},
+        created_at=datetime(2026, 6, 18, tzinfo=UTC),
+    )
+    calls: list[Sequence[str] | str] = []
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return cp(args)
+
+    validate_leaf(issue)
+    _demote_template_invalid_ready_leaf(
+        issue,
+        reason="issue missing planner template: Acceptance criteria",
+        runner=runner,
+        chainlink_bin="chainlink",
+    )
+
+    assert calls == []
 
 
 def test_worklink_runner_dry_run_reports_template_error_without_demoting(tmp_path: Path) -> None:

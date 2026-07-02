@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Worklink ready-queue poller (chainlink #444).
 
-Discovers ``worklink:ready`` leaf issues that are also unblocked in
-Chainlink, then dispatches up to the concurrent-claim cap by invoking
-``mimir worklink run <id>`` as a **detached** subprocess. It deliberately does
+Discovers actionable ``worklink:epic`` issues and ``worklink:ready`` leaves,
+then dispatches up to the concurrent-claim cap by invoking
+``mimir worklink run-epic <id>`` or ``mimir worklink run <id>`` as a
+**detached** subprocess. It deliberately does
 NOT reimplement claim/evidence/transition — all of that lives in the
 deterministic core executor behind the CLI.
 
@@ -43,6 +44,7 @@ import re
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -98,7 +100,23 @@ from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
 READY_LABEL = "worklink:ready"
-IN_PROGRESS_LABEL = "worklink:in-progress"
+EPIC_LABEL = "worklink:epic"
+
+
+@dataclass(frozen=True)
+class IssueRecord:
+    issue_id: int
+    parent_id: int | None = None
+
+
+@dataclass(frozen=True)
+class DispatchItem:
+    issue_id: int
+    mode: str
+
+    @property
+    def command(self) -> str:
+        return "run-epic" if self.mode == "epic" else "run"
 
 
 def _emit(record: dict) -> None:
@@ -111,8 +129,8 @@ def _chainlink_bin() -> str:
     return os.environ.get("CHAINLINK_BIN") or "chainlink"
 
 
-def _active_lock_count(home: Path) -> int | None:
-    """Active Chainlink lock count, or ``None`` if unreadable.
+def _active_lock_issue_ids(home: Path) -> set[int] | None:
+    """Active Chainlink lock issue ids, or ``None`` if unreadable.
 
     Locks are Worklink's atomic reservation surface. Counting labels here is a
     TOCTOU bug: detached workers apply ``worklink:in-progress`` only after cold
@@ -132,13 +150,26 @@ def _active_lock_count(home: Path) -> int | None:
     except json.JSONDecodeError:
         return None
     locks = data.get("locks", data if isinstance(data, list) else {})
-    if isinstance(locks, (dict, list)):
-        return len(locks)
-    return None
+    ids: set[int] = set()
+    if isinstance(locks, dict):
+        iterable = locks.items()
+    elif isinstance(locks, list):
+        iterable = enumerate(locks)
+    else:
+        return None
+    for key, value in iterable:
+        raw = value.get("issue_id") if isinstance(value, dict) else None
+        if raw is None:
+            raw = key
+        try:
+            ids.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return ids
 
 
-def _issue_ids_with_label(home: Path, label: str) -> list[int] | None:
-    """Issue ids carrying ``label``, or ``None`` if the query failed.
+def _issue_records_with_label(home: Path, label: str) -> list[IssueRecord] | None:
+    """Open issues carrying ``label``, or ``None`` if the query failed.
 
     ``None`` (subprocess error / non-zero exit / invalid JSON) is distinct from
     ``[]`` (no matches): the caller treats a failed read as a reason to NOT
@@ -158,18 +189,30 @@ def _issue_ids_with_label(home: Path, label: str) -> list[int] | None:
     except json.JSONDecodeError:
         return None
     issues = data if isinstance(data, list) else data.get("issues", [])
-    ids: list[int] = []
+    records: list[IssueRecord] = []
     for item in issues:
         if not isinstance(item, dict):
             continue
-        raw = item.get("id")
-        if raw is None:
-            raw = item.get("number")
+        raw = _issue_raw_id(item)
         try:
-            ids.append(int(raw))
+            issue_id = int(raw)
         except (TypeError, ValueError):
             continue
-    return ids
+        parent_id = None
+        if item.get("parent_id") is not None:
+            try:
+                parent_id = int(item["parent_id"])
+            except (TypeError, ValueError):
+                parent_id = None
+        records.append(IssueRecord(issue_id=issue_id, parent_id=parent_id))
+    return records
+
+
+def _issue_raw_id(item: dict) -> object:
+    raw = item.get("id")
+    if raw is None:
+        raw = item.get("number")
+    return raw
 
 
 def _issue_ids_from_records(data: object) -> list[int]:
@@ -183,9 +226,7 @@ def _issue_ids_from_records(data: object) -> list[int]:
     for item in issues:
         if not isinstance(item, dict):
             continue
-        raw = item.get("id")
-        if raw is None:
-            raw = item.get("number")
+        raw = _issue_raw_id(item)
         try:
             ids.append(int(raw))
         except (TypeError, ValueError):
@@ -235,21 +276,40 @@ def _actionable_issue_ids(home: Path) -> list[int] | None:
         return _issue_ids_from_ready_text(output)
 
 
-def _worklink_ready_actionable_ids(home: Path) -> tuple[list[int], int, int] | None:
-    """Return dispatchable ``worklink:ready`` ids plus raw/blocked counts.
+def _worklink_dispatch_plan(
+    home: Path, *, active_lock_ids: set[int]
+) -> tuple[list[DispatchItem], int, int, int] | None:
+    """Return dispatchable Worklink items plus ready/blocked/epic counts.
 
-    ``worklink:ready`` remains the human/planner intent signal, but it is no
-    longer sufficient: the issue must also appear in Chainlink's ready set.
+    Bare leaves still require ``worklink:ready`` and Chainlink actionability.
+    Epics are intake issues marked by ``worklink:epic``; when actionable, they
+    run through the integrated epic controller instead of per-leaf dispatch.
     """
-    ready_ids = _issue_ids_with_label(home, READY_LABEL)
+    ready_records = _issue_records_with_label(home, READY_LABEL)
+    epic_records = _issue_records_with_label(home, EPIC_LABEL)
     actionable_ids = _actionable_issue_ids(home)
-    if ready_ids is None or actionable_ids is None:
+    if ready_records is None or epic_records is None or actionable_ids is None:
         return None
-    labeled = set(ready_ids)
+    labeled = {record.issue_id for record in ready_records}
+    epics = {record.issue_id for record in epic_records}
     actionable = set(actionable_ids)
-    dispatchable = sorted(labeled & actionable)
+    dispatchable_epics = sorted(epics & actionable)
+    active_epics = epics & active_lock_ids
+    handled_epics = set(dispatchable_epics) | active_epics
+    dispatchable_leaves = sorted(
+        record.issue_id
+        for record in ready_records
+        if record.issue_id in actionable
+        and record.issue_id not in epics
+        and record.parent_id not in handled_epics
+    )
+    plan = [
+        DispatchItem(issue_id=issue_id, mode="epic")
+        for issue_id in dispatchable_epics
+    ]
+    plan.extend(DispatchItem(issue_id=issue_id, mode="leaf") for issue_id in dispatchable_leaves)
     blocked_count = len(labeled - actionable)
-    return dispatchable, len(labeled), blocked_count
+    return plan, len(labeled), blocked_count, len(dispatchable_epics)
 
 
 def _configured_cap(home: Path) -> int:
@@ -285,19 +345,24 @@ def main() -> int:
         return 0
     home = Path(home_env)
 
-    ready_result = _worklink_ready_actionable_ids(home)
-    active = _active_lock_count(home)
+    active_lock_ids = _active_lock_issue_ids(home)
     # Fail closed: if we can't read either the ready queue, Chainlink's
     # actionable set, or the active lock count, do not dispatch (an undercounted
     # cap or blocked issue could over-admit workers).
-    if ready_result is None or active is None:
+    ready_result = (
+        None
+        if active_lock_ids is None
+        else _worklink_dispatch_plan(home, active_lock_ids=active_lock_ids)
+    )
+    if ready_result is None or active_lock_ids is None:
         _emit({
             "signal": "worklink_poller_degraded",
             "reason": "chainlink ready/actionable/lock read failed; skipping dispatch this cycle",
         })
         return 0
-    ready, labeled_ready_count, blocked_ready_count = ready_result
+    ready, labeled_ready_count, blocked_ready_count, actionable_epic_count = ready_result
     cap = _configured_cap(home)
+    active = len(active_lock_ids)
     slots = max(0, cap - active)
 
     if not ready or slots == 0:
@@ -306,6 +371,7 @@ def main() -> int:
             "ready_count": len(ready),
             "labeled_ready_count": labeled_ready_count,
             "blocked_ready_count": blocked_ready_count,
+            "actionable_epic_count": actionable_epic_count,
             "active": active,
             "cap": cap,
             "slots": slots,
@@ -320,6 +386,7 @@ def main() -> int:
             "ready_count": len(ready),
             "labeled_ready_count": labeled_ready_count,
             "blocked_ready_count": blocked_ready_count,
+            "actionable_epic_count": actionable_epic_count,
         })
         return 0
 
@@ -328,10 +395,11 @@ def main() -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
 
     dispatched = 0
-    for issue_id in ready[:slots]:
-        argv = [*run_bin, "worklink", "run", str(issue_id),
+    for item in ready[:slots]:
+        issue_id = item.issue_id
+        argv = [*run_bin, "worklink", item.command, str(issue_id),
                 "--home", str(home), "--repo", repo, "--autonomous"]
-        log_path = state_dir / f"run-{issue_id}.log"
+        log_path = state_dir / f"{item.command}-{issue_id}.log"
         try:
             log_fh = log_path.open("ab")
         except OSError:
@@ -358,6 +426,7 @@ def main() -> int:
         _emit({
             "signal": "worklink_dispatched",
             "issue_id": issue_id,
+            "mode": item.mode,
             "log": str(log_path),
             "active_before": active,
             "cap": cap,
@@ -368,6 +437,7 @@ def main() -> int:
         "ready_count": len(ready),
         "labeled_ready_count": labeled_ready_count,
         "blocked_ready_count": blocked_ready_count,
+        "actionable_epic_count": actionable_epic_count,
         "active": active,
         "cap": cap,
         "dispatched": dispatched,
