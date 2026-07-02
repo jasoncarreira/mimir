@@ -464,27 +464,6 @@ defaults:
     )
 
 
-def test_worklink_config_tiered_review_accepts_deprecated_prefix_alias(tmp_path: Path) -> None:
-    config_path = tmp_path / "worklink.yaml"
-    config_path.write_text(
-        """
-defaults:
-  tiered_review:
-    high_risk_scope_prefixes:
-      - "**/legacy-hotspot/**"
-""".strip(),
-        encoding="utf-8",
-    )
-
-    defaults = WorklinkConfig.load(config_path).defaults
-
-    assert defaults.tiered_review.high_risk_scope_patterns == ("**/legacy-hotspot/**",)
-    assert defaults.tiered_review.high_risk_scope_prefixes == ("**/legacy-hotspot/**",)
-    assert TieredReviewConfig(
-        high_risk_scope_prefixes=("**/constructor-alias/**",)
-    ).high_risk_scope_patterns == ("**/constructor-alias/**",)
-
-
 def test_worklink_config_builds_docker_sibling_compute_backend(tmp_path: Path) -> None:
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(

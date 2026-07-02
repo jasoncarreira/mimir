@@ -51,7 +51,7 @@ DEFAULT_HIGH_RISK_LABELS: tuple[str, ...] = (
 )
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class TieredReviewConfig:
     # Default high-risk markers are ecosystem-agnostic glob patterns. A
     # deployment's own sensitive surfaces, such as Worklink internals,
@@ -62,34 +62,6 @@ class TieredReviewConfig:
     # other slices get one adversarial pass. Do not add a second trigger list
     # unless a real third tier appears.
     multi_vote_reviewer_count: int = 3
-
-    def __init__(
-        self,
-        high_risk_scope_patterns: tuple[str, ...] | None = None,
-        high_risk_labels: tuple[str, ...] = DEFAULT_HIGH_RISK_LABELS,
-        multi_vote_reviewer_count: int = 3,
-        *,
-        high_risk_scope_prefixes: tuple[str, ...] | None = None,
-    ) -> None:
-        if high_risk_scope_patterns is not None and high_risk_scope_prefixes is not None:
-            raise ValueError(
-                "use only one of high_risk_scope_patterns or high_risk_scope_prefixes"
-            )
-        if high_risk_scope_patterns is None:
-            high_risk_scope_patterns = (
-                high_risk_scope_prefixes
-                if high_risk_scope_prefixes is not None
-                else DEFAULT_HIGH_RISK_SCOPE_PATTERNS
-            )
-        object.__setattr__(self, "high_risk_scope_patterns", high_risk_scope_patterns)
-        object.__setattr__(self, "high_risk_labels", high_risk_labels)
-        object.__setattr__(self, "multi_vote_reviewer_count", multi_vote_reviewer_count)
-
-    @property
-    def high_risk_scope_prefixes(self) -> tuple[str, ...]:
-        """Deprecated alias for ``high_risk_scope_patterns``."""
-
-        return self.high_risk_scope_patterns
 
 
 @dataclass(frozen=True)
@@ -408,15 +380,11 @@ def _parse_tiered_review_config(value: Any) -> TieredReviewConfig:
     if not isinstance(value, dict):
         raise ValueError("worklink defaults.tiered_review must be a mapping")
     high_risk_scope_patterns = value.get("high_risk_scope_patterns")
-    high_risk_scope_field_name = "worklink defaults.tiered_review.high_risk_scope_patterns"
-    if high_risk_scope_patterns is None and "high_risk_scope_prefixes" in value:
-        high_risk_scope_patterns = value.get("high_risk_scope_prefixes")
-        high_risk_scope_field_name = "worklink defaults.tiered_review.high_risk_scope_prefixes"
     return TieredReviewConfig(
         high_risk_scope_patterns=_string_tuple_config(
             high_risk_scope_patterns,
             default=defaults.high_risk_scope_patterns,
-            field_name=high_risk_scope_field_name,
+            field_name="worklink defaults.tiered_review.high_risk_scope_patterns",
         ),
         high_risk_labels=_string_tuple_config(
             value.get("high_risk_labels"),
