@@ -8,6 +8,10 @@ All notable changes will land here. Format loosely follows
 
 ### Changed
 - Mark `claude-code:*` as a supported provider route after the authenticated operator-container soak and deployment-helper reconciliation; the supported install path is `mimir-agent[claude-code]` / `uv sync --extra claude-code` plus an authenticated Claude Code CLI.
+- Include a compact `mimir memory doctor` summary in the scheduled introspection report so memory health is visible alongside behavioral/tool health.
+
+### Documentation
+- Document `mimir memory doctor` usage, JSON/text output, read-only boundaries, status semantics, and automation guidance.
 
 ## [0.6.9] — 2026-06-29
 

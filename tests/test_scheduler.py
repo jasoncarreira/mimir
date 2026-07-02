@@ -623,7 +623,10 @@ async def test_introspection_report_callback_writes_report_and_emits(tmp_path: P
     # Report file written.
     reports = list((home / "state" / "reports").glob("introspection-*.md"))
     assert len(reports) == 1
-    assert "Heartbeat / scheduled-tick health" in reports[0].read_text()
+    body = reports[0].read_text()
+    assert "Heartbeat / scheduled-tick health" in body
+    assert "Memory Health" in body
+    assert str(reports[0]) in body
 
     # Algedonic event appended (find by type — log_event from the
     # callback's success path may also have written to events.jsonl

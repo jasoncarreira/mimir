@@ -17,10 +17,14 @@ report computed once. Produces a markdown summary covering:
   count, zero-recent-usage — surfaced so the reflection turn can author
   operator-gated refine/retire recommendations (#226; surface, not
   auto-act).
+- Memory health: compact read-only ``mimir memory doctor`` summary for
+  memory/core, channel memory, issue notes, SAGA substrate, indexes, and
+  wiki/state drift.
 
 Data sources: ``logs/turns.jsonl``, ``logs/events.jsonl``, and (for the
 skill-health section) the installed-skill inventory + a read-only saga
-connection for the negative-learning count.
+connection for the negative-learning count. When ``home`` is provided, the
+memory-health section also calls :mod:`mimir.memory_doctor` read-only.
 
 Algedonic side-effect: when ``--emit-algedonic`` is set and heartbeat
 success rate falls below ``--health-threshold``, append a
@@ -145,6 +149,31 @@ class SkillHealth:
 
 
 @dataclass
+class MemoryHealthFinding:
+    section: str
+    severity: str
+    path: str
+    check: str
+    message: str
+    suggestion: str
+
+
+@dataclass
+class MemoryHealthSummary:
+    """Compact read-only ``mimir memory doctor`` projection for the weekly
+    introspection report. The full doctor remains the source of truth; this
+    summary is intentionally small enough to make drift visible without
+    turning the report into the full diagnostic dump."""
+
+    status: str
+    severity_counts: dict[str, int]
+    section_counts: dict[str, dict[str, int]] = field(default_factory=dict)
+    top_findings: list[MemoryHealthFinding] = field(default_factory=list)
+    artifact: str | None = None
+    error: str | None = None
+
+
+@dataclass
 class Report:
     days: int
     generated_at: datetime
@@ -159,6 +188,7 @@ class Report:
     error_recurrence: list[ErrorRecurrence] = field(default_factory=list)
     skill_lifecycle: list[tuple[str, int]] = field(default_factory=list)
     skill_health: list[SkillHealth] = field(default_factory=list)
+    memory_health: MemoryHealthSummary | None = None
 
 
 # ─── Aggregation ───────────────────────────────────────────────────────
@@ -241,6 +271,63 @@ def _iter_jsonl(path: Path) -> Iterable[dict]:
 _SKILL_REFINE_SUCCESS_FLOOR = 0.5   # success rate under this → refine
 _SKILL_REFINE_MIN_RUNS = 3          # ...but only with enough samples to trust
 _SKILL_REFINE_NEG_LEARNINGS = 3     # negative-kind learnings in window → refine
+
+
+def _build_memory_health(
+    home: "Path | None",
+    *,
+    artifact: str | None = None,
+    top_n: int = 8,
+) -> MemoryHealthSummary | None:
+    """Run ``mimir memory doctor`` read-only and collapse it to the section
+    needed in the introspection report.
+
+    Best-effort by design: a doctor failure should appear as a Memory Health
+    error row, not fail the whole behavioral report. The ``artifact`` value is
+    a pointer to the containing introspection report when the scheduler/CLI
+    persists one; the compact summary remains useful even without a separate
+    JSON artifact.
+    """
+    if home is None:
+        return None
+    try:
+        from ..memory_doctor import run_doctor
+
+        doctor = run_doctor(home)
+    except Exception as exc:  # noqa: BLE001 — diagnostics must degrade visibly
+        log.warning("memory_health: memory doctor failed", exc_info=True)
+        return MemoryHealthSummary(
+            status="error",
+            severity_counts={"error": 1, "warning": 0, "info": 0},
+            artifact=artifact,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    section_counts: dict[str, dict[str, int]] = {
+        section.name: dict(section.metrics) for section in doctor.sections
+    }
+    severity_rank = {"error": 0, "warning": 1, "info": 2}
+    findings = sorted(
+        doctor.findings,
+        key=lambda f: (severity_rank.get(f.severity, 99), f.layer, f.path, f.check),
+    )[:top_n]
+    return MemoryHealthSummary(
+        status=doctor.status,
+        severity_counts=dict(doctor.severity_counts),
+        section_counts=section_counts,
+        top_findings=[
+            MemoryHealthFinding(
+                section=f.layer,
+                severity=f.severity,
+                path=f.path,
+                check=f.check,
+                message=f.message,
+                suggestion=f.suggestion,
+            )
+            for f in findings
+        ],
+        artifact=artifact,
+    )
 
 
 def _build_skill_health(
@@ -346,6 +433,7 @@ def aggregate(
     saga_conn: object | None = None,
     recent_error_hours: int = 24,
     error_recurrence_top_n: int = 10,
+    memory_health_artifact: str | None = None,
 ) -> Report:
     """Walk turns.jsonl + events.jsonl once, build a Report.
 
@@ -569,6 +657,10 @@ def aggregate(
         skill_counts=skill_counts,
         saga_conn=saga_conn,
     )
+    memory_health = _build_memory_health(
+        home,
+        artifact=memory_health_artifact,
+    )
 
     return Report(
         days=days,
@@ -584,6 +676,7 @@ def aggregate(
         error_recurrence=recurrence_rows,
         skill_lifecycle=skill_lifecycle,
         skill_health=skill_health,
+        memory_health=memory_health,
     )
 
 
@@ -633,6 +726,44 @@ def render_markdown(report: Report) -> str:
     lines.append(f"- Pipeline success rate: **{_fmt_pct(pl.success_rate)}** "
                  f"(successful / fired)")
     lines.append("")
+
+    # Memory health from mimir memory doctor.
+    if report.memory_health is not None:
+        mh = report.memory_health
+        lines.append("## Memory Health")
+        lines.append("")
+        lines.append(
+            f"- Status: **{mh.status}** "
+            f"(error={mh.severity_counts.get('error', 0)}, "
+            f"warning={mh.severity_counts.get('warning', 0)}, "
+            f"info={mh.severity_counts.get('info', 0)})"
+        )
+        if mh.artifact:
+            lines.append(f"- Full report artifact: `{mh.artifact}`")
+        if mh.error:
+            lines.append(f"- Doctor run failed: `{mh.error}`")
+        if mh.section_counts:
+            lines.append("")
+            lines.append("| Section | Key counts |")
+            lines.append("|---------|------------|")
+            for section, metrics in sorted(mh.section_counts.items()):
+                key_counts = ", ".join(
+                    f"{k}={v}" for k, v in sorted(metrics.items())
+                    if isinstance(v, int)
+                )
+                lines.append(f"| {section} | {key_counts} |")
+        if mh.top_findings:
+            lines.append("")
+            lines.append("Top actionable findings:")
+            for finding in mh.top_findings:
+                path = f" `{finding.path}`" if finding.path else ""
+                lines.append(
+                    f"- [{finding.severity}] {finding.section}/{finding.check}"
+                    f"{path}: {finding.message} Suggestion: {finding.suggestion}"
+                )
+        else:
+            lines.append("- Top actionable findings: none")
+        lines.append("")
 
     # Tool usage.
     if report.tool_usage:
@@ -850,7 +981,12 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         report = aggregate(
-            turns, events, days=args.days, home=home, saga_conn=saga_conn,
+            turns,
+            events,
+            days=args.days,
+            home=home,
+            saga_conn=saga_conn,
+            memory_health_artifact=str(args.output) if args.output else None,
         )
     finally:
         if saga_conn is not None:
