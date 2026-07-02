@@ -276,7 +276,12 @@ class EpicRunner:
     ) -> EpicRunResult:
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
         chainlink = self.chainlink or ChainlinkEpicClient(chainlink_bin=self.chainlink_bin, runner=runner)
-        roles = self.roles or MissingEpicRoleRunner()
+        if self.roles is None:
+            from .epic_roles import EpicSubagentRoleRunner
+
+            roles = EpicSubagentRoleRunner(home=self.home, repo=self.repo)
+        else:
+            roles = self.roles
         config = WorklinkConfig.load(self.home / "worklink.yaml")
         registry = self.registry or BackendRegistry(config)
         repo_url = _repo_remote_url(self.repo, runner=runner)
@@ -1067,8 +1072,14 @@ def run_epic(
     base_branch: str | None = None,
     autonomous: bool = False,
 ) -> EpicRunResult:
+    from .epic_roles import EpicSubagentRoleRunner
+
     return asyncio.run(
-        EpicRunner(home=home, repo=repo).run(
+        EpicRunner(
+            home=home,
+            repo=repo,
+            roles=EpicSubagentRoleRunner(home=home, repo=repo),
+        ).run(
             epic_id,
             backend_name=backend,
             base_branch=base_branch,
