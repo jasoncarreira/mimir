@@ -35,7 +35,6 @@ from mimir.worklink.review import (
     IntegrationValidation,
     SliceReview,
     WorkDecomposition,
-    WorklinkBlockerEdge,
     WorklinkLeafSpec,
 )
 from mimir.worklink.worktree import IntegrationBranchLease, SliceMergeSuccess, WorktreeLease
@@ -637,9 +636,9 @@ async def test_decompose_then_build_files_child_leaves_once(tmp_path: Path, monk
                 review_criteria=["check B"],
                 scope_paths=["b.py"],
                 suggested_test_command="true",
+                depends_on=["Leaf A"],
             ),
         ],
-        blocked_by=[WorklinkBlockerEdge(blocked_leaf="Leaf B", blocker_leaf="Leaf A", reason="A first")],
     )
     chainlink = FakeChainlink(
         epic=issue(100, parent_id=None, labels={"worklink:epic"}),
@@ -660,6 +659,8 @@ async def test_decompose_then_build_files_child_leaves_once(tmp_path: Path, monk
     assert result.status == "completed"
     assert chainlink.filed == ["Leaf A", "Leaf B"]
     assert chainlink.merged == [200, 201]
+    # Leaf B's depends_on=["Leaf A"] was wired into a chainlink blocker.
+    assert chainlink.blocked
 
 
 @pytest.mark.asyncio

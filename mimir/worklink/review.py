@@ -9,35 +9,60 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from mimir.worklink.backends.registry import TieredReviewConfig
-from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
 
 
 class WorklinkLeafSpec(BaseModel):
-    """One strict Worklink leaf emitted by the decomposer."""
+    """One strict Worklink leaf emitted by the decomposer.
 
-    title: str = Field(description="Short Chainlink subissue title.")
-    risk: Literal["standard", "high"] = Field(
-        default="standard",
-        description="Decomposer-assigned review risk for this leaf.",
+    Identity is the ``title``: other leaves reference it in their ``depends_on``.
+    Dependencies live on the leaf — there is no separate edge list or wave
+    structure. The orchestrator derives execution waves from the resulting
+    Chainlink blocked-by DAG.
+    """
+
+    title: str = Field(
+        description=(
+            "Short, UNIQUE Chainlink subissue title. Other leaves reference this "
+            "exact title in their depends_on."
+        ),
     )
     acceptance_criteria: list[str] = Field(
         min_length=1,
-        description="Observable checklist items for the leaf's Acceptance criteria section.",
+        description="Non-empty list of observable checklist items (Acceptance criteria).",
     )
     review_criteria: list[str] = Field(
         min_length=1,
-        description="Reviewer/operator checks for the leaf's Review criteria section.",
+        description="Non-empty list of reviewer/operator checks (Review criteria).",
     )
     scope_paths: list[str] = Field(
         min_length=1,
-        description="Real repo paths or narrow subsystems expected to change.",
+        description=(
+            "REQUIRED, never empty. Real repo paths or dirs this leaf changes "
+            "(e.g. 'mimir/worklink/foo.py'), grounded in the actual repository."
+        ),
+    )
+    suggested_test_command: str = Field(
+        description="REQUIRED. A single validation command or evidence requirement.",
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Exact titles of other leaves in THIS decomposition that must finish "
+            "before this one (this is how ordering/serialization is expressed). "
+            "Empty list if none. Must form a DAG."
+        ),
     )
     out_of_scope: list[str] = Field(
         default_factory=list,
         description="Nearby work explicitly excluded from this leaf.",
     )
-    suggested_test_command: str = Field(
-        description="Advisory validation command or evidence requirement.",
+    risk: Literal["standard", "high"] = Field(
+        default="standard",
+        description=(
+            "Review risk. 'high' => security/auth/secrets, migrations/prod-data, "
+            "generated code, or architecturally central/hard-to-reverse/hotspot; "
+            "otherwise 'standard'."
+        ),
     )
     labels: list[str] = Field(
         default_factory=lambda: ["worklink:ready"],
@@ -45,32 +70,16 @@ class WorklinkLeafSpec(BaseModel):
     )
 
 
-class WorklinkBlockerEdge(BaseModel):
-    """DAG edge: ``blocked_leaf`` cannot run until ``blocker_leaf`` is done."""
-
-    blocked_leaf: str = Field(description="Title or stable id of the blocked leaf.")
-    blocker_leaf: str = Field(description="Title or stable id of the prerequisite leaf.")
-    reason: str = Field(description="Why this dependency is required.")
-
-
-class WorklinkWave(BaseModel):
-    """Leaves that may run together because their scope paths are disjoint."""
-
-    wave: int = Field(ge=1)
-    leaves: list[str] = Field(description="Leaf titles or stable ids in this wave.")
-    serialized_hotspots: list[str] = Field(
-        default_factory=list,
-        description="Hotspot paths intentionally excluded from parallel execution.",
-    )
-
-
 class WorkDecomposition(BaseModel):
-    """Structured output for the Worklink work-decomposer role."""
+    """Structured output for the Worklink work-decomposer role.
+
+    Exactly two fields: ``summary`` and a non-empty ``leaves`` list. Ordering and
+    serialization are expressed per-leaf via ``depends_on`` — there is no ``waves``
+    or ``blocked_by`` edge structure.
+    """
 
     summary: str = Field(description="Concise decomposition rationale.")
     leaves: list[WorklinkLeafSpec] = Field(min_length=1)
-    blocked_by: list[WorklinkBlockerEdge] = Field(default_factory=list)
-    waves: list[WorklinkWave] = Field(default_factory=list)
 
 
 class ReviewFinding(BaseModel):
@@ -127,35 +136,50 @@ class IntegrationValidation(BaseModel):
     findings: list[ReviewFinding] = Field(default_factory=list)
 
 
-WORK_DECOMPOSER_PROMPT = f"""You are work-decomposer, the Worklink epic planner.
+WORK_DECOMPOSER_PROMPT = """You are work-decomposer, the Worklink epic planner.
 
-Given an epic brief and read-only repository access, return only the structured
-WorkDecomposition response requested by the runtime. Decompose the epic into
-small Worklink leaves that each satisfy this strict leaf template:
+Given an epic brief and read-only repository access, return ONLY the structured
+WorkDecomposition response the runtime requests. It has EXACTLY two top-level
+fields: `summary` (string) and `leaves` (a non-empty list). There is NO
+`blocked_by`, `waves`, `id`, `leaf_ids`, or any other top-level field.
 
-{LEAF_TEMPLATE_MARKDOWN}
+Each item in `leaves` MUST be an object with these EXACT field names:
+- `title`: short, UNIQUE string. Other leaves reference this exact title in
+  their `depends_on`. There is no `id` field — the title IS the identifier.
+- `acceptance_criteria`: non-empty list of observable strings.
+- `review_criteria`: non-empty list of reviewer-check strings.
+- `scope_paths`: non-empty list of REAL repo paths/dirs this leaf changes
+  (e.g. "mimir/worklink/foo.py", "frontend/src/Chat.tsx"). Never omit or leave
+  empty; ground each path in the actual repository.
+- `suggested_test_command`: a single string (validation command or evidence
+  requirement). Never omit.
+- `depends_on`: list of the EXACT titles of other leaves that must finish before
+  this one (empty list if none). This is how ordering and hotspot serialization
+  are expressed — do NOT emit waves or edge objects.
+- `out_of_scope`: list of strings (may be empty).
+- `risk`: "high" or "standard". Use "high" when the slice touches
+  security/auth/secrets, migrations/prod-data, or generated code, OR is
+  architecturally central, hard to reverse, or a shared hotspot; else "standard".
 
-Ground every Scope entry in real repository paths or narrow existing subsystems.
-Target file-disjoint waves wherever possible. Serialize hotspots by adding
-blocked_by edges and by keeping hotspot leaves out of the same wave. The
-blocked_by list is a DAG: blocked_leaf waits for blocker_leaf.
-
-Assign risk for every leaf. Use risk="high" when the slice touches
-security/auth/secrets, migrations/prod-data, or generated code, OR when it is
-architecturally central, hard to reverse, or a shared hotspot. Use
-risk="standard" otherwise.
+Keep leaves small. Leaves that can run in parallel must be file-disjoint (no
+shared scope_paths); serialize a hotspot by putting its prerequisite leaf's title
+in the dependent leaf's `depends_on`. `depends_on` must form a DAG (no cycles)
+and reference only titles that appear in `leaves`. Every epic acceptance
+criterion must map to at least one leaf.
 """
 
 
 DECOMPOSE_REVIEWER_PROMPT = """You are decompose-reviewer, a skeptical Worklink plan reviewer.
 
-Given the epic brief, proposed leaves, blocked-by DAG, and waves, return only the
-structured DecomposeReview response requested by the runtime. APPROVE only when:
-every epic acceptance criterion maps to at least one leaf; every leaf uses the
-strict Worklink template fields; same-wave leaves are file-disjoint; hotspots are
-serialized by dependencies or separate waves; and the dependency graph is a DAG.
-Use REJECT with findings for missing AC coverage, vague Scope, same-wave file
-overlap, unserialized hotspots, or invalid dependency structure.
+Given the epic brief and the proposed leaves (each carrying its own `depends_on`),
+return only the structured DecomposeReview response. APPROVE only when: every
+epic acceptance criterion maps to at least one leaf; every leaf has a non-empty
+`scope_paths` and a `suggested_test_command`; leaves that can run together (those
+with no unmet `depends_on`) are file-disjoint (no shared scope_paths); hotspots
+are serialized via `depends_on`; and `depends_on` forms a DAG that references only
+titles present in the plan. Use REJECT with findings for missing AC coverage,
+vague or empty Scope, parallel file overlap, unserialized hotspots, or
+invalid/cyclic dependencies.
 """
 
 
@@ -238,8 +262,9 @@ def build_worklink_review_subagents() -> list[dict]:
             **base,
             "name": "work-decomposer",
             "description": (
-                "Worklink epic decomposer returning strict leaf specs, blocked-by DAG, "
-                "and file-disjoint waves. Read-only filesystem profile."
+                "Worklink epic decomposer returning strict leaf specs with per-leaf "
+                "depends_on (file-disjoint parallel leaves, hotspots serialized). "
+                "Read-only filesystem profile."
             ),
             "system_prompt": WORK_DECOMPOSER_PROMPT,
             "response_format": WorkDecomposition,
@@ -248,8 +273,9 @@ def build_worklink_review_subagents() -> list[dict]:
             **base,
             "name": "decompose-reviewer",
             "description": (
-                "Worklink plan reviewer checking AC coverage, file-disjoint waves, "
-                "hotspot serialization, and DAG validity. Read-only filesystem profile."
+                "Worklink plan reviewer checking AC coverage, file-disjoint parallel "
+                "leaves, hotspot serialization via depends_on, and DAG validity. "
+                "Read-only filesystem profile."
             ),
             "system_prompt": DECOMPOSE_REVIEWER_PROMPT,
             "response_format": DecomposeReview,

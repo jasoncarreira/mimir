@@ -16,17 +16,15 @@ from mimir.worklink.review import (
     SliceAcceptanceMapping,
     SliceReview,
     WorkDecomposition,
-    WorklinkBlockerEdge,
     WorklinkLeafSpec,
-    WorklinkWave,
     build_worklink_review_subagents,
     classify_leaf_review_risk,
 )
 
 
-def test_work_decomposer_schema_carries_strict_leaf_fields_and_dag() -> None:
+def test_work_decomposer_schema_carries_strict_leaf_fields_and_dependencies() -> None:
     result = WorkDecomposition(
-        summary="Split into implementation and test leaves.",
+        summary="Split into implementation and wiring leaves.",
         leaves=[
             WorklinkLeafSpec(
                 title="Add review schemas",
@@ -35,29 +33,29 @@ def test_work_decomposer_schema_carries_strict_leaf_fields_and_dag() -> None:
                 scope_paths=["mimir/worklink/review.py"],
                 out_of_scope=["Invoking roles from the orchestrator"],
                 suggested_test_command='pytest -q tests/ -k "review"',
-            )
-        ],
-        blocked_by=[
-            WorklinkBlockerEdge(
-                blocked_leaf="Wire registration",
-                blocker_leaf="Add review schemas",
-                reason="Registration needs the schema classes.",
-            )
-        ],
-        waves=[
-            WorklinkWave(
-                wave=1,
-                leaves=["Add review schemas"],
-                serialized_hotspots=["mimir/subagents.py"],
-            )
+            ),
+            WorklinkLeafSpec(
+                title="Wire registration",
+                acceptance_criteria=["Roles registered via build_mimir_subagents"],
+                review_criteria=["Verify the four roles appear"],
+                scope_paths=["mimir/subagents.py"],
+                suggested_test_command='pytest -q tests/ -k "subagent"',
+                depends_on=["Add review schemas"],
+                risk="high",
+            ),
         ],
     )
 
     payload = result.model_dump()
     assert payload["leaves"][0]["risk"] == "standard"
     assert payload["leaves"][0]["scope_paths"] == ["mimir/worklink/review.py"]
-    assert payload["blocked_by"][0]["blocked_leaf"] == "Wire registration"
-    assert payload["waves"][0]["serialized_hotspots"] == ["mimir/subagents.py"]
+    assert payload["leaves"][0]["depends_on"] == []
+    # Dependencies live on the leaf; ordering is expressed via depends_on (title).
+    assert payload["leaves"][1]["depends_on"] == ["Add review schemas"]
+    assert payload["leaves"][1]["risk"] == "high"
+    # No separate edge-list or wave structures anymore.
+    assert "blocked_by" not in payload
+    assert "waves" not in payload
 
 
 def test_work_decomposer_leaf_requires_template_acceptance_scope_and_tests() -> None:
@@ -161,17 +159,19 @@ def test_worklink_review_subagent_specs_are_readonly_and_structured() -> None:
 
 
 def test_role_prompts_cover_required_review_contracts() -> None:
-    assert "strict leaf template" in WORK_DECOMPOSER_PROMPT.lower()
-    assert "scope" in WORK_DECOMPOSER_PROMPT.lower()
-    assert "file-disjoint waves" in WORK_DECOMPOSER_PROMPT.lower()
-    assert "hotspots" in WORK_DECOMPOSER_PROMPT.lower()
-    assert "assign risk for every leaf" in WORK_DECOMPOSER_PROMPT.lower()
-    assert "architecturally central" in WORK_DECOMPOSER_PROMPT.lower()
-    assert "hard to reverse" in WORK_DECOMPOSER_PROMPT.lower()
+    decomposer = WORK_DECOMPOSER_PROMPT.lower()
+    assert "scope_paths" in decomposer
+    assert "depends_on" in decomposer
+    assert "file-disjoint" in decomposer
+    assert "hotspot" in decomposer
+    assert "architecturally central" in decomposer
+    assert "hard to reverse" in decomposer
 
-    assert "every epic acceptance criterion maps" in DECOMPOSE_REVIEWER_PROMPT.lower()
-    assert "same-wave leaves are file-disjoint" in DECOMPOSE_REVIEWER_PROMPT.lower()
-    assert "serialized by dependencies" in DECOMPOSE_REVIEWER_PROMPT.lower()
+    reviewer = DECOMPOSE_REVIEWER_PROMPT.lower()
+    assert "acceptance criterion maps" in reviewer
+    assert "file-disjoint" in reviewer
+    assert "depends_on" in reviewer
+    assert "dag" in reviewer
 
     assert "code_refs and test_refs" in INTEGRATION_VALIDATOR_PROMPT
     assert "GO-WITH-NITS" in INTEGRATION_VALIDATOR_PROMPT
