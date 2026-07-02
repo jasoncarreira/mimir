@@ -278,7 +278,7 @@ class TestConfigFromEnv:
         monkeypatch.delenv("MIMIR_TOOL_CALL_BUDGET", raising=False)
         from mimir.config import Config
         cfg = Config.from_env()
-        assert cfg.tool_call_budget == 120
+        assert cfg.tool_call_budget == 200
 
     def test_turn_timeout_default_matches_documented_default(
         self, monkeypatch: pytest.MonkeyPatch,
