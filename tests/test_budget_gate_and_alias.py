@@ -21,6 +21,7 @@ These tests exercise the middleware via two surfaces:
 
 from __future__ import annotations
 
+import contextvars
 import time
 from pathlib import Path
 from textwrap import dedent
@@ -361,6 +362,44 @@ async def test_admin_sensitive_tool_denied_for_non_admin(
 
 
 @pytest.mark.asyncio
+async def test_admin_gate_uses_active_turn_resolution_when_contextvar_missing(
+    tmp_path: Path,
+) -> None:
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    ctx = _make_ctx(budget=0)
+    ctx.author = "slack-U1"
+    ctx.identity_resolver = resolver
+    ctx.access_control_enforced = True
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+    turn_context = contextvars.Context()
+    token = turn_context.run(set_current_turn, ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-active"), handler)
+    finally:
+        turn_context.run(reset_current_turn, token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.status == "error"
+    assert "requires an admin identity" in str(out.content)
+    assert handler_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_admin_sensitive_tool_allowed_via_canonical_discord_alias(
     tmp_path: Path,
 ) -> None:
@@ -545,6 +584,84 @@ async def test_admin_gate_denies_write_file_for_non_admin(tmp_path: Path) -> Non
     assert out.status == "error"
     assert "requires an admin identity" in str(out.content)
     assert handler_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_admin_gate_denies_sensitive_tool_when_enforced_context_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(kind: str, **kw: Any) -> None:
+        captured.append((kind, kw))
+
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", _capture)
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+    out = await mw.awrap_tool_call(_make_request("shell_exec", "id-missing-ctx"), handler)
+
+    assert isinstance(out, ToolMessage)
+    assert out.status == "error"
+    assert "requires an admin identity (missing_turn_context)" in str(out.content)
+    assert handler_calls == 0
+    assert ("admin_tool_call_denied", {
+        "tool": "shell_exec",
+        "allowed": False,
+        "status": "denied",
+        "required_tier": "admin",
+        "denial_reason": "missing_turn_context",
+        "author": None,
+        "canonical_author": None,
+        "roles": [],
+        "enforcement_enabled": True,
+    }) in captured
+
+
+@pytest.mark.asyncio
+async def test_admin_gate_missing_context_still_allows_non_admin_tools_when_enforced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="listed", tool_call_id=req.tool_call["id"])
+
+    out = await mw.awrap_tool_call(_make_request("list_schedules", "id-read"), handler)
+
+    assert isinstance(out, ToolMessage)
+    assert out.content == "listed"
+    assert handler_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_admin_gate_missing_context_allows_sensitive_tool_when_not_enforced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=req.tool_call["id"])
+
+    out = await mw.awrap_tool_call(_make_request("shell_exec", "id-no-enforce"), handler)
+
+    assert isinstance(out, ToolMessage)
+    assert out.content == "ran"
+    assert handler_calls == 1
 
 
 # ─── get_turn alias (unchanged from prior file) ───────────────────
