@@ -96,6 +96,8 @@ _ADMIN_BUILTIN_TOOL_NAMES = frozenset(
         "Bash",
         "bash",
         "bash_exec",
+        "execute",
+        "aexecute",
         "shell",
         "Write",
         "Edit",

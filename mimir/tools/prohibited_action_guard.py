@@ -27,7 +27,7 @@ Currently screened:
   from inside the agent process)
 
 Wired into BudgetGateMiddleware, so the screen applies to all
-bash/shell tool calls (shell_exec, bash_async, bash_exec, Bash)
+bash/shell tool calls (shell_exec, bash_async, bash_exec, execute, Bash)
 regardless of provider.
 """
 
@@ -45,6 +45,8 @@ _BASH_TOOL_NAMES: frozenset[str] = frozenset({
     "shell_exec",
     "bash_async",
     "bash_exec",
+    "execute",
+    "aexecute",
     "mcp__mimir__shell_exec",
     "mcp__mimir__bash_async",
 })
@@ -130,5 +132,13 @@ def is_bash_tool(tool_name: str) -> bool:
     # still gets screened before execution.
     return any(
         tool_name.endswith(f"__{name}") or tool_name.endswith(f"_{name}")
-        for name in ("shell_exec", "bash_async", "bash_exec", "Bash", "bash")
+        for name in (
+            "shell_exec",
+            "bash_async",
+            "bash_exec",
+            "execute",
+            "aexecute",
+            "Bash",
+            "bash",
+        )
     )
