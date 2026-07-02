@@ -185,6 +185,12 @@ class TestIsBashTool:
     def test_bash_exec_is_bash(self) -> None:
         assert is_bash_tool("bash_exec") is True
 
+    def test_deepagents_execute_is_bash(self) -> None:
+        assert is_bash_tool("execute") is True
+
+    def test_deepagents_aexecute_is_bash(self) -> None:
+        assert is_bash_tool("aexecute") is True
+
     def test_mcp_shell_exec_is_bash(self) -> None:
         assert is_bash_tool("mcp__mimir__shell_exec") is True
 
@@ -193,6 +199,12 @@ class TestIsBashTool:
 
     def test_normalized_mcp_shell_exec_is_bash(self) -> None:
         assert is_bash_tool("mcp_mimir_shell_exec") is True
+
+    def test_mcp_execute_is_bash(self) -> None:
+        assert is_bash_tool("mcp__deepagents__execute") is True
+
+    def test_normalized_mcp_aexecute_is_bash(self) -> None:
+        assert is_bash_tool("mcp_deepagents_aexecute") is True
 
     def test_bash_capital_b_is_bash(self) -> None:
         """claude-code's native shell built-in surfaces as 'Bash' (capital B)
@@ -319,6 +331,18 @@ class TestMiddlewareBlocksProhibited:
         assert "reason" in kwargs
         assert len(kwargs["reason"]) <= 200
         assert kwargs["tool"] == "shell_exec"
+
+
+class TestAdminSensitiveDeepagentsExecute:
+    def test_execute_is_admin_sensitive(self) -> None:
+        from mimir.tools.budget_gate import _is_admin_sensitive_tool
+
+        assert _is_admin_sensitive_tool("execute") is True
+
+    def test_aexecute_is_admin_sensitive(self) -> None:
+        from mimir.tools.budget_gate import _is_admin_sensitive_tool
+
+        assert _is_admin_sensitive_tool("aexecute") is True
 
 
 # ─── Claude Code PreToolUse enforcement ─────────────────────────────────────
