@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from mimir.worklink.backends import (
+    WORKLINK_MERGED_LABEL,
     BackendRegistry,
     Caps,
     ClaudeCliBackend,
@@ -20,9 +21,11 @@ from mimir.worklink.backends import (
     EcsRunTaskConfig,
     LocalSubprocessComputeBackend,
     RawResult,
+    TieredReviewConfig,
     ToolPin,
     WorkOrder,
     WorklinkConfig,
+    WorklinkDefaults,
 )
 from mimir.worklink.backends.base import blocked_reason_from_output
 from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, LaunchHandle, WorkSpec
@@ -399,6 +402,83 @@ defaults:
     defaults = WorklinkConfig.load(config_path).defaults
     assert defaults.max_concurrent == 2
     assert defaults.reaper_ttl_s == 7200
+
+
+def test_worklink_config_epic_defaults_and_merged_label_constant(tmp_path: Path) -> None:
+    old_config = tmp_path / "worklink.yaml"
+    old_config.write_text(
+        """
+defaults:
+  backend: claude_cli
+  timeout_s: 60
+""".strip(),
+        encoding="utf-8",
+    )
+
+    defaults = WorklinkConfig.load(old_config).defaults
+
+    assert defaults.epic_branch_prefix == "epic/"
+    assert defaults.max_review_retries == 3
+    assert defaults.reviewer_backend == "claude_cli"
+    assert defaults.merge_strategy == "no-ff"
+    assert defaults.tiered_review.multi_vote_reviewer_count == 3
+    assert "mimir/worklink/autonomy.py" in defaults.tiered_review.high_risk_scope_prefixes
+    assert "mimir/saga/migrations/" in defaults.tiered_review.high_risk_scope_prefixes
+    assert "auth" in defaults.tiered_review.high_risk_labels
+    assert "generated-code" in defaults.tiered_review.high_risk_labels
+    assert "uv.lock" in defaults.tiered_review.high_risk_scope_prefixes
+    assert WorklinkDefaults(backend="claude_cli").reviewer_backend == "claude_cli"
+    assert WORKLINK_MERGED_LABEL == "worklink:merged"
+
+
+def test_worklink_config_epic_overrides_and_tiered_review_parse(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  backend: codex
+  epic_branch_prefix: stacked/
+  max_review_retries: 5
+  reviewer_backend: claude_cli
+  merge_strategy: squash
+  tiered_review:
+    high_risk_scope_prefixes:
+      - mimir/security/
+      - migrations/prod/
+    high_risk_labels:
+      - risk:high
+      - production-data
+    multi_vote_reviewer_count: 4
+""".strip(),
+        encoding="utf-8",
+    )
+
+    defaults = WorklinkConfig.load(config_path).defaults
+
+    assert defaults.epic_branch_prefix == "stacked/"
+    assert defaults.max_review_retries == 5
+    assert defaults.reviewer_backend == "claude_cli"
+    assert defaults.merge_strategy == "squash"
+    assert defaults.tiered_review == TieredReviewConfig(
+        high_risk_scope_prefixes=("mimir/security/", "migrations/prod/"),
+        high_risk_labels=("risk:high", "production-data"),
+        multi_vote_reviewer_count=4,
+    )
+
+
+def test_worklink_config_rejects_unknown_merge_strategy(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  merge_strategy: noff
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="defaults.merge_strategy"):
+        WorklinkConfig.load(config_path)
+
 
 def test_worklink_config_builds_docker_sibling_compute_backend(tmp_path: Path) -> None:
     config_path = tmp_path / "worklink.yaml"

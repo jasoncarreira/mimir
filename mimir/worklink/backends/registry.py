@@ -21,6 +21,43 @@ from .claude_cli import ClaudeCliBackend
 from .codex import CodexBackend
 
 
+WORKLINK_MERGED_LABEL = "worklink:merged"
+VALID_MERGE_STRATEGIES = frozenset({"no-ff", "squash", "ff-only"})
+
+
+@dataclass(frozen=True)
+class TieredReviewConfig:
+    # Default high-risk markers cover the safety plane, migrations/prod-data,
+    # auth, generated code, and hotspot files/operators.
+    high_risk_scope_prefixes: tuple[str, ...] = (
+        "mimir/worklink/autonomy.py",
+        "mimir/worklink/claims.py",
+        "mimir/worklink/orchestrator.py",
+        "mimir/worklink/backends/",
+        "mimir/saga/migrations/",
+        "migrations/",
+        "alembic/",
+        "mimir/auth",
+        "mimir/web/auth",
+        "generated/",
+        "uv.lock",
+        "pyproject.toml",
+    )
+    high_risk_labels: tuple[str, ...] = (
+        "risk:high",
+        "security",
+        "auth",
+        "migration",
+        "prod-data",
+        "generated-code",
+        "hotspot",
+    )
+    # High-risk slices get multi-vote review using this reviewer count; all
+    # other slices get one adversarial pass. Do not add a second trigger list
+    # unless a real third tier appears.
+    multi_vote_reviewer_count: int = 3
+
+
 @dataclass(frozen=True)
 class WorklinkDefaults:
     backend: str = "codex"
@@ -52,6 +89,15 @@ class WorklinkDefaults:
     # is flipped true; it always prefers an isolated ComputeBackend
     # (docker_sibling / ecs_runtask). The operator CLI is never gated by this.
     allow_autonomous_local_subprocess: bool = False
+    epic_branch_prefix: str = "epic/"
+    max_review_retries: int = 3
+    reviewer_backend: str | None = None
+    merge_strategy: str = "no-ff"
+    tiered_review: TieredReviewConfig = field(default_factory=TieredReviewConfig)
+
+    def __post_init__(self) -> None:
+        if self.reviewer_backend is None:
+            object.__setattr__(self, "reviewer_backend", self.backend)
 
 
 @dataclass(frozen=True)
@@ -108,22 +154,27 @@ class WorklinkConfig:
         ) or {}
         if not isinstance(category_defaults, dict):
             raise ValueError("worklink category defaults must be a mapping")
+        default_values = WorklinkDefaults()
+        backend_name = str(defaults_data.get("backend", default_values.backend))
         defaults = WorklinkDefaults(
-            backend=str(defaults_data.get("backend", "codex")),
-            timeout_s=int(defaults_data.get("timeout_s", 1800)),
-            priority=str(defaults_data.get("priority", "normal")),
+            backend=backend_name,
+            timeout_s=int(defaults_data.get("timeout_s", default_values.timeout_s)),
+            priority=str(defaults_data.get("priority", default_values.priority)),
             test_command=str(
-                defaults_data.get("test_command", "env -u MIMIR_MODEL_SPEC uv run pytest -q")
+                defaults_data.get("test_command", default_values.test_command)
             ),
-            backend_by_category={str(key): str(value) for key, value in category_defaults.items()},
+            backend_by_category={
+                str(key): str(value) for key, value in category_defaults.items()
+            },
             compute_backend=_normalize_compute_backend_name(
                 str(
                     defaults_data.get(
-                        "compute_backend", defaults_data.get("compute", "local_subprocess")
+                        "compute_backend",
+                        defaults_data.get("compute", default_values.compute_backend),
                     )
                 )
             ),
-            base_branch=str(defaults_data.get("base_branch", "main")),
+            base_branch=str(defaults_data.get("base_branch", default_values.base_branch)),
             base_fetch=_coerce_safety_bool(defaults_data.get("base_fetch", True), default=True),
             max_concurrent=_positive_int(
                 defaults_data.get("max_concurrent"),
@@ -136,6 +187,18 @@ class WorklinkConfig:
             allow_autonomous_local_subprocess=_coerce_safety_bool(
                 defaults_data.get("allow_autonomous_local_subprocess", False)
             ),
+            epic_branch_prefix=str(
+                defaults_data.get("epic_branch_prefix", default_values.epic_branch_prefix)
+            ),
+            max_review_retries=_positive_int(
+                defaults_data.get("max_review_retries"),
+                default=WorklinkDefaults.max_review_retries,
+            ),
+            reviewer_backend=str(defaults_data.get("reviewer_backend", backend_name)),
+            merge_strategy=_parse_merge_strategy(
+                defaults_data.get("merge_strategy", default_values.merge_strategy)
+            ),
+            tiered_review=_parse_tiered_review_config(defaults_data.get("tiered_review")),
         )
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
         tool_pins = _parse_tool_pins(data.get("tool_pins") or [])
@@ -244,6 +307,14 @@ def _normalize_compute_backend_name(name: str) -> str:
     return name.strip().replace("-", "_")
 
 
+def _parse_merge_strategy(value: Any) -> str:
+    strategy = str(value)
+    if strategy not in VALID_MERGE_STRATEGIES:
+        valid = ", ".join(sorted(VALID_MERGE_STRATEGIES))
+        raise ValueError(f"worklink defaults.merge_strategy must be one of: {valid}")
+    return strategy
+
+
 def _expect_mapping(value: Any, label: str) -> Mapping[str, Any]:
     if value is None:
         return {}
@@ -306,6 +377,45 @@ def _parse_tool_pin(value: Any, *, index: int) -> ToolPin:
         install=str(value["install"]) if "install" in value else None,
         risk=str(value["risk"]) if "risk" in value else None,
     )
+
+
+def _parse_tiered_review_config(value: Any) -> TieredReviewConfig:
+    defaults = TieredReviewConfig()
+    if value is None:
+        return defaults
+    if not isinstance(value, dict):
+        raise ValueError("worklink defaults.tiered_review must be a mapping")
+    return TieredReviewConfig(
+        high_risk_scope_prefixes=_string_tuple_config(
+            value.get("high_risk_scope_prefixes"),
+            default=defaults.high_risk_scope_prefixes,
+            field_name="worklink defaults.tiered_review.high_risk_scope_prefixes",
+        ),
+        high_risk_labels=_string_tuple_config(
+            value.get("high_risk_labels"),
+            default=defaults.high_risk_labels,
+            field_name="worklink defaults.tiered_review.high_risk_labels",
+        ),
+        multi_vote_reviewer_count=_positive_int(
+            value.get("multi_vote_reviewer_count"),
+            default=defaults.multi_vote_reviewer_count,
+        ),
+    )
+
+
+def _string_tuple_config(
+    value: Any,
+    *,
+    default: tuple[str, ...],
+    field_name: str,
+) -> tuple[str, ...]:
+    if value is None:
+        return default
+    if not isinstance(value, list | tuple):
+        raise ValueError(f"{field_name} must be a list of strings")
+    if not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{field_name} must be a list of strings")
+    return tuple(value)
 
 
 def _parse_route(value: Any) -> WorklinkRoute:
