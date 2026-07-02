@@ -70,6 +70,9 @@ class EpicSubagentRoleRunner:
         if count == 1:
             return await self._invoke("per-slice-reviewer", prompt, SliceReview)
 
+        # Multi-reviewer mode is not a majority vote. Reusing the same role N
+        # times is valuable because it can surface different candidate bugs; a
+        # focused verify-dissent pass decides whether any dissent is real.
         reviews = await asyncio.gather(
             *(
                 self._invoke(
@@ -83,7 +86,14 @@ class EpicSubagentRoleRunner:
                 for idx in range(count)
             )
         )
-        return _aggregate_slice_reviews(reviews)
+        return await _aggregate_slice_reviews(
+            reviews,
+            verify_dissent=lambda verify_prompt: self._invoke(
+                "per-slice-reviewer",
+                verify_prompt,
+                SliceReview,
+            ),
+        )
 
     async def validate_integration(
         self,
@@ -144,28 +154,60 @@ class DeepAgentsTaskSubagentInvoker:
             tool_call_id=f"worklink-epic-{role}",
             store=None,
         )
-        result = await tool.coroutine(
-            description=prompt,
-            subagent_type=role,
-            runtime=runtime,
-        )
+        try:
+            result = await tool.coroutine(
+                description=prompt,
+                subagent_type=role,
+                runtime=runtime,
+            )
+        except AttributeError as exc:
+            raise WorklinkError(
+                "DeepAgents task tool shape changed; cannot run Worklink epic "
+                "role subagents. Update DeepAgents integration or pin a "
+                "compatible deepagents version."
+            ) from exc
         if isinstance(result, str):
             raise WorklinkError(result)
-        messages = result.update.get("messages", [])
+        update = getattr(result, "update", None)
+        if not isinstance(update, Mapping):
+            raise WorklinkError(
+                "DeepAgents task tool returned an unexpected result shape; "
+                "missing mapping update.messages"
+            )
+        messages = update.get("messages", [])
         if not messages:
             raise WorklinkError(f"{role} subagent returned no structured response")
-        content = str(messages[0].content)
-        return model_type.model_validate_json(content)
+        content = getattr(messages[0], "content", None)
+        if content is None:
+            raise WorklinkError(
+                "DeepAgents task tool returned an unexpected message shape; "
+                "missing message.content"
+            )
+        return model_type.model_validate_json(str(content))
 
     def _build_tool(self) -> Any:
-        from deepagents.middleware.subagents import _build_task_tool
+        try:
+            from deepagents.middleware import subagents as deepagents_subagents
+        except ImportError as exc:
+            raise WorklinkError(
+                "DeepAgents subagent middleware is unavailable; install a "
+                "compatible deepagents version to run Worklink epics"
+            ) from exc
+
+        build_task_tool = getattr(deepagents_subagents, "_build_task_tool", None)
+        if build_task_tool is None:
+            raise WorklinkError(
+                "DeepAgents private _build_task_tool API is unavailable; "
+                "update Worklink's epic role bridge or pin a compatible "
+                "deepagents version"
+            )
 
         model = self._model if self._model is not None else _resolve_epic_model(self.home)
         specs = [
             _structured_subagent_spec(spec, model=model, repo=self.repo)
             for spec in build_worklink_review_subagents()
         ]
-        return _build_task_tool(specs)
+        return build_task_tool(specs)
 
 
 def _structured_subagent_spec(
@@ -203,26 +245,80 @@ def _resolve_epic_model(home: Path) -> Any:
             os.environ["MIMIR_HOME"] = previous
 
 
-def _aggregate_slice_reviews(reviews: list[SliceReview]) -> SliceReview:
+async def _aggregate_slice_reviews(
+    reviews: list[SliceReview],
+    *,
+    verify_dissent: Callable[[str], Awaitable[SliceReview]] | None = None,
+) -> SliceReview:
     approvals = sum(1 for review in reviews if review.verdict == "APPROVE")
-    verdict = "APPROVE" if approvals > len(reviews) / 2 else "REJECT"
-    required_fixes = _unique(
-        fix
-        for review in reviews
-        if review.verdict == "REJECT"
-        for fix in review.required_fixes
-    )
+    dissents = [review for review in reviews if review.verdict == "REJECT"]
     findings = [finding for review in reviews for finding in review.findings]
     coverage = [mapping for review in reviews for mapping in review.ac_coverage]
+    if not dissents:
+        return SliceReview(
+            verdict="APPROVE",
+            summary=f"All {len(reviews)} slice reviewer(s) APPROVED; no dissent verification needed.",
+            ac_coverage=coverage,
+            findings=findings,
+            required_fixes=[],
+        )
+
+    dissent_fixes = _unique(fix for review in dissents for fix in review.required_fixes)
+    if verify_dissent is None:
+        return SliceReview(
+            verdict="REJECT",
+            summary=(
+                f"{len(dissents)}/{len(reviews)} slice reviewer(s) REJECTED; "
+                "no dissent verifier was configured, so the dissent blocks."
+            ),
+            ac_coverage=coverage,
+            findings=findings,
+            required_fixes=dissent_fixes,
+        )
+
+    verification = await verify_dissent(_render_dissent_verification_input(reviews, dissents))
+    if verification.verdict == "REJECT":
+        verified_fixes = _unique([*verification.required_fixes, *dissent_fixes])
+        return SliceReview(
+            verdict="REJECT",
+            summary=(
+                f"{len(dissents)}/{len(reviews)} reviewer dissent(s) were double-checked; "
+                "at least one dissenting finding was verified as real. "
+                f"Verifier summary: {verification.summary}"
+            ),
+            ac_coverage=coverage or verification.ac_coverage,
+            findings=[*findings, *verification.findings],
+            required_fixes=verified_fixes,
+        )
+
     return SliceReview(
-        verdict=verdict,
+        verdict="APPROVE",
         summary=(
-            f"Aggregated {approvals}/{len(reviews)} APPROVE vote(s); "
-            f"{len(reviews) - approvals}/{len(reviews)} REJECT vote(s)."
+            f"{len(dissents)}/{len(reviews)} reviewer dissent(s) were double-checked; "
+            f"none survived verification. Verifier summary: {verification.summary}"
         ),
-        ac_coverage=coverage,
+        ac_coverage=coverage or verification.ac_coverage,
         findings=findings,
-        required_fixes=required_fixes,
+        required_fixes=[],
+    )
+
+
+def _render_dissent_verification_input(
+    reviews: list[SliceReview], dissents: list[SliceReview]
+) -> str:
+    return "\n".join(
+        [
+            "Verify the dissenting per-slice review findings below against only the controller-observed evidence already present in the review context.",
+            "Return REJECT only if at least one dissenting finding is real and grounded in the observed diff/tests.",
+            "Return APPROVE if every dissenting finding is spurious, unsupported, or not grounded in observed evidence.",
+            "Do not decide by vote count; judge each dissenting finding on evidence.",
+            "",
+            "All slice reviews JSON:",
+            json.dumps([review.model_dump(mode="json") for review in reviews], indent=2, sort_keys=True),
+            "",
+            "Dissenting reviews JSON:",
+            json.dumps([review.model_dump(mode="json") for review in dissents], indent=2, sort_keys=True),
+        ]
     )
 
 

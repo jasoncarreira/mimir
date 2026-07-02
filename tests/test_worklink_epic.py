@@ -329,16 +329,18 @@ async def test_epic_subagent_role_runner_maps_structured_role_outputs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_epic_slice_review_multi_vote_majority_approve_does_not_block() -> None:
+async def test_epic_slice_review_multi_vote_unanimous_approve_skips_verification() -> None:
     votes = [
         SliceReview(verdict="APPROVE", summary="ok"),
-        SliceReview(verdict="REJECT", summary="too strict", required_fixes=["extra test"]),
+        SliceReview(verdict="APPROVE", summary="ok"),
         SliceReview(verdict="APPROVE", summary="ok"),
     ]
+    prompts: list[str] = []
 
     async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
         assert role == "per-slice-reviewer"
         assert model_type is SliceReview
+        prompts.append(prompt)
         return votes.pop(0)
 
     review = await EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker).review_slice(
@@ -349,42 +351,58 @@ async def test_epic_slice_review_multi_vote_majority_approve_does_not_block() ->
     )
 
     assert review.verdict == "APPROVE"
-    assert review.required_fixes == ["extra test"]
+    assert review.required_fixes == []
+    assert len(prompts) == 3
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "votes",
-    [
-        [
-            SliceReview(verdict="REJECT", summary="no", required_fixes=["fix A"]),
-            SliceReview(verdict="APPROVE", summary="ok"),
-        ],
-        [
-            SliceReview(verdict="REJECT", summary="no", required_fixes=["fix A"]),
-            SliceReview(verdict="REJECT", summary="no", required_fixes=["fix B", "fix A"]),
-            SliceReview(verdict="APPROVE", summary="ok"),
-        ],
-    ],
-)
-async def test_epic_slice_review_multi_vote_blocks_on_tie_or_reject_majority(
-    votes: list[SliceReview],
-) -> None:
-    pending = list(votes)
+async def test_epic_slice_review_multi_vote_verified_real_dissent_blocks() -> None:
+    responses = [
+        SliceReview(verdict="APPROVE", summary="ok"),
+        SliceReview(verdict="REJECT", summary="real bug", required_fixes=["fix A"]),
+        SliceReview(verdict="APPROVE", summary="ok"),
+        SliceReview(verdict="REJECT", summary="verified real", required_fixes=["fix A"]),
+    ]
+    prompts: list[str] = []
 
     async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
-        return pending.pop(0)
+        prompts.append(prompt)
+        return responses.pop(0)
 
     review = await EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker).review_slice(
         leaf=LeafIssue(issue(101)),
         evidence=ready_validation(101),
         mode="multi",
-        reviewer_count=len(votes),
+        reviewer_count=3,
     )
 
-    expected = ["fix A"] if len(votes) == 2 else ["fix A", "fix B"]
     assert review.verdict == "REJECT"
-    assert review.required_fixes == expected
+    assert review.required_fixes == ["fix A"]
+    assert "Verify the dissenting per-slice review findings" in prompts[-1]
+    assert "Do not decide by vote count" in prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_epic_slice_review_multi_vote_spurious_dissent_does_not_block() -> None:
+    responses = [
+        SliceReview(verdict="APPROVE", summary="ok"),
+        SliceReview(verdict="REJECT", summary="hallucinated", required_fixes=["extra test"]),
+        SliceReview(verdict="APPROVE", summary="ok"),
+        SliceReview(verdict="APPROVE", summary="dissent unsupported"),
+    ]
+
+    async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
+        return responses.pop(0)
+
+    review = await EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker).review_slice(
+        leaf=LeafIssue(issue(101)),
+        evidence=ready_validation(101),
+        mode="multi",
+        reviewer_count=3,
+    )
+
+    assert review.verdict == "APPROVE"
+    assert review.required_fixes == []
 
 
 @pytest.mark.asyncio
