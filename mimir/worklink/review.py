@@ -16,6 +16,10 @@ class WorklinkLeafSpec(BaseModel):
     """One strict Worklink leaf emitted by the decomposer."""
 
     title: str = Field(description="Short Chainlink subissue title.")
+    risk: Literal["standard", "high"] = Field(
+        default="standard",
+        description="Decomposer-assigned review risk for this leaf.",
+    )
     acceptance_criteria: list[str] = Field(
         min_length=1,
         description="Observable checklist items for the leaf's Acceptance criteria section.",
@@ -135,6 +139,11 @@ Ground every Scope entry in real repository paths or narrow existing subsystems.
 Target file-disjoint waves wherever possible. Serialize hotspots by adding
 blocked_by edges and by keeping hotspot leaves out of the same wave. The
 blocked_by list is a DAG: blocked_leaf waits for blocker_leaf.
+
+Assign risk for every leaf. Use risk="high" when the slice touches
+security/auth/secrets, migrations/prod-data, or generated code, OR when it is
+architecturally central, hard to reverse, or a shared hotspot. Use
+risk="standard" otherwise.
 """
 
 
@@ -180,11 +189,15 @@ def classify_leaf_review_risk(
     *,
     scope_paths: list[str] | tuple[str, ...],
     labels: set[str] | frozenset[str] | list[str] | tuple[str, ...] = (),
+    assigned_risk: Literal["standard", "high"] = "standard",
     tiered_review: TieredReviewConfig | None = None,
 ) -> ReviewVoteMode:
-    """Return ``multi`` when a leaf touches S1's configured high-risk set."""
+    """Return ``multi`` when assigned risk or config marks a leaf high-risk."""
 
     config = tiered_review or TieredReviewConfig()
+    if assigned_risk == "high":
+        return "multi"
+
     normalized_labels = {str(label).strip().lower() for label in labels}
     high_risk_labels = {label.lower() for label in config.high_risk_labels}
     if normalized_labels & high_risk_labels:

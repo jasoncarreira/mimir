@@ -54,6 +54,7 @@ def test_work_decomposer_schema_carries_strict_leaf_fields_and_dag() -> None:
     )
 
     payload = result.model_dump()
+    assert payload["leaves"][0]["risk"] == "standard"
     assert payload["leaves"][0]["scope_paths"] == ["mimir/worklink/review.py"]
     assert payload["blocked_by"][0]["blocked_leaf"] == "Wire registration"
     assert payload["waves"][0]["serialized_hotspots"] == ["mimir/subagents.py"]
@@ -164,6 +165,9 @@ def test_role_prompts_cover_required_review_contracts() -> None:
     assert "scope" in WORK_DECOMPOSER_PROMPT.lower()
     assert "file-disjoint waves" in WORK_DECOMPOSER_PROMPT.lower()
     assert "hotspots" in WORK_DECOMPOSER_PROMPT.lower()
+    assert "assign risk for every leaf" in WORK_DECOMPOSER_PROMPT.lower()
+    assert "architecturally central" in WORK_DECOMPOSER_PROMPT.lower()
+    assert "hard to reverse" in WORK_DECOMPOSER_PROMPT.lower()
 
     assert "every epic acceptance criterion maps" in DECOMPOSE_REVIEWER_PROMPT.lower()
     assert "same-wave leaves are file-disjoint" in DECOMPOSE_REVIEWER_PROMPT.lower()
@@ -178,6 +182,34 @@ def test_classifier_returns_single_for_low_risk_leaf() -> None:
         classify_leaf_review_risk(
             scope_paths=["docs/internal/WORKLINK.md"],
             labels={"worklink:ready", "docs"},
+            assigned_risk="standard",
+        )
+        == "single"
+    )
+
+
+def test_classifier_combines_decomposer_risk_with_scope_and_labels() -> None:
+    assert (
+        classify_leaf_review_risk(
+            scope_paths=["docs/internal/WORKLINK.md"],
+            labels={"worklink:ready"},
+            assigned_risk="high",
+        )
+        == "multi"
+    )
+    assert (
+        classify_leaf_review_risk(
+            scope_paths=["services/billing/db/migrations/001_add_table.sql"],
+            labels={"worklink:ready"},
+            assigned_risk="standard",
+        )
+        == "multi"
+    )
+    assert (
+        classify_leaf_review_risk(
+            scope_paths=["docs/internal/WORKLINK.md"],
+            labels={"worklink:ready"},
+            assigned_risk="standard",
         )
         == "single"
     )
