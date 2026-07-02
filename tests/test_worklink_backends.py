@@ -421,11 +421,12 @@ defaults:
     assert defaults.max_review_retries == 3
     assert defaults.reviewer_backend == "claude_cli"
     assert defaults.tiered_review.multi_vote_reviewer_count == 3
-    assert "mimir/worklink/autonomy.py" in defaults.tiered_review.high_risk_scope_prefixes
-    assert "mimir/saga/migrations/" in defaults.tiered_review.high_risk_scope_prefixes
+    assert "**/migrations/**" in defaults.tiered_review.high_risk_scope_patterns
+    assert "**/*secret*" in defaults.tiered_review.high_risk_scope_patterns
     assert "auth" in defaults.tiered_review.high_risk_labels
     assert "generated-code" in defaults.tiered_review.high_risk_labels
-    assert "uv.lock" in defaults.tiered_review.high_risk_scope_prefixes
+    assert "*.lock" in defaults.tiered_review.high_risk_scope_patterns
+    assert all("mimir/" not in pattern for pattern in defaults.tiered_review.high_risk_scope_patterns)
     assert WorklinkDefaults(backend="claude_cli").reviewer_backend == "claude_cli"
     assert WORKLINK_MERGED_LABEL == "worklink:merged"
 
@@ -440,9 +441,9 @@ defaults:
   max_review_retries: 5
   reviewer_backend: claude_cli
   tiered_review:
-    high_risk_scope_prefixes:
-      - mimir/security/
-      - migrations/prod/
+    high_risk_scope_patterns:
+      - "**/security/**"
+      - "**/migrations/prod/**"
     high_risk_labels:
       - risk:high
       - production-data
@@ -457,10 +458,31 @@ defaults:
     assert defaults.max_review_retries == 5
     assert defaults.reviewer_backend == "claude_cli"
     assert defaults.tiered_review == TieredReviewConfig(
-        high_risk_scope_prefixes=("mimir/security/", "migrations/prod/"),
+        high_risk_scope_patterns=("**/security/**", "**/migrations/prod/**"),
         high_risk_labels=("risk:high", "production-data"),
         multi_vote_reviewer_count=4,
     )
+
+
+def test_worklink_config_tiered_review_accepts_deprecated_prefix_alias(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  tiered_review:
+    high_risk_scope_prefixes:
+      - "**/legacy-hotspot/**"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    defaults = WorklinkConfig.load(config_path).defaults
+
+    assert defaults.tiered_review.high_risk_scope_patterns == ("**/legacy-hotspot/**",)
+    assert defaults.tiered_review.high_risk_scope_prefixes == ("**/legacy-hotspot/**",)
+    assert TieredReviewConfig(
+        high_risk_scope_prefixes=("**/constructor-alias/**",)
+    ).high_risk_scope_patterns == ("**/constructor-alias/**",)
 
 
 def test_worklink_config_builds_docker_sibling_compute_backend(tmp_path: Path) -> None:
