@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from fnmatch import fnmatch
 from pathlib import PurePosixPath
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from mimir.worklink.backends.registry import TieredReviewConfig
 from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
 
 
@@ -144,8 +143,7 @@ Given the epic brief, proposed leaves, blocked-by DAG, and waves, return only th
 structured DecomposeReview response requested by the runtime. APPROVE only when:
 every epic acceptance criterion maps to at least one leaf; every leaf uses the
 strict Worklink template fields; same-wave leaves are file-disjoint; hotspots are
-serialized by dependencies or separate waves; hotspots are serialized; and the
-dependency graph is a DAG.
+serialized by dependencies or separate waves; and the dependency graph is a DAG.
 Use REJECT with findings for missing AC coverage, vague Scope, same-wave file
 overlap, unserialized hotspots, or invalid dependency structure.
 """
@@ -174,53 +172,6 @@ conflicts, scope creep, or unvalidated behavior.
 """
 
 
-@dataclass(frozen=True)
-class WorklinkReviewRiskConfig:
-    """High-risk surfaces that require multi-vote slice review."""
-
-    high_risk_labels: frozenset[str] = field(
-        default_factory=lambda: frozenset(
-            {
-                "risk:high",
-                "security",
-                "auth",
-                "migration",
-                "generated-code",
-                "hotspot",
-            }
-        )
-    )
-    safety_plane_patterns: tuple[str, ...] = (
-        "mimir/worklink/**",
-        "mimir/tools/prohibited_action_guard.py",
-        "mimir/access_control.py",
-        "mimir/config.py",
-        "SECURITY.md",
-    )
-    migration_patterns: tuple[str, ...] = ("**/migrations/**", "**/schema.sql", "**/*migration*")
-    auth_patterns: tuple[str, ...] = (
-        "**/*auth*",
-        "**/*oauth*",
-        "**/*credential*",
-        "**/*secret*",
-        "mimir/cred_*.py",
-    )
-    generated_code_patterns: tuple[str, ...] = (
-        "**/generated/**",
-        "**/*_pb2.py",
-        "**/*.lock",
-        "uv.lock",
-        "package-lock.json",
-        "frontend/src/api/generated/**",
-    )
-    hotspot_patterns: tuple[str, ...] = (
-        "mimir/agent.py",
-        "mimir/server.py",
-        "mimir/subagents.py",
-        "mimir/worklink/orchestrator.py",
-    )
-
-
 ReviewVoteMode = Literal["single", "multi"]
 
 
@@ -228,25 +179,24 @@ def classify_leaf_review_risk(
     *,
     scope_paths: list[str] | tuple[str, ...],
     labels: set[str] | frozenset[str] | list[str] | tuple[str, ...] = (),
-    config: WorklinkReviewRiskConfig | None = None,
+    tiered_review: TieredReviewConfig | None = None,
 ) -> ReviewVoteMode:
-    """Return ``multi`` when a leaf touches configured high-risk surfaces."""
+    """Return ``multi`` when a leaf touches S1's configured high-risk set."""
 
-    cfg = config or WorklinkReviewRiskConfig()
+    config = tiered_review or TieredReviewConfig()
     normalized_labels = {str(label).strip().lower() for label in labels}
-    if normalized_labels & {label.lower() for label in cfg.high_risk_labels}:
+    high_risk_labels = {label.lower() for label in config.high_risk_labels}
+    if normalized_labels & high_risk_labels:
         return "multi"
 
-    patterns = (
-        cfg.safety_plane_patterns
-        + cfg.migration_patterns
-        + cfg.auth_patterns
-        + cfg.generated_code_patterns
-        + cfg.hotspot_patterns
+    prefixes = tuple(
+        _normalize_scope_path(prefix).rstrip("/")
+        for prefix in config.high_risk_scope_prefixes
+        if str(prefix).strip()
     )
     for raw_path in scope_paths:
         path = _normalize_scope_path(raw_path)
-        if any(_matches_path_pattern(path, pattern) for pattern in patterns):
+        if any(_path_has_prefix(path, prefix) for prefix in prefixes):
             return "multi"
     return "single"
 
@@ -256,13 +206,8 @@ def _normalize_scope_path(path: str) -> str:
     return normalized.removeprefix("./")
 
 
-def _matches_path_pattern(path: str, pattern: str) -> bool:
-    normalized_pattern = pattern.strip().replace("\\", "/")
-    if fnmatch(path, normalized_pattern):
-        return True
-    if normalized_pattern.endswith("/**"):
-        return path == normalized_pattern[:-3].rstrip("/")
-    return False
+def _path_has_prefix(path: str, prefix: str) -> bool:
+    return path.startswith(prefix)
 
 
 def build_worklink_review_subagents() -> list[dict]:

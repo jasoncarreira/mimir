@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from mimir.worklink.backends.registry import TieredReviewConfig
 from mimir.worklink.review import (
     DECOMPOSE_REVIEWER_PROMPT,
     INTEGRATION_VALIDATOR_PROMPT,
@@ -17,7 +18,6 @@ from mimir.worklink.review import (
     WorkDecomposition,
     WorklinkBlockerEdge,
     WorklinkLeafSpec,
-    WorklinkReviewRiskConfig,
     WorklinkWave,
     build_worklink_review_subagents,
     classify_leaf_review_risk,
@@ -167,7 +167,7 @@ def test_role_prompts_cover_required_review_contracts() -> None:
 
     assert "every epic acceptance criterion maps" in DECOMPOSE_REVIEWER_PROMPT.lower()
     assert "same-wave leaves are file-disjoint" in DECOMPOSE_REVIEWER_PROMPT.lower()
-    assert "hotspots are serialized" in DECOMPOSE_REVIEWER_PROMPT.lower()
+    assert "serialized by dependencies" in DECOMPOSE_REVIEWER_PROMPT.lower()
 
     assert "code_refs and test_refs" in INTEGRATION_VALIDATOR_PROMPT
     assert "GO-WITH-NITS" in INTEGRATION_VALIDATOR_PROMPT
@@ -187,34 +187,28 @@ def test_classifier_returns_single_for_low_risk_leaf() -> None:
     ("scope_path", "label"),
     [
         ("mimir/worklink/orchestrator.py", "worklink:ready"),
-        ("mimir/saga/migrations.py", "worklink:ready"),
-        ("mimir/web_auth.js", "worklink:ready"),
-        ("frontend/src/api/generated/contracts.ts", "worklink:ready"),
-        ("mimir/server.py", "worklink:ready"),
+        ("mimir/saga/migrations/001_add_table.py", "worklink:ready"),
         ("docs/internal/WORKLINK.md", "risk:high"),
     ],
 )
-def test_classifier_returns_multi_for_configured_high_risk_surfaces(
+def test_classifier_returns_multi_for_default_tiered_review_config(
     scope_path: str, label: str
 ) -> None:
     assert classify_leaf_review_risk(scope_paths=[scope_path], labels={label}) == "multi"
 
 
-def test_classifier_uses_supplied_config_hotspot_set() -> None:
-    config = WorklinkReviewRiskConfig(
-        high_risk_labels=frozenset({"review:multi"}),
-        safety_plane_patterns=(),
-        migration_patterns=(),
-        auth_patterns=(),
-        generated_code_patterns=(),
-        hotspot_patterns=("custom/hotspot.py",),
+def test_classifier_uses_supplied_tiered_review_config_scope_prefixes_and_labels() -> None:
+    config = TieredReviewConfig(
+        high_risk_scope_prefixes=("custom/hotspot",),
+        high_risk_labels=("review:multi",),
+        multi_vote_reviewer_count=5,
     )
 
     assert (
         classify_leaf_review_risk(
-            scope_paths=["custom/hotspot.py"],
+            scope_paths=["custom/hotspot/file.py"],
             labels={"worklink:ready"},
-            config=config,
+            tiered_review=config,
         )
         == "multi"
     )
@@ -222,7 +216,7 @@ def test_classifier_uses_supplied_config_hotspot_set() -> None:
         classify_leaf_review_risk(
             scope_paths=["mimir/worklink/orchestrator.py"],
             labels={"worklink:ready"},
-            config=config,
+            tiered_review=config,
         )
         == "single"
     )
@@ -230,7 +224,7 @@ def test_classifier_uses_supplied_config_hotspot_set() -> None:
         classify_leaf_review_risk(
             scope_paths=["docs/notes.md"],
             labels={"review:multi"},
-            config=config,
+            tiered_review=config,
         )
         == "multi"
     )
