@@ -84,6 +84,16 @@ with a `WORKLINK_BLOCKED` reason (fix it, remove `worklink:blocked`, re-add
 Review the PR like any other. Merging it (or posting an approval-shaped event)
 closes the leaf, and any slices blocked on it unblock automatically.
 
+### 4. Tiered review risk
+
+Integrated-epic leaves are classified for single- or multi-review using one
+`defaults.tiered_review` config source. Framework defaults are generic glob
+patterns for migrations/schema changes, auth/secrets/credentials, generated
+code, lockfiles, and CI/CD or infra config. Deployment-specific high-risk
+surfaces belong in that deployment's `worklink.yaml`, not in framework defaults;
+for this repo, examples would include `worklink/`, access-control code, config,
+and prohibited-action guards.
+
 ### Handy commands (`chainlink issue …`, run in the home / store)
 
 - `ready` — leaves ready to work (open, no open blockers)

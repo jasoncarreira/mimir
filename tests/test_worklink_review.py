@@ -186,8 +186,11 @@ def test_classifier_returns_single_for_low_risk_leaf() -> None:
 @pytest.mark.parametrize(
     ("scope_path", "label"),
     [
-        ("mimir/worklink/orchestrator.py", "worklink:ready"),
-        ("mimir/saga/migrations/001_add_table.py", "worklink:ready"),
+        ("services/billing/db/migrations/001_add_table.sql", "worklink:ready"),
+        ("apps/web/src/oauth_callback.ts", "worklink:ready"),
+        ("platform/config/secret_store.py", "worklink:ready"),
+        ("infra/prod/terraform.lock", "worklink:ready"),
+        ("packages/client/src/generated/api.ts", "worklink:ready"),
         ("docs/internal/WORKLINK.md", "risk:high"),
     ],
 )
@@ -197,16 +200,20 @@ def test_classifier_returns_multi_for_default_tiered_review_config(
     assert classify_leaf_review_risk(scope_paths=[scope_path], labels={label}) == "multi"
 
 
-def test_classifier_uses_supplied_tiered_review_config_scope_prefixes_and_labels() -> None:
+def test_default_tiered_review_scope_patterns_are_not_mimir_specific() -> None:
+    assert all("mimir/" not in pattern for pattern in TieredReviewConfig().high_risk_scope_patterns)
+
+
+def test_classifier_uses_supplied_tiered_review_config_scope_patterns_and_labels() -> None:
     config = TieredReviewConfig(
-        high_risk_scope_prefixes=("custom/hotspot",),
+        high_risk_scope_patterns=("**/custom/hotspot/**",),
         high_risk_labels=("review:multi",),
         multi_vote_reviewer_count=5,
     )
 
     assert (
         classify_leaf_review_risk(
-            scope_paths=["custom/hotspot/file.py"],
+            scope_paths=["src/custom/hotspot/file.py"],
             labels={"worklink:ready"},
             tiered_review=config,
         )
@@ -214,7 +221,7 @@ def test_classifier_uses_supplied_tiered_review_config_scope_prefixes_and_labels
     )
     assert (
         classify_leaf_review_risk(
-            scope_paths=["mimir/worklink/orchestrator.py"],
+            scope_paths=["services/billing/db/migrations/001_add_table.sql"],
             labels={"worklink:ready"},
             tiered_review=config,
         )
