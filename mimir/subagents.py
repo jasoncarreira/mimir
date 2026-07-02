@@ -60,6 +60,8 @@ def build_mimir_subagents() -> list[dict]:
     this list intentionally does not include a spec named ``general-purpose``.
     """
 
+    from mimir.worklink.review import build_worklink_review_subagents
+
     return [
         {
             "name": "critic-structured",
@@ -76,5 +78,6 @@ def build_mimir_subagents() -> list[dict]:
             "tools": [],
             "permissions": readonly_filesystem_permissions(),
             "response_format": CriticFindings,
-        }
+        },
+        *build_worklink_review_subagents(),
     ]

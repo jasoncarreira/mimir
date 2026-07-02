@@ -16,16 +16,32 @@ from mimir.subagents import (
     build_mimir_subagents,
     readonly_filesystem_permissions,
 )
+from mimir.worklink.review import (
+    DecomposeReview,
+    IntegrationValidation,
+    SliceReview,
+    WorkDecomposition,
+)
 
 
 def test_build_mimir_subagents_registers_structured_critic_without_replacing_gp() -> None:
     specs = build_mimir_subagents()
 
-    assert [spec["name"] for spec in specs] == ["critic-structured"]
+    assert [spec["name"] for spec in specs] == [
+        "critic-structured",
+        "work-decomposer",
+        "decompose-reviewer",
+        "per-slice-reviewer",
+        "integration-validator",
+    ]
     assert "general-purpose" not in {spec["name"] for spec in specs}
     assert specs[0]["response_format"] is CriticFindings
-    assert specs[0]["tools"] == []
-    assert "Read-only" in specs[0]["description"]
+    assert specs[1]["response_format"] is WorkDecomposition
+    assert specs[2]["response_format"] is DecomposeReview
+    assert specs[3]["response_format"] is SliceReview
+    assert specs[4]["response_format"] is IntegrationValidation
+    assert all(spec["tools"] == [] for spec in specs)
+    assert all("Read-only" in spec["description"] for spec in specs)
 
 
 def test_readonly_permissions_deny_write_catchall() -> None:
