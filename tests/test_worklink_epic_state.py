@@ -4,9 +4,13 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from mimir.worklink.epic_state import (
+    EPIC_STATE_VERSION,
     EpicRunManifest,
     EpicSliceRecord,
+    EpicStateError,
     epic_state_path,
     load_epic_state,
     load_or_init_epic_state,
@@ -73,7 +77,79 @@ def test_epic_state_atomic_round_trip_ignores_stray_temp_file(tmp_path: Path) ->
     loaded = load_epic_state(tmp_path, 770)
 
     assert loaded == manifest
-    assert json.loads(path.read_text(encoding="utf-8"))["slices"][0]["status"] == "review"
+    assert (
+        json.loads(path.read_text(encoding="utf-8"))["slices"][0]["status"] == "review"
+    )
+
+
+def test_present_corrupt_manifest_is_not_silently_reinitialized(tmp_path: Path) -> None:
+    path = epic_state_path(tmp_path, 770)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(EpicStateError, match="invalid JSON"):
+        load_epic_state(tmp_path, 770)
+
+    with pytest.raises(EpicStateError, match="invalid JSON"):
+        load_or_init_epic_state(
+            tmp_path,
+            epic_id=770,
+            integration_branch="new-branch",
+            integration_worktree="new-worktree",
+            base_ref="main",
+            slice_ids=(999,),
+        )
+
+    assert path.read_text(encoding="utf-8") == "{not json"
+
+
+def test_present_invalid_manifest_is_not_silently_reinitialized(tmp_path: Path) -> None:
+    path = epic_state_path(tmp_path, 770)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"version": EPIC_STATE_VERSION, "epic_id": 770}), encoding="utf-8"
+    )
+
+    with pytest.raises(EpicStateError, match="invalid epic manifest"):
+        load_or_init_epic_state(
+            tmp_path,
+            epic_id=770,
+            integration_branch="new-branch",
+            integration_worktree="new-worktree",
+            base_ref="main",
+        )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload == {"version": EPIC_STATE_VERSION, "epic_id": 770}
+
+
+def test_unknown_manifest_version_is_not_silently_reinitialized(tmp_path: Path) -> None:
+    manifest = EpicRunManifest(
+        epic_id=770,
+        integration_branch="worklink/epic-770",
+        integration_worktree="/tmp/epic-770",
+        base_ref="main",
+        phase="build",
+        slices=[],
+        version=EPIC_STATE_VERSION + 1,
+    )
+    path = epic_state_path(tmp_path, 770)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest.to_json()), encoding="utf-8")
+
+    with pytest.raises(EpicStateError, match="unsupported epic manifest version"):
+        load_or_init_epic_state(
+            tmp_path,
+            epic_id=770,
+            integration_branch="new-branch",
+            integration_worktree="new-worktree",
+            base_ref="main",
+        )
+
+    assert (
+        json.loads(path.read_text(encoding="utf-8"))["version"]
+        == EPIC_STATE_VERSION + 1
+    )
 
 
 def test_resume_point_skips_merged_slices_in_partial_manifest() -> None:
@@ -100,6 +176,29 @@ def test_resume_point_skips_merged_slices_in_partial_manifest() -> None:
     assert point.complete is False
 
 
+def test_resume_point_skips_terminally_blocked_slices() -> None:
+    manifest = EpicRunManifest(
+        epic_id=770,
+        integration_branch="worklink/epic-770",
+        integration_worktree="/tmp/epic-770",
+        base_ref="main",
+        phase="build",
+        slices=[
+            EpicSliceRecord(id=771, status="merged", attempts=1, merge_commit="abc123"),
+            EpicSliceRecord(id=772, status="blocked", attempts=3),
+        ],
+        status="partial",
+    )
+
+    point = resume_epic_run(manifest)
+
+    assert point.phase == "integrate"
+    assert point.slice_id is None
+    assert point.slice_status is None
+    assert point.overall_status == "partial"
+    assert point.complete is False
+
+
 def test_resume_point_reports_later_phases_and_completion() -> None:
     merged = EpicRunManifest(
         epic_id=770,
@@ -121,7 +220,9 @@ def test_resume_point_reports_later_phases_and_completion() -> None:
     assert point.phase is None
 
 
-def test_manifest_tracks_orchestration_not_chainlink_leaf_status(tmp_path: Path) -> None:
+def test_manifest_tracks_orchestration_not_chainlink_leaf_status(
+    tmp_path: Path,
+) -> None:
     manifest = EpicRunManifest(
         epic_id=770,
         integration_branch="worklink/epic-770",

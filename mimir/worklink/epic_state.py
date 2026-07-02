@@ -22,6 +22,11 @@ from typing import Any, Literal, Mapping
 
 EPIC_STATE_VERSION = 1
 
+
+class EpicStateError(RuntimeError):
+    """A persisted epic manifest exists but cannot be trusted for resume."""
+
+
 EpicPhase = Literal["decompose", "build", "integrate", "pr"]
 EpicSliceStatus = Literal["pending", "running", "review", "merged", "blocked"]
 EpicOverallStatus = Literal["running", "completed", "blocked", "partial", "needs-human"]
@@ -95,6 +100,12 @@ class EpicRunManifest:
     def from_json(cls, data: Any) -> "EpicRunManifest":
         if not isinstance(data, Mapping):
             raise TypeError("epic run manifest must be a JSON object")
+        version = int(data.get("version") or EPIC_STATE_VERSION)
+        if version != EPIC_STATE_VERSION:
+            raise ValueError(
+                f"unsupported epic manifest version: {version} "
+                f"(expected {EPIC_STATE_VERSION})"
+            )
         phase = str(data["phase"])
         if phase not in EPIC_PHASES:
             raise ValueError(f"unknown epic phase: {phase}")
@@ -112,7 +123,7 @@ class EpicRunManifest:
             phase=phase,  # type: ignore[arg-type]
             slices=[EpicSliceRecord.from_json(item) for item in slices_data],
             status=status,  # type: ignore[arg-type]
-            version=int(data.get("version") or EPIC_STATE_VERSION),
+            version=version,
         )
 
 
@@ -164,15 +175,28 @@ def save_epic_state(home: Path, manifest: EpicRunManifest) -> Path:
 
 
 def load_epic_state(home: Path, epic_id: int) -> EpicRunManifest | None:
+    """Load a persisted manifest, returning ``None`` only when it is absent.
+
+    A present-but-unreadable, corrupt, invalid, or unsupported-version manifest is
+    a crash-recovery stop condition: callers must not silently initialize over it
+    because that would discard integration branch and slice progress records.
+    """
+
     path = epic_state_path(home, epic_id)
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise EpicStateError(f"unable to read epic manifest {path}: {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise EpicStateError(f"invalid JSON in epic manifest {path}: {exc}") from exc
     try:
         return EpicRunManifest.from_json(data)
-    except (KeyError, TypeError, ValueError):
-        return None
+    except (KeyError, TypeError, ValueError) as exc:
+        raise EpicStateError(f"invalid epic manifest {path}: {exc}") from exc
 
 
 def load_or_init_epic_state(
@@ -206,10 +230,12 @@ def load_or_init_epic_state(
 def resume_epic_run(manifest: EpicRunManifest) -> EpicResumePoint:
     """Return the first phase/slice that still needs orchestration work.
 
-    Merged slices are skipped so a restarted controller does not redo already
-    integrated leaf work. If a manifest's current phase has advanced while a
-    slice is still unmerged, the build slice is reported first because the
-    integration and PR phases depend on all slices being merged.
+    Terminal slices (``merged`` and ``blocked``) are skipped so a restarted
+    controller does not redo already integrated leaf work or livelock on a slice
+    that already exhausted its retries. If a manifest's current phase has
+    advanced while a non-terminal slice is still unmerged, that build slice is
+    reported first because the integration and PR phases depend on all remaining
+    buildable slices reaching a terminal state.
     """
 
     if manifest.status == "completed":
@@ -222,7 +248,7 @@ def resume_epic_run(manifest: EpicRunManifest) -> EpicResumePoint:
         return EpicResumePoint(phase="decompose", overall_status=manifest.status)
 
     for slice_record in manifest.slices:
-        if slice_record.status != "merged":
+        if slice_record.status not in {"merged", "blocked"}:
             return EpicResumePoint(
                 phase="build",
                 slice_id=slice_record.id,
