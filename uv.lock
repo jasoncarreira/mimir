@@ -11,7 +11,6 @@ resolution-markers = [
 [manifest]
 members = [
     "mimir-agent",
-    "mimir-langchain-claude-code",
     "saga",
 ]
 
@@ -1129,16 +1128,16 @@ wheels = [
 ]
 
 [[package]]
-name = "langchain-claude-code"
-version = "0.1.0"
+name = "langchain-claude-code-mimir"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "claude-agent-sdk" },
     { name = "langchain-core" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e5/6b/0d4ecd906dd70a8f018cf555360e71718e48e4c8856994c9a53cac423297/langchain_claude_code-0.1.0.tar.gz", hash = "sha256:959273ee091374e087a657846a0258c287e0dbd7c4c0c8361875bc53e6babadb", size = 184861, upload-time = "2025-12-02T19:44:25.095Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8a/65/db66e7baa08aacefa2a51f3339cf2d0c99718e8a8a94845458345f0d56c9/langchain_claude_code_mimir-0.1.2.tar.gz", hash = "sha256:99c11e0b34c852c4b93f5e75f69beae2ca296f28277f5532d12b54651ad6886e", size = 193641, upload-time = "2026-07-02T01:39:02.531Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b7/bd/aef448681b6ebc1bca59fd9a67019f5225caec1ea17a1809930eec5491a3/langchain_claude_code-0.1.0-py3-none-any.whl", hash = "sha256:0f98d851654793e1d8cf3cc42aa5a33ff32b46e5f491ba8ff51d08b3279b507a", size = 10821, upload-time = "2025-12-02T19:44:23.418Z" },
+    { url = "https://files.pythonhosted.org/packages/68/a8/31f84fdf856dffae16c77739663cb69c24ad616a94f523d47fa8a321dd42/langchain_claude_code_mimir-0.1.2-py3-none-any.whl", hash = "sha256:78757df574b2efe7cd6f4deb2984f9f40d0817f8c70c68ac83955a770c645d0e", size = 14886, upload-time = "2026-07-02T01:39:01.2Z" },
 ]
 
 [[package]]
@@ -1157,7 +1156,7 @@ wheels = [
 
 [[package]]
 name = "langchain-core"
-version = "1.4.0"
+version = "1.4.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jsonpatch" },
@@ -1170,9 +1169,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "uuid-utils" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/59/de/679a53472c25860837e32c0442c962fa86e95317a36460e2c9d5c91b17c2/langchain_core-1.4.0.tar.gz", hash = "sha256:1dc341eed802ed9c117c0df3923c991e5e9e226571e5725c194eeb5bd93d1a7f", size = 920260, upload-time = "2026-05-11T18:42:35.919Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/12/e3/bea6d0080acf183332f24dcd74c208aee5857cf8f783c3fb0bd86027d8fb/langchain_core-1.4.8.tar.gz", hash = "sha256:5bf1f8411077c904182ad8f975943d36adcbf579c4e017b3a118b719229ebf9a", size = 957974, upload-time = "2026-06-18T19:39:23.636Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0f/1a/86c38c27b81913a1c6c12448cab55defb5a1097c7dc9a4cea83f55477a2d/langchain_core-1.4.0-py3-none-any.whl", hash = "sha256:23cbbdb46e38ddd1dd5247e6167e96013eae74bea4c5949c550809970a9e565c", size = 548120, upload-time = "2026-05-11T18:42:33.992Z" },
+    { url = "https://files.pythonhosted.org/packages/13/d6/bdf6f0481cc57ef300d6b1eb48cf1400c0409be715d6eb3cabadd1142a09/langchain_core-1.4.8-py3-none-any.whl", hash = "sha256:d84c28b05e3ba8d4271d0827aad5b592ccdaaf986e76768c23503f0a2045e8aa", size = 557416, upload-time = "2026-06-18T19:39:21.902Z" },
 ]
 
 [[package]]
@@ -1206,14 +1205,14 @@ wheels = [
 
 [[package]]
 name = "langchain-protocol"
-version = "0.0.15"
+version = "0.0.18"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4f/24/9777489d6fbbee64af0c8f96d4f840239c408cf694f3394672807dafc490/langchain_protocol-0.0.15.tar.gz", hash = "sha256:9ab2d11ee73944754f10e037e717098d3a6796f0e58afa9cadda6154e7655ade", size = 5862, upload-time = "2026-05-01T22:30:04.748Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d2/59/b5959aea96faa9146e2e49a7a22882b3528c62efafe9a6a95beab30c2305/langchain_protocol-0.0.18.tar.gz", hash = "sha256:ec3e11782f1ed0c9db38e5a9ed01b0e7a0d3fba406faa8aef6594b73c56a63e6", size = 6150, upload-time = "2026-06-18T17:08:26.959Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1d/7a/9c97a7b9cbe4c5dc6a44cdb1545450c28f0c8ce89b9c1f0ee7fbad896263/langchain_protocol-0.0.15-py3-none-any.whl", hash = "sha256:461eb794358f83d5e42635a5797799ffec7b4702314e34edf73ac21e75d3ef79", size = 6982, upload-time = "2026-05-01T22:30:03.877Z" },
+    { url = "https://files.pythonhosted.org/packages/99/2e/d82db9eec13ad0f72e7aaad5c4bc730ab111934fdc83c85523206eb9b0a0/langchain_protocol-0.0.18-py3-none-any.whl", hash = "sha256:70b53a86fbf9cedc863555effe44da192ab02d556ddbf2cf95b8873adcf41b5a", size = 7221, upload-time = "2026-06-18T17:08:25.996Z" },
 ]
 
 [[package]]
@@ -1374,7 +1373,7 @@ bench = [
     { name = "saga" },
 ]
 claude-code = [
-    { name = "mimir-langchain-claude-code" },
+    { name = "langchain-claude-code-mimir" },
 ]
 codex-plus = [
     { name = "langchain-codex-plus" },
@@ -1439,13 +1438,13 @@ requires-dist = [
     { name = "langchain", specifier = ">=1.3" },
     { name = "langchain-anthropic", marker = "extra == 'anthropic'", specifier = ">=1.4" },
     { name = "langchain-anthropic", marker = "extra == 'dev'", specifier = ">=1.4" },
+    { name = "langchain-claude-code-mimir", marker = "extra == 'claude-code'", specifier = ">=0.1.2,<0.2" },
     { name = "langchain-codex-plus", marker = "extra == 'codex-plus'", specifier = ">=0.0.5,<0.1" },
     { name = "langchain-codex-plus", marker = "extra == 'dev'", specifier = ">=0.0.5,<0.1" },
     { name = "langchain-openai", marker = "extra == 'dev'", specifier = ">=1.2.1" },
     { name = "langchain-openai", marker = "extra == 'openai'", specifier = ">=1.2.1" },
     { name = "mcp", marker = "extra == 'dev'", specifier = ">=1.27" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.27" },
-    { name = "mimir-langchain-claude-code", marker = "extra == 'claude-code'", editable = "packages/mimir-langchain-claude-code" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
     { name = "pytest-aiohttp", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.3.0" },
@@ -1472,17 +1471,6 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=1.3.0" },
     { name = "slack-bolt", specifier = ">=1.18" },
 ]
-
-[[package]]
-name = "mimir-langchain-claude-code"
-version = "0.1.0"
-source = { editable = "packages/mimir-langchain-claude-code" }
-dependencies = [
-    { name = "langchain-claude-code" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "langchain-claude-code", specifier = ">=0.1.0,<0.2" }]
 
 [[package]]
 name = "mmh3"

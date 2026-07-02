@@ -46,7 +46,7 @@ them, so a missing tool shows up as an autonomous "command not found" error or
 | **`poppler-utils`** | Optional | PDF text extraction in the reading-queue / ingest pipeline. |
 | **`tesseract-ocr`** + `tesseract-ocr-eng` | Optional | OCR for scanned/image PDFs in the same pipeline. |
 | **Node.js 20+** + `npm` | Optional (source installs only) | Building the React web console (`npm run build`). PyPI and Docker installs ship the bundle **prebuilt** — see §5. |
-| coding-agent CLIs (`@openai/codex`, `@anthropic-ai/claude-code`) | Optional | Only for the codex / claude-code providers and worklink workers. Install `mimir-agent[claude-code]` for the Python adapter and `@anthropic-ai/claude-code` for the CLI. |
+| coding-agent CLIs (`@openai/codex`, `@anthropic-ai/claude-code`) | Optional | Only for the codex / claude-code providers and worklink workers. Install `mimir-agent[claude-code]` (pulls `langchain-claude-code-mimir>=0.1.2,<0.2`) for the Python adapter and `@anthropic-ai/claude-code` for the CLI. |
 
 Install the common set:
 

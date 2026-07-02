@@ -481,7 +481,7 @@ def _claude_code_install_block() -> str:
     """
     return (
         "# Claude Code CLI — optional subprocess-provider transport.\n"
-        "# Same gate as the langchain-claude-code Python provider below.\n"
+        "# Same gate as the langchain-claude-code-mimir Python provider below.\n"
         "ARG MIMIR_ENABLE_CLAUDE_CODE=0\n"
         "RUN if [ \"$MIMIR_ENABLE_CLAUDE_CODE\" = \"1\" ]; then \\\n"
         "        npm install -g @anthropic-ai/claude-code@2.1.195 ; \\\n"

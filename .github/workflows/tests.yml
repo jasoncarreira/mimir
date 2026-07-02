@@ -126,6 +126,40 @@ jobs:
           fi
           echo "ran optional-skills tests for $ran skill(s)"
 
+  claude-code-extra-smoke:
+    # The claude-code extra is the permanent install path for Anthropic Max
+    # subprocess deployments. Keep a focused CI smoke so a dependency/metadata
+    # regression cannot hide behind the default dev-only sync.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Sync dependencies (with Claude Code extra)
+        run: uv sync --extra dev --extra claude-code
+
+      - name: Import adapter and verify Mimir enforcement hook
+        run: |
+          uv run python - <<'PY'
+          import langchain_claude_code
+          from mimir import _langchain_claude_code_patches as patches
+
+          patches.assert_supported_langchain_claude_code_adapter(langchain_claude_code)
+          patches.ensure_tool_enforcement_hooks_installed(langchain_claude_code)
+          print("claude-code adapter smoke ok")
+          PY
+
   frontend:
     runs-on: ubuntu-latest
     timeout-minutes: 5

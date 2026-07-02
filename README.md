@@ -103,7 +103,7 @@ Available extras (combine in one install command — e.g. `pip install
 | `mcp` | Model Context Protocol client |
 
 For **Claude Max** (the subprocess provider via Claude Code), install the
-normal `claude-code` extra plus the Claude Code CLI:
+normal `claude-code` extra (which pulls `langchain-claude-code-mimir>=0.1.2,<0.2`) plus the Claude Code CLI:
 
 ```bash
 pip install "mimir-agent[claude-code]"
@@ -258,7 +258,7 @@ Optional extras:
 
 | Extra | Pulls | When to use |
 |---|---|---|
-| `[dev]` | pytest + bridges + Anthropic / OpenAI / Codex Plus adapters + faiss | Default for contributors — covers the agent core, saga, bridges. Claude-code-specific tests skip cleanly via `pytest.importorskip`. |
+| `[dev]` | pytest + bridges + Anthropic / OpenAI / Codex Plus adapters + faiss | Default for contributors — covers the agent core, saga, bridges. Claude Code adapter import coverage runs in CI with `[claude-code]`; `[dev]` keeps the default contributor graph lean. |
 | `[anthropic]` / `[claude-code]` / `[openai]` / `[codex-plus]` | Single model adapter | Runtime install with one model path. |
 
 Developers on the Claude Code subprocess path add the adapter extra and
@@ -271,12 +271,12 @@ claude setup-token
 ```
 
 ```bash
-# Tests — minimal toolchain (claude-code-specific tests will skip)
+# Tests — minimal toolchain
 uv pip install -e ".[dev]"
 uv run pytest                                       # 600+ tests
 uv run pytest --ignore=tests/test_bench_via_mimir.py  # skip the slow integration test
 
-# Tests — full toolchain (claude-code-specific tests will run)
+# Tests — full toolchain, including the Claude Code adapter import smoke
 uv pip install -e ".[dev]"
 uv pip install -e ".[claude-code]"
 uv run pytest

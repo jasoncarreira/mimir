@@ -23,16 +23,6 @@ def _raise_package_not_found(name: str) -> None:
     raise lcc_patches.importlib_metadata.PackageNotFoundError(name)
 
 
-class _FakeDirectUrlDistribution:
-    def __init__(self, commit_id: str) -> None:
-        self.commit_id = commit_id
-
-    def read_text(self, name: str) -> str | None:
-        if name != "direct_url.json":
-            return None
-        return '{"vcs_info": {"vcs": "git", "commit_id": "%s"}}' % self.commit_id
-
-
 # ─── Responses API heuristic ────────────────────────────────────────
 
 
@@ -247,16 +237,10 @@ class TestResolveModelClaudeCode:
                 else (_raise_package_not_found(name))
             ),
         )
-        monkeypatch.setattr(
-            lcc_patches.importlib_metadata,
-            "distribution",
-            lambda name: _raise_package_not_found(name),
-        )
-
         with pytest.raises(ImportError, match="stale PyPI adapter"):
             _resolve_model("claude-code:claude-sonnet-4-6")
 
-    def test_accepts_pinned_fork_adapter_metadata(
+    def test_accepts_controlled_pypi_adapter_metadata(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         captured: dict[str, Any] = {}
@@ -275,29 +259,27 @@ class TestResolveModelClaudeCode:
             lcc_patches.importlib_metadata,
             "version",
             lambda name: (
-                "0.1.0"
-                if name == lcc_patches.UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST
+                "0.1.2"
+                if name == lcc_patches.CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST
                 else (_raise_package_not_found(name))
             ),
-        )
-        monkeypatch.setattr(
-            lcc_patches.importlib_metadata,
-            "distribution",
-            lambda name: _FakeDirectUrlDistribution(
-                lcc_patches.PINNED_LANGCHAIN_CLAUDE_CODE_REF
-            )
-            if name == lcc_patches.UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST
-            else _raise_package_not_found(name),
         )
 
         assert _resolve_model("claude-code:claude-sonnet-4-6") == "MODEL"
         assert captured["model"] == "claude-sonnet-4-6"
 
-    def test_native_compatible_adapter_skips_mimir_monkeypatches(
+    def test_native_compatible_adapter_still_installs_mimir_enforcement_hooks(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         fake_lcc = types.ModuleType("langchain_claude_code")
         fake_ccm = types.ModuleType("langchain_claude_code.claude_chat_model")
+        fake_sdk = types.ModuleType("claude_agent_sdk")
+
+        class _FakeHookMatcher:
+            def __init__(self, *, hooks: list[Any]) -> None:
+                self.hooks = hooks
+
+        fake_sdk.HookMatcher = _FakeHookMatcher
         fake_lcc.MIMIR_COMPATIBILITY = {
             "features": sorted(lcc_patches._REQUIRED_ADAPTER_FEATURES)
         }
@@ -327,24 +309,18 @@ class TestResolveModelClaudeCode:
         monkeypatch.setitem(
             sys.modules, "langchain_claude_code.claude_chat_model", fake_ccm
         )
+        monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_sdk)
 
         original_schema = _FakeChatClaudeCode._get_tool_schema
         original_wrap = _FakeChatClaudeCode._wrap_langchain_tool
-        original_build = _FakeChatClaudeCode._build_options
-        original_aquery = _FakeChatClaudeCode._aquery
-        original_astream = _FakeChatClaudeCode._astream
 
-        lcc_patches.apply_patches()
-        lcc_patches.enrich_streaming_metadata()
-        lcc_patches.install_tool_event_hooks()
+        lcc_patches.ensure_tool_enforcement_hooks_installed(fake_lcc)
 
         assert _FakeChatClaudeCode._get_tool_schema is original_schema
         assert _FakeChatClaudeCode._wrap_langchain_tool is original_wrap
-        assert _FakeChatClaudeCode._build_options is original_build
-        assert _FakeChatClaudeCode._aquery is original_aquery
-        assert _FakeChatClaudeCode._astream is original_astream
-        assert _FakeChatClaudeCode._mimir_arun_config_patched is True
-        assert _FakeChatClaudeCode._mimir_streaming_metadata_enriched is True
+        assert _FakeChatClaudeCode._build_options is not None
+        assert _FakeChatClaudeCode._aquery is not None
+        assert _FakeChatClaudeCode._astream is not None
         assert _FakeChatClaudeCode._mimir_tool_event_hooks_installed is True
 
 

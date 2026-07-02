@@ -79,10 +79,6 @@ from .subagent_inbox import SubagentInbox, render_subagent_updates
 from .templates import render_saga_session_end
 from .usage_stats import event_recently_emitted
 
-# Idempotent runtime patch for langchain-claude-code's ``_arun`` call —
-# see the module docstring for the bug + upstream PR. No-op if the
-# claude-code extra isn't installed.
-_lcc_patches.apply_patches()
 # Empty out deepagents' BASE_AGENT_PROMPT so it isn't appended to
 # mimir's system prompt. Mimir's prompt is the complete contract
 # (persona + memory layers + conventions + skills); the deepagents
@@ -94,15 +90,6 @@ _lcc_patches.strip_deepagents_base_prompt()
 # otherwise summarization middleware can rebuild Pydantic tool schemas on
 # the asyncio loop at every model boundary (chainlink #600).
 _lcc_patches.patch_deepagents_token_counter_tool_schema_cache()
-# Preserve SDK ``ResultMessage`` fields (``stop_reason``, ``num_turns``,
-# ``is_error``) that langchain-claude-code's streaming wrapper drops —
-# without this patch ``derive_result_fields`` loses granular stop-reason
-# semantics ("max_turns" / "max_tokens" collapse to binary "stop"/"error")
-# and has to approximate ``num_turns`` via ``count(AIMessage)``. Wraps
-# ``_astream`` to copy the missing fields from the instance's
-# ``_last_result`` (which the upstream code does store) into the result
-# chunk's ``generation_info``. No-op when claude-code extra not installed.
-_lcc_patches.enrich_streaming_metadata()
 # Register PreToolUse/PostToolUse/PostToolUseFailure SDK hooks so every
 # tool invocation (built-in Bash/Read/Edit/etc, bridged langchain tools,
 # MCP tools) is captured into ``generation_info["tool_events"]`` as an
@@ -340,7 +327,7 @@ def _resolve_model(
     responses transcribe their ``x-codex-*`` headers into the
     ``RateLimitStore`` keys that :class:`OpenAIQuotaProvider` reads.
 
-    The model-provider package (``langchain-claude-code``,
+    The model-provider package (``langchain-claude-code-mimir``,
     ``langchain-anthropic``, ``langchain-codex-plus``, etc.) is a pip
     extra (see pyproject.toml's ``[project.optional-dependencies]``).
     We lazy-import here so installing only the extras you'll use keeps
@@ -384,9 +371,8 @@ def _resolve_model(
         # daemons), so the approval gate is pure friction. Match the
         # SDK invariant.
         # Thread reasoning effort when set to a real level; "none"/unset →
-        # omit it so Claude keeps its adaptive default. Needs the
-        # langchain-claude-code fork's ``effort`` field (re-pinned in
-        # pyproject) — only passed when non-empty so older builds don't choke.
+        # omit it so Claude keeps its adaptive default. Needs the maintained
+        # langchain-claude-code-mimir adapter's ``effort`` field.
         cc_kwargs: dict[str, Any] = {
             "model": model_name,
             "permission_mode": "bypassPermissions",

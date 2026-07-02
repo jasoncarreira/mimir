@@ -1,32 +1,15 @@
-"""Runtime patches for the vendored ``langchain-claude-code`` package.
+"""Runtime checks and tool-safety hooks for ``langchain_claude_code``.
 
 Upstream repo: https://github.com/thehumanworks/langchain-claude-code
 (transferred from agentmish/langchain-claude-code)
 
-Patches applied:
-
-1. **_wrap_langchain_tool (config kwarg)** — langchain-core 1.x made
-   ``_arun``'s ``config`` kwarg required. Upstream issue #1, open.
-
-2. **_get_tool_schema (InjectedToolArg / args_schema)** — upstream uses
-   ``args_schema.model_json_schema()``, which includes ``InjectedToolArg``
-   params like ``config``. Claude Code then passes ``config`` in call args;
-   ``_wrap_langchain_tool`` also injects ``config=RunnableConfig()`` →
-   "got multiple values" crash on every tool that uses InjectedToolArg.
-   Fix: use ``tool_call_schema`` (the view that correctly excludes injected
-   params) with ``args_schema`` as fallback. Upstream issue #5, open.
-
-3. **_astream enrichment** — preserves ``stop_reason``, ``num_turns``,
-   ``is_error`` from ``ResultMessage`` in ``generation_info``.
-
-4. **Tool event hooks** — installs SDK PreToolUse/PostToolUse hooks so
-   every tool invocation (built-in, bridged, MCP) is captured as a
-   ``tool_events`` list in ``generation_info``. Upstream issue #3 / PR #4.
-
-Idempotent: re-running ``apply_patches()`` after the first call is a
-no-op. Safe to import unconditionally — if langchain-claude-code isn't
-installed (e.g. operator only has the anthropic extra), the patch
-function silently returns.
+The public PyPI distribution ``langchain-claude-code-mimir`` carries the
+adapter-level fixes Mimir used to monkeypatch locally (LangChain Core 1.x
+``_arun(config=...)``, injected-tool schema filtering, and streaming result
+metadata). This module keeps Mimir-side validation plus the safety-plane hooks
+that are deliberately *not* part of the adapter package: SDK PreToolUse /
+PostToolUse callbacks that capture every Claude Code tool invocation and keep
+pre-execution enforcement available for built-in, bridged, and MCP tools.
 """
 
 from __future__ import annotations
@@ -34,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import importlib.metadata as importlib_metadata
-import json
 import logging
 import time
 from dataclasses import dataclass
@@ -44,8 +26,7 @@ log = logging.getLogger(__name__)
 
 _PATCH_MARKER = "_mimir_arun_config_patched"
 
-PINNED_LANGCHAIN_CLAUDE_CODE_REF = "c03f075c8b84fb0c718de1aabdd6493f5d191786"
-CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST = "mimir-langchain-claude-code"
+CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST = "langchain-claude-code-mimir"
 UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST = "langchain-claude-code"
 
 _REQUIRED_ADAPTER_FEATURES = frozenset(
@@ -54,7 +35,6 @@ _REQUIRED_ADAPTER_FEATURES = frozenset(
         "tool_call_schema",
         "streaming_result_metadata",
         "sdk_tool_events",
-        "sdk_tool_enforcement",
     }
 )
 
@@ -92,24 +72,6 @@ def _distribution_version(dist_name: str) -> str | None:
         return None
 
 
-def _distribution_direct_url_commit(dist_name: str) -> str | None:
-    try:
-        dist = importlib_metadata.distribution(dist_name)
-    except importlib_metadata.PackageNotFoundError:
-        return None
-    raw = dist.read_text("direct_url.json")
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    vcs_info = data.get("vcs_info")
-    if not isinstance(vcs_info, dict):
-        return None
-    commit = vcs_info.get("commit_id") or vcs_info.get("requested_revision")
-    return commit if isinstance(commit, str) else None
-
 
 def langchain_claude_code_adapter_compatibility(module: Any | None = None) -> AdapterCompatibility:
     """Validate that ``langchain_claude_code`` is a supported adapter build.
@@ -119,10 +81,9 @@ def langchain_claude_code_adapter_compatibility(module: Any | None = None) -> Ad
     ``InjectedToolArg`` fields through schemas, and drops metadata/hook data
     Mimir consumes. Supported paths are:
 
-    * a controlled distribution named ``mimir-langchain-claude-code``;
+    * a controlled distribution named ``langchain-claude-code-mimir``;
     * an adapter module explicitly declaring all required compatibility
-      features; or
-    * the historical known fork commit from chainlink #733/#734.
+      features.
     """
     if module is None:
         try:
@@ -141,14 +102,6 @@ def langchain_claude_code_adapter_compatibility(module: Any | None = None) -> Ad
         )
 
     upstream_version = _distribution_version(UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST)
-    commit = _distribution_direct_url_commit(UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST)
-    if commit == PINNED_LANGCHAIN_CLAUDE_CODE_REF:
-        version_text = f"=={upstream_version}" if upstream_version else ""
-        return AdapterCompatibility(
-            True,
-            f"{UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST}{version_text} is installed from pinned fork",
-        )
-
     if upstream_version == "0.1.0":
         return AdapterCompatibility(
             False,
@@ -199,173 +152,6 @@ _tool_events_var: contextvars.ContextVar[list[dict[str, Any]] | None] = (
 )
 
 
-def _adapter_declares_tool_enforcement(module: Any | None = None) -> bool:
-    if module is None:
-        try:
-            import langchain_claude_code as module  # type: ignore[import-untyped,no-redef]
-        except ImportError:
-            return False
-    for attr in ("MIMIR_COMPATIBILITY", "__mimir_compatibility__"):
-        compat = getattr(module, attr, None)
-        if not isinstance(compat, dict):
-            continue
-        features = compat.get("features") or compat.get("adapter_features") or ()
-        try:
-            if "sdk_tool_enforcement" in set(features):
-                return True
-        except TypeError:
-            continue
-    return False
-
-
-def apply_patches() -> None:
-    """Apply runtime patches to ``ChatClaudeCode``. Idempotent + import-safe.
-
-    Patches applied:
-
-    1. **``_wrap_langchain_tool``** — passes an empty ``RunnableConfig`` to
-       ``tool._arun`` so langchain-core 1.x's required-kwarg validation
-       doesn't raise on every tool invocation.
-
-    2. **``_get_tool_schema``** — uses ``tool.tool_call_schema`` (which
-       correctly excludes ``InjectedToolArg`` parameters like ``config``)
-       instead of ``tool.args_schema`` (which includes them). Without this,
-       the MCP schema exposed to Claude Code lists ``config`` as a callable
-       parameter; the model passes it; ``_arun`` then receives ``config``
-       from both the caller args AND from patch #1's explicit injection →
-       "got multiple values for keyword argument 'config'". The three
-       affected tools are ``send_message``, ``react``, and
-       ``fetch_channel_history`` (all use ``InjectedToolArg`` for their
-       ``config: RunnableConfig`` parameter).
-
-    Detects when the upstream ``_wrap_langchain_tool`` has been fixed
-    (signature change or body no longer calling ``_arun`` without ``config``)
-    and skips the patch in that case.
-    """
-    try:
-        from langchain_claude_code import claude_chat_model as ccm
-    except ImportError:
-        # Operator hasn't installed the claude-code extra — nothing to
-        # patch. Other model providers (anthropic, openai) are untouched.
-        return
-
-    if _adapter_has_native_mimir_compatibility():
-        setattr(ccm.ClaudeCodeChatModel, _PATCH_MARKER, True)
-        return
-
-    if getattr(ccm.ClaudeCodeChatModel, _PATCH_MARKER, False):
-        return
-
-    _orig_wrap = ccm.ClaudeCodeChatModel._wrap_langchain_tool
-    _orig_get_schema = ccm.ClaudeCodeChatModel._get_tool_schema
-
-    # Upstream-fix detection: the original method we're patching had
-    # this exact signature when the bug existed: ``(self, tool, schema)``.
-    # If upstream renames the method, changes its parameters, or fixes
-    # the underlying ``_arun`` call to pass ``config`` itself, our
-    # shim is either irrelevant or actively harmful. Bail with a
-    # warning so the operator notices and removes this module.
-    import inspect as _inspect
-    try:
-        sig = _inspect.signature(_orig_wrap)
-        params = list(sig.parameters.keys())
-        expected = ["self", "tool", "schema"]
-        if params != expected:
-            log.warning(
-                "langchain-claude-code _wrap_langchain_tool signature "
-                "changed (got %s, expected %s) — skipping mimir's "
-                "stale patch. Remove _langchain_claude_code_patches.py "
-                "after verifying upstream behavior.", params, expected,
-            )
-            setattr(ccm.ClaudeCodeChatModel, _PATCH_MARKER, True)
-            return
-        # Heuristic: if upstream source already passes ``config=`` to
-        # ``_arun``, the bug is fixed; skip.
-        src = _inspect.getsource(_orig_wrap)
-        if "_arun" in src and "config=" in src and "_arun(**args, config=" in src:
-            log.info(
-                "langchain-claude-code already passes config= to _arun — "
-                "skipping mimir's now-redundant patch.",
-            )
-            setattr(ccm.ClaudeCodeChatModel, _PATCH_MARKER, True)
-            return
-    except (TypeError, OSError):
-        # signature/getsource may fail for C-extension or oddly-wrapped
-        # functions; fall through to apply the patch (current behavior).
-        pass
-
-    # ── Patch 1: _get_tool_schema ────────────────────────────────────
-    # Use tool_call_schema (excludes InjectedToolArg fields) instead of
-    # args_schema (includes them). This prevents config from appearing in
-    # the MCP schema that Claude Code sees — Claude Code won't pass it,
-    # so _arun won't receive it twice.
-    def _patched_get_tool_schema(self, tool: Any) -> dict[str, Any]:
-        if hasattr(tool, "tool_call_schema") and tool.tool_call_schema is not None:
-            try:
-                return tool.tool_call_schema.model_json_schema()
-            except Exception:
-                pass
-        return _orig_get_schema(self, tool)
-
-    ccm.ClaudeCodeChatModel._get_tool_schema = _patched_get_tool_schema
-
-    # ── Patch 2: _wrap_langchain_tool ────────────────────────────────
-    def _patched_wrap_langchain_tool(self, tool: Any, schema: dict[str, Any]) -> Any:
-        from langchain_core.runnables import RunnableConfig
-        try:
-            from claude_agent_sdk import tool as sdk_tool
-        except ImportError:
-            # claude_agent_sdk is a dep of langchain-claude-code itself.
-            # If we can't import it, the original wrap will fail anyway —
-            # fall through to upstream for a consistent error message.
-            return _orig_wrap(self, tool, schema)
-
-        props = schema.get("properties", {})
-        type_map = {
-            "string": str, "integer": int, "number": float,
-            "boolean": bool, "array": list, "object": dict,
-        }
-        param_types = {}
-        for name, prop in props.items():
-            json_type = prop.get("type", "string")
-            param_types[name] = type_map.get(json_type, str)
-
-        @sdk_tool(tool.name, tool.description or "", param_types)
-        async def wrapped_tool(args: dict[str, Any]) -> dict[str, Any]:
-            try:
-                if hasattr(tool, "_arun") and asyncio.iscoroutinefunction(tool._arun):
-                    # Strip InjectedToolArg params that may have leaked
-                    # through the schema (belt-and-suspenders for the
-                    # _get_tool_schema fix above). If config is already in
-                    # args, passing it again via config=RunnableConfig()
-                    # raises "got multiple values for keyword argument".
-                    clean_args = {k: v for k, v in args.items() if k != "config"}
-                    result = await tool._arun(**clean_args, config=RunnableConfig())
-                else:
-                    result = tool._run(**args)
-
-                captured = (
-                    self._tool_results_var.get(None) if self._tool_results_var else None
-                )
-                if captured is not None:
-                    captured.append({
-                        "name": tool.name, "args": args, "result": result,
-                    })
-                return {"content": [{"type": "text", "text": str(result)}]}
-            except Exception as e:
-                return {
-                    "content": [{"type": "text", "text": f"Error: {e}"}],
-                    "is_error": True,
-                }
-
-        return wrapped_tool
-
-    ccm.ClaudeCodeChatModel._wrap_langchain_tool = _patched_wrap_langchain_tool
-    setattr(ccm.ClaudeCodeChatModel, _PATCH_MARKER, True)
-    log.debug(
-        "applied langchain-claude-code patches: "
-        "_get_tool_schema (tool_call_schema) + _wrap_langchain_tool (config-kwarg)"
-    )
 
 
 _DEEPAGENTS_BASE_PROMPT_MARKER = "_mimir_base_prompt_stripped"
@@ -520,88 +306,7 @@ def strip_deepagents_base_prompt() -> None:
     log.debug("stripped deepagents BASE_AGENT_PROMPT (mimir owns system prompt)")
 
 
-_STREAMING_METADATA_MARKER = "_mimir_streaming_metadata_enriched"
 
-
-def enrich_streaming_metadata() -> None:
-    """Monkey-patch ``ChatClaudeCode._astream`` to preserve SDK
-    ``ResultMessage`` fields that the upstream streaming code drops.
-
-    The original ``_astream`` (``claude_chat_model.py:_astream``)
-    builds the final result chunk's ``generation_info`` from
-    ``msg.total_cost_usd``, ``duration_ms``, ``session_id``, and a
-    BINARY ``finish_reason`` (``"stop"`` or ``"error"``). It DROPS:
-
-      - ``msg.stop_reason`` — the granular SDK reason (``"max_turns"``,
-        ``"max_tokens"``, ``"end_turn"``, etc). Collapsed to binary
-        ``finish_reason``, losing the distinction.
-      - ``msg.is_error`` — collapsed into ``finish_reason`` and never
-        surfaced as its own field.
-      - ``msg.num_turns`` — the SDK's per-request model-turn count.
-        Not preserved at all; downstream code falls back to counting
-        AIMessage chunks (different value, different semantics).
-
-    ``mimir.turn_logger.derive_result_fields`` reads all three. Without
-    this patch:
-      - ``result_subtype`` defaults to ``"success"`` even on
-        ``max_turns`` truncation (we'd need ``stop_reason`` to detect).
-      - ``result_is_error`` is ``False`` on subprocess errors that
-        manifested as ``is_error=True`` in the original ``ResultMessage``
-        (the binary ``finish_reason="error"`` is at least recoverable;
-        see fallback in ``derive_result_fields``).
-      - ``num_turns`` is approximated by ``count(AIMessage)``.
-
-    The streaming code DOES store the original ``ResultMessage`` on
-    ``self._last_result`` (line 504 of ``_astream``). We wrap the
-    method to detect the result chunk (identified by ``finish_reason``
-    in ``generation_info``) and copy the missing fields from
-    ``_last_result`` into the chunk's ``generation_info``. Pure
-    additive enrichment — no behavior change for callers that don't
-    read the new keys.
-
-    Idempotent + import-safe: a no-op when ``langchain-claude-code``
-    isn't installed. The class-attribute marker prevents double-
-    wrapping on repeated calls.
-    """
-    try:
-        from langchain_claude_code import claude_chat_model as ccm
-    except ImportError:
-        return
-
-    if _adapter_has_native_mimir_compatibility():
-        setattr(ccm.ClaudeCodeChatModel, _STREAMING_METADATA_MARKER, True)
-        return
-
-    if getattr(ccm.ClaudeCodeChatModel, _STREAMING_METADATA_MARKER, False):
-        return
-
-    _orig_astream = ccm.ClaudeCodeChatModel._astream
-
-    async def _patched_astream(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        async for chunk in _orig_astream(self, *args, **kwargs):
-            # The result chunk is the only one with ``finish_reason``
-            # in generation_info (set inside the ``elif isinstance(msg,
-            # ResultMessage):`` branch of the upstream loop). Other
-            # chunks carry text content with no generation_info.
-            gi = getattr(chunk, "generation_info", None)
-            if gi and "finish_reason" in gi:
-                last = getattr(self, "_last_result", None)
-                if last is not None:
-                    for fld in ("stop_reason", "num_turns", "is_error"):
-                        if fld in gi:
-                            continue
-                        val = getattr(last, fld, None)
-                        if val is not None:
-                            gi[fld] = val
-                    chunk.generation_info = gi
-            yield chunk
-
-    ccm.ClaudeCodeChatModel._astream = _patched_astream
-    setattr(ccm.ClaudeCodeChatModel, _STREAMING_METADATA_MARKER, True)
-    log.debug(
-        "patched ChatClaudeCode._astream to preserve "
-        "stop_reason/num_turns/is_error from ResultMessage",
-    )
 
 
 _TOOL_EVENT_HOOKS_MARKER = "_mimir_tool_event_hooks_installed"
@@ -850,17 +555,13 @@ def install_tool_event_hooks() -> None:
        ``_astream`` injects on the final chunk (the one carrying
        ``finish_reason``) so the result chunk's metadata is complete.
 
-    Idempotent + import-safe: no-op when ``langchain-claude-code`` or
-    ``claude-agent-sdk`` isn't installed. Re-running ``apply_patches``
-    skips application via the class-attribute marker.
+    Idempotent + import-safe: no-op when ``langchain-claude-code-mimir`` or
+    ``claude-agent-sdk`` isn't installed. Re-running the installer skips
+    application via the class-attribute marker.
     """
     try:
         from langchain_claude_code import claude_chat_model as ccm
     except ImportError:
-        return
-
-    if _adapter_declares_tool_enforcement() and _adapter_has_native_mimir_compatibility():
-        setattr(ccm.ClaudeCodeChatModel, _TOOL_EVENT_HOOKS_MARKER, True)
         return
 
     try:
@@ -955,9 +656,6 @@ def ensure_tool_enforcement_hooks_installed(module: Any | None = None) -> None:
             "claude-code tool enforcement unavailable: "
             "langchain_claude_code is not installed"
         ) from exc
-
-    if _adapter_declares_tool_enforcement(module):
-        return
 
     install_tool_event_hooks()
     if getattr(ccm.ClaudeCodeChatModel, _TOOL_EVENT_HOOKS_MARKER, False):
