@@ -8,11 +8,16 @@ from typing import Sequence
 import pytest
 
 from mimir.worklink.worktree import (
+    SliceMergeConflict,
+    SliceMergeSuccess,
     WorktreeLease,
     _assert_self_contained_checkout,
     cleanup_worktree,
+    create_integration_branch,
     create_isolated_checkout,
+    create_slice_worktree,
     create_worktree,
+    merge_slice_into_integration,
     prune_attempt_worktrees,
 )
 
@@ -148,6 +153,24 @@ def test_prune_attempt_worktrees_covers_relocated_isolated_checkouts(tmp_path: P
 def _git(cwd: Path, *args: str) -> str:
     out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True)
     return out.stdout.strip()
+
+
+def _repo_with_main(tmp_path: Path) -> Path:
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@e.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "checkout", "-q", "-b", "main")
+    (repo / "shared.txt").write_text("base\n")
+    _git(repo, "add", "shared.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+    _git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.write_text(exclude.read_text(encoding="utf-8") + "\n.worklink/\n", encoding="utf-8")
+    return repo
 
 
 def _repo_with_stale_local_main(tmp_path: Path) -> tuple[Path, Path, str, str]:
@@ -319,6 +342,102 @@ def test_create_worktree_real_git_slash_named_remote_base(tmp_path: Path) -> Non
     # No stray local branch named after the base was created by DWIM.
     local_branches = _git(repo, "branch", "--format=%(refname:short)").split()
     assert "integration/worklink" not in local_branches
+
+
+def test_create_integration_branch_uses_fresh_origin_base(tmp_path: Path) -> None:
+    origin, repo, stale_sha, fresh_sha = _repo_with_stale_local_main(tmp_path)
+    assert origin.exists()
+    assert _git(repo, "rev-parse", "main") == stale_sha
+
+    lease = create_integration_branch(
+        repo,
+        epic_id=771,
+        base_ref="main",
+        slug="Worktree Integration Branch Ops",
+        epic_branch_prefix="integrated/",
+    )
+
+    assert lease.branch == "integrated/771-worktree-integration-branch-ops"
+    assert lease.path == repo / ".worklink" / "epics" / "771-worktree-integration-branch-ops"
+    assert lease.base_ref == "main"
+    assert lease.local_base == "origin/main"
+    assert _git(lease.path, "branch", "--show-current") == lease.branch
+    assert _git(lease.path, "rev-parse", "HEAD") == fresh_sha
+    assert _git(repo, "rev-parse", "main") == stale_sha
+
+
+def test_create_slice_worktree_starts_at_current_integration_head(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    integration = create_integration_branch(repo, epic_id=771, base_ref="main")
+    (integration.path / "dep.txt").write_text("dependency\n")
+    _git(integration.path, "add", "dep.txt")
+    _git(integration.path, "commit", "-q", "-m", "dependency")
+    integration_head = _git(integration.path, "rev-parse", "HEAD")
+
+    lease = create_slice_worktree(repo, slice_id=772, integration_branch=integration.branch)
+
+    assert lease.branch == "issue/772-a1"
+    assert lease.base_ref == integration.branch
+    assert lease.local_base == integration_head
+    assert _git(lease.path, "branch", "--show-current") == "issue/772-a1"
+    assert _git(lease.path, "rev-parse", "HEAD") == integration_head
+    assert (lease.path / "dep.txt").read_text() == "dependency\n"
+    assert _git(repo, "branch", "--show-current") == "main"
+
+
+def test_merge_slice_into_integration_records_merge_commit_and_cleans_worktree(
+    tmp_path: Path,
+) -> None:
+    repo = _repo_with_main(tmp_path)
+    integration = create_integration_branch(repo, epic_id=771, base_ref="main")
+    lease = create_slice_worktree(repo, slice_id=772, integration_branch=integration.branch)
+    (lease.path / "slice.txt").write_text("slice\n")
+    _git(lease.path, "add", "slice.txt")
+    _git(lease.path, "commit", "-q", "-m", "slice")
+    slice_head = _git(lease.path, "rev-parse", "HEAD")
+
+    result = merge_slice_into_integration(
+        repo,
+        slice_branch=lease.branch,
+        integration_branch=integration.branch,
+    )
+
+    assert isinstance(result, SliceMergeSuccess)
+    assert result.merge_commit == _git(integration.path, "rev-parse", "HEAD")
+    assert _git(integration.path, "rev-parse", "HEAD^2") == slice_head
+    assert (integration.path / "slice.txt").read_text() == "slice\n"
+    assert not lease.path.exists()
+    assert _git(repo, "branch", "--show-current") == "main"
+
+
+def test_merge_slice_into_integration_returns_conflict_result(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    integration = create_integration_branch(repo, epic_id=771, base_ref="main")
+    (integration.path / "shared.txt").write_text("integration\n")
+    _git(integration.path, "commit", "-q", "-am", "integration change")
+    integration_head = _git(integration.path, "rev-parse", "HEAD")
+    lease = create_slice_worktree(repo, slice_id=772, integration_branch=integration.branch)
+
+    (integration.path / "shared.txt").write_text("integration again\n")
+    _git(integration.path, "commit", "-q", "-am", "integration conflict side")
+    pre_merge_head = _git(integration.path, "rev-parse", "HEAD")
+
+    (lease.path / "shared.txt").write_text("slice\n")
+    _git(lease.path, "commit", "-q", "-am", "slice conflict side")
+    assert _git(lease.path, "rev-parse", "HEAD^") == integration_head
+
+    result = merge_slice_into_integration(
+        repo,
+        slice_branch=lease.branch,
+        integration_branch=integration.branch,
+    )
+
+    assert isinstance(result, SliceMergeConflict)
+    assert result.slice_branch == lease.branch
+    assert _git(integration.path, "rev-parse", "HEAD") == pre_merge_head
+    assert _git(integration.path, "status", "--short") == ""
+    assert lease.path.exists()
+    assert _git(repo, "branch", "--show-current") == "main"
 
 
 def test_create_isolated_checkout_has_real_git_dir_and_preserves_origin(tmp_path: Path) -> None:
