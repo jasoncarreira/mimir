@@ -17,10 +17,21 @@ from langchain_core.language_models import BaseChatModel
 
 from mimir import _langchain_claude_code_patches as lcc_patches
 from mimir.agent import _resolve_model, _supports_responses_api, resolve_model_from_config
+from mimir.providers import ClaudeCodeAuthStatus
 
 
 def _raise_package_not_found(name: str) -> None:
     raise lcc_patches.importlib_metadata.PackageNotFoundError(name)
+
+
+def _allow_claude_code_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mimir.providers as providers
+
+    monkeypatch.setattr(
+        providers,
+        "claude_code_auth_status",
+        lambda **_kw: ClaudeCodeAuthStatus(True, "test auth ok", ""),
+    )
 
 
 # ─── Responses API heuristic ────────────────────────────────────────
@@ -206,6 +217,29 @@ class TestResolveModelInitChat:
 
 
 class TestResolveModelClaudeCode:
+    def test_auth_probe_failure_is_actionable(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import mimir.providers as providers
+
+        monkeypatch.setattr(
+            providers,
+            "claude_code_auth_status",
+            lambda **_kw: ClaudeCodeAuthStatus(
+                False,
+                "claude CLI is not on PATH",
+                "install/authenticate without printing credential contents",
+            ),
+        )
+        with pytest.raises(RuntimeError) as exc:
+            _resolve_model("claude-code:claude-sonnet-4-6")
+
+        msg = str(exc.value)
+        assert "Claude Code / Anthropic Max subscription auth" in msg
+        assert "not Anthropic API spend" in msg
+        assert "claude CLI is not on PATH" in msg
+        assert "sk-ant" not in msg
+
     def test_claude_code_path_returns_chat_claude_code(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -218,6 +252,7 @@ class TestResolveModelClaudeCode:
         monkeypatch.setattr(
             lcc_patches, "ensure_tool_enforcement_hooks_installed", lambda *_a, **_kw: None
         )
+        _allow_claude_code_auth(monkeypatch)
         m = _resolve_model("claude-code:claude-sonnet-4-6", max_retries=12)
         assert isinstance(m, ChatClaudeCode)
         assert m.model == "claude-sonnet-4-6"
@@ -225,6 +260,7 @@ class TestResolveModelClaudeCode:
     def test_rejects_stale_pypi_adapter(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        _allow_claude_code_auth(monkeypatch)
         fake_lcc = types.ModuleType("langchain_claude_code")
         fake_lcc.ChatClaudeCode = lambda **_kwargs: "SHOULD_NOT_CONSTRUCT"
         monkeypatch.setitem(sys.modules, "langchain_claude_code", fake_lcc)
@@ -243,6 +279,7 @@ class TestResolveModelClaudeCode:
     def test_accepts_controlled_pypi_adapter_metadata(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        _allow_claude_code_auth(monkeypatch)
         captured: dict[str, Any] = {}
         fake_lcc = types.ModuleType("langchain_claude_code")
         monkeypatch.setattr(
@@ -534,6 +571,7 @@ def test_effort_skipped_when_none(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_claude_code_gets_effort_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("langchain_claude_code")
     captured: dict[str, Any] = {}
+    _allow_claude_code_auth(monkeypatch)
 
     def _fake(**kwargs: Any) -> str:
         captured.update(kwargs)
@@ -550,6 +588,7 @@ def test_claude_code_gets_effort_when_set(monkeypatch: pytest.MonkeyPatch) -> No
 def test_claude_code_omits_effort_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("langchain_claude_code")
     captured: dict[str, Any] = {}
+    _allow_claude_code_auth(monkeypatch)
 
     def _fake(**kwargs: Any) -> str:
         captured.update(kwargs)
@@ -589,6 +628,7 @@ def test_claude_code_invalid_effort_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("langchain_claude_code")
+    _allow_claude_code_auth(monkeypatch)
     monkeypatch.setattr(
         lcc_patches, "ensure_tool_enforcement_hooks_installed", lambda *_a, **_kw: None
     )

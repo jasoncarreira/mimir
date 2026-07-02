@@ -32,8 +32,12 @@ the later slices in chainlink #292.)
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
+import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urlparse
 
 # Canonical provider labels. These are the values written to
@@ -49,7 +53,19 @@ PROVIDER_OPENAI = "openai"
 #: ``anthropic-api`` subscription flip (below) and ``detect_route``'s
 #: explicit ``claude-code:`` branch, so the string lives in one place
 #: (chainlink #292 review).
-ANTHROPIC_OAUTH_MONITOR_LABEL = "Anthropic OAuth quota poller (5h + 7d windows)"
+ANTHROPIC_OAUTH_MONITOR_LABEL = (
+    "Claude Code / Anthropic Max subscription quota poller "
+    "(Anthropic OAuth usage endpoint; 5h + 7d windows; not Anthropic API spend)"
+)
+
+
+@dataclass(frozen=True)
+class ClaudeCodeAuthStatus:
+    """Result of a non-secret Claude Code auth/credential probe."""
+
+    ok: bool
+    reason: str
+    remediation: str
 
 
 @dataclass(frozen=True)
@@ -305,11 +321,94 @@ def claude_code_available() -> bool:
     a deployment routed to a non-Claude provider (e.g. Minimax) typically
     has no ``claude`` CLI installed, so registering the tool there would
     only offer the agent something that fails with "'claude' CLI not on
-    PATH". This checks *presence*, not auth state — a present-but-unauthed
-    CLI still surfaces the tool (it fails at call time instead); auth-state
-    probing is a heavier future refinement.
+    PATH". This checks *presence* only; provider startup and diagnostics
+    use :func:`claude_code_auth_status` for the non-secret auth probe.
     """
     return shutil.which(_ANTHROPIC_MAX.requires_cli or "claude") is not None
+
+
+def claude_code_auth_status(
+    *,
+    credentials_path: Path | None = None,
+    run_smoke: bool = False,
+    timeout_seconds: float = 15.0,
+) -> ClaudeCodeAuthStatus:
+    """Probe Claude Code subscription auth without exposing tokens.
+
+    The check is intentionally diagnostic rather than a token dumper:
+    it verifies the ``claude`` CLI is installed, that either a
+    ``CLAUDE_CODE_OAUTH_TOKEN`` env token or a Claude Code
+    ``.credentials.json`` file with an OAuth block is present, and
+    optionally runs a tiny ``claude -p ping`` smoke check while discarding
+    stdout/stderr. Error strings tell the operator what to fix without
+    echoing credential contents.
+    """
+    cli = shutil.which(_ANTHROPIC_MAX.requires_cli or "claude")
+    remediation = (
+        "Install the Claude Code CLI with "
+        "`npm install -g @anthropic-ai/claude-code`, authenticate with "
+        "`claude login` for quota polling or `claude setup-token` for "
+        "inference-only use, then verify with `claude -p 'ping'`. Do not "
+        "paste tokens or ~/.claude/.credentials.json contents into chat, "
+        "logs, or Chainlink comments."
+    )
+    if cli is None:
+        return ClaudeCodeAuthStatus(False, "claude CLI is not on PATH", remediation)
+
+    has_env_token = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip())
+    path = credentials_path or Path.home() / ".claude" / ".credentials.json"
+    has_credentials = False
+    if path.is_file():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            block = raw.get("claudeAiOauth") if isinstance(raw, dict) else None
+            has_credentials = isinstance(block, dict) and bool(
+                block.get("accessToken") or block.get("refreshToken")
+            )
+        except (OSError, json.JSONDecodeError):
+            return ClaudeCodeAuthStatus(
+                False,
+                f"Claude Code credentials file is unreadable or invalid JSON: {path}",
+                remediation,
+            )
+
+    if not (has_env_token or has_credentials):
+        return ClaudeCodeAuthStatus(
+            False,
+            "Claude Code is installed but no usable OAuth token or "
+            f".credentials.json was found at {path}",
+            remediation,
+        )
+
+    if run_smoke:
+        try:
+            completed = subprocess.run(
+                [cli, "-p", "ping"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return ClaudeCodeAuthStatus(
+                False,
+                f"Claude Code smoke check could not run: {type(exc).__name__}",
+                remediation,
+            )
+        if completed.returncode != 0:
+            return ClaudeCodeAuthStatus(
+                False,
+                "Claude Code smoke check failed; the CLI is installed but "
+                "is not authenticated or cannot use the configured credentials",
+                remediation,
+            )
+
+    return ClaudeCodeAuthStatus(
+        True,
+        "Claude Code CLI and non-secret credential markers are present",
+        "",
+    )
 
 
 #: The Codex CLI that ``spawn_codex`` shells out to. Distinct from the

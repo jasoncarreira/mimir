@@ -2568,8 +2568,15 @@ def test_resolve_model_claude_code_fails_closed_without_adapter(monkeypatch):
     """claude-code stays unavailable unless its adapter can install the
     PreToolUse budget/prohibited-action enforcement hook."""
     from mimir.agent import _resolve_model
+    from mimir.providers import ClaudeCodeAuthStatus
+    import mimir.providers as providers
 
     monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    monkeypatch.setattr(
+        providers,
+        "claude_code_auth_status",
+        lambda **_kw: ClaudeCodeAuthStatus(True, "test auth ok", ""),
+    )
     with pytest.raises((ImportError, RuntimeError)) as excinfo:
         _resolve_model("claude-code:claude-sonnet-4-6")
     msg = str(excinfo.value)
@@ -2586,10 +2593,17 @@ def test_resolve_model_claude_code_home_dotenv_requires_enforcement(
     remains fail-closed until the enforcement hook is active."""
     from mimir.agent import resolve_model_from_config
     from mimir.config import Config
+    from mimir.providers import ClaudeCodeAuthStatus
+    import mimir.providers as providers
 
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
     monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    monkeypatch.setattr(
+        providers,
+        "claude_code_auth_status",
+        lambda **_kw: ClaudeCodeAuthStatus(True, "test auth ok", ""),
+    )
     (tmp_path / ".env").write_text(
         "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6\n",
         encoding="utf-8",

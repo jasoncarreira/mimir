@@ -29,10 +29,10 @@ def test_window_hours_omits_open_ended_windows():
 
 def test_store_label_map_covers_all_providers():
     labels = qw.store_label_map()
-    assert labels["five_hour"] == "5-hour rolling"
+    assert labels["five_hour"] == "Claude Code Max 5-hour"
     assert labels["minimax_five_hour"] == "Minimax 5-hour"
     assert labels["openai_seven_day"] == "Codex Plus 7-day"
-    assert labels["overage"] == "Overage / pay-as-you-go"
+    assert labels["overage"] == "Claude Code Max overage / pay-as-you-go"
 
 
 def test_store_window_hours_omits_overage():

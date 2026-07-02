@@ -321,8 +321,8 @@ def test_render_plan_quota_lines_shows_only_active_provider_via_filter():
     )
     assert "Codex Plus 5-hour" in blob
     assert "Codex Plus 7-day" in blob
-    assert "5-hour rolling" not in blob   # the Anthropic 5h label
-    assert "7-day plan-wide" not in blob  # the Anthropic 7d label
+    assert "Claude Code Max 5-hour" not in blob
+    assert "Claude Code Max 7-day" not in blob
 
 
 def test_off_pace_fires_for_provider_windows():
@@ -440,10 +440,10 @@ def test_render_orders_known_keys_first():
     lines = render_plan_quota_lines(snaps)
     # Verify order via the labels present.
     labels = [line.split(" — ")[0] for line in lines]
-    assert labels[0] == "5-hour rolling"
-    assert labels[1] == "7-day plan-wide"
-    assert labels[2] == "7-day Opus"
-    assert labels[3] == "Overage / pay-as-you-go"
+    assert labels[0] == "Claude Code Max 5-hour"
+    assert labels[1] == "Claude Code Max 7-day"
+    assert labels[2] == "Claude Code Max 7-day Opus"
+    assert labels[3] == "Claude Code Max overage / pay-as-you-go"
 
 
 def test_render_includes_status_when_not_allowed():
@@ -736,7 +736,7 @@ def test_off_pace_warning_lists_each_bucket_with_resets():
     lines = render_off_pace_warning([("seven_day_opus", snap, proj)])
     # The verb line plus one bullet per bucket.
     assert len(lines) == 2
-    assert "7-day Opus" in lines[1]
+    assert "Claude Code Max 7-day Opus" in lines[1]
     assert "80% used" in lines[1]
     assert "140%" in lines[1]
     assert "in 1h" in lines[1]

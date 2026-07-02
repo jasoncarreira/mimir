@@ -70,7 +70,8 @@ class ProviderQuotaWindows:
 _HOUR = 1.0
 _WEEK_HOURS = 24.0 * 7
 
-# Anthropic Max OAuth (store keys are un-prefixed). Populated by
+# Claude Code / Anthropic Max OAuth subscription (store keys are
+# un-prefixed). Populated by
 # ``mimir/oauth_usage_poller.py`` under Max OAuth and the SDK rate-limit
 # capture path under direct API keys. The per-model 7d sub-windows are
 # Anthropic-specific; ``overage`` is the open-ended pay-as-you-go bolt-on.
@@ -78,11 +79,19 @@ ANTHROPIC = ProviderQuotaWindows(
     provider="anthropic",
     store_key_prefix="",
     windows=(
-        QuotaWindowSpec("five_hour", "5-hour rolling", 5.0),
-        QuotaWindowSpec("seven_day", "7-day plan-wide", _WEEK_HOURS),
-        QuotaWindowSpec("seven_day_opus", "7-day Opus", _WEEK_HOURS),
-        QuotaWindowSpec("seven_day_sonnet", "7-day Sonnet", _WEEK_HOURS),
-        QuotaWindowSpec("overage", "Overage / pay-as-you-go", None),
+        QuotaWindowSpec("five_hour", "Claude Code Max 5-hour", 5.0),
+        QuotaWindowSpec("seven_day", "Claude Code Max 7-day", _WEEK_HOURS),
+        QuotaWindowSpec("seven_day_opus", "Claude Code Max 7-day Opus", _WEEK_HOURS),
+        QuotaWindowSpec(
+            "seven_day_sonnet",
+            "Claude Code Max 7-day Sonnet",
+            _WEEK_HOURS,
+        ),
+        QuotaWindowSpec(
+            "overage",
+            "Claude Code Max overage / pay-as-you-go",
+            None,
+        ),
     ),
 )
 
