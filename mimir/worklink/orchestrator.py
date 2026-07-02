@@ -147,6 +147,8 @@ class ChainlinkIssueReader:
 
 
 def validate_leaf(issue: IssueContext) -> None:
+    if "worklink:epic" in issue.labels:
+        return
     missing = missing_leaf_template_parts(issue.description)
     if not missing:
         return
@@ -178,6 +180,8 @@ def _demote_template_invalid_ready_leaf(
     a pre-claim validation transition, not a worker attempt.
     """
 
+    if "worklink:epic" in issue.labels:
+        return
     if "worklink:ready" not in issue.labels:
         return
 

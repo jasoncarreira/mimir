@@ -28,7 +28,9 @@ dependencies = [
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "fastembed>=0.4",
-    "deepagents>=0.6.1",
+    # Worklink epic role-runner bridge uses DeepAgents task-tool internals;
+    # guard at runtime and keep the dependency inside the known-compatible 0.6 line.
+    "deepagents>=0.6.1,<0.7",
     "langchain>=1.3",
     "requests>=2.33.1",
 ]

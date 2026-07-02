@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -11,7 +11,17 @@ import pytest
 
 from mimir.worklink.backends import ComputeCaps, ComputeResult, RawResult, WorkOrder
 from mimir.worklink.compute import WorkSpec
-from mimir.worklink.epic import ChainlinkEpicClient, EpicRunner, EpicTestStatus, LeafIssue, compute_waves
+from mimir.worklink.epic import (
+    ChainlinkEpicClient,
+    EpicRunResult,
+    EpicRunner,
+    EpicTestStatus,
+    LeafIssue,
+    MissingEpicRoleRunner,
+    compute_waves,
+)
+from mimir.worklink.epic_state import EpicRunManifest
+from mimir.worklink.epic_roles import EpicSubagentRoleRunner
 from mimir.worklink.evidence import (
     CommandResult,
     EvidenceValidation,
@@ -255,6 +265,185 @@ def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
     if list(args)[:4] == ["git", "-C", "/repo"]:
         return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
     return cp(args)
+
+
+@pytest.mark.asyncio
+async def test_epic_subagent_role_runner_maps_structured_role_outputs() -> None:
+    decomposition = WorkDecomposition(
+        summary="split",
+        leaves=[
+            WorklinkLeafSpec(
+                title="Leaf A",
+                acceptance_criteria=["A works"],
+                review_criteria=["review A"],
+                scope_paths=["a.py"],
+                suggested_test_command="true",
+            )
+        ],
+    )
+    outputs = {
+        "work-decomposer": decomposition,
+        "decompose-reviewer": DecomposeReview(verdict="APPROVE", summary="ok"),
+        "per-slice-reviewer": SliceReview(verdict="APPROVE", summary="slice ok"),
+        "integration-validator": IntegrationValidation(verdict="GO", summary="integrated"),
+    }
+    calls: list[tuple[str, type[Any], str]] = []
+
+    async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
+        calls.append((role, model_type, prompt))
+        return outputs[role]
+
+    roles = EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker)
+    epic = issue(100, parent_id=None, labels={"worklink:epic"})
+    manifest = EpicRunManifest(
+        epic_id=100,
+        integration_branch="epic/100-integration",
+        integration_worktree="/tmp/integration",
+        base_ref="main",
+        phase="integrate",
+        slices=[],
+    )
+
+    assert await roles.decompose(epic) is decomposition
+    assert (await roles.review_decomposition(epic, decomposition)).verdict == "APPROVE"
+    slice_review = await roles.review_slice(
+        leaf=LeafIssue(issue(101)),
+        evidence=ready_validation(101),
+        mode="single",
+        reviewer_count=1,
+    )
+    integration = await roles.validate_integration(
+        epic=epic,
+        manifest=manifest,
+        partial=False,
+        blocked={},
+    )
+    assert slice_review.verdict == "APPROVE"
+    assert integration.verdict == "GO"
+    assert [(role, model_type) for role, model_type, _ in calls] == [
+        ("work-decomposer", WorkDecomposition),
+        ("decompose-reviewer", DecomposeReview),
+        ("per-slice-reviewer", SliceReview),
+        ("integration-validator", IntegrationValidation),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_epic_slice_review_multi_vote_unanimous_approve_skips_verification() -> None:
+    votes = [
+        SliceReview(verdict="APPROVE", summary="ok"),
+        SliceReview(verdict="APPROVE", summary="ok"),
+        SliceReview(verdict="APPROVE", summary="ok"),
+    ]
+    prompts: list[str] = []
+
+    async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
+        assert role == "per-slice-reviewer"
+        assert model_type is SliceReview
+        prompts.append(prompt)
+        return votes.pop(0)
+
+    review = await EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker).review_slice(
+        leaf=LeafIssue(issue(101)),
+        evidence=ready_validation(101),
+        mode="multi",
+        reviewer_count=3,
+    )
+
+    assert review.verdict == "APPROVE"
+    assert review.required_fixes == []
+    assert len(prompts) == 3
+
+
+@pytest.mark.asyncio
+async def test_epic_slice_review_multi_vote_verified_real_dissent_blocks() -> None:
+    responses = [
+        SliceReview(verdict="APPROVE", summary="ok"),
+        SliceReview(verdict="REJECT", summary="real bug", required_fixes=["fix A"]),
+        SliceReview(verdict="APPROVE", summary="ok"),
+        SliceReview(verdict="REJECT", summary="verified real", required_fixes=["fix A"]),
+    ]
+    prompts: list[str] = []
+
+    async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
+        prompts.append(prompt)
+        return responses.pop(0)
+
+    review = await EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker).review_slice(
+        leaf=LeafIssue(issue(101)),
+        evidence=ready_validation(101),
+        mode="multi",
+        reviewer_count=3,
+    )
+
+    assert review.verdict == "REJECT"
+    assert review.required_fixes == ["fix A"]
+    assert "Verify the dissenting per-slice review findings" in prompts[-1]
+    assert "Do not decide by vote count" in prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_epic_slice_review_multi_vote_spurious_dissent_does_not_block() -> None:
+    responses = [
+        SliceReview(verdict="APPROVE", summary="ok"),
+        SliceReview(verdict="REJECT", summary="hallucinated", required_fixes=["extra test"]),
+        SliceReview(verdict="APPROVE", summary="ok"),
+        SliceReview(verdict="APPROVE", summary="dissent unsupported"),
+    ]
+
+    async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
+        return responses.pop(0)
+
+    review = await EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker).review_slice(
+        leaf=LeafIssue(issue(101)),
+        evidence=ready_validation(101),
+        mode="multi",
+        reviewer_count=3,
+    )
+
+    assert review.verdict == "APPROVE"
+    assert review.required_fixes == []
+
+
+@pytest.mark.asyncio
+async def test_epic_slice_reviewer_prompt_uses_observed_diff_and_tests_not_worker_prose() -> None:
+    evidence = ready_validation(101)
+    evidence = replace(evidence, evidence=replace(evidence.evidence, transcript="/tmp/worker-transcript"))
+    prompts: list[str] = []
+
+    async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
+        prompts.append(prompt)
+        return SliceReview(verdict="APPROVE", summary="ok")
+
+    await EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker).review_slice(
+        leaf=LeafIssue(issue(101)),
+        evidence=evidence,
+        mode="single",
+        reviewer_count=1,
+    )
+
+    prompt = prompts[0]
+    assert "Observed diff stat:" in prompt
+    assert "file.txt | 1 +" in prompt
+    assert "Observed test result:" in prompt
+    assert "- Command: true" in prompt
+    assert "Controller-OBSERVED evidence only" in prompt
+    assert "worker-transcript" not in prompt
+
+
+def test_run_epic_wires_real_role_runner_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import mimir.worklink.epic as epic_mod
+
+    async def fake_run(self: EpicRunner, epic_id: int, **kwargs: object) -> EpicRunResult:
+        assert isinstance(self.roles, EpicSubagentRoleRunner)
+        assert not isinstance(self.roles, MissingEpicRoleRunner)
+        return EpicRunResult(epic_id, "completed")
+
+    monkeypatch.setattr(EpicRunner, "run", fake_run)
+
+    result = epic_mod.run_epic(home=tmp_path, repo=Path("/repo"), epic_id=100)
+
+    assert result.status == "completed"
 
 
 def patch_git(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -599,7 +788,7 @@ def test_child_leaves_preserve_created_at_and_classify_high_risk_scope_multi() -
                     {
                         "id": 101,
                         "title": "Leaf",
-                        "description": """Acceptance criteria:\n- [ ] Works\n\nReview criteria:\n- Verify it\n\nWorklink notes:\n- Scope: mimir/worklink/orchestrator.py, tests/test_worklink_epic.py\n- Out of scope: unrelated\n- Suggested test command: pytest -q\n""",
+                        "description": """Acceptance criteria:\n- [ ] Works\n\nReview criteria:\n- Verify it\n\nWorklink notes:\n- Scope: services/auth/session.py, tests/test_worklink_epic.py\n- Out of scope: unrelated\n- Suggested test command: pytest -q\n""",
                         "labels": ["worklink:ready"],
                         "parent_id": 100,
                         "blocked_by": [],
@@ -612,7 +801,7 @@ def test_child_leaves_preserve_created_at_and_classify_high_risk_scope_multi() -
     leaf = ChainlinkEpicClient(runner=fake_runner).child_leaves(100)[0]
 
     assert leaf.issue.created_at == datetime(2026, 7, 2, tzinfo=UTC)
-    assert leaf.scope_paths == ("mimir/worklink/orchestrator.py", "tests/test_worklink_epic.py")
+    assert leaf.scope_paths == ("services/auth/session.py", "tests/test_worklink_epic.py")
     from mimir.worklink.review import classify_leaf_review_risk
 
     assert classify_leaf_review_risk(scope_paths=list(leaf.scope_paths)) == "multi"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
 from typing import Literal
 
@@ -189,14 +190,14 @@ def classify_leaf_review_risk(
     if normalized_labels & high_risk_labels:
         return "multi"
 
-    prefixes = tuple(
-        _normalize_scope_path(prefix).rstrip("/")
-        for prefix in config.high_risk_scope_prefixes
-        if str(prefix).strip()
+    patterns = tuple(
+        _normalize_scope_path(pattern)
+        for pattern in config.high_risk_scope_patterns
+        if str(pattern).strip()
     )
     for raw_path in scope_paths:
         path = _normalize_scope_path(raw_path)
-        if any(_path_has_prefix(path, prefix) for prefix in prefixes):
+        if any(_path_matches_pattern(path, pattern) for pattern in patterns):
             return "multi"
     return "single"
 
@@ -206,8 +207,8 @@ def _normalize_scope_path(path: str) -> str:
     return normalized.removeprefix("./")
 
 
-def _path_has_prefix(path: str, prefix: str) -> bool:
-    return path.startswith(prefix)
+def _path_matches_pattern(path: str, pattern: str) -> bool:
+    return fnmatchcase(path, pattern) or fnmatchcase(f"/{path}", pattern)
 
 
 def build_worklink_review_subagents() -> list[dict]:
