@@ -70,6 +70,47 @@ Observed safe probes:
 Result: blocked. No live `claude-code:*` model call was possible, so the route
 must remain unpromoted.
 
+## 2026-07-02 Local Operator-Container Soak
+
+Local run from a #739 worktree rebased onto `origin/main` passed the source-level
+preflight and live Claude Code probes:
+
+- `git rev-parse HEAD` = `2145b60c50164be213e5ccb8bca466f00d72072d`, with
+  `origin/main` = `d0682c04980a0ade65b64e462f345862c93d833b`.
+- `uv run --extra claude-code` installed `langchain-claude-code-mimir==0.1.2`;
+  `langchain-claude-code` was not installed in that worktree venv.
+- `mimir._langchain_claude_code_patches.ensure_tool_enforcement_hooks_installed`
+  was present and returned successfully against the adapter.
+- `claude --version` returned `2.1.185 (Claude Code)`.
+- `mimir.providers.claude_code_auth_status(run_smoke=True)` returned `ok=True`
+  without printing credential contents.
+- `_resolve_model("claude-code:sonnet")` returned `ClaudeCodeChatModel` with
+  `permission_mode="bypassPermissions"`.
+- Auth-degraded probe with a nonexistent credentials path returned `ok=False`
+  with actionable remediation and no secret output.
+- Direct live prohibited-action canary: Claude Code attempted a Bash call whose
+  command text contained a force-push-to-main string; the PreToolUse hook blocked
+  it before execution and recorded paired `tool_call`/`tool_result` events.
+- Harnessed turn-path probes for `user_message`, `scheduled_tick`, and `poller`
+  all completed with `stop_reason="end_turn"`, non-error result fields,
+  `total_cost_usd`, usage metadata, explicit `send_message` delivery, and paired
+  Claude Code tool events.
+
+Blocker found: the live mimirbot helper installed in the container at
+`/usr/local/bin/mimirbot-agent.sh` still runs `uv sync --extra discord --extra
+codex-plus` and then, when `MIMIR_ALLOW_CLAUDE_CODE=1`, post-installs the stale
+`langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@...`
+fork. The currently-running daemon venv therefore showed
+`langchain-claude-code==0.1.0` and no `langchain-claude-code-mimir` before the
+worktree-specific `uv run --extra claude-code` checks. A plain source pull plus
+restart can still boot the merged code against the stale adapter and fail the
+adapter support assertion.
+
+Result: source-level soak is positive, but promotion remains blocked until the
+baked helper/image path is reconciled to install the `claude-code` extra (or
+otherwise install `langchain-claude-code-mimir>=0.1.2,<0.2`) and stop
+post-installing the old fork.
+
 ## Promotion Rule
 
 Only after all required live cases pass may the maintainer update
