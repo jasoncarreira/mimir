@@ -2353,7 +2353,6 @@ class Scheduler:
                     events_log,
                     days=days,
                     home=home,
-                    memory_health_artifact=str(out),
                 )
                 body = render_markdown(report)
                 out.parent.mkdir(parents=True, exist_ok=True)

@@ -472,7 +472,6 @@ def test_render_markdown_includes_memory_health_summary():
                     suggestion="Add backlinks or tag as orphan intentionally.",
                 )
             ],
-            artifact="/mimir-home/state/reports/introspection-2026-05-01.md",
         ),
     )
 
@@ -481,7 +480,7 @@ def test_render_markdown_includes_memory_health_summary():
     assert "## Memory Health" in body
     assert "Status: **warning**" in body
     assert "error=0, warning=2, info=1" in body
-    assert "Full report artifact" in body
+    assert "Full report artifact" not in body
     assert "state/wiki/concepts/orphan.md" in body
 
 
@@ -496,9 +495,7 @@ def test_aggregate_includes_memory_health_when_home_is_provided(tmp_path: Path):
         days=7,
         now=NOW,
         home=tmp_path,
-        memory_health_artifact="/tmp/report.md",
     )
 
     assert rep.memory_health is not None
-    assert rep.memory_health.artifact == "/tmp/report.md"
     assert rep.memory_health.status in {"ok", "warning", "error"}

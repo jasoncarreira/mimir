@@ -24,7 +24,8 @@ report computed once. Produces a markdown summary covering:
 Data sources: ``logs/turns.jsonl``, ``logs/events.jsonl``, and (for the
 skill-health section) the installed-skill inventory + a read-only saga
 connection for the negative-learning count. When ``home`` is provided, the
-memory-health section also calls :mod:`mimir.memory_doctor` read-only.
+report also includes home-gated sections such as skill health and the
+memory-health section, which calls :mod:`mimir.memory_doctor` read-only.
 
 Algedonic side-effect: when ``--emit-algedonic`` is set and heartbeat
 success rate falls below ``--health-threshold``, append a
@@ -169,7 +170,6 @@ class MemoryHealthSummary:
     severity_counts: dict[str, int]
     section_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     top_findings: list[MemoryHealthFinding] = field(default_factory=list)
-    artifact: str | None = None
     error: str | None = None
 
 
@@ -276,17 +276,15 @@ _SKILL_REFINE_NEG_LEARNINGS = 3     # negative-kind learnings in window → refi
 def _build_memory_health(
     home: "Path | None",
     *,
-    artifact: str | None = None,
     top_n: int = 8,
 ) -> MemoryHealthSummary | None:
     """Run ``mimir memory doctor`` read-only and collapse it to the section
     needed in the introspection report.
 
     Best-effort by design: a doctor failure should appear as a Memory Health
-    error row, not fail the whole behavioral report. The ``artifact`` value is
-    a pointer to the containing introspection report when the scheduler/CLI
-    persists one; the compact summary remains useful even without a separate
-    JSON artifact.
+    error row, not fail the whole behavioral report. The compact summary is
+    self-contained; callers that want the full doctor detail should run
+    ``mimir memory doctor --json`` separately.
     """
     if home is None:
         return None
@@ -299,7 +297,6 @@ def _build_memory_health(
         return MemoryHealthSummary(
             status="error",
             severity_counts={"error": 1, "warning": 0, "info": 0},
-            artifact=artifact,
             error=f"{type(exc).__name__}: {exc}",
         )
 
@@ -326,7 +323,6 @@ def _build_memory_health(
             )
             for f in findings
         ],
-        artifact=artifact,
     )
 
 
@@ -433,7 +429,6 @@ def aggregate(
     saga_conn: object | None = None,
     recent_error_hours: int = 24,
     error_recurrence_top_n: int = 10,
-    memory_health_artifact: str | None = None,
 ) -> Report:
     """Walk turns.jsonl + events.jsonl once, build a Report.
 
@@ -657,10 +652,7 @@ def aggregate(
         skill_counts=skill_counts,
         saga_conn=saga_conn,
     )
-    memory_health = _build_memory_health(
-        home,
-        artifact=memory_health_artifact,
-    )
+    memory_health = _build_memory_health(home)
 
     return Report(
         days=days,
@@ -738,8 +730,6 @@ def render_markdown(report: Report) -> str:
             f"warning={mh.severity_counts.get('warning', 0)}, "
             f"info={mh.severity_counts.get('info', 0)})"
         )
-        if mh.artifact:
-            lines.append(f"- Full report artifact: `{mh.artifact}`")
         if mh.error:
             lines.append(f"- Doctor run failed: `{mh.error}`")
         if mh.section_counts:
@@ -986,7 +976,6 @@ def run(args: argparse.Namespace) -> int:
             days=args.days,
             home=home,
             saga_conn=saga_conn,
-            memory_health_artifact=str(args.output) if args.output else None,
         )
     finally:
         if saga_conn is not None:
