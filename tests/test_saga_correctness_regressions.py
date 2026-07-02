@@ -683,6 +683,67 @@ async def test_consolidate_removes_dedup_tombstoned_from_faiss_index(
 
 
 @pytest.mark.asyncio
+async def test_consolidate_keeps_rollback_branch_live_atom_in_faiss_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """chainlink #748: if a stale overlapping dedup cluster picks a canonical
+    already tombstoned by an earlier cluster, the rolled-back cluster must not
+    report its duplicate as tombstoned or remove that live atom from FAISS."""
+    from mimir.saga.client import SagaStore
+    from mimir.saga.mark_access import AccessEvent, mark_access
+    import mimir.saga.cluster as cluster_mod
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "t.saga.db", embedding_dim=4)
+    stored: list[str] = []
+    for i in range(20):
+        res = await store.store(
+            content=f"dedup rollback fact {i}",
+            stream="semantic",
+        )
+        stored.append(res["atom_id"])
+    a, b, c = stored[:3]
+
+    conn = store._ensure_conn()
+    for _ in range(3):
+        mark_access(conn, [AccessEvent(atom_id=a, source="retrieval")])
+    conn.execute("DELETE FROM access_events WHERE atom_id = ?", (c,))
+    conn.execute("DELETE FROM atom_access_summary WHERE atom_id = ?", (c,))
+    conn.execute("UPDATE atoms SET is_pinned = 1 WHERE id = ?", (b,))
+    conn.commit()
+
+    index = store._ensure_index(conn)
+    assert index is not None and len(index._id_to_pos) == 20
+
+    def forced_cluster_fn(raws):
+        by_id = {raw["id"]: raw for raw in raws}
+        return [[by_id[a], by_id[b]], [by_id[b], by_id[c]]]
+
+    monkeypatch.setattr(
+        cluster_mod, "make_default_cluster_fn",
+        lambda *_args, **_kwargs: forced_cluster_fn,
+    )
+
+    async def _unused_synth(*_args, **_kwargs):
+        raise AssertionError("high min_cluster_size should skip synthesis")
+
+    store._rich_synth_fn = _unused_synth
+
+    result = await store.consolidate(dedup_first=True, min_cluster_size=99)
+
+    tombstoned = result["dedup"]["duplicates_tombstoned"]
+    assert tombstoned == [b]
+    assert c not in tombstoned
+    assert conn.execute(
+        "SELECT tombstoned FROM atoms WHERE id = ?", (c,),
+    ).fetchone()[0] == 0
+    assert c in index._id_to_pos
+    assert c in {atom_id for atom_id, _score in index.search(
+        [1.0, 0.0, 0.0, 0.0], top_k=20,
+    )}
+
+
+@pytest.mark.asyncio
 async def test_consolidate_restructure_tombstones_orphan_on_rollback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
