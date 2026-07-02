@@ -18,7 +18,15 @@ from ..compute import (
 from .base import Caps, RawResult, ToolBackend, WorkOrder
 from .claude_cli import ClaudeCliBackend
 from .codex import CodexBackend
-from .registry import BackendRegistry, ToolPin, WorklinkConfig, WorklinkDefaults, WorklinkRoute
+from .registry import (
+    WORKLINK_MERGED_LABEL,
+    BackendRegistry,
+    TieredReviewConfig,
+    ToolPin,
+    WorklinkConfig,
+    WorklinkDefaults,
+    WorklinkRoute,
+)
 
 __all__ = [
     "BackendRegistry",
@@ -40,6 +48,8 @@ __all__ = [
     "RawResult",
     "ToolBackend",
     "ToolPin",
+    "TieredReviewConfig",
+    "WORKLINK_MERGED_LABEL",
     "WorkOrder",
     "WorkSpec",
     "WorklinkConfig",
