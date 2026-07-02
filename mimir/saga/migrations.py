@@ -14,7 +14,7 @@ The public surface:
 - :func:`detect_schema_version` — PRAGMA-based introspection for
   pre-migration-era DBs (chainlink #175).
 - :func:`apply_pending_migrations` — walks the registry and applies
-  pending DDL.
+  pending DDL statement-by-statement inside per-migration transactions.
 
 Tests monkeypatch the registry by setting ``SagaStore.MIGRATIONS`` and
 ``SagaStore.CURRENT_SCHEMA_VERSION``; those class attributes still
@@ -26,8 +26,9 @@ time so monkeypatched values are honored.
 from __future__ import annotations
 
 import sqlite3
+import re
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Callable, Iterator
 
 
 CURRENT_SCHEMA_VERSION: int = 6
@@ -35,7 +36,7 @@ CURRENT_SCHEMA_VERSION: int = 6
 # Registry of post-greenfield schema changes. Keys are version
 # numbers (must be > 1, must be contiguous, must equal
 # ``CURRENT_SCHEMA_VERSION`` at the latest entry); values are raw
-# SQL scripts executed via ``conn.executescript``.
+# SQL scripts executed inside per-migration transactions.
 MIGRATIONS: dict[int, str] = {
     2: """
 -- Ensure sessions table exists on DBs created before schema.sql included it.
@@ -234,11 +235,10 @@ WHERE a.source_type = 'session_boundary'
         -- SQLite does not support ALTER TABLE ... MODIFY CONSTRAINT, so
         -- we use the standard CREATE + COPY + DROP + RENAME pattern.
         -- NOTE: FK enforcement is disabled at the connection level by
-        -- _apply_pending_migrations before calling executescript, and
-        -- restored afterwards. PRAGMA foreign_keys=OFF/ON inside
-        -- executescript would be a no-op (PRAGMAs that modify
-        -- connection state cannot be set within a transaction, and
-        -- executescript runs inside an implicit transaction).
+        -- _apply_pending_migrations before applying this script, and
+        -- restored afterwards. PRAGMA foreign_keys=OFF/ON inside the
+        -- migration script would be a no-op because PRAGMAs that modify
+        -- connection state cannot be set within a transaction.
 
         -- ── Orphan cleanup (belt + suspenders; the COPY step filters
         --    too, but explicit DELETEs make the before/after legible) ──
@@ -456,6 +456,85 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
     return 2  # sessions exists but no structured columns
 
 
+def _statement_has_sql(statement: str) -> bool:
+    without_line_comments = re.sub(r"--[^\n]*", "", statement)
+    without_comments = re.sub(
+        r"/\*.*?\*/", "", without_line_comments, flags=re.DOTALL
+    )
+    return bool(without_comments.strip())
+
+
+def _iter_sql_statements(script: str) -> Iterator[str]:
+    pending: list[str] = []
+    for char in script:
+        pending.append(char)
+        statement = "".join(pending)
+        if sqlite3.complete_statement(statement):
+            if _statement_has_sql(statement):
+                yield statement
+            pending.clear()
+
+    statement = "".join(pending)
+    if _statement_has_sql(statement):
+        yield statement
+
+
+_ADD_COLUMN_RE = re.compile(
+    r"""
+    \A\s*
+    (?:--[^\n]*\n\s*)*
+    ALTER\s+TABLE\s+
+    (?:"(?P<table_dq>[^"]+)"|`(?P<table_bt>[^`]+)`|\[(?P<table_br>[^\]]+)\]|(?P<table>\w+))
+    \s+ADD\s+(?:COLUMN\s+)?
+    (?:"(?P<col_dq>[^"]+)"|`(?P<col_bt>[^`]+)`|\[(?P<col_br>[^\]]+)\]|(?P<col>\w+))
+    \b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _identifier_from_match(match: re.Match[str], *names: str) -> str:
+    for name in names:
+        value = match.group(name)
+        if value is not None:
+            return value
+    raise AssertionError("missing SQL identifier capture")
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table!r})").fetchall()
+    return any(str(row[1]).casefold() == column.casefold() for row in rows)
+
+
+def _is_duplicate_add_column(
+    conn: sqlite3.Connection,
+    statement: str,
+    exc: sqlite3.OperationalError,
+) -> bool:
+    if "duplicate column name" not in str(exc).casefold():
+        return False
+    match = _ADD_COLUMN_RE.match(statement)
+    if match is None:
+        return False
+    table = _identifier_from_match(
+        match, "table_dq", "table_bt", "table_br", "table"
+    )
+    column = _identifier_from_match(
+        match, "col_dq", "col_bt", "col_br", "col"
+    )
+    return _column_exists(conn, table, column)
+
+
+def _execute_migration_script(conn: sqlite3.Connection, ddl: str) -> None:
+    for statement in _iter_sql_statements(ddl):
+        try:
+            conn.execute(statement)
+        except sqlite3.OperationalError as exc:
+            if _is_duplicate_add_column(conn, statement, exc):
+                continue
+            raise
+
+
 def apply_pending_migrations(
     conn: sqlite3.Connection,
     *,
@@ -557,22 +636,28 @@ def apply_pending_migrations(
             continue
         if version > target_version:
             break
-        # PRAGMA foreign_keys=ON/OFF inside executescript is a no-op:
-        # ``executescript`` issues an implicit COMMIT, which means it
-        # runs inside a transaction — connection-level PRAGMAs like
-        # ``foreign_keys`` cannot be set within a transaction. Control
-        # FK enforcement at the connection level instead, around the
-        # executescript call. Table-restructuring migrations (CREATE +
-        # COPY + DROP + RENAME) need FK=OFF during the intermediate
-        # state where both old and new tables exist; restoring ON
-        # afterward ensures constraints are enforced for all subsequent
-        # DML.
+        # PRAGMA foreign_keys=ON/OFF inside migration scripts is a no-op
+        # once the per-migration transaction has started.
+        # ``executescript`` would issue an implicit COMMIT before the
+        # script and leave a process-crash window where DDL is durable
+        # but the schema_version stamp is not. Execute statements inside
+        # our own per-migration transaction instead, so the DDL and stamp
+        # commit at the same boundary. Table-restructuring migrations
+        # (CREATE + COPY + DROP + RENAME) still need FK=OFF during the
+        # intermediate state where both old and new tables exist.
+        conn.commit()
         conn.execute("PRAGMA foreign_keys=OFF")
-        conn.executescript(ddl)
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute(
-            "INSERT INTO schema_version (version, applied_at) "
-            "VALUES (?, ?)",
-            (version, datetime.now(tz=timezone.utc).isoformat()),
-        )
-    conn.commit()
+        try:
+            conn.execute("BEGIN")
+            _execute_migration_script(conn, ddl)
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) "
+                "VALUES (?, ?)",
+                (version, datetime.now(tz=timezone.utc).isoformat()),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")

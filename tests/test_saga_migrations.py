@@ -141,3 +141,85 @@ class TestApplyPendingMigrations:
             "SELECT version FROM schema_version"
         )}
         assert versions == {1}
+
+    def test_unstamped_add_column_migration_can_be_replayed(self) -> None:
+        """Regression for an interrupted v4 migration.
+
+        Older migration code ran ``executescript(ddl)`` and stamped
+        ``schema_version`` afterward. If the process died after v4's
+        ``ALTER TABLE`` statements but before the v4 stamp committed, the
+        next open retried v4 and raised ``duplicate column name``.
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                emotional_state TEXT,
+                closed_since TEXT NOT NULL DEFAULT '[]',
+                embedding BLOB,
+                embedding_dim INTEGER
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (3, '2000-01-01T00:00:00+00:00');
+            """
+        )
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=4,
+            migrations={4: m.MIGRATIONS[4]},
+        )
+
+        versions = {r[0] for r in conn.execute(
+            "SELECT version FROM schema_version"
+        )}
+        columns = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
+        assert versions == {3, 4}
+        assert columns.count("embedding") == 1
+        assert columns.count("embedding_dim") == 1
+
+    def test_failed_migration_rolls_back_ddl_and_stamp_together(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (1, '2000-01-01T00:00:00+00:00');
+            """
+        )
+
+        with pytest.raises(sqlite3.OperationalError):
+            m.apply_pending_migrations(
+                conn,
+                fresh=False,
+                target_version=2,
+                migrations={
+                    2: (
+                        "CREATE TABLE should_roll_back (id INTEGER);"
+                        "INSERT INTO missing_table VALUES (1);"
+                    ),
+                },
+            )
+
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='should_roll_back'"
+        ).fetchone()
+        versions = {r[0] for r in conn.execute(
+            "SELECT version FROM schema_version"
+        )}
+        assert table_exists is None
+        assert versions == {1}
