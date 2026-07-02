@@ -164,7 +164,6 @@ def merge_slice_into_integration(
     *,
     slice_branch: str,
     integration_branch: str,
-    strategy: str | None = None,
     runner: Runner = _default_runner,
 ) -> SliceMergeResult:
     """Serially merge ``slice_branch`` into ``integration_branch`` with ``--no-ff``."""
@@ -178,18 +177,17 @@ def merge_slice_into_integration(
         if current.stdout.strip() != integration_branch:
             raise RuntimeError(f"integration branch is not checked out: {integration_branch}")
 
-        merge_cmd = [
-            "git",
-            "-C",
-            str(integration_path),
-            "merge",
-            "--no-ff",
-            "--no-edit",
-        ]
-        if strategy:
-            merge_cmd.extend(["-s", strategy])
-        merge_cmd.append(slice_branch)
-        merge = runner(merge_cmd)
+        merge = runner(
+            [
+                "git",
+                "-C",
+                str(integration_path),
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                slice_branch,
+            ]
+        )
         if merge.returncode != 0:
             abort = runner(["git", "-C", str(integration_path), "merge", "--abort"])
             if abort.returncode not in (0, 128):

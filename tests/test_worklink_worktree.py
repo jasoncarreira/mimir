@@ -400,7 +400,6 @@ def test_merge_slice_into_integration_records_merge_commit_and_cleans_worktree(
         repo,
         slice_branch=lease.branch,
         integration_branch=integration.branch,
-        strategy="ort",
     )
 
     assert isinstance(result, SliceMergeSuccess)
@@ -431,7 +430,6 @@ def test_merge_slice_into_integration_returns_conflict_result(tmp_path: Path) ->
         repo,
         slice_branch=lease.branch,
         integration_branch=integration.branch,
-        strategy="ort",
     )
 
     assert isinstance(result, SliceMergeConflict)
