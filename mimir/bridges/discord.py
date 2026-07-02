@@ -609,9 +609,6 @@ class DiscordBridge(Bridge):
 
         discord_embed = _coerce_discord_embed(embed)
         chunks = [c for c in _chunk_message(text) if c.strip()]
-        files = [discord.File(str(p)) for p in (attachment_paths or [])]
-        if (files or discord_embed is not None) and not chunks:
-            chunks = [""]
 
         send_kwargs: dict[str, Any] = {}
         if reply_to_message_id:
@@ -627,7 +624,11 @@ class DiscordBridge(Bridge):
 
         last_id: str | None = None
         sent_count = 0
+        files: list[discord.File] = []
         try:
+            files = [discord.File(str(p)) for p in (attachment_paths or [])]
+            if (files or discord_embed is not None) and not chunks:
+                chunks = [""]
             for i, chunk in enumerate(chunks):
                 chunk_kwargs = dict(send_kwargs) if i == 0 else {}
                 if i == 0 and discord_embed is not None:
@@ -649,6 +650,9 @@ class DiscordBridge(Bridge):
                 chunks=sent_count,
                 error=f"discord send error after {sent_count} chunk(s): {exc}",
             )
+        finally:
+            for file in files:
+                file.close()
         return SendResult(sent=True, message_id=last_id, chunks=sent_count)
 
     async def send_typing_indicator(self, channel_id: str) -> None:

@@ -235,6 +235,39 @@ async def test_send_returns_message_id(bridge_with_fake_client):
 
 
 @pytest.mark.asyncio
+async def test_send_closes_attachment_files_when_discord_send_fails(
+    bridge_with_fake_client, tmp_path: Path,
+):
+    import discord
+
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels[1]  # type: ignore[union-attr]
+    attachment_a = tmp_path / "a.txt"
+    attachment_b = tmp_path / "b.txt"
+    attachment_a.write_text("alpha")
+    attachment_b.write_text("bravo")
+    opened_files: list[discord.File] = []
+
+    async def boom(content: str = "", files=None, **kwargs):
+        del content, kwargs
+        opened_files.extend(files or [])
+        raise discord.DiscordException("missing permissions")
+
+    channel.send = boom
+
+    result = await bridge.send(
+        "discord-1",
+        "hello",
+        attachment_paths=[attachment_a, attachment_b],
+    )
+
+    assert result.sent is False
+    assert "discord send error" in (result.error or "")
+    assert len(opened_files) == 2
+    assert all(file.fp.closed for file in opened_files)
+
+
+@pytest.mark.asyncio
 async def test_send_passes_embed_and_reply_reference(bridge_with_fake_client):
     bridge, _, sent = bridge_with_fake_client
 
