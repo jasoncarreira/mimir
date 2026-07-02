@@ -32,6 +32,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mimir.saga._like import escape_like_pattern
+
 log = logging.getLogger(__name__)
 
 # Row-count safety cap so a large DB doesn't generate a huge payload.
@@ -302,7 +304,7 @@ def build_search_payload(
         return {"error": "q param required", "atoms": [], "total_matched": 0}
 
     try:
-        search_term = f"%{query}%"
+        search_term = f"%{escape_like_pattern(query)}%"
         base_sql = """
             SELECT
                 a.id,
