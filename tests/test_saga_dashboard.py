@@ -580,6 +580,35 @@ def test_search_case_insensitive(tmp_path: Path) -> None:
     assert "b3" not in ids
 
 
+@pytest.mark.parametrize(
+    ("query", "expected_id"),
+    [
+        ("50%", "pct"),
+        ("a_b", "underscore"),
+        (r"path\name", "backslash"),
+    ],
+)
+def test_search_escapes_like_metacharacters(
+    tmp_path: Path,
+    query: str,
+    expected_id: str,
+) -> None:
+    db_path = tmp_path / "saga.db"
+    conn = _make_db(db_path)
+    _insert_atom(conn, "pct", content="literal 50% complete")
+    _insert_atom(conn, "pct-wildcard", content="literal 50x complete")
+    _insert_atom(conn, "underscore", content="literal a_b token")
+    _insert_atom(conn, "underscore-wildcard", content="literal axb token")
+    _insert_atom(conn, "backslash", content=r"literal path\name token")
+    conn.close()
+
+    result = build_search_payload(db_path, query)
+
+    ids = [a["id"] for a in result["atoms"]]
+    assert ids == [expected_id]
+    assert result["total_matched"] == len(ids) == 1
+
+
 def test_search_channel_scope(tmp_path: Path) -> None:
     db_path = tmp_path / "saga.db"
     conn = _make_db(db_path)
