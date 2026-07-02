@@ -198,7 +198,7 @@ class SagaStore:
     # Registry of post-greenfield schema changes. Keys are version
     # numbers (must be > 1, must be contiguous, must equal
     # ``CURRENT_SCHEMA_VERSION`` at the latest entry); values are raw
-    # SQL scripts executed via ``conn.executescript``.
+    # SQL scripts executed inside per-migration transactions.
     MIGRATIONS: dict[int, str] = _migrations.MIGRATIONS
 
     def __init__(

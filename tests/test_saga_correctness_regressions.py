@@ -512,24 +512,19 @@ def test_apply_pending_migrations_restores_fk_on_after_each_migration(
     monkeypatch,
 ):
     """``_apply_pending_migrations`` must restore FK=ON after running each
-    migration's executescript.  PRAGMA foreign_keys cannot be set *inside*
-    executescript (it runs in an implicit transaction; the PRAGMA would be
-    a no-op).  The fix moves the PRAGMA toggle to explicit
-    ``conn.execute()`` calls around the executescript call.
+    migration. PRAGMA foreign_keys cannot be set *inside* the migration
+    transaction; the PRAGMA would be a no-op. The migration applier controls
+    the PRAGMA with explicit ``conn.execute()`` calls around each migration.
 
-    This test observes the FK state recorded by the migration DDL itself:
-    the patched migration captures the ``foreign_keys`` pragma value into
-    a sentinel table during execution, and we assert the connection is back
-    at FK=ON after the full migration pass completes.
+    This test asserts the connection is back at FK=ON after the full migration
+    pass completes.
     """
     from mimir.saga.client import SagaStore
     import sqlite3 as sq
 
     store = SagaStore.__new__(SagaStore)
-    # Patch a sentinel migration that records the FK state observed
-    # *after* its own DDL runs (inside the same executescript).  Because
-    # PRAGMA cannot be read from within executescript, we check the
-    # post-migration connection state via a separate conn.execute().
+    # Patch a sentinel migration. We check the post-migration connection
+    # state via a separate conn.execute().
     monkeypatch.setattr(
         SagaStore,
         "MIGRATIONS",
@@ -561,11 +556,9 @@ def test_apply_pending_migrations_restores_fk_on_after_each_migration(
 
 
 def test_migration_ddl_strings_contain_no_pragma_foreign_keys():
-    """PRAGMA foreign_keys=OFF/ON inside executescript is a no-op (the
-    PRAGMA modifies connection state, which is disallowed within a
-    transaction; executescript uses an implicit transaction).  The DDL
-    strings in MIGRATIONS must not include these PRAGMAs — connection-
-    level control lives in ``_apply_pending_migrations`` instead.
+    """PRAGMA foreign_keys=OFF/ON inside a migration transaction is a no-op.
+    The DDL strings in MIGRATIONS must not include these PRAGMAs —
+    connection-level control lives in ``_apply_pending_migrations`` instead.
     """
     from mimir.saga.client import SagaStore
 
@@ -579,13 +572,13 @@ def test_migration_ddl_strings_contain_no_pragma_foreign_keys():
         ddl_norm = ddl_no_comments.lower().replace(" ", "")
         assert "pragmaforeign_keys=off" not in ddl_norm, (
             f"Migration v{version} DDL contains 'PRAGMA foreign_keys=OFF' "
-            "which is a no-op inside executescript; move it to a "
+            "which is a no-op inside the migration transaction; move it to a "
             "connection-level conn.execute() call instead."
         )
         assert "pragmaforeign_keys=on" not in ddl_norm, (
             f"Migration v{version} DDL contains 'PRAGMA foreign_keys=ON' "
-            "which is a no-op inside executescript; the connection-level "
-            "restore in _apply_pending_migrations handles this."
+            "which is a no-op inside the migration transaction; the "
+            "connection-level restore in _apply_pending_migrations handles this."
         )
 
 
