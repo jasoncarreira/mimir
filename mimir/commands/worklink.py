@@ -18,6 +18,7 @@ from ..worklink.orchestrator import (
     run_worklink,
     run_worklink_reattach,
 )
+from ..worklink.epic import run_epic
 from ..worklink.worker import payload_from_json, run_worker_payload
 
 
@@ -78,6 +79,34 @@ def add_argparse(
             "operator-invoked runs — they always proceed (accept-the-risk; the "
             "local_subprocess backend runs with full container filesystem access)."
         ),
+    )
+
+    epic_p = worklink_sub.add_parser(
+        "run-epic",
+        help="Run one integrated Worklink epic parent issue.",
+    )
+    epic_p.add_argument("epic_id", type=int, help="Chainlink epic issue id to execute.")
+    epic_p.add_argument(
+        "--backend", default=None, help="Backend name (default: route from worklink.yaml)."
+    )
+    epic_p.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+    epic_p.add_argument(
+        "--repo", type=Path, default=None, help="Git repo to work in (default: cwd)."
+    )
+    epic_p.add_argument(
+        "--base",
+        default=None,
+        help="Base branch for the integration branch and final draft PR.",
+    )
+    epic_p.add_argument(
+        "--autonomous",
+        action="store_true",
+        help="Mark this an autonomous epic dispatch and enforce compute safety policy.",
     )
 
     worker_p = worklink_sub.add_parser("worker", help="Run one portable Worklink worker payload.")
@@ -148,6 +177,40 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         reason_suffix = _worker_reason_suffix(validation)
         print(f"worklink worker: {validation.status}{suffix}{reason_suffix}")
         return 0 if validation.status in {"completed", "blocked"} else 1
+
+    if args.worklink_action == "run-epic":
+        home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+        repo = (args.repo or Path.cwd()).resolve()
+        os.environ["MIMIR_HOME"] = str(home)
+        try:
+            from ..event_logger import init_logger
+
+            init_logger(
+                home / "logs" / "events.jsonl",
+                session_id=f"worklink-epic-{args.epic_id}",
+            )
+        except Exception:
+            pass
+        try:
+            result = run_epic(
+                home=home,
+                repo=repo,
+                epic_id=args.epic_id,
+                backend=args.backend,
+                base_branch=args.base,
+                autonomous=args.autonomous,
+            )
+        except WorklinkError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(
+            f"worklink epic #{result.epic_id}: {result.status}"
+            + (f" PR {result.pr_url}" if result.pr_url else "")
+            + (f" — {result.reason}" if result.reason else "")
+        )
+        if result.manifest_path:
+            print(f"manifest: {result.manifest_path}")
+        return 0 if result.status in {"completed", "partial"} else 1
 
     if args.worklink_action != "run":
         parser.print_help()
