@@ -44,8 +44,8 @@ DEFAULT_ENV_TEMPLATE = dedent(
     # MIMIR_MODEL_SPEC has the form ``<provider>:<model>``. Examples:
     #
     #   anthropic:claude-sonnet-4-6       (default — direct Anthropic API)
-    #   claude-code:claude-sonnet-4-6     (legacy Max OAuth subprocess; opt
-    #                                      in via ``mimir setup --subscription``)
+    #   claude-code:claude-sonnet-4-6     (Max OAuth subprocess; opt in via
+    #                                      ``mimir setup --subscription``)
     #   anthropic:MiniMax-M2.7            (Minimax via Anthropic-compat —
     #                                      also set ANTHROPIC_BASE_URL)
     #   anthropic:kimi-k2-0905-preview    (Moonshot Kimi)
@@ -1044,8 +1044,7 @@ def _print_setup_report(status: dict[str, object]) -> None:
         )
         # Surface the pip extra this model's chat adapter needs (chainlink
         # #292) so the operator installs it now rather than hitting an
-        # ImportError on first run. claude-code is git-installed (no extra)
-        # and is covered by the LLM-auth steps printed below.
+        # ImportError on first run.
         from ..providers import extra_for_spec
         adapter_extra = extra_for_spec(model_spec)
         if adapter_extra:
@@ -1109,8 +1108,10 @@ def _print_setup_report(status: dict[str, object]) -> None:
     print()
     print("Next steps:")
     print(f"  1. Configure LLM auth — pick one:")
-    print(f"     a. Max plan (free):  claude setup-token")
-    print(f"        (or `claude login` for an interactive session — same effect.)")
+    print(f"     a. Max plan: install `mimir-agent[claude-code]` + the Claude Code CLI,")
+    print(f"        then run `claude setup-token` or `claude login` on the host.")
+    print(f"        Verify with `claude --version` and `claude -p 'ping'`; do not")
+    print(f"        paste tokens or ~/.claude files into chat, logs, or issues.")
     print(f"     b. Anthropic API:    set ANTHROPIC_API_KEY in {home}/.env")
     print(f"     c. Gateway (e.g. LiteLLM, OpenRouter):")
     print(f"        set ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN in {home}/.env")
@@ -1131,7 +1132,8 @@ def _print_setup_report(status: dict[str, object]) -> None:
         print(f"  2. saga embeddings configured for local fastembed —")
         print(f"     no API key needed. First run downloads the ~33MB ONNX model.")
     print(f"  3. (optional) Edit {home}/memory/core/00-identity.md")
-    print(f"  4. Run:  mimir run --home {home}")
+    print(f"  4. Health check:  mimir setup --home {home} --subscription")
+    print(f"     then run:      mimir run --home {home}")
     # Passive skill env-deps summary — non-blocking, informational only.
     # Lists skills with env: blocks so the operator knows what to configure.
     # No prompts here (setup runs non-interactively from Dockerfiles / scripts).
@@ -1238,7 +1240,8 @@ def add_argparse(sub: "argparse._SubParsersAction") -> "argparse.ArgumentParser"
             "the chosen provider (not pay-per-token API billing). "
             "Effect is provider-polymorphic: Claude family swaps to "
             "``claude-code:`` (Max OAuth via subprocess — the "
-            "protocol IS different); OpenAI / Minimax / Moonshot keep "
+            "protocol IS different and requires the claude-code extra); "
+            "OpenAI / Minimax / Moonshot keep "
             "the same model_spec (same HTTP endpoint, just a "
             "different API token tier). Either way the usage monitor "
             "flips from cost-tracking to quota-polling. Without this "

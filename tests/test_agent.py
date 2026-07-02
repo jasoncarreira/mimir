@@ -2570,8 +2570,13 @@ def test_resolve_model_claude_code_fails_closed_without_adapter(monkeypatch):
     from mimir.agent import _resolve_model
 
     monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
-    with pytest.raises((ImportError, RuntimeError)):
+    with pytest.raises((ImportError, RuntimeError)) as excinfo:
         _resolve_model("claude-code:claude-sonnet-4-6")
+    msg = str(excinfo.value)
+    assert "mimir-agent[claude-code]" in msg
+    assert "claude setup-token" in msg
+    assert "claude -p 'ping'" in msg
+    assert "git+https" not in msg
 
 
 def test_resolve_model_claude_code_home_dotenv_requires_enforcement(

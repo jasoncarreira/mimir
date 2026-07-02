@@ -825,15 +825,10 @@ def test_derive_marks_openai_length_via_explicit_stop_reason_field():
 
 
 def test_derive_is_error_falls_back_to_finish_reason_when_streaming():
-    """``ChatClaudeCode._astream`` (the path mimir uses) collapses
-    ``msg.is_error`` into a binary ``finish_reason`` and never emits
-    ``is_error`` as its own response_metadata field. Without a fallback,
-    every streaming-mode subprocess error rendered as
-    ``result_is_error=False``. The ``enrich_streaming_metadata``
-    patch in ``_langchain_claude_code_patches`` is the primary fix
-    (restores the original ``is_error``); this test covers the
-    defense-in-depth path for deployments where the patch didn't
-    apply."""
+    """If a Claude Code streaming result only exposes binary
+    ``finish_reason`` metadata, ``derive_result_fields`` should still recover
+    ``result_is_error``. The maintained adapter normally emits the explicit
+    field too; this is the defense-in-depth fallback."""
     # finish_reason="error" with no explicit is_error → recover True
     msg_err = AIMessage(
         content="oops",
@@ -865,20 +860,17 @@ def test_derive_is_error_explicit_field_wins_over_finish_reason():
 
 
 def test_derive_picks_up_streaming_enriched_metadata():
-    """When the ``enrich_streaming_metadata`` patch is active (the
-    expected production path for claude-code subprocess turns), the
-    result chunk's response_metadata carries the full ResultMessage
-    field set: stop_reason / num_turns / is_error preserved alongside
-    the binary finish_reason. derive_result_fields should pick these
-    up just like the non-streaming path."""
+    """When the maintained Claude Code adapter emits the full ResultMessage
+    field set, derive_result_fields should pick it up just like the
+    non-streaming path."""
     msg = AIMessage(
         content="done",
         response_metadata={
-            # Streaming-shape generation_info as enriched by the patch
+            # Streaming-shape generation_info from the maintained adapter
             "finish_reason": "stop",
             "total_cost_usd": 0.0042,
             "session_id": "sess-abc",
-            # Patched-in fields (from ResultMessage):
+            # Adapter-preserved fields (from ResultMessage):
             "stop_reason": "end_turn",
             "num_turns": 7,
             "is_error": False,
@@ -893,20 +885,18 @@ def test_derive_picks_up_streaming_enriched_metadata():
     assert rf["total_cost_usd"] == pytest.approx(0.0042)
 
 
-def test_derive_max_turns_recoverable_via_streaming_patch():
-    """End-to-end: when the patch preserves the granular ``stop_reason``
+def test_derive_max_turns_recoverable_via_adapter_metadata():
+    """End-to-end: when adapter metadata preserves granular ``stop_reason``
     on a max-turns truncation, derive_result_fields correctly emits
     ``result_subtype="error_max_turns"`` even though the streaming
-    finish_reason was just the binary ``"error"``. Without the patch,
-    that distinction would be lost (only finish_reason="error"
-    survives, which maps to result_subtype=success-but-is_error path)."""
+    finish_reason was just the binary ``"error"``."""
     msg = AIMessage(
         content="truncated",
         response_metadata={
             "finish_reason": "error",       # streaming binary
-            "stop_reason": "max_turns",     # preserved by patch
-            "is_error": True,               # preserved by patch
-            "num_turns": 50,                # preserved by patch
+            "stop_reason": "max_turns",     # preserved by adapter
+            "is_error": True,               # preserved by adapter
+            "num_turns": 50,                # preserved by adapter
         },
     )
     rf = derive_result_fields([msg])

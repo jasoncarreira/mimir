@@ -41,12 +41,12 @@ them, so a missing tool shows up as an autonomous "command not found" error or
 | Tool | Needed? | What mimir uses it for |
 |---|---|---|
 | **`ripgrep`** (`rg`) | **Strongly recommended** | Backs the agent's file-search / `grep` tool — fast, GIL-free, and `.gitignore`-aware. Without it the tool falls back to a pure-Python directory walk that, on a large tree, runs for *minutes* and can starve the event loop into an unhealthy restart. Effectively required if you set `MIMIR_FILE_TOOL_ROOTS` (§4) to a big repo. |
-| **`git`** | Recommended | Git-backed skills/pollers (chainlink, worklink, github), the `memory/core/*` + `prompts/*` proposal-PR flow, and the Claude Code subprocess provider. |
+| **`git`** | Recommended | Git-backed skills/pollers (chainlink, worklink, github) and the `memory/core/*` + `prompts/*` proposal-PR flow. |
 | **`jq`** | Recommended | JSON/JSONL parsing in pollers, skill bodies, and operational/debug shell workflows. |
 | **`poppler-utils`** | Optional | PDF text extraction in the reading-queue / ingest pipeline. |
 | **`tesseract-ocr`** + `tesseract-ocr-eng` | Optional | OCR for scanned/image PDFs in the same pipeline. |
 | **Node.js 20+** + `npm` | Optional (source installs only) | Building the React web console (`npm run build`). PyPI and Docker installs ship the bundle **prebuilt** — see §5. |
-| coding-agent CLIs (`@openai/codex`, `@anthropic-ai/claude-code`) | Optional | Only for the codex / claude-code providers and worklink workers. Installed separately (npm). |
+| coding-agent CLIs (`@openai/codex`, `@anthropic-ai/claude-code`) | Optional | Only for the codex / claude-code providers and worklink workers. Install `mimir-agent[claude-code]` (pulls `langchain-claude-code-mimir>=0.1.2,<0.2`) for the Python adapter and `@anthropic-ai/claude-code` for the CLI. |
 
 Install the common set:
 

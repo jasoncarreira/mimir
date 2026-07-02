@@ -150,6 +150,7 @@ def collect_required_env_vars(home: Path) -> list[str]:
         "GH_USER_EMAIL",           # git config user.email
         "MIMIR_GIT_URL",           # mimir source clone URL — change for forks
         "MIMIR_DEFAULT_BRANCH",    # branch start.sh clones (default: main)
+        "MIMIR_ENABLE_CLAUDE_CODE",# 1 installs Claude Code CLI + adapter
     ]
     seen = set(baseline)
     extra: list[str] = []
@@ -369,11 +370,6 @@ FROM python:3.11-slim
 # gh for PR / issue automation, build-essential for C extensions
 # pulled by deps, poppler-utils + jq because skill bodies use them,
 # Node 22 for the optional claude-code CLI + mermaid CLI.
-#
-# git is also required when MIMIR_ENABLE_CLAUDE_CODE=1 below —
-# ``langchain-claude-code`` is a git-pinned fork (PyPI direct-URL
-# rejection means it can't be a mimir-agent extra). Without git in
-# the image, that conditional install fails at the clone step.
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends \\
         git \\
@@ -442,25 +438,21 @@ ENV PATH="$VIRTUAL_ENV/bin:/usr/local/bin:${PATH}"
 #   docker build --build-arg MIMIR_EXTRAS=anthropic,discord .
 #
 # Available extras (mimir-agent pyproject):
-#   anthropic, openai, codex-plus    (model providers)
+#   anthropic, claude-code, openai, codex-plus    (model providers)
 #   discord, slack                   (bridges)
 #   mcp                              (Model Context Protocol)
 #
-# Note: there is NO ``claude-code`` extra (PyPI rejects git+ URL
-# deps). Set MIMIR_ENABLE_CLAUDE_CODE=1 below for that path.
+# Set MIMIR_ENABLE_CLAUDE_CODE=1 below to install both the Claude Code
+# CLI and the adapter extra in one build switch.
 ARG MIMIR_EXTRAS="__MIMIR_EXTRAS__"
 RUN pip install --no-cache-dir --upgrade pip \\
  && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 
-# Optional: install the Claude Code subprocess provider
-# (``langchain-claude-code``). Git-pinned fork; set
-# ``MIMIR_ENABLE_CLAUDE_CODE=1`` at build to include. Bump
-# ``LANGCHAIN_CLAUDE_CODE_REF`` when upstream rolls (tracked at
-# mimir-repo issue #268).
-ARG LANGCHAIN_CLAUDE_CODE_REF=c03f075c8b84fb0c718de1aabdd6493f5d191786
+# Optional: install the Claude Code subprocess provider adapter. Set
+# ``MIMIR_ENABLE_CLAUDE_CODE=1`` to enable; the same build arg installs
+# the npm CLI above.
 RUN if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \\
-        pip install --no-cache-dir \\
-            "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@${LANGCHAIN_CLAUDE_CODE_REF}" ; \\
+        pip install --no-cache-dir "mimir-agent[claude-code]" ; \\
     fi
 
 # Pre-warm the fastembed model cache so the first request doesn't
@@ -482,14 +474,14 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]
 def _claude_code_install_block() -> str:
     """Dockerfile block installing the Claude Code CLI when enabled.
 
-    The npm CLI is needed only for the legacy Claude Code subprocess
-    provider. Gate it on the same build arg as the git-pinned
-    ``langchain-claude-code`` Python provider so Codex/OpenAI/Anthropic
+    The npm CLI is needed only for the Claude Code subprocess
+    provider. Gate it on the same build arg as the
+    ``mimir-agent[claude-code]`` Python provider so Codex/OpenAI/Anthropic
     API deployments don't carry an unused CLI binary.
     """
     return (
         "# Claude Code CLI — optional subprocess-provider transport.\n"
-        "# Same gate as the langchain-claude-code Python provider below.\n"
+        "# Same gate as the langchain-claude-code-mimir Python provider below.\n"
         "ARG MIMIR_ENABLE_CLAUDE_CODE=0\n"
         "RUN if [ \"$MIMIR_ENABLE_CLAUDE_CODE\" = \"1\" ]; then \\\n"
         "        npm install -g @anthropic-ai/claude-code@2.1.195 ; \\\n"
@@ -589,7 +581,12 @@ _COMPOSE_YML_TEMPLATE = """\
 
 services:
   {SERVICE_NAME}:
-    build: .
+    build:
+      context: .
+      args:
+        # One switch for Claude Code support: installs the npm CLI at
+        # build time and makes workspace start.sh sync --extra claude-code.
+        MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}
     container_name: {SERVICE_NAME}
     restart: unless-stopped
     # chainlink #510: give the graceful drain time to finish in-flight turns
@@ -649,7 +646,12 @@ _COMPOSE_YML_TEMPLATE_PYPI = """\
 
 services:
   {SERVICE_NAME}:
-    build: .
+    build:
+      context: .
+      args:
+        # One switch for Claude Code support: installs the npm CLI and
+        # mimir-agent[claude-code] adapter extra at build time.
+        MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}
     container_name: {SERVICE_NAME}
     restart: unless-stopped
     # chainlink #510: give the graceful drain time to finish in-flight turns
@@ -772,6 +774,9 @@ git config --global --get-all safe.directory 2>/dev/null \
 # resolved at boot. Override per-deployment if your bridges need
 # different extras (slack, etc.).
 UV_EXTRAS="{UV_EXTRAS}"
+if [ "${MIMIR_ENABLE_CLAUDE_CODE:-0}" = "1" ]; then
+    UV_EXTRAS="$UV_EXTRAS --extra claude-code"
+fi
 echo "[start.sh] uv sync (extras: ${UV_EXTRAS:-(none)})"
 uv sync $UV_EXTRAS
 

@@ -407,15 +407,11 @@ def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
     # langchain providers (anthropic / openai) populate
     # ``usage_metadata`` instead, handled above.
     #
-    # Streaming-path note (``ChatClaudeCode._astream``): the upstream
-    # code DROPS ``stop_reason`` / ``num_turns`` / ``is_error`` from
-    # generation_info, emitting only a binary ``finish_reason``
-    # (``"stop"`` / ``"error"``). ``enrich_streaming_metadata()`` in
-    # ``_langchain_claude_code_patches`` patches that to preserve the
-    # original fields, so production reads work normally. The
-    # fallbacks below are defense-in-depth for deployments where the
-    # patch didn't apply (claude-code extra absent, upstream version
-    # incompatible with the wrapper, etc.).
+    # Streaming-path note (``ChatClaudeCode._astream``): the maintained
+    # ``langchain-claude-code-mimir`` adapter preserves ``stop_reason`` /
+    # ``num_turns`` / ``is_error`` in generation_info. The fallbacks below are
+    # defense-in-depth for older/stale adapter shapes that only emit binary
+    # ``finish_reason`` (``"stop"`` / ``"error"``).
     cc_usage = md.get("usage")
     if usage is None and cc_usage:
         usage = cc_usage
@@ -435,7 +431,7 @@ def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
     # num_turns fallback chain:
     #   1. ``response_metadata["num_turns"]`` — populated by
     #      ``ChatClaudeCode`` (both call modes; non-streaming directly
-    #      and streaming via ``enrich_streaming_metadata``'s patch).
+    #      and streaming via the maintained adapter metadata path).
     #      This is the SDK's per-request model-turn count.
     #   2. ``count(AIMessage in messages)`` — fallback for native
     #      providers (langchain-anthropic / -openai) which don't emit
