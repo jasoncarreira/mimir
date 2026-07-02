@@ -481,6 +481,51 @@ async def test_on_message_dedupes_resume_protocol_redelivery(
 
 
 @pytest.mark.asyncio
+async def test_on_message_redelivery_after_rejected_enqueue_is_accepted(
+    bridge_with_fake_client,
+):
+    """Queue-full rejection must not commit the message id as seen.
+
+    The platform can redeliver the same source id after the dispatcher rejects
+    admission; that retry must still reach enqueue instead of being deduped.
+    """
+    import discord
+
+    bridge, enqueued, _ = bridge_with_fake_client
+    attempts: list[AgentEvent] = []
+
+    async def reject_once_then_accept(event: AgentEvent) -> bool:
+        attempts.append(event)
+        if len(attempts) == 1:
+            return False
+        enqueued.append(event)
+        return True
+
+    bridge.enqueue = reject_once_then_accept
+    channel = SimpleNamespace(
+        id=1, type=getattr(discord.ChannelType, "text", None), name="g"
+    )
+    author = SimpleNamespace(id=99, bot=False, display_name="Alice")
+    msg = SimpleNamespace(
+        id=12345, author=author, channel=channel, content="hello", mentions=[]
+    )
+
+    await bridge._on_message(msg)
+    assert len(attempts) == 1
+    assert "12345" not in bridge._seen_ids
+
+    await bridge._on_message(msg)
+    assert len(attempts) == 2
+    assert len(enqueued) == 1
+    assert enqueued[0].source_id == "12345"
+    assert "12345" in bridge._seen_ids
+
+    await bridge._on_message(msg)
+    assert len(attempts) == 2
+    assert len(enqueued) == 1
+
+
+@pytest.mark.asyncio
 async def test_on_message_does_not_dedupe_distinct_ids(
     bridge_with_fake_client,
 ):
