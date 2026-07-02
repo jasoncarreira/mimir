@@ -542,6 +542,51 @@ async def test_per_slice_observe_review_merge_happy_path(tmp_path: Path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_epic_runner_claims_heartbeats_and_releases_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    patch_git(monkeypatch, tmp_path)
+    import mimir.worklink.epic as epic_mod
+
+    monkeypatch.setattr(epic_mod, "_observe_slice", fake_observe_slice)
+    calls: list[list[str]] = []
+
+    def recording_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return runner(args)
+
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic", "worklink:ready"}),
+        leaves=[LeafIssue(issue(101), scope_paths=("a.py",), suggested_test_command="true")],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+
+    result = await EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=recording_runner,
+        registry=FakeRegistry(),  # type: ignore[arg-type]
+        roles=FakeRoles(),
+        chainlink=chainlink,  # type: ignore[arg-type]
+    ).run(100)
+
+    claim_comments = [
+        call[-1]
+        for call in calls
+        if call[:4] == ["chainlink", "issue", "comment", "100"]
+        and "WORKLINK_CLAIM" in call[-1]
+    ]
+    assert result.status == "completed"
+    assert ["chainlink", "locks", "claim", "100"] in calls
+    assert ["chainlink", "issue", "label", "100", "worklink:in-progress"] in calls
+    assert ["chainlink", "locks", "release", "100"] in calls
+    assert len(claim_comments) >= 2
+    assert any('"heartbeat_at":' in comment and "null" not in comment for comment in claim_comments)
+
+
+@pytest.mark.asyncio
 async def test_reject_retry_then_block_opens_partial_pr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     patch_git(monkeypatch, tmp_path)
     (tmp_path / "worklink.yaml").write_text("defaults:\n  max_review_retries: 2\n  test_command: true\n", encoding="utf-8")
@@ -736,6 +781,20 @@ def test_decomposer_high_risk_round_trips_through_file_leaf_labels_and_classifie
         )
         == "multi"
     )
+
+
+def test_chainlink_move_epic_to_review_clears_parent_in_progress_label() -> None:
+    calls: list[list[str]] = []
+
+    def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return cp(args)
+
+    ChainlinkEpicClient(runner=fake_runner).move_epic_to_review(100)
+
+    assert ["chainlink", "issue", "unlabel", "100", "worklink:ready"] in calls
+    assert ["chainlink", "issue", "unlabel", "100", "worklink:in-progress"] in calls
+    assert ["chainlink", "issue", "label", "100", "worklink:review"] in calls
 
 
 def test_chainlink_file_leaf_is_idempotent_by_title() -> None:

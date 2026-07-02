@@ -26,12 +26,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+import shlex
 import subprocess
 from typing import Sequence
 
 from .backends import WorklinkConfig
 from .backends.registry import WorklinkDefaults
 from .claims import ChainlinkClaims, ClaimRecord
+from .epic_state import load_epic_state
 from .worktree import prune_attempt_worktrees
 
 #: Chainlink agent identity the executor + reaper claim under. Mirrors
@@ -143,6 +145,50 @@ def prune_stale_attempt_worktrees_for_home(home: Path, *, repo: Path | str | Non
     )
 
 
+def dispatch_detached_epic_resume(*, home: Path, repo: Path, epic_id: int) -> Path:
+    """Launch manifest-backed epic recovery as a detached CLI subprocess.
+
+    Mirrors the ready-queue poller's detached ``mimir worklink run`` shape: the
+    reaper has already stolen the stale parent lock, so it should record the
+    recovery comment and return instead of running a whole epic inline.
+    """
+    run_bin = shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir")
+    state_dir = home / "state" / "worklink" / "epic-reaper"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    log_path = state_dir / f"run-epic-{epic_id}.log"
+    argv = [
+        *run_bin,
+        "worklink",
+        "run-epic",
+        str(epic_id),
+        "--home",
+        str(home),
+        "--repo",
+        str(repo),
+        "--autonomous",
+    ]
+    try:
+        log_fh = log_path.open("ab")
+    except OSError:
+        log_fh = subprocess.DEVNULL
+    try:
+        subprocess.Popen(
+            argv,
+            cwd=str(repo),
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+        )
+    finally:
+        if log_fh not in (subprocess.DEVNULL, None):
+            try:
+                log_fh.close()
+            except OSError:
+                pass
+    return log_path
+
+
 def reap_stale_claims_for_home(
     home: Path,
     *,
@@ -152,7 +198,10 @@ def reap_stale_claims_for_home(
     """TTL-reaper entry point: recover claims whose worker died.
 
     Reads ``reaper_ttl_s`` from worklink.yaml and delegates discovery +
-    staleness to :meth:`ChainlinkClaims.reap_home`.
+    staleness to :meth:`ChainlinkClaims.reap_home`. Epic-parent recovery
+    dispatches a detached ``mimir worklink run-epic`` process and returns
+    immediately, keeping the scheduler reaper fast enough to continue leaf
+    reaping in the same tick.
     """
     defaults = worklink_defaults(home)
     min_reaper_ttl_s = defaults.timeout_s * 2
@@ -164,4 +213,14 @@ def reap_stale_claims_for_home(
         )
     ttl = timedelta(seconds=defaults.reaper_ttl_s)
     cl = claims or make_claims(home, agent_id=agent_id)
-    return cl.reap_home(ttl=ttl)
+    reaped: list[ClaimRecord] = []
+
+    def recover_epic(record: ClaimRecord) -> bool:
+        if load_epic_state(home, record.issue_id) is None:
+            return False
+        dispatch_detached_epic_resume(home=home, repo=Path(worklink_repo()), epic_id=record.issue_id)
+        return True
+
+    reaped.extend(cl.reap_epic_home(ttl=ttl, recover=recover_epic))
+    reaped.extend(cl.reap_home(ttl=ttl))
+    return reaped

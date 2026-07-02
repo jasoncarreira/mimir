@@ -281,6 +281,61 @@ class ChainlinkClaims:
             reaped.append(record)
         return reaped
 
+    def reap_stale_epic_claims(
+        self,
+        records: Iterable[ClaimRecord],
+        *,
+        ttl: timedelta,
+        recover: Callable[[ClaimRecord], bool],
+    ) -> list[ClaimRecord]:
+        """Recover stale epic-parent claims by re-entering the epic runner.
+
+        Epic claims live on the parent issue. A stale epic parent must not be
+        treated like a leaf claim: child slice state is held in their labels
+        plus the durable epic manifest, so recovery steals only the stale parent
+        lock and then asks the caller to resume the manifest-backed run.
+        """
+        now = self.clock()
+        reaped: list[ClaimRecord] = []
+        for record in records:
+            if not record.is_stale(now, ttl):
+                continue
+            if not self._lock_still_held_by(record):
+                continue
+            steal = self._run("locks", "steal", str(record.issue_id), check=False)
+            if steal.returncode != 0:
+                continue
+            if not self._issue_has_label(record.issue_id, "worklink:in-progress"):
+                self._run("locks", "release", str(record.issue_id), check=False)
+                continue
+            if not self._issue_has_label(record.issue_id, "worklink:epic"):
+                self._run("locks", "release", str(record.issue_id), check=False)
+                continue
+            self._run("locks", "release", str(record.issue_id), check=False)
+            transition = "resume" if recover(record) else "ready"
+            if transition == "ready":
+                self._run("issue", "unlabel", str(record.issue_id), "worklink:in-progress", check=False)
+                if record.attempt >= self.max_attempts:
+                    self._run("issue", "label", str(record.issue_id), "worklink:blocked")
+                    transition = "blocked"
+                else:
+                    self._run("issue", "label", str(record.issue_id), "worklink:ready")
+            payload = {
+                "issue_id": record.issue_id,
+                "stale_agent_id": record.agent_id,
+                "attempt": record.attempt,
+                "transition": transition,
+                "reaped_at": now.isoformat(),
+            }
+            self._run(
+                "issue",
+                "comment",
+                str(record.issue_id),
+                REAPER_PREFIX + json.dumps(payload, sort_keys=True),
+            )
+            reaped.append(record)
+        return reaped
+
 
     def _issue_has_label(self, issue_id: int, label: str) -> bool:
         """Best-effort current-label check for reaper race avoidance.
@@ -462,11 +517,30 @@ class ChainlinkClaims:
         """
         latest: dict[int, ClaimRecord] = {}
         for issue_id in self.issue_ids_with_label("worklink:in-progress"):
+            if self._issue_has_label(issue_id, "worklink:epic"):
+                continue
             for record in claim_records_from_comments(self._issue_comments(issue_id)):
                 current = latest.get(record.issue_id)
                 if current is None or _claim_is_newer(record, current):
                     latest[record.issue_id] = record
         return self.reap_stale_claims(latest.values(), ttl=ttl)
+
+    def reap_epic_home(
+        self,
+        *,
+        ttl: timedelta,
+        recover: Callable[[ClaimRecord], bool],
+    ) -> list[ClaimRecord]:
+        """Discover stale epic-parent claims and resume them via ``recover``."""
+        latest: dict[int, ClaimRecord] = {}
+        for issue_id in self.issue_ids_with_label("worklink:in-progress"):
+            if not self._issue_has_label(issue_id, "worklink:epic"):
+                continue
+            for record in claim_records_from_comments(self._issue_comments(issue_id)):
+                current = latest.get(record.issue_id)
+                if current is None or _claim_is_newer(record, current):
+                    latest[record.issue_id] = record
+        return self.reap_stale_epic_claims(latest.values(), ttl=ttl, recover=recover)
 
     def _attempts_exhausted(self, issue_id: int, attempts: int) -> None:
         self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
