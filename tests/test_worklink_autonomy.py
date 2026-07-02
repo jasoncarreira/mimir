@@ -413,31 +413,68 @@ def test_reap_for_home_resumes_stale_epic_from_manifest(
         ),
     )
     fake = FakeChainlink(
-        in_progress=[100],
+        in_progress=[100, 60],
         epic_ids={100},
-        active_locks=[100],
-        comments={100: [_claim_comment(100, attempt=1, age=timedelta(hours=3))]},
+        active_locks=[100, 60],
+        comments={
+            100: [_claim_comment(100, attempt=1, age=timedelta(hours=3))],
+            60: [_claim_comment(60, attempt=1, age=timedelta(hours=3))],
+        },
     )
-    resumed: list[dict[str, object]] = []
+    dispatched: list[dict[str, object]] = []
 
-    def fake_run_epic(**kwargs: object) -> object:
-        resumed.append(kwargs)
-        return object()
-
-    import mimir.worklink.epic as epic_mod
+    def fake_dispatch_detached_epic_resume(**kwargs: object) -> Path:
+        dispatched.append(kwargs)
+        return tmp_path / "state" / "worklink" / "epic-reaper" / "run-epic-100.log"
 
     monkeypatch.setattr(autonomy, "worklink_repo", lambda: "/repo")
-    monkeypatch.setattr(epic_mod, "run_epic", fake_run_epic)
+    monkeypatch.setattr(autonomy, "dispatch_detached_epic_resume", fake_dispatch_detached_epic_resume)
 
     reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=ChainlinkClaims(agent_id="t", runner=fake))
 
-    assert [r.issue_id for r in reaped] == [100]
-    assert resumed == [{"home": tmp_path, "repo": Path("/repo"), "epic_id": 100, "autonomous": True}]
+    assert [r.issue_id for r in reaped] == [100, 60]
+    assert dispatched == [{"home": tmp_path, "repo": Path("/repo"), "epic_id": 100}]
     assert ["chainlink", "locks", "steal", "100"] in fake.calls
     assert ["chainlink", "locks", "release", "100"] in fake.calls
+    assert fake.names().index("issue comment 100") < fake.names().index("locks steal 60")
     assert not any(c[1:] == ["issue", "label", "101", "worklink:ready"] for c in fake.calls)
     assert not any(c[1:] == ["issue", "label", "102", "worklink:ready"] for c in fake.calls)
     assert not any(c[1:] == ["issue", "label", "100", "worklink:ready"] for c in fake.calls)
+
+
+def test_dispatch_detached_epic_resume_uses_run_epic_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    popens: list[dict[str, object]] = []
+
+    class FakePopen:
+        def __init__(self, argv: Sequence[str], **kwargs: object) -> None:
+            popens.append({"argv": list(argv), **kwargs})
+
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "uv run mimir")
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    log_path = autonomy.dispatch_detached_epic_resume(home=tmp_path, repo=repo, epic_id=100)
+
+    assert log_path == tmp_path / "state" / "worklink" / "epic-reaper" / "run-epic-100.log"
+    assert popens[0]["argv"] == [
+        "uv",
+        "run",
+        "mimir",
+        "worklink",
+        "run-epic",
+        "100",
+        "--home",
+        str(tmp_path),
+        "--repo",
+        str(repo),
+        "--autonomous",
+    ]
+    assert popens[0]["cwd"] == str(repo)
+    assert popens[0]["start_new_session"] is True
+
 
 
 def test_reap_for_home_live_epic_heartbeat_is_not_reaped(tmp_path: Path) -> None:
