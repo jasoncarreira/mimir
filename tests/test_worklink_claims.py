@@ -54,6 +54,35 @@ def test_claim_issue_records_attempt_and_labels_transition() -> None:
     assert comment_calls and "WORKLINK_CLAIM" in comment_calls[0][-1]
 
 
+def test_heartbeat_issue_appends_fresh_claim_record() -> None:
+    calls: list[list[str]] = []
+    heartbeat_at = datetime(2026, 6, 11, 5, 30, tzinfo=UTC)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(
+        chainlink_bin="chainlink",
+        agent_id="mimir-a",
+        runner=runner,
+        clock=lambda: heartbeat_at,
+    )
+    record = ClaimRecord(
+        issue_id=439,
+        attempt=1,
+        agent_id="mimir-a",
+        claimed_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
+    )
+
+    updated = claims.heartbeat_issue(record)
+
+    assert updated.heartbeat_at == heartbeat_at
+    assert calls == [["chainlink", "issue", "comment", "439", updated.to_comment()]]
+    parsed = claim_records_from_comments([calls[0][-1]])
+    assert parsed == [updated]
+
+
 def test_claim_issue_enforces_max_active_locks_after_reservation() -> None:
     calls: list[list[str]] = []
 

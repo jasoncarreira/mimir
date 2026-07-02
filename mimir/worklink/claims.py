@@ -193,6 +193,18 @@ class ChainlinkClaims:
         """Release the Chainlink lock for ``issue_id`` best-effort."""
         self._run("locks", "release", str(issue_id), check=False)
 
+    def heartbeat_issue(self, record: ClaimRecord) -> ClaimRecord:
+        """Append a refreshed claim record so the TTL reaper sees liveness."""
+        updated = ClaimRecord(
+            issue_id=record.issue_id,
+            attempt=record.attempt,
+            agent_id=record.agent_id,
+            claimed_at=record.claimed_at,
+            heartbeat_at=self.clock(),
+        )
+        self._run("issue", "comment", str(record.issue_id), updated.to_comment(), check=False)
+        return updated
+
     def transition_issue(
         self,
         issue_id: int,

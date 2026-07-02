@@ -41,8 +41,8 @@ class WorklinkDefaults:
     # claimed (``worklink:in-progress``) at once across autonomous dispatch
     # (poller + tool); the operator CLI is not capped. ``reaper_ttl_s`` is
     # how long a claim may sit without a heartbeat before the TTL reaper
-    # steals it back to ready/blocked — kept well above ``timeout_s`` so a
-    # legitimately-running worker is never reaped out from under itself.
+    # steals it back to ready/blocked — kept above 2x ``timeout_s`` so a normal
+    # worker timeout plus finalize-time remote test cannot be reaped.
     max_concurrent: int = 2
     reaper_ttl_s: int = 7200
     # Autonomy safety posture (#460). local_subprocess runs the backend with

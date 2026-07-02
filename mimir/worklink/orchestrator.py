@@ -20,7 +20,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .backends import BackendRegistry, WorkOrder, WorklinkConfig
 from .compute import ComputeLaunchError, ComputeResult, LaunchHandle
-from .claims import ChainlinkClaims
+from .claims import ChainlinkClaims, ClaimRecord
 from .evidence import (
     EvidenceValidation,
     WorklinkEvidence,
@@ -43,6 +43,7 @@ from .run_state import (
 from .worktree import WorktreeLease, cleanup_worktree, create_isolated_checkout, create_worktree
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+_CLAIM_HEARTBEAT_INTERVAL_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,44 @@ class WorklinkError(RuntimeError):
 
 class LeafValidationError(WorklinkError):
     """Issue is not structured enough to hand to a backend."""
+
+
+def _heartbeat_claim_best_effort(claims: ChainlinkClaims, record: ClaimRecord) -> None:
+    try:
+        claims.heartbeat_issue(record)
+    except Exception as exc:  # noqa: BLE001 - heartbeat loss must not fail the run.
+        _log_event(
+            "worklink_claim_heartbeat_failed",
+            issue_id=record.issue_id,
+            attempt=record.attempt,
+            error=str(exc)[:300],
+        )
+
+
+async def _heartbeat_while(
+    awaitable: Any,
+    *,
+    claims: ChainlinkClaims,
+    record: ClaimRecord,
+    interval_s: float = _CLAIM_HEARTBEAT_INTERVAL_S,
+) -> Any:
+    """Keep the Chainlink claim fresh while a long compute await is active."""
+
+    async def beat_loop() -> None:
+        _heartbeat_claim_best_effort(claims, record)
+        while True:
+            await asyncio.sleep(interval_s)
+            _heartbeat_claim_best_effort(claims, record)
+
+    task = asyncio.create_task(beat_loop())
+    try:
+        return await awaitable
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 class ChainlinkIssueReader:
@@ -394,7 +433,11 @@ class WorklinkRunner:
                         test_command=test_cmd,
                         started_at=started,
                     )
-                compute_result = await compute.wait(handle, spec.timeout_s)
+                compute_result = await _heartbeat_while(
+                    compute.wait(handle, spec.timeout_s),
+                    claims=claims,
+                    record=record,
+                )
             except ComputeLaunchError as exc:
                 compute_result = ComputeResult(
                     exit_code=-1,
@@ -408,6 +451,7 @@ class WorklinkRunner:
             return await self._finalize(
                 issue=issue,
                 claims=claims,
+                claim_record=record,
                 attempt=record.attempt,
                 config=config,
                 backend=backend,
@@ -459,6 +503,7 @@ class WorklinkRunner:
         *,
         issue: IssueContext,
         claims: ChainlinkClaims,
+        claim_record: ClaimRecord,
         attempt: int,
         config: WorklinkConfig,
         backend: Any,
@@ -514,7 +559,11 @@ class WorklinkRunner:
                 and validation.evidence.files_changed
             ):
                 test_exit = await _run_remote_test_job(
-                    compute, spec, timeout_s=config.defaults.timeout_s
+                    compute,
+                    spec,
+                    timeout_s=config.defaults.timeout_s,
+                    claims=claims,
+                    claim_record=claim_record,
                 )
                 if test_exit is not None:
                     validation = fold_remote_test_evidence(
@@ -749,8 +798,18 @@ class WorklinkRunner:
                 branch=state.branch,
                 test_command=test_cmd or "",
             )
+            claim_record = ClaimRecord(
+                issue_id=issue_id,
+                attempt=state.attempt,
+                agent_id=self.agent_id,
+                claimed_at=started,
+            )
             try:
-                compute_result = await compute.wait(handle, config.defaults.timeout_s)
+                compute_result = await _heartbeat_while(
+                    compute.wait(handle, config.defaults.timeout_s),
+                    claims=claims,
+                    record=claim_record,
+                )
             finally:
                 await compute.cleanup(handle)
             if _reattach_worker_lost(compute_result):
@@ -776,6 +835,7 @@ class WorklinkRunner:
             return await self._finalize(
                 issue=issue,
                 claims=claims,
+                claim_record=claim_record,
                 attempt=state.attempt,
                 config=config,
                 backend=backend,
@@ -1215,7 +1275,14 @@ def _ensure_clean_worktree(worktree: Path, *, runner: Runner) -> None:
         raise WorklinkError("worktree still dirty after Worklink commit")
 
 
-async def _run_remote_test_job(compute: Any, spec: Any, *, timeout_s: int) -> int | None:
+async def _run_remote_test_job(
+    compute: Any,
+    spec: Any,
+    *,
+    timeout_s: int,
+    claims: ChainlinkClaims | None = None,
+    claim_record: ClaimRecord | None = None,
+) -> int | None:
     """Dispatch a fresh sandboxed test job on the pushed branch and return its
     exit code (chainlink #538): 0 = tests passed.
 
@@ -1230,7 +1297,11 @@ async def _run_remote_test_job(compute: Any, spec: Any, *, timeout_s: int) -> in
     handle = None
     try:
         handle = await compute.launch(test_spec)
-        result = await compute.wait(handle, timeout_s)
+        wait = compute.wait(handle, timeout_s)
+        if claims is not None and claim_record is not None:
+            result = await _heartbeat_while(wait, claims=claims, record=claim_record)
+        else:
+            result = await wait
     except ComputeLaunchError as exc:
         _log_event("worklink_remote_test_job_launch_failed", issue_id=spec.issue_id, error=str(exc)[:300])
         return None

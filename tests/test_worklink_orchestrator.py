@@ -14,6 +14,7 @@ from mimir.event_logger import _reset_logger_for_tests, init_logger
 from mimir.worklink.backends import Caps, ComputeCaps, ComputeResult, RawResult, WorkOrder
 from mimir.worklink.evidence import EvidenceValidation, WorklinkEvidence
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
+from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, claim_records_from_comments
 from mimir.worklink.compute import WorkSpec
 from mimir.worklink.worker import WorkerPayload, run_worker_payload
 from mimir.worklink.worktree import WorktreeLease
@@ -21,6 +22,7 @@ from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
     WorklinkRunner,
+    _run_remote_test_job,
     render_decomposition_prompt,
     validate_leaf,
 )
@@ -52,6 +54,12 @@ class FakeCompute:
 
     async def cleanup(self, handle: WorkSpec) -> None:
         self.cleaned.append(handle)
+
+
+class SlowTestCompute(FakeCompute):
+    async def wait(self, handle: WorkSpec, timeout_s: int) -> ComputeResult:
+        await asyncio.sleep(0)
+        return ComputeResult(exit_code=0, stdout="tests ok", stderr="")
 
 
 class FakeBackend:
@@ -129,6 +137,57 @@ class WorkerFakeBackend(FakeBackend):
             local_worktree=order.worktree,
             local_argv=("fake-tool", "--cd", str(order.worktree), order.prompt),
         )
+
+
+@pytest.mark.asyncio
+async def test_remote_test_job_heartbeats_claim_during_finalize() -> None:
+    comments: list[str] = []
+    heartbeat_at = datetime(2026, 6, 12, 12, 45, tzinfo=UTC)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["issue", "comment"]:
+            comments.append(str(args[-1]))
+        return subprocess.CompletedProcess(list(args), 0, stdout="", stderr="")
+
+    claims = ChainlinkClaims(
+        agent_id="mimir-worklink",
+        runner=runner,
+        clock=lambda: heartbeat_at,
+    )
+    claim_record = ClaimRecord(
+        issue_id=750,
+        attempt=1,
+        agent_id="mimir-worklink",
+        claimed_at=datetime(2026, 6, 12, 12, tzinfo=UTC),
+    )
+    spec = WorkSpec(
+        issue_id=750,
+        attempt=1,
+        repo_url="https://example.invalid/repo.git",
+        base_ref="main",
+        branch="worklink/750-1",
+        prompt="",
+        rules=None,
+        test_command="pytest",
+        backend="fake",
+        timeout_s=1800,
+        env={},
+    )
+
+    exit_code = await _run_remote_test_job(
+        SlowTestCompute(),
+        spec,
+        timeout_s=1800,
+        claims=claims,
+        claim_record=claim_record,
+    )
+
+    assert exit_code == 0
+    heartbeats = claim_records_from_comments(comments)
+    assert heartbeats
+    assert heartbeats[-1].issue_id == 750
+    assert heartbeats[-1].attempt == 1
+    assert heartbeats[-1].heartbeat_at == heartbeat_at
 
 
 class WorkerOddArgvBackend(FakeBackend):
