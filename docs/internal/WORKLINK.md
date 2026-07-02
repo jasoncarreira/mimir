@@ -6,27 +6,69 @@ source of truth; mimir plans; pluggable coding/maintenance CLIs build;
 deterministic machinery connects them.
 
 Status: **Live and autonomous** (as of 2026-07-01; the original #380 slices have
-all shipped). In production the flow runs end-to-end with no manual invocation:
-the **ready-queue poller** auto-discovers `worklink:ready` leaves, the executor
-spawns a coding CLI (Codex today), observes evidence, pushes an `issue/<id>-a1`
-branch, and opens a **review PR** — posting `WORKLINK_CLAIM` / `WORKLINK_EVIDENCE`
-and moving the leaf `worklink:ready → worklink:review`. The **planner/decomposer
-contract** (the leaf template in §2.5) is enforced: a leaf missing the required
-sections is auto-demoted to `worklink:blocked` with a `WORKLINK_BLOCKED` reason
-before dispatch (re-plan → re-add `worklink:ready`). Execution is isolated in a
-per-issue worktree via the docker-sibling **broker** (§5; containment hardening
-in chainlink #517). Operator review/merge of the PR (or an approval-shaped event)
-closes the leaf; a failed attempt re-enters `worklink:ready` up to 3 times, then
-`worklink:blocked`. `mimir worklink run <issue-id>` remains as a manual / dry-run
-entry point. The slice markers below are historical rollout notes — the poller,
-the `worklink_run` tool path, and the planner contract are all live now.
+all shipped). The default production model is **integrated-epic mode**: Worklink
+claims one `worklink:epic` parent, creates or reads strict leaf slices, builds
+each slice in attempt branches, serially merges accepted slices into one epic
+integration branch, runs holistic validation, and opens exactly one final
+**draft** PR for the epic. The older one-leaf runner remains the lower-level
+execution primitive and manual / dry-run entry point (`mimir worklink run
+<issue-id>`), but ordinary operator intake should target epics.
+
+The **planner/decomposer contract** (the leaf template in §2.5) is enforced: a
+leaf missing the required sections is auto-demoted to `worklink:blocked` with a
+`WORKLINK_BLOCKED` reason before dispatch (re-plan → re-add `worklink:ready`).
+Execution is isolated in per-slice worktrees via the configured compute backend
+(docker-sibling broker in hardened deployments; §5). A failed slice attempt is
+retried through the epic reviewer loop up to the configured retry count and then
+marks that leaf blocked. The final epic PR is never auto-merged into base.
+Operator review of that single PR remains the merge boundary. The slice markers
+below are historical rollout notes — the poller, the `worklink_run` tool path,
+and the planner contract are all live now.
 Owner issue: chainlink #380; leaf issues are subissues of #380.
 
 ## Operator quickstart (TL;DR)
 
-You don't run anything by hand. You **file a well-formed leaf chainlink and label
-it `worklink:ready`**; the dispatcher claims it, builds it, and opens a review PR
-for you to merge. Everything below this section is the design/internals.
+You normally don't run anything by hand. You **file or select an epic** and label
+it `worklink:epic` (and `worklink:ready` when it should be dispatched). Worklink
+turns it into strict leaf slices, builds and reviews those slices, integrates
+them into one branch, and opens one draft epic PR for you to review and merge.
+Everything below this section is the design/internals.
+
+### 0. Integrated-epic intake paths
+
+There are two supported intake paths:
+
+1. **Brief → auto-decompose.** File a parent issue that describes the desired
+   outcome and label it `worklink:epic` + `worklink:ready`. The epic runner
+   invokes the `work-decomposer` role to emit strict leaf specs, dependency
+   edges, and proposed waves. The `decompose-reviewer` role must approve the
+   plan before any child leaf is filed.
+2. **Pre-authored leaves.** File a `worklink:epic` parent with already-authored
+   child leaves that satisfy the strict leaf template. Worklink skips child
+   creation, computes waves from the Chainlink blocked-by graph, and proceeds
+   directly to slice execution.
+
+The decompose review is a design review, not a rubber stamp: it checks epic AC
+coverage, strict leaf fields, file-disjoint same-wave work, serialized hotspots,
+and DAG validity. Each slice then receives adversarial per-slice review based on
+controller-observed evidence only. Standard slices get one reviewer pass; slices
+classified high-risk by assigned risk, labels, or `defaults.tiered_review` get
+multi-review with dissent verification.
+
+Accepted slices are merged **serially** into one integration branch
+(`defaults.epic_branch_prefix`, default `epic/`). Even when independent slices
+run in the same wave, the merge into the integration branch is protected by the
+integration merge lock and uses `--no-ff`; Worklink pushes the integration branch
+but does not merge it into `main` or any configured base branch.
+
+Before the final PR, the `integration-validator` role performs a holistic
+pre-finalize validation over the epic manifest and integrated diff. If all
+slices merged and validation is `GO`, Worklink opens one draft PR for the full
+epic. If one or more slices are blocked but validation returns `GO-WITH-NITS`,
+Worklink may open a **partial** draft PR containing the merged subset. A partial
+PR must name every stuck leaf explicitly as `Blocked leaf #<id>: <reason>` so
+operators can see what did not land. If a prerequisite slice blocks, dependent
+leaves are also marked blocked with `blocked by failed prerequisite`.
 
 ### 1. File a leaf
 
