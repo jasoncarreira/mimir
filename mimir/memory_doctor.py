@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import re
 from pathlib import Path
 from typing import Any
@@ -20,11 +21,25 @@ from .core_blocks import (
     describe_file,
     extract_desc_comment,
 )
-from .index import IndexEntry, render_memory_index
+from .index import (
+    IndexEntry,
+    build_state_index,
+    build_wiki_index,
+    render_memory_index,
+)
+from .wiki_backlinks import build_graph
 
 LEARNINGS_PENDING_MAX_BYTES = 8_192
 LEARNINGS_PENDING_MAX_LINES = 200
 ISSUE_NOTE_MAX_BYTES = 8_192
+STATE_SPEC_OLD_DAYS = 30
+TOP_EXAMPLES = 5
+
+_ALLOWED_TOP_LEVEL_STATE_MD = frozenset({
+    "INDEX.md",
+    "heartbeat-backlog.md",
+    "proposed-changes.md",
+})
 
 _SEVERITIES: tuple[str, ...] = ("error", "warning", "info")
 
@@ -83,6 +98,8 @@ def run_doctor(home: Path) -> DoctorReport:
         _check_issue_notes(home, findings),
         _check_learnings_pending(home, findings),
         _check_memory_index(home, findings),
+        _check_state(home, findings),
+        _check_wiki(home, findings),
     ]
     counts = Counter(f.severity for f in findings)
     severity_counts = {severity: counts.get(severity, 0) for severity in _SEVERITIES}
@@ -310,6 +327,138 @@ def _check_memory_index(home: Path, findings: list[DoctorFinding]) -> DoctorSect
     })
 
 
+def _check_state(home: Path, findings: list[DoctorFinding]) -> DoctorSection:
+    state_root = home / "state"
+    if not state_root.is_dir():
+        return DoctorSection("state", {
+            "exists": 0,
+            "index_exists": 0,
+            "index_stale": 0,
+            "unexpected_top_level_md_files": 0,
+            "spec_open_plan_files": 0,
+            "spec_old_open_plan_files": 0,
+            "spec_old_days": STATE_SPEC_OLD_DAYS,
+        })
+
+    index_path = state_root / "INDEX.md"
+    rendered = build_state_index(home)
+    index_exists = index_path.is_file()
+    index_stale = 0
+    if index_exists:
+        index_stale = int(_read_text(index_path) != rendered)
+        if index_stale:
+            findings.append(_finding(
+                "state", "index-stale", "warning", _rel(home, index_path),
+                "state/INDEX.md differs from the current rendered state index.",
+                "Let the normal index flush regenerate it after the next state change.",
+            ))
+    else:
+        findings.append(_finding(
+            "state", "index-missing", "warning", _rel(home, index_path),
+            "state/INDEX.md is missing.",
+            "Let the normal index flush regenerate it.",
+        ))
+
+    unexpected = [
+        path for path in _md_files(state_root, recursive=False)
+        if path.name not in _ALLOWED_TOP_LEVEL_STATE_MD
+    ]
+    for path in unexpected[:TOP_EXAMPLES]:
+        findings.append(_finding(
+            "state", "top-level-md", "warning", _rel(home, path),
+            "Unexpected top-level state markdown file.",
+            "Move durable knowledge under state/wiki/, state/raw/, or another named subtree.",
+        ))
+
+    open_plans, old_open_plans = _state_spec_plan_files(home)
+    for path in old_open_plans[:TOP_EXAMPLES]:
+        findings.append(_finding(
+            "state", "old-spec-plan", "info", _rel(home, path),
+            f"Open state/spec plan is at least {STATE_SPEC_OLD_DAYS} days old.",
+            "Decide whether to archive it under state/spec/archive/ or promote durable content to the wiki.",
+        ))
+
+    return DoctorSection("state", {
+        "exists": 1,
+        "index_exists": int(index_exists),
+        "index_stale": index_stale,
+        "rendered_index_bytes": len(rendered.encode("utf-8")),
+        "unexpected_top_level_md_files": len(unexpected),
+        "spec_open_plan_files": len(open_plans),
+        "spec_old_open_plan_files": len(old_open_plans),
+        "spec_old_days": STATE_SPEC_OLD_DAYS,
+    })
+
+
+def _check_wiki(home: Path, findings: list[DoctorFinding]) -> DoctorSection:
+    wiki_root = home / "state" / "wiki"
+    if not wiki_root.is_dir():
+        return DoctorSection("wiki", {
+            "exists": 0,
+            "index_exists": 0,
+            "index_stale": 0,
+            "pages": 0,
+            "orphans": 0,
+            "dangling_links": 0,
+            "slug_collisions": 0,
+        })
+
+    index_path = wiki_root / "index.md"
+    rendered = build_wiki_index(home)
+    index_exists = index_path.is_file()
+    index_stale = 0
+    if index_exists:
+        index_stale = int(_read_text(index_path) != rendered)
+        if index_stale:
+            findings.append(_finding(
+                "wiki", "index-stale", "warning", _rel(home, index_path),
+                "state/wiki/index.md differs from the current rendered wiki index.",
+                "Let the normal wiki index flush regenerate it after the next wiki change.",
+            ))
+    else:
+        findings.append(_finding(
+            "wiki", "index-missing", "warning", _rel(home, index_path),
+            "state/wiki/index.md is missing.",
+            "Let the normal wiki index flush regenerate it.",
+        ))
+
+    graph = build_graph(wiki_root)
+    for path_str in graph.orphans[:TOP_EXAMPLES]:
+        findings.append(_finding(
+            "wiki", "orphan", "warning", f"state/wiki/{path_str}",
+            "Wiki page has no inbound wikilinks.",
+            "Add an inbound link from a related page, merge it, or intentionally leave it documented.",
+        ))
+    for item in graph.dangling[:TOP_EXAMPLES]:
+        source = str(item.get("source") or "")
+        target = str(item.get("target") or "")
+        line = int(item.get("line") or 0)
+        findings.append(_finding(
+            "wiki", "dangling-link", "warning", f"state/wiki/{source}",
+            f"Wikilink [[{target}]] on line {line} does not resolve to a page.",
+            "Create the target page or correct the wikilink target.",
+        ))
+    for slug, paths in sorted(graph.collisions.items())[:TOP_EXAMPLES]:
+        rendered_paths = ", ".join(path.as_posix() for path in paths)
+        first = paths[0].as_posix() if paths else ""
+        findings.append(_finding(
+            "wiki", "slug-collision", "warning", f"state/wiki/{first}",
+            f"Slug '{slug}' is shared by multiple wiki pages: {rendered_paths}.",
+            "Rename one page so wikilinks resolve unambiguously for readers.",
+        ))
+
+    return DoctorSection("wiki", {
+        "exists": 1,
+        "index_exists": int(index_exists),
+        "index_stale": index_stale,
+        "rendered_index_bytes": len(rendered.encode("utf-8")),
+        "pages": len(graph.pages),
+        "orphans": len(graph.orphans),
+        "dangling_links": len(graph.dangling),
+        "slug_collisions": len(graph.collisions),
+    })
+
+
 def _render_memory_index_readonly(home: Path) -> str:
     memory_root = home / "memory"
     entries: list[IndexEntry] = []
@@ -326,6 +475,37 @@ def _render_memory_index_readonly(home: Path) -> str:
             is_core=rel.startswith("core/"),
         ))
     return render_memory_index(entries)
+
+
+def _state_spec_plan_files(home: Path) -> tuple[list[Path], list[Path]]:
+    spec_root = home / "state" / "spec"
+    if not spec_root.is_dir():
+        return [], []
+    now = datetime.now(timezone.utc).timestamp()
+    old_after_seconds = STATE_SPEC_OLD_DAYS * 24 * 60 * 60
+    open_plans: list[Path] = []
+    old_open_plans: list[Path] = []
+    for path in sorted(spec_root.rglob("*.md")):
+        rel_parts = path.relative_to(spec_root).parts
+        if rel_parts and rel_parts[0] == "archive":
+            continue
+        if not _is_open_spec_plan(path):
+            continue
+        open_plans.append(path)
+        try:
+            age_seconds = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if age_seconds >= old_after_seconds:
+            old_open_plans.append(path)
+    return open_plans, old_open_plans
+
+
+def _is_open_spec_plan(path: Path) -> bool:
+    name = path.name.lower()
+    if "decision" in name:
+        return False
+    return "plan" in name or "spec" in name
 
 
 def _issue_duplicate_key(path: Path, text: str) -> str:
