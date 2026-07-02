@@ -646,7 +646,7 @@ def ensure_tool_enforcement_hooks_installed(module: Any | None = None) -> None:
     ``claude-code:*`` executes built-in, bridged LangChain, and MCP tools inside
     the Claude Code SDK subprocess path, bypassing LangGraph's tool middleware.
     Model resolution calls this before constructing ``ChatClaudeCode`` so the
-    deprecated provider stays unavailable whenever the SDK/adapter no longer
+    supported provider stays fail-closed whenever the SDK/adapter no longer
     exposes the hook surface Mimir needs.
     """
     try:
@@ -662,9 +662,9 @@ def ensure_tool_enforcement_hooks_installed(module: Any | None = None) -> None:
         return
 
     raise RuntimeError(
-        "MIMIR_MODEL_SPEC=claude-code:* is disabled: Mimir could not install "
-        "the Claude Code PreToolUse enforcement hook required to run the "
-        "per-turn tool budget and prohibited-action guard before built-in, "
+        "MIMIR_MODEL_SPEC=claude-code:* cannot start safely: Mimir could not "
+        "install the Claude Code PreToolUse enforcement hook required to run "
+        "the per-turn tool budget and prohibited-action guard before built-in, "
         "bridged, and MCP tools execute. Install a supported "
         "langchain_claude_code/claude_agent_sdk adapter or use anthropic:, "
         "openai:, or codex-plus:."
