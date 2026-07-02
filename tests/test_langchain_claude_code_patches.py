@@ -28,12 +28,9 @@ from typing import Any
 
 import pytest
 
-# Skip the entire module if the optional ``langchain-claude-code`` fork
-# isn't installed. ``pip install mimir-agent`` doesn't pull the fork by
-# default (it's behind the ``claude-code`` extra); ``pip install -e
-# ".[dev]"`` likewise omits it. Operators who want to develop the
-# claude-code path install ``".[dev-claude-code]"`` which pulls both
-# the dev toolchain and the fork. Pre-OSS hardening (review item #4).
+# Skip the entire module if the optional Claude Code adapter isn't installed.
+# ``pip install mimir-agent`` and ``pip install -e ".[dev]"`` omit it by
+# default; Claude Code development uses the additional ``claude-code`` extra.
 pytest.importorskip("langchain_claude_code")
 
 from mimir._langchain_claude_code_patches import (

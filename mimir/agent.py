@@ -219,13 +219,8 @@ def _filter_session_turns(
 
 
 _PROVIDER_EXTRAS: dict[str, str] = {
-    # ``claude-code`` is intentionally absent: ``langchain-claude-code``
-    # is a git-pinned fork (PyPI rejects packages with direct URL deps),
-    # so it's installed as a separate step, not via an extra. See the
-    # ImportError message in the claude-code provider branch below for
-    # the install incantation. Tracked: issue #268 — restore the extra
-    # when upstream publishes a release.
     "anthropic": "anthropic",
+    "claude-code": "claude-code",
     "openai": "openai",
     "codex-plus": "codex-plus",
 }
@@ -368,14 +363,14 @@ def _resolve_model(
         except ImportError as exc:
             raise ImportError(
                 "MIMIR_MODEL_SPEC=claude-code:* requires the "
-                "``langchain-claude-code`` package. PyPI rejects "
-                "packages with direct URL deps, so it isn't a "
-                "mimir-agent extra — install it directly:\n"
-                "  pip install \"langchain-claude-code @ git+"
-                "https://github.com/jasoncarreira/langchain-claude-code"
-                f"@{_lcc_patches.PINNED_LANGCHAIN_CLAUDE_CODE_REF}\"\n"
-                "Restored as an extra once upstream patches "
-                "(see issue #268) merge + a release is cut."
+                "'claude-code' extra and the Claude Code CLI. Install "
+                "the adapter with `pip install 'mimir-agent[claude-code]'` "
+                "(or `uv sync --extra claude-code` in a checkout), install "
+                "the CLI with `npm install -g @anthropic-ai/claude-code`, "
+                "then authenticate on the host with `claude setup-token` "
+                "or `claude login`. Verify without exposing secrets by "
+                "running `claude --version`, `claude -p 'ping'`, and "
+                "`mimir setup --home <home> --subscription`."
             ) from exc
         _lcc_patches.assert_supported_langchain_claude_code_adapter(_lcc)
         _lcc_patches.ensure_tool_enforcement_hooks_installed(_lcc)

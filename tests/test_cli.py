@@ -832,6 +832,29 @@ def test_print_setup_report_omits_upstream_lines_when_absent(capsys):
     assert "initial push" not in out
 
 
+def test_print_setup_report_claude_code_operator_guidance(capsys):
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "model_spec": "claude-code:claude-sonnet-4-6",
+        "provider_name": "anthropic-max",
+        "billing_mode": "subscription",
+        "embedding_preset": "fastembed",
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "model adapter: pip install mimir-agent[claude-code]" in out
+    assert "claude setup-token" in out
+    assert "claude login" in out
+    assert "claude --version" in out
+    assert "claude -p 'ping'" in out
+    assert "do not" in out.lower()
+    assert "git+https" not in out
+
+
 
 
 # ─── --model flag (auto-routing via model_registry) ─────────────────────
@@ -851,7 +874,7 @@ def test_setup_default_model_routes_to_anthropic_api(tmp_path: Path):
 
 
 def test_setup_max_oauth_routes_claude_to_claude_code(tmp_path: Path):
-    """``--subscription`` opts INTO the legacy Max OAuth path for
+    """``--subscription`` opts INTO the Max OAuth path for
     operators with active Max plans."""
     home = tmp_path / "h"
     status = setup_home(home, subscription=True)

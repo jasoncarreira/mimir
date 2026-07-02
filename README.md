@@ -82,7 +82,7 @@ mimir setup --home ~/mimir-home
 
 # Configure auth — pick one
 #   API key:                     edit ~/mimir-home/.env, set ANTHROPIC_API_KEY
-#   Anthropic Max plan (free):   one extra install step — see "Claude Max plan" below
+#   Anthropic Max plan:          install [claude-code] + Claude Code CLI; see below
 #   Gateway:                     set ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
 #   Non-Anthropic Anthropic-compat (Minimax, Kimi, …): see "Alternative providers"
 
@@ -98,24 +98,21 @@ Available extras (combine in one install command — e.g. `pip install
 
 | Extra | Pulls |
 |---|---|
-| `anthropic`, `openai`, `codex-plus` | model adapter packages (`codex-plus` = ChatGPT Plus / Pro Codex subscription via the OAuth-backed gateway) |
+| `anthropic`, `claude-code`, `openai`, `codex-plus` | model adapter packages (`claude-code` = Claude Max OAuth subprocess; `codex-plus` = ChatGPT Plus / Pro Codex subscription via the OAuth-backed gateway) |
 | `discord`, `slack` | bridge runtimes |
 | `mcp` | Model Context Protocol client |
 
-For **Claude Max** (the subprocess provider via `langchain-claude-code`),
-that package is currently a git-pinned fork — PyPI rejects published
-packages that declare direct `git+` URLs, so it isn't an extra. Install
-the fork as a separate step after `mimir-agent`:
+For **Claude Max** (the subprocess provider via Claude Code), install the
+normal `claude-code` extra plus the Claude Code CLI:
 
 ```bash
-pip install mimir-agent[anthropic]
-pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@c03f075c8b84fb0c718de1aabdd6493f5d191786"
-claude setup-token   # OAuth dance — once per host
+pip install "mimir-agent[claude-code]"
+npm install -g @anthropic-ai/claude-code
+claude setup-token   # or: claude login
+claude --version && claude -p 'ping'
 ```
 
-This works around upstream PRs (#2 / #4 / #6) that haven't merged yet.
-Once they land + a release is cut, the second `pip install` collapses
-back into a `[claude-code]` extra. Tracked in mimir-repo issue #268.
+Do not paste Claude tokens or `~/.claude` files into chat, logs, or issues.
 
 ### Or clone for development
 
@@ -123,8 +120,8 @@ back into a `[claude-code]` extra. Tracked in mimir-repo issue #268.
 git clone https://github.com/jasoncarreira/mimir.git
 cd mimir
 uv sync --extra dev
-# For the Claude Code subprocess path, also:
-# uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@c03f075c8b84fb0c718de1aabdd6493f5d191786"
+# For the Claude Code subprocess path, use:
+# uv sync --extra dev --extra claude-code
 
 uv run mimir setup --home ~/mimir-home
 uv run mimir run --home ~/mimir-home
@@ -262,15 +259,15 @@ Optional extras:
 | Extra | Pulls | When to use |
 |---|---|---|
 | `[dev]` | pytest + bridges + Anthropic / OpenAI / Codex Plus adapters + faiss | Default for contributors — covers the agent core, saga, bridges. Claude-code-specific tests skip cleanly via `pytest.importorskip`. |
-| `[anthropic]` / `[openai]` / `[codex-plus]` | Single model adapter | Runtime install with one model path. |
+| `[anthropic]` / `[claude-code]` / `[openai]` / `[codex-plus]` | Single model adapter | Runtime install with one model path. |
 
-Developers on the Claude Code subprocess path install the
-git-pinned fork as a separate step (same reasoning as the runtime
-Claude Max path above):
+Developers on the Claude Code subprocess path add the adapter extra and
+install/authenticate the CLI once per host:
 
 ```bash
-uv sync --extra dev
-uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@c03f075c8b84fb0c718de1aabdd6493f5d191786"
+uv sync --extra dev --extra claude-code
+npm install -g @anthropic-ai/claude-code
+claude setup-token
 ```
 
 ```bash
@@ -281,7 +278,7 @@ uv run pytest --ignore=tests/test_bench_via_mimir.py  # skip the slow integratio
 
 # Tests — full toolchain (claude-code-specific tests will run)
 uv pip install -e ".[dev]"
-uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@c03f075c8b84fb0c718de1aabdd6493f5d191786"
+uv pip install -e ".[claude-code]"
 uv run pytest
 ```
 

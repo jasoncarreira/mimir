@@ -122,7 +122,7 @@ def langchain_claude_code_adapter_compatibility(module: Any | None = None) -> Ad
     * a controlled distribution named ``mimir-langchain-claude-code``;
     * an adapter module explicitly declaring all required compatibility
       features; or
-    * the known fork commit from chainlink #733/#734.
+    * the historical known fork commit from chainlink #733/#734.
     """
     if module is None:
         try:
@@ -175,11 +175,10 @@ def assert_supported_langchain_claude_code_adapter(module: Any | None = None) ->
         "MIMIR_MODEL_SPEC=claude-code:* requires a maintained "
         "langchain_claude_code adapter. "
         f"{status.reason}. Install the controlled adapter distribution "
-        f"``{CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST}`` when available, or the "
-        "known fork ref:\n"
-        "  pip install \"langchain-claude-code @ git+"
-        "https://github.com/jasoncarreira/langchain-claude-code"
-        f"@{PINNED_LANGCHAIN_CLAUDE_CODE_REF}\""
+        f"with `pip install 'mimir-agent[claude-code]'` or "
+        f"`pip install {CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST}`. Then "
+        "install/authenticate the Claude Code CLI with `claude setup-token` "
+        "or `claude login` and verify with `claude -p 'ping'`."
     )
 
 
@@ -188,9 +187,7 @@ def _adapter_has_native_mimir_compatibility() -> bool:
         import langchain_claude_code as lcc  # type: ignore[import-untyped]
     except ImportError:
         return False
-    return _module_declares_compatibility(lcc) or (
-        _distribution_version(CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST) is not None
-    )
+    return _module_declares_compatibility(lcc)
 
 
 # ContextVar carrying the per-call ``tool_events`` list. The hook

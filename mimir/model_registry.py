@@ -101,7 +101,7 @@ class ModelRoute:
 #: Default model when ``mimir setup`` runs without ``--model``.
 #: Resolves to ``anthropic:claude-sonnet-4-6`` (direct Anthropic API)
 #: by default; ``mimir setup --subscription`` flips Claude family
-#: routes to ``claude-code:`` (legacy Max OAuth subprocess).
+#: routes to ``claude-code:`` (Max OAuth subprocess).
 DEFAULT_MODEL_NAME = "claude-sonnet-4-6"
 
 

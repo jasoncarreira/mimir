@@ -11,6 +11,7 @@ resolution-markers = [
 [manifest]
 members = [
     "mimir-agent",
+    "mimir-langchain-claude-code",
     "saga",
 ]
 
@@ -454,6 +455,24 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/7a/1d/29d32e0fb40864b1f878c7f5a0b343ae676c6e2b271a2d55cc3a152391da/charset_normalizer-3.4.7-cp314-cp314t-win_amd64.whl", hash = "sha256:03853ed82eeebbce3c2abfdbc98c96dc205f32a79627688ac9a27370ea61a49c", size = 174168, upload-time = "2026-04-02T09:27:49.795Z" },
     { url = "https://files.pythonhosted.org/packages/de/32/d92444ad05c7a6e41fb2036749777c163baf7a0301a040cb672d6b2b1ae9/charset_normalizer-3.4.7-cp314-cp314t-win_arm64.whl", hash = "sha256:c35abb8bfff0185efac5878da64c45dafd2b37fb0383add1be155a763c1f083d", size = 153018, upload-time = "2026-04-02T09:27:51.116Z" },
     { url = "https://files.pythonhosted.org/packages/db/8f/61959034484a4a7c527811f4721e75d02d653a35afb0b6054474d8185d4c/charset_normalizer-3.4.7-py3-none-any.whl", hash = "sha256:3dce51d0f5e7951f8bb4900c257dad282f49190fdbebecd4ba99bcc41fef404d", size = 61958, upload-time = "2026-04-02T09:28:37.794Z" },
+]
+
+[[package]]
+name = "claude-agent-sdk"
+version = "0.2.110"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "mcp" },
+    { name = "sniffio" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bb/98/8fdab35ed9e1a36bc7afab4d390cc5002094a4950996c079da9aa4541cc4/claude_agent_sdk-0.2.110.tar.gz", hash = "sha256:538b548bac07a22f65686abab063a902ac76ba35989d0f073c942f96248e9fa3", size = 255632, upload-time = "2026-06-24T22:11:52.342Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/aa/93/29d4fdaa13e69034faf8d3503df915b07c820e2c08e3d6a7515149cde5bb/claude_agent_sdk-0.2.110-py3-none-macosx_11_0_arm64.whl", hash = "sha256:fed0e0f4804d9f9cff80ab7d1b44142ebd1046cdd29ca74caef4c92c35fff8d8", size = 64924533, upload-time = "2026-06-24T22:11:55.612Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/03/b40bb673cd93cdc3928262c1be75fde34a7bed4bf2c2c20e04218e2005ea/claude_agent_sdk-0.2.110-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:62b23869d46cef6f6ff1d00ceaa5e846e2f1d297478421c835efb8fe99369d4f", size = 69704449, upload-time = "2026-06-24T22:11:59.149Z" },
+    { url = "https://files.pythonhosted.org/packages/f9/18/ab67cb5ce641333385bed55ed8e9665c00f7d30d1f6ab12f8463ddb7695f/claude_agent_sdk-0.2.110-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:324e49553c6303d6b267217dc2912652b97af2bc96503efd12095ae915b46b83", size = 74879555, upload-time = "2026-06-24T22:12:03.25Z" },
+    { url = "https://files.pythonhosted.org/packages/91/88/3627d7d14310cfec66977551263e219365244a906fc7ca1209fb0c3a6cec/claude_agent_sdk-0.2.110-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:56371dd7a2c66c0bd497dc0b3cab4193a228b196f600676393d69c0ecee37cfb", size = 75924237, upload-time = "2026-06-24T22:12:07.183Z" },
+    { url = "https://files.pythonhosted.org/packages/49/79/c9066c5c387d42c19a4b675ec1ff5219f8920cfda8ff8b527119fd69b774/claude_agent_sdk-0.2.110-py3-none-win_amd64.whl", hash = "sha256:4235d4de6d685a189c12612095ab192b759280ede1f3aed0c3e784d52c3555f9", size = 75448209, upload-time = "2026-06-24T22:12:11.283Z" },
 ]
 
 [[package]]
@@ -1110,6 +1129,19 @@ wheels = [
 ]
 
 [[package]]
+name = "langchain-claude-code"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "claude-agent-sdk" },
+    { name = "langchain-core" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e5/6b/0d4ecd906dd70a8f018cf555360e71718e48e4c8856994c9a53cac423297/langchain_claude_code-0.1.0.tar.gz", hash = "sha256:959273ee091374e087a657846a0258c287e0dbd7c4c0c8361875bc53e6babadb", size = 184861, upload-time = "2025-12-02T19:44:25.095Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/bd/aef448681b6ebc1bca59fd9a67019f5225caec1ea17a1809930eec5491a3/langchain_claude_code-0.1.0-py3-none-any.whl", hash = "sha256:0f98d851654793e1d8cf3cc42aa5a33ff32b46e5f491ba8ff51d08b3279b507a", size = 10821, upload-time = "2025-12-02T19:44:23.418Z" },
+]
+
+[[package]]
 name = "langchain-codex-plus"
 version = "0.0.5"
 source = { registry = "https://pypi.org/simple" }
@@ -1341,6 +1373,9 @@ anthropic = [
 bench = [
     { name = "saga" },
 ]
+claude-code = [
+    { name = "mimir-langchain-claude-code" },
+]
 codex-plus = [
     { name = "langchain-codex-plus" },
 ]
@@ -1410,6 +1445,7 @@ requires-dist = [
     { name = "langchain-openai", marker = "extra == 'openai'", specifier = ">=1.2.1" },
     { name = "mcp", marker = "extra == 'dev'", specifier = ">=1.27" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.27" },
+    { name = "mimir-langchain-claude-code", marker = "extra == 'claude-code'", editable = "packages/mimir-langchain-claude-code" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
     { name = "pytest-aiohttp", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.3.0" },
@@ -1420,7 +1456,7 @@ requires-dist = [
     { name = "slack-bolt", marker = "extra == 'dev'", specifier = ">=1.18" },
     { name = "slack-bolt", marker = "extra == 'slack'", specifier = ">=1.18" },
 ]
-provides-extras = ["anthropic", "openai", "codex-plus", "mcp", "bench", "discord", "slack", "gepa", "dev"]
+provides-extras = ["anthropic", "claude-code", "openai", "codex-plus", "mcp", "bench", "discord", "slack", "gepa", "dev"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1436,6 +1472,17 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=1.3.0" },
     { name = "slack-bolt", specifier = ">=1.18" },
 ]
+
+[[package]]
+name = "mimir-langchain-claude-code"
+version = "0.1.0"
+source = { editable = "packages/mimir-langchain-claude-code" }
+dependencies = [
+    { name = "langchain-claude-code" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "langchain-claude-code", specifier = ">=0.1.0,<0.2" }]
 
 [[package]]
 name = "mmh3"

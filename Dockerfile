@@ -6,8 +6,9 @@
 # PyPI.
 #
 # ── Auth: pick ONE of these at runtime via -e or compose env: ─────────
-#   A. Max plan (free with subscription, requires the ``claude-code``
-#      extra — build with ``--build-arg MIMIR_EXTRAS=claude-code,...``):
+#   A. Max plan (subscription, requires the ``claude-code`` extra and
+#      Claude Code CLI — build with
+#      ``--build-arg MIMIR_ENABLE_CLAUDE_CODE=1``):
 #        Run ``claude setup-token`` ON THE HOST first, mount the
 #        credential file into the container at runtime. macOS hosts:
 #        keychain isn't portable; copy the token blob via
@@ -29,12 +30,7 @@ FROM python:3.11-slim AS base
 # OS deps:
 #   - ca-certificates curl gnupg: prereqs for adding NodeSource +
 #     fetching uv installer
-#   - git: required when the build adds Claude Code subprocess
-#     support — ``langchain-claude-code`` is pinned to a git ref
-#     until upstream PRs land (see issue #268). The fork isn't a
-#     mimir-agent extra (PyPI rejects direct git URLs), so it ships
-#     as an EXTRA build step that builds add explicitly (see the
-#     ``MIMIR_ENABLE_CLAUDE_CODE`` block below).
+#   - git: source-control tooling for skills and operator workflows.
 #   - jq: JSON/JSONL parsing relied on by pollers, skill bodies, and
 #     operational/debugging shell workflows. Kept in parity with the
 #     scaffold-generated image (scaffold_docker.py), which already ships
@@ -113,25 +109,21 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 #   docker build --build-arg MIMIR_EXTRAS=anthropic,discord .
 #
 # Available extras (see pyproject.toml):
-#   anthropic, openai, codex-plus               (model providers)
+#   anthropic, claude-code, openai, codex-plus  (model providers)
 #   discord, slack                              (bridges)
 #   mcp                                         (Model Context Protocol)
 #
-# Note: there is NO ``claude-code`` extra. ``langchain-claude-code``
-# is a git-pinned fork (PyPI rejects packages with direct URL deps),
-# so it installs as an extra build step gated on
-# ``MIMIR_ENABLE_CLAUDE_CODE``. See the block below.
+# ``MIMIR_ENABLE_CLAUDE_CODE=1`` below installs the Claude Code CLI and
+# the adapter extra together, so operators do not need to remember both.
 ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 
-# Optional: install the Claude Code subprocess provider. Set
-# ``--build-arg MIMIR_ENABLE_CLAUDE_CODE=1`` to enable. Pinned to a
-# specific fork SHA; bump when upstream patches merge (issue #268).
-ARG LANGCHAIN_CLAUDE_CODE_REF=c03f075c8b84fb0c718de1aabdd6493f5d191786
+# Optional: install the Claude Code subprocess provider adapter. Set
+# ``--build-arg MIMIR_ENABLE_CLAUDE_CODE=1`` to enable; the same build
+# arg installs the npm CLI in the OS layer above.
 RUN if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \
-        pip install --no-cache-dir \
-            "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@${LANGCHAIN_CLAUDE_CODE_REF}" ; \
+        pip install --no-cache-dir "mimir-agent[claude-code]" ; \
     fi
 
 # Pre-warm the fastembed cache so the first request doesn't pay the

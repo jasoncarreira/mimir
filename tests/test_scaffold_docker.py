@@ -324,7 +324,7 @@ def test_render_dockerfile_uses_tini_as_init():
 def test_render_dockerfile_gates_claude_code_cli_on_build_arg():
     """The Claude Code npm CLI should not ride along in every image.
 
-    It is only needed when the legacy subprocess provider is enabled, so
+    It is only needed when the subprocess provider is enabled, so
     generated Dockerfiles install it under the same MIMIR_ENABLE_CLAUDE_CODE
     gate as the Python provider. Mermaid remains unconditional.
     """
@@ -549,6 +549,14 @@ def test_render_start_sh_expands_extras():
     from mimir.scaffold_docker import render_start_sh
     out = render_start_sh(uv_extras=["discord", "claude-code"])
     assert "UV_EXTRAS=\"--extra discord --extra claude-code\"" in out
+
+
+def test_render_start_sh_enable_claude_code_adds_adapter_extra():
+    from mimir.scaffold_docker import render_start_sh
+    out = render_start_sh(uv_extras=["discord"])
+    assert 'if [ "${MIMIR_ENABLE_CLAUDE_CODE:-0}" = "1" ]; then' in out
+    assert 'UV_EXTRAS="$UV_EXTRAS --extra claude-code"' in out
+    assert 'UV_EXTRAS="$--extra' not in out
 
 
 def test_render_start_sh_uv_sync_line_is_valid_shell_with_no_extras():
@@ -923,7 +931,7 @@ def test_render_dockerfile_pypi_mode_installs_from_pypi(tmp_path):
     assert "VIRTUAL_ENV=/home/mimir/venv" in out
     # Optional claude-code support gated on a build-arg.
     assert "MIMIR_ENABLE_CLAUDE_CODE" in out
-    assert "langchain-claude-code @ git+https" in out
+    assert 'pip install --no-cache-dir "mimir-agent[claude-code]"' in out
 
 
 def test_render_dockerfile_pypi_mode_default_extras(tmp_path):
@@ -941,6 +949,14 @@ def test_render_dockerfile_pypi_mode_custom_extras(tmp_path):
     from mimir.scaffold_docker import render_dockerfile
     out = render_dockerfile([], mode="pypi", mimir_extras=["anthropic", "discord"])
     assert 'ARG MIMIR_EXTRAS="anthropic,discord"' in out
+
+
+def test_render_compose_yml_exposes_claude_code_build_switch():
+    from mimir.scaffold_docker import render_compose_yml
+
+    for mode in ("workspace", "pypi"):
+        out = render_compose_yml(service_name="x", web_port=8080, mode=mode)
+        assert "MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}" in out
 
 
 def test_render_dockerfile_pypi_mode_preserves_skill_fragments():

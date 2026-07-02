@@ -121,7 +121,7 @@ def test_provider_for_quota(model_spec, base_url, expected):
         ("anthropic:MiniMax-M2.7", "anthropic"),  # compat gateways use langchain-anthropic
         ("openai:gpt-4o", "openai"),
         ("codex-plus:gpt-4o", "codex-plus"),
-        ("claude-code:claude-sonnet-4-6", ""),  # git install, not a published extra
+        ("claude-code:claude-sonnet-4-6", "claude-code"),
         ("claude-sonnet-4-6", ""),  # bare name, no prefix
         ("", ""),
     ],

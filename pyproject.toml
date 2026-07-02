@@ -39,27 +39,16 @@ dependencies = [
 # (``claude-code:``, ``anthropic:``, ``openai:`` etc.) and lazy-imports
 # the matching package, so installing only one keeps the dep graph
 # small. Pick at least one or the agent can't build a model.
-# NOTE on Claude Code support: ``langchain-claude-code`` is required
-# to route the agent loop through the Claude Code CLI subprocess
-# (Max-plan friendly). We pin a private fork at a specific SHA because
-# the upstream patches (#2/#4/#6) haven't merged yet.
-#
-# PyPI rejects published packages that declare direct URL (git+)
-# dependencies — even gated behind an optional extra. So mimir-agent
-# CANNOT declare a ``[claude-code]`` extra here without breaking
-# publishing. Operators who want Claude Max support install the
-# fork separately AFTER mimir-agent:
-#
-#   pip install mimir-agent[anthropic]
-#   pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@c03f075c8b84fb0c718de1aabdd6493f5d191786"
-#
-# When upstream merges + cuts a release, this becomes a normal
-# registry dep and we can move it back into an extra. Tracking:
-# chainlink #268. The Dockerfile mirrors this — operators selecting
-# the Claude Code path do an extra ``pip install`` step in the
-# build (see Dockerfile comment block).
+# Claude Code support routes the agent loop through the Claude Code
+# CLI subprocess (Max-plan friendly). The maintained adapter is the
+# controlled distribution ``mimir-langchain-claude-code``; it preserves
+# the import package ``langchain_claude_code`` while letting operators
+# install a normal mimir extra instead of hand-copying a git URL.
 anthropic = [
     "langchain-anthropic>=1.4",
+]
+claude-code = [
+    "mimir-langchain-claude-code>=0.1.0,<0.2",
 ]
 openai = [
     "langchain-openai>=1.2.1",
@@ -74,9 +63,8 @@ codex-plus = [
 ]
 # Model Context Protocol — required if any ``MIMIR_MCP_SERVERS_*`` env
 # var is set. Pre-OSS hardening (review item #4 follow-on): this used
-# to come along transitively via ``langchain-claude-code``, but with
-# the fork now opt-in, MCP needs its own explicit extra so operators
-# who want MCP know to install it.
+# to come along transitively via the Claude Code adapter, but MCP now
+# has its own explicit extra so operators who want MCP know to install it.
 mcp = [
     "mcp>=1.27",
 ]
@@ -112,11 +100,9 @@ slack = [
 gepa = [
     "gepa>=0.1.1,<0.2",
 ]
-# ``pip install -e ".[dev]"`` — minimal dev toolchain. Does NOT pull
-# the langchain-claude-code git fork; that path is in
-# ``dev-claude-code`` below. Tests that touch the claude-code module
-# skip via ``pytest.importorskip("langchain_claude_code")`` when the
-# extra isn't installed.
+# ``pip install -e ".[dev]"`` — minimal dev toolchain. Claude-code
+# adapter tests still skip via ``pytest.importorskip("langchain_claude_code")``
+# unless the ``claude-code`` extra is also installed.
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
@@ -141,17 +127,6 @@ dev = [
     "botocore>=1.35",
 ]
 
-# For dev work on the Claude Code subprocess path, install ``[dev]``
-# then add the fork from git:
-#
-#   uv sync --extra dev
-#   uv pip install "langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@c03f075c8b84fb0c718de1aabdd6493f5d191786"
-#
-# The ``[dev-claude-code]`` extra is gone for the same reason
-# ``[claude-code]`` is gone — PyPI direct-URL rejection. Tests that
-# touch ``langchain_claude_code`` use ``pytest.importorskip`` so they
-# skip cleanly when the fork isn't installed.
-
 [project.scripts]
 mimir = "mimir.cli:main"
 
@@ -159,14 +134,9 @@ mimir = "mimir.cli:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# No ``allow-direct-references`` here. The previous ``[claude-code]``
-# optional extra used a ``git+https://…`` direct reference, but PyPI
-# rejects published packages that declare ANY direct URL dep — even
-# behind an extra. The fork install moved to a documented separate
-# step (see pyproject.toml's claude-code NOTE block, the Dockerfile's
-# claude-code comment, and README's auth section). When upstream
-# merges + publishes a release this flag can be reinstated alongside
-# a registry-style claude-code extra.
+# No ``allow-direct-references`` here. Claude Code support is exposed
+# through the normal ``claude-code`` extra backed by the controlled
+# ``mimir-langchain-claude-code`` distribution.
 
 [tool.hatch.build.targets.wheel]
 packages = ["mimir"]
@@ -245,21 +215,21 @@ testpaths = ["tests"]
 # benchmarks/saga/ is the second member (the LongMemEval bench shell
 # — not the runtime memory backend, which lives at mimir/saga/).
 [tool.uv.workspace]
-members = ["benchmarks/saga"]
+members = ["benchmarks/saga", "packages/mimir-langchain-claude-code"]
 
 # Resolve the ``saga`` dependency declared in [project.dependencies]
 # from the workspace member rather than PyPI. uv installs it editable so
 # saga.core / saga.benchmarks are importable from anywhere in the workspace.
 [tool.uv.sources]
 saga = { workspace = true }
+mimir-langchain-claude-code = { workspace = true }
 
 [dependency-groups]
 # uv-native dependency group (PEP 735). Mirrors
 # ``[project.optional-dependencies].dev`` so ``uv sync`` and
 # ``pip install -e ".[dev]"`` both pull the same test toolchain.
-# langchain-claude-code is OUT — it's behind the ``dev-claude-code``
-# extra (see pre-OSS hardening, review item #4). Tests that touch
-# the fork skip via ``pytest.importorskip``.
+# Claude Code remains opt-in via ``--extra claude-code``. Tests that
+# touch its adapter skip via ``pytest.importorskip`` when it is absent.
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
