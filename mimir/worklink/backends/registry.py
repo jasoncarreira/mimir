@@ -22,7 +22,6 @@ from .codex import CodexBackend
 
 
 WORKLINK_MERGED_LABEL = "worklink:merged"
-VALID_MERGE_STRATEGIES = frozenset({"no-ff", "squash", "ff-only"})
 
 
 @dataclass(frozen=True)
@@ -92,7 +91,6 @@ class WorklinkDefaults:
     epic_branch_prefix: str = "epic/"
     max_review_retries: int = 3
     reviewer_backend: str | None = None
-    merge_strategy: str = "no-ff"
     tiered_review: TieredReviewConfig = field(default_factory=TieredReviewConfig)
 
     def __post_init__(self) -> None:
@@ -195,9 +193,6 @@ class WorklinkConfig:
                 default=WorklinkDefaults.max_review_retries,
             ),
             reviewer_backend=str(defaults_data.get("reviewer_backend", backend_name)),
-            merge_strategy=_parse_merge_strategy(
-                defaults_data.get("merge_strategy", default_values.merge_strategy)
-            ),
             tiered_review=_parse_tiered_review_config(defaults_data.get("tiered_review")),
         )
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
@@ -305,14 +300,6 @@ def _positive_int(value: Any, *, default: int) -> int:
 
 def _normalize_compute_backend_name(name: str) -> str:
     return name.strip().replace("-", "_")
-
-
-def _parse_merge_strategy(value: Any) -> str:
-    strategy = str(value)
-    if strategy not in VALID_MERGE_STRATEGIES:
-        valid = ", ".join(sorted(VALID_MERGE_STRATEGIES))
-        raise ValueError(f"worklink defaults.merge_strategy must be one of: {valid}")
-    return strategy
 
 
 def _expect_mapping(value: Any, label: str) -> Mapping[str, Any]:
