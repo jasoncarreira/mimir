@@ -244,6 +244,60 @@ def test_dedup_pass_is_idempotent(conn):
     assert second.candidates_scanned == 1   # only the canonical remains
 
 
+def test_dedup_pass_reports_only_committed_tombstones(conn):
+    """Overlapping stale clusters can point at a canonical that was
+    tombstoned by an earlier cluster in the same run. The rollback branch must
+    not leak that skipped cluster's duplicate ids into the public result."""
+    embed_fn = _embed_fn_factory({
+        "alpha": [1.0, 0.0, 0.0, 0.0],
+        "beta":  [1.0, 0.0, 0.0, 0.0],
+        "gamma": [1.0, 0.0, 0.0, 0.0],
+    })
+    a = store(conn, "alpha", embed_fn=embed_fn).atom_id
+    b = store(conn, "beta", embed_fn=embed_fn).atom_id
+    c = store(conn, "gamma", embed_fn=embed_fn).atom_id
+    # Make a win the first cluster. Remove c's access history and pin b so the
+    # stale second cluster picks b as canonical after b has been tombstoned.
+    for _ in range(3):
+        mark_access(conn, [AccessEvent(atom_id=a, source="retrieval")])
+    conn.execute("DELETE FROM access_events WHERE atom_id = ?", (c,))
+    conn.execute("DELETE FROM atom_access_summary WHERE atom_id = ?", (c,))
+    conn.execute("UPDATE atoms SET is_pinned = 1 WHERE id = ?", (b,))
+    conn.commit()
+
+    cols = (
+        "id", "content", "stream", "memory_type", "source_type",
+        "created_at", "topics", "metadata", "is_pinned", "agent_id",
+        "session_id", "encoding_confidence",
+    )
+    raws = {
+        row[1]: dict(zip(cols, row))
+        for row in conn.execute(
+            "SELECT id, content, stream, memory_type, source_type, "
+            "created_at, topics, metadata, is_pinned, agent_id, session_id, "
+            "encoding_confidence FROM atoms WHERE id IN (?, ?, ?)",
+            (a, b, c),
+        ).fetchall()
+    }
+
+    def cluster_fn(_raws):
+        return [
+            [raws["alpha"], raws["beta"]],
+            [raws["beta"], raws["gamma"]],
+        ]
+
+    result = dedup_pass(conn, cluster_fn=cluster_fn, min_cluster_size=2)
+
+    assert result.duplicates_tombstoned == [b]
+    assert result.merges == {a: [b]}
+    assert conn.execute(
+        "SELECT tombstoned FROM atoms WHERE id = ?", (b,),
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT tombstoned FROM atoms WHERE id = ?", (c,),
+    ).fetchone()[0] == 0
+
+
 def test_dedup_pass_respects_min_cluster_size(conn):
     """A singleton cluster never merges."""
     embed_fn = _embed_fn_factory({
