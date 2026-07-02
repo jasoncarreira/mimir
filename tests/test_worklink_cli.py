@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from mimir.cli import main
+from mimir.worklink.epic import EpicRunResult
 from mimir.worklink.orchestrator import WorklinkRunResult
 
 
@@ -114,6 +115,55 @@ def test_worklink_run_cli_forwards_autonomous_flag(
 
     assert exc.value.code == 0
     assert calls and calls[0]["autonomous"] is True
+
+
+def test_worklink_run_epic_cli_dispatches_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_run_epic(**kwargs: object) -> EpicRunResult:
+        calls.append(kwargs)
+        return EpicRunResult(
+            epic_id=773,
+            status="partial",
+            pr_url="https://github.com/jasoncarreira/mimir/pull/1000",
+            manifest_path=tmp_path / "state" / "worklink" / "epics" / "773.json",
+            blocked_leaves=(775,),
+        )
+
+    import mimir.commands.worklink as worklink_cmd
+
+    monkeypatch.setattr(worklink_cmd, "run_epic", fake_run_epic)
+
+    with pytest.raises(SystemExit) as exc:
+        main([
+            "worklink",
+            "run-epic",
+            "773",
+            "--home",
+            str(tmp_path / "home"),
+            "--repo",
+            str(tmp_path / "repo"),
+            "--backend",
+            "fake",
+            "--base",
+            "main",
+            "--autonomous",
+        ])
+
+    assert exc.value.code == 0
+    assert calls == [
+        {
+            "home": (tmp_path / "home").resolve(),
+            "repo": (tmp_path / "repo").resolve(),
+            "epic_id": 773,
+            "backend": "fake",
+            "base_branch": "main",
+            "autonomous": True,
+        }
+    ]
+    assert "worklink epic #773: partial PR" in capsys.readouterr().out
 
 
 def test_worklink_run_cli_autonomous_refused_exits_1(
