@@ -18,6 +18,7 @@ import subprocess
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from .backends import BackendRegistry, WorkOrder, WorklinkConfig
+from .backends.registry import WORKLINK_MERGED_LABEL
 from .claims import ChainlinkClaims
 from .compute import ComputeLaunchError, ComputeResult
 from .epic_state import (
@@ -25,6 +26,7 @@ from .epic_state import (
     EpicSliceRecord,
     load_epic_state,
     load_or_init_epic_state,
+    resume_epic_run,
     save_epic_state,
 )
 from .evidence import (
@@ -40,9 +42,11 @@ from .orchestrator import (
     _commit_worktree_changes,
     _git_push,
     _repo_remote_url,
+    _parse_chainlink_datetime,
     _repo_slug,
     _runner_for_home,
     _run_remote_test_job,
+    _create_backend_checkout,
     _template_path,
     _write_evidence,
     render_work_order,
@@ -84,6 +88,13 @@ class EpicRunResult:
     manifest_path: Path | None = None
     blocked_leaves: tuple[int, ...] = ()
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class EpicTestStatus:
+    command: str
+    exit_code: int
+    summary: str
 
 
 class EpicRoleRunner(Protocol):
@@ -185,14 +196,26 @@ class ChainlinkEpicClient:
 
     def file_leaf(self, epic_id: int, leaf: Any) -> int:
         title = str(getattr(leaf, "title"))
+        for existing in self.child_leaves(epic_id):
+            if existing.issue.title == title:
+                return existing.issue.issue_id
         body = _leaf_body(leaf)
         labels = list(getattr(leaf, "labels", []) or ["worklink:ready"])
-        cmd = [self.chainlink_bin, "issue", "create", "--parent", str(epic_id), "--title", title, "--description", body]
+        cmd = [
+            self.chainlink_bin,
+            "issue",
+            "subissue",
+            str(epic_id),
+            title,
+            "--description",
+            body,
+            "--json",
+        ]
         for label in labels:
             cmd.extend(["--label", str(label)])
         result = self.runner(cmd)
         if result.returncode != 0:
-            raise WorklinkError((result.stderr or result.stdout).strip() or "chainlink issue create failed")
+            raise WorklinkError((result.stderr or result.stdout).strip() or "chainlink issue subissue failed")
         return _created_issue_id(result.stdout)
 
     def add_blocker(self, blocked_leaf: int, blocker_leaf: int, reason: str) -> None:
@@ -202,16 +225,24 @@ class ChainlinkEpicClient:
             "block",
             str(blocked_leaf),
             str(blocker_leaf),
-            "--reason",
-            reason,
         ])
         if result.returncode != 0:
             raise WorklinkError((result.stderr or result.stdout).strip() or "chainlink issue block failed")
+        if reason:
+            comment = self.runner([
+                self.chainlink_bin,
+                "issue",
+                "comment",
+                str(blocked_leaf),
+                f"WORKLINK_BLOCKED_BY #{blocker_leaf}: {reason}",
+            ])
+            if comment.returncode != 0:
+                raise WorklinkError((comment.stderr or comment.stdout).strip() or "chainlink issue comment failed")
 
     def mark_merged(self, leaf_id: int) -> None:
         self.runner([self.chainlink_bin, "issue", "unlabel", str(leaf_id), "worklink:review"])
         self.runner([self.chainlink_bin, "issue", "unlabel", str(leaf_id), "worklink:in-progress"])
-        self.runner([self.chainlink_bin, "issue", "label", str(leaf_id), "worklink:merged"])
+        self.runner([self.chainlink_bin, "issue", "label", str(leaf_id), WORKLINK_MERGED_LABEL])
 
     def mark_blocked(self, leaf_id: int, reason: str) -> None:
         self.runner([self.chainlink_bin, "issue", "unlabel", str(leaf_id), "worklink:ready"])
@@ -266,6 +297,7 @@ class EpicRunner:
 
         try:
             existing_manifest = load_epic_state(self.home, epic_id)
+            created_manifest = existing_manifest is None
             if existing_manifest is None:
                 integration = create_integration_branch(
                     self.repo,
@@ -275,29 +307,48 @@ class EpicRunner:
                     base_fetch=config.defaults.base_fetch,
                     runner=runner,
                 )
-            else:
-                integration = IntegrationBranchLease(
+                _git_push(integration.path, integration.branch, runner=runner)
+                manifest = load_or_init_epic_state(
+                    self.home,
                     epic_id=epic_id,
-                    repo=self.repo,
-                    path=Path(existing_manifest.integration_worktree),
-                    branch=existing_manifest.integration_branch,
-                    base_ref=existing_manifest.base_ref,
-                    local_base=existing_manifest.base_ref,
+                    integration_branch=integration.branch,
+                    integration_worktree=integration.path,
+                    base_ref=base,
+                    phase="decompose",
                 )
-                base = existing_manifest.base_ref
+            else:
+                manifest = existing_manifest
+                resume_point = resume_epic_run(manifest)
+                if resume_point.complete:
+                    return EpicRunResult(
+                        epic_id,
+                        manifest.status,
+                        manifest_path=self.home / "state" / "worklink" / "epics" / f"{epic_id}.json",
+                    )
+                integration = _ensure_integration_worktree(
+                    self.repo, manifest, runner=runner
+                )
+                base = manifest.base_ref
             leaves = chainlink.child_leaves(epic_id)
-            if not leaves:
+            if manifest.phase == "decompose" and (not leaves or not created_manifest):
                 leaves = await self._decompose(epic, chainlink, roles, config)
-            manifest = load_or_init_epic_state(
-                self.home,
-                epic_id=epic_id,
-                integration_branch=integration.branch,
-                integration_worktree=integration.path,
-                base_ref=base,
-                slice_ids=[leaf.issue.issue_id for leaf in leaves],
-                phase="build",
-            )
-            if not manifest.slices:
+                manifest = replace(
+                    _current_manifest(self.home, manifest),
+                    phase="build",
+                    status="running",
+                    slices=[EpicSliceRecord(id=leaf.issue.issue_id) for leaf in leaves],
+                )
+                save_epic_state(self.home, manifest)
+            elif manifest.phase == "decompose":
+                manifest = replace(
+                    manifest,
+                    phase="build",
+                    slices=[EpicSliceRecord(id=leaf.issue.issue_id) for leaf in leaves],
+                )
+                save_epic_state(self.home, manifest)
+            elif not leaves:
+                raise WorklinkError("epic manifest is past decompose but has no child leaves")
+            elif not manifest.slices:
                 manifest = replace(
                     manifest,
                     phase="build",
@@ -386,7 +437,7 @@ class EpicRunner:
                 partial=partial,
                 blocked=blocked,
             )
-            if validation.verdict == "NO-GO" and not partial:
+            if validation.verdict == "NO-GO":
                 manifest = replace(manifest, status="blocked")
                 save_epic_state(self.home, manifest)
                 return EpicRunResult(
@@ -396,7 +447,17 @@ class EpicRunner:
                     manifest_path=self.home / "state" / "worklink" / "epics" / f"{epic_id}.json",
                     reason=validation.summary,
                 )
-            _run_epic_tests(integration.path, config.defaults.test_command, runner=runner)
+            test_status = _run_epic_tests(integration.path, config.defaults.test_command, runner=runner)
+            if test_status.exit_code != 0 and not partial:
+                manifest = replace(manifest, status="blocked")
+                save_epic_state(self.home, manifest)
+                return EpicRunResult(
+                    epic_id,
+                    "blocked",
+                    blocked_leaves=tuple(blocked),
+                    manifest_path=self.home / "state" / "worklink" / "epics" / f"{epic_id}.json",
+                    reason=f"epic tests failed: {test_status.summary}",
+                )
             _git_push(integration.path, integration.branch, runner=runner)
             pr_url = _open_epic_pr(
                 self.repo,
@@ -407,6 +468,7 @@ class EpicRunner:
                 partial=partial,
                 blocked=blocked,
                 validation=validation,
+                test_status=test_status,
                 runner=runner,
             )
             manifest = replace(manifest, phase="pr", status="partial" if partial else "completed")
@@ -486,10 +548,13 @@ class EpicRunner:
             manifest = _current_manifest(self.home, manifest)
             manifest = _update_slice(manifest, leaf.issue.issue_id, status="running", attempts=attempts)
             save_epic_state(self.home, manifest)
-            lease = create_slice_worktree(
+            lease = _create_slice_checkout(
                 self.repo,
-                slice_id=leaf.issue.issue_id,
+                leaf=leaf,
+                attempt=attempts,
                 integration_branch=integration.branch,
+                backend_name=selected_backend.name,
+                compute_shared_filesystem=compute.capabilities().shared_filesystem,
                 runner=runner,
             )
             order = WorkOrder(
@@ -524,6 +589,8 @@ class EpicRunner:
             except ComputeLaunchError as exc:
                 compute_result = ComputeResult(-1, "", str(exc), launch_error=str(exc))
             raw = await selected_backend.interpret(order, compute_result)
+            if not compute.capabilities().shared_filesystem and backend_completed(raw.backend_status):
+                _git_push(lease.path, lease.branch, runner=runner)
             validation = await _observe_slice(
                 home=self.home,
                 leaf=leaf,
@@ -567,7 +634,7 @@ class EpicRunner:
             if validation.review_ready and review.verdict == "APPROVE":
                 if compute.capabilities().shared_filesystem:
                     _commit_worktree_changes(lease.path, leaf.issue, runner=runner)
-                _git_push(lease.path, lease.branch, runner=runner)
+                    _git_push(lease.path, lease.branch, runner=runner)
                 merged = merge_slice_into_integration(
                     self.repo,
                     slice_branch=lease.branch,
@@ -582,6 +649,7 @@ class EpicRunner:
                         "same-wave merge conflict requires human/decomposition review"
                     )
                 assert isinstance(merged, SliceMergeSuccess)
+                _git_push(integration.path, integration.branch, runner=runner)
                 chainlink.mark_merged(leaf.issue.issue_id)
                 manifest = _current_manifest(self.home, manifest)
                 manifest = _update_slice(
@@ -681,6 +749,35 @@ async def _observe_slice(
     return validation
 
 
+def _create_slice_checkout(
+    repo: Path,
+    *,
+    leaf: LeafIssue,
+    attempt: int,
+    integration_branch: str,
+    backend_name: str,
+    compute_shared_filesystem: bool,
+    runner: Runner,
+) -> WorktreeLease:
+    if backend_name == "codex" and compute_shared_filesystem:
+        return _create_backend_checkout(
+            repo,
+            issue_id=leaf.issue.issue_id,
+            attempt=attempt,
+            base=integration_branch,
+            backend_name=backend_name,
+            compute_shared_filesystem=compute_shared_filesystem,
+            base_fetch=False,
+            runner=runner,
+        )
+    return create_slice_worktree(
+        repo,
+        slice_id=leaf.issue.issue_id,
+        integration_branch=integration_branch,
+        runner=runner,
+    )
+
+
 def _file_disjoint_batches(leaves: list[LeafIssue]) -> list[list[LeafIssue]]:
     batches: list[list[LeafIssue]] = []
     for leaf in leaves:
@@ -730,18 +827,78 @@ def _dependents(leaves: Iterable[LeafIssue], blocker_id: int) -> list[LeafIssue]
     return [leaf for leaf in leaves if blocker_id in leaf.blocked_by]
 
 
-def _run_epic_tests(worktree: Path, test_command: str, *, runner: Runner) -> None:
-    del runner
-    result = subprocess.run(
-        test_command,
-        cwd=worktree,
-        shell=True,
-        capture_output=True,
-        text=True,
-        check=False,
+def _ensure_integration_worktree(
+    repo: Path, manifest: EpicRunManifest, *, runner: Runner
+) -> IntegrationBranchLease:
+    path = Path(manifest.integration_worktree)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        start_point = _last_merge_commit(manifest) or manifest.integration_branch
+        result = runner([
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            str(path),
+            start_point,
+        ])
+        if result.returncode != 0:
+            raise WorklinkError(
+                (result.stderr or result.stdout).strip()
+                or f"epic integration worktree is missing and could not be recreated: {path}"
+            )
+        last_merge_commit = _last_merge_commit(manifest)
+        if last_merge_commit:
+            checkout = runner([
+                "git",
+                "-C",
+                str(path),
+                "checkout",
+                "-B",
+                manifest.integration_branch,
+                last_merge_commit,
+            ])
+            if checkout.returncode != 0:
+                raise WorklinkError(
+                    (checkout.stderr or checkout.stdout).strip()
+                    or "git checkout integration branch failed"
+                )
+    head = runner(["git", "-C", str(path), "rev-parse", "--verify", "HEAD"])
+    if head.returncode != 0:
+        raise WorklinkError(
+            (head.stderr or head.stdout).strip()
+            or "epic integration worktree is not a git checkout"
+        )
+    expected = _last_merge_commit(manifest)
+    if expected and head.stdout.strip() != expected:
+        reset = runner(["git", "-C", str(path), "reset", "--hard", expected])
+        if reset.returncode != 0:
+            raise WorklinkError(
+                (reset.stderr or reset.stdout).strip()
+                or "failed to reset integration worktree to manifest merge commit"
+            )
+    return IntegrationBranchLease(
+        epic_id=manifest.epic_id,
+        repo=repo,
+        path=path,
+        branch=manifest.integration_branch,
+        base_ref=manifest.base_ref,
+        local_base=manifest.base_ref,
     )
-    if result.returncode != 0:
-        raise WorklinkError((result.stderr or result.stdout).strip() or "epic tests failed")
+
+
+def _last_merge_commit(manifest: EpicRunManifest) -> str | None:
+    for record in reversed(manifest.slices):
+        if record.merge_commit:
+            return record.merge_commit
+    return None
+
+
+def _run_epic_tests(worktree: Path, test_command: str, *, runner: Runner) -> EpicTestStatus:
+    result = runner(test_command, cwd=worktree)
+    summary = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+    return EpicTestStatus(test_command, result.returncode, summary[:1000])
 
 
 def _open_epic_pr(
@@ -754,6 +911,7 @@ def _open_epic_pr(
     partial: bool,
     blocked: Mapping[int, str],
     validation: IntegrationValidation,
+    test_status: EpicTestStatus,
     runner: Runner,
 ) -> str:
     body = [
@@ -764,9 +922,12 @@ def _open_epic_pr(
         f"- Branch: `{branch}`",
         f"- Merged slices: {', '.join('#' + str(s.id) for s in manifest.slices if s.status == 'merged') or '(none)'}",
         f"- Integration validation: {validation.verdict} - {validation.summary}",
+        f"- Epic tests: `{test_status.command}` → {test_status.exit_code}",
     ]
     if partial:
         body.append("- Epic status: partial")
+        if test_status.exit_code != 0:
+            body.append(f"- Partial-run test status: {test_status.summary}")
         for leaf_id, reason in sorted(blocked.items()):
             body.append(f"- Blocked leaf #{leaf_id}: {reason}")
     command = ["gh", "pr", "create", "--draft", "--base", base, "--head", branch]
@@ -788,6 +949,7 @@ def _issue_from_payload(payload: Mapping[str, Any], *, fallback_id: int | None =
         labels={str(label) for label in payload.get("labels") or ()},
         parent_id=int(payload["parent_id"]) if payload.get("parent_id") is not None else None,
         comments=tuple(_comment_text(item) for item in payload.get("comments") or ()),
+        created_at=_parse_chainlink_datetime(payload.get("created_at")),
     )
 
 
@@ -829,16 +991,17 @@ def _optional_str(value: Any) -> str | None:
 
 
 def _leaf_body(leaf: Any) -> str:
+    scope = ", ".join(str(item) for item in leaf.scope_paths)
+    out_of_scope = ", ".join(str(item) for item in getattr(leaf, "out_of_scope", []) or ["(none)"])
     return (
         "Acceptance criteria:\n"
         + "\n".join(f"- [ ] {item}" for item in leaf.acceptance_criteria)
         + "\n\nReview criteria:\n"
         + "\n".join(f"- {item}" for item in leaf.review_criteria)
-        + "\n\nScope:\n"
-        + "\n".join(f"- {item}" for item in leaf.scope_paths)
-        + "\n\nOut of scope:\n"
-        + "\n".join(f"- {item}" for item in getattr(leaf, "out_of_scope", []) or ["(none)"])
-        + f"\n\nSuggested test command: {leaf.suggested_test_command}\n"
+        + "\n\nWorklink notes:\n"
+        + f"- Scope: {scope}\n"
+        + f"- Out of scope: {out_of_scope}\n"
+        + f"- Suggested test command: {leaf.suggested_test_command}\n"
     )
 
 
@@ -853,8 +1016,10 @@ def _parse_scope_paths(description: str) -> list[str]:
     paths: list[str] = []
     for line in body.splitlines() or [body]:
         cleaned = line.strip().removeprefix("-").strip()
-        if cleaned:
-            paths.append(cleaned)
+        for part in cleaned.split(","):
+            path = part.strip()
+            if path:
+                paths.append(path)
     return paths
 
 
@@ -864,11 +1029,22 @@ def _parse_suggested_test_command(description: str) -> str | None:
 
 
 def _created_issue_id(text: str) -> int:
-    for token in text.replace("#", " ").split():
-        if token.isdigit():
-            return int(token)
-    data = json.loads(text)
-    return int(data["id"])
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, Mapping):
+        return int(data["id"])
+    if isinstance(data, list) and data and isinstance(data[0], Mapping):
+        return int(data[0]["id"])
+    for pattern in (
+        r"created\s+(?:issue|subissue)\s+#(?P<id>\d+)",
+        r"(?:issue|subissue)\s+#(?P<id>\d+)\s+created",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return int(match.group("id"))
+    raise WorklinkError("chainlink subissue output did not include a deterministic issue id")
 
 
 class _NoopClaim:

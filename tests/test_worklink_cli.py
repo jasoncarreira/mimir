@@ -166,6 +166,23 @@ def test_worklink_run_epic_cli_dispatches_controller(
     assert "worklink epic #773: partial PR" in capsys.readouterr().out
 
 
+def test_worklink_run_epic_blocked_exits_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_run_epic(**kwargs: object) -> EpicRunResult:
+        return EpicRunResult(epic_id=773, status="blocked", reason="validator no-go")
+
+    import mimir.commands.worklink as worklink_cmd
+
+    monkeypatch.setattr(worklink_cmd, "run_epic", fake_run_epic)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "run-epic", "773", "--home", str(tmp_path), "--repo", str(tmp_path)])
+
+    assert exc.value.code == 1
+    assert "worklink epic #773: blocked — validator no-go" in capsys.readouterr().out
+
+
 def test_worklink_run_cli_autonomous_refused_exits_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -210,7 +210,7 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         )
         if result.manifest_path:
             print(f"manifest: {result.manifest_path}")
-        return 0 if result.status in {"completed", "partial", "blocked"} else 1
+        return 0 if result.status in {"completed", "partial"} else 1
 
     if args.worklink_action != "run":
         parser.print_help()

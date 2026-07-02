@@ -11,14 +11,15 @@ import pytest
 
 from mimir.worklink.backends import ComputeCaps, ComputeResult, RawResult, WorkOrder
 from mimir.worklink.compute import WorkSpec
-from mimir.worklink.epic import ChainlinkEpicClient, EpicRunner, LeafIssue, compute_waves
+from mimir.worklink.epic import ChainlinkEpicClient, EpicRunner, EpicTestStatus, LeafIssue, compute_waves
 from mimir.worklink.evidence import (
     CommandResult,
     EvidenceValidation,
     TestResult,
     WorklinkEvidence,
 )
-from mimir.worklink.orchestrator import IssueContext
+from mimir.worklink.orchestrator import IssueContext, validate_leaf
+from mimir.worklink.planning import missing_leaf_template_parts
 from mimir.worklink.review import (
     DecomposeReview,
     IntegrationValidation,
@@ -277,7 +278,7 @@ def patch_git(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(epic_mod, "create_slice_worktree", fake_slice)
     monkeypatch.setattr(epic_mod, "_commit_worktree_changes", lambda *a, **k: None)
     monkeypatch.setattr(epic_mod, "_git_push", lambda *a, **k: None)
-    monkeypatch.setattr(epic_mod, "_run_epic_tests", lambda *a, **k: None)
+    monkeypatch.setattr(epic_mod, "_run_epic_tests", lambda *a, **k: EpicTestStatus("true", 0, "ok"))
     monkeypatch.setattr(
         epic_mod,
         "merge_slice_into_integration",
@@ -437,3 +438,334 @@ async def test_bare_ready_without_epic_label_is_not_epic(tmp_path: Path) -> None
             roles=FakeRoles(),
             chainlink=chainlink,  # type: ignore[arg-type]
         ).run(100)
+
+
+def test_chainlink_file_leaf_uses_strict_template_and_real_subissue_cli() -> None:
+    calls: list[list[str]] = []
+
+    def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if list(args) == ["chainlink", "issue", "list", "--json"]:
+            return cp(args, stdout="[]")
+        if list(args)[:3] == ["chainlink", "issue", "subissue"]:
+            return cp(args, stdout=json.dumps({"id": 123}))
+        return cp(args, returncode=99, stderr="unexpected command")
+
+    leaf = WorklinkLeafSpec(
+        title="Leaf A",
+        acceptance_criteria=["A works"],
+        review_criteria=["review A"],
+        scope_paths=["mimir/worklink/epic.py", "tests/test_worklink_epic.py"],
+        out_of_scope=["role runner"],
+        suggested_test_command="env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_epic.py",
+        labels=["worklink:ready", "risk:high"],
+    )
+
+    created = ChainlinkEpicClient(runner=fake_runner).file_leaf(100, leaf)
+
+    assert created == 123
+    subissue_call = calls[1]
+    assert subissue_call[:5] == ["chainlink", "issue", "subissue", "100", "Leaf A"]
+    assert "--parent" not in subissue_call
+    assert "--title" not in subissue_call
+    assert "--json" in subissue_call
+    assert subissue_call.count("--label") == 2
+    body = subissue_call[subissue_call.index("--description") + 1]
+    assert missing_leaf_template_parts(body) == []
+    issue_ctx = IssueContext(
+        issue_id=123,
+        title="Leaf A",
+        description=body,
+        labels={"worklink:ready"},
+        parent_id=100,
+        created_at=datetime(2026, 7, 2, tzinfo=UTC),
+    )
+    validate_leaf(issue_ctx)
+
+
+def test_chainlink_file_leaf_is_idempotent_by_title() -> None:
+    calls: list[list[str]] = []
+
+    def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        assert list(args) == ["chainlink", "issue", "list", "--json"]
+        return cp(
+            args,
+            stdout=json.dumps(
+                [
+                    {
+                        "id": 222,
+                        "title": "Leaf A",
+                        "description": leaf_description(),
+                        "labels": ["worklink:ready"],
+                        "parent_id": 100,
+                        "created_at": "2026-07-02T00:00:00Z",
+                    }
+                ]
+            ),
+        )
+
+    leaf = WorklinkLeafSpec(
+        title="Leaf A",
+        acceptance_criteria=["A works"],
+        review_criteria=["review A"],
+        scope_paths=["a.py"],
+        suggested_test_command="true",
+    )
+
+    assert ChainlinkEpicClient(runner=fake_runner).file_leaf(100, leaf) == 222
+    assert calls == [["chainlink", "issue", "list", "--json"]]
+
+
+def test_chainlink_add_blocker_uses_real_cli_and_comments_reason() -> None:
+    calls: list[list[str]] = []
+
+    def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return cp(args)
+
+    ChainlinkEpicClient(runner=fake_runner).add_blocker(201, 200, "A first")
+
+    assert calls[0] == ["chainlink", "issue", "block", "201", "200"]
+    assert "--reason" not in calls[0]
+    assert calls[1] == ["chainlink", "issue", "comment", "201", "WORKLINK_BLOCKED_BY #200: A first"]
+
+
+def test_child_leaves_preserve_created_at_and_classify_high_risk_scope_multi() -> None:
+    def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return cp(
+            args,
+            stdout=json.dumps(
+                [
+                    {
+                        "id": 101,
+                        "title": "Leaf",
+                        "description": """Acceptance criteria:\n- [ ] Works\n\nReview criteria:\n- Verify it\n\nWorklink notes:\n- Scope: mimir/worklink/orchestrator.py, tests/test_worklink_epic.py\n- Out of scope: unrelated\n- Suggested test command: pytest -q\n""",
+                        "labels": ["worklink:ready"],
+                        "parent_id": 100,
+                        "blocked_by": [],
+                        "created_at": "2026-07-02T00:00:00Z",
+                    }
+                ]
+            ),
+        )
+
+    leaf = ChainlinkEpicClient(runner=fake_runner).child_leaves(100)[0]
+
+    assert leaf.issue.created_at == datetime(2026, 7, 2, tzinfo=UTC)
+    assert leaf.scope_paths == ("mimir/worklink/orchestrator.py", "tests/test_worklink_epic.py")
+    from mimir.worklink.review import classify_leaf_review_risk
+
+    assert classify_leaf_review_risk(scope_paths=list(leaf.scope_paths)) == "multi"
+
+
+def test_created_issue_id_rejects_ambiguous_numeric_text() -> None:
+    import mimir.worklink.epic as epic_mod
+
+    with pytest.raises(Exception, match="deterministic issue id"):
+        epic_mod._created_issue_id("1 issue created under parent #100")
+
+
+@pytest.mark.asyncio
+async def test_remote_epic_pushes_integration_before_observing_slice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.epic as epic_mod
+
+    integration_path = tmp_path / "integration"
+    integration_path.mkdir()
+    monkeypatch.setattr(
+        epic_mod,
+        "create_integration_branch",
+        lambda *a, **k: IntegrationBranchLease(100, Path("/repo"), integration_path, "epic/100-integration", "main", "main"),
+    )
+    slice_path = tmp_path / "slice-101"
+    slice_path.mkdir()
+    monkeypatch.setattr(
+        epic_mod,
+        "create_slice_worktree",
+        lambda *a, **k: WorktreeLease(101, 1, Path("/repo"), slice_path, "issue/101-a1", "epic/100-integration", "HEAD"),
+    )
+    events: list[str] = []
+
+    def fake_push(path: Path, branch: str, *, runner: object) -> None:
+        events.append(f"push:{branch}")
+
+    async def observed_remote(**kw: object) -> EvidenceValidation:
+        events.append("observe")
+        return ready_validation(101, 1)
+
+    monkeypatch.setattr(epic_mod, "_git_push", fake_push)
+    monkeypatch.setattr(epic_mod, "_observe_slice", observed_remote)
+    monkeypatch.setattr(epic_mod, "merge_slice_into_integration", lambda *a, **k: SliceMergeSuccess("issue/101-a1", "epic/100-integration", "abc123"))
+    monkeypatch.setattr(epic_mod, "_run_epic_tests", lambda *a, **k: EpicTestStatus("true", 0, "ok"))
+    monkeypatch.setattr(epic_mod, "_open_epic_pr", lambda *a, **k: "https://github.com/o/r/pull/1")
+
+    class RemoteCompute(FakeCompute):
+        name = "remote_compute"
+
+        def capabilities(self) -> ComputeCaps:
+            return ComputeCaps(shared_filesystem=False, network_isolated=True, handle_cancel=True, persistent_after_disconnect=True)
+
+    class RemoteRegistry(FakeRegistry):
+        def __init__(self) -> None:
+            super().__init__()
+            self.compute = RemoteCompute()
+
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic", "worklink:ready"}),
+        leaves=[LeafIssue(issue(101), scope_paths=("a.py",), suggested_test_command="true")],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+
+    result = await EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=runner,
+        registry=RemoteRegistry(),  # type: ignore[arg-type]
+        roles=FakeRoles(),
+        chainlink=chainlink,  # type: ignore[arg-type]
+    ).run(100)
+
+    assert result.status == "completed"
+    assert events[:3] == ["push:epic/100-integration", "push:issue/101-a1", "observe"]
+    assert "push:epic/100-integration" in events[3:]
+
+
+@pytest.mark.asyncio
+async def test_no_go_blocks_even_for_partial_epic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_git(monkeypatch, tmp_path)
+    (tmp_path / "worklink.yaml").write_text("defaults:\n  max_review_retries: 1\n  test_command: true\n", encoding="utf-8")
+    import mimir.worklink.epic as epic_mod
+
+    monkeypatch.setattr(epic_mod, "_observe_slice", fake_observe_slice)
+
+    class NoGoRoles(FakeRoles):
+        async def validate_integration(self, **kwargs: object) -> IntegrationValidation:
+            self.validations += 1
+            return IntegrationValidation(verdict="NO-GO", summary="missing required slice")
+
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic"}),
+        leaves=[LeafIssue(issue(101), scope_paths=("a.py",), suggested_test_command="true")],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+
+    result = await EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=runner,
+        registry=FakeRegistry(),  # type: ignore[arg-type]
+        roles=NoGoRoles(reviews=["REJECT"]),
+        chainlink=chainlink,  # type: ignore[arg-type]
+    ).run(100)
+
+    assert result.status == "blocked"
+    assert result.reason == "missing required slice"
+    assert chainlink.moved_to_review is False
+
+
+@pytest.mark.asyncio
+async def test_partial_epic_records_failing_tests_in_pr_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    patch_git(monkeypatch, tmp_path)
+    (tmp_path / "worklink.yaml").write_text("defaults:\n  max_review_retries: 1\n  test_command: false\n", encoding="utf-8")
+    import mimir.worklink.epic as epic_mod
+
+    bodies: list[str] = []
+    monkeypatch.setattr(epic_mod, "_observe_slice", fake_observe_slice)
+    monkeypatch.setattr(epic_mod, "_run_epic_tests", lambda *a, **k: EpicTestStatus("false", 1, "blocked leaf absent"))
+
+    def capture_pr(*_: object, **kwargs: object) -> str:
+        test_status = kwargs["test_status"]
+        blocked = kwargs["blocked"]
+        assert isinstance(test_status, EpicTestStatus)
+        bodies.append(f"{test_status.exit_code}:{test_status.summary}:{sorted(blocked)}")
+        return "https://github.com/o/r/pull/1"
+
+    monkeypatch.setattr(epic_mod, "_open_epic_pr", capture_pr)
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic"}),
+        leaves=[LeafIssue(issue(101), scope_paths=("a.py",), suggested_test_command="true")],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+
+    result = await EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=runner,
+        registry=FakeRegistry(),  # type: ignore[arg-type]
+        roles=FakeRoles(reviews=["REJECT"]),
+        chainlink=chainlink,  # type: ignore[arg-type]
+    ).run(100)
+
+    assert result.status == "partial"
+    assert bodies == ["1:blocked leaf absent:[101]"]
+
+
+@pytest.mark.asyncio
+async def test_resume_missing_integration_worktree_rematerializes_to_merge_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.epic as epic_mod
+    from mimir.worklink.epic_state import EpicRunManifest, EpicSliceRecord, save_epic_state
+
+    manifest = EpicRunManifest(
+        epic_id=100,
+        integration_branch="epic/100-integration",
+        integration_worktree=str(tmp_path / "missing-integration"),
+        base_ref="main",
+        phase="build",
+        slices=[EpicSliceRecord(id=101, status="merged", merge_commit="abc123"), EpicSliceRecord(id=102)],
+    )
+    save_epic_state(tmp_path, manifest)
+    calls: list[list[str]] = []
+
+    def resume_runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, str):
+            return cp([args], stdout="ok")
+        calls.append(list(args))
+        if list(args)[:4] == ["git", "-C", "/repo", "worktree"]:
+            Path(args[6]).mkdir(parents=True, exist_ok=True)
+            return cp(args)
+        if list(args)[:3] == ["git", "-C", str(tmp_path / "missing-integration")]:
+            if "rev-parse" in args:
+                return cp(args, stdout="abc123\n")
+            return cp(args)
+        return runner(args)
+
+    monkeypatch.setattr(epic_mod, "create_slice_worktree", lambda *a, **k: WorktreeLease(102, 1, Path("/repo"), tmp_path / "slice-102", "issue/102-a1", "epic/100-integration", "HEAD"))
+    (tmp_path / "slice-102").mkdir()
+    monkeypatch.setattr(epic_mod, "_observe_slice", fake_observe_slice)
+    monkeypatch.setattr(epic_mod, "_commit_worktree_changes", lambda *a, **k: None)
+    monkeypatch.setattr(epic_mod, "_git_push", lambda *a, **k: None)
+    monkeypatch.setattr(epic_mod, "merge_slice_into_integration", lambda *a, **k: SliceMergeSuccess("issue/102-a1", "epic/100-integration", "def456"))
+    monkeypatch.setattr(epic_mod, "_run_epic_tests", lambda *a, **k: EpicTestStatus("true", 0, "ok"))
+    monkeypatch.setattr(epic_mod, "_open_epic_pr", lambda *a, **k: "https://github.com/o/r/pull/1")
+
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic"}),
+        leaves=[LeafIssue(issue(101), scope_paths=("a.py",), suggested_test_command="true"), LeafIssue(issue(102), scope_paths=("b.py",), suggested_test_command="true")],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+
+    result = await EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=resume_runner,
+        registry=FakeRegistry(),  # type: ignore[arg-type]
+        roles=FakeRoles(),
+        chainlink=chainlink,  # type: ignore[arg-type]
+    ).run(100)
+
+    assert result.status == "completed"
+    assert any(cmd[:5] == ["git", "-C", "/repo", "worktree", "add"] and cmd[-1] == "abc123" for cmd in calls)
