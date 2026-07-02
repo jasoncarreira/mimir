@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,7 @@ def run_doctor(home: Path) -> DoctorReport:
         _check_issue_notes(home, findings),
         _check_learnings_pending(home, findings),
         _check_memory_index(home, findings),
+        _check_saga_substrate(home, findings),
     ]
     counts = Counter(f.severity for f in findings)
     severity_counts = {severity: counts.get(severity, 0) for severity in _SEVERITIES}
@@ -308,6 +310,362 @@ def _check_memory_index(home: Path, findings: list[DoctorFinding]) -> DoctorSect
         "stale": stale,
         "rendered_bytes": len(rendered.encode("utf-8")),
     })
+
+
+def _check_saga_substrate(home: Path, findings: list[DoctorFinding]) -> DoctorSection:
+    db_path = home / ".mimir" / "saga.db"
+    rel = _rel(home, db_path)
+    metrics: dict[str, int] = {"exists": int(db_path.is_file())}
+    if not db_path.is_file():
+        findings.append(_finding(
+            "saga", "missing-db", "warning", rel,
+            "SAGA database is absent; substrate checks were skipped.",
+            "This is expected before SAGA has stored memories; run verify-index once the DB exists.",
+        ))
+        return DoctorSection("saga", metrics)
+
+    conn = _connect_sqlite_readonly(db_path)
+    if conn is None:
+        findings.append(_finding(
+            "saga", "open-db", "warning", rel,
+            "SAGA database could not be opened read-only.",
+            "Inspect file permissions and run `mimir verify-index --db saga` for details.",
+        ))
+        return DoctorSection("saga", metrics)
+
+    try:
+        _collect_saga_integrity_metrics(conn, home, db_path, findings, metrics)
+        tables = _sqlite_tables(conn)
+        for required in (
+            "atoms", "embeddings", "triples", "access_events",
+            "atom_access_summary",
+        ):
+            metrics[f"table_{required}_present"] = int(required in tables)
+            if required not in tables:
+                findings.append(_finding(
+                    "saga", f"missing-table-{required}", "warning", rel,
+                    f"SAGA table `{required}` is absent; related checks were skipped.",
+                    "This usually means an old or partially migrated SAGA DB; complete migrations before relying on these metrics.",
+                ))
+
+        if "atoms" in tables:
+            _collect_saga_atom_metrics(conn, home, db_path, findings, metrics)
+        if "embeddings" in tables:
+            _collect_saga_embedding_metrics(conn, home, db_path, findings, metrics, tables)
+        if "triples" in tables:
+            _collect_saga_triple_metrics(conn, home, db_path, findings, metrics, tables)
+        if "access_events" in tables or "atom_access_summary" in tables:
+            _collect_saga_access_metrics(conn, home, db_path, findings, metrics, tables)
+        _collect_forget_preview_metrics(home, metrics)
+    finally:
+        conn.close()
+    return DoctorSection("saga", metrics)
+
+
+def _collect_saga_integrity_metrics(
+    conn: sqlite3.Connection,
+    home: Path,
+    db_path: Path,
+    findings: list[DoctorFinding],
+    metrics: dict[str, int],
+) -> None:
+    rel = _rel(home, db_path)
+    try:
+        rows = conn.execute("PRAGMA integrity_check").fetchall()
+        ok = len(rows) == 1 and rows[0][0] == "ok"
+        metrics["sqlite_integrity_ok"] = int(ok)
+        if not ok:
+            issues = "; ".join(str(r[0]) for r in rows[:5])
+            if len(rows) > 5:
+                issues += f" (+ {len(rows) - 5} more)"
+            findings.append(_finding(
+                "saga", "sqlite_integrity_check", "warning", rel,
+                f"SQLite integrity check reported: {issues}",
+                "Run `mimir verify-index --db saga` for the full integrity report.",
+            ))
+    except sqlite3.Error as exc:
+        metrics["sqlite_integrity_ok"] = 0
+        findings.append(_finding(
+            "saga", "sqlite_integrity_check", "warning", rel,
+            f"SQLite integrity check failed: {exc}.",
+            "Run `mimir verify-index --db saga` for the full integrity report.",
+        ))
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+        metrics["foreign_key_check_ok"] = int(not rows)
+        metrics["foreign_key_violations"] = len(rows)
+        if rows:
+            summary = "; ".join(f"{r[0]} rowid={r[1]} -> {r[2]}" for r in rows[:5])
+            if len(rows) > 5:
+                summary += f" (+ {len(rows) - 5} more)"
+            findings.append(_finding(
+                "saga", "foreign_key_check", "warning", rel,
+                f"Foreign-key check reported orphans: {summary}",
+                "Run `mimir verify-index --db saga` for the full integrity report.",
+            ))
+    except sqlite3.Error as exc:
+        metrics["foreign_key_check_ok"] = 0
+        findings.append(_finding(
+            "saga", "foreign_key_check", "warning", rel,
+            f"Foreign-key check failed: {exc}.",
+            "Run `mimir verify-index --db saga` for the full integrity report.",
+        ))
+
+
+def _connect_sqlite_readonly(db_path: Path) -> sqlite3.Connection | None:
+    try:
+        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+
+
+def _sqlite_tables(conn: sqlite3.Connection) -> set[str]:
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+        ).fetchall()
+    except sqlite3.Error:
+        return set()
+    return {str(row[0]) for row in rows}
+
+
+def _collect_saga_atom_metrics(
+    conn: sqlite3.Connection,
+    home: Path,
+    db_path: Path,
+    findings: list[DoctorFinding],
+    metrics: dict[str, int],
+) -> None:
+    rel = _rel(home, db_path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN COALESCE(tombstoned, 0) = 0 THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN COALESCE(tombstoned, 0) != 0 THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN COALESCE(is_pinned, 0) != 0 THEN 1 ELSE 0 END) "
+            "FROM atoms"
+        ).fetchone()
+        total, live, tombstoned, pinned = (int(v or 0) for v in row)
+        metrics.update({
+            "atoms_total": total,
+            "atoms_live": live,
+            "atoms_tombstoned": tombstoned,
+            "atoms_pinned": pinned,
+        })
+        for stream, count in conn.execute(
+            "SELECT COALESCE(NULLIF(stream, ''), 'unknown'), COUNT(*) "
+            "FROM atoms GROUP BY COALESCE(NULLIF(stream, ''), 'unknown')"
+        ):
+            metrics[f"atoms_stream_{_metric_key(stream)}"] = int(count)
+        for memory_type, count in conn.execute(
+            "SELECT COALESCE(NULLIF(memory_type, ''), 'unknown'), COUNT(*) "
+            "FROM atoms GROUP BY COALESCE(NULLIF(memory_type, ''), 'unknown')"
+        ):
+            metrics[f"atoms_memory_type_{_metric_key(memory_type)}"] = int(count)
+    except sqlite3.Error as exc:
+        findings.append(_finding(
+            "saga", "atoms-query", "warning", rel,
+            f"Atom metrics could not be read: {exc}.",
+            "Inspect the SAGA schema; this may be an old or partial migration.",
+        ))
+
+
+def _collect_saga_embedding_metrics(
+    conn: sqlite3.Connection,
+    home: Path,
+    db_path: Path,
+    findings: list[DoctorFinding],
+    metrics: dict[str, int],
+    tables: set[str],
+) -> None:
+    rel = _rel(home, db_path)
+    try:
+        metrics["embeddings_total"] = int(
+            conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] or 0
+        )
+        for provider, dim, count in conn.execute(
+            "SELECT COALESCE(NULLIF(provider, ''), 'unknown'), "
+            "COALESCE(dim, -1), COUNT(*) FROM embeddings "
+            "GROUP BY COALESCE(NULLIF(provider, ''), 'unknown'), COALESCE(dim, -1)"
+        ):
+            metrics[
+                f"embeddings_provider_dim_{_metric_key(provider)}_{int(dim)}"
+            ] = int(count)
+        if "atoms" in tables:
+            live_with, live_missing = conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN e.atom_id IS NOT NULL THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN e.atom_id IS NULL THEN 1 ELSE 0 END) "
+                "FROM atoms a LEFT JOIN embeddings e ON e.atom_id = a.id "
+                "WHERE COALESCE(a.tombstoned, 0) = 0"
+            ).fetchone()
+            orphan = conn.execute(
+                "SELECT COUNT(*) FROM embeddings e "
+                "LEFT JOIN atoms a ON a.id = e.atom_id WHERE a.id IS NULL"
+            ).fetchone()[0]
+            metrics["embeddings_live_atoms_covered"] = int(live_with or 0)
+            metrics["embeddings_live_atoms_missing"] = int(live_missing or 0)
+            metrics["embeddings_orphan_rows"] = int(orphan or 0)
+            if live_missing:
+                findings.append(_finding(
+                    "saga", "missing-embeddings", "warning", rel,
+                    f"{int(live_missing)} live SAGA atoms have no embedding row.",
+                    "Reindex or repair outside doctor; doctor is read-only and will not embed.",
+                ))
+            if orphan:
+                findings.append(_finding(
+                    "saga", "orphan-embeddings", "warning", rel,
+                    f"{int(orphan)} embedding rows do not reference an atom.",
+                    "Inspect SAGA cleanup/migration history; doctor will not delete rows.",
+                ))
+    except sqlite3.Error as exc:
+        findings.append(_finding(
+            "saga", "embeddings-query", "warning", rel,
+            f"Embedding metrics could not be read: {exc}.",
+            "Inspect the SAGA schema; this may be an old or partial migration.",
+        ))
+
+
+def _collect_saga_triple_metrics(
+    conn: sqlite3.Connection,
+    home: Path,
+    db_path: Path,
+    findings: list[DoctorFinding],
+    metrics: dict[str, int],
+    tables: set[str],
+) -> None:
+    rel = _rel(home, db_path)
+    try:
+        total, live, tombstoned, embedded, missing_embedding = conn.execute(
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN COALESCE(tombstoned, 0) = 0 THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN COALESCE(tombstoned, 0) != 0 THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN COALESCE(tombstoned, 0) = 0 AND embedding IS NULL THEN 1 ELSE 0 END) "
+            "FROM triples"
+        ).fetchone()
+        metrics.update({
+            "triples_total": int(total or 0),
+            "triples_live": int(live or 0),
+            "triples_tombstoned": int(tombstoned or 0),
+            "triples_with_embedding": int(embedded or 0),
+            "triples_live_missing_embedding": int(missing_embedding or 0),
+        })
+        if "atoms" in tables:
+            source_live, source_missing, atoms_with_triples = conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN COALESCE(t.tombstoned, 0) = 0 "
+                " AND a.id IS NOT NULL AND COALESCE(a.tombstoned, 0) = 0 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN COALESCE(t.tombstoned, 0) = 0 "
+                " AND t.source_atom_id IS NOT NULL AND a.id IS NULL THEN 1 ELSE 0 END), "
+                "COUNT(DISTINCT CASE WHEN COALESCE(t.tombstoned, 0) = 0 "
+                " AND a.id IS NOT NULL AND COALESCE(a.tombstoned, 0) = 0 THEN a.id END) "
+                "FROM triples t LEFT JOIN atoms a ON a.id = t.source_atom_id"
+            ).fetchone()
+            metrics["triples_with_live_source_atom"] = int(source_live or 0)
+            metrics["triples_orphan_source_atom"] = int(source_missing or 0)
+            metrics["atoms_with_live_triples"] = int(atoms_with_triples or 0)
+            if source_missing:
+                findings.append(_finding(
+                    "saga", "orphan-triples", "warning", rel,
+                    f"{int(source_missing)} triples reference a missing source atom.",
+                    "Inspect SAGA migrations or cleanup; doctor will not rewrite triples.",
+                ))
+        if missing_embedding:
+            findings.append(_finding(
+                "saga", "missing-triple-embeddings", "warning", rel,
+                f"{int(missing_embedding)} live triples have no embedding.",
+                "Rebuild or re-embed outside doctor if triple semantic retrieval is expected.",
+            ))
+    except sqlite3.Error as exc:
+        findings.append(_finding(
+            "saga", "triples-query", "warning", rel,
+            f"Triple metrics could not be read: {exc}.",
+            "Inspect the SAGA schema; this may be an old or partial migration.",
+        ))
+
+
+def _collect_saga_access_metrics(
+    conn: sqlite3.Connection,
+    home: Path,
+    db_path: Path,
+    findings: list[DoctorFinding],
+    metrics: dict[str, int],
+    tables: set[str],
+) -> None:
+    rel = _rel(home, db_path)
+    try:
+        if "access_events" in tables:
+            metrics["access_events_total"] = int(
+                conn.execute("SELECT COUNT(*) FROM access_events").fetchone()[0] or 0
+            )
+            for source, count in conn.execute(
+                "SELECT COALESCE(NULLIF(source, ''), 'unknown'), COUNT(*) "
+                "FROM access_events GROUP BY COALESCE(NULLIF(source, ''), 'unknown')"
+            ):
+                metrics[f"access_events_source_{_metric_key(source)}"] = int(count)
+            if "atoms" in tables:
+                orphan = conn.execute(
+                    "SELECT COUNT(*) FROM access_events ae "
+                    "LEFT JOIN atoms a ON a.id = ae.atom_id WHERE a.id IS NULL"
+                ).fetchone()[0]
+                metrics["access_events_orphan_rows"] = int(orphan or 0)
+                if orphan:
+                    findings.append(_finding(
+                        "saga", "orphan-access-events", "warning", rel,
+                        f"{int(orphan)} access events reference missing atoms.",
+                        "Inspect SAGA migrations or cleanup; doctor will not delete events.",
+                    ))
+        if "atom_access_summary" in tables:
+            metrics["access_summary_rows"] = int(
+                conn.execute("SELECT COUNT(*) FROM atom_access_summary").fetchone()[0] or 0
+            )
+            if "atoms" in tables:
+                missing, orphan = conn.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM atoms a LEFT JOIN atom_access_summary s "
+                    " ON s.atom_id = a.id WHERE COALESCE(a.tombstoned, 0) = 0 AND s.atom_id IS NULL), "
+                    "(SELECT COUNT(*) FROM atom_access_summary s LEFT JOIN atoms a "
+                    " ON a.id = s.atom_id WHERE a.id IS NULL)"
+                ).fetchone()
+                metrics["access_summary_live_atoms_missing"] = int(missing or 0)
+                metrics["access_summary_orphan_rows"] = int(orphan or 0)
+                if missing:
+                    findings.append(_finding(
+                        "saga", "missing-access-summary", "warning", rel,
+                        f"{int(missing)} live atoms have no access summary row.",
+                        "Activation can fall back to access_events, but summary refresh should be inspected.",
+                    ))
+                if orphan:
+                    findings.append(_finding(
+                        "saga", "orphan-access-summary", "warning", rel,
+                        f"{int(orphan)} access summary rows reference missing atoms.",
+                        "Inspect SAGA migrations or cleanup; doctor will not delete summaries.",
+                    ))
+    except sqlite3.Error as exc:
+        findings.append(_finding(
+            "saga", "access-query", "warning", rel,
+            f"Access-event metrics could not be read: {exc}.",
+            "Inspect the SAGA schema; this may be an old or partial migration.",
+        ))
+
+
+def _collect_forget_preview_metrics(home: Path, metrics: dict[str, int]) -> None:
+    try:
+        from .feedback import pending_forget_candidates_count
+
+        pending = pending_forget_candidates_count(home / "logs" / "events.jsonl")
+    except Exception:  # noqa: BLE001 - doctor should not fail on optional logs
+        pending = None
+    metrics["forget_candidates_preview_available"] = int(pending is not None)
+    metrics["forget_candidates_pending"] = int(pending or 0)
+
+
+def _metric_key(value: object) -> str:
+    text = str(value if value is not None else "unknown").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return text or "unknown"
 
 
 def _render_memory_index_readonly(home: Path) -> str:
