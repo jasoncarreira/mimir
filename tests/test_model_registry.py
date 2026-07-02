@@ -372,8 +372,8 @@ def test_direct_provider_routes_dont_override_base_url():
 
 
 def test_claude_code_routes_do_not_scaffold_legacy_allow_env():
-    """claude-code availability is decided by the resolver's enforcement
-    hook check, not by the old unsafe MIMIR_ALLOW_CLAUDE_CODE opt-in."""
+    """claude-code availability is decided by the supported resolver path's
+    enforcement hook check, not by the old MIMIR_ALLOW_CLAUDE_CODE opt-in."""
     from mimir.model_registry import detect_route
 
     route = detect_route("claude-sonnet-4-6", subscription=True)

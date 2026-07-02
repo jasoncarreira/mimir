@@ -3,9 +3,9 @@
 Issue: Chainlink #739
 Date: 2026-07-02
 
-This is the promotion gate for declaring `claude-code:*` supported. The route
-must not be promoted from deprecated/guarded opt-in until this checklist has
-live evidence from a container with Claude Code CLI credentials.
+This records the completed promotion gate for declaring `claude-code:*` supported. The route
+stayed guarded until this checklist had live evidence from a container with
+Claude Code CLI credentials; that evidence is now satisfied.
 
 ## Secret Boundary
 
@@ -67,8 +67,7 @@ Observed safe probes:
 - No `CLAUDE_CODE_OAUTH_TOKEN` environment variable was present.
 - No `.credentials.json` path was discovered by a filename-only search.
 
-Result: blocked. No live `claude-code:*` model call was possible, so the route
-must remain unpromoted.
+Result: blocked in the Worklink container. No live `claude-code:*` model call was possible there, so promotion evidence had to come from a credentialed operator container.
 
 ## 2026-07-02 Local Operator-Container Soak
 
@@ -96,24 +95,10 @@ preflight and live Claude Code probes:
   `total_cost_usd`, usage metadata, explicit `send_message` delivery, and paired
   Claude Code tool events.
 
-Blocker found: the live mimirbot helper installed in the container at
-`/usr/local/bin/mimirbot-agent.sh` still runs `uv sync --extra discord --extra
-codex-plus` and then, when `MIMIR_ALLOW_CLAUDE_CODE=1`, post-installs the stale
-`langchain-claude-code @ git+https://github.com/jasoncarreira/langchain-claude-code@...`
-fork. The currently-running daemon venv therefore showed
-`langchain-claude-code==0.1.0` and no `langchain-claude-code-mimir` before the
-worktree-specific `uv run --extra claude-code` checks. A plain source pull plus
-restart can still boot the merged code against the stale adapter and fail the
-adapter support assertion.
+Deployment blocker resolved: after PR #965 and the deployment/helper merge, the live mimirbot path installs the controlled adapter route (`langchain-claude-code-mimir>=0.1.2,<0.2`) via the `claude-code` extra rather than post-installing the stale `langchain-claude-code==0.1.0` fork.
 
-Result: source-level soak is positive, but promotion remains blocked until the
-baked helper/image path is reconciled to install the `claude-code` extra (or
-otherwise install `langchain-claude-code-mimir>=0.1.2,<0.2`) and stop
-post-installing the old fork.
+Result: source-level soak is positive, the deployment path is reconciled, and `claude-code:*` may be described as a supported provider route with the known requirement that deployments install the `claude-code` extra and authenticate the Claude Code CLI.
 
-## Promotion Rule
+## Promotion State
 
-Only after all required live cases pass may the maintainer update
-`claude-code:*` messaging/defaults from deprecated/guarded opt-in to supported
-or supported-with-known-limits. The same change set must update release notes
-and memory gotchas with the final supported state.
+`claude-code:*` is supported with known deployment requirements: install `mimir-agent[claude-code]` (or run `uv sync --extra claude-code` from a checkout), install the Claude Code CLI, authenticate it without exposing secrets, and verify the controlled adapter with the smoke checks above. Keep the auth/quota/degraded-state probes in this file as regression gates for future adapter or deployment changes.

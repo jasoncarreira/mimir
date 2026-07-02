@@ -6,6 +6,9 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+- Mark `claude-code:*` as a supported provider route after the authenticated operator-container soak and deployment-helper reconciliation; the supported install path is `mimir-agent[claude-code]` / `uv sync --extra claude-code` plus an authenticated Claude Code CLI.
+
 ## [0.6.9] — 2026-06-29
 
 ### Added
@@ -934,12 +937,12 @@ longer hard-codes container paths).
   (e.g. an ops alert) no longer suppresses the `no_reply` signal for the
   user who asked; the event carries `delivered_elsewhere`, and the prompt
   conventions teach "close the loop with whoever asked" (a react counts).
-- **The `claude-code:` model route is deprecated (#634).** Its tools
-  execute inside the Claude Code subprocess, bypassing the per-turn tool
-  budget and prohibited-action screen. `_resolve_model` refuses it unless
-  opted in via `MIMIR_ALLOW_CLAUDE_CODE=1`; fresh setup homes can carry
-  that opt-in in `<home>/.env`, which runtime config now loads as defaults
-  while process environment values remain authoritative.
+- **The `claude-code:` model route was temporarily deprecated (#634).** Its
+  tools executed inside the Claude Code subprocess, bypassing the per-turn tool
+  budget and prohibited-action screen, so `_resolve_model` refused it unless
+  opted in via `MIMIR_ALLOW_CLAUDE_CODE=1`. Later releases restored this route
+  as supported once the controlled adapter and PreToolUse enforcement hook path
+  were available.
 
 ### Added
 
