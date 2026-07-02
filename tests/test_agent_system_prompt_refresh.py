@@ -91,7 +91,13 @@ async def test_build_agent_registers_structured_subagents(
     await agent._build_agent_if_needed()
 
     subagents = capture.kwargs[0]["subagents"]
-    assert [spec["name"] for spec in subagents] == ["critic-structured"]
+    assert [spec["name"] for spec in subagents] == [
+        "critic-structured",
+        "work-decomposer",
+        "decompose-reviewer",
+        "per-slice-reviewer",
+        "integration-validator",
+    ]
     assert all(spec["name"] != "general-purpose" for spec in subagents)
 
 

@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from mimir.worklink.backends.registry import TieredReviewConfig
+from mimir.worklink.review import (
+    DECOMPOSE_REVIEWER_PROMPT,
+    INTEGRATION_VALIDATOR_PROMPT,
+    PER_SLICE_REVIEWER_PROMPT,
+    WORK_DECOMPOSER_PROMPT,
+    DecomposeReview,
+    IntegrationAcceptanceMapping,
+    IntegrationValidation,
+    ReviewFinding,
+    SliceAcceptanceMapping,
+    SliceReview,
+    WorkDecomposition,
+    WorklinkBlockerEdge,
+    WorklinkLeafSpec,
+    WorklinkWave,
+    build_worklink_review_subagents,
+    classify_leaf_review_risk,
+)
+
+
+def test_work_decomposer_schema_carries_strict_leaf_fields_and_dag() -> None:
+    result = WorkDecomposition(
+        summary="Split into implementation and test leaves.",
+        leaves=[
+            WorklinkLeafSpec(
+                title="Add review schemas",
+                acceptance_criteria=["Schemas validate all Worklink review roles"],
+                review_criteria=["Verify structured response classes are registered"],
+                scope_paths=["mimir/worklink/review.py"],
+                out_of_scope=["Invoking roles from the orchestrator"],
+                suggested_test_command='pytest -q tests/ -k "review"',
+            )
+        ],
+        blocked_by=[
+            WorklinkBlockerEdge(
+                blocked_leaf="Wire registration",
+                blocker_leaf="Add review schemas",
+                reason="Registration needs the schema classes.",
+            )
+        ],
+        waves=[
+            WorklinkWave(
+                wave=1,
+                leaves=["Add review schemas"],
+                serialized_hotspots=["mimir/subagents.py"],
+            )
+        ],
+    )
+
+    payload = result.model_dump()
+    assert payload["leaves"][0]["scope_paths"] == ["mimir/worklink/review.py"]
+    assert payload["blocked_by"][0]["blocked_leaf"] == "Wire registration"
+    assert payload["waves"][0]["serialized_hotspots"] == ["mimir/subagents.py"]
+
+
+def test_work_decomposer_leaf_requires_template_acceptance_scope_and_tests() -> None:
+    with pytest.raises(ValidationError):
+        WorklinkLeafSpec(
+            title="Too vague",
+            acceptance_criteria=[],
+            review_criteria=["review it"],
+            scope_paths=["mimir/worklink/review.py"],
+            suggested_test_command="pytest",
+        )
+
+    with pytest.raises(ValidationError):
+        WorklinkLeafSpec(
+            title="No scope",
+            acceptance_criteria=["observable"],
+            review_criteria=["review it"],
+            scope_paths=[],
+            suggested_test_command="pytest",
+        )
+
+
+def test_decompose_reviewer_schema_uses_approve_reject_findings() -> None:
+    result = DecomposeReview(
+        verdict="REJECT",
+        summary="One same-wave overlap remains.",
+        findings=[
+            ReviewFinding(
+                title="Same-wave file overlap",
+                severity="blocker",
+                evidence="Two wave-1 leaves both include mimir/subagents.py",
+                recommendation="Serialize one leaf behind the other.",
+            )
+        ],
+    )
+
+    assert result.verdict == "REJECT"
+    assert result.findings[0].severity == "blocker"
+
+
+def test_per_slice_reviewer_schema_and_prompt_are_adversarial_observed_evidence_only() -> None:
+    result = SliceReview(
+        verdict="REJECT",
+        summary="Observed tests did not run.",
+        ac_coverage=[
+            SliceAcceptanceMapping(
+                acceptance_criterion="Tests cover the classifier",
+                status="unclear",
+                evidence="Controller-observed test result is missing.",
+            )
+        ],
+        required_fixes=["Run the focused pytest command and attach observed result."],
+    )
+
+    assert result.ac_coverage[0].status == "unclear"
+    assert "adversarial" in PER_SLICE_REVIEWER_PROMPT.lower()
+    assert "controller-observed" in PER_SLICE_REVIEWER_PROMPT.lower()
+    assert "do not trust worker prose" in PER_SLICE_REVIEWER_PROMPT.lower()
+    assert "approve only if" in PER_SLICE_REVIEWER_PROMPT.lower()
+
+
+def test_integration_validator_schema_maps_ac_to_code_and_tests() -> None:
+    result = IntegrationValidation(
+        verdict="GO-WITH-NITS",
+        summary="All ACs are covered with one naming nit.",
+        ac_mappings=[
+            IntegrationAcceptanceMapping(
+                acceptance_criterion="Register four Worklink roles",
+                code_refs=["mimir/subagents.py:56", "mimir/worklink/review.py:260"],
+                test_refs=["tests/test_structured_subagents.py:21"],
+                status="met_with_nits",
+                evidence="Registration includes the four role names.",
+            )
+        ],
+        findings=[],
+    )
+
+    assert result.verdict == "GO-WITH-NITS"
+    assert result.ac_mappings[0].code_refs
+    assert result.ac_mappings[0].test_refs
+
+
+def test_worklink_review_subagent_specs_are_readonly_and_structured() -> None:
+    specs = build_worklink_review_subagents()
+
+    assert [spec["name"] for spec in specs] == [
+        "work-decomposer",
+        "decompose-reviewer",
+        "per-slice-reviewer",
+        "integration-validator",
+    ]
+    assert [spec["response_format"] for spec in specs] == [
+        WorkDecomposition,
+        DecomposeReview,
+        SliceReview,
+        IntegrationValidation,
+    ]
+    assert all(spec["tools"] == [] for spec in specs)
+    assert all(spec["permissions"][0].operations == ["write"] for spec in specs)
+    assert all(spec["permissions"][0].mode == "deny" for spec in specs)
+
+
+def test_role_prompts_cover_required_review_contracts() -> None:
+    assert "strict leaf template" in WORK_DECOMPOSER_PROMPT.lower()
+    assert "scope" in WORK_DECOMPOSER_PROMPT.lower()
+    assert "file-disjoint waves" in WORK_DECOMPOSER_PROMPT.lower()
+    assert "hotspots" in WORK_DECOMPOSER_PROMPT.lower()
+
+    assert "every epic acceptance criterion maps" in DECOMPOSE_REVIEWER_PROMPT.lower()
+    assert "same-wave leaves are file-disjoint" in DECOMPOSE_REVIEWER_PROMPT.lower()
+    assert "serialized by dependencies" in DECOMPOSE_REVIEWER_PROMPT.lower()
+
+    assert "code_refs and test_refs" in INTEGRATION_VALIDATOR_PROMPT
+    assert "GO-WITH-NITS" in INTEGRATION_VALIDATOR_PROMPT
+
+
+def test_classifier_returns_single_for_low_risk_leaf() -> None:
+    assert (
+        classify_leaf_review_risk(
+            scope_paths=["docs/internal/WORKLINK.md"],
+            labels={"worklink:ready", "docs"},
+        )
+        == "single"
+    )
+
+
+@pytest.mark.parametrize(
+    ("scope_path", "label"),
+    [
+        ("mimir/worklink/orchestrator.py", "worklink:ready"),
+        ("mimir/saga/migrations/001_add_table.py", "worklink:ready"),
+        ("docs/internal/WORKLINK.md", "risk:high"),
+    ],
+)
+def test_classifier_returns_multi_for_default_tiered_review_config(
+    scope_path: str, label: str
+) -> None:
+    assert classify_leaf_review_risk(scope_paths=[scope_path], labels={label}) == "multi"
+
+
+def test_classifier_uses_supplied_tiered_review_config_scope_prefixes_and_labels() -> None:
+    config = TieredReviewConfig(
+        high_risk_scope_prefixes=("custom/hotspot",),
+        high_risk_labels=("review:multi",),
+        multi_vote_reviewer_count=5,
+    )
+
+    assert (
+        classify_leaf_review_risk(
+            scope_paths=["custom/hotspot/file.py"],
+            labels={"worklink:ready"},
+            tiered_review=config,
+        )
+        == "multi"
+    )
+    assert (
+        classify_leaf_review_risk(
+            scope_paths=["mimir/worklink/orchestrator.py"],
+            labels={"worklink:ready"},
+            tiered_review=config,
+        )
+        == "single"
+    )
+    assert (
+        classify_leaf_review_risk(
+            scope_paths=["docs/notes.md"],
+            labels={"review:multi"},
+            tiered_review=config,
+        )
+        == "multi"
+    )
