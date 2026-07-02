@@ -357,37 +357,11 @@ def _resolve_model(
     if not isinstance(spec, str):
         raise TypeError(f"unexpected model spec type: {type(spec).__name__}")
     if spec.startswith("claude-code:"):
-        # chainlink #426: the claude-code subprocess route is DEPRECATED.
-        # Its tools are bridged into the ClaudeSDKClient as in-process MCP
-        # tools and execute inside the SDK round-trip — they never
-        # traverse langgraph's tool node, so BudgetGateMiddleware and the
-        # prohibited-action screen do not run on this provider: an
-        # ungated agent. No live deployment uses it (codex-plus /
-        # anthropic-compat routes) and the subprocess-subagent direction
-        # is being retired, so rather than maintain gating code for a
-        # provider nobody exercises, the route is refused at resolve time
-        # with an explicit opt-out for operators who accept the gap.
-        # The opt-in is honored from the runtime environment.
-        # Config.from_env loads ``<home>/.env`` as defaults before the agent
-        # resolves models, so setup-written operator intent reaches this gate
-        # without a one-key scaffold parser here.
-        if os.environ.get("MIMIR_ALLOW_CLAUDE_CODE", "").strip() not in (
-            "1", "true", "yes",
-        ):
-            raise RuntimeError(
-                "MIMIR_MODEL_SPEC=claude-code:* is deprecated and disabled: "
-                "this provider executes tools inside the Claude Code "
-                "subprocess, bypassing the per-turn tool budget and the "
-                "prohibited-action screen (chainlink #426). Use a routed "
-                "provider (anthropic:, openai:, codex-plus:) — or set "
-                "MIMIR_ALLOW_CLAUDE_CODE=1 to run it anyway, accepting an "
-                "ungated agent."
-            )
-        log.warning(
-            "claude-code provider enabled via MIMIR_ALLOW_CLAUDE_CODE — "
-            "this route is deprecated and runs WITHOUT the tool budget "
-            "or prohibited-action gating (chainlink #426)"
-        )
+        # chainlink #426/#735: Claude Code executes built-in, bridged
+        # LangChain, and MCP tools inside the Claude SDK subprocess path, not
+        # through LangGraph's tool middleware. Keep this provider fail-closed
+        # unless the adapter exposes the PreToolUse hook surface Mimir uses to
+        # run the same budget/prohibited-action guards before execution.
         try:
             import langchain_claude_code as _lcc  # type: ignore[import-untyped]
             from langchain_claude_code import ChatClaudeCode  # type: ignore[import-untyped]
@@ -404,6 +378,7 @@ def _resolve_model(
                 "(see issue #268) merge + a release is cut."
             ) from exc
         _lcc_patches.assert_supported_langchain_claude_code_adapter(_lcc)
+        _lcc_patches.ensure_tool_enforcement_hooks_installed(_lcc)
         model_name = spec.split(":", 1)[1]
         # ``permission_mode="bypassPermissions"`` matches SDK-era
         # mimir's ClaudeAgentOptions setting — without it the claude

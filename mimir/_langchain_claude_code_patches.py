@@ -54,6 +54,7 @@ _REQUIRED_ADAPTER_FEATURES = frozenset(
         "tool_call_schema",
         "streaming_result_metadata",
         "sdk_tool_events",
+        "sdk_tool_enforcement",
     }
 )
 
@@ -199,6 +200,25 @@ def _adapter_has_native_mimir_compatibility() -> bool:
 _tool_events_var: contextvars.ContextVar[list[dict[str, Any]] | None] = (
     contextvars.ContextVar("mimir_claude_code_tool_events", default=None)
 )
+
+
+def _adapter_declares_tool_enforcement(module: Any | None = None) -> bool:
+    if module is None:
+        try:
+            import langchain_claude_code as module  # type: ignore[import-untyped,no-redef]
+        except ImportError:
+            return False
+    for attr in ("MIMIR_COMPATIBILITY", "__mimir_compatibility__"):
+        compat = getattr(module, attr, None)
+        if not isinstance(compat, dict):
+            continue
+        features = compat.get("features") or compat.get("adapter_features") or ()
+        try:
+            if "sdk_tool_enforcement" in set(features):
+                return True
+        except TypeError:
+            continue
+    return False
 
 
 def apply_patches() -> None:
@@ -590,27 +610,149 @@ def enrich_streaming_metadata() -> None:
 _TOOL_EVENT_HOOKS_MARKER = "_mimir_tool_event_hooks_installed"
 
 
+def _claude_code_permission_denial(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def _record_claude_code_tool_result_denial(
+    tool_name: str,
+    tool_use_id: str,
+    reason: str,
+) -> None:
+    events = _tool_events_var.get()
+    if events is None:
+        return
+    events.append({
+        "type": "tool_result",
+        "ts_mono_ns": time.monotonic_ns(),
+        "tool_use_id": tool_use_id,
+        "name": tool_name,
+        "error": reason,
+        "is_error": True,
+        "denied": True,
+    })
+
+
+def _claude_code_tool_duration_ms(tool_use_id: str) -> float | None:
+    events = _tool_events_var.get()
+    if events is None:
+        return None
+    for event in reversed(events):
+        if (
+            event.get("type") == "tool_call"
+            and event.get("tool_use_id") == tool_use_id
+        ):
+            started = event.get("ts_mono_ns")
+            if isinstance(started, int):
+                return (time.monotonic_ns() - started) / 1_000_000.0
+            return None
+    return None
+
+
+def _claude_code_pre_tool_enforcement(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    tool_use_id: str,
+    *,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Run mimir's pre-execution gates for Claude Code SDK tools.
+
+    This is the same boundary as the SDK's ``PreToolUse`` hook, so a deny
+    result prevents the Claude Code subprocess/tool runtime from receiving the
+    tool call. Keep the order aligned with ``BudgetGateMiddleware``: admin,
+    prohibited bash, then budget.
+    """
+    from .tools.budget_gate import (
+        _check_admin_authorized,
+        _check_and_increment_or_deny,
+        _emit_event_sync,
+        _emit_tool_call_sync,
+    )
+    from .tools.prohibited_action_guard import check_prohibited_bash, is_bash_tool
+    from ._context import get_current_turn, get_turn_by_session_id
+
+    ctx = get_current_turn() or get_turn_by_session_id(session_id)
+
+    admin_denial = _check_admin_authorized(tool_name, ctx)
+    if admin_denial is not None:
+        _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
+        _record_claude_code_tool_result_denial(tool_name, tool_use_id, admin_denial)
+        return _claude_code_permission_denial(admin_denial)
+
+    if is_bash_tool(tool_name):
+        command = tool_input.get("command", "")
+        if isinstance(command, str) and command:
+            prohibition = check_prohibited_bash(command)
+            if prohibition is not None:
+                _emit_event_sync(
+                    "prohibited_action_blocked",
+                    tool=tool_name,
+                    reason=prohibition[:200],
+                )
+                _emit_tool_call_sync(
+                    tool_name,
+                    ok=False,
+                    error=prohibition,
+                    denied=True,
+                )
+                _record_claude_code_tool_result_denial(
+                    tool_name,
+                    tool_use_id,
+                    prohibition,
+                )
+                return _claude_code_permission_denial(prohibition)
+
+    denial = _check_and_increment_or_deny(tool_name, ctx)
+    if denial is not None:
+        _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
+        _record_claude_code_tool_result_denial(tool_name, tool_use_id, denial)
+        return _claude_code_permission_denial(denial)
+
+    return {}
+
+
 # Third hook-callback param is the SDK's ``HookContext`` TypedDict —
 # currently just ``{"signal": None}`` (reserved for future abort-signal
 # support, see claude_agent_sdk/types.py:508). We don't use it; the
 # leading-underscore name signals "unused" to future readers.
 async def _pre_tool_use_hook(input_data: dict, tool_use_id: str, _ctx: Any) -> dict:
-    """Append a tool_call event to the active capture list."""
+    """Append a tool_call event and deny unsafe calls before execution."""
+    tool_name = str(input_data.get("tool_name") or "")
+    session_id = input_data.get("session_id")
+    session_id = session_id if isinstance(session_id, str) else None
+    raw_input = input_data.get("tool_input", {})
+    tool_input = raw_input if isinstance(raw_input, dict) else {}
     events = _tool_events_var.get()
-    if events is None:
-        return {}
-    events.append({
-        "type": "tool_call",
-        "ts_mono_ns": time.monotonic_ns(),
-        "tool_use_id": tool_use_id,
-        "name": input_data.get("tool_name", ""),
-        "input": input_data.get("tool_input", {}),
-    })
-    return {}
+    if events is not None:
+        events.append({
+            "type": "tool_call",
+            "ts_mono_ns": time.monotonic_ns(),
+            "tool_use_id": tool_use_id,
+            "name": tool_name,
+            "input": tool_input,
+        })
+    return _claude_code_pre_tool_enforcement(
+        tool_name,
+        tool_input,
+        tool_use_id,
+        session_id=session_id,
+    )
 
 
 async def _post_tool_use_hook(input_data: dict, tool_use_id: str, _ctx: Any) -> dict:
     """Append a tool_result event (success) to the active capture list."""
+    tool_name = str(input_data.get("tool_name") or "")
+    duration_ms = _claude_code_tool_duration_ms(tool_use_id)
+    from .tools.budget_gate import _emit_tool_call_sync
+
+    _emit_tool_call_sync(tool_name, ok=True, duration_ms=duration_ms)
     events = _tool_events_var.get()
     if events is None:
         return {}
@@ -618,7 +760,7 @@ async def _post_tool_use_hook(input_data: dict, tool_use_id: str, _ctx: Any) -> 
         "type": "tool_result",
         "ts_mono_ns": time.monotonic_ns(),
         "tool_use_id": tool_use_id,
-        "name": input_data.get("tool_name", ""),
+        "name": tool_name,
         "result": input_data.get("tool_response"),
         "is_error": False,
     })
@@ -629,6 +771,18 @@ async def _post_tool_use_failure_hook(
     input_data: dict, tool_use_id: str, _ctx: Any,
 ) -> dict:
     """Append a tool_result event (failure) to the active capture list."""
+    tool_name = str(input_data.get("tool_name") or "")
+    duration_ms = _claude_code_tool_duration_ms(tool_use_id)
+    error = input_data.get("error")
+    error_text = error if isinstance(error, str) else str(error) if error else None
+    from .tools.budget_gate import _emit_tool_call_sync
+
+    _emit_tool_call_sync(
+        tool_name,
+        ok=False,
+        duration_ms=duration_ms,
+        error=error_text,
+    )
     events = _tool_events_var.get()
     if events is None:
         return {}
@@ -636,8 +790,8 @@ async def _post_tool_use_failure_hook(
         "type": "tool_result",
         "ts_mono_ns": time.monotonic_ns(),
         "tool_use_id": tool_use_id,
-        "name": input_data.get("tool_name", ""),
-        "error": input_data.get("error"),
+        "name": tool_name,
+        "error": error,
         "is_error": True,
     })
     return {}
@@ -708,7 +862,7 @@ def install_tool_event_hooks() -> None:
     except ImportError:
         return
 
-    if _adapter_has_native_mimir_compatibility():
+    if _adapter_declares_tool_enforcement() and _adapter_has_native_mimir_compatibility():
         setattr(ccm.ClaudeCodeChatModel, _TOOL_EVENT_HOOKS_MARKER, True)
         return
 
@@ -785,4 +939,38 @@ def install_tool_event_hooks() -> None:
     log.debug(
         "installed tool-event hooks on ChatClaudeCode "
         "(_build_options, _aquery, _astream)",
+    )
+
+
+def ensure_tool_enforcement_hooks_installed(module: Any | None = None) -> None:
+    """Fail closed unless Claude Code tool calls have a pre-execution guard.
+
+    ``claude-code:*`` executes built-in, bridged LangChain, and MCP tools inside
+    the Claude Code SDK subprocess path, bypassing LangGraph's tool middleware.
+    Model resolution calls this before constructing ``ChatClaudeCode`` so the
+    deprecated provider stays unavailable whenever the SDK/adapter no longer
+    exposes the hook surface Mimir needs.
+    """
+    try:
+        from langchain_claude_code import claude_chat_model as ccm
+    except ImportError as exc:
+        raise RuntimeError(
+            "claude-code tool enforcement unavailable: "
+            "langchain_claude_code is not installed"
+        ) from exc
+
+    if _adapter_declares_tool_enforcement(module):
+        return
+
+    install_tool_event_hooks()
+    if getattr(ccm.ClaudeCodeChatModel, _TOOL_EVENT_HOOKS_MARKER, False):
+        return
+
+    raise RuntimeError(
+        "MIMIR_MODEL_SPEC=claude-code:* is disabled: Mimir could not install "
+        "the Claude Code PreToolUse enforcement hook required to run the "
+        "per-turn tool budget and prohibited-action guard before built-in, "
+        "bridged, and MCP tools execute. Install a supported "
+        "langchain_claude_code/claude_agent_sdk adapter or use anthropic:, "
+        "openai:, or codex-plus:."
     )

@@ -7,11 +7,18 @@ Covers:
 
 from __future__ import annotations
 
+import time
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from mimir._context import _active_turns, reset_current_turn, set_current_turn
+from mimir._langchain_claude_code_patches import (
+    _pre_tool_use_hook,
+    _tool_events_var,
+)
+from mimir.models import TurnContext
 from mimir.tools.prohibited_action_guard import (
     _BLOCK_PREFIX,
     check_prohibited_bash,
@@ -184,6 +191,9 @@ class TestIsBashTool:
     def test_mcp_bash_async_is_bash(self) -> None:
         assert is_bash_tool("mcp__mimir__bash_async") is True
 
+    def test_normalized_mcp_shell_exec_is_bash(self) -> None:
+        assert is_bash_tool("mcp_mimir_shell_exec") is True
+
     def test_bash_capital_b_is_bash(self) -> None:
         """claude-code's native shell built-in surfaces as 'Bash' (capital B)
         when registered through deepagents. Regression for the correctness gap
@@ -309,3 +319,101 @@ class TestMiddlewareBlocksProhibited:
         assert "reason" in kwargs
         assert len(kwargs["reason"]) <= 200
         assert kwargs["tool"] == "shell_exec"
+
+
+# ─── Claude Code PreToolUse enforcement ─────────────────────────────────────
+
+
+def _make_turn_ctx(*, budget: int = 5) -> TurnContext:
+    return TurnContext(
+        turn_id="t-claude-code-guard",
+        session_id="ch-claude-code-guard",
+        trigger="user_message",
+        channel_id="ch-claude-code-guard",
+        started_at=time.monotonic(),
+        tool_call_budget=budget,
+    )
+
+
+def _permission_decision(result: dict[str, Any]) -> str | None:
+    output = result.get("hookSpecificOutput")
+    if not isinstance(output, dict):
+        return None
+    decision = output.get("permissionDecision")
+    return decision if isinstance(decision, str) else None
+
+
+class TestClaudeCodePreToolUseGuard:
+    @pytest.mark.asyncio
+    async def test_prohibited_bash_canary_denies_before_runtime(self) -> None:
+        """A denied Claude Code Bash call returns a PreToolUse denial, so a
+        simulated SDK dispatcher does not invoke the tool runtime."""
+        runtime_called = False
+        events: list[dict[str, Any]] = []
+        token = _tool_events_var.set(events)
+        try:
+            result = await _pre_tool_use_hook(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git push --force origin main"},
+                },
+                "toolu_canary",
+                None,
+            )
+            if _permission_decision(result) != "deny":
+                runtime_called = True
+        finally:
+            _tool_events_var.reset(token)
+
+        assert _permission_decision(result) == "deny"
+        assert runtime_called is False
+        assert any(
+            event.get("type") == "tool_result"
+            and event.get("is_error") is True
+            and event.get("denied") is True
+            for event in events
+        )
+
+    @pytest.mark.asyncio
+    async def test_budget_denial_uses_session_id_when_hook_task_lacks_context(
+        self,
+    ) -> None:
+        ctx = _make_turn_ctx(budget=1)
+        ctx.tool_call_count = 1
+        _active_turns[ctx.turn_id] = ctx
+        try:
+            result = await _pre_tool_use_hook(
+                {
+                    "session_id": ctx.turn_id,
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "/tmp/example.txt"},
+                },
+                "toolu_budget",
+                None,
+            )
+        finally:
+            _active_turns.pop(ctx.turn_id, None)
+
+        assert _permission_decision(result) == "deny"
+        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "Tool-call budget exhausted" in reason
+        assert ctx.tool_call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_allowed_claude_code_tool_consumes_budget(self) -> None:
+        ctx = _make_turn_ctx(budget=2)
+        token = set_current_turn(ctx)
+        try:
+            result = await _pre_tool_use_hook(
+                {
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "/tmp/example.txt"},
+                },
+                "toolu_read",
+                None,
+            )
+        finally:
+            reset_current_turn(token)
+
+        assert result == {}
+        assert ctx.tool_call_count == 1

@@ -2564,40 +2564,34 @@ async def test_run_turn_cross_channel_only_delivery_still_flags(tmp_path: Path):
     assert sig["delivered_elsewhere"] == ["ops-channel"]
 
 
-def test_resolve_model_claude_code_deprecated_by_default(monkeypatch):
-    """chainlink #426: the claude-code subprocess route bypasses the tool
-    budget + prohibited-action gating, is unused by live deployments, and
-    is deprecated — _resolve_model refuses it unless the operator opts in
-    via MIMIR_ALLOW_CLAUDE_CODE."""
+def test_resolve_model_claude_code_fails_closed_without_adapter(monkeypatch):
+    """claude-code stays unavailable unless its adapter can install the
+    PreToolUse budget/prohibited-action enforcement hook."""
     from mimir.agent import _resolve_model
 
-    monkeypatch.delenv("MIMIR_ALLOW_CLAUDE_CODE", raising=False)
-    with pytest.raises(RuntimeError, match="deprecated"):
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    with pytest.raises((ImportError, RuntimeError)):
         _resolve_model("claude-code:claude-sonnet-4-6")
 
 
-def test_resolve_model_claude_code_home_dotenv_opt_in(tmp_path, monkeypatch):
-    """chainlink #447: Config.from_env loads <home>/.env defaults, so the
-    setup-written claude-code opt-in reaches normal model resolution."""
+def test_resolve_model_claude_code_home_dotenv_requires_enforcement(
+    tmp_path, monkeypatch,
+):
+    """Config.from_env can still select claude-code, but model resolution
+    remains fail-closed until the enforcement hook is active."""
     from mimir.agent import resolve_model_from_config
     from mimir.config import Config
 
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
-    monkeypatch.delenv("MIMIR_ALLOW_CLAUDE_CODE", raising=False)
     monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
     (tmp_path / ".env").write_text(
-        "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6\n"
-        "MIMIR_ALLOW_CLAUDE_CODE=1\n",
+        "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6\n",
         encoding="utf-8",
     )
     cfg = Config.from_env()
-    try:
+    with pytest.raises((ImportError, RuntimeError)):
         resolve_model_from_config(cfg)
-    except RuntimeError as exc:
-        pytest.fail(f"deprecation gate fired despite home .env opt-in: {exc}")
-    except ImportError:
-        pass  # langchain-claude-code fork not installed — past the gate
 
 
 # ─── chainlink #508: deliver: failure notice on EARLY-phase crash ────
