@@ -201,6 +201,10 @@ class ChainlinkEpicClient:
                 return existing.issue.issue_id
         body = _leaf_body(leaf)
         labels = list(getattr(leaf, "labels", []) or ["worklink:ready"])
+        if getattr(leaf, "risk", "standard") == "high":
+            normalized_labels = {str(label).strip().lower() for label in labels}
+            if "risk:high" not in normalized_labels:
+                labels.append("risk:high")
         cmd = [
             self.chainlink_bin,
             "issue",

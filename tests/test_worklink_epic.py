@@ -261,6 +261,15 @@ def cp(args: Sequence[str], returncode: int = 0, stdout: str = "", stderr: str =
     return subprocess.CompletedProcess(list(args), returncode, stdout=stdout, stderr=stderr)
 
 
+def _label_values(args: Sequence[str]) -> list[str]:
+    values: list[str] = []
+    items = list(args)
+    for index, item in enumerate(items):
+        if item == "--label":
+            values.append(items[index + 1])
+    return values
+
+
 def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
     if list(args)[:4] == ["git", "-C", "/repo"]:
         return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
@@ -642,12 +651,13 @@ def test_chainlink_file_leaf_uses_strict_template_and_real_subissue_cli() -> Non
 
     leaf = WorklinkLeafSpec(
         title="Leaf A",
+        risk="high",
         acceptance_criteria=["A works"],
         review_criteria=["review A"],
         scope_paths=["mimir/worklink/epic.py", "tests/test_worklink_epic.py"],
         out_of_scope=["role runner"],
         suggested_test_command="env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_epic.py",
-        labels=["worklink:ready", "risk:high"],
+        labels=["worklink:ready"],
     )
 
     created = ChainlinkEpicClient(runner=fake_runner).file_leaf(100, leaf)
@@ -659,6 +669,7 @@ def test_chainlink_file_leaf_uses_strict_template_and_real_subissue_cli() -> Non
     assert "--title" not in subissue_call
     assert "--json" in subissue_call
     assert subissue_call.count("--label") == 2
+    assert _label_values(subissue_call) == ["worklink:ready", "risk:high"]
     body = subissue_call[subissue_call.index("--description") + 1]
     assert missing_leaf_template_parts(body) == []
     issue_ctx = IssueContext(
@@ -670,6 +681,61 @@ def test_chainlink_file_leaf_uses_strict_template_and_real_subissue_cli() -> Non
         created_at=datetime(2026, 7, 2, tzinfo=UTC),
     )
     validate_leaf(issue_ctx)
+
+
+def test_decomposer_high_risk_round_trips_through_file_leaf_labels_and_classifier() -> None:
+    created: dict[str, Any] = {}
+
+    def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args) == ["chainlink", "issue", "list", "--json"]:
+            if not created:
+                return cp(args, stdout="[]")
+            return cp(
+                args,
+                stdout=json.dumps(
+                    [
+                        {
+                            "id": 123,
+                            "title": "Leaf A",
+                            "description": created["description"],
+                            "labels": created["labels"],
+                            "parent_id": 100,
+                            "blocked_by": [],
+                            "created_at": "2026-07-02T00:00:00Z",
+                        }
+                    ]
+                ),
+            )
+        if list(args)[:3] == ["chainlink", "issue", "subissue"]:
+            created["description"] = list(args)[list(args).index("--description") + 1]
+            created["labels"] = _label_values(list(args))
+            return cp(args, stdout=json.dumps({"id": 123}))
+        return cp(args, returncode=99, stderr="unexpected command")
+
+    leaf = WorklinkLeafSpec(
+        title="Leaf A",
+        risk="high",
+        acceptance_criteria=["A works"],
+        review_criteria=["review A"],
+        scope_paths=["docs/internal/WORKLINK.md"],
+        suggested_test_command="true",
+    )
+    client = ChainlinkEpicClient(runner=fake_runner)
+
+    assert client.file_leaf(100, leaf) == 123
+    child = client.child_leaves(100)[0]
+
+    assert "risk:high" in child.issue.labels
+    assert child.scope_paths == ("docs/internal/WORKLINK.md",)
+    from mimir.worklink.review import classify_leaf_review_risk
+
+    assert (
+        classify_leaf_review_risk(
+            scope_paths=list(child.scope_paths),
+            labels=child.issue.labels,
+        )
+        == "multi"
+    )
 
 
 def test_chainlink_file_leaf_is_idempotent_by_title() -> None:
