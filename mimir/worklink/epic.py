@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from .backends import BackendRegistry, WorkOrder, WorklinkConfig
 from .backends.registry import WORKLINK_MERGED_LABEL
-from .claims import ChainlinkClaims
+from .claims import ChainlinkClaims, ClaimRecord
 from .compute import ComputeLaunchError, ComputeResult
 from .epic_state import (
     EpicRunManifest,
@@ -252,6 +252,7 @@ class ChainlinkEpicClient:
 
     def move_epic_to_review(self, epic_id: int) -> None:
         self.runner([self.chainlink_bin, "issue", "unlabel", str(epic_id), "worklink:ready"])
+        self.runner([self.chainlink_bin, "issue", "unlabel", str(epic_id), "worklink:in-progress"])
         self.runner([self.chainlink_bin, "issue", "label", str(epic_id), "worklink:review"])
 
 
@@ -300,7 +301,21 @@ class EpicRunner:
         if not claim.claimed or claim.record is None:
             return EpicRunResult(epic_id, "failed", reason=claim.reason or "claim_failed")
 
+        claim_record = claim.record
+        heartbeat_task = asyncio.create_task(
+            _epic_claim_heartbeat_loop(
+                claims,
+                lambda: claim_record,
+                interval_s=_epic_heartbeat_interval_s(config),
+            )
+        )
+
+        def heartbeat() -> None:
+            nonlocal claim_record
+            claim_record = claims.heartbeat_issue(claim_record)
+
         try:
+            heartbeat()
             existing_manifest = load_epic_state(self.home, epic_id)
             created_manifest = existing_manifest is None
             if existing_manifest is None:
@@ -321,6 +336,7 @@ class EpicRunner:
                     base_ref=base,
                     phase="decompose",
                 )
+                heartbeat()
             else:
                 manifest = existing_manifest
                 resume_point = resume_epic_run(manifest)
@@ -334,6 +350,7 @@ class EpicRunner:
                     self.repo, manifest, runner=runner
                 )
                 base = manifest.base_ref
+                heartbeat()
             leaves = chainlink.child_leaves(epic_id)
             if manifest.phase == "decompose" and (not leaves or not created_manifest):
                 leaves = await self._decompose(epic, chainlink, roles, config)
@@ -344,6 +361,7 @@ class EpicRunner:
                     slices=[EpicSliceRecord(id=leaf.issue.issue_id) for leaf in leaves],
                 )
                 save_epic_state(self.home, manifest)
+                heartbeat()
             elif manifest.phase == "decompose":
                 manifest = replace(
                     manifest,
@@ -351,6 +369,7 @@ class EpicRunner:
                     slices=[EpicSliceRecord(id=leaf.issue.issue_id) for leaf in leaves],
                 )
                 save_epic_state(self.home, manifest)
+                heartbeat()
             elif not leaves:
                 raise WorklinkError("epic manifest is past decompose but has no child leaves")
             elif not manifest.slices:
@@ -360,6 +379,7 @@ class EpicRunner:
                     slices=[EpicSliceRecord(id=leaf.issue.issue_id) for leaf in leaves],
                 )
                 save_epic_state(self.home, manifest)
+                heartbeat()
             leaf_by_id = {leaf.issue.issue_id: leaf for leaf in leaves}
             waves = compute_waves(leaves)
             blocked: dict[int, str] = {
@@ -384,6 +404,7 @@ class EpicRunner:
                     manifest = _update_slice(manifest, leaf.issue.issue_id, status="blocked")
                     chainlink.mark_blocked(leaf.issue.issue_id, reason)
                     save_epic_state(self.home, manifest)
+                    heartbeat()
                 batches = _file_disjoint_batches(runnable)
                 for batch in batches:
                     for chunk in _chunks(batch, config.defaults.max_concurrent):
@@ -426,6 +447,7 @@ class EpicRunner:
                                         dependent.issue.issue_id, "blocked by failed prerequisite"
                                     )
                                 save_epic_state(self.home, manifest)
+                                heartbeat()
             manifest = load_or_init_epic_state(
                 self.home,
                 epic_id=epic_id,
@@ -436,6 +458,7 @@ class EpicRunner:
             partial = any(item.status == "blocked" for item in manifest.slices)
             manifest = replace(manifest, phase="integrate", status="partial" if partial else "running")
             save_epic_state(self.home, manifest)
+            heartbeat()
             validation = await roles.validate_integration(
                 epic=epic,
                 manifest=manifest,
@@ -445,6 +468,7 @@ class EpicRunner:
             if validation.verdict == "NO-GO":
                 manifest = replace(manifest, status="blocked")
                 save_epic_state(self.home, manifest)
+                heartbeat()
                 return EpicRunResult(
                     epic_id,
                     "blocked",
@@ -456,6 +480,7 @@ class EpicRunner:
             if test_status.exit_code != 0 and not partial:
                 manifest = replace(manifest, status="blocked")
                 save_epic_state(self.home, manifest)
+                heartbeat()
                 return EpicRunResult(
                     epic_id,
                     "blocked",
@@ -478,6 +503,7 @@ class EpicRunner:
             )
             manifest = replace(manifest, phase="pr", status="partial" if partial else "completed")
             save_epic_state(self.home, manifest)
+            heartbeat()
             chainlink.move_epic_to_review(epic_id)
             return EpicRunResult(
                 epic_id,
@@ -487,6 +513,11 @@ class EpicRunner:
                 blocked_leaves=tuple(sorted(blocked)),
             )
         finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
             claims.release_issue(epic_id)
 
     async def _decompose(
@@ -801,6 +832,21 @@ def _chunks(items: list[LeafIssue], size: int) -> Iterable[list[LeafIssue]]:
     size = max(1, size)
     for index in range(0, len(items), size):
         yield items[index : index + size]
+
+
+def _epic_heartbeat_interval_s(config: WorklinkConfig) -> float:
+    return float(max(30, min(300, config.defaults.timeout_s // 4)))
+
+
+async def _epic_claim_heartbeat_loop(
+    claims: ChainlinkClaims,
+    current_record: Callable[[], ClaimRecord],
+    *,
+    interval_s: float,
+) -> None:
+    while True:
+        await asyncio.sleep(interval_s)
+        claims.heartbeat_issue(current_record())
 
 
 def _update_slice(manifest: EpicRunManifest, leaf_id: int, **changes: Any) -> EpicRunManifest:
