@@ -32,6 +32,7 @@ from typing import Sequence
 from .backends import WorklinkConfig
 from .backends.registry import WorklinkDefaults
 from .claims import ChainlinkClaims, ClaimRecord
+from .epic_state import load_epic_state
 from .worktree import prune_attempt_worktrees
 
 #: Chainlink agent identity the executor + reaper claim under. Mirrors
@@ -164,4 +165,21 @@ def reap_stale_claims_for_home(
         )
     ttl = timedelta(seconds=defaults.reaper_ttl_s)
     cl = claims or make_claims(home, agent_id=agent_id)
-    return cl.reap_home(ttl=ttl)
+    reaped: list[ClaimRecord] = []
+
+    def recover_epic(record: ClaimRecord) -> bool:
+        if load_epic_state(home, record.issue_id) is None:
+            return False
+        from .epic import run_epic
+
+        run_epic(
+            home=home,
+            repo=Path(worklink_repo()),
+            epic_id=record.issue_id,
+            autonomous=True,
+        )
+        return True
+
+    reaped.extend(cl.reap_epic_home(ttl=ttl, recover=recover_epic))
+    reaped.extend(cl.reap_home(ttl=ttl))
+    return reaped

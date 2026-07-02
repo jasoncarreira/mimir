@@ -21,6 +21,7 @@ import pytest
 
 from mimir.worklink import autonomy
 from mimir.worklink.claims import CLAIM_PREFIX, ChainlinkClaims, ClaimRecord
+from mimir.worklink.epic_state import EpicRunManifest, EpicSliceRecord, save_epic_state
 
 
 def cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -39,6 +40,7 @@ class FakeChainlink:
         fail_steal: set[int] | None = None,
         active_locks: list[int] | None = None,
         lock_agents: dict[int, str] | None = None,
+        epic_ids: set[int] | None = None,
     ) -> None:
         self.in_progress = in_progress or []
         self.ready = ready or []
@@ -46,6 +48,7 @@ class FakeChainlink:
         self.fail_steal = fail_steal or set()
         self.active_locks = active_locks if active_locks is not None else list(self.in_progress)
         self.lock_agents = lock_agents or {}
+        self.epic_ids = epic_ids or set()
         self.calls: list[list[str]] = []
 
     def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -59,7 +62,12 @@ class FakeChainlink:
             return cp(stdout=json.dumps([{"id": i} for i in ids]))
         if tail[:2] == ["issue", "show"]:
             issue_id = int(tail[2])
-            payload = {"id": issue_id, "comments": list(self.comments.get(issue_id, [])), "labels": ["worklink:in-progress"] if issue_id in self.in_progress else []}
+            labels = []
+            if issue_id in self.in_progress:
+                labels.append("worklink:in-progress")
+            if issue_id in self.epic_ids:
+                labels.append("worklink:epic")
+            payload = {"id": issue_id, "comments": list(self.comments.get(issue_id, [])), "labels": labels}
             return cp(stdout=json.dumps(payload))
         if tail[:2] == ["locks", "list"]:
             locks = {
@@ -247,6 +255,18 @@ def test_reap_home_leaves_finalizing_claim_with_fresh_heartbeat_untouched() -> N
     assert "locks steal 57" not in fake.names()
 
 
+def test_reap_home_skips_epic_parent_claims_for_epic_reaper() -> None:
+    fake = FakeChainlink(
+        in_progress=[58],
+        epic_ids={58},
+        comments={58: [_claim_comment(58, attempt=1, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert "locks steal 58" not in fake.names()
+
+
 def test_reap_home_uses_latest_record_per_issue() -> None:
     # Two claim comments for the same issue; the latest (attempt 2, fresh) wins,
     # so the stale attempt-1 record must NOT trigger a reap.
@@ -372,6 +392,103 @@ def test_reap_for_home_uses_config_ttl(tmp_path: Path) -> None:
     claims = ChainlinkClaims(agent_id="t", runner=fake)
     reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
     assert [r.issue_id for r in reaped] == [60]
+
+
+def test_reap_for_home_resumes_stale_epic_from_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
+    save_epic_state(
+        tmp_path,
+        EpicRunManifest(
+            epic_id=100,
+            integration_branch="epic/100-integration",
+            integration_worktree=str(tmp_path / "integration"),
+            base_ref="main",
+            phase="build",
+            slices=[
+                EpicSliceRecord(id=101, status="merged", merge_commit="abc123"),
+                EpicSliceRecord(id=102, status="pending"),
+            ],
+        ),
+    )
+    fake = FakeChainlink(
+        in_progress=[100],
+        epic_ids={100},
+        active_locks=[100],
+        comments={100: [_claim_comment(100, attempt=1, age=timedelta(hours=3))]},
+    )
+    resumed: list[dict[str, object]] = []
+
+    def fake_run_epic(**kwargs: object) -> object:
+        resumed.append(kwargs)
+        return object()
+
+    import mimir.worklink.epic as epic_mod
+
+    monkeypatch.setattr(autonomy, "worklink_repo", lambda: "/repo")
+    monkeypatch.setattr(epic_mod, "run_epic", fake_run_epic)
+
+    reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=ChainlinkClaims(agent_id="t", runner=fake))
+
+    assert [r.issue_id for r in reaped] == [100]
+    assert resumed == [{"home": tmp_path, "repo": Path("/repo"), "epic_id": 100, "autonomous": True}]
+    assert ["chainlink", "locks", "steal", "100"] in fake.calls
+    assert ["chainlink", "locks", "release", "100"] in fake.calls
+    assert not any(c[1:] == ["issue", "label", "101", "worklink:ready"] for c in fake.calls)
+    assert not any(c[1:] == ["issue", "label", "102", "worklink:ready"] for c in fake.calls)
+    assert not any(c[1:] == ["issue", "label", "100", "worklink:ready"] for c in fake.calls)
+
+
+def test_reap_for_home_live_epic_heartbeat_is_not_reaped(tmp_path: Path) -> None:
+    _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
+    save_epic_state(
+        tmp_path,
+        EpicRunManifest(
+            epic_id=100,
+            integration_branch="epic/100-integration",
+            integration_worktree=str(tmp_path / "integration"),
+            base_ref="main",
+            phase="build",
+            slices=[EpicSliceRecord(id=101, status="pending")],
+        ),
+    )
+    fake = FakeChainlink(
+        in_progress=[100],
+        epic_ids={100},
+        active_locks=[100],
+        comments={
+            100: [
+                _claim_comment(
+                    100,
+                    attempt=1,
+                    age=timedelta(hours=3),
+                    heartbeat_age=timedelta(seconds=30),
+                )
+            ]
+        },
+    )
+
+    reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=ChainlinkClaims(agent_id="t", runner=fake))
+
+    assert reaped == []
+    assert "locks steal 100" not in fake.names()
+
+
+def test_reap_for_home_dead_epic_without_manifest_returns_parent_to_ready(tmp_path: Path) -> None:
+    _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
+    fake = FakeChainlink(
+        in_progress=[100],
+        epic_ids={100},
+        active_locks=[100],
+        comments={100: [_claim_comment(100, attempt=1, age=timedelta(hours=3))]},
+    )
+
+    reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=ChainlinkClaims(agent_id="t", runner=fake))
+
+    assert [r.issue_id for r in reaped] == [100]
+    assert ["chainlink", "issue", "label", "100", "worklink:ready"] in fake.calls
+    assert not any(c[1:] == ["issue", "label", "101", "worklink:ready"] for c in fake.calls)
 
 
 def test_reap_for_home_refuses_ttl_not_greater_than_timeout(tmp_path: Path) -> None:
