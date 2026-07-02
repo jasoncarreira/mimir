@@ -1,11 +1,14 @@
-"""Background poller for plan-window quota.
+"""Background poller for Claude Code / Anthropic Max plan-window quota.
 
-Reads OAuth credentials from a JSON file (default ``$HOME/.claude/.credentials.json``,
-override with ``MIMIR_CLAUDE_OAUTH_CREDENTIALS``), hits Anthropic's
-``/api/oauth/usage`` endpoint, and writes the returned per-window
-utilization snapshots into mimir's :class:`RateLimitStore`. On 401, refreshes
-the access token via the standard OAuth2 ``refresh_token`` grant and
-persists the rotated credentials back to disk atomically.
+Reads Claude Code OAuth credentials from a JSON file (default
+``$HOME/.claude/.credentials.json``, override with
+``MIMIR_CLAUDE_OAUTH_CREDENTIALS``), hits Anthropic's
+``/api/oauth/usage`` endpoint, and writes the returned Anthropic Max
+subscription-window utilization snapshots into mimir's
+:class:`RateLimitStore`. This is not Anthropic API spend tracking. On
+401, refreshes the access token via the standard OAuth2
+``refresh_token`` grant and persists the rotated credentials back to
+disk atomically.
 
 Why this exists separately from Stage 5's per-turn capture:
 

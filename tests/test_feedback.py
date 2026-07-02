@@ -342,6 +342,33 @@ def test_non_utf8_home_file_is_negative_and_renders_actionably():
     assert "UTF-8" in line
 
 
+def test_claude_code_oauth_feedback_labels_subscription_not_api_spend():
+    from mimir.feedback.renderers import _render_event_line
+
+    ok = _render_event_line(
+        "oauth_usage_ok",
+        {
+            "recorded": {
+                "five_hour": {"utilization": 0.12},
+                "seven_day": {"utilization": 0.34},
+            },
+        },
+    )
+    failed = _render_event_line(
+        "oauth_logged_out",
+        {
+            "stage": "refresh",
+            "accessToken": "sk-ant-oat01-secret",
+        },
+    )
+
+    assert "Claude Code / Anthropic Max quota poll ok" in ok
+    assert "Anthropic API spend" not in ok
+    assert "Claude Code / Anthropic Max OAuth logged out" in failed
+    assert "without printing its contents" in failed
+    assert "sk-ant-oat01-secret" not in failed
+
+
 def test_channel_memory_over_cap_is_negative_and_renders_actionably():
     """chainlink #643: oversized real channel memory surfaces as a negative
     signal naming the channel/path and remediation target."""

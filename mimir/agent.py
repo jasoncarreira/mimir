@@ -339,6 +339,15 @@ def _resolve_model(
     if not isinstance(spec, str):
         raise TypeError(f"unexpected model spec type: {type(spec).__name__}")
     if spec.startswith("claude-code:"):
+        from .providers import claude_code_auth_status
+
+        auth_status = claude_code_auth_status()
+        if not auth_status.ok:
+            raise RuntimeError(
+                "MIMIR_MODEL_SPEC=claude-code:* uses Claude Code / "
+                "Anthropic Max subscription auth, not Anthropic API spend. "
+                f"{auth_status.reason}. {auth_status.remediation}"
+            )
         # chainlink #426/#735: Claude Code executes built-in, bridged
         # LangChain, and MCP tools inside the Claude SDK subprocess path, not
         # through LangGraph's tool middleware. Keep this provider fail-closed

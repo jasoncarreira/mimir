@@ -319,20 +319,24 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             if isinstance(seven_util, (int, float)):
                 parts.append(f"7d {seven_util * 100:.0f}%")
             detail = ", ".join(parts) if parts else f"{len(recorded)} windows"
-            return f"oauth usage poll ok ({detail})"
-        return "oauth usage poll ok"
+            return f"Claude Code / Anthropic Max quota poll ok ({detail})"
+        return "Claude Code / Anthropic Max quota poll ok"
     if rule_kind == "oauth_usage_failed":
         stage = ev.get("stage") or "?"
         err = _sanitize_field(ev.get("error") or "(no detail)")
         status = ev.get("status")
         suffix = f" [HTTP {status}]" if status is not None else ""
-        return f"oauth usage poll failed at {stage}{suffix}: {err}"
+        return (
+            f"Claude Code / Anthropic Max quota poll failed at "
+            f"{stage}{suffix}: {err}"
+        )
     if rule_kind == "oauth_logged_out":
         stage = ev.get("stage") or "?"
         return (
-            f"OAuth logged out (refresh failed at {stage}). "
-            f"Operator action: re-run ``claude /login`` and copy "
-            f"~/.claude/.credentials.json into the mimir homedir."
+            f"Claude Code / Anthropic Max OAuth logged out "
+            f"(refresh failed at {stage}). Operator action: re-run "
+            f"``claude login`` and copy ~/.claude/.credentials.json into "
+            f"the mimir homedir without printing its contents."
         )
     if rule_kind == "oauth_refresh_age_warn":
         age = ev.get("age_days")
@@ -340,12 +344,13 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         age_str = f"{age:.1f}d" if isinstance(age, (int, float)) else "?"
         thr_str = f"{thr}d" if isinstance(thr, (int, float)) else "?"
         return (
-            f"OAuth credentials are {age_str} old (warn threshold {thr_str}). "
-            f"Consider re-running ``claude /login`` before the refresh "
-            f"token expires."
+            f"Claude Code / Anthropic Max OAuth credentials are {age_str} "
+            f"old (warn threshold {thr_str}). Consider re-running "
+            f"``claude login`` before the refresh token expires; do not "
+            f"print .credentials.json contents."
         )
     if rule_kind == "oauth_refresh_ok":
-        return "oauth access token refreshed"
+        return "Claude Code / Anthropic Max OAuth access token refreshed"
     if rule_kind == "bind_mount_stale":
         recent = ev.get("recent_restarts")
         cap = ev.get("max_restarts_per_hour")

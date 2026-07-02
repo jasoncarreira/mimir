@@ -147,6 +147,61 @@ def test_claude_code_available_reflects_cli_on_path(monkeypatch):
     assert P.claude_code_available() is False
 
 
+def test_claude_code_auth_status_missing_cli_is_actionable(monkeypatch, tmp_path):
+    import mimir.providers as P
+
+    monkeypatch.setattr(P.shutil, "which", lambda cmd: None)
+
+    status = P.claude_code_auth_status(credentials_path=tmp_path / ".credentials.json")
+
+    assert status.ok is False
+    assert "claude CLI" in status.reason
+    assert "npm install -g @anthropic-ai/claude-code" in status.remediation
+    assert ".credentials.json contents" in status.remediation
+    assert "sk-ant" not in status.reason + status.remediation
+
+
+def test_claude_code_auth_status_missing_credentials_is_actionable(
+    monkeypatch, tmp_path
+):
+    import mimir.providers as P
+
+    monkeypatch.setattr(
+        P.shutil, "which", lambda cmd: "/usr/bin/claude" if cmd == "claude" else None
+    )
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+    status = P.claude_code_auth_status(credentials_path=tmp_path / "missing.json")
+
+    assert status.ok is False
+    assert "no usable OAuth token or .credentials.json" in status.reason
+    assert "claude login" in status.remediation
+    assert "Anthropic API" not in status.reason
+
+
+def test_claude_code_auth_status_accepts_credentials_without_printing_secret(
+    monkeypatch, tmp_path
+):
+    import json
+    import mimir.providers as P
+
+    monkeypatch.setattr(
+        P.shutil, "which", lambda cmd: "/usr/bin/claude" if cmd == "claude" else None
+    )
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    secret = "sk-ant-oat01-secret"
+    path = tmp_path / ".credentials.json"
+    path.write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": secret}}),
+        encoding="utf-8",
+    )
+
+    status = P.claude_code_auth_status(credentials_path=path)
+
+    assert status.ok is True
+    assert secret not in status.reason + status.remediation
+
+
 # ── codex availability — spawn_codex gate (chainlink #293) ──────────
 
 

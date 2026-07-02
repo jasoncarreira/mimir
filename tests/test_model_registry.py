@@ -309,6 +309,9 @@ def test_qualified_claude_code_spec_passes_through():
     route = detect_route("claude-code:claude-sonnet-4-6")
     assert route.model_spec == "claude-code:claude-sonnet-4-6"
     assert route.provider_name == PROVIDER_ANTHROPIC_MAX
+    assert "Claude Code / Anthropic Max" in route.monitor_label
+    assert "not Anthropic API spend" in route.monitor_label
+    assert "Codex" not in route.monitor_label
     assert route.billing_mode == BILLING_SUBSCRIPTION
 
 

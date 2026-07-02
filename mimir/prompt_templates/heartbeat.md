@@ -62,12 +62,13 @@ that should be picked up now versus deferred?
 The "Resource usage" prompt section shows your last turn's cost,
 context utilization, rolling 1h / 5h / 7d aggregates with cache
 hit rate, and — when the SDK has reported them — the actual
-Anthropic plan window utilizations (5-hour rolling, 7-day plan /
-Opus / Sonnet, overage). Four things worth a glance before picking
+Claude Code / Anthropic Max subscription window utilizations
+(5-hour, 7-day plan / Opus / Sonnet, overage). Four things worth a
+glance before picking
 work:
 
 - **Plan window on pace > 100%** (each line under "Plan windows (from
-  Anthropic)" carries an "on pace: X% by reset" projection — what
+  Claude Code Max)" carries an "on pace: X% by reset" projection — what
   utilization will be at window end if the current burn rate
   continues). The ⚠ marker means projected to exceed quota: scale
   back regardless of where current % stands. This is more actionable
