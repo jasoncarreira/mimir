@@ -512,24 +512,19 @@ def test_apply_pending_migrations_restores_fk_on_after_each_migration(
     monkeypatch,
 ):
     """``_apply_pending_migrations`` must restore FK=ON after running each
-    migration's executescript.  PRAGMA foreign_keys cannot be set *inside*
-    executescript (it runs in an implicit transaction; the PRAGMA would be
-    a no-op).  The fix moves the PRAGMA toggle to explicit
-    ``conn.execute()`` calls around the executescript call.
+    migration. PRAGMA foreign_keys cannot be set *inside* the migration
+    transaction; the PRAGMA would be a no-op. The migration applier controls
+    the PRAGMA with explicit ``conn.execute()`` calls around each migration.
 
-    This test observes the FK state recorded by the migration DDL itself:
-    the patched migration captures the ``foreign_keys`` pragma value into
-    a sentinel table during execution, and we assert the connection is back
-    at FK=ON after the full migration pass completes.
+    This test asserts the connection is back at FK=ON after the full migration
+    pass completes.
     """
     from mimir.saga.client import SagaStore
     import sqlite3 as sq
 
     store = SagaStore.__new__(SagaStore)
-    # Patch a sentinel migration that records the FK state observed
-    # *after* its own DDL runs (inside the same executescript).  Because
-    # PRAGMA cannot be read from within executescript, we check the
-    # post-migration connection state via a separate conn.execute().
+    # Patch a sentinel migration. We check the post-migration connection
+    # state via a separate conn.execute().
     monkeypatch.setattr(
         SagaStore,
         "MIGRATIONS",
@@ -561,11 +556,9 @@ def test_apply_pending_migrations_restores_fk_on_after_each_migration(
 
 
 def test_migration_ddl_strings_contain_no_pragma_foreign_keys():
-    """PRAGMA foreign_keys=OFF/ON inside executescript is a no-op (the
-    PRAGMA modifies connection state, which is disallowed within a
-    transaction; executescript uses an implicit transaction).  The DDL
-    strings in MIGRATIONS must not include these PRAGMAs — connection-
-    level control lives in ``_apply_pending_migrations`` instead.
+    """PRAGMA foreign_keys=OFF/ON inside a migration transaction is a no-op.
+    The DDL strings in MIGRATIONS must not include these PRAGMAs —
+    connection-level control lives in ``_apply_pending_migrations`` instead.
     """
     from mimir.saga.client import SagaStore
 
@@ -579,13 +572,13 @@ def test_migration_ddl_strings_contain_no_pragma_foreign_keys():
         ddl_norm = ddl_no_comments.lower().replace(" ", "")
         assert "pragmaforeign_keys=off" not in ddl_norm, (
             f"Migration v{version} DDL contains 'PRAGMA foreign_keys=OFF' "
-            "which is a no-op inside executescript; move it to a "
+            "which is a no-op inside the migration transaction; move it to a "
             "connection-level conn.execute() call instead."
         )
         assert "pragmaforeign_keys=on" not in ddl_norm, (
             f"Migration v{version} DDL contains 'PRAGMA foreign_keys=ON' "
-            "which is a no-op inside executescript; the connection-level "
-            "restore in _apply_pending_migrations handles this."
+            "which is a no-op inside the migration transaction; the "
+            "connection-level restore in _apply_pending_migrations handles this."
         )
 
 
@@ -687,6 +680,67 @@ async def test_consolidate_removes_dedup_tombstoned_from_faiss_index(
             assert index._id_to_pos[atom_id] in index._removed, (
                 f"dedup-tombstoned {atom_id} still active in FAISS — #390 regression"
             )
+
+
+@pytest.mark.asyncio
+async def test_consolidate_keeps_rollback_branch_live_atom_in_faiss_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """chainlink #748: if a stale overlapping dedup cluster picks a canonical
+    already tombstoned by an earlier cluster, the rolled-back cluster must not
+    report its duplicate as tombstoned or remove that live atom from FAISS."""
+    from mimir.saga.client import SagaStore
+    from mimir.saga.mark_access import AccessEvent, mark_access
+    import mimir.saga.cluster as cluster_mod
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "t.saga.db", embedding_dim=4)
+    stored: list[str] = []
+    for i in range(20):
+        res = await store.store(
+            content=f"dedup rollback fact {i}",
+            stream="semantic",
+        )
+        stored.append(res["atom_id"])
+    a, b, c = stored[:3]
+
+    conn = store._ensure_conn()
+    for _ in range(3):
+        mark_access(conn, [AccessEvent(atom_id=a, source="retrieval")])
+    conn.execute("DELETE FROM access_events WHERE atom_id = ?", (c,))
+    conn.execute("DELETE FROM atom_access_summary WHERE atom_id = ?", (c,))
+    conn.execute("UPDATE atoms SET is_pinned = 1 WHERE id = ?", (b,))
+    conn.commit()
+
+    index = store._ensure_index(conn)
+    assert index is not None and len(index._id_to_pos) == 20
+
+    def forced_cluster_fn(raws):
+        by_id = {raw["id"]: raw for raw in raws}
+        return [[by_id[a], by_id[b]], [by_id[b], by_id[c]]]
+
+    monkeypatch.setattr(
+        cluster_mod, "make_default_cluster_fn",
+        lambda *_args, **_kwargs: forced_cluster_fn,
+    )
+
+    async def _unused_synth(*_args, **_kwargs):
+        raise AssertionError("high min_cluster_size should skip synthesis")
+
+    store._rich_synth_fn = _unused_synth
+
+    result = await store.consolidate(dedup_first=True, min_cluster_size=99)
+
+    tombstoned = result["dedup"]["duplicates_tombstoned"]
+    assert tombstoned == [b]
+    assert c not in tombstoned
+    assert conn.execute(
+        "SELECT tombstoned FROM atoms WHERE id = ?", (c,),
+    ).fetchone()[0] == 0
+    assert c in index._id_to_pos
+    assert c in {atom_id for atom_id, _score in index.search(
+        [1.0, 0.0, 0.0, 0.0], top_k=20,
+    )}
 
 
 @pytest.mark.asyncio

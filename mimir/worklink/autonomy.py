@@ -155,10 +155,12 @@ def reap_stale_claims_for_home(
     staleness to :meth:`ChainlinkClaims.reap_home`.
     """
     defaults = worklink_defaults(home)
-    if defaults.reaper_ttl_s <= defaults.timeout_s:
+    min_reaper_ttl_s = defaults.timeout_s * 2
+    if defaults.reaper_ttl_s <= min_reaper_ttl_s:
         raise RuntimeError(
-            "worklink reaper_ttl_s must be greater than timeout_s so the TTL "
-            "reaper cannot steal a legitimately running worker"
+            "worklink reaper_ttl_s must be greater than 2 * timeout_s so the TTL "
+            "reaper cannot steal a worker that is still finalizing its remote "
+            "test job"
         )
     ttl = timedelta(seconds=defaults.reaper_ttl_s)
     cl = claims or make_claims(home, agent_id=agent_id)

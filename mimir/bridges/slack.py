@@ -42,6 +42,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
 
 from ..background_tasks import spawn_background
 from ..models import AgentEvent
+from ..redaction import redact_text
 from ._attachments import _SLACK_CDN_HOSTS, build_inbound_path, download_to_path
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
@@ -221,7 +222,7 @@ class SlackBridge(Bridge):
         enqueue: dispatcher's enqueue coroutine.
         respond_to_bots: if True, on_message accepts other bots' messages.
             Default False — humans only. Self-messages are always skipped
-            via the bot's own user id.
+            via the bot's own user id or bot id.
     """
 
     bot_token: str
@@ -237,6 +238,7 @@ class SlackBridge(Bridge):
         default_factory=set, init=False, repr=False
     )
     _bot_user_id: str | None = field(default=None, init=False, repr=False)
+    _bot_id: str | None = field(default=None, init=False, repr=False)
     # In-memory cache of users.info results, populated lazily on first
     # message from each user. Bounded by workspace size; lives one
     # process lifetime. Failed lookups aren't cached so they self-heal
@@ -290,7 +292,9 @@ class SlackBridge(Bridge):
     async def _refresh_bot_user_id(self) -> None:
         """Best-effort lookup of the bot's own user_id via ``auth_test``.
         Called from the supervisor at the top of each iteration when
-        ``_bot_user_id`` is still None. Swallows all exceptions —
+        ``_bot_user_id`` is still None. Also captures ``bot_id`` when Slack
+        returns it, so self-filtering still works if the user id is absent.
+        Swallows all exceptions —
         failures here are common during a Slack outage and shouldn't
         prevent the supervisor from attempting the WebSocket handshake."""
         if self._bot_user_id is not None:
@@ -304,11 +308,50 @@ class SlackBridge(Bridge):
                 # ``slack_sdk`` returns a SlackResponse; treat .get() the
                 # same way (it implements __getitem__/get).
                 user_id = getattr(auth, "get", lambda _k: None)("user_id")
+            bot_id = auth.get("bot_id") if isinstance(auth, dict) else None
+            if not bot_id:
+                bot_id = getattr(auth, "get", lambda _k: None)("bot_id")
+            if bot_id:
+                self._bot_id = bot_id
             if user_id:
                 self._bot_user_id = user_id
                 log.info("SlackBridge: bot_user_id resolved to %s", user_id)
         except Exception as exc:  # noqa: BLE001
             log.warning("SlackBridge auth_test (supervisor) failed: %s", exc)
+
+    def _is_own_bot_actor(self, event: dict[str, Any]) -> bool:
+        user_id = event.get("user")
+        if self._bot_user_id and user_id == self._bot_user_id:
+            return True
+        bot_id = event.get("bot_id")
+        return bool(
+            self._bot_id and (bot_id == self._bot_id or user_id == self._bot_id)
+        )
+
+    def _is_own_bot_message_ref(
+        self, event: dict[str, Any], item: dict[str, Any],
+    ) -> bool:
+        target_user = item.get("item_user") or event.get("item_user")
+        if self._bot_user_id and target_user == self._bot_user_id:
+            return True
+        target_bot = (
+            item.get("bot_id")
+            or item.get("item_bot_id")
+            or event.get("item_bot_id")
+        )
+        return bool(self._bot_id and target_bot == self._bot_id)
+
+    def _capture_own_bot_id_from_response(self, resp: Any) -> None:
+        get = getattr(resp, "get", None)
+        if get is None:
+            return
+        bot_id = get("bot_id")
+        if not bot_id:
+            message = get("message") or {}
+            if isinstance(message, dict):
+                bot_id = message.get("bot_id")
+        if bot_id:
+            self._bot_id = str(bot_id)
 
     def _spawn_background(
         self, coro: Awaitable[Any], *, name: str | None = None,
@@ -518,6 +561,7 @@ class SlackBridge(Bridge):
                 if blocks is not None and sent_count == 0:
                     kwargs["blocks"] = blocks
                 resp = await self._app.client.chat_postMessage(**kwargs)
+                self._capture_own_bot_id_from_response(resp)
                 last_id = resp.get("ts") or last_id
                 sent_count += 1
             for path in attachment_paths or []:
@@ -543,7 +587,17 @@ class SlackBridge(Bridge):
                 sent=sent_count > 0,
                 message_id=last_id,
                 chunks=sent_count,
-                error=f"slack api error after {sent_count} chunk(s): {exc}",
+                error=redact_text(f"slack api error after {sent_count} chunk(s): {exc}"),
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort bridge send
+            return SendResult(
+                sent=sent_count > 0,
+                message_id=last_id,
+                chunks=sent_count,
+                error=redact_text(
+                    f"slack send error after {sent_count} chunk(s): "
+                    f"{type(exc).__name__}: {exc}"
+                ),
             )
         return SendResult(sent=True, message_id=last_id, chunks=sent_count)
 
@@ -802,7 +856,7 @@ class SlackBridge(Bridge):
         user_id = event.get("user")
         if user_id is None:
             return
-        if self._bot_user_id and user_id == self._bot_user_id:
+        if self._is_own_bot_actor(event):
             return
 
         # Skip subtypes we don't handle (channel_join, message_changed, etc.)
@@ -820,7 +874,8 @@ class SlackBridge(Bridge):
         # redelivers events on ACK loss; without the cache we'd burn a
         # turn (plus an attachment download) on every redelivery.
         source_id = event.get("ts")
-        if source_id and not self._seen_ids.add_if_new(source_id):
+        if source_id and source_id in self._seen_ids:
+            self._seen_ids.add_if_new(source_id)
             log.debug(
                 "SlackBridge: duplicate inbound message dropped "
                 "(source_id=%s) — Socket-Mode redelivery",
@@ -921,7 +976,9 @@ class SlackBridge(Bridge):
                 ),
             },
         )
-        await self.enqueue(agent_event)
+        accepted = await self.enqueue(agent_event)
+        if accepted:
+            self._seen_ids.add_if_new(source_id or "")
 
     # VSM: algedonic (in) — see DiscordBridge._on_reaction; identical
     #                       semantics, different protocol.
@@ -941,13 +998,13 @@ class SlackBridge(Bridge):
         from ..reactions import classify_reaction, normalize_emoji
 
         user_id = event.get("user")
-        if user_id is None or (self._bot_user_id and user_id == self._bot_user_id):
+        if self._is_own_bot_actor(event):
+            return
+        if user_id is None:
             return
 
         item = event.get("item") or {}
-        target_user = (item.get("item_user")
-                       or event.get("item_user"))  # older payloads
-        if target_user is None or target_user != self._bot_user_id:
+        if not self._is_own_bot_message_ref(event, item):
             return
 
         slack_channel = item.get("channel") or ""

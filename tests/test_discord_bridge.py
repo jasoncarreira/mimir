@@ -235,6 +235,39 @@ async def test_send_returns_message_id(bridge_with_fake_client):
 
 
 @pytest.mark.asyncio
+async def test_send_closes_attachment_files_when_discord_send_fails(
+    bridge_with_fake_client, tmp_path: Path,
+):
+    import discord
+
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels[1]  # type: ignore[union-attr]
+    attachment_a = tmp_path / "a.txt"
+    attachment_b = tmp_path / "b.txt"
+    attachment_a.write_text("alpha")
+    attachment_b.write_text("bravo")
+    opened_files: list[discord.File] = []
+
+    async def boom(content: str = "", files=None, **kwargs):
+        del content, kwargs
+        opened_files.extend(files or [])
+        raise discord.DiscordException("missing permissions")
+
+    channel.send = boom
+
+    result = await bridge.send(
+        "discord-1",
+        "hello",
+        attachment_paths=[attachment_a, attachment_b],
+    )
+
+    assert result.sent is False
+    assert "discord send error" in (result.error or "")
+    assert len(opened_files) == 2
+    assert all(file.fp.closed for file in opened_files)
+
+
+@pytest.mark.asyncio
 async def test_send_passes_embed_and_reply_reference(bridge_with_fake_client):
     bridge, _, sent = bridge_with_fake_client
 
@@ -477,6 +510,51 @@ async def test_on_message_dedupes_resume_protocol_redelivery(
     await bridge._on_message(msg)
     await bridge._on_message(msg)  # simulated resume redelivery
     await bridge._on_message(msg)  # and again
+    assert len(enqueued) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_message_redelivery_after_rejected_enqueue_is_accepted(
+    bridge_with_fake_client,
+):
+    """Queue-full rejection must not commit the message id as seen.
+
+    The platform can redeliver the same source id after the dispatcher rejects
+    admission; that retry must still reach enqueue instead of being deduped.
+    """
+    import discord
+
+    bridge, enqueued, _ = bridge_with_fake_client
+    attempts: list[AgentEvent] = []
+
+    async def reject_once_then_accept(event: AgentEvent) -> bool:
+        attempts.append(event)
+        if len(attempts) == 1:
+            return False
+        enqueued.append(event)
+        return True
+
+    bridge.enqueue = reject_once_then_accept
+    channel = SimpleNamespace(
+        id=1, type=getattr(discord.ChannelType, "text", None), name="g"
+    )
+    author = SimpleNamespace(id=99, bot=False, display_name="Alice")
+    msg = SimpleNamespace(
+        id=12345, author=author, channel=channel, content="hello", mentions=[]
+    )
+
+    await bridge._on_message(msg)
+    assert len(attempts) == 1
+    assert "12345" not in bridge._seen_ids
+
+    await bridge._on_message(msg)
+    assert len(attempts) == 2
+    assert len(enqueued) == 1
+    assert enqueued[0].source_id == "12345"
+    assert "12345" in bridge._seen_ids
+
+    await bridge._on_message(msg)
+    assert len(attempts) == 2
     assert len(enqueued) == 1
 
 

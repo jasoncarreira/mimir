@@ -609,9 +609,6 @@ class DiscordBridge(Bridge):
 
         discord_embed = _coerce_discord_embed(embed)
         chunks = [c for c in _chunk_message(text) if c.strip()]
-        files = [discord.File(str(p)) for p in (attachment_paths or [])]
-        if (files or discord_embed is not None) and not chunks:
-            chunks = [""]
 
         send_kwargs: dict[str, Any] = {}
         if reply_to_message_id:
@@ -627,7 +624,11 @@ class DiscordBridge(Bridge):
 
         last_id: str | None = None
         sent_count = 0
+        files: list[discord.File] = []
         try:
+            files = [discord.File(str(p)) for p in (attachment_paths or [])]
+            if (files or discord_embed is not None) and not chunks:
+                chunks = [""]
             for i, chunk in enumerate(chunks):
                 chunk_kwargs = dict(send_kwargs) if i == 0 else {}
                 if i == 0 and discord_embed is not None:
@@ -649,6 +650,9 @@ class DiscordBridge(Bridge):
                 chunks=sent_count,
                 error=f"discord send error after {sent_count} chunk(s): {exc}",
             )
+        finally:
+            for file in files:
+                file.close()
         return SendResult(sent=True, message_id=last_id, chunks=sent_count)
 
     async def send_typing_indicator(self, channel_id: str) -> None:
@@ -930,7 +934,8 @@ class DiscordBridge(Bridge):
         source_id = str(_raw_message_id) if _raw_message_id is not None else None
         # Truthy-check matches the Slack bridge pattern; SeenIdCache also
         # treats empty strings as "no id" so this is doubly safe.
-        if source_id and not self._seen_ids.add_if_new(source_id):
+        if source_id and source_id in self._seen_ids:
+            self._seen_ids.add_if_new(source_id)
             log.debug(
                 "DiscordBridge: duplicate inbound message dropped "
                 "(source_id=%s) — Discord resume-protocol redelivery",
@@ -1042,7 +1047,9 @@ class DiscordBridge(Bridge):
             self.send_typing_indicator(channel_id),
             name=f"mimir-discord-typing-trigger-{channel_id}",
         )
-        await self.enqueue(event)
+        accepted = await self.enqueue(event)
+        if accepted:
+            self._seen_ids.add_if_new(source_id or "")
 
     # VSM: algedonic (in) — inbound reactions on the bot's own messages,
     #                       classified by emoji polarity, time-gated by

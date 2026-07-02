@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Awaitable, Callable
 
@@ -96,6 +97,8 @@ _ADMIN_BUILTIN_TOOL_NAMES = frozenset(
         "Bash",
         "bash",
         "bash_exec",
+        "execute",
+        "aexecute",
         "shell",
         "Write",
         "Edit",
@@ -228,6 +231,22 @@ def _admin_denial_message(tool_name: str, reason: str | None) -> str:
     )
 
 
+def _env_access_control_enforced() -> bool:
+    raw = os.environ.get("MIMIR_ACCESS_CONTROL_ENFORCED")
+    if raw is None or raw == "":
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _resolve_admin_ctx(ctx: Any | None) -> Any | None:
+    if ctx is not None:
+        return ctx
+    from .._context import resolve_active_ctx
+
+    resolved, _resolution_path = resolve_active_ctx({})
+    return resolved
+
+
 def _turn_has_internal_admin_authority(ctx: Any) -> bool:
     trigger = (getattr(ctx, "trigger", None) or "").strip()
     if trigger != "user_message":
@@ -240,10 +259,31 @@ def _check_admin_authorized(tool_name: str, ctx: Any | None = None) -> str | Non
     if not _is_admin_sensitive_tool(tool_name):
         return None
 
+    ctx = _resolve_admin_ctx(ctx)
     if ctx is None:
-        from .._context import get_current_turn
-        ctx = get_current_turn()
-    if ctx is None:
+        if _env_access_control_enforced():
+            reason = "missing_turn_context"
+            _emit_event_sync(
+                "admin_tool_call_denied",
+                tool=tool_name,
+                allowed=False,
+                status="denied",
+                required_tier="admin",
+                denial_reason=reason,
+                author=None,
+                canonical_author=None,
+                roles=[],
+                enforcement_enabled=True,
+            )
+            _emit_event_sync(
+                "tool_call_denied",
+                tool=tool_name,
+                reason=reason,
+                required_tier="admin",
+                author=None,
+                canonical_author=None,
+            )
+            return _admin_denial_message(tool_name, reason)
         return None
     enforce = bool(getattr(ctx, "access_control_enforced", False))
     if not enforce:

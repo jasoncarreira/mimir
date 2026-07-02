@@ -665,12 +665,11 @@ def dedup_pass(
         if max_clusters is not None and clusters_processed >= max_clusters:
             break
 
-        result.canonicals_kept.append(canonical["id"])
-        result.merges[canonical["id"]] = [d["id"] for d in duplicates]
-        result.duplicates_tombstoned.extend(d["id"] for d in duplicates)
-        clusters_processed += 1
-
         if dry_run:
+            result.canonicals_kept.append(canonical["id"])
+            result.merges[canonical["id"]] = [d["id"] for d in duplicates]
+            result.duplicates_tombstoned.extend(d["id"] for d in duplicates)
+            clusters_processed += 1
             continue
 
         now = _utc_now_iso()
@@ -688,11 +687,22 @@ def dedup_pass(
             if current_can is None or current_can[4] == 1:
                 conn.rollback()
                 continue
+            live_duplicates: list[dict] = []
+            for dup in duplicates:
+                current_dup = conn.execute(
+                    "SELECT tombstoned FROM atoms WHERE id = ?",
+                    (dup["id"],),
+                ).fetchone()
+                if current_dup is not None and current_dup[0] == 0:
+                    live_duplicates.append(dup)
+            if not live_duplicates:
+                conn.rollback()
+                continue
             canonical_dict = {
                 "id": current_can[0], "topics": current_can[1],
                 "metadata": current_can[2], "agent_id": current_can[3],
             }
-            for dup in duplicates:
+            for dup in live_duplicates:
                 merge_duplicate_into_canonical(
                     conn,
                     canonical=canonical_dict,
@@ -713,6 +723,10 @@ def dedup_pass(
                         "metadata": row[2], "agent_id": row[3],
                     }
             conn.commit()
+            result.canonicals_kept.append(canonical["id"])
+            result.merges[canonical["id"]] = [d["id"] for d in live_duplicates]
+            result.duplicates_tombstoned.extend(d["id"] for d in live_duplicates)
+            clusters_processed += 1
         except Exception:
             conn.rollback()
             raise

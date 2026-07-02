@@ -4,6 +4,7 @@ under a fake slack-bolt AsyncApp (SPEC §7.2.1)."""
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -143,7 +144,10 @@ def bridge_with_fake_app():
 
     async def fake_post(**kwargs):
         sent.append(kwargs)
-        return {"ts": f"1234567890.{len(sent):06d}"}
+        return {
+            "ts": f"1234567890.{len(sent):06d}",
+            "message": {"bot_id": "BSELF123"},
+        }
 
     async def fake_reactions_add(*, channel: str, timestamp: str, name: str):
         sent.append({"reaction": name, "channel": channel, "ts": timestamp})
@@ -255,6 +259,27 @@ async def test_send_can_post_threaded_block_kit_panel(bridge_with_fake_app):
     assert sent[0]["channel"] == "C01ABC"
     assert sent[0]["thread_ts"] == "111.222"
     assert sent[0]["blocks"] == blocks
+
+
+@pytest.mark.asyncio
+async def test_send_missing_attachment_returns_failure(bridge_with_fake_app, tmp_path: Path):
+    bridge, _, _ = bridge_with_fake_app
+    missing = tmp_path / "removed.txt"
+
+    async def fake_upload(**kwargs):
+        with open(kwargs["file"], "rb"):
+            pass
+        return {"file": {}}
+
+    bridge._app.client.files_upload_v2 = fake_upload  # type: ignore[union-attr]
+
+    result = await bridge.send("slack-C01ABC", "", attachment_paths=[missing])
+
+    assert result.sent is False
+    assert result.chunks == 0
+    assert "slack send error after 0 chunk(s)" in (result.error or "")
+    assert "FileNotFoundError" in (result.error or "")
+    assert "removed.txt" in (result.error or "")
 
 
 @pytest.mark.asyncio
@@ -385,6 +410,68 @@ async def test_react_rejects_unknown_channel_id(bridge_with_fake_app):
 
 
 @pytest.mark.asyncio
+async def test_on_reaction_matches_self_bot_id_when_user_id_unresolved(
+    bridge_with_fake_app, tmp_path: Path,
+):
+    """Reactions on our own bot-id-authored messages are still surfaced
+    when the bot user id is unresolved."""
+    bridge, _, _ = bridge_with_fake_app
+    bridge._bot_user_id = None
+    bridge._bot_id = "BSELF123"
+
+    await bridge._on_reaction(
+        {
+            "user": "U05ALICE",
+            "reaction": "thumbsup",
+            "item": {
+                "type": "message",
+                "channel": "C01ENG",
+                "ts": "1714768925.000100",
+                "bot_id": "BSELF123",
+            },
+        }
+    )
+
+    lines = (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+    records = [json.loads(line) for line in lines]
+    assert any(
+        record["type"] == "react_received"
+        and record["bridge"] == "slack"
+        and record["channel_id"] == "slack-C01ENG"
+        and record["author"] == "slack-U05ALICE"
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_skips_self_bot_id_when_user_id_unresolved(
+    bridge_with_fake_app, tmp_path: Path,
+):
+    """Reactions made by our own bot are dropped even when only bot_id
+    identifies the actor."""
+    bridge, _, _ = bridge_with_fake_app
+    bridge._bot_user_id = None
+    bridge._bot_id = "BSELF123"
+
+    await bridge._on_reaction(
+        {
+            "user": "USLACKBOT",
+            "bot_id": "BSELF123",
+            "reaction": "thumbsup",
+            "item": {
+                "type": "message",
+                "channel": "C01ENG",
+                "ts": "1714768925.000100",
+                "bot_id": "BSELF123",
+            },
+        }
+    )
+
+    events_path = tmp_path / "logs" / "events.jsonl"
+    assert not events_path.exists() or events_path.read_text() == ""
+
+
+@pytest.mark.asyncio
 async def test_on_message_enqueues_user_message(bridge_with_fake_app):
     """A real-shape Slack message lands on the dispatcher with the right
     channel_id, source, and metadata."""
@@ -494,6 +581,31 @@ async def test_on_message_skips_self(bridge_with_fake_app):
 
 
 @pytest.mark.asyncio
+async def test_on_message_skips_self_bot_id_when_user_id_unresolved(bridge_with_fake_app):
+    """Own bot messages are dropped even when auth_test has not resolved
+    the bot user id and respond_to_bots is enabled."""
+    bridge, enqueued, _ = bridge_with_fake_app
+    bridge._bot_user_id = None
+    bridge._bot_id = None
+    bridge.respond_to_bots = True
+
+    await bridge.send("slack-C01ENG", "outbound")
+    assert bridge._bot_id == "BSELF123"
+
+    await bridge._on_message(
+        {
+            "user": "USLACKBOT",
+            "channel": "C01ENG",
+            "text": "echo of own msg",
+            "ts": "1.001",
+            "bot_id": "BSELF123",
+        }
+    )
+
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
 async def test_on_message_skips_subtype_channel_join(bridge_with_fake_app):
     """Subtype events (channel_join, message_changed, etc.) are dropped —
     the agent shouldn't react to system noise."""
@@ -572,6 +684,45 @@ async def test_on_message_dedupes_socket_mode_redelivery(bridge_with_fake_app):
     await bridge._on_message(event)
     await bridge._on_message(event)  # simulated redelivery
     await bridge._on_message(event)  # and again
+    assert len(enqueued) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_message_redelivery_after_rejected_enqueue_is_accepted(
+    bridge_with_fake_app,
+):
+    """Queue-full rejection must not commit the message ts as seen."""
+    bridge, enqueued, _ = bridge_with_fake_app
+    attempts: list[AgentEvent] = []
+
+    async def reject_once_then_accept(event: AgentEvent) -> bool:
+        attempts.append(event)
+        if len(attempts) == 1:
+            return False
+        enqueued.append(event)
+        return True
+
+    bridge.enqueue = reject_once_then_accept
+    event = {
+        "user": "U05ALICE",
+        "channel": "C01ENG",
+        "channel_type": "channel",
+        "text": "hello mimir",
+        "ts": "1234567890.000042",
+    }
+
+    await bridge._on_message(event)
+    assert len(attempts) == 1
+    assert "1234567890.000042" not in bridge._seen_ids
+
+    await bridge._on_message(event)
+    assert len(attempts) == 2
+    assert len(enqueued) == 1
+    assert enqueued[0].source_id == "1234567890.000042"
+    assert "1234567890.000042" in bridge._seen_ids
+
+    await bridge._on_message(event)
+    assert len(attempts) == 2
     assert len(enqueued) == 1
 
 

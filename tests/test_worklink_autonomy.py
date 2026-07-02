@@ -80,9 +80,22 @@ class FakeChainlink:
         return [" ".join(c[1:4]) for c in self.calls]
 
 
-def _claim_comment(issue_id: int, *, attempt: int, age: timedelta, agent: str = "mimir-worklink") -> str:
-    claimed = datetime.now(UTC) - age
-    rec = ClaimRecord(issue_id=issue_id, attempt=attempt, agent_id=agent, claimed_at=claimed)
+def _claim_comment(
+    issue_id: int,
+    *,
+    attempt: int,
+    age: timedelta,
+    agent: str = "mimir-worklink",
+    heartbeat_age: timedelta | None = None,
+) -> str:
+    now = datetime.now(UTC)
+    rec = ClaimRecord(
+        issue_id=issue_id,
+        attempt=attempt,
+        agent_id=agent,
+        claimed_at=now - age,
+        heartbeat_at=now - heartbeat_age if heartbeat_age is not None else None,
+    )
     return rec.to_comment()
 
 
@@ -209,6 +222,29 @@ def test_reap_home_leaves_fresh_claim_untouched() -> None:
     claims = ChainlinkClaims(agent_id="t", runner=fake)
     assert claims.reap_home(ttl=timedelta(hours=2)) == []
     assert "locks steal 52" not in fake.names()
+
+
+def test_reap_home_leaves_finalizing_claim_with_fresh_heartbeat_untouched() -> None:
+    # Regression for chainlink #750: the claim is older than timeout_s and in
+    # the finalize window, but a fresh heartbeat proves the orchestrator is
+    # still alive while the remote test job runs.
+    fake = FakeChainlink(
+        in_progress=[57],
+        comments={
+            57: [
+                _claim_comment(
+                    57,
+                    attempt=1,
+                    age=timedelta(seconds=2700),
+                    heartbeat_age=timedelta(seconds=30),
+                )
+            ]
+        },
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    assert claims.reap_home(ttl=timedelta(seconds=1860)) == []
+    assert "locks steal 57" not in fake.names()
 
 
 def test_reap_home_uses_latest_record_per_issue() -> None:
@@ -342,6 +378,13 @@ def test_reap_for_home_refuses_ttl_not_greater_than_timeout(tmp_path: Path) -> N
     _write_worklink_yaml(tmp_path, timeout_s=7200, reaper_ttl_s=7200)
     claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(in_progress=[60]))
     with pytest.raises(RuntimeError, match="reaper_ttl_s must be greater"):
+        autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
+
+
+def test_reap_for_home_refuses_ttl_inside_finalize_window(tmp_path: Path) -> None:
+    _write_worklink_yaml(tmp_path, timeout_s=1800, reaper_ttl_s=1860)
+    claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(in_progress=[60]))
+    with pytest.raises(RuntimeError, match=r"2 \* timeout_s"):
         autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
 
 
