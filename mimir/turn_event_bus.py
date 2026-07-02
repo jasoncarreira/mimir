@@ -34,6 +34,8 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from .turn_event_redaction import scrub_turn_event
+
 if TYPE_CHECKING:
     from .models import AgentEvent
 
@@ -101,6 +103,7 @@ class TurnEventBus:
         Never raises: a bad event must not break a turn.
         """
         try:
+            event = scrub_turn_event(event)
             channel_id = event.get("channel_id") or ""
             for key in (channel_id, WILDCARD):
                 subs = self._subscribers.get(key)
