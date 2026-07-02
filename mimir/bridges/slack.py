@@ -820,7 +820,8 @@ class SlackBridge(Bridge):
         # redelivers events on ACK loss; without the cache we'd burn a
         # turn (plus an attachment download) on every redelivery.
         source_id = event.get("ts")
-        if source_id and not self._seen_ids.add_if_new(source_id):
+        if source_id and source_id in self._seen_ids:
+            self._seen_ids.add_if_new(source_id)
             log.debug(
                 "SlackBridge: duplicate inbound message dropped "
                 "(source_id=%s) — Socket-Mode redelivery",
@@ -921,7 +922,9 @@ class SlackBridge(Bridge):
                 ),
             },
         )
-        await self.enqueue(agent_event)
+        accepted = await self.enqueue(agent_event)
+        if accepted:
+            self._seen_ids.add_if_new(source_id or "")
 
     # VSM: algedonic (in) — see DiscordBridge._on_reaction; identical
     #                       semantics, different protocol.

@@ -930,7 +930,8 @@ class DiscordBridge(Bridge):
         source_id = str(_raw_message_id) if _raw_message_id is not None else None
         # Truthy-check matches the Slack bridge pattern; SeenIdCache also
         # treats empty strings as "no id" so this is doubly safe.
-        if source_id and not self._seen_ids.add_if_new(source_id):
+        if source_id and source_id in self._seen_ids:
+            self._seen_ids.add_if_new(source_id)
             log.debug(
                 "DiscordBridge: duplicate inbound message dropped "
                 "(source_id=%s) — Discord resume-protocol redelivery",
@@ -1042,7 +1043,9 @@ class DiscordBridge(Bridge):
             self.send_typing_indicator(channel_id),
             name=f"mimir-discord-typing-trigger-{channel_id}",
         )
-        await self.enqueue(event)
+        accepted = await self.enqueue(event)
+        if accepted:
+            self._seen_ids.add_if_new(source_id or "")
 
     # VSM: algedonic (in) — inbound reactions on the bot's own messages,
     #                       classified by emoji polarity, time-gated by

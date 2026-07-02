@@ -576,6 +576,45 @@ async def test_on_message_dedupes_socket_mode_redelivery(bridge_with_fake_app):
 
 
 @pytest.mark.asyncio
+async def test_on_message_redelivery_after_rejected_enqueue_is_accepted(
+    bridge_with_fake_app,
+):
+    """Queue-full rejection must not commit the message ts as seen."""
+    bridge, enqueued, _ = bridge_with_fake_app
+    attempts: list[AgentEvent] = []
+
+    async def reject_once_then_accept(event: AgentEvent) -> bool:
+        attempts.append(event)
+        if len(attempts) == 1:
+            return False
+        enqueued.append(event)
+        return True
+
+    bridge.enqueue = reject_once_then_accept
+    event = {
+        "user": "U05ALICE",
+        "channel": "C01ENG",
+        "channel_type": "channel",
+        "text": "hello mimir",
+        "ts": "1234567890.000042",
+    }
+
+    await bridge._on_message(event)
+    assert len(attempts) == 1
+    assert "1234567890.000042" not in bridge._seen_ids
+
+    await bridge._on_message(event)
+    assert len(attempts) == 2
+    assert len(enqueued) == 1
+    assert enqueued[0].source_id == "1234567890.000042"
+    assert "1234567890.000042" in bridge._seen_ids
+
+    await bridge._on_message(event)
+    assert len(attempts) == 2
+    assert len(enqueued) == 1
+
+
+@pytest.mark.asyncio
 async def test_on_message_does_not_dedupe_distinct_ts(bridge_with_fake_app):
     """Distinct ``ts`` values must each enqueue — guards against the
     dedup cache short-circuiting all messages."""
