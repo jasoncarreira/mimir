@@ -15,6 +15,7 @@ from typing import Any
 
 from ..channel_registry import ChannelRegistry
 from ..turn_event_bus import TurnEventBus
+from ..turn_event_redaction import scrub_detail as _shared_scrub_detail
 from .base import MessageUpdate
 
 log = logging.getLogger(__name__)
@@ -526,38 +527,8 @@ def _clean_arg_key(value: Any) -> str | None:
     return re.sub(r"[^A-Za-z0-9_.:-]", "", text)[:48] or None
 
 
-_SECRET_PATTERNS = (
-    # Authorization: Bearer value and bare Bearer value shapes. Keep this before
-    # the generic authorization key/value pattern so it consumes the token, not
-    # just the literal "Bearer" prefix.
-    re.compile(r"(?i)\b(authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/=-]+"),
-    # key=value, key: value, JSON, and Python dict-repr secret values.
-    re.compile(
-        r"(?i)(['\"]?[A-Za-z0-9_.:-]*(?:token|api[_-]?key|secret|password|authorization)['\"]?\s*[:=]\s*)"
-        r"(?:['\"][^'\"]*['\"]|[^,\s}]+)"
-    ),
-    # Common provider / GitHub / AWS token prefixes.
-    re.compile(r"\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{16})\b"),
-    # Conservative high-entropy fallback for long unbroken credential-like blobs.
-    re.compile(r"\b(?=[A-Za-z0-9_+/=-]{40,}\b)(?=.*[A-Z])(?=.*[a-z])(?=.*\d)[A-Za-z0-9_+/=-]+\b"),
-)
-_PATH_PATTERN = re.compile(
-    r"(?<![\w:])(?:/[^\s,'\"}]+|~/[^\s,'\"}]+|[A-Za-z]:\\[^\s,'\"}]+|"
-    r"(?:attachments|scratch|state|memory|mimir|tests|frontend|docs|uploads|tmp|workspace)[/\\][^\s,'\"}]+)"
-)
-
-
 def _scrub_detail(value: Any, *, limit: int = 320) -> str | None:
-    text = _clean(value, limit=limit * 2)
-    if not text:
-        return None
-    for pattern in _SECRET_PATTERNS:
-        text = pattern.sub("[redacted]", text)
-    text = _PATH_PATTERN.sub("[path]", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > limit:
-        return text[: limit - 3].rstrip() + "..."
-    return text
+    return _shared_scrub_detail(value, limit=limit)
 
 
 def _tool_name(value: Any) -> str:

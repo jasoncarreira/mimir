@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -26,6 +27,7 @@ from mimir.identities import IdentityResolver
 from mimir.identities_populator import issue_web_key
 from mimir.pollers import PollerConfig
 from mimir.scheduler import Scheduler, SchedulerJob
+from mimir.turn_event_bus import TurnEventBus
 from mimir.web_contracts import (
     render_typescript_contracts,
     validate_api_envelope,
@@ -625,6 +627,63 @@ def _sse_data_items(text: str) -> list[dict]:
         if data_lines:
             items.append(json.loads("\n".join(data_lines)))
     return items
+
+
+async def _read_sse_data(resp, *, timeout: float = 2.0) -> dict:
+    while True:
+        line = await asyncio.wait_for(resp.content.readline(), timeout=timeout)
+        assert line, "SSE stream closed before data"
+        text = line.decode("utf-8").strip()
+        if text.startswith("data: "):
+            return json.loads(text[6:])
+
+
+@pytest.mark.asyncio
+async def test_api_v1_turn_events_sse_scrubs_tool_args_results_and_text(tmp_path: Path):
+    bus = TurnEventBus()
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        turn_event_bus=bus,
+    )
+    secret = "sk-live-secret-value"
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/turn-events?channel=web-alice")
+        assert resp.status == 200
+        assert resp.content_type == "text/event-stream"
+
+        bus.publish(
+            {
+                "type": "tool_result",
+                "phase": "chunk",
+                "turn_id": "t1",
+                "channel_id": "web-alice",
+                "seq": 1,
+                "ts": "2026-07-02T00:00:00+00:00",
+                "args": {
+                    "cmd": f"echo {secret} > /tmp/leak.txt",
+                    "api_key": "ghp_supersecret",
+                },
+                "content_delta": f"result TOKEN=abc {secret} attachments/private.txt",
+                "text": f"reasoning saw {secret} in memory/core/00-identity.md",
+            }
+        )
+        event = await _read_sse_data(resp)
+        resp.close()
+
+    serialized = json.dumps(event, ensure_ascii=False)
+    assert secret not in serialized
+    assert "TOKEN=abc" not in serialized
+    assert "ghp_supersecret" not in serialized
+    assert "/tmp/leak.txt" not in serialized
+    assert "attachments/private.txt" not in serialized
+    assert "memory/core/00-identity.md" not in serialized
+    assert event["args"]["api_key"] == "[redacted]"
+    assert "[redacted]" in serialized
+    assert "[path]" in serialized
 
 
 @pytest.mark.asyncio

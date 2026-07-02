@@ -56,6 +56,41 @@ def test_publish_never_raises_on_bad_state():
     bus.publish({"type": "turn", "phase": "end"})
 
 
+def test_publish_scrubs_tool_args_results_and_text_at_bus_boundary():
+    bus = TurnEventBus()
+    q = bus.subscribe("web-default")
+    secret = "sk-live-secret-value"
+
+    bus.publish(
+        {
+            "type": "tool_call",
+            "phase": "end",
+            "turn_id": "t1",
+            "channel_id": "web-default",
+            "id": "c1",
+            "tool_name": "shell_exec",
+            "args": {
+                "cmd": f"cat /secret/path TOKEN=abc {secret}",
+                "password": "hunter2",
+            },
+            "text": f"thinking with {secret} in /tmp/reasoning.txt",
+            "content": f"result {secret} from attachments/private.txt",
+        }
+    )
+
+    event = _drain(q)[0]
+    serialized = str(event)
+    assert secret not in serialized
+    assert "TOKEN=abc" not in serialized
+    assert "hunter2" not in serialized
+    assert "/secret/path" not in serialized
+    assert "/tmp/reasoning.txt" not in serialized
+    assert "attachments/private.txt" not in serialized
+    assert event["args"]["password"] == "[redacted]"
+    assert "[redacted]" in serialized
+    assert "[path]" in serialized
+
+
 def test_emitter_noop_when_bus_none():
     emitter = TurnEventEmitter(None, turn_id="t1", channel_id="web-default")
     assert emitter.enabled is False
