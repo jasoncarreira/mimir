@@ -4,6 +4,7 @@ under a fake slack-bolt AsyncApp (SPEC §7.2.1)."""
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -143,7 +144,10 @@ def bridge_with_fake_app():
 
     async def fake_post(**kwargs):
         sent.append(kwargs)
-        return {"ts": f"1234567890.{len(sent):06d}"}
+        return {
+            "ts": f"1234567890.{len(sent):06d}",
+            "message": {"bot_id": "BSELF123"},
+        }
 
     async def fake_reactions_add(*, channel: str, timestamp: str, name: str):
         sent.append({"reaction": name, "channel": channel, "ts": timestamp})
@@ -385,6 +389,68 @@ async def test_react_rejects_unknown_channel_id(bridge_with_fake_app):
 
 
 @pytest.mark.asyncio
+async def test_on_reaction_matches_self_bot_id_when_user_id_unresolved(
+    bridge_with_fake_app, tmp_path: Path,
+):
+    """Reactions on our own bot-id-authored messages are still surfaced
+    when the bot user id is unresolved."""
+    bridge, _, _ = bridge_with_fake_app
+    bridge._bot_user_id = None
+    bridge._bot_id = "BSELF123"
+
+    await bridge._on_reaction(
+        {
+            "user": "U05ALICE",
+            "reaction": "thumbsup",
+            "item": {
+                "type": "message",
+                "channel": "C01ENG",
+                "ts": "1714768925.000100",
+                "bot_id": "BSELF123",
+            },
+        }
+    )
+
+    lines = (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+    records = [json.loads(line) for line in lines]
+    assert any(
+        record["type"] == "react_received"
+        and record["bridge"] == "slack"
+        and record["channel_id"] == "slack-C01ENG"
+        and record["author"] == "slack-U05ALICE"
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_skips_self_bot_id_when_user_id_unresolved(
+    bridge_with_fake_app, tmp_path: Path,
+):
+    """Reactions made by our own bot are dropped even when only bot_id
+    identifies the actor."""
+    bridge, _, _ = bridge_with_fake_app
+    bridge._bot_user_id = None
+    bridge._bot_id = "BSELF123"
+
+    await bridge._on_reaction(
+        {
+            "user": "USLACKBOT",
+            "bot_id": "BSELF123",
+            "reaction": "thumbsup",
+            "item": {
+                "type": "message",
+                "channel": "C01ENG",
+                "ts": "1714768925.000100",
+                "bot_id": "BSELF123",
+            },
+        }
+    )
+
+    events_path = tmp_path / "logs" / "events.jsonl"
+    assert not events_path.exists() or events_path.read_text() == ""
+
+
+@pytest.mark.asyncio
 async def test_on_message_enqueues_user_message(bridge_with_fake_app):
     """A real-shape Slack message lands on the dispatcher with the right
     channel_id, source, and metadata."""
@@ -490,6 +556,31 @@ async def test_on_message_skips_self(bridge_with_fake_app):
             "ts": "1.000",
         }
     )
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_on_message_skips_self_bot_id_when_user_id_unresolved(bridge_with_fake_app):
+    """Own bot messages are dropped even when auth_test has not resolved
+    the bot user id and respond_to_bots is enabled."""
+    bridge, enqueued, _ = bridge_with_fake_app
+    bridge._bot_user_id = None
+    bridge._bot_id = None
+    bridge.respond_to_bots = True
+
+    await bridge.send("slack-C01ENG", "outbound")
+    assert bridge._bot_id == "BSELF123"
+
+    await bridge._on_message(
+        {
+            "user": "USLACKBOT",
+            "channel": "C01ENG",
+            "text": "echo of own msg",
+            "ts": "1.001",
+            "bot_id": "BSELF123",
+        }
+    )
+
     assert enqueued == []
 
 
