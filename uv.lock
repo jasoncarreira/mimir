@@ -1428,7 +1428,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.12" },
     { name = "apscheduler", specifier = ">=3.11" },
     { name = "botocore", marker = "extra == 'dev'", specifier = ">=1.35" },
-    { name = "deepagents", specifier = ">=0.6.1" },
+    { name = "deepagents", specifier = ">=0.6.1,<0.7" },
     { name = "discord-py", marker = "extra == 'dev'", specifier = ">=2.6" },
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.6" },
     { name = "faiss-cpu", marker = "extra == 'dev'", specifier = ">=1.13" },
