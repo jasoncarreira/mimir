@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from mimir.cli import main
-from mimir.index import build_memory_index
+from mimir.index import build_memory_index, build_state_index, build_wiki_index
 from mimir.memory_doctor import render_text, run_doctor
 
 
@@ -157,6 +157,95 @@ def test_stale_memory_index_is_reported(tmp_path: Path) -> None:
     assert finding.severity == "warning"
     index = next(s for s in report.sections if s.name == "index")
     assert index.metrics["stale"] == 1
+
+
+def test_stale_state_index_is_reported_without_rewriting(tmp_path: Path) -> None:
+    _seed_clean_home(tmp_path)
+    _write(tmp_path / "state" / "raw" / "one.md", "<!-- desc: one -->\nbody")
+    _write(tmp_path / "state" / "INDEX.md", build_state_index(tmp_path))
+    before = (tmp_path / "state" / "INDEX.md").read_text(encoding="utf-8")
+    _write(tmp_path / "state" / "raw" / "two.md", "<!-- desc: two -->\nbody")
+
+    report = run_doctor(tmp_path)
+
+    finding = _find(report, layer="state", check="index-stale", path="state/INDEX.md")
+    assert finding.severity == "warning"
+    assert (tmp_path / "state" / "INDEX.md").read_text(encoding="utf-8") == before
+    state = next(s for s in report.sections if s.name == "state")
+    assert state.metrics["index_stale"] == 1
+
+
+def test_stale_wiki_index_is_reported_without_rewriting(tmp_path: Path) -> None:
+    _seed_clean_home(tmp_path)
+    _write(tmp_path / "state" / "wiki" / "entities" / "alice.md", "<!-- desc: Alice -->\n[[bob]]")
+    _write(tmp_path / "state" / "wiki" / "entities" / "bob.md", "<!-- desc: Bob -->\n[[alice]]")
+    _write(tmp_path / "state" / "wiki" / "index.md", build_wiki_index(tmp_path))
+    before = (tmp_path / "state" / "wiki" / "index.md").read_text(encoding="utf-8")
+    _write(tmp_path / "state" / "wiki" / "entities" / "carol.md", "<!-- desc: Carol -->\n[[alice]]")
+
+    report = run_doctor(tmp_path)
+
+    finding = _find(report, layer="wiki", check="index-stale", path="state/wiki/index.md")
+    assert finding.severity == "warning"
+    assert (tmp_path / "state" / "wiki" / "index.md").read_text(encoding="utf-8") == before
+    wiki = next(s for s in report.sections if s.name == "wiki")
+    assert wiki.metrics["index_stale"] == 1
+
+
+def test_wiki_orphan_is_reported(tmp_path: Path) -> None:
+    _seed_clean_home(tmp_path)
+    _write(tmp_path / "state" / "wiki" / "concepts" / "lonely.md", "<!-- desc: Lonely -->\n# Lonely")
+    _write(tmp_path / "state" / "wiki" / "index.md", build_wiki_index(tmp_path))
+
+    report = run_doctor(tmp_path)
+
+    finding = _find(
+        report,
+        layer="wiki",
+        check="orphan",
+        path="state/wiki/concepts/lonely.md",
+    )
+    assert finding.severity == "warning"
+    wiki = next(s for s in report.sections if s.name == "wiki")
+    assert wiki.metrics["orphans"] == 1
+
+
+def test_wiki_dangling_link_is_reported(tmp_path: Path) -> None:
+    _seed_clean_home(tmp_path)
+    _write(tmp_path / "state" / "wiki" / "topics" / "source.md", "<!-- desc: Source -->\n[[ghost]]")
+    _write(tmp_path / "state" / "wiki" / "topics" / "target.md", "<!-- desc: Target -->\n[[source]]")
+    _write(tmp_path / "state" / "wiki" / "index.md", build_wiki_index(tmp_path))
+
+    report = run_doctor(tmp_path)
+
+    finding = _find(
+        report,
+        layer="wiki",
+        check="dangling-link",
+        path="state/wiki/topics/source.md",
+    )
+    assert finding.severity == "warning"
+    assert "[[ghost]]" in finding.message
+    wiki = next(s for s in report.sections if s.name == "wiki")
+    assert wiki.metrics["dangling_links"] == 1
+
+
+def test_unexpected_top_level_state_markdown_is_reported(tmp_path: Path) -> None:
+    _seed_clean_home(tmp_path)
+    _write(tmp_path / "state" / "voice-drafts.md", "<!-- desc: draft -->\nbody")
+    _write(tmp_path / "state" / "INDEX.md", build_state_index(tmp_path))
+
+    report = run_doctor(tmp_path)
+
+    finding = _find(
+        report,
+        layer="state",
+        check="top-level-md",
+        path="state/voice-drafts.md",
+    )
+    assert finding.severity == "warning"
+    state = next(s for s in report.sections if s.name == "state")
+    assert state.metrics["unexpected_top_level_md_files"] == 1
 
 
 def test_overgrown_learnings_pending_is_reported(tmp_path: Path) -> None:
