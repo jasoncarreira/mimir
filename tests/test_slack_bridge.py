@@ -258,6 +258,27 @@ async def test_send_can_post_threaded_block_kit_panel(bridge_with_fake_app):
 
 
 @pytest.mark.asyncio
+async def test_send_missing_attachment_returns_failure(bridge_with_fake_app, tmp_path: Path):
+    bridge, _, _ = bridge_with_fake_app
+    missing = tmp_path / "removed.txt"
+
+    async def fake_upload(**kwargs):
+        with open(kwargs["file"], "rb"):
+            pass
+        return {"file": {}}
+
+    bridge._app.client.files_upload_v2 = fake_upload  # type: ignore[union-attr]
+
+    result = await bridge.send("slack-C01ABC", "", attachment_paths=[missing])
+
+    assert result.sent is False
+    assert result.chunks == 0
+    assert "slack send error after 0 chunk(s)" in (result.error or "")
+    assert "FileNotFoundError" in (result.error or "")
+    assert "removed.txt" in (result.error or "")
+
+
+@pytest.mark.asyncio
 async def test_bridge_default_edit_message_is_soft_noop():
     class _NoEditBridge(Bridge):
         async def connect(self) -> None:
