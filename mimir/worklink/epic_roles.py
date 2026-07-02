@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, TypeVar
 
-from langchain.tools import ToolRuntime
 from pydantic import BaseModel
 
 from .epic_state import EpicRunManifest
@@ -127,7 +126,21 @@ class EpicSubagentRoleRunner:
 
 
 class DeepAgentsTaskSubagentInvoker:
-    """Invoke Worklink role subagents through DeepAgents' ``task`` tool."""
+    """Invoke Worklink review-role subagents as compiled LangChain agents.
+
+    Each role from ``build_worklink_review_subagents`` is compiled once (via
+    ``langchain.agents.create_agent``) into an agent runnable bound to its
+    structured ``response_format`` and a read-only filesystem view of the repo.
+    Invoking a role runs that agent and returns its parsed
+    ``structured_response``.
+
+    This mirrors how DeepAgents' ``SubAgentMiddleware`` compiles subagent specs
+    (``create_agent(...)`` per spec) rather than reaching into the private
+    ``_build_task_tool`` helper — which requires already-compiled ``runnable``
+    specs and would otherwise raise ``KeyError: 'runnable'`` when handed raw
+    config dicts. Structured output is read from the public ``structured_response``
+    state key, so the bridge does not depend on task-tool internals.
+    """
 
     def __init__(
         self,
@@ -139,93 +152,65 @@ class DeepAgentsTaskSubagentInvoker:
         self.home = home
         self.repo = repo or Path.cwd()
         self._model = model
-        self._tool: Any | None = None
+        self._agents: dict[str, Any] | None = None
 
     async def __call__(
         self, role: str, prompt: str, model_type: type[ModelT]
     ) -> ModelT:
-        tool = self._tool or self._build_tool()
-        self._tool = tool
-        runtime = ToolRuntime(
-            state={"messages": []},
-            context=None,
-            config={},
-            stream_writer=lambda _: None,
-            tool_call_id=f"worklink-epic-{role}",
-            store=None,
+        from langchain_core.messages import HumanMessage
+
+        agents = self._agents if self._agents is not None else self._build_agents()
+        self._agents = agents
+        agent = agents.get(role)
+        if agent is None:
+            raise WorklinkError(f"unknown Worklink epic role subagent: {role}")
+
+        result = await agent.ainvoke({"messages": [HumanMessage(content=prompt)]})
+        structured = (
+            result.get("structured_response") if isinstance(result, Mapping) else None
         )
-        try:
-            result = await tool.coroutine(
-                description=prompt,
-                subagent_type=role,
-                runtime=runtime,
-            )
-        except AttributeError as exc:
+        if structured is None:
             raise WorklinkError(
-                "DeepAgents task tool shape changed; cannot run Worklink epic "
-                "role subagents. Update DeepAgents integration or pin a "
-                "compatible deepagents version."
-            ) from exc
-        if isinstance(result, str):
-            raise WorklinkError(result)
-        update = getattr(result, "update", None)
-        if not isinstance(update, Mapping):
-            raise WorklinkError(
-                "DeepAgents task tool returned an unexpected result shape; "
-                "missing mapping update.messages"
+                f"{role} subagent returned no structured_response "
+                f"(expected {model_type.__name__})"
             )
-        messages = update.get("messages", [])
-        if not messages:
-            raise WorklinkError(f"{role} subagent returned no structured response")
-        content = getattr(messages[0], "content", None)
-        if content is None:
-            raise WorklinkError(
-                "DeepAgents task tool returned an unexpected message shape; "
-                "missing message.content"
-            )
-        return model_type.model_validate_json(str(content))
+        if isinstance(structured, model_type):
+            return structured
+        # Tolerate a dict / loosely-typed structured payload.
+        return model_type.model_validate(structured)
 
-    def _build_tool(self) -> Any:
+    def _build_agents(self) -> dict[str, Any]:
         try:
-            from deepagents.middleware import subagents as deepagents_subagents
-        except ImportError as exc:
+            from langchain.agents import create_agent
+        except ImportError as exc:  # pragma: no cover - dependency guard
             raise WorklinkError(
-                "DeepAgents subagent middleware is unavailable; install a "
-                "compatible deepagents version to run Worklink epics"
+                "langchain create_agent is unavailable; install a compatible "
+                "langchain/deepagents version to run Worklink epics"
             ) from exc
-
-        build_task_tool = getattr(deepagents_subagents, "_build_task_tool", None)
-        if build_task_tool is None:
-            raise WorklinkError(
-                "DeepAgents private _build_task_tool API is unavailable; "
-                "update Worklink's epic role bridge or pin a compatible "
-                "deepagents version"
-            )
+        from deepagents.backends import FilesystemBackend
+        from deepagents.middleware.filesystem import FilesystemMiddleware
 
         model = self._model if self._model is not None else _resolve_epic_model(self.home)
-        specs = [
-            _structured_subagent_spec(spec, model=model, repo=self.repo)
-            for spec in build_worklink_review_subagents()
-        ]
-        return build_task_tool(specs)
-
-
-def _structured_subagent_spec(
-    spec: dict[str, Any], *, model: Any, repo: Path
-) -> dict[str, Any]:
-    from deepagents.backends import FilesystemBackend
-    from deepagents.middleware.filesystem import FilesystemMiddleware
-
-    return {
-        **spec,
-        "model": model,
-        "middleware": [
-            FilesystemMiddleware(
-                backend=FilesystemBackend(root_dir=repo),
-                _permissions=spec.get("permissions"),
+        agents: dict[str, Any] = {}
+        for spec in build_worklink_review_subagents():
+            middleware = [
+                FilesystemMiddleware(
+                    # virtual_mode=True confines the read-only reviewer to the
+                    # repo root (blocks absolute/`..` escapes) and pins the
+                    # behavior across deepagents' changing default.
+                    backend=FilesystemBackend(root_dir=self.repo, virtual_mode=True),
+                    _permissions=spec.get("permissions"),
+                )
+            ]
+            agents[spec["name"]] = create_agent(
+                model,
+                system_prompt=spec["system_prompt"],
+                tools=list(spec.get("tools", [])),
+                middleware=middleware,
+                name=spec["name"],
+                response_format=spec.get("response_format"),
             )
-        ],
-    }
+        return agents
 
 
 def _resolve_epic_model(home: Path) -> Any:
