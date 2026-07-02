@@ -540,7 +540,7 @@ def test_child_leaves_preserve_created_at_and_classify_high_risk_scope_multi() -
                     {
                         "id": 101,
                         "title": "Leaf",
-                        "description": """Acceptance criteria:\n- [ ] Works\n\nReview criteria:\n- Verify it\n\nWorklink notes:\n- Scope: mimir/worklink/orchestrator.py, tests/test_worklink_epic.py\n- Out of scope: unrelated\n- Suggested test command: pytest -q\n""",
+                        "description": """Acceptance criteria:\n- [ ] Works\n\nReview criteria:\n- Verify it\n\nWorklink notes:\n- Scope: services/auth/session.py, tests/test_worklink_epic.py\n- Out of scope: unrelated\n- Suggested test command: pytest -q\n""",
                         "labels": ["worklink:ready"],
                         "parent_id": 100,
                         "blocked_by": [],
@@ -553,7 +553,7 @@ def test_child_leaves_preserve_created_at_and_classify_high_risk_scope_multi() -
     leaf = ChainlinkEpicClient(runner=fake_runner).child_leaves(100)[0]
 
     assert leaf.issue.created_at == datetime(2026, 7, 2, tzinfo=UTC)
-    assert leaf.scope_paths == ("mimir/worklink/orchestrator.py", "tests/test_worklink_epic.py")
+    assert leaf.scope_paths == ("services/auth/session.py", "tests/test_worklink_epic.py")
     from mimir.worklink.review import classify_leaf_review_risk
 
     assert classify_leaf_review_risk(scope_paths=list(leaf.scope_paths)) == "multi"
