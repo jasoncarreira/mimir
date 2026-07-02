@@ -14,6 +14,7 @@ tests. A proposal can change both memory/core and prompts in one PR:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -68,6 +69,17 @@ def _run_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_doctor(args: argparse.Namespace) -> int:
+    from ..memory_doctor import render_text, run_doctor
+
+    report = run_doctor(Path(args.home).resolve())
+    if args.json:
+        print(json.dumps(report.to_json(), indent=2, sort_keys=True))
+    else:
+        print(render_text(report), end="")
+    return 1 if report.status == "error" else 0
+
+
 def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     """Register the ``mimir memory`` subcommand tree."""
     mem_p = sub.add_parser(
@@ -98,6 +110,17 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     st.add_argument("--home", type=Path, default=Path.cwd())
     st.add_argument("--lane", choices=("agent", "upgrade"), default="agent")
 
+    doc = mem_sub.add_parser(
+        "doctor",
+        help="Read-only prompt-budget lint report for file memory.",
+    )
+    doc.add_argument("--home", type=Path, default=Path.cwd())
+    doc.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the stable JSON report model instead of text.",
+    )
+
     return mem_p
 
 
@@ -112,5 +135,7 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return _run_abandon(args)
     if action == "status":
         return _run_status(args)
+    if action == "doctor":
+        return _run_doctor(args)
     parser.print_help()
     return 1

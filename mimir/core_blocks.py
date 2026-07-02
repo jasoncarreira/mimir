@@ -196,7 +196,7 @@ def load_core(home: Path) -> list[CoreBlock]:
 #   content, and an algedonic event is emitted so over-filed real channels
 #   do not stay silently stale.
 
-_CHANNEL_MEMORY_MAX_BYTES: int = 8_000  # ~2k tokens; covers current files with headroom
+_CHANNEL_MEMORY_MAX_BYTES: int = 8_192  # ~2k tokens; covers current files with headroom
 
 
 # Synthetic channel prefixes whose turns should NOT receive channel-memory
