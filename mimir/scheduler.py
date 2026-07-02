@@ -2345,12 +2345,16 @@ class Scheduler:
                 )
                 turns_log = home / "logs" / "turns.jsonl"
                 events_log = home / "logs" / "events.jsonl"
-                report = await asyncio.to_thread(
-                    aggregate, turns_log, events_log, days=days,
-                )
-                body = render_markdown(report)
                 today = datetime.now(tz=_tz.utc).strftime("%Y-%m-%d")
                 out = home / "state" / "reports" / f"introspection-{today}.md"
+                report = await asyncio.to_thread(
+                    aggregate,
+                    turns_log,
+                    events_log,
+                    days=days,
+                    home=home,
+                )
+                body = render_markdown(report)
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_text(body, encoding="utf-8")
 

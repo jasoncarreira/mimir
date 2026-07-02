@@ -235,6 +235,22 @@ falling back to `claude_code` — see
 [`benchmarks/saga/saga.example.toml`](./benchmarks/saga/saga.example.toml) for the
 provider options + per-section documentation.
 
+## Memory diagnostics
+
+`mimir memory doctor` is a read-only health report for Mimir's memory
+surfaces: core/channel/issue memory, `learnings-pending.md`, memory and
+wiki indexes, SAGA substrate checks, and state/wiki drift.
+
+```bash
+mimir memory doctor --home /mimir-home
+mimir memory doctor --home /mimir-home --json
+```
+
+It reports `ok` / `warning` / `error` status, exits nonzero only for
+`error`, and never auto-fixes or rewrites memory. See
+[`docs/memory-doctor.md`](./docs/memory-doctor.md) for the full command
+contract and automation guidance.
+
 ## Scheduler timezone
 
 `scheduler.yaml` cron expressions are interpreted in UTC by default —

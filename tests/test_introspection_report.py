@@ -14,6 +14,8 @@ import pytest
 
 from mimir.reflection.introspection_report import (
     HeartbeatPipeline,
+    MemoryHealthFinding,
+    MemoryHealthSummary,
     Report,
     aggregate,
     health_degraded_fields,
@@ -447,3 +449,53 @@ def test_render_markdown_includes_all_sections(tmp_path: Path):
     assert "Tools with errors" in body
     assert "Recent errors" in body
     assert "Read" in body
+
+
+def test_render_markdown_includes_memory_health_summary():
+    rep = Report(
+        days=7,
+        generated_at=NOW,
+        memory_health=MemoryHealthSummary(
+            status="warning",
+            severity_counts={"error": 0, "warning": 2, "info": 1},
+            section_counts={
+                "core": {"files": 8, "bytes": 12000},
+                "wiki": {"pages": 42, "orphans": 1},
+            },
+            top_findings=[
+                MemoryHealthFinding(
+                    section="wiki",
+                    severity="warning",
+                    path="state/wiki/concepts/orphan.md",
+                    check="orphan",
+                    message="Wiki page has no backlinks.",
+                    suggestion="Add backlinks or tag as orphan intentionally.",
+                )
+            ],
+        ),
+    )
+
+    body = render_markdown(rep)
+
+    assert "## Memory Health" in body
+    assert "Status: **warning**" in body
+    assert "error=0, warning=2, info=1" in body
+    assert "Full report artifact" not in body
+    assert "state/wiki/concepts/orphan.md" in body
+
+
+def test_aggregate_includes_memory_health_when_home_is_provided(tmp_path: Path):
+    from tests.test_memory_doctor import _seed_clean_home
+
+    _seed_clean_home(tmp_path)
+    (tmp_path / "logs").mkdir()
+    rep = aggregate(
+        tmp_path / "logs" / "turns.jsonl",
+        tmp_path / "logs" / "events.jsonl",
+        days=7,
+        now=NOW,
+        home=tmp_path,
+    )
+
+    assert rep.memory_health is not None
+    assert rep.memory_health.status in {"ok", "warning", "error"}
