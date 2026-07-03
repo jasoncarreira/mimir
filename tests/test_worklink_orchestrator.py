@@ -410,14 +410,20 @@ class WorkerScriptedBackend(WorkerFakeBackend):
         return replace(spec, local_argv=(sys.executable, "-c", self._script))
 
 
-def _worker_diag_payload(tmp_path: Path, backend: WorkerFakeBackend, *, env: dict[str, str] | None = None) -> WorkerPayload:
+def _worker_diag_payload(
+    tmp_path: Path,
+    backend: WorkerFakeBackend,
+    *,
+    env: dict[str, str] | None = None,
+    timeout_s: int = 30,
+) -> WorkerPayload:
     spec = backend.work_spec(
         WorkOrder(
             issue_id=793,
             worktree=tmp_path / "ignored",
             prompt="Do worker handoff",
             rules=None,
-            timeout_s=30,
+            timeout_s=timeout_s,
             env=env or {},
             transcript_root=tmp_path / "transcripts",
         ),
@@ -656,7 +662,6 @@ def test_tests_tail_redacts_secret_straddling_clip_boundary(
     payload = _worker_diag_payload(tmp_path, backend, env={"CODEX_API_KEY": secret})
     gate_output = "padding " + secret + "B" * 5990  # 6000-char clip lands inside the secret
     repo = payload.repo_dir
-
     def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         if isinstance(args, list) and args[:2] == ["git", "clone"]:
             repo.mkdir(parents=True, exist_ok=True)
@@ -681,6 +686,131 @@ def test_tests_tail_redacts_secret_straddling_clip_boundary(
     assert "WORKLINK_TESTS_TAIL_BEGIN" in out
     assert secret not in out
     assert "1234567890x" not in out
+
+
+def _repair_gate_runner(repo: Path, *, gate_results: list[int], gate_output: str) -> Any:
+    """Runner whose gate command pops exit codes from ``gate_results`` per call."""
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:2] == ["git", "clone"]:
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / ".git").mkdir(exist_ok=True)
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--cached" in args:
+            return cp(args, stdout="changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--name-only" in args:
+            return cp(args, stdout="changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--stat" in args:
+            return cp(args, stdout=" changed.txt | 1 +\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "status"]:
+            return cp(args, stdout="?? changed.txt\n")
+        if args == "echo ok":
+            code = gate_results.pop(0) if gate_results else 0
+            return cp(args, returncode=code, stdout=gate_output if code else "all green")
+        return cp(args)
+
+    return runner
+
+def test_worker_repairs_gate_failure_within_attempt(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """chainlink #817: a failed gate triggers an in-attempt repair round — the
+    backend is re-invoked in the same checkout with the failure tail, the gate
+    re-runs, and a now-green attempt pushes normally."""
+    backend = WorkerScriptedBackend(script="print('ok')", status="success")
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    payload = _worker_diag_payload(tmp_path, backend, timeout_s=600)
+    runner = _repair_gate_runner(
+        payload.repo_dir,
+        gate_results=[1],  # first gate run fails, re-run passes
+        gate_output="FAILED tests/test_q.py::test_it - AssertionError",
+    )
+
+    validation = asyncio.run(run_worker_payload(payload, registry=registry, runner=runner))
+
+    assert validation.review_ready is True
+    assert validation.evidence.repair_rounds == 1
+    assert len(backend.orders) == 2
+    repair_prompt = backend.orders[1].prompt
+    assert "NOT done until the gate command passes" in repair_prompt
+    assert "FAILED tests/test_q.py::test_it" in repair_prompt
+    assert "NEVER delete, skip, or weaken tests" in repair_prompt
+    out = capsys.readouterr().out
+    assert "WORKLINK_TESTS_TAIL" not in out  # repaired attempt is a clean success
+    evidence = json.loads(payload.evidence_path.read_text(encoding="utf-8"))
+    assert evidence["repair_rounds"] == 1
+
+
+def test_worker_repair_exhausts_rounds_then_fails_with_tail(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    backend = WorkerScriptedBackend(script="print('ok')", status="success")
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    payload = _worker_diag_payload(tmp_path, backend, timeout_s=600)
+    runner = _repair_gate_runner(
+        payload.repo_dir,
+        gate_results=[1, 1],  # fails before AND after the repair round
+        gate_output="FAILED tests/test_q.py::test_it - AssertionError",
+    )
+
+    validation = asyncio.run(run_worker_payload(payload, registry=registry, runner=runner))
+
+    assert validation.review_ready is False
+    assert "tests_failed" in validation.reasons
+    assert validation.evidence.repair_rounds == 1
+    assert len(backend.orders) == 2  # implement + one bounded repair round
+    out = capsys.readouterr().out
+    assert "WORKLINK_TESTS_TAIL_BEGIN" in out
+    assert "WORKLINK_WORKER_DIAG_BEGIN" in out
+
+
+def test_worker_repair_rounds_zero_disables(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from dataclasses import replace as dc_replace
+
+    backend = WorkerScriptedBackend(script="print('ok')", status="success")
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    payload = _worker_diag_payload(tmp_path, backend, timeout_s=600)
+    payload = WorkerPayload(
+        spec=dc_replace(payload.spec, gate_repair_rounds=0),
+        repo_dir=payload.repo_dir,
+        evidence_path=payload.evidence_path,
+        transcript_root=payload.transcript_root,
+        safe_env=payload.safe_env,
+    )
+    runner = _repair_gate_runner(
+        payload.repo_dir, gate_results=[1, 1], gate_output="FAILED tests/test_q.py::t"
+    )
+
+    validation = asyncio.run(run_worker_payload(payload, registry=registry, runner=runner))
+
+    assert validation.review_ready is False
+    assert len(backend.orders) == 1  # no repair invocation
+    assert validation.evidence.repair_rounds == 0
+
+
+def test_worker_repair_skipped_when_timeout_budget_low(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Repair never extends wall-clock: with <2min of attempt budget left the
+    worker fails straight through rather than starting a round it can't finish."""
+    backend = WorkerScriptedBackend(script="print('ok')", status="success")
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    payload = _worker_diag_payload(tmp_path, backend, timeout_s=30)
+    runner = _repair_gate_runner(
+        payload.repo_dir, gate_results=[1, 1], gate_output="FAILED tests/test_q.py::t"
+    )
+
+    validation = asyncio.run(run_worker_payload(payload, registry=registry, runner=runner))
+
+    assert validation.review_ready is False
+    assert len(backend.orders) == 1
+    assert validation.evidence.repair_rounds == 0
 
 
 def test_worker_prepares_slash_named_feature_base(tmp_path: Path) -> None:
@@ -1807,7 +1937,7 @@ def test_worklink_ignores_planner_suggested_test_command_by_default(
     out = capsys.readouterr().out
     assert result.dry_run is True
     assert "echo planner-controlled; touch /tmp/owned" in out
-    assert "run the FULL gate command below yourself" in out
+    assert "NOT done until the gate command below passes" in out
     assert "  echo safe" in out
 
 
@@ -1853,7 +1983,7 @@ def test_worklink_prompt_keeps_planner_suggestion_advisory(
 
     out = capsys.readouterr().out
     assert result.dry_run is True
-    assert "run the FULL gate command below yourself" in out
+    assert "NOT done until the gate command below passes" in out
     assert "Treat it as advisory only" in out
     assert "  echo safe" in out
     assert "  cd /workspace/mimir && pytest -q tests/test_identities.py" not in out

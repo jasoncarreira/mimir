@@ -997,6 +997,7 @@ defaults:
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
   epic_branch_prefix: "epic/"       # prefix for integrated-epic branches
   max_review_retries: 3             # reviewer-requested rebuild attempts before blocking a leaf
+  gate_repair_rounds: 1             # in-attempt backend repair rounds when the worker's gate fails (0 disables)
   reviewer_backend: codex           # defaults to the configured `backend` when omitted
   tiered_review:
     # Glob patterns matched against any scope path with fnmatch; `**` is supported.

@@ -417,6 +417,7 @@ class WorklinkRunner:
                 branch=lease.branch,
                 test_command=test_cmd,
             )
+            spec = replace(spec, gate_repair_rounds=config.defaults.gate_repair_rounds)
             handle = None
             try:
                 handle = await compute.launch(spec)

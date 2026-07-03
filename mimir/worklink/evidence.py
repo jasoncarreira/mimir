@@ -46,6 +46,9 @@ class WorklinkEvidence:
     blocked_reason: str | None = None
     transcript: str | None = None
     diff_observed: bool = True
+    # chainlink #817: in-attempt gate-repair rounds this evidence reflects
+    # (0 = the gate passed/failed without repair).
+    repair_rounds: int = 0
 
 
 @dataclass(frozen=True)

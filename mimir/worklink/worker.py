@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -160,6 +160,19 @@ async def run_worker_payload(
             blocked_reason=raw.blocked_reason,
             runner=runner,
         )
+        validation, repair_rounds = await _repair_gate_failures(
+            payload,
+            backend=backend,
+            base_order=order,
+            validation=validation,
+            started=started,
+            compute=compute,
+            runner=runner,
+        )
+        if repair_rounds:
+            validation = replace(
+                validation, evidence=replace(validation.evidence, repair_rounds=repair_rounds)
+            )
         _write_worker_evidence(payload.evidence_path, validation)
         if validation.review_ready:
             _check(runner(["git", "-C", str(repo), "push", "origin", f"HEAD:{spec.branch}"]), "git push")
@@ -278,6 +291,119 @@ def _backend_completed(status: str) -> bool:
 TESTS_TAIL_BEGIN = "WORKLINK_TESTS_TAIL_BEGIN"
 TESTS_TAIL_END = "WORKLINK_TESTS_TAIL_END"
 _TESTS_TAIL_MAX_CHARS = 6000
+
+
+_REPAIR_MIN_BUDGET_S = 120
+
+
+def _render_repair_prompt(spec: WorkSpec, tests: Any) -> str:
+    tail = (tests.summary or "(no output captured)").strip()[-_TESTS_TAIL_MAX_CHARS:]
+    return (
+        f"You are repairing your previous change for Chainlink issue #{spec.issue_id} in this "
+        "same checkout; the diff you produced is already applied and committed.\n\n"
+        f"The required gate command FAILED:\n  command: {tests.cmd}\n  exit: {tests.exit_code}\n\n"
+        f"Failing output (tail):\n{tail}\n\n"
+        "Rules:\n"
+        "- You are NOT done until the gate command passes when you run it.\n"
+        f"- Run it yourself to verify: {spec.test_command}\n"
+        "- Fix ALL failures by correcting the code — including failures in code you did not write.\n"
+        "- Only modify a test if this issue's acceptance criteria explicitly require changing "
+        "that test's behavior.\n"
+        "- NEVER delete, skip, or weaken tests to make the gate pass.\n"
+        "- Keep changes scoped to fixing the gate; do not start new work.\n"
+    )
+
+
+async def _repair_gate_failures(
+    payload: WorkerPayload,
+    *,
+    backend: Any,
+    base_order: WorkOrder,
+    validation: EvidenceValidation,
+    started: datetime,
+    compute: Any,
+    runner: Any,
+) -> tuple[EvidenceValidation, int]:
+    """Bounded in-attempt gate repair (chainlink #817).
+
+    A failed gate on an otherwise completed run leaves the failing state right
+    here — same checkout, diff applied, output in hand. Re-invoke the backend
+    with the failure tail and re-run the gate, up to ``spec.gate_repair_rounds``
+    rounds, inside the attempt's existing ``timeout_s`` budget. A fresh retry
+    attempt would re-implement from scratch and can introduce different bugs;
+    repairing in place converges. Every round re-derives evidence via
+    ``observe_evidence`` — the trust model is unchanged (the controller still
+    re-derives independently)."""
+    spec = payload.spec
+    repo = payload.repo_dir
+    rounds = 0
+    while (
+        rounds < spec.gate_repair_rounds
+        and not validation.review_ready
+        and "tests_failed" in validation.reasons
+    ):
+        tests = validation.evidence.tests
+        if tests is None or not tests.observed or not tests.exit_code:
+            break
+        remaining_s = int(spec.timeout_s - (datetime.now(UTC) - started).total_seconds())
+        if remaining_s < _REPAIR_MIN_BUDGET_S:
+            break
+        rounds += 1
+        repair_order = WorkOrder(
+            issue_id=spec.issue_id,
+            worktree=repo,
+            prompt=_render_repair_prompt(spec, tests),
+            rules=spec.rules,
+            timeout_s=remaining_s,
+            env=base_order.env,
+            transcript_root=payload.transcript_root,
+        )
+        repair_spec = backend.work_spec(
+            repair_order,
+            attempt=spec.attempt,
+            repo_url=spec.repo_url,
+            base_ref=spec.base_ref,
+            branch=spec.branch,
+            test_command=spec.test_command,
+        )
+        handle = None
+        try:
+            handle = await compute.launch(repair_spec)
+            try:
+                repair_result = await compute.wait(handle, remaining_s)
+            finally:
+                await compute.cleanup(handle)
+        except ComputeLaunchError:
+            break
+        repair_raw = await backend.interpret(repair_order, repair_result)
+        if not _backend_completed(repair_raw.backend_status):
+            break
+        _check(runner(["git", "-C", str(repo), "add", "-A"]), "git add")
+        commit = runner([
+            "git",
+            "-C",
+            str(repo),
+            "commit",
+            "-m",
+            f"worklink: issue #{spec.issue_id} gate repair {rounds}",
+        ])
+        if commit.returncode != 0 and "nothing to commit" not in (commit.stdout + commit.stderr).lower():
+            raise RuntimeError((commit.stderr or commit.stdout).strip() or "git commit failed")
+        validation = observe_evidence(
+            issue=spec.issue_id,
+            attempt=spec.attempt,
+            backend=spec.backend,
+            branch=spec.branch,
+            worktree=repo,
+            started_at=started,
+            base_ref=spec.base_ref,
+            backend_status=repair_raw.backend_status,
+            test_command=spec.test_command,
+            transcript=str(repair_raw.transcript_path) if repair_raw.transcript_path else None,
+            blocked_reason=repair_raw.blocked_reason,
+            runner=runner,
+        )
+    return validation, rounds
 
 
 def _spec_secret_values(spec: WorkSpec) -> list[str]:
@@ -518,6 +644,7 @@ def _spec_from_json(data: Mapping[str, Any]) -> WorkSpec:
         local_worktree=(Path(str(data["local_worktree"])) if data.get("local_worktree") else None),
         local_argv=tuple(str(arg) for arg in data.get("local_argv") or ()) or None,
         test_only=bool(data.get("test_only", False)),
+        gate_repair_rounds=int(data.get("gate_repair_rounds", 1)),
     )
 
 

@@ -419,6 +419,7 @@ defaults:
 
     assert defaults.epic_branch_prefix == "epic/"
     assert defaults.max_review_retries == 3
+    assert defaults.gate_repair_rounds == 1
     assert defaults.reviewer_backend == "claude_cli"
     assert defaults.tiered_review.multi_vote_reviewer_count == 3
     assert "**/migrations/**" in defaults.tiered_review.high_risk_scope_patterns
@@ -439,6 +440,7 @@ defaults:
   backend: codex
   epic_branch_prefix: stacked/
   max_review_retries: 5
+  gate_repair_rounds: 0
   reviewer_backend: claude_cli
   tiered_review:
     high_risk_scope_patterns:
@@ -456,6 +458,7 @@ defaults:
 
     assert defaults.epic_branch_prefix == "stacked/"
     assert defaults.max_review_retries == 5
+    assert defaults.gate_repair_rounds == 0  # 0 is a valid explicit "disabled"
     assert defaults.reviewer_backend == "claude_cli"
     assert defaults.tiered_review == TieredReviewConfig(
         high_risk_scope_patterns=("**/security/**", "**/migrations/prod/**"),
