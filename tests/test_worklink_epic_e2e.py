@@ -23,7 +23,6 @@ from mimir.worklink.review import (
     IntegrationValidation,
     SliceReview,
     WorkDecomposition,
-    WorklinkBlockerEdge,
     WorklinkLeafSpec,
 )
 from mimir.worklink.worktree import IntegrationBranchLease, SliceMergeSuccess, WorktreeLease
@@ -134,14 +133,8 @@ class RecordingRoles:
                     review_criteria=["review B"],
                     scope_paths=["b.py"],
                     suggested_test_command="true",
+                    depends_on=["Slice A"],
                 ),
-            ],
-            blocked_by=[
-                WorklinkBlockerEdge(
-                    blocked_leaf="Slice B",
-                    blocker_leaf="Slice A",
-                    reason="B depends on A",
-                )
             ],
         )
 
@@ -417,7 +410,7 @@ async def test_integrated_epic_e2e_decomposes_merges_serially_and_resumes(
         ("merge", "issue/701-a1", "epic/700-integration"),
         ("merge", "issue/702-a1", "epic/700-integration"),
     ]
-    assert ("block", 702, 701, "B depends on A") in events
+    assert ("block", 702, 701, "Slice B depends on Slice A") in events
     assert [event for event in events if event[0] == "epic-review"] == [("epic-review", 700)]
     assert len(_pr_bodies(events)) == 1
     assert any(event[0] == "pr" and "--draft" in event[1] for event in events)

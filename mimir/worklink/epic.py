@@ -540,11 +540,14 @@ class EpicRunner:
                 ids_by_title: dict[str, int] = {}
                 for leaf in decomposition.leaves:
                     ids_by_title[leaf.title] = chainlink.file_leaf(epic.issue_id, leaf)
-                for edge in decomposition.blocked_by:
-                    blocked = ids_by_title.get(edge.blocked_leaf)
-                    blocker = ids_by_title.get(edge.blocker_leaf)
-                    if blocked is not None and blocker is not None:
-                        chainlink.add_blocker(blocked, blocker, edge.reason)
+                for leaf in decomposition.leaves:
+                    blocked = ids_by_title.get(leaf.title)
+                    for dep_title in leaf.depends_on:
+                        blocker = ids_by_title.get(dep_title)
+                        if blocked is not None and blocker is not None and blocker != blocked:
+                            chainlink.add_blocker(
+                                blocked, blocker, f"{leaf.title} depends on {dep_title}"
+                            )
                 return chainlink.child_leaves(epic.issue_id)
         raise WorklinkError(
             "decompose-reviewer rejected decomposition"
