@@ -44,6 +44,7 @@ from .worktree import WorktreeLease, cleanup_worktree, create_isolated_checkout,
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 _CLAIM_HEARTBEAT_INTERVAL_S = 60.0
+CONTINUATION_PREFIX = "WORKLINK_CONTINUATION "
 
 
 @dataclass(frozen=True)
@@ -530,6 +531,7 @@ class WorklinkRunner:
         persisted handle)."""
         selected_name = backend.name
         raw = await backend.interpret(order, compute_result)
+        quota_exhausted = _is_quota_exhausted(raw.backend_status)
         remote_gate = not compute.capabilities().shared_filesystem
         pr_url = None
         if remote_gate:
@@ -573,6 +575,8 @@ class WorklinkRunner:
                     validation = fold_remote_test_evidence(
                         validation, test_cmd, test_exit, backend_status=raw.backend_status
                     )
+            if quota_exhausted:
+                validation = _blocked_for_quota_exhaustion(validation)
             evidence_path = _write_evidence(self.home, validation.evidence)
             if validation.review_ready:
                 pr_url = _open_pr(
@@ -609,6 +613,8 @@ class WorklinkRunner:
                 runner=runner,
                 root_dirty_before=root_dirty_before,
             )
+            if quota_exhausted:
+                validation = _blocked_for_quota_exhaustion(validation)
             evidence_path = _write_evidence(self.home, validation.evidence)
             if validation.review_ready:
                 _commit_worktree_changes(lease.path, issue, runner=runner)
@@ -661,6 +667,17 @@ class WorklinkRunner:
                 validation = _with_pr_url(validation, pr_url)
                 evidence_path = _write_evidence(self.home, validation.evidence)
         _comment_evidence(claims, validation.evidence, validation, evidence_path)
+        checkpoint_path: Path | None = None
+        if quota_exhausted:
+            checkpoint_path = _publish_exhaustion_continuation(
+                self.home,
+                claims,
+                issue=issue,
+                evidence=validation.evidence,
+                evidence_path=evidence_path,
+                test_command=test_cmd,
+                validation_reasons=validation.reasons,
+            )
         _log_event(
             "worklink_evidence",
             issue_id=issue.issue_id,
@@ -669,15 +686,43 @@ class WorklinkRunner:
             review_ready=validation.review_ready,
             reasons=list(validation.reasons),
         )
-        claims.transition_issue(
-            issue.issue_id,
-            status=validation.status,
-            review_ready=validation.review_ready,
-            attempt=attempt,
-            reason=validation.evidence.blocked_reason
-            if validation.status == "blocked"
-            else (", ".join(validation.reasons) if validation.reasons else None),
-        )
+        try:
+            claims.transition_issue(
+                issue.issue_id,
+                status=validation.status,
+                review_ready=validation.review_ready,
+                attempt=attempt,
+                reason=validation.evidence.blocked_reason
+                if validation.status == "blocked"
+                else (", ".join(validation.reasons) if validation.reasons else None),
+            )
+        except Exception as exc:
+            if quota_exhausted:
+                _annotate_continuation_transition_failure(
+                    claims,
+                    issue_id=issue.issue_id,
+                    attempt=attempt,
+                    checkpoint_path=checkpoint_path,
+                    error=str(exc),
+                )
+                _log_event(
+                    "worklink_continuation_transition_failed",
+                    issue_id=issue.issue_id,
+                    attempt=attempt,
+                    checkpoint=str(checkpoint_path) if checkpoint_path else None,
+                    error=str(exc)[:500],
+                )
+                return WorklinkRunResult(
+                    issue.issue_id,
+                    attempt,
+                    "failed",
+                    review_ready=False,
+                    evidence_path=evidence_path,
+                    worktree=lease.path,
+                    branch=lease.branch,
+                    reason=f"continuation published but Chainlink transition failed: {exc}",
+                )
+            raise
         _log_event(
             "worklink_transition",
             issue_id=issue.issue_id,
@@ -1087,6 +1132,148 @@ def _write_evidence(home: Path, evidence: WorklinkEvidence) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def _is_quota_exhausted(status: str) -> bool:
+    return status.lower().strip() in {"quota_exhausted", "tool_budget_exhausted"}
+
+
+def _blocked_for_quota_exhaustion(validation: EvidenceValidation) -> EvidenceValidation:
+    reason = (
+        "tool budget exhausted; resume from the WORKLINK_CONTINUATION checkpoint "
+        "comment before re-dispatching"
+    )
+    evidence = replace(validation.evidence, status="blocked", blocked_reason=reason)
+    return replace(validation, status="blocked", review_ready=False, reasons=(), evidence=evidence)
+
+
+def _write_checkpoint(home: Path, issue: int, attempt: int, checkpoint: Mapping[str, Any]) -> Path:
+    path = home / "state" / "worklink" / "checkpoints" / f"{issue}-{attempt}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(checkpoint)
+    payload["checkpoint_path"] = str(path)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def _publish_exhaustion_continuation(
+    home: Path,
+    claims: ChainlinkClaims,
+    *,
+    issue: IssueContext,
+    evidence: WorklinkEvidence,
+    evidence_path: Path,
+    test_command: str | None,
+    validation_reasons: Sequence[str],
+) -> Path:
+    checkpoint = _exhaustion_checkpoint(
+        issue=issue,
+        evidence=evidence,
+        evidence_path=evidence_path,
+        test_command=test_command,
+        validation_reasons=validation_reasons,
+    )
+    checkpoint_path = _write_checkpoint(home, evidence.issue, evidence.attempt, checkpoint)
+    payload = dict(checkpoint)
+    payload["checkpoint_path"] = str(checkpoint_path)
+    claims._run(  # noqa: SLF001 - Chainlink wrapper owns quoting/checks.
+        "issue",
+        "comment",
+        str(evidence.issue),
+        CONTINUATION_PREFIX + json.dumps(payload, sort_keys=True),
+    )
+    _log_event(
+        "worklink_continuation_published",
+        issue_id=evidence.issue,
+        attempt=evidence.attempt,
+        checkpoint=str(checkpoint_path),
+    )
+    return checkpoint_path
+
+
+def _exhaustion_checkpoint(
+    *,
+    issue: IssueContext,
+    evidence: WorklinkEvidence,
+    evidence_path: Path,
+    test_command: str | None,
+    validation_reasons: Sequence[str],
+) -> dict[str, Any]:
+    tests_unrun = (
+        evidence.tests is None
+        or not evidence.tests.observed
+        or evidence.tests.exit_code is None
+        or bool(evidence.tests.skipped_reason)
+    )
+    unrun_validation: list[str] = []
+    if tests_unrun:
+        unrun_validation.append(test_command or (evidence.tests.cmd if evidence.tests else "tests"))
+    if not evidence.diff_observed:
+        unrun_validation.append("controller diff observation")
+    return {
+        "kind": "worklink_exhaustion_continuation",
+        "related_chainlink": {
+            "issue": issue.issue_id,
+            "parent": issue.parent_id,
+            "pr": evidence.pr_url,
+        },
+        "attempt": evidence.attempt,
+        "backend": evidence.backend,
+        "worktree": evidence.worktree,
+        "branch": evidence.branch,
+        "completed_edits": {
+            "files_changed": list(evidence.files_changed),
+            "diff_stat": evidence.diff_stat,
+        },
+        "unrun_validation": unrun_validation,
+        "validation_reasons": list(validation_reasons),
+        "next_commands": [
+            f"cd {evidence.worktree}",
+            "git status --short",
+            test_command if test_command else "run the issue's focused validation command",
+            f"resume Worklink for chainlink #{issue.issue_id} from branch {evidence.branch}",
+        ],
+        "labels_status_require_adjustment": {
+            "required": True,
+            "target": "remove worklink:in-progress/worklink:ready/worklink:review; add worklink:blocked",
+            "operator_action": (
+                "After resuming or replacing the exhausted turn, remove worklink:blocked "
+                "and re-add worklink:ready or move to worklink:review as appropriate."
+            ),
+        },
+        "evidence_path": str(evidence_path),
+        "transcript": evidence.transcript,
+    }
+
+
+def _annotate_continuation_transition_failure(
+    claims: ChainlinkClaims,
+    *,
+    issue_id: int,
+    attempt: int,
+    checkpoint_path: Path | None,
+    error: str,
+) -> None:
+    payload = {
+        "issue_id": issue_id,
+        "attempt": attempt,
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
+        "error": error,
+        "operator_action": (
+            "Continuation was published, but Worklink could not finish Chainlink "
+            "label/status adjustment. Manually remove stranded Worklink labels and "
+            "apply worklink:blocked before resuming."
+        ),
+    }
+    try:
+        claims._run(  # noqa: SLF001 - Chainlink wrapper owns quoting/checks.
+            "issue",
+            "comment",
+            str(issue_id),
+            "WORKLINK_CONTINUATION_MUTATION_FAILED " + json.dumps(payload, sort_keys=True),
+        )
+    except Exception:
+        pass
 
 
 def _comment_evidence(

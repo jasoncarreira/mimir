@@ -677,6 +677,8 @@ def _orchestrator_runner(
     files_stdout: str = "changed.txt\n",
     dirty_after_commit: bool = False,
     cleanup_returncode: int = 0,
+    issue_json: str = ISSUE_JSON,
+    fail_blocked_label: bool = False,
 ):
     calls: list[Sequence[str] | str] = []
     commit_seen = False
@@ -685,7 +687,7 @@ def _orchestrator_runner(
         nonlocal commit_seen
         calls.append(args)
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
-            return cp(args, stdout=ISSUE_JSON)
+            return cp(args, stdout=issue_json)
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
@@ -695,6 +697,14 @@ def _orchestrator_runner(
         if isinstance(args, list) and args[:3] == ["chainlink", "issue", "close"]:
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "issue", "label"]:
+            if fail_blocked_label and args == [
+                "chainlink",
+                "issue",
+                "label",
+                "441",
+                "worklink:blocked",
+            ]:
+                return cp(args, returncode=1, stderr="label failed\n")
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "issue", "unlabel"]:
             return cp(args)
@@ -1262,6 +1272,98 @@ def test_worklink_runner_timeout_transitions_failed_without_pr(tmp_path: Path) -
         for call in calls
     )
     assert ["chainlink", "issue", "label", "441", "worklink:ready"] in calls
+
+
+def test_worklink_runner_quota_exhaustion_publishes_continuation_and_blocks(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    issue_json = ISSUE_JSON.replace(
+        '"labels": ["worklink"]',
+        '"labels": ["worklink", "worklink:ready", "worklink:review"]',
+    )
+    calls, runner = _orchestrator_runner(repo, worktree, issue_json=issue_json)
+    backend = FakeBackend(status="quota_exhausted")
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.review_ready is False
+    checkpoint_path = tmp_path / "state" / "worklink" / "checkpoints" / "441-1.json"
+    assert checkpoint_path.is_file()
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert checkpoint["related_chainlink"] == {"issue": 441, "parent": 380, "pr": None}
+    assert checkpoint["worktree"] == str(worktree)
+    assert checkpoint["branch"] == "issue/441-a1"
+    assert checkpoint["completed_edits"]["files_changed"] == ["changed.txt"]
+    assert checkpoint["unrun_validation"] == []
+    assert checkpoint["labels_status_require_adjustment"]["required"] is True
+
+    continuation_comments = [
+        call
+        for call in calls
+        if isinstance(call, list)
+        and call[:4] == ["chainlink", "issue", "comment", "441"]
+        and call[4].startswith("WORKLINK_CONTINUATION ")
+    ]
+    assert len(continuation_comments) == 1
+    payload = json.loads(continuation_comments[0][4].removeprefix("WORKLINK_CONTINUATION "))
+    assert payload["checkpoint_path"] == str(checkpoint_path)
+    assert payload["completed_edits"] == checkpoint["completed_edits"]
+    assert payload["next_commands"] == checkpoint["next_commands"]
+
+    assert ["chainlink", "issue", "unlabel", "441", "worklink:in-progress"] in calls
+    assert ["chainlink", "issue", "unlabel", "441", "worklink:ready"] in calls
+    assert ["chainlink", "issue", "unlabel", "441", "worklink:review"] in calls
+    assert ["chainlink", "issue", "label", "441", "worklink:blocked"] in calls
+
+
+def test_worklink_runner_quota_exhaustion_annotates_partial_chainlink_failure(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree, fail_blocked_label=True)
+    backend = FakeBackend(status="quota_exhausted")
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.reason
+    assert result.reason.startswith("continuation published but Chainlink transition failed:")
+    assert (tmp_path / "state" / "worklink" / "checkpoints" / "441-1.json").is_file()
+    assert any(
+        isinstance(call, list)
+        and call[:4] == ["chainlink", "issue", "comment", "441"]
+        and call[4].startswith("WORKLINK_CONTINUATION ")
+        for call in calls
+    )
+    mutation_comments = [
+        call
+        for call in calls
+        if isinstance(call, list)
+        and call[:4] == ["chainlink", "issue", "comment", "441"]
+        and call[4].startswith("WORKLINK_CONTINUATION_MUTATION_FAILED ")
+    ]
+    assert len(mutation_comments) == 1
+    payload = json.loads(
+        mutation_comments[0][4].removeprefix("WORKLINK_CONTINUATION_MUTATION_FAILED ")
+    )
+    assert payload["checkpoint_path"].endswith("state/worklink/checkpoints/441-1.json")
+    assert "label failed" in payload["error"]
 
 
 def test_worklink_runner_dirty_after_commit_fails_before_push(tmp_path: Path) -> None:
