@@ -273,6 +273,19 @@ class ChainlinkEpicClient:
         self.runner([self.chainlink_bin, "issue", "unlabel", str(epic_id), "worklink:in-progress"])
         self.runner([self.chainlink_bin, "issue", "label", str(epic_id), "worklink:review"])
 
+    def mark_epic_failed(self, epic_id: int, *, retryable: bool, reason: str) -> None:
+        self.runner([self.chainlink_bin, "issue", "comment", str(epic_id), f"WORKLINK_EPIC_FAILED {reason}"])
+        self.runner([self.chainlink_bin, "issue", "unlabel", str(epic_id), "worklink:in-progress"])
+        self.runner([self.chainlink_bin, "issue", "unlabel", str(epic_id), "worklink:ready"])
+        self.runner([self.chainlink_bin, "issue", "unlabel", str(epic_id), "worklink:blocked"])
+        self.runner([
+            self.chainlink_bin,
+            "issue",
+            "label",
+            str(epic_id),
+            "worklink:ready" if retryable else "worklink:blocked",
+        ])
+
 
 @dataclass(frozen=True)
 class EpicRunner:
@@ -364,8 +377,14 @@ class EpicRunner:
                         manifest.status,
                         manifest_path=self.home / "state" / "worklink" / "epics" / f"{epic_id}.json",
                     )
+                manifest = _recover_crashed_running_slices(
+                    self.home,
+                    manifest,
+                    max_attempts=config.defaults.max_review_retries,
+                    chainlink=chainlink,
+                )
                 integration = _ensure_integration_worktree(
-                    self.repo, manifest, runner=runner
+                    self.repo, manifest, home=self.home, runner=runner
                 )
                 base = manifest.base_ref
                 heartbeat()
@@ -533,6 +552,22 @@ class EpicRunner:
                 manifest_path=self.home / "state" / "worklink" / "epics" / f"{epic_id}.json",
                 blocked_leaves=tuple(sorted(blocked)),
             )
+        except Exception as exc:
+            reason = _failure_reason(exc)
+            retryable = claim_record.attempt < claims.max_attempts
+            try:
+                _persist_epic_crash_checkpoint(
+                    self.home,
+                    epic_id,
+                    retryable=retryable,
+                )
+            except Exception:
+                pass
+            try:
+                chainlink.mark_epic_failed(epic_id, retryable=retryable, reason=reason)
+            except Exception:
+                pass
+            raise
         finally:
             heartbeat_task.cancel()
             try:
@@ -899,6 +934,77 @@ def _current_manifest(home: Path, fallback: EpicRunManifest) -> EpicRunManifest:
     return load_epic_state(home, fallback.epic_id) or fallback
 
 
+def _recover_crashed_running_slices(
+    home: Path,
+    manifest: EpicRunManifest,
+    *,
+    max_attempts: int,
+    chainlink: ChainlinkEpicClient,
+) -> EpicRunManifest:
+    records: list[EpicSliceRecord] = []
+    changed = False
+    for record in manifest.slices:
+        if record.status != "running":
+            records.append(record)
+            continue
+        changed = True
+        next_attempt_floor = max_attempts - 1 if record.attempts >= max_attempts else record.attempts - 1
+        records.append(
+            replace(
+                record,
+                status="pending",
+                attempts=max(0, next_attempt_floor),
+                evidence_ref=None,
+                review_ref=None,
+            )
+        )
+        try:
+            chainlink.comment(
+                record.id,
+                "WORKLINK_EPIC_FAILED crashed running slice re-armed for retry",
+            )
+        except Exception:
+            pass
+    if not changed:
+        return manifest
+    recovered = replace(manifest, slices=records, status="running")
+    save_epic_state(home, recovered)
+    return recovered
+
+
+def _persist_epic_crash_checkpoint(home: Path, epic_id: int, *, retryable: bool) -> None:
+    manifest = load_epic_state(home, epic_id)
+    if manifest is None:
+        return
+    records: list[EpicSliceRecord] = []
+    for record in manifest.slices:
+        if record.status == "running":
+            records.append(
+                replace(
+                    record,
+                    status="pending" if retryable else "blocked",
+                    attempts=max(0, record.attempts - 1) if retryable else record.attempts,
+                    evidence_ref=None,
+                    review_ref=None,
+                )
+            )
+        else:
+            records.append(record)
+    save_epic_state(
+        home,
+        replace(
+            manifest,
+            status="running" if retryable else "needs-human",
+            slices=records,
+        ),
+    )
+
+
+def _failure_reason(exc: Exception) -> str:
+    text = str(exc).strip()
+    return (text or exc.__class__.__name__)[:1000]
+
+
 def _slice(manifest: EpicRunManifest, leaf_id: int) -> EpicSliceRecord:
     for record in manifest.slices:
         if record.id == leaf_id:
@@ -911,7 +1017,7 @@ def _dependents(leaves: Iterable[LeafIssue], blocker_id: int) -> list[LeafIssue]
 
 
 def _ensure_integration_worktree(
-    repo: Path, manifest: EpicRunManifest, *, runner: Runner
+    repo: Path, manifest: EpicRunManifest, *, runner: Runner, home: Path | None = None
 ) -> IntegrationBranchLease:
     path = Path(manifest.integration_worktree)
     if not path.exists():
@@ -961,6 +1067,10 @@ def _ensure_integration_worktree(
                 (reset.stderr or reset.stdout).strip()
                 or "failed to reset integration worktree to manifest merge commit"
             )
+    updated_manifest = _refresh_stale_integration_base(repo, path, manifest, runner=runner)
+    if updated_manifest != manifest and home is not None:
+        save_epic_state(home, updated_manifest)
+        manifest = updated_manifest
     return IntegrationBranchLease(
         epic_id=manifest.epic_id,
         repo=repo,
@@ -969,6 +1079,96 @@ def _ensure_integration_worktree(
         base_ref=manifest.base_ref,
         local_base=manifest.base_ref,
     )
+
+
+def _refresh_stale_integration_base(
+    repo: Path,
+    path: Path,
+    manifest: EpicRunManifest,
+    *,
+    runner: Runner,
+) -> EpicRunManifest:
+    remote_base = _origin_base_ref(manifest.base_ref)
+    _fetch_origin_base(repo, manifest.base_ref, runner=runner)
+    base_rev = runner(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", remote_base])
+    if base_rev.returncode != 0 or not base_rev.stdout.strip():
+        return manifest
+    ancestor = runner(["git", "-C", str(path), "merge-base", "--is-ancestor", remote_base, "HEAD"])
+    if ancestor.returncode == 0:
+        return manifest
+    if ancestor.returncode not in (1,):
+        raise WorklinkError(
+            (ancestor.stderr or ancestor.stdout).strip()
+            or f"failed to validate integration branch base against {remote_base}"
+        )
+    if _last_merge_commit(manifest) is None:
+        checkout = runner(["git", "-C", str(path), "checkout", "-B", manifest.integration_branch, remote_base])
+        if checkout.returncode != 0:
+            raise WorklinkError(
+                (checkout.stderr or checkout.stdout).strip()
+                or f"failed to recreate stale integration branch from {remote_base}"
+            )
+        _force_push_branch(path, manifest.integration_branch, runner=runner)
+        return manifest
+
+    old_base = runner(["git", "-C", str(path), "merge-base", "HEAD", remote_base])
+    if old_base.returncode != 0 or not old_base.stdout.strip():
+        raise WorklinkError(
+            (old_base.stderr or old_base.stdout).strip()
+            or f"failed to find old integration branch base for {remote_base}"
+        )
+    rebase = runner([
+        "git",
+        "-C",
+        str(path),
+        "rebase",
+        "--rebase-merges",
+        "--onto",
+        remote_base,
+        old_base.stdout.strip(),
+    ])
+    if rebase.returncode != 0:
+        runner(["git", "-C", str(path), "rebase", "--abort"])
+        raise WorklinkError(
+            (rebase.stderr or rebase.stdout).strip()
+            or f"failed to rebase integration branch onto {remote_base}"
+        )
+    head = runner(["git", "-C", str(path), "rev-parse", "--verify", "HEAD"])
+    if head.returncode != 0 or not head.stdout.strip():
+        raise WorklinkError(
+            (head.stderr or head.stdout).strip()
+            or "failed to read rebased integration branch HEAD"
+        )
+    _force_push_branch(path, manifest.integration_branch, runner=runner)
+    return _replace_last_merge_commit(manifest, head.stdout.strip())
+
+
+def _origin_base_ref(base_ref: str) -> str:
+    return base_ref if base_ref.startswith("origin/") else f"origin/{base_ref}"
+
+
+def _fetch_origin_base(repo: Path, base_ref: str, *, runner: Runner) -> None:
+    if base_ref.startswith("origin/"):
+        branch = base_ref.removeprefix("origin/")
+    else:
+        branch = base_ref
+    if branch:
+        runner(["git", "-C", str(repo), "fetch", "origin", branch])
+
+
+def _force_push_branch(path: Path, branch: str, *, runner: Runner) -> None:
+    result = runner(["git", "-C", str(path), "push", "-u", "--force-with-lease", "origin", branch])
+    if result.returncode != 0:
+        raise WorklinkError((result.stderr or result.stdout).strip() or "git push failed")
+
+
+def _replace_last_merge_commit(manifest: EpicRunManifest, merge_commit: str) -> EpicRunManifest:
+    records = list(manifest.slices)
+    for index in range(len(records) - 1, -1, -1):
+        if records[index].merge_commit:
+            records[index] = replace(records[index], merge_commit=merge_commit)
+            return replace(manifest, slices=records)
+    return manifest
 
 
 def _last_merge_commit(manifest: EpicRunManifest) -> str | None:
