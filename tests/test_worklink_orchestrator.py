@@ -236,7 +236,9 @@ class WorkerOddArgvBackend(FakeBackend):
         return await super().interpret(order, result)
 
 
-def test_worker_payload_clone_branch_fake_backend_pushes_and_writes_evidence(tmp_path: Path) -> None:
+def test_worker_payload_clone_branch_fake_backend_pushes_and_writes_evidence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     repo = tmp_path / "worker-repo"
     evidence_path = tmp_path / "out" / "evidence.json"
     calls: list[Sequence[str] | str] = []
@@ -304,9 +306,12 @@ def test_worker_payload_clone_branch_fake_backend_pushes_and_writes_evidence(tmp
     assert ["git", "-C", str(repo), "push", "origin", "HEAD:issue/456-a1"] in calls
     assert calls.count("echo ok") == 1
     assert backend.orders[0].worktree == repo
+    assert "WORKLINK_WORKER_DIAG" not in capsys.readouterr().out
 
 
-def test_worker_payload_no_commit_result_does_not_push(tmp_path: Path) -> None:
+def test_worker_payload_no_commit_result_does_not_push(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     repo = tmp_path / "worker-repo"
     evidence_path = tmp_path / "out" / "evidence.json"
     calls: list[Sequence[str] | str] = []
@@ -366,6 +371,143 @@ def test_worker_payload_no_commit_result_does_not_push(tmp_path: Path) -> None:
     assert validation.evidence.blocked_reason == "backend produced no changes"
     assert not any(isinstance(call, list) and call[:4] == ["git", "-C", str(repo), "commit"] for call in calls)
     assert not any(isinstance(call, list) and call[:4] == ["git", "-C", str(repo), "push"] for call in calls)
+    diag = capsys.readouterr().out
+    assert "WORKLINK_WORKER_DIAG_BEGIN" in diag
+    assert "backend_produced_no_changes" in diag
+
+
+class WorkerScriptedBackend(WorkerFakeBackend):
+    """WorkerFakeBackend whose local compute job runs an arbitrary python -c script."""
+
+    def __init__(self, *, script: str, status: str = "failed") -> None:
+        super().__init__()
+        self.status = status
+        self._script = script
+
+    def work_spec(
+        self,
+        order: WorkOrder,
+        *,
+        attempt: int,
+        repo_url: str,
+        base_ref: str,
+        branch: str,
+        test_command: str,
+    ) -> WorkSpec:
+        from dataclasses import replace
+
+        spec = super().work_spec(
+            order,
+            attempt=attempt,
+            repo_url=repo_url,
+            base_ref=base_ref,
+            branch=branch,
+            test_command=test_command,
+        )
+        return replace(spec, local_argv=(sys.executable, "-c", self._script))
+
+
+def _worker_diag_payload(tmp_path: Path, backend: WorkerFakeBackend, *, env: dict[str, str] | None = None) -> WorkerPayload:
+    spec = backend.work_spec(
+        WorkOrder(
+            issue_id=793,
+            worktree=tmp_path / "ignored",
+            prompt="Do worker handoff",
+            rules=None,
+            timeout_s=30,
+            env=env or {},
+            transcript_root=tmp_path / "transcripts",
+        ),
+        attempt=2,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="origin/main",
+        branch="issue/793-a2",
+        test_command="echo ok",
+    )
+    return WorkerPayload(
+        spec=spec,
+        repo_dir=tmp_path / "worker-repo",
+        evidence_path=tmp_path / "out" / "evidence.json",
+        transcript_root=tmp_path / "transcripts",
+        safe_env={"PATH": "/bin"},
+    )
+
+
+def _worker_diag_runner(repo: Path) -> Any:
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:2] == ["git", "clone"]:
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / ".git").mkdir(exist_ok=True)
+            return cp(args)
+        return cp(args)
+
+    return runner
+
+
+def test_worker_backend_failure_emits_bounded_redacted_diag_block(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    backend = WorkerScriptedBackend(
+        script=(
+            "import sys; "
+            "sys.stderr.write('codex: request failed with status 429\\n"
+            "Authorization: Bearer live-token-abcdef\\n"
+            "env leak: injected-secret-value-123\\n'); "
+            "sys.exit(3)"
+        ),
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    transcripts = tmp_path / "transcripts"
+    transcripts.mkdir(parents=True)
+    transcript_lines = [f"transcript-line-{index}" for index in range(1, 41)]
+    transcript_lines.append('{"api_key": "sk-aaaabbbbccccddddeeee"}')
+    (transcripts / "fake.json").write_text("\n".join(transcript_lines), encoding="utf-8")
+    payload = _worker_diag_payload(
+        tmp_path, backend, env={"CODEX_API_KEY": "injected-secret-value-123"}
+    )
+
+    validation = asyncio.run(
+        run_worker_payload(payload, registry=registry, runner=_worker_diag_runner(payload.repo_dir))
+    )
+
+    assert validation.review_ready is False
+    out = capsys.readouterr().out
+    assert "WORKLINK_WORKER_DIAG_BEGIN" in out
+    assert "WORKLINK_WORKER_DIAG_END" in out
+    diag = out.split("WORKLINK_WORKER_DIAG_BEGIN", 1)[1].split("WORKLINK_WORKER_DIAG_END", 1)[0]
+    assert "issue=#793 attempt=2" in diag
+    assert "backend_exit=3" in diag
+    assert "codex: request failed with status 429" in diag
+    # Credential patterns and injected env values are redacted.
+    assert "live-token-abcdef" not in diag
+    assert "injected-secret-value-123" not in diag
+    assert "sk-aaaabbbbccccddddeeee" not in diag
+    assert "<redacted>" in diag
+    # Transcript tail keeps the last 30 lines only.
+    assert "transcript-line-40" in diag
+    assert "transcript-line-1\n" not in diag
+
+
+def test_worker_diag_block_is_size_capped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    backend = WorkerScriptedBackend(
+        script="import sys; sys.stderr.write(('x' * 400 + '\\n') * 60); sys.exit(1)",
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    payload = _worker_diag_payload(tmp_path, backend)
+
+    asyncio.run(
+        run_worker_payload(payload, registry=registry, runner=_worker_diag_runner(payload.repo_dir))
+    )
+
+    out = capsys.readouterr().out
+    assert "WORKLINK_WORKER_DIAG_END" in out
+    diag = out.split("WORKLINK_WORKER_DIAG_BEGIN", 1)[1].split("WORKLINK_WORKER_DIAG_END", 1)[0]
+    assert len(diag) <= 8100
+    assert "(head truncated)" in diag
 
 
 def test_worker_prepares_slash_named_feature_base(tmp_path: Path) -> None:
