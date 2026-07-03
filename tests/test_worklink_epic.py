@@ -83,6 +83,20 @@ def test_compute_waves_from_blocked_by_dag() -> None:
 
 def test_chainlink_child_leaves_parse_scope_and_test_from_leaf_template() -> None:
     def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args) == ["chainlink", "issue", "show", "101", "--json"]:
+            return cp(
+                args,
+                stdout=json.dumps(
+                    {
+                        "id": 101,
+                        "title": "Leaf",
+                        "description": leaf_description("pytest -q tests/test_x.py"),
+                        "labels": ["worklink:ready"],
+                        "parent_id": 100,
+                        "blocked_by": [],
+                    }
+                ),
+            )
         return cp(
             args,
             stdout=json.dumps(
@@ -91,9 +105,7 @@ def test_chainlink_child_leaves_parse_scope_and_test_from_leaf_template() -> Non
                         "id": 101,
                         "title": "Leaf",
                         "description": leaf_description("pytest -q tests/test_x.py"),
-                        "labels": ["worklink:ready"],
                         "parent_id": 100,
-                        "blocked_by": [],
                     }
                 ]
             ),
@@ -842,6 +854,8 @@ def test_decomposer_high_risk_round_trips_through_file_leaf_labels_and_classifie
     created: dict[str, Any] = {}
 
     def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        # Real `issue list --json` items carry only id/parent_id/title/description
+        # and friends — labels and blocked_by come exclusively from `issue show`.
         if list(args) == ["chainlink", "issue", "list", "--json"]:
             if not created:
                 return cp(args, stdout="[]")
@@ -853,12 +867,25 @@ def test_decomposer_high_risk_round_trips_through_file_leaf_labels_and_classifie
                             "id": 123,
                             "title": "Leaf A",
                             "description": created["description"],
-                            "labels": created["labels"],
                             "parent_id": 100,
-                            "blocked_by": [],
                             "created_at": "2026-07-02T00:00:00Z",
                         }
                     ]
+                ),
+            )
+        if list(args) == ["chainlink", "issue", "show", "123", "--json"]:
+            return cp(
+                args,
+                stdout=json.dumps(
+                    {
+                        "id": 123,
+                        "title": "Leaf A",
+                        "description": created["description"],
+                        "labels": created["labels"],
+                        "parent_id": 100,
+                        "blocked_by": [],
+                        "created_at": "2026-07-02T00:00:00Z",
+                    }
                 ),
             )
         if list(args)[:3] == ["chainlink", "issue", "subissue"]:
@@ -926,6 +953,21 @@ def test_chainlink_file_leaf_is_idempotent_by_title() -> None:
 
     def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
+        if list(args) == ["chainlink", "issue", "show", "222", "--json"]:
+            return cp(
+                args,
+                stdout=json.dumps(
+                    {
+                        "id": 222,
+                        "title": "Leaf A",
+                        "description": leaf_description(),
+                        "labels": ["worklink:ready"],
+                        "parent_id": 100,
+                        "blocked_by": [],
+                        "created_at": "2026-07-02T00:00:00Z",
+                    }
+                ),
+            )
         assert list(args) == ["chainlink", "issue", "list", "--json"]
         return cp(
             args,
@@ -935,7 +977,6 @@ def test_chainlink_file_leaf_is_idempotent_by_title() -> None:
                         "id": 222,
                         "title": "Leaf A",
                         "description": leaf_description(),
-                        "labels": ["worklink:ready"],
                         "parent_id": 100,
                         "created_at": "2026-07-02T00:00:00Z",
                     }
@@ -952,7 +993,10 @@ def test_chainlink_file_leaf_is_idempotent_by_title() -> None:
     )
 
     assert ChainlinkEpicClient(runner=fake_runner).file_leaf(100, leaf) == 222
-    assert calls == [["chainlink", "issue", "list", "--json"]]
+    assert calls == [
+        ["chainlink", "issue", "list", "--json"],
+        ["chainlink", "issue", "show", "222", "--json"],
+    ]
 
 
 def test_chainlink_add_blocker_uses_real_cli_and_comments_reason() -> None:
@@ -970,7 +1014,24 @@ def test_chainlink_add_blocker_uses_real_cli_and_comments_reason() -> None:
 
 
 def test_child_leaves_preserve_created_at_and_classify_high_risk_scope_multi() -> None:
+    description = """Acceptance criteria:\n- [ ] Works\n\nReview criteria:\n- Verify it\n\nWorklink notes:\n- Scope: services/auth/session.py, tests/test_worklink_epic.py\n- Out of scope: unrelated\n- Suggested test command: pytest -q\n"""
+
     def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args) == ["chainlink", "issue", "show", "101", "--json"]:
+            return cp(
+                args,
+                stdout=json.dumps(
+                    {
+                        "id": 101,
+                        "title": "Leaf",
+                        "description": description,
+                        "labels": ["worklink:ready"],
+                        "parent_id": 100,
+                        "blocked_by": [],
+                        "created_at": "2026-07-02T00:00:00Z",
+                    }
+                ),
+            )
         return cp(
             args,
             stdout=json.dumps(
@@ -978,10 +1039,8 @@ def test_child_leaves_preserve_created_at_and_classify_high_risk_scope_multi() -
                     {
                         "id": 101,
                         "title": "Leaf",
-                        "description": """Acceptance criteria:\n- [ ] Works\n\nReview criteria:\n- Verify it\n\nWorklink notes:\n- Scope: services/auth/session.py, tests/test_worklink_epic.py\n- Out of scope: unrelated\n- Suggested test command: pytest -q\n""",
-                        "labels": ["worklink:ready"],
+                        "description": description,
                         "parent_id": 100,
-                        "blocked_by": [],
                         "created_at": "2026-07-02T00:00:00Z",
                     }
                 ]
@@ -995,6 +1054,84 @@ def test_child_leaves_preserve_created_at_and_classify_high_risk_scope_multi() -
     from mimir.worklink.review import classify_leaf_review_risk
 
     assert classify_leaf_review_risk(scope_paths=list(leaf.scope_paths)) == "multi"
+
+
+def test_child_leaves_hydrate_dag_and_labels_from_issue_show_not_list() -> None:
+    """Regression for #810: real `issue list --json` omits blocked_by and labels,
+    so hydrating from the list flattened every epic DAG into one parallel wave."""
+
+    def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args) == ["chainlink", "issue", "list", "--json"]:
+            # Exact key set the real CLI returns for list items.
+            items = [
+                {
+                    "id": issue_id,
+                    "title": title,
+                    "description": leaf_description(),
+                    "status": "open",
+                    "priority": "medium",
+                    "parent_id": 100,
+                    "created_at": "2026-07-02T00:00:00Z",
+                    "updated_at": "2026-07-02T00:00:00Z",
+                    "closed_at": None,
+                }
+                for issue_id, title in ((793, "Registry"), (794, "Dispatch"))
+            ]
+            return cp(args, stdout=json.dumps(items))
+        if list(args)[:3] == ["chainlink", "issue", "show"]:
+            issue_id = int(list(args)[3])
+            return cp(
+                args,
+                stdout=json.dumps(
+                    {
+                        "id": issue_id,
+                        "title": "Registry" if issue_id == 793 else "Dispatch",
+                        "description": leaf_description(),
+                        "labels": ["worklink:ready"] + (["risk:high"] if issue_id == 794 else []),
+                        "parent_id": 100,
+                        "blocked_by": [] if issue_id == 793 else [793],
+                        "created_at": "2026-07-02T00:00:00Z",
+                    }
+                ),
+            )
+        return cp(args, returncode=99, stderr="unexpected command")
+
+    leaves = ChainlinkEpicClient(runner=fake_runner).child_leaves(100)
+
+    by_id = {leaf.issue.issue_id: leaf for leaf in leaves}
+    assert by_id[793].blocked_by == ()
+    assert by_id[794].blocked_by == (793,)
+    assert "risk:high" in by_id[794].issue.labels
+    from mimir.worklink.epic import compute_waves
+
+    waves = compute_waves(leaves)
+    assert [[leaf.issue.issue_id for leaf in wave] for wave in waves] == [[793], [794]]
+
+
+def test_child_leaves_warn_when_show_payload_drops_dag_keys(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args) == ["chainlink", "issue", "list", "--json"]:
+            return cp(
+                args,
+                stdout=json.dumps(
+                    [{"id": 101, "title": "Leaf", "description": leaf_description(), "parent_id": 100}]
+                ),
+            )
+        return cp(
+            args,
+            stdout=json.dumps(
+                {"id": 101, "title": "Leaf", "description": leaf_description(), "parent_id": 100}
+            ),
+        )
+
+    leaves = ChainlinkEpicClient(runner=fake_runner).child_leaves(100)
+
+    assert leaves[0].blocked_by == ()
+    stderr = capsys.readouterr().err
+    assert "blocked_by" in stderr
+    assert "labels" in stderr
 
 
 def test_created_issue_id_rejects_ambiguous_numeric_text() -> None:
@@ -1297,6 +1434,20 @@ async def test_run_crash_mid_build_relabels_epic_and_rearms_manifest(
                     }
                 ),
             )
+        if list(args) == ["chainlink", "issue", "show", "101", "--json"]:
+            return cp(
+                args,
+                stdout=json.dumps(
+                    {
+                        "id": 101,
+                        "title": "Leaf",
+                        "description": leaf_description(),
+                        "labels": ["worklink:ready"],
+                        "parent_id": 100,
+                        "blocked_by": [],
+                    }
+                ),
+            )
         if list(args) == ["chainlink", "issue", "list", "--json"]:
             return cp(
                 args,
@@ -1306,9 +1457,7 @@ async def test_run_crash_mid_build_relabels_epic_and_rearms_manifest(
                             "id": 101,
                             "title": "Leaf",
                             "description": leaf_description(),
-                            "labels": ["worklink:ready"],
                             "parent_id": 100,
-                            "blocked_by": [],
                         }
                     ]
                 ),
