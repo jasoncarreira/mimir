@@ -54,9 +54,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # --- Backend CLI (REQUIRED, operator-specific) -------------------------------
 # The worker shells out to the backend the leaf is routed to; it MUST be present.
-# Pin the backend CLI to the version your main agent image uses so worker and
-# controller behavior stay comparable (chainlink #814).
-ARG CODEX_VERSION=0.140.0
+# Pin the backend CLI. The default tracks the framework's canonical pin
+# (mimir/worklink/tool_pins.py); override the ARG to match YOUR main agent
+# image so worker and controller behavior stay comparable (chainlink #814).
+ARG CODEX_VERSION=0.142.4
 RUN npm install -g @openai/codex@${CODEX_VERSION}
 # -----------------------------------------------------------------------------
 
