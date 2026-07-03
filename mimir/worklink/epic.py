@@ -795,9 +795,17 @@ class EpicRunner:
                 raw = await selected_backend.interpret(order, compute_result)
             no_push_reason = None
             if not adopted and not compute.capabilities().shared_filesystem and backend_completed(raw.backend_status):
-                if _slice_branch_has_changes(lease.path, lease.local_base or lease.base_ref, runner=runner):
-                    _git_push(lease.path, lease.branch, runner=runner)
-                else:
+                # chainlink #824: on non-shared substrates the WORKER pushed the
+                # changes; the local lease branch still sits at the integration
+                # base. Sync it from origin first — the has-changes check,
+                # observe, review, and the eventual merge all consume the LOCAL
+                # branch, so without this every remote slice was discarded as
+                # "no changes" (run 14: three gate-passing pushes thrown away)
+                # and even a passing one would have merged empty.
+                if not _sync_lease_from_origin(lease, runner=runner):
+                    no_push_reason = "backend_produced_no_changes"
+                    raw = replace(raw, backend_status="failed", error="worker pushed no branch")
+                elif not _slice_branch_has_changes(lease.path, lease.local_base or lease.base_ref, runner=runner):
                     no_push_reason = "backend_produced_no_changes"
                     raw = replace(raw, backend_status="failed", error="backend produced no changes")
             validation = await _observe_slice(
@@ -1063,6 +1071,20 @@ class _AdoptedRaw:
     backend_status: str = "completed"
     transcript_path: Path | None = None
     blocked_reason: str | None = None
+
+
+def _sync_lease_from_origin(lease: WorktreeLease, *, runner: Runner) -> bool:
+    """Mirror the worker's pushed branch into the local lease worktree (#824).
+
+    Returns False when origin has no such branch (the worker never pushed)."""
+    listed = runner(["git", "-C", str(lease.path), "ls-remote", "--heads", "origin", lease.branch])
+    if listed.returncode != 0 or not listed.stdout.strip():
+        return False
+    fetched = runner(["git", "-C", str(lease.path), "fetch", "origin", lease.branch])
+    if fetched.returncode != 0:
+        return False
+    reset = runner(["git", "-C", str(lease.path), "reset", "--hard", f"origin/{lease.branch}"])
+    return reset.returncode == 0
 
 
 def _adopt_slice_branch(repo: Path, *, lease: WorktreeLease, runner: Runner) -> bool:
