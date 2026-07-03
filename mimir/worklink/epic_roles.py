@@ -101,6 +101,11 @@ def build_decompose_tools(
         depends_on may only reference the exact titles of leaves you have
         already filed in this session; file leaves in dependency order.
         """
+        if state.deficiency is not None:
+            return (
+                "ERROR: a brief deficiency was already reported for this epic; "
+                "this decompose run must not file leaves."
+            )
         try:
             spec = WorklinkLeafSpec(
                 title=title,
@@ -147,13 +152,29 @@ def build_decompose_tools(
     @tool
     def comment_on_epic(message: str) -> str:
         """Report that the epic brief is too deficient to plan from (file nothing)."""
+        if state.filed > 0:
+            return (
+                "ERROR: leaves were already filed in this run; a deficiency report "
+                "is only valid when NO leaves are filed. Finish the plan instead."
+            )
         if state.deficiency is not None:
             return "ERROR: a deficiency was already reported."
         state.deficiency = message.strip() or "brief reported deficient (no detail given)"
-        chainlink.comment(epic_id, f"WORKLINK_BRIEF_DEFICIENT: {state.deficiency}")
-        return "Deficiency recorded on the epic."
+        warning = _safe_comment(
+            chainlink, epic_id, f"WORKLINK_BRIEF_DEFICIENT: {state.deficiency}"
+        )
+        return "Deficiency recorded on the epic." + warning
 
     return [file_leaf, add_dependency, comment_on_epic]
+
+
+def _safe_comment(chainlink: ChainlinkEpicActions, issue_id: int, text: str) -> str:
+    """Post an audit comment; a failure must not void the in-process decision."""
+    try:
+        chainlink.comment(issue_id, text)
+    except Exception as exc:  # noqa: BLE001 - audit trail is best-effort
+        return f" (WARNING: audit comment failed: {exc})"
+    return ""
 
 
 def build_slice_decision_tools(
@@ -162,14 +183,28 @@ def build_slice_decision_tools(
     chainlink: ChainlinkEpicActions,
     state: _DecisionState,
     spawn: Callable[[str], Awaitable[str]],
+    required_lenses: Sequence[str] = (),
 ) -> list[Any]:
-    """Decision + fan-out tools for the lead slice reviewer."""
+    """Decision + fan-out tools for the lead slice reviewer.
+
+    In multi mode, ``approve_slice`` is tool-gated on every required lens having
+    been spawned first — approval cannot skip the fan-out. ``request_fixes`` is
+    never gated: rejecting must always be possible.
+    """
 
     from langchain.tools import tool
+
+    spawned_lenses: set[str] = set()
 
     @tool
     def approve_slice(summary: str = "") -> str:
         """Approve this slice: the observed diff meets every acceptance criterion."""
+        missing = [lens for lens in required_lenses if lens not in spawned_lenses]
+        if missing:
+            return (
+                "ERROR: approval requires an independent sub-review for every "
+                f"required lens first. Call spawn_reviewer for: {', '.join(missing)}."
+            )
         if not state.record(SliceDecision(approved=True, summary=summary.strip())):
             return "ERROR: a decision was already recorded for this slice."
         return "Decision recorded: APPROVED."
@@ -184,16 +219,18 @@ def build_slice_decision_tools(
             SliceDecision(approved=False, summary=summary.strip(), fixes=cleaned)
         ):
             return "ERROR: a decision was already recorded for this slice."
-        chainlink.comment(
+        warning = _safe_comment(
+            chainlink,
             leaf_id,
             "WORKLINK_REVIEW_FIXES requested by the slice reviewer:\n"
             + "\n".join(f"- {fix}" for fix in cleaned),
         )
-        return "Decision recorded: fixes requested."
+        return "Decision recorded: fixes requested." + warning
 
     @tool
     async def spawn_reviewer(lens: str) -> str:
         """Run one independent sub-reviewer with the given lens; returns its report."""
+        spawned_lenses.add(str(lens).strip().lower())
         return await spawn(lens)
 
     return [approve_slice, request_fixes, spawn_reviewer]
@@ -226,12 +263,13 @@ def build_integration_decision_tools(
             IntegrationDecision(approved=False, summary=summary.strip(), reasons=cleaned)
         ):
             return "ERROR: a decision was already recorded."
-        chainlink.comment(
+        warning = _safe_comment(
+            chainlink,
             epic_id,
             "WORKLINK_INTEGRATION_BLOCKED by the integration validator:\n"
             + "\n".join(f"- {reason}" for reason in cleaned),
         )
-        return "Decision recorded: integration blocked."
+        return "Decision recorded: integration blocked." + warning
 
     return [approve_integration, block_integration]
 
@@ -287,7 +325,11 @@ class EpicSubagentRoleRunner:
 
         state = _DecisionState()
         tools = build_slice_decision_tools(
-            leaf_id=leaf.issue.issue_id, chainlink=chainlink, state=state, spawn=spawn
+            leaf_id=leaf.issue.issue_id,
+            chainlink=chainlink,
+            state=state,
+            spawn=spawn,
+            required_lenses=lenses,
         )
         await self._run_agent(
             "lead-slice-reviewer", LEAD_SLICE_REVIEWER_PROMPT, tools, review_input

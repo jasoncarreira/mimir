@@ -196,15 +196,65 @@ def test_add_dependency_and_deficiency_comment() -> None:
 
     ok = tools["add_dependency"].invoke({"blocked_title": "B", "blocker_title": "A"})
     bad = tools["add_dependency"].invoke({"blocked_title": "B", "blocker_title": "Zed"})
-    note = tools["comment_on_epic"].invoke({"message": "no acceptance criteria in brief"})
-    again = tools["comment_on_epic"].invoke({"message": "second"})
 
     assert "Dependency added" in ok and bad.startswith("ERROR: unknown leaf title")
     assert chainlink.blockers[-1][:2] == (102, 101)
+
+
+def test_deficiency_comment_records_once_on_fresh_run() -> None:
+    chainlink = FakeChainlinkActions()
+    state = _DecomposeState()
+    tools = {t.name: t for t in build_decompose_tools(epic_id=99, chainlink=chainlink, state=state)}
+
+    note = tools["comment_on_epic"].invoke({"message": "no acceptance criteria in brief"})
+    again = tools["comment_on_epic"].invoke({"message": "second"})
+
     assert "Deficiency recorded" in note
     assert state.deficiency == "no acceptance criteria in brief"
     assert again.startswith("ERROR: a deficiency was already reported")
     assert any("WORKLINK_BRIEF_DEFICIENT" in text for _, text in chainlink.comments)
+
+
+def test_decompose_mode_is_mutually_exclusive_leaf_then_deficiency() -> None:
+    chainlink = FakeChainlinkActions()
+    state = _DecomposeState()
+    tools = {t.name: t for t in build_decompose_tools(epic_id=99, chainlink=chainlink, state=state)}
+    tools["file_leaf"].invoke(
+        {
+            "title": "A",
+            "acceptance_criteria": ["a"],
+            "review_criteria": ["r"],
+            "scope_paths": ["a.py"],
+            "suggested_test_command": "true",
+        }
+    )
+
+    refused = tools["comment_on_epic"].invoke({"message": "actually the brief is bad"})
+
+    assert refused.startswith("ERROR: leaves were already filed")
+    assert state.deficiency is None
+    assert not any("WORKLINK_BRIEF_DEFICIENT" in text for _, text in chainlink.comments)
+
+
+def test_decompose_mode_is_mutually_exclusive_deficiency_then_leaf() -> None:
+    chainlink = FakeChainlinkActions()
+    state = _DecomposeState()
+    tools = {t.name: t for t in build_decompose_tools(epic_id=99, chainlink=chainlink, state=state)}
+    tools["comment_on_epic"].invoke({"message": "no acceptance criteria"})
+
+    refused = tools["file_leaf"].invoke(
+        {
+            "title": "A",
+            "acceptance_criteria": ["a"],
+            "review_criteria": ["r"],
+            "scope_paths": ["a.py"],
+            "suggested_test_command": "true",
+        }
+    )
+
+    assert refused.startswith("ERROR: a brief deficiency was already reported")
+    assert chainlink.filed == [] and state.filed == 0
+    assert state.deficiency == "no acceptance criteria"
 
 
 # ─── decision tools ──────────────────────────────────────────────────────────
@@ -237,6 +287,86 @@ def test_slice_decision_records_once_and_comments_fixes() -> None:
         "WORKLINK_REVIEW_FIXES" in text and "run the tests" in text
         for _, text in chainlink.comments
     )
+
+
+@pytest.mark.asyncio
+async def test_approve_slice_is_tool_gated_on_required_lenses() -> None:
+    state = _DecisionState()
+
+    async def spawn(lens: str) -> str:
+        return "report"
+
+    tools = {
+        t.name: t
+        for t in build_slice_decision_tools(
+            leaf_id=101,
+            chainlink=FakeChainlinkActions(),
+            state=state,
+            spawn=spawn,
+            required_lenses=("correctness", "scope"),
+        )
+    }
+
+    early = tools["approve_slice"].invoke({"summary": "lgtm"})
+    assert early.startswith("ERROR: approval requires an independent sub-review")
+    assert "correctness" in early and "scope" in early
+    assert state.decision is None
+
+    await tools["spawn_reviewer"].ainvoke({"lens": "correctness"})
+    partial = tools["approve_slice"].invoke({"summary": "lgtm"})
+    assert partial.startswith("ERROR") and "scope" in partial and "correctness" not in partial
+
+    await tools["spawn_reviewer"].ainvoke({"lens": "scope"})
+    done = tools["approve_slice"].invoke({"summary": "lgtm"})
+    assert "Decision recorded: APPROVED" in done
+    assert state.decision == SliceDecision(approved=True, summary="lgtm")
+
+
+def test_request_fixes_is_never_lens_gated() -> None:
+    state = _DecisionState()
+
+    async def spawn(lens: str) -> str:
+        return "report"
+
+    tools = {
+        t.name: t
+        for t in build_slice_decision_tools(
+            leaf_id=101,
+            chainlink=FakeChainlinkActions(),
+            state=state,
+            spawn=spawn,
+            required_lenses=("correctness", "scope", "testing"),
+        )
+    }
+
+    rejected = tools["request_fixes"].invoke({"fixes": ["broken import"]})
+
+    assert "Decision recorded" in rejected
+    assert state.decision == SliceDecision(approved=False, summary="", fixes=("broken import",))
+
+
+def test_audit_comment_failure_does_not_void_decision() -> None:
+    class FailingComments(FakeChainlinkActions):
+        def comment(self, issue_id: int, text: str) -> None:
+            raise RuntimeError("chainlink unavailable")
+
+    state = _DecisionState()
+
+    async def spawn(lens: str) -> str:
+        return ""
+
+    tools = {
+        t.name: t
+        for t in build_slice_decision_tools(
+            leaf_id=101, chainlink=FailingComments(), state=state, spawn=spawn
+        )
+    }
+
+    recorded = tools["request_fixes"].invoke({"fixes": ["fix it"]})
+
+    assert "Decision recorded" in recorded
+    assert "WARNING: audit comment failed" in recorded
+    assert state.decision == SliceDecision(approved=False, summary="", fixes=("fix it",))
 
 
 def test_integration_decision_block_comments_epic() -> None:
