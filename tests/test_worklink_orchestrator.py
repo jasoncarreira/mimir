@@ -175,7 +175,7 @@ async def test_remote_test_job_heartbeats_claim_during_finalize() -> None:
         env={},
     )
 
-    exit_code = await _run_remote_test_job(
+    outcome = await _run_remote_test_job(
         SlowTestCompute(),
         spec,
         timeout_s=1800,
@@ -183,7 +183,8 @@ async def test_remote_test_job_heartbeats_claim_during_finalize() -> None:
         claim_record=claim_record,
     )
 
-    assert exit_code == 0
+    assert outcome.exit_code == 0
+    assert outcome.failure_tail is None
     heartbeats = claim_records_from_comments(comments)
     assert heartbeats
     assert heartbeats[-1].issue_id == 750

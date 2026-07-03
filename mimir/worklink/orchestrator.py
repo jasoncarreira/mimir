@@ -40,7 +40,7 @@ from .run_state import (
     load_run_state,
     save_run_state,
 )
-from .worker import extract_gate_test_tail
+from .worker import extract_gate_test_tail, gate_failure_detail
 from .worktree import WorktreeLease, cleanup_worktree, create_isolated_checkout, create_worktree
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -563,16 +563,20 @@ class WorklinkRunner:
                 and validation.evidence.diff_observed
                 and validation.evidence.files_changed
             ):
-                test_exit = await _run_remote_test_job(
+                test_outcome = await _run_remote_test_job(
                     compute,
                     spec,
                     timeout_s=config.defaults.timeout_s,
                     claims=claims,
                     claim_record=claim_record,
                 )
-                if test_exit is not None:
+                if test_outcome.exit_code is not None:
                     validation = fold_remote_test_evidence(
-                        validation, test_cmd, test_exit, backend_status=raw.backend_status
+                        validation,
+                        test_cmd,
+                        test_outcome.exit_code,
+                        backend_status=raw.backend_status,
+                        failure_tail=test_outcome.failure_tail,
                     )
             evidence_path = _write_evidence(self.home, validation.evidence)
             if validation.review_ready:
@@ -667,7 +671,7 @@ class WorklinkRunner:
             validation,
             evidence_path,
             gate_test_tail=(
-                None if validation.review_ready else extract_gate_test_tail(compute_result.stdout)
+                None if validation.review_ready else gate_failure_detail(validation, compute_result.stdout)
             ),
         )
         _log_event(
@@ -1294,6 +1298,20 @@ def _ensure_clean_worktree(worktree: Path, *, runner: Runner) -> None:
         raise WorklinkError("worktree still dirty after Worklink commit")
 
 
+@dataclass(frozen=True)
+class RemoteTestOutcome:
+    """Result of the controller-orchestrated sandboxed test job (chainlink #538).
+
+    ``exit_code`` is ``None`` when the job couldn't run cleanly (launch error /
+    timeout) — the caller leaves tests unobserved and the gate stays fail-closed.
+    ``failure_tail`` (chainlink #815) is the worker's WORKLINK_TESTS_TAIL section
+    parsed out of the job's stdout: the pytest failure detail that would
+    otherwise die with the test container."""
+
+    exit_code: int | None
+    failure_tail: str | None = None
+
+
 async def _run_remote_test_job(
     compute: Any,
     spec: Any,
@@ -1301,16 +1319,14 @@ async def _run_remote_test_job(
     timeout_s: int,
     claims: ChainlinkClaims | None = None,
     claim_record: ClaimRecord | None = None,
-) -> int | None:
-    """Dispatch a fresh sandboxed test job on the pushed branch and return its
-    exit code (chainlink #538): 0 = tests passed.
+) -> RemoteTestOutcome:
+    """Dispatch a fresh sandboxed test job on the pushed branch (chainlink #538):
+    exit 0 = tests passed.
 
     Reuses the same compute substrate as the implement run — the worker, in
     ``test_only`` mode, clones + checks out the pushed branch, runs
     ``test_command``, and exits with the test's code, which surfaces as the
-    job's ``ComputeResult.exit_code``. Returns ``None`` when the job couldn't run
-    cleanly (launch error / timeout) so the caller leaves tests unobserved and
-    the gate stays fail-closed.
+    job's ``ComputeResult.exit_code``.
     """
     test_spec = replace(spec, test_only=True)
     handle = None
@@ -1323,10 +1339,10 @@ async def _run_remote_test_job(
             result = await wait
     except ComputeLaunchError as exc:
         _log_event("worklink_remote_test_job_launch_failed", issue_id=spec.issue_id, error=str(exc)[:300])
-        return None
+        return RemoteTestOutcome(None)
     except Exception as exc:  # noqa: BLE001 — any dispatch failure is non-fatal: fail closed, leaving tests unobserved
         _log_event("worklink_remote_test_job_unobserved", issue_id=spec.issue_id, error=str(exc)[:300])
-        return None
+        return RemoteTestOutcome(None)
     finally:
         if handle is not None:
             await compute.cleanup(handle)
@@ -1337,9 +1353,9 @@ async def _run_remote_test_job(
             timed_out=result.timed_out,
             error=(result.launch_error or "")[:300],
         )
-        return None
+        return RemoteTestOutcome(None)
     _log_event("worklink_remote_test_job", issue_id=spec.issue_id, exit_code=result.exit_code)
-    return result.exit_code
+    return RemoteTestOutcome(result.exit_code, extract_gate_test_tail(result.stdout))
 
 
 def _git_push(repo: Path, branch: str, *, runner: Runner) -> None:

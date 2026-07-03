@@ -15,7 +15,7 @@ from typing import Any, Mapping, Sequence
 
 from .backends import BackendRegistry, WorkOrder, WorklinkConfig
 from .compute import ComputeLaunchError, ComputeResult, LocalSubprocessComputeBackend, WorkSpec
-from .evidence import EvidenceValidation, observe_evidence
+from .evidence import EvidenceValidation, _summarize_test_output, observe_evidence
 
 
 @dataclass(frozen=True)
@@ -221,6 +221,16 @@ async def _run_test_only(payload: WorkerPayload, *, runner: Any | None = None) -
         print(json.dumps({"test_only": True, "setup_error": str(exc)}))
         return 70  # setup failure — distinct from a test pass(0)/fail(non-zero)
     test = runner(spec.test_command, cwd=repo)
+    if test.returncode != 0:
+        # chainlink #815: this fresh sandboxed job is the REMOTE trusted gate —
+        # its pytest output would otherwise die with the container, leaving the
+        # next attempt only an exit code (the original blind-retry loop).
+        _print_tests_tail(
+            spec.test_command,
+            test.returncode,
+            _summarize_test_output(test),
+            _spec_secret_values(spec),
+        )
     print(json.dumps({
         "test_only": True,
         "branch": spec.branch,
@@ -270,6 +280,23 @@ TESTS_TAIL_END = "WORKLINK_TESTS_TAIL_END"
 _TESTS_TAIL_MAX_CHARS = 6000
 
 
+def _spec_secret_values(spec: WorkSpec) -> list[str]:
+    return sorted(
+        {value for value in (*spec.env.values(), *spec.creds_ref.values()) if len(value) >= 8},
+        key=len,
+        reverse=True,
+    )
+
+
+def _print_tests_tail(cmd: str | None, exit_code: int | None, body: str, secret_values: Sequence[str]) -> None:
+    body = (body or "(no output captured)").strip()[-_TESTS_TAIL_MAX_CHARS:]
+    print(TESTS_TAIL_BEGIN)
+    print(f"command: {cmd}")
+    print(f"exit: {exit_code}")
+    print(_redact_diagnostics(body, secret_values))
+    print(TESTS_TAIL_END, flush=True)
+
+
 def _emit_gate_test_failure(payload: WorkerPayload, validation: EvidenceValidation) -> None:
     """Print the failed gate-test output as a delimited stdout section (chainlink
     #815). Stdout is the only worker artifact that survives a docker-sibling
@@ -279,28 +306,33 @@ def _emit_gate_test_failure(payload: WorkerPayload, validation: EvidenceValidati
     tests = validation.evidence.tests
     if tests is None or not tests.observed or not tests.exit_code:
         return
-    spec = payload.spec
-    secret_values = sorted(
-        {value for value in (*spec.env.values(), *spec.creds_ref.values()) if len(value) >= 8},
-        key=len,
-        reverse=True,
-    )
-    body = (tests.summary or "(no output captured)").strip()[-_TESTS_TAIL_MAX_CHARS:]
-    print(TESTS_TAIL_BEGIN)
-    print(f"command: {tests.cmd}")
-    print(f"exit: {tests.exit_code}")
-    print(_redact_diagnostics(body, secret_values))
-    print(TESTS_TAIL_END, flush=True)
+    _print_tests_tail(tests.cmd, tests.exit_code, tests.summary or "", _spec_secret_values(payload.spec))
 
 
 def extract_gate_test_tail(stdout: str | None) -> str | None:
-    """Controller-side parser for the section ``_emit_gate_test_failure`` prints.
+    """Controller-side parser for the section ``_print_tests_tail`` emits.
     Tolerant of a missing/unterminated section; bounded to the emit cap."""
     if not stdout or TESTS_TAIL_BEGIN not in stdout:
         return None
     section = stdout.split(TESTS_TAIL_BEGIN, 1)[1]
     section = section.split(TESTS_TAIL_END, 1)[0].strip()
     return section[:_TESTS_TAIL_MAX_CHARS] or None
+
+
+def gate_failure_detail(validation: EvidenceValidation, stdout: str | None) -> str | None:
+    """Best available gate-failure detail for retry feedback (chainlink #815).
+
+    Prefers the WORKLINK_TESTS_TAIL section from the implementation worker's
+    stdout (local in-worker gate). When the worker's internal gate passed but
+    the controller's fresh sandboxed test job failed (the remote trusted gate),
+    the tail lives in the folded evidence's TestResult summary instead."""
+    tail = extract_gate_test_tail(stdout)
+    if tail:
+        return tail
+    tests = validation.evidence.tests
+    if tests is not None and tests.observed and tests.exit_code and tests.summary:
+        return tests.summary[:_TESTS_TAIL_MAX_CHARS]
+    return None
 
 
 _DIAG_BEGIN = "WORKLINK_WORKER_DIAG_BEGIN"

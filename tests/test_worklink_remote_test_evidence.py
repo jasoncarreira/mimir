@@ -80,6 +80,48 @@ def test_fold_failing_test_job_blocks_review(tmp_path: Path):
     assert folded.evidence.tests.observed is True  # observed, but failed
 
 
+def test_fold_failing_test_job_carries_failure_tail_into_summary(tmp_path: Path):
+    """chainlink #815 remote trusted gate: the test job's failure detail must
+    survive into the folded evidence so retry feedback can act on it."""
+    folded = fold_remote_test_evidence(
+        _remote_validation(tmp_path),
+        "pytest -q",
+        1,
+        backend_status="completed",
+        failure_tail="command: pytest -q\nexit: 1\nFAILED tests/test_a.py::t - boom",
+    )
+    assert folded.review_ready is False
+    assert "FAILED tests/test_a.py::t - boom" in folded.evidence.tests.summary
+    assert "remote sandboxed test job: exit 1" in folded.evidence.tests.summary
+
+    # A PASSING job ignores any stray tail — summary stays the exit line.
+    passing = fold_remote_test_evidence(
+        _remote_validation(tmp_path), "pytest -q", 0, backend_status="completed",
+        failure_tail="stray",
+    )
+    assert passing.evidence.tests.summary == "remote sandboxed test job: exit 0"
+
+
+def test_gate_failure_detail_prefers_stdout_then_folded_evidence(tmp_path: Path):
+    from mimir.worklink.worker import gate_failure_detail
+
+    folded = fold_remote_test_evidence(
+        _remote_validation(tmp_path), "pytest -q", 1, backend_status="completed",
+        failure_tail="FAILED tests/test_a.py::t - boom",
+    )
+    # No section in the implementation job's stdout → falls back to the folded
+    # remote-gate evidence.
+    assert "FAILED tests/test_a.py::t - boom" in gate_failure_detail(folded, "worklink worker: completed")
+    # A stdout section (worker's local gate) wins when present.
+    stdout = "WORKLINK_TESTS_TAIL_BEGIN\nlocal gate detail\nWORKLINK_TESTS_TAIL_END\n"
+    assert gate_failure_detail(folded, stdout) == "local gate detail"
+    # Review-ready evidence with passing tests yields nothing.
+    passing = fold_remote_test_evidence(
+        _remote_validation(tmp_path), "pytest -q", 0, backend_status="completed"
+    )
+    assert gate_failure_detail(passing, "worklink worker: completed") is None
+
+
 def test_fold_cannot_launder_a_failed_run_even_when_tests_pass(tmp_path: Path):
     # Defense in depth: even if fold is reached on a non-completed backend run
     # (e.g. a partial diff got pushed), a passing test job must NOT flip it to
@@ -139,6 +181,51 @@ async def test_run_test_only_propagates_test_failure_exit_code(tmp_path: Path):
 
     code = await _run_test_only(_test_only_payload(tmp_path, "pytest -q"), runner=runner)
     assert code == 1  # non-zero → caller blocks the gate
+
+
+@pytest.mark.asyncio
+async def test_run_test_only_failure_emits_tests_tail_section(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """chainlink #815: the remote trusted gate's failure output must survive the
+    test container via stdout — otherwise the retry loop stays blind whenever the
+    worker's internal gate passed but the controller's fresh job failed."""
+    failure_output = "\n".join(
+        [f"line-{index}" for index in range(1, 81)]
+        + ["FAILED tests/test_remote.py::test_gate - AssertionError", "1 failed in 2.2s"]
+    )
+
+    def runner(args, *, cwd=None):
+        if args == "pytest -q":
+            return _cp(args, returncode=1, stdout=failure_output)
+        return _cp(args)
+
+    code = await _run_test_only(_test_only_payload(tmp_path, "pytest -q"), runner=runner)
+
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "WORKLINK_TESTS_TAIL_BEGIN" in out
+    section = out.split("WORKLINK_TESTS_TAIL_BEGIN", 1)[1].split("WORKLINK_TESTS_TAIL_END", 1)[0]
+    assert "command: pytest -q" in section
+    assert "exit: 1" in section
+    assert "FAILED tests/test_remote.py::test_gate" in section
+    assert "line-1\n" not in section  # tail, not head
+    # The machine-readable JSON status line is still the FINAL line.
+    assert out.rstrip().splitlines()[-1].startswith('{"test_only": true')
+
+
+@pytest.mark.asyncio
+async def test_run_test_only_success_emits_no_tail_section(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    def runner(args, *, cwd=None):
+        if args == "echo ok":
+            return _cp(args, returncode=0, stdout="all good")
+        return _cp(args)
+
+    code = await _run_test_only(_test_only_payload(tmp_path), runner=runner)
+    assert code == 0
+    assert "WORKLINK_TESTS_TAIL" not in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
