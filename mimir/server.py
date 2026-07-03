@@ -635,6 +635,221 @@ def reattach_inflight_worklink_runs(
     return dispatched
 
 
+def _worklink_exhaustion_dirs(home: Path) -> list[Path]:
+    root = home / "state" / "worklink"
+    return [root / "exhaustion", root / "exhausted"]
+
+
+def _checkpoint_issue_id(data: dict[str, Any]) -> int | None:
+    for key in ("issue_id", "chainlink_issue_id", "worklink_issue_id"):
+        try:
+            return int(data[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+def _checkpoint_dedupe_key(path: Path, data: dict[str, Any], issue_id: int | None) -> str:
+    for key in ("work_item_key", "exhaustion_key", "turn_id", "source_id"):
+        raw = data.get(key)
+        if isinstance(raw, str) and raw.strip():
+            prefix = f"issue:{issue_id}:" if issue_id is not None else ""
+            return prefix + raw.strip()
+    if issue_id is not None:
+        return f"issue:{issue_id}"
+    return path.stem
+
+
+def _safe_checkpoint_key(key: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.:-]+", "_", key).strip("._") or "checkpoint"
+
+
+def _mark_exhaustion_checkpoint_consumed(
+    home: Path,
+    *,
+    key: str,
+    source: Path,
+    action: str,
+) -> bool:
+    consumed_dir = home / "state" / "worklink" / "exhaustion-consumed"
+    consumed_dir.mkdir(parents=True, exist_ok=True)
+    marker = consumed_dir / f"{_safe_checkpoint_key(key)}.json"
+    try:
+        fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return False
+    payload = {
+        "key": key,
+        "source": str(source),
+        "action": action,
+        "consumed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    return True
+
+
+def _dispatch_exhausted_worklink_issue(
+    home: Path,
+    repo: str,
+    issue_id: int,
+    *,
+    popen: Any,
+) -> None:
+    import shlex
+    import subprocess
+
+    from .worklink.run_state import load_run_state, reattach_dispatch_argv
+
+    run_bin = shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir")
+    if load_run_state(home, issue_id) is not None:
+        argv = reattach_dispatch_argv(run_bin, home, repo, issue_id)
+    else:
+        argv = [
+            *run_bin,
+            "worklink",
+            "run",
+            str(issue_id),
+            "--autonomous",
+            "--home",
+            str(home),
+            "--repo",
+            repo,
+        ]
+    log_dir = home / "state" / "worklink" / "exhaustion-recovery"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"run-{issue_id}.log"
+    try:
+        log_fh: Any = log_path.open("ab")
+    except OSError:
+        log_fh = subprocess.DEVNULL
+    try:
+        popen(
+            argv,
+            cwd=repo,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+        )
+    finally:
+        if log_fh not in (subprocess.DEVNULL, None):
+            try:
+                log_fh.close()
+            except OSError:
+                pass
+
+
+def _file_exhaustion_followup(
+    home: Path,
+    data: dict[str, Any],
+    *,
+    runner: Any,
+) -> None:
+    import subprocess
+
+    title = str(data.get("title") or "Recover exhausted Worklink turn")[:120]
+    turn_id = data.get("turn_id") or data.get("source_id") or "unknown"
+    reason = data.get("reason") or data.get("error") or "tool-call budget exhausted"
+    body = (
+        "A persisted Worklink exhaustion checkpoint was found during startup, "
+        "but it did not identify a Chainlink issue to retry.\n\n"
+        f"Turn/work key: {turn_id}\n"
+        f"Reason: {reason}\n\n"
+        "Review the original turn artifact and schedule the appropriate continuation."
+    )
+    result = runner(
+        [
+            os.environ.get("CHAINLINK_BIN") or "chainlink",
+            "issue",
+            "create",
+            title,
+            "--description",
+            body,
+            "--priority",
+            "high",
+            "--label",
+            "worklink",
+            "--label",
+            "recovery",
+        ],
+        cwd=str(home),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if getattr(result, "returncode", 0) != 0:
+        message = (
+            getattr(result, "stderr", None)
+            or getattr(result, "stdout", None)
+            or "chainlink issue create failed"
+        )
+        raise subprocess.SubprocessError(str(message).strip())
+
+
+def consume_worklink_exhaustion_checkpoints(
+    home: Path,
+    *,
+    popen: Any = None,
+    runner: Any = None,
+) -> dict[str, Any]:
+    """Consume persisted Worklink exhaustion checkpoints once.
+
+    Checkpoints live under ``state/worklink/exhaustion`` (``exhausted`` is
+    accepted for early producers). A known Chainlink issue becomes a detached
+    Worklink recovery run. Unknown work becomes a high-priority Chainlink
+    follow-up. The consumed ledger is keyed by the exhausted turn/work item so
+    repeated startup or autonomous recovery passes do not enqueue duplicates.
+    """
+    import subprocess
+
+    spawn = popen or subprocess.Popen
+    run = runner or subprocess.run
+    repo = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    recovered: list[int] = []
+    followups = 0
+    skipped = 0
+    errors: list[str] = []
+    for directory in _worklink_exhaustion_dirs(home):
+        if not directory.exists():
+            continue
+        for path in sorted(directory.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                skipped += 1
+                continue
+            if not isinstance(data, dict):
+                skipped += 1
+                continue
+            issue_id = _checkpoint_issue_id(data)
+            action = "worklink_run" if issue_id is not None else "chainlink_followup"
+            key = _checkpoint_dedupe_key(path, data, issue_id)
+            if not _mark_exhaustion_checkpoint_consumed(
+                home, key=key, source=path, action=action,
+            ):
+                skipped += 1
+                continue
+            try:
+                if issue_id is not None:
+                    if not repo:
+                        raise RuntimeError("WORKLINK_REPO is required for Worklink recovery")
+                    _dispatch_exhausted_worklink_issue(home, repo, issue_id, popen=spawn)
+                    recovered.append(issue_id)
+                else:
+                    _file_exhaustion_followup(home, data, runner=run)
+                    followups += 1
+            except Exception as exc:  # noqa: BLE001 - best-effort startup recovery
+                errors.append(f"{path.name}: {exc}")
+    return {
+        "recovered": recovered,
+        "followups": followups,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
 def build_app(config: Config) -> web.Application:
     # 10MB body cap (aiohttp default is 1MB). Mimir takes JSON-only bodies on
     # /event and /chat — long bluesky transcripts and seed payloads can run
@@ -1347,6 +1562,22 @@ def build_app(config: Config) -> web.Application:
                 await log_event("worklink_reattach_dispatched", issues=resumed)
         except Exception as exc:  # noqa: BLE001 — startup reconcile must never abort boot
             await log_event("worklink_reattach_dispatch_failed", error=str(exc))
+
+        # Consume Worklink exhaustion checkpoints (#808). These are written when
+        # an autonomous turn stops at the tool-call budget with a durable pointer
+        # to the work item. Startup turns each unconsumed checkpoint into exactly
+        # one next action: detached Worklink recovery for known issues, or a
+        # high-priority Chainlink follow-up when the issue is unknown.
+        try:
+            exhaustion = consume_worklink_exhaustion_checkpoints(config.home)
+            if (
+                exhaustion["recovered"]
+                or exhaustion["followups"]
+                or exhaustion["errors"]
+            ):
+                await log_event("worklink_exhaustion_recovery", **exhaustion)
+        except Exception as exc:  # noqa: BLE001 — startup recovery must never abort boot
+            await log_event("worklink_exhaustion_recovery_failed", error=str(exc))
 
         # Register the weekly viability report (SPEC §16 follow-up
         # from the 2026-05-23 VSM eval — collapse detection + curation

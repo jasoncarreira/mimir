@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 from typing import Sequence
@@ -498,3 +499,125 @@ def test_reattach_inflight_noop_without_repo(tmp_path: Path, monkeypatch) -> Non
     )
     assert dispatched == []
     assert spawned == []
+
+
+def test_exhaustion_checkpoint_known_issue_dispatches_once(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from mimir import server
+
+    checkpoint_dir = tmp_path / "state" / "worklink" / "exhaustion"
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / "turn-abc.json").write_text(
+        json.dumps(
+            {
+                "issue_id": 808,
+                "turn_id": "turn-abc",
+                "reason": "tool-call budget exhausted",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
+    monkeypatch.delenv("WORKLINK_RUN_BIN", raising=False)
+    spawned: list[dict] = []
+
+    def fake_popen(argv, **kwargs):
+        spawned.append({"argv": argv, "kwargs": kwargs})
+        return object()
+
+    first = server.consume_worklink_exhaustion_checkpoints(
+        tmp_path, popen=fake_popen
+    )
+    second = server.consume_worklink_exhaustion_checkpoints(
+        tmp_path, popen=fake_popen
+    )
+
+    assert first["recovered"] == [808]
+    assert first["followups"] == 0
+    assert first["errors"] == []
+    assert second["recovered"] == []
+    assert second["followups"] == 0
+    assert len(spawned) == 1
+    assert spawned[0]["argv"] == [
+        "mimir", "worklink", "run", "808", "--autonomous",
+        "--home", str(tmp_path), "--repo", "/workspace/mimir",
+    ]
+    assert spawned[0]["kwargs"]["start_new_session"] is True
+
+
+def test_exhaustion_checkpoint_known_issue_reattaches_when_run_state_exists(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from mimir import server
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _save_inflight_state(tmp_path, repo, issue_id=809, job="job-survived")
+    checkpoint_dir = tmp_path / "state" / "worklink" / "exhaustion"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    (checkpoint_dir / "turn-reattach.json").write_text(
+        json.dumps({"chainlink_issue_id": 809, "turn_id": "turn-reattach"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    spawned: list[list[str]] = []
+
+    result = server.consume_worklink_exhaustion_checkpoints(
+        tmp_path,
+        popen=lambda argv, **kwargs: spawned.append(argv),
+    )
+
+    assert result["recovered"] == [809]
+    assert spawned == [
+        [
+            "mimir", "worklink", "run", "809", "--reattach", "--autonomous",
+            "--home", str(tmp_path), "--repo", str(repo),
+        ]
+    ]
+
+
+def test_exhaustion_checkpoint_unknown_issue_files_followup_once(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from mimir import server
+
+    checkpoint_dir = tmp_path / "state" / "worklink" / "exhausted"
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / "unknown.json").write_text(
+        json.dumps(
+            {
+                "work_item_key": "worker:lost-turn",
+                "turn_id": "lost-turn",
+                "reason": "tool-call budget exhausted before Chainlink id",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    calls: list[tuple] = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return cp(args, stdout="#900\n")
+
+    first = server.consume_worklink_exhaustion_checkpoints(
+        tmp_path, runner=fake_run
+    )
+    second = server.consume_worklink_exhaustion_checkpoints(
+        tmp_path, runner=fake_run
+    )
+
+    assert first["recovered"] == []
+    assert first["followups"] == 1
+    assert first["errors"] == []
+    assert second["followups"] == 0
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[:4] == [
+        "chainlink", "issue", "create", "Recover exhausted Worklink turn",
+    ]
+    assert "--priority" in args
+    assert args[args.index("--priority") + 1] == "high"
+    assert "--label" in args
+    assert kwargs["cwd"] == str(tmp_path)
