@@ -101,6 +101,8 @@ from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
 READY_LABEL = "worklink:ready"
 EPIC_LABEL = "worklink:epic"
+BLOCKED_LABEL = "worklink:blocked"
+REVIEW_LABEL = "worklink:review"
 
 
 @dataclass(frozen=True)
@@ -287,15 +289,27 @@ def _worklink_dispatch_plan(
     """
     ready_records = _issue_records_with_label(home, READY_LABEL)
     epic_records = _issue_records_with_label(home, EPIC_LABEL)
+    blocked_records = _issue_records_with_label(home, BLOCKED_LABEL)
+    review_records = _issue_records_with_label(home, REVIEW_LABEL)
     actionable_ids = _actionable_issue_ids(home)
-    if ready_records is None or epic_records is None or actionable_ids is None:
+    if (
+        ready_records is None
+        or epic_records is None
+        or blocked_records is None
+        or review_records is None
+        or actionable_ids is None
+    ):
         return None
     labeled = {record.issue_id for record in ready_records}
     epics = {record.issue_id for record in epic_records}
+    terminal_epics = epics & (
+        {record.issue_id for record in blocked_records}
+        | {record.issue_id for record in review_records}
+    )
     actionable = set(actionable_ids)
-    dispatchable_epics = sorted(epics & actionable)
+    dispatchable_epics = sorted((epics & actionable) - terminal_epics)
     active_epics = epics & active_lock_ids
-    handled_epics = set(dispatchable_epics) | active_epics
+    handled_epics = set(dispatchable_epics) | active_epics | terminal_epics
     dispatchable_leaves = sorted(
         record.issue_id
         for record in ready_records

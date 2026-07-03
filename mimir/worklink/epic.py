@@ -273,6 +273,11 @@ class ChainlinkEpicClient:
         self.runner([self.chainlink_bin, "issue", "unlabel", str(epic_id), "worklink:in-progress"])
         self.runner([self.chainlink_bin, "issue", "label", str(epic_id), "worklink:review"])
 
+    def move_epic_to_blocked(self, epic_id: int) -> None:
+        self.runner([self.chainlink_bin, "issue", "unlabel", str(epic_id), "worklink:ready"])
+        self.runner([self.chainlink_bin, "issue", "unlabel", str(epic_id), "worklink:in-progress"])
+        self.runner([self.chainlink_bin, "issue", "label", str(epic_id), "worklink:blocked"])
+
     def mark_epic_failed(self, epic_id: int, *, retryable: bool, reason: str) -> None:
         self.runner([self.chainlink_bin, "issue", "comment", str(epic_id), f"WORKLINK_EPIC_FAILED {reason}"])
         self.runner([self.chainlink_bin, "issue", "unlabel", str(epic_id), "worklink:in-progress"])
@@ -371,6 +376,15 @@ class EpicRunner:
                 heartbeat()
             else:
                 manifest = existing_manifest
+                if _manifest_is_terminal_blocked(manifest):
+                    chainlink.move_epic_to_blocked(epic_id)
+                    return EpicRunResult(
+                        epic_id,
+                        "blocked",
+                        blocked_leaves=tuple(sorted(item.id for item in manifest.slices)),
+                        manifest_path=self.home / "state" / "worklink" / "epics" / f"{epic_id}.json",
+                        reason="all slices blocked",
+                    )
                 resume_point = resume_epic_run(manifest)
                 if resume_point.complete:
                     return EpicRunResult(
@@ -529,6 +543,7 @@ class EpicRunner:
                     lambda current: replace(current, status="blocked"),
                 )
                 heartbeat()
+                chainlink.move_epic_to_blocked(epic_id)
                 return EpicRunResult(
                     epic_id,
                     "blocked",
@@ -545,6 +560,7 @@ class EpicRunner:
                     lambda current: replace(current, status="blocked"),
                 )
                 heartbeat()
+                chainlink.move_epic_to_blocked(epic_id)
                 return EpicRunResult(
                     epic_id,
                     "blocked",
@@ -1152,6 +1168,14 @@ def _persist_epic_crash_checkpoint(home: Path, epic_id: int, *, retryable: bool)
 def _failure_reason(exc: Exception) -> str:
     text = str(exc).strip()
     return (text or exc.__class__.__name__)[:1000]
+
+
+def _manifest_is_terminal_blocked(manifest: EpicRunManifest) -> bool:
+    return bool(
+        manifest.status == "blocked"
+        and manifest.slices
+        and all(record.status == "blocked" for record in manifest.slices)
+    )
 
 
 def _slice(manifest: EpicRunManifest, leaf_id: int) -> EpicSliceRecord:
