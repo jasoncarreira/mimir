@@ -64,6 +64,151 @@ def test_readonly_permissions_block_filesystem_write_tool() -> None:
     assert result.content == "Error: permission denied for write on /blocked.txt"
 
 
+def test_critic_findings_parses_observed_model_variance_payload() -> None:
+    structured = CriticFindings.model_validate(
+        {
+            "verdict": "findings",
+            "summary": "Two concerns found.",
+            "ignored": "extra response field",
+            "findings": [
+                {
+                    "title": "Missing guard",
+                    "severity": "high",
+                    "evidence": "mimir/subagents.py crashes on literal mismatch",
+                    "file": "mimir/subagents.py",
+                },
+                {
+                    "title": "Retry loses review",
+                    "severity": "medium",
+                    "evidence": "agent.astream failed before returning a result",
+                    "file": "mimir/subagents.py",
+                },
+            ],
+        }
+    )
+
+    assert structured.verdict == "blocker"
+    assert [finding.severity for finding in structured.findings] == [
+        "blocker",
+        "important",
+    ]
+    assert structured.findings[0].recommendation == ""
+    assert structured.findings[0].model_dump() == {
+        "title": "Missing guard",
+        "severity": "blocker",
+        "evidence": "mimir/subagents.py crashes on literal mismatch",
+        "recommendation": "",
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw_severity", "expected"),
+    [
+        ("critical", "blocker"),
+        ("high", "blocker"),
+        ("medium", "important"),
+        ("low", "nit"),
+        ("minor", "nit"),
+        ("Not Mapped", "important"),
+    ],
+)
+def test_critic_finding_normalizes_severity_synonyms(
+    raw_severity: str, expected: str
+) -> None:
+    finding = CriticFinding.model_validate(
+        {
+            "title": "Concern",
+            "severity": raw_severity,
+            "evidence": "evidence",
+            "recommendation": "fix",
+        }
+    )
+
+    assert finding.severity == expected
+
+
+def test_critic_findings_unknown_verdict_falls_back_to_most_severe_finding() -> None:
+    structured = CriticFindings.model_validate(
+        {
+            "verdict": "findings",
+            "summary": "Fallback from findings.",
+            "findings": [
+                {
+                    "title": "Minor concern",
+                    "severity": "minor",
+                    "evidence": "small issue",
+                    "recommendation": "polish",
+                },
+                {
+                    "title": "Important concern",
+                    "severity": "medium",
+                    "evidence": "larger issue",
+                    "recommendation": "fix",
+                },
+            ],
+        }
+    )
+
+    assert structured.verdict == "important"
+
+
+def test_critic_findings_unknown_verdict_without_findings_defaults_to_important() -> None:
+    structured = CriticFindings.model_validate(
+        {"verdict": "findings", "summary": "No concrete findings.", "findings": []}
+    )
+
+    assert structured.verdict == "important"
+
+
+def test_critic_findings_malformed_finding_degrades_to_best_effort() -> None:
+    structured = CriticFindings.model_validate(
+        {
+            "verdict": "findings",
+            "summary": "Malformed child item.",
+            "findings": [
+                "plain finding text",
+                {
+                    "message": "message-only finding",
+                    "severity": {"unexpected": "shape"},
+                    "file": "mimir/subagents.py",
+                },
+            ],
+        }
+    )
+
+    assert structured.verdict == "important"
+    assert structured.findings[0].model_dump() == {
+        "title": "plain finding text",
+        "severity": "important",
+        "evidence": "",
+        "recommendation": "",
+    }
+    assert structured.findings[1].model_dump() == {
+        "title": "message-only finding",
+        "severity": "important",
+        "evidence": "mimir/subagents.py",
+        "recommendation": "",
+    }
+
+
+def test_critic_findings_well_formed_round_trip_is_unchanged() -> None:
+    payload = {
+        "verdict": "important",
+        "summary": "One test gap remains.",
+        "findings": [
+            {
+                "title": "Missing regression test",
+                "severity": "important",
+                "evidence": "tests/test_example.py has no coverage for the new branch",
+                "recommendation": "Add a focused test before shipping.",
+            }
+        ],
+        "open_questions": ["Should this path be covered at the API boundary?"],
+    }
+
+    assert CriticFindings.model_validate(payload).model_dump() == payload
+
+
 def test_task_tool_returns_structured_response_as_json_tool_message() -> None:
     finding = CriticFinding(
         title="Missing regression test",
