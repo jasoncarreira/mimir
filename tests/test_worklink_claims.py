@@ -257,3 +257,40 @@ def test_transition_failed_exhausted_attempt_blocks() -> None:
 
     assert ["chainlink", "issue", "label", "2", "worklink:blocked"] in calls
     assert ["chainlink", "issue", "label", "2", "worklink:ready"] not in calls
+
+
+def _reclaim_runner(calls, stdout="You already hold the lock on issue #783"):
+    def runner(args):
+        calls.append(list(args))
+        if list(args)[1:3] == ["locks", "claim"]:
+            return subprocess.CompletedProcess(list(args), 0, stdout=stdout, stderr="")
+        return subprocess.CompletedProcess(list(args), 0, stdout="", stderr="")
+    return runner
+
+
+def test_same_agent_reclaim_with_fresh_heartbeat_is_refused():
+    """chainlink #822: 'You already hold the lock' rc=0 must not admit a
+    duplicate process while the owner's claim heartbeat is fresh."""
+    now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
+    calls: list[list[str]] = []
+    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls), clock=lambda: now)
+    fresh = ClaimRecord(issue_id=783, attempt=1, agent_id="mimir-worklink-epic", claimed_at=now, heartbeat_at=now)
+
+    result = claims.claim_issue(783, [fresh.to_comment()])
+
+    assert result.claimed is False
+    assert result.reason == "duplicate_run_live"
+    # refused WITHOUT touching labels/comments or stealing
+    assert not any(call[1] in ("issue",) or call[1:3] == ["locks", "steal"] for call in calls if len(call) > 2)
+
+
+def test_same_agent_reclaim_with_stale_heartbeat_steals_and_proceeds():
+    now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
+    calls: list[list[str]] = []
+    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls), clock=lambda: now)
+    stale = ClaimRecord(issue_id=783, attempt=1, agent_id="mimir-worklink-epic", claimed_at=now - timedelta(hours=2), heartbeat_at=now - timedelta(hours=1))
+
+    result = claims.claim_issue(783, [stale.to_comment()])
+
+    assert result.claimed is True
+    assert any(call[1:3] == ["locks", "steal"] for call in calls)
