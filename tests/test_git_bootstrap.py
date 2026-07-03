@@ -999,6 +999,9 @@ def test_ensure_workspace_hooks_installs_pre_push(tmp_path: Path) -> None:
     content = hook.read_text()
     assert "origin" in content
     assert "stale" in content.lower()
+    assert "Worklink slice branches" in content
+    assert r"^issue/[0-9]+-a[0-9]+$" in content
+    assert 'epic/*' in content
 
 
 def test_ensure_workspace_hooks_idempotent(tmp_path: Path) -> None:
@@ -1013,6 +1016,22 @@ def test_ensure_workspace_hooks_idempotent(tmp_path: Path) -> None:
     assert r1 is True
     assert r2 is True
     assert (workspace / ".git" / "hooks" / "pre-push").is_file()
+
+
+def test_ensure_workspace_hooks_overwrites_existing_pre_push(tmp_path: Path) -> None:
+    """Template updates must propagate to already-bootstrapped workspaces."""
+    workspace = tmp_path / "workspace"
+    _init_bare_repo(workspace)
+    hook = workspace / ".git" / "hooks" / "pre-push"
+    hook.write_text("#!/bin/sh\necho stale old hook\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    result = git_bootstrap.ensure_workspace_hooks(workspace)
+
+    assert result is True
+    content = hook.read_text(encoding="utf-8")
+    assert "stale old hook" not in content
+    assert "Worklink slice branches" in content
 
 
 def test_ensure_workspace_hooks_no_git_dir_returns_false(tmp_path: Path) -> None:
@@ -1044,6 +1063,76 @@ def test_ensure_workspace_hooks_missing_template_returns_false(
 
     assert result is False
     assert not (workspace / ".git" / "hooks" / "pre-push").is_file()
+
+
+def _workspace_with_stale_branch(tmp_path: Path, branch: str) -> Path:
+    """Return a clone where ``branch`` is based behind current origin/main."""
+    origin = tmp_path / f"{branch.replace('/', '_')}.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+        check=True, capture_output=True,
+    )
+
+    ws_a = tmp_path / f"{branch.replace('/', '_')}_a"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(ws_a)],
+        check=True, capture_output=True,
+    )
+    _git("config", "user.name", "Test", cwd=ws_a)
+    _git("config", "user.email", "test@example.com", cwd=ws_a)
+    _git("config", "commit.gpgsign", "false", cwd=ws_a)
+    (ws_a / "README.md").write_text("initial\n", encoding="utf-8")
+    _git("add", "README.md", cwd=ws_a)
+    _git("commit", "-q", "-m", "initial", cwd=ws_a)
+    _git("push", "-q", "origin", "main", cwd=ws_a)
+
+    ws_b = tmp_path / f"{branch.replace('/', '_')}_b"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(ws_b)],
+        check=True, capture_output=True,
+    )
+    _git("config", "user.name", "Test", cwd=ws_b)
+    _git("config", "user.email", "test@example.com", cwd=ws_b)
+    _git("config", "commit.gpgsign", "false", cwd=ws_b)
+
+    (ws_a / "other.md").write_text("other PR\n", encoding="utf-8")
+    _git("add", "other.md", cwd=ws_a)
+    _git("commit", "-q", "-m", "other PR merged to main", cwd=ws_a)
+    _git("push", "-q", "origin", "main", cwd=ws_a)
+
+    _git("checkout", "-b", branch, cwd=ws_b)
+    (ws_b / "branch.txt").write_text(f"{branch}\n", encoding="utf-8")
+    _git("add", "branch.txt", cwd=ws_b)
+    _git("commit", "-q", "-m", f"add {branch}", cwd=ws_b)
+    git_bootstrap.ensure_workspace_hooks(ws_b)
+    return ws_b
+
+
+@pytest.mark.parametrize("branch", ["issue/793-a3", "epic/783-integration"])
+def test_pre_push_hook_exempts_worklink_stale_branches(tmp_path: Path, branch: str) -> None:
+    """Worklink branch classes do not rebase directly onto origin/main."""
+    workspace = _workspace_with_stale_branch(tmp_path, branch)
+
+    proc = subprocess.run(
+        [str(workspace / ".git" / "hooks" / "pre-push"), "origin", ""],
+        cwd=workspace, capture_output=True, text=True, check=False,
+    )
+
+    assert proc.returncode == 0
+    assert "STALE BASE" not in (proc.stdout + proc.stderr)
+
+
+def test_pre_push_hook_still_refuses_stale_feature_branch_shell(tmp_path: Path) -> None:
+    """The Worklink exemption must not weaken the gate for normal branches."""
+    workspace = _workspace_with_stale_branch(tmp_path, "feature/x")
+
+    proc = subprocess.run(
+        [str(workspace / ".git" / "hooks" / "pre-push"), "origin", ""],
+        cwd=workspace, capture_output=True, text=True, check=False,
+    )
+
+    assert proc.returncode == 1
+    assert "STALE BASE" in (proc.stdout + proc.stderr)
 
 
 def test_pre_push_hook_refuses_stale_branch(tmp_path: Path) -> None:
