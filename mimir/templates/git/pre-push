@@ -23,6 +23,15 @@ if [ "$remote" != "origin" ]; then
     exit 0
 fi
 
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "<unknown>")
+
+# Worklink slice branches (issue/<digits>-a<digits>) are based on their
+# epic integration branch, and epic/* integration branches merge through the
+# single epic draft PR. The rebase-on-main rule is for standalone PR branches.
+if [[ "$BRANCH" =~ ^issue/[0-9]+-a[0-9]+$ || "$BRANCH" == epic/* ]]; then
+    exit 0
+fi
+
 # Fetch latest origin/main so we have the current tip.
 if ! git fetch --quiet origin main 2>/dev/null; then
     echo "pre-push: could not fetch origin/main — skipping staleness check" >&2
@@ -39,7 +48,6 @@ MAIN_TIP=$(git rev-parse origin/main 2>/dev/null) || {
 }
 
 if [ "$MERGE_BASE" != "$MAIN_TIP" ]; then
-    BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "<unknown>")
     echo "pre-push: STALE BASE on branch '$BRANCH'" >&2
     echo "  merge-base : $MERGE_BASE" >&2
     echo "  origin/main: $MAIN_TIP" >&2

@@ -87,6 +87,11 @@ other PRs may have merged to `main`; a stale base makes the PR diff include
 complete reverts of unrelated landed work. A squash-merge would silently drop
 those commits from `main`.
 
+Exception: Worklink slice branches named `issue/<digits>-a<digits>` are based
+on their epic integration branch, and `epic/*` integration branches merge to
+main only through the single epic draft PR. Do not rebase those machinery
+branches directly onto `origin/main` for this gate.
+
 ```bash
 # Step 1: fetch and check staleness
 git fetch origin main
