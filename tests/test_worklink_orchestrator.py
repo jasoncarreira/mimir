@@ -542,8 +542,12 @@ def test_worker_gate_failure_emits_tests_tail_section(
     # Tail-based: early noise dropped; secrets redacted.
     assert "noise-line-1\n" not in section
     assert "super-secret-gate-value" not in section
-    # The general diag block still follows for full context.
+    # The general diag block still follows for full context, and (chainlink
+    # #816) carries its own bounded gate-tests section.
     assert "WORKLINK_WORKER_DIAG_BEGIN" in out
+    diag = out.split("WORKLINK_WORKER_DIAG_BEGIN", 1)[1].split("WORKLINK_WORKER_DIAG_END", 1)[0]
+    assert "--- gate tests: echo ok (exit 1) ---" in diag
+    assert "FAILED tests/test_z.py::test_gate" in diag
 
 
 def test_extract_gate_test_tail_parses_and_bounds() -> None:
@@ -579,8 +583,38 @@ def test_worker_diag_block_is_size_capped(
     out = capsys.readouterr().out
     assert "WORKLINK_WORKER_DIAG_END" in out
     diag = out.split("WORKLINK_WORKER_DIAG_BEGIN", 1)[1].split("WORKLINK_WORKER_DIAG_END", 1)[0]
-    assert len(diag) <= 8100
-    assert "(head truncated)" in diag
+    assert len(diag) <= 8600
+    # chainlink #816: per-section caps — the header always survives, and the
+    # oversized stderr section is tail-capped with a marker.
+    assert "issue=#793 attempt=2" in diag
+    assert "(truncated)" in diag
+
+
+def test_worker_diag_header_survives_giant_single_line_transcript(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """chainlink #816: one giant transcript JSONL line used to eat the whole
+    8KB budget and truncate away the header + stderr sections."""
+    backend = WorkerScriptedBackend(
+        script="import sys; sys.stderr.write('codex: the real error line\\n'); sys.exit(3)",
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    transcripts = tmp_path / "transcripts"
+    transcripts.mkdir(parents=True)
+    (transcripts / "fake.json").write_text('{"blob": "' + "y" * 50000 + '"}', encoding="utf-8")
+    payload = _worker_diag_payload(tmp_path, backend)
+
+    asyncio.run(
+        run_worker_payload(payload, registry=registry, runner=_worker_diag_runner(payload.repo_dir))
+    )
+
+    out = capsys.readouterr().out
+    diag = out.split("WORKLINK_WORKER_DIAG_BEGIN", 1)[1].split("WORKLINK_WORKER_DIAG_END", 1)[0]
+    assert "issue=#793 attempt=2" in diag
+    assert "backend_exit=3" in diag
+    assert "codex: the real error line" in diag
+    assert len(diag) <= 8600
 
 
 def test_worker_prepares_slash_named_feature_base(tmp_path: Path) -> None:
