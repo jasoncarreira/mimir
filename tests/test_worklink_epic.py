@@ -111,6 +111,8 @@ class FakeChainlink:
     filed: list[str]
     blocked: dict[int, str]
     merged: list[int]
+    comments: list[tuple[int, str]] | None = None
+    failed_epics: list[tuple[int, bool, str]] | None = None
     moved_to_review: bool = False
 
     def read_issue(self, issue_id: int) -> IssueContext:
@@ -141,6 +143,15 @@ class FakeChainlink:
 
     def mark_blocked(self, leaf_id: int, reason: str) -> None:
         self.blocked[leaf_id] = reason
+
+    def comment(self, issue_id: int, text: str) -> None:
+        if self.comments is not None:
+            self.comments.append((issue_id, text))
+
+    def mark_epic_failed(self, epic_id: int, *, retryable: bool, reason: str) -> None:
+        if self.failed_epics is not None:
+            self.failed_epics.append((epic_id, retryable, reason))
+        self.comment(epic_id, f"WORKLINK_EPIC_FAILED {reason}")
 
     def move_epic_to_review(self, epic_id: int) -> None:
         assert epic_id == self.epic.issue_id
@@ -932,6 +943,219 @@ async def test_resume_missing_integration_worktree_rematerializes_to_merge_commi
 
     assert result.status == "completed"
     assert any(cmd[:5] == ["git", "-C", "/repo", "worktree", "add"] and cmd[-1] == "abc123" for cmd in calls)
+
+
+@pytest.mark.asyncio
+async def test_run_crash_mid_build_relabels_epic_and_rearms_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    patch_git(monkeypatch, tmp_path)
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  max_review_retries: 2\n  test_command: true\n",
+        encoding="utf-8",
+    )
+    import mimir.worklink.epic as epic_mod
+    from mimir.worklink.epic_state import load_epic_state
+
+    async def crash_observe(**_: object) -> EvidenceValidation:
+        raise RuntimeError("worker vanished")
+
+    monkeypatch.setattr(epic_mod, "_observe_slice", crash_observe)
+    calls: list[list[str]] = []
+
+    def recording_runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, str):
+            return cp([args])
+        calls.append(list(args))
+        if list(args) == ["chainlink", "issue", "show", "100", "--json"]:
+            return cp(
+                args,
+                stdout=json.dumps(
+                    {
+                        "id": 100,
+                        "title": "Epic",
+                        "description": "epic",
+                        "labels": ["worklink:epic", "worklink:ready"],
+                        "comments": [],
+                    }
+                ),
+            )
+        if list(args) == ["chainlink", "issue", "list", "--json"]:
+            return cp(
+                args,
+                stdout=json.dumps(
+                    [
+                        {
+                            "id": 101,
+                            "title": "Leaf",
+                            "description": leaf_description(),
+                            "labels": ["worklink:ready"],
+                            "parent_id": 100,
+                            "blocked_by": [],
+                        }
+                    ]
+                ),
+            )
+        return runner(args)
+
+    with pytest.raises(RuntimeError, match="worker vanished"):
+        await EpicRunner(
+            home=tmp_path,
+            repo=Path("/repo"),
+            runner=recording_runner,
+            registry=FakeRegistry(),  # type: ignore[arg-type]
+            roles=FakeRoles(),
+            chainlink=ChainlinkEpicClient(runner=recording_runner),
+        ).run(100)
+
+    manifest = load_epic_state(tmp_path, 100)
+    assert manifest is not None
+    assert manifest.status == "running"
+    assert manifest.slices[0].status == "pending"
+    assert manifest.slices[0].attempts == 0
+    assert ["chainlink", "issue", "unlabel", "100", "worklink:in-progress"] in calls
+    assert ["chainlink", "issue", "label", "100", "worklink:ready"] in calls
+    assert any(
+        call[:4] == ["chainlink", "issue", "comment", "100"]
+        and call[-1].startswith("WORKLINK_EPIC_FAILED worker vanished")
+        for call in calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_exhausted_running_slice_rearms_one_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    patch_git(monkeypatch, tmp_path)
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  max_review_retries: 2\n  test_command: true\n",
+        encoding="utf-8",
+    )
+    import mimir.worklink.epic as epic_mod
+    from mimir.worklink.epic_state import EpicSliceRecord, save_epic_state
+
+    integration_path = tmp_path / "integration"
+    integration_path.mkdir(exist_ok=True)
+    save_epic_state(
+        tmp_path,
+        EpicRunManifest(
+            epic_id=100,
+            integration_branch="epic/100-integration",
+            integration_worktree=str(integration_path),
+            base_ref="main",
+            phase="build",
+            slices=[EpicSliceRecord(id=101, status="running", attempts=2)],
+        ),
+    )
+    monkeypatch.setattr(epic_mod, "_observe_slice", fake_observe_slice)
+    comments: list[tuple[int, str]] = []
+    registry = FakeRegistry()
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic"}),
+        leaves=[LeafIssue(issue(101), scope_paths=("a.py",), suggested_test_command="true")],
+        filed=[],
+        blocked={},
+        merged=[],
+        comments=comments,
+    )
+
+    result = await EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=runner,
+        registry=registry,  # type: ignore[arg-type]
+        roles=FakeRoles(),
+        chainlink=chainlink,  # type: ignore[arg-type]
+    ).run(100)
+
+    assert result.status == "completed"
+    assert [spec.attempt for spec in registry.compute.launched] == [2]
+    assert (101, "WORKLINK_EPIC_FAILED crashed running slice re-armed for retry") in comments
+
+
+def test_stale_integration_base_without_merged_slices_recreates_branch(tmp_path: Path) -> None:
+    import mimir.worklink.epic as epic_mod
+    from mimir.worklink.epic_state import EpicSliceRecord
+
+    path = tmp_path / "integration"
+    path.mkdir()
+    manifest = EpicRunManifest(
+        epic_id=100,
+        integration_branch="epic/100-integration",
+        integration_worktree=str(path),
+        base_ref="main",
+        phase="build",
+        slices=[EpicSliceRecord(id=101)],
+    )
+    calls: list[list[str]] = []
+
+    def stale_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if list(args) == ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"]:
+            return cp(args, stdout="oldbase\n")
+        if list(args) == ["git", "-C", "/repo", "rev-parse", "--verify", "--quiet", "origin/main"]:
+            return cp(args, stdout="newbase\n")
+        if list(args) == ["git", "-C", str(path), "merge-base", "--is-ancestor", "origin/main", "HEAD"]:
+            return cp(args, returncode=1)
+        return cp(args)
+
+    lease = epic_mod._ensure_integration_worktree(Path("/repo"), manifest, runner=stale_runner)
+
+    assert lease.branch == "epic/100-integration"
+    assert ["git", "-C", str(path), "checkout", "-B", "epic/100-integration", "origin/main"] in calls
+    assert ["git", "-C", str(path), "push", "-u", "--force-with-lease", "origin", "epic/100-integration"] in calls
+
+
+def test_stale_integration_base_with_merged_slices_rebases_and_updates_manifest(tmp_path: Path) -> None:
+    import mimir.worklink.epic as epic_mod
+    from mimir.worklink.epic_state import EpicSliceRecord, load_epic_state, save_epic_state
+
+    path = tmp_path / "integration"
+    path.mkdir()
+    manifest = EpicRunManifest(
+        epic_id=100,
+        integration_branch="epic/100-integration",
+        integration_worktree=str(path),
+        base_ref="main",
+        phase="build",
+        slices=[
+            EpicSliceRecord(id=101, status="merged", merge_commit="oldmerge"),
+            EpicSliceRecord(id=102),
+        ],
+    )
+    save_epic_state(tmp_path, manifest)
+    calls: list[list[str]] = []
+    head_reads = 0
+
+    def stale_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal head_reads
+        calls.append(list(args))
+        if list(args) == ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"]:
+            head_reads += 1
+            return cp(args, stdout=("oldmerge\n" if head_reads == 1 else "newmerge\n"))
+        if list(args) == ["git", "-C", "/repo", "rev-parse", "--verify", "--quiet", "origin/main"]:
+            return cp(args, stdout="newbase\n")
+        if list(args) == ["git", "-C", str(path), "merge-base", "--is-ancestor", "origin/main", "HEAD"]:
+            return cp(args, returncode=1)
+        if list(args) == ["git", "-C", str(path), "merge-base", "HEAD", "origin/main"]:
+            return cp(args, stdout="oldbase\n")
+        return cp(args)
+
+    epic_mod._ensure_integration_worktree(Path("/repo"), manifest, home=tmp_path, runner=stale_runner)
+
+    assert [
+        "git",
+        "-C",
+        str(path),
+        "rebase",
+        "--rebase-merges",
+        "--onto",
+        "origin/main",
+        "oldbase",
+    ] in calls
+    saved = load_epic_state(tmp_path, 100)
+    assert saved is not None
+    assert saved.slices[0].merge_commit == "newmerge"
 
 
 def test_chainlink_comment_raises_on_failure() -> None:
