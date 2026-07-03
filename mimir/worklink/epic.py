@@ -59,6 +59,7 @@ from .review import (
     SliceDecision,
     classify_leaf_review_risk,
 )
+from .worker import extract_gate_test_tail
 from .worktree import (
     IntegrationBranchLease,
     SliceMergeConflict,
@@ -819,10 +820,20 @@ class EpicRunner:
                 review_ref = decision.summary or ("approved" if decision.approved else "fixes requested")
             else:
                 reasons = validation.reasons or ("evidence_not_review_ready",)
+                fixes = list(reasons)
+                # chainlink #815: the worker's gate-test output only survives the
+                # container via its stdout; surface it so the next attempt fixes
+                # the actual failures instead of retrying blind on "tests_failed".
+                gate_tail = extract_gate_test_tail(compute_result.stdout)
+                if gate_tail:
+                    fixes.append(
+                        "the previous attempt FAILED the full test gate — fix these failures:\n"
+                        + gate_tail
+                    )
                 decision = SliceDecision(
                     approved=False,
                     summary="review skipped: evidence not review-ready",
-                    fixes=tuple(reasons),
+                    fixes=tuple(fixes),
                 )
                 review_ref = "review skipped: " + ", ".join(reasons)
             manifest = await self._save_manifest_update(

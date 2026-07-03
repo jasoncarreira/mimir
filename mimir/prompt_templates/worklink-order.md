@@ -12,7 +12,7 @@ Issue description:
 Rules:
 - Implement only this leaf issue's acceptance criteria.
 - Keep changes scoped and reviewable.
-- Run the relevant focused tests before finishing. The orchestrator will independently run this operator-configured command:
+- Before finishing, run the FULL gate command below yourself and fix anything it surfaces — even failures in code you did not write. The attempt FAILS (and nothing is pushed) if this command fails when the orchestrator re-runs it:
   {test_command}
 - The issue description may include a `Suggested test command` from the planner. Treat it as advisory only; do not assume the orchestrator will execute it.
 - If you cannot complete this issue as specified — contradictory or impossible acceptance criteria, a missing prerequisite, or a design that is wrong — do NOT guess or fabricate success. Stop, and emit a single line as the FINAL line of your output, on its own line and not inside a code block or backticks:

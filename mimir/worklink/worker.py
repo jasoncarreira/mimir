@@ -164,6 +164,7 @@ async def run_worker_payload(
         if validation.review_ready:
             _check(runner(["git", "-C", str(repo), "push", "origin", f"HEAD:{spec.branch}"]), "git push")
         else:
+            _emit_gate_test_failure(payload, validation)
             _emit_failure_diagnostics(payload, validation, compute_result, transcript_path)
         return validation
     except Exception as exc:
@@ -262,6 +263,44 @@ def _remote_ref(base_ref: str) -> str:
 
 def _backend_completed(status: str) -> bool:
     return status.lower().strip() in {"completed", "success", "succeeded", "ok"}
+
+
+TESTS_TAIL_BEGIN = "WORKLINK_TESTS_TAIL_BEGIN"
+TESTS_TAIL_END = "WORKLINK_TESTS_TAIL_END"
+_TESTS_TAIL_MAX_CHARS = 6000
+
+
+def _emit_gate_test_failure(payload: WorkerPayload, validation: EvidenceValidation) -> None:
+    """Print the failed gate-test output as a delimited stdout section (chainlink
+    #815). Stdout is the only worker artifact that survives a docker-sibling
+    container; the controller parses this section out of the broker-wait output
+    and feeds it to the next attempt's work order, so retries act on the actual
+    failures instead of a bare ``tests_failed``."""
+    tests = validation.evidence.tests
+    if tests is None or not tests.observed or not tests.exit_code:
+        return
+    spec = payload.spec
+    secret_values = sorted(
+        {value for value in (*spec.env.values(), *spec.creds_ref.values()) if len(value) >= 8},
+        key=len,
+        reverse=True,
+    )
+    body = (tests.summary or "(no output captured)").strip()[-_TESTS_TAIL_MAX_CHARS:]
+    print(TESTS_TAIL_BEGIN)
+    print(f"command: {tests.cmd}")
+    print(f"exit: {tests.exit_code}")
+    print(_redact_diagnostics(body, secret_values))
+    print(TESTS_TAIL_END, flush=True)
+
+
+def extract_gate_test_tail(stdout: str | None) -> str | None:
+    """Controller-side parser for the section ``_emit_gate_test_failure`` prints.
+    Tolerant of a missing/unterminated section; bounded to the emit cap."""
+    if not stdout or TESTS_TAIL_BEGIN not in stdout:
+        return None
+    section = stdout.split(TESTS_TAIL_BEGIN, 1)[1]
+    section = section.split(TESTS_TAIL_END, 1)[0].strip()
+    return section[:_TESTS_TAIL_MAX_CHARS] or None
 
 
 _DIAG_BEGIN = "WORKLINK_WORKER_DIAG_BEGIN"

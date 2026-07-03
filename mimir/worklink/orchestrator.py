@@ -40,6 +40,7 @@ from .run_state import (
     load_run_state,
     save_run_state,
 )
+from .worker import extract_gate_test_tail
 from .worktree import WorktreeLease, cleanup_worktree, create_isolated_checkout, create_worktree
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -660,7 +661,15 @@ class WorklinkRunner:
                 )
                 validation = _with_pr_url(validation, pr_url)
                 evidence_path = _write_evidence(self.home, validation.evidence)
-        _comment_evidence(claims, validation.evidence, validation, evidence_path)
+        _comment_evidence(
+            claims,
+            validation.evidence,
+            validation,
+            evidence_path,
+            gate_test_tail=(
+                None if validation.review_ready else extract_gate_test_tail(compute_result.stdout)
+            ),
+        )
         _log_event(
             "worklink_evidence",
             issue_id=issue.issue_id,
@@ -1094,6 +1103,8 @@ def _comment_evidence(
     evidence: WorklinkEvidence,
     validation: EvidenceValidation,
     evidence_path: Path,
+    *,
+    gate_test_tail: str | None = None,
 ) -> None:
     summary = (
         f"WORKLINK_EVIDENCE issue={evidence.issue} attempt={evidence.attempt} "
@@ -1101,8 +1112,12 @@ def _comment_evidence(
         f"files={len(evidence.files_changed)} evidence={evidence_path}"
     )
     reasons = f"\nReasons: {', '.join(validation.reasons)}" if validation.reasons else ""
+    # chainlink #815: the failed gate-test output otherwise dies with the worker
+    # container; the issue comment is the per-leaf surface the planner (and the
+    # next dispatch's groomer) actually reads.
+    tail = f"\nGate test output (failed):\n{gate_test_tail}" if gate_test_tail else ""
     claims._run(  # noqa: SLF001 - Chainlink wrapper owns quoting/checks.
-        "issue", "comment", str(evidence.issue), summary + reasons
+        "issue", "comment", str(evidence.issue), summary + reasons + tail
     )
 
 

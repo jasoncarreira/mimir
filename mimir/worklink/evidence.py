@@ -341,7 +341,7 @@ def _observe_evidence_from_ref(
             tests = TestResult(test_command, None, "checkout failed before test", observed=False)
         else:
             test = runner(test_command, cwd=worktree)
-            tests = TestResult(test_command, test.returncode, _summarize(test))
+            tests = TestResult(test_command, test.returncode, _summarize_test_output(test))
             commands.append(CommandResult(test_command, test.returncode, _summarize(test)))
 
     evidence = WorklinkEvidence(
@@ -414,3 +414,21 @@ def _summarize(result: subprocess.CompletedProcess[str]) -> str:
     if len(text) > 500:
         return text[:497] + "..."
     return text
+
+
+_TEST_OUTPUT_TAIL_LINES = 60
+_TEST_OUTPUT_TAIL_CHARS = 6000
+
+
+def _summarize_test_output(result: subprocess.CompletedProcess[str]) -> str:
+    """Tail-based summary for the gate test run (chainlink #815). Test runners
+    print the failure list LAST — a head-truncated summary loses exactly the
+    detail a retry needs to act on."""
+    parts = [part for part in (result.stdout, result.stderr) if part and part.strip()]
+    text = "\n".join(part.strip() for part in parts)
+    if not text:
+        return ""
+    clipped = "\n".join(text.splitlines()[-_TEST_OUTPUT_TAIL_LINES:])
+    if len(clipped) > _TEST_OUTPUT_TAIL_CHARS:
+        clipped = clipped[-_TEST_OUTPUT_TAIL_CHARS:]
+    return clipped
