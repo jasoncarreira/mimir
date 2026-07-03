@@ -280,8 +280,14 @@ def test_same_agent_reclaim_with_fresh_heartbeat_is_refused():
 
     assert result.claimed is False
     assert result.reason == "duplicate_run_live"
-    # refused WITHOUT touching labels/comments or stealing
-    assert not any(call[1] in ("issue",) or call[1:3] == ["locks", "steal"] for call in calls if len(call) > 2)
+    # refused WITHOUT mutating state: reads (issue show) are fine, but no
+    # steal and no label/comment writes.
+    assert not any(
+        call[1:3] == ["locks", "steal"]
+        or (call[1] == "issue" and call[2] in ("label", "unlabel", "comment"))
+        for call in calls
+        if len(call) > 2
+    )
 
 
 def test_same_agent_reclaim_with_stale_heartbeat_steals_and_proceeds():

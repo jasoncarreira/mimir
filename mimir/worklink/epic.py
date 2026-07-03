@@ -1507,7 +1507,13 @@ def _comment_text(item: Any) -> str:
     if isinstance(item, str):
         return item
     if isinstance(item, Mapping):
-        return str(item.get("body") or item.get("text") or "")
+        # chainlink stores comment text under "content" (see
+        # ChainlinkClaims._issue_comments); missing it here fed the #822
+        # duplicate-run guard an empty comment list, so every duplicate saw
+        # zero claim records, treated the live run as dead, and stole its
+        # lock — the guard's first live test failed on THIS parse, not its
+        # own logic. It also pinned next_attempt at 1 forever.
+        return str(item.get("content") or item.get("body") or item.get("text") or "")
     return ""
 
 

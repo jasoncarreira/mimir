@@ -170,7 +170,15 @@ class ChainlinkClaims:
             # process owns this run — refuse without touching any state. A
             # stale one is a crashed predecessor: steal explicitly and proceed.
             latest: ClaimRecord | None = None
-            for existing in claim_records_from_comments(comments):
+            # Read comments through our own JSON reader rather than trusting the
+            # caller's parse — a caller-side key mismatch here means stealing a
+            # LIVE run's lock (exactly how the guard's first live test failed).
+            guard_comments = list(comments) or []
+            try:
+                guard_comments = self._issue_comments(issue_id) or guard_comments
+            except Exception:
+                pass
+            for existing in claim_records_from_comments(guard_comments):
                 if existing.issue_id != issue_id:
                     continue
                 if latest is None or _claim_is_newer(existing, latest):
