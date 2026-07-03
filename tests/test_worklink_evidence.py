@@ -107,6 +107,28 @@ def test_observe_evidence_carries_backend_blocked_reason(tmp_path: Path) -> None
     assert result.evidence.blocked_reason == "Acceptance criteria conflict with review criteria"
 
 
+def test_gate_test_summary_keeps_output_tail_not_head() -> None:
+    """chainlink #815: pytest prints the failure list LAST — the evidence test
+    summary must keep the tail so retries can act on it."""
+    from mimir.worklink.evidence import _summarize_test_output
+
+    lines = [f"noise-{index}" for index in range(1, 101)] + [
+        "FAILED tests/test_z.py::test_gate - AssertionError",
+        "1 failed, 9 passed in 3.16s",
+    ]
+    result = subprocess.CompletedProcess(
+        ["pytest"], 1, stdout="\n".join(lines), stderr="warning: deprecation"
+    )
+
+    summary = _summarize_test_output(result)
+
+    assert "1 failed, 9 passed in 3.16s" in summary
+    assert "FAILED tests/test_z.py::test_gate" in summary
+    assert "warning: deprecation" in summary
+    assert "noise-1\n" not in summary
+    assert len(summary) <= 6000
+
+
 def test_completed_requires_tests_or_skipped_reason() -> None:
     result = validate_evidence(base_evidence(tests=None))
 

@@ -557,6 +557,75 @@ async def test_empty_diff_evidence_skips_slice_reviewer_and_records_reasons(
 
 
 @pytest.mark.asyncio
+async def test_gate_test_tail_from_worker_stdout_feeds_next_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """chainlink #815: the worker's WORKLINK_TESTS_TAIL stdout section must reach
+    the next attempt's work order — retries act on failures, not a bare reason."""
+    patch_git(monkeypatch, tmp_path)
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  max_review_retries: 2\n  test_command: true\n", encoding="utf-8"
+    )
+    import mimir.worklink.epic as epic_mod
+
+    observed = {"count": 0}
+
+    async def observe_fail_then_pass(**kw: object) -> EvidenceValidation:
+        leaf = kw["leaf"]
+        spec = kw["spec"]
+        assert isinstance(leaf, LeafIssue)
+        assert isinstance(spec, WorkSpec)
+        observed["count"] += 1
+        if observed["count"] == 1:
+            failing = ready_validation(leaf.issue.issue_id, spec.attempt)
+            return EvidenceValidation("failed", False, ("tests_failed",), failing.evidence)
+        return ready_validation(leaf.issue.issue_id, spec.attempt)
+
+    monkeypatch.setattr(epic_mod, "_observe_slice", observe_fail_then_pass)
+
+    class GateFailCompute(FakeCompute):
+        async def wait(self, handle: WorkSpec, timeout_s: int) -> ComputeResult:
+            return ComputeResult(
+                1,
+                "worklink worker: failed — tests_failed\n"
+                "WORKLINK_TESTS_TAIL_BEGIN\n"
+                "command: env -u MIMIR_MODEL_SPEC uv run pytest -q\n"
+                "exit: 1\n"
+                "FAILED tests/test_x.py::test_y - AssertionError: broke the contract\n"
+                "1 failed, 5000 passed\n"
+                "WORKLINK_TESTS_TAIL_END\n",
+                "",
+            )
+
+    registry = FakeRegistry()
+    registry.compute = GateFailCompute()
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic"}),
+        leaves=[LeafIssue(issue(101), scope_paths=("a.py",), suggested_test_command="true")],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+
+    result = await EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=runner,
+        registry=registry,  # type: ignore[arg-type]
+        roles=FakeRoles(),
+        chainlink=chainlink,  # type: ignore[arg-type]
+    ).run(100)
+
+    assert result.status == "completed"
+    assert len(registry.compute.launched) == 2
+    retry_prompt = registry.compute.launched[1].prompt
+    assert "FAILED the full test gate" in retry_prompt
+    assert "FAILED tests/test_x.py::test_y - AssertionError: broke the contract" in retry_prompt
+    # First attempt's prompt must NOT carry feedback.
+    assert "FAILED the full test gate" not in registry.compute.launched[0].prompt
+
+
+@pytest.mark.asyncio
 async def test_transient_provider_error_backs_off_within_attempt_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -175,7 +175,7 @@ async def test_remote_test_job_heartbeats_claim_during_finalize() -> None:
         env={},
     )
 
-    exit_code = await _run_remote_test_job(
+    outcome = await _run_remote_test_job(
         SlowTestCompute(),
         spec,
         timeout_s=1800,
@@ -183,7 +183,8 @@ async def test_remote_test_job_heartbeats_claim_during_finalize() -> None:
         claim_record=claim_record,
     )
 
-    assert exit_code == 0
+    assert outcome.exit_code == 0
+    assert outcome.failure_tail is None
     heartbeats = claim_records_from_comments(comments)
     assert heartbeats
     assert heartbeats[-1].issue_id == 750
@@ -306,7 +307,9 @@ def test_worker_payload_clone_branch_fake_backend_pushes_and_writes_evidence(
     assert ["git", "-C", str(repo), "push", "origin", "HEAD:issue/456-a1"] in calls
     assert calls.count("echo ok") == 1
     assert backend.orders[0].worktree == repo
-    assert "WORKLINK_WORKER_DIAG" not in capsys.readouterr().out
+    success_out = capsys.readouterr().out
+    assert "WORKLINK_WORKER_DIAG" not in success_out
+    assert "WORKLINK_TESTS_TAIL" not in success_out
 
 
 def test_worker_payload_no_commit_result_does_not_push(
@@ -487,6 +490,76 @@ def test_worker_backend_failure_emits_bounded_redacted_diag_block(
     # Transcript tail keeps the last 30 lines only.
     assert "transcript-line-40" in diag
     assert "transcript-line-1\n" not in diag
+
+
+def test_worker_gate_failure_emits_tests_tail_section(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """chainlink #815: a failed gate run prints a delimited, redacted tests-tail
+    section on stdout — the only channel that outlives the worker container."""
+    backend = WorkerFakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    repo = tmp_path / "worker-repo"
+    gate_output = "\n".join(
+        [f"noise-line-{index}" for index in range(1, 71)]
+        + [
+            "token=super-secret-gate-value",
+            "FAILED tests/test_z.py::test_gate - AssertionError",
+            "1 failed, 9 passed",
+        ]
+    )
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:2] == ["git", "clone"]:
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / ".git").mkdir(exist_ok=True)
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--cached" in args:
+            return cp(args, stdout="changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--name-only" in args:
+            return cp(args, stdout="changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--stat" in args:
+            return cp(args, stdout=" changed.txt | 1 +\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "status"]:
+            return cp(args, stdout="?? changed.txt\n")
+        if args == "echo ok":
+            return cp(args, returncode=1, stdout=gate_output)
+        return cp(args)
+
+    payload = _worker_diag_payload(tmp_path, backend)
+
+    validation = asyncio.run(run_worker_payload(payload, registry=registry, runner=runner))
+
+    assert validation.review_ready is False
+    assert "tests_failed" in validation.reasons
+    out = capsys.readouterr().out
+    assert "WORKLINK_TESTS_TAIL_BEGIN" in out
+    section = out.split("WORKLINK_TESTS_TAIL_BEGIN", 1)[1].split("WORKLINK_TESTS_TAIL_END", 1)[0]
+    assert "command: echo ok" in section
+    assert "exit: 1" in section
+    assert "FAILED tests/test_z.py::test_gate" in section
+    # Tail-based: early noise dropped; secrets redacted.
+    assert "noise-line-1\n" not in section
+    assert "super-secret-gate-value" not in section
+    # The general diag block still follows for full context.
+    assert "WORKLINK_WORKER_DIAG_BEGIN" in out
+
+
+def test_extract_gate_test_tail_parses_and_bounds() -> None:
+    from mimir.worklink.worker import extract_gate_test_tail
+
+    stdout = (
+        "worklink worker: failed — tests_failed\n"
+        "WORKLINK_TESTS_TAIL_BEGIN\ncommand: pytest\nexit: 1\nFAILED a::b\nWORKLINK_TESTS_TAIL_END\n"
+    )
+    assert extract_gate_test_tail(stdout) == "command: pytest\nexit: 1\nFAILED a::b"
+    assert extract_gate_test_tail("worklink worker: completed") is None
+    assert extract_gate_test_tail(None) is None
+    assert extract_gate_test_tail("") is None
+    unterminated = "WORKLINK_TESTS_TAIL_BEGIN\n" + "x" * 20000
+    parsed = extract_gate_test_tail(unterminated)
+    assert parsed is not None and len(parsed) <= 6000
 
 
 def test_worker_diag_block_is_size_capped(
@@ -1634,7 +1707,7 @@ def test_worklink_ignores_planner_suggested_test_command_by_default(
     out = capsys.readouterr().out
     assert result.dry_run is True
     assert "echo planner-controlled; touch /tmp/owned" in out
-    assert "orchestrator will independently run this operator-configured command" in out
+    assert "run the FULL gate command below yourself" in out
     assert "  echo safe" in out
 
 
@@ -1680,7 +1753,7 @@ def test_worklink_prompt_keeps_planner_suggestion_advisory(
 
     out = capsys.readouterr().out
     assert result.dry_run is True
-    assert "orchestrator will independently run this operator-configured command" in out
+    assert "run the FULL gate command below yourself" in out
     assert "Treat it as advisory only" in out
     assert "  echo safe" in out
     assert "  cd /workspace/mimir && pytest -q tests/test_identities.py" not in out

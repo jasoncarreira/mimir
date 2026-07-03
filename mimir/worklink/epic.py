@@ -59,6 +59,7 @@ from .review import (
     SliceDecision,
     classify_leaf_review_risk,
 )
+from .worker import gate_failure_detail
 from .worktree import (
     IntegrationBranchLease,
     SliceMergeConflict,
@@ -819,10 +820,21 @@ class EpicRunner:
                 review_ref = decision.summary or ("approved" if decision.approved else "fixes requested")
             else:
                 reasons = validation.reasons or ("evidence_not_review_ready",)
+                fixes = list(reasons)
+                # chainlink #815: gate-test output only survives the container via
+                # stdout (worker's local gate) or the folded remote-test evidence
+                # (controller's trusted gate); surface it so the next attempt fixes
+                # the actual failures instead of retrying blind on "tests_failed".
+                gate_tail = gate_failure_detail(validation, compute_result.stdout)
+                if gate_tail:
+                    fixes.append(
+                        "the previous attempt FAILED the full test gate — fix these failures:\n"
+                        + gate_tail
+                    )
                 decision = SliceDecision(
                     approved=False,
                     summary="review skipped: evidence not review-ready",
-                    fixes=tuple(reasons),
+                    fixes=tuple(fixes),
                 )
                 review_ref = "review skipped: " + ", ".join(reasons)
             manifest = await self._save_manifest_update(
@@ -958,10 +970,14 @@ async def _observe_slice(
         runner=runner,
     )
     if test_cmd and backend_completed(raw.backend_status) and validation.evidence.files_changed:
-        test_exit = await _run_remote_test_job(compute, spec, timeout_s=config.defaults.timeout_s, claims=_NoopClaims(), claim_record=_NoopClaim(leaf.issue.issue_id, spec.attempt))
-        if test_exit is not None:
+        test_outcome = await _run_remote_test_job(compute, spec, timeout_s=config.defaults.timeout_s, claims=_NoopClaims(), claim_record=_NoopClaim(leaf.issue.issue_id, spec.attempt))
+        if test_outcome.exit_code is not None:
             validation = fold_remote_test_evidence(
-                validation, test_cmd, test_exit, backend_status=raw.backend_status
+                validation,
+                test_cmd,
+                test_outcome.exit_code,
+                backend_status=raw.backend_status,
+                failure_tail=test_outcome.failure_tail,
             )
     return validation
 

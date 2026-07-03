@@ -235,6 +235,7 @@ def fold_remote_test_evidence(
     exit_code: int,
     *,
     backend_status: str,
+    failure_tail: str | None = None,
 ) -> EvidenceValidation:
     """Replace the stubbed remote test result with an OBSERVED one (chainlink
     #538), then re-validate.
@@ -247,7 +248,14 @@ def fold_remote_test_evidence(
 
     Folding only makes sense on a run the backend actually *completed*; pass the
     original ``backend_status`` so a failed/blocked run can't be laundered into
-    review-ready by a passing test job (see the status reset below)."""
+    review-ready by a passing test job (see the status reset below).
+
+    ``failure_tail`` (chainlink #815) is the test job's WORKLINK_TESTS_TAIL —
+    folded into the summary on failure so the remote trusted gate carries the
+    same retry-feedback detail as the worker's local gate."""
+    summary = f"remote sandboxed test job: exit {exit_code}"
+    if exit_code and failure_tail:
+        summary = f"{summary}\n{failure_tail}"
     evidence = replace(
         validation.evidence,
         # Re-validate from the ORIGINAL backend status, not the persisted one: the
@@ -260,7 +268,7 @@ def fold_remote_test_evidence(
         tests=TestResult(
             test_command,
             exit_code,
-            f"remote sandboxed test job: exit {exit_code}",
+            summary,
             observed=True,
         ),
     )
@@ -341,7 +349,7 @@ def _observe_evidence_from_ref(
             tests = TestResult(test_command, None, "checkout failed before test", observed=False)
         else:
             test = runner(test_command, cwd=worktree)
-            tests = TestResult(test_command, test.returncode, _summarize(test))
+            tests = TestResult(test_command, test.returncode, _summarize_test_output(test))
             commands.append(CommandResult(test_command, test.returncode, _summarize(test)))
 
     evidence = WorklinkEvidence(
@@ -414,3 +422,21 @@ def _summarize(result: subprocess.CompletedProcess[str]) -> str:
     if len(text) > 500:
         return text[:497] + "..."
     return text
+
+
+_TEST_OUTPUT_TAIL_LINES = 60
+_TEST_OUTPUT_TAIL_CHARS = 6000
+
+
+def _summarize_test_output(result: subprocess.CompletedProcess[str]) -> str:
+    """Tail-based summary for the gate test run (chainlink #815). Test runners
+    print the failure list LAST — a head-truncated summary loses exactly the
+    detail a retry needs to act on."""
+    parts = [part for part in (result.stdout, result.stderr) if part and part.strip()]
+    text = "\n".join(part.strip() for part in parts)
+    if not text:
+        return ""
+    clipped = "\n".join(text.splitlines()[-_TEST_OUTPUT_TAIL_LINES:])
+    if len(clipped) > _TEST_OUTPUT_TAIL_CHARS:
+        clipped = clipped[-_TEST_OUTPUT_TAIL_CHARS:]
+    return clipped
