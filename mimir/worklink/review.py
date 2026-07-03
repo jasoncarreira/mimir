@@ -82,29 +82,20 @@ class WorkDecomposition(BaseModel):
     leaves: list[WorklinkLeafSpec] = Field(min_length=1)
 
 
-class ReviewFinding(BaseModel):
-    """One structured Worklink review finding."""
-
-    title: str
-    severity: Literal["nit", "important", "blocker"]
-    evidence: str = Field(description="Specific prompt, diff, path, or test evidence.")
-    recommendation: str = Field(description="Concrete required or suggested action.")
-
-
 class DecomposeReview(BaseModel):
-    """Structured output for the decompose-reviewer role."""
+    """Structured output for the decompose-reviewer role.
+
+    Flat by design: ``verdict`` + ``summary`` drive the decision; ``findings`` is
+    a plain list of short strings (no nested objects) so the model can conform
+    reliably.
+    """
 
     verdict: Literal["APPROVE", "REJECT"]
     summary: str
-    findings: list[ReviewFinding] = Field(default_factory=list)
-
-
-class SliceAcceptanceMapping(BaseModel):
-    """Per-AC judgment grounded in observed slice evidence."""
-
-    acceptance_criterion: str
-    status: Literal["met", "unmet", "unclear"]
-    evidence: str
+    findings: list[str] = Field(
+        default_factory=list,
+        description="Short plain-text findings explaining the verdict (empty on a clean APPROVE).",
+    )
 
 
 class SliceReview(BaseModel):
@@ -112,19 +103,14 @@ class SliceReview(BaseModel):
 
     verdict: Literal["APPROVE", "REJECT"]
     summary: str
-    ac_coverage: list[SliceAcceptanceMapping] = Field(default_factory=list)
-    findings: list[ReviewFinding] = Field(default_factory=list)
-    required_fixes: list[str] = Field(default_factory=list)
-
-
-class IntegrationAcceptanceMapping(BaseModel):
-    """Whole-epic AC mapping to code and tests in the integrated diff."""
-
-    acceptance_criterion: str
-    code_refs: list[str] = Field(default_factory=list)
-    test_refs: list[str] = Field(default_factory=list)
-    status: Literal["met", "met_with_nits", "unmet", "unclear"]
-    evidence: str
+    findings: list[str] = Field(
+        default_factory=list,
+        description="Short plain-text findings (empty on a clean APPROVE).",
+    )
+    required_fixes: list[str] = Field(
+        default_factory=list,
+        description="Concrete fixes the builder must make; non-empty on REJECT.",
+    )
 
 
 class IntegrationValidation(BaseModel):
@@ -132,8 +118,10 @@ class IntegrationValidation(BaseModel):
 
     verdict: Literal["GO", "GO-WITH-NITS", "NO-GO"]
     summary: str
-    ac_mappings: list[IntegrationAcceptanceMapping] = Field(default_factory=list)
-    findings: list[ReviewFinding] = Field(default_factory=list)
+    findings: list[str] = Field(
+        default_factory=list,
+        description="Short plain-text findings (empty on a clean GO). Note AC gaps here.",
+    )
 
 
 WORK_DECOMPOSER_PROMPT = """You are work-decomposer, the Worklink epic planner.
@@ -185,24 +173,33 @@ invalid/cyclic dependencies.
 
 PER_SLICE_REVIEWER_PROMPT = """You are per-slice-reviewer, an adversarial Worklink reviewer.
 
-Your job is to find reasons to REJECT. Judge only controller-OBSERVED evidence:
-the actual diff, changed files, and controller-observed test results.
-Do not trust worker prose. Do not trust worker claims, summaries, or intentions
-when they conflict with or go beyond the observed evidence. APPROVE only if the
-observed diff clearly meets every leaf acceptance criterion, stays inside Scope,
-respects Out of scope, and has adequate observed validation. Return
-required_fixes for every blocker.
+Your job is to find reasons to REJECT. Judge ONLY controller-OBSERVED evidence:
+the actual diff, changed files, and controller-observed test results. Do not
+trust worker prose, claims, summaries, or intentions that go beyond the observed
+evidence. APPROVE only if the observed diff clearly meets every leaf acceptance
+criterion, stays inside Scope, respects Out of scope, and has adequate observed
+validation.
+
+Return only the structured SliceReview with these fields: `verdict` ("APPROVE"
+or "REJECT"), `summary` (string), `findings` (a flat list of short plain-text
+strings, empty on a clean APPROVE), and `required_fixes` (a flat list of strings;
+include a concrete fix for every blocker when you REJECT). Every list field holds
+plain strings — do NOT emit nested finding/mapping objects.
 """
 
 
 INTEGRATION_VALIDATOR_PROMPT = """You are integration-validator, the holistic Worklink reviewer.
 
-Given the epic brief and the integrated diff, return only the structured
-IntegrationValidation response requested by the runtime. Decide GO,
-GO-WITH-NITS, or NO-GO for the whole integrated change. Map every epic
-acceptance criterion to concrete code_refs and test_refs, and mark unclear or
-unmet coverage explicitly. Use NO-GO for missing AC coverage, integration
-conflicts, scope creep, or unvalidated behavior.
+Given the epic brief and the integrated diff, decide GO, GO-WITH-NITS, or NO-GO
+for the whole integrated change. Check that every epic acceptance criterion is
+covered by the integrated code and tests, and call out any unclear or unmet
+coverage. Use NO-GO for missing AC coverage, integration conflicts, scope creep,
+or unvalidated behavior.
+
+Return only the structured IntegrationValidation with these fields: `verdict`
+("GO", "GO-WITH-NITS", or "NO-GO"), `summary` (string), and `findings` (a flat
+list of short plain-text strings — note any AC gap or concern here; empty on a
+clean GO). `findings` are plain strings — do NOT emit nested mapping objects.
 """
 
 
