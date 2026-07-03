@@ -117,6 +117,20 @@ async def run_worker_payload(
         raw = await backend.interpret(order, compute_result)
         if _backend_completed(raw.backend_status):
             _check(runner(["git", "-C", str(repo), "add", "-A"]), "git add")
+            staged = runner(["git", "-C", str(repo), "diff", "--cached", "--name-only"])
+            if staged.returncode != 0:
+                raise RuntimeError((staged.stderr or staged.stdout).strip() or "git staged diff failed")
+            if not staged.stdout.strip():
+                validation = _failed_worker_evidence(
+                    payload,
+                    repo,
+                    started,
+                    "backend produced no changes",
+                    runner=runner,
+                    extra_reasons=("backend_produced_no_changes",),
+                )
+                _write_worker_evidence(payload.evidence_path, validation)
+                return validation
             commit = runner([
                 "git",
                 "-C",
@@ -249,6 +263,7 @@ def _failed_worker_evidence(
     reason: str,
     *,
     runner: Any,
+    extra_reasons: tuple[str, ...] = (),
 ) -> EvidenceValidation:
     from dataclasses import replace
 
@@ -266,7 +281,13 @@ def _failed_worker_evidence(
         runner=runner,
     )
     evidence = replace(validation.evidence, status="failed", blocked_reason=reason)
-    return replace(validation, status="failed", review_ready=False, reasons=(*validation.reasons, "worker_error"), evidence=evidence)
+    return replace(
+        validation,
+        status="failed",
+        review_ready=False,
+        reasons=(*validation.reasons, "worker_error", *extra_reasons),
+        evidence=evidence,
+    )
 
 
 def _write_worker_evidence(path: Path, validation: EvidenceValidation) -> None:
