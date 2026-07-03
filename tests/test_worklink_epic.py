@@ -31,10 +31,9 @@ from mimir.worklink.evidence import (
 from mimir.worklink.orchestrator import IssueContext, validate_leaf
 from mimir.worklink.planning import missing_leaf_template_parts
 from mimir.worklink.review import (
-    DecomposeReview,
-    IntegrationValidation,
-    SliceReview,
-    WorkDecomposition,
+    DecomposeOutcome,
+    IntegrationDecision,
+    SliceDecision,
     WorklinkLeafSpec,
 )
 from mimir.worklink.worktree import IntegrationBranchLease, SliceMergeSuccess, WorktreeLease
@@ -149,20 +148,30 @@ class FakeChainlink:
 
 
 class FakeRoles:
-    def __init__(self, *, reviews: list[str] | None = None, decomposition: WorkDecomposition | None = None) -> None:
+    """Action-based fake: decompose files leaves via the chainlink client;
+    reviews return recorded-style decisions."""
+
+    def __init__(
+        self, *, reviews: list[str] | None = None, decomposition: list[WorklinkLeafSpec] | None = None
+    ) -> None:
         self.reviews = reviews or ["APPROVE"]
         self.decomposition = decomposition
         self.slice_review_calls: list[dict[str, Any]] = []
         self.validations = 0
 
-    async def decompose(self, epic: IssueContext) -> WorkDecomposition:
+    async def run_decompose(self, epic: IssueContext, *, chainlink: Any) -> DecomposeOutcome:
         assert self.decomposition is not None
-        return self.decomposition
-
-    async def review_decomposition(
-        self, epic: IssueContext, decomposition: WorkDecomposition
-    ) -> DecomposeReview:
-        return DecomposeReview(verdict="APPROVE", summary="ok")
+        ids_by_title: dict[str, int] = {}
+        for leaf in self.decomposition:
+            ids_by_title[leaf.title] = chainlink.file_leaf(epic.issue_id, leaf)
+        for leaf in self.decomposition:
+            for dep_title in leaf.depends_on:
+                chainlink.add_blocker(
+                    ids_by_title[leaf.title],
+                    ids_by_title[dep_title],
+                    f"{leaf.title} depends on {dep_title}",
+                )
+        return DecomposeOutcome(filed_leaves=len(self.decomposition))
 
     async def review_slice(
         self,
@@ -171,11 +180,15 @@ class FakeRoles:
         evidence: EvidenceValidation,
         mode: str,
         reviewer_count: int,
-    ) -> SliceReview:
+        chainlink: Any,
+    ) -> SliceDecision:
         self.slice_review_calls.append({"leaf": leaf.issue.issue_id, "mode": mode, "count": reviewer_count})
         verdict = self.reviews.pop(0) if self.reviews else "APPROVE"
-        return SliceReview(
-            verdict=verdict, summary=verdict.lower(), required_fixes=["fix it"] if verdict == "REJECT" else []
+        approved = verdict == "APPROVE"
+        return SliceDecision(
+            approved=approved,
+            summary=verdict.lower(),
+            fixes=() if approved else ("fix it",),
         )
 
     async def validate_integration(
@@ -185,9 +198,10 @@ class FakeRoles:
         manifest: object,
         partial: bool,
         blocked: dict[int, str],
-    ) -> IntegrationValidation:
+        chainlink: Any,
+    ) -> IntegrationDecision:
         self.validations += 1
-        return IntegrationValidation(verdict="GO-WITH-NITS" if partial else "GO", summary="integrated")
+        return IntegrationDecision(approved=True, summary="integrated")
 
 
 class FakeBackend:
@@ -274,169 +288,6 @@ def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
     return cp(args)
 
-
-@pytest.mark.asyncio
-async def test_epic_subagent_role_runner_maps_structured_role_outputs() -> None:
-    decomposition = WorkDecomposition(
-        summary="split",
-        leaves=[
-            WorklinkLeafSpec(
-                title="Leaf A",
-                acceptance_criteria=["A works"],
-                review_criteria=["review A"],
-                scope_paths=["a.py"],
-                suggested_test_command="true",
-            )
-        ],
-    )
-    outputs = {
-        "work-decomposer": decomposition,
-        "decompose-reviewer": DecomposeReview(verdict="APPROVE", summary="ok"),
-        "per-slice-reviewer": SliceReview(verdict="APPROVE", summary="slice ok"),
-        "integration-validator": IntegrationValidation(verdict="GO", summary="integrated"),
-    }
-    calls: list[tuple[str, type[Any], str]] = []
-
-    async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
-        calls.append((role, model_type, prompt))
-        return outputs[role]
-
-    roles = EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker)
-    epic = issue(100, parent_id=None, labels={"worklink:epic"})
-    manifest = EpicRunManifest(
-        epic_id=100,
-        integration_branch="epic/100-integration",
-        integration_worktree="/tmp/integration",
-        base_ref="main",
-        phase="integrate",
-        slices=[],
-    )
-
-    assert await roles.decompose(epic) is decomposition
-    assert (await roles.review_decomposition(epic, decomposition)).verdict == "APPROVE"
-    slice_review = await roles.review_slice(
-        leaf=LeafIssue(issue(101)),
-        evidence=ready_validation(101),
-        mode="single",
-        reviewer_count=1,
-    )
-    integration = await roles.validate_integration(
-        epic=epic,
-        manifest=manifest,
-        partial=False,
-        blocked={},
-    )
-    assert slice_review.verdict == "APPROVE"
-    assert integration.verdict == "GO"
-    assert [(role, model_type) for role, model_type, _ in calls] == [
-        ("work-decomposer", WorkDecomposition),
-        ("decompose-reviewer", DecomposeReview),
-        ("per-slice-reviewer", SliceReview),
-        ("integration-validator", IntegrationValidation),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_epic_slice_review_multi_vote_unanimous_approve_skips_verification() -> None:
-    votes = [
-        SliceReview(verdict="APPROVE", summary="ok"),
-        SliceReview(verdict="APPROVE", summary="ok"),
-        SliceReview(verdict="APPROVE", summary="ok"),
-    ]
-    prompts: list[str] = []
-
-    async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
-        assert role == "per-slice-reviewer"
-        assert model_type is SliceReview
-        prompts.append(prompt)
-        return votes.pop(0)
-
-    review = await EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker).review_slice(
-        leaf=LeafIssue(issue(101)),
-        evidence=ready_validation(101),
-        mode="multi",
-        reviewer_count=3,
-    )
-
-    assert review.verdict == "APPROVE"
-    assert review.required_fixes == []
-    assert len(prompts) == 3
-
-
-@pytest.mark.asyncio
-async def test_epic_slice_review_multi_vote_verified_real_dissent_blocks() -> None:
-    responses = [
-        SliceReview(verdict="APPROVE", summary="ok"),
-        SliceReview(verdict="REJECT", summary="real bug", required_fixes=["fix A"]),
-        SliceReview(verdict="APPROVE", summary="ok"),
-        SliceReview(verdict="REJECT", summary="verified real", required_fixes=["fix A"]),
-    ]
-    prompts: list[str] = []
-
-    async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
-        prompts.append(prompt)
-        return responses.pop(0)
-
-    review = await EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker).review_slice(
-        leaf=LeafIssue(issue(101)),
-        evidence=ready_validation(101),
-        mode="multi",
-        reviewer_count=3,
-    )
-
-    assert review.verdict == "REJECT"
-    assert review.required_fixes == ["fix A"]
-    assert "Verify the dissenting per-slice review findings" in prompts[-1]
-    assert "Do not decide by vote count" in prompts[-1]
-
-
-@pytest.mark.asyncio
-async def test_epic_slice_review_multi_vote_spurious_dissent_does_not_block() -> None:
-    responses = [
-        SliceReview(verdict="APPROVE", summary="ok"),
-        SliceReview(verdict="REJECT", summary="hallucinated", required_fixes=["extra test"]),
-        SliceReview(verdict="APPROVE", summary="ok"),
-        SliceReview(verdict="APPROVE", summary="dissent unsupported"),
-    ]
-
-    async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
-        return responses.pop(0)
-
-    review = await EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker).review_slice(
-        leaf=LeafIssue(issue(101)),
-        evidence=ready_validation(101),
-        mode="multi",
-        reviewer_count=3,
-    )
-
-    assert review.verdict == "APPROVE"
-    assert review.required_fixes == []
-
-
-@pytest.mark.asyncio
-async def test_epic_slice_reviewer_prompt_uses_observed_diff_and_tests_not_worker_prose() -> None:
-    evidence = ready_validation(101)
-    evidence = replace(evidence, evidence=replace(evidence.evidence, transcript="/tmp/worker-transcript"))
-    prompts: list[str] = []
-
-    async def invoker(role: str, prompt: str, model_type: type[Any]) -> Any:
-        prompts.append(prompt)
-        return SliceReview(verdict="APPROVE", summary="ok")
-
-    await EpicSubagentRoleRunner(home=Path("/tmp/mimir"), invoker=invoker).review_slice(
-        leaf=LeafIssue(issue(101)),
-        evidence=evidence,
-        mode="single",
-        reviewer_count=1,
-    )
-
-    prompt = prompts[0]
-    assert "Observed diff stat:" in prompt
-    assert "file.txt | 1 +" in prompt
-    assert "Observed test result:" in prompt
-    assert "- Command: true" in prompt
-    assert "Controller-OBSERVED evidence only" in prompt
-    assert "worker-transcript" not in prompt
 
 
 def test_run_epic_wires_real_role_runner_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -620,26 +471,23 @@ async def test_decompose_then_build_files_child_leaves_once(tmp_path: Path, monk
     import mimir.worklink.epic as epic_mod
 
     monkeypatch.setattr(epic_mod, "_observe_slice", fake_observe_slice)
-    decomposition = WorkDecomposition(
-        summary="split",
-        leaves=[
-            WorklinkLeafSpec(
-                title="Leaf A",
-                acceptance_criteria=["A works"],
-                review_criteria=["check A"],
-                scope_paths=["a.py"],
-                suggested_test_command="true",
-            ),
-            WorklinkLeafSpec(
-                title="Leaf B",
-                acceptance_criteria=["B works"],
-                review_criteria=["check B"],
-                scope_paths=["b.py"],
-                suggested_test_command="true",
-                depends_on=["Leaf A"],
-            ),
-        ],
-    )
+    decomposition = [
+        WorklinkLeafSpec(
+            title="Leaf A",
+            acceptance_criteria=["A works"],
+            review_criteria=["check A"],
+            scope_paths=["a.py"],
+            suggested_test_command="true",
+        ),
+        WorklinkLeafSpec(
+            title="Leaf B",
+            acceptance_criteria=["B works"],
+            review_criteria=["check B"],
+            scope_paths=["b.py"],
+            suggested_test_command="true",
+            depends_on=["Leaf A"],
+        ),
+    ]
     chainlink = FakeChainlink(
         epic=issue(100, parent_id=None, labels={"worklink:epic"}),
         leaves=[],
@@ -958,9 +806,9 @@ async def test_no_go_blocks_even_for_partial_epic(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr(epic_mod, "_observe_slice", fake_observe_slice)
 
     class NoGoRoles(FakeRoles):
-        async def validate_integration(self, **kwargs: object) -> IntegrationValidation:
+        async def validate_integration(self, **kwargs: object) -> IntegrationDecision:
             self.validations += 1
-            return IntegrationValidation(verdict="NO-GO", summary="missing required slice")
+            return IntegrationDecision(approved=False, summary="missing required slice")
 
     chainlink = FakeChainlink(
         epic=issue(100, parent_id=None, labels={"worklink:epic"}),
@@ -1084,3 +932,63 @@ async def test_resume_missing_integration_worktree_rematerializes_to_merge_commi
 
     assert result.status == "completed"
     assert any(cmd[:5] == ["git", "-C", "/repo", "worktree", "add"] and cmd[-1] == "abc123" for cmd in calls)
+
+
+def test_chainlink_comment_raises_on_failure() -> None:
+    def failing_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["issue", "comment"]:
+            return cp(args, returncode=1, stderr="comment failed")
+        return cp(args)
+
+    client = ChainlinkEpicClient(runner=failing_runner)
+
+    with pytest.raises(Exception, match="comment failed"):
+        client.comment(101, "WORKLINK_REVIEW_FIXES ...")
+
+
+@pytest.mark.asyncio
+async def test_decompose_deficiency_wins_over_leaves_from_prior_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (PR #1000 review): a mixed state — leaves present (e.g. from a
+    crashed earlier attempt) AND a deficiency reported — must halt as deficient,
+    not proceed to build a partial plan."""
+    patch_git(monkeypatch, tmp_path)
+    import mimir.worklink.epic as epic_mod
+
+    monkeypatch.setattr(epic_mod, "_observe_slice", fake_observe_slice)
+
+    class MixedRoles(FakeRoles):
+        async def run_decompose(self, epic: IssueContext, *, chainlink: Any) -> DecomposeOutcome:
+            chainlink.file_leaf(
+                epic.issue_id,
+                WorklinkLeafSpec(
+                    title="Partial leaf",
+                    acceptance_criteria=["works"],
+                    review_criteria=["check"],
+                    scope_paths=["a.py"],
+                    suggested_test_command="true",
+                ),
+            )
+            return DecomposeOutcome(filed_leaves=1, deficiency="brief has no usable outcome")
+
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic"}),
+        leaves=[],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+
+    with pytest.raises(Exception, match="deficient"):
+        await EpicRunner(
+            home=tmp_path,
+            repo=Path("/repo"),
+            runner=runner,
+            registry=FakeRegistry(),  # type: ignore[arg-type]
+            roles=MixedRoles(decomposition=[]),
+            chainlink=chainlink,  # type: ignore[arg-type]
+        ).run(100)
+
+    # Nothing was merged and the epic was not moved to review.
+    assert chainlink.merged == []

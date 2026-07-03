@@ -19,10 +19,9 @@ from mimir.worklink.evidence import (
 )
 from mimir.worklink.orchestrator import IssueContext
 from mimir.worklink.review import (
-    DecomposeReview,
-    IntegrationValidation,
-    SliceReview,
-    WorkDecomposition,
+    DecomposeOutcome,
+    IntegrationDecision,
+    SliceDecision,
     WorklinkLeafSpec,
 )
 from mimir.worklink.worktree import IntegrationBranchLease, SliceMergeSuccess, WorktreeLease
@@ -111,38 +110,43 @@ class RecordingChainlink:
 
 
 class RecordingRoles:
+    """Action-based recording fake: decompose files the two slices via the
+    chainlink client; reviews return recorded-style decisions."""
+
     def __init__(self, *, reject: set[int] | None = None) -> None:
         self.reject = reject or set()
         self.events: list[tuple[Any, ...]] = []
 
-    async def decompose(self, epic: IssueContext) -> WorkDecomposition:
+    async def run_decompose(self, epic: IssueContext, *, chainlink: Any) -> DecomposeOutcome:
         self.events.append(("decompose", epic.issue_id))
-        return WorkDecomposition(
-            summary="two dependent slices",
-            leaves=[
-                WorklinkLeafSpec(
-                    title="Slice A",
-                    acceptance_criteria=["A works"],
-                    review_criteria=["review A"],
-                    scope_paths=["a.py"],
-                    suggested_test_command="true",
-                ),
-                WorklinkLeafSpec(
-                    title="Slice B",
-                    acceptance_criteria=["B works"],
-                    review_criteria=["review B"],
-                    scope_paths=["b.py"],
-                    suggested_test_command="true",
-                    depends_on=["Slice A"],
-                ),
-            ],
-        )
-
-    async def review_decomposition(
-        self, epic: IssueContext, decomposition: WorkDecomposition
-    ) -> DecomposeReview:
-        self.events.append(("decompose-review", epic.issue_id, len(decomposition.leaves)))
-        return DecomposeReview(verdict="APPROVE", summary="ok")
+        leaves = [
+            WorklinkLeafSpec(
+                title="Slice A",
+                acceptance_criteria=["A works"],
+                review_criteria=["review A"],
+                scope_paths=["a.py"],
+                suggested_test_command="true",
+            ),
+            WorklinkLeafSpec(
+                title="Slice B",
+                acceptance_criteria=["B works"],
+                review_criteria=["review B"],
+                scope_paths=["b.py"],
+                suggested_test_command="true",
+                depends_on=["Slice A"],
+            ),
+        ]
+        ids_by_title: dict[str, int] = {}
+        for leaf in leaves:
+            ids_by_title[leaf.title] = chainlink.file_leaf(epic.issue_id, leaf)
+        for leaf in leaves:
+            for dep_title in leaf.depends_on:
+                chainlink.add_blocker(
+                    ids_by_title[leaf.title],
+                    ids_by_title[dep_title],
+                    f"{leaf.title} depends on {dep_title}",
+                )
+        return DecomposeOutcome(filed_leaves=len(leaves))
 
     async def review_slice(
         self,
@@ -151,17 +155,18 @@ class RecordingRoles:
         evidence: EvidenceValidation,
         mode: str,
         reviewer_count: int,
-    ) -> SliceReview:
+        chainlink: Any,
+    ) -> SliceDecision:
         self.events.append(
             ("slice-review", leaf.issue.issue_id, mode, reviewer_count, evidence.review_ready)
         )
         if leaf.issue.issue_id in self.reject:
-            return SliceReview(
-                verdict="REJECT",
+            return SliceDecision(
+                approved=False,
                 summary="blocked by reviewer",
-                required_fixes=[f"{leaf.issue.title} stuck"],
+                fixes=(f"{leaf.issue.title} stuck",),
             )
-        return SliceReview(verdict="APPROVE", summary="ok")
+        return SliceDecision(approved=True, summary="ok")
 
     async def validate_integration(
         self,
@@ -170,10 +175,11 @@ class RecordingRoles:
         manifest: object,
         partial: bool,
         blocked: dict[int, str],
-    ) -> IntegrationValidation:
+        chainlink: Any,
+    ) -> IntegrationDecision:
         self.events.append(("integrate", epic.issue_id, partial, tuple(sorted(blocked))))
-        return IntegrationValidation(
-            verdict="GO-WITH-NITS" if partial else "GO",
+        return IntegrationDecision(
+            approved=True,
             summary="partial" if partial else "complete",
         )
 
