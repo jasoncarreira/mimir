@@ -117,6 +117,46 @@ def test_integration_validator_schema_is_flat_verdict_summary_findings() -> None
     assert result.findings and all(isinstance(f, str) for f in result.findings)
 
 
+def test_review_findings_coerce_objects_and_normalize_verdict_and_ignore_extra() -> None:
+    # The model often emits findings as objects, a lowercase verdict, and extra
+    # top-level fields — none of which should crash the structured response.
+    result = DecomposeReview.model_validate(
+        {
+            "verdict": "reject",
+            "summary": "issues found",
+            "findings": [
+                "plain string finding",
+                {"type": "vague_test_command", "message": "no concrete check invocation."},
+            ],
+            "confidence": 0.9,  # extra top-level field
+        }
+    )
+    assert result.verdict == "REJECT"
+    assert len(result.findings) == 2
+    assert all(isinstance(f, str) for f in result.findings)
+    assert "vague_test_command" in result.findings[1]
+
+
+def test_slice_review_required_fixes_coerce_and_summary_optional() -> None:
+    result = SliceReview.model_validate(
+        {
+            "verdict": "APPROVE",
+            "required_fixes": [{"fix": "run tests", "why": "no observed result"}],
+        }
+    )
+    assert result.verdict == "APPROVE"
+    assert result.summary == ""  # tolerated when omitted
+    assert result.required_fixes and isinstance(result.required_fixes[0], str)
+
+
+def test_integration_validation_verdict_normalizes_spacing() -> None:
+    result = IntegrationValidation.model_validate(
+        {"verdict": "go with nits", "findings": [{"gap": "AC3 unclear"}]}
+    )
+    assert result.verdict == "GO-WITH-NITS"
+    assert isinstance(result.findings[0], str)
+
+
 def test_worklink_review_subagent_specs_are_readonly_and_structured() -> None:
     specs = build_worklink_review_subagents()
 

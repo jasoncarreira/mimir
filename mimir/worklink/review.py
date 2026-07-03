@@ -4,11 +4,48 @@ from __future__ import annotations
 
 from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
-from typing import Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from mimir.worklink.backends.registry import TieredReviewConfig
+
+
+def _coerce_finding_item(item: Any) -> str:
+    """Render a single finding/fix as a readable string.
+
+    The reviewer models frequently return findings as objects (e.g.
+    ``{"type": ..., "message": ...}``) rather than bare strings. Rather than
+    reject the whole structured response, normalize each item to a string.
+    """
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        parts = [f"{k}: {v}" for k, v in item.items() if v not in (None, "", [], {})]
+        return "; ".join(parts) if parts else "(empty finding)"
+    return str(item)
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    """Accept a string, a single object, or a list of strings/objects → list[str]."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [_coerce_finding_item(item) for item in value]
+    return [_coerce_finding_item(value)]
+
+
+def _normalize_verdict(value: Any) -> Any:
+    """Normalize a verdict to canonical UPPER-DASHED form before Literal validation."""
+    if isinstance(value, str):
+        return value.strip().upper().replace(" ", "-")
+    return value
+
+
+#: List field that tolerates the model returning strings or objects.
+StrList = Annotated[list[str], BeforeValidator(_coerce_str_list)]
 
 
 class WorklinkLeafSpec(BaseModel):
@@ -85,29 +122,34 @@ class WorkDecomposition(BaseModel):
 class DecomposeReview(BaseModel):
     """Structured output for the decompose-reviewer role.
 
-    Flat by design: ``verdict`` + ``summary`` drive the decision; ``findings`` is
-    a plain list of short strings (no nested objects) so the model can conform
-    reliably.
+    Flat + tolerant: ``verdict`` + ``summary`` drive the decision; ``findings``
+    accepts strings OR model-emitted objects (coerced to strings), the verdict is
+    case/spacing-normalized, and extra fields are ignored — so advisory output
+    variance can never crash the verdict.
     """
 
-    verdict: Literal["APPROVE", "REJECT"]
-    summary: str
-    findings: list[str] = Field(
+    model_config = ConfigDict(extra="ignore")
+
+    verdict: Annotated[Literal["APPROVE", "REJECT"], BeforeValidator(_normalize_verdict)]
+    summary: str = ""
+    findings: StrList = Field(
         default_factory=list,
-        description="Short plain-text findings explaining the verdict (empty on a clean APPROVE).",
+        description="Short findings explaining the verdict (empty on a clean APPROVE).",
     )
 
 
 class SliceReview(BaseModel):
     """Structured output for the adversarial per-slice reviewer role."""
 
-    verdict: Literal["APPROVE", "REJECT"]
-    summary: str
-    findings: list[str] = Field(
+    model_config = ConfigDict(extra="ignore")
+
+    verdict: Annotated[Literal["APPROVE", "REJECT"], BeforeValidator(_normalize_verdict)]
+    summary: str = ""
+    findings: StrList = Field(
         default_factory=list,
-        description="Short plain-text findings (empty on a clean APPROVE).",
+        description="Short findings (empty on a clean APPROVE).",
     )
-    required_fixes: list[str] = Field(
+    required_fixes: StrList = Field(
         default_factory=list,
         description="Concrete fixes the builder must make; non-empty on REJECT.",
     )
@@ -116,11 +158,15 @@ class SliceReview(BaseModel):
 class IntegrationValidation(BaseModel):
     """Structured output for the holistic integration-validator role."""
 
-    verdict: Literal["GO", "GO-WITH-NITS", "NO-GO"]
-    summary: str
-    findings: list[str] = Field(
+    model_config = ConfigDict(extra="ignore")
+
+    verdict: Annotated[
+        Literal["GO", "GO-WITH-NITS", "NO-GO"], BeforeValidator(_normalize_verdict)
+    ]
+    summary: str = ""
+    findings: StrList = Field(
         default_factory=list,
-        description="Short plain-text findings (empty on a clean GO). Note AC gaps here.",
+        description="Short findings (empty on a clean GO). Note AC gaps here.",
     )
 
 
