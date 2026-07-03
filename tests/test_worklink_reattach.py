@@ -14,10 +14,16 @@ from mimir.worklink.orchestrator import WorklinkRunner
 from mimir.worklink.run_state import (
     WorklinkRunState,
     clear_run_state,
+    exhaustion_checkpoint_dedupe_key,
+    known_issue_exhaustion_checkpoint,
+    list_exhaustion_checkpoints,
     list_run_states,
+    load_exhaustion_checkpoint,
     load_run_state,
     reattach_dispatch_argv,
+    save_exhaustion_checkpoint,
     save_run_state,
+    unknown_issue_exhaustion_checkpoint,
 )
 
 
@@ -227,6 +233,117 @@ def test_reattach_dispatch_argv() -> None:
         "mimir", "worklink", "run", "561", "--reattach", "--autonomous",
         "--home", "/home", "--repo", "/repo",
     ]
+
+
+# --------------------------------------------------------------------------
+# exhaustion checkpoint module
+# --------------------------------------------------------------------------
+
+
+def test_known_issue_exhaustion_checkpoint_roundtrip(tmp_path: Path) -> None:
+    checkpoint = known_issue_exhaustion_checkpoint(
+        issue_id=806,
+        pr_url="https://github.com/jasoncarreira/mimir/pull/999",
+        turn_id="turn-abc",
+        work_item_id="worklink:806:a1",
+        repo="/workspace/mimir",
+        worktree="/workspace/mimir/.worklink/806-1",
+        branch="issue/806-a1",
+        completed_edits=("mimir/worklink/run_state.py",),
+        unrun_validation=("uv run pytest -q tests/test_worklink_reattach.py",),
+        next_commands=("git diff --check",),
+        label_status_adjustments=("keep worklink:in-progress until continuation",),
+        created_at="2026-07-03T00:00:00+00:00",
+    )
+
+    path, created = save_exhaustion_checkpoint(tmp_path, checkpoint)
+
+    assert created is True
+    assert path.name == f"{checkpoint.dedupe_key}.json"
+    loaded = load_exhaustion_checkpoint(tmp_path, checkpoint.dedupe_key)
+    assert loaded == checkpoint
+    assert loaded is not None
+    assert loaded.mode == "known_issue"
+    assert loaded.issue_id == 806
+    assert loaded.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
+    assert [c.dedupe_key for c in list_exhaustion_checkpoints(tmp_path)] == [
+        checkpoint.dedupe_key
+    ]
+
+
+def test_unknown_issue_exhaustion_checkpoint_is_high_priority_generic(tmp_path: Path) -> None:
+    checkpoint = unknown_issue_exhaustion_checkpoint(
+        turn_id="turn-no-issue",
+        work_item_id="worklink-finalizer",
+        repo="/workspace/mimir",
+        worktree="/workspace/mimir",
+        branch="feature/unknown",
+        completed_edits=("edited run_state.py",),
+        unrun_validation=("pytest was not run before exhaustion",),
+        next_commands=("inspect git status", "resume Chainlink inference"),
+        label_status_adjustments=("infer related issue before labeling",),
+        created_at="2026-07-03T00:05:00+00:00",
+    )
+
+    _, created = save_exhaustion_checkpoint(tmp_path, checkpoint)
+    loaded = load_exhaustion_checkpoint(tmp_path, checkpoint.dedupe_key)
+
+    assert created is True
+    assert loaded == checkpoint
+    assert checkpoint.mode == "unknown_issue"
+    assert checkpoint.priority == "high"
+    assert checkpoint.issue_id is None
+    assert checkpoint.pr_url is None
+    assert checkpoint.next_commands == (
+        "inspect git status",
+        "resume Chainlink inference",
+    )
+
+
+def test_exhaustion_checkpoint_dedupe_suppresses_duplicate_records(tmp_path: Path) -> None:
+    first = known_issue_exhaustion_checkpoint(
+        issue_id=806,
+        turn_id="turn-abc",
+        work_item_id="worklink:806:a1",
+        repo="/workspace/mimir",
+        worktree="/workspace/mimir/.worklink/806-1",
+        branch="issue/806-a1",
+        completed_edits=("initial edit",),
+        created_at="2026-07-03T00:00:00+00:00",
+    )
+    enriched_retry = known_issue_exhaustion_checkpoint(
+        issue_id=806,
+        turn_id="turn-abc",
+        work_item_id="worklink:806:a1",
+        repo="/workspace/mimir",
+        worktree="/workspace/mimir/.worklink/806-1",
+        branch="issue/806-a1",
+        completed_edits=("initial edit", "added tests"),
+        unrun_validation=("uv run pytest -q tests/test_worklink_reattach.py",),
+        created_at="2026-07-03T00:01:00+00:00",
+    )
+
+    expected_key = exhaustion_checkpoint_dedupe_key(
+        mode="known_issue",
+        turn_id="turn-abc",
+        work_item_id="worklink:806:a1",
+        issue_id=806,
+        repo="/workspace/mimir",
+        worktree="/workspace/mimir/.worklink/806-1",
+        branch="issue/806-a1",
+    )
+    assert first.dedupe_key == expected_key
+    assert enriched_retry.dedupe_key == expected_key
+
+    first_path, first_created = save_exhaustion_checkpoint(tmp_path, first)
+    retry_path, retry_created = save_exhaustion_checkpoint(tmp_path, enriched_retry)
+
+    assert first_created is True
+    assert retry_created is False
+    assert retry_path == first_path
+    checkpoints = list_exhaustion_checkpoints(tmp_path)
+    assert len(checkpoints) == 1
+    assert checkpoints[0] == enriched_retry
 
 
 # --------------------------------------------------------------------------
