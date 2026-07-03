@@ -12,11 +12,16 @@ from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, Wo
 from mimir.worklink.compute import LaunchHandle, WorkSpec
 from mimir.worklink.orchestrator import WorklinkRunner
 from mimir.worklink.run_state import (
+    WorklinkExhaustionCheckpoint,
     WorklinkRunState,
     clear_run_state,
+    exhaustion_checkpoint_dedupe_key,
+    list_exhaustion_checkpoints,
     list_run_states,
+    load_exhaustion_checkpoint_path,
     load_run_state,
     reattach_dispatch_argv,
+    save_exhaustion_checkpoint,
     save_run_state,
 )
 
@@ -227,6 +232,103 @@ def test_reattach_dispatch_argv() -> None:
         "mimir", "worklink", "run", "561", "--reattach", "--autonomous",
         "--home", "/home", "--repo", "/repo",
     ]
+
+
+# --------------------------------------------------------------------------
+# exhaustion checkpoint artifacts
+# --------------------------------------------------------------------------
+
+
+def test_known_issue_exhaustion_checkpoint_roundtrip(tmp_path: Path) -> None:
+    checkpoint = WorklinkExhaustionCheckpoint.for_known_issue(
+        issue_id=806,
+        pr_url="https://github.com/jasoncarreira/mimir/pull/900",
+        work_item="chainlink-806",
+        exhausted_turn_id="turn-abc",
+        worktree="/work/repo",
+        branch="issue/806-a3",
+        completed_edits=["mimir/worklink/run_state.py"],
+        unrun_validation=["uv run pytest -q tests/test_worklink_reattach.py"],
+        next_commands=["git diff -- mimir/worklink/run_state.py"],
+        label_status_adjustments=["keep worklink:in-progress"],
+        created_at="2026-07-03T00:00:00+00:00",
+    )
+
+    expected_key = exhaustion_checkpoint_dedupe_key(
+        case="known-issue",
+        work_item="chainlink-806",
+        exhausted_turn_id="turn-abc",
+        issue_id=806,
+        pr_url="https://github.com/jasoncarreira/mimir/pull/900",
+    )
+    assert checkpoint.dedupe_key == expected_key
+
+    saved = save_exhaustion_checkpoint(tmp_path, checkpoint)
+    assert saved.created is True
+    assert saved.path.parts[-2:] == ("known-issue", f"{expected_key.replace(':', '-')}.json")
+    assert load_exhaustion_checkpoint_path(saved.path) == checkpoint
+    assert list_exhaustion_checkpoints(tmp_path) == [checkpoint]
+
+
+def test_unknown_issue_exhaustion_checkpoint_is_high_priority(tmp_path: Path) -> None:
+    checkpoint = WorklinkExhaustionCheckpoint.for_unknown_issue(
+        work_item="finalizer-no-chainlink-context",
+        exhausted_turn_id="turn-xyz",
+        worktree="/work/repo",
+        branch="detached",
+        completed_edits=["unknown local edits; inspect git status"],
+        unrun_validation=["uv run pytest -q"],
+        next_commands=["git status --short --branch"],
+        label_status_adjustments=["infer Chainlink issue before applying labels"],
+        created_at="2026-07-03T00:00:00+00:00",
+    )
+
+    saved = save_exhaustion_checkpoint(tmp_path, checkpoint)
+    loaded = load_exhaustion_checkpoint_path(saved.path)
+    assert loaded == checkpoint
+    assert loaded is not None
+    assert loaded.case == "unknown-issue"
+    assert loaded.issue_id is None
+    assert loaded.pr_url is None
+    assert loaded.priority == "high"
+    assert saved.path.parts[-2] == "unknown-issue"
+
+
+def test_exhaustion_checkpoint_save_suppresses_duplicates(tmp_path: Path) -> None:
+    first = WorklinkExhaustionCheckpoint.for_known_issue(
+        issue_id=806,
+        work_item="chainlink-806",
+        exhausted_turn_id="turn-abc",
+        worktree="/work/repo",
+        branch="issue/806-a3",
+        completed_edits=["first edit"],
+        unrun_validation=["first validation"],
+        next_commands=["first command"],
+        label_status_adjustments=["first status"],
+        created_at="2026-07-03T00:00:00+00:00",
+    )
+    duplicate = WorklinkExhaustionCheckpoint.for_known_issue(
+        issue_id=806,
+        pr_url="https://github.com/jasoncarreira/mimir/pull/900",
+        work_item="chainlink-806",
+        exhausted_turn_id="turn-abc",
+        worktree="/work/repo",
+        branch="issue/806-a3",
+        completed_edits=["second edit should not overwrite"],
+        unrun_validation=["second validation"],
+        next_commands=["second command"],
+        label_status_adjustments=["second status"],
+        created_at="2026-07-03T00:01:00+00:00",
+    )
+
+    saved_first = save_exhaustion_checkpoint(tmp_path, first)
+    saved_duplicate = save_exhaustion_checkpoint(tmp_path, duplicate)
+
+    assert saved_first.created is True
+    assert saved_duplicate.created is False
+    assert saved_duplicate.path == saved_first.path
+    assert saved_duplicate.checkpoint == first
+    assert list_exhaustion_checkpoints(tmp_path) == [first]
 
 
 # --------------------------------------------------------------------------
