@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from .backends import BackendRegistry, WorkOrder, WorklinkConfig
@@ -159,12 +160,17 @@ class ChainlinkEpicClient:
         self.chainlink_bin = chainlink_bin
         self.runner = runner
 
-    def read_issue(self, issue_id: int) -> IssueContext:
+    def _show_issue(self, issue_id: int) -> Mapping[str, Any]:
         result = self.runner([self.chainlink_bin, "issue", "show", str(issue_id), "--json"])
         if result.returncode != 0:
             raise WorklinkError((result.stderr or result.stdout).strip() or "chainlink issue show failed")
         payload = json.loads(result.stdout)
-        return _issue_from_payload(payload, fallback_id=issue_id)
+        if not isinstance(payload, Mapping):
+            raise WorklinkError("chainlink issue show did not return an object")
+        return payload
+
+    def read_issue(self, issue_id: int) -> IssueContext:
+        return _issue_from_payload(self._show_issue(issue_id), fallback_id=issue_id)
 
     def child_leaves(self, epic_id: int) -> list[LeafIssue]:
         result = self.runner([self.chainlink_bin, "issue", "list", "--json"])
@@ -173,25 +179,42 @@ class ChainlinkEpicClient:
         payload = json.loads(result.stdout)
         if not isinstance(payload, list):
             raise WorklinkError("chainlink issue list did not return a list")
-        leaves = []
+        # `issue list --json` omits blocked_by and labels entirely; only `issue show`
+        # carries them. Hydrate every child from show or the DAG flattens to one wave
+        # and risk labels never reach the review classifier.
+        child_ids: list[int] = []
         for item in payload:
             if not isinstance(item, Mapping):
                 continue
-            issue = _issue_from_payload(item)
-            if issue.parent_id != epic_id:
+            if item.get("parent_id") is None or item.get("id") is None:
                 continue
-            scope_paths = tuple(_str_list(_first_present(item, ("scope_paths", "scope", "paths"))))
+            if int(item["parent_id"]) != epic_id:
+                continue
+            child_ids.append(int(item["id"]))
+        leaves = []
+        missing_keys: set[str] = set()
+        for child_id in child_ids:
+            detail = self._show_issue(child_id)
+            missing_keys.update(key for key in ("blocked_by", "labels") if key not in detail)
+            issue = _issue_from_payload(detail, fallback_id=child_id)
+            scope_paths = tuple(_str_list(_first_present(detail, ("scope_paths", "scope", "paths"))))
             suggested_test_command = _optional_str(
-                _first_present(item, ("suggested_test_command", "test_command"))
+                _first_present(detail, ("suggested_test_command", "test_command"))
             )
             leaves.append(
                 LeafIssue(
                     issue=issue,
-                    blocked_by=tuple(_int_list(_first_present(item, ("blocked_by", "blockers", "blocked_by_ids")))),
+                    blocked_by=tuple(_int_list(_first_present(detail, ("blocked_by", "blockers", "blocked_by_ids")))),
                     scope_paths=scope_paths or tuple(_parse_scope_paths(issue.description)),
                     suggested_test_command=suggested_test_command
                     or _parse_suggested_test_command(issue.description),
                 )
+            )
+        if missing_keys:
+            print(
+                "worklink epic: chainlink issue show payload missing "
+                f"{sorted(missing_keys)}; dependency waves/risk labels may be wrong",
+                file=sys.stderr,
             )
         return leaves
 
