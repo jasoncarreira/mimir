@@ -21,7 +21,7 @@ from mimir.worklink.epic import (
     MissingEpicRoleRunner,
     compute_waves,
 )
-from mimir.worklink.epic_state import EpicRunManifest, EpicSliceRecord
+from mimir.worklink.epic_state import EpicRunManifest, EpicSliceRecord, save_epic_state
 from mimir.worklink.epic_roles import EpicSubagentRoleRunner
 from mimir.worklink.evidence import (
     CommandResult,
@@ -115,6 +115,7 @@ class FakeChainlink:
     comments: list[tuple[int, str]] | None = None
     failed_epics: list[tuple[int, bool, str]] | None = None
     moved_to_review: bool = False
+    moved_to_blocked: bool = False
 
     def read_issue(self, issue_id: int) -> IssueContext:
         assert issue_id == self.epic.issue_id
@@ -157,6 +158,10 @@ class FakeChainlink:
     def move_epic_to_review(self, epic_id: int) -> None:
         assert epic_id == self.epic.issue_id
         self.moved_to_review = True
+
+    def move_epic_to_blocked(self, epic_id: int) -> None:
+        assert epic_id == self.epic.issue_id
+        self.moved_to_blocked = True
 
 
 class FakeRoles:
@@ -902,6 +907,20 @@ def test_chainlink_move_epic_to_review_clears_parent_in_progress_label() -> None
     assert ["chainlink", "issue", "label", "100", "worklink:review"] in calls
 
 
+def test_chainlink_move_epic_to_blocked_clears_parent_in_progress_label() -> None:
+    calls: list[list[str]] = []
+
+    def fake_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return cp(args)
+
+    ChainlinkEpicClient(runner=fake_runner).move_epic_to_blocked(100)
+
+    assert ["chainlink", "issue", "unlabel", "100", "worklink:ready"] in calls
+    assert ["chainlink", "issue", "unlabel", "100", "worklink:in-progress"] in calls
+    assert ["chainlink", "issue", "label", "100", "worklink:blocked"] in calls
+
+
 def test_chainlink_file_leaf_is_idempotent_by_title() -> None:
     calls: list[list[str]] = []
 
@@ -1091,6 +1110,54 @@ async def test_no_go_blocks_even_for_partial_epic(tmp_path: Path, monkeypatch: p
     assert result.status == "blocked"
     assert result.reason == "missing required slice"
     assert chainlink.moved_to_review is False
+    assert chainlink.moved_to_blocked is True
+
+
+@pytest.mark.asyncio
+async def test_all_blocked_resume_exits_without_integration_validation(tmp_path: Path) -> None:
+    save_epic_state(
+        tmp_path,
+        EpicRunManifest(
+            epic_id=100,
+            integration_branch="epic/100-integration",
+            integration_worktree=str(tmp_path / "missing-integration"),
+            base_ref="main",
+            phase="integrate",
+            status="blocked",
+            slices=[
+                EpicSliceRecord(id=101, status="blocked"),
+                EpicSliceRecord(id=102, status="blocked"),
+            ],
+        ),
+    )
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic", "worklink:in-progress"}),
+        leaves=[
+            LeafIssue(issue(101), scope_paths=("a.py",), suggested_test_command="true"),
+            LeafIssue(issue(102), scope_paths=("b.py",), suggested_test_command="true"),
+        ],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+    roles = FakeRoles()
+
+    result = await EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=runner,
+        registry=FakeRegistry(),  # type: ignore[arg-type]
+        roles=roles,
+        chainlink=chainlink,  # type: ignore[arg-type]
+    ).run(100)
+
+    assert result.status == "blocked"
+    assert result.blocked_leaves == (101, 102)
+    assert result.reason == "all slices blocked"
+    assert roles.validations == 0
+    assert chainlink.merged == []
+    assert chainlink.moved_to_review is False
+    assert chainlink.moved_to_blocked is True
 
 
 @pytest.mark.asyncio

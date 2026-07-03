@@ -696,6 +696,8 @@ def _fake_chainlink_script(
     *,
     ready: list[int],
     epics: list[int] | None = None,
+    blocked_epics: list[int] | None = None,
+    review_epics: list[int] | None = None,
     parents: dict[int, int] | None = None,
     in_progress: list[int] | None = None,
     active_locks: list[int] | None = None,
@@ -709,6 +711,8 @@ def _fake_chainlink_script(
         "a = sys.argv[1:]\n"
         f"ready = {ready!r}\n"
         f"epics = {(epics or [])!r}\n"
+        f"blocked_epics = {(blocked_epics or [])!r}\n"
+        f"review_epics = {(review_epics or [])!r}\n"
         f"parents = {(parents or {})!r}\n"
         f"actionable = {(ready if actionable is None else actionable)!r}\n"
         f"inprog = {(in_progress or [])!r}\n"
@@ -721,7 +725,7 @@ def _fake_chainlink_script(
         "    sys.exit(0)\n"
         "if a[:2] == ['issue','list']:\n"
         "    label = a[a.index('--label')+1] if '--label' in a else ''\n"
-        "    ids = epics if label=='worklink:epic' else inprog if label=='worklink:in-progress' else ready if label=='worklink:ready' else []\n"
+        "    ids = epics if label=='worklink:epic' else blocked_epics if label=='worklink:blocked' else review_epics if label=='worklink:review' else inprog if label=='worklink:in-progress' else ready if label=='worklink:ready' else []\n"
         "    print(json.dumps([{'id': i, 'parent_id': parents.get(i)} for i in ids]))\n"
         "sys.exit(0)\n",
         encoding="utf-8",
@@ -917,6 +921,37 @@ def test_poller_routes_actionable_epic_to_epic_run(tmp_path: Path) -> None:
     assert (tmp_path / "dispatched.txt").read_text(encoding="utf-8").splitlines() == [
         f"worklink run-epic 100 --home {home} --repo {repo} --autonomous"
     ]
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_skips_terminal_epic_labels(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path,
+        ready=[101, 102, 103],
+        epics=[100, 200, 300],
+        blocked_epics=[100],
+        review_epics=[200],
+        parents={101: 100, 102: 200, 103: 300},
+        actionable=[100, 101, 200, 102, 300, 103],
+        active_locks=[],
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "3",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert [(e["mode"], e["issue_id"]) for e in dispatched] == [("epic", 300)]
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
