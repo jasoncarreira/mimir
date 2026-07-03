@@ -542,8 +542,12 @@ def test_worker_gate_failure_emits_tests_tail_section(
     # Tail-based: early noise dropped; secrets redacted.
     assert "noise-line-1\n" not in section
     assert "super-secret-gate-value" not in section
-    # The general diag block still follows for full context.
+    # The general diag block still follows for full context, and (chainlink
+    # #816) carries its own bounded gate-tests section.
     assert "WORKLINK_WORKER_DIAG_BEGIN" in out
+    diag = out.split("WORKLINK_WORKER_DIAG_BEGIN", 1)[1].split("WORKLINK_WORKER_DIAG_END", 1)[0]
+    assert "--- gate tests: echo ok (exit 1) ---" in diag
+    assert "FAILED tests/test_z.py::test_gate" in diag
 
 
 def test_extract_gate_test_tail_parses_and_bounds() -> None:
@@ -579,8 +583,104 @@ def test_worker_diag_block_is_size_capped(
     out = capsys.readouterr().out
     assert "WORKLINK_WORKER_DIAG_END" in out
     diag = out.split("WORKLINK_WORKER_DIAG_BEGIN", 1)[1].split("WORKLINK_WORKER_DIAG_END", 1)[0]
-    assert len(diag) <= 8100
-    assert "(head truncated)" in diag
+    assert len(diag) <= 8600
+    # chainlink #816: per-section caps — the header always survives, and the
+    # oversized stderr section is tail-capped with a marker.
+    assert "issue=#793 attempt=2" in diag
+    assert "(truncated)" in diag
+
+
+def test_worker_diag_header_survives_giant_single_line_transcript(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """chainlink #816: one giant transcript JSONL line used to eat the whole
+    8KB budget and truncate away the header + stderr sections."""
+    backend = WorkerScriptedBackend(
+        script="import sys; sys.stderr.write('codex: the real error line\\n'); sys.exit(3)",
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    transcripts = tmp_path / "transcripts"
+    transcripts.mkdir(parents=True)
+    (transcripts / "fake.json").write_text('{"blob": "' + "y" * 50000 + '"}', encoding="utf-8")
+    payload = _worker_diag_payload(tmp_path, backend)
+
+    asyncio.run(
+        run_worker_payload(payload, registry=registry, runner=_worker_diag_runner(payload.repo_dir))
+    )
+
+    out = capsys.readouterr().out
+    diag = out.split("WORKLINK_WORKER_DIAG_BEGIN", 1)[1].split("WORKLINK_WORKER_DIAG_END", 1)[0]
+    assert "issue=#793 attempt=2" in diag
+    assert "backend_exit=3" in diag
+    assert "codex: the real error line" in diag
+    assert len(diag) <= 8600
+
+
+def test_worker_diag_redacts_secret_straddling_truncation_boundary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """chainlink #816 review blocker: redaction must run BEFORE truncation — a
+    secret split by the clip boundary leaves a suffix that exact-value
+    replacement can no longer match."""
+    secret = "SECRETVALUE1234567890x"
+    # Place the secret so the 2400-char stderr cap boundary falls INSIDE it.
+    backend = WorkerScriptedBackend(
+        script=(
+            "import sys; "
+            f"sys.stderr.write('padding ' + '{secret}' + 'B' * 2390); "
+            "sys.exit(3)"
+        ),
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    payload = _worker_diag_payload(tmp_path, backend, env={"CODEX_API_KEY": secret})
+
+    asyncio.run(
+        run_worker_payload(payload, registry=registry, runner=_worker_diag_runner(payload.repo_dir))
+    )
+
+    out = capsys.readouterr().out
+    assert secret not in out
+    assert "1234567890x" not in out  # no straddle suffix leak
+    assert "<redacted>" in out
+
+
+def test_tests_tail_redacts_secret_straddling_clip_boundary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    secret = "SECRETVALUE1234567890x"
+    backend = WorkerScriptedBackend(script="print('ok')", status="success")
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    payload = _worker_diag_payload(tmp_path, backend, env={"CODEX_API_KEY": secret})
+    gate_output = "padding " + secret + "B" * 5990  # 6000-char clip lands inside the secret
+    repo = payload.repo_dir
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:2] == ["git", "clone"]:
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / ".git").mkdir(exist_ok=True)
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--cached" in args:
+            return cp(args, stdout="changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--name-only" in args:
+            return cp(args, stdout="changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--stat" in args:
+            return cp(args, stdout=" changed.txt | 1 +\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "status"]:
+            return cp(args, stdout="?? changed.txt\n")
+        if args == "echo ok":
+            return cp(args, returncode=1, stdout=gate_output)
+        return cp(args)
+
+    validation = asyncio.run(run_worker_payload(payload, registry=registry, runner=runner))
+
+    assert validation.review_ready is False
+    out = capsys.readouterr().out
+    assert "WORKLINK_TESTS_TAIL_BEGIN" in out
+    assert secret not in out
+    assert "1234567890x" not in out
 
 
 def test_worker_prepares_slash_named_feature_base(tmp_path: Path) -> None:

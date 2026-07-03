@@ -289,11 +289,13 @@ def _spec_secret_values(spec: WorkSpec) -> list[str]:
 
 
 def _print_tests_tail(cmd: str | None, exit_code: int | None, body: str, secret_values: Sequence[str]) -> None:
-    body = (body or "(no output captured)").strip()[-_TESTS_TAIL_MAX_CHARS:]
+    # Redact BEFORE clipping: a secret straddling the clip boundary would leave
+    # a suffix the exact-value replacement can no longer match.
+    body = _redact_diagnostics((body or "(no output captured)").strip(), secret_values)
     print(TESTS_TAIL_BEGIN)
     print(f"command: {cmd}")
     print(f"exit: {exit_code}")
-    print(_redact_diagnostics(body, secret_values))
+    print(body[-_TESTS_TAIL_MAX_CHARS:])
     print(TESTS_TAIL_END, flush=True)
 
 
@@ -337,10 +339,18 @@ def gate_failure_detail(validation: EvidenceValidation, stdout: str | None) -> s
 
 _DIAG_BEGIN = "WORKLINK_WORKER_DIAG_BEGIN"
 _DIAG_END = "WORKLINK_WORKER_DIAG_END"
+# chainlink #816: per-SECTION budgets, not one tail-biased total cap. A single
+# giant transcript JSONL line used to eat the whole 8KB budget and truncate away
+# the header + stderr — the most diagnostic lines. The header is always printed
+# uncut; each section is tail-capped independently; worst-case total stays ~8KB.
 _DIAG_STDERR_TAIL_LINES = 50
+_DIAG_STDERR_MAX_CHARS = 2400
 _DIAG_STDOUT_TAIL_LINES = 30
+_DIAG_STDOUT_MAX_CHARS = 1600
+_DIAG_TESTS_TAIL_LINES = 30
+_DIAG_TESTS_MAX_CHARS = 1600
 _DIAG_TRANSCRIPT_TAIL_LINES = 30
-_DIAG_TOTAL_MAX_CHARS = 8000
+_DIAG_TRANSCRIPT_MAX_CHARS = 2000
 
 _DIAG_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)\b(authorization\s*[:=]\s*)\S.*"), r"\1<redacted>"),
@@ -357,6 +367,16 @@ _DIAG_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 def _tail_lines(text: str, limit: int) -> str:
     return "\n".join(text.splitlines()[-limit:])
+
+
+def _tail_capped(text: str, *, lines: int, chars: int, secret_values: Sequence[str]) -> str:
+    # Redact BEFORE any truncation (chainlink #816 review): clipping first can
+    # split a secret across the boundary, leaving a suffix the exact-value
+    # replacement no longer matches — which would then be emitted verbatim.
+    clipped = _tail_lines(_redact_diagnostics(text, secret_values), lines)
+    if len(clipped) > chars:
+        clipped = "(truncated)\n" + clipped[-chars:]
+    return clipped or "(empty)"
 
 
 def _redact_diagnostics(text: str, secret_values: Sequence[str]) -> str:
@@ -391,6 +411,8 @@ def _emit_failure_diagnostics(
         reverse=True,
     )
     exit_code = compute_result.exit_code if compute_result is not None else "n/a"
+    # Header first and NEVER truncated — issue/attempt/status/reasons are the
+    # lines a post-mortem needs even when every section overflows.
     lines = [
         f"issue=#{spec.issue_id} attempt={spec.attempt} backend={spec.backend} "
         f"status={validation.status} backend_exit={exit_code} "
@@ -398,21 +420,30 @@ def _emit_failure_diagnostics(
     ]
     if compute_result is not None:
         lines.append(f"--- backend stderr (last {_DIAG_STDERR_TAIL_LINES} lines) ---")
-        lines.append(_tail_lines(compute_result.stderr, _DIAG_STDERR_TAIL_LINES) or "(empty)")
+        lines.append(
+            _tail_capped(compute_result.stderr, lines=_DIAG_STDERR_TAIL_LINES, chars=_DIAG_STDERR_MAX_CHARS, secret_values=secret_values)
+        )
         lines.append(f"--- backend stdout (last {_DIAG_STDOUT_TAIL_LINES} lines) ---")
-        lines.append(_tail_lines(compute_result.stdout, _DIAG_STDOUT_TAIL_LINES) or "(empty)")
+        lines.append(
+            _tail_capped(compute_result.stdout, lines=_DIAG_STDOUT_TAIL_LINES, chars=_DIAG_STDOUT_MAX_CHARS, secret_values=secret_values)
+        )
+    tests = validation.evidence.tests
+    if tests is not None and tests.observed and tests.exit_code:
+        lines.append(f"--- gate tests: {tests.cmd} (exit {tests.exit_code}) ---")
+        lines.append(
+            _tail_capped(tests.summary or "", lines=_DIAG_TESTS_TAIL_LINES, chars=_DIAG_TESTS_MAX_CHARS, secret_values=secret_values)
+        )
     if transcript_path is not None:
         try:
             transcript_text = Path(transcript_path).read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             transcript_text = f"(transcript unreadable: {exc})"
         lines.append(f"--- transcript tail (last {_DIAG_TRANSCRIPT_TAIL_LINES} lines of {transcript_path}) ---")
-        lines.append(_tail_lines(transcript_text, _DIAG_TRANSCRIPT_TAIL_LINES) or "(empty)")
-    body = _redact_diagnostics("\n".join(lines), secret_values)
-    if len(body) > _DIAG_TOTAL_MAX_CHARS:
-        body = "(head truncated)\n" + body[-_DIAG_TOTAL_MAX_CHARS:]
+        lines.append(
+            _tail_capped(transcript_text, lines=_DIAG_TRANSCRIPT_TAIL_LINES, chars=_DIAG_TRANSCRIPT_MAX_CHARS, secret_values=secret_values)
+        )
     print(_DIAG_BEGIN)
-    print(body)
+    print(_redact_diagnostics("\n".join(lines), secret_values))
     print(_DIAG_END, flush=True)
 
 
