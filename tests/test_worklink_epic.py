@@ -1279,8 +1279,11 @@ async def test_adopts_pushed_slice_branch_without_compute(
         lambda *a, **k: WorktreeLease(101, 1, Path("/repo"), slice_path, "issue/101-a1", "epic/100-integration", "HEAD"),
     )
 
+    runner_calls: list[list[str]] = []
+
     def adoption_runner(args, cwd=None):
         listed = list(args)
+        runner_calls.append(listed)
         if listed[:2] == ["git", "-C"] and "ls-remote" in listed:
             return cp(args, stdout="c4246a8f\trefs/heads/issue/101-a1\n")
         return cp(args)
@@ -1325,6 +1328,12 @@ async def test_adopts_pushed_slice_branch_without_compute(
     assert result.status == "completed"
     assert registry.compute.launched == []  # adoption skipped compute entirely
     assert chainlink.merged == [101]
+    # PR #1014 review catch: the LOCAL lease branch must be reset to the
+    # adopted remote ref — the merge consumes the local branch.
+    assert any(
+        call[:2] == ["git", "-C"] and "reset" in call and "origin/issue/101-a1" in call
+        for call in runner_calls
+    )
 
 
 @pytest.mark.asyncio

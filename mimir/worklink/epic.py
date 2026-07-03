@@ -778,7 +778,7 @@ class EpicRunner:
             adopted = (
                 not pending_fixes
                 and not compute.capabilities().shared_filesystem
-                and _slice_branch_adoptable(self.repo, lease=lease, runner=runner)
+                and _adopt_slice_branch(self.repo, lease=lease, runner=runner)
             )
             if adopted:
                 compute_result = ComputeResult(0, "adopted pushed slice branch", "")
@@ -1065,9 +1065,13 @@ class _AdoptedRaw:
     blocked_reason: str | None = None
 
 
-def _slice_branch_adoptable(repo: Path, *, lease: WorktreeLease, runner: Runner) -> bool:
-    """True when origin already has this attempt branch built on the CURRENT
-    integration base — a prior run pushed it but died before review (#823)."""
+def _adopt_slice_branch(repo: Path, *, lease: WorktreeLease, runner: Runner) -> bool:
+    """Adopt an already-pushed attempt branch built on the CURRENT integration
+    base — a prior run pushed it but died before review (#823). On success the
+    LOCAL lease branch is hard-reset to the fetched remote ref: the later
+    ``merge_slice_into_integration`` merges the local branch, so without the
+    reset the adopted work would be silently dropped (review catch on PR
+    #1014)."""
     listed = runner(["git", "-C", str(repo), "ls-remote", "--heads", "origin", lease.branch])
     if listed.returncode != 0 or not listed.stdout.strip():
         return False
@@ -1078,7 +1082,12 @@ def _slice_branch_adoptable(repo: Path, *, lease: WorktreeLease, runner: Runner)
     ancestor = runner(
         ["git", "-C", str(repo), "merge-base", "--is-ancestor", base, f"origin/{lease.branch}"]
     )
-    return ancestor.returncode == 0
+    if ancestor.returncode != 0:
+        return False
+    reset = runner(
+        ["git", "-C", str(lease.path), "reset", "--hard", f"origin/{lease.branch}"]
+    )
+    return reset.returncode == 0
 
 
 def _slice_branch_has_changes(worktree: Path, base_ref: str, *, runner: Runner) -> bool:
