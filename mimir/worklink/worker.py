@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Any, Mapping, Sequence
@@ -105,6 +106,8 @@ async def run_worker_payload(
     started = datetime.now(UTC)
     compute = LocalSubprocessComputeBackend()
     handle = None
+    compute_result: ComputeResult | None = None
+    transcript_path: Path | None = None
     try:
         try:
             handle = await compute.launch(local_spec)
@@ -115,6 +118,7 @@ async def run_worker_payload(
             if handle is not None:
                 await compute.cleanup(handle)
         raw = await backend.interpret(order, compute_result)
+        transcript_path = raw.transcript_path
         if _backend_completed(raw.backend_status):
             _check(runner(["git", "-C", str(repo), "add", "-A"]), "git add")
             staged = runner(["git", "-C", str(repo), "diff", "--cached", "--name-only"])
@@ -130,6 +134,7 @@ async def run_worker_payload(
                     extra_reasons=("backend_produced_no_changes",),
                 )
                 _write_worker_evidence(payload.evidence_path, validation)
+                _emit_failure_diagnostics(payload, validation, compute_result, transcript_path)
                 return validation
             commit = runner([
                 "git",
@@ -158,10 +163,13 @@ async def run_worker_payload(
         _write_worker_evidence(payload.evidence_path, validation)
         if validation.review_ready:
             _check(runner(["git", "-C", str(repo), "push", "origin", f"HEAD:{spec.branch}"]), "git push")
+        else:
+            _emit_failure_diagnostics(payload, validation, compute_result, transcript_path)
         return validation
     except Exception as exc:
         failed = _failed_worker_evidence(payload, repo, started, str(exc), runner=runner)
         _write_worker_evidence(payload.evidence_path, failed)
+        _emit_failure_diagnostics(payload, failed, compute_result, transcript_path)
         return failed
 
 
@@ -254,6 +262,87 @@ def _remote_ref(base_ref: str) -> str:
 
 def _backend_completed(status: str) -> bool:
     return status.lower().strip() in {"completed", "success", "succeeded", "ok"}
+
+
+_DIAG_BEGIN = "WORKLINK_WORKER_DIAG_BEGIN"
+_DIAG_END = "WORKLINK_WORKER_DIAG_END"
+_DIAG_STDERR_TAIL_LINES = 50
+_DIAG_STDOUT_TAIL_LINES = 30
+_DIAG_TRANSCRIPT_TAIL_LINES = 30
+_DIAG_TOTAL_MAX_CHARS = 8000
+
+_DIAG_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)\b(authorization\s*[:=]\s*)\S.*"), r"\1<redacted>"),
+    (re.compile(r"(?i)\b(bearer)\s+\S+"), r"\1 <redacted>"),
+    (
+        re.compile(r"(?i)([\"']?\w*(?:api[_-]?key|access[_-]?token|token|secret|password|passwd)[\"']?\s*[:=]\s*)\S+"),
+        r"\1<redacted>",
+    ),
+    (re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}\b"), "<redacted>"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"), "<redacted>"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{16,}\b"), "<redacted>"),
+)
+
+
+def _tail_lines(text: str, limit: int) -> str:
+    return "\n".join(text.splitlines()[-limit:])
+
+
+def _redact_diagnostics(text: str, secret_values: Sequence[str]) -> str:
+    for value in secret_values:
+        text = text.replace(value, "<redacted>")
+    for pattern, replacement in _DIAG_SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _emit_failure_diagnostics(
+    payload: WorkerPayload,
+    validation: EvidenceValidation,
+    compute_result: ComputeResult | None,
+    transcript_path: Path | None,
+) -> None:
+    """Print a bounded, redacted diagnostic block on worker stdout (chainlink #809).
+
+    On non-shared substrates (docker-sibling / ecs) stdout is the only worker
+    artifact that outlives the reaped container — the controller's transcript
+    wrapper records the broker-wait output, so this block is the durable record
+    of WHY the backend failed. Additive only: evidence JSON and the final status
+    line are unchanged, and review-ready runs print nothing.
+    """
+    spec = payload.spec
+    # Values injected via the work order env / creds are credentials by
+    # construction; safe_env is the sanitized set (PATH, HOME, ...) and would
+    # mangle tracebacks if redacted.
+    secret_values = sorted(
+        {value for value in (*spec.env.values(), *spec.creds_ref.values()) if len(value) >= 8},
+        key=len,
+        reverse=True,
+    )
+    exit_code = compute_result.exit_code if compute_result is not None else "n/a"
+    lines = [
+        f"issue=#{spec.issue_id} attempt={spec.attempt} backend={spec.backend} "
+        f"status={validation.status} backend_exit={exit_code} "
+        f"reasons={','.join(validation.reasons) or '-'}"
+    ]
+    if compute_result is not None:
+        lines.append(f"--- backend stderr (last {_DIAG_STDERR_TAIL_LINES} lines) ---")
+        lines.append(_tail_lines(compute_result.stderr, _DIAG_STDERR_TAIL_LINES) or "(empty)")
+        lines.append(f"--- backend stdout (last {_DIAG_STDOUT_TAIL_LINES} lines) ---")
+        lines.append(_tail_lines(compute_result.stdout, _DIAG_STDOUT_TAIL_LINES) or "(empty)")
+    if transcript_path is not None:
+        try:
+            transcript_text = Path(transcript_path).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            transcript_text = f"(transcript unreadable: {exc})"
+        lines.append(f"--- transcript tail (last {_DIAG_TRANSCRIPT_TAIL_LINES} lines of {transcript_path}) ---")
+        lines.append(_tail_lines(transcript_text, _DIAG_TRANSCRIPT_TAIL_LINES) or "(empty)")
+    body = _redact_diagnostics("\n".join(lines), secret_values)
+    if len(body) > _DIAG_TOTAL_MAX_CHARS:
+        body = "(head truncated)\n" + body[-_DIAG_TOTAL_MAX_CHARS:]
+    print(_DIAG_BEGIN)
+    print(body)
+    print(_DIAG_END, flush=True)
 
 
 def _failed_worker_evidence(
