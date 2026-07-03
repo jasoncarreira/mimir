@@ -10,10 +10,7 @@ from mimir.worklink.review import (
     PER_SLICE_REVIEWER_PROMPT,
     WORK_DECOMPOSER_PROMPT,
     DecomposeReview,
-    IntegrationAcceptanceMapping,
     IntegrationValidation,
-    ReviewFinding,
-    SliceAcceptanceMapping,
     SliceReview,
     WorkDecomposition,
     WorklinkLeafSpec,
@@ -78,64 +75,46 @@ def test_work_decomposer_leaf_requires_template_acceptance_scope_and_tests() -> 
         )
 
 
-def test_decompose_reviewer_schema_uses_approve_reject_findings() -> None:
+def test_decompose_reviewer_schema_uses_approve_reject_flat_findings() -> None:
     result = DecomposeReview(
         verdict="REJECT",
-        summary="One same-wave overlap remains.",
+        summary="One parallel file overlap remains.",
         findings=[
-            ReviewFinding(
-                title="Same-wave file overlap",
-                severity="blocker",
-                evidence="Two wave-1 leaves both include mimir/subagents.py",
-                recommendation="Serialize one leaf behind the other.",
-            )
+            "Two parallel leaves both include mimir/subagents.py; serialize one via depends_on.",
         ],
     )
 
     assert result.verdict == "REJECT"
-    assert result.findings[0].severity == "blocker"
+    # findings are flat strings (no nested finding objects).
+    assert result.findings and all(isinstance(f, str) for f in result.findings)
 
 
 def test_per_slice_reviewer_schema_and_prompt_are_adversarial_observed_evidence_only() -> None:
     result = SliceReview(
         verdict="REJECT",
         summary="Observed tests did not run.",
-        ac_coverage=[
-            SliceAcceptanceMapping(
-                acceptance_criterion="Tests cover the classifier",
-                status="unclear",
-                evidence="Controller-observed test result is missing.",
-            )
-        ],
-        required_fixes=["Run the focused pytest command and attach observed result."],
+        findings=["Controller-observed test result is missing for the classifier AC."],
+        required_fixes=["Run the focused pytest command and attach the observed result."],
     )
 
-    assert result.ac_coverage[0].status == "unclear"
+    assert result.verdict == "REJECT"
+    assert result.findings and isinstance(result.findings[0], str)
+    assert result.required_fixes and isinstance(result.required_fixes[0], str)
     assert "adversarial" in PER_SLICE_REVIEWER_PROMPT.lower()
     assert "controller-observed" in PER_SLICE_REVIEWER_PROMPT.lower()
-    assert "do not trust worker prose" in PER_SLICE_REVIEWER_PROMPT.lower()
+    assert "trust worker prose" in PER_SLICE_REVIEWER_PROMPT.lower()
     assert "approve only if" in PER_SLICE_REVIEWER_PROMPT.lower()
 
 
-def test_integration_validator_schema_maps_ac_to_code_and_tests() -> None:
+def test_integration_validator_schema_is_flat_verdict_summary_findings() -> None:
     result = IntegrationValidation(
         verdict="GO-WITH-NITS",
         summary="All ACs are covered with one naming nit.",
-        ac_mappings=[
-            IntegrationAcceptanceMapping(
-                acceptance_criterion="Register four Worklink roles",
-                code_refs=["mimir/subagents.py:56", "mimir/worklink/review.py:260"],
-                test_refs=["tests/test_structured_subagents.py:21"],
-                status="met_with_nits",
-                evidence="Registration includes the four role names.",
-            )
-        ],
-        findings=[],
+        findings=["AC 'register four roles' is covered; minor naming nit in review.py."],
     )
 
     assert result.verdict == "GO-WITH-NITS"
-    assert result.ac_mappings[0].code_refs
-    assert result.ac_mappings[0].test_refs
+    assert result.findings and all(isinstance(f, str) for f in result.findings)
 
 
 def test_worklink_review_subagent_specs_are_readonly_and_structured() -> None:
@@ -173,8 +152,9 @@ def test_role_prompts_cover_required_review_contracts() -> None:
     assert "depends_on" in reviewer
     assert "dag" in reviewer
 
-    assert "code_refs and test_refs" in INTEGRATION_VALIDATOR_PROMPT
+    assert "acceptance criterion" in INTEGRATION_VALIDATOR_PROMPT
     assert "GO-WITH-NITS" in INTEGRATION_VALIDATOR_PROMPT
+    assert "plain-text" in INTEGRATION_VALIDATOR_PROMPT
 
 
 def test_classifier_returns_single_for_low_risk_leaf() -> None:

@@ -237,13 +237,11 @@ async def _aggregate_slice_reviews(
 ) -> SliceReview:
     approvals = sum(1 for review in reviews if review.verdict == "APPROVE")
     dissents = [review for review in reviews if review.verdict == "REJECT"]
-    findings = [finding for review in reviews for finding in review.findings]
-    coverage = [mapping for review in reviews for mapping in review.ac_coverage]
+    findings = _unique(finding for review in reviews for finding in review.findings)
     if not dissents:
         return SliceReview(
             verdict="APPROVE",
             summary=f"All {len(reviews)} slice reviewer(s) APPROVED; no dissent verification needed.",
-            ac_coverage=coverage,
             findings=findings,
             required_fixes=[],
         )
@@ -256,7 +254,6 @@ async def _aggregate_slice_reviews(
                 f"{len(dissents)}/{len(reviews)} slice reviewer(s) REJECTED; "
                 "no dissent verifier was configured, so the dissent blocks."
             ),
-            ac_coverage=coverage,
             findings=findings,
             required_fixes=dissent_fixes,
         )
@@ -271,8 +268,7 @@ async def _aggregate_slice_reviews(
                 "at least one dissenting finding was verified as real. "
                 f"Verifier summary: {verification.summary}"
             ),
-            ac_coverage=coverage or verification.ac_coverage,
-            findings=[*findings, *verification.findings],
+            findings=_unique([*findings, *verification.findings]),
             required_fixes=verified_fixes,
         )
 
@@ -282,7 +278,6 @@ async def _aggregate_slice_reviews(
             f"{len(dissents)}/{len(reviews)} reviewer dissent(s) were double-checked; "
             f"none survived verification. Verifier summary: {verification.summary}"
         ),
-        ac_coverage=coverage or verification.ac_coverage,
         findings=findings,
         required_fixes=[],
     )
