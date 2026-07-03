@@ -710,7 +710,13 @@ class EpicRunner:
             allowed, reason = config.autonomous_compute_allowed(compute.name, compute.capabilities())
             if not allowed:
                 return _SliceOutcome(leaf.issue.issue_id, reason or "autonomous compute refused")
-        test_cmd = leaf.suggested_test_command or config.defaults.test_command
+        # chainlink #820: the gate is ALWAYS the operator-declared test_command —
+        # the environment-known-good invocation. The planner-written
+        # suggested_test_command is advisory prompt context only (matching the
+        # per-leaf runner and the work-order template); executing it as the gate
+        # let a bare `pytest ...` suggestion fail every attempt with exit 127
+        # ("pytest: not found") across epic #783 runs 9-11.
+        test_cmd = config.defaults.test_command
         attempts = _slice(manifest, leaf.issue.issue_id).attempts
         last_reason = "review rejected"
         pending_fixes: tuple[str, ...] = ()

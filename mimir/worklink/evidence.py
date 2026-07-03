@@ -103,6 +103,13 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
         tests_ok = True
     elif evidence.tests.exit_code == 0:
         tests_ok = True
+    elif evidence.tests.exit_code == 127:
+        # chainlink #820: `sh -c` 127 means the gate COMMAND was not found — an
+        # environment/config error no code change can fix. Distinct reason so
+        # retries and #817 repair rounds are not spent on it.
+        reasons.append("gate_command_not_found")
+        if status == "completed":
+            status = "failed"
     else:
         reasons.append("tests_failed")
         if status == "completed":

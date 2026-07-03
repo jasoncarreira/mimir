@@ -129,6 +129,16 @@ def test_gate_test_summary_keeps_output_tail_not_head() -> None:
     assert len(summary) <= 6000
 
 
+def test_gate_command_not_found_is_not_tests_failed() -> None:
+    """chainlink #820: exit 127 = the gate command itself cannot run — an
+    environment error, distinct from failing tests."""
+    result = validate_evidence(base_evidence(tests=TestResult("pytest -q", 127, "pytest: not found")))
+
+    assert result.review_ready is False
+    assert "gate_command_not_found" in result.reasons
+    assert "tests_failed" not in result.reasons
+
+
 def test_completed_requires_tests_or_skipped_reason() -> None:
     result = validate_evidence(base_evidence(tests=None))
 
