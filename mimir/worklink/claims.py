@@ -127,12 +127,16 @@ class ChainlinkClaims:
         runner: Runner = _default_runner,
         clock: Callable[[], datetime] | None = None,
         max_attempts: int = 3,
+        duplicate_freshness_s: float = 600.0,
     ) -> None:
         self.chainlink_bin = chainlink_bin
         self.agent_id = agent_id
         self.runner = runner
         self.clock = clock or (lambda: datetime.now(UTC))
         self.max_attempts = max_attempts
+        # chainlink #822: a claim-comment heartbeat younger than this means the
+        # owning process is alive (2x the max epic heartbeat interval of 300s).
+        self.duplicate_freshness_s = duplicate_freshness_s
 
     def claim_issue(
         self,
@@ -157,6 +161,26 @@ class ChainlinkClaims:
         lock = self._run("locks", "claim", str(issue_id), check=False)
         if lock.returncode != 0:
             return ClaimResult(False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed")
+        if "already hold" in ((lock.stdout or "") + (lock.stderr or "")).lower():
+            # chainlink #822: the chainlink CLI treats a same-agent re-claim as
+            # idempotent success ("You already hold the lock", rc=0). All poller
+            # dispatches share one agent identity, so without this guard a
+            # duplicate run-epic sails through and wrecks the live run (epic
+            # #783 run 12). A FRESH claim-comment heartbeat means another live
+            # process owns this run — refuse without touching any state. A
+            # stale one is a crashed predecessor: steal explicitly and proceed.
+            latest: ClaimRecord | None = None
+            for existing in claim_records_from_comments(comments):
+                if existing.issue_id != issue_id:
+                    continue
+                if latest is None or _claim_is_newer(existing, latest):
+                    latest = existing
+            if latest is not None:
+                anchor = latest.heartbeat_at or latest.claimed_at
+                age_s = (self.clock() - anchor).total_seconds()
+                if age_s < self.duplicate_freshness_s:
+                    return ClaimResult(False, reason="duplicate_run_live")
+            self._run("locks", "steal", str(issue_id), check=False)
 
         if max_active_locks is not None:
             try:

@@ -770,17 +770,31 @@ class EpicRunner:
                 test_command=test_cmd,
             )
             spec = replace(spec, gate_repair_rounds=config.defaults.gate_repair_rounds)
-            try:
-                handle = await compute.launch(spec)
+            # chainlink #823: a prior run may have already built and pushed this
+            # exact attempt branch (e.g. it died between push and review).
+            # Adoption skips the COMPUTE only — the branch goes through the
+            # identical observe/re-derive/remote-test/review path below, so the
+            # trust model is unchanged.
+            adopted = (
+                not pending_fixes
+                and not compute.capabilities().shared_filesystem
+                and _slice_branch_adoptable(self.repo, lease=lease, runner=runner)
+            )
+            if adopted:
+                compute_result = ComputeResult(0, "adopted pushed slice branch", "")
+                raw = _AdoptedRaw()
+            else:
                 try:
-                    compute_result = await compute.wait(handle, spec.timeout_s)
-                finally:
-                    await compute.cleanup(handle)
-            except ComputeLaunchError as exc:
-                compute_result = ComputeResult(-1, "", str(exc), launch_error=str(exc))
-            raw = await selected_backend.interpret(order, compute_result)
+                    handle = await compute.launch(spec)
+                    try:
+                        compute_result = await compute.wait(handle, spec.timeout_s)
+                    finally:
+                        await compute.cleanup(handle)
+                except ComputeLaunchError as exc:
+                    compute_result = ComputeResult(-1, "", str(exc), launch_error=str(exc))
+                raw = await selected_backend.interpret(order, compute_result)
             no_push_reason = None
-            if not compute.capabilities().shared_filesystem and backend_completed(raw.backend_status):
+            if not adopted and not compute.capabilities().shared_filesystem and backend_completed(raw.backend_status):
                 if _slice_branch_has_changes(lease.path, lease.local_base or lease.base_ref, runner=runner):
                     _git_push(lease.path, lease.branch, runner=runner)
                 else:
@@ -1040,6 +1054,31 @@ def _chunks(items: list[LeafIssue], size: int) -> Iterable[list[LeafIssue]]:
 
 def _epic_heartbeat_interval_s(config: WorklinkConfig) -> float:
     return float(max(30, min(300, config.defaults.timeout_s // 4)))
+
+
+@dataclass(frozen=True)
+class _AdoptedRaw:
+    """RawResult stand-in for an adopted, already-pushed slice branch (#823)."""
+
+    backend_status: str = "completed"
+    transcript_path: Path | None = None
+    blocked_reason: str | None = None
+
+
+def _slice_branch_adoptable(repo: Path, *, lease: WorktreeLease, runner: Runner) -> bool:
+    """True when origin already has this attempt branch built on the CURRENT
+    integration base — a prior run pushed it but died before review (#823)."""
+    listed = runner(["git", "-C", str(repo), "ls-remote", "--heads", "origin", lease.branch])
+    if listed.returncode != 0 or not listed.stdout.strip():
+        return False
+    fetched = runner(["git", "-C", str(repo), "fetch", "origin", lease.branch])
+    if fetched.returncode != 0:
+        return False
+    base = lease.local_base or lease.base_ref
+    ancestor = runner(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", base, f"origin/{lease.branch}"]
+    )
+    return ancestor.returncode == 0
 
 
 def _slice_branch_has_changes(worktree: Path, base_ref: str, *, runner: Runner) -> bool:

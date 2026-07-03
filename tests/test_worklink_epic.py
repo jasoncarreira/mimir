@@ -1256,6 +1256,78 @@ def test_created_issue_id_rejects_ambiguous_numeric_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_adopts_pushed_slice_branch_without_compute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """chainlink #823: when origin already has this attempt branch built on the
+    current integration base (a prior run died between push and review), the
+    slice is adopted — no compute launched, normal observe/review path."""
+    import mimir.worklink.epic as epic_mod
+
+    integration_path = tmp_path / "integration"
+    integration_path.mkdir()
+    monkeypatch.setattr(
+        epic_mod,
+        "create_integration_branch",
+        lambda *a, **k: IntegrationBranchLease(100, Path("/repo"), integration_path, "epic/100-integration", "main", "main"),
+    )
+    slice_path = tmp_path / "slice-101"
+    slice_path.mkdir()
+    monkeypatch.setattr(
+        epic_mod,
+        "create_slice_worktree",
+        lambda *a, **k: WorktreeLease(101, 1, Path("/repo"), slice_path, "issue/101-a1", "epic/100-integration", "HEAD"),
+    )
+
+    def adoption_runner(args, cwd=None):
+        listed = list(args)
+        if listed[:2] == ["git", "-C"] and "ls-remote" in listed:
+            return cp(args, stdout="c4246a8f\trefs/heads/issue/101-a1\n")
+        return cp(args)
+
+    async def observe_ready(**kw: object) -> EvidenceValidation:
+        return ready_validation(101, 1)
+
+    monkeypatch.setattr(epic_mod, "_observe_slice", observe_ready)
+    monkeypatch.setattr(epic_mod, "_git_push", lambda *a, **k: None)
+    monkeypatch.setattr(epic_mod, "merge_slice_into_integration", lambda *a, **k: SliceMergeSuccess("issue/101-a1", "epic/100-integration", "abc123"))
+    monkeypatch.setattr(epic_mod, "_run_epic_tests", lambda *a, **k: EpicTestStatus("true", 0, "ok"))
+    monkeypatch.setattr(epic_mod, "_open_epic_pr", lambda *a, **k: "https://github.com/o/r/pull/1")
+
+    class RemoteCompute(FakeCompute):
+        name = "remote_compute"
+
+        def capabilities(self) -> ComputeCaps:
+            return ComputeCaps(shared_filesystem=False, network_isolated=True, handle_cancel=True, persistent_after_disconnect=True)
+
+    registry = FakeRegistry()
+    registry.compute = RemoteCompute()
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic"}),
+        leaves=[LeafIssue(issue(101), scope_paths=("a.py",), suggested_test_command="true")],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  max_review_retries: 1\n  test_command: true\n", encoding="utf-8"
+    )
+
+    result = await EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=adoption_runner,
+        registry=registry,  # type: ignore[arg-type]
+        roles=FakeRoles(),
+        chainlink=chainlink,  # type: ignore[arg-type]
+    ).run(100)
+
+    assert result.status == "completed"
+    assert registry.compute.launched == []  # adoption skipped compute entirely
+    assert chainlink.merged == [101]
+
+
+@pytest.mark.asyncio
 async def test_remote_epic_pushes_integration_before_observing_slice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
