@@ -1,60 +1,266 @@
-"""Concrete EpicRoleRunner bridge for Worklink structured review roles."""
+"""Action-based EpicRoleRunner: epic roles act via epic-scoped tools.
+
+Every role is a tool-calling agent, not a structured-output parser:
+
+- The **decomposer** files child leaves directly (``file_leaf`` /
+  ``add_dependency``) or reports a deficient brief (``comment_on_epic``).
+- The **lead slice reviewer** records its decision via ``approve_slice`` /
+  ``request_fixes`` (the latter also comments the fixes on the leaf). For
+  high-risk (multi) slices it first fans out to independent, text-only
+  sub-reviewers via ``spawn_reviewer`` and verifies any dissent itself.
+- The **integration validator** records ``approve_integration`` /
+  ``block_integration`` (the latter comments the reasons on the epic).
+
+The orchestrator reads the recorded decisions and Chainlink state; all git,
+merge, and PR machinery stays deterministic in :mod:`mimir.worklink.epic`.
+Decisions are captured from tool closures — never parsed from model output —
+and every review path fails closed (no decision recorded => not approved).
+"""
 
 from __future__ import annotations
 
-import asyncio
-import json
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping, TypeVar
+from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 
-from pydantic import BaseModel
+from pydantic import ValidationError
 
 from .epic_state import EpicRunManifest
 from .evidence import EvidenceValidation
 from .orchestrator import IssueContext, WorklinkError
 from .review import (
-    DecomposeReview,
-    IntegrationValidation,
-    SliceReview,
-    WorkDecomposition,
-    build_worklink_review_subagents,
+    INTEGRATION_VALIDATOR_PROMPT,
+    LEAD_SLICE_REVIEWER_PROMPT,
+    SUB_SLICE_REVIEWER_PROMPT,
+    WORK_DECOMPOSER_PROMPT,
+    DecomposeOutcome,
+    IntegrationDecision,
+    SliceDecision,
+    WorklinkLeafSpec,
 )
 
-ModelT = TypeVar("ModelT", bound=BaseModel)
-SubagentInvoker = Callable[[str, str, type[ModelT]], Awaitable[ModelT]]
+#: Lenses assigned to sub-reviewers in multi (high-risk) mode, in order.
+REVIEW_LENSES: tuple[str, ...] = ("correctness", "scope", "testing", "security", "performance")
+
+#: Factory that builds a tool-calling agent for a role. Injectable for tests.
+AgentFactory = Callable[[str, str, Sequence[Any]], Any]
+
+
+class ChainlinkEpicActions(Protocol):
+    """The subset of ChainlinkEpicClient the role tools need."""
+
+    def file_leaf(self, epic_id: int, leaf: Any) -> int: ...
+
+    def add_blocker(self, blocked_leaf: int, blocker_leaf: int, reason: str) -> None: ...
+
+    def comment(self, issue_id: int, text: str) -> None: ...
+
+
+class _DecisionState:
+    """Single-shot decision holder shared between tool closures and the runner."""
+
+    def __init__(self) -> None:
+        self.decision: Any | None = None
+
+    def record(self, decision: Any) -> bool:
+        if self.decision is not None:
+            return False
+        self.decision = decision
+        return True
+
+
+class _DecomposeState:
+    def __init__(self) -> None:
+        self.ids_by_title: dict[str, int] = {}
+        self.filed = 0
+        self.deficiency: str | None = None
+
+
+def build_decompose_tools(
+    *,
+    epic_id: int,
+    chainlink: ChainlinkEpicActions,
+    state: _DecomposeState,
+) -> list[Any]:
+    """Epic-scoped tools for the decomposer: file leaves or report a bad brief."""
+
+    from langchain.tools import tool
+
+    @tool
+    def file_leaf(
+        title: str,
+        acceptance_criteria: list[str],
+        review_criteria: list[str],
+        scope_paths: list[str],
+        suggested_test_command: str,
+        depends_on: list[str] | None = None,
+        out_of_scope: list[str] | None = None,
+        risk: str = "standard",
+    ) -> str:
+        """File one Worklink leaf as a child issue of this epic.
+
+        depends_on may only reference the exact titles of leaves you have
+        already filed in this session; file leaves in dependency order.
+        """
+        try:
+            spec = WorklinkLeafSpec(
+                title=title,
+                acceptance_criteria=acceptance_criteria,
+                review_criteria=review_criteria,
+                scope_paths=scope_paths,
+                suggested_test_command=suggested_test_command,
+                depends_on=list(depends_on or []),
+                out_of_scope=list(out_of_scope or []),
+                risk="high" if str(risk).strip().lower() == "high" else "standard",
+            )
+        except ValidationError as exc:
+            return f"ERROR: invalid leaf: {exc.errors(include_url=False)}"
+        unknown = [dep for dep in spec.depends_on if dep not in state.ids_by_title]
+        if unknown:
+            return (
+                f"ERROR: depends_on references titles not filed yet: {unknown}. "
+                "File those leaves first, or fix the titles."
+            )
+        leaf_id = chainlink.file_leaf(epic_id, spec)
+        state.ids_by_title[spec.title] = leaf_id
+        state.filed += 1
+        for dep_title in spec.depends_on:
+            chainlink.add_blocker(
+                leaf_id,
+                state.ids_by_title[dep_title],
+                f"{spec.title} depends on {dep_title}",
+            )
+        return f"Filed leaf #{leaf_id}: {spec.title}"
+
+    @tool
+    def add_dependency(blocked_title: str, blocker_title: str) -> str:
+        """Add a missed dependency between two leaves you already filed."""
+        blocked = state.ids_by_title.get(blocked_title)
+        blocker = state.ids_by_title.get(blocker_title)
+        if blocked is None or blocker is None:
+            missing = [t for t, i in ((blocked_title, blocked), (blocker_title, blocker)) if i is None]
+            return f"ERROR: unknown leaf title(s): {missing}. Use exact filed titles."
+        if blocked == blocker:
+            return "ERROR: a leaf cannot depend on itself."
+        chainlink.add_blocker(blocked, blocker, f"{blocked_title} depends on {blocker_title}")
+        return f"Dependency added: #{blocked} waits for #{blocker}."
+
+    @tool
+    def comment_on_epic(message: str) -> str:
+        """Report that the epic brief is too deficient to plan from (file nothing)."""
+        if state.deficiency is not None:
+            return "ERROR: a deficiency was already reported."
+        state.deficiency = message.strip() or "brief reported deficient (no detail given)"
+        chainlink.comment(epic_id, f"WORKLINK_BRIEF_DEFICIENT: {state.deficiency}")
+        return "Deficiency recorded on the epic."
+
+    return [file_leaf, add_dependency, comment_on_epic]
+
+
+def build_slice_decision_tools(
+    *,
+    leaf_id: int,
+    chainlink: ChainlinkEpicActions,
+    state: _DecisionState,
+    spawn: Callable[[str], Awaitable[str]],
+) -> list[Any]:
+    """Decision + fan-out tools for the lead slice reviewer."""
+
+    from langchain.tools import tool
+
+    @tool
+    def approve_slice(summary: str = "") -> str:
+        """Approve this slice: the observed diff meets every acceptance criterion."""
+        if not state.record(SliceDecision(approved=True, summary=summary.strip())):
+            return "ERROR: a decision was already recorded for this slice."
+        return "Decision recorded: APPROVED."
+
+    @tool
+    def request_fixes(fixes: list[str], summary: str = "") -> str:
+        """Reject this slice and request concrete fixes (one per problem)."""
+        cleaned = tuple(str(f).strip() for f in fixes if str(f).strip())
+        if not cleaned:
+            return "ERROR: provide at least one concrete fix."
+        if not state.record(
+            SliceDecision(approved=False, summary=summary.strip(), fixes=cleaned)
+        ):
+            return "ERROR: a decision was already recorded for this slice."
+        chainlink.comment(
+            leaf_id,
+            "WORKLINK_REVIEW_FIXES requested by the slice reviewer:\n"
+            + "\n".join(f"- {fix}" for fix in cleaned),
+        )
+        return "Decision recorded: fixes requested."
+
+    @tool
+    async def spawn_reviewer(lens: str) -> str:
+        """Run one independent sub-reviewer with the given lens; returns its report."""
+        return await spawn(lens)
+
+    return [approve_slice, request_fixes, spawn_reviewer]
+
+
+def build_integration_decision_tools(
+    *,
+    epic_id: int,
+    chainlink: ChainlinkEpicActions,
+    state: _DecisionState,
+) -> list[Any]:
+    """Decision tools for the integration validator."""
+
+    from langchain.tools import tool
+
+    @tool
+    def approve_integration(summary: str = "") -> str:
+        """Approve the integrated epic for a draft PR (note any nits in the summary)."""
+        if not state.record(IntegrationDecision(approved=True, summary=summary.strip())):
+            return "ERROR: a decision was already recorded."
+        return "Decision recorded: APPROVED."
+
+    @tool
+    def block_integration(reasons: list[str], summary: str = "") -> str:
+        """Block the integrated epic (one concrete reason per problem)."""
+        cleaned = tuple(str(r).strip() for r in reasons if str(r).strip())
+        if not cleaned:
+            return "ERROR: provide at least one concrete reason."
+        if not state.record(
+            IntegrationDecision(approved=False, summary=summary.strip(), reasons=cleaned)
+        ):
+            return "ERROR: a decision was already recorded."
+        chainlink.comment(
+            epic_id,
+            "WORKLINK_INTEGRATION_BLOCKED by the integration validator:\n"
+            + "\n".join(f"- {reason}" for reason in cleaned),
+        )
+        return "Decision recorded: integration blocked."
+
+    return [approve_integration, block_integration]
 
 
 class EpicSubagentRoleRunner:
-    """Run epic roles through DeepAgents structured subagents."""
+    """Run the epic roles as tool-calling agents over the repo (read-only FS)."""
 
     def __init__(
         self,
         *,
         home: Path,
         repo: Path | None = None,
-        invoker: SubagentInvoker | None = None,
         model: Any | None = None,
+        agent_factory: AgentFactory | None = None,
     ) -> None:
         self.home = home
         self.repo = repo or Path.cwd()
-        self._invoker = invoker
         self._model = model
+        self._agent_factory = agent_factory
 
-    async def decompose(self, epic: IssueContext) -> WorkDecomposition:
-        return await self._invoke(
-            "work-decomposer",
-            _render_decompose_input(epic),
-            WorkDecomposition,
+    async def run_decompose(
+        self, epic: IssueContext, *, chainlink: ChainlinkEpicActions
+    ) -> DecomposeOutcome:
+        state = _DecomposeState()
+        tools = build_decompose_tools(epic_id=epic.issue_id, chainlink=chainlink, state=state)
+        await self._run_agent(
+            "work-decomposer", WORK_DECOMPOSER_PROMPT, tools, _render_decompose_input(epic)
         )
-
-    async def review_decomposition(
-        self, epic: IssueContext, decomposition: WorkDecomposition
-    ) -> DecomposeReview:
-        return await self._invoke(
-            "decompose-reviewer",
-            _render_decompose_review_input(epic, decomposition),
-            DecomposeReview,
-        )
+        return DecomposeOutcome(filed_leaves=state.filed, deficiency=state.deficiency)
 
     async def review_slice(
         self,
@@ -63,35 +269,36 @@ class EpicSubagentRoleRunner:
         evidence: EvidenceValidation,
         mode: str,
         reviewer_count: int,
-    ) -> SliceReview:
-        count = max(1, int(reviewer_count or 1))
-        prompt = _render_slice_review_input(leaf=leaf, evidence=evidence, mode=mode)
-        if count == 1:
-            return await self._invoke("per-slice-reviewer", prompt, SliceReview)
-
-        # Multi-reviewer mode is not a majority vote. Reusing the same role N
-        # times is valuable because it can surface different candidate bugs; a
-        # focused verify-dissent pass decides whether any dissent is real.
-        reviews = await asyncio.gather(
-            *(
-                self._invoke(
-                    "per-slice-reviewer",
-                    (
-                        f"{prompt}\n\nReviewer vote: {idx + 1} of {count}. "
-                        "Run an independent adversarial review."
-                    ),
-                    SliceReview,
-                )
-                for idx in range(count)
-            )
+        chainlink: ChainlinkEpicActions,
+    ) -> SliceDecision:
+        lenses = REVIEW_LENSES[: max(1, int(reviewer_count or 1))] if mode == "multi" else ()
+        review_input = _render_slice_review_input(
+            leaf=leaf, evidence=evidence, mode=mode, lenses=lenses
         )
-        return await _aggregate_slice_reviews(
-            reviews,
-            verify_dissent=lambda verify_prompt: self._invoke(
-                "per-slice-reviewer",
-                verify_prompt,
-                SliceReview,
-            ),
+
+        async def spawn(lens: str) -> str:
+            result = await self._invoke_agent(
+                "sub-slice-reviewer",
+                SUB_SLICE_REVIEWER_PROMPT,
+                [],
+                f"Assigned lens: {lens}\n\n{review_input}",
+            )
+            return _final_text(result) or "(sub-reviewer returned no report)"
+
+        state = _DecisionState()
+        tools = build_slice_decision_tools(
+            leaf_id=leaf.issue.issue_id, chainlink=chainlink, state=state, spawn=spawn
+        )
+        await self._run_agent(
+            "lead-slice-reviewer", LEAD_SLICE_REVIEWER_PROMPT, tools, review_input
+        )
+        if isinstance(state.decision, SliceDecision):
+            return state.decision
+        # Fail closed: an adversarial gate that records nothing must not pass.
+        return SliceDecision(
+            approved=False,
+            summary="reviewer completed without recording a decision",
+            fixes=("re-run: the slice reviewer recorded no decision",),
         )
 
     async def validate_integration(
@@ -101,85 +308,45 @@ class EpicSubagentRoleRunner:
         manifest: EpicRunManifest,
         partial: bool,
         blocked: Mapping[int, str],
-    ) -> IntegrationValidation:
-        return await self._invoke(
+        chainlink: ChainlinkEpicActions,
+    ) -> IntegrationDecision:
+        state = _DecisionState()
+        tools = build_integration_decision_tools(
+            epic_id=epic.issue_id, chainlink=chainlink, state=state
+        )
+        await self._run_agent(
             "integration-validator",
+            INTEGRATION_VALIDATOR_PROMPT,
+            tools,
             _render_integration_validation_input(
-                epic=epic,
-                manifest=manifest,
-                partial=partial,
-                blocked=blocked,
+                epic=epic, manifest=manifest, partial=partial, blocked=blocked
             ),
-            IntegrationValidation,
+        )
+        if isinstance(state.decision, IntegrationDecision):
+            return state.decision
+        return IntegrationDecision(
+            approved=False,
+            summary="validator completed without recording a decision",
+            reasons=("re-run: the integration validator recorded no decision",),
         )
 
-    async def _invoke(self, role: str, prompt: str, model_type: type[ModelT]) -> ModelT:
-        invoker = self._invoker
-        if invoker is None:
-            invoker = DeepAgentsTaskSubagentInvoker(
-                home=self.home,
-                repo=self.repo,
-                model=self._model,
-            )
-            self._invoker = invoker
-        return await invoker(role, prompt, model_type)
+    # ── agent plumbing ────────────────────────────────────────────────────
 
-
-class DeepAgentsTaskSubagentInvoker:
-    """Invoke Worklink review-role subagents as compiled LangChain agents.
-
-    Each role from ``build_worklink_review_subagents`` is compiled once (via
-    ``langchain.agents.create_agent``) into an agent runnable bound to its
-    structured ``response_format`` and a read-only filesystem view of the repo.
-    Invoking a role runs that agent and returns its parsed
-    ``structured_response``.
-
-    This mirrors how DeepAgents' ``SubAgentMiddleware`` compiles subagent specs
-    (``create_agent(...)`` per spec) rather than reaching into the private
-    ``_build_task_tool`` helper — which requires already-compiled ``runnable``
-    specs and would otherwise raise ``KeyError: 'runnable'`` when handed raw
-    config dicts. Structured output is read from the public ``structured_response``
-    state key, so the bridge does not depend on task-tool internals.
-    """
-
-    def __init__(
-        self,
-        *,
-        home: Path,
-        repo: Path | None = None,
-        model: Any | None = None,
+    async def _run_agent(
+        self, name: str, system_prompt: str, tools: Sequence[Any], user_input: str
     ) -> None:
-        self.home = home
-        self.repo = repo or Path.cwd()
-        self._model = model
-        self._agents: dict[str, Any] | None = None
+        await self._invoke_agent(name, system_prompt, tools, user_input)
 
-    async def __call__(
-        self, role: str, prompt: str, model_type: type[ModelT]
-    ) -> ModelT:
+    async def _invoke_agent(
+        self, name: str, system_prompt: str, tools: Sequence[Any], user_input: str
+    ) -> Any:
         from langchain_core.messages import HumanMessage
 
-        agents = self._agents if self._agents is not None else self._build_agents()
-        self._agents = agents
-        agent = agents.get(role)
-        if agent is None:
-            raise WorklinkError(f"unknown Worklink epic role subagent: {role}")
+        factory = self._agent_factory or self._default_factory
+        agent = factory(name, system_prompt, tools)
+        return await agent.ainvoke({"messages": [HumanMessage(content=user_input)]})
 
-        result = await agent.ainvoke({"messages": [HumanMessage(content=prompt)]})
-        structured = (
-            result.get("structured_response") if isinstance(result, Mapping) else None
-        )
-        if structured is None:
-            raise WorklinkError(
-                f"{role} subagent returned no structured_response "
-                f"(expected {model_type.__name__})"
-            )
-        if isinstance(structured, model_type):
-            return structured
-        # Tolerate a dict / loosely-typed structured payload.
-        return model_type.model_validate(structured)
-
-    def _build_agents(self) -> dict[str, Any]:
+    def _default_factory(self, name: str, system_prompt: str, tools: Sequence[Any]) -> Any:
         try:
             from langchain.agents import create_agent
         except ImportError as exc:  # pragma: no cover - dependency guard
@@ -190,27 +357,26 @@ class DeepAgentsTaskSubagentInvoker:
         from deepagents.backends import FilesystemBackend
         from deepagents.middleware.filesystem import FilesystemMiddleware
 
-        model = self._model if self._model is not None else _resolve_epic_model(self.home)
-        agents: dict[str, Any] = {}
-        for spec in build_worklink_review_subagents():
-            middleware = [
-                FilesystemMiddleware(
-                    # virtual_mode=True confines the read-only reviewer to the
-                    # repo root (blocks absolute/`..` escapes) and pins the
-                    # behavior across deepagents' changing default.
-                    backend=FilesystemBackend(root_dir=self.repo, virtual_mode=True),
-                    _permissions=spec.get("permissions"),
-                )
-            ]
-            agents[spec["name"]] = create_agent(
-                model,
-                system_prompt=spec["system_prompt"],
-                tools=list(spec.get("tools", [])),
-                middleware=middleware,
-                name=spec["name"],
-                response_format=spec.get("response_format"),
+        from mimir.subagents import readonly_filesystem_permissions
+
+        if self._model is None:
+            self._model = _resolve_epic_model(self.home)
+        middleware = [
+            FilesystemMiddleware(
+                # virtual_mode=True confines the read-only role to the repo root
+                # (blocks absolute/`..` escapes) and pins behavior across
+                # deepagents' changing default.
+                backend=FilesystemBackend(root_dir=self.repo, virtual_mode=True),
+                _permissions=readonly_filesystem_permissions(),
             )
-        return agents
+        ]
+        return create_agent(
+            self._model,
+            system_prompt=system_prompt,
+            tools=list(tools),
+            middleware=middleware,
+            name=name,
+        )
 
 
 def _resolve_epic_model(home: Path) -> Any:
@@ -230,87 +396,26 @@ def _resolve_epic_model(home: Path) -> Any:
             os.environ["MIMIR_HOME"] = previous
 
 
-async def _aggregate_slice_reviews(
-    reviews: list[SliceReview],
-    *,
-    verify_dissent: Callable[[str], Awaitable[SliceReview]] | None = None,
-) -> SliceReview:
-    approvals = sum(1 for review in reviews if review.verdict == "APPROVE")
-    dissents = [review for review in reviews if review.verdict == "REJECT"]
-    findings = _unique(finding for review in reviews for finding in review.findings)
-    if not dissents:
-        return SliceReview(
-            verdict="APPROVE",
-            summary=f"All {len(reviews)} slice reviewer(s) APPROVED; no dissent verification needed.",
-            findings=findings,
-            required_fixes=[],
-        )
-
-    dissent_fixes = _unique(fix for review in dissents for fix in review.required_fixes)
-    if verify_dissent is None:
-        return SliceReview(
-            verdict="REJECT",
-            summary=(
-                f"{len(dissents)}/{len(reviews)} slice reviewer(s) REJECTED; "
-                "no dissent verifier was configured, so the dissent blocks."
-            ),
-            findings=findings,
-            required_fixes=dissent_fixes,
-        )
-
-    verification = await verify_dissent(_render_dissent_verification_input(reviews, dissents))
-    if verification.verdict == "REJECT":
-        verified_fixes = _unique([*verification.required_fixes, *dissent_fixes])
-        return SliceReview(
-            verdict="REJECT",
-            summary=(
-                f"{len(dissents)}/{len(reviews)} reviewer dissent(s) were double-checked; "
-                "at least one dissenting finding was verified as real. "
-                f"Verifier summary: {verification.summary}"
-            ),
-            findings=_unique([*findings, *verification.findings]),
-            required_fixes=verified_fixes,
-        )
-
-    return SliceReview(
-        verdict="APPROVE",
-        summary=(
-            f"{len(dissents)}/{len(reviews)} reviewer dissent(s) were double-checked; "
-            f"none survived verification. Verifier summary: {verification.summary}"
-        ),
-        findings=findings,
-        required_fixes=[],
-    )
+def _final_text(result: Any) -> str:
+    """Best-effort extraction of the final assistant text from an agent run."""
+    messages = result.get("messages") if isinstance(result, Mapping) else None
+    if not messages:
+        return ""
+    content = getattr(messages[-1], "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text", "")))
+            else:
+                parts.append(str(part))
+        return "\n".join(p for p in parts if p)
+    return str(content)
 
 
-def _render_dissent_verification_input(
-    reviews: list[SliceReview], dissents: list[SliceReview]
-) -> str:
-    return "\n".join(
-        [
-            "Verify the dissenting per-slice review findings below against only the controller-observed evidence already present in the review context.",
-            "Return REJECT only if at least one dissenting finding is real and grounded in the observed diff/tests.",
-            "Return APPROVE if every dissenting finding is spurious, unsupported, or not grounded in observed evidence.",
-            "Do not decide by vote count; judge each dissenting finding on evidence.",
-            "",
-            "All slice reviews JSON:",
-            json.dumps([review.model_dump(mode="json") for review in reviews], indent=2, sort_keys=True),
-            "",
-            "Dissenting reviews JSON:",
-            json.dumps([review.model_dump(mode="json") for review in dissents], indent=2, sort_keys=True),
-        ]
-    )
-
-
-def _unique(items: Any) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in items:
-        text = str(item).strip()
-        if text and text not in seen:
-            seen.add(text)
-            out.append(text)
-    return out
+# ─── Role input rendering ───────────────────────────────────────────────────
 
 
 def _render_decompose_input(epic: IssueContext) -> str:
@@ -330,21 +435,8 @@ def _render_decompose_input(epic: IssueContext) -> str:
     )
 
 
-def _render_decompose_review_input(
-    epic: IssueContext, decomposition: WorkDecomposition
-) -> str:
-    return "\n".join(
-        [
-            _render_decompose_input(epic),
-            "",
-            "Proposed WorkDecomposition JSON:",
-            decomposition.model_dump_json(indent=2),
-        ]
-    )
-
-
 def _render_slice_review_input(
-    *, leaf: Any, evidence: EvidenceValidation, mode: str
+    *, leaf: Any, evidence: EvidenceValidation, mode: str, lenses: Sequence[str] = ()
 ) -> str:
     observed = evidence.evidence
     tests = observed.tests
@@ -368,6 +460,13 @@ def _render_slice_review_input(
         )
         for cmd in observed.commands
     ]
+    if mode == "multi" and lenses:
+        mode_line = (
+            "Review mode: multi (high-risk) — call spawn_reviewer once for each of "
+            f"these lenses before deciding: {', '.join(lenses)}."
+        )
+    else:
+        mode_line = "Review mode: single — review directly yourself."
     return "\n".join(
         [
             f"Leaf #{leaf.issue.issue_id}: {leaf.issue.title}",
@@ -375,7 +474,7 @@ def _render_slice_review_input(
             "Leaf issue description:",
             leaf.issue.description,
             "",
-            f"Review mode: {mode}",
+            mode_line,
             "",
             (
                 "Controller-OBSERVED evidence only. Do not use worker prose, "
@@ -407,6 +506,8 @@ def _render_integration_validation_input(
     partial: bool,
     blocked: Mapping[int, str],
 ) -> str:
+    import json
+
     return "\n".join(
         [
             f"Epic #{epic.issue_id}: {epic.title}",
@@ -425,8 +526,10 @@ def _render_integration_validation_input(
 
 
 __all__ = [
-    "DeepAgentsTaskSubagentInvoker",
     "EpicSubagentRoleRunner",
-    "_aggregate_slice_reviews",
+    "REVIEW_LENSES",
+    "build_decompose_tools",
+    "build_integration_decision_tools",
+    "build_slice_decision_tools",
     "_render_slice_review_input",
 ]

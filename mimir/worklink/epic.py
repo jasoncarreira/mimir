@@ -53,10 +53,9 @@ from .orchestrator import (
     validate_leaf,
 )
 from .review import (
-    DecomposeReview,
-    IntegrationValidation,
-    SliceReview,
-    WorkDecomposition,
+    DecomposeOutcome,
+    IntegrationDecision,
+    SliceDecision,
     classify_leaf_review_risk,
 )
 from .worktree import (
@@ -98,11 +97,12 @@ class EpicTestStatus:
 
 
 class EpicRoleRunner(Protocol):
-    async def decompose(self, epic: IssueContext) -> WorkDecomposition: ...
+    """Action-based epic roles: agents act via tools; the runner returns the
+    recorded outcome/decision (see mimir.worklink.epic_roles)."""
 
-    async def review_decomposition(
-        self, epic: IssueContext, decomposition: WorkDecomposition
-    ) -> DecomposeReview: ...
+    async def run_decompose(
+        self, epic: IssueContext, *, chainlink: "ChainlinkEpicClient"
+    ) -> DecomposeOutcome: ...
 
     async def review_slice(
         self,
@@ -111,7 +111,8 @@ class EpicRoleRunner(Protocol):
         evidence: EvidenceValidation,
         mode: str,
         reviewer_count: int,
-    ) -> SliceReview: ...
+        chainlink: "ChainlinkEpicClient",
+    ) -> SliceDecision: ...
 
     async def validate_integration(
         self,
@@ -120,17 +121,15 @@ class EpicRoleRunner(Protocol):
         manifest: EpicRunManifest,
         partial: bool,
         blocked: Mapping[int, str],
-    ) -> IntegrationValidation: ...
+        chainlink: "ChainlinkEpicClient",
+    ) -> IntegrationDecision: ...
 
 
 class MissingEpicRoleRunner:
-    async def decompose(self, epic: IssueContext) -> WorkDecomposition:
+    async def run_decompose(
+        self, epic: IssueContext, *, chainlink: "ChainlinkEpicClient"
+    ) -> DecomposeOutcome:
         raise WorklinkError("epic decompose role runner is not configured")
-
-    async def review_decomposition(
-        self, epic: IssueContext, decomposition: WorkDecomposition
-    ) -> DecomposeReview:
-        raise WorklinkError("epic decompose-reviewer role runner is not configured")
 
     async def review_slice(
         self,
@@ -139,7 +138,8 @@ class MissingEpicRoleRunner:
         evidence: EvidenceValidation,
         mode: str,
         reviewer_count: int,
-    ) -> SliceReview:
+        chainlink: "ChainlinkEpicClient",
+    ) -> SliceDecision:
         raise WorklinkError("epic per-slice reviewer role runner is not configured")
 
     async def validate_integration(
@@ -149,7 +149,8 @@ class MissingEpicRoleRunner:
         manifest: EpicRunManifest,
         partial: bool,
         blocked: Mapping[int, str],
-    ) -> IntegrationValidation:
+        chainlink: "ChainlinkEpicClient",
+    ) -> IntegrationDecision:
         raise WorklinkError("epic integration-validator role runner is not configured")
 
 
@@ -253,6 +254,10 @@ class ChainlinkEpicClient:
         self.runner([self.chainlink_bin, "issue", "unlabel", str(leaf_id), "worklink:in-progress"])
         self.runner([self.chainlink_bin, "issue", "label", str(leaf_id), "worklink:blocked"])
         self.runner([self.chainlink_bin, "issue", "comment", str(leaf_id), f"WORKLINK_BLOCKED {reason}"])
+
+    def comment(self, issue_id: int, text: str) -> None:
+        """Post a plain comment (role tools use this for fixes/deficiency notes)."""
+        self.runner([self.chainlink_bin, "issue", "comment", str(issue_id), text])
 
     def move_epic_to_review(self, epic_id: int) -> None:
         self.runner([self.chainlink_bin, "issue", "unlabel", str(epic_id), "worklink:ready"])
@@ -463,13 +468,14 @@ class EpicRunner:
             manifest = replace(manifest, phase="integrate", status="partial" if partial else "running")
             save_epic_state(self.home, manifest)
             heartbeat()
-            validation = await roles.validate_integration(
+            integration_decision = await roles.validate_integration(
                 epic=epic,
                 manifest=manifest,
                 partial=partial,
                 blocked=blocked,
+                chainlink=chainlink,
             )
-            if validation.verdict == "NO-GO":
+            if not integration_decision.approved:
                 manifest = replace(manifest, status="blocked")
                 save_epic_state(self.home, manifest)
                 heartbeat()
@@ -478,7 +484,9 @@ class EpicRunner:
                     "blocked",
                     blocked_leaves=tuple(blocked),
                     manifest_path=self.home / "state" / "worklink" / "epics" / f"{epic_id}.json",
-                    reason=validation.summary,
+                    reason=integration_decision.summary
+                    or "; ".join(integration_decision.reasons)
+                    or "integration validation blocked",
                 )
             test_status = _run_epic_tests(integration.path, config.defaults.test_command, runner=runner)
             if test_status.exit_code != 0 and not partial:
@@ -501,7 +509,7 @@ class EpicRunner:
                 manifest=manifest,
                 partial=partial,
                 blocked=blocked,
-                validation=validation,
+                decision=integration_decision,
                 test_status=test_status,
                 runner=runner,
             )
@@ -531,29 +539,23 @@ class EpicRunner:
         roles: EpicRoleRunner,
         config: WorklinkConfig,
     ) -> list[LeafIssue]:
-        last: WorkDecomposition | None = None
+        """Run the action-based decomposer until child leaves exist in Chainlink.
+
+        The decompose agent files leaves directly through epic-scoped tools; the
+        gate is real state (children exist), not a parsed verdict. A reported
+        brief deficiency (already commented on the epic by the agent's tool)
+        stops the run instead of burning retries.
+        """
         for _attempt in range(config.defaults.max_review_retries):
-            decomposition = await roles.decompose(epic)
-            review = await roles.review_decomposition(epic, decomposition)
-            last = decomposition
-            if review.verdict == "APPROVE":
-                ids_by_title: dict[str, int] = {}
-                for leaf in decomposition.leaves:
-                    ids_by_title[leaf.title] = chainlink.file_leaf(epic.issue_id, leaf)
-                for leaf in decomposition.leaves:
-                    blocked = ids_by_title.get(leaf.title)
-                    for dep_title in leaf.depends_on:
-                        blocker = ids_by_title.get(dep_title)
-                        if blocked is not None and blocker is not None and blocker != blocked:
-                            chainlink.add_blocker(
-                                blocked, blocker, f"{leaf.title} depends on {dep_title}"
-                            )
-                return chainlink.child_leaves(epic.issue_id)
-        raise WorklinkError(
-            "decompose-reviewer rejected decomposition"
-            if last is not None
-            else "work-decomposer returned no decomposition"
-        )
+            outcome = await roles.run_decompose(epic, chainlink=chainlink)
+            leaves = chainlink.child_leaves(epic.issue_id)
+            if leaves:
+                return leaves
+            if outcome.deficiency:
+                raise WorklinkError(
+                    f"epic brief reported deficient by work-decomposer: {outcome.deficiency}"
+                )
+        raise WorklinkError("work-decomposer filed no leaves")
 
     async def _build_review_merge_slice(
         self,
@@ -586,6 +588,7 @@ class EpicRunner:
         test_cmd = leaf.suggested_test_command or config.defaults.test_command
         attempts = _slice(manifest, leaf.issue.issue_id).attempts
         last_reason = "review rejected"
+        pending_fixes: tuple[str, ...] = ()
         while attempts < config.defaults.max_review_retries:
             attempts += 1
             manifest = _current_manifest(self.home, manifest)
@@ -600,15 +603,21 @@ class EpicRunner:
                 compute_shared_filesystem=compute.capabilities().shared_filesystem,
                 runner=runner,
             )
+            work_prompt = render_work_order(
+                leaf.issue,
+                template_path=_template_path(self.home),
+                backend_name=selected_backend.name,
+                test_command=test_cmd,
+            )
+            if pending_fixes:
+                work_prompt += (
+                    "\n\nReviewer feedback from the previous attempt — address ALL of these:\n"
+                    + "\n".join(f"- {fix}" for fix in pending_fixes)
+                )
             order = WorkOrder(
                 issue_id=leaf.issue.issue_id,
                 worktree=lease.path,
-                prompt=render_work_order(
-                    leaf.issue,
-                    template_path=_template_path(self.home),
-                    backend_name=selected_backend.name,
-                    test_command=test_cmd,
-                ),
+                prompt=work_prompt,
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
                 env={"MIMIR_HOME": str(self.home)},
@@ -658,11 +667,12 @@ class EpicRunner:
                 if mode == "multi"
                 else 1
             )
-            review = await roles.review_slice(
+            decision = await roles.review_slice(
                 leaf=leaf,
                 evidence=validation,
                 mode=mode,
                 reviewer_count=reviewer_count,
+                chainlink=chainlink,
             )
             manifest = _current_manifest(self.home, manifest)
             manifest = _update_slice(
@@ -671,10 +681,11 @@ class EpicRunner:
                 status="review",
                 attempts=attempts,
                 evidence_ref=str(evidence_path),
-                review_ref=review.summary,
+                review_ref=decision.summary
+                or ("approved" if decision.approved else "fixes requested"),
             )
             save_epic_state(self.home, manifest)
-            if validation.review_ready and review.verdict == "APPROVE":
+            if validation.review_ready and decision.approved:
                 if compute.capabilities().shared_filesystem:
                     _commit_worktree_changes(lease.path, leaf.issue, runner=runner)
                     _git_push(lease.path, lease.branch, runner=runner)
@@ -703,7 +714,8 @@ class EpicRunner:
                 )
                 save_epic_state(self.home, manifest)
                 return _SliceOutcome(leaf.issue.issue_id)
-            last_reason = "; ".join(review.required_fixes) or ", ".join(validation.reasons) or last_reason
+            pending_fixes = decision.fixes
+            last_reason = "; ".join(decision.fixes) or ", ".join(validation.reasons) or last_reason
         chainlink.mark_blocked(leaf.issue.issue_id, last_reason)
         manifest = _current_manifest(self.home, manifest)
         manifest = _update_slice(
@@ -968,7 +980,7 @@ def _open_epic_pr(
     manifest: EpicRunManifest,
     partial: bool,
     blocked: Mapping[int, str],
-    validation: IntegrationValidation,
+    decision: IntegrationDecision,
     test_status: EpicTestStatus,
     runner: Runner,
 ) -> str:
@@ -979,7 +991,7 @@ def _open_epic_pr(
         f"- Base: `{base}`",
         f"- Branch: `{branch}`",
         f"- Merged slices: {', '.join('#' + str(s.id) for s in manifest.slices if s.status == 'merged') or '(none)'}",
-        f"- Integration validation: {validation.verdict} - {validation.summary}",
+        f"- Integration validation: APPROVED - {decision.summary or '(no summary)'}",
         f"- Epic tests: `{test_status.command}` → {test_status.exit_code}",
     ]
     if partial:
