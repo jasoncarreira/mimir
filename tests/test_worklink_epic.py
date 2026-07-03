@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
@@ -619,6 +620,105 @@ async def test_transient_provider_error_backs_off_within_attempt_timeout(
     assert sleeps
     assert 0 < sleeps[0] <= 60
     assert registry.backend.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_parallel_slice_manifest_updates_are_serialized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    patch_git(monkeypatch, tmp_path)
+    import mimir.worklink.epic as epic_mod
+    from mimir.worklink.epic_state import load_epic_state, save_epic_state
+
+    # This simulates the stale fallback reads that used to make whole-manifest
+    # writes from parallel slices clobber each other.
+    monkeypatch.setattr(epic_mod, "_current_manifest", lambda home, fallback: fallback)
+    arrived: set[int] = set()
+    both_observing = asyncio.Event()
+
+    async def observe_after_both_slices_start(**kw: object) -> EvidenceValidation:
+        leaf = kw["leaf"]
+        spec = kw["spec"]
+        assert isinstance(leaf, LeafIssue)
+        assert isinstance(spec, WorkSpec)
+        arrived.add(leaf.issue.issue_id)
+        if len(arrived) == 2:
+            both_observing.set()
+        await asyncio.wait_for(both_observing.wait(), timeout=1)
+        return ready_validation(leaf.issue.issue_id, spec.attempt)
+
+    monkeypatch.setattr(epic_mod, "_observe_slice", observe_after_both_slices_start)
+    integration = IntegrationBranchLease(
+        100,
+        Path("/repo"),
+        tmp_path / "integration",
+        "epic/100-integration",
+        "main",
+        "main",
+    )
+    integration.path.mkdir(exist_ok=True)
+    manifest = EpicRunManifest(
+        epic_id=100,
+        integration_branch=integration.branch,
+        integration_worktree=str(integration.path),
+        base_ref="main",
+        phase="build",
+        slices=[EpicSliceRecord(id=101), EpicSliceRecord(id=102)],
+    )
+    save_epic_state(tmp_path, manifest)
+    leaves = [
+        LeafIssue(issue(101), scope_paths=("a.py",), suggested_test_command="true"),
+        LeafIssue(issue(102), scope_paths=("b.py",), suggested_test_command="true"),
+    ]
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic"}),
+        leaves=leaves,
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+    registry = FakeRegistry()
+    roles = FakeRoles()
+    runner_instance = EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=runner,
+        registry=registry,  # type: ignore[arg-type]
+        roles=roles,
+        chainlink=chainlink,  # type: ignore[arg-type]
+    )
+
+    outcomes = await asyncio.gather(
+        *[
+            runner_instance._build_review_merge_slice(
+                leaf=leaf,
+                epic=chainlink.epic,
+                manifest=manifest,
+                integration=integration,
+                config=WorklinkConfig.load(tmp_path / "missing-worklink.yaml"),
+                registry=registry,  # type: ignore[arg-type]
+                repo_url="git@github.com:jasoncarreira/mimir.git",
+                repo_slug="jasoncarreira/mimir",
+                backend_name=None,
+                roles=roles,
+                chainlink=chainlink,  # type: ignore[arg-type]
+                runner=runner,
+                autonomous=False,
+            )
+            for leaf in leaves
+        ]
+    )
+
+    saved = load_epic_state(tmp_path, 100)
+    assert saved is not None
+    records = {record.id: record for record in saved.slices}
+    assert [outcome.blocked_reason for outcome in outcomes] == [None, None]
+    assert set(chainlink.merged) == {101, 102}
+    assert set(records) == {101, 102}
+    assert {record.status for record in records.values()} == {"merged"}
+    assert {record.attempts for record in records.values()} == {1}
+    assert all(record.review_ref == "approve" for record in records.values())
+    assert all(record.evidence_ref for record in records.values())
 
 
 @pytest.mark.asyncio

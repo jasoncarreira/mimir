@@ -9,7 +9,7 @@ observe/review/merge each slice and open exactly one draft PR at the end.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -297,6 +297,7 @@ class EpicRunner:
     registry: BackendRegistry | None = None
     roles: EpicRoleRunner | None = None
     chainlink: ChainlinkEpicClient | None = None
+    _manifest_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False, compare=False)
 
     async def run(
         self,
@@ -391,31 +392,37 @@ class EpicRunner:
             leaves = chainlink.child_leaves(epic_id)
             if manifest.phase == "decompose" and (not leaves or not created_manifest):
                 leaves = await self._decompose(epic, chainlink, roles, config)
-                manifest = replace(
-                    _current_manifest(self.home, manifest),
-                    phase="build",
-                    status="running",
-                    slices=[EpicSliceRecord(id=leaf.issue.issue_id) for leaf in leaves],
+                manifest = await self._save_manifest_update(
+                    manifest,
+                    lambda current: replace(
+                        current,
+                        phase="build",
+                        status="running",
+                        slices=[EpicSliceRecord(id=leaf.issue.issue_id) for leaf in leaves],
+                    ),
                 )
-                save_epic_state(self.home, manifest)
                 heartbeat()
             elif manifest.phase == "decompose":
-                manifest = replace(
+                manifest = await self._save_manifest_update(
                     manifest,
-                    phase="build",
-                    slices=[EpicSliceRecord(id=leaf.issue.issue_id) for leaf in leaves],
+                    lambda current: replace(
+                        current,
+                        phase="build",
+                        slices=[EpicSliceRecord(id=leaf.issue.issue_id) for leaf in leaves],
+                    ),
                 )
-                save_epic_state(self.home, manifest)
                 heartbeat()
             elif not leaves:
                 raise WorklinkError("epic manifest is past decompose but has no child leaves")
             elif not manifest.slices:
-                manifest = replace(
+                manifest = await self._save_manifest_update(
                     manifest,
-                    phase="build",
-                    slices=[EpicSliceRecord(id=leaf.issue.issue_id) for leaf in leaves],
+                    lambda current: replace(
+                        current,
+                        phase="build",
+                        slices=[EpicSliceRecord(id=leaf.issue.issue_id) for leaf in leaves],
+                    ),
                 )
-                save_epic_state(self.home, manifest)
                 heartbeat()
             leaf_by_id = {leaf.issue.issue_id: leaf for leaf in leaves}
             waves = compute_waves(leaves)
@@ -438,9 +445,15 @@ class EpicRunner:
                 for leaf in skipped:
                     reason = "blocked by failed prerequisite"
                     blocked[leaf.issue.issue_id] = reason
-                    manifest = _update_slice(manifest, leaf.issue.issue_id, status="blocked")
                     chainlink.mark_blocked(leaf.issue.issue_id, reason)
-                    save_epic_state(self.home, manifest)
+                    manifest = await self._save_manifest_update(
+                        manifest,
+                        lambda current, leaf_id=leaf.issue.issue_id: _update_slice(
+                            current,
+                            leaf_id,
+                            status="blocked",
+                        ),
+                    )
                     heartbeat()
                 batches = _file_disjoint_batches(runnable)
                 for batch in batches:
@@ -473,17 +486,18 @@ class EpicRunner:
                             )
                             if outcome.blocked_reason:
                                 blocked[outcome.leaf_id] = outcome.blocked_reason
-                                for dependent in _dependents(leaf_by_id.values(), outcome.leaf_id):
+                                dependents = _dependents(leaf_by_id.values(), outcome.leaf_id)
+                                for dependent in dependents:
                                     blocked[dependent.issue.issue_id] = "blocked by failed prerequisite"
-                                    manifest = _update_slice(
-                                        manifest,
-                                        dependent.issue.issue_id,
-                                        status="blocked",
-                                    )
                                     chainlink.mark_blocked(
                                         dependent.issue.issue_id, "blocked by failed prerequisite"
                                     )
-                                save_epic_state(self.home, manifest)
+                                manifest = await self._save_manifest_update(
+                                    manifest,
+                                    lambda current, blocked_ids=tuple(
+                                        dependent.issue.issue_id for dependent in dependents
+                                    ): _mark_slices_blocked(current, blocked_ids),
+                                )
                                 heartbeat()
             manifest = load_or_init_epic_state(
                 self.home,
@@ -493,8 +507,14 @@ class EpicRunner:
                 base_ref=base,
             )
             partial = any(item.status == "blocked" for item in manifest.slices)
-            manifest = replace(manifest, phase="integrate", status="partial" if partial else "running")
-            save_epic_state(self.home, manifest)
+            manifest = await self._save_manifest_update(
+                manifest,
+                lambda current: replace(
+                    current,
+                    phase="integrate",
+                    status="partial" if partial else "running",
+                ),
+            )
             heartbeat()
             integration_decision = await roles.validate_integration(
                 epic=epic,
@@ -504,8 +524,10 @@ class EpicRunner:
                 chainlink=chainlink,
             )
             if not integration_decision.approved:
-                manifest = replace(manifest, status="blocked")
-                save_epic_state(self.home, manifest)
+                manifest = await self._save_manifest_update(
+                    manifest,
+                    lambda current: replace(current, status="blocked"),
+                )
                 heartbeat()
                 return EpicRunResult(
                     epic_id,
@@ -518,8 +540,10 @@ class EpicRunner:
                 )
             test_status = _run_epic_tests(integration.path, config.defaults.test_command, runner=runner)
             if test_status.exit_code != 0 and not partial:
-                manifest = replace(manifest, status="blocked")
-                save_epic_state(self.home, manifest)
+                manifest = await self._save_manifest_update(
+                    manifest,
+                    lambda current: replace(current, status="blocked"),
+                )
                 heartbeat()
                 return EpicRunResult(
                     epic_id,
@@ -541,8 +565,10 @@ class EpicRunner:
                 test_status=test_status,
                 runner=runner,
             )
-            manifest = replace(manifest, phase="pr", status="partial" if partial else "completed")
-            save_epic_state(self.home, manifest)
+            manifest = await self._save_manifest_update(
+                manifest,
+                lambda current: replace(current, phase="pr", status="partial" if partial else "completed"),
+            )
             heartbeat()
             chainlink.move_epic_to_review(epic_id)
             return EpicRunResult(
@@ -605,6 +631,17 @@ class EpicRunner:
                 return leaves
         raise WorklinkError("work-decomposer filed no leaves")
 
+    async def _save_manifest_update(
+        self,
+        fallback: EpicRunManifest,
+        update: Callable[[EpicRunManifest], EpicRunManifest],
+    ) -> EpicRunManifest:
+        async with self._manifest_lock:
+            current = load_epic_state(self.home, fallback.epic_id) or fallback
+            updated = update(current)
+            save_epic_state(self.home, updated)
+            return updated
+
     async def _build_review_merge_slice(
         self,
         *,
@@ -639,9 +676,15 @@ class EpicRunner:
         pending_fixes: tuple[str, ...] = ()
         while attempts < config.defaults.max_review_retries:
             attempts += 1
-            manifest = _current_manifest(self.home, manifest)
-            manifest = _update_slice(manifest, leaf.issue.issue_id, status="running", attempts=attempts)
-            save_epic_state(self.home, manifest)
+            manifest = await self._save_manifest_update(
+                manifest,
+                lambda current: _update_slice(
+                    current,
+                    leaf.issue.issue_id,
+                    status="running",
+                    attempts=attempts,
+                ),
+            )
             lease = _create_slice_checkout(
                 self.repo,
                 leaf=leaf,
@@ -743,16 +786,17 @@ class EpicRunner:
                     fixes=tuple(reasons),
                 )
                 review_ref = "review skipped: " + ", ".join(reasons)
-            manifest = _current_manifest(self.home, manifest)
-            manifest = _update_slice(
+            manifest = await self._save_manifest_update(
                 manifest,
-                leaf.issue.issue_id,
-                status="review",
-                attempts=attempts,
-                evidence_ref=str(evidence_path),
-                review_ref=review_ref,
+                lambda current: _update_slice(
+                    current,
+                    leaf.issue.issue_id,
+                    status="review",
+                    attempts=attempts,
+                    evidence_ref=str(evidence_path),
+                    review_ref=review_ref,
+                ),
             )
-            save_epic_state(self.home, manifest)
             if validation.review_ready and decision.approved:
                 if compute.capabilities().shared_filesystem:
                     _commit_worktree_changes(lease.path, leaf.issue, runner=runner)
@@ -764,23 +808,25 @@ class EpicRunner:
                     runner=runner,
                 )
                 if isinstance(merged, SliceMergeConflict):
-                    manifest = _current_manifest(self.home, manifest)
-                    manifest = replace(manifest, status="needs-human")
-                    save_epic_state(self.home, manifest)
+                    manifest = await self._save_manifest_update(
+                        manifest,
+                        lambda current: replace(current, status="needs-human"),
+                    )
                     raise WorklinkError(
                         "same-wave merge conflict requires human/decomposition review"
                     )
                 assert isinstance(merged, SliceMergeSuccess)
                 _git_push(integration.path, integration.branch, runner=runner)
                 chainlink.mark_merged(leaf.issue.issue_id)
-                manifest = _current_manifest(self.home, manifest)
-                manifest = _update_slice(
+                manifest = await self._save_manifest_update(
                     manifest,
-                    leaf.issue.issue_id,
-                    status="merged",
-                    merge_commit=merged.merge_commit,
+                    lambda current: _update_slice(
+                        current,
+                        leaf.issue.issue_id,
+                        status="merged",
+                        merge_commit=merged.merge_commit,
+                    ),
                 )
-                save_epic_state(self.home, manifest)
                 return _SliceOutcome(leaf.issue.issue_id)
             pending_fixes = decision.fixes
             last_reason = "; ".join(decision.fixes) or ", ".join(validation.reasons) or last_reason
@@ -793,14 +839,15 @@ class EpicRunner:
             if attempts < config.defaults.max_review_retries and backoff_s > 0:
                 await asyncio.sleep(backoff_s)
         chainlink.mark_blocked(leaf.issue.issue_id, last_reason)
-        manifest = _current_manifest(self.home, manifest)
-        manifest = _update_slice(
+        manifest = await self._save_manifest_update(
             manifest,
-            leaf.issue.issue_id,
-            status="blocked",
-            attempts=attempts,
+            lambda current: _update_slice(
+                current,
+                leaf.issue.issue_id,
+                status="blocked",
+                attempts=attempts,
+            ),
         )
-        save_epic_state(self.home, manifest)
         return _SliceOutcome(leaf.issue.issue_id, last_reason)
 
 
@@ -1023,6 +1070,13 @@ def _update_slice(manifest: EpicRunManifest, leaf_id: int, **changes: Any) -> Ep
     if not found:
         records.append(EpicSliceRecord(id=leaf_id, **changes))
     return replace(manifest, slices=records)
+
+
+def _mark_slices_blocked(manifest: EpicRunManifest, leaf_ids: Iterable[int]) -> EpicRunManifest:
+    updated = manifest
+    for leaf_id in leaf_ids:
+        updated = _update_slice(updated, leaf_id, status="blocked")
+    return updated
 
 
 def _current_manifest(home: Path, fallback: EpicRunManifest) -> EpicRunManifest:
