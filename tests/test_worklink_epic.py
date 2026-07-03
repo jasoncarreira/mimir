@@ -932,3 +932,63 @@ async def test_resume_missing_integration_worktree_rematerializes_to_merge_commi
 
     assert result.status == "completed"
     assert any(cmd[:5] == ["git", "-C", "/repo", "worktree", "add"] and cmd[-1] == "abc123" for cmd in calls)
+
+
+def test_chainlink_comment_raises_on_failure() -> None:
+    def failing_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["issue", "comment"]:
+            return cp(args, returncode=1, stderr="comment failed")
+        return cp(args)
+
+    client = ChainlinkEpicClient(runner=failing_runner)
+
+    with pytest.raises(Exception, match="comment failed"):
+        client.comment(101, "WORKLINK_REVIEW_FIXES ...")
+
+
+@pytest.mark.asyncio
+async def test_decompose_deficiency_wins_over_leaves_from_prior_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (PR #1000 review): a mixed state — leaves present (e.g. from a
+    crashed earlier attempt) AND a deficiency reported — must halt as deficient,
+    not proceed to build a partial plan."""
+    patch_git(monkeypatch, tmp_path)
+    import mimir.worklink.epic as epic_mod
+
+    monkeypatch.setattr(epic_mod, "_observe_slice", fake_observe_slice)
+
+    class MixedRoles(FakeRoles):
+        async def run_decompose(self, epic: IssueContext, *, chainlink: Any) -> DecomposeOutcome:
+            chainlink.file_leaf(
+                epic.issue_id,
+                WorklinkLeafSpec(
+                    title="Partial leaf",
+                    acceptance_criteria=["works"],
+                    review_criteria=["check"],
+                    scope_paths=["a.py"],
+                    suggested_test_command="true",
+                ),
+            )
+            return DecomposeOutcome(filed_leaves=1, deficiency="brief has no usable outcome")
+
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic"}),
+        leaves=[],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+
+    with pytest.raises(Exception, match="deficient"):
+        await EpicRunner(
+            home=tmp_path,
+            repo=Path("/repo"),
+            runner=runner,
+            registry=FakeRegistry(),  # type: ignore[arg-type]
+            roles=MixedRoles(decomposition=[]),
+            chainlink=chainlink,  # type: ignore[arg-type]
+        ).run(100)
+
+    # Nothing was merged and the epic was not moved to review.
+    assert chainlink.merged == []

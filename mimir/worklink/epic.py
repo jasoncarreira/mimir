@@ -256,8 +256,17 @@ class ChainlinkEpicClient:
         self.runner([self.chainlink_bin, "issue", "comment", str(leaf_id), f"WORKLINK_BLOCKED {reason}"])
 
     def comment(self, issue_id: int, text: str) -> None:
-        """Post a plain comment (role tools use this for fixes/deficiency notes)."""
-        self.runner([self.chainlink_bin, "issue", "comment", str(issue_id), text])
+        """Post a plain comment (role tools use this for fixes/deficiency notes).
+
+        Raises on failure so the tool closures' ``_safe_comment`` can surface a
+        real audit-comment failure as a warning instead of dropping it silently
+        (mirrors ``add_blocker``).
+        """
+        result = self.runner([self.chainlink_bin, "issue", "comment", str(issue_id), text])
+        if result.returncode != 0:
+            raise WorklinkError(
+                (result.stderr or result.stdout).strip() or "chainlink issue comment failed"
+            )
 
     def move_epic_to_review(self, epic_id: int) -> None:
         self.runner([self.chainlink_bin, "issue", "unlabel", str(epic_id), "worklink:ready"])
@@ -548,13 +557,17 @@ class EpicRunner:
         """
         for _attempt in range(config.defaults.max_review_retries):
             outcome = await roles.run_decompose(epic, chainlink=chainlink)
-            leaves = chainlink.child_leaves(epic.issue_id)
-            if leaves:
-                return leaves
+            # Deficiency wins over any existing leaves: the tool closures make
+            # file-vs-deficiency exclusive within one run, but leaves filed by
+            # an earlier crashed attempt can coexist with a fresh deficiency
+            # report — that mixed state must halt, not build a partial plan.
             if outcome.deficiency:
                 raise WorklinkError(
                     f"epic brief reported deficient by work-decomposer: {outcome.deficiency}"
                 )
+            leaves = chainlink.child_leaves(epic.issue_id)
+            if leaves:
+                return leaves
         raise WorklinkError("work-decomposer filed no leaves")
 
     async def _build_review_merge_slice(
