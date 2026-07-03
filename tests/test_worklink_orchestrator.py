@@ -306,6 +306,68 @@ def test_worker_payload_clone_branch_fake_backend_pushes_and_writes_evidence(tmp
     assert backend.orders[0].worktree == repo
 
 
+def test_worker_payload_no_commit_result_does_not_push(tmp_path: Path) -> None:
+    repo = tmp_path / "worker-repo"
+    evidence_path = tmp_path / "out" / "evidence.json"
+    calls: list[Sequence[str] | str] = []
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:2] == ["git", "clone"]:
+            repo.mkdir(parents=True)
+            (repo / ".git").mkdir()
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--cached" in args:
+            return cp(args, stdout="")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--name-only" in args:
+            return cp(args, stdout="")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--stat" in args:
+            return cp(args, stdout="")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "status"]:
+            return cp(args, stdout="")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "add"]:
+            return cp(args)
+        if args == "echo ok":
+            return cp(args, stdout="ok\n")
+        return cp(args)
+
+    backend = WorkerFakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    spec = backend.work_spec(
+        WorkOrder(
+            issue_id=456,
+            worktree=tmp_path / "origin-local-worktree-is-ignored",
+            prompt="Do worker handoff",
+            rules=None,
+            timeout_s=30,
+            env={"MIMIR_HOME": str(tmp_path / "home")},
+            transcript_root=tmp_path / "transcripts",
+        ),
+        attempt=1,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="origin/main",
+        branch="issue/456-a1",
+        test_command="echo ok",
+    )
+    payload = WorkerPayload(
+        spec=spec,
+        repo_dir=repo,
+        evidence_path=evidence_path,
+        transcript_root=tmp_path / "transcripts",
+        safe_env={"PATH": "/bin"},
+    )
+
+    validation = asyncio.run(run_worker_payload(payload, registry=registry, runner=runner))
+
+    assert validation.status == "failed"
+    assert validation.review_ready is False
+    assert "backend_produced_no_changes" in validation.reasons
+    assert validation.evidence.blocked_reason == "backend produced no changes"
+    assert not any(isinstance(call, list) and call[:4] == ["git", "-C", str(repo), "commit"] for call in calls)
+    assert not any(isinstance(call, list) and call[:4] == ["git", "-C", str(repo), "push"] for call in calls)
+
+
 def test_worker_prepares_slash_named_feature_base(tmp_path: Path) -> None:
     # Regression for #467: a long-running feature base such as
     # `integration/worklink` must be materialized as a local ref and checked out

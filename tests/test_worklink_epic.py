@@ -9,7 +9,7 @@ from typing import Any, Sequence
 
 import pytest
 
-from mimir.worklink.backends import ComputeCaps, ComputeResult, RawResult, WorkOrder
+from mimir.worklink.backends import ComputeCaps, ComputeResult, RawResult, WorkOrder, WorklinkConfig
 from mimir.worklink.compute import WorkSpec
 from mimir.worklink.epic import (
     ChainlinkEpicClient,
@@ -20,7 +20,7 @@ from mimir.worklink.epic import (
     MissingEpicRoleRunner,
     compute_waves,
 )
-from mimir.worklink.epic_state import EpicRunManifest
+from mimir.worklink.epic_state import EpicRunManifest, EpicSliceRecord
 from mimir.worklink.epic_roles import EpicSubagentRoleRunner
 from mimir.worklink.evidence import (
     CommandResult,
@@ -365,6 +365,25 @@ def ready_validation(leaf_id: int, attempt: int = 1) -> EvidenceValidation:
     return EvidenceValidation("completed", True, (), evidence)
 
 
+def empty_diff_validation(leaf_id: int, attempt: int = 1) -> EvidenceValidation:
+    evidence = WorklinkEvidence(
+        issue=leaf_id,
+        attempt=attempt,
+        backend="fake",
+        branch=f"issue/{leaf_id}-a{attempt}",
+        worktree="/tmp/wt",
+        started_at="2026-07-02T00:00:00+00:00",
+        finished_at="2026-07-02T00:00:01+00:00",
+        files_changed=[],
+        diff_stat="",
+        commands=[CommandResult("git diff", 0)],
+        tests=TestResult("true", 0),
+        pr_url=None,
+        status="failed",
+    )
+    return EvidenceValidation("failed", False, ("completed_empty_diff",), evidence)
+
+
 async def fake_observe_slice(**kw: object) -> EvidenceValidation:
     leaf = kw["leaf"]
     spec = kw["spec"]
@@ -474,6 +493,132 @@ async def test_reject_retry_then_block_opens_partial_pr(tmp_path: Path, monkeypa
     assert result.blocked_leaves == (101,)
     assert chainlink.blocked[101] == "fix it"
     assert chainlink.moved_to_review is True
+
+
+@pytest.mark.asyncio
+async def test_empty_diff_evidence_skips_slice_reviewer_and_records_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    patch_git(monkeypatch, tmp_path)
+    (tmp_path / "worklink.yaml").write_text("defaults:\n  max_review_retries: 1\n  test_command: true\n", encoding="utf-8")
+    import mimir.worklink.epic as epic_mod
+
+    async def observe_empty(**kw: object) -> EvidenceValidation:
+        leaf = kw["leaf"]
+        spec = kw["spec"]
+        assert isinstance(leaf, LeafIssue)
+        assert isinstance(spec, WorkSpec)
+        return empty_diff_validation(leaf.issue.issue_id, spec.attempt)
+
+    monkeypatch.setattr(epic_mod, "_observe_slice", observe_empty)
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic"}),
+        leaves=[LeafIssue(issue(101), scope_paths=("a.py",), suggested_test_command="true")],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+    roles = FakeRoles()
+
+    result = await EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=runner,
+        registry=FakeRegistry(),  # type: ignore[arg-type]
+        roles=roles,
+        chainlink=chainlink,  # type: ignore[arg-type]
+    ).run(100)
+
+    assert result.status == "partial"
+    assert roles.slice_review_calls == []
+    assert chainlink.blocked[101] == "completed_empty_diff"
+    manifest = EpicRunManifest.from_json(json.loads(Path(result.manifest_path).read_text(encoding="utf-8")))
+    record = manifest.slices[0]
+    assert record.attempts == 1
+    assert record.review_ref == "review skipped: completed_empty_diff"
+
+
+@pytest.mark.asyncio
+async def test_transient_provider_error_backs_off_within_attempt_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    patch_git(monkeypatch, tmp_path)
+    import mimir.worklink.epic as epic_mod
+
+    class OverloadedThenReadyBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def interpret(self, order: WorkOrder, result: ComputeResult) -> RawResult:
+            self.calls += 1
+            if self.calls == 1:
+                return RawResult(1, order.transcript_root / "fake.json", "backend_error", "servers are currently overloaded")
+            return RawResult(0, order.transcript_root / "fake.json", "completed", None)
+
+    async def observe_by_attempt(**kw: object) -> EvidenceValidation:
+        leaf = kw["leaf"]
+        spec = kw["spec"]
+        assert isinstance(leaf, LeafIssue)
+        assert isinstance(spec, WorkSpec)
+        if spec.attempt == 1:
+            return empty_diff_validation(leaf.issue.issue_id, spec.attempt)
+        return ready_validation(leaf.issue.issue_id, spec.attempt)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    registry = FakeRegistry()
+    registry.backend = OverloadedThenReadyBackend()
+    monkeypatch.setattr(epic_mod, "_observe_slice", observe_by_attempt)
+    monkeypatch.setattr(epic_mod.asyncio, "sleep", fake_sleep)
+    integration = IntegrationBranchLease(100, Path("/repo"), tmp_path / "integration", "epic/100-integration", "main", "main")
+    manifest = EpicRunManifest(
+        epic_id=100,
+        integration_branch=integration.branch,
+        integration_worktree=str(integration.path),
+        base_ref="main",
+        phase="build",
+        slices=[EpicSliceRecord(id=101)],
+    )
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic"}),
+        leaves=[LeafIssue(issue(101), scope_paths=("a.py",), suggested_test_command="true")],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+    roles = FakeRoles()
+
+    outcome = await EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=runner,
+        registry=registry,  # type: ignore[arg-type]
+        roles=roles,
+        chainlink=chainlink,  # type: ignore[arg-type]
+    )._build_review_merge_slice(
+        leaf=chainlink.leaves[0],
+        epic=chainlink.epic,
+        manifest=manifest,
+        integration=integration,
+        config=WorklinkConfig.load(tmp_path / "missing-worklink.yaml"),
+        registry=registry,  # type: ignore[arg-type]
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        repo_slug="jasoncarreira/mimir",
+        backend_name=None,
+        roles=roles,
+        chainlink=chainlink,  # type: ignore[arg-type]
+        runner=runner,
+        autonomous=False,
+    )
+
+    assert outcome.blocked_reason is None
+    assert sleeps
+    assert 0 < sleeps[0] <= 60
+    assert registry.backend.calls == 2
 
 
 @pytest.mark.asyncio
@@ -794,10 +939,15 @@ async def test_remote_epic_pushes_integration_before_observing_slice(
         merged=[],
     )
 
+    def remote_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[:4] == ["git", "-C", str(slice_path), "diff"]:
+            return cp(args, stdout="changed.txt\n")
+        return runner(args)
+
     result = await EpicRunner(
         home=tmp_path,
         repo=Path("/repo"),
-        runner=runner,
+        runner=remote_runner,
         registry=RemoteRegistry(),  # type: ignore[arg-type]
         roles=FakeRoles(),
         chainlink=chainlink,  # type: ignore[arg-type]

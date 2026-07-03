@@ -689,8 +689,13 @@ class EpicRunner:
             except ComputeLaunchError as exc:
                 compute_result = ComputeResult(-1, "", str(exc), launch_error=str(exc))
             raw = await selected_backend.interpret(order, compute_result)
+            no_push_reason = None
             if not compute.capabilities().shared_filesystem and backend_completed(raw.backend_status):
-                _git_push(lease.path, lease.branch, runner=runner)
+                if _slice_branch_has_changes(lease.path, lease.local_base or lease.base_ref, runner=runner):
+                    _git_push(lease.path, lease.branch, runner=runner)
+                else:
+                    no_push_reason = "backend_produced_no_changes"
+                    raw = replace(raw, backend_status="failed", error="backend produced no changes")
             validation = await _observe_slice(
                 home=self.home,
                 leaf=leaf,
@@ -704,24 +709,40 @@ class EpicRunner:
                 config=config,
                 runner=runner,
             )
+            if no_push_reason:
+                validation = _with_validation_reason(
+                    validation,
+                    no_push_reason,
+                    blocked_reason="backend produced no changes",
+                )
             evidence_path = _write_evidence(self.home, validation.evidence)
-            mode = classify_leaf_review_risk(
-                scope_paths=list(leaf.scope_paths),
-                labels=leaf.issue.labels,
-                tiered_review=config.defaults.tiered_review,
-            )
-            reviewer_count = (
-                config.defaults.tiered_review.multi_vote_reviewer_count
-                if mode == "multi"
-                else 1
-            )
-            decision = await roles.review_slice(
-                leaf=leaf,
-                evidence=validation,
-                mode=mode,
-                reviewer_count=reviewer_count,
-                chainlink=chainlink,
-            )
+            if validation.review_ready:
+                mode = classify_leaf_review_risk(
+                    scope_paths=list(leaf.scope_paths),
+                    labels=leaf.issue.labels,
+                    tiered_review=config.defaults.tiered_review,
+                )
+                reviewer_count = (
+                    config.defaults.tiered_review.multi_vote_reviewer_count
+                    if mode == "multi"
+                    else 1
+                )
+                decision = await roles.review_slice(
+                    leaf=leaf,
+                    evidence=validation,
+                    mode=mode,
+                    reviewer_count=reviewer_count,
+                    chainlink=chainlink,
+                )
+                review_ref = decision.summary or ("approved" if decision.approved else "fixes requested")
+            else:
+                reasons = validation.reasons or ("evidence_not_review_ready",)
+                decision = SliceDecision(
+                    approved=False,
+                    summary="review skipped: evidence not review-ready",
+                    fixes=tuple(reasons),
+                )
+                review_ref = "review skipped: " + ", ".join(reasons)
             manifest = _current_manifest(self.home, manifest)
             manifest = _update_slice(
                 manifest,
@@ -729,8 +750,7 @@ class EpicRunner:
                 status="review",
                 attempts=attempts,
                 evidence_ref=str(evidence_path),
-                review_ref=decision.summary
-                or ("approved" if decision.approved else "fixes requested"),
+                review_ref=review_ref,
             )
             save_epic_state(self.home, manifest)
             if validation.review_ready and decision.approved:
@@ -764,6 +784,14 @@ class EpicRunner:
                 return _SliceOutcome(leaf.issue.issue_id)
             pending_fixes = decision.fixes
             last_reason = "; ".join(decision.fixes) or ", ".join(validation.reasons) or last_reason
+            backoff_s = _transient_provider_backoff_s(
+                raw=raw,
+                compute_result=compute_result,
+                started=started,
+                timeout_s=config.defaults.timeout_s,
+            )
+            if attempts < config.defaults.max_review_retries and backoff_s > 0:
+                await asyncio.sleep(backoff_s)
         chainlink.mark_blocked(leaf.issue.issue_id, last_reason)
         manifest = _current_manifest(self.home, manifest)
         manifest = _update_slice(
@@ -903,6 +931,73 @@ def _chunks(items: list[LeafIssue], size: int) -> Iterable[list[LeafIssue]]:
 
 def _epic_heartbeat_interval_s(config: WorklinkConfig) -> float:
     return float(max(30, min(300, config.defaults.timeout_s // 4)))
+
+
+def _slice_branch_has_changes(worktree: Path, base_ref: str, *, runner: Runner) -> bool:
+    diff = runner(["git", "-C", str(worktree), "diff", "--name-only", f"{base_ref}...HEAD"])
+    if diff.returncode != 0:
+        raise WorklinkError((diff.stderr or diff.stdout).strip() or "git diff failed")
+    return bool(diff.stdout.strip())
+
+
+def _with_validation_reason(
+    validation: EvidenceValidation,
+    reason: str,
+    *,
+    blocked_reason: str | None = None,
+) -> EvidenceValidation:
+    evidence = validation.evidence
+    if blocked_reason:
+        evidence = replace(evidence, blocked_reason=blocked_reason)
+    if reason in validation.reasons:
+        return replace(validation, evidence=evidence)
+    return replace(validation, reasons=(*validation.reasons, reason), evidence=evidence)
+
+
+def _transient_provider_backoff_s(
+    *,
+    raw: Any,
+    compute_result: ComputeResult,
+    started: datetime,
+    timeout_s: int,
+) -> float:
+    text = " ".join(
+        str(part or "")
+        for part in (
+            getattr(raw, "backend_status", ""),
+            getattr(raw, "error", ""),
+            compute_result.launch_error,
+            compute_result.stdout,
+            compute_result.stderr,
+        )
+    ).lower()
+    if not _looks_like_transient_provider_error(text):
+        return 0.0
+    remaining = float(timeout_s) - (datetime.now(UTC) - started).total_seconds()
+    if remaining <= 0:
+        return 0.0
+    return max(0.0, min(60.0, remaining))
+
+
+def _looks_like_transient_provider_error(text: str) -> bool:
+    patterns = (
+        "server overloaded",
+        "servers are currently overloaded",
+        "currently overloaded",
+        "overloaded",
+        "rate limit",
+        "rate-limit",
+        "rate_limited",
+        "too many requests",
+        "429",
+        "temporarily unavailable",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "internal server error",
+        "5xx",
+    )
+    return any(pattern in text for pattern in patterns) or re.search(r"\b(?:429|5\d\d)\b", text) is not None
 
 
 async def _epic_claim_heartbeat_loop(
