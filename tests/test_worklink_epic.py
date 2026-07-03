@@ -1391,9 +1391,21 @@ async def test_remote_epic_pushes_integration_before_observing_slice(
     )
 
     def remote_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        if list(args)[:4] == ["git", "-C", str(slice_path), "diff"]:
+        listed = list(args)
+        # Adoption probe runs in the parent repo (/repo): report no remote
+        # branch so the build path runs. The post-build lease sync runs in the
+        # slice worktree: report the branch the worker "pushed" (chainlink
+        # #824 — content exists only on origin, never written locally).
+        if listed[:2] == ["git", "-C"] and "ls-remote" in listed:
+            if listed[2] == str(slice_path):
+                return cp(args, stdout="f5c3c571\trefs/heads/issue/101-a1\n")
+            return cp(args, stdout="")
+        if listed[:4] == ["git", "-C", str(slice_path), "diff"]:
             return cp(args, stdout="changed.txt\n")
+        runner_calls.append(listed)
         return runner(args)
+
+    runner_calls: list[list[str]] = []
 
     result = await EpicRunner(
         home=tmp_path,
@@ -1405,8 +1417,16 @@ async def test_remote_epic_pushes_integration_before_observing_slice(
     ).run(100)
 
     assert result.status == "completed"
-    assert events[:3] == ["push:epic/100-integration", "push:issue/101-a1", "observe"]
-    assert "push:epic/100-integration" in events[3:]
+    # chainlink #824: the WORKER owns the slice push on non-shared substrates;
+    # the controller syncs the local lease branch from origin instead of
+    # pushing its (empty) local branch, then observes.
+    assert events[:2] == ["push:epic/100-integration", "observe"]
+    assert "push:issue/101-a1" not in events
+    assert "push:epic/100-integration" in events[2:]
+    assert any(
+        call[:2] == ["git", "-C"] and "reset" in call and "origin/issue/101-a1" in call
+        for call in runner_calls
+    )
 
 
 @pytest.mark.asyncio
