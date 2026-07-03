@@ -13,6 +13,24 @@
 #   docker build -f docs/examples/worklink/worklink-worker.Dockerfile \
 #     --build-arg MIMIR_VERSION=<release-with-#538> -t mimir-worklink:latest .
 #
+# Smoke after build (compare against the controller's version; no restart is
+# needed — the broker launches workers from the tag on the next job):
+#   docker run --rm --entrypoint python mimir-worklink:latest \
+#     -c "import importlib.metadata as m; from mimir.worklink import worker; print(m.version('mimir-agent'))"
+#
+# DEPLOY INVARIANT (chainlink #814): rebuild this image whenever
+# mimir/worklink/worker.py — or anything the worker imports — changes in the
+# deployed mimir. Updating the CONTROLLER (git pull / pip upgrade) never
+# updates workers; a stale image silently nullifies worker-side fixes (this
+# bit epic #783 runs 7-8: a 2-week-old image ran without the fixes the
+# controller assumed). Chainlink #818 adds a fail-fast skew check; until then
+# the rebuild discipline is the guard.
+#
+# DUAL-ROLE NOTE: some deployments run the docker-sibling BROKER from this
+# same image (compose service + workers). That variant additionally needs
+# docker-ce-cli installed — if yours does, do NOT rebuild the shared tag from
+# this worker-only template; keep one canonical Dockerfile per deployment.
+#
 # OPERATOR DECISIONS — edit before building:
 #   1. Pin MIMIR_VERSION to a release that INCLUDES #538 (`test_only` worker /
 #      `fold_remote_test_evidence`) AND #540 (worker honors `spec.backend_config`
@@ -36,7 +54,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # --- Backend CLI (REQUIRED, operator-specific) -------------------------------
 # The worker shells out to the backend the leaf is routed to; it MUST be present.
-RUN npm install -g @openai/codex
+# Pin the backend CLI. The default tracks the framework's canonical pin
+# (mimir/worklink/tool_pins.py); override the ARG to match YOUR main agent
+# image so worker and controller behavior stay comparable (chainlink #814).
+ARG CODEX_VERSION=0.142.4
+RUN npm install -g @openai/codex@${CODEX_VERSION}
 # -----------------------------------------------------------------------------
 
 # uv — worker test commands like `uv run pytest …` auto-create the venv + sync
