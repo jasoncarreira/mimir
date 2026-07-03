@@ -617,6 +617,72 @@ def test_worker_diag_header_survives_giant_single_line_transcript(
     assert len(diag) <= 8600
 
 
+def test_worker_diag_redacts_secret_straddling_truncation_boundary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """chainlink #816 review blocker: redaction must run BEFORE truncation — a
+    secret split by the clip boundary leaves a suffix that exact-value
+    replacement can no longer match."""
+    secret = "SECRETVALUE1234567890x"
+    # Place the secret so the 2400-char stderr cap boundary falls INSIDE it.
+    backend = WorkerScriptedBackend(
+        script=(
+            "import sys; "
+            f"sys.stderr.write('padding ' + '{secret}' + 'B' * 2390); "
+            "sys.exit(3)"
+        ),
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    payload = _worker_diag_payload(tmp_path, backend, env={"CODEX_API_KEY": secret})
+
+    asyncio.run(
+        run_worker_payload(payload, registry=registry, runner=_worker_diag_runner(payload.repo_dir))
+    )
+
+    out = capsys.readouterr().out
+    assert secret not in out
+    assert "1234567890x" not in out  # no straddle suffix leak
+    assert "<redacted>" in out
+
+
+def test_tests_tail_redacts_secret_straddling_clip_boundary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    secret = "SECRETVALUE1234567890x"
+    backend = WorkerScriptedBackend(script="print('ok')", status="success")
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    payload = _worker_diag_payload(tmp_path, backend, env={"CODEX_API_KEY": secret})
+    gate_output = "padding " + secret + "B" * 5990  # 6000-char clip lands inside the secret
+    repo = payload.repo_dir
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:2] == ["git", "clone"]:
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / ".git").mkdir(exist_ok=True)
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--cached" in args:
+            return cp(args, stdout="changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--name-only" in args:
+            return cp(args, stdout="changed.txt\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "diff"] and "--stat" in args:
+            return cp(args, stdout=" changed.txt | 1 +\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "status"]:
+            return cp(args, stdout="?? changed.txt\n")
+        if args == "echo ok":
+            return cp(args, returncode=1, stdout=gate_output)
+        return cp(args)
+
+    validation = asyncio.run(run_worker_payload(payload, registry=registry, runner=runner))
+
+    assert validation.review_ready is False
+    out = capsys.readouterr().out
+    assert "WORKLINK_TESTS_TAIL_BEGIN" in out
+    assert secret not in out
+    assert "1234567890x" not in out
+
+
 def test_worker_prepares_slash_named_feature_base(tmp_path: Path) -> None:
     # Regression for #467: a long-running feature base such as
     # `integration/worklink` must be materialized as a local ref and checked out
