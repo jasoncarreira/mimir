@@ -12,11 +12,15 @@ from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, Wo
 from mimir.worklink.compute import LaunchHandle, WorkSpec
 from mimir.worklink.orchestrator import WorklinkRunner
 from mimir.worklink.run_state import (
+    WorklinkContinuationCheckpoint,
     WorklinkRunState,
     clear_run_state,
+    list_continuation_checkpoints,
     list_run_states,
+    load_continuation_checkpoint,
     load_run_state,
     reattach_dispatch_argv,
+    save_continuation_checkpoint,
     save_run_state,
 )
 
@@ -227,6 +231,105 @@ def test_reattach_dispatch_argv() -> None:
         "mimir", "worklink", "run", "561", "--reattach", "--autonomous",
         "--home", "/home", "--repo", "/repo",
     ]
+
+
+def test_known_issue_continuation_checkpoint_roundtrip(tmp_path: Path) -> None:
+    checkpoint = WorklinkContinuationCheckpoint.known_issue(
+        issue_id=806,
+        related_pr="https://github.com/jasoncarreira/mimir/pull/123",
+        work_item_key="chainlink:806",
+        exhausted_turn_id="turn-abc",
+        repo="/workspace/mimir",
+        worktree="/workspace/mimir",
+        branch="issue/806-a1",
+        completed_edits=["mimir/worklink/run_state.py"],
+        unrun_validation=["uv run pytest -q tests/test_worklink_reattach.py"],
+        next_commands=["git diff -- mimir/worklink/run_state.py"],
+        required_label_status_adjustments=["keep worklink:in-progress"],
+        created_at="2026-07-03T12:00:00+00:00",
+    )
+
+    path, created = save_continuation_checkpoint(tmp_path, checkpoint)
+
+    assert created is True
+    assert path.exists()
+    loaded = load_continuation_checkpoint(tmp_path, checkpoint.dedupe_key)
+    assert loaded == checkpoint
+    assert loaded is not None
+    assert loaded.kind == "known_issue"
+    assert loaded.related_chainlink_issue_id == 806
+    assert loaded.priority == "normal"
+    assert [c.dedupe_key for c in list_continuation_checkpoints(tmp_path)] == [
+        checkpoint.dedupe_key
+    ]
+
+
+def test_generic_continuation_checkpoint_is_high_priority_when_issue_unknown(
+    tmp_path: Path,
+) -> None:
+    checkpoint = WorklinkContinuationCheckpoint.generic(
+        work_item_key="worklink-finalizer:unknown",
+        exhausted_turn_id="turn-no-issue",
+        repo="/workspace/mimir",
+        worktree="/workspace/mimir",
+        branch="scratch",
+        completed_edits=["inspected run_state.py"],
+        unrun_validation=["pytest not started before exhaustion"],
+        next_commands=["inspect artifact and infer Chainlink issue"],
+        required_label_status_adjustments=["file or label a continuation issue"],
+        created_at="2026-07-03T12:05:00+00:00",
+    )
+
+    _, created = save_continuation_checkpoint(tmp_path, checkpoint)
+    loaded = load_continuation_checkpoint(tmp_path, checkpoint.dedupe_key)
+
+    assert created is True
+    assert loaded is not None
+    assert loaded.kind == "generic"
+    assert loaded.related_chainlink_issue_id is None
+    assert loaded.priority == "high"
+    assert loaded.next_commands == ["inspect artifact and infer Chainlink issue"]
+
+
+def test_continuation_checkpoint_duplicate_save_is_suppressed(
+    tmp_path: Path,
+) -> None:
+    first = WorklinkContinuationCheckpoint.known_issue(
+        issue_id=806,
+        work_item_key="chainlink:806",
+        exhausted_turn_id="turn-abc",
+        repo="/workspace/mimir",
+        worktree="/workspace/mimir",
+        branch="issue/806-a1",
+        completed_edits=["first snapshot"],
+        unrun_validation=["pytest"],
+        next_commands=["resume"],
+        required_label_status_adjustments=["none"],
+        created_at="2026-07-03T12:00:00+00:00",
+    )
+    rerendered = WorklinkContinuationCheckpoint.known_issue(
+        issue_id=806,
+        related_pr="https://github.com/jasoncarreira/mimir/pull/123",
+        work_item_key="chainlink:806",
+        exhausted_turn_id="turn-abc",
+        repo="/workspace/mimir",
+        worktree="/workspace/mimir",
+        branch="issue/806-a1",
+        completed_edits=["second snapshot should not replace first"],
+        unrun_validation=["pytest -q"],
+        next_commands=["resume again"],
+        required_label_status_adjustments=["none"],
+        created_at="2026-07-03T12:01:00+00:00",
+    )
+
+    first_path, first_created = save_continuation_checkpoint(tmp_path, first)
+    second_path, second_created = save_continuation_checkpoint(tmp_path, rerendered)
+
+    assert first.dedupe_key == rerendered.dedupe_key
+    assert first_path == second_path
+    assert first_created is True
+    assert second_created is False
+    assert list_continuation_checkpoints(tmp_path) == [first]
 
 
 # --------------------------------------------------------------------------

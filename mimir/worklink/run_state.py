@@ -25,11 +25,13 @@ be able to reattach to".
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 RUN_STATE_VERSION = 1
+CONTINUATION_CHECKPOINT_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -76,12 +78,199 @@ class WorklinkRunState:
         )
 
 
+@dataclass(frozen=True)
+class WorklinkContinuationCheckpoint:
+    """Durable handoff for a Worklink/Chainlink turn that exhausted mid-work.
+
+    This is intentionally separate from :class:`WorklinkRunState`: run state is
+    for reattaching to a still-running worker, while continuation checkpoints are
+    reviewable "resume this work safely" artifacts written after a turn exhausts.
+
+    Known-issue checkpoints set ``kind="known_issue"`` and carry the related
+    Chainlink issue id. If no issue can be inferred, callers still write a
+    ``kind="generic"`` checkpoint; those are always high priority and identify
+    the interrupted work by ``work_item_key`` plus ``exhausted_turn_id``.
+
+    Deduplication is path-based. ``dedupe_key`` hashes the stable work identity
+    for one exhausted turn/work item, not mutable resume notes or optional PR
+    context, so retries of the same finalizer call suppress duplicate records
+    even if they re-render prose.
+    """
+
+    kind: str
+    work_item_key: str
+    exhausted_turn_id: str
+    worktree: str
+    branch: str
+    completed_edits: list[str]
+    unrun_validation: list[str]
+    next_commands: list[str]
+    required_label_status_adjustments: list[str]
+    created_at: str
+    related_chainlink_issue_id: int | None = None
+    related_pr: str | None = None
+    repo: str = ""
+    priority: str = "normal"
+    dedupe_key: str = ""
+    version: int = CONTINUATION_CHECKPOINT_VERSION
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"known_issue", "generic"}:
+            raise ValueError("continuation checkpoint kind must be known_issue or generic")
+        if self.kind == "known_issue" and self.related_chainlink_issue_id is None:
+            raise ValueError("known_issue checkpoints require related_chainlink_issue_id")
+        if self.kind == "generic" and self.related_chainlink_issue_id is not None:
+            raise ValueError("generic checkpoints cannot carry a Chainlink issue id")
+        if self.kind == "generic" and self.priority != "high":
+            raise ValueError("generic continuation checkpoints must be high priority")
+        if self.dedupe_key and self.dedupe_key != continuation_checkpoint_dedupe_key(self):
+            raise ValueError("continuation checkpoint dedupe_key does not match identity")
+
+    def to_json(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["dedupe_key"] = self.dedupe_key or continuation_checkpoint_dedupe_key(self)
+        return data
+
+    @classmethod
+    def known_issue(
+        cls,
+        *,
+        issue_id: int,
+        work_item_key: str,
+        exhausted_turn_id: str,
+        worktree: str,
+        branch: str,
+        completed_edits: list[str],
+        unrun_validation: list[str],
+        next_commands: list[str],
+        required_label_status_adjustments: list[str],
+        created_at: str,
+        related_pr: str | None = None,
+        repo: str = "",
+        priority: str = "normal",
+    ) -> "WorklinkContinuationCheckpoint":
+        checkpoint = cls(
+            kind="known_issue",
+            related_chainlink_issue_id=issue_id,
+            related_pr=related_pr,
+            work_item_key=work_item_key,
+            exhausted_turn_id=exhausted_turn_id,
+            worktree=worktree,
+            branch=branch,
+            repo=repo,
+            completed_edits=completed_edits,
+            unrun_validation=unrun_validation,
+            next_commands=next_commands,
+            required_label_status_adjustments=required_label_status_adjustments,
+            created_at=created_at,
+            priority=priority,
+        )
+        return cls.from_json(checkpoint.to_json())
+
+    @classmethod
+    def generic(
+        cls,
+        *,
+        work_item_key: str,
+        exhausted_turn_id: str,
+        worktree: str,
+        branch: str,
+        completed_edits: list[str],
+        unrun_validation: list[str],
+        next_commands: list[str],
+        required_label_status_adjustments: list[str],
+        created_at: str,
+        related_pr: str | None = None,
+        repo: str = "",
+    ) -> "WorklinkContinuationCheckpoint":
+        checkpoint = cls(
+            kind="generic",
+            related_pr=related_pr,
+            work_item_key=work_item_key,
+            exhausted_turn_id=exhausted_turn_id,
+            worktree=worktree,
+            branch=branch,
+            repo=repo,
+            completed_edits=completed_edits,
+            unrun_validation=unrun_validation,
+            next_commands=next_commands,
+            required_label_status_adjustments=required_label_status_adjustments,
+            created_at=created_at,
+            priority="high",
+        )
+        return cls.from_json(checkpoint.to_json())
+
+    @classmethod
+    def from_json(cls, data: Any) -> "WorklinkContinuationCheckpoint":
+        if not isinstance(data, dict):
+            raise TypeError("worklink continuation checkpoint must be a JSON object")
+        checkpoint = cls(
+            kind=str(data["kind"]),
+            related_chainlink_issue_id=(
+                int(data["related_chainlink_issue_id"])
+                if data.get("related_chainlink_issue_id") is not None
+                else None
+            ),
+            related_pr=(str(data["related_pr"]) if data.get("related_pr") else None),
+            work_item_key=str(data["work_item_key"]),
+            exhausted_turn_id=str(data["exhausted_turn_id"]),
+            worktree=str(data["worktree"]),
+            branch=str(data["branch"]),
+            repo=str(data.get("repo") or ""),
+            completed_edits=[str(item) for item in data.get("completed_edits", [])],
+            unrun_validation=[str(item) for item in data.get("unrun_validation", [])],
+            next_commands=[str(item) for item in data.get("next_commands", [])],
+            required_label_status_adjustments=[
+                str(item) for item in data.get("required_label_status_adjustments", [])
+            ],
+            created_at=str(data["created_at"]),
+            priority=str(data.get("priority") or "normal"),
+            dedupe_key=str(data.get("dedupe_key") or ""),
+            version=int(data.get("version") or CONTINUATION_CHECKPOINT_VERSION),
+        )
+        if not checkpoint.dedupe_key:
+            return cls.from_json(checkpoint.to_json())
+        return checkpoint
+
+
 def runs_dir(home: Path) -> Path:
     return home / "state" / "worklink" / "runs"
 
 
+def continuation_checkpoints_dir(home: Path) -> Path:
+    return home / "state" / "worklink" / "continuations"
+
+
 def run_state_path(home: Path, issue_id: int) -> Path:
     return runs_dir(home) / f"{issue_id}.json"
+
+
+def continuation_checkpoint_dedupe_key(
+    checkpoint: WorklinkContinuationCheckpoint,
+) -> str:
+    """Stable identity for duplicate-suppressing one exhausted turn/work item."""
+    identity = {
+        "version": CONTINUATION_CHECKPOINT_VERSION,
+        "kind": checkpoint.kind,
+        "related_chainlink_issue_id": checkpoint.related_chainlink_issue_id,
+        "work_item_key": checkpoint.work_item_key,
+        "exhausted_turn_id": checkpoint.exhausted_turn_id,
+        "worktree": checkpoint.worktree,
+        "branch": checkpoint.branch,
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def continuation_checkpoint_path(
+    home: Path, checkpoint_or_key: WorklinkContinuationCheckpoint | str
+) -> Path:
+    key = (
+        checkpoint_or_key
+        if isinstance(checkpoint_or_key, str)
+        else continuation_checkpoint_dedupe_key(checkpoint_or_key)
+    )
+    return continuation_checkpoints_dir(home) / f"{key}.json"
 
 
 def save_run_state(home: Path, state: WorklinkRunState) -> Path:
@@ -136,6 +325,60 @@ def list_run_states(home: Path) -> list[WorklinkRunState]:
         except (KeyError, TypeError, ValueError):
             continue
     return states
+
+
+def save_continuation_checkpoint(
+    home: Path, checkpoint: WorklinkContinuationCheckpoint
+) -> tuple[Path, bool]:
+    """Persist a continuation checkpoint, suppressing duplicates by identity.
+
+    Returns ``(path, created)``. A repeated save for the same exhausted
+    turn/work item returns the existing path with ``created=False`` and leaves
+    the first artifact intact.
+    """
+    checkpoint = WorklinkContinuationCheckpoint.from_json(checkpoint.to_json())
+    path = continuation_checkpoint_path(home, checkpoint)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(checkpoint.to_json(), indent=2, sort_keys=True)
+    try:
+        with path.open("x", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.write("\n")
+    except FileExistsError:
+        return path, False
+    return path, True
+
+
+def load_continuation_checkpoint(
+    home: Path, checkpoint_key: str
+) -> WorklinkContinuationCheckpoint | None:
+    path = continuation_checkpoint_path(home, checkpoint_key)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    try:
+        return WorklinkContinuationCheckpoint.from_json(data)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def list_continuation_checkpoints(home: Path) -> list[WorklinkContinuationCheckpoint]:
+    """All readable exhausted-turn continuation checkpoints, sorted by key."""
+    directory = continuation_checkpoints_dir(home)
+    if not directory.exists():
+        return []
+    checkpoints: list[WorklinkContinuationCheckpoint] = []
+    for child in sorted(directory.glob("*.json")):
+        try:
+            data = json.loads(child.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        try:
+            checkpoints.append(WorklinkContinuationCheckpoint.from_json(data))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return checkpoints
 
 
 def reattach_dispatch_argv(run_bin: list[str], home: Path, repo: str, issue_id: int) -> list[str]:
