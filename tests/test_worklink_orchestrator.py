@@ -1242,6 +1242,158 @@ def test_worklink_runner_backend_nonzero_transitions_failed_without_pr(tmp_path:
     assert ["chainlink", "locks", "release", "441"] in calls
 
 
+def test_exhausted_known_issue_publishes_structured_continuation_checkpoint(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-3"
+    comments: list[str] = []
+    prior_claims = (
+        "WORKLINK_CLAIM {"
+        '"agent_id": "mimir-worklink", "attempt": 1, '
+        '"claimed_at": "2026-06-12T12:00:00+00:00", '
+        '"heartbeat_at": null, "issue_id": 441}'
+        "\n"
+        "WORKLINK_CLAIM {"
+        '"agent_id": "mimir-worklink", "attempt": 2, '
+        '"claimed_at": "2026-06-12T12:10:00+00:00", '
+        '"heartbeat_at": null, "issue_id": 441}'
+    )
+    issue_json = ISSUE_JSON.replace(
+        '"comments": []',
+        '"comments": [{"content": ' + json.dumps(prior_claims) + "}]",
+    )
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            return cp(args, stdout=issue_json)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]:
+            comments.append(str(args[-1]))
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "label"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "unlabel"]:
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
+            worktree.mkdir(parents=True)
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"]:
+            return cp(args, stdout="")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "status"]:
+            return cp(args, stdout="")
+        return cp(args)
+
+    backend = FakeBackend(status="quota_exhausted", write_change=False)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command=""
+        )
+    )
+
+    assert result.status == "failed"
+    continuation = next(c for c in comments if c.startswith("WORKLINK_CONTINUATION "))
+    payload = json.loads(continuation.removeprefix("WORKLINK_CONTINUATION "))
+    assert payload["schema"] == "worklink.continuation.v1"
+    assert payload["chainlink"] == {"issue_id": 441, "parent_id": 380, "pr_url": None}
+    assert payload["attempt"] == {
+        "current": 3,
+        "max": 3,
+        "status": "failed",
+        "review_ready": False,
+        "reasons": [],
+        "blocked_reason": None,
+    }
+    assert payload["worktree"] == str(worktree)
+    assert payload["branch"] == "issue/441-a3"
+    assert payload["completed_edits"]["files_changed"] == []
+    assert payload["completed_edits"]["evidence_path"].endswith("441-3.json")
+    assert payload["unrun_validation"] == ["tests_missing"]
+    assert payload["labels_status"]["requires_adjustment"] is True
+    assert "chainlink issue label 441 worklink:ready" in payload["next_commands"]
+
+
+def test_exhausted_transition_failure_is_annotated_for_operator_action(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-3"
+    comments: list[str] = []
+    calls: list[Sequence[str] | str] = []
+    prior_claims = (
+        "WORKLINK_CLAIM {"
+        '"agent_id": "mimir-worklink", "attempt": 1, '
+        '"claimed_at": "2026-06-12T12:00:00+00:00", '
+        '"heartbeat_at": null, "issue_id": 441}'
+        "\n"
+        "WORKLINK_CLAIM {"
+        '"agent_id": "mimir-worklink", "attempt": 2, '
+        '"claimed_at": "2026-06-12T12:10:00+00:00", '
+        '"heartbeat_at": null, "issue_id": 441}'
+    )
+    issue_json = ISSUE_JSON.replace(
+        '"comments": []',
+        '"comments": [{"content": ' + json.dumps(prior_claims) + "}]",
+    )
+
+    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            return cp(args, stdout=issue_json)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]:
+            comments.append(str(args[-1]))
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "label"]:
+            if args[-1] == "worklink:blocked":
+                return cp(args, returncode=1, stderr="label service down\n")
+            return cp(args)
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "unlabel"]:
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
+            worktree.mkdir(parents=True)
+            return cp(args)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"]:
+            return cp(args, stdout="")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "status"]:
+            return cp(args, stdout="")
+        return cp(args)
+
+    backend = FakeBackend(status="quota_exhausted", write_change=False)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command=None
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "chainlink transition failed after evidence checkpoint" in result.reason
+    assert any(c.startswith("WORKLINK_CONTINUATION ") for c in comments)
+    action = next(c for c in comments if c.startswith("WORKLINK_OPERATOR_ACTION "))
+    payload = json.loads(action.removeprefix("WORKLINK_OPERATOR_ACTION "))
+    assert payload["reason"] == "chainlink_transition_failed"
+    assert payload["target_status"] == "failed"
+    assert payload["error"] == "label service down"
+    assert ["chainlink", "issue", "label", "441", "worklink:blocked"] in calls
+
+
 def test_worklink_runner_timeout_transitions_failed_without_pr(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo / ".worklink" / "441-1"

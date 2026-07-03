@@ -661,6 +661,21 @@ class WorklinkRunner:
                 validation = _with_pr_url(validation, pr_url)
                 evidence_path = _write_evidence(self.home, validation.evidence)
         _comment_evidence(claims, validation.evidence, validation, evidence_path)
+        continuation_payload = None
+        if _requires_exhaustion_continuation(
+            validation,
+            attempt=attempt,
+            max_attempts=claims.max_attempts,
+        ):
+            continuation_payload = _continuation_payload(
+                issue=issue,
+                evidence=validation.evidence,
+                validation=validation,
+                evidence_path=evidence_path,
+                max_attempts=claims.max_attempts,
+                label_status_action="pending terminal transition to worklink:blocked",
+            )
+            claims.publish_continuation(issue.issue_id, continuation_payload)
         _log_event(
             "worklink_evidence",
             issue_id=issue.issue_id,
@@ -669,15 +684,41 @@ class WorklinkRunner:
             review_ready=validation.review_ready,
             reasons=list(validation.reasons),
         )
-        claims.transition_issue(
-            issue.issue_id,
-            status=validation.status,
-            review_ready=validation.review_ready,
-            attempt=attempt,
-            reason=validation.evidence.blocked_reason
-            if validation.status == "blocked"
-            else (", ".join(validation.reasons) if validation.reasons else None),
-        )
+        try:
+            claims.transition_issue(
+                issue.issue_id,
+                status=validation.status,
+                review_ready=validation.review_ready,
+                attempt=attempt,
+                reason=validation.evidence.blocked_reason
+                if validation.status == "blocked"
+                else (", ".join(validation.reasons) if validation.reasons else None),
+            )
+        except Exception as exc:
+            _annotate_transition_failure(
+                claims,
+                issue=issue,
+                validation=validation,
+                attempt=attempt,
+                error=str(exc),
+            )
+            if continuation_payload is not None:
+                _log_event(
+                    "worklink_continuation_transition_failed",
+                    issue_id=issue.issue_id,
+                    attempt=attempt,
+                    error=str(exc),
+                )
+            return WorklinkRunResult(
+                issue.issue_id,
+                attempt,
+                "failed",
+                review_ready=False,
+                evidence_path=evidence_path,
+                worktree=lease.path,
+                branch=lease.branch,
+                reason=f"chainlink transition failed after evidence checkpoint: {exc}",
+            )
         _log_event(
             "worklink_transition",
             issue_id=issue.issue_id,
@@ -1104,6 +1145,138 @@ def _comment_evidence(
     claims._run(  # noqa: SLF001 - Chainlink wrapper owns quoting/checks.
         "issue", "comment", str(evidence.issue), summary + reasons
     )
+
+
+def _requires_exhaustion_continuation(
+    validation: EvidenceValidation,
+    *,
+    attempt: int,
+    max_attempts: int,
+) -> bool:
+    """True when a failed/blocked known issue is about to leave retry rotation."""
+    return (
+        attempt >= max_attempts
+        and not validation.review_ready
+        and validation.status in {"failed", "blocked"}
+    )
+
+
+def _continuation_payload(
+    *,
+    issue: IssueContext,
+    evidence: WorklinkEvidence,
+    validation: EvidenceValidation,
+    evidence_path: Path,
+    max_attempts: int,
+    label_status_action: str,
+) -> dict[str, Any]:
+    unrun_validation = _unrun_validation(evidence, validation)
+    return {
+        "schema": "worklink.continuation.v1",
+        "reason": "attempts_exhausted",
+        "chainlink": {
+            "issue_id": issue.issue_id,
+            "parent_id": issue.parent_id,
+            "pr_url": evidence.pr_url,
+        },
+        "attempt": {
+            "current": evidence.attempt,
+            "max": max_attempts,
+            "status": validation.status,
+            "review_ready": validation.review_ready,
+            "reasons": list(validation.reasons),
+            "blocked_reason": evidence.blocked_reason,
+        },
+        "worktree": evidence.worktree,
+        "branch": evidence.branch,
+        "completed_edits": {
+            "files_changed": list(evidence.files_changed),
+            "diff_stat": evidence.diff_stat,
+            "evidence_path": str(evidence_path),
+            "transcript": evidence.transcript,
+        },
+        "unrun_validation": unrun_validation,
+        "next_commands": _continuation_next_commands(
+            evidence,
+            unrun_validation=unrun_validation,
+            issue_id=issue.issue_id,
+        ),
+        "labels_status": {
+            "requires_adjustment": True,
+            "action": label_status_action,
+        },
+    }
+
+
+def _unrun_validation(evidence: WorklinkEvidence, validation: EvidenceValidation) -> list[str]:
+    items: list[str] = []
+    if evidence.tests is None:
+        items.append("tests_missing")
+    elif not evidence.tests.observed:
+        items.append(f"tests_not_observed: {evidence.tests.cmd or '(none)'}")
+    if "diff_not_observed" in validation.reasons:
+        items.append("diff_not_observed")
+    return items
+
+
+def _continuation_next_commands(
+    evidence: WorklinkEvidence,
+    *,
+    unrun_validation: Sequence[str],
+    issue_id: int,
+) -> list[str]:
+    commands = [
+        f"cd {evidence.worktree}",
+        "git status --short",
+    ]
+    if evidence.tests and evidence.tests.cmd and (
+        unrun_validation or evidence.tests.exit_code not in (0, None)
+    ):
+        commands.append(evidence.tests.cmd)
+    commands.extend([
+        f"chainlink issue unlabel {issue_id} worklink:blocked",
+        f"chainlink issue label {issue_id} worklink:ready",
+    ])
+    return commands
+
+
+def _annotate_transition_failure(
+    claims: ChainlinkClaims,
+    *,
+    issue: IssueContext,
+    validation: EvidenceValidation,
+    attempt: int,
+    error: str,
+) -> None:
+    payload = {
+        "schema": "worklink.operator_action.v1",
+        "reason": "chainlink_transition_failed",
+        "issue_id": issue.issue_id,
+        "attempt": attempt,
+        "target_status": validation.status,
+        "target_review_ready": validation.review_ready,
+        "error": error[:500],
+        "operator_action": (
+            "Inspect current Chainlink labels, then apply the terminal Worklink "
+            "state shown by target_status/target_review_ready."
+        ),
+    }
+    try:
+        claims._run(  # noqa: SLF001 - Chainlink wrapper owns quoting/checks.
+            "issue",
+            "comment",
+            str(issue.issue_id),
+            "WORKLINK_OPERATOR_ACTION " + json.dumps(payload, sort_keys=True),
+            check=False,
+        )
+    except Exception as comment_exc:  # noqa: BLE001 - transition already failed.
+        _log_event(
+            "worklink_transition_failure_annotation_failed",
+            issue_id=issue.issue_id,
+            attempt=attempt,
+            transition_error=error[:300],
+            annotation_error=str(comment_exc)[:300],
+        )
 
 
 def _commit_worktree_changes(worktree: Path, issue: IssueContext, *, runner: Runner) -> None:

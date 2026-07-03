@@ -12,10 +12,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
 import subprocess
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
 REAPER_PREFIX = "WORKLINK_REAPER "
+CONTINUATION_PREFIX = "WORKLINK_CONTINUATION "
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
@@ -230,6 +231,15 @@ class ChainlinkClaims:
         if reason:
             prefix = "WORKLINK_BLOCKED" if status == "blocked" else "WORKLINK_FAILED"
             self._run("issue", "comment", str(issue_id), f"{prefix} {reason}")
+
+    def publish_continuation(self, issue_id: int, payload: Mapping[str, Any]) -> None:
+        """Publish a durable operator continuation checkpoint on Chainlink."""
+        self._run(
+            "issue",
+            "comment",
+            str(issue_id),
+            CONTINUATION_PREFIX + json.dumps(payload, sort_keys=True),
+        )
 
     def next_attempt(self, comments: Iterable[str]) -> int:
         records = claim_records_from_comments(comments)
