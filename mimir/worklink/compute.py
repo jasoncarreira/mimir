@@ -66,6 +66,10 @@ class WorkSpec:
     # fresh sandboxed compute job — controller-orchestrated, exit-code as the
     # trust channel — instead of fail-closing on unverified tests.
     test_only: bool = False
+    # chainlink #817: bounded in-attempt gate repair. On a failed gate run the
+    # worker re-invokes the backend in the same checkout with the failure tail,
+    # up to this many rounds, within the attempt's timeout budget. 0 disables.
+    gate_repair_rounds: int = 1
 
 
 @dataclass(frozen=True)

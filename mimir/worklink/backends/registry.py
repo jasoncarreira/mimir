@@ -97,6 +97,11 @@ class WorklinkDefaults:
     allow_autonomous_local_subprocess: bool = False
     epic_branch_prefix: str = "epic/"
     max_review_retries: int = 3
+    # chainlink #817: bounded in-attempt gate repair. When the worker's gate run
+    # fails on an otherwise completed backend run, the worker re-invokes the
+    # backend in the same checkout with the failure tail, up to this many rounds,
+    # before the attempt is declared failed. 0 disables.
+    gate_repair_rounds: int = 1
     reviewer_backend: str | None = None
     tiered_review: TieredReviewConfig = field(default_factory=TieredReviewConfig)
 
@@ -199,6 +204,10 @@ class WorklinkConfig:
                 defaults_data.get("max_review_retries"),
                 default=WorklinkDefaults.max_review_retries,
             ),
+            gate_repair_rounds=_non_negative_int(
+                defaults_data.get("gate_repair_rounds"),
+                default=WorklinkDefaults.gate_repair_rounds,
+            ),
             reviewer_backend=str(defaults_data.get("reviewer_backend", backend_name)),
             tiered_review=_parse_tiered_review_config(defaults_data.get("tiered_review")),
         )
@@ -285,6 +294,17 @@ class WorklinkConfig:
                 f"The operator CLI `mimir worklink run` is unaffected."
             )
         return True, None
+
+
+def _non_negative_int(value: Any, *, default: int) -> int:
+    """Like ``_positive_int`` but 0 is a valid value (an explicit "disabled")."""
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
 
 
 def _positive_int(value: Any, *, default: int) -> int:

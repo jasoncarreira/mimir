@@ -763,6 +763,7 @@ class EpicRunner:
                 branch=lease.branch,
                 test_command=test_cmd,
             )
+            spec = replace(spec, gate_repair_rounds=config.defaults.gate_repair_rounds)
             try:
                 handle = await compute.launch(spec)
                 try:
