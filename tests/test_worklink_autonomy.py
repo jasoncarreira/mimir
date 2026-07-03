@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Sequence
@@ -795,15 +797,98 @@ def test_poller_import_path_repair_adds_source_venv_site_packages(tmp_path: Path
 def _fake_run_bin(tmp: Path) -> Path:
     """A run-bin that records each `worklink run <id>` dispatch to a file."""
     record = tmp / "dispatched.txt"
+    pids = tmp / "fake-run-bin-pids.txt"
+    log = tmp / "fake-run-bin.log"
     script = tmp / "fakemimir"
     script.write_text(
         "#!/usr/bin/env python3\n"
-        "import sys\n"
-        f"open({str(record)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n",
+        "import os, sys\n"
+        f"log_path = {str(log)!r}\n"
+        "devnull = os.open(os.devnull, os.O_RDWR)\n"
+        "try:\n"
+        "    os.dup2(devnull, 0)\n"
+        "    os.dup2(os.open(log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644), 1)\n"
+        "    os.dup2(os.open(log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644), 2)\n"
+        "finally:\n"
+        "    os.close(devnull)\n"
+        f"open({str(pids)!r}, 'a', encoding='utf-8').write(str(os.getpid()) + '\\n')\n"
+        f"open({str(record)!r}, 'a', encoding='utf-8').write(' '.join(sys.argv[1:]) + '\\n')\n",
         encoding="utf-8",
     )
     script.chmod(0o755)
     return script
+
+
+def _read_dispatch_lines(tmp: Path) -> list[str]:
+    record = tmp / "dispatched.txt"
+    if not record.exists():
+        return []
+    return record.read_text(encoding="utf-8").splitlines()
+
+
+def _wait_for_dispatch_lines(tmp: Path, expected: list[str], timeout: float = 10.0) -> list[str]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        lines = _read_dispatch_lines(tmp)
+        if lines == expected:
+            return lines
+        time.sleep(0.05)
+    lines = _read_dispatch_lines(tmp)
+    assert lines == expected
+    return lines
+
+
+def _wait_for_fake_run_bin_exit(tmp: Path, expected_count: int, timeout: float = 10.0) -> None:
+    pids_path = tmp / "fake-run-bin-pids.txt"
+    deadline = time.monotonic() + timeout
+    pids: list[int] = []
+    while time.monotonic() < deadline:
+        if pids_path.exists():
+            pids = [
+                int(line)
+                for line in pids_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        if len(pids) >= expected_count and not _live_pids(pids):
+            return
+        time.sleep(0.05)
+
+    assert len(pids) >= expected_count
+    live = _live_pids(pids)
+    for pid in live:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and _live_pids(pids):
+        time.sleep(0.05)
+    assert not _live_pids(pids)
+
+
+def _live_pids(pids: list[int]) -> list[int]:
+    live: list[int] = []
+    for pid in pids:
+        proc_stat = Path("/proc") / str(pid) / "stat"
+        try:
+            if proc_stat.exists() and proc_stat.read_text(encoding="utf-8").split()[2] == "Z":
+                continue
+        except (OSError, IndexError):
+            pass
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            live.append(pid)
+        else:
+            live.append(pid)
+    return live
 
 
 def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
@@ -816,7 +901,10 @@ def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
         capture_output=True, text=True, timeout=30,
     )
     assert proc.returncode == 0, proc.stderr
-    return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    expected_fake_runs = sum(1 for event in events if event.get("signal") == "worklink_dispatched")
+    _wait_for_fake_run_bin_exit(tmp, expected_fake_runs)
+    return events
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
@@ -843,6 +931,10 @@ def test_poller_reads_cap_from_worklink_yaml(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0
     records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    _wait_for_fake_run_bin_exit(
+        tmp_path,
+        sum(1 for record in records if record.get("signal") == "worklink_dispatched"),
+    )
     assert [
         r.get("issue_id") for r in records if r.get("signal") == "worklink_dispatched"
     ] == [10, 11]
@@ -918,9 +1010,10 @@ def test_poller_routes_actionable_epic_to_epic_run(tmp_path: Path) -> None:
 
     dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
     assert [(e["mode"], e["issue_id"]) for e in dispatched] == [("epic", 100)]
-    assert (tmp_path / "dispatched.txt").read_text(encoding="utf-8").splitlines() == [
+    expected_lines = [
         f"worklink run-epic 100 --home {home} --repo {repo} --autonomous"
     ]
+    assert _wait_for_dispatch_lines(tmp_path, expected_lines) == expected_lines
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
@@ -1008,9 +1101,10 @@ def test_poller_keeps_bare_ready_leaf_on_per_leaf_run(tmp_path: Path) -> None:
 
     dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
     assert [(e["mode"], e["issue_id"]) for e in dispatched] == [("leaf", 201)]
-    assert (tmp_path / "dispatched.txt").read_text(encoding="utf-8").splitlines() == [
+    expected_lines = [
         f"worklink run 201 --home {home} --repo {repo} --autonomous"
     ]
+    assert _wait_for_dispatch_lines(tmp_path, expected_lines) == expected_lines
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
