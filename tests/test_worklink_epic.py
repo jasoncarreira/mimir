@@ -626,6 +626,51 @@ async def test_gate_test_tail_from_worker_stdout_feeds_next_attempt(
 
 
 @pytest.mark.asyncio
+async def test_epic_gate_ignores_leaf_suggested_test_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """chainlink #820: the slice gate is the operator test_command; the
+    planner's suggested command is advisory only. A bare `pytest ...`
+    suggestion executed as the gate failed every #783 attempt with exit 127."""
+    patch_git(monkeypatch, tmp_path)
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  max_review_retries: 1\n  test_command: env -u MIMIR_MODEL_SPEC uv run pytest -q\n",
+        encoding="utf-8",
+    )
+    import mimir.worklink.epic as epic_mod
+
+    monkeypatch.setattr(epic_mod, "_observe_slice", fake_observe_slice)
+    registry = FakeRegistry()
+    chainlink = FakeChainlink(
+        epic=issue(100, parent_id=None, labels={"worklink:epic"}),
+        leaves=[
+            LeafIssue(
+                issue(101),
+                scope_paths=("a.py",),
+                suggested_test_command="pytest tests/test_skill_catalog.py",
+            )
+        ],
+        filed=[],
+        blocked={},
+        merged=[],
+    )
+
+    result = await EpicRunner(
+        home=tmp_path,
+        repo=Path("/repo"),
+        runner=runner,
+        registry=registry,  # type: ignore[arg-type]
+        roles=FakeRoles(),
+        chainlink=chainlink,  # type: ignore[arg-type]
+    ).run(100)
+
+    assert result.status == "completed"
+    assert registry.compute.launched, "no worker dispatched"
+    for spec in registry.compute.launched:
+        assert spec.test_command == "env -u MIMIR_MODEL_SPEC uv run pytest -q"
+
+
+@pytest.mark.asyncio
 async def test_transient_provider_error_backs_off_within_attempt_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

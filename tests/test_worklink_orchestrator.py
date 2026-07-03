@@ -813,6 +813,31 @@ def test_worker_repair_skipped_when_timeout_budget_low(
     assert validation.evidence.repair_rounds == 0
 
 
+def test_worker_gate_command_not_found_skips_repair(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """chainlink #820: exit 127 (gate command missing) must not burn a #817
+    repair round — no code change can fix the environment."""
+    backend = WorkerScriptedBackend(script="print('ok')", status="success")
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    payload = _worker_diag_payload(tmp_path, backend, timeout_s=600)
+    runner = _repair_gate_runner(
+        payload.repo_dir, gate_results=[127, 127], gate_output="/bin/sh: 1: pytest: not found"
+    )
+
+    validation = asyncio.run(run_worker_payload(payload, registry=registry, runner=runner))
+
+    assert validation.review_ready is False
+    assert "gate_command_not_found" in validation.reasons
+    assert "tests_failed" not in validation.reasons
+    assert len(backend.orders) == 1  # no repair invocation
+    assert validation.evidence.repair_rounds == 0
+    out = capsys.readouterr().out
+    assert "WORKLINK_TESTS_TAIL_BEGIN" in out  # the tail is how 127 was finally seen
+    assert "pytest: not found" in out
+
+
 def test_worker_prepares_slash_named_feature_base(tmp_path: Path) -> None:
     # Regression for #467: a long-running feature base such as
     # `integration/worklink` must be materialized as a local ref and checked out
