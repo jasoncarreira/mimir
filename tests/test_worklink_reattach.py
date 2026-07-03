@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 from typing import Sequence
@@ -498,3 +499,107 @@ def test_reattach_inflight_noop_without_repo(tmp_path: Path, monkeypatch) -> Non
     )
     assert dispatched == []
     assert spawned == []
+
+
+def test_exhaustion_checkpoint_known_issue_queues_once(tmp_path: Path) -> None:
+    from mimir import server
+
+    artifact_dir = tmp_path / "state" / "worklink" / "exhaustion"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "turn-abc.json").write_text(
+        json.dumps(
+            {
+                "turn_id": "turn-abc",
+                "issue_id": 808,
+                "reason": "tool-call budget exhausted",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "zz-turn-abc-copy.json").write_text(
+        json.dumps(
+            {
+                "turn_id": "turn-abc",
+                "issue_id": 808,
+                "reason": "same exhausted turn persisted twice",
+            }
+        ),
+        encoding="utf-8",
+    )
+    enqueued = []
+
+    async def enqueue(event):
+        enqueued.append(event)
+        return True
+
+    first = asyncio.run(
+        server.consume_worklink_exhaustion_checkpoints(tmp_path, enqueue=enqueue)
+    )
+    second = asyncio.run(
+        server.consume_worklink_exhaustion_checkpoints(tmp_path, enqueue=enqueue)
+    )
+
+    assert [item["action"] for item in first] == ["queued_continuation", "deduped"]
+    assert second == []
+    assert len(enqueued) == 1
+    event = enqueued[0]
+    assert event.trigger == "worklink_exhaustion_recovery"
+    assert event.channel_id == "worklink:issue:808"
+    assert event.extra["worklink_issue_id"] == 808
+    assert event.extra["exhaustion_dedupe_key"] == "worklink-exhaustion:turn-abc"
+    assert not (artifact_dir / "turn-abc.json").exists()
+    assert not (artifact_dir / "zz-turn-abc-copy.json").exists()
+    assert (artifact_dir / "consumed" / "turn-abc.json").exists()
+
+
+def test_exhaustion_checkpoint_unknown_issue_files_followup_once(tmp_path: Path) -> None:
+    from mimir import server
+
+    artifact_dir = tmp_path / "state" / "worklink" / "exhaustion"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "unknown.json").write_text(
+        json.dumps(
+            {
+                "turn_id": "turn-xyz",
+                "work_item_id": "worklink-ready-poller",
+                "reason": "tool-call budget exhausted",
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if args[:3] == ["chainlink", "issue", "search"]:
+            return cp(args, stdout="[]")
+        if args[:3] == ["chainlink", "issue", "create"]:
+            return cp(args, stdout="Created issue #909\n")
+        return cp(args, returncode=1, stderr="unexpected")
+
+    first = asyncio.run(
+        server.consume_worklink_exhaustion_checkpoints(tmp_path, runner=runner)
+    )
+    second = asyncio.run(
+        server.consume_worklink_exhaustion_checkpoints(tmp_path, runner=runner)
+    )
+
+    assert [item["action"] for item in first] == ["filed_followup"]
+    assert second == []
+    assert len(calls) == 2
+    assert calls[0] == [
+        "chainlink",
+        "issue",
+        "search",
+        "worklink-exhaustion:turn-xyz",
+        "--json",
+    ]
+    create = calls[1]
+    assert create[:4] == ["chainlink", "issue", "create", "Recover exhausted Worklink turn"]
+    assert "--priority" in create
+    assert create[create.index("--priority") + 1] == "high"
+    assert "Dedupe-Key: worklink-exhaustion:turn-xyz" in create[
+        create.index("--description") + 1
+    ]
+    assert not (artifact_dir / "unknown.json").exists()
+    assert (artifact_dir / "consumed" / "unknown.json").exists()

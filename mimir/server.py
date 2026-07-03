@@ -635,6 +635,213 @@ def reattach_inflight_worklink_runs(
     return dispatched
 
 
+def _worklink_exhaustion_dir(home: Path) -> Path:
+    return home / "state" / "worklink" / "exhaustion"
+
+
+def _worklink_exhaustion_consumed_dir(home: Path) -> Path:
+    return _worklink_exhaustion_dir(home) / "consumed"
+
+
+def _exhaustion_dedupe_key(path: Path, data: dict[str, Any]) -> str:
+    raw = (
+        data.get("dedupe_key")
+        or data.get("turn_id")
+        or data.get("work_item_id")
+        or data.get("artifact_id")
+        or path.stem
+    )
+    return f"worklink-exhaustion:{str(raw).strip() or path.stem}"
+
+
+def _exhaustion_consumed_marker(consumed_dir: Path, dedupe_key: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", dedupe_key).strip("._")
+    return consumed_dir / f"{(safe or 'checkpoint')[:120]}.consumed"
+
+
+def _exhaustion_issue_id(data: dict[str, Any]) -> int | None:
+    for key in ("issue_id", "chainlink_issue_id", "worklink_issue_id"):
+        value = data.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            issue_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if issue_id > 0:
+            return issue_id
+    return None
+
+
+def _exhaustion_followup_body(data: dict[str, Any], *, dedupe_key: str) -> str:
+    turn_id = str(data.get("turn_id") or "unknown")
+    work_item = str(data.get("work_item_id") or data.get("channel_id") or "unknown")
+    reason = str(data.get("reason") or "tool-call budget exhausted")
+    return (
+        "A Worklink/autonomous turn exhausted its tool-call budget and no "
+        "Chainlink issue id was recorded, so startup recovery could not queue "
+        "a targeted continuation.\n\n"
+        f"Dedupe-Key: {dedupe_key}\n"
+        f"Turn: {turn_id}\n"
+        f"Work item: {work_item}\n"
+        f"Reason: {reason}\n\n"
+        "Recovery task: inspect the exhausted turn artifact, identify the "
+        "intended work item, and either resume it or file the correct "
+        "targeted Chainlink follow-up."
+    )
+
+
+def _chainlink_issue_exists(
+    dedupe_key: str,
+    *,
+    runner: Any,
+) -> bool:
+    result = runner(["chainlink", "issue", "search", dedupe_key, "--json"])
+    if getattr(result, "returncode", 1) != 0:
+        return False
+    try:
+        issues = json.loads(getattr(result, "stdout", "") or "[]")
+    except json.JSONDecodeError:
+        return False
+    return isinstance(issues, list) and len(issues) > 0
+
+
+async def consume_worklink_exhaustion_checkpoints(
+    home: Path,
+    *,
+    enqueue: Any | None = None,
+    runner: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Consume persisted Worklink exhaustion checkpoints once.
+
+    Checkpoints live under ``<home>/state/worklink/exhaustion/*.json``. A known
+    Chainlink issue becomes a synthetic continuation turn. An unknown issue
+    becomes a high-priority generic Chainlink follow-up, deduped by a stable key
+    embedded in the issue body. Successfully handled artifacts move to
+    ``exhaustion/consumed`` so repeated startup/autonomous recovery passes do
+    not enqueue or file duplicates.
+    """
+    import subprocess
+
+    directory = _worklink_exhaustion_dir(home)
+    if not directory.exists():
+        return []
+
+    consumed_dir = _worklink_exhaustion_consumed_dir(home)
+    handled: list[dict[str, Any]] = []
+
+    def default_runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(args, text=True, capture_output=True, check=False)
+
+    run = runner or default_runner
+
+    for path in sorted(directory.glob("*.json")):
+        if not path.is_file() or path.parent == consumed_dir:
+            continue
+        consumed_path = consumed_dir / path.name
+        if consumed_path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            handled.append({"artifact": path.name, "action": "deduped"})
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        dedupe_key = _exhaustion_dedupe_key(path, data)
+        marker_path = _exhaustion_consumed_marker(consumed_dir, dedupe_key)
+        if marker_path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            handled.append(
+                {
+                    "artifact": path.name,
+                    "action": "deduped",
+                    "dedupe_key": dedupe_key,
+                }
+            )
+            continue
+        issue_id = _exhaustion_issue_id(data)
+        if issue_id is not None:
+            if enqueue is None:
+                continue
+            event = AgentEvent(
+                trigger="worklink_exhaustion_recovery",
+                channel_id=f"worklink:issue:{issue_id}",
+                content=(
+                    f"Continue Chainlink issue #{issue_id}; the previous "
+                    f"Worklink/autonomous turn exhausted its tool-call budget. "
+                    f"Dedupe-Key: {dedupe_key}"
+                ),
+                source="system",
+                extra={
+                    "force_new_turn": True,
+                    "worklink_issue_id": issue_id,
+                    "exhaustion_dedupe_key": dedupe_key,
+                    "exhaustion_artifact": path.name,
+                },
+            )
+            accepted = await enqueue(event)
+            if not accepted:
+                continue
+            action = "queued_continuation"
+        else:
+            if not _chainlink_issue_exists(dedupe_key, runner=run):
+                result = run(
+                    [
+                        "chainlink",
+                        "issue",
+                        "create",
+                        "Recover exhausted Worklink turn",
+                        "--description",
+                        _exhaustion_followup_body(data, dedupe_key=dedupe_key),
+                        "--priority",
+                        "high",
+                        "--label",
+                        "worklink",
+                        "--label",
+                        "recovery",
+                    ]
+                )
+                if getattr(result, "returncode", 1) != 0:
+                    continue
+            action = "filed_followup"
+
+        try:
+            consumed_dir.mkdir(parents=True, exist_ok=True)
+            path.replace(consumed_path)
+            marker_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": path.name,
+                        "action": action,
+                        "dedupe_key": dedupe_key,
+                        "issue_id": issue_id,
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            continue
+        handled.append(
+            {
+                "artifact": path.name,
+                "action": action,
+                "issue_id": issue_id,
+                "dedupe_key": dedupe_key,
+            }
+        )
+    return handled
+
+
 def build_app(config: Config) -> web.Application:
     # 10MB body cap (aiohttp default is 1MB). Mimir takes JSON-only bodies on
     # /event and /chat — long bluesky transcripts and seed payloads can run
@@ -1347,6 +1554,21 @@ def build_app(config: Config) -> web.Application:
                 await log_event("worklink_reattach_dispatched", issues=resumed)
         except Exception as exc:  # noqa: BLE001 — startup reconcile must never abort boot
             await log_event("worklink_reattach_dispatch_failed", error=str(exc))
+
+        # Consume Worklink/autonomous tool-call exhaustion checkpoints (#808).
+        # Known Chainlink work gets a synthetic continuation turn; unknown work
+        # files one high-priority generic follow-up. Artifacts move to
+        # ``exhaustion/consumed`` after a successful durable action so repeated
+        # startup passes do not loop on the same exhausted turn.
+        try:
+            recovered = await consume_worklink_exhaustion_checkpoints(
+                config.home,
+                enqueue=dispatcher.enqueue,
+            )
+            if recovered:
+                await log_event("worklink_exhaustion_checkpoints_consumed", recovered=recovered)
+        except Exception as exc:  # noqa: BLE001 — recovery must never abort boot
+            await log_event("worklink_exhaustion_checkpoint_recovery_failed", error=str(exc))
 
         # Register the weekly viability report (SPEC §16 follow-up
         # from the 2026-05-23 VSM eval — collapse detection + curation
