@@ -838,9 +838,8 @@ def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
 def test_poller_does_not_dispatch_worklink_epic_issues(tmp_path: Path) -> None:
-    """chainlink #830: the epic runner is removed — an actionable worklink:epic
-    issue must NOT be dispatched by the poller (it is built by the opencode
-    feature-factory, not as a leaf or via a run-epic controller)."""
+    """chainlink #833: epics are dispatched to the feature-factory via run-epic,
+    not as leaves via run. The epic is dispatched with mode='epic'."""
     home = tmp_path / "home"
     home.mkdir()
     repo = tmp_path / "repo"
@@ -864,7 +863,10 @@ def test_poller_does_not_dispatch_worklink_epic_issues(tmp_path: Path) -> None:
     })
 
     dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
-    assert dispatched == []
+    # chainlink #833: epics ARE dispatched now, but with mode='epic' (run-epic)
+    assert len(dispatched) == 1
+    assert dispatched[0]["issue_id"] == 100
+    assert dispatched[0]["mode"] == "epic"
 
 
 def test_poller_keeps_bare_ready_leaf_on_per_leaf_run(tmp_path: Path) -> None:

@@ -892,6 +892,282 @@ class WorklinkRunner:
             claims.release_issue(issue_id)
             clear_run_state(self.home, issue_id)
 
+    async def run_epic(
+        self,
+        issue_id: int,
+        *,
+        autonomous: bool = False,
+    ) -> WorklinkRunResult:
+        """Run a worklink:epic issue via the feature-factory adapter (#833).
+
+        This is a separate path from run() because epics use the feature_factory
+        backend, mirror state from the factory's run.json, and don't create leaf
+        issues.
+        """
+        from .backends.feature_factory import (
+            FeatureFactoryBackend,
+            has_concurrent_factory_session,
+            read_factory_run_state,
+        )
+
+        runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
+        issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
+
+        if "worklink:epic" not in issue.labels:
+            _log_event(
+                "worklink_epic_invalid",
+                issue_id=issue_id,
+                reason="issue does not have worklink:epic label",
+            )
+            return WorklinkRunResult(issue_id, None, "failed", reason="not an epic issue")
+
+        config = WorklinkConfig.load(self.home / "worklink.yaml")
+        registry = self.registry or BackendRegistry(config)
+        repo_url = _repo_remote_url(self.repo, runner=runner)
+        repo_slug = _repo_slug_from_url(repo_url)
+
+        backend = registry.get("feature_factory")
+        compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
+
+        if autonomous:
+            allowed, reason = config.autonomous_compute_allowed(compute.name, compute.capabilities())
+            if not allowed:
+                _log_event(
+                    "worklink_epic_autonomous_refused",
+                    issue_id=issue_id,
+                    compute_backend=compute.name,
+                )
+                return WorklinkRunResult(issue_id, None, "refused", reason=reason)
+
+        claims = ChainlinkClaims(
+            chainlink_bin=self.chainlink_bin,
+            agent_id=self.agent_id,
+            runner=_list_runner(runner),
+        )
+
+        if has_concurrent_factory_session(self.repo):
+            _log_event(
+                "worklink_epic_concurrent",
+                issue_id=issue_id,
+                reason="another factory session is already running",
+            )
+            return WorklinkRunResult(issue_id, None, "blocked", reason="concurrent factory session")
+
+        issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
+        claim = claims.claim_issue(
+            issue.issue_id,
+            issue.comments,
+            max_active_locks=config.defaults.max_concurrent if autonomous else None,
+        )
+        if claim.attempts_exhausted:
+            _log_event("worklink_epic_attempts_exhausted", issue_id=issue.issue_id)
+            return WorklinkRunResult(issue.issue_id, None, "blocked", reason="attempts_exhausted")
+        if not claim.claimed or claim.record is None:
+            return WorklinkRunResult(
+                issue.issue_id, None, "failed", reason=claim.reason or "claim_failed"
+            )
+        record = claim.record
+        _log_event(
+            "worklink_epic_claimed",
+            issue_id=issue.issue_id,
+            attempt=record.attempt,
+        )
+
+        try:
+            state = read_factory_run_state(self.repo)
+            if state and state.is_terminal:
+                return await self._finalize_epic(
+                    issue=issue,
+                    claims=claims,
+                    claim_record=record,
+                    attempt=record.attempt,
+                    config=config,
+                    backend=backend,
+                    compute=compute,
+                )
+
+            base = config.defaults.base_branch
+            lease = _create_backend_checkout(
+                self.repo,
+                issue_id=issue.issue_id,
+                attempt=record.attempt,
+                base=base,
+                backend_name="feature_factory",
+                compute_shared_filesystem=compute.capabilities().shared_filesystem,
+                base_fetch=config.defaults.base_fetch,
+                event_logger=_log_event,
+                runner=_list_runner(runner),
+            )
+
+            test_cmd = config.defaults.test_command
+            order = WorkOrder(
+                issue_id=issue.issue_id,
+                worktree=lease.path,
+                prompt=issue.description,
+                rules=None,
+                timeout_s=config.defaults.timeout_s,
+                env={"MIMIR_HOME": str(self.home)},
+                transcript_root=self.home / "state" / "worklink" / "transcripts",
+            )
+            started = datetime.now(UTC)
+            spec = backend.work_spec(
+                order,
+                attempt=record.attempt,
+                repo_url=repo_url,
+                base_ref=lease.base_ref,
+                branch=lease.branch,
+                test_command=test_cmd,
+            )
+            spec = replace(spec, gate_repair_rounds=0)
+            handle = None
+            try:
+                handle = await compute.launch(spec)
+                compute_result = await _heartbeat_while(
+                    compute.wait(spec.timeout_s),
+                    claims=claims,
+                    record=record,
+                )
+            except ComputeLaunchError as exc:
+                compute_result = ComputeResult(
+                    exit_code=-1,
+                    stdout="",
+                    stderr=str(exc),
+                    launch_error=str(exc),
+                )
+            finally:
+                if handle is not None:
+                    await compute.cleanup(handle)
+
+            return await self._finalize_epic(
+                issue=issue,
+                claims=claims,
+                claim_record=record,
+                attempt=record.attempt,
+                config=config,
+                backend=backend,
+                compute=compute,
+                compute_result=compute_result,
+                order=order,
+                lease=lease,
+                spec=spec,
+                started=started,
+            )
+        except Exception as exc:
+            try:
+                claims.transition_issue(
+                    issue.issue_id,
+                    status="failed",
+                    review_ready=False,
+                    attempt=record.attempt,
+                    reason=str(exc),
+                )
+            except Exception:
+                pass
+            _log_event(
+                "worklink_epic_transition",
+                issue_id=issue.issue_id,
+                attempt=record.attempt,
+                status="failed",
+                reason=str(exc),
+            )
+            return WorklinkRunResult(
+                issue.issue_id,
+                record.attempt,
+                "failed",
+                reason=str(exc),
+            )
+        finally:
+            claims.release_issue(issue.issue_id)
+
+    async def _finalize_epic(
+        self,
+        *,
+        issue: IssueContext,
+        claims: ChainlinkClaims,
+        claim_record: ClaimRecord,
+        attempt: int,
+        config: Any,
+        backend: Any,
+        compute: Any,
+        compute_result: Any = None,
+        order: Any = None,
+        lease: Any = None,
+        spec: Any = None,
+        started: Any = None,
+    ) -> WorklinkRunResult:
+        """Finalize an epic run by reading the factory state and mirroring to Chainlink."""
+        from .backends.feature_factory import (
+            FactoryRunState,
+            has_concurrent_factory_session,
+            read_factory_run_state,
+        )
+
+        state = read_factory_run_state(self.repo)
+
+        if state is None:
+            status = "failed"
+            reason = "factory run.json not found"
+        elif state.is_stale:
+            status = "failed"
+            reason = f"stale heartbeat: {state.heartbeat_at}"
+            if has_concurrent_factory_session(self.repo):
+                comment = (
+                    f"WORKLINK_BLOCKED: feature-factory session appears stuck (stale heartbeat). "
+                    f"Last heartbeat: {state.heartbeat_at}. "
+                    "Please check the factory run manually and restart if needed."
+                )
+                claims._run("issue", "comment", str(issue.issue_id), comment)
+        elif state.error:
+            status = "failed"
+            reason = state.error
+        elif state.status == "completed":
+            if state.gates_needed:
+                status = "blocked"
+                reason = f"gates pending: {', '.join(state.gates_needed)}"
+            else:
+                status = "completed"
+                reason = None
+        else:
+            status = "in_progress"
+            reason = f"factory status: {state.status}"
+
+        claims.transition_issue(
+            issue.issue_id,
+            status=status,
+            review_ready=status == "completed",
+            attempt=attempt,
+            reason=reason,
+        )
+
+        _log_event(
+            "worklink_epic_transition",
+            issue_id=issue.issue_id,
+            attempt=attempt,
+            status=status,
+            reason=reason,
+            pr_url=state.pr_url if state else None,
+        )
+
+        if lease is not None:
+            cleanup_error = _cleanup_worktree_after_transition(
+                lease,
+                outcome=status,
+                runner=_list_runner(self.runner or _runner_for_home(self.home, self.chainlink_bin)),
+                issue_id=issue.issue_id,
+                attempt=attempt,
+            )
+
+        return WorklinkRunResult(
+            issue.issue_id,
+            attempt,
+            status,
+            review_ready=status == "completed",
+            pr_url=state.pr_url if state and state.pr_url else None,
+            worktree=lease.path if lease else None,
+            branch=lease.branch if lease else None,
+            reason=reason,
+        )
+
 
 def _cleanup_worktree_after_transition(
     lease: WorktreeLease,
@@ -951,6 +1227,29 @@ def run_worklink(
 def run_worklink_reattach(*, home: Path, repo: Path, issue_id: int) -> WorklinkRunResult:
     """Resume one in-flight run after a controller restart (#561)."""
     return asyncio.run(WorklinkRunner(home=home, repo=repo).reattach(issue_id))
+
+
+def run_worklink_epic(
+    *,
+    home: Path,
+    repo: Path,
+    issue_id: int,
+    autonomous: bool = False,
+) -> WorklinkRunResult:
+    """Run a worklink:epic issue via the feature-factory adapter (#833).
+
+    This is a separate entry point from run_worklink because epics:
+    - Use the feature_factory backend instead of regular backends
+    - Don't create leaf issues in Chainlink
+    - Mirror progress from the factory's run.json
+    - Handle gates through the factory's file protocol
+    """
+    return asyncio.run(
+        WorklinkRunner(home=home, repo=repo).run_epic(
+            issue_id,
+            autonomous=autonomous,
+        )
+    )
 
 
 def _persist_run_state(

@@ -19,6 +19,7 @@ from ..compute import (
 from .base import ToolBackend
 from .claude_cli import ClaudeCliBackend
 from .codex import CodexBackend
+from .feature_factory import FeatureFactoryBackend
 from .opencode import OpenCodeBackend
 
 
@@ -475,6 +476,9 @@ class BackendRegistry:
             "claude_cli": self._build_claude_cli(
                 self.config.backend_settings.get("claude_cli", {})
             ),
+            "feature_factory": self._build_feature_factory(
+                self.config.backend_settings.get("feature_factory", {})
+            ),
             "opencode": self._build_opencode(
                 self.config.backend_settings.get("opencode", {})
             ),
@@ -659,6 +663,14 @@ class BackendRegistry:
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ValueError("worklink claude_cli args must be a list of strings")
         return ClaudeCliBackend(bin=bin_name, extra_args=tuple(args))
+
+    @staticmethod
+    def _build_feature_factory(settings: Mapping[str, Any]) -> FeatureFactoryBackend:
+        bin_name = str(settings.get("bin", "opencode"))
+        args = settings.get("args", [])
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise ValueError("worklink feature_factory args must be a list of strings")
+        return FeatureFactoryBackend(bin=bin_name, extra_args=tuple(args))
 
 
 def _string_tuple(value: Any, *, field_name: str) -> tuple[str, ...]:

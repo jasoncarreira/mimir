@@ -16,6 +16,7 @@ from ..worklink.orchestrator import (
     LeafValidationError,
     WorklinkError,
     run_worklink,
+    run_worklink_epic,
     run_worklink_reattach,
 )
 from ..worklink.worker import payload_from_json, run_worker_payload
@@ -77,6 +78,26 @@ def add_argparse(
             "defaults.allow_autonomous_local_subprocess is set. Omit for "
             "operator-invoked runs — they always proceed (accept-the-risk; the "
             "local_subprocess backend runs with full container filesystem access)."
+        ),
+    )
+
+    run_epic_p = worklink_sub.add_parser("run-epic", help="Run a worklink:epic issue via feature-factory.")
+    run_epic_p.add_argument("issue_id", type=int, help="Chainlink epic issue id to execute.")
+    run_epic_p.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+    run_epic_p.add_argument(
+        "--repo", type=Path, default=None, help="Git repo to work in (default: cwd)."
+    )
+    run_epic_p.add_argument(
+        "--autonomous",
+        action="store_true",
+        help=(
+            "Mark this an autonomous dispatch (set by the ready-queue poller). "
+            "Enforces the compute-backend autonomy policy."
         ),
     )
 
@@ -149,6 +170,9 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         print(f"worklink worker: {validation.status}{suffix}{reason_suffix}")
         return 0 if validation.status in {"completed", "blocked"} else 1
 
+    if args.worklink_action == "run-epic":
+        return _run_epic(args, parser)
+
     if args.worklink_action != "run":
         parser.print_help()
         return 1
@@ -216,3 +240,42 @@ def _worker_reason_suffix(validation: object) -> str:
     if reasons:
         return " — " + ", ".join(reasons)
     return ""
+
+
+def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Handle the run-epic command for worklink:epic issues via feature-factory."""
+    home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    repo = (args.repo or Path.cwd()).resolve()
+    os.environ["MIMIR_HOME"] = str(home)
+    try:
+        from ..event_logger import init_logger
+
+        init_logger(
+            home / "logs" / "events.jsonl",
+            session_id=f"worklink-epic-{args.issue_id}",
+        )
+    except Exception:
+        pass
+    try:
+        result = run_worklink_epic(
+            home=home,
+            repo=repo,
+            issue_id=args.issue_id,
+            autonomous=args.autonomous,
+        )
+    except LeafValidationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except WorklinkError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"worklink:epic #{result.issue_id} attempt {result.attempt}: {result.status}"
+        + (" review-ready" if result.review_ready else "")
+        + (f" PR {result.pr_url}" if result.pr_url else "")
+        + (f" — {result.reason}" if result.reason else "")
+    )
+    if result.evidence_path:
+        print(f"evidence: {result.evidence_path}")
+    return 0 if result.status in {"completed", "blocked"} else 1
