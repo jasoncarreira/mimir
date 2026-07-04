@@ -66,6 +66,7 @@ async def test_codex_backend_invokes_exec_json_with_worktree_and_prompt(
         return FakeProcess(returncode=0, stdout=b'{"event":"done"}\n', stderr=b"")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
     backend = CodexBackend()
     transcript_root = tmp_path / "state" / "worklink" / "transcripts"
     order = WorkOrder(
@@ -126,6 +127,7 @@ async def test_codex_backend_maps_quota_and_auth_errors(
         return FakeProcess(returncode=1, stdout=b"", stderr=b"HTTP 429 quota exhausted")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
     order = WorkOrder(
         issue_id=440,
         worktree=tmp_path,
@@ -172,6 +174,7 @@ async def test_codex_backend_enforces_timeout(
         proc.kill()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
     monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
     monkeypatch.setattr(compute_module, "_kill_process_group", fake_kill_process_group)
     order = WorkOrder(
@@ -228,6 +231,7 @@ async def test_claude_cli_backend_invokes_print_json_in_worktree(
         return FakeProcess(returncode=0, stdout=b'{"type":"result"}\n', stderr=b"")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
     backend = ClaudeCliBackend()
     transcript_root = tmp_path / "state" / "worklink" / "transcripts"
     order = WorkOrder(
@@ -894,6 +898,7 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
         return FakeProcess(returncode=0, stdout=b"ok", stderr=b"")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
     backend = LocalSubprocessComputeBackend()
 
     spec = WorkSpec(
@@ -1311,6 +1316,7 @@ async def test_worker_honors_spec_backend_config_codex_args(
         return FakeProcess(returncode=0, stdout=b'{"type":"item.completed"}\n', stderr=b"")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1367,6 +1373,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
         return FakeProcess(returncode=0, stdout=b"done\n", stderr=b"")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
     backend = OpenCodeBackend()
     transcript_root = tmp_path / "state" / "worklink" / "transcripts"
     order = WorkOrder(
@@ -1438,3 +1445,48 @@ def test_registry_builds_opencode_backend_with_settings() -> None:
     backend = BackendRegistry(config).get("opencode")
     assert backend.bin == "/usr/local/bin/opencode"
     assert backend.extra_args == ("--model", "openai/gpt-5.5")
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_env_allowlist_passes_creds_not_bridge_secrets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """chainlink #830: autonomous local_subprocess must hand the coding CLI its
+    provider creds + HOME (so opencode finds config/plugins/auth) while never
+    leaking bridge/operator secrets. Inert until the docker->worktree pivot."""
+    captured: dict[str, Any] = {}
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        captured["env"] = kwargs.get("env", {})
+        return FakeProcess(returncode=0, stdout=b"ok\n", stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setenv("HOME", "/home/mimir")
+    monkeypatch.setenv("MINIMAX_API_KEY", "mm-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-oai")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "bridge-secret")
+    monkeypatch.setenv("MIMIR_API_KEY", "operator-secret")
+
+    from mimir.worklink.compute import LocalSubprocessComputeBackend
+    from mimir.worklink.compute import WorkSpec
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    spec = WorkSpec(
+        issue_id=782, attempt=1, repo_url="u", base_ref="main", branch="issue/782-a1",
+        prompt="p", rules=None, test_command="true", backend="opencode", timeout_s=30,
+        env={"MIMIR_HOME": "/mimir-home"},
+        local_worktree=wt, local_argv=("opencode", "run", "--dir", str(wt), "--", "p"),
+    )
+    compute = LocalSubprocessComputeBackend()
+    handle = await compute.launch(spec)
+    await compute.wait(handle, 30)
+    await compute.cleanup(handle)
+
+    env = captured["env"]
+    assert env["HOME"] == "/home/mimir"
+    assert env["MINIMAX_API_KEY"] == "mm-key"
+    assert env["OPENAI_API_KEY"] == "sk-oai"
+    assert env["MIMIR_HOME"] == "/mimir-home"  # spec.env still applied
+    assert "DISCORD_BOT_TOKEN" not in env
+    assert "MIMIR_API_KEY" not in env
