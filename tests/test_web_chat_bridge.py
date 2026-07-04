@@ -11,9 +11,67 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from mimir.chat_skills import (
+    CHAT_SKILL_EXTRA_KEY,
+    ChatSkillDescriptor,
+    ChatSkillError,
+    ChatSkillInvocation,
+)
 from mimir.bridges.web_chat import DEFAULT_CHANNEL, WebChatBridge, _Subscriber
 from mimir.models import AgentEvent
 from mimir.web_contracts import validate_api_envelope, validate_live_event
+
+
+class StubChatSkillRegistry:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        discoverable: tuple[ChatSkillDescriptor, ...] = (),
+        resolved: ChatSkillInvocation | ChatSkillError | None = None,
+    ) -> None:
+        self.enabled = enabled
+        self._discoverable = discoverable
+        self._resolved = resolved
+        self.resolve_calls: list[str] = []
+
+    def list_discoverable(self) -> tuple[ChatSkillDescriptor, ...]:
+        return self._discoverable
+
+    def resolve_post_content(self, content: str) -> ChatSkillInvocation | ChatSkillError | None:
+        self.resolve_calls.append(content)
+        return self._resolved
+
+
+def _authed_bridge_app(
+    tmp_path: Path,
+    *,
+    registry: StubChatSkillRegistry | None = None,
+    canonical: str = "alice",
+    display_name: str = "Alice",
+):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(
+            canonical=canonical,
+            display_name=display_name,
+        )
+        return await handler(request)
+
+    bridge = WebChatBridge(
+        enqueue=fake_enqueue,
+        home=tmp_path,
+        chat_skill_registry=registry,
+    )
+    app = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(app)
+    return bridge, app, enqueued
 
 
 @pytest.fixture
@@ -114,6 +172,239 @@ async def test_post_chat_v1_enqueues_and_returns_contract_envelope(tmp_path):
     assert body["data"] == {"channel_id": "web-alice", "source_id": "client-1"}
     assert enqueued[0].source_id == "client-1"
     assert enqueued[0].channel_id == "web-alice"
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_slash_passthrough_when_registry_disabled_strips_client_metadata(
+    tmp_path,
+):
+    registry = StubChatSkillRegistry(enabled=False)
+    _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/api/v1/chat",
+            json={
+                "content": "  /memory remember this  ",
+                "extra": {
+                    "keep": "ok",
+                    CHAT_SKILL_EXTRA_KEY: {"name": "github"},
+                    "chat_skill": {"name": "legacy"},
+                },
+            },
+        )
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert registry.resolve_calls == []
+    assert len(enqueued) == 1
+    assert enqueued[0].content == "/memory remember this"
+    assert enqueued[0].extra == {"keep": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_injects_server_owned_chat_skill_metadata(tmp_path):
+    registry = StubChatSkillRegistry(
+        enabled=True,
+        resolved=ChatSkillInvocation(
+            name="memory",
+            command="/memory",
+            args="remember this",
+            raw="  /memory remember this  ",
+        ),
+    )
+    _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/api/v1/chat",
+            json={
+                "content": "  /memory remember this  ",
+                "extra": {
+                    "keep": "ok",
+                    CHAT_SKILL_EXTRA_KEY: {"name": "tampered"},
+                    "chat_skill": {"name": "legacy-tampered"},
+                },
+            },
+        )
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert registry.resolve_calls == ["  /memory remember this  "]
+    assert len(enqueued) == 1
+    assert enqueued[0].content == "/memory remember this"
+    assert enqueued[0].extra == {
+        "keep": "ok",
+        CHAT_SKILL_EXTRA_KEY: {
+            "name": "memory",
+            "command": "/memory",
+            "args": "remember this",
+            "raw": "  /memory remember this  ",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_rejects_invalid_slash_commands_with_stable_code(tmp_path):
+    registry = StubChatSkillRegistry(
+        enabled=True,
+        resolved=ChatSkillError(
+            code="invalid_skill_name",
+            message="Chat skill name must be lowercase letters, digits, and hyphens.",
+            command="/memory!",
+            raw="/memory!",
+        ),
+    )
+    _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/api/v1/chat", json={"content": "/memory!"})
+        body = await resp.json()
+
+    assert resp.status == 400
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "invalid_slash_command"
+    assert body["error"]["message"] == (
+        "Chat skill name must be lowercase letters, digits, and hyphens."
+    )
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_rejects_unavailable_slash_commands_with_stable_code(tmp_path):
+    registry = StubChatSkillRegistry(
+        enabled=True,
+        resolved=ChatSkillError(
+            code="skill_unavailable",
+            message="Chat skill '/github' is not available.",
+            command="/github",
+            raw="/github",
+        ),
+    )
+    _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/api/v1/chat", json={"content": "/github"})
+        body = await resp.json()
+
+    assert resp.status == 400
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "chat_skill_unavailable"
+    assert body["error"]["message"] == "Chat skill '/github' is not available."
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_post_chat_legacy_rejects_unavailable_slash_commands_without_enqueue(tmp_path):
+    registry = StubChatSkillRegistry(
+        enabled=True,
+        resolved=ChatSkillError(
+            code="skill_unavailable",
+            message="Chat skill '/github' is not available.",
+            command="/github",
+            raw="/github",
+        ),
+    )
+    _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/chat", json={"content": "/github"})
+        body = await resp.json()
+
+    assert resp.status == 400
+    assert body == {
+        "error": "chat_skill_unavailable",
+        "detail": "Chat skill '/github' is not available.",
+    }
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_get_chat_skills_requires_authenticated_identity(bridge_app):
+    _, app, _ = bridge_app
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/v1/chat/skills")
+        body = await resp.json()
+
+    assert resp.status == 401
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "chat_login_required"
+
+
+@pytest.mark.asyncio
+async def test_get_chat_skills_returns_disabled_surface_when_registry_absent(tmp_path):
+    _, app, _ = _authed_bridge_app(tmp_path)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/v1/chat/skills")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"] == {"enabled": False, "skills": []}
+
+
+@pytest.mark.asyncio
+async def test_get_chat_skills_returns_enabled_empty_catalog(tmp_path):
+    registry = StubChatSkillRegistry(enabled=True)
+    _, app, _ = _authed_bridge_app(tmp_path, registry=registry)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/v1/chat/skills")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"] == {"enabled": True, "skills": []}
+
+
+@pytest.mark.asyncio
+async def test_get_chat_skills_returns_allowlisted_catalog(tmp_path):
+    registry = StubChatSkillRegistry(
+        enabled=True,
+        discoverable=(
+            ChatSkillDescriptor(
+                name="github",
+                command="/github",
+                label="GitHub",
+                description="Review pull requests.",
+            ),
+            ChatSkillDescriptor(
+                name="memory",
+                command="/memory",
+                label="Memory",
+                description="Capture durable context.",
+            ),
+        ),
+    )
+    _, app, _ = _authed_bridge_app(tmp_path, registry=registry)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/v1/chat/skills")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"] == {
+        "enabled": True,
+        "skills": [
+            {
+                "id": "github",
+                "command": "/github",
+                "label": "GitHub",
+                "description": "Review pull requests.",
+            },
+            {
+                "id": "memory",
+                "command": "/memory",
+                "label": "Memory",
+                "description": "Capture durable context.",
+            },
+        ],
+    }
 
 
 @pytest.mark.asyncio
