@@ -653,6 +653,39 @@ def _safe_json(value: Any) -> str:
     return _bounded_text(json.dumps(value, sort_keys=True, default=str))
 
 
+_LOCAL_ENV_INFRA = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM",
+    "TMPDIR", "TMP", "TEMP", "TZ", "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE", "SSL_CERT_DIR",
+)
+_LOCAL_ENV_INFRA_PREFIXES = ("LC_", "XDG_")
+# Provider-credential families a routed coding CLI (codex / claude / opencode,
+# which is provider-agnostic) may legitimately need. Union kept broad on
+# purpose — opencode routes to whichever provider its config selects.
+_LOCAL_ENV_CRED_PREFIXES = (
+    "OPENAI_", "CODEX_", "ANTHROPIC_", "CLAUDE_", "OPENCODE_",
+    "MINIMAX_", "OPENROUTER_", "GROQ_", "GEMINI_", "GOOGLE_",
+    "VOYAGE_", "GITHUB_TOKEN", "GH_TOKEN",
+)
+
+
+def _local_child_env() -> dict[str, str]:
+    """Allowlisted env for an autonomous local_subprocess worker (#830).
+
+    Infra vars + provider-credential families from the parent process; nothing
+    else (no bridge/operator secrets). Mirrors ``tools.registry`` spawn-env
+    philosophy on the worklink compute path."""
+    env: dict[str, str] = {}
+    for key in _LOCAL_ENV_INFRA:
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
+    for key, val in os.environ.items():
+        if key.startswith(_LOCAL_ENV_INFRA_PREFIXES) or key.startswith(_LOCAL_ENV_CRED_PREFIXES):
+            env[key] = val
+    return env
+
+
 @dataclass
 class LocalSubprocessComputeBackend:
     """Run a WorkSpec as a local subprocess in the current container."""
@@ -680,7 +713,16 @@ class LocalSubprocessComputeBackend:
         command = tuple(str(arg) for arg in spec.local_argv)
         if not command:
             raise ComputeLaunchError("local_subprocess spec.local_argv must not be empty")
-        env = {"PATH": os.environ.get("PATH", "")}
+        # chainlink #830: autonomous local_subprocess builds an allowlisted env
+        # from the parent process — infra vars (HOME so a coding CLI finds its
+        # config/plugins + provider auth files; locale/cert vars) plus provider
+        # credential families. Bridge/operator secrets (DISCORD_/SLACK_/
+        # MIMIR_API_KEY, ...) are NEVER passed. This was inert while docker was
+        # the only autonomous substrate (creds arrived via broker policy) and
+        # local_subprocess was operator-CLI-only (full env inherited); the
+        # opencode-on-worktrees pivot makes it the live path. ``spec.env`` (the
+        # orchestrator's per-run vars, e.g. MIMIR_HOME) wins over the passthrough.
+        env = _local_child_env()
         env.update(spec.env)
         try:
             proc = await asyncio.create_subprocess_exec(
