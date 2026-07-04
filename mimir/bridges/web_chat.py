@@ -33,6 +33,12 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
+from ..chat_skills import (
+    CHAT_SKILL_EXTRA_KEY,
+    ChatSkillError,
+    ChatSkillInvocation,
+    ChatSkillRegistry,
+)
 from ..models import AgentEvent
 from ..web_channels import DEFAULT_WEB_CHANNEL, web_channel_for_identity
 from ..web_contracts import (
@@ -49,6 +55,31 @@ EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
 
 DEFAULT_CHANNEL = DEFAULT_WEB_CHANNEL
 CHAT_STREAM_MAX_SUBSCRIBERS = int(os.environ.get("MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS", "8"))
+LEGACY_CHAT_SKILL_EXTRA_KEY = "chat_skill"
+
+
+@dataclass(frozen=True)
+class _ChatRequestError:
+    status: int
+    legacy_error: str
+    legacy_detail: str | None = None
+    v1_code: str = "bad_request"
+    v1_message: str | None = None
+    v1_details: dict[str, Any] | None = None
+
+    def legacy_response(self) -> web.Response:
+        payload = {"error": self.legacy_error}
+        if self.legacy_detail is not None:
+            payload["detail"] = self.legacy_detail
+        return web.json_response(payload, status=self.status)
+
+    def v1_response(self) -> web.Response:
+        return json_error(
+            self.v1_code,
+            self.v1_message or self.legacy_detail or self.legacy_error,
+            status=self.status,
+            details=self.v1_details,
+        )
 
 
 @dataclass
@@ -82,17 +113,59 @@ def _chat_identity(request: web.Request):
     anonymous shared channel.
     """
     if request.get("auth_is_master"):
-        return None, web.json_response(
-            {
-                "error": "master_key_not_chat_identity",
-                "detail": "the admin master key cannot use chat; use a per-user key",
-            },
+        return None, _ChatRequestError(
             status=403,
+            legacy_error="master_key_not_chat_identity",
+            legacy_detail="the admin master key cannot use chat; use a per-user key",
+            v1_code="master_key_not_chat_identity",
+            v1_message="the admin master key cannot use chat; use a per-user key",
         )
     identity = request.get("auth_identity")
     if identity is None:
-        return None, web.json_response({"error": "chat_login_required"}, status=401)
+        return None, _ChatRequestError(
+            status=401,
+            legacy_error="chat_login_required",
+            v1_code="chat_login_required",
+            v1_message="chat login required",
+        )
     return identity, None
+
+
+def _sanitize_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
+    if not extra:
+        return {}
+    return {
+        key: value
+        for key, value in extra.items()
+        if key not in {CHAT_SKILL_EXTRA_KEY, LEGACY_CHAT_SKILL_EXTRA_KEY}
+    }
+
+
+def _slash_command_error(parsed: ChatSkillError) -> _ChatRequestError:
+    if parsed.code in {"invalid_command", "invalid_skill_name"}:
+        return _ChatRequestError(
+            status=400,
+            legacy_error="invalid_slash_command",
+            legacy_detail=parsed.message,
+            v1_code="invalid_slash_command",
+            v1_message=parsed.message,
+        )
+    return _ChatRequestError(
+        status=400,
+        legacy_error="chat_skill_unavailable",
+        legacy_detail=parsed.message,
+        v1_code="chat_skill_unavailable",
+        v1_message=parsed.message,
+    )
+
+
+def _chat_skill_extra(invocation: ChatSkillInvocation) -> dict[str, str]:
+    return {
+        "name": invocation.name,
+        "command": invocation.command,
+        "args": invocation.args,
+        "raw": invocation.raw,
+    }
 
 
 SSE_HEARTBEAT_S = 15.0
@@ -109,6 +182,7 @@ class WebChatBridge(Bridge):
 
     enqueue: EnqueueFn
     home: Path
+    chat_skill_registry: ChatSkillRegistry | None = None
     _subscribers: list[_Subscriber] = field(default_factory=list, init=False)
     _lock: asyncio.Lock | None = field(default=None, init=False)
 
@@ -211,14 +285,23 @@ class WebChatBridge(Bridge):
     async def _build_inbound_event(
         self,
         request: web.Request,
-    ) -> tuple[AgentEvent | None, str | None, web.Response | None]:
+    ) -> tuple[AgentEvent | None, str | None, _ChatRequestError | None]:
         try:
             body = await request.json()
         except json.JSONDecodeError:
-            return None, None, web.json_response({"error": "invalid json"}, status=400)
-        content = (body.get("content") or "").strip()
+            return None, None, _ChatRequestError(
+                status=400,
+                legacy_error="invalid json",
+                v1_message="invalid json",
+            )
+        raw_content = body.get("content") or ""
+        content = raw_content.strip()
         if not content:
-            return None, None, web.json_response({"error": "content required"}, status=400)
+            return None, None, _ChatRequestError(
+                status=400,
+                legacy_error="content required",
+                v1_message="content required",
+            )
         identity, auth_error = _chat_identity(request)
         if auth_error is not None:
             return None, None, auth_error
@@ -228,9 +311,32 @@ class WebChatBridge(Bridge):
         # ``or {}`` and later ``event.extra.get(...)`` raises.
         extra = body.get("extra")
         if extra is not None and not isinstance(extra, dict):
-            return None, None, web.json_response(
-                {"error": "extra must be an object"}, status=400
+            return None, None, _ChatRequestError(
+                status=400,
+                legacy_error="extra must be an object",
+                v1_message="extra must be an object",
             )
+        sanitized_extra = _sanitize_extra(extra)
+
+        registry = self.chat_skill_registry
+        if registry is not None and registry.enabled:
+            parsed = registry.resolve_post_content(raw_content)
+            if isinstance(parsed, ChatSkillError):
+                error = _slash_command_error(parsed)
+                if error.v1_code == "invalid_slash_command":
+                    log.info(
+                        "web chat slash command rejected: reason=invalid command=%s",
+                        parsed.command,
+                    )
+                else:
+                    log.info(
+                        "web chat slash command rejected: reason=unavailable command=%s allowlist_size=%d",
+                        parsed.command,
+                        len(registry.list_discoverable()),
+                    )
+                return None, None, error
+            if isinstance(parsed, ChatSkillInvocation):
+                sanitized_extra[CHAT_SKILL_EXTRA_KEY] = _chat_skill_extra(parsed)
 
         # Trusted attribution (github #726): the author comes from the
         # AUTHENTICATED per-user key, not the client body (which is spoofable).
@@ -247,14 +353,28 @@ class WebChatBridge(Bridge):
             author_id=author_id,
             source_id=body.get("msg_id") or uuid.uuid4().hex[:12],
             source="web",
-            extra=extra or {},
+            extra=sanitized_extra,
         )
         return event, channel_id, None
+
+    def _log_chat_skill_accepted(self, event: AgentEvent) -> None:
+        invocation = event.extra.get(CHAT_SKILL_EXTRA_KEY)
+        if not isinstance(invocation, dict):
+            return
+        command = invocation.get("command")
+        name = invocation.get("name")
+        if not isinstance(command, str) or not isinstance(name, str):
+            return
+        log.info(
+            "web chat slash command accepted: command=%s skill=%s",
+            command,
+            name,
+        )
 
     async def _handle_post(self, request: web.Request) -> web.Response:
         event, channel_id, error = await self._build_inbound_event(request)
         if error is not None:
-            return error
+            return error.legacy_response()
         assert event is not None and channel_id is not None
         accepted = await self.enqueue(event)
         if not accepted:
@@ -262,18 +382,13 @@ class WebChatBridge(Bridge):
                 {"error": "queue_full_or_closed", "channel_id": channel_id},
                 status=503,
             )
+        self._log_chat_skill_accepted(event)
         return web.json_response({"ok": True, "channel_id": channel_id})
 
     async def _handle_post_v1(self, request: web.Request) -> web.Response:
         event, channel_id, error = await self._build_inbound_event(request)
         if error is not None:
-            try:
-                legacy = json.loads(error.text or "{}")
-            except json.JSONDecodeError:
-                legacy = {"error": error.text or "invalid request"}
-            message = str(legacy.get("error") or "invalid request")
-            code = message if error.status in (401, 403) else "bad_request"
-            return json_error(code, message, status=error.status)
+            return error.v1_response()
         assert event is not None and channel_id is not None
         accepted = await self.enqueue(event)
         if not accepted:
@@ -283,6 +398,7 @@ class WebChatBridge(Bridge):
                 status=503,
                 details={"channel_id": channel_id},
             )
+        self._log_chat_skill_accepted(event)
         return json_success({"channel_id": channel_id, "source_id": event.source_id})
 
     def _allowed_stream_channels(self, request: web.Request) -> frozenset[str]:
@@ -293,7 +409,7 @@ class WebChatBridge(Bridge):
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
         _, auth_error = _chat_identity(request)
         if auth_error is not None:
-            return auth_error
+            return auth_error.legacy_response()
 
         if self._lock is None:
             self._lock = asyncio.Lock()
@@ -361,13 +477,7 @@ class WebChatBridge(Bridge):
 
         identity, auth_error = _chat_identity(request)
         if auth_error is not None:
-            if auth_error.status == 401:
-                return json_error("chat_login_required", "chat login required", status=401)
-            return json_error(
-                "master_key_not_chat_identity",
-                "the admin master key cannot use chat; use a per-user key",
-                status=403,
-            )
+            return auth_error.v1_response()
         assert identity is not None
         channel_id = _web_channel_for(identity.canonical)
         try:
@@ -392,6 +502,37 @@ class WebChatBridge(Bridge):
         ]
         return json_success({"channel_id": channel_id, "messages": messages})
 
+    async def _handle_skills(self, request: web.Request) -> web.Response:
+        identity, auth_error = _chat_identity(request)
+        if auth_error is not None:
+            return auth_error.v1_response()
+        assert identity is not None
+
+        registry = self.chat_skill_registry
+        if registry is None or not registry.enabled:
+            log.info("web chat skill catalog served: enabled=false skills=0")
+            return json_success({"enabled": False, "skills": []})
+
+        discoverable = registry.list_discoverable()
+        log.info(
+            "web chat skill catalog served: enabled=true skills=%d",
+            len(discoverable),
+        )
+        return json_success(
+            {
+                "enabled": True,
+                "skills": [
+                    {
+                        "id": skill.name,
+                        "command": skill.command,
+                        "label": skill.label,
+                        "description": skill.description,
+                    }
+                    for skill in discoverable
+                ],
+            }
+        )
+
     def register_routes(self, app: web.Application) -> None:
         """Mount /chat (POST) + /chat/stream (GET) + history on the shared app."""
         existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
@@ -399,6 +540,8 @@ class WebChatBridge(Bridge):
             app.router.add_post("/chat", self._handle_post)
         if ("POST", "/api/v1/chat") not in existing:
             app.router.add_post("/api/v1/chat", self._handle_post_v1)
+        if ("GET", "/api/v1/chat/skills") not in existing:
+            app.router.add_get("/api/v1/chat/skills", self._handle_skills)
         if ("GET", "/api/v1/chat/history") not in existing:
             app.router.add_get("/api/v1/chat/history", self._handle_history)
         if ("GET", "/chat/stream") not in existing:
