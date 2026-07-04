@@ -94,12 +94,14 @@ def test_fold_failing_test_job_carries_failure_tail_into_summary(tmp_path: Path)
     assert "FAILED tests/test_a.py::t - boom" in folded.evidence.tests.summary
     assert "remote sandboxed test job: exit 1" in folded.evidence.tests.summary
 
-    # A PASSING job ignores any stray tail — summary stays the exit line.
+    # A PASSING fold PRESERVES the tail too (PR #1018 review): a
+    # retried-then-passed job carries its retry marker there.
     passing = fold_remote_test_evidence(
         _remote_validation(tmp_path), "pytest -q", 0, backend_status="completed",
-        failure_tail="stray",
+        failure_tail="trusted job retried (first: exit 1, retry: exit 0)",
     )
-    assert passing.evidence.tests.summary == "remote sandboxed test job: exit 0"
+    assert passing.review_ready is True
+    assert "trusted job retried (first: exit 1" in passing.evidence.tests.summary
 
 
 def test_gate_failure_detail_prefers_stdout_then_folded_evidence(tmp_path: Path):
@@ -237,3 +239,17 @@ async def test_run_test_only_setup_failure_returns_sentinel(tmp_path: Path):
 
     code = await _run_test_only(_test_only_payload(tmp_path), runner=runner)
     assert code == 70  # distinct setup-failure sentinel (still non-zero → fails closed)
+
+
+def test_fold_passing_retry_keeps_flaky_marker_review_ready(tmp_path: Path):
+    """PR #1018 review blocker: exit_code=0 + retry note must persist the note
+    (the accepted flaky-pass case) while remaining review-ready."""
+    folded = fold_remote_test_evidence(
+        _remote_validation(tmp_path), "env -u MIMIR_MODEL_SPEC uv run pytest -q", 0,
+        backend_status="completed",
+        failure_tail="trusted job retried (first: exit 1, retry: exit 0)\nFAILED tests/test_a.py::t",
+    )
+    assert folded.review_ready is True
+    assert folded.evidence.tests.exit_code == 0
+    assert "remote sandboxed test job: exit 0" in folded.evidence.tests.summary
+    assert "trusted job retried" in folded.evidence.tests.summary
