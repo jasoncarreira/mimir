@@ -105,10 +105,16 @@ EPIC_LABEL = "worklink:epic"
 
 
 def _factory_epics_enabled() -> bool:
-    """chainlink #834: opt-in routing of ``worklink:epic`` issues to the
-    feature-factory driver. Default OFF — until set, epics are only excluded
-    from leaf dispatch (the pre-#834 behavior)."""
+    """Opt-in routing of ``worklink:epic`` issues to the feature-factory backend
+    (``mimir worklink run-epic``, chainlink #833). Default OFF: until
+    ``MIMIR_FACTORY_EPICS_ENABLED`` is set, epics are only excluded from leaf
+    dispatch and are never dispatched — so a deployment that hasn't opted in
+    doesn't dispatch-then-refuse (``run-epic`` refuses non-autonomous-safe
+    compute) every cycle. The capability-based ``autonomous_compute_allowed``
+    policy is the second, hard safety layer once this is on."""
     return os.environ.get("MIMIR_FACTORY_EPICS_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 BLOCKED_LABEL = "worklink:blocked"
 REVIEW_LABEL = "worklink:review"
 
@@ -126,9 +132,9 @@ class DispatchItem:
 
     @property
     def command(self) -> str:
-        # chainlink #834: epics route to the feature-factory driver
-        # (``mimir worklink factory <id>``); leaves run as before.
-        return "factory" if self.mode == "epic" else "run"
+        if self.mode == "epic":
+            return "run-epic"
+        return "run"
 
 
 def _emit(record: dict) -> None:
@@ -291,13 +297,15 @@ def _actionable_issue_ids(home: Path) -> list[int] | None:
 def _worklink_dispatch_plan(
     home: Path, *, active_lock_ids: set[int]
 ) -> tuple[list[DispatchItem], int, int, int] | None:
-    """Return dispatchable Worklink leaves plus ready/blocked/epic counts.
+    """Return dispatchable Worklink leaves and epics plus ready/blocked/epic counts.
 
     Leaves require ``worklink:ready`` and Chainlink actionability. ``worklink:
-    epic`` issues are recognized ONLY to EXCLUDE them (and their child leaves)
-    from per-leaf dispatch — the in-mimir epic runner was removed (#830); epics
-    are built by the opencode feature-factory, so the poller never dispatches
-    them. The epic count is reported for observability only.
+    epic`` issues are dispatched to the feature-factory adapter (#833) — the
+    poller starts/resumes the opencode feature-factory which reads the factory's
+    run.json and mirrors progress/gates/PR/terminal state back to Chainlink.
+
+    Epics require ``worklink:ready`` + ``worklink:epic`` labels + Chainlink
+    actionability. The epic count is reported for observability.
     """
     ready_records = _issue_records_with_label(home, READY_LABEL)
     epic_records = _issue_records_with_label(home, EPIC_LABEL)
@@ -309,10 +317,6 @@ def _worklink_dispatch_plan(
     ):
         return None
     labeled = {record.issue_id for record in ready_records}
-    # ``worklink:epic`` issues are NOT dispatched by the poller (#830 — an epic
-    # is built by the opencode feature-factory, not as a leaf). They are
-    # tracked here only to EXCLUDE them (and any child leaves) from per-leaf
-    # dispatch, so a worklink:epic issue is never run as a single leaf.
     epics = {record.issue_id for record in epic_records}
     actionable = set(actionable_ids)
     dispatchable_leaves = sorted(
@@ -322,17 +326,14 @@ def _worklink_dispatch_plan(
         and record.issue_id not in epics
         and record.parent_id not in epics
     )
+    dispatchable_epics = sorted(
+        record.issue_id
+        for record in epic_records
+        if record.issue_id in actionable
+    )
     plan = [DispatchItem(issue_id=issue_id, mode="leaf") for issue_id in dispatchable_leaves]
-    # chainlink #834: when opted in, an actionable worklink:epic (labeled both
-    # worklink:ready and worklink:epic) is dispatched to the feature-factory
-    # driver instead of merely excluded. Its child leaves stay excluded above —
-    # the factory builds them internally.
     if _factory_epics_enabled():
-        ready_ids = {record.issue_id for record in ready_records}
-        dispatchable_epics = sorted(
-            issue_id for issue_id in epics if issue_id in actionable and issue_id in ready_ids
-        )
-        plan += [DispatchItem(issue_id=issue_id, mode="epic") for issue_id in dispatchable_epics]
+        plan.extend(DispatchItem(issue_id=issue_id, mode="epic") for issue_id in dispatchable_epics)
     blocked_count = len(labeled - actionable)
     return plan, len(labeled), blocked_count, len(epics)
 
