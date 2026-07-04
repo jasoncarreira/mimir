@@ -751,6 +751,19 @@ export interface ChatAcceptedData {
   source_id: string;
 }
 
+/** One allowlisted slash command exposed by GET /api/v1/chat/skills. */
+export interface ChatSkillCommand {
+  id: string;
+  command: string;
+  label: string;
+  description: string;
+}
+
+export interface ChatSkillsData {
+  enabled: boolean;
+  skills: ChatSkillCommand[];
+}
+
 /** One restored message from GET /api/v1/chat/history (oldest→newest). */
 export interface ChatHistoryMessage {
   message_id: string;
