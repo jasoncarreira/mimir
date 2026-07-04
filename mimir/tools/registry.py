@@ -1912,9 +1912,17 @@ async def spawn_open_code(
     # opencode may legitimately route to + its own vars + incremented spawn
     # depth. Bridge/operator secrets are NOT inherited. (Spec tier-1; the
     # per-run auth home is the tier-2 follow-up.)
+    # opencode is provider-agnostic — it routes to whichever provider its config
+    # selects — so it needs the broad provider-credential union, matching the
+    # worklink local_subprocess allowlist (#830). Bridge/operator secrets are
+    # still excluded by _minimal_child_env's allowlist model.
     child_env = _minimal_child_env(
         depth=current_depth + 1,
-        cred_prefixes=("OPENAI_", "CODEX_", "ANTHROPIC_", "CLAUDE_", "OPENCODE_"),
+        cred_prefixes=(
+            "OPENAI_", "CODEX_", "ANTHROPIC_", "CLAUDE_", "OPENCODE_",
+            "MINIMAX_", "OPENROUTER_", "GROQ_", "GEMINI_", "GOOGLE_",
+            "VOYAGE_", "GITHUB_TOKEN", "GH_TOKEN",
+        ),
     )
 
     run_id = f"opencode-{uuid.uuid4().hex[:12]}"

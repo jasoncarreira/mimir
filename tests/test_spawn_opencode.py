@@ -68,6 +68,8 @@ async def test_child_env_is_allowlisted(
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant")
     monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "oc-pass")
+    monkeypatch.setenv("MINIMAX_API_KEY", "mm-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
     record: dict = {}
     monkeypatch.setattr(registry, "_run_claude_subprocess", _capture_run(record))
 
@@ -79,6 +81,9 @@ async def test_child_env_is_allowlisted(
     assert child["OPENAI_API_KEY"] == "sk-openai"
     assert child["ANTHROPIC_API_KEY"] == "sk-ant"
     assert child["OPENCODE_SERVER_PASSWORD"] == "oc-pass"
+    # opencode is provider-agnostic — the broad provider union must reach it.
+    assert child["MINIMAX_API_KEY"] == "mm-key"
+    assert child["OPENROUTER_API_KEY"] == "or-key"
     assert child[_SPAWN_DEPTH_ENV] == "1"
 
 
