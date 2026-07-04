@@ -1440,6 +1440,62 @@ async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> N
     assert plain.error == "boom"
 
 
+@pytest.mark.asyncio
+async def test_opencode_backend_transcript_filename_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """chainlink #831: regression test that opencode transcript filenames use
+    the 'opencode-' prefix (not 'codex-') and embed the issue id, so mixed
+    deployments can tell runs apart."""
+    calls: list[dict[str, Any]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeProcess(returncode=0, stdout=b'done\n', stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    backend = OpenCodeBackend()
+    transcript_root = tmp_path / "state" / "worklink" / "transcripts"
+    issue_id = 831
+    order = WorkOrder(
+        issue_id=issue_id,
+        worktree=tmp_path / "worktree",
+        prompt="Do the work",
+        rules=None,
+        timeout_s=30,
+        env={"PATH": "/bin"},
+        transcript_root=transcript_root,
+    )
+
+    spec = backend.work_spec(
+        order,
+        attempt=1,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="issue/831-a1",
+        test_command="echo ok",
+    )
+    compute = LocalSubprocessComputeBackend()
+    handle = await compute.launch(spec)
+    compute_result = await compute.wait(handle, spec.timeout_s)
+    await compute.cleanup(handle)
+    result = await backend.interpret(order, compute_result)
+
+    assert result == RawResult(
+        exit_code=0,
+        transcript_path=result.transcript_path,
+        backend_status="success",
+        error=None,
+    )
+    assert result.transcript_path is not None
+    filename = result.transcript_path.name
+    assert filename.startswith("opencode-"), f"expected 'opencode-' prefix, got {filename}"
+    assert str(issue_id) in filename, f"expected issue id {issue_id} in filename, got {filename}"
+    transcript = json.loads(result.transcript_path.read_text())
+    assert transcript["backend"] == "opencode"
+
+
 def test_registry_builds_opencode_backend_with_settings() -> None:
     config = WorklinkConfig(backend_settings={"opencode": {"bin": "/usr/local/bin/opencode", "args": ["--model", "openai/gpt-5.5"]}})
     backend = BackendRegistry(config).get("opencode")
