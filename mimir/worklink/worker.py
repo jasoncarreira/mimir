@@ -244,6 +244,9 @@ async def _run_test_only(payload: WorkerPayload, *, runner: Any | None = None) -
             _summarize_test_output(test),
             _spec_secret_values(spec),
         )
+        # chainlink #826: a structured line is sturdier in transit than a text
+        # tail — "which tests failed" as a machine contract.
+        _print_test_report(test)
     print(json.dumps({
         "test_only": True,
         "branch": spec.branch,
@@ -412,6 +415,43 @@ def _spec_secret_values(spec: WorkSpec) -> list[str]:
         key=len,
         reverse=True,
     )
+
+
+TEST_REPORT_PREFIX = "WORKLINK_TEST_REPORT "
+
+
+def _print_test_report(test: subprocess.CompletedProcess[str]) -> None:
+    """Emit a machine-readable failed-test summary line (chainlink #826)."""
+    out = (test.stdout or "") + "\n" + (test.stderr or "")
+    failed = []
+    summary = ""
+    for line in out.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("FAILED "):
+            failed.append(stripped.split(" ", 1)[1].split(" - ")[0])
+        if re.match(r"=+ .*(passed|failed|error).* =+$", stripped) or re.match(
+            r"^\d+ (passed|failed)", stripped
+        ):
+            summary = stripped.strip("= ")
+    print(TEST_REPORT_PREFIX + json.dumps({
+        "exit": test.returncode,
+        "failed": failed[:50],
+        "summary": summary,
+    }), flush=True)
+
+
+def extract_test_report(stdout: str | None) -> dict | None:
+    """Controller-side parser for the WORKLINK_TEST_REPORT line."""
+    if not stdout or TEST_REPORT_PREFIX not in stdout:
+        return None
+    for line in stdout.splitlines():
+        if line.startswith(TEST_REPORT_PREFIX):
+            try:
+                payload = json.loads(line[len(TEST_REPORT_PREFIX):])
+            except ValueError:
+                return None
+            return payload if isinstance(payload, dict) else None
+    return None
 
 
 def _print_tests_tail(cmd: str | None, exit_code: int | None, body: str, secret_values: Sequence[str]) -> None:

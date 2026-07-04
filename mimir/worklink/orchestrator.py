@@ -570,6 +570,8 @@ class WorklinkRunner:
                     timeout_s=config.defaults.timeout_s,
                     claims=claims,
                     claim_record=claim_record,
+                    transcript_dir=self.home / "state" / "worklink" / "transcripts",
+                    retries=config.defaults.trusted_test_retries,
                 )
                 if test_outcome.exit_code is not None:
                     validation = fold_remote_test_evidence(
@@ -1320,6 +1322,8 @@ async def _run_remote_test_job(
     timeout_s: int,
     claims: ChainlinkClaims | None = None,
     claim_record: ClaimRecord | None = None,
+    transcript_dir: Path | None = None,
+    retries: int = 1,
 ) -> RemoteTestOutcome:
     """Dispatch a fresh sandboxed test job on the pushed branch (chainlink #538):
     exit 0 = tests passed.
@@ -1329,6 +1333,49 @@ async def _run_remote_test_job(
     ``test_command``, and exits with the test's code, which surfaces as the
     job's ``ComputeResult.exit_code``.
     """
+    # chainlink #827: an UNOBSERVED outcome (launch/wait failure) or an observed
+    # failure gets ONE bounded re-dispatch against the same immutable branch —
+    # run 15 burned two full rebuild attempts on a flake and a wait-timeout.
+    outcome = await _run_remote_test_job_once(
+        compute, spec, timeout_s=timeout_s, claims=claims,
+        claim_record=claim_record, transcript_dir=transcript_dir,
+    )
+    attempts_left = max(0, retries)
+    while attempts_left and (outcome.exit_code is None or outcome.exit_code != 0):
+        attempts_left -= 1
+        _log_event(
+            "worklink_remote_test_job_retry",
+            issue_id=spec.issue_id,
+            first_exit=outcome.exit_code,
+        )
+        retry = await _run_remote_test_job_once(
+            compute, spec, timeout_s=timeout_s, claims=claims,
+            claim_record=claim_record, transcript_dir=transcript_dir,
+        )
+        retry_note = (
+            f"trusted job retried (first: "
+            f"{'unobserved' if outcome.exit_code is None else f'exit {outcome.exit_code}'}, "
+            f"retry: {'unobserved' if retry.exit_code is None else f'exit {retry.exit_code}'})"
+        )
+        merged_tail = retry.failure_tail or outcome.failure_tail
+        outcome = RemoteTestOutcome(
+            retry.exit_code,
+            (f"{retry_note}\n{merged_tail}" if merged_tail else retry_note),
+        ) if retry.exit_code == 0 else RemoteTestOutcome(
+            retry.exit_code, (f"{retry_note}\n{merged_tail}" if merged_tail else retry_note)
+        )
+    return outcome
+
+
+async def _run_remote_test_job_once(
+    compute: Any,
+    spec: Any,
+    *,
+    timeout_s: int,
+    claims: ChainlinkClaims | None = None,
+    claim_record: ClaimRecord | None = None,
+    transcript_dir: Path | None = None,
+) -> RemoteTestOutcome:
     test_spec = replace(spec, test_only=True)
     handle = None
     try:
@@ -1356,7 +1403,40 @@ async def _run_remote_test_job(
         )
         return RemoteTestOutcome(None)
     _log_event("worklink_remote_test_job", issue_id=spec.issue_id, exit_code=result.exit_code)
-    return RemoteTestOutcome(result.exit_code, extract_gate_test_tail(result.stdout))
+    stdout = result.stdout
+    if not (stdout or "").strip() and result.exit_code != 0:
+        # chainlink #826: some transports return exit-only wait responses; the
+        # logs endpoint is the fallback so the failure detail survives.
+        try:
+            stdout = await compute.logs(result.handle) if result.handle else stdout
+        except Exception:  # noqa: BLE001 — diagnostics fallback is best-effort
+            pass
+    if transcript_dir is not None:
+        _persist_test_job_transcript(
+            transcript_dir, issue_id=spec.issue_id, exit_code=result.exit_code, stdout=stdout or ""
+        )
+    return RemoteTestOutcome(result.exit_code, extract_gate_test_tail(stdout))
+
+
+def _persist_test_job_transcript(
+    transcript_dir: Path, *, issue_id: int, exit_code: int | None, stdout: str
+) -> None:
+    """Durable record of the trusted test job's output (chainlink #826) — build
+    waits get wrappers via backend.interpret; test-only jobs previously left NO
+    record, which is why run 15's failures were undiagnosable."""
+    try:
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        path = transcript_dir / f"testjob-{issue_id}-{stamp}.json"
+        path.write_text(
+            json.dumps(
+                {"issue_id": issue_id, "exit_code": exit_code, "recorded_at": stamp, "stdout": stdout[-20000:]},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 def _git_push(repo: Path, branch: str, *, runner: Runner) -> None:

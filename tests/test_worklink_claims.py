@@ -140,7 +140,11 @@ def test_claim_issue_blocks_when_attempts_exhausted() -> None:
 
     assert result.claimed is False
     assert result.attempts_exhausted is True
-    assert ["chainlink", "locks", "claim", "7"] not in calls
+    # chainlink #825: exhaustion is judged AFTER lock ownership is established
+    # (so a duplicate bouncing off a live run can never mislabel it); the
+    # transient lock is released before the blocked transition.
+    assert ["chainlink", "locks", "claim", "7"] in calls
+    assert ["chainlink", "locks", "release", "7"] in calls
     assert ["chainlink", "issue", "label", "7", "worklink:blocked"] in calls
 
 
@@ -300,3 +304,23 @@ def test_same_agent_reclaim_with_stale_heartbeat_steals_and_proceeds():
 
     assert result.claimed is True
     assert any(call[1:3] == ["locks", "steal"] for call in calls)
+
+
+def test_duplicate_vs_live_final_attempt_never_labels_blocked():
+    """chainlink #825 (run-15 regression): a duplicate bouncing off a LIVE
+    final-attempt claim must refuse as duplicate_run_live — the old ordering
+    declared attempts_exhausted and mislabeled the healthy epic blocked."""
+    now = datetime(2026, 7, 3, 22, 20, tzinfo=UTC)
+    calls: list[list[str]] = []
+    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls), clock=lambda: now)
+    live_final = ClaimRecord(
+        issue_id=783, attempt=3, agent_id="mimir-worklink-epic",
+        claimed_at=now - timedelta(minutes=10), heartbeat_at=now - timedelta(minutes=1),
+    )
+
+    result = claims.claim_issue(783, [live_final.to_comment()])
+
+    assert result.claimed is False
+    assert result.reason == "duplicate_run_live"
+    assert result.attempts_exhausted is False
+    assert not any(call[1:3] == ["issue", "label"] for call in calls)
