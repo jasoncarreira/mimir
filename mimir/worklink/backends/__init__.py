@@ -18,6 +18,7 @@ from ..compute import (
 from .base import Caps, RawResult, ToolBackend, WorkOrder
 from .claude_cli import ClaudeCliBackend
 from .codex import CodexBackend
+from .opencode import OpenCodeBackend
 from .registry import (
     WORKLINK_MERGED_LABEL,
     BackendRegistry,
@@ -33,6 +34,7 @@ __all__ = [
     "Caps",
     "ClaudeCliBackend",
     "CodexBackend",
+    "OpenCodeBackend",
     "ComputeBackend",
     "ComputeCaps",
     "ComputeLaunchError",

@@ -19,6 +19,7 @@ from ..compute import (
 from .base import ToolBackend
 from .claude_cli import ClaudeCliBackend
 from .codex import CodexBackend
+from .opencode import OpenCodeBackend
 
 
 WORKLINK_MERGED_LABEL = "worklink:merged"
@@ -474,6 +475,9 @@ class BackendRegistry:
             "claude_cli": self._build_claude_cli(
                 self.config.backend_settings.get("claude_cli", {})
             ),
+            "opencode": self._build_opencode(
+                self.config.backend_settings.get("opencode", {})
+            ),
         }
         self._compute_backends: dict[str, ComputeBackend] = {
             "local_subprocess": LocalSubprocessComputeBackend(),
@@ -639,6 +643,14 @@ class BackendRegistry:
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ValueError("worklink codex args must be a list of strings")
         return CodexBackend(bin=bin_name, extra_args=tuple(args))
+
+    @staticmethod
+    def _build_opencode(settings: Mapping[str, Any]) -> OpenCodeBackend:
+        bin_name = str(settings.get("bin", "opencode"))
+        args = settings.get("args", [])
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise ValueError("worklink opencode args must be a list of strings")
+        return OpenCodeBackend(bin=bin_name, extra_args=tuple(args))
 
     @staticmethod
     def _build_claude_cli(settings: Mapping[str, Any]) -> ClaudeCliBackend:
