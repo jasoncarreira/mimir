@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ChatStreamError, createChatStream } from "./chat";
+import { ChatStreamError, createChatStream, fetchChatSkills } from "./chat";
 
 function sseResponse(chunks: string[]): Response {
   const encoder = new TextEncoder();
@@ -19,6 +19,37 @@ function openSseResponse(chunks: string[]): Response {
     }
   }), { status: 200 });
 }
+
+function jsonResponse(body: unknown): Response {
+  return {
+    ok: true,
+    headers: new Headers({ "content-type": "application/json" }),
+    json: async () => body
+  } as Response;
+}
+
+describe("fetchChatSkills", () => {
+  it("loads the backend-authoritative chat skill commands", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      ok: true,
+      version: "v1",
+      data: {
+        enabled: true,
+        skills: [{ id: "memory", label: "Memory", command: "/memory", description: "Capture durable context." }]
+      }
+    }));
+
+    const response = await fetchChatSkills({ fetchImpl });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "/api/v1/chat/skills",
+      expect.objectContaining({ method: "GET", headers: expect.any(Headers) })
+    );
+    expect(response.data.skills).toEqual([
+      expect.objectContaining({ command: "/memory", label: "Memory" })
+    ]);
+  });
+});
 
 describe("createChatStream", () => {
   afterEach(() => {

@@ -5,6 +5,7 @@ import type {
   ChatHistoryData,
   ChatMessageEvent as GeneratedChatMessageEvent,
   ChatReactionEvent as GeneratedChatReactionEvent,
+  ChatSkillsData,
   LiveEvent
 } from "./generated/contracts";
 
@@ -14,7 +15,7 @@ export interface ChatPostRequest {
   extra?: Record<string, unknown>;
 }
 
-export type { ChatHistoryData, LiveEvent };
+export type { ChatHistoryData, ChatSkillsData, LiveEvent };
 
 export type ChatPostAccepted = Omit<ChatAcceptedData, "source_id"> & {
   source_id?: string;
@@ -56,6 +57,15 @@ export function fetchChatHistory(
 ): Promise<ApiSuccessEnvelope<ChatHistoryData>> {
   const params = new URLSearchParams({ limit: String(limit) });
   return apiFetchEnvelope<ChatHistoryData>(`/api/v1/chat/history?${params.toString()}`, {
+    ...options,
+    method: "GET"
+  });
+}
+
+export function fetchChatSkills(
+  options?: RequestInit & ApiClientOptions
+): Promise<ApiSuccessEnvelope<ChatSkillsData>> {
+  return apiFetchEnvelope<ChatSkillsData>("/api/v1/chat/skills", {
     ...options,
     method: "GET"
   });
