@@ -340,8 +340,10 @@ describe("ChatRoute", () => {
     });
 
     renderChat();
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("Memory");
     const input = screen.getByLabelText("Message");
-    fireEvent.change(input, { target: { value: "/memory" } });
+    fireEvent.change(input, { target: { value: "/memory remember this" } });
     fireEvent.submit(input.closest("form") as HTMLFormElement);
 
     expect(await screen.findByText("Command accepted")).toBeTruthy();
@@ -350,6 +352,51 @@ describe("ChatRoute", () => {
     await waitFor(() => {
       expect(screen.queryByText("Command accepted")).toBeNull();
     });
+  });
+
+  it("does not show command accepted when chat skills are disabled", async () => {
+    chatApi.fetchChatSkills.mockResolvedValueOnce({
+      ok: true,
+      version: "v1",
+      data: { enabled: false, skills: defaultSkillCommands }
+    });
+    chatApi.sendChatMessage.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: { channel_id: "web-default", source_id: "client-1" }
+    });
+
+    renderChat();
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("No chat skills are currently available.");
+    const input = screen.getByLabelText("Message");
+    fireEvent.change(input, { target: { value: "/memory" } });
+    fireEvent.submit(input.closest("form") as HTMLFormElement);
+
+    await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
+      content: "/memory"
+    })));
+    expect(screen.queryByText("Command accepted")).toBeNull();
+  });
+
+  it("does not show command accepted for slash text outside the allowlist", async () => {
+    chatApi.sendChatMessage.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: { channel_id: "web-default", source_id: "client-1" }
+    });
+
+    renderChat();
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("Memory");
+    const input = screen.getByLabelText("Message");
+    fireEvent.change(input, { target: { value: "/unknown extra args" } });
+    fireEvent.submit(input.closest("form") as HTMLFormElement);
+
+    await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
+      content: "/unknown extra args"
+    })));
+    expect(screen.queryByText("Command accepted")).toBeNull();
   });
 
   it("shows an actionable message when chat auth is rejected (master key)", async () => {
