@@ -102,6 +102,12 @@ class WorklinkDefaults:
     # backend in the same checkout with the failure tail, up to this many rounds,
     # before the attempt is declared failed. 0 disables.
     gate_repair_rounds: int = 1
+    # chainlink #827: bounded same-branch re-dispatch of the trusted test job on
+    # an observed failure or unobserved (timeout/launch) outcome. 0 disables.
+    trusted_test_retries: int = 1
+    # chainlink #825: epic claim retry budget (whole-run attempts). Debugging
+    # epics legitimately need more headroom than production ones.
+    max_claim_attempts: int = 3
     reviewer_backend: str | None = None
     tiered_review: TieredReviewConfig = field(default_factory=TieredReviewConfig)
 
@@ -207,6 +213,14 @@ class WorklinkConfig:
             gate_repair_rounds=_non_negative_int(
                 defaults_data.get("gate_repair_rounds"),
                 default=WorklinkDefaults.gate_repair_rounds,
+            ),
+            trusted_test_retries=_non_negative_int(
+                defaults_data.get("trusted_test_retries"),
+                default=WorklinkDefaults.trusted_test_retries,
+            ),
+            max_claim_attempts=_positive_int(
+                defaults_data.get("max_claim_attempts"),
+                default=WorklinkDefaults.max_claim_attempts,
             ),
             reviewer_backend=str(defaults_data.get("reviewer_backend", backend_name)),
             tiered_review=_parse_tiered_review_config(defaults_data.get("tiered_review")),

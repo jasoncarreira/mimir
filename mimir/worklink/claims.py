@@ -153,11 +153,6 @@ class ChainlinkClaims:
         the cap, the lock is released before any label/comment mutation or
         backend compute launch.
         """
-        attempt = self.next_attempt(comments)
-        if attempt > self.max_attempts:
-            self._attempts_exhausted(issue_id, attempt - 1)
-            return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
-
         lock = self._run("locks", "claim", str(issue_id), check=False)
         if lock.returncode != 0:
             return ClaimResult(False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed")
@@ -189,6 +184,17 @@ class ChainlinkClaims:
                 if age_s < self.duplicate_freshness_s:
                     return ClaimResult(False, reason="duplicate_run_live")
             self._run("locks", "steal", str(issue_id), check=False)
+
+        # chainlink #825: exhaustion is judged AFTER the duplicate-liveness
+        # guard — a duplicate bouncing off a LIVE final-attempt run must yield
+        # duplicate_run_live above, never label the epic blocked (a poller
+        # duplicate did exactly that to run 15's healthy attempt-3 claim).
+        # Reaching here means we genuinely own the (fresh or stolen) lock.
+        attempt = self.next_attempt(comments)
+        if attempt > self.max_attempts:
+            self.release_issue(issue_id)
+            self._attempts_exhausted(issue_id, attempt - 1)
+            return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
 
         if max_active_locks is not None:
             try:

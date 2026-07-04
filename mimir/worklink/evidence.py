@@ -264,7 +264,11 @@ def fold_remote_test_evidence(
     folded into the summary on failure so the remote trusted gate carries the
     same retry-feedback detail as the worker's local gate."""
     summary = f"remote sandboxed test job: exit {exit_code}"
-    if exit_code and failure_tail:
+    if failure_tail:
+        # Kept on PASSING folds too (chainlink #827): a retried-then-passed job
+        # carries its "trusted job retried (first: exit 1, ...)" marker here —
+        # discarding it on success would hide exactly the flakiness signal the
+        # retry policy exists to surface to review.
         summary = f"{summary}\n{failure_tail}"
     evidence = replace(
         validation.evidence,

@@ -353,6 +353,7 @@ class EpicRunner:
             chainlink_bin=self.chainlink_bin,
             agent_id=self.agent_id,
             runner=runner,
+            max_attempts=config.defaults.max_claim_attempts,
         )
 
         epic = chainlink.read_issue(epic_id)
@@ -999,7 +1000,15 @@ async def _observe_slice(
         runner=runner,
     )
     if test_cmd and backend_completed(raw.backend_status) and validation.evidence.files_changed:
-        test_outcome = await _run_remote_test_job(compute, spec, timeout_s=config.defaults.timeout_s, claims=_NoopClaims(), claim_record=_NoopClaim(leaf.issue.issue_id, spec.attempt))
+        test_outcome = await _run_remote_test_job(
+            compute,
+            spec,
+            timeout_s=config.defaults.timeout_s,
+            claims=_NoopClaims(),
+            claim_record=_NoopClaim(leaf.issue.issue_id, spec.attempt),
+            transcript_dir=home / "state" / "worklink" / "transcripts",
+            retries=config.defaults.trusted_test_retries,
+        )
         if test_outcome.exit_code is not None:
             validation = fold_remote_test_evidence(
                 validation,

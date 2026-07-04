@@ -2237,3 +2237,100 @@ def test_codex_on_controller_requires_isolated_checkout(tmp_path: Path, monkeypa
     )
     assert result.status == "blocked", (result.status, result.reason)
     assert "isolated checkout" in (result.reason or "")
+
+
+from mimir.worklink.compute import LaunchHandle as _LaunchHandle
+from mimir.worklink.orchestrator import _run_remote_test_job as _rjob
+
+
+class _ScriptedTestCompute:
+    """Compute fake whose wait pops scripted (exit, stdout) results (#827)."""
+
+    name = "scripted"
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.launches = 0
+
+    async def launch(self, spec):
+        self.launches += 1
+        return _LaunchHandle(substrate="scripted", identifier=f"job-{self.launches}")
+
+    async def wait(self, handle, timeout_s):
+        exit_code, stdout = self.results.pop(0)
+        if exit_code is None:
+            raise RuntimeError("broker wait failed: timed out")
+        return ComputeResult(exit_code=exit_code, stdout=stdout, stderr="", handle=handle)
+
+    async def logs(self, handle):
+        return "logs-fallback"
+
+    async def cleanup(self, handle):
+        return None
+
+
+def _job_spec():
+    return WorkSpec(
+        issue_id=793, attempt=1, repo_url="u", base_ref="main", branch="issue/793-a1",
+        prompt="p", rules=None, test_command="pytest -q", backend="codex", timeout_s=60,
+    )
+
+
+def test_trusted_job_retries_unobserved_without_burning_attempt(tmp_path: Path) -> None:
+    compute = _ScriptedTestCompute([(None, ""), (0, "ok")])
+    outcome = asyncio.run(
+        _run_remote_test_job(compute, _job_spec(), timeout_s=60, transcript_dir=tmp_path, retries=1)
+    )
+    assert outcome.exit_code == 0
+    assert compute.launches == 2
+    assert "unobserved" in (outcome.failure_tail or "")
+
+
+def test_trusted_job_retries_observed_failure_and_records_both(tmp_path: Path) -> None:
+    fail_out = "WORKLINK_TESTS_TAIL_BEGIN\nFAILED tests/a.py::b\nWORKLINK_TESTS_TAIL_END"
+    compute = _ScriptedTestCompute([(1, fail_out), (0, "ok")])
+    outcome = asyncio.run(
+        _run_remote_test_job(compute, _job_spec(), timeout_s=60, transcript_dir=tmp_path, retries=1)
+    )
+    assert outcome.exit_code == 0
+    assert "first: exit 1" in outcome.failure_tail
+    wrappers = list(tmp_path.glob("testjob-793-*.json"))
+    assert len(wrappers) == 2  # both runs persisted (#826)
+
+
+def test_trusted_job_fail_twice_folds_failed_with_tail(tmp_path: Path) -> None:
+    fail_out = "WORKLINK_TESTS_TAIL_BEGIN\nFAILED tests/a.py::b\nWORKLINK_TESTS_TAIL_END"
+    compute = _ScriptedTestCompute([(1, fail_out), (1, fail_out)])
+    outcome = asyncio.run(
+        _run_remote_test_job(compute, _job_spec(), timeout_s=60, transcript_dir=tmp_path, retries=1)
+    )
+    assert outcome.exit_code == 1
+    assert "FAILED tests/a.py::b" in outcome.failure_tail
+    assert compute.launches == 2
+
+
+def test_trusted_job_retries_zero_is_single_shot(tmp_path: Path) -> None:
+    compute = _ScriptedTestCompute([(1, "")])
+    outcome = asyncio.run(
+        _run_remote_test_job(compute, _job_spec(), timeout_s=60, transcript_dir=tmp_path, retries=0)
+    )
+    assert outcome.exit_code == 1
+    assert compute.launches == 1
+
+
+def test_worker_emits_structured_test_report(capsys: pytest.CaptureFixture[str]) -> None:
+    from mimir.worklink.worker import _print_test_report, extract_test_report
+
+    result = subprocess.CompletedProcess(
+        ["pytest"], 1,
+        stdout="....\nFAILED tests/test_x.py::test_y - AssertionError: boom\nFAILED tests/test_z.py::test_q\n= 2 failed, 10 passed in 3.2s =",
+        stderr="",
+    )
+    _print_test_report(result)
+    out = capsys.readouterr().out
+    report = extract_test_report(out)
+    assert report is not None
+    assert report["exit"] == 1
+    assert report["failed"] == ["tests/test_x.py::test_y", "tests/test_z.py::test_q"]
+    assert "2 failed, 10 passed" in report["summary"]
+    assert extract_test_report("no report here") is None
