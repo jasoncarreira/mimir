@@ -781,6 +781,23 @@ export interface DashboardExtensionManifest {
   requires_role?: string | null;
 }
 
+export type InvocableSkillSideEffectClass =
+  | "read_only"
+  | "local_write"
+  | "external_mutation"
+  | "privileged";
+
+export interface InvocableSkillContract {
+  skill_id: string;
+  slash_name: string;
+  description: string;
+  invocation_syntax: string;
+  context_shape: string;
+  side_effect_class: InvocableSkillSideEffectClass;
+  channel_constraints: string[];
+  user_constraints: string[];
+}
+
 export interface WhoamiData {
   canonical: string | null;
   display_name: string | null;
@@ -918,6 +935,7 @@ export interface WebBootstrapData {
   };
   /** Available skins: built-in ids plus full operator-installed manifests. */
   skins: WebSkinsData;
+  invocable_skills: InvocableSkillContract[];
   dashboard_extensions: DashboardExtensionManifest[];
 }
 

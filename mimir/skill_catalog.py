@@ -30,6 +30,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from mimir.event_logger import log_event_sync
 from mimir.skill_md import parse_frontmatter
@@ -77,6 +78,82 @@ class SkillEntry:
     name: str
     description: str
     trigger: str
+
+
+SkillSideEffectClass = Literal["read_only", "local_write", "external_mutation", "privileged"]
+
+
+@dataclass(frozen=True)
+class InvocableSkill:
+    """Allowlisted slash-invocable skill surfaced to chat and web clients."""
+
+    skill_id: str
+    slash_name: str
+    description: str
+    invocation_syntax: str
+    context_shape: str
+    side_effect_class: SkillSideEffectClass
+    channel_constraints: tuple[str, ...] = ()
+    user_constraints: tuple[str, ...] = ()
+
+    def to_web_contract(self) -> dict[str, object]:
+        return {
+            "skill_id": self.skill_id,
+            "slash_name": self.slash_name,
+            "description": self.description,
+            "invocation_syntax": self.invocation_syntax,
+            "context_shape": self.context_shape,
+            "side_effect_class": self.side_effect_class,
+            "channel_constraints": list(self.channel_constraints),
+            "user_constraints": list(self.user_constraints),
+        }
+
+
+_INVOCABLE_SKILL_ALLOWLIST: tuple[InvocableSkill, ...] = (
+    InvocableSkill(
+        skill_id="find-skills",
+        slash_name="/skills",
+        description=(
+            "Discover bundled skills and their descriptions without invoking "
+            "mutating helpers."
+        ),
+        invocation_syntax="/skills [search terms]",
+        context_shape=(
+            "Optional free-text search query after the slash command. The "
+            "handler should treat the command as read-only skill discovery."
+        ),
+        side_effect_class="read_only",
+    ),
+)
+
+
+def list_invocable_skills() -> list[InvocableSkill]:
+    """Return the explicit allowlist of skills exposed as slash commands.
+
+    This registry is intentionally separate from the full bundled-skill catalog:
+    a skill being installed or discoverable does not make it slash-invocable.
+    """
+    return list(_INVOCABLE_SKILL_ALLOWLIST)
+
+
+def invocable_skill_contracts() -> list[dict[str, object]]:
+    """Serialize invocable skills for the React/API contract."""
+    return [skill.to_web_contract() for skill in list_invocable_skills()]
+
+
+def resolve_invocable_skill_slash_name(slash_name: str) -> InvocableSkill | None:
+    """Resolve a slash command only if it is explicitly allowlisted.
+
+    Non-allowlisted bundled skill names must not resolve by guessable slash
+    names such as ``/memory`` or ``/github``.
+    """
+    candidate = slash_name.strip().split(maxsplit=1)[0].lower()
+    if candidate and not candidate.startswith("/"):
+        candidate = f"/{candidate}"
+    for skill in _INVOCABLE_SKILL_ALLOWLIST:
+        if skill.slash_name.lower() == candidate:
+            return skill
+    return None
 
 
 def _extract_trigger(description: str) -> str:

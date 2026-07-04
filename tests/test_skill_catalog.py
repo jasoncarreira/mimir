@@ -13,9 +13,12 @@ from mimir.skill_catalog import (
     _load_catalog_inner,
     cmd,
     generate,
+    invocable_skill_contracts,
+    list_invocable_skills,
     load_catalog,
     load_skill,
     render_catalog,
+    resolve_invocable_skill_slash_name,
 )
 
 
@@ -397,3 +400,45 @@ def test_cmd_non_strict_exits_0_even_with_parse_error(
     # Warning still emitted to stderr.
     captured = capsys.readouterr()
     assert "WARNING:" in captured.err
+
+
+def test_invocable_skill_registry_is_explicit_safe_allowlist() -> None:
+    invocable = list_invocable_skills()
+
+    assert [skill.slash_name for skill in invocable] == ["/skills"]
+    assert all(skill.side_effect_class == "read_only" for skill in invocable)
+    assert all(skill.slash_name.startswith("/") for skill in invocable)
+    assert all(skill.description for skill in invocable)
+    assert all(skill.invocation_syntax for skill in invocable)
+    assert all(skill.context_shape for skill in invocable)
+
+
+def test_invocable_skill_resolver_rejects_guessable_non_allowlisted_names() -> None:
+    assert resolve_invocable_skill_slash_name("/skills") is not None
+    assert resolve_invocable_skill_slash_name("/skills memory") is not None
+
+    for guessed in ("/memory", "memory", "/github", "/chainlink", "/pollers"):
+        assert resolve_invocable_skill_slash_name(guessed) is None
+
+
+def test_invocable_skill_contract_shape_matches_web_surface() -> None:
+    contracts = invocable_skill_contracts()
+
+    assert contracts == [
+        {
+            "skill_id": "find-skills",
+            "slash_name": "/skills",
+            "description": (
+                "Discover bundled skills and their descriptions without invoking "
+                "mutating helpers."
+            ),
+            "invocation_syntax": "/skills [search terms]",
+            "context_shape": (
+                "Optional free-text search query after the slash command. The "
+                "handler should treat the command as read-only skill discovery."
+            ),
+            "side_effect_class": "read_only",
+            "channel_constraints": [],
+            "user_constraints": [],
+        }
+    ]

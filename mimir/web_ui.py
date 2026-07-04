@@ -85,6 +85,7 @@ from .saga_dashboard import (
     render_saga_html,
 )
 from .session_browser import build_sessions_payload
+from .skill_catalog import invocable_skill_contracts
 from .web_contracts import json_error, json_success, list_meta
 from .wiki_backlinks import (
     _category_of,
@@ -1315,6 +1316,7 @@ def register_routes(
                     "built_in_ids": sorted(BUILT_IN_WEB_SKIN_IDS),
                     "operator": read_operator_skin_manifests(home),
                 },
+                "invocable_skills": invocable_skill_contracts(),
                 "dashboard_extensions": _dashboard_extensions.navigation_payload(),
             },
             headers=_no_store_headers(),

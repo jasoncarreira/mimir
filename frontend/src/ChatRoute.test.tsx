@@ -5,7 +5,7 @@ import React from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatStreamError, type ChatStreamPayload } from "./api/chat";
-import type { ChatHistoryMessage } from "./api/generated/contracts";
+import type { ChatHistoryMessage, WebBootstrapData } from "./api/generated/contracts";
 import { ChatRoute } from "./ChatRoute";
 import { useChatStore } from "./chatStore";
 import { useUiState } from "./uiState";
@@ -84,8 +84,45 @@ const surface: DashboardSurface = {
   filterLabel: "Channel"
 };
 
+const bootstrap: WebBootstrapData = {
+  version: "test",
+  model: "gpt-test",
+  turns_total: 0,
+  auth: {
+    required: false,
+    scheme: "x-api-key",
+    storage: "browser-localStorage"
+  },
+  server: {
+    web_host: "127.0.0.1",
+    public_bind: false,
+    unauthenticated_allowed: true
+  },
+  stream_auth: {
+    shape: "fetch-event-stream",
+    header: "X-API-Key",
+    native_eventsource_supported_when_auth_required: false
+  },
+  ui: { agent_name: "Mimir", skin: "neon-terminal" },
+  skins: { built_in_ids: [], operator: [] },
+  invocable_skills: [
+    {
+      skill_id: "find-skills",
+      slash_name: "/skills",
+      description: "Discover bundled skills and their descriptions without invoking mutating helpers.",
+      invocation_syntax: "/skills [search terms]",
+      context_shape: "Optional free-text search query after the slash command.",
+      side_effect_class: "read_only",
+      channel_constraints: [],
+      user_constraints: []
+    }
+  ],
+  dashboard_extensions: []
+};
+
 function renderChat(initialEntry = "/chat") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  queryClient.setQueryData(["web-bootstrap"], bootstrap);
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[initialEntry]}>
@@ -183,14 +220,14 @@ describe("ChatRoute", () => {
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
     const insert = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Insert" })[0];
     fireEvent.click(insert);
-    expect(input.value).toBe("/memory ");
+    expect(input.value).toBe("/skills ");
     expect(chatApi.sendChatMessage).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
-    const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
+    const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[0];
     fireEvent.click(invoke);
     await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
-      content: "/github"
+      content: "/skills"
     })));
   });
 
@@ -206,11 +243,11 @@ describe("ChatRoute", () => {
     fireEvent.change(input, { target: { value: "keep this draft" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
-    const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
+    const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[0];
     fireEvent.click(invoke);
 
     await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
-      content: "/github"
+      content: "/skills"
     })));
     expect(input.value).toBe("keep this draft");
   });
@@ -226,7 +263,7 @@ describe("ChatRoute", () => {
     fireEvent.change(input, { target: { value: "draft" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
-    const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
+    const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[0];
     fireEvent.click(invoke);
 
     await waitFor(() => expect((screen.getByRole("button", { name: "SENDING…" }) as HTMLButtonElement).disabled).toBe(true));

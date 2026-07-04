@@ -1048,6 +1048,27 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     assert body["data"]["ui"] == {"agent_name": "Mimir", "skin": "neon-terminal"}
     assert body["data"]["auth"]["required"] is True
     assert body["data"]["server"]["public_bind"] is True
+    assert body["data"]["invocable_skills"] == [
+        {
+            "skill_id": "find-skills",
+            "slash_name": "/skills",
+            "description": (
+                "Discover bundled skills and their descriptions without invoking "
+                "mutating helpers."
+            ),
+            "invocation_syntax": "/skills [search terms]",
+            "context_shape": (
+                "Optional free-text search query after the slash command. The "
+                "handler should treat the command as read-only skill discovery."
+            ),
+            "side_effect_class": "read_only",
+            "channel_constraints": [],
+            "user_constraints": [],
+        }
+    ]
+    assert {item["slash_name"] for item in body["data"]["invocable_skills"]}.isdisjoint(
+        {"/memory", "/github", "/chainlink", "/pollers"}
+    )
     assert [item["id"] for item in body["data"]["dashboard_extensions"]][:4] == [
         "chat",
         "usage",
