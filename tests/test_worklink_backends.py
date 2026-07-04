@@ -15,6 +15,7 @@ from mimir.worklink.backends import (
     Caps,
     ClaudeCliBackend,
     CodexBackend,
+    OpenCodeBackend,
     ComputeResult,
     DockerSiblingComputeBackend,
     EcsRunTaskComputeBackend,
@@ -1351,3 +1352,89 @@ async def test_worker_honors_spec_backend_config_codex_args(
     assert codex_calls, "codex backend was never invoked"
     flat = [tok for call in codex_calls for tok in call]
     assert "--sandbox" in flat and "danger-full-access" in flat
+
+
+@pytest.mark.asyncio
+async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """chainlink #830: the opencode backend runs `opencode run --dir <worktree>
+    -- <prompt>` and interprets output like the codex backend."""
+    calls: list[dict[str, Any]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeProcess(returncode=0, stdout=b"done\n", stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    backend = OpenCodeBackend()
+    transcript_root = tmp_path / "state" / "worklink" / "transcripts"
+    order = WorkOrder(
+        issue_id=782,
+        worktree=tmp_path / "worktree",
+        prompt="-starts with dash",
+        rules=None,
+        timeout_s=30,
+        env={"PATH": "/bin"},
+        transcript_root=transcript_root,
+    )
+
+    spec = backend.work_spec(
+        order,
+        attempt=1,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="issue/782-a1",
+        test_command="echo ok",
+    )
+    compute = LocalSubprocessComputeBackend()
+    handle = await compute.launch(spec)
+    compute_result = await compute.wait(handle, spec.timeout_s)
+    await compute.cleanup(handle)
+    result = await backend.interpret(order, compute_result)
+
+    assert result.backend_status == "success"
+    assert calls[0]["args"] == (
+        "opencode", "run", "--dir", str(order.worktree), "--", "-starts with dash"
+    )
+    assert result.transcript_path is not None
+    assert result.transcript_path.parent == transcript_root
+    transcript = json.loads(result.transcript_path.read_text())
+    assert transcript["backend"] == "opencode"
+
+
+@pytest.mark.asyncio
+async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> None:
+    order = WorkOrder(
+        issue_id=782,
+        worktree=tmp_path,
+        prompt="p",
+        rules=None,
+        timeout_s=30,
+        env={},
+        transcript_root=tmp_path / "t",
+    )
+    backend = OpenCodeBackend()
+
+    blocked = await backend.interpret(
+        order, ComputeResult(0, "some work\nWORKLINK_BLOCKED: needs a decision", "")
+    )
+    assert blocked.backend_status == "blocked"
+    assert blocked.blocked_reason == "needs a decision"
+
+    auth = await backend.interpret(order, ComputeResult(1, "", "provider: unauthorized token"))
+    assert auth.backend_status == "auth_error"
+
+    quota = await backend.interpret(order, ComputeResult(1, "rate limit exceeded", ""))
+    assert quota.backend_status == "quota_exhausted"
+
+    plain = await backend.interpret(order, ComputeResult(3, "", "boom"))
+    assert plain.backend_status == "failed"
+    assert plain.error == "boom"
+
+
+def test_registry_builds_opencode_backend_with_settings() -> None:
+    config = WorklinkConfig(backend_settings={"opencode": {"bin": "/usr/local/bin/opencode", "args": ["--model", "openai/gpt-5.5"]}})
+    backend = BackendRegistry(config).get("opencode")
+    assert backend.bin == "/usr/local/bin/opencode"
+    assert backend.extra_args == ("--model", "openai/gpt-5.5")
