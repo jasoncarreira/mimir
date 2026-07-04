@@ -1836,6 +1836,169 @@ async def spawn_codex(
     return json.dumps({"result": stdout.strip()[:2000], "name": name}, indent=2)
 
 
+@tool
+async def spawn_open_code(
+    prompt: str,
+    cwd: Optional[str] = None,
+    timeout_s: int = 1800,
+    name: Optional[str] = None,
+    model: Optional[str] = None,
+    agent: Optional[str] = None,
+    artifact_root: Optional[str] = None,
+) -> str:
+    """Spawn an OpenCode CLI subprocess to execute a coding task.
+
+    The provider-agnostic substrate spawn (chainlink #830 / the opencode
+    software-factory spec, phase 1): runs ``opencode run --dir <cwd>``
+    once, non-interactively, and returns a structured result. OpenCode
+    routes to whichever model provider its own config selects, so this
+    collapses the provider-shaped split (spawn_claude_code / spawn_codex)
+    into a backend-shaped one. Registered only when the ``opencode`` CLI
+    is on PATH (``providers.opencode_available``).
+
+    Shares the spawn caps with spawn_claude_code/spawn_codex — one
+    per-hour / concurrency / recursion-depth budget across all spawn
+    paths.
+
+    Args:
+        prompt: The task to hand to the spawned OpenCode instance.
+        cwd: Working directory for the run. Defaults to home.
+        timeout_s: Subprocess timeout (default 30 min).
+        name: Optional label recorded in the spawn log/manifest.
+        model: ``provider/model`` (opencode ``-m`` format). Omit for the
+            opencode config default.
+        agent: opencode agent name (``--agent``). Omit for default.
+        artifact_root: When set, persist run artifacts under
+            ``<artifact_root>/.factory/runs/<run_id>/`` — prompt.md,
+            stdout.txt, stderr.txt, and a manifest.json carrying labels
+            only (never secret values).
+    """
+    cfg = _STATE["spawn_config"]
+    if cfg is None:
+        return "spawn_open_code failed: no spawn config"
+    if not prompt or not prompt.strip():
+        return "spawn_open_code failed: prompt is required"
+
+    guard = _spawn_guard_init()
+    current_depth = _env_int_floor1(_SPAWN_DEPTH_ENV, 0) if os.environ.get(
+        _SPAWN_DEPTH_ENV
+    ) else 0
+    if current_depth >= guard.max_depth:
+        return (
+            f"spawn_open_code refused: recursion depth cap reached "
+            f"({current_depth} >= MIMIR_SPAWN_MAX_DEPTH={guard.max_depth})."
+        )
+    rate_token, rate_err = await _spawn_acquire_rate_slot(guard)
+    if rate_err is not None:
+        return rate_err.replace("spawn_claude_code", "spawn_open_code")
+
+    cwd_path = Path(cwd).expanduser() if cwd else cfg.get("default_cwd")
+    import shlex
+    import uuid
+    argv = ["opencode", "run"]
+    if cwd_path:
+        argv += ["--dir", str(cwd_path)]
+    # Operator-tunable extra flags (permissions profile, --format json, ...)
+    # — the opencode CLI surface evolves, so don't hardcode beyond the
+    # subcommand. e.g. MIMIR_OPENCODE_SPAWN_ARGS="--format json".
+    argv += shlex.split(os.environ.get("MIMIR_OPENCODE_SPAWN_ARGS", ""))
+    if model:
+        argv += ["-m", model]
+    if agent:
+        argv += ["--agent", agent]
+    argv += ["--", prompt]
+
+    # Allowlisted child env (#494): infra + the provider credential families
+    # opencode may legitimately route to + its own vars + incremented spawn
+    # depth. Bridge/operator secrets are NOT inherited. (Spec tier-1; the
+    # per-run auth home is the tier-2 follow-up.)
+    child_env = _minimal_child_env(
+        depth=current_depth + 1,
+        cred_prefixes=("OPENAI_", "CODEX_", "ANTHROPIC_", "CLAUDE_", "OPENCODE_"),
+    )
+
+    run_id = f"opencode-{uuid.uuid4().hex[:12]}"
+    started = datetime.now(timezone.utc)
+    status = "completed"
+    returncode: Optional[int] = None
+    stdout = ""
+    stderr = ""
+    assert guard.sem is not None
+    try:
+        async with guard.sem:
+            try:
+                returncode, stdout, stderr = await asyncio.to_thread(
+                    _run_claude_subprocess,
+                    argv,
+                    str(cwd_path) if cwd_path else None,
+                    timeout_s,
+                    child_env,
+                )
+            except subprocess.TimeoutExpired:
+                status = "timeout"
+            except FileNotFoundError:
+                status = "spawn_failed"
+    except BaseException:
+        await _spawn_release_rate_slot(guard, rate_token)
+        raise
+    if status == "completed" and returncode != 0:
+        # Spec §6 failure taxonomy: distinguish auth failures (fix = operator
+        # re-auth) from work failures (fix = different prompt/task).
+        blob = (stderr + "\n" + stdout).lower()
+        status = (
+            "auth_failed"
+            if any(marker in blob for marker in ("unauthorized", "not logged in", "credential", "auth", "401"))
+            else "work_failed"
+        )
+
+    artifact_dir: Optional[Path] = None
+    if artifact_root:
+        try:
+            artifact_dir = Path(artifact_root).expanduser() / ".factory" / "runs" / run_id
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "prompt.md").write_text(prompt, encoding="utf-8")
+            (artifact_dir / "stdout.txt").write_text(stdout, encoding="utf-8")
+            (artifact_dir / "stderr.txt").write_text(stderr, encoding="utf-8")
+            (artifact_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "run_id": run_id,
+                        "launcher": "mimir.spawn_open_code",
+                        "name": name,
+                        "cwd": str(cwd_path) if cwd_path else None,
+                        "model": model,
+                        "agent": agent,
+                        "status": status,
+                        "exit_code": returncode,
+                        "started_at": started.isoformat(),
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass  # artifacts are best-effort; the structured return is primary
+
+    if status == "spawn_failed":
+        stderr = "'opencode' CLI not on PATH"
+    elif status == "timeout":
+        stderr = f"timed out after {timeout_s}s"
+    return json.dumps(
+        {
+            "run_id": run_id,
+            "status": status,
+            "exit_code": returncode,
+            "result": stdout.strip()[:2000],
+            "stderr": stderr.strip()[:500] if status != "completed" else "",
+            "artifact_dir": str(artifact_dir) if artifact_dir else None,
+            "name": name,
+        },
+        indent=2,
+    )
+
+
 # ────────────────────────────────────────────────────────────────────
 # Pending mimir-package update (mimir/update_on_start.py)
 # ────────────────────────────────────────────────────────────────────
@@ -2119,6 +2282,10 @@ def all_mimir_tools() -> list:
     # Same gate for spawn_codex on the ``codex`` CLI (chainlink #293).
     if codex_available():
         tools.append(spawn_codex)
+    # And for spawn_open_code on the ``opencode`` CLI (chainlink #830).
+    from ..providers import opencode_available
+    if opencode_available():
+        tools.append(spawn_open_code)
     # MCP-bridged tools (populated by server.py:_on_startup after the
     # MCP servers come up; empty when MCP is unconfigured).
     from .mcp import get_mcp_tools

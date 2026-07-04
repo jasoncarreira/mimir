@@ -417,6 +417,20 @@ def claude_code_auth_status(
 _CODEX_CLI = "codex"
 
 
+_OPENCODE_CLI = "opencode"
+
+
+def opencode_available() -> bool:
+    """True when the ``opencode`` CLI — which the ``spawn_open_code`` tool
+    shells out to (``opencode run``) — is on ``PATH``.
+
+    Same registration gate pattern as :func:`codex_available` (#293) /
+    :func:`claude_code_available` (#292); presence, not auth state. Part of
+    the #830 pivot: opencode as the provider-agnostic coding substrate.
+    """
+    return shutil.which(_OPENCODE_CLI) is not None
+
+
 def codex_available() -> bool:
     """True when the ``codex`` CLI — which the ``spawn_codex`` tool shells
     out to (``codex exec``) — is on ``PATH``.
