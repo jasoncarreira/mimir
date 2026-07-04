@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Worklink ready-queue poller (chainlink #444).
 
-Discovers actionable ``worklink:epic`` issues and ``worklink:ready`` leaves,
-then dispatches up to the concurrent-claim cap by invoking
-``mimir worklink run-epic <id>`` or ``mimir worklink run <id>`` as a
-**detached** subprocess. It deliberately does
+Discovers actionable ``worklink:ready`` leaves and dispatches up to the
+concurrent-claim cap by invoking ``mimir worklink run <id>`` as a
+**detached** subprocess. ``worklink:epic`` issues are recognized only to be
+EXCLUDED from leaf dispatch (an epic is built by the opencode feature-factory,
+not as a single leaf; #830) — the poller never dispatches them. It deliberately does
 NOT reimplement claim/evidence/transition — all of that lives in the
 deterministic core executor behind the CLI.
 
@@ -118,7 +119,7 @@ class DispatchItem:
 
     @property
     def command(self) -> str:
-        return "run-epic" if self.mode == "epic" else "run"
+        return "run"
 
 
 def _emit(record: dict) -> None:
@@ -281,49 +282,40 @@ def _actionable_issue_ids(home: Path) -> list[int] | None:
 def _worklink_dispatch_plan(
     home: Path, *, active_lock_ids: set[int]
 ) -> tuple[list[DispatchItem], int, int, int] | None:
-    """Return dispatchable Worklink items plus ready/blocked/epic counts.
+    """Return dispatchable Worklink leaves plus ready/blocked/epic counts.
 
-    Bare leaves still require ``worklink:ready`` and Chainlink actionability.
-    Epics are intake issues marked by ``worklink:epic``; when actionable, they
-    run through the integrated epic controller instead of per-leaf dispatch.
+    Leaves require ``worklink:ready`` and Chainlink actionability. ``worklink:
+    epic`` issues are recognized ONLY to EXCLUDE them (and their child leaves)
+    from per-leaf dispatch — the in-mimir epic runner was removed (#830); epics
+    are built by the opencode feature-factory, so the poller never dispatches
+    them. The epic count is reported for observability only.
     """
     ready_records = _issue_records_with_label(home, READY_LABEL)
     epic_records = _issue_records_with_label(home, EPIC_LABEL)
-    blocked_records = _issue_records_with_label(home, BLOCKED_LABEL)
-    review_records = _issue_records_with_label(home, REVIEW_LABEL)
     actionable_ids = _actionable_issue_ids(home)
     if (
         ready_records is None
         or epic_records is None
-        or blocked_records is None
-        or review_records is None
         or actionable_ids is None
     ):
         return None
     labeled = {record.issue_id for record in ready_records}
+    # ``worklink:epic`` issues are NOT dispatched by the poller (#830 — an epic
+    # is built by the opencode feature-factory, not as a leaf). They are
+    # tracked here only to EXCLUDE them (and any child leaves) from per-leaf
+    # dispatch, so a worklink:epic issue is never run as a single leaf.
     epics = {record.issue_id for record in epic_records}
-    terminal_epics = epics & (
-        {record.issue_id for record in blocked_records}
-        | {record.issue_id for record in review_records}
-    )
     actionable = set(actionable_ids)
-    dispatchable_epics = sorted((epics & actionable) - terminal_epics)
-    active_epics = epics & active_lock_ids
-    handled_epics = set(dispatchable_epics) | active_epics | terminal_epics
     dispatchable_leaves = sorted(
         record.issue_id
         for record in ready_records
         if record.issue_id in actionable
         and record.issue_id not in epics
-        and record.parent_id not in handled_epics
+        and record.parent_id not in epics
     )
-    plan = [
-        DispatchItem(issue_id=issue_id, mode="epic")
-        for issue_id in dispatchable_epics
-    ]
-    plan.extend(DispatchItem(issue_id=issue_id, mode="leaf") for issue_id in dispatchable_leaves)
+    plan = [DispatchItem(issue_id=issue_id, mode="leaf") for issue_id in dispatchable_leaves]
     blocked_count = len(labeled - actionable)
-    return plan, len(labeled), blocked_count, len(dispatchable_epics)
+    return plan, len(labeled), blocked_count, len(epics)
 
 
 def _configured_cap(home: Path) -> int:

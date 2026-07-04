@@ -179,10 +179,6 @@ def build_mimir_subagents() -> list[dict]:
 
     The default DeepAgents ``general-purpose`` subagent is still auto-added because
     this list intentionally does not include a spec named ``general-purpose``.
-
-    The Worklink epic roles are NOT registered here: they are action-based
-    agents whose tools are per-epic-run closures, constructed inside
-    ``mimir.worklink.epic_roles`` for each run.
     """
 
     return [

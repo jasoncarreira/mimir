@@ -91,7 +91,7 @@ async def test_build_agent_registers_structured_subagents(
     await agent._build_agent_if_needed()
 
     subagents = capture.kwargs[0]["subagents"]
-    # Worklink epic roles are per-run tool-armed agents (mimir.worklink.epic_roles),
+    # Worklink epic roles are per-run tool-armed agents (the retired epic roles (removed #830)),
     # not agent-wide registrations.
     assert [spec["name"] for spec in subagents] == ["critic-structured"]
     assert all(spec["name"] != "general-purpose" for spec in subagents)

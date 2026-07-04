@@ -22,7 +22,7 @@ def test_build_mimir_subagents_registers_structured_critic_without_replacing_gp(
     specs = build_mimir_subagents()
 
     # The Worklink epic roles are per-run tool-armed agents constructed inside
-    # mimir.worklink.epic_roles — they are intentionally NOT registered here.
+    # the retired epic roles module (removed #830).
     assert [spec["name"] for spec in specs] == ["critic-structured"]
     assert "general-purpose" not in {spec["name"] for spec in specs}
     assert specs[0]["response_format"] is CriticFindings
