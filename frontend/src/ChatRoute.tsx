@@ -102,6 +102,18 @@ function isSlashCommandText(text: string): boolean {
   return text.startsWith("/");
 }
 
+function isAvailableSkillCommandText(
+  text: string,
+  skillCommands: Array<{ command: string }>,
+  hasAvailableSkillCommands: boolean
+): boolean {
+  if (!hasAvailableSkillCommands) return false;
+  const trimmedText = text.trim();
+  if (!isSlashCommandText(trimmedText)) return false;
+  const [submittedCommand] = trimmedText.split(/\s+/, 1);
+  return skillCommands.some((skill) => skill.command === submittedCommand);
+}
+
 export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const { update } = useRouteState(surface);
   const [channelId, setChannelId] = React.useState("");
@@ -358,7 +370,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     setSendInFlight(true);
     const clientId = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const timestamp = new Date().toISOString();
-    const slashCommand = isSlashCommandText(text);
+    const acceptedSkillCommand = isAvailableSkillCommandText(text, skillCommands, hasAvailableSkillCommands);
     if (options.clearComposer) {
       setComposerText("");
     }
@@ -392,7 +404,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
       if (accepted.data.channel_id !== channelId) {
         setChannelId(accepted.data.channel_id);
       }
-      if (slashCommand) {
+      if (acceptedSkillCommand) {
         setAcceptedSlashMessageId(clientId);
       }
     } catch (error) {
@@ -452,7 +464,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
                 <span className="chat-message__role">{message.role === "user" ? "You" : agentName}</span>
                 <span className="chat-message__text">{message.text}</span>
                 {message.error ? <span className="chat-message__error">{message.error}</span> : null}
-                {message.id === acceptedSlashMessageId ? (
+                {message.id === acceptedSlashMessageId && isAvailableSkillCommandText(message.text, skillCommands, hasAvailableSkillCommands) ? (
                   <span aria-live="polite" className="chat-message__status">Command accepted</span>
                 ) : null}
               </li>
