@@ -11,7 +11,7 @@ import { useChatStore } from "./chatStore";
 import { useUiState } from "./uiState";
 import type { DashboardSurface } from "./dashboardExtensions";
 
-const { chatApi, turnApi } = vi.hoisted(() => ({
+const { chatApi, turnApi, skillsApi } = vi.hoisted(() => ({
   chatApi: {
     activePayload: undefined as ((payload: ChatStreamPayload) => void) | undefined,
     activeError: undefined as ((error: unknown) => void) | undefined,
@@ -33,6 +33,38 @@ const { chatApi, turnApi } = vi.hoisted(() => ({
       turnApi.activeEvent = onEvent;
       return { close: turnApi.close };
     })
+  },
+  skillsApi: {
+    fetchInvocableSkills: vi.fn(async () => ({
+      ok: true,
+      version: "v1",
+      data: {
+        skills: [
+          {
+            skill_name: "find-skills",
+            slash_name: "/find-skills",
+            description: "Find the most relevant skill for a task without invoking it.",
+            invocation_syntax: "/find-skills <task or question>",
+            context_shape: { input: "freeform task or question", result: "advisory skill suggestions" },
+            side_effect_class: "read_only",
+            allowed_channels: [],
+            allowed_users: [],
+            enabled: true
+          },
+          {
+            skill_name: "five-whys",
+            slash_name: "/five-whys",
+            description: "Run a structured five-whys analysis on a problem statement.",
+            invocation_syntax: "/five-whys <problem statement>",
+            context_shape: { input: "problem statement", result: "advisory root-cause analysis" },
+            side_effect_class: "advisory",
+            allowed_channels: [],
+            allowed_users: [],
+            enabled: true
+          }
+        ]
+      }
+    }))
   }
 }));
 
@@ -49,6 +81,10 @@ vi.mock("./api/chat", async (importOriginal) => ({
 // (chainlink #583 slice 2); capture the callback so tests can drive it.
 vi.mock("./api/turn-events", () => ({
   createTurnEventStream: turnApi.createTurnEventStream
+}));
+
+vi.mock("./api/skills", () => ({
+  fetchInvocableSkills: skillsApi.fetchInvocableSkills
 }));
 
 // ChatRoute's right rail (field log + agent dossier) consumes useLiveEvents;
@@ -123,6 +159,7 @@ afterEach(() => {
   turnApi.activeEvent = undefined;
   turnApi.close.mockClear();
   turnApi.createTurnEventStream.mockClear();
+  skillsApi.fetchInvocableSkills.mockClear();
   useUiState.setState({ apiKeyEpoch: 0 });
   window.localStorage.clear();
 });
@@ -181,17 +218,20 @@ describe("ChatRoute", () => {
     const input = screen.getByLabelText("Message") as HTMLTextAreaElement;
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("Find Skills");
     const insert = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Insert" })[0];
     fireEvent.click(insert);
-    expect(input.value).toBe("/memory ");
+    expect(input.value).toBe("/find-skills ");
     expect(chatApi.sendChatMessage).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
     const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
     fireEvent.click(invoke);
     await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
-      content: "/github"
+      content: "/five-whys"
     })));
+    expect(screen.queryByText("/github")).toBeNull();
+    expect(screen.queryByText("/review")).toBeNull();
   });
 
   it("invokes a skill command without clearing an unsent draft", async () => {
@@ -206,11 +246,12 @@ describe("ChatRoute", () => {
     fireEvent.change(input, { target: { value: "keep this draft" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("Five Whys");
     const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
     fireEvent.click(invoke);
 
     await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
-      content: "/github"
+      content: "/five-whys"
     })));
     expect(input.value).toBe("keep this draft");
   });
@@ -226,6 +267,7 @@ describe("ChatRoute", () => {
     fireEvent.change(input, { target: { value: "draft" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("Five Whys");
     const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
     fireEvent.click(invoke);
 

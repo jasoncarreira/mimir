@@ -66,6 +66,7 @@ from .scheduler_dashboard import (
     build_scheduler_dashboard_payload,
     parse_due_window,
 )
+from .skill_catalog import invocable_skills_payload
 from .web_channels import DEFAULT_WEB_CHANNEL, web_channel_for_identity
 from .file_memory_dashboard import (
     list_channel_dirs,
@@ -1716,6 +1717,12 @@ def register_routes(
             )
         )
 
+    async def invocable_skills_v1(request: web.Request) -> web.Response:
+        identity = request.get("auth_identity")
+        user = getattr(identity, "canonical", None) if identity is not None else None
+        channel_id = request.query.get("channel_id") or None
+        return json_success(invocable_skills_payload(channel_id=channel_id, user=user))
+
     async def user_prefs_v1(request: web.Request) -> web.Response:
         identity = request.get("auth_identity")
         if identity is None or request.get("auth_is_master"):
@@ -1807,6 +1814,8 @@ def register_routes(
         app.router.add_get("/api/v1/web/bootstrap", web_bootstrap_v1)
     if ("GET", "/api/v1/whoami") not in existing:
         app.router.add_get("/api/v1/whoami", whoami_v1)
+    if ("GET", "/api/v1/skills/invocable") not in existing:
+        app.router.add_get("/api/v1/skills/invocable", invocable_skills_v1)
     if ("POST", "/api/v1/user/prefs") not in existing:
         app.router.add_post("/api/v1/user/prefs", user_prefs_v1)
     if ("GET", "/api/v1/wiki") not in existing:

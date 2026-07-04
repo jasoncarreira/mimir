@@ -79,6 +79,116 @@ class SkillEntry:
     trigger: str
 
 
+@dataclass(frozen=True)
+class InvocableSkill:
+    """Allowlisted skill exposed through chat slash commands and web UI."""
+
+    skill_name: str
+    slash_name: str
+    description: str
+    invocation_syntax: str
+    context_shape: dict[str, str]
+    side_effect_class: str
+    allowed_channels: tuple[str, ...] = ()
+    allowed_users: tuple[str, ...] = ()
+    enabled: bool = True
+
+    def to_contract(self) -> dict[str, object]:
+        return {
+            "skill_name": self.skill_name,
+            "slash_name": self.slash_name,
+            "description": self.description,
+            "invocation_syntax": self.invocation_syntax,
+            "context_shape": dict(self.context_shape),
+            "side_effect_class": self.side_effect_class,
+            "allowed_channels": list(self.allowed_channels),
+            "allowed_users": list(self.allowed_users),
+            "enabled": self.enabled,
+        }
+
+
+# Explicit allowlist for skills that may be invoked by slash name. This is the
+# safety boundary: bundled or operator-installed skills are not exposed unless a
+# row is added here, so guessing "/github" or "/review" cannot resolve.
+INVOCABLE_SKILLS: tuple[InvocableSkill, ...] = (
+    InvocableSkill(
+        skill_name="find-skills",
+        slash_name="/find-skills",
+        description="Find the most relevant skill for a task without invoking it.",
+        invocation_syntax="/find-skills <task or question>",
+        context_shape={
+            "input": "freeform task or question",
+            "result": "advisory skill suggestions",
+        },
+        side_effect_class="read_only",
+    ),
+    InvocableSkill(
+        skill_name="five-whys",
+        slash_name="/five-whys",
+        description="Run a structured five-whys analysis on a problem statement.",
+        invocation_syntax="/five-whys <problem statement>",
+        context_shape={
+            "input": "problem statement",
+            "result": "advisory root-cause analysis",
+        },
+        side_effect_class="advisory",
+    ),
+)
+
+
+def list_invocable_skills(
+    *,
+    include_disabled: bool = False,
+    channel_id: str | None = None,
+    user: str | None = None,
+) -> list[InvocableSkill]:
+    """Return allowlisted invocable skills visible in the given context."""
+    visible: list[InvocableSkill] = []
+    for skill in INVOCABLE_SKILLS:
+        if not include_disabled and not skill.enabled:
+            continue
+        if channel_id and skill.allowed_channels and channel_id not in skill.allowed_channels:
+            continue
+        if user and skill.allowed_users and user not in skill.allowed_users:
+            continue
+        visible.append(skill)
+    return visible
+
+
+def invocable_skills_payload(
+    *,
+    include_disabled: bool = False,
+    channel_id: str | None = None,
+    user: str | None = None,
+) -> dict[str, object]:
+    return {
+        "skills": [
+            skill.to_contract()
+            for skill in list_invocable_skills(
+                include_disabled=include_disabled,
+                channel_id=channel_id,
+                user=user,
+            )
+        ],
+    }
+
+
+def resolve_invocable_skill(
+    slash_name: str,
+    *,
+    channel_id: str | None = None,
+    user: str | None = None,
+) -> InvocableSkill | None:
+    """Resolve a slash command only if it is explicitly allowlisted."""
+    normalized = slash_name.strip().split(maxsplit=1)[0].lower()
+    if normalized and not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    for skill in list_invocable_skills(channel_id=channel_id, user=user):
+        if skill.slash_name.lower() == normalized:
+            return skill
+    return None
+
+
 def _extract_trigger(description: str) -> str:
     """Pick a one-line trigger phrase from the description.
 

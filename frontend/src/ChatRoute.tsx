@@ -1,6 +1,7 @@
 import React from "react";
 import { AgentDossier } from "./AgentDossier";
 import { ChatStreamError, createChatStream, fetchChatHistory, sendChatMessage, type ChatStreamPayload } from "./api/chat";
+import { fetchInvocableSkills, type InvocableSkill } from "./api/skills";
 import { createTurnEventStream } from "./api/turn-events";
 import type { TurnStreamEvent } from "./api/generated/contracts";
 import { useBootstrap } from "./api/bootstrap";
@@ -14,16 +15,6 @@ import { Badge, Button, Dialog, ErrorState } from "./ui";
 import { useUiState } from "./uiState";
 
 type ChatStreamState = "connecting" | "open" | "error";
-
-// chainlink #581: composer actions are intentionally frontend-local: the
-// chat backend accepts text, so picker "invoke" sends slash-command text
-// through the normal message path while picker "insert" keeps composing.
-const SKILL_COMMANDS = [
-  { id: "memory", label: "Memory", command: "/memory", description: "Capture or update durable context." },
-  { id: "github", label: "GitHub", command: "/github", description: "Work with PRs, issues, and CI." },
-  { id: "review", label: "Review", command: "/review", description: "Review a pull request and post the result." },
-  { id: "chainlink", label: "Chainlink", command: "/chainlink", description: "Track durable tasks and follow-ups." },
-] as const;
 
 type ComposerShortcut = {
   id: string;
@@ -107,6 +98,14 @@ function chatStreamErrorMessage(error: unknown): string {
   return "Chat stream unavailable; reconnecting…";
 }
 
+function skillLabel(skill: InvocableSkill): string {
+  return skill.skill_name
+    .split("-")
+    .filter(Boolean)
+    .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
 export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const { update } = useRouteState(surface);
   const [channelId, setChannelId] = React.useState("");
@@ -114,6 +113,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const [composerText, setComposerText] = React.useState("");
   const [sendInFlight, setSendInFlight] = React.useState(false);
   const [skillPickerOpen, setSkillPickerOpen] = React.useState(false);
+  const [invocableSkills, setInvocableSkills] = React.useState<InvocableSkill[]>([]);
   const [shortcutPickerOpen, setShortcutPickerOpen] = React.useState(false);
   const [shortcuts, setShortcuts] = React.useState<ComposerShortcut[]>(() => loadComposerShortcuts());
   const [shortcutLabel, setShortcutLabel] = React.useState("");
@@ -187,6 +187,21 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   React.useEffect(() => {
     channelIdRef.current = channelId;
   }, [channelId]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetchInvocableSkills({ channelId });
+        if (!cancelled) setInvocableSkills(res.data.skills);
+      } catch {
+        if (!cancelled) setInvocableSkills([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [channelId, apiKeyEpoch]);
 
   // chainlink #616: on a key change, drop the previous user's channel so the
   // reconnected streams re-adopt the new identity's channel (otherwise the new
@@ -488,16 +503,16 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
           </form>
           <Dialog open={skillPickerOpen} title="Skills" onClose={() => setSkillPickerOpen(false)}>
             <div className="chat-picker" aria-label="Skill commands">
-              {SKILL_COMMANDS.map((skill) => (
-                <article className="chat-picker__row" key={skill.id}>
+              {invocableSkills.map((skill) => (
+                <article className="chat-picker__row" key={skill.skill_name}>
                   <div>
-                    <strong>{skill.label}</strong>
-                    <code>{skill.command}</code>
+                    <strong>{skillLabel(skill)}</strong>
+                    <code>{skill.invocation_syntax}</code>
                     <p>{skill.description}</p>
                   </div>
                   <div className="chat-picker__actions">
-                    <Button disabled={sendInFlight} onClick={() => { insertComposerText(`${skill.command} `); setSkillPickerOpen(false); composerInputRef.current?.focus(); }} type="button" variant="secondary">Insert</Button>
-                    <Button disabled={sendInFlight} onClick={() => void invokeCommand(skill.command)} type="button" variant="primary">{sendInFlight ? "Invoking…" : "Invoke"}</Button>
+                    <Button disabled={sendInFlight} onClick={() => { insertComposerText(`${skill.slash_name} `); setSkillPickerOpen(false); composerInputRef.current?.focus(); }} type="button" variant="secondary">Insert</Button>
+                    <Button disabled={sendInFlight} onClick={() => void invokeCommand(skill.slash_name)} type="button" variant="primary">{sendInFlight ? "Invoking…" : "Invoke"}</Button>
                   </div>
                 </article>
               ))}

@@ -40,6 +40,29 @@ export type JsonValue =
 
 export type JsonObject = Record<string, JsonValue>;
 
+export type InvocableSkillSideEffectClass =
+  | "read_only"
+  | "advisory"
+  | "writes_memory"
+  | "external_mutation"
+  | "escalation";
+
+export interface InvocableSkill {
+  skill_name: string;
+  slash_name: `/${string}`;
+  description: string;
+  invocation_syntax: string;
+  context_shape: Record<string, string>;
+  side_effect_class: InvocableSkillSideEffectClass;
+  allowed_channels: string[];
+  allowed_users: string[];
+  enabled: boolean;
+}
+
+export interface InvocableSkillsData {
+  skills: InvocableSkill[];
+}
+
 export type TurnTrigger =
   | "user_message"
   | "scheduled_tick"

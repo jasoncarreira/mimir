@@ -179,6 +179,40 @@ def validate_live_event(event: Any) -> None:
         assert event.get("phase") in {"started", "finished", "failed"}
 
 
+def validate_invocable_skills_data(data: Any) -> None:
+    assert isinstance(data, dict)
+    skills = data.get("skills")
+    assert isinstance(skills, list)
+    seen_slashes: set[str] = set()
+    for skill in skills:
+        assert isinstance(skill, dict)
+        assert set(skill) == {
+            "skill_name",
+            "slash_name",
+            "description",
+            "invocation_syntax",
+            "context_shape",
+            "side_effect_class",
+            "allowed_channels",
+            "allowed_users",
+            "enabled",
+        }
+        assert isinstance(skill["skill_name"], str) and skill["skill_name"]
+        assert isinstance(skill["slash_name"], str) and skill["slash_name"].startswith("/")
+        assert skill["slash_name"] not in seen_slashes
+        seen_slashes.add(skill["slash_name"])
+        assert isinstance(skill["description"], str) and skill["description"]
+        assert isinstance(skill["invocation_syntax"], str) and skill["invocation_syntax"]
+        assert isinstance(skill["context_shape"], dict)
+        assert all(isinstance(k, str) and isinstance(v, str) for k, v in skill["context_shape"].items())
+        assert skill["side_effect_class"] in {"read_only", "advisory", "writes_memory", "external_mutation", "escalation"}
+        assert isinstance(skill["allowed_channels"], list)
+        assert all(isinstance(item, str) for item in skill["allowed_channels"])
+        assert isinstance(skill["allowed_users"], list)
+        assert all(isinstance(item, str) for item in skill["allowed_users"])
+        assert isinstance(skill["enabled"], bool)
+
+
 TYPESCRIPT_CONTRACTS = """// Auto-generated from mimir.web_contracts. Do not edit by hand.
 
 export type ApiVersion = "v1";
@@ -220,6 +254,29 @@ export type JsonValue =
   | { [key: string]: JsonValue };
 
 export type JsonObject = Record<string, JsonValue>;
+
+export type InvocableSkillSideEffectClass =
+  | "read_only"
+  | "advisory"
+  | "writes_memory"
+  | "external_mutation"
+  | "escalation";
+
+export interface InvocableSkill {
+  skill_name: string;
+  slash_name: `/${string}`;
+  description: string;
+  invocation_syntax: string;
+  context_shape: Record<string, string>;
+  side_effect_class: InvocableSkillSideEffectClass;
+  allowed_channels: string[];
+  allowed_users: string[];
+  enabled: boolean;
+}
+
+export interface InvocableSkillsData {
+  skills: InvocableSkill[];
+}
 
 export type TurnTrigger =
   | "user_message"

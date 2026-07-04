@@ -34,6 +34,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from ..models import AgentEvent
+from ..skill_catalog import resolve_invocable_skill
 from ..web_channels import DEFAULT_WEB_CHANNEL, web_channel_for_identity
 from ..web_contracts import (
     json_error,
@@ -224,6 +225,18 @@ class WebChatBridge(Bridge):
             return None, None, auth_error
         assert identity is not None
         channel_id = _web_channel_for(identity.canonical)
+        if (
+            content.startswith("/")
+            and resolve_invocable_skill(
+                content,
+                channel_id=channel_id,
+                user=identity.canonical,
+            ) is None
+        ):
+            return None, None, web.json_response(
+                {"error": "skill_not_allowlisted"},
+                status=403,
+            )
         # #487: type-check, don't coerce — a truthy non-dict ``extra`` survives
         # ``or {}`` and later ``event.extra.get(...)`` raises.
         extra = body.get("extra")

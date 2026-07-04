@@ -117,6 +117,63 @@ async def test_post_chat_v1_enqueues_and_returns_contract_envelope(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_post_chat_v1_rejects_non_allowlisted_slash_skill(tmp_path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/api/v1/chat", json={"content": "/github"})
+        body = await resp.json()
+
+    assert resp.status == 403
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "skill_not_allowlisted"
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_accepts_allowlisted_slash_skill(tmp_path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post(
+            "/api/v1/chat",
+            json={"content": "/find-skills web auth endpoints"},
+        )
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert len(enqueued) == 1
+    assert enqueued[0].content == "/find-skills web auth endpoints"
+
+
+@pytest.mark.asyncio
 async def test_post_chat_rejects_anonymous_dev_open_request(bridge_app):
     _, a, enqueued = bridge_app
     async with TestClient(TestServer(a)) as client:

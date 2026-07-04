@@ -8,13 +8,16 @@ from pathlib import Path
 import pytest
 
 from mimir.skill_catalog import (
+    INVOCABLE_SKILLS,
     SkillEntry,
     _extract_trigger,
+    invocable_skills_payload,
     _load_catalog_inner,
     cmd,
     generate,
     load_catalog,
     load_skill,
+    resolve_invocable_skill,
     render_catalog,
 )
 
@@ -260,6 +263,50 @@ def test_generate_is_idempotent(tmp_path: Path) -> None:
     first = generate(tmp_path)
     second = generate(tmp_path)
     assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Invocable-skill allowlist (chainlink #793)
+# ---------------------------------------------------------------------------
+
+
+def test_invocable_skills_are_explicit_safe_allowlist() -> None:
+    slashes = {skill.slash_name for skill in INVOCABLE_SKILLS}
+    assert slashes == {"/find-skills", "/five-whys"}
+    assert all(skill.enabled for skill in INVOCABLE_SKILLS)
+    assert {skill.side_effect_class for skill in INVOCABLE_SKILLS} <= {
+        "read_only",
+        "advisory",
+    }
+
+
+def test_invocable_skills_payload_exposes_typed_contract_shape() -> None:
+    payload = invocable_skills_payload()
+    assert [item["slash_name"] for item in payload["skills"]] == [
+        "/find-skills",
+        "/five-whys",
+    ]
+    for item in payload["skills"]:
+        assert set(item) == {
+            "skill_name",
+            "slash_name",
+            "description",
+            "invocation_syntax",
+            "context_shape",
+            "side_effect_class",
+            "allowed_channels",
+            "allowed_users",
+            "enabled",
+        }
+
+
+def test_resolve_invocable_skill_allows_only_allowlisted_slash_names() -> None:
+    assert resolve_invocable_skill("/find-skills") is not None
+    assert resolve_invocable_skill("five-whys") is not None
+    assert resolve_invocable_skill("/github") is None
+    assert resolve_invocable_skill("/review") is None
+    assert resolve_invocable_skill("/chainlink") is None
+    assert resolve_invocable_skill("/memory") is None
 
 
 # ---------------------------------------------------------------------------

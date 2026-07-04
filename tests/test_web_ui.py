@@ -31,6 +31,7 @@ from mimir.turn_event_bus import TurnEventBus
 from mimir.web_contracts import (
     render_typescript_contracts,
     validate_api_envelope,
+    validate_invocable_skills_data,
     validate_live_event,
     validate_list_meta,
 )
@@ -75,6 +76,22 @@ def test_global_dashboard_extensions_are_admin_only_in_nav_payload():
     assert manifests["saga"]["requires_role"] == "admin"
     assert manifests["state-memory"]["requires_role"] == "admin"
     assert manifests["chat"]["requires_role"] is None
+
+
+@pytest.mark.asyncio
+async def test_invocable_skills_v1_uses_shared_allowlist_contract(app):
+    a, _, _ = app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/skills/invocable")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    validate_invocable_skills_data(body["data"])
+    slashes = {skill["slash_name"] for skill in body["data"]["skills"]}
+    assert slashes == {"/find-skills", "/five-whys"}
+    assert "/github" not in slashes
+    assert "/review" not in slashes
 
 
 def test_dashboard_extension_registry_sorts_hides_and_validates_scope():
