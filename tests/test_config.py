@@ -3,6 +3,7 @@ and Config properties (chainlink #247, slice 2/5).
 
 Coverage map:
 - ``_parse_sources``     — all three output shapes (frozenset, frozenset(), None)
+- ``_parse_chat_skill_allowlist`` — normalization, dedupe, invalid-drop
 - ``_env_float``         — unset/empty/valid
 - ``_env_int``           — unset/valid/negative
 - ``_turns_cap``         — default, normal, ceiling clamp
@@ -32,6 +33,7 @@ from mimir.config import (
     _TURNS_CAP_MAX,
     _env_float,
     _env_int,
+    _parse_chat_skill_allowlist,
     _events_cap,
     _parse_sources,
     _turns_cap,
@@ -79,6 +81,22 @@ class TestParseSources:
         result = _parse_sources("slack,discord,web")
         assert result == frozenset({"slack", "discord", "web"})
 
+
+# ---------------------------------------------------------------------------
+# _parse_chat_skill_allowlist
+# ---------------------------------------------------------------------------
+
+class TestParseChatSkillAllowlist:
+    def test_empty_string_returns_empty_tuple(self) -> None:
+        assert _parse_chat_skill_allowlist("") == ()
+
+    def test_normalizes_dedupes_and_drops_invalid_entries(self) -> None:
+        assert _parse_chat_skill_allowlist(
+            " /Memory, github, GITHUB, //oops, world_scanning, foo/bar, review "
+        ) == ("memory", "github", "review")
+
+
+class TestParseSourcesTokens:
     def test_normalises_to_lowercase(self) -> None:
         """Tokens are lowercased for normalisation."""
         result = _parse_sources("Slack,DISCORD")
@@ -316,6 +334,29 @@ class TestConfigFromEnv:
         monkeypatch.setenv("MIMIR_ACTIVITY_PANEL_CHANNELS", "slack-C01, dm-slack-")
         cfg = Config.from_env()
         assert cfg.activity_panel_channels == ("slack-C01", "dm-slack-")
+
+    def test_chat_skills_disabled_with_empty_allowlist_by_default(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_CHAT_SKILLS_ENABLED", raising=False)
+        monkeypatch.delenv("MIMIR_CHAT_SKILL_ALLOWLIST", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.chat_skills_enabled is False
+        assert cfg.chat_skill_allowlist == ()
+
+    def test_chat_skill_allowlist_from_env_is_normalized(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_CHAT_SKILLS_ENABLED", "true")
+        monkeypatch.setenv(
+            "MIMIR_CHAT_SKILL_ALLOWLIST",
+            " /Memory, github, GITHUB, //oops, foo/bar, review ",
+        )
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.chat_skills_enabled is True
+        assert cfg.chat_skill_allowlist == ("memory", "github", "review")
 
     def test_file_op_extra_roots_empty_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._base(monkeypatch)
