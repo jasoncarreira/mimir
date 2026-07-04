@@ -204,7 +204,7 @@ async def test_post_chat_v1_slash_passthrough_when_registry_disabled_strips_clie
 
 
 @pytest.mark.asyncio
-async def test_post_chat_v1_injects_server_owned_chat_skill_metadata(tmp_path):
+async def test_post_chat_v1_injects_server_owned_chat_skill_metadata(tmp_path, caplog):
     registry = StubChatSkillRegistry(
         enabled=True,
         resolved=ChatSkillInvocation(
@@ -215,6 +215,8 @@ async def test_post_chat_v1_injects_server_owned_chat_skill_metadata(tmp_path):
         ),
     )
     _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
+
+    caplog.set_level("INFO")
 
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
@@ -244,10 +246,11 @@ async def test_post_chat_v1_injects_server_owned_chat_skill_metadata(tmp_path):
             "raw": "  /memory remember this  ",
         },
     }
+    assert "web chat slash command accepted: command=/memory skill=memory" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_post_chat_v1_rejects_invalid_slash_commands_with_stable_code(tmp_path):
+async def test_post_chat_v1_rejects_invalid_slash_commands_with_stable_code(tmp_path, caplog):
     registry = StubChatSkillRegistry(
         enabled=True,
         resolved=ChatSkillError(
@@ -258,6 +261,8 @@ async def test_post_chat_v1_rejects_invalid_slash_commands_with_stable_code(tmp_
         ),
     )
     _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
+
+    caplog.set_level("INFO")
 
     async with TestClient(TestServer(app)) as client:
         resp = await client.post("/api/v1/chat", json={"content": "/memory!"})
@@ -270,10 +275,11 @@ async def test_post_chat_v1_rejects_invalid_slash_commands_with_stable_code(tmp_
         "Chat skill name must be lowercase letters, digits, and hyphens."
     )
     assert enqueued == []
+    assert "web chat slash command rejected: reason=invalid command=/memory!" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_post_chat_v1_rejects_unavailable_slash_commands_with_stable_code(tmp_path):
+async def test_post_chat_v1_rejects_unavailable_slash_commands_with_stable_code(tmp_path, caplog):
     registry = StubChatSkillRegistry(
         enabled=True,
         resolved=ChatSkillError(
@@ -285,6 +291,8 @@ async def test_post_chat_v1_rejects_unavailable_slash_commands_with_stable_code(
     )
     _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
 
+    caplog.set_level("INFO")
+
     async with TestClient(TestServer(app)) as client:
         resp = await client.post("/api/v1/chat", json={"content": "/github"})
         body = await resp.json()
@@ -294,6 +302,10 @@ async def test_post_chat_v1_rejects_unavailable_slash_commands_with_stable_code(
     assert body["error"]["code"] == "chat_skill_unavailable"
     assert body["error"]["message"] == "Chat skill '/github' is not available."
     assert enqueued == []
+    assert (
+        "web chat slash command rejected: reason=unavailable command=/github allowlist_size=0"
+        in caplog.text
+    )
 
 
 @pytest.mark.asyncio
