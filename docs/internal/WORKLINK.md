@@ -18,8 +18,12 @@ PR) is gone. Epics are now built by the external **opencode feature-factory**;
 The **planner/decomposer contract** (the leaf template in §2.5) is enforced: a
 leaf missing the required sections is auto-demoted to `worklink:blocked` with a
 `WORKLINK_BLOCKED` reason before dispatch (re-plan → re-add `worklink:ready`).
-Execution is isolated in per-leaf worktrees on the local substrate (#830 retired
-the docker-sibling broker). A failed attempt is retried up to the configured
+Execution is isolated in per-leaf worktrees via the configured compute backend
+(§5). The docker-sibling broker and `ecs-runtask` remain available as isolated
+substrates for autonomous/unsandboxed use; the current mimirbot deployment runs
+the local substrate with the opencode backend by operator config — that is a
+deployment choice, not a code change in #830 (which removed only the in-mimir
+epic runner, not the broker). A failed attempt is retried up to the configured
 retry count and then marks the leaf blocked. A leaf PR is never auto-merged into
 base — operator/reviewer approval of each PR remains the merge boundary. The
 slice markers below are historical rollout notes — the poller, the
