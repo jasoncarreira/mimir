@@ -23,7 +23,6 @@ import pytest
 
 from mimir.worklink import autonomy
 from mimir.worklink.claims import CLAIM_PREFIX, ChainlinkClaims, ClaimRecord
-from mimir.worklink.epic_state import EpicRunManifest, EpicSliceRecord, save_epic_state
 
 
 def cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -257,18 +256,6 @@ def test_reap_home_leaves_finalizing_claim_with_fresh_heartbeat_untouched() -> N
     assert "locks steal 57" not in fake.names()
 
 
-def test_reap_home_skips_epic_parent_claims_for_epic_reaper() -> None:
-    fake = FakeChainlink(
-        in_progress=[58],
-        epic_ids={58},
-        comments={58: [_claim_comment(58, attempt=1, age=timedelta(hours=3))]},
-    )
-    claims = ChainlinkClaims(agent_id="t", runner=fake)
-
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
-    assert "locks steal 58" not in fake.names()
-
-
 def test_reap_home_uses_latest_record_per_issue() -> None:
     # Two claim comments for the same issue; the latest (attempt 2, fresh) wins,
     # so the stale attempt-1 record must NOT trigger a reap.
@@ -394,140 +381,6 @@ def test_reap_for_home_uses_config_ttl(tmp_path: Path) -> None:
     claims = ChainlinkClaims(agent_id="t", runner=fake)
     reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
     assert [r.issue_id for r in reaped] == [60]
-
-
-def test_reap_for_home_resumes_stale_epic_from_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
-    save_epic_state(
-        tmp_path,
-        EpicRunManifest(
-            epic_id=100,
-            integration_branch="epic/100-integration",
-            integration_worktree=str(tmp_path / "integration"),
-            base_ref="main",
-            phase="build",
-            slices=[
-                EpicSliceRecord(id=101, status="merged", merge_commit="abc123"),
-                EpicSliceRecord(id=102, status="pending"),
-            ],
-        ),
-    )
-    fake = FakeChainlink(
-        in_progress=[100, 60],
-        epic_ids={100},
-        active_locks=[100, 60],
-        comments={
-            100: [_claim_comment(100, attempt=1, age=timedelta(hours=3))],
-            60: [_claim_comment(60, attempt=1, age=timedelta(hours=3))],
-        },
-    )
-    dispatched: list[dict[str, object]] = []
-
-    def fake_dispatch_detached_epic_resume(**kwargs: object) -> Path:
-        dispatched.append(kwargs)
-        return tmp_path / "state" / "worklink" / "epic-reaper" / "run-epic-100.log"
-
-    monkeypatch.setattr(autonomy, "worklink_repo", lambda: "/repo")
-    monkeypatch.setattr(autonomy, "dispatch_detached_epic_resume", fake_dispatch_detached_epic_resume)
-
-    reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=ChainlinkClaims(agent_id="t", runner=fake))
-
-    assert [r.issue_id for r in reaped] == [100, 60]
-    assert dispatched == [{"home": tmp_path, "repo": Path("/repo"), "epic_id": 100}]
-    assert ["chainlink", "locks", "steal", "100"] in fake.calls
-    assert ["chainlink", "locks", "release", "100"] in fake.calls
-    assert fake.names().index("issue comment 100") < fake.names().index("locks steal 60")
-    assert not any(c[1:] == ["issue", "label", "101", "worklink:ready"] for c in fake.calls)
-    assert not any(c[1:] == ["issue", "label", "102", "worklink:ready"] for c in fake.calls)
-    assert not any(c[1:] == ["issue", "label", "100", "worklink:ready"] for c in fake.calls)
-
-
-def test_dispatch_detached_epic_resume_uses_run_epic_cli(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    popens: list[dict[str, object]] = []
-
-    class FakePopen:
-        def __init__(self, argv: Sequence[str], **kwargs: object) -> None:
-            popens.append({"argv": list(argv), **kwargs})
-
-    monkeypatch.setenv("WORKLINK_RUN_BIN", "uv run mimir")
-    monkeypatch.setattr(subprocess, "Popen", FakePopen)
-
-    log_path = autonomy.dispatch_detached_epic_resume(home=tmp_path, repo=repo, epic_id=100)
-
-    assert log_path == tmp_path / "state" / "worklink" / "epic-reaper" / "run-epic-100.log"
-    assert popens[0]["argv"] == [
-        "uv",
-        "run",
-        "mimir",
-        "worklink",
-        "run-epic",
-        "100",
-        "--home",
-        str(tmp_path),
-        "--repo",
-        str(repo),
-        "--autonomous",
-    ]
-    assert popens[0]["cwd"] == str(repo)
-    assert popens[0]["start_new_session"] is True
-
-
-
-def test_reap_for_home_live_epic_heartbeat_is_not_reaped(tmp_path: Path) -> None:
-    _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
-    save_epic_state(
-        tmp_path,
-        EpicRunManifest(
-            epic_id=100,
-            integration_branch="epic/100-integration",
-            integration_worktree=str(tmp_path / "integration"),
-            base_ref="main",
-            phase="build",
-            slices=[EpicSliceRecord(id=101, status="pending")],
-        ),
-    )
-    fake = FakeChainlink(
-        in_progress=[100],
-        epic_ids={100},
-        active_locks=[100],
-        comments={
-            100: [
-                _claim_comment(
-                    100,
-                    attempt=1,
-                    age=timedelta(hours=3),
-                    heartbeat_age=timedelta(seconds=30),
-                )
-            ]
-        },
-    )
-
-    reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=ChainlinkClaims(agent_id="t", runner=fake))
-
-    assert reaped == []
-    assert "locks steal 100" not in fake.names()
-
-
-def test_reap_for_home_dead_epic_without_manifest_returns_parent_to_ready(tmp_path: Path) -> None:
-    _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
-    fake = FakeChainlink(
-        in_progress=[100],
-        epic_ids={100},
-        active_locks=[100],
-        comments={100: [_claim_comment(100, attempt=1, age=timedelta(hours=3))]},
-    )
-
-    reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=ChainlinkClaims(agent_id="t", runner=fake))
-
-    assert [r.issue_id for r in reaped] == [100]
-    assert ["chainlink", "issue", "label", "100", "worklink:ready"] in fake.calls
-    assert not any(c[1:] == ["issue", "label", "101", "worklink:ready"] for c in fake.calls)
 
 
 def test_reap_for_home_refuses_ttl_not_greater_than_timeout(tmp_path: Path) -> None:
@@ -984,78 +837,17 @@ def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
-def test_poller_routes_actionable_epic_to_epic_run(tmp_path: Path) -> None:
+def test_poller_does_not_dispatch_worklink_epic_issues(tmp_path: Path) -> None:
+    """chainlink #830: the epic runner is removed — an actionable worklink:epic
+    issue must NOT be dispatched by the poller (it is built by the opencode
+    feature-factory, not as a leaf or via a run-epic controller)."""
     home = tmp_path / "home"
     home.mkdir()
     repo = tmp_path / "repo"
     repo.mkdir()
     chainlink = _fake_chainlink_script(
         tmp_path,
-        ready=[101, 102],
-        epics=[100],
-        parents={101: 100, 102: 100},
-        actionable=[100, 101, 102],
-        active_locks=[],
-    )
-    runbin = _fake_run_bin(tmp_path)
-
-    events = _run_poller(tmp_path, {
-        "MIMIR_HOME": str(home),
-        "CHAINLINK_BIN": str(chainlink),
-        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
-        "WORKLINK_REPO": str(repo),
-        "WORKLINK_MAX_CONCURRENT": "3",
-        "STATE_DIR": str(tmp_path / "state"),
-    })
-
-    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
-    assert [(e["mode"], e["issue_id"]) for e in dispatched] == [("epic", 100)]
-    expected_lines = [
-        f"worklink run-epic 100 --home {home} --repo {repo} --autonomous"
-    ]
-    assert _wait_for_dispatch_lines(tmp_path, expected_lines) == expected_lines
-
-
-@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
-def test_poller_skips_terminal_epic_labels(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    chainlink = _fake_chainlink_script(
-        tmp_path,
-        ready=[101, 102, 103],
-        epics=[100, 200, 300],
-        blocked_epics=[100],
-        review_epics=[200],
-        parents={101: 100, 102: 200, 103: 300},
-        actionable=[100, 101, 200, 102, 300, 103],
-        active_locks=[],
-    )
-    runbin = _fake_run_bin(tmp_path)
-
-    events = _run_poller(tmp_path, {
-        "MIMIR_HOME": str(home),
-        "CHAINLINK_BIN": str(chainlink),
-        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
-        "WORKLINK_REPO": str(repo),
-        "WORKLINK_MAX_CONCURRENT": "3",
-        "STATE_DIR": str(tmp_path / "state"),
-    })
-
-    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
-    assert [(e["mode"], e["issue_id"]) for e in dispatched] == [("epic", 300)]
-
-
-@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
-def test_poller_routes_actionable_epic_brief_without_leaves_to_epic_run(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    chainlink = _fake_chainlink_script(
-        tmp_path,
-        ready=[],
+        ready=[100],
         epics=[100],
         actionable=[100],
         active_locks=[],
@@ -1067,15 +859,14 @@ def test_poller_routes_actionable_epic_brief_without_leaves_to_epic_run(tmp_path
         "CHAINLINK_BIN": str(chainlink),
         "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
         "WORKLINK_REPO": str(repo),
-        "WORKLINK_MAX_CONCURRENT": "1",
+        "WORKLINK_MAX_CONCURRENT": "3",
         "STATE_DIR": str(tmp_path / "state"),
     })
 
     dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
-    assert [(e["mode"], e["issue_id"]) for e in dispatched] == [("epic", 100)]
+    assert dispatched == []
 
 
-@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
 def test_poller_keeps_bare_ready_leaf_on_per_leaf_run(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
