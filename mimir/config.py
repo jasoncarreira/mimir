@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -477,6 +478,45 @@ def _parse_activity_panel_detail(raw: str) -> tuple[tuple[str, str], ...]:
             )
             continue
         out.append((prefix, level))
+    return tuple(out)
+
+
+_CHAT_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _normalize_chat_skill_name(raw: str) -> str | None:
+    """Normalize one chat-skill name to its command slug.
+
+    Rules (chainlink #783): strip surrounding whitespace, tolerate one optional
+    leading slash, lowercase, and reject anything outside the normalized
+    ``lowercase-with-hyphens`` command surface.
+    """
+    candidate = (raw or "").strip()
+    if not candidate:
+        return None
+    if candidate.startswith("/"):
+        candidate = candidate[1:]
+    candidate = candidate.lower()
+    if not candidate or not _CHAT_SKILL_NAME_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def _parse_chat_skill_allowlist(raw: str) -> tuple[str, ...]:
+    """Parse ``MIMIR_CHAT_SKILL_ALLOWLIST`` into normalized unique names.
+
+    Invalid entries are dropped silently (fail-safe, default-off posture); the
+    operator-visible behavior is simply that only valid, normalized skill names
+    survive into the allowlist.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in (raw or "").split(","):
+        name = _normalize_chat_skill_name(token)
+        if name is None or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
     return tuple(out)
 
 
@@ -952,6 +992,10 @@ class Config:
     # scrubbed in-flight detail; ``prefix:level`` entries opt specific prefixes.
     # ``MIMIR_ACTIVITY_PANEL_DETAIL``.
     activity_panel_detail: tuple[tuple[str, str], ...] = ()
+    # chainlink #783: opt-in chat slash-skill discovery/invocation. Disabled by
+    # default; the allowlist is normalized, lowercased skill slugs only.
+    chat_skills_enabled: bool = False
+    chat_skill_allowlist: tuple[str, ...] = ()
     # Operator-declared absolute roots OUTSIDE the home the file tools may
     # read/edit, as ``(abs_path, "ro"|"rw")`` pairs (chainlink #650). Empty =
     # home-only (today's behavior). ``MIMIR_FILE_TOOL_ROOTS``.
@@ -1103,6 +1147,10 @@ class Config:
             ),
             activity_panel_detail=_parse_activity_panel_detail(
                 _env("MIMIR_ACTIVITY_PANEL_DETAIL", "")
+            ),
+            chat_skills_enabled=_env_bool("MIMIR_CHAT_SKILLS_ENABLED", False),
+            chat_skill_allowlist=_parse_chat_skill_allowlist(
+                _env("MIMIR_CHAT_SKILL_ALLOWLIST", "")
             ),
             api_key=_env("MIMIR_API_KEY"),
             web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),
