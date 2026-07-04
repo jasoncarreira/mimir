@@ -179,6 +179,33 @@ def validate_live_event(event: Any) -> None:
         assert event.get("phase") in {"started", "finished", "failed"}
 
 
+def validate_invocable_skills_data(payload: Any) -> None:
+    assert isinstance(payload, dict)
+    skills = payload.get("skills")
+    assert isinstance(skills, list)
+    for item in skills:
+        assert isinstance(item, dict)
+        assert isinstance(item.get("skill_name"), str) and item["skill_name"]
+        slash_name = item.get("slash_name")
+        assert isinstance(slash_name, str) and slash_name.startswith("/")
+        assert isinstance(item.get("description"), str) and item["description"]
+        assert isinstance(item.get("invocation_syntax"), str) and item["invocation_syntax"]
+        assert isinstance(item.get("context_schema"), dict)
+        assert item.get("side_effect_class") in {
+            "none",
+            "read",
+            "write",
+            "external",
+            "escalation",
+        }
+        constraints = item.get("constraints")
+        assert isinstance(constraints, dict)
+        assert isinstance(constraints.get("channels"), list)
+        assert isinstance(constraints.get("users"), list)
+        assert all(isinstance(channel, str) for channel in constraints["channels"])
+        assert all(isinstance(user, str) for user in constraints["users"])
+
+
 TYPESCRIPT_CONTRACTS = """// Auto-generated from mimir.web_contracts. Do not edit by hand.
 
 export type ApiVersion = "v1";
@@ -930,6 +957,30 @@ export interface ChatPostRequest {
 export interface ChatAcceptedData {
   channel_id: string;
   source_id: string;
+}
+
+export type InvocableSkillSideEffectClass =
+  | "none"
+  | "read"
+  | "write"
+  | "external"
+  | "escalation";
+
+export interface InvocableSkill {
+  skill_name: string;
+  slash_name: string;
+  description: string;
+  invocation_syntax: string;
+  context_schema: JsonObject;
+  side_effect_class: InvocableSkillSideEffectClass;
+  constraints: {
+    channels: string[];
+    users: string[];
+  };
+}
+
+export interface InvocableSkillsData {
+  skills: InvocableSkill[];
 }
 
 /** One restored message from GET /api/v1/chat/history (oldest→newest). */

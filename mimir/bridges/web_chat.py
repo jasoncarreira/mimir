@@ -34,6 +34,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from ..models import AgentEvent
+from ..skill_catalog import list_invocable_skills
 from ..web_channels import DEFAULT_WEB_CHANNEL, web_channel_for_identity
 from ..web_contracts import (
     json_error,
@@ -392,6 +393,20 @@ class WebChatBridge(Bridge):
         ]
         return json_success({"channel_id": channel_id, "messages": messages})
 
+    async def _handle_skills(self, request: web.Request) -> web.Response:
+        """GET /api/v1/chat/skills: read-only invocable skill registry."""
+        identity = request.get("auth_identity")
+        user_id = getattr(identity, "canonical", None)
+        channel_id = _web_channel_for(user_id) if isinstance(user_id, str) else None
+        return json_success(
+            {
+                "skills": list_invocable_skills(
+                    channel_id=channel_id,
+                    user_id=user_id if isinstance(user_id, str) else None,
+                )
+            }
+        )
+
     def register_routes(self, app: web.Application) -> None:
         """Mount /chat (POST) + /chat/stream (GET) + history on the shared app."""
         existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
@@ -401,5 +416,7 @@ class WebChatBridge(Bridge):
             app.router.add_post("/api/v1/chat", self._handle_post_v1)
         if ("GET", "/api/v1/chat/history") not in existing:
             app.router.add_get("/api/v1/chat/history", self._handle_history)
+        if ("GET", "/api/v1/chat/skills") not in existing:
+            app.router.add_get("/api/v1/chat/skills", self._handle_skills)
         if ("GET", "/chat/stream") not in existing:
             app.router.add_get("/chat/stream", self._handle_stream)

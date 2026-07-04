@@ -13,9 +13,12 @@ from mimir.skill_catalog import (
     _load_catalog_inner,
     cmd,
     generate,
+    invocable_skill_registry,
+    list_invocable_skills,
     load_catalog,
     load_skill,
     render_catalog,
+    resolve_invocable_skill,
 )
 
 
@@ -260,6 +263,35 @@ def test_generate_is_idempotent(tmp_path: Path) -> None:
     first = generate(tmp_path)
     second = generate(tmp_path)
     assert first == second
+
+
+def test_invocable_skill_registry_is_explicit_safe_allowlist() -> None:
+    skills = invocable_skill_registry()
+    slash_names = {skill.slash_name for skill in skills}
+    assert slash_names == {"/find-skills", "/five-whys", "/try-harder"}
+    assert all(skill.side_effect_class == "none" for skill in skills)
+    assert all(skill.invocation_syntax.startswith(skill.slash_name) for skill in skills)
+    assert all(skill.context_schema.get("type") == "object" for skill in skills)
+
+
+def test_resolve_invocable_skill_only_accepts_allowlisted_slash_names() -> None:
+    assert resolve_invocable_skill("/find-skills") is not None
+    assert resolve_invocable_skill("find-skills please") is not None
+    assert resolve_invocable_skill("/memory") is None
+    assert resolve_invocable_skill("/github") is None
+    assert resolve_invocable_skill("/review") is None
+    assert resolve_invocable_skill("/chainlink") is None
+
+
+def test_invocable_skill_listing_uses_registry_shape() -> None:
+    payload = list_invocable_skills()
+    assert [item["slash_name"] for item in payload] == [
+        "/find-skills",
+        "/five-whys",
+        "/try-harder",
+    ]
+    assert all(set(item["constraints"]) == {"channels", "users"} for item in payload)
+    assert all("context_schema" in item for item in payload)
 
 
 # ---------------------------------------------------------------------------

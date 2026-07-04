@@ -30,6 +30,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from mimir.event_logger import log_event_sync
 from mimir.skill_md import parse_frontmatter
@@ -77,6 +78,156 @@ class SkillEntry:
     name: str
     description: str
     trigger: str
+
+
+@dataclass(frozen=True)
+class InvocableSkill:
+    """Allowlisted skill that may be surfaced as an explicit slash command."""
+
+    skill_name: str
+    slash_name: str
+    description: str
+    invocation_syntax: str
+    context_schema: dict[str, Any]
+    side_effect_class: str
+    allowed_channels: tuple[str, ...] = ()
+    allowed_users: tuple[str, ...] = ()
+    enabled: bool = True
+
+    def to_web_dict(self) -> dict[str, Any]:
+        """Stable public shape for React/API consumers."""
+        return {
+            "skill_name": self.skill_name,
+            "slash_name": self.slash_name,
+            "description": self.description,
+            "invocation_syntax": self.invocation_syntax,
+            "context_schema": self.context_schema,
+            "side_effect_class": self.side_effect_class,
+            "constraints": {
+                "channels": list(self.allowed_channels),
+                "users": list(self.allowed_users),
+            },
+        }
+
+
+_NO_CONTEXT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {},
+    "required": [],
+}
+
+
+# Explicit allowlist for slash-invocable skills. The broader skill catalog is
+# discovery-only; this registry is the safety boundary for any UI/command
+# surface that lets users invoke a skill by name.
+INVOCABLE_SKILLS: tuple[InvocableSkill, ...] = (
+    InvocableSkill(
+        skill_name="find-skills",
+        slash_name="/find-skills",
+        description="Find the bundled skill most relevant to the current task.",
+        invocation_syntax="/find-skills <task or question>",
+        context_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Short task or question used to choose a skill.",
+                },
+            },
+            "required": ["query"],
+        },
+        side_effect_class="none",
+    ),
+    InvocableSkill(
+        skill_name="five-whys",
+        slash_name="/five-whys",
+        description="Run a lightweight five-whys analysis for a problem.",
+        invocation_syntax="/five-whys <problem>",
+        context_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "problem": {
+                    "type": "string",
+                    "description": "Problem statement to analyze.",
+                },
+            },
+            "required": ["problem"],
+        },
+        side_effect_class="none",
+    ),
+    InvocableSkill(
+        skill_name="try-harder",
+        slash_name="/try-harder",
+        description="Ask the agent to revisit a stuck task with deeper effort.",
+        invocation_syntax="/try-harder <stuck task>",
+        context_schema=_NO_CONTEXT_SCHEMA,
+        side_effect_class="none",
+    ),
+)
+
+
+def invocable_skill_registry() -> tuple[InvocableSkill, ...]:
+    """Return enabled allowlisted skills in stable slash-name order."""
+    return tuple(
+        sorted(
+            (skill for skill in INVOCABLE_SKILLS if skill.enabled),
+            key=lambda skill: skill.slash_name,
+        )
+    )
+
+
+def list_invocable_skills(
+    *,
+    channel_id: str | None = None,
+    user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return public invocable-skill metadata, honoring optional constraints."""
+    return [
+        skill.to_web_dict()
+        for skill in invocable_skill_registry()
+        if _invocable_constraints_match(skill, channel_id=channel_id, user_id=user_id)
+    ]
+
+
+def resolve_invocable_skill(
+    slash_name: str,
+    *,
+    channel_id: str | None = None,
+    user_id: str | None = None,
+) -> InvocableSkill | None:
+    """Resolve only explicitly allowlisted slash names.
+
+    This intentionally performs no fallback from arbitrary ``/<skill>`` text to
+    the broader catalog, so non-allowlisted bundled skills cannot be invoked by
+    guessing their slash name.
+    """
+    normalized = slash_name.strip().split(maxsplit=1)[0] if slash_name.strip() else ""
+    if normalized and not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    for skill in invocable_skill_registry():
+        if skill.slash_name == normalized and _invocable_constraints_match(
+            skill,
+            channel_id=channel_id,
+            user_id=user_id,
+        ):
+            return skill
+    return None
+
+
+def _invocable_constraints_match(
+    skill: InvocableSkill,
+    *,
+    channel_id: str | None,
+    user_id: str | None,
+) -> bool:
+    if skill.allowed_channels and channel_id not in skill.allowed_channels:
+        return False
+    if skill.allowed_users and user_id not in skill.allowed_users:
+        return False
+    return True
 
 
 def _extract_trigger(description: str) -> str:

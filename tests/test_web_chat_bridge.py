@@ -13,7 +13,11 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from mimir.bridges.web_chat import DEFAULT_CHANNEL, WebChatBridge, _Subscriber
 from mimir.models import AgentEvent
-from mimir.web_contracts import validate_api_envelope, validate_live_event
+from mimir.web_contracts import (
+    validate_api_envelope,
+    validate_invocable_skills_data,
+    validate_live_event,
+)
 
 
 @pytest.fixture
@@ -114,6 +118,26 @@ async def test_post_chat_v1_enqueues_and_returns_contract_envelope(tmp_path):
     assert body["data"] == {"channel_id": "web-alice", "source_id": "client-1"}
     assert enqueued[0].source_id == "client-1"
     assert enqueued[0].channel_id == "web-alice"
+
+
+@pytest.mark.asyncio
+async def test_chat_skills_v1_returns_invocable_skill_registry(authed_bridge_app):
+    _, a, _ = authed_bridge_app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(
+            "/api/v1/chat/skills",
+            headers={"X-API-Key": "stream-secret"},
+        )
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    validate_invocable_skills_data(body["data"])
+    assert {item["slash_name"] for item in body["data"]["skills"]} == {
+        "/find-skills",
+        "/five-whys",
+        "/try-harder",
+    }
 
 
 @pytest.mark.asyncio

@@ -751,6 +751,30 @@ export interface ChatAcceptedData {
   source_id: string;
 }
 
+export type InvocableSkillSideEffectClass =
+  | "none"
+  | "read"
+  | "write"
+  | "external"
+  | "escalation";
+
+export interface InvocableSkill {
+  skill_name: string;
+  slash_name: string;
+  description: string;
+  invocation_syntax: string;
+  context_schema: JsonObject;
+  side_effect_class: InvocableSkillSideEffectClass;
+  constraints: {
+    channels: string[];
+    users: string[];
+  };
+}
+
+export interface InvocableSkillsData {
+  skills: InvocableSkill[];
+}
+
 /** One restored message from GET /api/v1/chat/history (oldest→newest). */
 export interface ChatHistoryMessage {
   message_id: string;

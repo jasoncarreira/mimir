@@ -13,12 +13,14 @@ from typing import Any
 import pytest
 
 from mimir.tools import web as web_tools_mod
+from mimir.skill_catalog import list_invocable_skills
 from mimir.tools.web import (
     _name_from_url,
     _provider_from_model_spec,
     _sanitize_download_name,
     web_tools_enabled,
 )
+from mimir.web_contracts import validate_invocable_skills_data
 
 
 # ─── Provider gating ───────────────────────────────────────────────
@@ -360,6 +362,16 @@ async def test_web_search_bad_time_range(monkeypatch: pytest.MonkeyPatch) -> Non
         {"query": "anthropic", "time_range": "fortnight"}
     )
     assert "time_range must be one of" in out
+
+
+def test_invocable_skills_payload_matches_web_contract() -> None:
+    payload = {"skills": list_invocable_skills()}
+    validate_invocable_skills_data(payload)
+    assert {item["slash_name"] for item in payload["skills"]} == {
+        "/find-skills",
+        "/five-whys",
+        "/try-harder",
+    }
 
 
 # ─── Registry conditional inclusion ────────────────────────────────
