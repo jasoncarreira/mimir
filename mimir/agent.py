@@ -45,7 +45,7 @@ import traceback
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -57,6 +57,7 @@ from .channel_registry import (
     post_job_failure_notice,
     resolve_deliver_channel,
 )
+from .chat_skills import CHAT_SKILL_EXTRA_KEY, ChatSkillRegistry
 from .config import Config
 from .event_logger import log_event, log_event_sync, safe_log_event
 from .feedback import FeedbackLog
@@ -771,6 +772,7 @@ class Agent:
         commitments_store: Any = None,
         turn_hooks: list[Any] | None = None,
         turn_event_bus: Any = None,
+        chat_skill_registry: ChatSkillRegistry | None = None,
     ) -> None:
         self._config = config
         self._turn_logger = turn_logger
@@ -795,6 +797,9 @@ class Agent:
         # in real time so the dashboard character animates live instead of
         # replaying post-hoc from turns.jsonl. None → feature off (no-op).
         self._turn_event_bus = turn_event_bus
+        # chainlink #783: chat-skill slash-command prompt injection is driven
+        # only by the injected registry; Agent must not construct its own.
+        self._chat_skill_registry = chat_skill_registry
         # Phase 2b due-check poller (server.py:_on_startup) reads this
         # attribute via getattr. Pre-fix it was always None — every
         # commitment_complete / _snooze / _dismiss / _list tool call
@@ -1493,6 +1498,15 @@ class Agent:
             # with the in-body path (which sets that flag after the loop).
             if not getattr(ctx, "outcome_emitted", False):
                 try:
+                    await self._notify_chat_skill_failure(
+                        event,
+                        f"{type(exc).__name__}: {exc}",
+                        ctx,
+                        phase="early_exception",
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original
+                    log.exception("early-phase chat-skill failure notice failed")
+                try:
                     await self._post_deliver_failure(
                         event, f"{type(exc).__name__}: {exc}",
                     )
@@ -1582,6 +1596,91 @@ class Agent:
         await post_job_failure_notice(
             self._channels, deliver, label=str(label), error=error[:240],
         )
+
+    @staticmethod
+    def _chat_skill_failure_fields(invocation_payload: Any) -> dict[str, Any]:
+        """Return a bounded, non-sensitive summary of a chat-skill payload."""
+        fields: dict[str, Any] = {}
+        if not isinstance(invocation_payload, Mapping):
+            fields["chat_skill_payload_type"] = type(invocation_payload).__name__[:80]
+            return fields
+        raw_token = ""
+        raw = invocation_payload.get("raw")
+        if isinstance(raw, str):
+            raw_token = raw.lstrip().split(None, 1)[0].strip()
+        command_token = ""
+        command = invocation_payload.get("command")
+        if isinstance(command, str):
+            command_token = command.strip().split(None, 1)[0].strip()
+        label = raw_token or command_token
+        if label.startswith("/"):
+            fields["chat_skill_command"] = label[:80]
+        name = invocation_payload.get("name")
+        if isinstance(name, str) and name.strip():
+            fields["chat_skill_name"] = name.strip()[:80]
+        return fields
+
+    @staticmethod
+    def _chat_skill_failure_notice(phase: str, command: str | None) -> str:
+        label = command or "that slash command"
+        if phase == "prompt_resolution":
+            return (
+                f"⚠️ I couldn't validate {label} safely, so I didn't run it. "
+                "Please try again or ask the operator to verify the chat-skill "
+                "allowlist."
+            )
+        return (
+            f"⚠️ I couldn't complete {label} on this turn. "
+            "Please try again in a new message."
+        )
+
+    async def _notify_chat_skill_failure(
+        self,
+        event: AgentEvent,
+        error: str,
+        ctx: Any,
+        phase: str,
+    ) -> None:
+        """Best-effort notice + structured log for chat-skill runtime failures."""
+        extra = event.extra or {}
+        if CHAT_SKILL_EXTRA_KEY not in extra:
+            return
+        failure_fields = self._chat_skill_failure_fields(
+            extra.get(CHAT_SKILL_EXTRA_KEY)
+        )
+        await safe_log_event(
+            "chat_skill_runtime_failed",
+            channel_id=event.channel_id,
+            trigger=event.trigger,
+            phase=phase,
+            error=(error or "chat skill runtime failed")[:240],
+            **failure_fields,
+        )
+        if getattr(ctx, "_chat_skill_failure_notice_sent", False):
+            return
+        if self._channels is None or not event.channel_id:
+            return
+        try:
+            result = await self._channels.send(
+                event.channel_id,
+                self._chat_skill_failure_notice(
+                    phase,
+                    failure_fields.get("chat_skill_command"),
+                ),
+                final=True,
+            )
+        except Exception:  # noqa: BLE001 — failure notice must not cascade
+            log.exception("chat-skill failure notice failed")
+            return
+        if not getattr(result, "sent", False):
+            return
+        if ctx is not None:
+            try:
+                ctx.delivered_channel_ids.add(event.channel_id)
+                ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
+                ctx._chat_skill_failure_notice_sent = True
+            except Exception:  # noqa: BLE001 — bookkeeping must not break the turn
+                log.debug("chat-skill failure delivery bookkeeping failed", exc_info=True)
 
     async def _notify_iteration_hard_stop(
         self, event: AgentEvent, budget: int, ctx: Any,
@@ -2194,6 +2293,9 @@ class Agent:
                     if turn_error_request_summary else {}
                 ),
                 **_turn_outcome_identity(event),
+            )
+            await self._notify_chat_skill_failure(
+                event, error, ctx, phase="model_loop",
             )
             # chainlink #508: a poller/tick turn that declared a deliver:
             # channel couldn't surface its own result — post the mechanical
@@ -3212,6 +3314,36 @@ class Agent:
             event.channel_id,
             skills_dirs,
         )
+        # chainlink #783: slash-command chat skills resolve only through the
+        # injected registry + the server-owned serialized invocation stored in
+        # ``event.extra``. Presence of the extra key replaces any poller auto-
+        # skill path for this turn.
+        if CHAT_SKILL_EXTRA_KEY in (event.extra or {}):
+            auto_skill_block = None
+            invocation_payload = (event.extra or {}).get(CHAT_SKILL_EXTRA_KEY)
+            prompt_block = (
+                self._chat_skill_registry.prompt_block_for_invocation(invocation_payload)
+                if self._chat_skill_registry is not None
+                else None
+            )
+            if prompt_block is not None:
+                skill_name = "chat-skill"
+                if isinstance(invocation_payload, Mapping):
+                    raw_name = invocation_payload.get("name")
+                    if isinstance(raw_name, str) and raw_name.strip():
+                        skill_name = raw_name.strip()
+                auto_skill_block = (skill_name, prompt_block)
+            else:
+                await self._notify_chat_skill_failure(
+                    event,
+                    (
+                        "chat skill invocation could not be validated"
+                        if self._chat_skill_registry is not None
+                        else "chat skill registry unavailable"
+                    ),
+                    ctx,
+                    phase="prompt_resolution",
+                )
         # chainlink #266: when a skill auto-loads, its accumulated
         # learnings (gotchas/tips stored as skill_learning atoms) load
         # with it — appended under the same Skill section. Best-effort:
