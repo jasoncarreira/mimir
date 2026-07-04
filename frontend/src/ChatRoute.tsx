@@ -1,6 +1,7 @@
+import { useQuery } from "@tanstack/react-query";
 import React from "react";
 import { AgentDossier } from "./AgentDossier";
-import { ChatStreamError, createChatStream, fetchChatHistory, sendChatMessage, type ChatStreamPayload } from "./api/chat";
+import { ChatStreamError, createChatStream, fetchChatHistory, fetchChatSkills, sendChatMessage, type ChatStreamPayload } from "./api/chat";
 import { createTurnEventStream } from "./api/turn-events";
 import type { TurnStreamEvent } from "./api/generated/contracts";
 import { useBootstrap } from "./api/bootstrap";
@@ -10,20 +11,10 @@ import type { DashboardSurface } from "./dashboardExtensions";
 import { LiveActivityPanel } from "./LiveActivityPanel";
 import { useRouteState } from "./routeState";
 import { TurnSpansProvider } from "./turn-spans";
-import { Badge, Button, Dialog, ErrorState } from "./ui";
+import { Badge, Button, Dialog, ErrorState, LoadingState } from "./ui";
 import { useUiState } from "./uiState";
 
 type ChatStreamState = "connecting" | "open" | "error";
-
-// chainlink #581: composer actions are intentionally frontend-local: the
-// chat backend accepts text, so picker "invoke" sends slash-command text
-// through the normal message path while picker "insert" keeps composing.
-const SKILL_COMMANDS = [
-  { id: "memory", label: "Memory", command: "/memory", description: "Capture or update durable context." },
-  { id: "github", label: "GitHub", command: "/github", description: "Work with PRs, issues, and CI." },
-  { id: "review", label: "Review", command: "/review", description: "Review a pull request and post the result." },
-  { id: "chainlink", label: "Chainlink", command: "/chainlink", description: "Track durable tasks and follow-ups." },
-] as const;
 
 type ComposerShortcut = {
   id: string;
@@ -107,6 +98,10 @@ function chatStreamErrorMessage(error: unknown): string {
   return "Chat stream unavailable; reconnecting…";
 }
 
+function isSlashCommandText(text: string): boolean {
+  return text.startsWith("/");
+}
+
 export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const { update } = useRouteState(surface);
   const [channelId, setChannelId] = React.useState("");
@@ -120,6 +115,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const [shortcutText, setShortcutText] = React.useState("");
   const [streamState, setStreamState] = React.useState<ChatStreamState>("connecting");
   const [streamError, setStreamError] = React.useState("");
+  const [acceptedSlashMessageId, setAcceptedSlashMessageId] = React.useState("");
   // chainlink #583 slice 2: the reply forming live from the turn-event bus
   // (send_message tool-call arg deltas), shown as a provisional bubble until
   // the authoritative chat.message arrives on /chat/stream and replaces it.
@@ -127,6 +123,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   const streamRawRef = React.useRef<{ spanId: string; raw: string } | null>(null);
   const channelIdRef = React.useRef(channelId);
   const composerInputRef = React.useRef<HTMLTextAreaElement | null>(null);
+  const focusComposerAfterSkillPickerCloseRef = React.useRef(false);
   const sendInFlightRef = React.useRef(false);
   // Bottom-anchored timeline: keep the newest message in view as the stack grows.
   const timelineRef = React.useRef<HTMLOListElement | null>(null);
@@ -140,7 +137,13 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   // the new per-user channel. Bumps on any in-session key switch.
   const apiKeyEpoch = useUiState((state) => state.apiKeyEpoch);
   const { data: bootstrap } = useBootstrap();
+  const chatSkillsQuery = useQuery({
+    queryKey: ["chat-skills", apiKeyEpoch],
+    queryFn: async () => (await fetchChatSkills()).data
+  });
   const agentName = bootstrap?.ui?.agent_name || "Mimir";
+  const skillCommands = chatSkillsQuery.data?.skills ?? [];
+  const hasAvailableSkillCommands = Boolean(chatSkillsQuery.data?.enabled && skillCommands.length > 0);
 
   function insertComposerText(text: string) {
     setComposerText((current) => `${current}${text}`);
@@ -188,6 +191,13 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     channelIdRef.current = channelId;
   }, [channelId]);
 
+  React.useEffect(() => {
+    if (!skillPickerOpen && focusComposerAfterSkillPickerCloseRef.current) {
+      focusComposerAfterSkillPickerCloseRef.current = false;
+      composerInputRef.current?.focus();
+    }
+  }, [skillPickerOpen]);
+
   // chainlink #616: on a key change, drop the previous user's channel so the
   // reconnected streams re-adopt the new identity's channel (otherwise the new
   // user's messages — on a different channel — would be filtered out as "not
@@ -196,6 +206,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
   React.useEffect(() => {
     channelIdRef.current = "";
     setChannelId("");
+    setAcceptedSlashMessageId("");
   }, [apiKeyEpoch]);
 
   React.useEffect(() => {
@@ -212,6 +223,7 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
         } else if (payload.channel_id !== activeChannel) {
           return;
         }
+        setAcceptedSlashMessageId("");
         setMessages((current) => {
           if (current.some((message) => message.id === payload.message_id)) return current;
           return [
@@ -282,6 +294,12 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     return () => handle.close();
   }, [channelId, apiKeyEpoch]);
 
+  React.useEffect(() => {
+    if (streamingReply) {
+      setAcceptedSlashMessageId("");
+    }
+  }, [streamingReply]);
+
   // chainlink: restore this channel's prior conversation on entry. Live messages
   // still arrive via the SSE effect above; merge by id and order by timestamp so
   // re-entry (tab switch / reload) is idempotent and the timeline stays
@@ -335,10 +353,12 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
     const text = rawText.trim();
     if (!text || sendInFlightRef.current) return;
 
+    setAcceptedSlashMessageId("");
     sendInFlightRef.current = true;
     setSendInFlight(true);
     const clientId = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const timestamp = new Date().toISOString();
+    const slashCommand = isSlashCommandText(text);
     if (options.clearComposer) {
       setComposerText("");
     }
@@ -371,6 +391,9 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
       )));
       if (accepted.data.channel_id !== channelId) {
         setChannelId(accepted.data.channel_id);
+      }
+      if (slashCommand) {
+        setAcceptedSlashMessageId(clientId);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Message failed";
@@ -429,6 +452,9 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
                 <span className="chat-message__role">{message.role === "user" ? "You" : agentName}</span>
                 <span className="chat-message__text">{message.text}</span>
                 {message.error ? <span className="chat-message__error">{message.error}</span> : null}
+                {message.id === acceptedSlashMessageId ? (
+                  <span aria-live="polite" className="chat-message__status">Command accepted</span>
+                ) : null}
               </li>
             ))}
             {streamingReply ? (
@@ -488,7 +514,13 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
           </form>
           <Dialog open={skillPickerOpen} title="Skills" onClose={() => setSkillPickerOpen(false)}>
             <div className="chat-picker" aria-label="Skill commands">
-              {SKILL_COMMANDS.map((skill) => (
+              {chatSkillsQuery.isLoading ? (
+                <LoadingState label="Loading skill commands" />
+              ) : chatSkillsQuery.isError ? (
+                <p className="chat-picker__empty" role="alert">Skill commands are unavailable right now.</p>
+              ) : !hasAvailableSkillCommands ? (
+                <p className="chat-picker__empty">No chat skills are currently available.</p>
+              ) : skillCommands.map((skill) => (
                 <article className="chat-picker__row" key={skill.id}>
                   <div>
                     <strong>{skill.label}</strong>
@@ -496,7 +528,11 @@ export function ChatRoute({ surface }: { surface: DashboardSurface }) {
                     <p>{skill.description}</p>
                   </div>
                   <div className="chat-picker__actions">
-                    <Button disabled={sendInFlight} onClick={() => { insertComposerText(`${skill.command} `); setSkillPickerOpen(false); composerInputRef.current?.focus(); }} type="button" variant="secondary">Insert</Button>
+                    <Button disabled={sendInFlight} onClick={() => {
+                      insertComposerText(`${skill.command} `);
+                      focusComposerAfterSkillPickerCloseRef.current = true;
+                      setSkillPickerOpen(false);
+                    }} type="button" variant="secondary">Insert</Button>
                     <Button disabled={sendInFlight} onClick={() => void invokeCommand(skill.command)} type="button" variant="primary">{sendInFlight ? "Invoking…" : "Invoke"}</Button>
                   </div>
                 </article>
