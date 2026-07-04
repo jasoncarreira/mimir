@@ -123,8 +123,10 @@ async def test_spawn_failed_when_cli_missing(
 
     monkeypatch.setattr(registry, "_run_claude_subprocess", missing)
 
-    result = await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path)})
-    assert result == "spawn_open_code failed: 'opencode' CLI not on PATH"
+    payload = json.loads(await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path)}))
+    assert payload["status"] == "spawn_failed"
+    assert "not on PATH" in payload["stderr"]
+    assert payload["exit_code"] is None
 
 
 @pytest.mark.asyncio
@@ -169,3 +171,25 @@ def test_registration_gated_on_cli(monkeypatch: pytest.MonkeyPatch) -> None:
     assert providers.opencode_available() is False
     monkeypatch.setattr(providers.shutil, "which", lambda name: "/usr/bin/opencode")
     assert providers.opencode_available() is True
+
+
+@pytest.mark.asyncio
+async def test_timeout_returns_structured_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess as _subprocess
+
+    set_spawn_config({"default_cwd": tmp_path})
+    from mimir.tools import registry
+
+    def hangs(argv, cwd, timeout_s, env=None):
+        raise _subprocess.TimeoutExpired(argv, timeout_s)
+
+    monkeypatch.setattr(registry, "_run_claude_subprocess", hangs)
+
+    payload = json.loads(
+        await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path), "timeout_s": 7})
+    )
+    assert payload["status"] == "timeout"
+    assert "7s" in payload["stderr"]
+    assert payload["exit_code"] is None

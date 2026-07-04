@@ -1982,9 +1982,9 @@ async def spawn_open_code(
             pass  # artifacts are best-effort; the structured return is primary
 
     if status == "spawn_failed":
-        return "spawn_open_code failed: 'opencode' CLI not on PATH"
-    if status == "timeout":
-        return f"spawn_open_code timed out after {timeout_s}s"
+        stderr = "'opencode' CLI not on PATH"
+    elif status == "timeout":
+        stderr = f"timed out after {timeout_s}s"
     return json.dumps(
         {
             "run_id": run_id,
