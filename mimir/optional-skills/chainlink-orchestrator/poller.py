@@ -282,11 +282,13 @@ def _actionable_issue_ids(home: Path) -> list[int] | None:
 def _worklink_dispatch_plan(
     home: Path, *, active_lock_ids: set[int]
 ) -> tuple[list[DispatchItem], int, int, int] | None:
-    """Return dispatchable Worklink items plus ready/blocked/epic counts.
+    """Return dispatchable Worklink leaves plus ready/blocked/epic counts.
 
-    Bare leaves still require ``worklink:ready`` and Chainlink actionability.
-    Epics are intake issues marked by ``worklink:epic``; when actionable, they
-    run through the integrated epic controller instead of per-leaf dispatch.
+    Leaves require ``worklink:ready`` and Chainlink actionability. ``worklink:
+    epic`` issues are recognized ONLY to EXCLUDE them (and their child leaves)
+    from per-leaf dispatch — the in-mimir epic runner was removed (#830); epics
+    are built by the opencode feature-factory, so the poller never dispatches
+    them. The epic count is reported for observability only.
     """
     ready_records = _issue_records_with_label(home, READY_LABEL)
     epic_records = _issue_records_with_label(home, EPIC_LABEL)
