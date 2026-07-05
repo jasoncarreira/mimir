@@ -1427,6 +1427,96 @@ class TestSendMessageInteractivityGuard:
         assert event["reason"] == "non_interactive_no_reply_channel"
 
     @pytest.mark.asyncio
+    async def test_non_interactive_no_reply_sentinel_fails_closed_with_multiple_active_turns_when_contextvar_lost(
+        self, tmp_path,
+    ) -> None:
+        from mimir import _context
+        from mimir._context import reset_current_turn, set_current_turn
+        from mimir.event_logger import init_logger
+        from mimir.models import TurnContext
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        registry = _StubRegistry(bridge, channel_id="No-RePlY")
+        set_channel_registry(registry)
+        turn1_tok = set_current_turn(TurnContext(
+            turn_id="t-poller-1",
+            session_id="s-poller-1",
+            trigger="poller",
+            channel_id="poller:gmail-inbox",
+            started_at=0.0,
+            agent_id="test",
+        ))
+        turn2_tok = set_current_turn(TurnContext(
+            turn_id="t-poller-2",
+            session_id="s-poller-2",
+            trigger="poller",
+            channel_id="poller:calendar",
+            started_at=0.0,
+            agent_id="test",
+        ))
+        lost_tok = _context._current_turn.set(None)
+        try:
+            out = await send_message.ainvoke({"text": "hi", "channel_id": "No-RePlY"})
+        finally:
+            _context._current_turn.reset(lost_tok)
+            reset_current_turn(turn2_tok)
+            reset_current_turn(turn1_tok)
+
+        assert "send_message rejected" in out
+        assert "Declining to reply means NOT calling send_message" in out
+        assert registry.find_calls == []
+        assert bridge.send_calls == []
+
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        ]
+        [event] = [e for e in events if e["type"] == "send_message_blocked"]
+        assert event["tool"] == "send_message"
+        assert event["channel_id"] == "No-RePlY"
+        assert event["reason"] == "non_interactive_no_reply_channel"
+
+    @pytest.mark.asyncio
+    async def test_no_reply_sentinel_does_not_trust_interactive_trigger_when_interactivity_is_unset(
+        self, tmp_path,
+    ) -> None:
+        from mimir._context import reset_current_turn, set_current_turn
+        from mimir.event_logger import init_logger
+        from mimir.models import TurnContext
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        registry = _StubRegistry(bridge, channel_id="No-RePlY")
+        set_channel_registry(registry)
+        turn_tok = set_current_turn(TurnContext(
+            turn_id="t-user-message",
+            session_id="s-user-message",
+            trigger="user_message",
+            channel_id="web-1",
+            started_at=0.0,
+            agent_id="test",
+        ))
+        try:
+            out = await send_message.ainvoke({"text": "hi", "channel_id": "No-RePlY"})
+        finally:
+            reset_current_turn(turn_tok)
+
+        assert "send_message rejected" in out
+        assert "Declining to reply means NOT calling send_message" in out
+        assert registry.find_calls == []
+        assert bridge.send_calls == []
+
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        ]
+        [event] = [e for e in events if e["type"] == "send_message_blocked"]
+        assert event["tool"] == "send_message"
+        assert event["channel_id"] == "No-RePlY"
+        assert event["reason"] == "non_interactive_no_reply_channel"
+
+    @pytest.mark.asyncio
     async def test_interactive_no_reply_sentinel_uses_existing_lookup_path(self) -> None:
         bridge = _StubBridge()
         registry = _StubRegistry(bridge, channel_id="chan-1")
