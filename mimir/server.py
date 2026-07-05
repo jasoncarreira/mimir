@@ -51,6 +51,10 @@ from .prompt_templates import seed_prompts
 from .subagent_defs import seed_subagent_defs
 from .subagent_inbox import SubagentInbox
 from .turn_logger import TurnLogger
+from .worklink.continuation import (
+    stamp_http_event_ingress_extra,
+    strip_worklink_hint_extra,
+)
 from . import web_ui
 
 log = logging.getLogger(__name__)
@@ -260,11 +264,14 @@ async def _handle_event(request: web.Request) -> web.Response:
     extra = body.get("extra")
     if extra is not None and not isinstance(extra, dict):
         return web.json_response({"error": "extra must be an object"}, status=400)
-    # chainlink #783 (security): the generic /event ingress is client-controlled,
-    # so strip server-owned chat-skill keys — only the WebChatBridge may produce
-    # a chat-skill invocation (after auth + server-side slash parsing). Otherwise
-    # a client could forge extra.chat_skill_invocation and inject skill prompts.
-    extra = strip_chat_skill_extra(extra)
+    # chainlink #783 / #740 (security): the generic /event ingress is client-
+    # controlled, so strip server-owned chat-skill keys and Worklink
+    # continuation hint keys before constructing the AgentEvent. Otherwise a
+    # client could forge skill invocations or smuggle issue/PR/worktree hints
+    # that later look authoritative to continuation recovery paths.
+    extra = stamp_http_event_ingress_extra(
+        strip_worklink_hint_extra(strip_chat_skill_extra(extra))
+    )
     attachment_names = body.get("attachment_names")
     if attachment_names is not None and not isinstance(attachment_names, list):
         return web.json_response(

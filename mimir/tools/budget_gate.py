@@ -46,6 +46,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
 from ..access_control import authorize_action
+from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
 log = logging.getLogger(__name__)
@@ -105,6 +106,8 @@ _ADMIN_BUILTIN_TOOL_NAMES = frozenset(
     }
 )
 
+_HTTP_EVENT_ADMIN_DENIAL_REASON = "http_event_author_untrusted"
+
 
 def _resolve_budget_state(ctx: Any | None = None) -> tuple[Any, int] | None:
     """Return ``(ctx, budget)`` if a TurnContext with a non-zero
@@ -156,6 +159,23 @@ def _budget_denied_message(tool_name: str, count: int, budget: int) -> str:
     )
 
 
+def _mark_budget_denied(ctx: Any, tool_name: str, count: int) -> None:
+    """Persist hard-denial markers on the active turn context."""
+    ctx.tool_call_budget_exhausted = True
+    ctx.tool_call_budget_denied_count = (
+        int(getattr(ctx, "tool_call_budget_denied_count", 0) or 0) + 1
+    )
+    denied_tools = getattr(ctx, "tool_call_budget_denied_tools", None)
+    if isinstance(denied_tools, list):
+        denied_tools.append(tool_name)
+    elif denied_tools is None:
+        ctx.tool_call_budget_denied_tools = [tool_name]
+    else:
+        ctx.tool_call_budget_denied_tools = [*denied_tools, tool_name]
+    if getattr(ctx, "tool_call_budget_first_denied_at_count", None) is None:
+        ctx.tool_call_budget_first_denied_at_count = count
+
+
 def _check_and_increment_or_deny(tool_name: str, ctx: Any | None = None) -> str | None:
     """Returns a denial message (str) if the call should be refused,
     or ``None`` if the call should proceed. Shared between the sync
@@ -171,6 +191,7 @@ def _check_and_increment_or_deny(tool_name: str, ctx: Any | None = None) -> str 
     ctx, budget = state
     count = getattr(ctx, "tool_call_count", 0) or 0
     if count >= budget:
+        _mark_budget_denied(ctx, tool_name, count)
         _emit_event_sync(
             "tool_call_budget_denied",
             tool=tool_name,
@@ -255,6 +276,54 @@ def _turn_has_internal_admin_authority(ctx: Any) -> bool:
     return source in _ADMIN_TRUSTED_INTERNAL_SOURCES
 
 
+def _turn_has_http_event_ingress(ctx: Any) -> bool:
+    ingress = getattr(ctx, "event_ingress", None)
+    return isinstance(ingress, str) and ingress.strip() == HTTP_EVENT_INGRESS_EXTRA_VALUE
+
+
+def _admin_identity_fields(ctx: Any | None) -> tuple[str | None, str | None, list[str]]:
+    if ctx is None:
+        return None, None, []
+    decision = authorize_action(
+        getattr(ctx, "author", None),
+        getattr(ctx, "identity_resolver", None),
+        admin=True,
+        enforce=True,
+    )
+    return decision.author, decision.canonical_author, list(decision.roles)
+
+
+def _deny_admin_tool(
+    tool_name: str,
+    reason: str,
+    *,
+    ctx: Any | None,
+    enforcement_enabled: bool,
+) -> str:
+    author, canonical_author, roles = _admin_identity_fields(ctx)
+    _emit_event_sync(
+        "admin_tool_call_denied",
+        tool=tool_name,
+        allowed=False,
+        status="denied",
+        required_tier="admin",
+        denial_reason=reason,
+        author=author,
+        canonical_author=canonical_author,
+        roles=roles,
+        enforcement_enabled=enforcement_enabled,
+    )
+    _emit_event_sync(
+        "tool_call_denied",
+        tool=tool_name,
+        reason=reason,
+        required_tier="admin",
+        author=author,
+        canonical_author=canonical_author,
+    )
+    return _admin_denial_message(tool_name, reason)
+
+
 def _check_admin_authorized(tool_name: str, ctx: Any | None = None) -> str | None:
     if not _is_admin_sensitive_tool(tool_name):
         return None
@@ -262,29 +331,20 @@ def _check_admin_authorized(tool_name: str, ctx: Any | None = None) -> str | Non
     ctx = _resolve_admin_ctx(ctx)
     if ctx is None:
         if _env_access_control_enforced():
-            reason = "missing_turn_context"
-            _emit_event_sync(
-                "admin_tool_call_denied",
-                tool=tool_name,
-                allowed=False,
-                status="denied",
-                required_tier="admin",
-                denial_reason=reason,
-                author=None,
-                canonical_author=None,
-                roles=[],
+            return _deny_admin_tool(
+                tool_name,
+                "missing_turn_context",
+                ctx=None,
                 enforcement_enabled=True,
             )
-            _emit_event_sync(
-                "tool_call_denied",
-                tool=tool_name,
-                reason=reason,
-                required_tier="admin",
-                author=None,
-                canonical_author=None,
-            )
-            return _admin_denial_message(tool_name, reason)
         return None
+    if _turn_has_http_event_ingress(ctx):
+        return _deny_admin_tool(
+            tool_name,
+            _HTTP_EVENT_ADMIN_DENIAL_REASON,
+            ctx=ctx,
+            enforcement_enabled=bool(getattr(ctx, "access_control_enforced", False)),
+        )
     enforce = bool(getattr(ctx, "access_control_enforced", False))
     if not enforce:
         return None
@@ -298,22 +358,12 @@ def _check_admin_authorized(tool_name: str, ctx: Any | None = None) -> str | Non
     )
     if decision.allowed:
         return None
-
-    fields = decision.as_log_fields()
-    _emit_event_sync(
-        "admin_tool_call_denied",
-        tool=tool_name,
-        **fields,
+    return _deny_admin_tool(
+        tool_name,
+        decision.denial_reason or "admin_required",
+        ctx=ctx,
+        enforcement_enabled=True,
     )
-    _emit_event_sync(
-        "tool_call_denied",
-        tool=tool_name,
-        reason=decision.denial_reason,
-        required_tier=decision.required_tier.value,
-        author=decision.author,
-        canonical_author=decision.canonical_author,
-    )
-    return _admin_denial_message(tool_name, decision.denial_reason)
 
 
 def _emit_tool_call_sync(

@@ -15,11 +15,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
+from textwrap import dedent
 from typing import Any
 
 import pytest
+from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from mimir import mid_turn_injection as _mti
@@ -31,10 +35,17 @@ from mimir.chat_skills import (
 )
 from mimir.config import Config
 from mimir.history import MessageBuffer
+from mimir.identities import IdentityResolver
 from mimir.index import IndexGenerator
 from mimir.models import AgentEvent, TurnContext
 from mimir.skill_defs import home_builtin_skills_dir
+from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.turn_logger import TurnLogger
+from mimir.worklink.continuation import (
+    HTTP_EVENT_INGRESS_EXTRA_KEY,
+    HTTP_EVENT_INGRESS_EXTRA_VALUE,
+    stamp_http_event_ingress_extra,
+)
 
 
 def _make_config(home: Path) -> Config:
@@ -87,6 +98,45 @@ def _read_events(tmp_path: Path) -> list[dict[str, Any]]:
     return [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
 
 
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "identities.yaml").write_text(dedent(body), encoding="utf-8")
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    return resolver
+
+
+def _init_continuation_repo(
+    tmp_path: Path,
+    *,
+    branch: str = "feature/worklink-recovery",
+    remote_url: str = "https://github.com/acme/demo.git",
+) -> Path:
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "checkout", "-q", "-b", "main")
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "tracked.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "remote", "add", "origin", remote_url)
+    if branch != "main":
+        _git(repo, "checkout", "-q", "-b", branch)
+    return repo
+
+
 class _FakeAgent:
     """Replaces the deepagents CompiledStateGraph. Returns a canned
     message list shaped like ChatClaudeCode's output."""
@@ -107,6 +157,37 @@ class _FakeAgent:
         events/output from the final cumulative message list."""
         self.invocations.append({"state": state, "config": config})
         yield {"messages": list(state.get("messages") or []) + self._response_messages}
+
+
+class _BudgetExhaustingAgent(_FakeAgent):
+    """Simulate a turn that exhausted the tool-call budget."""
+
+    def __init__(
+        self,
+        response_messages: list[Any],
+        *,
+        budget: int = 7,
+        denied_tools: list[str] | None = None,
+    ) -> None:
+        super().__init__(response_messages)
+        self._budget = budget
+        self._denied_tools = denied_tools or ["Bash"]
+
+    async def astream(self, state: dict[str, Any], *, config: dict[str, Any], stream_mode: str = "values"):
+        from mimir._context import get_current_turn
+
+        _ctx = get_current_turn()
+        if _ctx is not None:
+            _ctx.tool_call_count = self._budget
+            _ctx.tool_call_budget = self._budget
+            _ctx.tool_call_budget_exhausted = True
+            _ctx.tool_call_budget_denied_count = 1
+            _ctx.tool_call_budget_denied_tools = list(self._denied_tools)
+            _ctx.tool_call_budget_first_denied_at_count = self._budget
+        async for chunk in super().astream(
+            state, config=config, stream_mode=stream_mode,
+        ):
+            yield chunk
 
 
 class _BridgeStub:
@@ -250,6 +331,60 @@ class _BoundaryFakeAgent(_FakeAgent):
             yield chunk
 
 
+class _HttpEventAdminProbeAgent(_FakeAgent):
+    """Probe the TurnContext Agent installs before admin-tool auth runs."""
+
+    def __init__(self) -> None:
+        super().__init__([AIMessage(content="denied")])
+        self.observed_ctx: dict[str, Any] | None = None
+        self.denial: ToolMessage | None = None
+        self.handler_calls = 0
+
+    async def astream(
+        self,
+        state: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        stream_mode: str = "values",
+    ):
+        from mimir._context import get_current_turn
+
+        ctx = get_current_turn()
+        assert ctx is not None
+        self.observed_ctx = {
+            "trigger": ctx.trigger,
+            "channel_source": ctx.channel_source,
+            "author": ctx.author,
+            "event_ingress": ctx.event_ingress,
+            "access_control_enforced": ctx.access_control_enforced,
+        }
+        gate = BudgetGateMiddleware()
+
+        async def _handler(req: ToolCallRequest) -> ToolMessage:
+            self.handler_calls += 1
+            return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+        self.denial = await gate.awrap_tool_call(
+            ToolCallRequest(
+                tool_call={
+                    "name": "shell_exec",
+                    "args": {},
+                    "id": "tc-http-event",
+                    "type": "tool_call",
+                },
+                tool=None,
+                state=None,
+                runtime=None,  # type: ignore[arg-type]
+            ),
+            _handler,
+        )
+
+        async for chunk in super().astream(
+            state, config=config, stream_mode=stream_mode,
+        ):
+            yield chunk
+
+
 class _FakeChannelSession:
     """Tiny ChannelSession stand-in. Real ChannelSession is a dataclass
     in session_manager.py; we only need the ``saga_session_id`` attribute
@@ -376,6 +511,7 @@ async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
     tc = next(e for e in record.events if e["type"] == "tool_call")
     assert tc["name"] == "memory_store"
 
+
     # Result fields surfaced cost + num_turns
     assert record.total_cost_usd == pytest.approx(0.001)
     assert record.num_turns == 2
@@ -384,6 +520,64 @@ async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
     # The TurnLogger appended one record
     turns = (tmp_path / "home" / "logs" / "turns.jsonl").read_text().splitlines()
     assert len(turns) == 1
+
+
+async def test_run_turn_http_event_ingress_reaches_turn_context_before_admin_tool_auth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(kind: str, **kw: Any) -> None:
+        captured.append((kind, kw))
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", _capture)
+
+    fake_agent = _HttpEventAdminProbeAgent()
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._identity_resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: root
+            aliases: [api-root]
+            access: {roles: [user, admin]}
+        """,
+    )
+
+    stamped_extra = stamp_http_event_ingress_extra(
+        {HTTP_EVENT_INGRESS_EXTRA_KEY: "forged-client-value", "keep": "me"}
+    )
+    record = await agent.run_turn(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="ch-http",
+            content="resume chainlink #740",
+            source="api",
+            author="api-root",
+            extra=stamped_extra,
+        )
+    )
+
+    assert record.error is None
+    assert fake_agent.observed_ctx == {
+        "trigger": "scheduled_tick",
+        "channel_source": "api",
+        "author": "api-root",
+        "event_ingress": HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        "access_control_enforced": True,
+    }
+    assert fake_agent.handler_calls == 0
+    assert fake_agent.denial is not None
+    assert fake_agent.denial.status == "error"
+    assert "requires an admin identity (http_event_author_untrusted)" in str(
+        fake_agent.denial.content
+    )
+    admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
+    assert admin_event["tool"] == "shell_exec"
+    assert admin_event["canonical_author"] == "root"
+    assert admin_event["denial_reason"] == "http_event_author_untrusted"
 
 
 class _FoldingFakeAgent(_FakeAgent):
@@ -454,6 +648,136 @@ async def test_run_turn_no_injected_inputs_when_nothing_folded(tmp_path: Path):
     )
     assert record.injected_inputs == []
     assert agent._buffer.channel_count("ch-1") == 1
+
+
+async def test_budget_exhaustion_creates_worklink_continuation_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = _init_continuation_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_BudgetExhaustingAgent(
+            response_messages=[AIMessage(content="continuing worklink recovery")],
+        ),
+        fake_saga=None,
+    )
+
+    record = await agent.run_turn(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="ops",
+            content="generic worklink follow-up",
+            source_id="budget-src-1",
+        )
+    )
+
+    sidecars = sorted((tmp_path / "home" / "state" / "worklink" / "continuations").glob("*.json"))
+    assert len(sidecars) == 1
+    payload = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    assert payload["budget"]["count"] == 7
+    assert payload["budget"]["budget"] == 7
+    assert payload["budget"]["denied_count"] == 1
+    assert payload["budget"]["denied_tools"] == ["Bash"]
+    assert payload["association"]["branch"] == "feature/worklink-recovery"
+    assert payload["association"]["repo"] == "acme/demo"
+    assert payload["association"]["worktree"] == str(repo.resolve())
+    assert payload["turns"][-1]["turn_id"] == record.turn_id
+    assert any(
+        ev.get("type") == "worklink_continuation_created"
+        for ev in _read_events(tmp_path)
+    )
+
+
+async def test_continuation_written_even_without_assistant_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = _init_continuation_repo(
+        tmp_path,
+        branch="chainlink-740-budget-continuation--be-agent-finalizer",
+    )
+    monkeypatch.chdir(repo)
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_BudgetExhaustingAgent(
+            response_messages=[AIMessage(content="")],
+        ),
+        fake_saga=None,
+    )
+
+    record = await agent.run_turn(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="ops",
+            content="resume chainlink #740",
+            source_id="budget-src-2",
+        )
+    )
+
+    assert record.output == ""
+    turns = [
+        json.loads(line)
+        for line in (tmp_path / "home" / "logs" / "turns.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert turns[-1]["output"] == ""
+    sidecars = sorted((tmp_path / "home" / "state" / "worklink" / "continuations").glob("*.json"))
+    assert len(sidecars) == 1
+    payload = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    assert payload["turns"][-1]["turn_id"] == record.turn_id
+    assert payload["association"]["branch"] == "chainlink-740-budget-continuation--be-agent-finalizer"
+
+
+async def test_budget_continuation_timeout_logs_failure_and_still_runs_finalize_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = _init_continuation_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_BudgetExhaustingAgent(
+            response_messages=[AIMessage(content="ok")],
+        ),
+        fake_saga=None,
+    )
+    finalized: list[str] = []
+
+    class _FinalizeHook:
+        async def finalize(self, ctx, event, record):
+            finalized.append(record.turn_id)
+
+    def _slow_continuation(**_kwargs):
+        time.sleep(0.2)
+        return None
+
+    monkeypatch.setattr("mimir.agent.maybe_create_worklink_budget_continuation", _slow_continuation)
+    monkeypatch.setattr("mimir.agent._worklink_continuation_timeout_seconds", lambda _cfg: 0.01)
+    agent._hooks.append(_FinalizeHook())
+
+    record = await asyncio.wait_for(
+        agent.run_turn(
+            AgentEvent(
+                trigger="scheduled_tick",
+                channel_id="ops",
+                content="generic worklink follow-up",
+                source_id="budget-timeout-src",
+            )
+        ),
+        timeout=5.0,
+    )
+
+    assert record.output == "ok"
+    assert finalized == [record.turn_id]
+    failed = [
+        ev for ev in _read_events(tmp_path)
+        if ev.get("type") == "worklink_continuation_failed"
+    ]
+    assert len(failed) == 1
+    assert failed[0]["error"].startswith("timed out after")
+    assert failed[0]["timeout_s"] == 0.01
 
 
 async def test_append_inbound_to_buffer_is_idempotent(tmp_path: Path):
