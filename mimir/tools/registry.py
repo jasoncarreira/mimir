@@ -288,32 +288,19 @@ def _is_non_interactive_no_reply_channel(channel_id: str) -> bool:
 
 
 def _active_turn_is_non_interactive_for_send_message_guard() -> bool:
-    """Best-effort non-interactive check for the no-reply sentinel guard.
+    """Return whether a no-reply pseudo-channel must be rejected.
 
-    Keep the direct per-task ContextVar behavior, but also recover the active
-    turn from the shared turn registry when MCP dispatch lost ContextVar
-    inheritance. Explicit ``True`` must preserve interactive behavior; only an
-    unset/lost ContextVar falls back to the active turn. Only triggers that are
-    definitely automated count here; missing/interactive triggers preserve the
-    existing behavior.
+    Only an explicit ``set_current_turn_interactive(True)`` proves that a turn
+    is interactive enough to preserve the historical no-reply lookup behavior.
+    ``False`` and unset/``None`` both fail closed for these pseudo-channel
+    sentinels so MCP/control-task ContextVar loss cannot reopen them. Real
+    channel_ids are unaffected because this helper is consulted only after the
+    sentinel match.
     """
     interactive = _current_turn_interactive_var.get()
-    if interactive is False:
-        return True
     if interactive is True:
         return False
-
-    from .._context import get_current_turn, get_only_active_turn
-    from ..channel_registry import INTERACTIVE_TRIGGERS
-
-    ctx = get_current_turn()
-    if ctx is None:
-        ctx = get_only_active_turn()
-    if ctx is None:
-        return False
-
-    trigger = (getattr(ctx, "trigger", None) or "").strip()
-    return bool(trigger) and trigger not in INTERACTIVE_TRIGGERS
+    return True
 
 
 # ────────────────────────────────────────────────────────────────────
