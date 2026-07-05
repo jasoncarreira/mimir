@@ -28,6 +28,8 @@ WORKLINK_HINT_EXTRA_KEYS = frozenset({
     "schedule_name",
     "run_id",
 })
+HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
+HTTP_EVENT_INGRESS_EXTRA_VALUE = "http_event"
 _MAX_RECENT_TURNS = 10
 _MAX_CHANGED_PATHS = 25
 _MAX_EXTERNAL_COMMANDS = 5
@@ -70,6 +72,18 @@ def strip_worklink_hint_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]
     if not extra:
         return {}
     return scrub(extra)
+
+
+def stamp_http_event_ingress_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Mark generic HTTP ``/event`` ingress as untrusted for admin provenance.
+
+    The marker is server-owned: callers may supply the same key, but the server
+    stamps this after client-controlled stripping and always overwrites it.
+    """
+
+    stamped = dict(extra or {})
+    stamped[HTTP_EVENT_INGRESS_EXTRA_KEY] = HTTP_EVENT_INGRESS_EXTRA_VALUE
+    return stamped
 
 
 @dataclass(frozen=True)
@@ -914,6 +928,8 @@ def _comment_authorization_denial(
         return "missing_turn_context"
     if _event_has_server_stamped_continuation_trigger(event):
         return None
+    if _event_has_http_event_ingress(event):
+        return "http_event_author_untrusted"
     if not bool(getattr(ctx, "access_control_enforced", False)):
         return "admin_access_control_required"
     decision = authorize_action(
@@ -935,6 +951,16 @@ def _event_has_server_stamped_continuation_trigger(event: AgentEvent | None) -> 
     if trigger == "scheduled_tick":
         return bool(_mapping_str(extra, "schedule_name"))
     return False
+
+
+def _event_has_http_event_ingress(event: AgentEvent | None) -> bool:
+    if event is None:
+        return False
+    extra = event.extra if isinstance(event.extra, Mapping) else {}
+    return (
+        _mapping_str(extra, HTTP_EVENT_INGRESS_EXTRA_KEY)
+        == HTTP_EVENT_INGRESS_EXTRA_VALUE
+    )
 
 
 def _render_external_comment(payload: Mapping[str, Any]) -> str:
