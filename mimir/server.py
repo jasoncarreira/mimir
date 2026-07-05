@@ -26,6 +26,7 @@ from .agent import Agent
 from .background_tasks import spawn_background
 from .bridges.bench import BenchBridge
 from .bridges.web_chat import WebChatBridge
+from .chat_skills import ChatSkillRegistry, strip_chat_skill_extra
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .dispatcher import Dispatcher
@@ -259,6 +260,11 @@ async def _handle_event(request: web.Request) -> web.Response:
     extra = body.get("extra")
     if extra is not None and not isinstance(extra, dict):
         return web.json_response({"error": "extra must be an object"}, status=400)
+    # chainlink #783 (security): the generic /event ingress is client-controlled,
+    # so strip server-owned chat-skill keys — only the WebChatBridge may produce
+    # a chat-skill invocation (after auth + server-side slash parsing). Otherwise
+    # a client could forge extra.chat_skill_invocation and inject skill prompts.
+    extra = strip_chat_skill_extra(extra)
     attachment_names = body.get("attachment_names")
     if attachment_names is not None and not isinstance(attachment_names, list):
         return web.json_response(
@@ -788,6 +794,7 @@ def build_app(config: Config) -> web.Application:
     # animates mid-turn instead of replaying post-hoc from turns.jsonl.
     from .turn_event_bus import TurnEventBus
     turn_event_bus = TurnEventBus()
+    chat_skill_registry = ChatSkillRegistry.from_config(config)
 
     agent = Agent(
         config,
@@ -803,6 +810,7 @@ def build_app(config: Config) -> web.Application:
         dispatcher=dispatcher,
         commitments_store=commitments_store,
         turn_event_bus=turn_event_bus,
+        chat_skill_registry=chat_skill_registry,
     )
     dispatcher.set_run_turn(agent.run_turn)
     # chainlink #376 (PR 4): record mid-turn injected messages in chat history at
@@ -990,7 +998,11 @@ def build_app(config: Config) -> web.Application:
 
     # WebChatBridge needs the dispatcher (for inbound) — built after dispatcher
     # exists, registered before channels.connect_all() runs at startup.
-    web_chat = WebChatBridge(enqueue=dispatcher.enqueue, home=config.home)
+    web_chat = WebChatBridge(
+        enqueue=dispatcher.enqueue,
+        home=config.home,
+        chat_skill_registry=chat_skill_registry,
+    )
     channels.register(web_chat)
 
     # Inbound attachments land here; the agent reads files by path. The

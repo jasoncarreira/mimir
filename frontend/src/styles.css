@@ -1343,6 +1343,12 @@ textarea {
   font-size: var(--mimir-font-size-sm, 0.875rem);
 }
 
+.chat-message__status {
+  display: block;
+  color: var(--mimir-color-text-muted, #58685f);
+  font-size: var(--mimir-font-size-xs, 0.75rem);
+}
+
 /* Composer: textarea, compact utility controls, then SEND. */
 .chat-composer {
   display: grid;
@@ -1390,6 +1396,12 @@ textarea {
 .chat-picker {
   display: grid;
   gap: var(--mimir-space-sm, 12px);
+}
+
+.chat-picker__empty {
+  margin: 0;
+  color: var(--mimir-color-text-muted, #58685f);
+  text-align: center;
 }
 
 .chat-picker__row {

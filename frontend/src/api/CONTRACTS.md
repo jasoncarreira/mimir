@@ -24,10 +24,24 @@ React dashboard parity surface inventoried from the legacy pages:
 - `GET /api/v1/saga`
 - `POST /api/v1/saga/sql` when `MIMIR_SAGA_SQL_ENABLED=1`
 - `GET /api/v1/memory`
+- `GET /api/v1/chat/skills`
 - `POST /api/v1/chat`
 
 Legacy `/api/*` and `/chat` routes remain compatible with the static HTML pages
 until those pages are cut over.
+
+## Chat skill discovery
+
+`GET /api/v1/chat/skills` returns the standard v1 success envelope with
+`ChatSkillsData` in `data`.
+
+- Discovery disabled: `{"enabled": false, "skills": []}`
+- Discovery enabled with an empty operator allowlist: `{"enabled": true, "skills": []}`
+- Populated discovery: `{"enabled": true, "skills": [{"id": "github", "command": "/github", "label": "GitHub", "description": "Work with PRs, issues, and CI."}]}`
+
+This payload is server-authoritative. It only exposes the globally curated
+allowlisted skills returned by the endpoint and does not imply per-user RBAC or
+broader skill enumeration beyond the response itself.
 
 ## Envelope
 

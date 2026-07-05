@@ -11,8 +11,16 @@ import { useChatStore } from "./chatStore";
 import { useUiState } from "./uiState";
 import type { DashboardSurface } from "./dashboardExtensions";
 
-const { chatApi, turnApi } = vi.hoisted(() => ({
-  chatApi: {
+const { defaultSkillCommands, chatApi, turnApi } = vi.hoisted(() => {
+  const defaultSkillCommands = [
+    { id: "memory", label: "Memory", command: "/memory", description: "Capture or update durable context." },
+    { id: "github", label: "GitHub", command: "/github", description: "Work with PRs, issues, and CI." },
+    { id: "review", label: "Review", command: "/review", description: "Review a pull request and post the result." }
+  ];
+
+  return {
+    defaultSkillCommands,
+    chatApi: {
     activePayload: undefined as ((payload: ChatStreamPayload) => void) | undefined,
     activeError: undefined as ((error: unknown) => void) | undefined,
     close: vi.fn(),
@@ -21,6 +29,11 @@ const { chatApi, turnApi } = vi.hoisted(() => ({
       chatApi.activeError = options?.onError;
       return { close: chatApi.close };
     }),
+    fetchChatSkills: vi.fn(async () => ({
+      ok: true,
+      version: "v1",
+      data: { enabled: true, skills: defaultSkillCommands }
+    })),
     sendChatMessage: vi.fn(),
     fetchChatHistory: vi.fn(async () => ({
       ok: true, version: "v1", data: { channel_id: "web-default", messages: [] as ChatHistoryMessage[] }
@@ -34,13 +47,15 @@ const { chatApi, turnApi } = vi.hoisted(() => ({
       return { close: turnApi.close };
     })
   }
-}));
+  };
+});
 
 vi.mock("./api/chat", async (importOriginal) => ({
   // Keep the real exports (notably ChatStreamError, which ChatRoute uses to map
   // auth failures to actionable messages) and only stub the network functions.
   ...(await importOriginal<typeof import("./api/chat")>()),
   createChatStream: chatApi.createChatStream,
+  fetchChatSkills: chatApi.fetchChatSkills,
   sendChatMessage: chatApi.sendChatMessage,
   fetchChatHistory: chatApi.fetchChatHistory
 }));
@@ -115,6 +130,12 @@ afterEach(() => {
   chatApi.activeError = undefined;
   chatApi.close.mockClear();
   chatApi.createChatStream.mockClear();
+  chatApi.fetchChatSkills.mockReset();
+  chatApi.fetchChatSkills.mockResolvedValue({
+    ok: true,
+    version: "v1",
+    data: { enabled: true, skills: defaultSkillCommands }
+  });
   chatApi.sendChatMessage.mockReset();
   chatApi.fetchChatHistory.mockReset();
   chatApi.fetchChatHistory.mockResolvedValue({
@@ -123,6 +144,7 @@ afterEach(() => {
   turnApi.activeEvent = undefined;
   turnApi.close.mockClear();
   turnApi.createTurnEventStream.mockClear();
+  useChatStore.setState({ messages: [] });
   useUiState.setState({ apiKeyEpoch: 0 });
   window.localStorage.clear();
 });
@@ -149,8 +171,7 @@ describe("ChatRoute", () => {
 
     const timeline = screen.getByRole("list", { name: "Messages" });
     expect(within(timeline).getByText("hello mimir")).toBeTruthy();
-    // The optimistic message stays in the transcript once accepted (boxless;
-    // no per-message status badge anymore).
+    // The optimistic message stays in the transcript once accepted.
     await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalled());
     expect(within(timeline).getByText("hello mimir")).toBeTruthy();
   });
@@ -181,12 +202,15 @@ describe("ChatRoute", () => {
     const input = screen.getByLabelText("Message") as HTMLTextAreaElement;
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("Memory");
     const insert = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Insert" })[0];
     fireEvent.click(insert);
     expect(input.value).toBe("/memory ");
+    await waitFor(() => expect(document.activeElement).toBe(input));
     expect(chatApi.sendChatMessage).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("GitHub");
     const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
     fireEvent.click(invoke);
     await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
@@ -206,6 +230,7 @@ describe("ChatRoute", () => {
     fireEvent.change(input, { target: { value: "keep this draft" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("GitHub");
     const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
     fireEvent.click(invoke);
 
@@ -226,6 +251,7 @@ describe("ChatRoute", () => {
     fireEvent.change(input, { target: { value: "draft" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("GitHub");
     const invoke = within(screen.getByRole("dialog", { name: "Skills" })).getAllByRole("button", { name: "Invoke" })[1];
     fireEvent.click(invoke);
 
@@ -280,6 +306,97 @@ describe("ChatRoute", () => {
     fireEvent.submit(input.closest("form") as HTMLFormElement);
 
     await waitFor(() => expect(screen.getAllByText("queue full").length).toBeGreaterThan(0));
+  });
+
+  it("shows loading, unavailable, and empty skill menu states", async () => {
+    chatApi.fetchChatSkills.mockImplementationOnce(() => new Promise(() => {}));
+    renderChat();
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    expect(screen.getByText("Loading skill commands")).toBeTruthy();
+
+    cleanup();
+    chatApi.fetchChatSkills.mockRejectedValueOnce(new Error("offline"));
+    renderChat();
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    expect(await screen.findByText("Skill commands are unavailable right now.")).toBeTruthy();
+
+    cleanup();
+    chatApi.fetchChatSkills.mockResolvedValueOnce({
+      ok: true,
+      version: "v1",
+      data: { enabled: false, skills: defaultSkillCommands }
+    });
+    renderChat();
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    expect(await screen.findByText("No chat skills are currently available.")).toBeTruthy();
+  });
+
+  it("shows a lightweight command accepted status for successful slash posts", async () => {
+    chatApi.sendChatMessage.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: { channel_id: "web-default", source_id: "client-1" }
+    });
+
+    renderChat();
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("Memory");
+    const input = screen.getByLabelText("Message");
+    fireEvent.change(input, { target: { value: "/memory remember this" } });
+    fireEvent.submit(input.closest("form") as HTMLFormElement);
+
+    expect(await screen.findByText("Command accepted")).toBeTruthy();
+
+    emitMessage("web-default", "working on it", "assistant-1");
+    await waitFor(() => {
+      expect(screen.queryByText("Command accepted")).toBeNull();
+    });
+  });
+
+  it("does not show command accepted when chat skills are disabled", async () => {
+    chatApi.fetchChatSkills.mockResolvedValueOnce({
+      ok: true,
+      version: "v1",
+      data: { enabled: false, skills: defaultSkillCommands }
+    });
+    chatApi.sendChatMessage.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: { channel_id: "web-default", source_id: "client-1" }
+    });
+
+    renderChat();
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("No chat skills are currently available.");
+    const input = screen.getByLabelText("Message");
+    fireEvent.change(input, { target: { value: "/memory" } });
+    fireEvent.submit(input.closest("form") as HTMLFormElement);
+
+    await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
+      content: "/memory"
+    })));
+    expect(screen.queryByText("Command accepted")).toBeNull();
+  });
+
+  it("does not show command accepted for slash text outside the allowlist", async () => {
+    chatApi.sendChatMessage.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: { channel_id: "web-default", source_id: "client-1" }
+    });
+
+    renderChat();
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("Memory");
+    const input = screen.getByLabelText("Message");
+    fireEvent.change(input, { target: { value: "/unknown extra args" } });
+    fireEvent.submit(input.closest("form") as HTMLFormElement);
+
+    await waitFor(() => expect(chatApi.sendChatMessage).toHaveBeenCalledWith(expect.objectContaining({
+      content: "/unknown extra args"
+    })));
+    expect(screen.queryByText("Command accepted")).toBeNull();
   });
 
   it("shows an actionable message when chat auth is rejected (master key)", async () => {
@@ -347,8 +464,9 @@ describe("ChatRoute", () => {
     expect(seen[seen.length - 1]).toContain("tab=conversation");
   });
 
-  it("reconnects the chat + turn-event streams when the API key changes (#616)", () => {
+  it("reconnects the chat + turn-event streams when the API key changes (#616)", async () => {
     renderChat();
+    await waitFor(() => expect(chatApi.fetchChatSkills).toHaveBeenCalledTimes(1));
     expect(chatApi.createChatStream).toHaveBeenCalledTimes(1);
     const turnBefore = turnApi.createTurnEventStream.mock.calls.length;
 
@@ -362,6 +480,7 @@ describe("ChatRoute", () => {
     expect(chatApi.close).toHaveBeenCalled();
     expect(chatApi.createChatStream).toHaveBeenCalledTimes(2);
     expect(turnApi.createTurnEventStream.mock.calls.length).toBeGreaterThan(turnBefore);
+    await waitFor(() => expect(chatApi.fetchChatSkills).toHaveBeenCalledTimes(2));
   });
 
   it("keeps the conversation when the route unmounts and remounts (#567)", () => {

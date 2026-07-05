@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +24,16 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from mimir import mid_turn_injection as _mti
 from mimir.agent import Agent
+from mimir.chat_skills import (
+    CHAT_SKILL_EXTRA_KEY,
+    ChatSkillInvocation,
+    ChatSkillRegistry,
+)
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
 from mimir.models import AgentEvent, TurnContext
+from mimir.skill_defs import home_builtin_skills_dir
 from mimir.turn_logger import TurnLogger
 
 
@@ -40,6 +46,45 @@ def _make_config(home: Path) -> Config:
     import os
     os.environ["MIMIR_HOME"] = str(home)
     return Config.from_env()
+
+
+def _make_chat_skill_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    home: Path,
+    *,
+    slug: str = "memory",
+    label: str = "Memory",
+    description: str = "Capture durable context.",
+    body: str = "Use memory carefully.",
+    allowlist: str = "memory",
+) -> ChatSkillRegistry:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+    monkeypatch.setenv("MIMIR_CHAT_SKILLS_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_CHAT_SKILL_ALLOWLIST", allowlist)
+    skill_dir = home_builtin_skills_dir(home) / slug
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "\n".join(
+            [
+                "---",
+                f"name: {label}",
+                f"description: {description}",
+                "---",
+                body,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return ChatSkillRegistry.from_config(Config.from_env())
+
+
+def _read_events(tmp_path: Path) -> list[dict[str, Any]]:
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    if not events_log.exists():
+        return []
+    return [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
 
 
 class _FakeAgent:
@@ -261,7 +306,8 @@ class _FakeSessionManager:
 def _build_agent(tmp_path: Path, *,
                  fake_agent: _FakeAgent,
                  fake_saga: _FakeSaga | None = None,
-                 session_manager=None) -> Agent:
+                 session_manager=None,
+                 chat_skill_registry: ChatSkillRegistry | None = None) -> Agent:
     from mimir.event_logger import init_logger
     home = tmp_path / "home"
     (home / "logs").mkdir(parents=True, exist_ok=True)
@@ -274,6 +320,7 @@ def _build_agent(tmp_path: Path, *,
         index_generator=IndexGenerator(home),
         saga_client=fake_saga,  # type: ignore[arg-type]
         session_manager=session_manager,  # type: ignore[arg-type]
+        chat_skill_registry=chat_skill_registry,
     )
     # Skip the real deepagents.create_deep_agent — return our fake
     # whenever Agent goes to build/fetch the graph.
@@ -717,6 +764,225 @@ async def test_run_turn_typing_fires_at_start_and_cancels_at_end(
     # The model's final text is captured as reasoning in the turn record.
     assert "here is my reply" in record.output
     assert record.error is None
+
+
+async def test_run_turn_injects_chat_skill_prompt_block_from_injected_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    chat_skill_registry = _make_chat_skill_registry(
+        monkeypatch,
+        home,
+        body="Use memory carefully.",
+    )
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="done")])
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=fake_agent,
+        chat_skill_registry=chat_skill_registry,
+    )
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-1",
+        content="/memory remember this",
+        extra={
+            CHAT_SKILL_EXTRA_KEY: asdict(
+                ChatSkillInvocation(
+                    name="memory",
+                    command="/memory",
+                    args="remember this",
+                    raw="/memory remember this",
+                )
+            )
+        },
+    )
+
+    await agent.run_turn(event)
+
+    prompt = fake_agent.invocations[0]["state"]["messages"][0].content
+    assert "## Chat skill command: /memory" in prompt
+    assert "The user invoked the allowlisted chat skill `/memory`." in prompt
+    assert "Use memory carefully." in prompt
+    assert [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "chat_skill_runtime_failed"
+    ] == []
+
+
+async def test_run_turn_chat_skill_without_injected_registry_notifies_and_skips_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.channel_registry import ChannelRegistry
+
+    home = tmp_path / "home"
+    _make_chat_skill_registry(monkeypatch, home)
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="done")])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=fake_agent,
+    )
+    agent._channels = registry  # type: ignore[attr-defined]
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-1",
+        content="/memory remember this",
+        extra={
+            CHAT_SKILL_EXTRA_KEY: asdict(
+                ChatSkillInvocation(
+                    name="memory",
+                    command="/memory",
+                    args="remember this",
+                    raw="/memory remember this",
+                )
+            )
+        },
+    )
+
+    await agent.run_turn(event)
+
+    prompt = fake_agent.invocations[0]["state"]["messages"][0].content
+    assert "## Chat skill command:" not in prompt
+    assert bridge.sends == [
+        (
+            "ch-1",
+            "⚠️ I couldn't validate /memory safely, so I didn't run it. "
+            "Please try again or ask the operator to verify the chat-skill allowlist.",
+            True,
+        )
+    ]
+    events = _read_events(tmp_path)
+    failures = [e for e in events if e.get("type") == "chat_skill_runtime_failed"]
+    assert len(failures) == 1
+    assert failures[0]["phase"] == "prompt_resolution"
+    assert failures[0]["chat_skill_command"] == "/memory"
+    assert [
+        e for e in events if e.get("type") == "interactive_turn_no_send_message"
+    ] == []
+
+
+async def test_run_turn_chat_skill_runtime_failure_notifies_and_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.channel_registry import ChannelRegistry
+
+    class _BoomAgent:
+        async def ainvoke(self, *a, **kw):
+            raise RuntimeError("upstream failure")
+
+        async def astream(self, *a, **kw):
+            raise RuntimeError("upstream failure")
+            yield  # pragma: no cover
+
+    home = tmp_path / "home"
+    chat_skill_registry = _make_chat_skill_registry(monkeypatch, home)
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_BoomAgent(),  # type: ignore[arg-type]
+        chat_skill_registry=chat_skill_registry,
+    )
+    agent._channels = registry  # type: ignore[attr-defined]
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-1",
+        content="/memory remember this",
+        extra={
+            CHAT_SKILL_EXTRA_KEY: asdict(
+                ChatSkillInvocation(
+                    name="memory",
+                    command="/memory",
+                    args="remember this",
+                    raw="/memory remember this",
+                )
+            )
+        },
+    )
+
+    record = await agent.run_turn(event)
+
+    assert record.error == "RuntimeError: upstream failure"
+    assert bridge.sends == [
+        (
+            "ch-1",
+            "⚠️ I couldn't complete /memory on this turn. Please try again in a new message.",
+            True,
+        )
+    ]
+    failures = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "chat_skill_runtime_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["phase"] == "model_loop"
+    assert failures[0]["chat_skill_command"] == "/memory"
+
+
+async def test_run_turn_chat_skill_early_exception_notifies_and_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.channel_registry import ChannelRegistry
+
+    home = tmp_path / "home"
+    chat_skill_registry = _make_chat_skill_registry(monkeypatch, home)
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="done")])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=fake_agent,
+        chat_skill_registry=chat_skill_registry,
+    )
+    agent._channels = registry  # type: ignore[attr-defined]
+
+    async def _boom():
+        raise RuntimeError("build failed")
+
+    monkeypatch.setattr(agent, "_build_agent_if_needed", _boom)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-1",
+        content="/memory remember this",
+        extra={
+            CHAT_SKILL_EXTRA_KEY: asdict(
+                ChatSkillInvocation(
+                    name="memory",
+                    command="/memory",
+                    args="remember this",
+                    raw="/memory remember this",
+                )
+            )
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="build failed"):
+        await agent.run_turn(event)
+
+    assert bridge.sends == [
+        (
+            "ch-1",
+            "⚠️ I couldn't complete /memory on this turn. Please try again in a new message.",
+            True,
+        )
+    ]
+    failures = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "chat_skill_runtime_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["phase"] == "early_exception"
+    assert failures[0]["chat_skill_command"] == "/memory"
 
 
 async def test_run_turn_records_error_when_ainvoke_raises(tmp_path: Path):
