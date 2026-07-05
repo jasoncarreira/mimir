@@ -287,18 +287,31 @@ def _is_non_interactive_no_reply_channel(channel_id: str) -> bool:
     return channel_id.strip().lower() in _NON_INTERACTIVE_NO_REPLY_CHANNEL_LITERALS
 
 
+def _active_turn_has_http_event_ingress_for_send_message_guard() -> bool:
+    from .._context import get_current_turn, get_only_active_turn
+    from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
+
+    ctx = get_current_turn()
+    if ctx is None:
+        ctx = get_only_active_turn()
+    ingress = getattr(ctx, "event_ingress", None)
+    return isinstance(ingress, str) and ingress.strip() == HTTP_EVENT_INGRESS_EXTRA_VALUE
+
+
 def _active_turn_is_non_interactive_for_send_message_guard() -> bool:
     """Return whether a no-reply pseudo-channel must be rejected.
 
     Only an explicit ``set_current_turn_interactive(True)`` proves that a turn
-    is interactive enough to preserve the historical no-reply lookup behavior.
+    is interactive enough to preserve the historical no-reply lookup behavior,
+    except for generic HTTP ``/event`` turns whose server-stamped
+    ``event_ingress`` provenance marks them as untrusted for this bypass.
     ``False`` and unset/``None`` both fail closed for these pseudo-channel
     sentinels so MCP/control-task ContextVar loss cannot reopen them. Real
     channel_ids are unaffected because this helper is consulted only after the
     sentinel match.
     """
     interactive = _current_turn_interactive_var.get()
-    if interactive is True:
+    if interactive is True and not _active_turn_has_http_event_ingress_for_send_message_guard():
         return False
     return True
 
