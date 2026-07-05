@@ -19,9 +19,11 @@ import subprocess
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
+from textwrap import dedent
 from typing import Any
 
 import pytest
+from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from mimir import mid_turn_injection as _mti
@@ -33,10 +35,17 @@ from mimir.chat_skills import (
 )
 from mimir.config import Config
 from mimir.history import MessageBuffer
+from mimir.identities import IdentityResolver
 from mimir.index import IndexGenerator
 from mimir.models import AgentEvent, TurnContext
 from mimir.skill_defs import home_builtin_skills_dir
+from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.turn_logger import TurnLogger
+from mimir.worklink.continuation import (
+    HTTP_EVENT_INGRESS_EXTRA_KEY,
+    HTTP_EVENT_INGRESS_EXTRA_VALUE,
+    stamp_http_event_ingress_extra,
+)
 
 
 def _make_config(home: Path) -> Config:
@@ -97,6 +106,15 @@ def _git(cwd: Path, *args: str) -> str:
         check=True,
     )
     return result.stdout.strip()
+
+
+def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "identities.yaml").write_text(dedent(body), encoding="utf-8")
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    return resolver
 
 
 def _init_continuation_repo(
@@ -313,6 +331,60 @@ class _BoundaryFakeAgent(_FakeAgent):
             yield chunk
 
 
+class _HttpEventAdminProbeAgent(_FakeAgent):
+    """Probe the TurnContext Agent installs before admin-tool auth runs."""
+
+    def __init__(self) -> None:
+        super().__init__([AIMessage(content="denied")])
+        self.observed_ctx: dict[str, Any] | None = None
+        self.denial: ToolMessage | None = None
+        self.handler_calls = 0
+
+    async def astream(
+        self,
+        state: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        stream_mode: str = "values",
+    ):
+        from mimir._context import get_current_turn
+
+        ctx = get_current_turn()
+        assert ctx is not None
+        self.observed_ctx = {
+            "trigger": ctx.trigger,
+            "channel_source": ctx.channel_source,
+            "author": ctx.author,
+            "event_ingress": ctx.event_ingress,
+            "access_control_enforced": ctx.access_control_enforced,
+        }
+        gate = BudgetGateMiddleware()
+
+        async def _handler(req: ToolCallRequest) -> ToolMessage:
+            self.handler_calls += 1
+            return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+        self.denial = await gate.awrap_tool_call(
+            ToolCallRequest(
+                tool_call={
+                    "name": "shell_exec",
+                    "args": {},
+                    "id": "tc-http-event",
+                    "type": "tool_call",
+                },
+                tool=None,
+                state=None,
+                runtime=None,  # type: ignore[arg-type]
+            ),
+            _handler,
+        )
+
+        async for chunk in super().astream(
+            state, config=config, stream_mode=stream_mode,
+        ):
+            yield chunk
+
+
 class _FakeChannelSession:
     """Tiny ChannelSession stand-in. Real ChannelSession is a dataclass
     in session_manager.py; we only need the ``saga_session_id`` attribute
@@ -439,6 +511,7 @@ async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
     tc = next(e for e in record.events if e["type"] == "tool_call")
     assert tc["name"] == "memory_store"
 
+
     # Result fields surfaced cost + num_turns
     assert record.total_cost_usd == pytest.approx(0.001)
     assert record.num_turns == 2
@@ -447,6 +520,64 @@ async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
     # The TurnLogger appended one record
     turns = (tmp_path / "home" / "logs" / "turns.jsonl").read_text().splitlines()
     assert len(turns) == 1
+
+
+async def test_run_turn_http_event_ingress_reaches_turn_context_before_admin_tool_auth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(kind: str, **kw: Any) -> None:
+        captured.append((kind, kw))
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", _capture)
+
+    fake_agent = _HttpEventAdminProbeAgent()
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._identity_resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: root
+            aliases: [api-root]
+            access: {roles: [user, admin]}
+        """,
+    )
+
+    stamped_extra = stamp_http_event_ingress_extra(
+        {HTTP_EVENT_INGRESS_EXTRA_KEY: "forged-client-value", "keep": "me"}
+    )
+    record = await agent.run_turn(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="ch-http",
+            content="resume chainlink #740",
+            source="api",
+            author="api-root",
+            extra=stamped_extra,
+        )
+    )
+
+    assert record.error is None
+    assert fake_agent.observed_ctx == {
+        "trigger": "scheduled_tick",
+        "channel_source": "api",
+        "author": "api-root",
+        "event_ingress": HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        "access_control_enforced": True,
+    }
+    assert fake_agent.handler_calls == 0
+    assert fake_agent.denial is not None
+    assert fake_agent.denial.status == "error"
+    assert "requires an admin identity (http_event_author_untrusted)" in str(
+        fake_agent.denial.content
+    )
+    admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
+    assert admin_event["tool"] == "shell_exec"
+    assert admin_event["canonical_author"] == "root"
+    assert admin_event["denial_reason"] == "http_event_author_untrusted"
 
 
 class _FoldingFakeAgent(_FakeAgent):
