@@ -54,6 +54,7 @@ from ..pollers import (
     PollerOverridesValidationError,
     validate_poller_overrides_text,
 )
+from ..models import TurnInteractivity
 from ..scheduler import SchedulerJob
 
 # Per-task ContextVar for channel_id — isolated across concurrent asyncio
@@ -62,11 +63,11 @@ _current_channel_id_var: contextvars.ContextVar[str | None] = contextvars.Contex
     "mimir_current_channel_id", default=None
 )
 
-# Per-task ContextVar: is the active turn an interactive (user-facing) one?
-# Set by the dispatcher at turn start, paired with the channel id. ``None``
-# means "unset / lost" so send_message can recover non-interactive poller turns
-# from the shared active-turn registry without conflating that case with an
-# explicit interactive=True setting.
+# Legacy per-task ContextVar for turn interactivity. Kept as a compatibility
+# setter for older call sites/tests, but send_message's no-reply sentinel guard
+# no longer trusts it authoritatively; allow decisions resolve
+# TurnContext.interactivity from the current / uniquely-active turn and fail
+# closed when that authoritative context is missing.
 _current_turn_interactive_var: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
     "mimir_current_turn_interactive", default=None
 )
@@ -287,33 +288,35 @@ def _is_non_interactive_no_reply_channel(channel_id: str) -> bool:
     return channel_id.strip().lower() in _NON_INTERACTIVE_NO_REPLY_CHANNEL_LITERALS
 
 
-def _active_turn_has_http_event_ingress_for_send_message_guard() -> bool:
+def _resolve_authoritative_turn_context_for_send_message_guard() -> Any | None:
+    """Resolve the authoritative turn context for the no-reply sentinel guard.
+
+    Prefer the current TurnContext when present. If the ContextVar was lost on a
+    forked SDK/MCP task, fall back only to the exact single-active-turn helper.
+    Ambiguous multi-active cases fail closed upstream.
+    """
     from .._context import get_current_turn, get_only_active_turn
-    from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
 
     ctx = get_current_turn()
-    if ctx is None:
-        ctx = get_only_active_turn()
-    ingress = getattr(ctx, "event_ingress", None)
-    return isinstance(ingress, str) and ingress.strip() == HTTP_EVENT_INGRESS_EXTRA_VALUE
+    if ctx is not None:
+        return ctx
+    return get_only_active_turn()
 
 
 def _active_turn_is_non_interactive_for_send_message_guard() -> bool:
     """Return whether a no-reply pseudo-channel must be rejected.
 
-    Only an explicit ``set_current_turn_interactive(True)`` proves that a turn
-    is interactive enough to preserve the historical no-reply lookup behavior,
-    except for generic HTTP ``/event`` turns whose server-stamped
-    ``event_ingress`` provenance marks them as untrusted for this bypass.
-    ``False`` and unset/``None`` both fail closed for these pseudo-channel
-    sentinels so MCP/control-task ContextVar loss cannot reopen them. Real
-    channel_ids are unaffected because this helper is consulted only after the
-    sentinel match.
+    Only an authoritative carried ``TurnContext.interactivity`` classification
+    of ``INTERACTIVE`` preserves the historical no-reply lookup behavior.
+    Resolve the current turn first; if ContextVar state was lost on an SDK/MCP
+    fork, fall back only to the unique active turn. Missing, ambiguous, or
+    unclassified turns all fail closed. Real channel_ids are unaffected because
+    this helper is consulted only after the sentinel match.
     """
-    interactive = _current_turn_interactive_var.get()
-    if interactive is True and not _active_turn_has_http_event_ingress_for_send_message_guard():
-        return False
-    return True
+    ctx = _resolve_authoritative_turn_context_for_send_message_guard()
+    if ctx is None:
+        return True
+    return getattr(ctx, "interactivity", None) != TurnInteractivity.INTERACTIVE
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -387,8 +390,12 @@ def reset_current_channel_id(token: contextvars.Token) -> None:
 
 
 def set_current_turn_interactive(interactive: bool) -> contextvars.Token:
-    """Set whether the active turn is interactive (user-facing). Paired with
-    ``set_current_channel_id`` at turn start; reset in a finally block."""
+    """Compatibility setter for the legacy per-task interactivity ContextVar.
+
+    Kept so older call sites/tests can continue to stamp/reset the value, but
+    send_message's no-reply sentinel guard now resolves authoritative carried
+    ``TurnContext.interactivity`` instead of consulting this ContextVar.
+    """
     return _current_turn_interactive_var.set(interactive)
 
 
