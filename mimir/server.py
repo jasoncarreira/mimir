@@ -51,7 +51,10 @@ from .prompt_templates import seed_prompts
 from .subagent_defs import seed_subagent_defs
 from .subagent_inbox import SubagentInbox
 from .turn_logger import TurnLogger
-from .worklink.continuation import strip_worklink_hint_extra
+from .worklink.continuation import (
+    stamp_http_event_ingress_extra,
+    strip_worklink_hint_extra,
+)
 from . import web_ui
 
 log = logging.getLogger(__name__)
@@ -266,7 +269,9 @@ async def _handle_event(request: web.Request) -> web.Response:
     # continuation hint keys before constructing the AgentEvent. Otherwise a
     # client could forge skill invocations or smuggle issue/PR/worktree hints
     # that later look authoritative to continuation recovery paths.
-    extra = strip_worklink_hint_extra(strip_chat_skill_extra(extra))
+    extra = stamp_http_event_ingress_extra(
+        strip_worklink_hint_extra(strip_chat_skill_extra(extra))
+    )
     attachment_names = body.get("attachment_names")
     if attachment_names is not None and not isinstance(attachment_names, list):
         return web.json_response(

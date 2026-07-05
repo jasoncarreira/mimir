@@ -12,6 +12,8 @@ from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent, TurnContext, TurnRecord
 from mimir.worklink.continuation import (
     CONTINUATION_PREFIX,
+    HTTP_EVENT_INGRESS_EXTRA_KEY,
+    HTTP_EVENT_INGRESS_EXTRA_VALUE,
     maybe_create_worklink_budget_continuation,
 )
 from mimir.worklink.run_state import WorklinkRunState, save_run_state
@@ -128,6 +130,25 @@ people:
     aliases: [slack-U1]
     access:
       roles: [user]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    resolver = IdentityResolver(home)
+    resolver.reload()
+    return resolver
+
+
+def _write_admin_identities(home: Path) -> IdentityResolver:
+    identities = home / "state" / "identities.yaml"
+    identities.parent.mkdir(parents=True, exist_ok=True)
+    identities.write_text(
+        """
+people:
+  - canonical: root
+    aliases: [slack-UADMIN]
+    access:
+      roles: [user, admin]
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -557,6 +578,57 @@ def test_user_message_default_access_control_cannot_post_external_comment(tmp_pa
         or argv[:3] == ["gh", "pr", "comment"]
         for argv, _cwd in runner.calls
     )
+
+
+def test_http_event_forged_admin_author_cannot_post_external_comment(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch="chainlink-740-http-event-forged-admin")
+    _save_run_state(
+        home,
+        issue_id=740,
+        branch="chainlink-740-http-event-forged-admin",
+        test_command="uv run pytest -q tests/test_worklink_continuation.py",
+    )
+    resolver = _write_admin_identities(home)
+    event = _make_event(
+        trigger="user_message",
+        source="api",
+        author="slack-UADMIN",
+        content="resume chainlink #740",
+        extra={
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "keep": "me",
+        },
+    )
+    ctx = _make_ctx(
+        event,
+        access_control_enforced=True,
+        author="slack-UADMIN",
+        resolver=resolver,
+        channel_source="api",
+    )
+    record = _make_record(event)
+    runner = SpyRunner()
+
+    result = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=ctx,
+        record=record,
+        repo=repo,
+        current_worktree=repo,
+        current_labels=["worklink:ready"],
+        runner=runner,
+    )
+
+    assert result is not None
+    payload = json.loads(result.sidecar_path.read_text(encoding="utf-8"))
+    assert payload["association"]["issue_id"] == 740
+    assert payload["external_comment"]["posted"] is False
+    assert payload["external_comment"]["skipped_reason"] == "http_event_author_untrusted"
+    assert payload["external_comment"]["target"] == "issue"
+    assert runner.issue_comments == []
 
 
 @pytest.mark.parametrize(
