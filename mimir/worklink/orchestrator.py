@@ -1023,7 +1023,7 @@ class WorklinkRunner:
             try:
                 handle = await compute.launch(spec)
                 compute_result = await _heartbeat_while(
-                    compute.wait(spec.timeout_s),
+                    compute.wait(handle, spec.timeout_s),
                     claims=claims,
                     record=record,
                 )

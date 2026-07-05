@@ -2334,3 +2334,90 @@ def test_worker_emits_structured_test_report(capsys: pytest.CaptureFixture[str])
     assert report["failed"] == ["tests/test_x.py::test_y", "tests/test_z.py::test_q"]
     assert "2 failed, 10 passed" in report["summary"]
     assert extract_test_report("no report here") is None
+
+
+def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
+    """Regression (mimir review on #1030): run_epic must call
+    ``compute.wait(handle, timeout_s)`` — the same 2-arg signature run() uses —
+    after launching the factory compute job. A prior bug passed only
+    ``timeout_s``; it bound to ``handle`` and dropped ``timeout_s``, so run-epic
+    crashed with a TypeError right after launch and transitioned the epic to
+    failed. This drives run_epic through launch/wait with a fake compute whose
+    factory writes a completed run.json, and asserts a clean completion plus the
+    exact wait() arguments.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    worktree = repo / ".worklink" / "700-1"
+    factory_run = repo / ".opencode" / "factory" / "run.json"
+
+    epic_json = json.dumps(
+        {
+            "id": 700,
+            "title": "epic",
+            "description": "build the thing",
+            "labels": ["worklink", "worklink:epic", "worklink:ready"],
+            "parent_id": None,
+            "comments": [],
+        }
+    )
+
+    class FactoryCompute(FakeCompute):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.waited: tuple[object, int] | None = None
+
+        async def wait(self, handle: WorkSpec, timeout_s: int) -> ComputeResult:
+            self.waited = (handle, timeout_s)
+            factory_run.parent.mkdir(parents=True, exist_ok=True)
+            factory_run.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "heartbeat_at": datetime.now(UTC).isoformat(),
+                        "status": "completed",
+                        "pr_url": "https://github.com/jasoncarreira/mimir/pull/999",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return ComputeResult(exit_code=0, stdout="factory ok", stderr="")
+
+    class FactoryBackend(FakeBackend):
+        name = "feature_factory"
+
+    compute = FactoryCompute(shared_filesystem=True)
+
+    def runner(
+        args: Sequence[str] | str, **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "700"]:
+            return cp(args, stdout=epic_json)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
+            worktree.mkdir(parents=True, exist_ok=True)
+            return cp(args)
+        return cp(args)
+
+    registry = BackendRegistry(
+        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    )
+    registry.register(FactoryBackend(status="success"))
+    registry.register_compute(compute)
+
+    result = asyncio.run(
+        WorklinkRunner(
+            home=tmp_path, repo=repo, runner=runner, registry=registry
+        ).run_epic(700)
+    )
+
+    # With the bug (compute.wait(spec.timeout_s)) run_epic caught a TypeError and
+    # returned status="failed"; the fix reaches wait() with the launch handle.
+    assert result.status == "completed", (result.status, result.reason)
+    assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
+    assert compute.specs, "compute.launch was never called"
+    assert compute.waited is not None, "compute.wait was never reached"
+    handle, waited_timeout = compute.waited
+    assert handle is compute.specs[0], "wait() did not receive the launch handle"
+    assert waited_timeout == compute.specs[0].timeout_s
