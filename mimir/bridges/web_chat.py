@@ -38,6 +38,7 @@ from ..chat_skills import (
     ChatSkillError,
     ChatSkillInvocation,
     ChatSkillRegistry,
+    strip_chat_skill_extra,
 )
 from ..models import AgentEvent
 from ..web_channels import DEFAULT_WEB_CHANNEL, web_channel_for_identity
@@ -55,7 +56,6 @@ EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
 
 DEFAULT_CHANNEL = DEFAULT_WEB_CHANNEL
 CHAT_STREAM_MAX_SUBSCRIBERS = int(os.environ.get("MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS", "8"))
-LEGACY_CHAT_SKILL_EXTRA_KEY = "chat_skill"
 
 
 @dataclass(frozen=True)
@@ -132,13 +132,9 @@ def _chat_identity(request: web.Request):
 
 
 def _sanitize_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
-    if not extra:
-        return {}
-    return {
-        key: value
-        for key, value in extra.items()
-        if key not in {CHAT_SKILL_EXTRA_KEY, LEGACY_CHAT_SKILL_EXTRA_KEY}
-    }
+    # Single source of truth for the chat-skill key set (chat_skills), shared
+    # with the generic /event ingress in server.py.
+    return strip_chat_skill_extra(extra)
 
 
 def _slash_command_error(parsed: ChatSkillError) -> _ChatRequestError:

@@ -26,7 +26,7 @@ from .agent import Agent
 from .background_tasks import spawn_background
 from .bridges.bench import BenchBridge
 from .bridges.web_chat import WebChatBridge
-from .chat_skills import ChatSkillRegistry
+from .chat_skills import ChatSkillRegistry, strip_chat_skill_extra
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .dispatcher import Dispatcher
@@ -260,6 +260,11 @@ async def _handle_event(request: web.Request) -> web.Response:
     extra = body.get("extra")
     if extra is not None and not isinstance(extra, dict):
         return web.json_response({"error": "extra must be an object"}, status=400)
+    # chainlink #783 (security): the generic /event ingress is client-controlled,
+    # so strip server-owned chat-skill keys — only the WebChatBridge may produce
+    # a chat-skill invocation (after auth + server-side slash parsing). Otherwise
+    # a client could forge extra.chat_skill_invocation and inject skill prompts.
+    extra = strip_chat_skill_extra(extra)
     attachment_names = body.get("attachment_names")
     if attachment_names is not None and not isinstance(attachment_names, list):
         return web.json_response(

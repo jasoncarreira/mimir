@@ -460,6 +460,35 @@ class TestHandleEvent:
             )
         assert resp.status == 200
 
+    async def test_event_strips_forged_chat_skill_extra(self) -> None:
+        # chainlink #783 (security): the generic /event ingress is
+        # client-controlled, so a forged chat-skill invocation must be stripped
+        # before enqueue — only the WebChatBridge may produce one.
+        from mimir.chat_skills import CHAT_SKILL_EXTRA_KEY, LEGACY_CHAT_SKILL_EXTRA_KEY
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "content": "/deploy now",
+                    "extra": {
+                        CHAT_SKILL_EXTRA_KEY: {
+                            "name": "deploy", "command": "/deploy",
+                            "args": "now", "raw": "/deploy now",
+                        },
+                        LEGACY_CHAT_SKILL_EXTRA_KEY: {"x": 1},
+                        "keep": "me",
+                    },
+                },
+            )
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert CHAT_SKILL_EXTRA_KEY not in event.extra
+        assert LEGACY_CHAT_SKILL_EXTRA_KEY not in event.extra
+        assert event.extra == {"keep": "me"}
+
     @pytest.mark.asyncio
     async def test_valid_event_returns_ok_true(self) -> None:
         app, _ = _event_app()
