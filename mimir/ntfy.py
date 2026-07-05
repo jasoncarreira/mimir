@@ -50,9 +50,10 @@ block in mimir/feedback.py — wiring deferred to chainlink #65):
 
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -474,6 +475,70 @@ def _last_heartbeat_timestamp(
     return None
 
 
+@dataclass(frozen=True)
+class _SchedulerWedgeAssessment:
+    heartbeat_cron: str | None
+    threshold_minutes: float | None = None
+    last_tick: datetime | None = None
+    elapsed_minutes: float | None = None
+    classification: str | None = None
+    suppress_reason: str | None = None
+
+
+def _assess_scheduler_wedge(
+    events_path: Path,
+    *,
+    scheduler_yaml_path: Path,
+    safety_factor: float,
+    channel_id: str,
+    now: datetime,
+) -> _SchedulerWedgeAssessment:
+    """Read scheduler/events state and classify heartbeat silence.
+
+    This helper intentionally contains the synchronous YAML + JSONL reads so
+    the async scheduler-health job can run the whole assessment in
+    ``asyncio.to_thread``.  The public coroutine then only performs cheap
+    arithmetic plus async event/alarm emission on the event loop.
+    """
+    heartbeat_cron = _read_heartbeat_cron(scheduler_yaml_path)
+    if heartbeat_cron is None or not heartbeat_cron.strip():
+        return _SchedulerWedgeAssessment(heartbeat_cron=None)
+
+    period_min = _cron_period_minutes(heartbeat_cron)
+    threshold_minutes = period_min * safety_factor
+
+    last_tick = _last_heartbeat_timestamp(events_path, channel_id=channel_id)
+    if last_tick is None:
+        return _SchedulerWedgeAssessment(
+            heartbeat_cron=heartbeat_cron,
+            threshold_minutes=threshold_minutes,
+        )
+
+    elapsed_minutes = (now - last_tick).total_seconds() / 60.0
+    if elapsed_minutes < threshold_minutes:
+        return _SchedulerWedgeAssessment(
+            heartbeat_cron=heartbeat_cron,
+            threshold_minutes=threshold_minutes,
+            last_tick=last_tick,
+            elapsed_minutes=elapsed_minutes,
+        )
+
+    classification, suppress_reason = _classify_silence(
+        events_path,
+        channel_id=channel_id,
+        window_start=last_tick,
+        window_end=now,
+    )
+    return _SchedulerWedgeAssessment(
+        heartbeat_cron=heartbeat_cron,
+        threshold_minutes=threshold_minutes,
+        last_tick=last_tick,
+        elapsed_minutes=elapsed_minutes,
+        classification=classification,
+        suppress_reason=suppress_reason,
+    )
+
+
 async def fire_scheduler_wedge_alarm_if_warranted(
     events_path: Path,
     *,
@@ -515,29 +580,32 @@ async def fire_scheduler_wedge_alarm_if_warranted(
 
     Always returns ``None``.  Never raises.
     """
-    # --- check 1: is the heartbeat job configured at all? ----------------
-    heartbeat_cron = _read_heartbeat_cron(scheduler_yaml_path)
-    if heartbeat_cron is None or not heartbeat_cron.strip():
-        # Heartbeat intentionally disabled or scheduler.yaml unreadable —
-        # not a wedge condition; return silently.
-        return
-
-    # --- derive threshold from actual cron period ------------------------
-    period_min = _cron_period_minutes(heartbeat_cron)
-    threshold_minutes = period_min * safety_factor
-
     if now is None:
         now = datetime.now(timezone.utc)
 
-    last_tick = _last_heartbeat_timestamp(events_path, channel_id=channel_id)
-    if last_tick is None:
-        # No prior tick in the log — likely first boot or very small log
-        # window.  Don't alarm; we have no baseline.
+    assessment = await asyncio.to_thread(
+        _assess_scheduler_wedge,
+        events_path,
+        scheduler_yaml_path=scheduler_yaml_path,
+        safety_factor=safety_factor,
+        channel_id=channel_id,
+        now=now,
+    )
+    if (
+        assessment.heartbeat_cron is None
+        or assessment.threshold_minutes is None
+        or assessment.last_tick is None
+        or assessment.elapsed_minutes is None
+        or assessment.classification is None
+    ):
+        # Heartbeat disabled/unreadable, no baseline tick, or still within
+        # the threshold.  The synchronous YAML/JSONL reads above ran off-loop;
+        # no event/alarm work is needed for these normal no-op cases.
         return
 
-    elapsed_minutes = (now - last_tick).total_seconds() / 60.0
-    if elapsed_minutes < threshold_minutes:
-        return
+    heartbeat_cron = assessment.heartbeat_cron
+    threshold_minutes = assessment.threshold_minutes
+    elapsed_minutes = assessment.elapsed_minutes
 
     # chainlink #221: distinguish genuine wedge from intentional
     # suppression. The legacy alarm fired identically when APScheduler
@@ -545,14 +613,7 @@ async def fire_scheduler_wedge_alarm_if_warranted(
     # suppressing ticks (quota saturated, operator-disabled, etc.) —
     # but the operator response differs (restart vs. fix the upstream
     # cause), so the alarm shouldn't conflate them.
-    classification, suppress_reason = _classify_silence(
-        events_path,
-        channel_id=channel_id,
-        window_start=last_tick,
-        window_end=now,
-    )
-
-    if classification == "suppressed":
+    if assessment.classification == "suppressed":
         # Silence is explained by ``scheduled_tick_suppressed`` events
         # in the window. The scheduler is alive and intentionally not
         # firing — operator action is upstream (fix the quota
@@ -576,7 +637,7 @@ async def fire_scheduler_wedge_alarm_if_warranted(
             channel_id=channel_id,
             elapsed_minutes=round(elapsed_minutes, 1),
             threshold_minutes=round(threshold_minutes, 1),
-            suppress_reason=suppress_reason,
+            suppress_reason=assessment.suppress_reason,
         )
         return
 
