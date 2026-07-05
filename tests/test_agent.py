@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -87,6 +88,36 @@ def _read_events(tmp_path: Path) -> list[dict[str, Any]]:
     return [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
 
 
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _init_continuation_repo(
+    tmp_path: Path,
+    *,
+    branch: str = "feature/worklink-recovery",
+    remote_url: str = "https://github.com/acme/demo.git",
+) -> Path:
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "checkout", "-q", "-b", "main")
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "tracked.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "remote", "add", "origin", remote_url)
+    if branch != "main":
+        _git(repo, "checkout", "-q", "-b", branch)
+    return repo
+
+
 class _FakeAgent:
     """Replaces the deepagents CompiledStateGraph. Returns a canned
     message list shaped like ChatClaudeCode's output."""
@@ -107,6 +138,37 @@ class _FakeAgent:
         events/output from the final cumulative message list."""
         self.invocations.append({"state": state, "config": config})
         yield {"messages": list(state.get("messages") or []) + self._response_messages}
+
+
+class _BudgetExhaustingAgent(_FakeAgent):
+    """Simulate a turn that exhausted the tool-call budget."""
+
+    def __init__(
+        self,
+        response_messages: list[Any],
+        *,
+        budget: int = 7,
+        denied_tools: list[str] | None = None,
+    ) -> None:
+        super().__init__(response_messages)
+        self._budget = budget
+        self._denied_tools = denied_tools or ["Bash"]
+
+    async def astream(self, state: dict[str, Any], *, config: dict[str, Any], stream_mode: str = "values"):
+        from mimir._context import get_current_turn
+
+        _ctx = get_current_turn()
+        if _ctx is not None:
+            _ctx.tool_call_count = self._budget
+            _ctx.tool_call_budget = self._budget
+            _ctx.tool_call_budget_exhausted = True
+            _ctx.tool_call_budget_denied_count = 1
+            _ctx.tool_call_budget_denied_tools = list(self._denied_tools)
+            _ctx.tool_call_budget_first_denied_at_count = self._budget
+        async for chunk in super().astream(
+            state, config=config, stream_mode=stream_mode,
+        ):
+            yield chunk
 
 
 class _BridgeStub:
@@ -454,6 +516,86 @@ async def test_run_turn_no_injected_inputs_when_nothing_folded(tmp_path: Path):
     )
     assert record.injected_inputs == []
     assert agent._buffer.channel_count("ch-1") == 1
+
+
+async def test_budget_exhaustion_creates_worklink_continuation_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = _init_continuation_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_BudgetExhaustingAgent(
+            response_messages=[AIMessage(content="continuing worklink recovery")],
+        ),
+        fake_saga=None,
+    )
+
+    record = await agent.run_turn(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="ops",
+            content="generic worklink follow-up",
+            source_id="budget-src-1",
+        )
+    )
+
+    sidecars = sorted((tmp_path / "home" / "state" / "worklink" / "continuations").glob("*.json"))
+    assert len(sidecars) == 1
+    payload = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    assert payload["budget"]["count"] == 7
+    assert payload["budget"]["budget"] == 7
+    assert payload["budget"]["denied_count"] == 1
+    assert payload["budget"]["denied_tools"] == ["Bash"]
+    assert payload["association"]["branch"] == "feature/worklink-recovery"
+    assert payload["association"]["repo"] == "acme/demo"
+    assert payload["association"]["worktree"] == str(repo.resolve())
+    assert payload["turns"][-1]["turn_id"] == record.turn_id
+    assert any(
+        ev.get("type") == "worklink_continuation_created"
+        for ev in _read_events(tmp_path)
+    )
+
+
+async def test_continuation_written_even_without_assistant_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = _init_continuation_repo(
+        tmp_path,
+        branch="chainlink-740-budget-continuation--be-agent-finalizer",
+    )
+    monkeypatch.chdir(repo)
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_BudgetExhaustingAgent(
+            response_messages=[AIMessage(content="")],
+        ),
+        fake_saga=None,
+    )
+
+    record = await agent.run_turn(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="ops",
+            content="resume chainlink #740",
+            source_id="budget-src-2",
+        )
+    )
+
+    assert record.output == ""
+    turns = [
+        json.loads(line)
+        for line in (tmp_path / "home" / "logs" / "turns.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert turns[-1]["output"] == ""
+    sidecars = sorted((tmp_path / "home" / "state" / "worklink" / "continuations").glob("*.json"))
+    assert len(sidecars) == 1
+    payload = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    assert payload["turns"][-1]["turn_id"] == record.turn_id
+    assert payload["association"]["branch"] == "chainlink-740-budget-continuation--be-agent-finalizer"
 
 
 async def test_append_inbound_to_buffer_is_idempotent(tmp_path: Path):
