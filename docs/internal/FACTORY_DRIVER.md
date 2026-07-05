@@ -27,11 +27,17 @@ worklink:epic + worklink:ready issue
 ### Gate policy (decided 2026-07-04)
 
 `story`/`brief` are auto-approved on the factory's own validator — trusted
-autonomously. `pre_pr` has **no human gate**; an independent review subagent
-reads the diff, runs the suite, and returns approve/changes/stop. **The PR is the
-human review point** — it opens with the mimir reviewer requested and nothing
-auto-merges. The `pre_pr` reviewer fails *safe*: an unparseable verdict maps to
-`changes`, never a silent approve.
+autonomously. `pre_pr` has **no human gate**; the review runs as **two passes**
+(chainlink #835) — a general review plus a dedicated **security lens** (trust
+boundaries, prompt-injection, forgeable provenance, secrets — each requiring
+file:line) — and the **strictest** verdict wins (approve/changes/stop). A single
+generic review under-covers: on PR #1027 a generic review *and* the factory's own
+validator both missed a `/event` forgery bypass and an args prompt-injection.
+**The PR is the human review point** — it opens with the mimir reviewer requested
+and nothing auto-merges. The reviewer fails *safe*: an unparseable verdict maps to
+`changes`, never a silent approve. The epic ships to `worklink:review` only on a
+**successful terminal status AND a PR** — a draft PR under a `blocked`/`failed`
+status is treated as blocked/failed, not shipped.
 
 ## Enabling it
 

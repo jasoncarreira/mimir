@@ -24,10 +24,14 @@ from mimir.worklink.factory import (
     FactoryEpicRunner,
     FactoryReview,
     FactoryReviewContext,
+    _combine_reviews,
+    _default_reviewer_factory,
     _parse_review,
+    _review_prompt,
+    _security_review_prompt,
     factory_bin_from_env,
 )
-from mimir.worklink.orchestrator import WorklinkError
+from mimir.worklink.orchestrator import IssueContext, WorklinkError
 
 ISSUE_ID = 834
 FACTORY_BIN = ("feature-factory",)
@@ -55,13 +59,15 @@ class FakeClaims:
     def __init__(self, *, claimed: bool = True) -> None:
         self.transitions: list[tuple[int, str, bool, str | None]] = []
         self.released: list[int] = []
+        self.claim_calls: list[tuple[int, tuple, int | None]] = []
         record = ClaimRecord(
             issue_id=ISSUE_ID, attempt=1, agent_id="mimir-factory", claimed_at=datetime.now(UTC)
         )
         self._result = ClaimResult(claimed=claimed, record=record if claimed else None,
                                    reason=None if claimed else "cap reached")
 
-    def claim_issue(self, issue_id: int, *args, **kwargs) -> ClaimResult:
+    def claim_issue(self, issue_id: int, comments=(), *, max_active_locks=None) -> ClaimResult:
+        self.claim_calls.append((issue_id, tuple(comments), max_active_locks))
         return self._result
 
     def heartbeat_issue(self, record: ClaimRecord) -> ClaimRecord:
@@ -337,11 +343,16 @@ async def test_launch_and_answer_argv_target_the_repo(tmp_path):
     )
     await runner.run(ISSUE_ID, autonomous=True)
 
-    starts = [a for a in captured if "start" in a and "factory" in a]
-    assert starts, "factory start was never invoked"
-    for argv in starts:
+    launches = [a for a in captured if "start" in a and "factory" in a]
+    assert launches, "factory was never invoked"
+    for argv in launches:
         assert "--headless" in argv
         assert "--repo" in argv and str(fake.repo) in argv
+    # first invocation is a START carrying the epic prompt; every later invocation
+    # is a RESUME of the same run id — not another fresh start (blocker: #1028).
+    assert launches[0][-1].startswith(f"Build chainlink #{ISSUE_ID}")
+    for argv in launches[1:]:
+        assert argv[-1] == f"resume chainlink-{ISSUE_ID}"
     answers = [a for a in captured if "answer" in a and "factory" in a]
     for argv in answers:
         assert argv[:2] == ["feature-factory", "factory"]
@@ -377,3 +388,120 @@ def test_factory_epics_enabled_flag(monkeypatch):
     assert poller._factory_epics_enabled() is True
     monkeypatch.setenv("MIMIR_FACTORY_EPICS_ENABLED", "0")
     assert poller._factory_epics_enabled() is False
+
+
+# ── claim contract (mimir #1028 blocker 1) ──────────────────────────────────
+
+async def test_claim_passes_comments_and_autonomous_cap(tmp_path):
+    # Mirrors the leaf runner: comments (attempt accounting / duplicate-live
+    # guard) + max_active_locks (autonomous concurrency cap) must be passed.
+    runner, fake, claims = _runner_for(tmp_path)
+    await runner.run(ISSUE_ID, autonomous=True)
+    assert len(claims.claim_calls) == 1
+    issue_id, comments, cap = claims.claim_calls[0]
+    assert issue_id == ISSUE_ID
+    assert isinstance(comments, tuple)  # the issue's comments, not dropped
+    assert cap == 2  # WorklinkDefaults.max_concurrent (no worklink.yaml → default)
+
+
+async def test_claim_omits_cap_for_operator_runs(tmp_path):
+    runner, fake, claims = _runner_for(tmp_path)
+    await runner.run(ISSUE_ID, autonomous=False)
+    assert claims.claim_calls[0][2] is None  # no cap for operator-invoked runs
+
+
+async def test_cap_or_duplicate_refusal_returns_refused(tmp_path):
+    # A declined claim (cap reached / duplicate-live) must refuse without running.
+    claims = FakeClaims(claimed=False)
+    runner, fake, _ = _runner_for(tmp_path, claims=claims)
+    result = await runner.run(ISSUE_ID, autonomous=True)
+    assert result.status == "refused"
+    assert "cap" in (result.reason or "")
+    assert fake.launches == 0
+
+
+# ── finalize: success-status AND pr_url (mimir #1028 blocker 3) ──────────────
+
+async def test_pr_url_under_non_success_status_is_not_shipped(tmp_path):
+    runner, fake, claims = _runner_for(tmp_path)
+    orig = fake._advance
+
+    def advance_blocked_with_pr():
+        orig()
+        if ("brief", "approve") in fake.answers and not [a for a in fake.answers if a[0] == "pre_pr"]:
+            # pre_pr pending was just written; simulate: PR drafted but run then
+            # ended blocked (e.g. push/finalize trouble) — a URL is present.
+            (fake.run_dir / "run.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": fake.run_id,
+                        "status": "blocked",
+                        "gates": {"story": {"status": "approved"}, "brief": {"status": "approved"}},
+                        "pr_url": "https://github.com/o/r/pull/99",
+                        "blocked_reason": "push finalize failed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    fake._advance = advance_blocked_with_pr  # type: ignore[method-assign]
+    result = await runner.run(ISSUE_ID, autonomous=True)
+
+    assert result.status == "blocked"  # NOT review_ready, despite the pr_url
+    assert not any(c[:3] == ["gh", "pr", "ready"] for c in fake.gh_calls)
+    assert any(t[1] == "blocked" for t in claims.transitions)
+
+
+# ── #835: two-pass reviewer + strictest-verdict combination ─────────────────
+
+def _ctx(tmp_path=Path("/x")) -> FactoryReviewContext:
+    issue = IssueContext(issue_id=ISSUE_ID, title="Epic", description="", labels=set())
+    return FactoryReviewContext(
+        repo=tmp_path, run_dir=tmp_path / ".opencode" / "factory" / "r", run_id="r", issue=issue
+    )
+
+
+def test_combine_reviews_strictest_verdict_wins():
+    assert _combine_reviews(
+        FactoryReview("no_concerns"), FactoryReview("no_concerns")
+    ).verdict == "no_concerns"
+    combined = _combine_reviews(
+        FactoryReview("no_concerns"), FactoryReview("important", "sec issue at web_chat.py:1")
+    )
+    assert combined.verdict == "important"
+    assert "sec issue at web_chat.py:1" in combined.rationale
+    assert _combine_reviews(
+        FactoryReview("important", "x"), FactoryReview("blocker", "critical")
+    ).verdict == "blocker"
+    # no reviews → fail safe (request changes, never silent approve)
+    assert _combine_reviews().verdict == "important"
+
+
+def test_default_reviewer_runs_general_plus_security_pass_strictest_wins():
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        argv = list(argv)
+        calls.append(argv)
+        if argv[:2] == ["opencode", "run"]:
+            n = sum(1 for c in calls if c[:2] == ["opencode", "run"])
+            verdict = "no_concerns" if n == 1 else "important"  # general clean, security flags
+            return _cp(stdout=json.dumps({"verdict": verdict, "rationale": f"pass{n} f.py:1"}))
+        return _cp()
+
+    reviewer = _default_reviewer_factory(runner=runner, timeout_s=1, review_bin=("opencode",))
+    review = reviewer(_ctx())
+    assert review.verdict == "important"  # strictest of the two passes
+    assert len([c for c in calls if c[:2] == ["opencode", "run"]]) == 2  # two passes ran
+
+
+def test_review_prompts_demand_security_analysis():
+    general = _review_prompt(_ctx())
+    security = _security_review_prompt(_ctx())
+    for prompt in (general, security):
+        assert "file:line" in prompt
+    assert "trust boundar" in general.lower()
+    up = security.upper()
+    assert "TRUST BOUNDAR" in up
+    assert "PROMPT INJECTION" in up
+    assert "FORGEABLE" in up

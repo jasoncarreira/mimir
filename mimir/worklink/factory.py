@@ -51,6 +51,8 @@ _GATE_ORDER: tuple[str, ...] = ("story", "brief", "pre_pr")
 
 # Factory run statuses that mean "no more gates will open on their own".
 _TERMINAL_STATUSES = frozenset({"done", "completed", "complete", "blocked", "failed"})
+# Terminal statuses that mean the run SUCCEEDED — only these + a PR ship.
+_SUCCESS_TERMINAL_STATUSES = frozenset({"done", "completed", "complete"})
 
 # Reviewer verdict vocabulary (CriticFindings, mimir/subagents.py) → gate answer.
 _APPROVE_VERDICTS = frozenset({"no_concerns", "nits", "approve"})
@@ -98,19 +100,54 @@ def factory_bin_from_env(default: str = "feature-factory") -> tuple[str, ...]:
     return tuple(shlex.split(raw)) if raw else (default,)
 
 
+# Verdict severity for combining review passes (chainlink #835). Higher = worse.
+_VERDICT_SEVERITY = {
+    "no_concerns": 0, "approve": 0,
+    "nits": 1,
+    "important": 2, "changes": 2,
+    "blocker": 3, "stop": 3,
+}
+
+
 def _default_reviewer_factory(
     *, runner: Runner, timeout_s: int, review_bin: tuple[str, ...]
 ) -> FactoryReviewer:
-    """Reviewer that shells ``opencode run`` in the repo to judge the diff."""
+    """Two-pass reviewer (chainlink #835): a general review PLUS a dedicated
+    security-lens pass, combined so the STRICTER verdict wins. A single generic
+    review demonstrably under-covers trust-boundary / prompt-injection issues
+    (see PR #1027, where a generic review + the factory's own validator both
+    missed a /event forgery bypass and an args prompt-injection)."""
 
     def review(ctx: FactoryReviewContext) -> FactoryReview:
-        prompt = _review_prompt(ctx)
-        argv = [*review_bin, "run", "--dir", str(ctx.repo), "--", prompt]
-        result = runner(argv)
-        text = (result.stdout or "") + "\n" + (result.stderr or "")
-        return _parse_review(text)
+        general = _run_opencode_review(runner, review_bin, ctx, _review_prompt(ctx))
+        security = _run_opencode_review(runner, review_bin, ctx, _security_review_prompt(ctx))
+        return _combine_reviews(general, security)
 
     return review
+
+
+def _run_opencode_review(
+    runner: Runner, review_bin: tuple[str, ...], ctx: FactoryReviewContext, prompt: str
+) -> FactoryReview:
+    argv = [*review_bin, "run", "--dir", str(ctx.repo), "--", prompt]
+    result = runner(argv)
+    text = (result.stdout or "") + "\n" + (result.stderr or "")
+    return _parse_review(text)
+
+
+def _combine_reviews(*reviews: FactoryReview | None) -> FactoryReview:
+    """Combine review passes — the strictest verdict wins; the rationale carries
+    the concern(s) that drove any changes/stop outcome."""
+    present = [r for r in reviews if r is not None]
+    if not present:
+        return FactoryReview(verdict="important", rationale="no review produced")
+    worst = max(present, key=lambda r: _VERDICT_SEVERITY.get(r.verdict.strip().lower(), 2))
+    notes = [
+        r.rationale.strip()
+        for r in present
+        if _VERDICT_SEVERITY.get(r.verdict.strip().lower(), 2) >= 2 and r.rationale.strip()
+    ]
+    return FactoryReview(verdict=worst.verdict, rationale="; ".join(notes) or worst.rationale)
 
 
 def _review_prompt(ctx: FactoryReviewContext) -> str:
@@ -122,15 +159,52 @@ def _review_prompt(ctx: FactoryReviewContext) -> str:
         "1. Inspect the full diff against the base branch (git log/diff).\n"
         "2. Run the project's test suite and report pass/fail.\n"
         "3. Read the factory's own validation report under "
-        f".opencode/factory/{ctx.run_id}/artifacts/ if present.\n\n"
+        f".opencode/factory/{ctx.run_id}/artifacts/ if present.\n"
+        "4. SECURITY: check trust boundaries — does untrusted/client-controlled "
+        "input (request bodies, event metadata, tool/command args) reach a "
+        "privileged sink (LLM prompt/system/skill instructions, shell, file "
+        "writes, auth) without validation? Is untrusted text interpolated into a "
+        "privileged prompt region rather than rendered as labeled data? Can a "
+        "server-owned marker be forged via an alternate endpoint? (A separate "
+        "security-lens pass runs too — but flag anything you see here.)\n\n"
+        "Cite the specific file:line for every concern.\n\n"
         "Then decide a verdict using EXACTLY this vocabulary:\n"
         "  no_concerns | nits | important | blocker\n"
         "- no_concerns/nits => ship it (approve)\n"
         "- important => request changes (the factory will fix and re-gate)\n"
         "- blocker => stop the run\n\n"
         "End your reply with a single final line of JSON and nothing after it:\n"
-        '{"verdict": "<one of the four>", "rationale": "<one sentence; for important/blocker '
-        'state the specific change needed>"}'
+        '{"verdict": "<one of the four>", "rationale": "<one sentence with file:line; for '
+        'important/blocker state the specific change needed>"}'
+    )
+
+
+def _security_review_prompt(ctx: FactoryReviewContext) -> str:
+    return (
+        f"You are a SECURITY reviewer for chainlink #{ctx.issue.issue_id} "
+        f"({ctx.issue.title}). Review ONLY the trust boundaries of the integration "
+        "branch in this repo (assume functional correctness is covered elsewhere). "
+        "Inspect the full diff (git diff against the base) and answer each of these, "
+        "enumerating EVERY relevant path — not just the one the feature is 'about':\n"
+        "1. TRUST BOUNDARIES: does any untrusted/client-controlled input (HTTP "
+        "request bodies, event.extra/metadata, tool/command arguments, env, file "
+        "contents) reach a privileged sink (LLM prompt/system/skill instructions, "
+        "shell/subprocess, file writes, DB, auth decisions) WITHOUT sanitization or "
+        "validation? Check ALL ingress endpoints/handlers, not only the obvious one.\n"
+        "2. PROMPT INJECTION: is any untrusted string interpolated into a privileged "
+        "prompt region? It MUST be rendered as clearly-labeled untrusted data "
+        "(JSON-encoded or fenced), never as instructions.\n"
+        "3. FORGEABLE PROVENANCE: can a server-owned marker (a skill invocation, an "
+        "author/identity/source field, a signed flag) be manufactured by a client "
+        "via an alternate endpoint or by setting request fields directly?\n"
+        "4. SECRETS: are any secrets/tokens logged, echoed, or written to artifacts?\n\n"
+        "For EACH concern cite the specific file:line. Prefer a false positive you "
+        "can point to over silence.\n\n"
+        "Verdict vocabulary (EXACTLY): no_concerns | nits | important | blocker\n"
+        "- a real trust-boundary bypass or injection => at least 'important'; a "
+        "critical/unauth RCE-class issue => 'blocker'.\n\n"
+        "End with a single final JSON line and nothing after it:\n"
+        '{"verdict": "<one of the four>", "rationale": "<file:line + the specific fix needed>"}'
     )
 
 
@@ -180,6 +254,15 @@ class FactoryEpicRunner:
             chainlink_bin=self.chainlink_bin, agent_id=self.agent_id, runner=self._runner()
         )
 
+    def _autonomous_cap(self, autonomous: bool) -> int | None:
+        """The autonomous concurrency cap (worklink.yaml ``defaults.max_concurrent``),
+        or None for operator-invoked runs. Matches the leaf runner's contract."""
+        if not autonomous:
+            return None
+        from .backends.registry import WorklinkConfig
+
+        return WorklinkConfig.load(self.home / "worklink.yaml").defaults.max_concurrent
+
     def _reviewer(self) -> FactoryReviewer:
         if self.reviewer is not None:
             return self.reviewer
@@ -204,7 +287,14 @@ class FactoryEpicRunner:
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
 
         claims = self._claims()
-        claim = claims.claim_issue(issue_id)
+        # Mirror the leaf runner's claim contract: pass the freshly-read comments
+        # (attempt accounting + duplicate-live guard) and the autonomous
+        # concurrency cap (prevents autonomous dispatch over-admitting workers).
+        claim = claims.claim_issue(
+            issue.issue_id,
+            issue.comments,
+            max_active_locks=self._autonomous_cap(autonomous),
+        )
         if not claim.claimed or claim.record is None:
             reason = claim.reason or "could not claim epic"
             _log_event("factory_epic_claim_declined", issue_id=issue_id, reason=reason)
@@ -242,17 +332,18 @@ class FactoryEpicRunner:
         claims: ChainlinkClaims,
         record: ClaimRecord,
     ) -> WorklinkRunResult:
-        runner = self._runner()
-        prompt = self._initial_prompt(issue, run_id)
         answered: set[tuple[str, int]] = set()
+        started = False
 
         for cycle in range(self.max_cycles):
-            # Launch (start or resume) — a long subprocess (build runs here).
-            await _heartbeat_while(
-                asyncio.to_thread(self._launch, prompt),
-                claims=claims,
-                record=record,
-            )
+            # Launch — START on the first cycle, RESUME thereafter. Each call is a
+            # long subprocess (the whole build runs during the post-brief resume).
+            if not started:
+                launch = asyncio.to_thread(self._factory_start, self._initial_prompt(issue, run_id))
+                started = True
+            else:
+                launch = asyncio.to_thread(self._factory_resume, run_id)
+            await _heartbeat_while(launch, claims=claims, record=record)
             run = self._read_run(run_dir)
             if run is None:
                 raise WorklinkError(
@@ -303,7 +394,6 @@ class FactoryEpicRunner:
                 raise WorklinkError(f"feature-factory presented an unknown gate: {gate!r}")
 
             answered.add(gate_key)
-            prompt = f"resume {run_id}"
 
         raise WorklinkError(f"feature-factory did not terminate within {self.max_cycles} gate cycles")
 
@@ -320,9 +410,12 @@ class FactoryEpicRunner:
         pr_url = _run_pr_url(run)
         status = str(run.get("status") or "").strip().lower()
 
-        if pr_url:
-            # The factory opened its (draft) PR. Promote it to ready-for-review
-            # and request the mimir reviewer, then move the epic to review.
+        # Ship ONLY on a successful terminal status AND a PR. A run can carry a
+        # draft pr_url yet still end blocked/failed (validation or push/finalize
+        # trouble) — that must NOT be promoted to review.
+        if status in _SUCCESS_TERMINAL_STATUSES and pr_url:
+            # Promote the factory's draft PR to ready-for-review + request the
+            # mimir reviewer, then move the epic to review.
             runner(["gh", "pr", "ready", pr_url])
             runner(["gh", "pr", "edit", pr_url, "--add-reviewer", MIMIR_REVIEWER])
             claims.transition_issue(
@@ -335,21 +428,46 @@ class FactoryEpicRunner:
                 review_ready=True, pr_url=pr_url,
             )
 
-        # Terminal without a PR: the factory couldn't push/open one (e.g. a
-        # credentials/identity block). Surface as blocked for operator follow-up.
-        reason = _run_blocked_reason(run) or f"factory ended in status '{status}' with no PR"
+        # Anything else: blocked/failed status, success-without-PR, or (the case
+        # this guards) a PR URL under a non-success status. Surface for operator
+        # follow-up; keep pr_url on the result for visibility.
+        reason = _run_blocked_reason(run) or (
+            f"factory ended in status '{status or 'unknown'}'"
+            + (" with a PR URL but a non-success status" if pr_url else " with no PR")
+        )
+        epic_status = "failed" if status == "failed" else "blocked"
         claims.transition_issue(
-            issue.issue_id, status="blocked", review_ready=False,
+            issue.issue_id, status=epic_status, review_ready=False,
             attempt=record.attempt, reason=reason,
         )
-        _log_event("factory_epic_blocked", issue_id=issue.issue_id, reason=reason)
+        _log_event(
+            "factory_epic_not_shipped",
+            issue_id=issue.issue_id, status=epic_status, reason=reason,
+            pr_url=pr_url or None,
+        )
         return WorklinkRunResult(
-            issue_id=issue.issue_id, attempt=record.attempt, status="blocked", reason=reason,
+            issue_id=issue.issue_id, attempt=record.attempt, status=epic_status,
+            reason=reason, pr_url=pr_url,
         )
 
     # --- factory CLI seams -------------------------------------------------
 
-    def _launch(self, prompt: str):
+    def _factory_start(self, prompt: str):
+        """Start a fresh factory run (runs headless to the first gate, exits)."""
+        return self._factory_invoke(prompt)
+
+    def _factory_resume(self, run_id: str):
+        """Resume a gated run and run headless to the next gate.
+
+        NOTE: this factory's CLI has NO separate resume subcommand — resume is
+        ``factory start`` with a ``resume <run-id>`` prompt (verified against
+        opencode-feature-factory src/cli.js: only start/status/watch/answer
+        exist). Kept as a distinct method so start-vs-resume is explicit and
+        testable; change the argv here if a future factory adds a resume command.
+        """
+        return self._factory_invoke(f"resume {run_id}")
+
+    def _factory_invoke(self, prompt: str):
         argv = [*self.factory_bin, "factory", "start", "--headless", "--repo", str(self.repo), prompt]
         return self._runner()(argv)
 
