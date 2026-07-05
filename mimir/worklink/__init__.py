@@ -41,11 +41,15 @@ from .tool_pins import (
     render_bump_issue_title,
 )
 from .worktree import WorktreeLease
+from .factory import FactoryEpicRunner, FactoryReview, run_factory_epic
 
 __all__ = [
     "BackendRegistry",
     "Caps",
     "ChainlinkClaims",
+    "FactoryEpicRunner",
+    "FactoryReview",
+    "run_factory_epic",
     "CodexBackend",
     "ClaimRecord",
     "ClaimResult",

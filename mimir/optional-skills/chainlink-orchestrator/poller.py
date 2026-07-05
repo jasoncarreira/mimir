@@ -102,6 +102,13 @@ from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
 READY_LABEL = "worklink:ready"
 EPIC_LABEL = "worklink:epic"
+
+
+def _factory_epics_enabled() -> bool:
+    """chainlink #834: opt-in routing of ``worklink:epic`` issues to the
+    feature-factory driver. Default OFF — until set, epics are only excluded
+    from leaf dispatch (the pre-#834 behavior)."""
+    return os.environ.get("MIMIR_FACTORY_EPICS_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
 BLOCKED_LABEL = "worklink:blocked"
 REVIEW_LABEL = "worklink:review"
 
@@ -119,7 +126,9 @@ class DispatchItem:
 
     @property
     def command(self) -> str:
-        return "run"
+        # chainlink #834: epics route to the feature-factory driver
+        # (``mimir worklink factory <id>``); leaves run as before.
+        return "factory" if self.mode == "epic" else "run"
 
 
 def _emit(record: dict) -> None:
@@ -314,6 +323,16 @@ def _worklink_dispatch_plan(
         and record.parent_id not in epics
     )
     plan = [DispatchItem(issue_id=issue_id, mode="leaf") for issue_id in dispatchable_leaves]
+    # chainlink #834: when opted in, an actionable worklink:epic (labeled both
+    # worklink:ready and worklink:epic) is dispatched to the feature-factory
+    # driver instead of merely excluded. Its child leaves stay excluded above —
+    # the factory builds them internally.
+    if _factory_epics_enabled():
+        ready_ids = {record.issue_id for record in ready_records}
+        dispatchable_epics = sorted(
+            issue_id for issue_id in epics if issue_id in actionable and issue_id in ready_ids
+        )
+        plan += [DispatchItem(issue_id=issue_id, mode="epic") for issue_id in dispatchable_epics]
     blocked_count = len(labeled - actionable)
     return plan, len(labeled), blocked_count, len(epics)
 
