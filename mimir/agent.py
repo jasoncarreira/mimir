@@ -115,7 +115,10 @@ from .turn_logger import (
     make_turn_id,
     truncate_input,
 )
-from .worklink.continuation import maybe_create_worklink_budget_continuation
+from .worklink.continuation import (
+    HTTP_EVENT_INGRESS_EXTRA_KEY,
+    maybe_create_worklink_budget_continuation,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1384,6 +1387,11 @@ class Agent:
             from .models import TurnContext as _TurnContext
             from ._context import set_current_turn, reset_current_turn
             from .loop_detector import LoopDetector
+            event_ingress = None
+            if isinstance(event.extra, Mapping):
+                stamped_ingress = event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY)
+                if isinstance(stamped_ingress, str):
+                    event_ingress = stamped_ingress or None
             ctx = _TurnContext(
                 turn_id=turn_id,
                 session_id=session_id,
@@ -1421,6 +1429,7 @@ class Agent:
                 # recent_sources allowlist in recent_for_channel (chainlink #270);
                 # this field is no longer the source of that tag.
                 channel_source=event.source,
+                event_ingress=event_ingress,
                 # Runtime access-control context consumed by tool middleware.
                 author=event.author,
                 identity_resolver=getattr(self, "_identity_resolver", None),

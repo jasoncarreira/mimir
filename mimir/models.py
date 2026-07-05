@@ -168,6 +168,11 @@ class TurnContext:
     # summary, latency_ms, error). Empty when no saga calls fired (e.g.
     # synthetic ticks with no inbound, scheduled callables).
     saga_calls: list[SagaCallRecord] = field(default_factory=list)
+    # Durable server-owned ingress provenance copied from ``AgentEvent.extra``
+    # when present (for example generic HTTP ``POST /event`` stamping). Tool
+    # middleware reads this instead of trusting client-controlled trigger /
+    # source / author fields for admin-sensitive decisions.
+    event_ingress: str | None = None
 
 
 @dataclass
