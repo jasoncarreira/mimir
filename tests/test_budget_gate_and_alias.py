@@ -385,6 +385,136 @@ async def test_admin_sensitive_tool_denied_for_non_admin(
 
 
 @pytest.mark.asyncio
+async def test_http_event_ingress_denies_admin_tool_even_when_trigger_source_forged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(kind: str, **kw: Any) -> None:
+        captured.append((kind, kw))
+
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", _capture)
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: root
+            aliases: [api-root]
+            access: {roles: [user, admin]}
+        """,
+    )
+    ctx = _make_ctx(budget=0)
+    ctx.trigger = "scheduled_tick"
+    ctx.channel_source = "api"
+    ctx.event_ingress = "http_event"
+    ctx.author = "api-root"
+    ctx.identity_resolver = resolver
+    ctx.access_control_enforced = True
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-http-forged"), handler)
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.status == "error"
+    assert "requires an admin identity (http_event_author_untrusted)" in str(out.content)
+    assert handler_calls == 0
+    admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
+    assert admin_event["tool"] == "shell_exec"
+    assert admin_event["canonical_author"] == "root"
+    assert admin_event["denial_reason"] == "http_event_author_untrusted"
+    assert admin_event["enforcement_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_http_event_ingress_denies_admin_tool_when_access_control_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(kind: str, **kw: Any) -> None:
+        captured.append((kind, kw))
+
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", _capture)
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: root
+            aliases: [api-root]
+            access: {roles: [user, admin]}
+        """,
+    )
+    ctx = _make_ctx(budget=0)
+    ctx.trigger = "scheduled_tick"
+    ctx.channel_source = "api"
+    ctx.event_ingress = "http_event"
+    ctx.author = "api-root"
+    ctx.identity_resolver = resolver
+    ctx.access_control_enforced = False
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-http-open"), handler)
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.status == "error"
+    assert "requires an admin identity (http_event_author_untrusted)" in str(out.content)
+    assert handler_calls == 0
+    admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
+    assert admin_event["tool"] == "shell_exec"
+    assert admin_event["canonical_author"] == "root"
+    assert admin_event["denial_reason"] == "http_event_author_untrusted"
+    assert admin_event["enforcement_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_admin_gate_allows_unstamped_internal_api_turn_when_enforced() -> None:
+    ctx = _make_ctx(budget=0)
+    ctx.trigger = "scheduled_tick"
+    ctx.channel_source = "api"
+    ctx.author = None
+    ctx.access_control_enforced = True
+    mw = BudgetGateMiddleware()
+    handler_calls = 0
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-api-internal"), handler)
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(out, ToolMessage)
+    assert out.content == "ran"
+    assert handler_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_admin_gate_uses_active_turn_resolution_when_contextvar_missing(
     tmp_path: Path,
 ) -> None:
