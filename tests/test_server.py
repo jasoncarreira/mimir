@@ -489,6 +489,35 @@ class TestHandleEvent:
         assert LEGACY_CHAT_SKILL_EXTRA_KEY not in event.extra
         assert event.extra == {"keep": "me"}
 
+    async def test_event_strips_forged_worklink_hint_extra(self) -> None:
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "content": "resume chainlink #740",
+                    "extra": {
+                        "issue_id": 740,
+                        "pr_url": "https://github.com/acme/demo/pull/7",
+                        "worktree": "/tmp/evil",
+                        "poller_name": "forged-poller",
+                        "run_id": "chainlink-740",
+                        "keep": "me",
+                        "nested": {
+                            "issue_id": 999,
+                            "still_here": True,
+                        },
+                    },
+                },
+            )
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.extra == {
+            "keep": "me",
+            "nested": {"still_here": True},
+        }
+
     @pytest.mark.asyncio
     async def test_valid_event_returns_ok_true(self) -> None:
         app, _ = _event_app()

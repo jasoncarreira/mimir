@@ -498,6 +498,54 @@ def test_comment_posting_is_admin_gated(tmp_path: Path) -> None:
     assert runner.issue_comments == []
 
 
+def test_user_message_default_access_control_cannot_post_external_comment(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch="chainlink-740-user-turn-default-open")
+    _save_run_state(
+        home,
+        issue_id=740,
+        branch="chainlink-740-user-turn-default-open",
+        test_command="uv run pytest -q tests/test_worklink_continuation.py",
+    )
+    event = _make_event(
+        trigger="user_message",
+        source="slack",
+        author="slack-U1",
+        content="resume chainlink #740",
+    )
+    ctx = _make_ctx(
+        event,
+        access_control_enforced=False,
+        author="slack-U1",
+        channel_source="slack",
+    )
+    record = _make_record(event)
+    runner = SpyRunner()
+
+    result = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=ctx,
+        record=record,
+        repo=repo,
+        current_worktree=repo,
+        current_labels=["worklink:ready"],
+        runner=runner,
+    )
+
+    assert result is not None
+    payload = json.loads(result.sidecar_path.read_text(encoding="utf-8"))
+    assert payload["association"]["issue_id"] == 740
+    assert payload["external_comment"]["posted"] is False
+    assert payload["external_comment"]["skipped_reason"] == "admin_access_control_required"
+    assert not any(
+        argv[:3] == ["chainlink", "issue", "comment"]
+        or argv[:3] == ["gh", "pr", "comment"]
+        for argv, _cwd in runner.calls
+    )
+
+
 @pytest.mark.parametrize(
     ("labels", "expected"),
     [

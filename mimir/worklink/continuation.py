@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -21,7 +20,13 @@ CONTINUATION_KIND = "worklink_tool_budget_continuation"
 CONTINUATION_VERSION = 1
 CONTINUATION_PREFIX = "WORKLINK_CONTINUATION "
 
-_ADMIN_TRUSTED_INTERNAL_SOURCES = frozenset({"web", "api", "stdin"})
+WORKLINK_HINT_EXTRA_KEYS = frozenset({
+    "issue_id",
+    "pr_url",
+    "worktree",
+    "poller_name",
+    "run_id",
+})
 _MAX_RECENT_TURNS = 10
 _MAX_CHANGED_PATHS = 25
 _MAX_EXTERNAL_COMMANDS = 5
@@ -41,6 +46,29 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 Runner = Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]]
+
+
+def strip_worklink_hint_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Drop client-controlled Worklink continuation hint keys from ``extra``.
+
+    Strips recursively so nested objects cannot smuggle authoritative-looking
+    issue / PR / worktree hints through the generic ``POST /event`` ingress.
+    """
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                key: scrub(item)
+                for key, item in value.items()
+                if key not in WORKLINK_HINT_EXTRA_KEYS
+            }
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    if not extra:
+        return {}
+    return scrub(extra)
 
 
 @dataclass(frozen=True)
@@ -876,11 +904,11 @@ def _handle_external_comment(
 
 def _comment_authorization_denial(ctx: TurnContext | None) -> str | None:
     if ctx is None:
-        return "missing_turn_context" if _env_access_control_enforced() else None
+        return "missing_turn_context"
+    if _turn_is_internal_continuation_trigger(ctx):
+        return None
     if not bool(getattr(ctx, "access_control_enforced", False)):
-        return None
-    if _turn_has_internal_admin_authority(ctx):
-        return None
+        return "admin_access_control_required"
     decision = authorize_action(
         getattr(ctx, "author", None),
         getattr(ctx, "identity_resolver", None),
@@ -890,19 +918,11 @@ def _comment_authorization_denial(ctx: TurnContext | None) -> str | None:
     return None if decision.allowed else (decision.denial_reason or "admin_required")
 
 
-def _env_access_control_enforced() -> bool:
-    raw = os.environ.get("MIMIR_ACCESS_CONTROL_ENFORCED")
-    if raw is None or raw == "":
-        return False
-    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
-
-
-def _turn_has_internal_admin_authority(ctx: TurnContext) -> bool:
-    trigger = (getattr(ctx, "trigger", None) or "").strip()
-    if trigger != "user_message":
-        return True
-    source = (getattr(ctx, "channel_source", None) or "").strip().lower()
-    return source in _ADMIN_TRUSTED_INTERNAL_SOURCES
+def _turn_is_internal_continuation_trigger(ctx: TurnContext) -> bool:
+    # External issue/PR comments are allowed automatically only for synthetic /
+    # server-owned continuation triggers. Interactive ``user_message`` turns must
+    # cross the explicit admin authorization boundary below.
+    return (getattr(ctx, "trigger", None) or "").strip() != "user_message"
 
 
 def _render_external_comment(payload: Mapping[str, Any]) -> str:
