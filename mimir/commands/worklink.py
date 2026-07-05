@@ -19,6 +19,7 @@ from ..worklink.orchestrator import (
     run_worklink_reattach,
 )
 from ..worklink.worker import payload_from_json, run_worker_payload
+from ..worklink.factory import run_factory_epic
 
 
 def add_argparse(
@@ -78,6 +79,23 @@ def add_argparse(
             "operator-invoked runs — they always proceed (accept-the-risk; the "
             "local_subprocess backend runs with full container filesystem access)."
         ),
+    )
+
+    factory_p = worklink_sub.add_parser(
+        "factory",
+        help="Drive the opencode feature-factory for one worklink:epic issue (chainlink #834).",
+    )
+    factory_p.add_argument("issue_id", type=int, help="Chainlink worklink:epic issue id to build.")
+    factory_p.add_argument(
+        "--home", type=Path, default=None, help="Agent home (overrides MIMIR_HOME; default: cwd)."
+    )
+    factory_p.add_argument(
+        "--repo", type=Path, default=None, help="Git repo the factory builds in (default: cwd)."
+    )
+    factory_p.add_argument(
+        "--autonomous",
+        action="store_true",
+        help="Mark this an autonomous dispatch (set by the ready-queue poller).",
     )
 
     worker_p = worklink_sub.add_parser("worker", help="Run one portable Worklink worker payload.")
@@ -148,6 +166,33 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         reason_suffix = _worker_reason_suffix(validation)
         print(f"worklink worker: {validation.status}{suffix}{reason_suffix}")
         return 0 if validation.status in {"completed", "blocked"} else 1
+
+    if args.worklink_action == "factory":
+        home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+        repo = (args.repo or Path.cwd()).resolve()
+        os.environ["MIMIR_HOME"] = str(home)
+        try:
+            from ..event_logger import init_logger
+
+            init_logger(home / "logs" / "events.jsonl", session_id=f"factory-{args.issue_id}")
+        except Exception:
+            pass
+        try:
+            result = run_factory_epic(
+                home=home, repo=repo, issue_id=args.issue_id, autonomous=args.autonomous
+            )
+        except WorklinkError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if result.status == "refused":
+            print(f"factory #{result.issue_id}: refused — {result.reason}", file=sys.stderr)
+            return 1
+        print(
+            f"factory #{result.issue_id}: {result.status}"
+            + (f" PR {result.pr_url}" if result.pr_url else "")
+            + (f" — {result.reason}" if result.reason else "")
+        )
+        return 0 if result.status in {"review_ready", "blocked"} else 1
 
     if args.worklink_action != "run":
         parser.print_help()

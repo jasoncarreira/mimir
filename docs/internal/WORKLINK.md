@@ -52,10 +52,18 @@ workflow that owns its own decomposition (`.opencode/factory/<run>/plan/
 slices.json`), human/scripted approval gates, worktrees, and one draft PR — and
 knows nothing about Chainlink. A `worklink:epic` label in Chainlink is now only a
 marker: the ready-queue poller recognizes it solely to EXCLUDE the epic (and any
-child leaves) from per-leaf dispatch, so an epic is never run as a leaf and never
-dispatched by mimir. Wiring the factory to consume `worklink:epic` (a thin
-mimir→factory adapter that reads the factory's `run.json`) is future work; today
-epics are co-driven manually.
+child leaves) from per-leaf dispatch, so an epic is never run as a leaf.
+
+The thin mimir→factory adapter that consumes `worklink:epic` now exists
+(chainlink #834, **opt-in** via `MIMIR_FACTORY_EPICS_ENABLED`): the ready-queue
+poller dispatches an actionable epic to `mimir worklink factory <id>`, which
+drives the factory headless — auto-approving the `story`/`brief` gates on the
+factory's own validator, running an independent review subagent at the `pre_pr`
+gate (approve/changes/stop), then promoting the factory's draft PR to
+ready-for-review + requesting the mimir reviewer. See
+[FACTORY_DRIVER.md](FACTORY_DRIVER.md). Until the flag is set (and the factory is
+installed in the deployment image), epics stay excluded and are co-driven
+manually.
 
 Per-leaf worklink (the rest of this document) is unaffected: file a
 `worklink:ready` leaf that satisfies the strict template (§2.5) and the poller
