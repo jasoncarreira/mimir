@@ -21,6 +21,7 @@ The aiohttp mocking pattern matches ``tests/test_oauth_usage_poller.py``
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock
@@ -493,6 +494,50 @@ def _write_scheduler_yaml(tmp_path, cron: str = "*/45 * * * *"):
 
 
 @pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_offloads_log_assessment_from_event_loop(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """chainlink #838: scheduler-health log scans must not run on the loop.
+
+    The wedge check reads scheduler.yaml and tail-scans events.jsonl.  Those
+    synchronous file operations belong behind ``asyncio.to_thread`` so the
+    health check itself does not create a ``scheduler_loop_lag`` sample.
+    """
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=130)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    loop_thread = threading.get_ident()
+    observed_threads: list[int] = []
+    real_assess = ntfy._assess_scheduler_wedge
+
+    def wrapped_assess(*args: Any, **kwargs: Any):
+        observed_threads.append(threading.get_ident())
+        return real_assess(*args, **kwargs)
+
+    monkeypatch.setattr(ntfy, "_assess_scheduler_wedge", wrapped_assess)
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    assert observed_threads, "wedge assessment did not run"
+    assert all(thread_id != loop_thread for thread_id in observed_threads), (
+        "scheduler wedge assessment ran on the event-loop thread"
+    )
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds
+
+
+@pytest.mark.asyncio
 async def test_scheduler_wedge_alarm_fires_when_stale(
     tmp_path: "pytest.fixture",
     monkeypatch: pytest.MonkeyPatch,
@@ -577,8 +622,6 @@ async def test_scheduler_wedge_alarm_silent_no_heartbeat_in_log(
     monkeypatch.setenv("NTFY_TOPIC", "test-topic")
     events_file = tmp_path / "events.jsonl"
     sched_yaml = _write_scheduler_yaml(tmp_path)
-    import json as _json
-
     # Only non-heartbeat events.
     _write_events(events_file, [
         {"timestamp": "2026-05-27T03:00:00+00:00", "type": "oauth_ok", "channel_id": "other"},
@@ -915,7 +958,6 @@ async def test_wedge_alarm_ignores_suppress_events_outside_window(
         now=now,
     )
 
-    kinds = [e[0] for e in captured_events]
     skip_evt = next(e for e in captured_events if e[0] == "ntfy_skip_no_topic")
     # Old suppress is outside the window → classifies as wedge.
     assert skip_evt[1]["category"] == "scheduler-wedge"
