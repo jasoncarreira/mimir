@@ -36,6 +36,7 @@ _MAX_EXTERNAL_COMMANDS = 5
 _MAX_EXTERNAL_COMMAND_LEN = 160
 _MAX_LABEL_ACTIONS = 5
 _MAX_LABEL_ACTION_LEN = 80
+_EXTERNAL_COMMAND_TIMEOUT_SECONDS = 15
 
 _RUN_ID_RE = re.compile(r"\bchainlink-\d+\b", re.IGNORECASE)
 _PR_URL_RE = re.compile(r"https?://github\.com/[^\s)]+/pull/\d+", re.IGNORECASE)
@@ -394,7 +395,22 @@ def _default_runner(
     args: Sequence[str],
     cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(list(args), cwd=cwd, capture_output=True, text=True, check=False)
+    argv = list(args)
+    try:
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_EXTERNAL_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        timeout_msg = f"command timed out after {_EXTERNAL_COMMAND_TIMEOUT_SECONDS}s"
+        stderr = f"{stderr}\n{timeout_msg}" if stderr else timeout_msg
+        return subprocess.CompletedProcess(argv, 124, stdout=stdout, stderr=stderr)
 
 
 def _resolve_existing_dir(path: Path | None) -> Path | None:
@@ -926,10 +942,10 @@ def _comment_authorization_denial(
 ) -> str | None:
     if ctx is None:
         return "missing_turn_context"
-    if _event_has_server_stamped_continuation_trigger(event):
-        return None
     if _event_has_http_event_ingress(event):
         return "http_event_author_untrusted"
+    if _event_has_server_stamped_continuation_trigger(event):
+        return None
     if not bool(getattr(ctx, "access_control_enforced", False)):
         return "admin_access_control_required"
     decision = authorize_action(

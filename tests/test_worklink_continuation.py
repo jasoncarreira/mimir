@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
 from typing import Sequence
 
 import pytest
@@ -14,6 +15,7 @@ from mimir.worklink.continuation import (
     CONTINUATION_PREFIX,
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     HTTP_EVENT_INGRESS_EXTRA_VALUE,
+    _default_runner,
     maybe_create_worklink_budget_continuation,
 )
 from mimir.worklink.run_state import WorklinkRunState, save_run_state
@@ -578,6 +580,64 @@ def test_user_message_default_access_control_cannot_post_external_comment(tmp_pa
         or argv[:3] == ["gh", "pr", "comment"]
         for argv, _cwd in runner.calls
     )
+
+
+def test_default_runner_bounds_hung_external_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(_default_runner.__globals__, "_EXTERNAL_COMMAND_TIMEOUT_SECONDS", 0.1)
+
+    result = _default_runner(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+        ],
+    )
+
+    assert result.returncode == 124
+    assert "command timed out after 0.1s" in result.stderr
+
+
+def test_http_event_server_stamp_still_cannot_post_external_comment(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch="chainlink-740-http-event-server-stamp")
+    _save_run_state(
+        home,
+        issue_id=740,
+        branch="chainlink-740-http-event-server-stamp",
+        test_command="uv run pytest -q tests/test_worklink_continuation.py",
+    )
+    event = _make_event(
+        trigger="poller",
+        source="api",
+        content="resume chainlink #740",
+        extra={
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "poller_name": "worklink-ready-queue",
+        },
+    )
+    ctx = _make_ctx(event, access_control_enforced=False, channel_source="api")
+    record = _make_record(event)
+    runner = SpyRunner()
+
+    result = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=ctx,
+        record=record,
+        repo=repo,
+        current_worktree=repo,
+        current_labels=["worklink:ready"],
+        runner=runner,
+    )
+
+    assert result is not None
+    payload = json.loads(result.sidecar_path.read_text(encoding="utf-8"))
+    assert payload["association"]["issue_id"] == 740
+    assert payload["external_comment"]["posted"] is False
+    assert payload["external_comment"]["skipped_reason"] == "http_event_author_untrusted"
+    assert runner.issue_comments == []
+
 
 
 def test_http_event_forged_admin_author_cannot_post_external_comment(tmp_path: Path) -> None:
