@@ -286,6 +286,30 @@ def _is_non_interactive_no_reply_channel(channel_id: str) -> bool:
     return channel_id.strip().lower() in _NON_INTERACTIVE_NO_REPLY_CHANNEL_LITERALS
 
 
+def _active_turn_is_non_interactive_for_send_message_guard() -> bool:
+    """Best-effort non-interactive check for the no-reply sentinel guard.
+
+    Keep the direct per-task ContextVar behavior, but also recover the active
+    turn from the shared turn registry when MCP dispatch lost ContextVar
+    inheritance. Only triggers that are definitely automated count here;
+    missing/interactive triggers preserve the existing behavior.
+    """
+    if _current_turn_interactive_var.get() is False:
+        return True
+
+    from .._context import get_current_turn, get_only_active_turn
+    from ..channel_registry import INTERACTIVE_TRIGGERS
+
+    ctx = get_current_turn()
+    if ctx is None:
+        ctx = get_only_active_turn()
+    if ctx is None:
+        return False
+
+    trigger = (getattr(ctx, "trigger", None) or "").strip()
+    return bool(trigger) and trigger not in INTERACTIVE_TRIGGERS
+
+
 # ────────────────────────────────────────────────────────────────────
 # Module-state dependency injection (parallel to memory_tool.py)
 # ────────────────────────────────────────────────────────────────────
@@ -394,11 +418,9 @@ async def send_message(
     explicit_channel = bool(stripped_channel_id)
     if not explicit_channel:
         await _reject_send_message(channel_id, "not_deliverable_channel")
-    if (
-        _current_turn_interactive_var.get() is False
-        and _is_non_interactive_no_reply_channel(stripped_channel_id)
-    ):
-        await _reject_send_message(channel_id, "non_interactive_no_reply_channel")
+    if _is_non_interactive_no_reply_channel(stripped_channel_id):
+        if _active_turn_is_non_interactive_for_send_message_guard():
+            await _reject_send_message(channel_id, "non_interactive_no_reply_channel")
     if _is_non_deliverable_channel(stripped_channel_id):
         await _reject_send_message(channel_id, "not_deliverable_channel")
     channels = _STATE["channel_registry"]
