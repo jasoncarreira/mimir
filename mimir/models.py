@@ -9,7 +9,15 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
+
+
+class TurnInteractivity(StrEnum):
+    """Server-owned interactivity classification for a turn."""
+
+    INTERACTIVE = "interactive"
+    NON_INTERACTIVE = "non_interactive"
 
 
 @dataclass
@@ -173,6 +181,10 @@ class TurnContext:
     # middleware reads this instead of trusting client-controlled trigger /
     # source / author fields for admin-sensitive decisions.
     event_ingress: str | None = None
+    # Server-owned turn classification. Optional so older call sites and
+    # fail-closed guards can distinguish "not classified yet" from an explicit
+    # interactive/non-interactive decision.
+    interactivity: TurnInteractivity | None = None
 
 
 @dataclass
@@ -293,6 +305,9 @@ class TurnRecord:
     # so "what saga did this turn" is visible inline without joining to
     # events.jsonl.
     saga_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Server-owned turn classification carried into the durable turn log.
+    # Optional for backward compatibility and fail-closed downstream guards.
+    interactivity: TurnInteractivity | None = None
 
 
 def make_turn_id() -> str:
