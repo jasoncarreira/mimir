@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -596,6 +597,56 @@ async def test_continuation_written_even_without_assistant_output(
     payload = json.loads(sidecars[0].read_text(encoding="utf-8"))
     assert payload["turns"][-1]["turn_id"] == record.turn_id
     assert payload["association"]["branch"] == "chainlink-740-budget-continuation--be-agent-finalizer"
+
+
+async def test_budget_continuation_timeout_logs_failure_and_still_runs_finalize_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = _init_continuation_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_BudgetExhaustingAgent(
+            response_messages=[AIMessage(content="ok")],
+        ),
+        fake_saga=None,
+    )
+    finalized: list[str] = []
+
+    class _FinalizeHook:
+        async def finalize(self, ctx, event, record):
+            finalized.append(record.turn_id)
+
+    def _slow_continuation(**_kwargs):
+        time.sleep(0.2)
+        return None
+
+    monkeypatch.setattr("mimir.agent.maybe_create_worklink_budget_continuation", _slow_continuation)
+    monkeypatch.setattr("mimir.agent._worklink_continuation_timeout_seconds", lambda _cfg: 0.01)
+    agent._hooks.append(_FinalizeHook())
+
+    record = await asyncio.wait_for(
+        agent.run_turn(
+            AgentEvent(
+                trigger="scheduled_tick",
+                channel_id="ops",
+                content="generic worklink follow-up",
+                source_id="budget-timeout-src",
+            )
+        ),
+        timeout=5.0,
+    )
+
+    assert record.output == "ok"
+    assert finalized == [record.turn_id]
+    failed = [
+        ev for ev in _read_events(tmp_path)
+        if ev.get("type") == "worklink_continuation_failed"
+    ]
+    assert len(failed) == 1
+    assert failed[0]["error"].startswith("timed out after")
+    assert failed[0]["timeout_s"] == 0.01
 
 
 async def test_append_inbound_to_buffer_is_idempotent(tmp_path: Path):
