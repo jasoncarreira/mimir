@@ -226,7 +226,11 @@ def test_continuation_payload_captures_required_context(tmp_path: Path) -> None:
     (repo / "new.txt").write_text("new\n", encoding="utf-8")
     events_path = home / "logs" / "events.jsonl"
     event_logger.init_logger(events_path, session_id="test")
-    event = _make_event(extra={"poller_name": "chainlink-orchestrator"})
+    event = _make_event(
+        trigger="poller",
+        source="poller",
+        extra={"poller_name": "chainlink-orchestrator"},
+    )
     ctx = _make_ctx(event)
     record = _make_record(event)
     runner = SpyRunner()
@@ -327,7 +331,10 @@ def test_idempotent_same_work_item_updates_existing_artifact(tmp_path: Path) -> 
     )
     runner = SpyRunner()
 
-    event1 = _make_event(source_id="src-1")
+    event1 = _make_event(
+        source_id="src-1",
+        extra={"schedule_name": "worklink-continuation"},
+    )
     first = maybe_create_worklink_budget_continuation(
         home=home,
         event=event1,
@@ -337,7 +344,10 @@ def test_idempotent_same_work_item_updates_existing_artifact(tmp_path: Path) -> 
         current_worktree=repo,
         runner=runner,
     )
-    event2 = _make_event(source_id="src-2")
+    event2 = _make_event(
+        source_id="src-2",
+        extra={"schedule_name": "worklink-continuation"},
+    )
     second = maybe_create_worklink_budget_continuation(
         home=home,
         event=event2,
@@ -412,7 +422,10 @@ def test_external_comment_schema_is_allowlisted_and_redacted(tmp_path: Path) -> 
         test_command=f"uv run pytest -q {repo / 'tests' / 'test_worklink_continuation.py'}",
     )
     (repo / "secret.txt").write_text("top secret\n", encoding="utf-8")
-    event = _make_event(content="resume chainlink #740")
+    event = _make_event(
+        content="resume chainlink #740",
+        extra={"schedule_name": "worklink-continuation"},
+    )
     ctx = _make_ctx(event)
     record = _make_record(event)
     runner = SpyRunner()
@@ -520,6 +533,62 @@ def test_user_message_default_access_control_cannot_post_external_comment(tmp_pa
         author="slack-U1",
         channel_source="slack",
     )
+    record = _make_record(event)
+    runner = SpyRunner()
+
+    result = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=ctx,
+        record=record,
+        repo=repo,
+        current_worktree=repo,
+        current_labels=["worklink:ready"],
+        runner=runner,
+    )
+
+    assert result is not None
+    payload = json.loads(result.sidecar_path.read_text(encoding="utf-8"))
+    assert payload["association"]["issue_id"] == 740
+    assert payload["external_comment"]["posted"] is False
+    assert payload["external_comment"]["skipped_reason"] == "admin_access_control_required"
+    assert not any(
+        argv[:3] == ["chainlink", "issue", "comment"]
+        or argv[:3] == ["gh", "pr", "comment"]
+        for argv, _cwd in runner.calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("trigger", "source"),
+    [
+        ("scheduled_tick", "api"),
+        ("poller", "poller"),
+    ],
+)
+def test_forged_non_user_message_trigger_without_server_stamp_cannot_post_external_comment(
+    tmp_path: Path,
+    trigger: str,
+    source: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch=f"chainlink-740-forged-{trigger}")
+    _save_run_state(
+        home,
+        issue_id=740,
+        branch=f"chainlink-740-forged-{trigger}",
+        test_command="uv run pytest -q tests/test_worklink_continuation.py",
+    )
+    # Simulates a generic /event client after ingress stripping removed any
+    # forged schedule_name / poller_name server stamps.
+    event = _make_event(
+        trigger=trigger,
+        source=source,
+        content="resume chainlink #740",
+        extra={"keep": "me"},
+    )
+    ctx = _make_ctx(event, access_control_enforced=False, channel_source=source)
     record = _make_record(event)
     runner = SpyRunner()
 

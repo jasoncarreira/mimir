@@ -25,6 +25,7 @@ WORKLINK_HINT_EXTRA_KEYS = frozenset({
     "pr_url",
     "worktree",
     "poller_name",
+    "schedule_name",
     "run_id",
 })
 _MAX_RECENT_TURNS = 10
@@ -344,6 +345,7 @@ def maybe_create_worklink_budget_continuation(
     atomic_write_json(path, payload)
 
     comment_state = _handle_external_comment(
+        event=event,
         payload=payload,
         existing_comment=existing_comment,
         home=home,
@@ -836,6 +838,7 @@ def _initial_external_comment(existing: Any) -> dict[str, Any]:
 
 def _handle_external_comment(
     *,
+    event: AgentEvent,
     payload: Mapping[str, Any],
     existing_comment: Any,
     home: Path,
@@ -873,7 +876,7 @@ def _handle_external_comment(
         state["skipped_reason"] = "no_validated_target"
         return state
 
-    denial = _comment_authorization_denial(ctx)
+    denial = _comment_authorization_denial(event=event, ctx=ctx)
     if denial is not None:
         state["skipped_reason"] = denial
         state["target"] = target
@@ -902,10 +905,14 @@ def _handle_external_comment(
     return state
 
 
-def _comment_authorization_denial(ctx: TurnContext | None) -> str | None:
+def _comment_authorization_denial(
+    *,
+    event: AgentEvent | None,
+    ctx: TurnContext | None,
+) -> str | None:
     if ctx is None:
         return "missing_turn_context"
-    if _turn_is_internal_continuation_trigger(ctx):
+    if _event_has_server_stamped_continuation_trigger(event):
         return None
     if not bool(getattr(ctx, "access_control_enforced", False)):
         return "admin_access_control_required"
@@ -918,11 +925,16 @@ def _comment_authorization_denial(ctx: TurnContext | None) -> str | None:
     return None if decision.allowed else (decision.denial_reason or "admin_required")
 
 
-def _turn_is_internal_continuation_trigger(ctx: TurnContext) -> bool:
-    # External issue/PR comments are allowed automatically only for synthetic /
-    # server-owned continuation triggers. Interactive ``user_message`` turns must
-    # cross the explicit admin authorization boundary below.
-    return (getattr(ctx, "trigger", None) or "").strip() != "user_message"
+def _event_has_server_stamped_continuation_trigger(event: AgentEvent | None) -> bool:
+    if event is None:
+        return False
+    trigger = (getattr(event, "trigger", None) or "").strip()
+    extra = event.extra if isinstance(event.extra, Mapping) else {}
+    if trigger == "poller":
+        return bool(_mapping_str(extra, "poller_name"))
+    if trigger == "scheduled_tick":
+        return bool(_mapping_str(extra, "schedule_name"))
+    return False
 
 
 def _render_external_comment(payload: Mapping[str, Any]) -> str:

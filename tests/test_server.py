@@ -502,10 +502,12 @@ class TestHandleEvent:
                         "pr_url": "https://github.com/acme/demo/pull/7",
                         "worktree": "/tmp/evil",
                         "poller_name": "forged-poller",
+                        "schedule_name": "forged-schedule",
                         "run_id": "chainlink-740",
                         "keep": "me",
                         "nested": {
                             "issue_id": 999,
+                            "schedule_name": "nested-forged-schedule",
                             "still_here": True,
                         },
                     },
