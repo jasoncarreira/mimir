@@ -237,6 +237,12 @@ from langchain_core.tools import InjectedToolArg, ToolException, tool
 
 _NON_DELIVERABLE_CHANNEL_PREFIXES = ("poller:", "scheduler:")
 _NON_DELIVERABLE_CHANNEL_LITERALS = {"system"}
+_NON_INTERACTIVE_NO_REPLY_CHANNEL_LITERALS = {
+    "no_reply",
+    "no-reply",
+    "noreply",
+    "none",
+}
 
 
 async def _reject_send_message(channel_id: str | None, reason: str) -> None:
@@ -253,6 +259,14 @@ async def _reject_send_message(channel_id: str | None, reason: str) -> None:
             "send_message rejected: empty message. The message text is empty "
             "or whitespace-only; end the turn or send non-empty text."
         )
+    if reason == "non_interactive_no_reply_channel":
+        raise ToolException(
+            "send_message rejected: this non-interactive turn was given a "
+            "pseudo-channel that means no reply. Declining to reply means NOT "
+            f"calling send_message. For a genuine non-interactive send, provide "
+            "a real deliverable channel_id such as the operator alert channel; "
+            f"got {channel_id!r}."
+        )
     raise ToolException(
         "send_message rejected: not a deliverable channel. Provide a real "
         "bridge channel_id such as discord-<id>, dm-discord-<id>, or web-*; "
@@ -266,6 +280,10 @@ def _is_non_deliverable_channel(channel_id: str) -> bool:
         lowered in _NON_DELIVERABLE_CHANNEL_LITERALS
         or lowered.startswith(_NON_DELIVERABLE_CHANNEL_PREFIXES)
     )
+
+
+def _is_non_interactive_no_reply_channel(channel_id: str) -> bool:
+    return channel_id.strip().lower() in _NON_INTERACTIVE_NO_REPLY_CHANNEL_LITERALS
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -372,10 +390,16 @@ async def send_message(
     """
     if not text or not text.strip():
         await _reject_send_message(channel_id, "empty_message")
-    explicit_channel = bool((channel_id or "").strip())
+    stripped_channel_id = (channel_id or "").strip()
+    explicit_channel = bool(stripped_channel_id)
     if not explicit_channel:
         await _reject_send_message(channel_id, "not_deliverable_channel")
-    if _is_non_deliverable_channel((channel_id or "").strip()):
+    if (
+        _current_turn_interactive_var.get() is False
+        and _is_non_interactive_no_reply_channel(stripped_channel_id)
+    ):
+        await _reject_send_message(channel_id, "non_interactive_no_reply_channel")
+    if _is_non_deliverable_channel(stripped_channel_id):
         await _reject_send_message(channel_id, "not_deliverable_channel")
     channels = _STATE["channel_registry"]
     if channels is None:
