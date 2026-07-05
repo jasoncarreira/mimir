@@ -595,6 +595,31 @@ def test_send_message_failed_classified_negative():
     assert classify("send_message_failed") == ("negative", "send_failed")
 
 
+def test_worklink_continuation_created_surfaces_as_negative_feedback(tmp_path: Path):
+    from mimir.feedback import classify
+
+    assert classify("worklink_continuation_created") == (
+        "negative",
+        "worklink_continuation",
+    )
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "timestamp": _ts(0.1),
+                "type": "worklink_continuation_created",
+                "issue_id": 740,
+            }
+        ],
+    )
+
+    block = log.recent_block()
+
+    assert block is not None
+    assert "Negative (last 24h):" in block
+    assert "worklink_continuation" in block
+
+
 def test_background_task_failed_surfaces_as_negative(tmp_path: Path):
     from mimir.feedback import classify
 
