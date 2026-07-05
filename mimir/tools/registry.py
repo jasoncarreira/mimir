@@ -63,11 +63,12 @@ _current_channel_id_var: contextvars.ContextVar[str | None] = contextvars.Contex
 )
 
 # Per-task ContextVar: is the active turn an interactive (user-facing) one?
-# Set by the dispatcher at turn start, paired with the channel id. Retained
-# for callers that still thread turn interactivity through the tool registry;
-# send_message itself now requires an explicit deliverable channel_id.
-_current_turn_interactive_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "mimir_current_turn_interactive", default=True
+# Set by the dispatcher at turn start, paired with the channel id. ``None``
+# means "unset / lost" so send_message can recover non-interactive poller turns
+# from the shared active-turn registry without conflating that case with an
+# explicit interactive=True setting.
+_current_turn_interactive_var: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
+    "mimir_current_turn_interactive", default=None
 )
 
 SEND_MESSAGE_SKIPLIST_TRIGGERS: frozenset[str] = frozenset(
@@ -291,11 +292,16 @@ def _active_turn_is_non_interactive_for_send_message_guard() -> bool:
 
     Keep the direct per-task ContextVar behavior, but also recover the active
     turn from the shared turn registry when MCP dispatch lost ContextVar
-    inheritance. Only triggers that are definitely automated count here;
-    missing/interactive triggers preserve the existing behavior.
+    inheritance. Explicit ``True`` must preserve interactive behavior; only an
+    unset/lost ContextVar falls back to the active turn. Only triggers that are
+    definitely automated count here; missing/interactive triggers preserve the
+    existing behavior.
     """
-    if _current_turn_interactive_var.get() is False:
+    interactive = _current_turn_interactive_var.get()
+    if interactive is False:
         return True
+    if interactive is True:
+        return False
 
     from .._context import get_current_turn, get_only_active_turn
     from ..channel_registry import INTERACTIVE_TRIGGERS

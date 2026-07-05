@@ -1442,6 +1442,36 @@ class TestSendMessageInteractivityGuard:
         assert registry.find_calls == ["No-Reply"]
         assert bridge.send_calls == []
 
+    @pytest.mark.asyncio
+    async def test_explicit_interactive_true_skips_active_turn_fallback_for_no_reply_sentinel(
+        self,
+    ) -> None:
+        from mimir._context import reset_current_turn, set_current_turn
+        from mimir.models import TurnContext
+
+        bridge = _StubBridge()
+        registry = _StubRegistry(bridge, channel_id="chan-1")
+        set_channel_registry(registry)
+        turn_tok = set_current_turn(TurnContext(
+            turn_id="t-poller",
+            session_id="s-poller",
+            trigger="poller",
+            channel_id="poller:gmail-inbox",
+            started_at=0.0,
+            agent_id="test",
+        ))
+        int_tok = set_current_turn_interactive(True)
+        try:
+            out = await send_message.ainvoke({"text": "hi", "channel_id": "No-RePlY"})
+        finally:
+            reset_current_turn_interactive(int_tok)
+            reset_current_turn(turn_tok)
+
+        assert out == "send_message failed: no bridge for channel 'No-RePlY'"
+        assert "Declining to reply means NOT calling send_message" not in out
+        assert registry.find_calls == ["No-RePlY"]
+        assert bridge.send_calls == []
+
 
 class TestSendMessageSkiplistGuard:
     def _turn_ctx(self, trigger: str):
