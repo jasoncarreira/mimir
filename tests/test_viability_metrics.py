@@ -7,10 +7,8 @@ collapse indicators) + the 2026-05-23 VSM eval's curation-rate gap.
 from __future__ import annotations
 
 import json
-import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -380,10 +378,72 @@ async def test_scheduled_run_emits_warnings_and_ok(
 
 
 @pytest.mark.asyncio
+async def test_scheduled_run_offloads_build_and_write_to_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """run_scheduled_viability_report keeps blocking report work off
+    the scheduler event loop."""
+    events: list[tuple[str, dict]] = []
+    to_thread_calls: list[tuple[object, tuple[object, ...]]] = []
+    report = vm.ViabilityReport(
+        generated_at=datetime(2026, 7, 5, 5, 0, tzinfo=timezone.utc),
+        home=tmp_path,
+        collapse=vm.CollapseMetrics(
+            window_turns=0,
+            window_days=7,
+            cosine_sim_sample_size=0,
+            cosine_sim_mean=None,
+            cosine_sim_max=None,
+            embedder_unavailable=False,
+            citations_total=0,
+            distinct_atoms_cited=0,
+            atom_citation_gini=None,
+            distinct_topics=0,
+            topic_diversity_ratio=None,
+        ),
+        curation=vm.CurationMetrics(
+            window_days=28,
+            reflection_turn_count=0,
+            reflection_bytes_total=0,
+            reflection_bytes_per_week=0.0,
+            feedback_event_count=0,
+            feedback_events_per_week=0.0,
+            forget_event_count=0,
+        ),
+    )
+    out_path = tmp_path / "state" / "reports" / "viability-2026-07-05.md"
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        to_thread_calls.append((func, args))
+        return func(*args, **kwargs)
+
+    async def fake_log(kind, **kw):
+        events.append((kind, kw))
+
+    def fake_build(home: Path):
+        assert home == tmp_path
+        return report
+
+    def fake_write(got_report: vm.ViabilityReport):
+        assert got_report is report
+        return out_path
+
+    monkeypatch.setattr(vm.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(vm, "build_report", fake_build)
+    monkeypatch.setattr(vm, "write_report", fake_write)
+    monkeypatch.setattr("mimir.event_logger.log_event", fake_log)
+
+    await vm.run_scheduled_viability_report(tmp_path)
+
+    assert to_thread_calls == [(fake_build, (tmp_path,)), (fake_write, (report,))]
+    assert ("viability_report_ok", {"report_path": str(out_path), "warnings": 0}) in events
+
+
+@pytest.mark.asyncio
 async def test_scheduled_run_catches_exceptions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    """If build_report raises, run_scheduled_viability_report logs
+    """If offloaded build_report raises, run_scheduled_viability_report logs
     a viability_report_error event rather than propagating."""
     events: list[tuple[str, dict]] = []
 

@@ -55,6 +55,7 @@ the specific metric flagged.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -179,7 +180,7 @@ class ViabilityReport:
             )
 
         if c.topic_diversity_ratio is None:
-            lines.append(f"- Topic diversity: (no turns in window)")
+            lines.append("- Topic diversity: (no turns in window)")
         else:
             flag = " ⚠️" if c.topic_diversity_ratio < TOPIC_DIVERSITY_MIN_RATIO else ""
             lines.append(
@@ -607,8 +608,8 @@ async def run_scheduled_viability_report(home: Path) -> None:
     can confirm the job is firing."""
     from .event_logger import log_event
     try:
-        report = build_report(home)
-        out_path = write_report(report)
+        report = await asyncio.to_thread(build_report, home)
+        out_path = await asyncio.to_thread(write_report, report)
         await emit_warnings(report)
         await log_event(
             "viability_report_ok",
