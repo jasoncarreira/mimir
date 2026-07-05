@@ -115,6 +115,7 @@ from .turn_logger import (
     make_turn_id,
     truncate_input,
 )
+from .worklink.continuation import maybe_create_worklink_budget_continuation
 
 log = logging.getLogger(__name__)
 
@@ -138,6 +139,19 @@ NON_USER_QUERY_TRIGGERS: frozenset[str] = frozenset(
 IMMEDIATE_SESSION_END_TRIGGERS: frozenset[str] = frozenset(
     {"scheduled_tick", "poller", "upgrade"}
 )
+
+
+# Budget-exhaustion continuation recovery is best-effort durability work that
+# may run git / chainlink / gh subprocesses. Bound it separately from finalize
+# hooks so a hung recovery path cannot strand the rest of turn finalization.
+_WORKLINK_CONTINUATION_TIMEOUT_SECONDS = 30.0
+
+
+def _worklink_continuation_timeout_seconds(config: Config) -> float:
+    configured = int(getattr(config, "post_turn_timeout_seconds", 0) or 0)
+    if configured <= 0:
+        return _WORKLINK_CONTINUATION_TIMEOUT_SECONDS
+    return float(min(configured, int(_WORKLINK_CONTINUATION_TIMEOUT_SECONDS)))
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -2501,6 +2515,64 @@ class Agent:
             **result_fields,
         )
         await self._turn_logger.write(record)
+        if ctx.tool_call_budget_exhausted:
+            continuation_timeout_s = _worklink_continuation_timeout_seconds(self._config)
+            try:
+                try:
+                    current_worktree = Path.cwd().resolve()
+                except OSError:
+                    current_worktree = None
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        maybe_create_worklink_budget_continuation,
+                        home=self._config.home,
+                        event=event,
+                        ctx=ctx,
+                        record=record,
+                        repo=current_worktree,
+                        current_worktree=current_worktree,
+                    ),
+                    timeout=continuation_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "worklink continuation recovery exceeded timeout (%ss) for turn %s",
+                    continuation_timeout_s,
+                    turn_id,
+                )
+                await safe_log_event(
+                    "worklink_continuation_failed",
+                    turn_id=turn_id,
+                    channel_id=event.channel_id,
+                    trigger=event.trigger,
+                    source_id=event.source_id,
+                    error=f"timed out after {continuation_timeout_s:.2f}s",
+                    timeout_s=continuation_timeout_s,
+                    tool_call_count=ctx.tool_call_count,
+                    tool_call_budget=ctx.tool_call_budget,
+                    denied_count=ctx.tool_call_budget_denied_count,
+                    denied_tools=ctx.tool_call_budget_denied_tools or None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "worklink continuation recovery failed for turn %s: %s",
+                    turn_id,
+                    exc,
+                    exc_info=True,
+                )
+                await safe_log_event(
+                    "worklink_continuation_failed",
+                    turn_id=turn_id,
+                    channel_id=event.channel_id,
+                    trigger=event.trigger,
+                    source_id=event.source_id,
+                    error=str(exc)[:300],
+                    timeout_s=continuation_timeout_s,
+                    tool_call_count=ctx.tool_call_count,
+                    tool_call_budget=ctx.tool_call_budget,
+                    denied_count=ctx.tool_call_budget_denied_count,
+                    denied_tools=ctx.tool_call_budget_denied_tools or None,
+                )
 
         # Fire the finalize stage of the turn hook chain. The default
         # ``CommitmentExtractionHook`` runs Phase 2a commitment
