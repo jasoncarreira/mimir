@@ -80,6 +80,15 @@ class TurnContext:
     # threshold is first crossed. 0 = no budget enforced.
     tool_call_count: int = 0
     tool_call_budget: int = 0
+    # Durable hard-denial markers for continuation/recovery paths.
+    # Populated only when a NON-exempt tool is refused at/over the cap;
+    # allowed calls leave them untouched. ``first_denied_at_count`` records
+    # the already-used count seen at the first refusal (normally == budget
+    # because denied calls do not increment ``tool_call_count``).
+    tool_call_budget_exhausted: bool = False
+    tool_call_budget_denied_count: int = 0
+    tool_call_budget_denied_tools: list[str] = field(default_factory=list)
+    tool_call_budget_first_denied_at_count: int | None = None
     # CR2 (agent runtime) fix: soft-warning idempotency. Without this
     # flag, the previous ``count == soft_threshold`` trigger could miss
     # a warning if any code path skipped an increment, AND could fire

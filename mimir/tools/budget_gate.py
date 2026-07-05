@@ -156,6 +156,23 @@ def _budget_denied_message(tool_name: str, count: int, budget: int) -> str:
     )
 
 
+def _mark_budget_denied(ctx: Any, tool_name: str, count: int) -> None:
+    """Persist hard-denial markers on the active turn context."""
+    ctx.tool_call_budget_exhausted = True
+    ctx.tool_call_budget_denied_count = (
+        int(getattr(ctx, "tool_call_budget_denied_count", 0) or 0) + 1
+    )
+    denied_tools = getattr(ctx, "tool_call_budget_denied_tools", None)
+    if isinstance(denied_tools, list):
+        denied_tools.append(tool_name)
+    elif denied_tools is None:
+        ctx.tool_call_budget_denied_tools = [tool_name]
+    else:
+        ctx.tool_call_budget_denied_tools = [*denied_tools, tool_name]
+    if getattr(ctx, "tool_call_budget_first_denied_at_count", None) is None:
+        ctx.tool_call_budget_first_denied_at_count = count
+
+
 def _check_and_increment_or_deny(tool_name: str, ctx: Any | None = None) -> str | None:
     """Returns a denial message (str) if the call should be refused,
     or ``None`` if the call should proceed. Shared between the sync
@@ -171,6 +188,7 @@ def _check_and_increment_or_deny(tool_name: str, ctx: Any | None = None) -> str 
     ctx, budget = state
     count = getattr(ctx, "tool_call_count", 0) or 0
     if count >= budget:
+        _mark_budget_denied(ctx, tool_name, count)
         _emit_event_sync(
             "tool_call_budget_denied",
             tool=tool_name,
