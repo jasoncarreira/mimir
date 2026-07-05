@@ -39,31 +39,77 @@ For a whole feature/epic, use the external **opencode feature-factory** rather
 than filing a `worklink:epic` in mimir (the in-mimir epic runner was removed,
 #830). Everything below this section is the design/internals.
 
-### 0. Epics: use the opencode feature-factory (integrated-epic mode retired, #830)
+### 0. Epics: use the opencode feature-factory (chainlink #833)
 
 The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompose-reviewer`
 → per-slice adversarial review → serial `--no-ff` integration branch →
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are now built by the external **opencode feature-factory**
+Epics are built by the external **opencode feature-factory**
 (`~/projects/odin/opencode-feature-factory`): a session-driven `/feature`
 workflow that owns its own decomposition (`.opencode/factory/<run>/plan/
 slices.json`), human/scripted approval gates, worktrees, and one draft PR — and
-knows nothing about Chainlink. A `worklink:epic` label in Chainlink is now only a
-marker: the ready-queue poller recognizes it solely to EXCLUDE the epic (and any
-child leaves) from per-leaf dispatch, so an epic is never run as a leaf.
+knows nothing about Chainlink. The **feature-factory adapter** (#833) connects
+the two:
 
-The thin mimir→factory adapter that consumes `worklink:epic` now exists
-(chainlink #834, **opt-in** via `MIMIR_FACTORY_EPICS_ENABLED`): the ready-queue
-poller dispatches an actionable epic to `mimir worklink factory <id>`, which
-drives the factory headless — auto-approving the `story`/`brief` gates on the
-factory's own validator, running an independent review subagent at the `pre_pr`
-gate (approve/changes/stop), then promoting the factory's draft PR to
-ready-for-review + requesting the mimir reviewer. See
-[FACTORY_DRIVER.md](FACTORY_DRIVER.md). Until the flag is set (and the factory is
-installed in the deployment image), epics stay excluded and are co-driven
-manually.
+- **Poller routing** (opt-in via `MIMIR_FACTORY_EPICS_ENABLED`, default off):
+  when the flag is set, the ready-queue poller dispatches `worklink:epic` issues
+  (those with both `worklink:ready` and `worklink:epic` labels) via
+  `mimir worklink run-epic` instead of `mimir worklink run`, and the adapter
+  starts or resumes the opencode feature-factory in the target repo. Until the
+  flag is set, epics are only excluded from leaf dispatch and are never
+  dispatched (no dispatch-then-refuse churn).
+- **State mirroring**: The adapter reads the factory's `run.json` atomically
+  (schema_version + heartbeat_at) and mirrors progress, gate-needed state, PR URL,
+  and terminal status into the Chainlink issue without creating leaf issues.
+- **Gate protocol**: Gate answers flow through the factory's file protocol
+  (`gates/<gate>.answer`) so manual and mimir-driven runs are identical. Review
+  is **owned by the factory**: its in-package multi-agent pre_pr panel
+  (`implementation-validator` + adversarial `security-reviewer`,
+  strictest-verdict-wins) resolves the pre_pr gate and drives the changes loop
+  to convergence; the adapter **relays** that outcome by mirroring the terminal
+  state + PR rather than running its own reviewer.
+- **Autonomy** (second, hard opt-in): autonomous dispatch is gated by the
+  capability-based `autonomous_compute_allowed` policy. The factory runs as a
+  local subprocess (shared filesystem, no network isolation), so an
+  autonomously-dispatched epic is *refused* unless the deployment sets, in
+  `<MIMIR_HOME>/worklink.yaml`:
+
+  ```yaml
+  defaults:
+    allow_autonomous_local_subprocess: true
+  ```
+
+  This knob is fail-closed — only `true` / `1` / `yes` / `on` enable it; a typo
+  or unrecognized value stays OFF. The operator CLI `mimir worklink run-epic
+  <id>`, invoked by hand, is unaffected (it never hits this gate). So an
+  **autonomous** factory epic needs *both* knobs — `MIMIR_FACTORY_EPICS_ENABLED`
+  (poller dispatches it) and `defaults.allow_autonomous_local_subprocess: true`
+  (run-epic accepts the local-subprocess compute); with either missing the epic
+  is safely not built.
+- **Failure handling**: Stale heartbeat or failed factory run produces an actionable
+  Chainlink comment/label and prevents duplicate concurrent factory sessions.
+
+The factory's `run.json` contract:
+
+```json
+{
+  "schema_version": 1,
+  "heartbeat_at": "2026-01-01T00:00:00+00:00",
+  "status": "in_progress|completed|failed|cancelled",
+  "pr_url": "https://github.com/owner/repo/pull/123",
+  "gates_needed": ["test-gate", "review-gate"],
+  "gates_complete": ["code-gate"],
+  "error": "optional error message"
+}
+```
+
+- `heartbeat_at` must be updated periodically by the factory; if it's stale
+  (>5min old), the adapter marks the epic as failed with a stale heartbeat error.
+- `gates_needed` lists gates waiting for answers; the adapter mirrors these as
+  `blocked` status with the first gate name in the reason.
+- `gates_complete` lists gates that have been answered.
 
 Per-leaf worklink (the rest of this document) is unaffected: file a
 `worklink:ready` leaf that satisfies the strict template (§2.5) and the poller
