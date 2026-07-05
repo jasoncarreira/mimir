@@ -104,6 +104,29 @@ def test_at_budget_returns_denial_message():
     assert ctx.tool_call_count == 2
 
 
+def test_small_budget_denial_marks_context():
+    ctx = _make_ctx(budget=1)
+    token = set_current_turn(ctx)
+    try:
+        assert _check_and_increment_or_deny("first_tool") is None  # 1
+        first_denial = _check_and_increment_or_deny("second_tool")
+        second_denial = _check_and_increment_or_deny("third_tool")
+        # Exempt tools stay available after exhaustion and must not mutate
+        # the hard-denial markers.
+        assert _check_and_increment_or_deny("send_message") is None
+        assert _check_and_increment_or_deny("react") is None
+    finally:
+        reset_current_turn(token)
+
+    assert first_denial is not None
+    assert second_denial is not None
+    assert ctx.tool_call_count == 1
+    assert ctx.tool_call_budget_exhausted is True
+    assert ctx.tool_call_budget_denied_count == 2
+    assert ctx.tool_call_budget_denied_tools == ["second_tool", "third_tool"]
+    assert ctx.tool_call_budget_first_denied_at_count == 1
+
+
 def test_budget_zero_disables_gating():
     ctx = _make_ctx(budget=0)
     token = set_current_turn(ctx)
