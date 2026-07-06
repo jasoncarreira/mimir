@@ -8,6 +8,8 @@ from typing import Any, Literal
 from deepagents.middleware.filesystem import FilesystemPermission
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from mimir.structured_output_retry import StructuredOutputRetryMiddleware
+
 
 _SEVERITY_SYNONYMS = {
     "nit": "nit",
@@ -196,6 +198,7 @@ def build_mimir_subagents() -> list[dict]:
             # permissions below.
             "tools": [],
             "permissions": readonly_filesystem_permissions(),
+            "middleware": [StructuredOutputRetryMiddleware()],
             "response_format": CriticFindings,
         },
     ]

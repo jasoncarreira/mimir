@@ -27,6 +27,8 @@ def test_build_mimir_subagents_registers_structured_critic_without_replacing_gp(
     assert "general-purpose" not in {spec["name"] for spec in specs}
     assert specs[0]["response_format"] is CriticFindings
     assert all(spec["tools"] == [] for spec in specs)
+    assert len(specs[0]["middleware"]) == 1
+    assert specs[0]["middleware"][0].__class__.__name__ == "StructuredOutputRetryMiddleware"
     assert all("Read-only" in spec["description"] for spec in specs)
 
 

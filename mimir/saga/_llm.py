@@ -39,12 +39,21 @@ Single async entry point:
 
 The legacy ``call_llm_sync`` + ``_PersistentClaudePool`` daemon-thread
 bridge was deleted in Phase 3 — saga's internals are now async-native.
+
+Retry behavior (chainlink #841):
+- Transient provider errors (429, 5xx, overloaded, connection/timeout)
+  are retried with exponential backoff + jitter.
+- Non-transient errors (400, auth/401/403, context-length, content-policy)
+  fail fast without retry.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
+
+from mimir._llm_retry import _retry_async, _retry_sync
 
 log = logging.getLogger(__name__)
 
@@ -231,26 +240,33 @@ async def call_llm(
       caller's loop stays responsive.
 
     Returns the assistant's reply text. Empty string on transport
-    failure — every existing caller already handles empty gracefully."""
-    import asyncio
+    failure — every existing caller already handles empty gracefully.
 
+    Retry behavior: Transient provider errors are retried with exponential
+    backoff + jitter (see ``mimir._llm_retry``)."""
     raw_provider = llm.get("provider") or "openai_compat"
     provider = raw_provider.lower()
     if provider == "claude_code":
-        return await _call_claude_code_async(
+        return await _retry_async(
+            _call_claude_code_async,
             llm, prompt=prompt, max_tokens=max_tokens,
             temperature=temperature, system=system,
+            provider=provider,
         )
     if provider == "codex_plus":
-        return await _call_codex_plus_async(
+        return await _retry_async(
+            _call_codex_plus_async,
             llm, prompt=prompt, max_tokens=max_tokens,
             temperature=temperature, system=system,
+            provider=provider,
         )
     if provider == "anthropic":
         return await asyncio.to_thread(
+            _retry_sync,
             _call_anthropic, llm,
             prompt=prompt, max_tokens=max_tokens,
             temperature=temperature, system=system,
+            provider=provider,
         )
     # ``openai_compat`` is the documented fallback name. Anything else
     # is a typo or stale enum value — warn so the operator can spot it
@@ -265,9 +281,11 @@ async def call_llm(
             raw_provider,
         )
     return await asyncio.to_thread(
+        _retry_sync,
         _call_openai_compat, llm,
         prompt=prompt, max_tokens=max_tokens,
         temperature=temperature, system=system,
+        provider="openai_compat",
     )
 
 
