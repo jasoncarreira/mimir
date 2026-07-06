@@ -12,11 +12,12 @@ import asyncio
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import warnings
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from .backends import BackendRegistry, WorkOrder, WorklinkConfig
 from .compute import ComputeLaunchError, ComputeResult, LaunchHandle
@@ -45,6 +46,68 @@ from .worktree import WorktreeLease, cleanup_worktree, create_isolated_checkout,
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 _CLAIM_HEARTBEAT_INTERVAL_S = 60.0
+
+# --- feature-factory autonomous adapter (chainlink #833) --------------------
+# The factory self-drives every gate and writes run.json.terminal_result at a
+# terminal state. Under --detached the launcher backgrounds opencode and exits
+# immediately, so the adapter launches ONCE (detached), then POLLS run.json to a
+# terminal state, mirroring meaningful transitions. Liveness is probe-based: a
+# stale heartbeat is a TRIGGER TO PROBE (recent run-dir / process-log file
+# activity), never an auto-fail; with --detached the launcher process is gone so
+# job-liveness reads as unknown and the file-activity signal governs. There is no
+# held compute.wait timeout anymore, so _epic_run_timeout_s() is the run's hard
+# wall-clock ceiling.
+
+
+def _epic_run_timeout_s() -> float:
+    """Wall-clock ceiling (seconds) for a whole DETACHED autonomous run.
+
+    With ``--detached`` the launcher returns immediately, so there is no held
+    ``compute.wait`` timeout to bound the run — the poll loop enforces this bound
+    instead. Generous default (~4h); a run whose ``run.json`` never reaches a
+    terminal state within it is marked failed ("exceeded run timeout").
+    """
+    try:
+        return max(0.0, float(os.environ.get("MIMIR_FACTORY_RUN_TIMEOUT_S", "14400")))
+    except ValueError:
+        return 14400.0
+
+
+def _epic_stale_heartbeat_s() -> float:
+    """Heartbeat age (seconds) that TRIGGERS a liveness probe — not an auto-fail.
+
+    Generous default (~15 min): the factory bumps ``heartbeat_at`` far more
+    often, so exceeding this only means "look closer", not "give up". Also gates
+    the startup grace for "no run.json yet" (a fresh detached launch has none).
+    """
+    try:
+        return max(0.0, float(os.environ.get("MIMIR_FACTORY_STALE_HEARTBEAT_S", "900")))
+    except ValueError:
+        return 900.0
+
+
+def _epic_probe_window_s() -> float:
+    """Window (seconds) within which SOME run-dir file must have advanced for a
+    stale-heartbeat run to still count as making progress."""
+    try:
+        return max(1.0, float(os.environ.get("MIMIR_FACTORY_PROBE_WINDOW_S", "300")))
+    except ValueError:
+        return 300.0
+
+
+def _epic_prompt(issue: "IssueContext") -> str:
+    """The factory's START prompt for a worklink:epic issue.
+
+    Includes an explicit ``Use factory run id`` line so the factory namespaces its
+    control plane under ``.opencode/factory/<run-id>/`` at the id the adapter then
+    OBSERVES, rather than relying on the factory deriving it from the prompt.
+    """
+    from .backends.feature_factory import epic_run_id
+
+    header = f"Build chainlink #{issue.issue_id}: {issue.title}".strip()
+    body = issue.description.strip()
+    base = f"{header}\n\n{body}".strip() if body else header
+    return f"{base}\n\nUse factory run id `{epic_run_id(issue.issue_id)}` for the control plane."
 
 
 @dataclass(frozen=True)
@@ -904,11 +967,7 @@ class WorklinkRunner:
         backend, mirror state from the factory's run.json, and don't create leaf
         issues.
         """
-        from .backends.feature_factory import (
-            FeatureFactoryBackend,
-            has_concurrent_factory_session,
-            read_factory_run_state,
-        )
+        from .backends.feature_factory import has_concurrent_factory_session
 
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
@@ -974,18 +1033,6 @@ class WorklinkRunner:
         )
 
         try:
-            state = read_factory_run_state(self.repo)
-            if state and state.is_terminal:
-                return await self._finalize_epic(
-                    issue=issue,
-                    claims=claims,
-                    claim_record=record,
-                    attempt=record.attempt,
-                    config=config,
-                    backend=backend,
-                    compute=compute,
-                )
-
             base = config.defaults.base_branch
             lease = _create_backend_checkout(
                 self.repo,
@@ -999,58 +1046,26 @@ class WorklinkRunner:
                 runner=_list_runner(runner),
             )
 
-            test_cmd = config.defaults.test_command
             order = WorkOrder(
                 issue_id=issue.issue_id,
                 worktree=lease.path,
-                prompt=issue.description,
+                prompt=_epic_prompt(issue),
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
                 env={"MIMIR_HOME": str(self.home)},
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
-            started = datetime.now(UTC)
-            spec = backend.work_spec(
-                order,
-                attempt=record.attempt,
-                repo_url=repo_url,
-                base_ref=lease.base_ref,
-                branch=lease.branch,
-                test_command=test_cmd,
-            )
-            spec = replace(spec, gate_repair_rounds=0)
-            handle = None
-            try:
-                handle = await compute.launch(spec)
-                compute_result = await _heartbeat_while(
-                    compute.wait(handle, spec.timeout_s),
-                    claims=claims,
-                    record=record,
-                )
-            except ComputeLaunchError as exc:
-                compute_result = ComputeResult(
-                    exit_code=-1,
-                    stdout="",
-                    stderr=str(exc),
-                    launch_error=str(exc),
-                )
-            finally:
-                if handle is not None:
-                    await compute.cleanup(handle)
-
-            return await self._finalize_epic(
+            return await self._run_detached_epic(
                 issue=issue,
                 claims=claims,
-                claim_record=record,
-                attempt=record.attempt,
-                config=config,
+                record=record,
                 backend=backend,
                 compute=compute,
-                compute_result=compute_result,
                 order=order,
                 lease=lease,
-                spec=spec,
-                started=started,
+                repo_url=repo_url,
+                test_cmd=config.defaults.test_command,
+                runner=runner,
             )
         except Exception as exc:
             try:
@@ -1079,94 +1094,608 @@ class WorklinkRunner:
         finally:
             claims.release_issue(issue.issue_id)
 
-    async def _finalize_epic(
+    async def _run_detached_epic(
         self,
         *,
         issue: IssueContext,
         claims: ChainlinkClaims,
-        claim_record: ClaimRecord,
-        attempt: int,
-        config: Any,
+        record: ClaimRecord,
         backend: Any,
         compute: Any,
-        compute_result: Any = None,
-        order: Any = None,
-        lease: Any = None,
-        spec: Any = None,
-        started: Any = None,
+        order: WorkOrder,
+        lease: WorktreeLease,
+        repo_url: str | None,
+        test_cmd: str,
+        runner: Runner,
     ) -> WorklinkRunResult:
-        """Finalize an epic run by reading the factory state and mirroring to Chainlink."""
-        from .backends.feature_factory import (
-            FactoryRunState,
-            has_concurrent_factory_session,
-            read_factory_run_state,
+        """Launch the factory DETACHED once, poll run.json to terminal, finalize.
+
+        ``factory start --autonomous --detached`` backgrounds opencode and the
+        launcher returns immediately, so ``compute.wait`` completes fast (the
+        launcher's exit, NOT the run's). The run-completion detector is therefore
+        the poll loop over ``run.json``, not ``compute.wait``.
+
+        Flow:
+        - **Resume check (pre-launch):** read the current ``run.json``. If it is
+          already TERMINAL, a prior dispatch's detached run finished → finalize
+          straight away. If it is non-terminal AND non-stale, a detached factory
+          is still running from a prior interrupted dispatch → SKIP the launch and
+          just resume polling. Otherwise → launch.
+        - **Launch (detached):** ``compute.launch`` + ``compute.wait`` (fast). A
+          launch error or a non-zero launcher exit is a launch FAILURE (raise);
+          the launcher's clean exit is NOT run completion.
+        - **Poll:** ``_poll_factory_to_terminal`` mirrors transitions + probes
+          liveness until the run is terminal / stuck / over the run-timeout, then
+          ``_finalize_epic`` maps the outcome to Chainlink.
+        """
+        from .backends.feature_factory import epic_run_id, read_factory_run_state
+
+        run_id = epic_run_id(issue.issue_id)
+
+        # Resume check (before launching): a prior dispatch's detached factory may
+        # already be terminal (finalize now) or still running (resume polling).
+        existing = read_factory_run_state(order.worktree, run_id)
+        if existing is not None and existing.is_terminal:
+            _log_event(
+                "worklink_epic_resume_terminal", issue_id=issue.issue_id, run_id=run_id
+            )
+            return await self._finalize_epic(
+                issue=issue,
+                claims=claims,
+                attempt=record.attempt,
+                worktree=order.worktree,
+                lease=lease,
+                state=existing,
+                stuck_reason=None,
+                runner=runner,
+            )
+
+        handle = None
+        try:
+            if existing is not None and not existing.is_stale:
+                # A detached factory from a prior interrupted dispatch is still
+                # live for this epic — resume polling instead of relaunching.
+                _log_event(
+                    "worklink_epic_resume_running",
+                    issue_id=issue.issue_id,
+                    run_id=run_id,
+                    heartbeat_at=existing.heartbeat_at,
+                )
+            else:
+                spec = backend.work_spec(
+                    order,
+                    attempt=record.attempt,
+                    repo_url=repo_url,
+                    base_ref=lease.base_ref,
+                    branch=lease.branch,
+                    test_command=test_cmd,
+                )
+                spec = replace(spec, gate_repair_rounds=0)
+                try:
+                    handle = await compute.launch(spec)
+                    launch_result = await compute.wait(handle, spec.timeout_s)
+                except ComputeLaunchError as exc:
+                    launch_result = ComputeResult(
+                        exit_code=-1, stdout="", stderr=str(exc), launch_error=str(exc)
+                    )
+                # The detached launcher backgrounds opencode and exits ~immediately;
+                # a launch error or non-zero launcher exit means it never spawned
+                # the run. Do NOT treat the launcher's clean exit as run completion.
+                if launch_result.launch_error or launch_result.exit_code != 0:
+                    detail = (
+                        launch_result.launch_error
+                        or (launch_result.stderr or "").strip()
+                        or f"launcher exited {launch_result.exit_code}"
+                    )
+                    raise WorklinkError(f"feature-factory launch failed: {detail}")
+
+            state, stuck_reason = await self._poll_factory_to_terminal(
+                claims=claims,
+                record=record,
+                worktree=order.worktree,
+                run_id=run_id,
+                issue=issue,
+                poll_interval_s=float(getattr(backend, "poll_interval_s", 10) or 0),
+            )
+        finally:
+            if handle is not None:
+                await compute.cleanup(handle)
+
+        return await self._finalize_epic(
+            issue=issue,
+            claims=claims,
+            attempt=record.attempt,
+            worktree=order.worktree,
+            lease=lease,
+            state=state,
+            stuck_reason=stuck_reason,
+            runner=runner,
         )
 
-        state = read_factory_run_state(self.repo)
+    async def _poll_factory_to_terminal(
+        self,
+        *,
+        claims: ChainlinkClaims,
+        record: ClaimRecord,
+        worktree: Path,
+        run_id: str,
+        issue: IssueContext,
+        poll_interval_s: float,
+    ) -> tuple[Any, str | None]:
+        """Poll ``run.json`` to a terminal state — the detached run's completion
+        detector — mirroring transitions and probing liveness each tick.
 
-        if state is None:
-            status = "failed"
-            reason = "factory run.json not found"
-        elif state.is_stale:
-            status = "failed"
-            reason = f"stale heartbeat: {state.heartbeat_at}"
-            if has_concurrent_factory_session(self.repo):
-                comment = (
-                    f"WORKLINK_BLOCKED: feature-factory session appears stuck (stale heartbeat). "
-                    f"Last heartbeat: {state.heartbeat_at}. "
-                    "Please check the factory run manually and restart if needed."
+        Returns ``(state, stuck_reason)``: on a terminal run.json, ``(state, None)``
+        (``_finalize_epic`` prefers ``terminal_result``); on a probe-declared stuck
+        run or an exceeded run-timeout, ``(state, reason)`` → finalized as failed.
+
+        Each tick it (a) mirrors meaningful run.json transitions (gate approved,
+        slice progress, panel verdict, PR opened) to Chainlink — only on CHANGE;
+        (b) does probe-based liveness — a stale ``heartbeat_at`` TRIGGERS a probe,
+        never an auto-fail. With ``--detached`` the launcher process is gone but
+        the backgrounded factory child survives, so liveness is probed directly
+        via ``_detached_factory_alive`` (scan for the child by worktree); a live
+        child keeps waiting even when momentarily quiet (the pre_pr review panel),
+        and only if liveness can't be determined does ``_epic_stuck_reason`` fall
+        back to the file-activity signal. It heartbeats the claim best-effort each
+        tick.
+        """
+        from .backends.feature_factory import read_factory_run_state
+
+        memo = _new_factory_mirror_memo()
+        stale_threshold_s = _epic_stale_heartbeat_s()
+        probe_window_s = _epic_probe_window_s()
+        run_timeout_s = _epic_run_timeout_s()
+        started_at = datetime.now(UTC).timestamp()
+
+        _heartbeat_claim_best_effort(claims, record)
+        while True:
+            state: Any = None
+            try:
+                state = read_factory_run_state(worktree, run_id)
+                if state is not None:
+                    for line in _factory_mirror_lines(state, memo):
+                        _epic_comment(claims, issue.issue_id, line)
+                        _log_event(
+                            "worklink_epic_mirror", issue_id=issue.issue_id, note=line
+                        )
+                    if state.is_terminal or state.terminal_result is not None:
+                        return state, None
+            except Exception as exc:  # noqa: BLE001 - observation must not fail the run
+                _log_event(
+                    "worklink_epic_observe_error",
+                    issue_id=issue.issue_id,
+                    error=str(exc)[:300],
                 )
-                claims._run("issue", "comment", str(issue.issue_id), comment)
-        elif state.error:
-            status = "failed"
-            reason = state.error
-        elif state.status == "completed":
-            if state.gates_needed:
-                status = "blocked"
-                reason = f"gates pending: {', '.join(state.gates_needed)}"
-            else:
-                status = "completed"
-                reason = None
-        else:
-            status = "in_progress"
-            reason = f"factory status: {state.status}"
 
+            elapsed_s = max(0.0, datetime.now(UTC).timestamp() - started_at)
+            # Detached: the launcher is gone, but the backgrounded factory child
+            # survives (reparented). Probe for it directly by worktree so a quiet
+            # review panel isn't mistaken for a hang; None (can't tell) falls back
+            # to run-dir / process-log file activity.
+            reason = _epic_stuck_reason(
+                state=state,
+                recent_activity_s=_run_dir_recent_activity_s(worktree, run_id),
+                job_alive=_detached_factory_alive(worktree),
+                elapsed_s=elapsed_s,
+                stale_threshold_s=stale_threshold_s,
+                probe_window_s=probe_window_s,
+            )
+            if reason is not None:
+                _log_event("worklink_epic_stuck", issue_id=issue.issue_id, reason=reason)
+                return state, reason
+            if elapsed_s >= run_timeout_s:
+                timeout_reason = f"factory exceeded run timeout ({run_timeout_s:.0f}s)"
+                _log_event(
+                    "worklink_epic_run_timeout",
+                    issue_id=issue.issue_id,
+                    reason=timeout_reason,
+                )
+                return state, timeout_reason
+
+            await asyncio.sleep(poll_interval_s)
+            _heartbeat_claim_best_effort(claims, record)
+
+    def _epic_terminal_result(
+        self,
+        *,
+        issue: IssueContext,
+        claims: ChainlinkClaims,
+        attempt: int,
+        lease: WorktreeLease | None,
+        status: str,
+        reason: str | None,
+        pr_url: str | None,
+        runner: Runner,
+    ) -> WorklinkRunResult:
+        """Transition the epic to a non-shippable terminal status and clean up."""
         claims.transition_issue(
             issue.issue_id,
             status=status,
-            review_ready=status == "completed",
+            review_ready=False,
             attempt=attempt,
             reason=reason,
         )
-
         _log_event(
             "worklink_epic_transition",
             issue_id=issue.issue_id,
             attempt=attempt,
             status=status,
             reason=reason,
-            pr_url=state.pr_url if state else None,
+            pr_url=pr_url,
         )
-
         if lease is not None:
-            cleanup_error = _cleanup_worktree_after_transition(
+            _cleanup_worktree_after_transition(
                 lease,
                 outcome=status,
-                runner=_list_runner(self.runner or _runner_for_home(self.home, self.chainlink_bin)),
+                runner=_list_runner(runner),
                 issue_id=issue.issue_id,
                 attempt=attempt,
             )
-
         return WorklinkRunResult(
             issue.issue_id,
             attempt,
             status,
-            review_ready=status == "completed",
-            pr_url=state.pr_url if state and state.pr_url else None,
+            review_ready=False,
+            pr_url=pr_url,
             worktree=lease.path if lease else None,
             branch=lease.branch if lease else None,
             reason=reason,
         )
+
+    async def _finalize_epic(
+        self,
+        *,
+        issue: IssueContext,
+        claims: ChainlinkClaims,
+        attempt: int,
+        worktree: Path,
+        lease: WorktreeLease | None,
+        state: Any,
+        stuck_reason: str | None,
+        runner: Runner,
+    ) -> WorklinkRunResult:
+        """Mirror the factory's terminal outcome to Chainlink, then clean up.
+
+        Outcome (preferring ``run.json.terminal_result``, falling back to
+        ``status``/``pr_url``/gates when it is absent):
+
+        - ``completed`` (or run status completed) WITH a ``pr_url`` → the factory
+          already opened + (via ``--ready``/``--reviewer``) promoted/requested
+          review, so the adapter only MIRRORS: transition the epic to review,
+          record the PR URL, and clean up. It does NOT re-run ``gh pr ready`` /
+          ``--add-reviewer``.
+        - ``blocked`` / ``needs-human`` / ``partial`` (or completed-without-PR) →
+          transition to ``blocked`` with the terminal reason/summary (keeping any
+          ``pr_url`` on the result for visibility).
+        - probe-declared stuck, or no run.json → ``failed`` with the reason.
+        """
+        list_runner = _list_runner(runner)
+
+        # Probe-declared stuck / no run.json → failed (the hard-ceiling wait or
+        # the liveness probe fired).
+        if stuck_reason:
+            return self._epic_terminal_result(
+                issue=issue,
+                claims=claims,
+                attempt=attempt,
+                lease=lease,
+                status="failed",
+                reason=stuck_reason,
+                pr_url=state.pr_url if state else None,
+                runner=runner,
+            )
+        if state is None:
+            return self._epic_terminal_result(
+                issue=issue,
+                claims=claims,
+                attempt=attempt,
+                lease=lease,
+                status="failed",
+                reason="factory produced no run.json",
+                pr_url=None,
+                runner=runner,
+            )
+
+        terminal = state.terminal_result
+        outcome_status = (terminal.status if terminal else state.status).strip().lower()
+        pr_url = (terminal.pr_url if terminal and terminal.pr_url else None) or state.pr_url
+
+        if outcome_status == "completed" and pr_url:
+            # The factory already opened + promoted/requested review on the PR;
+            # just mirror the outcome to Chainlink (no duplicate gh calls).
+            claims.transition_issue(
+                issue.issue_id,
+                status="review",
+                review_ready=True,
+                attempt=attempt,
+            )
+            _epic_comment(
+                claims, issue.issue_id, f"factory completed; PR ready for review: {pr_url}"
+            )
+            _log_event("worklink_epic_pr_opened", issue_id=issue.issue_id, pr_url=pr_url)
+            if lease is not None:
+                # The factory already pushed the branch + opened the PR; the local
+                # attempt checkout is disposable. ``completed`` is cleanup_worktree's
+                # remove-on-success sentinel (same as the leaf happy path).
+                _cleanup_worktree_after_transition(
+                    lease,
+                    outcome="completed",
+                    runner=list_runner,
+                    issue_id=issue.issue_id,
+                    attempt=attempt,
+                )
+            return WorklinkRunResult(
+                issue.issue_id,
+                attempt,
+                "review_ready",
+                review_ready=True,
+                pr_url=pr_url,
+                worktree=lease.path if lease else None,
+                branch=lease.branch if lease else None,
+            )
+
+        # blocked / needs-human / partial / completed-without-PR → blocked, with
+        # the factory's own terminal reason/summary as an actionable comment.
+        reason = (
+            (terminal.reason or terminal.summary if terminal else None)
+            or state.error
+            or (
+                f"factory ended in status '{outcome_status or 'unknown'}'"
+                + (" with a PR URL but not review-ready" if pr_url else " with no PR")
+            )
+        )
+        return self._epic_terminal_result(
+            issue=issue,
+            claims=claims,
+            attempt=attempt,
+            lease=lease,
+            status="blocked",
+            reason=reason,
+            pr_url=pr_url,
+            runner=runner,
+        )
+
+
+def _epic_comment(claims: ChainlinkClaims, issue_id: int, text: str) -> None:
+    """Mirror a factory-progress note to the Chainlink epic issue (best-effort)."""
+    try:
+        claims._run(  # noqa: SLF001 - Chainlink wrapper owns quoting/checks.
+            "issue", "comment", str(issue_id), f"WORKLINK_EPIC {text}", check=False
+        )
+    except Exception as exc:  # noqa: BLE001 - a lost mirror comment must not fail the run.
+        _log_event("worklink_epic_comment_failed", issue_id=issue_id, error=str(exc)[:300])
+
+
+_FACTORY_SLICE_DONE_STATUSES = frozenset({"merged", "completed", "done"})
+
+
+def _new_factory_mirror_memo() -> dict[str, Any]:
+    """Fresh memo of what has already been mirrored, so transitions fire once."""
+    return {
+        "gates_approved": set(),
+        "slices": None,
+        "validator": None,
+        "security": None,
+        "pr_url": None,
+    }
+
+
+def _factory_mirror_lines(state: Any, memo: dict[str, Any]) -> list[str]:
+    """Comment lines for meaningful run.json transitions since the last poll.
+
+    Compares ``state`` against ``memo`` (which it mutates) so each transition —
+    gate approved (story/brief/pre_pr), slice progress, panel verdict, draft PR
+    opened — is mirrored exactly ONCE, even if intermediate polls are skipped
+    (the comparison is net-change, and the tracked transitions are monotonic).
+    """
+    lines: list[str] = []
+
+    for name, status in state.gate_statuses:
+        if (status or "").strip().lower() == "approved" and name not in memo["gates_approved"]:
+            memo["gates_approved"].add(name)
+            lines.append(f"gate approved: {name}")
+
+    if state.slices:
+        total = len(state.slices)
+        merged = sum(
+            1
+            for _sid, status in state.slices
+            if (status or "").strip().lower() in _FACTORY_SLICE_DONE_STATUSES
+        )
+        summary = f"{merged}/{total}"
+        if summary != memo["slices"]:
+            memo["slices"] = summary
+            lines.append(f"slices: {merged}/{total} merged")
+
+    if state.validator_verdict and state.validator_verdict != memo["validator"]:
+        memo["validator"] = state.validator_verdict
+        lines.append(f"validator verdict: {state.validator_verdict}")
+    if state.security_verdict and state.security_verdict != memo["security"]:
+        memo["security"] = state.security_verdict
+        lines.append(f"security verdict: {state.security_verdict}")
+
+    if state.pr_url and state.pr_url != memo["pr_url"]:
+        memo["pr_url"] = state.pr_url
+        lines.append(f"draft PR opened: {state.pr_url}")
+
+    return lines
+
+
+def _heartbeat_age_s(state: Any) -> float | None:
+    """Seconds since ``state.heartbeat_at``; None if absent/unparseable."""
+    if state is None:
+        return None
+    raw = getattr(state, "heartbeat_at", "") or ""
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - parsed).total_seconds()
+
+
+def _fmt_age(age_s: float | None) -> str:
+    return "unknown" if age_s is None else f"{age_s:.0f}s ago"
+
+
+def _run_dir_recent_activity_s(worktree: Path, run_id: str) -> float | None:
+    """Seconds since the most recently modified factory file. None if there is
+    nothing to point to — i.e. no activity.
+
+    Two sources, because with ``--detached`` the run's file activity shows up in
+    two places: the per-run control plane
+    (``.opencode/factory/<run-id>/`` — run.json + artifacts/reviews/evidence) AND
+    the detached factory's process log
+    (``.opencode/factory/processes/<ts>.log``, which advances as the backgrounded
+    opencode writes to it while it runs). The most recent mtime across both is the
+    liveness signal, so the probe keeps waiting on a stale ``heartbeat_at`` as long
+    as EITHER is advancing.
+    """
+    from .backends.feature_factory import factory_run_dir
+
+    run_dir = factory_run_dir(worktree, run_id)
+    # processes/ is a sibling of the per-run dir: <worktree>/.opencode/factory/processes/
+    processes_dir = run_dir.parent.parent / "processes"
+    newest = 0.0
+    try:
+        if run_dir.exists():
+            for path in run_dir.rglob("*"):
+                try:
+                    if path.is_file():
+                        newest = max(newest, path.stat().st_mtime)
+                except OSError:
+                    continue
+        if processes_dir.is_dir():
+            for log in processes_dir.glob("*.log"):
+                try:
+                    newest = max(newest, log.stat().st_mtime)
+                except OSError:
+                    continue
+    except OSError:
+        return None
+    if newest <= 0.0:
+        return None
+    return max(0.0, datetime.now(UTC).timestamp() - newest)
+
+
+# Factory runtime whose process we scan for detached-mode liveness. With
+# ``--detached`` the launcher backgrounds this child and reparents it, so no
+# compute job handle survives; we recognise the live child by its
+# ``--dir <worktree>``.
+_FACTORY_RUNTIME_HINT = "opencode"
+
+
+def _cmdline_is_factory_child(cmdline: str, worktree: str) -> bool:
+    """True if a process command line is the detached factory runtime working in
+    ``worktree`` — the opencode child the launcher backgrounded with
+    ``--dir <worktree>``."""
+    return _FACTORY_RUNTIME_HINT in cmdline and worktree in cmdline
+
+
+def _iter_proc_cmdlines() -> Iterator[str]:
+    """Yield each process's command line from ``/proc`` (Linux). Best-effort:
+    unreadable entries (permissions / exited mid-scan) are skipped."""
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        yield raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+
+
+def _detached_factory_alive(
+    worktree: Path,
+    *,
+    cmdlines: Iterable[str] | None = None,
+) -> bool | None:
+    """Liveness for a DETACHED factory child, which the launcher backgrounds and
+    reparents so no compute job handle survives.
+
+    Scans process command lines for the factory runtime working in ``worktree``.
+    Returns True when found. Returns None ("unknown") when it can't tell —
+    non-Linux / no ``/proc``, or simply no match — so a scan miss is NEVER
+    reported as dead (that would re-introduce the very false-positive this
+    guards against). Genuine death is still caught by the file-activity fallback
+    in ``_epic_stuck_reason`` and, ultimately, by the run timeout.
+    """
+    if cmdlines is None:
+        if not Path("/proc").is_dir():
+            return None
+        cmdlines = _iter_proc_cmdlines()
+    needle = str(worktree)
+    for cmdline in cmdlines:
+        if _cmdline_is_factory_child(cmdline, needle):
+            return True
+    return None
+
+
+def _epic_stuck_reason(
+    *,
+    state: Any,
+    recent_activity_s: float | None,
+    job_alive: bool | None,
+    elapsed_s: float,
+    stale_threshold_s: float,
+    probe_window_s: float,
+) -> str | None:
+    """Probe-based liveness decision. Returns a stuck reason, or None to keep
+    waiting.
+
+    A stale ``heartbeat_at`` (older than ``stale_threshold_s``) is a TRIGGER TO
+    PROBE, never an auto-fail. On a stale heartbeat:
+
+    - ``job_alive is False`` (KNOWN dead) → stuck immediately.
+    - ``job_alive is True`` (KNOWN alive) → keep waiting. A live process is doing
+      work even when it is momentarily quiet — the classic case is the pre_pr
+      review panel, where the reviewer sub-agents run for minutes without writing
+      run.json or the process log. Only the run timeout (enforced by the caller)
+      bounds a live-but-slow process; file quiet must NOT fail it.
+    - ``job_alive is None`` (UNKNOWN — e.g. a substrate with no liveness probe)
+      → fall back to the file-activity signal: stuck only if no run-dir/process
+      file advanced within ``probe_window_s``.
+
+    A fresh heartbeat always keeps waiting.
+    """
+    advancing = recent_activity_s is not None and recent_activity_s <= probe_window_s
+
+    if state is None:
+        # No run.json yet: give the factory a startup grace window equal to the
+        # stale threshold before probing.
+        if elapsed_s <= stale_threshold_s:
+            return None
+        if job_alive is False:
+            return "factory exited before writing run.json"
+        if job_alive is True:
+            return None  # alive, still starting up → run timeout is the ceiling
+        if not advancing:
+            return f"factory wrote no run.json within {stale_threshold_s:.0f}s of launch"
+        return None
+
+    age = _heartbeat_age_s(state)
+    if age is not None and age <= stale_threshold_s:
+        return None  # fresh heartbeat → healthy
+
+    # Stale (or unparseable) heartbeat → probe, don't auto-fail.
+    if job_alive is False:
+        return f"factory process is not alive (heartbeat {_fmt_age(age)})"
+    if job_alive is True:
+        # Demonstrably alive — a quiet review panel is not a hang. Only the run
+        # timeout bounds a live process.
+        return None
+    if not advancing:
+        return (
+            f"factory heartbeat stale ({_fmt_age(age)}) and no run-dir file advanced "
+            f"within {probe_window_s:.0f}s"
+        )
+    return None
 
 
 def _cleanup_worktree_after_transition(

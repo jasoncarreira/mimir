@@ -670,7 +670,14 @@ class BackendRegistry:
         args = settings.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ValueError("worklink feature_factory args must be a list of strings")
-        return FeatureFactoryBackend(bin=bin_name, extra_args=tuple(args))
+        # ``ready``/``reviewer`` are optional overrides; when unset the backend
+        # defaults apply (ready=True; reviewer from MIMIR_FACTORY_REVIEWER).
+        kwargs: dict[str, Any] = {"bin": bin_name, "extra_args": tuple(args)}
+        if "ready" in settings:
+            kwargs["ready_for_review"] = bool(settings["ready"])
+        if "reviewer" in settings:
+            kwargs["reviewer"] = str(settings["reviewer"] or "")
+        return FeatureFactoryBackend(**kwargs)
 
 
 def _string_tuple(value: Any, *, field_name: str) -> tuple[str, ...]:

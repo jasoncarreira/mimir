@@ -765,6 +765,15 @@ class LocalSubprocessComputeBackend:
         self._job(handle)
         return ""
 
+    def job_alive(self, handle: LaunchHandle) -> bool:
+        """Whether the launched subprocess is still running (liveness probe for
+        the feature-factory observe loop). Unknown/gone handles read as dead."""
+        try:
+            proc, _spec, _command = self._job(handle)
+        except KeyError:
+            return False
+        return getattr(proc, "returncode", 0) is None
+
     async def cancel(self, handle: LaunchHandle) -> None:
         proc, _spec, _command = self._job(handle)
         await _kill_process_group(proc)
