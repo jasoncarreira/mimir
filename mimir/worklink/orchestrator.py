@@ -967,7 +967,10 @@ class WorklinkRunner:
         backend, mirror state from the factory's run.json, and don't create leaf
         issues.
         """
-        from .backends.feature_factory import has_concurrent_factory_session
+        from .backends.feature_factory import (
+            epic_run_id,
+            has_concurrent_factory_session,
+        )
 
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
@@ -1004,7 +1007,7 @@ class WorklinkRunner:
             runner=_list_runner(runner),
         )
 
-        if has_concurrent_factory_session(self.repo):
+        if has_concurrent_factory_session(self.repo, exclude_run_id=epic_run_id(issue_id)):
             _log_event(
                 "worklink_epic_concurrent",
                 issue_id=issue_id,
@@ -1556,8 +1559,9 @@ def _run_dir_recent_activity_s(worktree: Path, run_id: str) -> float | None:
     from .backends.feature_factory import factory_run_dir
 
     run_dir = factory_run_dir(worktree, run_id)
-    # processes/ is a sibling of the per-run dir: <worktree>/.opencode/factory/processes/
-    processes_dir = run_dir.parent.parent / "processes"
+    # processes/ is a sibling of the per-run dir under the factory root:
+    # <worktree>/.opencode/factory/processes/ (run_dir is .../factory/<run-id>).
+    processes_dir = run_dir.parent / "processes"
     newest = 0.0
     try:
         if run_dir.exists():

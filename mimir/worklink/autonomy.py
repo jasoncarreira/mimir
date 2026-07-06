@@ -135,6 +135,15 @@ def _attempt_is_active(child: Path) -> bool:
     would otherwise reap a live run mid-flight (removing its ``run.json`` and
     checkout). Errs toward keeping (returns True) when activity cannot be
     determined, so the reaper never nukes a possibly-live run.
+
+    Deliberate tradeoff: treating ANY non-terminal ``run.json`` as active means a
+    factory that CRASHED while leaving ``status: running`` is not auto-reaped by
+    the TTL prune — it must be retired explicitly (``feature-factory factory
+    cleanup --force`` or manual removal). This prioritizes never deleting live
+    work over reclaiming disk from a rare leaked run; a heartbeat-freshness or
+    process-liveness gate here could misfire during a legitimately quiet phase
+    (the pre_pr review panel) and reintroduce the very mid-flight reap this
+    guards against.
     """
     from .backends.feature_factory import epic_run_id, read_factory_run_state
     from .orchestrator import _detached_factory_alive

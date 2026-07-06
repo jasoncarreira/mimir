@@ -425,18 +425,39 @@ def write_gate_answer(repo_path: Path, run_id: str, gate: str, answer: str) -> N
     answer_path.write_text(answer, encoding="utf-8")
 
 
-def has_concurrent_factory_session(repo_path: Path) -> bool:
-    """True if any factory run under ``.opencode/factory/*/`` is non-terminal and
-    non-stale."""
-    factory_root = repo_path / FACTORY_DIR
-    if not factory_root.is_dir():
-        return False
-    for run_json in factory_root.glob(f"*/{RUN_JSON}"):
-        try:
-            data = json.loads(run_json.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
+def has_concurrent_factory_session(
+    repo_path: Path, *, exclude_run_id: str | None = None
+) -> bool:
+    """True if any OTHER factory run is non-terminal and non-stale.
+
+    Detached runs live in per-attempt checkouts
+    (``<repo>/.worklink/<issue>-<attempt>/.opencode/factory/<run-id>/run.json``),
+    not under the repo root, so scan the repo-root control plane AND every
+    ``.worklink`` attempt checkout — otherwise the "one factory session at a time"
+    guard never sees the sessions the detached adapter actually creates.
+    ``exclude_run_id`` skips the caller's own run so a resume/re-dispatch of the
+    same epic is not counted as a concurrent session.
+    """
+    roots = [repo_path / FACTORY_DIR]
+    worklink_root = repo_path / ".worklink"
+    if worklink_root.is_dir():
+        roots.extend(
+            attempt / FACTORY_DIR
+            for attempt in worklink_root.iterdir()
+            if attempt.is_dir()
+        )
+    for factory_root in roots:
+        if not factory_root.is_dir():
             continue
-        state = _parse_run_state(data)
-        if state and not state.is_terminal and not state.is_stale:
+        for run_json in factory_root.glob(f"*/{RUN_JSON}"):
+            try:
+                data = json.loads(run_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            state = _parse_run_state(data)
+            if state is None or state.is_terminal or state.is_stale:
+                continue
+            if exclude_run_id is not None and state.run_id == exclude_run_id:
+                continue
             return True
     return False

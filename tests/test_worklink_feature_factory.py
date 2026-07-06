@@ -285,6 +285,28 @@ def test_has_concurrent_factory_session(tmp_path: Path) -> None:
     assert not has_concurrent_factory_session(tmp_path)  # stale
 
 
+def test_has_concurrent_factory_session_scans_attempt_checkouts(tmp_path: Path) -> None:
+    # Detached runs live under repo/.worklink/<attempt>/.opencode/factory/, not the
+    # repo root, so the guard must scan the attempt checkouts too (else it never
+    # sees the sessions the detached adapter actually creates).
+    attempt = tmp_path / ".worklink" / "841-1"
+    rd = factory_run_dir(attempt, epic_run_id(841))
+    rd.mkdir(parents=True)
+    rd.joinpath("run.json").write_text(
+        json.dumps({"run_id": epic_run_id(841), "status": "running", "heartbeat_at": _now(), "gates": {}}),
+        encoding="utf-8",
+    )
+    assert has_concurrent_factory_session(tmp_path)  # sees the .worklink attempt run
+    # A resume/re-dispatch of that same epic must NOT count its own run as concurrent.
+    assert not has_concurrent_factory_session(tmp_path, exclude_run_id=epic_run_id(841))
+    # A terminal attempt run is not a concurrent session.
+    rd.joinpath("run.json").write_text(
+        json.dumps({"run_id": epic_run_id(841), "status": "completed", "heartbeat_at": _now(), "gates": {}}),
+        encoding="utf-8",
+    )
+    assert not has_concurrent_factory_session(tmp_path)
+
+
 # ── _factory_command (autonomous) / work_spec ───────────────────────────────
 
 
@@ -634,9 +656,10 @@ def _write_factory_run(wt: Path, payload: dict) -> None:
 
 
 def _process_log_dir(wt: Path) -> Path:
-    """The detached factory's process-log dir — a sibling of the per-run dir:
-    ``<wt>/.opencode/factory/processes/``."""
-    return factory_run_dir(wt, epic_run_id(ISSUE_ID)).parent.parent / "processes"
+    """The detached factory's process-log dir — a sibling of the per-run dir under
+    the factory root: ``<wt>/.opencode/factory/processes/`` (run dir is
+    ``.../factory/<run-id>``)."""
+    return factory_run_dir(wt, epic_run_id(ISSUE_ID)).parent / "processes"
 
 
 def _touch_process_log(wt: Path, name: str = "20260705-000000.log") -> Path:
@@ -1214,6 +1237,20 @@ def test_run_dir_recent_activity_includes_process_log(tmp_path: Path) -> None:
     os.utime(rj, (old, old))
     _touch_process_log(tmp_path, name="20260705-000001.log")
     assert _run_dir_recent_activity_s(tmp_path, run_id) < 100
+
+
+def test_run_dir_recent_activity_uses_real_factory_processes_path(tmp_path: Path) -> None:
+    # Guard against the impl and test helper drifting to the same wrong path again:
+    # write the process log at the LITERAL documented location
+    # (<wt>/.opencode/factory/processes/) and confirm it feeds the activity signal,
+    # and that the old buggy location (<wt>/.opencode/processes/) is not used.
+    run_id = epic_run_id(ISSUE_ID)
+    log_dir = tmp_path / ".opencode" / "factory" / "processes"
+    log_dir.mkdir(parents=True)
+    (log_dir / "ts.log").write_text("advancing\n", encoding="utf-8")
+    activity = _run_dir_recent_activity_s(tmp_path, run_id)
+    assert activity is not None and activity < 100
+    assert not (tmp_path / ".opencode" / "processes").exists()
 
 
 def test_feature_factory_backend_capabilities() -> None:
