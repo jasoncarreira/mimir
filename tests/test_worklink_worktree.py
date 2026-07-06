@@ -116,6 +116,40 @@ def test_prune_attempt_worktrees_is_conservative(tmp_path: Path) -> None:
     ]
 
 
+def test_prune_attempt_worktrees_skips_active(tmp_path: Path) -> None:
+    # An over-TTL attempt whose is_active() reports True is NEVER reaped — this
+    # guards a live detached-factory run whose top-level attempt-dir mtime froze
+    # while it works in deep subdirs (the #840 worktree-loss race).
+    import os
+
+    root = tmp_path / ".worklink"
+    live = root / "840-1"
+    dead = root / "841-1"
+    live.mkdir(parents=True)
+    dead.mkdir()
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    now = datetime.now(UTC)
+    old_mtime = (now - timedelta(days=10)).timestamp()
+    for path in (live, dead):
+        os.utime(path, (old_mtime, old_mtime))
+
+    pruned = prune_attempt_worktrees(
+        tmp_path,
+        older_than=timedelta(days=3),
+        now=now,
+        runner=runner,
+        is_active=lambda child: child.name == "840-1",
+    )
+
+    assert pruned == [dead]  # only the inactive attempt is reaped
+    assert all("840-1" not in " ".join(c) for c in calls)  # live attempt untouched
+
+
 def test_prune_attempt_worktrees_covers_relocated_isolated_checkouts(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
