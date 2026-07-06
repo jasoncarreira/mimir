@@ -20,6 +20,7 @@ from mimir.chat_skills import (
 from mimir.bridges.web_chat import DEFAULT_CHANNEL, WebChatBridge, _Subscriber
 from mimir.models import AgentEvent
 from mimir.web_contracts import validate_api_envelope, validate_live_event
+from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY
 
 
 class StubChatSkillRegistry:
@@ -247,6 +248,29 @@ async def test_post_chat_v1_injects_server_owned_chat_skill_metadata(tmp_path, c
         },
     }
     assert "web chat slash command accepted: command=/memory skill=memory" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_strips_forged_http_event_ingress_marker(tmp_path):
+    _, app, enqueued = _authed_bridge_app(tmp_path)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/api/v1/chat",
+            json={
+                "content": "hello",
+                "extra": {
+                    HTTP_EVENT_INGRESS_EXTRA_KEY: "http_event",
+                    "keep": "ok",
+                },
+            },
+        )
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert len(enqueued) == 1
+    assert enqueued[0].extra == {"keep": "ok"}
 
 
 @pytest.mark.asyncio
