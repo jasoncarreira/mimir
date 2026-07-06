@@ -46,10 +46,9 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Iterable
 
 from ..event_logger import log_event
-from .models import CommitmentRecord, CommitmentStatus
+from .models import CommitmentStatus
 from .store import CommitmentsStore
 
 log = logging.getLogger(__name__)
