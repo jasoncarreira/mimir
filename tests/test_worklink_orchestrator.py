@@ -2343,13 +2343,16 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
     ``timeout_s``; it bound to ``handle`` and dropped ``timeout_s``, so run-epic
     crashed with a TypeError right after launch and transitioned the epic to
     failed. This drives run_epic through launch/wait with a fake compute whose
-    factory writes a completed run.json, and asserts a clean completion plus the
-    exact wait() arguments.
+    autonomous factory writes a completed run.json (with terminal_result) into
+    the WORKTREE, and asserts review_ready mirroring plus the exact wait() args.
+
+    Under the autonomous model the factory opens + promotes/requests review on
+    the PR itself (via --ready/--reviewer), so the adapter only MIRRORS the
+    outcome — it must NOT re-run ``gh pr ready`` / ``--add-reviewer``.
     """
     repo = tmp_path / "repo"
     repo.mkdir()
     worktree = repo / ".worklink" / "700-1"
-    factory_run = repo / ".opencode" / "factory" / "run.json"
 
     epic_json = json.dumps(
         {
@@ -2369,14 +2372,30 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
 
         async def wait(self, handle: WorkSpec, timeout_s: int) -> ComputeResult:
             self.waited = (handle, timeout_s)
+            # The factory namespaces run.json under .opencode/factory/<run-id>/
+            # (run-id = chainlink-<issue_id>) inside its ``--repo`` worktree.
+            factory_run = (
+                handle.local_worktree / ".opencode" / "factory" / "chainlink-700" / "run.json"
+            )
             factory_run.parent.mkdir(parents=True, exist_ok=True)
             factory_run.write_text(
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "run_id": "chainlink-700",
                         "heartbeat_at": datetime.now(UTC).isoformat(),
                         "status": "completed",
+                        "gates": {
+                            "story": {"status": "approved"},
+                            "brief": {"status": "approved"},
+                            "pre_pr": {"status": "approved"},
+                        },
                         "pr_url": "https://github.com/jasoncarreira/mimir/pull/999",
+                        "terminal_result": {
+                            "status": "completed",
+                            "run_id": "chainlink-700",
+                            "pr_url": "https://github.com/jasoncarreira/mimir/pull/999",
+                            "summary": "shipped",
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -2387,6 +2406,7 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
         name = "feature_factory"
 
     compute = FactoryCompute(shared_filesystem=True)
+    gh_calls: list[list[str]] = []
 
     def runner(
         args: Sequence[str] | str, **_: object
@@ -2397,6 +2417,9 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
             return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
         if isinstance(args, list) and args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
             worktree.mkdir(parents=True, exist_ok=True)
+            return cp(args)
+        if isinstance(args, list) and args[:2] == ["gh", "pr"]:
+            gh_calls.append(list(args))
             return cp(args)
         return cp(args)
 
@@ -2413,9 +2436,13 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
     )
 
     # With the bug (compute.wait(spec.timeout_s)) run_epic caught a TypeError and
-    # returned status="failed"; the fix reaches wait() with the launch handle.
-    assert result.status == "completed", (result.status, result.reason)
+    # returned status="failed"; the fix reaches wait() with the launch handle and
+    # mirrors the completed run's PR to review-ready.
+    assert result.status == "review_ready", (result.status, result.reason)
+    assert result.review_ready is True
     assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
+    # The factory already opened/promoted the PR; the adapter must NOT re-run gh.
+    assert not any(c[:2] == ["gh", "pr"] for c in gh_calls)
     assert compute.specs, "compute.launch was never called"
     assert compute.waited is not None, "compute.wait was never reached"
     handle, waited_timeout = compute.waited

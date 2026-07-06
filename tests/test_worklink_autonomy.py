@@ -371,6 +371,45 @@ def test_prune_stale_attempt_worktrees_for_home_silent_without_repo_env(
     assert autonomy.prune_stale_attempt_worktrees_for_home(tmp_path) == []
 
 
+def _seed_factory_run(child: Path, issue_id: int, status: str) -> None:
+    run_dir = child / ".opencode" / "factory" / f"chainlink-{issue_id}"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": f"chainlink-{issue_id}",
+                "status": status,
+                "heartbeat_at": "2026-07-06T01:00:00Z",
+                "updated_at": "2026-07-06T01:00:00Z",
+                "gates": {},
+                "slices": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_attempt_is_active_true_for_nonterminal_run(tmp_path: Path) -> None:
+    # A non-terminal factory run.json marks the attempt live → must not be reaped.
+    child = tmp_path / ".worklink" / "840-1"
+    child.mkdir(parents=True)
+    _seed_factory_run(child, 840, "running")
+    assert autonomy._attempt_is_active(child) is True
+
+
+def test_attempt_is_active_false_for_terminal_or_absent(tmp_path: Path) -> None:
+    # Terminal run.json (and no live process) → reapable.
+    done = tmp_path / ".worklink" / "841-1"
+    done.mkdir(parents=True)
+    _seed_factory_run(done, 841, "completed")
+    assert autonomy._attempt_is_active(done) is False
+
+    # No run.json (and no live process) → also reapable.
+    bare = tmp_path / ".worklink" / "842-1"
+    bare.mkdir(parents=True)
+    assert autonomy._attempt_is_active(bare) is False
+
+
 def test_reap_for_home_uses_config_ttl(tmp_path: Path) -> None:
     # reaper_ttl_s = 1h; a 3h-old claim is stale and gets reaped.
     _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)

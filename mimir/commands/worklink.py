@@ -278,4 +278,4 @@ def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     )
     if result.evidence_path:
         print(f"evidence: {result.evidence_path}")
-    return 0 if result.status in {"completed", "blocked"} else 1
+    return 0 if result.status in {"completed", "review_ready", "blocked"} else 1

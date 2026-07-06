@@ -524,6 +524,7 @@ def prune_attempt_worktrees(
     now: datetime,
     worklink_dir: str = ".worklink",
     runner: Runner = _default_runner,
+    is_active: Callable[[Path], bool] | None = None,
 ) -> list[Path]:
     """Prune retained attempt checkouts older than ``older_than``.
 
@@ -534,6 +535,14 @@ def prune_attempt_worktrees(
     ``repo.parent/<worklink_dir>/<repo.name>/<issue>-<attempt>``.  Both shapes
     retain failed/blocked attempts for autopsy, so both must be covered by the
     TTL prune path (#613).
+
+    ``is_active`` (optional) is consulted for each over-TTL attempt; when it
+    returns True the attempt is skipped and never reaped.  This guards a live
+    detached-factory run — whose top-level attempt-dir mtime freezes while its
+    real work happens in deep subdirs — from being misclassified as abandoned by
+    the mtime-only staleness test and having its checkout (and factory
+    ``run.json``) removed mid-flight.  Defaults to ``None`` (legacy: no liveness
+    check), so this stays import-light and callers opt in.
     """
     pruned: list[Path] = []
     for root, isolated in _attempt_roots(repo, worklink_dir):
@@ -544,6 +553,8 @@ def prune_attempt_worktrees(
                 continue
             mtime = datetime.fromtimestamp(child.stat().st_mtime, tz=now.tzinfo)
             if now - mtime <= older_than:
+                continue
+            if is_active is not None and is_active(child):
                 continue
             if isolated:
                 shutil.rmtree(child, ignore_errors=True)

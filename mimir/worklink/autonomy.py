@@ -124,6 +124,40 @@ def check_concurrency(
 
 
 
+def _attempt_is_active(child: Path) -> bool:
+    """True if a stale-by-mtime attempt checkout is actually still live and must
+    NOT be reaped: a non-terminal factory ``run.json`` OR a detached factory
+    process still working in the checkout.
+
+    A long-running detached factory does its work in deep subdirs
+    (``.opencode/factory/<run-id>/``, ``.opencode/worktrees/...``), so the
+    attempt's top-level mtime freezes at setup and the reaper's mtime-only TTL
+    would otherwise reap a live run mid-flight (removing its ``run.json`` and
+    checkout). Errs toward keeping (returns True) when activity cannot be
+    determined, so the reaper never nukes a possibly-live run.
+
+    Deliberate tradeoff: treating ANY non-terminal ``run.json`` as active means a
+    factory that CRASHED while leaving ``status: running`` is not auto-reaped by
+    the TTL prune — it must be retired explicitly (``feature-factory factory
+    cleanup --force`` or manual removal). This prioritizes never deleting live
+    work over reclaiming disk from a rare leaked run; a heartbeat-freshness or
+    process-liveness gate here could misfire during a legitimately quiet phase
+    (the pre_pr review panel) and reintroduce the very mid-flight reap this
+    guards against.
+    """
+    from .backends.feature_factory import epic_run_id, read_factory_run_state
+    from .orchestrator import _detached_factory_alive
+
+    try:
+        issue_id = int(child.name.split("-", 1)[0])
+        state = read_factory_run_state(child, epic_run_id(issue_id))
+        if state is not None and not state.is_terminal:
+            return True
+        return _detached_factory_alive(child) is True
+    except Exception:  # noqa: BLE001 - undeterminable activity must not cause a reap
+        return True
+
+
 def prune_stale_attempt_worktrees_for_home(home: Path, *, repo: Path | str | None = None) -> list[Path]:
     """Prune retained Worklink attempt checkouts past the reaper TTL (#613).
 
@@ -132,6 +166,12 @@ def prune_stale_attempt_worktrees_for_home(home: Path, *, repo: Path | str | Non
     the filesystem prune on the same TTL so retained attempts do not grow
     without bound.  If no Worklink repo is configured, return silently; homes can
     opt into claim reaping before they opt into autonomous dispatch.
+
+    Passes ``is_active`` so an attempt with a live detached factory (or a
+    non-terminal ``run.json``) is skipped rather than reaped: a detached epic can
+    run for longer than the TTL, and its top-level attempt-dir mtime freezes
+    while it works in subdirs, so the mtime-only staleness test alone would
+    delete a live run's checkout out from under it.
     """
     defaults = worklink_defaults(home)
     repo_raw = repo or os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
@@ -141,6 +181,7 @@ def prune_stale_attempt_worktrees_for_home(home: Path, *, repo: Path | str | Non
         Path(repo_raw),
         older_than=timedelta(seconds=defaults.reaper_ttl_s),
         now=datetime.now(timezone.utc),
+        is_active=_attempt_is_active,
     )
 
 
