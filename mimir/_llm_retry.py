@@ -81,7 +81,9 @@ def _is_retryable_error(exc: BaseException, provider: str | None = None) -> tupl
     """
     exc_type = type(exc)
     exc_name = exc_type.__name__
-    exc_msg = str(exc).lower()
+
+    if _is_empty_structured_output_validation_error(exc):
+        return True, f"empty_structured_output:{exc_name}"
 
     if _is_non_retryable_client_error(exc):
         return False, f"non_retryable_client_error:{exc_name}"
@@ -89,22 +91,72 @@ def _is_retryable_error(exc: BaseException, provider: str | None = None) -> tupl
     if _is_transient_connection_error(exc):
         return True, f"connection_error:{exc_name}"
 
-    if provider == "anthropic" or "anthropic" in exc_msg:
+    exc_name_lower = exc_name.lower()
+    if provider == "anthropic" or "anthropic" in exc_name_lower:
         if _is_anthropic_retryable(exc):
             return True, f"anthropic_retryable:{exc_name}"
 
-    if provider == "openai_compat" or "openai" in exc_msg:
+    if provider == "openai_compat" or "openai" in exc_name_lower:
         if _is_openai_retryable(exc):
             return True, f"openai_retryable:{exc_name}"
 
-    if provider == "codex_plus" or "codex" in exc_msg:
+    if provider == "codex_plus" or "codex" in exc_name_lower:
         if _is_codex_retryable(exc):
             return True, f"codex_retryable:{exc_name}"
 
     if _is_generic_retryable(exc):
         return True, f"generic_retryable:{exc_name}"
 
-    return True, f"unknown_default_retry:{exc_name}"
+    return False, f"unknown_non_retryable:{exc_name}"
+
+
+def _http_status_code(exc: BaseException) -> int | None:
+    """Best-effort HTTP status extraction from SDK exception shapes."""
+    raw_status = getattr(exc, "status_code", None)
+    if raw_status is None:
+        response = getattr(exc, "response", None)
+        raw_status = getattr(response, "status_code", None)
+    try:
+        return int(raw_status) if raw_status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _message_content_is_blank(message: Any) -> bool:
+    content = getattr(message, "content", None)
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        pieces: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                pieces.append(block)
+            elif isinstance(block, dict):
+                pieces.append(str(block.get("text") or block.get("content") or ""))
+            else:
+                pieces.append(str(getattr(block, "text", "") or getattr(block, "content", "")))
+        return not "".join(pieces).strip()
+    return not str(content).strip()
+
+
+def _is_empty_structured_output_validation_error(exc: BaseException) -> bool:
+    """Retry native structured-output parse failures caused by an empty completion.
+
+    LangChain raises ``StructuredOutputValidationError`` after the provider call
+    when native structured output returns an empty assistant message. That parse
+    seam sits outside provider transport wrappers, but the empty response is a
+    transient provider/model failure rather than a terminal schema mismatch.
+    """
+    if exc.__class__.__name__ != "StructuredOutputValidationError":
+        return False
+    ai_message = getattr(exc, "ai_message", None)
+    if ai_message is None:
+        return False
+    if getattr(ai_message, "tool_calls", None):
+        return False
+    return _message_content_is_blank(ai_message)
 
 
 def _is_transient_connection_error(exc: BaseException) -> bool:
@@ -158,22 +210,15 @@ def _is_anthropic_retryable(exc: BaseException) -> bool:
     """Check for Anthropic-specific retryable errors."""
     exc_name = exc.__class__.__name__
     msg = str(exc).lower()
+    status = _http_status_code(exc)
 
-    if "rate" in exc_name.lower() or "429" in msg:
+    if status is not None:
+        return status == 429 or 500 <= status < 600
+
+    if exc_name == "RateLimitError" or exc_name == "OverloadedError":
         return True
 
-    if "overloaded" in msg or exc_name == "OverloadedError":
-        return True
-
-    if exc_name in {"APIStatusError", "APIError"}:
-        status = getattr(exc, "status_code", None)
-        if status is not None:
-            if status == 429:
-                return True
-            if 500 <= status < 600:
-                return True
-
-    if "529" in msg or "service unavailable" in msg:
+    if "overloaded" in msg or "service unavailable" in msg:
         return True
 
     return False
@@ -183,19 +228,15 @@ def _is_openai_retryable(exc: BaseException) -> bool:
     """Check for OpenAI-compatible API retryable errors."""
     exc_name = exc.__class__.__name__
     msg = str(exc).lower()
+    status = _http_status_code(exc)
 
-    if "rate" in exc_name.lower() or "429" in msg:
+    if status is not None:
+        return status == 429 or 500 <= status < 600
+
+    if exc_name == "RateLimitError":
         return True
 
-    if exc_name in {"APIStatusError", "APIError", "RateLimitError"}:
-        status = getattr(exc, "status_code", None)
-        if status is not None:
-            if status == 429:
-                return True
-            if 500 <= status < 600:
-                return True
-
-    if "529" in msg or "service unavailable" in msg:
+    if "service unavailable" in msg:
         return True
 
     return False
@@ -205,20 +246,17 @@ def _is_codex_retryable(exc: BaseException) -> bool:
     """Check for Codex-specific retryable errors."""
     exc_name = exc.__class__.__name__
     msg = str(exc).lower()
+    status = _http_status_code(exc)
+
+    if status is not None:
+        return status == 429 or 500 <= status < 600
 
     if exc_name == "CodexResponseError" or "codexresponseerror" in msg:
-        if "retry" in msg or "you can retry" in msg:
+        if "you can retry" in msg:
             return True
 
-        if "rate" in msg or "429" in msg:
+        if "rate limit" in msg or "too many requests" in msg:
             return True
-
-        status = getattr(exc, "status_code", None)
-        if status is not None:
-            if status == 429:
-                return True
-            if 500 <= status < 600:
-                return True
 
         if "overloaded" in msg or "temporarily unavailable" in msg:
             return True
@@ -228,7 +266,7 @@ def _is_codex_retryable(exc: BaseException) -> bool:
 
 def _is_generic_retryable(exc: BaseException) -> bool:
     """Check for generic retryable errors by status code."""
-    status = getattr(exc, "status_code", None)
+    status = _http_status_code(exc)
     if status is not None:
         if status == 429:
             return True
@@ -238,9 +276,9 @@ def _is_generic_retryable(exc: BaseException) -> bool:
             return True
 
     msg = str(exc).lower()
-    if any(kw in msg for kw in ["429", "rate limit", "too many requests"]):
+    if "rate limit" in msg or "too many requests" in msg:
         return True
-    if any(kw in msg for kw in ["5xx", "500", "502", "503", "504", "internal error", "server error"]):
+    if "5xx" in msg or "internal server error" in msg or "server error" in msg:
         return True
 
     return False
@@ -254,29 +292,26 @@ def _is_non_retryable_client_error(exc: BaseException) -> bool:
     if exc_name in {"AuthenticationError", "AuthorizationError", "PermissionError"}:
         return True
 
-    if "401" in msg or "unauthorized" in msg:
-        return True
-
-    if "403" in msg or "forbidden" in msg:
-        return True
-
-    if exc_name in {"BadRequestError", "BadRequest"}:
-        return True
-
-    if "400" in msg and "bad request" in msg:
-        return True
-
-    status = getattr(exc, "status_code", None)
+    status = _http_status_code(exc)
     if status is not None:
         if status == 400:
             return True
         if 400 < status < 500 and status not in (429,):
             return True
 
+    if "unauthorized" in msg or "forbidden" in msg:
+        return True
+
+    if exc_name in {"BadRequestError", "BadRequest"}:
+        return True
+
+    if "bad request" in msg:
+        return True
+
     if any(kw in msg for kw in ["context length", "max tokens", "too long", "maximum context"]):
         return True
 
-    if any(kw in msg for kw in ["content policy", "content policy violation", "blocked", "prohibited"]):
+    if any(kw in msg for kw in ["content policy", "content policy violation", "safety policy", "prohibited"]):
         return True
 
     return False
@@ -397,4 +432,5 @@ __all__ = [
     "_retry_async",
     "_retry_sync",
     "_retry_config",
+    "_is_empty_structured_output_validation_error",
 ]
