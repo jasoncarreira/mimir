@@ -37,7 +37,7 @@ from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.identities import IdentityResolver
 from mimir.index import IndexGenerator
-from mimir.models import AgentEvent, TurnContext
+from mimir.models import AgentEvent, TurnContext, TurnInteractivity
 from mimir.skill_defs import home_builtin_skills_dir
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.turn_logger import TurnLogger
@@ -3313,6 +3313,7 @@ async def test_iteration_hard_stop_notifies_interactive_channel(tmp_path: Path):
     ctx = TurnContext(
         turn_id="t", session_id="discord-1", trigger="user_message",
         channel_id="discord-1", started_at=0.0,
+        interactivity=TurnInteractivity.INTERACTIVE,
     )
     await agent._notify_iteration_hard_stop(event, 200, ctx)
     assert len(ch.sent) == 1
@@ -3379,6 +3380,7 @@ async def test_iteration_hard_stop_soft_send_failure_not_recorded(tmp_path: Path
     ctx = TurnContext(
         turn_id="t", session_id="discord-1", trigger="user_message",
         channel_id="discord-1", started_at=0.0,
+        interactivity=TurnInteractivity.INTERACTIVE,
     )
     await agent._notify_iteration_hard_stop(event, 200, ctx)
     assert len(ch.sent) == 1                       # the send was attempted

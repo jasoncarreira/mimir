@@ -48,6 +48,7 @@ from ..web_contracts import (
     make_chat_message_event,
     make_chat_reaction_event,
 )
+from ..worklink.continuation import strip_http_event_ingress_extra
 from .base import Bridge, SendResult
 
 log = logging.getLogger(__name__)
@@ -134,7 +135,7 @@ def _chat_identity(request: web.Request):
 def _sanitize_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
     # Single source of truth for the chat-skill key set (chat_skills), shared
     # with the generic /event ingress in server.py.
-    return strip_chat_skill_extra(extra)
+    return strip_http_event_ingress_extra(strip_chat_skill_extra(extra))
 
 
 def _slash_command_error(parsed: ChatSkillError) -> _ChatRequestError:
