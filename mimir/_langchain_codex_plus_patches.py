@@ -10,6 +10,14 @@ Keep patches at the boundary ``langchain-codex-plus`` actually uses. For
 example, the Codex Plus streaming path consumes httpx ``iter_lines`` /
 ``aiter_lines`` and never instantiates OpenAI SDK ``SSEDecoder``; do not patch
 that SDK decoder here as a proxy for Codex Plus transport failures.
+
+Retry behavior (chainlink #841):
+- Uses provider-agnostic error classification from ``mimir._llm_retry``.
+- Transient errors (429, 5xx, connection/timeout, overloaded) are retried
+  with exponential backoff + jitter.
+- Non-transient errors (400, auth, context-length, content-policy) fail fast.
+- Streaming retries only happen before the first chunk is yielded to avoid
+  duplicating partial output.
 """
 
 from __future__ import annotations
@@ -17,10 +25,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import time
 from collections.abc import AsyncIterator
 from contextvars import ContextVar
 from typing import Any
+
+from mimir._llm_retry import _is_retryable_error
 
 log = logging.getLogger(__name__)
 
@@ -62,35 +73,11 @@ def _retry_base_delay() -> float:
         return _DEFAULT_BASE_DELAY_SECONDS
 
 
-def _is_transient_connection_error(exc: BaseException) -> bool:
-    """Return True for network failures worth re-issuing once or twice.
-
-    Keep this deliberately narrower than the quota-pause classifier: 429s and
-    provider ``CodexResponseError`` failures are semantic refusals, not transport
-    drops. The motivating production failures were httpx ``ReadError`` stream
-    drops against ``chatgpt.com/backend-api/codex/responses``.
-    """
-    try:
-        import httpx
-    except ImportError:  # pragma: no cover - codex-plus pulls httpx in practice
-        return type(exc).__name__ in {
-            "ReadError",
-            "ConnectError",
-            "RemoteProtocolError",
-            "ReadTimeout",
-            "ConnectTimeout",
-        }
-
-    return isinstance(
-        exc,
-        (
-            httpx.ReadError,
-            httpx.ConnectError,
-            httpx.RemoteProtocolError,
-            httpx.ReadTimeout,
-            httpx.ConnectTimeout,
-        ),
-    )
+def _calculate_delay(attempt: int, base_delay: float) -> float:
+    """Calculate exponential backoff delay with jitter."""
+    delay = base_delay * (2 ** (attempt - 1))
+    jitter = random.uniform(0, 0.5 * delay)
+    return delay + jitter
 
 
 def install_codex_plus_transient_retry_patch(ChatCodexPlus: type[Any] | None = None) -> None:
@@ -177,13 +164,16 @@ def _patch_astream(ChatCodexPlus: type[Any]) -> None:
                     yielded = True
                     yield chunk
             except Exception as exc:
-                if yielded or attempt >= attempts or not _is_transient_connection_error(exc):
+                if yielded or attempt >= attempts:
                     raise
-                delay = base_delay * (2 ** (attempt - 1))
+                is_retryable, reason = _is_retryable_error(exc, provider="codex_plus")
+                if not is_retryable:
+                    raise
+                delay = _calculate_delay(attempt, base_delay)
                 log.warning(
-                    "ChatCodexPlus._astream transient %s before first chunk; "
+                    "ChatCodexPlus._astream transient %s (reason=%s) before first chunk; "
                     "retrying attempt %s/%s after %.2fs: %s",
-                    type(exc).__name__, attempt + 1, attempts, delay, exc,
+                    type(exc).__name__, reason, attempt + 1, attempts, delay, exc,
                 )
                 if delay > 0:
                     await asyncio.sleep(delay)
@@ -207,13 +197,16 @@ def _patch_generate(ChatCodexPlus: type[Any]) -> None:
             try:
                 return original(self, *args, **kwargs)
             except Exception as exc:
-                if attempt >= attempts or not _is_transient_connection_error(exc):
+                if attempt >= attempts:
                     raise
-                delay = base_delay * (2 ** (attempt - 1))
+                is_retryable, reason = _is_retryable_error(exc, provider="codex_plus")
+                if not is_retryable:
+                    raise
+                delay = _calculate_delay(attempt, base_delay)
                 log.warning(
-                    "ChatCodexPlus._generate transient %s; retrying attempt "
+                    "ChatCodexPlus._generate transient %s (reason=%s); retrying attempt "
                     "%s/%s after %.2fs: %s",
-                    type(exc).__name__, attempt + 1, attempts, delay, exc,
+                    type(exc).__name__, reason, attempt + 1, attempts, delay, exc,
                 )
                 if delay > 0:
                     time.sleep(delay)
