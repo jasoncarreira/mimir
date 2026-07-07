@@ -2246,18 +2246,20 @@ class Scheduler:
         deployments install nothing.
         """
         from .worklink.autonomy import (
+            close_merged_chainlinks_for_home,
             prune_stale_attempt_worktrees_for_home,
             reap_stale_claims_for_home,
         )
 
         async def _fire() -> None:
-            def _reap() -> tuple[list[object], list[Path]]:
+            def _reap() -> tuple[list[object], list[Path], list[object]]:
                 return (
                     reap_stale_claims_for_home(home),
                     prune_stale_attempt_worktrees_for_home(home),
+                    close_merged_chainlinks_for_home(home),
                 )
 
-            reaped, pruned_paths = await asyncio.to_thread(_reap)
+            reaped, pruned_paths, closed_chainlinks = await asyncio.to_thread(_reap)
             if reaped:
                 await log_event(
                     "worklink_claims_reaped",
@@ -2269,6 +2271,12 @@ class Scheduler:
                     "worklink_attempt_checkouts_pruned",
                     count=len(pruned_paths),
                     paths=[str(path) for path in pruned_paths],
+                )
+            if closed_chainlinks:
+                await log_event(
+                    "worklink_merged_chainlinks_closed",
+                    count=len(closed_chainlinks),
+                    issue_ids=[record.issue_id for record in closed_chainlinks],
                 )
 
         return self.register_callable(

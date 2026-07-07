@@ -1416,6 +1416,11 @@ class WorklinkRunner:
             _epic_comment(
                 claims, issue.issue_id, f"factory completed; PR ready for review: {pr_url}"
             )
+            _epic_comment(
+                claims,
+                issue.issue_id,
+                f"WORKLINK_EVIDENCE issue={issue.issue_id} attempt={attempt} status=completed review_ready=true pr_url={pr_url}",
+            )
             _log_event("worklink_epic_pr_opened", issue_id=issue.issue_id, pr_url=pr_url)
             if lease is not None:
                 # The factory already pushed the branch + opened the PR; the local
