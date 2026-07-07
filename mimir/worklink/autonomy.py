@@ -331,6 +331,9 @@ def _find_pr_url_from_comments(comments: list[str]) -> str | None:
     """Find PR URL from issue comments.
 
     Looks for WORKLINK_EVIDENCE comments which contain the pr_url field.
+    Feature-factory epics historically mirrored their PR as
+    ``draft PR opened: <url>`` instead of a WORKLINK_EVIDENCE record, so accept
+    that shape too to reconcile already-stranded epic issues.
     """
     for comment in reversed(comments):
         match = re.search(r"pr_url=([^\s]+)", comment)
@@ -340,6 +343,11 @@ def _find_pr_url_from_comments(comments: list[str]) -> str | None:
                 normalized = _normalize_pr_url(url)
                 if normalized:
                     return normalized
+        match = re.search(r"draft PR opened:\s*(https?://github\.com/[^\s]+)", comment)
+        if match:
+            normalized = _normalize_pr_url(match.group(1))
+            if normalized:
+                return normalized
     return None
 
 
@@ -358,7 +366,7 @@ def _find_latest_attempt_from_comments(comments: list[str]) -> int | None:
 def get_pr_url_for_review_issue(
     home: Path,
     issue_id: int,
-    chainlink_runner: Sequence[str] | None = None,
+    chainlink_runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None,
 ) -> str | None:
     """Get the PR URL for a worklink:review issue.
 
@@ -374,18 +382,16 @@ def get_pr_url_for_review_issue(
                 return normalized
 
     if chainlink_runner:
-        runner = lambda args: subprocess.run(
-            list(args), capture_output=True, text=True, check=False,
-        )
-        result = runner(["chainlink", "issue", "show", str(issue_id), "--json"])
+        result = chainlink_runner([chainlink_bin(), "issue", "show", str(issue_id), "--json"])
         if result.returncode == 0:
             try:
                 data = json.loads(result.stdout)
                 comments = data.get("comments") or []
                 comment_texts = [
                     c.get("content") or c.get("text") or c.get("body") or ""
+                    if isinstance(c, dict) else str(c)
                     for c in comments
-                    if isinstance(c, dict)
+                    if isinstance(c, (dict, str))
                 ]
                 return _find_pr_url_from_comments(comment_texts)
             except (json.JSONDecodeError, TypeError):
@@ -440,7 +446,7 @@ def close_merged_chainlinks_for_home(
     closed_results: list[MergedChainlinkResult] = []
 
     for issue_id in review_issue_ids:
-        pr_url = get_pr_url_for_review_issue(home, issue_id)
+        pr_url = get_pr_url_for_review_issue(home, issue_id, chainlink_runner=cl.runner)
         if not pr_url:
             continue
 

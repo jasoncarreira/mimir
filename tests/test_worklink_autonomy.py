@@ -1210,6 +1210,14 @@ def test_find_pr_url_from_comments() -> None:
     assert autonomy._find_pr_url_from_comments(comments) == "https://github.com/owner/repo/pull/1029"
 
 
+def test_find_pr_url_from_epic_mirror_comment() -> None:
+    comments = [
+        "WORKLINK_EPIC gate approved: pre_pr",
+        "WORKLINK_EPIC draft PR opened: https://github.com/Owner/Repo/pull/1037",
+    ]
+    assert autonomy._find_pr_url_from_comments(comments) == "https://github.com/owner/repo/pull/1037"
+
+
 def test_find_pr_url_from_comments_none() -> None:
     assert autonomy._find_pr_url_from_comments([]) is None
     assert autonomy._find_pr_url_from_comments(["no pr url here"]) is None
@@ -1303,8 +1311,10 @@ class FakeChainlinkForReview:
     def __init__(
         self,
         review_ids: list[int] = None,
+        comments: dict[int, list[str]] | None = None,
     ) -> None:
         self.review_ids = review_ids or []
+        self.comments = comments or {}
         self.calls: list[list[str]] = []
 
     def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -1316,6 +1326,9 @@ class FakeChainlinkForReview:
             if label == "worklink:review":
                 return cp(stdout=json.dumps([{"id": i} for i in self.review_ids]))
             return cp(stdout=json.dumps([]))
+        if tail[:2] == ["issue", "show"]:
+            issue_id = int(tail[2])
+            return cp(stdout=json.dumps({"id": issue_id, "comments": self.comments.get(issue_id, [])}))
         return cp()
 
     def names(self) -> list[str]:
@@ -1442,6 +1455,61 @@ def test_close_merged_chainlinks_skips_closed_unmerged(tmp_path: Path) -> None:
         aut.make_claims = orig_make_claims
 
     assert results == []
+
+
+def test_close_merged_chainlinks_closes_epic_from_mirror_comment(tmp_path: Path) -> None:
+    """Completed feature-factory epics expose PR URL via mirror comments."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    fake_gh = FakeGh({"owner/repo#1042": {"state": "MERGED", "mergedAt": "2026-07-07T04:00:00Z", "mergeCommit": "abc1234"}})
+    fake_cl = FakeChainlinkForReview(
+        review_ids=[845],
+        comments={845: ["WORKLINK_EPIC draft PR opened: https://github.com/owner/repo/pull/1042"]},
+    )
+
+    def make_claims_runner(home):
+        return ChainlinkClaims(agent_id="test", runner=fake_cl)
+
+    import mimir.worklink.autonomy as aut
+    orig_make_claims = aut.make_claims
+    aut.make_claims = make_claims_runner
+
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(home, dry_run=False, gh_runner=fake_gh)
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert [result.issue_id for result in results] == [845]
+    assert "issue unlabel 845" in fake_cl.names()
+    assert any("PR merged" in " ".join(c) for c in fake_cl.calls)
+
+
+def test_close_merged_chainlinks_leaves_epic_with_open_pr(tmp_path: Path) -> None:
+    """Feature-factory epics stay in review while their mirrored PR is open."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    fake_gh = FakeGh({"owner/repo#1043": {"state": "OPEN", "mergedAt": "null", "mergeCommit": "null"}})
+    fake_cl = FakeChainlinkForReview(
+        review_ids=[846],
+        comments={846: ["WORKLINK_EPIC draft PR opened: https://github.com/owner/repo/pull/1043"]},
+    )
+
+    def make_claims_runner(home):
+        return ChainlinkClaims(agent_id="test", runner=fake_cl)
+
+    import mimir.worklink.autonomy as aut
+    orig_make_claims = aut.make_claims
+    aut.make_claims = make_claims_runner
+
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(home, dry_run=False, gh_runner=fake_gh)
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    assert "issue unlabel 846" not in fake_cl.names()
 
 
 def test_close_merged_chainlinks_skips_missing_pr_url(tmp_path: Path) -> None:

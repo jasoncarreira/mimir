@@ -947,6 +947,7 @@ def test_autonomous_progress_mirrored_to_chainlink(tmp_path: Path) -> None:
     assert "gate approved: brief" in joined
     assert "gate approved: pre_pr" in joined
     assert f"draft PR opened: {PR_URL}" in joined
+    assert f"WORKLINK_EVIDENCE issue={ISSUE_ID} attempt=1 status=completed review_ready=true pr_url={PR_URL}" in joined
     assert "validator verdict: GO" in joined
     assert "security verdict: PASS" in joined
     assert "merged" in joined  # slice progress mirrored
