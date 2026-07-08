@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pytest
@@ -143,97 +144,25 @@ def test_worklink_run_cli_autonomous_refused_exits_1(
     assert "refused" in captured.err and "unsafe compute" in captured.err
 
 
-def test_worklink_worker_cli_dispatches_payload_runner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_worklink_cli_rejects_unknown_subcommand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[object] = []
-    payload = tmp_path / "payload.json"
-    payload.write_text("{}", encoding="utf-8")
-
-    class FakeValidation:
-        status = "completed"
-        review_ready = True
-        reasons = ()
-
+    """chainlink #832: docker-broker and worker subcommands were retired. The
+    parser surface only registers ``run`` + ``run-epic``; argparse itself
+    rejects anything else (e.g. ``mimir worklink worker …``), so the
+    dispatcher's catch-all ``return 1`` for unknown actions never has to fire
+    in production. This test pins that contract."""
     import mimir.commands.worklink as worklink_cmd
 
-    def fake_payload_from_json(data: object) -> object:
-        calls.append(("payload", data))
-        return {"payload": data}
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    worklink_cmd.add_argparse(sub)
 
-    async def fake_run_worker_payload(payload_obj: object) -> FakeValidation:
-        calls.append(("run", payload_obj))
-        return FakeValidation()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["worklink", "worker", "/tmp/payload.json"])
 
-    monkeypatch.setattr(worklink_cmd, "payload_from_json", fake_payload_from_json)
-    monkeypatch.setattr(worklink_cmd, "run_worker_payload", fake_run_worker_payload)
-
-    with pytest.raises(SystemExit) as exc:
-        main(["worklink", "worker", str(payload)])
-
-    assert exc.value.code == 0
-    assert calls == [("payload", {}), ("run", {"payload": {}})]
-    assert "worklink worker: completed review-ready" in capsys.readouterr().out
-
-
-
-def test_worklink_worker_accepts_inline_payload_json(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    calls: list[object] = []
-
-    class FakeValidation:
-        status = "blocked"
-        review_ready = False
-        reasons = ("needs planner",)
-
-    import mimir.commands.worklink as worklink_cmd
-
-    def fake_payload_from_json(data: object) -> object:
-        calls.append(("payload", data))
-        return {"payload": data}
-
-    async def fake_run_worker_payload(payload_obj: object) -> FakeValidation:
-        calls.append(("run", payload_obj))
-        return FakeValidation()
-
-    monkeypatch.setattr(worklink_cmd, "payload_from_json", fake_payload_from_json)
-    monkeypatch.setattr(worklink_cmd, "run_worker_payload", fake_run_worker_payload)
-
-    with pytest.raises(SystemExit) as exc:
-        main(["worklink", "worker", "--payload-json", '{"spec":{"issue_id":459}}'])
-
-    assert exc.value.code == 0
-    assert calls == [("payload", {"spec": {"issue_id": 459}}), ("run", {"payload": {"spec": {"issue_id": 459}}})]
-    assert "worklink worker: blocked" in capsys.readouterr().out
-
-
-def test_worklink_worker_failed_validation_exits_nonzero_with_reason(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    class FakeEvidence:
-        blocked_reason = "git push failed: auth denied"
-
-    class FakeValidation:
-        status = "failed"
-        review_ready = False
-        reasons = ("worker_error",)
-        evidence = FakeEvidence()
-
-    import mimir.commands.worklink as worklink_cmd
-
-    monkeypatch.setattr(worklink_cmd, "payload_from_json", lambda data: {"payload": data})
-
-    async def fake_run_worker_payload(payload_obj: object) -> FakeValidation:
-        return FakeValidation()
-
-    monkeypatch.setattr(worklink_cmd, "run_worker_payload", fake_run_worker_payload)
-
-    with pytest.raises(SystemExit) as exc:
-        main(["worklink", "worker", "--payload-json", '{"spec":{"issue_id":529}}'])
-
-    assert exc.value.code == 1
-    assert "worklink worker: failed — git push failed: auth denied" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        parser.parse_args(["worklink", "docker-broker", "--policy", "/tmp/p.yaml"])
 
 
 def test_worklink_run_failed_without_attempt_prints_reason(

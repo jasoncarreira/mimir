@@ -17,9 +17,6 @@ from mimir.worklink.backends import (
     CodexBackend,
     OpenCodeBackend,
     ComputeResult,
-    DockerSiblingComputeBackend,
-    EcsRunTaskComputeBackend,
-    EcsRunTaskConfig,
     LocalSubprocessComputeBackend,
     RawResult,
     TieredReviewConfig,
@@ -30,12 +27,6 @@ from mimir.worklink.backends import (
 )
 from mimir.worklink.backends.base import blocked_reason_from_output
 from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, LaunchHandle, WorkSpec
-from mimir.worklink.worker import (
-    WorkerPayload,
-    payload_from_json,
-    payload_to_json,
-    run_worker_payload,
-)
 import mimir.worklink.backends.codex as codex_module
 import mimir.worklink.compute as compute_module
 
@@ -424,8 +415,6 @@ defaults:
 
     assert defaults.epic_branch_prefix == "epic/"
     assert defaults.max_review_retries == 3
-    assert defaults.gate_repair_rounds == 1
-    assert defaults.trusted_test_retries == 1
     assert defaults.max_claim_attempts == 3
     assert defaults.reviewer_backend == "claude_cli"
     assert defaults.tiered_review.multi_vote_reviewer_count == 3
@@ -447,8 +436,6 @@ defaults:
   backend: codex
   epic_branch_prefix: stacked/
   max_review_retries: 5
-  gate_repair_rounds: 0
-  trusted_test_retries: 0
   max_claim_attempts: 10
   reviewer_backend: claude_cli
   tiered_review:
@@ -467,8 +454,6 @@ defaults:
 
     assert defaults.epic_branch_prefix == "stacked/"
     assert defaults.max_review_retries == 5
-    assert defaults.gate_repair_rounds == 0  # 0 is a valid explicit "disabled"
-    assert defaults.trusted_test_retries == 0
     assert defaults.max_claim_attempts == 10
     assert defaults.reviewer_backend == "claude_cli"
     assert defaults.tiered_review == TieredReviewConfig(
@@ -478,230 +463,40 @@ defaults:
     )
 
 
-def test_worklink_config_builds_docker_sibling_compute_backend(tmp_path: Path) -> None:
+def test_worklink_config_builds_local_subprocess_compute_backend(tmp_path: Path) -> None:
+    """chainlink #832: local_subprocess is the only built-in compute backend."""
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(
         """
 defaults:
   backend: codex
-  compute_backend: docker-sibling
+  compute_backend: local-subprocess
 routes:
-  - label: local-ok
-    backend: codex
-    compute_backend: local_subprocess
-compute_backends:
-  docker-sibling:
-    broker_url: "unix:///run/worklink-broker.sock"
-    image: mimirbot-mimirbot
-    policy:
-      network: none
+  - label: docs
+    backend: claude_cli
 """.strip()
     )
 
     config = WorklinkConfig.load(config_path)
     registry = BackendRegistry(config)
 
-    assert config.defaults.compute_backend == "docker_sibling"
-    assert config.compute_backend_settings["docker_sibling"] == {
-        "broker_url": "unix:///run/worklink-broker.sock",
-        "image": "mimirbot-mimirbot",
-        "policy": {"network": "none"},
-    }
+    assert config.defaults.compute_backend == "local_subprocess"
     backend = registry.select_compute(labels={"worklink"})
-    assert isinstance(backend, DockerSiblingComputeBackend)
-    assert backend.name == "docker_sibling"
-    assert backend.broker_url == "unix:///run/worklink-broker.sock"
-    assert backend.image == "mimirbot-mimirbot"
-    assert backend.policy == {"network": "none"}
+    assert isinstance(backend, LocalSubprocessComputeBackend)
+    assert backend.name == "local_subprocess"
     assert backend.capabilities() == ComputeCaps(
-        shared_filesystem=False,
-        network_isolated=True,
+        shared_filesystem=True,
+        network_isolated=False,
         handle_cancel=True,
-        persistent_after_disconnect=True,
-    )
-    assert isinstance(registry.select_compute(labels={"local-ok"}), LocalSubprocessComputeBackend)
-
-
-class FakeDockerSiblingTransport:
-    def __init__(self) -> None:
-        self.submitted: list[dict[str, Any]] = []
-        self.waits: list[tuple[str, int]] = []
-        self.logs_requested: list[str] = []
-        self.cancelled: list[str] = []
-        self.cleaned: list[str] = []
-        self.wait_response: dict[str, Any] = {
-            "status": "completed",
-            "exit_code": 0,
-            "stdout": "done",
-            "stderr": "",
-        }
-
-    async def submit_job(self, payload: dict[str, Any], *, timeout_s: int) -> dict[str, Any]:
-        self.submitted.append({"payload": payload, "timeout_s": timeout_s})
-        return {"job_id": "job-123"}
-
-    async def wait_job(self, job_id: str, *, timeout_s: int) -> dict[str, Any]:
-        self.waits.append((job_id, timeout_s))
-        return self.wait_response
-
-    async def job_logs(self, job_id: str) -> str:
-        self.logs_requested.append(job_id)
-        return "broker logs"
-
-    async def cancel_job(self, job_id: str) -> None:
-        self.cancelled.append(job_id)
-
-    async def cleanup_job(self, job_id: str) -> None:
-        self.cleaned.append(job_id)
-
-
-def _portable_spec() -> WorkSpec:
-    return WorkSpec(
-        issue_id=472,
-        attempt=2,
-        repo_url="git@github.com:jasoncarreira/mimir.git",
-        base_ref="main",
-        branch="issue/472-a2",
-        prompt="prompt",
-        rules=None,
-        test_command="echo ok",
-        backend="codex",
-        timeout_s=5,
-        env={"MIMIR_HOME": "/home/mimir"},
-        backend_config={"bin": "codex", "args": ["exec", "--json"]},
+        persistent_after_disconnect=False,
     )
 
 
-@pytest.mark.asyncio
-async def test_docker_sibling_compute_backend_uses_broker_contract_not_docker() -> None:
-    transport = FakeDockerSiblingTransport()
-    backend = DockerSiblingComputeBackend(
-        broker_url="unix:///run/worklink-broker.sock",
-        image="mimirbot-mimirbot",
-        policy={"network": "none"},
-        transport=transport,
-    )
-
-    handle = await backend.launch(_portable_spec())
-    result = await backend.wait(handle, timeout_s=7)
-    logs = await backend.logs(handle)
-    await backend.cancel(handle)
-    await backend.cleanup(handle)
-
-    assert handle.substrate == "docker_sibling"
-    assert handle.identifier == "job-123"
-    assert result == ComputeResult(
-        exit_code=0,
-        stdout="done",
-        stderr="",
-        handle=handle,
-        command=("worklink-broker", "unix:///run/worklink-broker.sock", "wait", "job-123"),
-    )
-    assert logs == "broker logs"
-    assert transport.waits == [("job-123", 7)]
-    assert transport.logs_requested == ["job-123"]
-    assert transport.cancelled == ["job-123"]
-    assert transport.cleaned == ["job-123"]
-    submitted = transport.submitted[0]
-    assert submitted["timeout_s"] == 5
-    assert submitted["payload"]["image"] == "mimirbot-mimirbot"
-    assert submitted["payload"]["policy"] == {"network": "none"}
-    worker_payload = submitted["payload"]["worker_payload"]
-    assert worker_payload["repo_dir"] == "/work/repo"
-    assert worker_payload["evidence_path"] == "/work/evidence/evidence.json"
-    assert worker_payload["transcript_root"] == "/work/transcripts"
-    assert worker_payload["spec"]["branch"] == "issue/472-a2"
-    assert worker_payload["spec"]["backend_config"] == {"bin": "codex", "args": ["exec", "--json"]}
-
-
-@pytest.mark.asyncio
-async def test_docker_sibling_compute_backend_maps_transport_failures_to_results() -> None:
-    class FailingWaitTransport(FakeDockerSiblingTransport):
-        async def wait_job(self, job_id: str, *, timeout_s: int) -> dict[str, Any]:
-            raise RuntimeError("broker unavailable")
-
-    backend = DockerSiblingComputeBackend(
-        broker_url="https://broker.example.invalid",
-        image="mimirbot-mimirbot",
-        transport=FailingWaitTransport(),
-    )
-
-    handle = await backend.launch(_portable_spec())
-    result = await backend.wait(handle, timeout_s=7)
-
-    assert result.exit_code == -1
-    assert result.launch_error == "docker-sibling broker wait failed: broker unavailable"
-    assert result.handle == handle
-
-
-@pytest.mark.asyncio
-async def test_docker_sibling_compute_backend_cleanup_is_best_effort() -> None:
-    class FailingCleanupTransport(FakeDockerSiblingTransport):
-        async def cleanup_job(self, job_id: str) -> None:
-            raise RuntimeError("cleanup failed")
-
-    backend = DockerSiblingComputeBackend(
-        broker_url="https://broker.example.invalid",
-        image="mimirbot-mimirbot",
-        transport=FailingCleanupTransport(),
-    )
-
-    handle = await backend.launch(_portable_spec())
-    await backend.cleanup(handle)
-
-
-@pytest.mark.asyncio
-async def test_docker_sibling_compute_backend_requires_broker_job_id() -> None:
-    class MissingJobIdTransport(FakeDockerSiblingTransport):
-        async def submit_job(self, payload: dict[str, Any], *, timeout_s: int) -> dict[str, Any]:
-            return {}
-
-    backend = DockerSiblingComputeBackend(
-        broker_url="https://broker.example.invalid",
-        image="mimirbot-mimirbot",
-        transport=MissingJobIdTransport(),
-    )
-
-    with pytest.raises(ComputeLaunchError, match="missing job_id"):
-        await backend.launch(_portable_spec())
-
-
-def test_worklink_config_accepts_legacy_compute_alias_for_docker_sibling(tmp_path: Path) -> None:
+def test_worklink_config_rejects_retired_docker_sibling_compute_backend(tmp_path: Path) -> None:
+    """chainlink #832: docker_sibling was retired. An old config stanza must
+    fail clean — registry rejects unknown compute_backend names — instead of
+    silently rebuilding it from the docker_sibling/ecs_runtask paths."""
     config_path = tmp_path / "worklink.yaml"
-    config_path.write_text(
-        """
-defaults:
-  backend: codex
-  compute: docker-sibling
-compute_backends:
-  docker_sibling:
-    broker_endpoint: "https://broker.example.invalid"
-    image: mimirbot-mimirbot
-""".strip()
-    )
-
-    registry = BackendRegistry(WorklinkConfig.load(config_path))
-
-    backend = registry.select_compute()
-    assert isinstance(backend, DockerSiblingComputeBackend)
-    assert backend.broker_url == "https://broker.example.invalid"
-
-
-def test_worklink_config_rejects_malformed_docker_sibling_compute_backend(tmp_path: Path) -> None:
-    config_path = tmp_path / "worklink.yaml"
-    config_path.write_text(
-        """
-defaults:
-  compute_backend: docker-sibling
-compute_backends:
-  docker-sibling:
-    broker_url: "file:///tmp/socket"
-    image: mimirbot-mimirbot
-""".strip()
-    )
-    with pytest.raises(ValueError, match="broker_url must use"):
-        BackendRegistry(WorklinkConfig.load(config_path))
-
     config_path.write_text(
         """
 defaults:
@@ -710,21 +505,57 @@ compute_backends:
   docker-sibling:
     broker_url: "unix:///run/worklink-broker.sock"
     image: mimirbot-mimirbot
-    docker_socket: /var/run/docker.sock
 """.strip()
     )
-    with pytest.raises(ValueError, match="unknown setting"):
+    with pytest.raises(ValueError, match="unknown Worklink compute backend config: docker_sibling"):
         BackendRegistry(WorklinkConfig.load(config_path))
 
-    config_path.write_text("compute_backends:\n  docker-sibling: []\n")
-    with pytest.raises(
-        ValueError, match="worklink compute_backends.docker-sibling must be a mapping"
-    ):
-        WorklinkConfig.load(config_path)
-
-    config_path.write_text("defaults:\n  compute_backend: docker-sibling\n")
-    with pytest.raises(ValueError, match="requires compute_backends.docker-sibling config"):
+    # select_compute() with no compute_backends block returns the built-in
+    # local_subprocess; with an unknown one selected it must fail clean.
+    config_path.write_text("defaults:\n  compute_backend: docker_sibling\n")
+    with pytest.raises(KeyError, match="unknown Worklink compute backend"):
         BackendRegistry(WorklinkConfig.load(config_path)).select_compute()
+
+
+def test_worklink_config_rejects_retired_ecs_runtask_compute_backend(tmp_path: Path) -> None:
+    """chainlink #832: ecs_runtask was retired alongside docker_sibling."""
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  compute_backend: ecs-runtask
+compute_backends:
+  ecs-runtask:
+    cluster: worklink
+    task_definition: worklink-worker
+    container_name: worker
+    subnets: [subnet-a]
+""".strip()
+    )
+    with pytest.raises(ValueError, match="unknown Worklink compute backend config: ecs_runtask"):
+        BackendRegistry(WorklinkConfig.load(config_path))
+
+    config_path.write_text("defaults:\n  compute_backend: ecs_runtask\n")
+    with pytest.raises(KeyError, match="unknown Worklink compute backend"):
+        BackendRegistry(WorklinkConfig.load(config_path)).select_compute()
+
+
+def test_worklink_config_rejects_local_subprocess_with_settings(tmp_path: Path) -> None:
+    """local_subprocess is the only built-in compute backend and it does not
+    accept any operator-supplied settings (chainlink #832)."""
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+compute_backends:
+  local_subprocess:
+    something: unexpected
+""".strip()
+    )
+    with pytest.raises(
+        ValueError,
+        match="worklink local-subprocess compute backend does not accept settings",
+    ):
+        BackendRegistry(WorklinkConfig.load(config_path))
 
 
 def test_worklink_config_loads_base_branch(tmp_path: Path) -> None:
@@ -1005,359 +836,6 @@ def test_blocked_reason_from_output_requires_final_line_marker() -> None:
 def test_codex_status_auth_detection_does_not_match_author_text() -> None:
     assert codex_module._status_from_output(1, "author: test@example.com", "") == "failed"
     assert codex_module._status_from_output(1, "", "authentication required") == "auth_error"
-
-
-def test_worker_payload_round_trips_portable_work_spec(tmp_path: Path) -> None:
-    spec = WorkSpec(
-        issue_id=456,
-        attempt=2,
-        repo_url="git@github.com:jasoncarreira/mimir.git",
-        base_ref="origin/main",
-        branch="issue/456-a2",
-        prompt="Do the worker slice",
-        rules="Follow policy",
-        test_command="echo ok",
-        backend="codex",
-        timeout_s=30,
-        creds_ref={"github": "worklink-github"},
-        env={"MIMIR_HOME": "/home/worklink"},
-        backend_config={"bin": "codex", "args": ["exec", "--json"]},
-        local_worktree=tmp_path / "ignored-local",
-        local_argv=("codex", "exec", "--cd", str(tmp_path / "ignored-local"), "--json", "Do the worker slice"),
-    )
-    payload = WorkerPayload(
-        spec=spec,
-        repo_dir=tmp_path / "repo",
-        evidence_path=tmp_path / "evidence.json",
-        transcript_root=tmp_path / "transcripts",
-        safe_env={"PATH": "/bin"},
-    )
-
-    restored = payload_from_json(payload_to_json(payload))
-
-    assert restored.spec == spec
-    assert restored.repo_dir == (tmp_path / "repo").resolve()
-    assert restored.evidence_path == (tmp_path / "evidence.json").resolve()
-    assert restored.transcript_root == (tmp_path / "transcripts").resolve()
-    assert restored.safe_env == {"PATH": "/bin"}
-
-
-
-def test_ecs_runtask_backend_builds_value_blind_runtask_request() -> None:
-    config = EcsRunTaskConfig(
-        cluster="worklink",
-        task_definition="worklink-worker:7",
-        container_name="worker",
-        subnets=("subnet-a", "subnet-b"),
-        security_groups=("sg-worklink",),
-        platform_version="1.4.0",
-        task_role_arn="arn:aws:iam::123:role/worklink-task",
-        execution_role_arn="arn:aws:iam::123:role/worklink-exec",
-        safe_env={"MIMIR_HOME": "/worklink/home"},
-        tags={"component": "worklink"},
-    )
-    spec = WorkSpec(
-        issue_id=459,
-        attempt=3,
-        repo_url="https://github.com/jasoncarreira/mimir.git",
-        base_ref="main",
-        branch="issue/459-a3",
-        prompt="Implement ECS launcher",
-        rules=None,
-        test_command="uv run pytest -q tests/test_worklink_backends.py",
-        backend="codex",
-        timeout_s=900,
-        creds_ref={"github": "task-definition-env:GITHUB_TOKEN"},
-        env={"WORKLINK_MODE": "test"},
-        backend_config={"bin": "codex", "args": ["exec", "--json"]},
-    )
-
-    request = EcsRunTaskComputeBackend(config).build_request(spec)
-
-    assert request.params["cluster"] == "worklink"
-    assert request.params["taskDefinition"] == "worklink-worker:7"
-    assert request.params["launchType"] == "FARGATE"
-    assert request.params["platformVersion"] == "1.4.0"
-    assert request.params["networkConfiguration"] == {
-        "awsvpcConfiguration": {
-            "subnets": ["subnet-a", "subnet-b"],
-            "assignPublicIp": "DISABLED",
-            "securityGroups": ["sg-worklink"],
-        }
-    }
-    overrides = request.params["overrides"]
-    assert overrides["taskRoleArn"] == "arn:aws:iam::123:role/worklink-task"
-    assert overrides["executionRoleArn"] == "arn:aws:iam::123:role/worklink-exec"
-    container = overrides["containerOverrides"][0]
-    assert container["name"] == "worker"
-    assert container["command"][:3] == ["mimir", "worklink", "worker"]
-    assert "secrets" not in container
-    rendered = json.dumps(request.params, sort_keys=True)
-    assert "ghp_" not in rendered
-    assert "github-token" not in rendered
-    assert "ssm:" not in rendered
-    payload = json.loads(container["command"][4])
-    assert payload == request.payload
-    assert payload["spec"]["branch"] == "issue/459-a3"
-    assert payload["spec"]["local_worktree"] is None
-    assert payload["spec"]["local_argv"] is None
-    env = {item["name"]: item["value"] for item in container["environment"]}
-    assert env["MIMIR_HOME"] == "/worklink/home"
-    assert env["WORKLINK_MODE"] == "test"
-    assert "WORKLINK_PAYLOAD_JSON" not in env
-
-
-def test_ecs_payload_propagates_test_only_and_nulls_local_fields(tmp_path) -> None:
-    # chainlink #538: the ECS payload builder must carry spec.test_only. If it's
-    # dropped, the controller's sandboxed test job runs the full implementation
-    # worker again and the controller folds THAT exit code as if it were the test
-    # command's — silently wrong. (Regression: the old field-by-field rebuild
-    # omitted test_only; replace() carries it.)
-    config = EcsRunTaskConfig(
-        cluster="worklink",
-        task_definition="worklink-worker:7",
-        container_name="worker",
-        subnets=("subnet-a",),
-    )
-    spec = WorkSpec(
-        issue_id=538,
-        attempt=1,
-        repo_url="https://github.com/jasoncarreira/mimir.git",
-        base_ref="main",
-        branch="issue/538-a1",
-        prompt="run tests only",
-        rules=None,
-        test_command="uv run pytest -q",
-        backend="codex",
-        timeout_s=900,
-        local_worktree=tmp_path,
-        local_argv=("mimir", "worklink", "worker"),
-        test_only=True,
-    )
-
-    payload = EcsRunTaskComputeBackend(config).build_request(spec).payload
-
-    assert payload["spec"]["test_only"] is True
-    # local-substrate-only fields are nulled for the remote worker
-    assert payload["spec"]["local_worktree"] is None
-    assert payload["spec"]["local_argv"] is None
-    # round-trips back to a test_only spec the worker will route to _run_test_only
-    assert payload_from_json(payload).spec.test_only is True
-    # a normal implementation spec stays test_only=False
-    normal_payload = EcsRunTaskComputeBackend(config).build_request(
-        replace(spec, test_only=False)
-    ).payload
-    assert normal_payload["spec"]["test_only"] is False
-
-
-def test_ecs_runtask_request_validates_against_botocore_param_model() -> None:
-    botocore_session = pytest.importorskip("botocore.session")
-    botocore_validate = pytest.importorskip("botocore.validate")
-    config = EcsRunTaskConfig(
-        cluster="worklink",
-        task_definition="worklink-worker:7",
-        container_name="worker",
-        subnets=("subnet-a",),
-        security_groups=("sg-worklink",),
-        task_role_arn="arn:aws:iam::123:role/worklink-task",
-        execution_role_arn="arn:aws:iam::123:role/worklink-exec",
-        safe_env={"MIMIR_HOME": "/worklink/home"},
-    )
-    spec = WorkSpec(
-        issue_id=459,
-        attempt=3,
-        repo_url="https://github.com/jasoncarreira/mimir.git",
-        base_ref="main",
-        branch="issue/459-a3",
-        prompt="Implement ECS launcher",
-        rules=None,
-        test_command="uv run pytest -q tests/test_worklink_backends.py",
-        backend="codex",
-        timeout_s=900,
-        creds_ref={"github": "task-definition-env:GITHUB_TOKEN"},
-        env={"WORKLINK_MODE": "test"},
-        backend_config={"bin": "codex", "args": ["exec", "--json"]},
-    )
-    request = EcsRunTaskComputeBackend(config).build_request(spec)
-
-    service_model = botocore_session.get_session().get_service_model("ecs")
-    run_task_model = service_model.operation_model("RunTask")
-    validation = botocore_validate.ParamValidator().validate(
-        dict(request.params), run_task_model.input_shape
-    )
-
-    assert not validation.has_errors(), validation.generate_report()
-
-
-@pytest.mark.asyncio
-async def test_ecs_runtask_backend_launch_wait_and_cancel_with_fake_client() -> None:
-    class FakeEcsClient:
-        def __init__(self) -> None:
-            self.run_kwargs: dict[str, Any] | None = None
-            self.stopped = False
-
-        def run_task(self, **kwargs: Any) -> dict[str, Any]:
-            self.run_kwargs = kwargs
-            return {"tasks": [{"taskArn": "arn:aws:ecs:task/worklink/abc"}]}
-
-        def describe_tasks(self, **kwargs: Any) -> dict[str, Any]:
-            return {
-                "tasks": [
-                    {
-                        "taskArn": kwargs["tasks"][0],
-                        "lastStatus": "STOPPED",
-                        "stoppedReason": "Essential container exited",
-                        "containers": [{"name": "worker", "exitCode": 0}],
-                    }
-                ]
-            }
-
-        def stop_task(self, **kwargs: Any) -> dict[str, Any]:
-            self.stopped = True
-            return {"task": {"taskArn": kwargs["task"]}}
-
-    client = FakeEcsClient()
-    backend = EcsRunTaskComputeBackend(
-        EcsRunTaskConfig(
-            cluster="worklink",
-            task_definition="worklink-worker",
-            container_name="worker",
-            subnets=("subnet-a",),
-        ),
-        client=client,
-    )
-    spec = WorkSpec(
-        issue_id=459,
-        attempt=1,
-        repo_url="repo",
-        base_ref="main",
-        branch="issue/459-a1",
-        prompt="x",
-        rules=None,
-        test_command="echo ok",
-        backend="codex",
-        timeout_s=30,
-    )
-
-    handle = await backend.launch(spec)
-    result = await backend.wait(handle, timeout_s=30)
-    await backend.cancel(handle)
-
-    assert handle == LaunchHandle("ecs_runtask", "arn:aws:ecs:task/worklink/abc")
-    assert result.exit_code == 0
-    assert result.stderr == "Essential container exited"
-    assert client.run_kwargs is not None
-    assert client.stopped is True
-
-
-def test_worklink_config_rejects_ecs_runtask_runtime_secrets(tmp_path: Path) -> None:
-    config_path = tmp_path / "worklink.yaml"
-    config_path.write_text(
-        """
-compute_backends:
-  ecs-runtask:
-    cluster: worklink
-    task_definition: worklink-worker
-    container_name: worker
-    subnets: [subnet-a]
-    secrets:
-      - name: GITHUB_TOKEN
-        value_from: arn:aws:secretsmanager:us-east-1:123:secret:github
-""".strip(),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="unknown setting.*secrets"):
-        BackendRegistry(WorklinkConfig.load(config_path))
-
-
-def test_worklink_config_registers_ecs_runtask_compute_backend(tmp_path: Path) -> None:
-    config_path = tmp_path / "worklink.yaml"
-    config_path.write_text(
-        """
-defaults:
-  compute_backend: ecs-runtask
-compute_backends:
-  ecs-runtask:
-    cluster: worklink
-    task_definition: worklink-worker
-    container_name: worker
-    subnets: [subnet-a]
-    security_groups: [sg-worklink]
-    safe_env:
-      MIMIR_HOME: /worklink/home
-""".strip(),
-        encoding="utf-8",
-    )
-
-    registry = BackendRegistry(WorklinkConfig.load(config_path))
-    backend = registry.select_compute()
-
-    assert isinstance(backend, EcsRunTaskComputeBackend)
-    assert backend.config.cluster == "worklink"
-    assert backend.config.subnets == ("subnet-a",)
-    assert backend.config.security_groups == ("sg-worklink",)
-    assert backend.config.safe_env == {"MIMIR_HOME": "/worklink/home"}
-
-
-@pytest.mark.asyncio
-async def test_worker_honors_spec_backend_config_codex_args(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    # chainlink #540: a non-shared worker (docker-sibling/ecs) has no worklink.yaml,
-    # so it must run codex with the args the ORCHESTRATOR resolved into
-    # spec.backend_config (e.g. --sandbox danger-full-access). Without honoring it
-    # the worker falls back to default codex args, runs sandboxed, writes nothing,
-    # and the run fails not-review-ready (no push) — the bug the first smoke hit.
-    codex_calls: list[tuple[str, ...]] = []
-
-    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
-        codex_calls.append(tuple(args))
-        return FakeProcess(returncode=0, stdout=b'{"type":"item.completed"}\n', stderr=b"")
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
-
-    repo = tmp_path / "repo"
-    repo.mkdir()
-
-    def cp(args: Any, returncode: int = 0, stdout: str = "") -> subprocess.CompletedProcess:
-        return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
-
-    def runner(args: Any, **kw: Any) -> subprocess.CompletedProcess:
-        if isinstance(args, list) and "diff" in args and "--name-only" in args:
-            return cp(args, stdout="docs/worklink-smoke.md\n")  # non-empty diff → review-ready
-        if args == "echo ok":
-            return cp(args, stdout="ok\n")  # test passes
-        return cp(args)
-
-    spec = WorkSpec(
-        issue_id=553,
-        attempt=1,
-        repo_url="https://github.com/jasoncarreira/mimir.git",
-        base_ref="main",
-        branch="issue/553-a1",
-        prompt="create docs/worklink-smoke.md",
-        rules=None,
-        test_command="echo ok",
-        backend="codex",
-        timeout_s=60,
-        backend_config={"bin": "codex", "args": ["exec", "--json", "--sandbox", "danger-full-access"]},
-    )
-    payload = WorkerPayload(
-        spec=spec,
-        repo_dir=repo,
-        evidence_path=tmp_path / "evidence.json",
-        transcript_root=tmp_path / "transcripts",
-        safe_env={},
-    )
-
-    # No registry passed → exercises the spec.backend_config path (the fix).
-    await run_worker_payload(payload, runner=runner)
-
-    assert codex_calls, "codex backend was never invoked"
-    flat = [tok for call in codex_calls for tok in call]
-    assert "--sandbox" in flat and "danger-full-access" in flat
 
 
 @pytest.mark.asyncio
