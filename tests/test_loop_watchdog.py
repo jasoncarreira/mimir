@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import threading
 
-from mimir.loop_watchdog import LoopStallWatchdog, stack_is_idle
+from mimir.loop_watchdog import (
+    LoopStallWatchdog,
+    stack_is_apscheduler_logging_flush,
+    stack_is_idle,
+)
 
 
 def _wd() -> LoopStallWatchdog:
@@ -38,6 +42,23 @@ def test_stack_is_idle_true_for_empty_capture():
     # The watchdog (same process) is frozen through a whole-process stall and
     # samples nothing — treated as idle/host, not a real on-loop block.
     assert stack_is_idle("") is True
+
+
+def test_stack_is_apscheduler_logging_flush_matches_live_signature():
+    stack = (
+        '  File "/workspace/mimir/.venv/lib/python3.11/site-packages/'
+        'apscheduler/executors/base.py", line 181, in run_coroutine_job\n'
+        '    retval = await job.func(*job.args, **job.kwargs)\n'
+        '  File "/usr/local/lib/python3.11/logging/__init__.py", line 1489, in info\n'
+        '    self._log(INFO, msg, args, **kwargs)\n'
+        '  File "/usr/local/lib/python3.11/logging/__init__.py", line 1114, in emit\n'
+        '    self.flush()\n'
+    )
+
+    assert stack_is_apscheduler_logging_flush(stack) is True
+    assert stack_is_apscheduler_logging_flush(
+        '  File "/app/mimir/health_probe.py", line 351, in probe_pwd\n'
+    ) is False
 
 
 def test_no_capture_under_threshold():
