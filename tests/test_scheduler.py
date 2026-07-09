@@ -19,6 +19,7 @@ from mimir.scheduler import (
     _build_trigger,
     _resolve_tz,
     _scheduler_channel_id,
+    _scheduler_loop_lag_details,
     _summarize_skill_consolidate,
     load_jobs,
     write_jobs,
@@ -2448,6 +2449,15 @@ _REAL_LOOP_STACK = (
     '  File "/app/mimir/health_probe.py", line 351, in probe_pwd\n'
     '  File "/usr/local/lib/python3.11/subprocess.py", line 1885, in _execute_child\n'
 )
+_APSCHEDULER_LOG_FLUSH_STACK = (
+    '  File "/workspace/mimir/.venv/lib/python3.11/site-packages/'
+    'apscheduler/executors/base.py", line 181, in run_coroutine_job\n'
+    '    retval = await job.func(*job.args, **job.kwargs)\n'
+    '  File "/usr/local/lib/python3.11/logging/__init__.py", line 1489, in info\n'
+    '    self._log(INFO, msg, args, **kwargs)\n'
+    '  File "/usr/local/lib/python3.11/logging/__init__.py", line 1114, in emit\n'
+    '    self.flush()\n'
+)
 
 
 async def _run_loop_lag_monitor_once(
@@ -2456,6 +2466,7 @@ async def _run_loop_lag_monitor_once(
     *,
     stacks: list[str],
     cpu_ticks: list[float],
+    sched: Scheduler | None = None,
 ) -> tuple[str, dict]:
     logged: list[tuple[str, dict]] = []
     ticks = iter([0.0, 0.11, 0.34])
@@ -2483,7 +2494,8 @@ async def _run_loop_lag_monitor_once(
     async def noop(event: AgentEvent) -> bool:
         return True
 
-    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    if sched is None:
+        sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
     sched._loop_watchdog = _FakeWatchdog()
 
     with pytest.raises(asyncio.CancelledError):
@@ -2552,6 +2564,62 @@ async def test_scheduler_loop_lag_monitor_uses_sample_dominance_for_cause(
 
     assert event_type == expected_event_type
     assert payload["cause"] == expected_cause
+
+
+@pytest.mark.asyncio
+async def test_scheduler_loop_lag_monitor_adds_apscheduler_logging_flush_details(
+    tmp_path: Path, monkeypatch
+):
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    sched._scheduler.add_job(
+        sched._fire_poller,
+        trigger="interval",
+        seconds=60,
+        kwargs={"poller_name": "worklink-ready-queue"},
+        id="poller:worklink-ready-queue",
+    )
+    sched._scheduler.add_job(
+        sched._fire,
+        trigger="interval",
+        seconds=60,
+        kwargs={"job": SchedulerJob(name="heartbeat", prompt="x", cron="* * * * *")},
+        id="scheduler:heartbeat",
+    )
+
+    event_type, payload = await _run_loop_lag_monitor_once(
+        tmp_path,
+        monkeypatch,
+        stacks=[_APSCHEDULER_LOG_FLUSH_STACK],
+        cpu_ticks=[0.0, 0.0, 0.0],
+        sched=sched,
+    )
+
+    assert event_type == "scheduler_loop_lag"
+    assert payload["cause"] == "on_loop"
+    assert payload["stall_signature"] == "apscheduler_coroutine_job_logging_flush"
+    assert payload["likely_logger"] == "apscheduler.executors.default"
+    assert payload["candidate_job_ids"] == [
+        "poller:worklink-ready-queue",
+        "scheduler:heartbeat",
+    ]
+    assert "slow stdout/stderr/container log flush" in payload["diagnosis"]
+    assert "scheduled coroutine job" in payload["diagnosis"]
+    assert "poller coroutine body" not in payload["diagnosis"]
+
+
+def test_scheduler_loop_lag_details_empty_for_unrecognized_stack(tmp_path: Path):
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    assert _scheduler_loop_lag_details(
+        scheduler=sched._scheduler,
+        blocking_stacks=[{"stack": _REAL_LOOP_STACK}],
+    ) == {}
 
 
 @pytest.mark.asyncio

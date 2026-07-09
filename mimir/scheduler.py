@@ -48,7 +48,11 @@ from .billing import normalize_priority
 from .core_blocks import read_text_lossy
 from .event_logger import get_events_path, log_event
 from ._context import active_turn_snapshots
-from .loop_watchdog import LoopStallWatchdog, stack_is_idle
+from .loop_watchdog import (
+    LoopStallWatchdog,
+    stack_is_apscheduler_logging_flush,
+    stack_is_idle,
+)
 from .quota_windows import provider_store_keys
 from .models import AgentEvent
 from .pollers import (
@@ -64,6 +68,43 @@ from .saga_client import SagaClient, SagaError
 log = logging.getLogger(__name__)
 
 UTC = timezone.utc
+
+
+def _scheduler_job_ids(scheduler: AsyncIOScheduler) -> list[str]:
+    """Best-effort list of currently registered APScheduler job ids.
+
+    APScheduler's own INFO lines format ``job`` but the loop-stall watchdog only
+    captures the stack. When the captured leaf is APScheduler awaiting a coroutine
+    job whose next frame is stdlib logging, the stack tells us the stall was the
+    scheduler's synchronous pre/post job log flush — not which coroutine job was
+    being logged. Return all live job ids as candidates while keeping the monitor
+    read-only.
+    """
+    try:
+        jobs = scheduler.get_jobs()
+    except Exception:  # noqa: BLE001 — observability should not affect monitoring
+        return []
+    return sorted(str(job.id) for job in jobs)
+
+
+def _scheduler_loop_lag_details(
+    *, scheduler: AsyncIOScheduler, blocking_stacks: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Return structured details for known scheduler-loop stall signatures."""
+    details: dict[str, Any] = {}
+    if any(
+        stack_is_apscheduler_logging_flush(s.get("stack", ""))
+        for s in blocking_stacks
+    ):
+        details["stall_signature"] = "apscheduler_coroutine_job_logging_flush"
+        details["likely_logger"] = "apscheduler.executors.default"
+        details["candidate_job_ids"] = _scheduler_job_ids(scheduler)
+        details["diagnosis"] = (
+            "APScheduler emitted a synchronous pre/post coroutine-job INFO log "
+            "on the event loop; a slow stdout/stderr/container log flush stalled "
+            "the loop before or after a scheduled coroutine job."
+        )
+    return details
 
 
 def _resolve_tz(name: str) -> ZoneInfo:
@@ -2903,6 +2944,10 @@ class Scheduler:
                     active_turn_count=len(active_turns),
                     active_turns=active_turns[:8],
                     blocking_stacks=blocking_stacks[:3],
+                    **_scheduler_loop_lag_details(
+                        scheduler=self._scheduler,
+                        blocking_stacks=blocking_stacks,
+                    ),
                 )
         except asyncio.CancelledError:
             raise
