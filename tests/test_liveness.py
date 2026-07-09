@@ -26,6 +26,36 @@ from mimir.liveness import (
 )
 
 
+@pytest.mark.asyncio
+async def test_liveness_beat_loop_writes_off_loop(tmp_path: Path, monkeypatch) -> None:
+    home = _home(tmp_path)
+    calls: list[tuple[object, tuple, dict]] = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        func(*args, **kwargs)
+        if len(calls) >= 2:
+            raise asyncio.CancelledError
+
+    async def fake_sleep(_interval: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    from mimir.liveness import liveness_beat_loop
+
+    with pytest.raises(asyncio.CancelledError):
+        await liveness_beat_loop(home, interval=60, started_at=1000.0)
+
+    assert [call[0] for call in calls] == [write_beat, write_beat]
+    assert all(call[1] == (home,) for call in calls)
+    assert all(call[2] == {"started_at": 1000.0} for call in calls)
+    beat = read_beat(home)
+    assert beat is not None
+    assert beat["started_at"] == 1000.0
+
+
 async def _anoop(*_a, **_k):
     return None
 
