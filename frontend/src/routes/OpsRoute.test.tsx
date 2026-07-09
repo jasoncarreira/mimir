@@ -48,6 +48,8 @@ describe("UsageRoute dashboard (#573)", () => {
     expect(screen.getByLabelText("codex_plus quota utilization line chart with percent axis")).toBeTruthy();
     // Per-window projection lives in the legend below the chart (the redundant
     // header summary was removed in #584).
+    expect(screen.getByText(/five hour: 12\.0% · projected 20\.0% · resets in .* · clear/)).toBeTruthy();
+    expect(screen.queryByText(/five hour: 12\.0% · projected 20\.0% · reset .* ago · clear/)).toBeNull();
     expect(screen.getByText(/seven day: 42\.0% · projected 84\.0% · reset.* · tight/)).toBeTruthy();
     expect(screen.queryByText("Scheduler, Poller, and Job Signals")).toBeNull();
   });
