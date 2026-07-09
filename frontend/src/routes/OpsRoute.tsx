@@ -97,9 +97,21 @@ function prStateLabel(pr: OpsPullRequestRow) {
   return pr.reviewDecision ? pr.reviewDecision.replaceAll("_", " ").toLowerCase() : "Review pending";
 }
 
-function formatResetTime(value: number | null) {
+const usageWindowDurationMs: Record<string, number> = {
+  five_hour: 5 * 3_600_000
+};
+
+function resetMsForDisplay(resetMs: number, window: string) {
+  const durationMs = usageWindowDurationMs[window];
+  const now = Date.now();
+  if (!durationMs || resetMs >= now) return resetMs;
+  const cyclesElapsed = Math.floor((now - resetMs) / durationMs) + 1;
+  return resetMs + cyclesElapsed * durationMs;
+}
+
+function formatResetTime(value: number | null, window: string) {
   if (typeof value !== "number" || !Number.isFinite(value)) return "reset n/a";
-  const resetMs = value * 1000;
+  const resetMs = resetMsForDisplay(value * 1000, window);
   const absolute = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(resetMs);
   const deltaMs = resetMs - Date.now();
   const absMs = Math.abs(deltaMs);
@@ -246,7 +258,7 @@ function QuotaTrendChart({ data }: { data: SafeOpsDashboardData }) {
               {latestRows.map((row) => (
                 <span key={`${row.provider}-${row.window}`}>
                   <i style={{ backgroundColor: usageWindowColors[row.window] || "#9ca3af" }} />
-                  {windowLabel(row.window)}: {formatPercent(row.latestUtilization)} · projected {formatPercent(row.latestProjection)} · {formatResetTime(row.latestResetAt)} · {row.latestPressure}
+                  {windowLabel(row.window)}: {formatPercent(row.latestUtilization)} · projected {formatPercent(row.latestProjection)} · {formatResetTime(row.latestResetAt, row.window)} · {row.latestPressure}
                 </span>
               ))}
             </div>
