@@ -2581,6 +2581,13 @@ async def test_scheduler_loop_lag_monitor_adds_apscheduler_logging_flush_details
         kwargs={"poller_name": "worklink-ready-queue"},
         id="poller:worklink-ready-queue",
     )
+    sched._scheduler.add_job(
+        sched._fire,
+        trigger="interval",
+        seconds=60,
+        kwargs={"job": SchedulerJob(name="heartbeat", prompt="x", cron="* * * * *")},
+        id="scheduler:heartbeat",
+    )
 
     event_type, payload = await _run_loop_lag_monitor_once(
         tmp_path,
@@ -2594,8 +2601,13 @@ async def test_scheduler_loop_lag_monitor_adds_apscheduler_logging_flush_details
     assert payload["cause"] == "on_loop"
     assert payload["stall_signature"] == "apscheduler_coroutine_job_logging_flush"
     assert payload["likely_logger"] == "apscheduler.executors.default"
-    assert payload["candidate_job_ids"] == ["poller:worklink-ready-queue"]
+    assert payload["candidate_job_ids"] == [
+        "poller:worklink-ready-queue",
+        "scheduler:heartbeat",
+    ]
     assert "slow stdout/stderr/container log flush" in payload["diagnosis"]
+    assert "scheduled coroutine job" in payload["diagnosis"]
+    assert "poller coroutine body" not in payload["diagnosis"]
 
 
 def test_scheduler_loop_lag_details_empty_for_unrecognized_stack(tmp_path: Path):

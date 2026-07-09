@@ -70,25 +70,21 @@ log = logging.getLogger(__name__)
 UTC = timezone.utc
 
 
-def _scheduler_job_ids_by_func(scheduler: AsyncIOScheduler, func_path: str) -> list[str]:
-    """Best-effort lookup for APScheduler jobs bound to ``func_path``.
+def _scheduler_job_ids(scheduler: AsyncIOScheduler) -> list[str]:
+    """Best-effort list of currently registered APScheduler job ids.
 
     APScheduler's own INFO lines format ``job`` but the loop-stall watchdog only
     captures the stack. When the captured leaf is APScheduler awaiting a coroutine
-    job whose next frame is stdlib logging, the stack alone tells us the stall was
-    the scheduler's synchronous pre/post job log flush — not which cron triggered
-    it. Function path is stable enough to narrow the candidate set while keeping
-    the monitor read-only.
+    job whose next frame is stdlib logging, the stack tells us the stall was the
+    scheduler's synchronous pre/post job log flush — not which coroutine job was
+    being logged. Return all live job ids as candidates while keeping the monitor
+    read-only.
     """
-    matches: list[str] = []
     try:
         jobs = scheduler.get_jobs()
     except Exception:  # noqa: BLE001 — observability should not affect monitoring
-        return matches
-    for job in jobs:
-        if getattr(job, "func_ref", None) == func_path:
-            matches.append(str(job.id))
-    return sorted(matches)
+        return []
+    return sorted(str(job.id) for job in jobs)
 
 
 def _scheduler_loop_lag_details(
@@ -102,13 +98,11 @@ def _scheduler_loop_lag_details(
     ):
         details["stall_signature"] = "apscheduler_coroutine_job_logging_flush"
         details["likely_logger"] = "apscheduler.executors.default"
-        details["candidate_job_ids"] = _scheduler_job_ids_by_func(
-            scheduler, "mimir.scheduler:Scheduler._fire_poller",
-        )
+        details["candidate_job_ids"] = _scheduler_job_ids(scheduler)
         details["diagnosis"] = (
-            "APScheduler emitted its synchronous pre/post coroutine-job INFO log "
+            "APScheduler emitted a synchronous pre/post coroutine-job INFO log "
             "on the event loop; a slow stdout/stderr/container log flush stalled "
-            "the loop before or after the poller coroutine body."
+            "the loop before or after a scheduled coroutine job."
         )
     return details
 
