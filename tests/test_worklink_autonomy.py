@@ -236,7 +236,7 @@ def test_reap_home_leaves_fresh_claim_untouched() -> None:
 def test_reap_home_leaves_finalizing_claim_with_fresh_heartbeat_untouched() -> None:
     # Regression for chainlink #750: the claim is older than timeout_s and in
     # the finalize window, but a fresh heartbeat proves the orchestrator is
-    # still alive while the remote test job runs.
+    # still alive during a long finalization step.
     fake = FakeChainlink(
         in_progress=[57],
         comments={

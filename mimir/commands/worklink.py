@@ -4,14 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import os
 from pathlib import Path
 import sys
 
-import yaml
-
-from ..worklink.docker_broker import DockerBrokerPolicy, DockerBrokerPolicyError, run_broker
 from ..worklink.orchestrator import (
     LeafValidationError,
     WorklinkError,
@@ -19,7 +15,6 @@ from ..worklink.orchestrator import (
     run_worklink_epic,
     run_worklink_reattach,
 )
-from ..worklink.worker import payload_from_json, run_worker_payload
 
 
 def add_argparse(
@@ -101,35 +96,6 @@ def add_argparse(
         ),
     )
 
-    worker_p = worklink_sub.add_parser("worker", help="Run one portable Worklink worker payload.")
-    worker_p.add_argument("payload", type=Path, nargs="?", help="Path to worker payload JSON.")
-    worker_p.add_argument(
-        "--payload-json",
-        default=None,
-        help="Inline worker payload JSON (used by remote compute substrates).",
-    )
-
-    broker_p = worklink_sub.add_parser(
-        "docker-broker",
-        help="Run the narrow Docker-sibling broker for isolated Worklink workers.",
-    )
-    broker_p.add_argument(
-        "--policy",
-        type=Path,
-        required=True,
-        help="YAML/JSON broker policy file (allowed images, network, env allowlist).",
-    )
-    broker_p.add_argument(
-        "--socket",
-        type=Path,
-        default=None,
-        help="Unix socket path to bind instead of TCP (e.g. /run/worklink-broker.sock).",
-    )
-    broker_p.add_argument("--host", default="127.0.0.1", help="TCP host when --socket is not set.")
-    broker_p.add_argument(
-        "--port", type=int, default=8765, help="TCP port when --socket is not set."
-    )
-
     return worklink_p
 
 
@@ -137,38 +103,6 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.worklink_action is None:
         parser.print_help()
         return 1
-    if args.worklink_action == "docker-broker":
-        data = yaml.safe_load(args.policy.read_text(encoding="utf-8")) or {}
-        if not isinstance(data, dict):
-            print("error: docker broker policy root must be a mapping", file=sys.stderr)
-            return 2
-        try:
-            policy = DockerBrokerPolicy.from_mapping(data)
-        except DockerBrokerPolicyError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        try:
-            asyncio.run(
-                run_broker(policy=policy, host=args.host, port=args.port, socket_path=args.socket)
-            )
-        except KeyboardInterrupt:
-            return 0
-        return 0
-
-    if args.worklink_action == "worker":
-        if args.payload_json is not None:
-            payload_data = json.loads(args.payload_json)
-        elif args.payload is not None:
-            payload_data = json.loads(args.payload.read_text(encoding="utf-8"))
-        else:
-            print("error: worklink worker requires payload path or --payload-json", file=sys.stderr)
-            return 2
-        payload = payload_from_json(payload_data)
-        validation = asyncio.run(run_worker_payload(payload))
-        suffix = " review-ready" if validation.review_ready else ""
-        reason_suffix = _worker_reason_suffix(validation)
-        print(f"worklink worker: {validation.status}{suffix}{reason_suffix}")
-        return 0 if validation.status in {"completed", "blocked"} else 1
 
     if args.worklink_action == "run-epic":
         return _run_epic(args, parser)
@@ -229,17 +163,6 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if result.evidence_path:
         print(f"evidence: {result.evidence_path}")
     return 0 if result.status in {"completed", "blocked"} else 1
-
-
-def _worker_reason_suffix(validation: object) -> str:
-    reasons = tuple(str(item) for item in getattr(validation, "reasons", ()) if item)
-    evidence = getattr(validation, "evidence", None)
-    blocked_reason = getattr(evidence, "blocked_reason", None) if evidence is not None else None
-    if blocked_reason:
-        return f" — {blocked_reason}"
-    if reasons:
-        return " — " + ", ".join(reasons)
-    return ""
 
 
 def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

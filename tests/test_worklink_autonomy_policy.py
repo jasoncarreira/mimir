@@ -145,7 +145,13 @@ def test_policy_allows_local_subprocess_when_opted_in() -> None:
     assert cfg.autonomous_compute_allowed("local_subprocess") == (True, None)
 
 
-def test_policy_allows_isolated_substrates() -> None:
+def test_policy_allows_isolated_capability_substrate() -> None:
+    """A capability-based check: a hypothetical substrate that declares
+    itself isolated (shared_filesystem=False, network_isolated=True) is
+    allowed by autonomous dispatch without operator opt-in. The name check
+    alone is not authoritative — capabilities are. After the #832 substrate
+    cleanup there is no built-in isolated compute; this test uses a fake name
+    to validate the capability check still works."""
     cfg = WorklinkConfig(defaults=WorklinkDefaults(allow_autonomous_local_subprocess=False))
     isolated = ComputeCaps(
         shared_filesystem=False,
@@ -153,8 +159,7 @@ def test_policy_allows_isolated_substrates() -> None:
         handle_cancel=True,
         persistent_after_disconnect=False,
     )
-    assert cfg.autonomous_compute_allowed("docker_sibling", isolated) == (True, None)
-    assert cfg.autonomous_compute_allowed("ecs_runtask", isolated) == (True, None)
+    assert cfg.autonomous_compute_allowed("hypothetical_isolated", isolated) == (True, None)
 
 
 def test_policy_refuses_differently_named_unsandboxed_backend() -> None:
@@ -168,6 +173,18 @@ def test_policy_refuses_differently_named_unsandboxed_backend() -> None:
     allowed, reason = cfg.autonomous_compute_allowed("custom_alias", caps)
     assert allowed is False
     assert reason and "shared filesystem" in reason
+
+
+def test_policy_refusal_text_no_longer_recommends_retired_substrates() -> None:
+    """chainlink #832: the refusal text used to recommend docker_sibling /
+    ecs_runtask as the isolated alternative. With those substrates retired
+    the only escape is the opt-in knob; the message must reflect that."""
+    cfg = WorklinkConfig(defaults=WorklinkDefaults(allow_autonomous_local_subprocess=False))
+    _, reason = cfg.autonomous_compute_allowed("local_subprocess")
+    assert reason is not None
+    assert "docker_sibling" not in reason
+    assert "ecs_runtask" not in reason
+    assert "allow_autonomous_local_subprocess" in reason
 
 
 # ── orchestrator gate ───────────────────────────────────────────────
@@ -193,11 +210,17 @@ def test_autonomous_local_subprocess_allowed_when_opted_in(tmp_path: Path) -> No
     assert result.status != "refused"
 
 
-def test_autonomous_isolated_substrate_allowed(tmp_path: Path) -> None:
+def test_autonomous_isolated_capability_substrate_allowed(tmp_path: Path) -> None:
+    """Capability-based gate: a compute substrate whose capabilities declare
+    isolation (shared_filesystem=False, network_isolated=True) is allowed for
+    autonomous dispatch without the operator opt-in. After the #832 cleanup
+    there is no built-in isolated compute; this uses a fake name to validate
+    the gate. The legacy "docker_sibling" / "ecs_runtask" names are no longer
+    preferred since both substrates were retired."""
     result, claimed = _run(
         tmp_path,
         autonomous=True,
-        compute_name="docker_sibling",
+        compute_name="hypothetical_isolated",
         shared_filesystem=False,
         network_isolated=True,
     )

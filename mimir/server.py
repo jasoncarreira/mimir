@@ -595,11 +595,14 @@ def reattach_inflight_worklink_runs(
 ) -> list[int]:
     """Startup reconcile (#561): resume Worklink runs orphaned by a restart.
 
-    A container restart kills the detached ``mimir worklink run`` controllers but
-    NOT the docker-sibling/ecs worker containers they launched. For each persisted
-    run state, spawn a detached ``mimir worklink run <id> --reattach`` that waits
-    on the surviving worker, harvests evidence, and opens the PR — instead of
-    orphaning the compute and waiting for the TTL reaper to re-run from scratch.
+    After the #832 substrate cleanup local_subprocess is the only Worklink
+    compute substrate and its runs die with the controller, so no run state is
+    ever persisted. This function therefore no-ops in production today; it
+    remains so a stale run-state file from a pre-#832 deployment (docker-sibling
+    / ecs-runtask) still triggers the same detached ``mimir worklink run <id>
+    --reattach`` resume — which ``WorklinkRunner.reattach`` then declines with
+    ``reattach: no run state`` (the state file was cleared once the resumed
+    run reached a terminal state on the prior container).
 
     Gated on ``WORKLINK_REPO`` (the same env the ready-queue poller needs); no-op
     on non-Worklink homes. Best-effort and non-blocking: each resume runs
@@ -1355,10 +1358,12 @@ def build_app(config: Config) -> web.Application:
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc), job="worklink-reaper")
 
-        # Resume Worklink runs orphaned by a restart (#561). The detached
-        # controllers died with the old container, but the docker-sibling/ecs
-        # workers they launched survive; reattach to them (wait + harvest + open
-        # the PR) instead of orphaning the compute and waiting for the reaper.
+        # Resume Worklink runs orphaned by a restart (#561). After the #832
+        # substrate cleanup local_subprocess is the only Worklink compute and
+        # its runs die with the controller, so no run state is persisted today
+        # and this is a no-op in production. It remains in place so a stale
+        # run-state file from a pre-#832 docker-sibling / ecs-runtask run still
+        # triggers a (then-no-op) resume instead of orphaning the work.
         # Best-effort + non-blocking (each resume runs detached).
         try:
             resumed = reattach_inflight_worklink_runs(config.home)
