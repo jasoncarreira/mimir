@@ -21,6 +21,8 @@ The aiohttp mocking pattern matches ``tests/test_oauth_usage_poller.py``
 
 from __future__ import annotations
 
+import asyncio
+import json
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -535,6 +537,60 @@ async def test_scheduler_wedge_alarm_offloads_log_assessment_from_event_loop(
     )
     kinds = [e[0] for e in captured_events]
     assert "ntfy_skip_no_topic" in kinds
+
+
+@pytest.mark.asyncio
+async def test_size_scaled_events_log_scan_does_not_lag_event_loop(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """chainlink #843: a large events.jsonl scan must not monopolize the loop."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    old_ts = (now - timedelta(hours=48)).isoformat()
+    rows = [
+        {
+            "timestamp": old_ts,
+            "type": "other_event",
+            "channel_id": "other",
+            "payload": "x" * 200,
+        }
+        for _ in range(20_000)
+    ]
+    events_file.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    ticks = 0
+    done = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not done.is_set():
+            ticks += 1
+            await asyncio.sleep(0)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        await asyncio.wait_for(
+            ntfy.fire_scheduler_wedge_alarm_if_warranted(
+                events_file,
+                scheduler_yaml_path=sched_yaml,
+                now=now,
+            ),
+            timeout=5,
+        )
+    finally:
+        done.set()
+        await ticker_task
+
+    assert ticks > 0, "event loop did not advance while events.jsonl was scanned"
+    assert captured_events == []
 
 
 @pytest.mark.asyncio

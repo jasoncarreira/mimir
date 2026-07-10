@@ -11,9 +11,6 @@ import yaml
 from ..compute import (
     ComputeBackend,
     ComputeCaps,
-    DockerSiblingComputeBackend,
-    EcsRunTaskComputeBackend,
-    EcsRunTaskConfig,
     LocalSubprocessComputeBackend,
 )
 from .base import ToolBackend
@@ -86,27 +83,20 @@ class WorklinkDefaults:
     # claimed (``worklink:in-progress``) at once across autonomous dispatch
     # (poller + tool); the operator CLI is not capped. ``reaper_ttl_s`` is
     # how long a claim may sit without a heartbeat before the TTL reaper
-    # steals it back to ready/blocked — kept above 2x ``timeout_s`` so a normal
-    # worker timeout plus finalize-time remote test cannot be reaped.
+    # steals it back to ready/blocked.
     max_concurrent: int = 2
     reaper_ttl_s: int = 7200
-    # Autonomy safety posture (#460). local_subprocess runs the backend with
+    # Autonomy safety posture (#460, #832). local_subprocess runs the backend with
     # full container-filesystem access (no sandbox) — fine for an operator who
     # accepts the blast radius, unsafe as an autonomous default. Autonomous
     # dispatch (poller / worklink_run tool) REFUSES local_subprocess unless this
-    # is flipped true; it always prefers an isolated ComputeBackend
-    # (docker_sibling / ecs_runtask). The operator CLI is never gated by this.
+    # is flipped true. local_subprocess is the only Worklink compute substrate
+    # after #832 (docker_sibling / ecs_runtask were retired); there is no
+    # isolated alternative to fall back to. The operator CLI is never gated by
+    # this.
     allow_autonomous_local_subprocess: bool = False
     epic_branch_prefix: str = "epic/"
     max_review_retries: int = 3
-    # chainlink #817: bounded in-attempt gate repair. When the worker's gate run
-    # fails on an otherwise completed backend run, the worker re-invokes the
-    # backend in the same checkout with the failure tail, up to this many rounds,
-    # before the attempt is declared failed. 0 disables.
-    gate_repair_rounds: int = 1
-    # chainlink #827: bounded same-branch re-dispatch of the trusted test job on
-    # an observed failure or unobserved (timeout/launch) outcome. 0 disables.
-    trusted_test_retries: int = 1
     # chainlink #825: epic claim retry budget (whole-run attempts). Debugging
     # epics legitimately need more headroom than production ones.
     max_claim_attempts: int = 3
@@ -212,14 +202,6 @@ class WorklinkConfig:
                 defaults_data.get("max_review_retries"),
                 default=WorklinkDefaults.max_review_retries,
             ),
-            gate_repair_rounds=_non_negative_int(
-                defaults_data.get("gate_repair_rounds"),
-                default=WorklinkDefaults.gate_repair_rounds,
-            ),
-            trusted_test_retries=_non_negative_int(
-                defaults_data.get("trusted_test_retries"),
-                default=WorklinkDefaults.trusted_test_retries,
-            ),
             max_claim_attempts=_positive_int(
                 defaults_data.get("max_claim_attempts"),
                 default=WorklinkDefaults.max_claim_attempts,
@@ -303,11 +285,11 @@ class WorklinkConfig:
                 reason = "known unsandboxed compute backend"
             return False, (
                 f"autonomous Worklink dispatch refuses the unsandboxed "
-                f"'{compute_backend_name}' compute backend ({reason}). Route this "
-                f"issue to an isolated ComputeBackend (docker_sibling / ecs_runtask), "
-                f"or set defaults.allow_autonomous_local_subprocess: true in "
-                f"worklink.yaml to accept the blast radius for autonomous runs. "
-                f"The operator CLI `mimir worklink run` is unaffected."
+                f"'{compute_backend_name}' compute backend ({reason}). After the "
+                f"#832 substrate cleanup local_subprocess is the only Worklink "
+                f"compute backend; set defaults.allow_autonomous_local_subprocess: "
+                f"true in worklink.yaml to accept the blast radius for autonomous "
+                f"runs. The operator CLI `mimir worklink run` is unaffected."
             )
         return True, None
 
@@ -518,15 +500,7 @@ class BackendRegistry:
         name = self.config.select_compute_backend_name(
             labels=labels, repo=repo, tool_category=tool_category
         )
-        try:
-            return self.get_compute(name)
-        except KeyError:
-            if _normalize_compute_backend_name(name) == "docker_sibling":
-                raise ValueError(
-                    "worklink docker-sibling compute backend requires "
-                    "compute_backends.docker-sibling config"
-                ) from None
-            raise
+        return self.get_compute(name)
 
     def select(
         self,
@@ -547,97 +521,7 @@ class BackendRegistry:
                     "worklink local-subprocess compute backend does not accept settings"
                 )
             return LocalSubprocessComputeBackend()
-        if name == "docker_sibling":
-            allowed = {"broker_url", "broker_endpoint", "image", "policy"}
-            unknown = sorted(set(settings) - allowed)
-            if unknown:
-                raise ValueError(
-                    "worklink docker-sibling compute backend unknown setting(s): "
-                    + ", ".join(unknown)
-                )
-            broker_url = str(settings.get("broker_url", settings.get("broker_endpoint", "")))
-            image = str(settings.get("image", ""))
-            policy = settings.get("policy") or {}
-            if not isinstance(policy, Mapping):
-                raise ValueError("worklink docker-sibling policy must be a mapping")
-            return DockerSiblingComputeBackend(broker_url=broker_url, image=image, policy=policy)
-        if name == "ecs_runtask":
-            return BackendRegistry._build_ecs_runtask(settings)
         raise ValueError(f"unknown Worklink compute backend config: {name}")
-
-
-    @staticmethod
-    def _build_ecs_runtask(settings: Mapping[str, Any]) -> EcsRunTaskComputeBackend:
-        allowed = {
-            "cluster",
-            "task_definition",
-            "container_name",
-            "subnets",
-            "security_groups",
-            "assign_public_ip",
-            "launch_type",
-            "platform_version",
-            "task_role_arn",
-            "execution_role_arn",
-            "worker_repo_dir",
-            "worker_evidence_path",
-            "worker_transcript_root",
-            "safe_env",
-            "tags",
-        }
-        unknown = sorted(set(settings) - allowed)
-        if unknown:
-            raise ValueError(
-                "worklink ecs_runtask compute backend unknown setting(s): "
-                + ", ".join(unknown)
-            )
-        missing = [
-            field
-            for field in ("cluster", "task_definition", "container_name", "subnets")
-            if field not in settings
-        ]
-        if missing:
-            raise ValueError(f"worklink ecs_runtask missing required field(s): {', '.join(missing)}")
-        subnets = _string_tuple(settings.get("subnets"), field_name="worklink ecs_runtask subnets")
-        if not subnets:
-            raise ValueError("worklink ecs_runtask subnets must not be empty")
-        security_groups = _string_tuple(
-            settings.get("security_groups", ()), field_name="worklink ecs_runtask security_groups"
-        )
-        safe_env = settings.get("safe_env") or {}
-        if not isinstance(safe_env, dict):
-            raise ValueError("worklink ecs_runtask safe_env must be a mapping")
-        tags = settings.get("tags") or {}
-        if not isinstance(tags, dict):
-            raise ValueError("worklink ecs_runtask tags must be a mapping")
-        config = EcsRunTaskConfig(
-            cluster=str(settings["cluster"]),
-            task_definition=str(settings["task_definition"]),
-            container_name=str(settings["container_name"]),
-            subnets=subnets,
-            security_groups=security_groups,
-            assign_public_ip=bool(settings.get("assign_public_ip", False)),
-            launch_type=str(settings.get("launch_type", "FARGATE")),
-            platform_version=(
-                str(settings["platform_version"]) if "platform_version" in settings else None
-            ),
-            task_role_arn=(str(settings["task_role_arn"]) if "task_role_arn" in settings else None),
-            execution_role_arn=(
-                str(settings["execution_role_arn"]) if "execution_role_arn" in settings else None
-            ),
-            worker_repo_dir=str(settings.get("worker_repo_dir", "/worklink/repo")),
-            worker_evidence_path=str(
-                settings.get("worker_evidence_path", "/worklink/evidence/evidence.json")
-            ),
-            worker_transcript_root=(
-                str(settings["worker_transcript_root"])
-                if "worker_transcript_root" in settings
-                else "/worklink/transcripts"
-            ),
-            safe_env={str(key): str(value) for key, value in safe_env.items()},
-            tags={str(key): str(value) for key, value in tags.items()},
-        )
-        return EcsRunTaskComputeBackend(config)
 
 
     @staticmethod
@@ -670,12 +554,11 @@ class BackendRegistry:
         args = settings.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ValueError("worklink feature_factory args must be a list of strings")
-        return FeatureFactoryBackend(bin=bin_name, extra_args=tuple(args))
-
-
-def _string_tuple(value: Any, *, field_name: str) -> tuple[str, ...]:
-    if not isinstance(value, list | tuple):
-        raise ValueError(f"{field_name} must be a list of strings")
-    if not all(isinstance(item, str) for item in value):
-        raise ValueError(f"{field_name} must be a list of strings")
-    return tuple(value)
+        # ``ready``/``reviewer`` are optional overrides; when unset the backend
+        # defaults apply (ready=True; reviewer from MIMIR_FACTORY_REVIEWER).
+        kwargs: dict[str, Any] = {"bin": bin_name, "extra_args": tuple(args)}
+        if "ready" in settings:
+            kwargs["ready_for_review"] = bool(settings["ready"])
+        if "reviewer" in settings:
+            kwargs["reviewer"] = str(settings["reviewer"] or "")
+        return FeatureFactoryBackend(**kwargs)

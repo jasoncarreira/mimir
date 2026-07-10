@@ -5,30 +5,33 @@ decomposition and execution. Chainlink is the coordination surface and
 source of truth; mimir plans; pluggable coding/maintenance CLIs build;
 deterministic machinery connects them.
 
-Status: **Live and autonomous** (as of 2026-07-01; the original #380 slices have
-all shipped). The production model is **per-leaf execution**: Worklink claims a
-`worklink:ready` leaf, builds it in an attempt branch via the configured coding
-backend (opencode by default; #830), observes evidence, and opens one PR per
-leaf. **Integrated-epic mode was removed (#830)** — the in-mimir distributed
-epic runner (decompose → per-slice review → one integration branch → one draft
-PR) is gone. Epics are now built by the external **opencode feature-factory**;
-`worklink:epic` remains only as a marker the poller EXCLUDES from leaf dispatch
-(reserved for the feature-factory), never a run path in mimir.
+Status: **Live and autonomous** (as of 2026-07-08; the original #380 slices
+have all shipped, and the #832 substrate cleanup has retired the
+`docker-sibling` broker and `ecs-runtask` compute paths). The production model
+is **per-leaf execution**: Worklink claims a `worklink:ready` leaf, builds it
+in an attempt branch via the configured coding backend (opencode by default;
+#830), observes evidence, and opens one PR per leaf. **Integrated-epic mode
+was removed (#830)** — the in-mimir distributed epic runner (decompose →
+per-slice review → one integration branch → one draft PR) is gone. Epics are
+now built by the external **opencode feature-factory**; `worklink:epic`
+remains only as a marker the poller EXCLUDES from leaf dispatch (reserved for
+the feature-factory), never a run path in mimir.
 
 The **planner/decomposer contract** (the leaf template in §2.5) is enforced: a
 leaf missing the required sections is auto-demoted to `worklink:blocked` with a
 `WORKLINK_BLOCKED` reason before dispatch (re-plan → re-add `worklink:ready`).
 Execution is isolated in per-leaf worktrees via the configured compute backend
-(§5). The docker-sibling broker and `ecs-runtask` remain available as isolated
-substrates for autonomous/unsandboxed use; the current mimirbot deployment runs
-the local substrate with the opencode backend by operator config — that is a
-deployment choice, not a code change in #830 (which removed only the in-mimir
-epic runner, not the broker). A failed attempt is retried up to the configured
-retry count and then marks the leaf blocked. A leaf PR is never auto-merged into
-base — operator/reviewer approval of each PR remains the merge boundary. The
-slice markers below are historical rollout notes — the poller, the
-`worklink_run` tool path, and the leaf template contract are all live now.
-Owner issue: chainlink #380; leaf issues are subissues of #380.
+(§5). **The only Worklink compute substrate is `local_subprocess`** (chainlink
+#832 — `docker_sibling` and `ecs_runtask` were retired); autonomous dispatch
+needs `defaults.allow_autonomous_local_subprocess: true` in `worklink.yaml` to
+opt into the unsandboxed blast radius. The current mimirbot deployment runs
+the local substrate with the opencode backend by operator config. A failed
+attempt is retried up to the configured retry count and then marks the leaf
+blocked. A leaf PR is never auto-merged into base — operator/reviewer approval
+of each PR remains the merge boundary. The slice markers below are historical
+rollout notes — the poller, the `worklink_run` tool path, and the leaf
+template contract are all live now. Owner issue: chainlink #380; leaf issues
+are subissues of #380.
 
 ## Operator quickstart (TL;DR)
 
@@ -254,8 +257,9 @@ mimir/worklink/
     base.py         # ToolBackend protocol, Caps, WorkOrder, RawResult
     codex.py        # first adapter
     claude_cli.py   # second adapter (mechanical addition)
-  compute.py       # ComputeBackend protocol, WorkSpec, LaunchHandle, local-subprocess
-  # future compute launchers: docker-sibling broker, ecs-runtask worker
+    opencode.py     # #830 default backend
+    feature_factory.py # #833 worklink:epic adapter
+  compute.py       # ComputeBackend protocol, WorkSpec, LaunchHandle, LocalSubprocessComputeBackend
 ```
 
 **Packaging (decided 2026-06-12).** The executor above (`mimir/worklink/`) and
@@ -433,45 +437,13 @@ and is configured for `native_pr_creation`).
 
 ### Execution substrate (the orthogonal `ComputeBackend` axis)
 
-`ToolBackend` answers **what** builds (codex / claude / cursor). A second,
-orthogonal axis answers **where** it runs: `ComputeBackend` ∈
-{`local-subprocess`, `docker-sibling`, `ecs-runtask`, `k8s-job`}. This is the
-portable, design-level home of the "containerized worker" idea, generalized so
-the same Worklink runs on OrbStack today and AWS ECS/Fargate later. Full
-design: chainlink #454.
-
-Four facts shape it:
-
-- **"Spawn a container" is not a portable primitive.** The Docker family
-  (OrbStack, Docker Desktop, plain Docker, ECS-on-EC2) exposes a daemon socket;
-  ECS Fargate and Kubernetes do not — they have job APIs (`RunTask`, k8s `Job`).
-  A socket implementation covers the Docker family but is impossible on Fargate.
-  (The seccomp/userns profile below likewise does not port to Fargate.) So the
-  abstraction is required, not `docker run` baked into the orchestrator.
-- **Git handoff is the portable common denominator.** The orchestrator today
-  assumes a *local* worktree it creates, a *local* backend subprocess, and
-  *local* `git diff`/test observation — a remote worker breaks all three.
-  Instead of shipping a worktree, ship a git ref: the `WorkSpec` carries
-  `{repo_url, base_ref, branch, prompt, test_command, creds_ref, …}`. The
-  bundled worker entrypoint (`python -m mimir.worklink.worker` or
-  `mimir worklink worker <payload.json>`) accepts a `WorkerPayload`, clones or
-  fetches the repo, checks out the base ref, creates/resets the attempt branch,
-  runs the selected `ToolBackend`, runs tests, **pushes the branch**, and emits
-  `evidence.json`. Bind-mounting a worktree is a Docker-only optimization (and
-  the sibling-mount footgun: `-v /path` resolves on the *daemon* host, not the
-  parent container's namespace).
-- **Observe-don't-trust survives.** The orchestrator can no longer diff a local
-  worktree, so it **fetches the pushed branch and re-derives** diff/tests from
-  `base..head` itself. The worker's `evidence.json` is a hint; the orchestrator's
-  re-derivation from the immutable pushed commit is the gate. Empty-diff demotion
-  and tests-exit-0 carry over unchanged. The worker payload
-  (clone→checkout→backend→tests→push→evidence) is identical across substrates;
-  only the launcher differs (Docker reuses the agent image, AWS publishes to ECR).
-- **The Docker socket is root-equivalent** on the host VM, so the `docker-sibling`
-  launcher is a **broker**: a tiny service *outside* the agent container owns the
-  socket and accepts only one narrow request ("run worklink job N on branch B"),
-  building the spec itself (worktree-only, no extra caps). On ECS the equivalent
-  is a scoped IAM task role permitted to `RunTask` only the worklink task def.
+`ToolBackend` answers **what** builds (codex / claude / opencode). The
+orthogonal `ComputeBackend` axis answers **where** it runs. **After the #832
+substrate cleanup, the only Worklink compute substrate is
+`local_subprocess`** (chainlink #832 retired `docker_sibling` and
+`ecs_runtask`; the design-level home of the "containerized worker" idea and the
+portable git-handoff `WorkSpec` remain in the code as #454, but no built-in
+compute substrate other than `local_subprocess` ships today).
 
 ```python
 @dataclass(frozen=True)
@@ -487,17 +459,9 @@ class WorkSpec:
     local_argv: tuple[str, ...] | None            # local-subprocess compatibility only
 
 @dataclass(frozen=True)
-class WorkerPayload:
-    spec: WorkSpec
-    repo_dir: Path                                # worker-local clone directory
-    evidence_path: Path                           # where evidence.json is written
-    transcript_root: Path | None = None           # outside worktree when possible
-    safe_env: dict[str, str] = field(default_factory=dict)
-
-@dataclass(frozen=True)
 class LaunchHandle:
     substrate: str
-    identifier: str                              # pid / container id / ECS task ARN
+    identifier: str                              # pid (local_subprocess only today)
 
 @dataclass(frozen=True)
 class ComputeResult:
@@ -519,19 +483,28 @@ class ComputeBackend(Protocol):
     async def cleanup(self, h: LaunchHandle) -> None: ...
 ```
 
-**Slice #455 implementation note.** The first implemented substrate is
-`local-subprocess`, so it necessarily uses `local_worktree` to preserve today's
-manual in-container behavior. The same `WorkSpec` still carries the git
-coordinates and handle-based protocol required by #454; Docker/ECS slices should
-ignore `local_worktree` and use the git handoff fields.
+The `WorkSpec` still carries git coordinates + the handle-based protocol
+required by #454, so adding a future isolated compute substrate (a new
+docker-sibling broker, ECS, k8s) is one builder function + one registry entry;
+nothing in the orchestrator or the workorder render path depends on the
+specific substrate.
 
-**Operator decision (2026-06-12):** `local-subprocess` (today's behavior — the
-backend runs as a local subprocess with full container filesystem access)
-remains available as an explicit **accept-the-risk fallback**. The isolated
-worker (`docker-sibling` / `ecs-runtask`) is the recommended path for
-unsandboxed or autonomous use; operators may opt back into `local-subprocess`
-and accept the documented blast radius. The safe path should be easy, while the
-risky path stays possible for bounded operator-invoked runs.
+**Operator posture (post-#832):** `local_subprocess` runs the backend as a
+local subprocess with full container filesystem access. That is the **only**
+built-in choice today and is gated by `defaults.allow_autonomous_local_subprocess`
+for autonomous dispatch — there is no isolated alternative to fall back to.
+The operator CLI (`mimir worklink run`, no `--autonomous`) is never gated.
+
+**Historical substrate-design notes (#454, pre-#832):** the prior design
+distinguished "Spawn a container is not a portable primitive" (the Docker
+family exposes a daemon socket; ECS Fargate and k8s expose job APIs
+`RunTask` / k8s `Job`); "Git handoff is the portable common denominator" (the
+worker cloned the repo, ran the backend, ran tests, pushed the branch, emitted
+evidence, and the orchestrator re-derived diff/tests from the pushed commit);
+and "Observe-don't-trust survives" (the worker evidence was a hint, the
+orchestrator's re-derivation was the gate). The `WorkSpec` carries every one of
+those git-shaped fields today so a future isolated compute substrate can be
+added without an orchestrator change.
 
 ### Backend trust model
 
@@ -553,9 +526,7 @@ worktree isolation as an audit/review boundary, not a security boundary.
 This is acceptable for **operator-invoked** slice-1 runs on bounded issues
 because the output still lands as a review PR and the executor observes
 diff/tests itself. It is not acceptable as a silent autonomous-dispatch
-boundary without a fresh risk decision. Before slice 3 turns on ready-queue
-polling or in-turn `worklink_run` dispatch for Codex, pick an isolation
-posture — the options are now concrete (chainlink #452 / #454):
+boundary without a fresh risk decision. The pre-#832 options were:
 
 1. **In-container sandbox (verified).** A one-line seccomp profile permitting
    user namespaces (`docs/internal/seccomp-userns.json`) lets Codex's own bwrap
@@ -569,6 +540,16 @@ posture — the options are now concrete (chainlink #452 / #454):
    documented operator policy decision — recorded 2026-06-12 as a permitted
    fallback, not the default.
 
+After #832 options 1 and 2 are no longer shipping compute substrates. The
+seccomp/userns profile (1) is still a valid operator hardening for operators
+who want Codex confined to the worktree. Options 2 and 3 collapse: with no
+isolated substrate shipped, the only shipping posture is the
+`local_subprocess` accept-the-risk fallback (3), gated by
+`defaults.allow_autonomous_local_subprocess` for autonomous dispatch. The
+`ComputeBackend` plumbing (git-handoff `WorkSpec`, handle-based protocol) stays
+in place so a future isolated substrate can be added without an orchestrator
+change.
+
 
 Planner-supplied `Suggested test command` text in Chainlink issue descriptions
 is advisory only. It is shown to the backend as part of the issue body, but the
@@ -577,13 +558,13 @@ input. Controller-side test execution uses only the explicit CLI override or the
 operator-configured `worklink.yaml` default test command, which live in the same
 operator/agent-private trust boundary as poller commands.
 
-For non-shared-filesystem compute substrates, controller-side evidence
-re-derivation is intentionally diff-only for now: the orchestrator fetches refs
-and runs `git diff`, but it must **not** check out the worker branch and run
-`test_command` on the controller. Test re-derivation for remote workers needs a
-fresh sandboxed compute job in the same substrate; until that exists, remote
-evidence marks tests `observed=false`, so the gate fails closed instead of
-executing backend-authored branch code on the controller.
+After the #832 substrate cleanup the only Worklink compute substrate is
+`local_subprocess` (shared_filesystem=True), so the orchestrator always runs
+the test command on the controller in the attempt worktree. The pre-#832
+non-shared-filesystem evidence path (orchestrator fetches refs and runs `git
+diff`, but must not check out the worker branch and run `test_command` on the
+controller) is documented in #454 but is no longer reached by any shipping
+code path.
 
 Prompt content originates from chainlink issues (operator/planner-authored),
 not arbitrary external text; the planner must not paste untrusted web/PR
@@ -622,28 +603,30 @@ content verbatim into acceptance criteria.
 
   | Tool | Category | Source lookup | Current pin | Install surface | Smoke command | Risk surface |
   |------|----------|---------------|-------------|-----------------|---------------|--------------|
-  | codex | `coding-cli` | npm package `@openai/codex` | `0.142.4` | scaffold Dockerfiles when `codex-plus` is selected | `codex --version && env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_backends.py` | High: first Worklink coding backend; CLI drift can affect prompt execution, sandbox flags, transcript shape, and quota use. |
+  | codex | `coding-cli` | npm package `@openai/codex` | `0.144.1` | scaffold Dockerfiles when `codex-plus` is selected | `codex --version && env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_backends.py` | High: first Worklink coding backend; CLI drift can affect prompt execution, sandbox flags, transcript shape, and quota use. |
   | chainlink | `issue-cli` | GitHub release/tag `dollspace-gay/chainlink` | `chainlink-1.6.0` | bundled Chainlink skill `dockerfile.fragment` | `chainlink --version && chainlink issue ready` | High: Worklink coordination depends on issue, lock, comment, and dependency semantics. |
-  | mermaid-cli | `renderer` | npm package `@mermaid-js/mermaid-cli` | `11.15.0` | scaffold Dockerfiles | `mmdc --version` | Low: renderer/Chromium drift affects diagram generation, not coding execution. |
-  | claude-code | `coding-cli` | npm package `@anthropic-ai/claude-code` | `2.1.195` | root/scaffold Dockerfiles when `MIMIR_ENABLE_CLAUDE_CODE=1` | `claude --version` | Medium: optional second coding backend; real smoke requires a deployment with `claude` installed. |
+  | mermaid-cli | `renderer` | npm package `@mermaid-js/mermaid-cli` | `11.16.0` | scaffold Dockerfiles | `mmdc --version` | Low: renderer/Chromium drift affects diagram generation, not coding execution. |
+  | claude-code | `coding-cli` | npm package `@anthropic-ai/claude-code` | `2.1.206` | root/scaffold Dockerfiles when `MIMIR_ENABLE_CLAUDE_CODE=1` | `claude --version` | Medium: optional second coding backend; real smoke requires a deployment with `claude` installed. |
   | gogcli | `integration-cli` | GitHub release/tag `steipete/gogcli` | `v0.9.0` | gmail-poller optional-skill `dockerfile.fragment` | `gog --version && gog gmail messages search 'in:inbox newer_than:1d' --account "$GOG_ACCOUNT" --max 1 --json --no-input` | High: pre-1.0 Gmail/Calendar helper drift can break polling subcommands on Muninn; large version jumps need an authenticated smoke before merge. |
 
-## 6.5 Compute-backend autonomy policy (#460)
+## 6.5 Compute-backend autonomy policy (#460, #832)
 
 Worklink composes on two orthogonal axes: the **ToolBackend** (*what* builds —
-`codex`, `claude_cli`; chosen by `backends:` + `routes[].backend`) and the
-**ComputeBackend** (*where* it runs — `local_subprocess`, `docker_sibling`,
-`ecs_runtask`; chosen by `defaults.compute` + `routes[].compute_backend`). They
-mix freely: codex-on-local, codex-on-docker, a future claude-on-ecs — a route
-matches first, otherwise the defaults apply.
+`codex`, `claude_cli`, `opencode`, `feature_factory`; chosen by `backends:` +
+`routes[].backend`) and the **ComputeBackend** (*where* it runs). After the #832
+substrate cleanup the only Worklink compute substrate is `local_subprocess`
+(chainlink #832 retired `docker_sibling` and `ecs_runtask`; the
+`ComputeBackend` plumbing stays in place so a future isolated substrate can be
+added without an orchestrator change). They mix freely: codex-on-local,
+claude-on-local, opencode-on-local — a route matches first, otherwise the
+defaults apply.
 
 `local_subprocess` runs the backend **unsandboxed**, with full
 container-filesystem access (codex needs `--sandbox danger-full-access` in the
 current image). That is an **explicit accept-the-risk fallback**, not the
-recommended autonomous path. Isolation comes from an isolated substrate
-(`docker_sibling` broker / `ecs_runtask`) per environment; the seccomp/userns
-profile is an optional Docker-family-only operator hardening, never a default
-(it doesn't port to ECS).
+recommended autonomous path. With no built-in isolated substrate to fall back
+to after #832, the only escape from the autonomous refusal is the
+`allow_autonomous_local_subprocess: true` opt-in.
 
 **Policy (enforced in the core executor, `WorklinkConfig.autonomous_compute_allowed`):**
 
@@ -653,10 +636,9 @@ profile is an optional Docker-family-only operator hardening, never a default
   `defaults.compute: local_subprocess` and
   `defaults.allow_autonomous_local_subprocess: false` (the default), the run
   returns `refused` *before claiming* and the issue is left untouched.
-  Autonomous use **prefers** an isolated ComputeBackend; route Worklink-ready
-  leaves to `docker_sibling`/`ecs_runtask`, or set
-  `allow_autonomous_local_subprocess: true` to accept the blast radius for
-  autonomous runs too.
+  Autonomous use **requires** the opt-in (the pre-#832 "route to an isolated
+  substrate" alternative is no longer available — there is no built-in
+  isolated substrate to route to).
 - **Operator-invoked `mimir worklink run`** (no `--autonomous`) is **never
   gated** — it always proceeds. The blast radius is real: on `local_subprocess`
   the backend can read/write the whole container filesystem, so reserve manual
@@ -691,7 +673,7 @@ Minimal current config shape:
 ```yaml
 defaults:
   backend: codex
-  compute_backend: local_subprocess  # accept-the-risk fallback; docker-sibling below is selectable once configured
+  compute_backend: local_subprocess  # the only built-in compute substrate (#832)
   timeout_s: 1800
   priority: normal
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
@@ -704,161 +686,12 @@ backends:
   claude_cli:
     bin: claude
     args: ["-p", "--output-format", "json"]
-
-compute_backends:
-  docker-sibling:
-    broker_url: "unix:///run/worklink-broker.sock"
-    image: mimir-worklink:latest
-    policy:
-      network: none
 ```
 
-> Copy-paste-able, CI-validated versions of both config files live in
-> [`docs/examples/worklink/`](../examples/worklink/):
-> `worklink.docker-sibling.yaml` (a complete agent-side config) and
-> `docker-broker-policy.yaml` (the broker trust boundary).
-> `tests/test_worklink_example_configs.py` keeps them loadable as the schemas
-> evolve.
-
-The agent-side `docker-sibling` backend is a broker **client**, not a Docker
-launcher. Its contract is deliberately narrow: `POST /jobs` submits `{image,
-policy, worker_payload}`, `POST /jobs/<id>/wait` returns bounded compute result
-fields, `GET /jobs/<id>/logs` returns text/JSON logs, `POST /jobs/<id>/cancel`
-cancels, and `DELETE /jobs/<id>` cleans up. The submitted worker payload is the
-same JSON schema consumed by `mimir worklink worker <payload.json>`; do not add a
-second Docker-only work schema. The client supports `unix://`, `http://`, and
-`https://` broker URLs and contains no direct docker CLI or docker.sock access.
-
-The broker process is started separately, outside the agent container, with the
-Docker socket mounted only there. Its policy file is static operator-owned
-configuration; the agent cannot submit raw Docker flags, host mounts,
-`--privileged`, arbitrary env, or arbitrary network mode:
-
-```yaml
-allowed_images: [mimir-worklink:latest]
-network: none          # only none/bridge are accepted; host is intentionally refused
-env_allowlist: [GITHUB_TOKEN, MIMIR_HOME]
-default_env:
-  GITHUB_TOKEN: "${GITHUB_TOKEN}"
-max_timeout_s: 1800
-# Backends whose creds are FILES, not env vars (e.g. codex's ChatGPT OAuth
-# bundle) need a read-only mount — env_allowlist can't carry them. creds_mounts
-# is operator-declared + always :ro; the agent can't request or widen a mount.
-creds_mounts:
-  - source: /Users/you/.codex/auth.json   # HOST path (broker runs sibling containers)
-    target: /home/worker/.codex/auth.json
-```
-
-Run it on a Unix socket the agent can reach:
-
-```bash
-uv run mimir worklink docker-broker \
-  --policy /etc/mimir/worklink-docker-broker.yaml \
-  --socket /run/worklink-broker.sock
-```
-
-The broker builds `docker run --rm --name <job> --network <policy.network> ...
-<allowed-image> mimir worklink worker --payload-json <payload>` from policy and
-the worker payload. Tests inject fake process primitives; no broker test requires
-a live Docker daemon.
-
-#### Building the worker image
-
-The `image:` the broker launches (`mimir-worklink:latest` above) is **not** the
-agent server image — it just needs `mimir`, `git`, and the routed backend CLI on
-`PATH`; the broker overrides the command. A starting-point template lives at
-[`docs/examples/worklink/worklink-worker.Dockerfile`](../examples/worklink/worklink-worker.Dockerfile).
-Two operator decisions are load-bearing: **pin `MIMIR_VERSION` to a release that
-includes the #538 `test_only` worker** (an older mimir silently re-runs the full
-implementation pass instead of the sandboxed test job), and **install the backend
-CLI(s)** your routes select (codex/claude). Build + tag to match the broker
-policy's `allowed_images`:
-
-```bash
-docker build -f docs/examples/worklink/worklink-worker.Dockerfile \
-  --build-arg MIMIR_VERSION=<release-with-#538> -t mimir-worklink:latest .
-```
-
-#### DockerSibling smoke / runbook
-
-The real Docker/OrbStack-family smoke is deliberately opt-in. It exercises the
-complete boundary rather than just unit-level broker calls:
-
-1. Start the broker outside the agent container, where Docker/OrbStack and the
-   Docker socket are available:
-
-   ```bash
-   uv run mimir worklink docker-broker \
-     --policy /etc/mimir/worklink-docker-broker.yaml \
-     --socket /run/worklink-broker.sock
-   ```
-
-2. Pick a sacrificial Worklink-ready Chainlink leaf whose acceptance criteria are
-   intentionally tiny. The run may push `issue/<id>-a<attempt>` and open a PR, so
-   do not point it at an issue with ambiguous or high-risk scope.
-
-3. From `/workspace/mimir`, run the opt-in smoke:
-
-   ```bash
-   MIMIR_WORKLINK_DOCKER_SMOKE=1 \
-   WORKLINK_DOCKER_BROKER_URL=unix:///run/worklink-broker.sock \
-   WORKLINK_DOCKER_IMAGE=mimir-worklink:latest \
-   env -u MIMIR_MODEL_SPEC \
-     uv run python scripts/worklink_docker_sibling_smoke.py <chainlink-issue-id>
-   ```
-
-   Override `--test-command`, `--base`, `--backend`, or `--broker-url` when the
-   smoke issue needs a narrower validation command or the broker is exposed over
-   HTTP(S). Without `MIMIR_WORKLINK_DOCKER_SMOKE=1`, the script refuses to run.
-
-4. Expected success output:
-
-   ```text
-   worklink docker-sibling smoke issue=<id> attempt=<n> status=completed review_ready=True
-   pr: https://github.com/jasoncarreira/mimir/pull/<n>
-   evidence: /mimir-home/state/worklink/evidence/<id>-<attempt>.json
-   ```
-
-5. Inspect the evidence file before treating the smoke as passed. It should show
-   the controller re-derived evidence from remote refs, including commands like
-   `git fetch origin main`, `git fetch origin issue/<id>-a<attempt>`, and
-   `git diff --name-only origin/main...origin/issue/<id>-a<attempt>`. On a
-   completed run with a real diff the controller also dispatches a **second,
-   sandboxed `test_only` job** on the pushed branch (#538) and folds its exit
-   code into the evidence (`tests.observed: true`, summary `remote sandboxed test
-   job: exit <n>`) — so review-ready means the tests were actually re-run in a
-   container, not asserted by the worker. The worker's own evidence file is only a
-   handoff artifact; the orchestrator's remote evidence gate is the trust
-   boundary.
-
-Cleanup is bounded on both sides. The orchestrator calls broker cleanup after
-`wait`, and the broker uses `docker run --rm` plus a best-effort `docker rm -f
-<job>`. Worklink state intentionally remains for audit: Chainlink comments/labels,
-`/mimir-home/state/worklink/evidence/<id>-<attempt>.json`, transcripts under
-`/mimir-home/state/worklink/transcripts/`, and any opened PR/attempt branch.
-Broker logs are available through `GET /jobs/<id>/logs` while the broker still has
-the job in memory; after cleanup, inspect the broker process logs and the
-orchestrator evidence/transcript files instead.
-
-If the broker/socket/image is unavailable, fall back to `compute_backend:
-local_subprocess` for manual operator-run Worklink. That fallback is useful for
-local development but is not a DockerSibling smoke: it runs inside the agent
-container and does not prove the broker/client/worker-container/remote-evidence
-boundary.
-
-Security caveats remain after a successful smoke: DockerSibling reduces the
-agent container's direct privilege by keeping docker.sock in the broker process,
-but the broker is still privileged relative to the host and the selected worker
-image still runs model-generated code. Keep policy static/operator-owned, keep
-`network: none` unless a specific issue requires otherwise, allowlist env vars
-narrowly, and do not treat this as the final sandbox gate for autonomous Worklink
-(#452/#460 remain the autonomy/security decision surface).
-
-`claude_cli` is registered by default but is only runnable in deployments that
-actually install the `claude` binary. The current production container may omit
-it when Claude Code CLI installation is disabled; in that state the adapter can
-be selected/configured and unit-tested, but a real Worklink smoke run must wait
-for an image with `claude` on `PATH`.
+The `compute_backends:` stanza is not needed in normal configs — it is only
+required to add a future isolated substrate (a docker-sibling broker, ECS
+RunTask, k8s Job) without changing the orchestrator. Unknown compute-backend
+names fail clean at config-load time; `local_subprocess` is the only built-in.
 
 ### Dry run
 
@@ -956,17 +789,16 @@ Current slice-1 recovery is manual:
 ```yaml
 defaults:
   backend: codex
-  compute_backend: local_subprocess # WHERE the backend runs: local_subprocess | docker-sibling | ecs-runtask
+  compute_backend: local_subprocess # the only built-in Worklink compute substrate (#832)
   timeout_s: 1800
   priority: normal          # arbiter priority for autonomous dispatch (low|normal|high)
   max_concurrent: 2         # cap on concurrent autonomous claims (poller + tool); CLI uncapped
   reaper_ttl_s: 7200        # claim age (no heartbeat) before the TTL reaper steals it back
-  allow_autonomous_local_subprocess: false  # autonomy policy (#460): autonomous dispatch
+  allow_autonomous_local_subprocess: false  # autonomy policy (#460, #832): autonomous dispatch
                             # refuses the unsandboxed local_subprocess substrate unless this
                             # is true. The operator CLI is never gated. See §6.5.
   test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
   max_review_retries: 3             # reviewer-requested rebuild attempts before blocking a leaf
-  gate_repair_rounds: 1             # in-attempt backend repair rounds when the worker's gate fails (0 disables)
   # Retained-but-INERT since #830 (integrated-epic runner removed). These parse
   # for back-compat but no code consumes them; safe to omit:
   epic_branch_prefix: "epic/"       # (inert) was the integrated-epic branch prefix
@@ -1016,32 +848,18 @@ backends:                   # ToolBackend adapters — WHAT builds
 # back to Chainlink by printing `WORKLINK_BLOCKED: <one-line reason>`. This is
 # for design contradictions or missing prerequisites, not transient tool errors.
 
-compute_backends:           # ComputeBackend launchers — WHERE it runs (#454)
-  local-subprocess: {}      # today's behavior; accept-the-risk fallback
-  docker-sibling:
-    broker_url: "unix:///run/worklink-broker.sock"   # broker owns the docker socket, not the agent
-    image: mimir-worklink:latest
-    policy:
-      network: none       # broker enforces static image/network/env/timeout policy
-  ecs-runtask:
-    cluster: worklink
-    task_definition: worklink-worker
-    container_name: worker
-    subnets: ["subnet-…"]
-    security_groups: ["sg-…"]
-    task_role_arn: arn:aws:iam::<acct>:role/worklink-task
-    execution_role_arn: arn:aws:iam::<acct>:role/worklink-execution
-    # ECS secrets are not RunTask overrides. Declare SSM Parameter Store or
-    # Secrets Manager `valueFrom` references on the task definition's container
-    # definition, and grant the task/execution roles permission to read them.
-    # Worklink's generated RunTask request carries only worker metadata, safe
-    # environment values, role overrides, network config, and tags.
+compute_backends:           # ComputeBackend launchers — WHERE it runs (#454).
+                            # Today only ``local_subprocess`` is a built-in
+                            # substrate; the stanza is only needed when adding
+                            # a future isolated compute (docker-sibling broker,
+                            # ECS RunTask, k8s Job) without an orchestrator
+                            # change. Unknown compute_backend names fail clean
+                            # at config-load time.
+  local-subprocess: {}      # the built-in default; accept-the-risk fallback
 ```
 
-`compute_backend` also accepts the legacy spelling `compute`; backend names are
-normalized so `docker-sibling`/`docker_sibling` and `ecs-runtask`/`ecs_runtask`
-select the same Python registry keys. Invalid or unknown compute-backend fields
-fail closed during config load instead of falling back to local execution.
+Invalid or unknown compute-backend fields fail closed during config load
+instead of falling back to local execution.
 
 `tiered_review` and the inert `epic_branch_prefix`/`reviewer_backend` settings
 live under `defaults`. Since #830 removed the integrated-epic runner these are
@@ -1121,7 +939,7 @@ tool_pins:
 |---|---|
 | Chainlink locks not atomic cross-process | Slice 0 probe; O_EXCL fallback; upstream issue |
 | Backend session brittleness | Start operator-invoked (slice 1); autonomy only after dry-run |
-| Unsandboxed backend filesystem access | Verified in-container seccomp/userns profile confines bwrap `workspace-write` (#452, `docs/internal/seccomp-userns.json`), or out-of-container `ComputeBackend` isolation (#454); `local-subprocess` (today's `--sandbox danger-full-access`) is the explicit accept-the-risk fallback, gated before slice-3 autonomous dispatch |
+| Unsandboxed backend filesystem access | Verified in-container seccomp/userns profile confines bwrap `workspace-write` (#452, `docs/internal/seccomp-userns.json`); `local_subprocess` (the only built-in compute substrate after #832, today's `--sandbox danger-full-access`) is the explicit accept-the-risk fallback, gated before slice-3 autonomous dispatch |
 | Evidence gaming by the backend agent | Orchestrator observes diff/tests itself; empty-diff demotion |
 | Worktree cost under concurrency | Worktrees are per-issue and short-lived; cap concurrent claims (default 2) |
 | Shared quota exhaustion | `quota_pool` + arbiter gating; operator runs bypass |

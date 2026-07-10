@@ -147,10 +147,13 @@ async def liveness_beat_loop(
     Stops (and the beat goes stale) if the event loop dies or wedges — which
     is exactly the signal the watchdog keys on."""
     started_at = time.time() if started_at is None else started_at
-    write_beat(home, started_at=started_at)  # first beat immediately
+    # Keep the heartbeat task loop-sensitive while moving the filesystem write
+    # itself off-loop. A wedged event loop still stops scheduling new beats, but
+    # a slow bind mount / os.replace no longer stalls the scheduler loop.
+    await asyncio.to_thread(write_beat, home, started_at=started_at)  # first beat immediately
     while True:
         await asyncio.sleep(interval)
-        write_beat(home, started_at=started_at)
+        await asyncio.to_thread(write_beat, home, started_at=started_at)
 
 
 async def _post_webhook(title: str, body: str) -> None:

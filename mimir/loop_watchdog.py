@@ -53,6 +53,25 @@ def stack_is_idle(stack: str) -> bool:
     return "selectors.py" in leaf and " in select" in leaf
 
 
+def stack_is_apscheduler_logging_flush(stack: str) -> bool:
+    """True when APScheduler's coroutine runner is blocked in logging flush.
+
+    APScheduler wraps coroutine jobs with synchronous INFO logs immediately
+    before and after ``await job.func(...)``. If stdout/stderr/container log I/O
+    stalls, the loop-stack capture points at ``run_coroutine_job`` plus stdlib
+    logging/``Handler.flush`` rather than at the job body. This signature is an
+    observability hint, not a reason to hide the stall: the work is still
+    synchronous on the event loop, but the next fix should target scheduler
+    logging/sink behavior instead of the named job body.
+    """
+    return (
+        "apscheduler/executors/base.py" in stack
+        and "in run_coroutine_job" in stack
+        and "logging/__init__.py" in stack
+        and "self.flush()" in stack
+    )
+
+
 class LoopStallWatchdog:
     def __init__(
         self,

@@ -2,20 +2,16 @@
 
 The Worklink controller (``mimir worklink run``) is a *detached* subprocess the
 ready-queue poller spawns. It survives the poller's own exit, but a container
-restart (``docker restart`` / SIGTERM) kills it mid-run. For remote compute
-substrates (``docker_sibling``/``ecs``) the *worker* runs in a separate
-container/task that survives that restart, so a fresh controller can reattach to
-the live job — wait for it, harvest evidence, open the PR — instead of orphaning
-the work and letting the TTL reaper (#444) re-run it from scratch.
+restart (``docker restart`` / SIGTERM) kills it mid-run. Originally this module
+persisted the minimal handle a fresh controller needed to reattach to a
+surviving remote worker (docker_sibling / ecs-runtask); after the #832
+substrate cleanup local_subprocess is the only Worklink compute substrate, its
+runs die with the controller, and nothing is ever persisted.
 
-This module persists the minimal handle a fresh controller needs to find that
-worker again: the issue/attempt, the compute substrate name + opaque launch
-handle, and the git coordinates (branch/base/repo) the post-launch evidence and
-PR steps re-derive from the *pushed* branch.
-
-Only substrates whose ``ComputeCaps.persistent_after_disconnect`` is true are
-ever persisted — ``local_subprocess`` work dies with the controller and has
-nothing to reattach to (the reaper remains its safety net).
+State files at ``<home>/state/worklink/runs/<issue_id>.json`` from older
+deployments are still readable so ``mimir worklink run --reattach`` and the
+startup reconcile keep working unchanged against them; the write path is
+inert.
 
 State lives at ``<home>/state/worklink/runs/<issue_id>.json`` and is deleted on
 terminal completion, so a file present at startup means "a worker we may still

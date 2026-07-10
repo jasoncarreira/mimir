@@ -47,8 +47,15 @@ def _issue_json(issue_id: int, labels: list[str]) -> str:
 
 
 class FakeRemoteCompute:
-    """A persistent (docker-sibling-shaped) compute: survives a controller
-    disconnect, no shared filesystem (so the remote evidence gate applies)."""
+    """A persistent (non-shared-filesystem) compute: survives a controller
+    disconnect, so the controller would reattach to it.
+
+    After the #832 substrate cleanup local_subprocess is the only built-in
+    Worklink compute substrate and it is non-persistent, so this fake no
+    longer models a real production path. It is kept to validate the
+    WorklinkRunner.reattach() plumbing (handle/claim/wait transitions) so
+    the entry point and the server-side reattach_inflight_worklink_runs
+    stay testable should a future persistent compute be added."""
 
     def __init__(
         self,
@@ -163,10 +170,21 @@ def _remote_runner(repo: Path, calls: list, *, issue_id: int, labels: list[str])
         if args[:1] == ["git"]:
             if "config" in args:
                 return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+            if "diff" in args and "--cached" in args and "--quiet" in args:
+                # chainlink #832: reattach finalize path now commits locally.
+                # exit 1 = "yes there are staged changes" (matches the contract
+                # WorklinkRunner's _commit_worktree_changes expects).
+                return cp(args, returncode=1)
             if "diff" in args and "--name-only" in args:
                 return cp(args, stdout="changed.txt\n")
             if "diff" in args and "--stat" in args:
                 return cp(args, stdout=" changed.txt | 1 +\n")
+            if len(args) >= 4 and args[3] == "add":
+                return cp(args)
+            if len(args) >= 4 and args[3] == "commit":
+                return cp(args, stdout=f"[issue/{issue_id}-a1 abc123] worklink\n")
+            if len(args) >= 4 and args[3] == "push":
+                return cp(args)
             return cp(args)  # fetch, rev-parse, worktree add/remove, status
         if args[:3] == ["gh", "pr", "create"]:
             return cp(args, stdout="https://github.com/jasoncarreira/mimir/pull/777\n")
@@ -185,8 +203,8 @@ def test_run_state_roundtrip(tmp_path: Path) -> None:
         issue_id=561,
         attempt=2,
         backend="codex",
-        compute_name="docker_sibling",
-        handle_substrate="docker_sibling",
+        compute_name="fake_persistent",
+        handle_substrate="fake_persistent",
         handle_identifier="worklink-abc123",
         branch="issue/561-a2",
         base_ref="main",
@@ -209,8 +227,8 @@ def test_run_state_roundtrip(tmp_path: Path) -> None:
 
 def test_list_run_states_skips_unparseable(tmp_path: Path) -> None:
     good = WorklinkRunState(
-        issue_id=1, attempt=1, backend="codex", compute_name="docker_sibling",
-        handle_substrate="docker_sibling", handle_identifier="j1", branch="issue/1-a1",
+        issue_id=1, attempt=1, backend="codex", compute_name="fake_persistent",
+        handle_substrate="fake_persistent", handle_identifier="j1", branch="issue/1-a1",
         base_ref="main", local_base="main", repo="/r", repo_url="", test_command=None,
         started_at="2026-06-18T16:00:00+00:00",
     )
@@ -256,6 +274,14 @@ def _save_inflight_state(home: Path, repo: Path, *, issue_id: int, job: str) -> 
 
 
 def test_reattach_waits_on_surviving_worker_and_opens_pr(tmp_path: Path) -> None:
+    """After the #832 substrate cleanup local_subprocess is the only Worklink
+    compute substrate and never persists run state, so a *fresh* controller
+    will never have something to reattach to. These tests pre-date #832 and
+    simulate a persistent remote compute by saving a fake run state by hand
+    and registering a fake persistent compute in the registry. They validate
+    the WorklinkRunner.reattach() plumbing so the API surface stays testable
+    should a future persistent substrate be added; they no longer reflect a
+    production-reachable path."""
     repo = tmp_path / "repo"
     repo.mkdir()
     issue_id = 561
@@ -263,8 +289,18 @@ def test_reattach_waits_on_surviving_worker_and_opens_pr(tmp_path: Path) -> None
     calls: list = []
     runner = _remote_runner(repo, calls, issue_id=issue_id, labels=["worklink:in-progress"])
     compute = FakeRemoteCompute(wait_result=ComputeResult(exit_code=0, stdout="ok", stderr=""))
+
+    class ReattachWriteBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            # Mimic a resumable compute having pushed changes by writing into the
+            # reattach worktree. The local-only finalize path then commits +
+            # pushes from there.
+            order.worktree.mkdir(parents=True, exist_ok=True)
+            (order.worktree / "changed.txt").write_text("hello\n", encoding="utf-8")
+            return await super().interpret(order, result)
+
     registry = BackendRegistry(WorklinkConfig())
-    registry.register(FakeBackend())
+    registry.register(ReattachWriteBackend())
     registry.register_compute(compute)
 
     result = asyncio.run(
@@ -356,6 +392,12 @@ def test_reattach_no_state_is_noop(tmp_path: Path) -> None:
 
 
 def test_run_persists_state_for_persistent_compute_then_clears(tmp_path: Path) -> None:
+    """After #832 the only built-in compute substrate is local_subprocess
+    (persistent_after_disconnect=False), so a fresh run never persists state.
+    This test pre-dates #832 and exercises the persistence plumbing against
+    a fake persistent compute; it remains useful as a guard for the
+    WorklinkRunner.run() persistence path should a future persistent substrate
+    be added."""
     repo = tmp_path / "repo"
     repo.mkdir()
     issue_id = 441
@@ -371,10 +413,18 @@ def test_run_persists_state_for_persistent_compute_then_clears(tmp_path: Path) -
         seen["during"] = st
 
     compute = FakeRemoteCompute(on_wait=on_wait)
+
+    class PersistentWriteBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            # Mimic a persistent resumable compute having pushed changes.
+            order.worktree.mkdir(parents=True, exist_ok=True)
+            (order.worktree / "changed.txt").write_text("hello\n", encoding="utf-8")
+            return await super().interpret(order, result)
+
     registry = BackendRegistry(
         WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_remote"))
     )
-    registry.register(FakeBackend())
+    registry.register(PersistentWriteBackend())
     registry.register_compute(compute)
 
     result = asyncio.run(

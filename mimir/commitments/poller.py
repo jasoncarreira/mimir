@@ -42,13 +42,13 @@ existing in-process scheduler in mimir, so we slot in there.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Iterable
 
 from ..event_logger import log_event
-from .models import CommitmentRecord, CommitmentStatus
+from .models import CommitmentStatus
 from .store import CommitmentsStore
 
 log = logging.getLogger(__name__)
@@ -102,7 +102,7 @@ async def check_due_and_expired(
         now_unix = time.time()
 
     result = DueCheckResult()
-    state = store.current_state()
+    state = await asyncio.to_thread(store.current_state)
 
     for rec in state.values():
         result.scanned += 1

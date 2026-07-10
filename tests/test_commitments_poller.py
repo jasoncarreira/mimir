@@ -9,7 +9,9 @@ actually land in ``events.jsonl``.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -24,7 +26,6 @@ from mimir.commitments import (
 )
 from mimir.commitments.poller import (
     DEFAULT_SNOOZE_PILEUP_THRESHOLD,
-    DueCheckResult,
     check_due_and_expired,
 )
 from mimir.event_logger import init_logger
@@ -44,6 +45,70 @@ def home(tmp_path: Path) -> Path:
     (tmp_path / "logs").mkdir()
     init_logger(tmp_path / "logs" / "events.jsonl", session_id="test-poller")
     return tmp_path
+
+
+@pytest.mark.asyncio
+async def test_current_state_read_runs_off_event_loop(tmp_path: Path):
+    """chainlink #843: store replay can be size-scaled, so offload it."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="Future reminder",
+        due_window_start_unix=time.time() + 3600,
+    ))
+
+    loop_thread = threading.get_ident()
+    observed_threads: list[int] = []
+    real_current_state = store.current_state
+
+    def wrapped_current_state():
+        observed_threads.append(threading.get_ident())
+        return real_current_state()
+
+    store.current_state = wrapped_current_state  # type: ignore[method-assign]
+
+    result = await check_due_and_expired(store)
+
+    assert result.scanned == 1
+    assert observed_threads, "current_state was not called"
+    assert all(thread_id != loop_thread for thread_id in observed_threads), (
+        "commitments current_state replay ran on the event-loop thread"
+    )
+
+
+@pytest.mark.asyncio
+async def test_size_scaled_current_state_read_does_not_lag_event_loop(
+    tmp_path: Path,
+) -> None:
+    """A large commitments log replay must not monopolize the event loop."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    for i in range(2_000):
+        await store.add(CommitmentRecord(
+            id=make_commitment_id(),
+            channel_id="c1",
+            text=f"Future reminder {i}",
+            due_window_start_unix=time.time() + 3600,
+        ))
+
+    ticks = 0
+    done = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not done.is_set():
+            ticks += 1
+            await asyncio.sleep(0)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        result = await asyncio.wait_for(check_due_and_expired(store), timeout=5)
+    finally:
+        done.set()
+        await ticker_task
+
+    assert result.scanned == 2_000
+    assert ticks > 0, "event loop did not advance while current_state replay ran"
 
 
 @pytest.mark.asyncio
@@ -122,7 +187,7 @@ async def test_does_not_re_emit_due_on_already_delivered(
     pattern would flood events.jsonl over multi-day windows."""
     store = CommitmentsStore(path=tmp_path / "c.jsonl")
     now = time.time()
-    rec = await store.add(CommitmentRecord(
+    await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id="c1", text="X",
         due_window_start_unix=now - 60,
         due_window_end_unix=now + 86400,
