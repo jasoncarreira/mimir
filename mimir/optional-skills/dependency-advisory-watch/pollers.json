@@ -1,0 +1,10 @@
+{
+  "pollers": [
+    {
+      "name": "dependency-advisory-watch",
+      "description": "Scans uv.lock and package-lock.json for OSV vulnerabilities",
+      "entrypoint": "poller.py",
+      "frequency": "daily"
+    }
+  ]
+}
