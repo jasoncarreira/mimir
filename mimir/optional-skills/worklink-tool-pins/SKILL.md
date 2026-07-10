@@ -54,7 +54,7 @@ is shed before interactive or high-value pollers under resource pressure.
 tool_pins:
   - name: codex
     category: coding-cli
-    pin: "0.142.4"
+    pin: "0.144.1"
     smoke: "codex --version"
     source: npm
     package: "@openai/codex"

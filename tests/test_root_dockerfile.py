@@ -58,6 +58,6 @@ def test_claude_code_build_arg_installs_cli_and_adapter_extra() -> None:
     """One root-image switch should install both Claude Code pieces."""
     text = _text()
     assert "ARG MIMIR_ENABLE_CLAUDE_CODE=0" in text
-    assert "npm install -g @anthropic-ai/claude-code@2.1.195" in text
+    assert "npm install -g @anthropic-ai/claude-code@2.1.206" in text
     assert 'pip install --no-cache-dir "mimir-agent[claude-code]"' in text
     assert "git+https://github.com/jasoncarreira/langchain-claude-code" not in text

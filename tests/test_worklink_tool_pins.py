@@ -95,14 +95,14 @@ def test_inventory_tool_pins_reports_drift_without_mutating_or_smoking() -> None
 
 
 def test_inventory_tool_pins_skips_matching_manual_unknown_and_failed_resolvers() -> None:
-    matching = ToolPin("mermaid", "renderer", "11.15.0", "mmdc --version", source="npm")
+    matching = ToolPin("mermaid", "renderer", "11.16.0", "mmdc --version", source="npm")
     manual = ToolPin("bespoke", "coding-cli", "local", "bespoke --version", source="manual")
     unknown = ToolPin("other", "coding-cli", "1.0.0", "other --version", source="github")
     failing = ToolPin("chainlink", "issue-cli", "1.6.0", "chainlink --version", source="cargo")
 
     inventory = inventory_tool_pins(
         [matching, manual, unknown, failing],
-        {"npm": FakeResolver("11.15.0"), "cargo": FailingResolver()},
+        {"npm": FakeResolver("11.16.0"), "cargo": FailingResolver()},
     )
 
     assert inventory.drift == ()
