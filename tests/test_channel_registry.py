@@ -13,10 +13,13 @@ from mimir.channel_registry import (
     INTERACTIVE_TRIGGERS,
     OPERATOR_CHANNEL_SENTINEL,
     UnknownChannelError,
+    classify_turn_interactivity,
     is_interactive_turn,
     post_job_failure_notice,
     resolve_deliver_channel,
 )
+from mimir.models import TurnInteractivity
+from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
 
 
 @dataclass
@@ -171,6 +174,15 @@ def test_interactive_triggers_allowlist_membership():
     assert "shell_job_complete" in INTERACTIVE_TRIGGERS
     assert "scheduled_tick" not in INTERACTIVE_TRIGGERS
     assert "saga_session_end" not in INTERACTIVE_TRIGGERS
+
+
+def test_http_event_ingress_forces_non_interactive_even_on_bridge_user_message():
+    assert classify_turn_interactivity(
+        "discord-123",
+        "user_message",
+        HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        _interactive_reg(),
+    ) == TurnInteractivity.NON_INTERACTIVE
 
 
 # ─── chainlink #508: deliver: channel resolution + failure notice ────

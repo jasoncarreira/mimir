@@ -75,6 +75,18 @@ def strip_worklink_hint_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]
     return scrub(extra)
 
 
+def strip_http_event_ingress_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Drop the server-owned HTTP ingress marker from client ``extra``."""
+
+    if not extra:
+        return {}
+    return {
+        key: value
+        for key, value in extra.items()
+        if key != HTTP_EVENT_INGRESS_EXTRA_KEY
+    }
+
+
 def stamp_http_event_ingress_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
     """Mark generic HTTP ``/event`` ingress as untrusted for admin provenance.
 
@@ -82,7 +94,7 @@ def stamp_http_event_ingress_extra(extra: Mapping[str, Any] | None) -> dict[str,
     stamps this after client-controlled stripping and always overwrites it.
     """
 
-    stamped = dict(extra or {})
+    stamped = strip_http_event_ingress_extra(extra)
     stamped[HTTP_EVENT_INGRESS_EXTRA_KEY] = HTTP_EVENT_INGRESS_EXTRA_VALUE
     return stamped
 

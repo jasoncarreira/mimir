@@ -15,8 +15,12 @@ import logging
 from typing import Iterable
 
 from .bridges.base import Bridge, SendResult
+from .models import TurnInteractivity
 
 log = logging.getLogger(__name__)
+
+
+_HTTP_EVENT_INGRESS = "http_event"
 
 
 # Triggers that represent a live, user-facing exchange the agent can reply
@@ -53,6 +57,25 @@ def is_interactive_turn(
     if registry is None:
         return False
     return registry.find(channel_id) is not None
+
+
+def classify_turn_interactivity(
+    channel_id: str | None,
+    trigger: str | None,
+    event_ingress: str | None,
+    registry: "ChannelRegistry | None",
+) -> TurnInteractivity:
+    """Return the server-owned interactivity classification for a turn.
+
+    Generic HTTP ``/event`` ingress is always non-interactive, even if the
+    client forges an interactive-looking trigger or channel. All other cases
+    preserve :func:`is_interactive_turn` behavior and fail closed.
+    """
+    if isinstance(event_ingress, str) and event_ingress.strip() == _HTTP_EVENT_INGRESS:
+        return TurnInteractivity.NON_INTERACTIVE
+    if is_interactive_turn(channel_id, trigger, registry):
+        return TurnInteractivity.INTERACTIVE
+    return TurnInteractivity.NON_INTERACTIVE
 
 
 # chainlink #508: optional ``deliver:`` channel for pollers + scheduled ticks.
