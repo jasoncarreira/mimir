@@ -59,6 +59,16 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
         risk="Medium: optional second coding backend; real smoke requires deployments with the Claude CLI installed.",
     ),
     ToolPin(
+        name="osv-scanner",
+        category="security-scanner",
+        pin="v2.4.0",
+        smoke="osv-scanner --version",
+        source="github-release",
+        repo="google/osv-scanner",
+        install="dependency-advisory-watch optional-skill dockerfile.fragment",
+        risk="High: dependency security findings and fail-open behavior depend on scanner CLI semantics.",
+    ),
+    ToolPin(
         name="gogcli",
         category="integration-cli",
         pin="v0.9.0",
