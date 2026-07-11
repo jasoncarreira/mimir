@@ -1,35 +1,22 @@
 #!/usr/bin/env python3
-"""OSV lockfile scanner — polls uv.lock and package-lock.json for vulnerabilities.
+"""Run the pinned osv-scanner CLI over repository lockfiles.
 
-Inventories the repository root lockfiles, queries the OSV API for those
-resolved packages, and normalizes matched vulnerabilities into deterministic
-records. Runs standalone under system python3 with stdlib only.
-
-Environment variables:
-    ROOT_DIR    - Repository root (default: cwd)
-    OSV_API_URL - OSV API endpoint (default: https://api.osv.dev/v1/query)
-
-Output contract:
-    stdout: JSONL — one record per matched vulnerability
-    stderr: diagnostic logging (errors only)
-    exit 0: success (zero events fine — no vulnerabilities found)
-    non-zero: error (transport/parse failure)
+stdout is deterministic JSONL (one normalized advisory per line).  Exit 0 means
+the scan completed, including when vulnerabilities were found; scanner or JSON
+failures return non-zero so the poller cannot report a false clean result.
 """
-
 from __future__ import annotations
 
 import json
 import os
-import sys
-import tomllib
-import urllib.request
-import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
+import subprocess
+import sys
 
 ROOT_DIR = Path(os.environ.get("ROOT_DIR", os.getcwd())).resolve()
-EXCLUDED_DIRS = {".worklink", ".opencode"}
-OSV_API_URL = os.environ.get("OSV_API_URL", "https://api.osv.dev/v1/querybatch")
+OSV_SCANNER = os.environ.get("OSV_SCANNER", "osv-scanner")
+LOCKFILE_NAMES = ("uv.lock", "package-lock.json")
 
 
 @dataclass(frozen=True, order=True)
@@ -39,10 +26,10 @@ class Advisory:
     affected_range: str
     severity: str
     advisory_url: str
-    remediation_version: str | None
+    remediation_version: str | None = None
 
-    def to_dict(self) -> dict:
-        d = {
+    def to_dict(self) -> dict[str, str]:
+        result = {
             "package": self.package,
             "current_version": self.current_version,
             "affected_range": self.affected_range,
@@ -50,206 +37,104 @@ class Advisory:
             "advisory_url": self.advisory_url,
         }
         if self.remediation_version:
-            d["remediation_version"] = self.remediation_version
-        return d
+            result["remediation_version"] = self.remediation_version
+        return result
 
 
-def _log(msg: str) -> None:
-    print(msg, file=sys.stderr)
+def find_lockfiles(root: Path) -> list[Path]:
+    """Return supported root lockfiles in stable order."""
+    return [root / name for name in LOCKFILE_NAMES if (root / name).is_file()]
 
 
-def _emit(event: dict) -> None:
-    print(json.dumps(event), flush=True)
+def run_osv_scanner(lockfile: Path) -> dict:
+    """Run osv-scanner for one lockfile and parse its JSON report.
+
+    osv-scanner uses exit 1 when findings exist.  Exit codes above 1 are real
+    scanner failures and must remain failures rather than becoming clean scans.
+    """
+    proc = subprocess.run(
+        [OSV_SCANNER, "scan", "--format", "json", "--lockfile", str(lockfile)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode not in (0, 1):
+        detail = proc.stderr.strip() or f"exit {proc.returncode}"
+        raise RuntimeError(f"osv-scanner failed for {lockfile.name}: {detail}")
+    try:
+        return json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid osv-scanner JSON for {lockfile.name}: {exc}") from exc
 
 
-def _is_excluded(path: Path) -> bool:
-    return path.parent.name in EXCLUDED_DIRS
+def _severity(vulnerability: dict) -> str:
+    severities = vulnerability.get("severity") or []
+    if not severities:
+        return "UNKNOWN"
+    score = str(severities[0].get("score", "UNKNOWN"))
+    return score.rsplit("/", 1)[-1] if score.startswith("CVSS") else score
 
 
-def parse_uv_lock(lock_path: Path) -> dict[str, str]:
-    """Parse uv.lock and return package name -> version map."""
-    packages: dict[str, str] = {}
-    content = lock_path.read_text(encoding="utf-8")
-    data = tomllib.loads(content)
-
-    for pkg in data.get("package", []):
-        name = pkg.get("name")
-        version = pkg.get("version")
-        if name and version:
-            packages[name] = version
-    return packages
-
-
-def parse_package_lock(lock_path: Path) -> dict[str, str]:
-    """Parse package-lock.json and return package name -> version map."""
-    packages: dict[str, str] = {}
-    data = json.loads(lock_path.read_text(encoding="utf-8"))
-
-    pkgs = data.get("packages", {})
-    for pkg_path, info in pkgs.items():
-        if pkg_path == "":
+def _range_and_fix(vulnerability: dict, package_name: str) -> tuple[str, str | None]:
+    bounds: list[str] = []
+    fixed: str | None = None
+    for affected in vulnerability.get("affected") or []:
+        affected_name = (affected.get("package") or {}).get("name")
+        if affected_name and affected_name != package_name:
             continue
-        if not pkg_path.startswith("node_modules/"):
-            continue
-        name = info.get("name")
-        version = info.get("version")
-        if name and version:
-            packages[name] = version
-    return packages
+        for version_range in affected.get("ranges") or []:
+            for event in version_range.get("events") or []:
+                if "introduced" in event:
+                    bounds.append(f">={event['introduced']}")
+                elif "fixed" in event:
+                    bounds.append(f"<{event['fixed']}")
+                    fixed = fixed or str(event["fixed"])
+                elif "last_affected" in event:
+                    bounds.append(f"<={event['last_affected']}")
+    return (",".join(bounds) or "unknown", fixed)
 
 
-def find_lockfiles(root: Path) -> list[tuple[str, Path]]:
-    """Find lockfiles in root, respecting excluded directories."""
-    lockfiles: list[tuple[str, Path]] = []
-    for name in ["uv.lock", "package-lock.json"]:
-        path = root / name
-        if path.exists() and not _is_excluded(path):
-            lockfiles.append((name, path))
-    return lockfiles
-
-
-def query_osv(packages: dict[str, str], ecosystem: str) -> list[dict]:
-    """Query OSV API for vulnerabilities in the given packages."""
-    if not packages:
-        return []
-
-    results: list[dict] = []
-
-    for name, ver in packages.items():
-        query = {"package": {"name": name, "ecosystem": ecosystem}, "version": ver}
-        data = json.dumps(query).encode("utf-8")
-        req = urllib.request.Request(
-            "https://api.osv.dev/v1/query",
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.URLError as e:
-            _log(f"OSV transport error for {name}: {e}")
-            continue
-        except json.JSONDecodeError as e:
-            _log(f"OSV parse error for {name}: {e}")
-            continue
-
-        vulns = result.get("vulns", [])
-        if vulns:
-            res = {"vulns": vulns, "_query_package": name}
-            results.append(res)
-
-    return results
-
-
-def extract_advisories(
-    packages: dict[str, str], osv_results: list[dict], ecosystem: str
-) -> list[Advisory]:
-    """Extract and normalize advisories from OSV results."""
+def extract_advisories(report: dict) -> list[Advisory]:
+    """Normalize osv-scanner v2 ``results[].packages[]`` output."""
     advisories: list[Advisory] = []
-
-    for result in osv_results:
-        vulns = result.get("vulns", [])
-        if not vulns:
-            continue
-
-        pkg_info = result.get("package", {})
-        name = pkg_info.get("name", "")
-        if not name:
-            name = result.get("_query_package", "")
-        current_version = packages.get(name, "")
-
-        for vuln in vulns:
-            affected = vuln.get("affected", [])
-            ranges = []
-            severity = "UNKNOWN"
-            advisory_url = vuln.get("id", "")
-            if advisory_url:
-                advisory_url = f"https://osv.dev/vulnerability/{advisory_url}"
-
-            for aff in affected:
-                if aff.get("package", {}).get("name") != name:
-                    continue
-
-                for r in aff.get("ranges", []):
-                    for evt in r.get("events", []):
-                        if "introduced" in evt:
-                            ranges.append(f">={evt['introduced']}")
-                        elif "fixed" in evt:
-                            ranges.append(f"<{evt['fixed']}")
-                        elif "last_affected" in evt:
-                            ranges.append(f"<={evt['last_affected']}")
-
-                sev = aff.get("severity", [])
-                if sev:
-                    severity = sev[0].get("score", "UNKNOWN")
-                    if severity.startswith("CVSS_V3") or severity.startswith("CVSS:"):
-                        if "/" in severity:
-                            severity = severity.split("/")[-1]
-                        elif ":" in severity:
-                            severity = severity.split(":")[-1]
-
-            affected_range = ",".join(ranges) if ranges else "unknown"
-
-            remediation = None
-            for aff in affected:
-                for r in aff.get("ranges", []):
-                    for evt in r.get("events", []):
-                        if "fixed" in evt:
-                            remediation = evt["fixed"]
-                            break
-                    if remediation:
-                        break
-                if remediation:
-                    break
-
-            advisories.append(Advisory(
-                package=name,
-                current_version=current_version,
-                affected_range=affected_range,
-                severity=severity,
-                advisory_url=advisory_url,
-                remediation_version=remediation,
-            ))
-
+    for result in report.get("results") or []:
+        for package_result in result.get("packages") or []:
+            package = package_result.get("package") or {}
+            name = str(package.get("name", ""))
+            version = str(package.get("version", ""))
+            if not name:
+                continue
+            for vulnerability in package_result.get("vulnerabilities") or []:
+                vuln_id = str(vulnerability.get("id", ""))
+                affected_range, fixed = _range_and_fix(vulnerability, name)
+                advisories.append(
+                    Advisory(
+                        package=name,
+                        current_version=version,
+                        affected_range=affected_range,
+                        severity=_severity(vulnerability),
+                        advisory_url=(
+                            f"https://osv.dev/vulnerability/{vuln_id}" if vuln_id else ""
+                        ),
+                        remediation_version=fixed,
+                    )
+                )
     return advisories
 
 
 def run_scan() -> int:
-    """Main scan function. Returns 0 on success, non-zero on error."""
-    lockfiles = find_lockfiles(ROOT_DIR)
+    try:
+        advisories = [
+            advisory
+            for lockfile in find_lockfiles(ROOT_DIR)
+            for advisory in extract_advisories(run_osv_scanner(lockfile))
+        ]
+    except (OSError, RuntimeError) as exc:
+        print(exc, file=sys.stderr)
+        return 2
 
-    if not lockfiles:
-        return 0
-
-    all_advisories: list[Advisory] = []
-
-    for lockname, lockpath in lockfiles:
-        if lockname == "uv.lock":
-            packages = parse_uv_lock(lockpath)
-            ecosystem = "PyPI"
-        elif lockname == "package-lock.json":
-            packages = parse_package_lock(lockpath)
-            ecosystem = "npm"
-        else:
-            continue
-
-        if not packages:
-            continue
-
-        try:
-            osv_results = query_osv(packages, ecosystem)
-        except Exception:
-            return 1
-
-        advisories = extract_advisories(packages, osv_results, ecosystem)
-        all_advisories.extend(advisories)
-
-    all_advisories.sort(key=lambda a: (a.package, a.current_version, a.advisory_url))
-
-    for adv in all_advisories:
-        _emit(adv.to_dict())
-
+    for advisory in sorted(set(advisories)):
+        print(json.dumps(advisory.to_dict(), sort_keys=True), flush=True)
     return 0
 
 
@@ -258,4 +143,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

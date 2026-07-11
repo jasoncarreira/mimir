@@ -39,12 +39,13 @@ class FailingResolver:
 def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -> None:
     pins = {pin.name: pin for pin in default_tool_pins()}
 
-    assert set(pins) == {"codex", "chainlink", "mermaid-cli", "claude-code", "gogcli"}
+    assert set(pins) == {"codex", "chainlink", "mermaid-cli", "claude-code", "osv-scanner", "gogcli"}
     assert pins["codex"].category == "coding-cli"
     assert pins["claude-code"].category == "coding-cli"
     assert pins["chainlink"].category == "issue-cli"
     assert pins["mermaid-cli"].category == "renderer"
     assert pins["gogcli"].category == "integration-cli"
+    assert pins["osv-scanner"].category == "security-scanner"
     for pin in pins.values():
         assert pin.pin
         assert pin.smoke
@@ -63,6 +64,7 @@ def test_default_tool_pin_inventory_matches_shipped_install_literals() -> None:
             "mimir/scaffold_docker.py",
             "mimir/skills/chainlink/dockerfile.fragment",
             "mimir/optional-skills/gmail-poller/dockerfile.fragment",
+            "mimir/optional-skills/dependency-advisory-watch/dockerfile.fragment",
         )
     )
 
@@ -71,6 +73,7 @@ def test_default_tool_pin_inventory_matches_shipped_install_literals() -> None:
     assert f"@mermaid-js/mermaid-cli@{pins['mermaid-cli'].pin}" in install_text
     assert f"@anthropic-ai/claude-code@{pins['claude-code'].pin}" in install_text
     assert f"github.com/steipete/gogcli/cmd/gog@{pins['gogcli'].pin}" in install_text
+    assert pins["osv-scanner"].pin in install_text
 
 
 def test_inventory_tool_pins_reports_drift_without_mutating_or_smoking() -> None:
