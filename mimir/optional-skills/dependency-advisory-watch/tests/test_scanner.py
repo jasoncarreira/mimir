@@ -306,10 +306,10 @@ class TestErrorHandling:
 
 
 class TestFullIntegration:
-    """Integration tests using real lockfiles from workspace."""
+    """Integration tests using the repository checkout running pytest."""
 
     def test_scanner_finds_workspace_lockfiles(self):
-        root = Path("/workspace/mimir/.worklink/850-2")
+        root = Path(__file__).resolve().parents[4]
         lockfiles = scanner.find_lockfiles(root)
 
         names = [name for name, _ in lockfiles]
