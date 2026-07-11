@@ -37,7 +37,7 @@ from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.identities import IdentityResolver
 from mimir.index import IndexGenerator
-from mimir.models import AgentEvent, TurnContext
+from mimir.models import AgentEvent, TurnContext, TurnInteractivity
 from mimir.skill_defs import home_builtin_skills_dir
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.turn_logger import TurnLogger
@@ -578,6 +578,63 @@ async def test_run_turn_http_event_ingress_reaches_turn_context_before_admin_too
     assert admin_event["tool"] == "shell_exec"
     assert admin_event["canonical_author"] == "root"
     assert admin_event["denial_reason"] == "http_event_author_untrusted"
+
+
+async def test_run_turn_http_event_ingress_forces_non_interactive_on_bridge_user_message(
+    tmp_path: Path,
+):
+    from mimir.channel_registry import ChannelRegistry, is_interactive_turn
+
+    class _TurnContextProbeAgent(_FakeAgent):
+        def __init__(self) -> None:
+            super().__init__([AIMessage(content="observed")])
+            self.observed_ctx: dict[str, Any] | None = None
+
+        async def astream(
+            self,
+            state: dict[str, Any],
+            *,
+            config: dict[str, Any],
+            stream_mode: str = "values",
+        ):
+            from mimir._context import get_current_turn
+
+            ctx = get_current_turn()
+            assert ctx is not None
+            self.observed_ctx = {
+                "event_ingress": ctx.event_ingress,
+                "interactivity": ctx.interactivity,
+            }
+            async for chunk in super().astream(
+                state, config=config, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    assert is_interactive_turn("ch-http", "user_message", registry) is True
+
+    fake_agent = _TurnContextProbeAgent()
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+
+    record = await agent.run_turn(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="ch-http",
+            content="resume chainlink #840",
+            source="api",
+            extra=stamp_http_event_ingress_extra({"keep": "me"}),
+        )
+    )
+
+    assert record.error is None
+    assert fake_agent.observed_ctx == {
+        "event_ingress": HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        "interactivity": TurnInteractivity.NON_INTERACTIVE,
+    }
+    assert bridge.typing_starts == []
 
 
 class _FoldingFakeAgent(_FakeAgent):
@@ -3313,6 +3370,7 @@ async def test_iteration_hard_stop_notifies_interactive_channel(tmp_path: Path):
     ctx = TurnContext(
         turn_id="t", session_id="discord-1", trigger="user_message",
         channel_id="discord-1", started_at=0.0,
+        interactivity=TurnInteractivity.INTERACTIVE,
     )
     await agent._notify_iteration_hard_stop(event, 200, ctx)
     assert len(ch.sent) == 1
@@ -3379,6 +3437,7 @@ async def test_iteration_hard_stop_soft_send_failure_not_recorded(tmp_path: Path
     ctx = TurnContext(
         turn_id="t", session_id="discord-1", trigger="user_message",
         channel_id="discord-1", started_at=0.0,
+        interactivity=TurnInteractivity.INTERACTIVE,
     )
     await agent._notify_iteration_hard_stop(event, 200, ctx)
     assert len(ch.sent) == 1                       # the send was attempted

@@ -53,7 +53,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from .channel_registry import (
     ChannelRegistry,
-    is_interactive_turn,
+    classify_turn_interactivity,
     post_job_failure_notice,
     resolve_deliver_channel,
 )
@@ -68,7 +68,7 @@ from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
 from ._jsonl_tail import tail_jsonl_records
 from .jsonl_snapshot import JsonlSnapshot
-from .models import AgentEvent, TurnRecord
+from .models import AgentEvent, TurnInteractivity, TurnRecord
 from .prompts import build_system_prompt, build_turn_prompt
 from .rate_limits import RateLimitStore
 from .saga_client import SagaClient
@@ -176,6 +176,11 @@ def _turn_record_ts(rec: dict) -> datetime | None:
         return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _turn_is_interactive(interactivity: TurnInteractivity | None) -> bool:
+    """Return True only for an explicit interactive classification."""
+    return interactivity == TurnInteractivity.INTERACTIVE
 
 
 def _filter_session_turns(
@@ -1358,6 +1363,18 @@ class Agent:
                 saga_session_id = sess.saga_session_id
                 self._sessions.increment_turn_count(event.channel_id)
 
+            event_ingress = None
+            if isinstance(event.extra, Mapping):
+                stamped_ingress = event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY)
+                if isinstance(stamped_ingress, str):
+                    event_ingress = stamped_ingress or None
+            turn_interactivity = classify_turn_interactivity(
+                event.channel_id,
+                event.trigger,
+                event_ingress,
+                self._channels,
+            )
+
             # Typing indicator: fire at turn START on interactive turns so the
             # user sees "mimir is typing…" the moment their message lands and for
             # the whole turn (0.3.0 removed auto-dispatch, so this is the only
@@ -1369,7 +1386,7 @@ class Agent:
             if (
                 self._channels is not None
                 and event.channel_id
-                and is_interactive_turn(event.channel_id, event.trigger, self._channels)
+                and _turn_is_interactive(turn_interactivity)
             ):
                 _typing_bridge = self._channels.find(event.channel_id)
                 if _typing_bridge is not None and hasattr(
@@ -1387,11 +1404,6 @@ class Agent:
             from .models import TurnContext as _TurnContext
             from ._context import set_current_turn, reset_current_turn
             from .loop_detector import LoopDetector
-            event_ingress = None
-            if isinstance(event.extra, Mapping):
-                stamped_ingress = event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY)
-                if isinstance(stamped_ingress, str):
-                    event_ingress = stamped_ingress or None
             ctx = _TurnContext(
                 turn_id=turn_id,
                 session_id=session_id,
@@ -1430,6 +1442,7 @@ class Agent:
                 # this field is no longer the source of that tag.
                 channel_source=event.source,
                 event_ingress=event_ingress,
+                interactivity=turn_interactivity,
                 # Runtime access-control context consumed by tool middleware.
                 author=event.author,
                 identity_resolver=getattr(self, "_identity_resolver", None),
@@ -1468,13 +1481,13 @@ class Agent:
                 reset_current_turn_interactive as _reset_interactive,
             )
             cid_token = _set_cid(event.channel_id)
-            # Pair the interactivity flag with the channel id: send_message uses it
-            # to decide whether a channel-less call may default to this turn's
-            # channel (interactive) or must be given an explicit channel (non-
-            # interactive heartbeat / poller / synthesis / upgrade turns).
-            interactive_token = _set_interactive(
-                is_interactive_turn(event.channel_id, event.trigger, self._channels)
-            )
+            # Pair the stored server-owned interactivity classification with the
+            # channel id: send_message uses it to decide whether a channel-less
+            # call may default to this turn's channel (interactive) or must be
+            # given an explicit channel (non-interactive heartbeat / poller /
+            # synthesis / upgrade turns). Keep the ContextVar for backward
+            # compatibility only; the authoritative decision lives on TurnContext.
+            interactive_token = _set_interactive(_turn_is_interactive(ctx.interactivity))
             _turn_record = await self._run_turn_body(
                 event, ctx, ctx_token, turn_id, session_id, saga_session_id,
                 t_total_start, emitter,
@@ -1716,8 +1729,8 @@ class Agent:
             (event.extra or {}).get("deliver"),
             getattr(self._config, "operator_alert_channel", ""),
         )
-        if not target and is_interactive_turn(
-            event.channel_id, event.trigger, self._channels,
+        if not target and event.channel_id and _turn_is_interactive(
+            getattr(ctx, "interactivity", None)
         ):
             target = event.channel_id
         if not target or self._channels is None:
@@ -2067,11 +2080,9 @@ class Agent:
         # to the channel — the agent must call the ``send_message`` tool to
         # reply (and may call it multiple times per turn). The unsent final
         # text is captured as reasoning in the turn record.
-        # ``turn_is_interactive`` feeds the forgot-to-send guard at turn end;
-        # the typing indicator is started/cancelled in ``run_turn``.
-        turn_is_interactive = is_interactive_turn(
-            event.channel_id, event.trigger, self._channels
-        )
+        # The stored server-owned classification feeds the forgot-to-send guard
+        # at turn end; the typing indicator is started/cancelled in run_turn.
+        turn_is_interactive = _turn_is_interactive(getattr(ctx, "interactivity", None))
 
         timeout = self._config.turn_timeout_seconds
         # asyncio.timeout() is available on Python 3.11+, which is the
@@ -2520,6 +2531,7 @@ class Agent:
             error=error,
             permission_denials=permission_denials,
             saga_calls=saga_calls,
+            interactivity=getattr(ctx, "interactivity", None),
             kind=kind,
             **result_fields,
         )

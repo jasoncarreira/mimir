@@ -22,7 +22,9 @@ from typing import Optional
 
 import pytest
 
+from mimir._context import reset_current_turn, set_current_turn
 from mimir.commitments.models import CommitmentStatus
+from mimir.models import TurnContext, TurnInteractivity
 from mimir.scheduler import SchedulerJob
 from mimir.tools.registry import (
     _STATE,
@@ -1282,17 +1284,45 @@ class TestSendMessageInteractivityGuard:
     """send_message interactivity guard coverage for channel-less sends and
     non-interactive no-reply pseudo-channels."""
 
+    def _turn_ctx(
+        self,
+        *,
+        turn_id: str,
+        session_id: str,
+        trigger: str,
+        channel_id: str,
+        interactivity: TurnInteractivity | None,
+        event_ingress: str | None = None,
+    ) -> tuple[TurnContext, object]:
+        ctx = TurnContext(
+            turn_id=turn_id,
+            session_id=session_id,
+            trigger=trigger,
+            channel_id=channel_id,
+            started_at=0.0,
+            agent_id="test",
+            event_ingress=event_ingress,
+            interactivity=interactivity,
+        )
+        return ctx, set_current_turn(ctx)
+
     @pytest.mark.asyncio
     async def test_non_interactive_no_channel_errors(self) -> None:
         bridge = _StubBridge()
         set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        _ctx, turn_tok = self._turn_ctx(
+            turn_id="t-poller",
+            session_id="s-poller",
+            trigger="poller",
+            channel_id="poller:gmail-inbox",
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        )
         cid_tok = set_current_channel_id("chan-1")
-        int_tok = set_current_turn_interactive(False)
         try:
             out = await send_message.ainvoke({"text": "hi"})
         finally:
-            reset_current_turn_interactive(int_tok)
             reset_current_channel_id(cid_tok)
+            reset_current_turn(turn_tok)
         assert "send_message rejected" in out
         assert "not a deliverable channel" in out
         assert bridge.send_calls == []  # nothing was sent
@@ -1302,11 +1332,17 @@ class TestSendMessageInteractivityGuard:
         bridge = _StubBridge()
         registry = _StubRegistry(bridge, channel_id="chan-1")
         set_channel_registry(registry)
-        int_tok = set_current_turn_interactive(False)
+        _ctx, turn_tok = self._turn_ctx(
+            turn_id="t-poller",
+            session_id="s-poller",
+            trigger="poller",
+            channel_id="poller:gmail-inbox",
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        )
         try:
             out = await send_message.ainvoke({"text": "hi", "channel_id": "chan-1"})
         finally:
-            reset_current_turn_interactive(int_tok)
+            reset_current_turn(turn_tok)
         assert "send_message ok" in out
         assert registry.find_calls == ["chan-1"]
         assert bridge.send_calls == [{"cid": "chan-1", "text": "hi"}]
@@ -1315,13 +1351,19 @@ class TestSendMessageInteractivityGuard:
     async def test_interactive_no_channel_is_rejected(self) -> None:
         bridge = _StubBridge()
         set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        _ctx, turn_tok = self._turn_ctx(
+            turn_id="t-user-message",
+            session_id="s-user-message",
+            trigger="user_message",
+            channel_id="web-1",
+            interactivity=TurnInteractivity.INTERACTIVE,
+        )
         cid_tok = set_current_channel_id("chan-1")
-        int_tok = set_current_turn_interactive(True)
         try:
             out = await send_message.ainvoke({"text": "hi"})
         finally:
-            reset_current_turn_interactive(int_tok)
             reset_current_channel_id(cid_tok)
+            reset_current_turn(turn_tok)
         assert "send_message rejected" in out
         assert "not a deliverable channel" in out
         assert bridge.send_calls == []
@@ -1333,14 +1375,10 @@ class TestSendMessageInteractivityGuard:
         call bridge.react(cid, None, emoji) (chainlink #394)."""
         bridge = _StubBridge()
         set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
-        int_tok = set_current_turn_interactive(True)
-        try:
-            out = await send_message.ainvoke({
-                "text": '<actions><react emoji="thumbsup" /></actions>',
-                "channel_id": "chan-1",
-            })
-        finally:
-            reset_current_turn_interactive(int_tok)
+        out = await send_message.ainvoke({
+            "text": '<actions><react emoji="thumbsup" /></actions>',
+            "channel_id": "chan-1",
+        })
         # No text was sent and the targetless react was skipped (not None).
         assert bridge.send_calls == []
         assert bridge.react_calls == []
@@ -1360,7 +1398,14 @@ class TestSendMessageInteractivityGuard:
         bridge = _StubBridge()
         registry = _StubRegistry(bridge, channel_id=channel_id.strip())
         set_channel_registry(registry)
-        int_tok = set_current_turn_interactive(False)
+        _ctx, turn_tok = self._turn_ctx(
+            turn_id="t-poller",
+            session_id="s-poller",
+            trigger="poller",
+            channel_id="poller:gmail-inbox",
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        )
+        int_tok = set_current_turn_interactive(True)
         try:
             out = await send_message.ainvoke({
                 "text": "hi",
@@ -1368,6 +1413,7 @@ class TestSendMessageInteractivityGuard:
             })
         finally:
             reset_current_turn_interactive(int_tok)
+            reset_current_turn(turn_tok)
         assert "send_message rejected" in out
         assert "Declining to reply means NOT calling send_message" in out
         assert "operator alert channel" in out
@@ -1389,27 +1435,26 @@ class TestSendMessageInteractivityGuard:
         self, tmp_path,
     ) -> None:
         from mimir import _context
-        from mimir._context import reset_current_turn, set_current_turn
         from mimir.event_logger import init_logger
-        from mimir.models import TurnContext
 
         init_logger(tmp_path / "events.jsonl", session_id="test-session")
         bridge = _StubBridge()
         registry = _StubRegistry(bridge, channel_id="No-RePlY")
         set_channel_registry(registry)
-        turn_tok = set_current_turn(TurnContext(
+        _ctx, turn_tok = self._turn_ctx(
             turn_id="t-poller",
             session_id="s-poller",
             trigger="poller",
             channel_id="poller:gmail-inbox",
-            started_at=0.0,
-            agent_id="test",
-        ))
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        )
+        int_tok = set_current_turn_interactive(True)
         lost_tok = _context._current_turn.set(None)
         try:
             out = await send_message.ainvoke({"text": "hi", "channel_id": "No-RePlY"})
         finally:
             _context._current_turn.reset(lost_tok)
+            reset_current_turn_interactive(int_tok)
             reset_current_turn(turn_tok)
 
         assert "send_message rejected" in out
@@ -1431,35 +1476,33 @@ class TestSendMessageInteractivityGuard:
         self, tmp_path,
     ) -> None:
         from mimir import _context
-        from mimir._context import reset_current_turn, set_current_turn
         from mimir.event_logger import init_logger
-        from mimir.models import TurnContext
 
         init_logger(tmp_path / "events.jsonl", session_id="test-session")
         bridge = _StubBridge()
         registry = _StubRegistry(bridge, channel_id="No-RePlY")
         set_channel_registry(registry)
-        turn1_tok = set_current_turn(TurnContext(
+        _ctx1, turn1_tok = self._turn_ctx(
             turn_id="t-poller-1",
             session_id="s-poller-1",
             trigger="poller",
             channel_id="poller:gmail-inbox",
-            started_at=0.0,
-            agent_id="test",
-        ))
-        turn2_tok = set_current_turn(TurnContext(
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        )
+        _ctx2, turn2_tok = self._turn_ctx(
             turn_id="t-poller-2",
             session_id="s-poller-2",
-            trigger="poller",
-            channel_id="poller:calendar",
-            started_at=0.0,
-            agent_id="test",
-        ))
+            trigger="user_message",
+            channel_id="discord-123",
+            interactivity=TurnInteractivity.INTERACTIVE,
+        )
+        int_tok = set_current_turn_interactive(True)
         lost_tok = _context._current_turn.set(None)
         try:
             out = await send_message.ainvoke({"text": "hi", "channel_id": "No-RePlY"})
         finally:
             _context._current_turn.reset(lost_tok)
+            reset_current_turn_interactive(int_tok)
             reset_current_turn(turn2_tok)
             reset_current_turn(turn1_tok)
 
@@ -1481,25 +1524,24 @@ class TestSendMessageInteractivityGuard:
     async def test_no_reply_sentinel_does_not_trust_interactive_trigger_when_interactivity_is_unset(
         self, tmp_path,
     ) -> None:
-        from mimir._context import reset_current_turn, set_current_turn
         from mimir.event_logger import init_logger
-        from mimir.models import TurnContext
 
         init_logger(tmp_path / "events.jsonl", session_id="test-session")
         bridge = _StubBridge()
         registry = _StubRegistry(bridge, channel_id="No-RePlY")
         set_channel_registry(registry)
-        turn_tok = set_current_turn(TurnContext(
+        _ctx, turn_tok = self._turn_ctx(
             turn_id="t-user-message",
             session_id="s-user-message",
             trigger="user_message",
             channel_id="web-1",
-            started_at=0.0,
-            agent_id="test",
-        ))
+            interactivity=None,
+        )
+        int_tok = set_current_turn_interactive(True)
         try:
             out = await send_message.ainvoke({"text": "hi", "channel_id": "No-RePlY"})
         finally:
+            reset_current_turn_interactive(int_tok)
             reset_current_turn(turn_tok)
 
         assert "send_message rejected" in out
@@ -1517,27 +1559,64 @@ class TestSendMessageInteractivityGuard:
         assert event["reason"] == "non_interactive_no_reply_channel"
 
     @pytest.mark.asyncio
+    async def test_no_reply_sentinel_fails_closed_when_no_turn_is_resolvable(
+        self, tmp_path,
+    ) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        registry = _StubRegistry(bridge, channel_id="No-RePlY")
+        set_channel_registry(registry)
+        int_tok = set_current_turn_interactive(True)
+        try:
+            out = await send_message.ainvoke({
+                "type": "tool_call",
+                "id": "call-1",
+                "name": "send_message",
+                "args": {
+                    "text": "hi",
+                    "channel_id": "No-RePlY",
+                    "interactivity": "interactive",
+                },
+            })
+        finally:
+            reset_current_turn_interactive(int_tok)
+
+        assert out.status == "error"
+        assert "send_message rejected" in out.content
+        assert "Declining to reply means NOT calling send_message" in out.content
+        assert registry.find_calls == []
+        assert bridge.send_calls == []
+
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        ]
+        [event] = [e for e in events if e["type"] == "send_message_blocked"]
+        assert event["tool"] == "send_message"
+        assert event["channel_id"] == "No-RePlY"
+        assert event["reason"] == "non_interactive_no_reply_channel"
+
+    @pytest.mark.asyncio
     async def test_http_event_ingress_no_reply_sentinel_rejects_even_when_interactive_true(
         self, tmp_path,
     ) -> None:
-        from mimir._context import reset_current_turn, set_current_turn
         from mimir.event_logger import init_logger
-        from mimir.models import TurnContext
         from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
 
         init_logger(tmp_path / "events.jsonl", session_id="test-session")
         bridge = _StubBridge()
         registry = _StubRegistry(bridge, channel_id="No-RePlY")
         set_channel_registry(registry)
-        turn_tok = set_current_turn(TurnContext(
+        _ctx, turn_tok = self._turn_ctx(
             turn_id="t-http-event",
             session_id="s-http-event",
             trigger="user_message",
             channel_id="web-1",
-            started_at=0.0,
-            agent_id="test",
             event_ingress=HTTP_EVENT_INGRESS_EXTRA_VALUE,
-        ))
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        )
         int_tok = set_current_turn_interactive(True)
         try:
             out = await send_message.ainvoke({"text": "hi", "channel_id": "No-RePlY"})
@@ -1564,11 +1643,19 @@ class TestSendMessageInteractivityGuard:
         bridge = _StubBridge()
         registry = _StubRegistry(bridge, channel_id="chan-1")
         set_channel_registry(registry)
-        int_tok = set_current_turn_interactive(True)
+        _ctx, turn_tok = self._turn_ctx(
+            turn_id="t-user-message",
+            session_id="s-user-message",
+            trigger="user_message",
+            channel_id="web-1",
+            interactivity=TurnInteractivity.INTERACTIVE,
+        )
+        int_tok = set_current_turn_interactive(False)
         try:
             out = await send_message.ainvoke({"text": "hi", "channel_id": "No-Reply"})
         finally:
             reset_current_turn_interactive(int_tok)
+            reset_current_turn(turn_tok)
 
         assert out == "send_message failed: no bridge for channel 'No-Reply'"
         assert "Declining to reply means NOT calling send_message" not in out
@@ -1576,34 +1663,41 @@ class TestSendMessageInteractivityGuard:
         assert bridge.send_calls == []
 
     @pytest.mark.asyncio
-    async def test_explicit_interactive_true_skips_active_turn_fallback_for_no_reply_sentinel(
+    async def test_tool_args_and_legacy_interactive_contextvar_cannot_override_non_interactive_turn(
         self,
     ) -> None:
-        from mimir._context import reset_current_turn, set_current_turn
-        from mimir.models import TurnContext
-
         bridge = _StubBridge()
         registry = _StubRegistry(bridge, channel_id="chan-1")
         set_channel_registry(registry)
-        turn_tok = set_current_turn(TurnContext(
+        _ctx, turn_tok = self._turn_ctx(
             turn_id="t-poller",
             session_id="s-poller",
             trigger="poller",
             channel_id="poller:gmail-inbox",
-            started_at=0.0,
-            agent_id="test",
-        ))
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        )
         int_tok = set_current_turn_interactive(True)
         try:
-            out = await send_message.ainvoke({"text": "hi", "channel_id": "No-RePlY"})
+            out = await send_message.ainvoke({
+                "type": "tool_call",
+                "id": "call-1",
+                "name": "send_message",
+                "args": {
+                    "text": "hi",
+                    "channel_id": "No-RePlY",
+                    "interactivity": "interactive",
+                    "trigger": "user_message",
+                },
+            })
         finally:
             reset_current_turn_interactive(int_tok)
             reset_current_turn(turn_tok)
 
-        assert out == "send_message failed: no bridge for channel 'No-RePlY'"
-        assert "Declining to reply means NOT calling send_message" not in out
-        assert registry.find_calls == ["No-RePlY"]
+        assert out.status == "error"
+        assert "send_message rejected" in out.content
+        assert "Declining to reply means NOT calling send_message" in out.content
         assert bridge.send_calls == []
+        assert registry.find_calls == []
 
 
 class TestSendMessageSkiplistGuard:
@@ -1862,11 +1956,10 @@ class TestDirectiveReactAccounting:
     instead of vanishing into an except-pass."""
 
     def _turn_ctx(self):
-        from mimir.models import TurnContext
-        from mimir._context import set_current_turn, reset_current_turn
         ctx = TurnContext(
             turn_id="t1", session_id="s1", trigger="user_message",
             channel_id="chan-1", started_at=0.0, agent_id="test",
+            interactivity=TurnInteractivity.INTERACTIVE,
         )
         tok = set_current_turn(ctx)
         return ctx, tok, reset_current_turn
@@ -1877,14 +1970,12 @@ class TestDirectiveReactAccounting:
         bridge.react_returns = True
         set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
         ctx, tok, reset = self._turn_ctx()
-        int_tok = set_current_turn_interactive(True)
         try:
             out = await send_message.ainvoke({
                 "text": '<actions><react emoji="👍" message="m-7" /></actions>',
                 "channel_id": "chan-1",
             })
         finally:
-            reset_current_turn_interactive(int_tok)
             reset(tok)
         assert "send_message ok" in out
         assert bridge.react_calls == [
@@ -1903,14 +1994,12 @@ class TestDirectiveReactAccounting:
         bridge.react_returns = False  # bridge declined
         set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
         ctx, tok, reset = self._turn_ctx()
-        int_tok = set_current_turn_interactive(True)
         try:
             await send_message.ainvoke({
                 "text": '<actions><react emoji="👍" message="m-7" /></actions>',
                 "channel_id": "chan-1",
             })
         finally:
-            reset_current_turn_interactive(int_tok)
             reset(tok)
         assert ctx.react_count == 0
         events = [
@@ -1931,14 +2020,12 @@ class TestDirectiveReactAccounting:
         bridge.raise_on = "react"
         set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
         ctx, tok, reset = self._turn_ctx()
-        int_tok = set_current_turn_interactive(True)
         try:
             out = await send_message.ainvoke({
                 "text": 'hi there <splitter>\n<actions><react emoji="👍" /></actions>'.replace(" <splitter>", ""),
                 "channel_id": "chan-1",
             })
         finally:
-            reset_current_turn_interactive(int_tok)
             reset(tok)
         # The text part delivered (counts), the react raised (doesn't).
         assert "send_message ok" in out
