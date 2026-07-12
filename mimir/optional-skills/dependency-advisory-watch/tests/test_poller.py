@@ -13,16 +13,16 @@ import scanner
 
 
 @pytest.fixture
-def tmp_home(tmp_path: Path, monkeypatch):
-    home = tmp_path / "home"
-    home.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
+def state_dir(tmp_path: Path, monkeypatch):
+    path = tmp_path / "state" / "pollers" / "dependency-advisory-watch"
+    path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("STATE_DIR", str(path))
     sys.modules.pop("poller", None)
-    return home
+    return path
 
 
 @pytest.fixture
-def fresh_poller(tmp_home, monkeypatch):
+def fresh_poller(state_dir, monkeypatch):
     sys.modules.pop("poller", None)
     return importlib.import_module("poller")
 
@@ -44,26 +44,26 @@ def _advisory(package="test-pkg", version="1.0.0", vuln_id="TEST-001"):
 
 
 class TestFirstRunSeed:
-    def test_first_run_seeds_cursor_without_emitting_events(self, tmp_home, fresh_poller, monkeypatch, capsys):
-        (tmp_home.parent / "uv.lock").write_text("", encoding="utf-8")
+    def test_first_run_seeds_cursor_without_emitting_events(self, state_dir, fresh_poller, monkeypatch, capsys):
+        (state_dir.parent / "uv.lock").write_text("", encoding="utf-8")
 
-        with patch("scanner.find_lockfiles", return_value=[tmp_home.parent / "uv.lock"]):
+        with patch("scanner.find_lockfiles", return_value=[state_dir.parent / "uv.lock"]):
             with patch("scanner.run_osv_scanner", return_value={"results": []}):
                 with patch("scanner.extract_advisories", return_value=[]):
                     assert fresh_poller.main() == 0
 
         assert _events(capsys) == []
 
-        cursor_path = tmp_home / "dependency-advisory-cursor.json"
+        cursor_path = state_dir / "dependency-advisory-cursor.json"
         assert cursor_path.exists()
         cursor_data = json.loads(cursor_path.read_text())
         assert cursor_data["advisory_ids"] == []
 
-    def test_first_run_with_advisories_seeds_only(self, tmp_home, fresh_poller, monkeypatch, capsys):
-        (tmp_home.parent / "uv.lock").write_text("", encoding="utf-8")
+    def test_first_run_with_advisories_seeds_only(self, state_dir, fresh_poller, monkeypatch, capsys):
+        (state_dir.parent / "uv.lock").write_text("", encoding="utf-8")
         advisories = [_advisory(vuln_id="VULN-001"), _advisory(vuln_id="VULN-002", package="other-pkg")]
 
-        with patch("scanner.find_lockfiles", return_value=[tmp_home.parent / "uv.lock"]):
+        with patch("scanner.find_lockfiles", return_value=[state_dir.parent / "uv.lock"]):
             with patch("scanner.run_osv_scanner", return_value={"results": []}):
                 with patch("scanner.extract_advisories", return_value=advisories):
                     assert fresh_poller.main() == 0
@@ -71,23 +71,23 @@ class TestFirstRunSeed:
         events = _events(capsys)
         assert events == []
 
-        cursor_path = tmp_home / "dependency-advisory-cursor.json"
+        cursor_path = state_dir / "dependency-advisory-cursor.json"
         cursor_data = json.loads(cursor_path.read_text())
         assert set(cursor_data["advisory_ids"]) == {"VULN-001", "VULN-002"}
 
 
 class TestNewMatch:
-    def test_second_run_emits_only_new_advisories(self, tmp_home, fresh_poller, monkeypatch, capsys):
-        cursor_path = tmp_home / "dependency-advisory-cursor.json"
+    def test_second_run_emits_only_new_advisories(self, state_dir, fresh_poller, monkeypatch, capsys):
+        cursor_path = state_dir / "dependency-advisory-cursor.json"
         cursor_path.write_text(json.dumps({"advisory_ids": ["VULN-001"], "version": 1}), encoding="utf-8")
-        (tmp_home.parent / "uv.lock").write_text("", encoding="utf-8")
+        (state_dir.parent / "uv.lock").write_text("", encoding="utf-8")
 
         new_advisories = [
             _advisory(vuln_id="VULN-001"),
             _advisory(vuln_id="VULN-002"),
         ]
 
-        with patch("scanner.find_lockfiles", return_value=[tmp_home.parent / "uv.lock"]):
+        with patch("scanner.find_lockfiles", return_value=[state_dir.parent / "uv.lock"]):
             with patch("scanner.run_osv_scanner", return_value={"results": []}):
                 with patch("scanner.extract_advisories", return_value=new_advisories):
                     assert fresh_poller.main() == 0
@@ -97,10 +97,10 @@ class TestNewMatch:
         assert events[0]["advisory_id"] == "VULN-002"
         assert events[0]["package"] == "test-pkg"
 
-    def test_emits_complete_prompt_with_all_fields(self, tmp_home, fresh_poller, monkeypatch, capsys):
-        cursor_path = tmp_home / "dependency-advisory-cursor.json"
+    def test_emits_complete_prompt_with_all_fields(self, state_dir, fresh_poller, monkeypatch, capsys):
+        cursor_path = state_dir / "dependency-advisory-cursor.json"
         cursor_path.write_text(json.dumps({"advisory_ids": [], "version": 1}), encoding="utf-8")
-        (tmp_home.parent / "uv.lock").write_text("", encoding="utf-8")
+        (state_dir.parent / "uv.lock").write_text("", encoding="utf-8")
 
         advisories = [
             scanner.Advisory(
@@ -113,7 +113,7 @@ class TestNewMatch:
             )
         ]
 
-        with patch("scanner.find_lockfiles", return_value=[tmp_home.parent / "uv.lock"]):
+        with patch("scanner.find_lockfiles", return_value=[state_dir.parent / "uv.lock"]):
             with patch("scanner.run_osv_scanner", return_value={"results": []}):
                 with patch("scanner.extract_advisories", return_value=advisories):
                     assert fresh_poller.main() == 0
@@ -135,17 +135,17 @@ class TestNewMatch:
 
 
 class TestRepeatDeduplication:
-    def test_repeated_advisories_are_silent(self, tmp_home, fresh_poller, monkeypatch, capsys):
-        cursor_path = tmp_home / "dependency-advisory-cursor.json"
+    def test_repeated_advisories_are_silent(self, state_dir, fresh_poller, monkeypatch, capsys):
+        cursor_path = state_dir / "dependency-advisory-cursor.json"
         cursor_path.write_text(json.dumps({"advisory_ids": ["VULN-001", "VULN-002"], "version": 1}), encoding="utf-8")
-        (tmp_home.parent / "uv.lock").write_text("", encoding="utf-8")
+        (state_dir.parent / "uv.lock").write_text("", encoding="utf-8")
 
         same_advisories = [
             _advisory(vuln_id="VULN-001"),
             _advisory(vuln_id="VULN-002"),
         ]
 
-        with patch("scanner.find_lockfiles", return_value=[tmp_home.parent / "uv.lock"]):
+        with patch("scanner.find_lockfiles", return_value=[state_dir.parent / "uv.lock"]):
             with patch("scanner.run_osv_scanner", return_value={"results": []}):
                 with patch("scanner.extract_advisories", return_value=same_advisories):
                     assert fresh_poller.main() == 0
@@ -155,14 +155,14 @@ class TestRepeatDeduplication:
 
 
 class TestResolvedReappearing:
-    def test_resolved_advisories_removed_from_cursor(self, tmp_home, fresh_poller, monkeypatch, capsys):
-        cursor_path = tmp_home / "dependency-advisory-cursor.json"
+    def test_resolved_advisories_removed_from_cursor(self, state_dir, fresh_poller, monkeypatch, capsys):
+        cursor_path = state_dir / "dependency-advisory-cursor.json"
         cursor_path.write_text(json.dumps({"advisory_ids": ["VULN-001", "VULN-002"], "version": 1}), encoding="utf-8")
-        (tmp_home.parent / "uv.lock").write_text("", encoding="utf-8")
+        (state_dir.parent / "uv.lock").write_text("", encoding="utf-8")
 
         only_one = [_advisory(vuln_id="VULN-001")]
 
-        with patch("scanner.find_lockfiles", return_value=[tmp_home.parent / "uv.lock"]):
+        with patch("scanner.find_lockfiles", return_value=[state_dir.parent / "uv.lock"]):
             with patch("scanner.run_osv_scanner", return_value={"results": []}):
                 with patch("scanner.extract_advisories", return_value=only_one):
                     assert fresh_poller.main() == 0
@@ -173,14 +173,14 @@ class TestResolvedReappearing:
         cursor_data = json.loads(cursor_path.read_text())
         assert cursor_data["advisory_ids"] == ["VULN-001"]
 
-    def test_reappearing_advisories_emit_events(self, tmp_home, fresh_poller, monkeypatch, capsys):
-        cursor_path = tmp_home / "dependency-advisory-cursor.json"
+    def test_reappearing_advisories_emit_events(self, state_dir, fresh_poller, monkeypatch, capsys):
+        cursor_path = state_dir / "dependency-advisory-cursor.json"
         cursor_path.write_text(json.dumps({"advisory_ids": ["VULN-001"], "version": 1}), encoding="utf-8")
-        (tmp_home.parent / "uv.lock").write_text("", encoding="utf-8")
+        (state_dir.parent / "uv.lock").write_text("", encoding="utf-8")
 
         both_advisories = [_advisory(vuln_id="VULN-001"), _advisory(vuln_id="VULN-002")]
 
-        with patch("scanner.find_lockfiles", return_value=[tmp_home.parent / "uv.lock"]):
+        with patch("scanner.find_lockfiles", return_value=[state_dir.parent / "uv.lock"]):
             with patch("scanner.run_osv_scanner", return_value={"results": []}):
                 with patch("scanner.extract_advisories", return_value=both_advisories):
                     assert fresh_poller.main() == 0
@@ -191,12 +191,12 @@ class TestResolvedReappearing:
 
 
 class TestFailureWithoutCursorAdvance:
-    def test_scanner_failure_does_not_update_cursor(self, tmp_home, fresh_poller, monkeypatch, capsys):
-        cursor_path = tmp_home / "dependency-advisory-cursor.json"
+    def test_scanner_failure_does_not_update_cursor(self, state_dir, fresh_poller, monkeypatch, capsys):
+        cursor_path = state_dir / "dependency-advisory-cursor.json"
         cursor_path.write_text(json.dumps({"advisory_ids": ["VULN-001"], "version": 1}), encoding="utf-8")
-        (tmp_home.parent / "uv.lock").write_text("", encoding="utf-8")
+        (state_dir.parent / "uv.lock").write_text("", encoding="utf-8")
 
-        with patch("scanner.find_lockfiles", return_value=[tmp_home.parent / "uv.lock"]):
+        with patch("scanner.find_lockfiles", return_value=[state_dir.parent / "uv.lock"]):
             with patch("scanner.run_osv_scanner", side_effect=RuntimeError("scanner failed")):
                 assert fresh_poller.main() == 2
 
@@ -206,26 +206,26 @@ class TestFailureWithoutCursorAdvance:
         cursor_data = json.loads(cursor_path.read_text())
         assert cursor_data["advisory_ids"] == ["VULN-001"]
 
-    def test_scanner_failure_emits_to_stderr(self, tmp_home, fresh_poller, monkeypatch, capsys):
-        (tmp_home.parent / "uv.lock").write_text("", encoding="utf-8")
+    def test_scanner_failure_emits_to_stderr(self, state_dir, fresh_poller, monkeypatch, capsys):
+        (state_dir.parent / "uv.lock").write_text("", encoding="utf-8")
 
-        with patch("scanner.find_lockfiles", return_value=[tmp_home.parent / "uv.lock"]):
+        with patch("scanner.find_lockfiles", return_value=[state_dir.parent / "uv.lock"]):
             with patch("scanner.run_osv_scanner", side_effect=RuntimeError("transport error")):
                 assert fresh_poller.main() == 2
 
         captured = capsys.readouterr()
         assert "transport error" in captured.err
 
-    def test_missing_mimir_home_uses_fallback(self, tmp_home, fresh_poller, monkeypatch, capsys):
-        monkeypatch.delenv("MIMIR_HOME", raising=False)
+    def test_missing_state_dir_runs_without_persistence(self, state_dir, fresh_poller, monkeypatch, capsys):
+        monkeypatch.delenv("STATE_DIR", raising=False)
         sys.modules.pop("poller", None)
 
         import poller
         monkeypatch.setattr(poller, "_cursor_path", lambda: None)
 
-        (tmp_home.parent / "uv.lock").write_text("", encoding="utf-8")
+        (state_dir.parent / "uv.lock").write_text("", encoding="utf-8")
 
-        with patch("scanner.find_lockfiles", return_value=[tmp_home.parent / "uv.lock"]):
+        with patch("scanner.find_lockfiles", return_value=[state_dir.parent / "uv.lock"]):
             with patch("scanner.run_osv_scanner", return_value={"results": []}):
                 with patch("scanner.extract_advisories", return_value=[_advisory()]):
                     assert poller.main() == 0
@@ -235,29 +235,29 @@ class TestFailureWithoutCursorAdvance:
 
 
 class TestCursorAtomicity:
-    def test_cursor_update_is_atomic(self, tmp_home, fresh_poller, monkeypatch, capsys):
-        cursor_path = tmp_home / "dependency-advisory-cursor.json"
+    def test_cursor_update_is_atomic(self, state_dir, fresh_poller, monkeypatch, capsys):
+        cursor_path = state_dir / "dependency-advisory-cursor.json"
         cursor_path.write_text(json.dumps({"advisory_ids": [], "version": 1}), encoding="utf-8")
-        (tmp_home.parent / "uv.lock").write_text("", encoding="utf-8")
+        (state_dir.parent / "uv.lock").write_text("", encoding="utf-8")
 
         advisories = [_advisory(vuln_id="NEW-001")]
 
-        with patch("scanner.find_lockfiles", return_value=[tmp_home.parent / "uv.lock"]):
+        with patch("scanner.find_lockfiles", return_value=[state_dir.parent / "uv.lock"]):
             with patch("scanner.run_osv_scanner", return_value={"results": []}):
                 with patch("scanner.extract_advisories", return_value=advisories):
                     assert fresh_poller.main() == 0
 
-        temp_file = tmp_home / "dependency-advisory-cursor.json.tmp"
+        temp_file = state_dir / "dependency-advisory-cursor.json.tmp"
         assert not temp_file.exists()
 
 
 class TestNoLockfiles:
-    def test_no_lockfiles_exits_zero_silently(self, tmp_home, fresh_poller, monkeypatch, capsys):
+    def test_no_lockfiles_exits_zero_silently(self, state_dir, fresh_poller, monkeypatch, capsys):
         with patch("scanner.find_lockfiles", return_value=[]):
             assert fresh_poller.main() == 0
 
         events = _events(capsys)
         assert events == []
 
-        cursor_path = tmp_home / "dependency-advisory-cursor.json"
+        cursor_path = state_dir / "dependency-advisory-cursor.json"
         assert cursor_path.exists()

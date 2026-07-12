@@ -25,15 +25,14 @@ from typing import Any
 import scanner
 
 POLLER_NAME = "dependency-advisory-watch"
-CURSOR_DIR = os.environ.get("MIMIR_HOME", os.environ.get("CURSOR_DIR", ".mimir"))
 CURSOR_FILE = "dependency-advisory-cursor.json"
 
 
 def _cursor_path() -> Path | None:
-    cursor_dir = os.environ.get("MIMIR_HOME")
-    if not cursor_dir:
+    state_dir = os.environ.get("STATE_DIR")
+    if not state_dir:
         return None
-    return Path(cursor_dir) / CURSOR_FILE
+    return Path(state_dir) / CURSOR_FILE
 
 
 def _read_cursor(path: Path | None) -> tuple[str, ...] | None:
