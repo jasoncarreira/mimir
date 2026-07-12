@@ -53,6 +53,11 @@ CRITICAL_RUNTIME_DATA = (
     "mimir/optional-skills/chainlink-orchestrator/SKILL.md",  # Worklink planner skill (opt-in)
     "mimir/optional-skills/chainlink-orchestrator/poller.py",  # ready-queue poller (#444)
     "mimir/optional-skills/chainlink-orchestrator/pollers.json",
+    "mimir/optional-skills/dependency-advisory-watch/SKILL.md",  # OSV dependency advisory poller (opt-in)
+    "mimir/optional-skills/dependency-advisory-watch/poller.py",  # poller entry point
+    "mimir/optional-skills/dependency-advisory-watch/pollers.json",  # poller manifest
+    "mimir/optional-skills/dependency-advisory-watch/scanner.py",  # OSV scanning logic
+    "mimir/optional-skills/dependency-advisory-watch/dockerfile.fragment",  # pinned osv-scanner installer
 )
 
 
