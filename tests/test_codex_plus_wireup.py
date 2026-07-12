@@ -196,6 +196,58 @@ def test_callback_maps_by_window_length_pro_plan_7d_as_primary(tmp_path: Path):
     assert "openai_five_hour" not in loaded
 
 
+def test_callback_reconciles_stale_misclassified_five_hour(tmp_path: Path):
+    """Migration path (chainlink #874): an older position-based mapper had
+    stored the Pro plan's 7-day usage under ``openai_five_hour`` with the
+    7-DAY reset. That reset is in the future, so ``current()`` will NOT drop
+    it as stale — it would linger as a phantom 5h bucket for up to a week.
+    A single Pro-shaped callback (7d primary, empty secondary) must remove
+    that absent-this-round owned key in the same atomic write, leaving only
+    the correct 7d entry."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    reset_7d = int(time.time()) + 7 * 24 * 3600
+    # Seed the stale, misclassified record: 7d value + 7d reset under the 5h key.
+    store.record_sync(
+        "openai_five_hour",
+        RateLimitSnapshot(status="allowed", utilization=0.09, resets_at=reset_7d),
+    )
+    assert "openai_five_hour" in store.current()  # future reset → survives staleness filter
+
+    callback = make_codex_plus_rate_limit_callback(store)
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(
+            used_percent=9.0, window_minutes=10080, reset_at=reset_7d,
+        ),
+        secondary=_FakeQuotaWindow(
+            used_percent=0.0, window_minutes=0, reset_at=None,
+        ),
+    ))
+
+    loaded = store.current()
+    assert loaded["openai_seven_day"].utilization == pytest.approx(0.09)
+    # Phantom 5h key is gone — from the live view AND from disk (not merely
+    # filtered), proving reconcile deleted it rather than staleness hiding it.
+    assert "openai_five_hour" not in loaded
+    assert "openai_five_hour" not in store._load()
+
+
+def test_callback_windowless_response_preserves_existing_records(tmp_path: Path):
+    """Guard on the reconcile: a response carrying no usable window
+    (``used_percent`` omitted) must NOT wipe a previously-recorded window —
+    reconcile only runs when at least one window was reported this round, so
+    a transient headerless response never blanks the panel."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    reset_5h = int(time.time()) + 5 * 3600
+    store.record_sync(
+        "openai_five_hour",
+        RateLimitSnapshot(status="allowed", utilization=0.25, resets_at=reset_5h),
+    )
+    callback = make_codex_plus_rate_limit_callback(store)
+    callback(_FakeRateLimits(primary=_FakeQuotaWindow(used_percent=None)))
+    loaded = store.current()
+    assert loaded["openai_five_hour"].utilization == pytest.approx(0.25)
+
+
 def test_callback_skips_when_used_percent_missing(tmp_path: Path):
     """A window with ``used_percent=None`` (gateway omitted the
     header) — skip rather than write a misleading utilization=0."""
@@ -288,19 +340,19 @@ async def test_callback_on_running_loop_returns_before_sync_io(
     sync JSON/event writes off-loop and return promptly rather than blocking
     scheduler dispatch.
     """
-    calls: list[tuple[str, object]] = []
+    calls: list[tuple[object, object]] = []
     continue_sync = threading.Event()
     sync_started = threading.Event()
 
-    def _blocking_record_sync(key: str, snapshot: RateLimitSnapshot) -> None:
-        calls.append((key, snapshot))
+    def _blocking_reconcile_sync(updates: object, *, owned_keys: object) -> None:
+        calls.append((updates, owned_keys))
         sync_started.set()
         deadline = time.monotonic() + 1.0
         while not continue_sync.is_set() and time.monotonic() < deadline:
             time.sleep(0.01)
 
     store = RateLimitStore(path=tmp_path / "rl.json")
-    monkeypatch.setattr(store, "record_sync", _blocking_record_sync)
+    monkeypatch.setattr(store, "reconcile_sync", _blocking_reconcile_sync)
     callback = make_codex_plus_rate_limit_callback(store)
 
     start = time.monotonic()
@@ -315,7 +367,7 @@ async def test_callback_on_running_loop_returns_before_sync_io(
     deadline = time.monotonic() + 1.0
     while not calls and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
-    assert calls and calls[0][0] == "openai_five_hour"
+    assert calls and "openai_five_hour" in calls[0][0]
 
 
 # ─── End-to-end read: OpenAIQuotaProvider sees what the callback wrote ─

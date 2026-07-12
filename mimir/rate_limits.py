@@ -37,6 +37,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,6 +162,39 @@ class RateLimitStore:
         with self._thread_lock:
             data = self._load()
             data[rate_limit_type] = asdict(snapshot)
+            try:
+                atomic_write_json(self.path, data)
+            except OSError as exc:
+                log.warning("rate_limits.json write failed: %s", exc)
+
+    def reconcile_sync(
+        self,
+        updates: dict[str, RateLimitSnapshot],
+        *,
+        owned_keys: Iterable[str],
+    ) -> None:
+        """Atomically apply ``updates`` AND drop any ``owned_keys`` absent
+        from ``updates``, in one locked write.
+
+        Use when a provider reports the full current set of its windows in a
+        single callback: a window it owns but did NOT report this round is
+        stale and must be removed, not left to linger. :meth:`current` only
+        drops entries by ``resets_at``, so a misclassified key carrying a
+        future reset — e.g. a 7-day reset written under ``openai_five_hour``
+        by an older position-based mapper (chainlink #874) — would otherwise
+        survive for the whole window and keep the panel/arbiter reading a
+        phantom 5h bucket. Popping absent owned keys keeps the on-disk set
+        for this provider exactly equal to what the snapshot reported.
+
+        Keys outside ``owned_keys`` (other providers' windows) are left
+        untouched. Best-effort: IO errors are logged and swallowed."""
+        owned = set(owned_keys)
+        with self._thread_lock:
+            data = self._load()
+            for key in owned:
+                data.pop(key, None)
+            for key, snapshot in updates.items():
+                data[key] = asdict(snapshot)
             try:
                 atomic_write_json(self.path, data)
             except OSError as exc:
