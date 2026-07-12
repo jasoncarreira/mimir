@@ -141,7 +141,11 @@ blocks from what it learns. When onboarding is done the agent deletes the
 `init` block, and it's never re-seeded — so it won't re-trigger on later
 `setup` runs.
 
-See `.env.example` for every environment variable mimir reads.
+See **[docs/configuration.md](./docs/configuration.md)** for the complete
+reference of every environment variable mimir reads — types, defaults, and what
+each does, including the opt-in feature flags (auto-deliver, activity panel,
+mid-turn injection, …) that are easy to miss. `.env.example` is a copy-paste
+starter covering the common ones.
 
 ## Web UI
 
@@ -340,7 +344,9 @@ If you're orienting yourself in the codebase:
 3. **[mimir/saga/\_\_init\_\_.py](./mimir/saga/__init__.py)** — memory
    backend operation surface (the module docstring is the public-API
    reference)
-4. **[docs/](./docs/)** — additional architectural notes, including the
+4. **[docs/configuration.md](./docs/configuration.md)** — the complete
+   environment-variable reference (every flag, default, and what it does)
+5. **[docs/](./docs/)** — additional architectural notes, including the
    [Recent activity context](./docs/recent-activity-context.md) privacy and
    cross-channel scoping contract (`docs/internal/` holds historical process
    docs that may help when archeology is needed but aren't part of the public
