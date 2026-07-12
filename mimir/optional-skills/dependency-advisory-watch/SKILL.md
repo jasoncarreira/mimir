@@ -13,7 +13,7 @@ env:
 
 # Dependency Advisory Watch
 
-<!-- desc: Scans Python lockfiles for OSV vulnerabilities and emits dependency_advisory events -->
+<!-- desc: Scans Python and npm lockfiles for OSV vulnerabilities and emits dependency_advisory events -->
 
 This is an **opt-in poller skill** that ships with mimir under
 `mimir/optional-skills/` but is NOT auto-installed. It monitors your
@@ -22,14 +22,20 @@ Vulnerabilities).
 
 ## Installation
 
-1. **Install osv-scanner** — the skill requires the `osv-scanner` CLI:
+1. **Install osv-scanner v2.4.0** — the poller invokes the v2-only `scan`
+   subcommand. The shipped `dockerfile.fragment` is the canonical pinned
+   container installation and supports `amd64` and `arm64`. For a direct
+   installation on Linux:
    ```bash
-   # Option A: binary release
-   curl -sL https://github.com/google/osv-scanner/releases/download/v1.9.0/osv-scanner-linux-amd64 \
-     -o /usr/local/bin/osv-scanner && chmod +x /usr/local/bin/osv-scanner
+   # Option A: pinned binary release (set amd64 or arm64)
+   OSV_SCANNER_ARCH=amd64
+   curl -fsSL \
+     "https://github.com/google/osv-scanner/releases/download/v2.4.0/osv-scanner_linux_${OSV_SCANNER_ARCH}" \
+     -o /usr/local/bin/osv-scanner
+   chmod 0755 /usr/local/bin/osv-scanner
 
-   # Option B: via package manager
-   go install github.com/google/osv-scanner/cmd/osv-scanner@latest
+   # Option B: pinned Go install
+   go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.4.0
    ```
 
 2. **Copy the skill to your agent home:**
@@ -91,9 +97,9 @@ captured as `poller_stderr` events for debugging.
 
 ## OSV Coverage Boundary
 
-This poller scans **Python lockfiles only**:
-- `uv.lock` (uv)
-- `package-lock.json` (npm/pip)
+This poller scans Python and npm lockfiles:
+- `uv.lock` (Python/uv)
+- `package-lock.json` (JavaScript/npm)
 
 Coverage is limited to what OSV.dev supports for these lockfile formats.
 The poller does NOT scan:
