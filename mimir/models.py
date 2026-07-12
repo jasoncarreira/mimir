@@ -54,6 +54,33 @@ class AgentEvent:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class AuthContext:
+    """Frozen, server-created authorization context (chainlink #864).
+
+    This context carries immutable authorization state from the server's ingress
+    point through the entire turn execution. It is created BEFORE model execution
+    and CANNOT be widened or mutated by the model, tools, or downstream handlers.
+
+    The key invariant: authority is derived ONLY from this frozen carrier, NOT from:
+    - Model-passed session_id
+    - ContextVar fallback heuristics
+    - Single-active-turn heuristics
+
+    Fields are immutable (frozen=True) to prevent post-creation widening.
+    """
+
+    principal: str | None
+    canonical_principal: str | None
+    roles: tuple[str, ...]
+    event_ingress: str | None
+    trigger: str
+    channel_id: str | None
+    interactivity: "TurnInteractivity | None"
+    policy_version: str | None = None
+    is_service: bool = False
+
+
 @dataclass
 class TurnContext:
     """Per-turn state. One instance per run_turn — never shared across turns."""
@@ -125,6 +152,11 @@ class TurnContext:
     author: str | None = None
     identity_resolver: Any | None = None
     access_control_enforced: bool = False
+    # Frozen authorization context (chainlink #864). Created at ingress before
+    # model execution and carried through all tool requests, MCP wrappers, and
+    # subagents. Immutable - authority derives ONLY from this carrier, NOT from
+    # model session_id, ContextVar fallback, or single-active-turn heuristics.
+    auth_context: AuthContext | None = None
     # Number of successful send_message deliveries in this turn (incremented
     # only after the bridge confirms ``SendResult.sent``). The forgot-to-send
     # guard emits ``interactive_turn_no_send_message`` when an interactive turn

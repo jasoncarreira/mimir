@@ -54,6 +54,19 @@ def _resolve_turn_ctx(session_id: str | None) -> tuple[Any | None, str]:
     return resolve_active_ctx({"session_id": (session_id or "").strip()})
 
 
+def _get_auth_context() -> Any | None:
+    """Get the frozen AuthContext from the current turn (chainlink #864).
+
+    Returns the frozen auth_context from the active TurnContext, or None
+    if no turn has a valid auth_context. This is the authoritative source
+    for authorization decisions - authority derives ONLY from this carrier.
+    """
+    from .._context import resolve_auth_context
+
+    auth_ctx, _ = resolve_auth_context({})
+    return auth_ctx
+
+
 def _resolve_session_id(explicit: str | None) -> str | None:
     """Prefer the model-supplied ``session_id``; fall back to the
     active TurnContext's ``saga_session_id`` using the MCP-safe

@@ -284,6 +284,19 @@ def _turn_has_http_event_ingress(ctx: Any) -> bool:
 def _admin_identity_fields(ctx: Any | None) -> tuple[str | None, str | None, list[str]]:
     if ctx is None:
         return None, None, []
+
+    # chainlink #864: Use the frozen auth_context when available for authoritative
+    # authorization. This is the secure path that doesn't trust mutable ctx.author
+    # or ctx.identity_resolver that could be widened after ingress.
+    auth_ctx = getattr(ctx, "auth_context", None)
+    if auth_ctx is not None:
+        return (
+            auth_ctx.principal,
+            auth_ctx.canonical_principal,
+            list(auth_ctx.roles),
+        )
+
+    # Fallback for non-auth_context paths (tests, legacy code)
     decision = authorize_action(
         getattr(ctx, "author", None),
         getattr(ctx, "identity_resolver", None),
@@ -350,6 +363,24 @@ def _check_admin_authorized(tool_name: str, ctx: Any | None = None) -> str | Non
         return None
     if _turn_has_internal_admin_authority(ctx):
         return None
+
+    # chainlink #864: Use the frozen auth_context when available for authoritative
+    # authorization. This is the secure path that doesn't trust mutable ctx.author
+    # or ctx.identity_resolver that could be widened after ingress.
+    auth_ctx = getattr(ctx, "auth_context", None)
+    if auth_ctx is not None:
+        # Check if the frozen auth_context has admin role
+        if "admin" in auth_ctx.roles:
+            return None
+        # Deny - no admin role in the frozen context
+        return _deny_admin_tool(
+            tool_name,
+            "admin_required",
+            ctx=ctx,
+            enforcement_enabled=True,
+        )
+
+    # Fallback for non-auth_context paths (tests, legacy code)
     decision = authorize_action(
         getattr(ctx, "author", None),
         getattr(ctx, "identity_resolver", None),
