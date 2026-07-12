@@ -723,8 +723,8 @@ def _resolve_recent_message_id(channel_id: str) -> Optional[str]:
     Backs ``react``'s default target. Returns None when no buffer is
     registered (test paths that bypass ``server.serve``) or the channel
     has no id-bearing message in the recent window. ``recent_for_channel``
-    pools across public channels, so we filter to the requested channel
-    and walk newest-first for the first message with a usable id.
+    is exact-channel scoped; walk newest-first for the first message with a
+    usable id.
     """
     from ..history import get_global_buffer
     buf = get_global_buffer()

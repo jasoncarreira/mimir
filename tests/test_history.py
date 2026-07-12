@@ -120,6 +120,35 @@ async def test_assemble_public_activity_pulls_same_user_not_global_pool(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("target_channel", ["help", "dm-slack-alice"])
+async def test_assemble_activity_excludes_other_users_adjacent_replies(
+    tmp_path: Path, target_channel: str,
+):
+    """Only assistant replies following the target user's anchor may cross channels."""
+    buf = _make_buffer(tmp_path)
+    for channel, kind, content, author, offset in [
+        ("general", "user_message", "bob-secret", "bob", -5),
+        ("general", "assistant_message", "reply-to-bob", None, -4),
+        ("general", "user_message", "alice-anchor", "alice", -3),
+        ("general", "assistant_message", "reply-to-alice", None, -2),
+        (target_channel, "user_message", "alice-current", "alice", 0),
+    ]:
+        await buf.append(buf.make_message(
+            channel_id=channel, kind=kind, content=content, author=author,
+            ts=_now_iso(offset_minutes=offset),
+        ))
+
+    out = buf.assemble_recent_activity(
+        channel_id=target_channel, author="alice", recent_per_channel=10,
+        recent_author_cross=10, cross_hours=24,
+    )
+
+    assert [m.content for m in out] == [
+        "alice-anchor", "reply-to-alice", "alice-current",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_assemble_public_activity_resolves_cross_platform_aliases(tmp_path: Path):
     class Resolver:
         def resolve(self, author):
