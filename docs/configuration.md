@@ -4,9 +4,13 @@ Every configuration environment variable mimir reads, with its type, default,
 and what it does. **This is the complete list**, enforced by
 `tests/test_config_docs_complete.py` — an AST scan of the core runtime asserts
 every env read is documented here (or on the explicit exclusion allowlist), so
-the list can't silently drift out of date. [`.env.example`](../.env.example) is
-a copy-paste starter that covers the common ones; this file is the exhaustive
-reference.
+the list can't silently drift out of date. The scan resolves string-literal
+reads *and* reads via a module-level string constant (e.g.
+`os.environ.get(_WEBHOOK_ENV)`); the only unenforced shape is a name computed at
+runtime from a non-constant value (a helper parameter, a cross-module import, an
+f-string), which is plumbing rather than an operator flag.
+[`.env.example`](../.env.example) is a copy-paste starter that covers the common
+ones; this file is the exhaustive reference.
 
 **Not included** (owned/documented elsewhere, and on the test's allowlist):
 standard OS vars (`HOME`); environment injected by the harness into poller/tool
