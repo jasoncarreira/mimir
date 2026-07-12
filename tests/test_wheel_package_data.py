@@ -139,3 +139,40 @@ def test_wheel_include_config_covers_critical_runtime_data() -> None:
         f"[tool.hatch.build].include (or are killed by exclude): {uncovered}. "
         "Add a matching include glob in pyproject.toml (see chainlink #290)."
     )
+
+
+# ---- Reference docs shipped via force-include (mimir/doc_seed.py) ----------
+# The operator docs live at the repo root but must ALSO ship in the wheel under
+# mimir/bundled_docs/ so `mimir setup` can seed them into <home>/docs/. They're
+# packaged via [tool.hatch.build.targets.wheel.force-include], not the include
+# allowlist above.
+
+def _force_include() -> dict:
+    cfg = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    return (
+        cfg["tool"]["hatch"]["build"]["targets"]["wheel"].get("force-include", {})
+    )
+
+
+def test_docs_force_included_into_wheel() -> None:
+    fi = _force_include()
+    # Sources map under mimir/bundled_docs/ so doc_seed.source_root() finds them.
+    assert fi.get("docs") == "mimir/bundled_docs/docs"
+    assert fi.get("README.md") == "mimir/bundled_docs/README.md"
+    assert fi.get(".env.example") == "mimir/bundled_docs/.env.example"
+    # And the sources exist in the tree.
+    for rel in ("docs/configuration.md", "README.md", ".env.example"):
+        assert (REPO_ROOT / rel).is_file(), f"seed source missing: {rel}"
+
+
+def test_doc_seed_enumerates_operator_docs_excluding_internal() -> None:
+    from mimir import doc_seed
+
+    root = doc_seed.source_root()
+    assert root is not None
+    rels = {rel for rel, _src in doc_seed._seed_items(root)}
+    assert "docs/configuration.md" in rels
+    assert "docs/README.md" in rels
+    assert "docs/.env.example" in rels
+    # docs/internal/ is never seeded into the home
+    assert not any(r.startswith("docs/internal") or "internal" in r for r in rels)

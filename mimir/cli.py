@@ -378,6 +378,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             embedding=args.embedding,
             model=args.model,
             subscription=args.subscription,
+            restore_docs=args.restore_docs,
         )
         _print_setup_report(status)
         return

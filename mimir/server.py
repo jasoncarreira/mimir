@@ -711,6 +711,18 @@ def build_app(config: Config) -> web.Application:
     # default updates are handled by the startup defaults-upgrade proposal path.
     seed_prompts(config.home)
     seed_scheduler(config.home)
+    # Refresh reference docs on upgrade: rewrite docs still present in
+    # <home>/docs/ to the shipped version, seed docs new in this release, and
+    # leave operator-deleted ones deleted. No-ops unless the version changed
+    # (mimir/doc_seed.py). Also seeds docs into a pre-existing home that never
+    # had them (e.g. created before this feature).
+    try:
+        from .doc_seed import refresh_docs
+        _doc_changes = refresh_docs(config.home)
+        if _doc_changes:
+            log.info("docs refreshed on upgrade: %s", _doc_changes)
+    except Exception as exc:  # never block startup on doc seeding
+        log.warning("doc refresh skipped: %s", exc)
     # Initialize the Chainlink store if absent (+ the CLI is installed) so the
     # Tasks board works out of the box instead of reporting "unavailable".
     # Best-effort and gated on the binary, so plain pip installs are unaffected.

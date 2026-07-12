@@ -143,6 +143,16 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["mimir"]
 
+# Operator reference docs. They live at the repo root (docs/, README.md,
+# .env.example) for GitHub + README links, but must ALSO ship in the wheel so
+# `mimir setup` can seed them into <home>/docs/ (mimir/doc_seed.py). force-include
+# maps the repo paths under the package as mimir/bundled_docs/; the seeder reads
+# from there in a wheel install and falls back to the repo root in a dev tree.
+[tool.hatch.build.targets.wheel.force-include]
+"docs" = "mimir/bundled_docs/docs"
+"README.md" = "mimir/bundled_docs/README.md"
+".env.example" = "mimir/bundled_docs/.env.example"
+
 [tool.hatch.build]
 # The built React app (mimir/react_app/dist/) is a VCS-IGNORED build artifact:
 # frontend bundles are gitignored, only mimir/react_app/.gitkeep is tracked.
