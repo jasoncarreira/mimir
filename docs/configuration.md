@@ -1,9 +1,20 @@
 # Configuration reference
 
-Every environment variable mimir reads, with its type, default, and what it
-does. **This is the complete list.** [`.env.example`](../.env.example) is a
-copy-paste starter that covers the common ones; this file is the exhaustive
-reference for the rest.
+Every configuration environment variable mimir reads, with its type, default,
+and what it does. **This is the complete list**, enforced by
+`tests/test_config_docs_complete.py` — an AST scan of the core runtime asserts
+every env read is documented here (or on the explicit exclusion allowlist), so
+the list can't silently drift out of date. [`.env.example`](../.env.example) is
+a copy-paste starter that covers the common ones; this file is the exhaustive
+reference.
+
+**Not included** (owned/documented elsewhere, and on the test's allowlist):
+standard OS vars (`HOME`); environment injected by the harness into poller/tool
+subprocesses (`STATE_DIR`, `POLLER_NAME`, `ROOT_DIR`); and locators for external
+CLIs mimir shells out to, defined by those tools (`CODEX_HOME`,
+`CLAUDE_CONFIG_DIR`, `CHAINLINK_BIN`, `WORKLINK_RUN_BIN`, `OSV_SCANNER`).
+Optional-skill poller variables are listed below for convenience but live in
+their own skill subprocesses.
 
 ## How configuration is loaded
 
@@ -55,6 +66,9 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_USE_RESPONSES_API` | bool (tri-state) | auto | Force OpenAI Responses API on/off. Unset → derived from `OPENAI_BASE_URL`. |
 | `MIMIR_CODEX_PLUS_TRANSIENT_RETRY_ATTEMPTS` | int | `3` | Max attempts for Codex-Plus transient connection-error retries (floor 1). |
 | `MIMIR_CODEX_PLUS_TRANSIENT_RETRY_BASE_DELAY` | float | `0.5` | Base backoff (s) for Codex-Plus transient retries (floor 0.0). |
+| `MIMIR_LLM_RETRY_MAX_ATTEMPTS` | int | `3` | Max attempts in the shared provider-agnostic LLM retry layer (backoff + jitter on transient errors). |
+| `MIMIR_LLM_RETRY_BASE_DELAY` | float | `0.5` | Base backoff (s) for the shared LLM retry layer. |
+| `MIMIR_LLM_RETRY_MAX_DELAY` | float | `30.0` | Max backoff (s) cap for the shared LLM retry layer. |
 | `MIMIR_CLAUDE_OAUTH_CREDENTIALS` | path | `$MIMIR_HOME/.claude/.credentials.json` | Anthropic OAuth credentials for the usage poller. Empty disables; auto-disabled on a non-Anthropic `ANTHROPIC_BASE_URL`. |
 | `MIMIR_BILLING_MODE` | enum | auto-detected | Override billing mode: `quota` (demotes cost-rate spikes to advisory) or `pay-as-you-go`. |
 
@@ -122,9 +136,15 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_SAGA_SQL_MAX_VALUE_BYTES` | int | `10000000` | Caps any single string/blob via `SQLITE_LIMIT_LENGTH`. |
 | `SAGA_ENDPOINT` | str | unset | Only if running SAGA as a separate HTTP server (default is in-process). |
 | `SAGA_API_KEY` | str | unset | Key for the SAGA HTTP server. |
+| `SAGA_CONFIG` | path | unset | Explicit path to `saga.toml` (highest-priority in the config search order). Set automatically to `<MIMIR_HOME>/saga.toml` when present. |
+| `SAGA_DATA_DIR` | path | unset | Data directory searched for `saga.toml` (`$SAGA_DATA_DIR/saga.toml`). |
+| `SAGA_QUIET_CONFIG` | bool (`1`) | off | Suppress the "no `saga.toml` found, using defaults" startup log. |
+| `SAGA_PERSISTENT_CLAUDE_POOL_SIZE` | int (≥1) | SAGA default | Size of SAGA's persistent Claude-Code client pool (only relevant when SAGA's LLM `provider = "claude_code"`). |
+| `SAGA_PERSISTENT_CLAUDE_RECYCLE` | int (≥1) | SAGA default | Recycle a pooled SAGA Claude-Code client after this many calls. |
 
-> SAGA's own dials (retrieval, consolidation, embeddings, LLM provider) live in
-> `<MIMIR_HOME>/saga.toml`, not env vars. See the SAGA docs.
+> SAGA's substantive dials (retrieval, consolidation, embeddings, LLM provider)
+> live in `<MIMIR_HOME>/saga.toml`. The variables above only locate that file and
+> tune the (opt-in) persistent Claude-Code pool.
 
 ## Web server & auth
 
@@ -230,6 +250,10 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_WORKLINK_REAPER_CRON` | cron | `""` (off) | Stale-claim TTL reaper cron; empty registers no job (non-Worklink homes). |
 | `MIMIR_CHAINLINK_AUTOINIT` | bool | `1` (on) | Auto-run `chainlink init` on boot if `.chainlink` absent and the CLI is present. |
 | `MIMIR_FACTORY_EPICS_ENABLED` | bool | off | Feature-factory epic dispatch in the chainlink-orchestrator poller (`worklink:epic`). |
+| `MIMIR_FACTORY_RUN_TIMEOUT_S` | float | `14400` (4h) | Wall-clock timeout for a feature-factory run before the orchestrator treats it as failed. |
+| `MIMIR_FACTORY_STALE_HEARTBEAT_S` | float | `900` (15m) | Heartbeat age at which a factory run is considered stalled. |
+| `MIMIR_FACTORY_PROBE_WINDOW_S` | float | `300` (floor 1) | Interval the orchestrator re-probes a running factory job's state. |
+| `MIMIR_FACTORY_REVIEWER` | str | `mimir-carreira` | Reviewer the factory requests on the PR it opens (`--reviewer <name>`); empty omits the flag. |
 | `MIMIR_SOURCE_DIR` | path | unset | Override for locating the source checkout in the chainlink-orchestrator poller. |
 
 ## Optional-skill pollers (gmail / social / github)
@@ -266,9 +290,21 @@ once the corresponding skill is installed.
 | `ANTHROPIC_BASE_URL` | str | unset | Gateway / Anthropic-compat base URL (LiteLLM, OpenRouter, Minimax, Kimi). |
 | `ANTHROPIC_MODEL` | str | unset | Reader model override. |
 | `ANTHROPIC_CUSTOM_MODEL_OPTION` | str | unset | Extra model option passed through to the gateway. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | str | unset | OAuth token for the Claude Code subprocess path (alternative to a `claude login` credentials file). |
+| `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` | str | unset | Passed through to the Claude Code CLI to disable its experimental beta headers. |
 | `OPENAI_API_KEY` | str | unset | Used for SAGA embeddings + consolidation; without it SAGA falls back to local fastembed. |
 | `GITHUB_TOKEN` | str | unset | Token for home git push + GitHub-backed tools/pollers. Paired with `MIMIR_STATE_REPO`. |
 | `MINIMAX_API_KEY` | str | unset | Enables the Minimax usage poller (with `MIMIR_MINIMAX_USAGE_POLL_CRON`). |
+
+## Tool & skill integration keys
+
+Optional keys that enable specific tools/skills; unset = the tool/skill is off.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `TAVILY_API_KEY` | str | unset | Enables the `web_search` tool (Tavily). Unset = `web_search` disabled. |
+| `TAVILY_SEARCH_URL` | str | `https://api.tavily.com/search` | Override the Tavily search endpoint (SSRF-checked). |
+| `OPENWEATHER_API_KEY` | str | unset | API key for the bundled `weather` skill. |
 
 ---
 
