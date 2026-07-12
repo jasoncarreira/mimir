@@ -259,7 +259,7 @@ Subagent invocations land as a single `tool_result` event in turns.jsonl with `n
 **Status:** v1 shipped (commits `b6a8f9b`, `c043ff3`, `291e754` — see also v0.4 shipped log below); chainlink #40 expansion shipped 2026-05-08:
 
 - **#41 (PR #69)** — schema extension: parallel `channels:` section in `state/identities.yaml`, with `IdentityResolver` gaining a channel-side API (`resolve_channel`, `channel_display_name`, `channel`, `all_channels`).
-- **#43 (PR #70)** — cross-channel content surfacing: `recent_for_channel` pulls the global public-channel pool unconditionally; `render_recent_activity` learns channel-side resolver support so known channels render `<display_name> (<channel_id>)`.
+- **#43 (PR #70)** — cross-channel content surfacing originally made `recent_for_channel` pull a global public-channel pool; issue #1048 later replaced that unsafe scope with active-channel history plus same-canonical-user public context. `render_recent_activity` retains channel-side resolver support so known channels render `<display_name> (<channel_id>)`.
 - **#42 (PR #72)** — `identity-lookup` skill bundled at `mimir/skills/identity-lookup/` (auto-installed by `seed_skills` on `mimir setup`).
 - **#44 (PR #71)** — daily bridge populators (`mimir/identities_populator.py`): scrapes connected Discord guilds + Slack workspaces into `state/identities.yaml`. Idempotent (rerun → zero deltas, operator-set fields preserved, atomic writeback). Top-of-file YAML comment headers preserved across writes. Runtime auto-installed via `Scheduler.add_identities_populate_job`; opt-in via `MIMIR_IDENTITIES_POPULATE_CRON` (default empty; recommended `0 6 * * *`).
 
