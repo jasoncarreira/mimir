@@ -1142,16 +1142,16 @@ wheels = [
 
 [[package]]
 name = "langchain-codex-plus"
-version = "0.0.5"
+version = "0.0.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "langchain-core" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d2/98/33da783803fa22cec783812720fa998f982efe0b75e6c5f1d8c74771c207/langchain_codex_plus-0.0.5.tar.gz", hash = "sha256:3c481d0b2e051276e3c36ccf34bbdfac663dce8ecf0171e57524b5290625bafd", size = 137435, upload-time = "2026-06-23T21:23:15.064Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c9/94/b4ec59e9d8a538c02b16ffbfc632bfac322c0a1c95ed241e71c17b056a63/langchain_codex_plus-0.0.6.tar.gz", hash = "sha256:bcbd0cdb9f06bb8ea85c2d5db56496752d0991115e7caaf965a0c7a94b360f9d", size = 137629, upload-time = "2026-07-12T18:00:32.111Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1a/27/cf98d2fb91c8c235c2d96da1ead24d2048b2235049a7c837a0ee0fec8012/langchain_codex_plus-0.0.5-py3-none-any.whl", hash = "sha256:8d64a26a62a71d35fdecd392e1f641ef61f30a557c0d900f9318746d8c048e1f", size = 36584, upload-time = "2026-06-23T21:23:13.992Z" },
+    { url = "https://files.pythonhosted.org/packages/77/e4/4d7f2d9e86a56cce3a310f760ebb4d6c31a3a653879123de3e38604d4089/langchain_codex_plus-0.0.6-py3-none-any.whl", hash = "sha256:e717a5a40b46bfe353ce616195fdd8d7cad8e6dee2bfbe071ce249d131a98c39", size = 36799, upload-time = "2026-07-12T18:00:30.671Z" },
 ]
 
 [[package]]
@@ -1439,8 +1439,8 @@ requires-dist = [
     { name = "langchain-anthropic", marker = "extra == 'anthropic'", specifier = ">=1.4" },
     { name = "langchain-anthropic", marker = "extra == 'dev'", specifier = ">=1.4" },
     { name = "langchain-claude-code-mimir", marker = "extra == 'claude-code'", specifier = ">=0.1.2,<0.2" },
-    { name = "langchain-codex-plus", marker = "extra == 'codex-plus'", specifier = ">=0.0.5,<0.1" },
-    { name = "langchain-codex-plus", marker = "extra == 'dev'", specifier = ">=0.0.5,<0.1" },
+    { name = "langchain-codex-plus", marker = "extra == 'codex-plus'", specifier = ">=0.0.6,<0.1" },
+    { name = "langchain-codex-plus", marker = "extra == 'dev'", specifier = ">=0.0.6,<0.1" },
     { name = "langchain-openai", marker = "extra == 'dev'", specifier = ">=1.2.1" },
     { name = "langchain-openai", marker = "extra == 'openai'", specifier = ">=1.2.1" },
     { name = "mcp", marker = "extra == 'dev'", specifier = ">=1.27" },
@@ -1463,7 +1463,7 @@ dev = [
     { name = "discord-py", specifier = ">=2.6" },
     { name = "faiss-cpu", specifier = ">=1.13" },
     { name = "langchain-anthropic", specifier = ">=1.4" },
-    { name = "langchain-codex-plus", specifier = ">=0.0.5,<0.1" },
+    { name = "langchain-codex-plus", specifier = ">=0.0.6,<0.1" },
     { name = "langchain-openai", specifier = ">=1.2.1" },
     { name = "mcp", specifier = ">=1.27" },
     { name = "pytest", specifier = ">=9.0.3" },
