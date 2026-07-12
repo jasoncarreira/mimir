@@ -64,11 +64,16 @@ The context must be attached before model execution and must not be reconstructe
 |---|---|---|
 | Authenticated interactive admin/regular | Preserve the current single-operator behavior, but log the decision that enforcement would make; prohibited-action guards remain active. | Apply the full policy. |
 | Generic HTTP event | Possession of the current API key authenticates the transport only, not an admin principal. Deny every non-open operation unless a future server-owned credential mapping establishes a named principal and admitted ingress. | Same fail-closed rule. Forged event fields cannot widen authority. |
+| Authenticated web chat | Treat as an interactive authenticated principal, not generic HTTP-event ingress: the server derives a per-user identity and channel from the per-user credential. The admin master API key is deliberately not a chat identity. | Apply the full policy using that resolved principal; admin-tool use requires the per-user identity to carry the admin role. |
 | Unknown/missing external | Open operations only. | Open operations only. |
 | Registered trusted-autonomous service principal | Apply its explicit capability matrix; no source-name or missing-author shortcut. | Same. |
 | Unknown synthetic trigger | Open operations only. | Open operations only. |
 
 An unknown native, built-in, dynamically registered, or external operation is admin-required under compatibility mode and denied to non-admins under enforcement; it is never implicitly open. The runtime inventory must cover the final assembled tool surface, not only `all_mimir_tools()`.
+
+Web chat is HTTP-transported but is not currently stamped as generic HTTP-event ingress. Its route resolves a server-owned per-user credential mapping, derives `web-<canonical principal>` rather than trusting a client channel, and rejects the shared admin master key as a chat identity. Consequently the operator can retain admin-tool use in web chat only through a named per-user credential mapped to an admin principal; possession of `MIMIR_API_KEY` alone is intentionally insufficient.
+
+**Enablement ordering invariant:** enforcement must not be enabled until the trusted-autonomous capability registry and entries required by deployed scheduler, poller, synthesis, and system turns have landed. Removing `resolve_active_ctx` fallback authority in leaf 1 is safe while enforcement remains off, but enabling enforcement after that removal and before leaf 2's registry exists would incorrectly strip internal turns of required access.
 
 Trusted-autonomous authority is registered by stable service principal and server-owned creation path. Each entry specifies exact trigger type, allowed operations/adapters, readable resource domains, sink destinations, cross-principal-read permission, and declassification permission. Scheduler, poller, synthesis, and system turns are separate entries rather than one blanket admin class. Unknown trigger names receive no privileged capability. The initial compatibility registry may reproduce currently required maintenance access, but must enumerate it and must not rely on `trigger != "user_message"`.
 
@@ -88,7 +93,7 @@ If authoritative context is missing or ambiguous, external turns are treated as 
 
 ## Decision order
 
-For every tool call, evaluate in this order:
+For every model-invoked operation, evaluate steps 1-6 below. Every egress path, including harness-emitted egress that does not originate in a model tool call, must then pass steps 7-8 before emitting content:
 
 1. Resolve the immutable server-owned authorization context. Missing/ambiguous external context denies anything not open.
 2. Resolve stable tool provenance and operation identity. Unknown external MCP provenance is admin-required.
@@ -96,8 +101,8 @@ For every tool call, evaluate in this order:
 4. Determine the capability class for this call, including argument-dependent escalation.
 5. For admin-required calls, require an admin or an explicitly admitted trusted-autonomous capability.
 6. For resource-scoped calls, run the registered adapter, resolve every referenced resource, and require all predicates to pass. Missing adapter, unknown resource, mixed-owner batch, wildcard, or parse failure denies the call.
-7. Apply read-to-egress policy before a sink executes.
-8. Emit a structured allow/deny audit event with principal kind/id, stable operation id, resource classes/ids (redacted where sensitive), policy version, decision, and reason.
+7. At the final egress boundary, apply read-to-egress policy to the accumulated labels and concrete destination before any model-invoked or harness-emitted sink executes.
+8. Emit a structured allow/deny audit event with principal kind/id, stable operation or egress-path id, resource classes/ids (redacted where sensitive), policy version, decision, and reason.
 
 Enforcement mode may remain off by default for the current single-operator deployment. However, server-stamped HTTP-event ingress remains fail-closed for privileged actions, and any future multi-user ingress must require enforcement rather than relying on the compatibility flag.
 
@@ -185,8 +190,9 @@ Per-tool checks do not prevent an allowed private read from being copied into a 
 
 - Labels are initialized before the first model call from every server-supplied input: inbound/folded messages, recent history, automatic SAGA retrieval, session summaries, skill-memory or indexed-file injection, continuation/recovery context, and attachments. Protected tool results and subagent results add labels afterward, including partial results; a failed call adds labels if protected content may have been returned.
 - Source labels contain principal/domain, channel/resource scope, and sensitivity class. They propagate into subagents, spawned processes, continuations, and resumed turns; delegated contexts may only attenuate capabilities, not labels.
-- Sinks include `send_message`, reactions/directives carrying text or files, outbound email/chat/calendar/GitHub/Jira/Drive MCP writes, file uploads, webhook/HTTP posts, `fetch_url` or shell/process invocations that can transmit data, spawned agents/processes with external connectivity, and any future notification tool.
-- A sink is allowed only when every accumulated label is permitted to flow to the sink's destination. Same-principal/same-channel replies may be allowed; cross-principal, cross-channel, public, or unknown destinations require admin or a narrowly defined declassification action.
+- Sinks are egress paths, not merely model-invoked tools. They include `send_message`, reactions/directives carrying text or files, outbound email/chat/calendar/GitHub/Jira/Drive MCP writes, file uploads, webhook/HTTP posts, `fetch_url` or shell/process invocations that can transmit data, spawned agents/processes with external connectivity, and any future notification tool.
+- Harness-emitted channel egress is subject to the same check at its final send/edit boundary even when no model tool call occurs. This explicitly includes `MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS` delivery of captured final text; `MIMIR_RESEND_NUDGE_CHANNELS` recovery and any delivery it induces; and `MIMIR_ACTIVITY_PANEL_CHANNELS` panel posts/edits in both coarse and detailed modes. Detailed activity-panel tool-result previews carry the source labels of those results; `scrub_detail` secret/path redaction does not declassify them. Coarse activity metadata also remains labeled and checked rather than being presumed harmless.
+- A sink is allowed only when every accumulated label is permitted to flow to the sink's destination. Same-principal/same-channel replies may be allowed; cross-principal, cross-channel, public, or unknown destinations require admin or a narrowly defined declassification action. Targeting the triggering channel does not by itself permit content labeled from a different principal or protected domain.
 - Unknown source labels or unknown sink destinations deny for regular users.
 - Taint is monotonic for the turn. Summarizing, paraphrasing, transforming, or having the model assert “no secrets included” does not clear it.
 - Declassification must be an explicit admin action with auditable source labels and destination, not a prompt instruction.
@@ -213,7 +219,9 @@ Implementation leaves must prove:
 - argument tests cover same-channel versus cross-channel sends, explicit/implicit targets, aliases, batches, wildcards, and unknown resources;
 - commitments/files/SAGA legacy records fail closed for regular users;
 - source taint blocks a later incompatible sink even when both calls would pass in isolation, including when the protected content was injected before the first tool call;
-- enforcement-off preserves the current single-operator behavior, while generic HTTP events deny every non-open operation and prohibited-action policy remains intact;
+- auto-deliver final text, resend-nudge recovery/delivery, and coarse and detailed activity-panel posts/edits pass through the same egress gate; tests cover cross-principal taint to the triggering channel and detailed tool-result previews;
+- enforcement cannot be enabled until the deployed trusted-autonomous capability registry is complete; enforcement-off preserves the current single-operator behavior, while generic HTTP events deny every non-open operation and prohibited-action policy remains intact;
+- authenticated web chat is tested as named interactive-principal ingress with a server-derived channel, while the master API key remains transport/admin API authority rather than a chat identity;
 - denials are structured and observable without logging secrets or protected result bodies.
 
 ## Follow-on Worklink leaf DAG
@@ -227,7 +235,7 @@ Each implementation issue must use the Worklink leaf template, preserve the sing
 5. **Filesystem/admin-read baseline** — depends on 2. Classify all file/index/search/attachment reads as admin until a principal-owned virtual-root design exists; ensure built-ins cannot escape the catalog through aliases. Focused validation: `uv run pytest tests/test_budget_gate.py tests/test_file_tools.py tests/test_file_search.py -q`.
 6. **SAGA ownership, storage-scoped reads, and derived ACL propagation** — depends on 1 and 2. Add owner/channel/visibility provenance, storage-level query/get filters, service-only fallback for legacy/ambiguous/mixed derivations, and admin/service-only shared-memory writes until partitioned write semantics exist. Focused validation: `uv run pytest tests/test_saga.py tests/test_saga_tools.py tests/test_saga_session_boundaries.py -q`.
 7. **MCP provenance and classification substrate** — depends on 2. Preserve the versioned provenance record on wrappers; default missing/unclassified metadata to admin; add adapter registry and canonical drift detection; reject bare resource-scoped labels. The #855 UI/API depends on this substrate but is not part of the leaf. Focused validation: `uv run pytest tests/test_mcp_client.py tests/test_budget_gate.py tests/test_config.py -q`.
-8. **Information-flow labels and sink gate** — depends on 1-3 and defines extension hooks used by 5-7. Initialize labels from prompt inputs, propagate protected results/delegation/continuations, enumerate sinks, and block incompatible destinations unless a distinct admin declassification action exists. Focused validation: `uv run pytest tests/test_information_flow.py tests/test_channeltools.py tests/test_spawn_tools.py tests/test_mcp_client.py -q`.
+8. **Information-flow labels and egress gate** — depends on 1-3 and defines extension hooks used by 5-7. Initialize labels from prompt inputs, propagate protected results/delegation/continuations, enumerate model-invoked and harness-emitted sinks, and bind the check at every final egress boundary rather than only tool middleware. Cover auto-deliver final text, resend-nudge recovery/delivery, and coarse/detailed activity-panel posts and edits; block incompatible destinations unless a distinct admin declassification action exists. Focused validation: `uv run pytest tests/test_information_flow.py tests/test_channeltools.py tests/test_resend_nudge.py tests/test_activity_panel.py tests/test_spawn_tools.py tests/test_mcp_client.py -q`.
 9. **Compatibility, generic-HTTP, audit, and adversarial integration matrix** — depends on 3-8. Verify the truth table, structured redacted events, forged fields, unknown native/built-in/MCP operations, legacy records, concurrent turns, preloaded private context, same-scope success, and incompatible egress denial. Run the full suite after focused tests. Focused validation: `uv run pytest tests/test_access_control.py tests/test_server.py tests/test_budget_gate.py tests/test_information_flow.py -q && uv run pytest`.
 
 Leaves 3-7 may proceed in parallel after their dependencies; leaf 8 should define the common label/sink interfaces early and can be implemented alongside them, but cannot close until every protected source and sink adapter is integrated. Leaf 9 is the integration gate. #854 closes only after all implementation leaves and the #855 policy-management surface (or an explicit decision to defer that UI while retaining operator configuration) are reconciled.
