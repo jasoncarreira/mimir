@@ -39,6 +39,9 @@ log = logging.getLogger(__name__)
 DEFAULT_ENV_TEMPLATE = dedent(
     """\
     # mimir environment — fill in what you use, leave the rest blank.
+    #
+    # Full reference for EVERY variable (types, defaults, opt-in feature flags):
+    #   docs/configuration.md  (seeded into this home under docs/)
 
     # ---- Agent chat model ------------------------------------------------
     # MIMIR_MODEL_SPEC has the form ``<provider>:<model>``. Examples:
@@ -677,6 +680,7 @@ def setup_home(
     embedding: str = DEFAULT_EMBEDDING_PRESET,
     model: str | None = None,
     subscription: bool = False,
+    restore_docs: bool = False,
 ) -> dict[str, object]:
     """Scaffold an agent home directory. Returns a status dict for printing.
 
@@ -864,6 +868,15 @@ def setup_home(
     from ..skill_defs import migrate_legacy_skills_dir
     migrate_legacy_skills_dir(home)
     seeded_skills = seed_skills(home)
+
+    # Reference docs → <home>/docs/ (configuration.md + guides + README +
+    # .env.example) so a pip-install operator has them on disk. Seed-if-missing;
+    # deleted docs are not re-introduced (mimir/doc_seed.py). --restore-docs
+    # force-re-seeds everything.
+    from ..doc_seed import seed_docs
+    for _rel, _status in seed_docs(home, restore=restore_docs).items():
+        if _status in ("created", "restored"):
+            files_created.append(_rel)
 
     # PR 4b: bootstrap the home dir as a git repo (idempotent). Reads
     # ``MIMIR_STATE_REPO`` + ``GITHUB_TOKEN`` from the environment so a
@@ -1132,7 +1145,9 @@ def _print_setup_report(status: dict[str, object]) -> None:
         print(f"  2. saga embeddings configured for local fastembed —")
         print(f"     no API key needed. First run downloads the ~33MB ONNX model.")
     print(f"  3. (optional) Edit {home}/memory/core/00-identity.md")
-    print(f"  4. Health check:  mimir setup --home {home} --subscription")
+    print(f"  4. Reference docs seeded to {home}/docs/ — see")
+    print(f"     {home}/docs/configuration.md for every env var + feature flag.")
+    print(f"  5. Health check:  mimir setup --home {home} --subscription")
     print(f"     then run:      mimir run --home {home}")
     # Passive skill env-deps summary — non-blocking, informational only.
     # Lists skills with env: blocks so the operator knows what to configure.
@@ -1247,6 +1262,15 @@ def add_argparse(sub: "argparse._SubParsersAction") -> "argparse.ArgumentParser"
             "flips from cost-tracking to quota-polling. Without this "
             "flag, every route defaults to pay-per-token + cost "
             "monitoring."
+        ),
+    )
+    setup_p.add_argument(
+        "--restore-docs", action="store_true",
+        help=(
+            "Force re-seed all reference docs into <home>/docs/, including "
+            "any you previously deleted. Normal setup/upgrade seeds missing "
+            "docs and refreshes present ones but never re-introduces deleted "
+            "ones; this overrides that."
         ),
     )
     return setup_p
