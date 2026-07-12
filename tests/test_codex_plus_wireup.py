@@ -171,6 +171,31 @@ def test_callback_writes_both_windows_when_present(tmp_path: Path):
     assert loaded["openai_seven_day"].resets_at == secondary_reset
 
 
+def test_callback_maps_by_window_length_pro_plan_7d_as_primary(tmp_path: Path):
+    """Pro-plan shape: the backend reports the 7-day window as PRIMARY
+    (window_minutes=10080) with an empty secondary (window_minutes=0). The 7d
+    usage must land in ``openai_seven_day`` — not ``openai_five_hour`` by
+    position — and no false 5h entry is written. Regression for the "7-day
+    usage shows 0%" bug (position-based mapping put the real 7d value under the
+    5h key and read the empty secondary for 7d)."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    reset_7d = int(time.time()) + 7 * 24 * 3600
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(
+            used_percent=9.0, window_minutes=10080, reset_at=reset_7d,
+        ),
+        secondary=_FakeQuotaWindow(
+            used_percent=0.0, window_minutes=0, reset_at=None,
+        ),
+    ))
+    loaded = store.current()
+    assert loaded["openai_seven_day"].utilization == pytest.approx(0.09)
+    assert loaded["openai_seven_day"].resets_at == reset_7d
+    # Empty secondary (window_minutes=0) is skipped; no 5h window exists.
+    assert "openai_five_hour" not in loaded
+
+
 def test_callback_skips_when_used_percent_missing(tmp_path: Path):
     """A window with ``used_percent=None`` (gateway omitted the
     header) — skip rather than write a misleading utilization=0."""
