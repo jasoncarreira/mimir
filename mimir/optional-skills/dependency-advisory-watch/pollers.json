@@ -5,6 +5,8 @@
       "description": "Scans root uv.lock and package-lock.json files for OSV vulnerabilities",
       "command": "python3 poller.py",
       "cron": "0 6 * * *",
+      "priority": "low",
+      "batch_size": 10,
       "pass_env": ["ROOT_DIR", "OSV_SCANNER"]
     }
   ]
