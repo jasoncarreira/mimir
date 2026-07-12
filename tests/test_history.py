@@ -127,10 +127,10 @@ async def test_assemble_activity_excludes_other_users_adjacent_replies(
     """Only assistant replies following the target user's anchor may cross channels."""
     buf = _make_buffer(tmp_path)
     for channel, kind, content, author, offset in [
-        ("general", "user_message", "bob-secret", "bob", -5),
-        ("general", "assistant_message", "reply-to-bob", None, -4),
-        ("general", "user_message", "alice-anchor", "alice", -3),
-        ("general", "assistant_message", "reply-to-alice", None, -2),
+        ("general", "user_message", "alice-anchor", "alice", -4),
+        ("general", "assistant_message", "reply-to-alice", None, -3),
+        ("general", "user_message", "bob-secret", "bob", -2),
+        ("general", "assistant_message", "reply-to-bob", None, -1),
         (target_channel, "user_message", "alice-current", "alice", 0),
     ]:
         await buf.append(buf.make_message(
