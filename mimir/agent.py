@@ -1340,6 +1340,7 @@ class Agent:
         # pre-bound so the finally releases exactly what was created.
         _typing_bridge = None
         ctx = None
+        auth_token = None
         ctx_token = None
         cid_token = None
         interactive_token = None
@@ -1401,8 +1402,14 @@ class Agent:
             # ctx.saga_calls. Without this all saga calls — pre-message
             # query, post-message feedback — were lost from the turn
             # record. The context is reset in the finally block.
+            from .models import AuthorizationContext as _AuthorizationContext
             from .models import TurnContext as _TurnContext
-            from ._context import set_current_turn, reset_current_turn
+            from ._context import (
+                set_current_authorization,
+                reset_current_authorization,
+                set_current_turn,
+                reset_current_turn,
+            )
             from .loop_detector import LoopDetector
             ctx = _TurnContext(
                 turn_id=turn_id,
@@ -1449,6 +1456,27 @@ class Agent:
                 access_control_enforced=self._config.access_control_enforced,
             )
             ctx.turn_event_emitter = emitter
+
+            identity_resolver = getattr(self, "_identity_resolver", None)
+            _resolved_principal = None
+            _resolved_roles: tuple[str, ...] = ()
+            if identity_resolver is not None and event.author:
+                _resolved_principal = identity_resolver.resolve(event.author)
+                if _resolved_principal:
+                    access_meta = identity_resolver.access_metadata(event.author)
+                    _resolved_roles = access_meta.roles
+
+            auth_ctx = _AuthorizationContext(
+                principal=_resolved_principal,
+                roles=_resolved_roles,
+                ingress_provenance=event_ingress,
+                trigger=event.trigger,
+                channel_id=event.channel_id,
+                interactivity=turn_interactivity,
+                policy_version=None,
+            )
+            auth_token = set_current_authorization(auth_ctx)
+
             # WikiBacklinksHook pre-snapshot — capture mtimes of every
             # state/wiki/ content page BEFORE the model loop runs so the
             # finalize step can tell if any wiki page was edited this turn.
@@ -1603,6 +1631,8 @@ class Agent:
             # Token guards: a setup-phase exception may land here before a
             # given token (or its importing module) was bound — release
             # only what was actually created.
+            if auth_token is not None:
+                reset_current_authorization(auth_token)
             if ctx_token is not None:
                 reset_current_turn(ctx_token)
             if interactive_token is not None:

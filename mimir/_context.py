@@ -59,10 +59,14 @@ from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .models import TurnContext
+    from .models import AuthorizationContext, TurnContext
 
 _current_turn: ContextVar["TurnContext | None"] = ContextVar(
     "mimir_current_turn", default=None
+)
+
+_current_authorization: ContextVar["AuthorizationContext | None"] = ContextVar(
+    "mimir_current_authorization", default=None
 )
 
 # Registry of active turns keyed by turn_id. Populated by ``run_turn``,
@@ -119,6 +123,18 @@ def reset_current_turn(token: Token) -> None:
 
 def get_current_turn() -> "TurnContext | None":
     return _current_turn.get()
+
+
+def set_current_authorization(ctx: "AuthorizationContext") -> Token:
+    return _current_authorization.set(ctx)
+
+
+def reset_current_authorization(token: Token) -> None:
+    _current_authorization.reset(token)
+
+
+def get_current_authorization() -> "AuthorizationContext | None":
+    return _current_authorization.get()
 
 
 def get_turn_by_session_id(session_id: str | None) -> "TurnContext | None":
@@ -231,3 +247,13 @@ def resolve_active_ctx(args: dict[str, Any]) -> tuple["TurnContext | None", str]
     if ctx is not None:
         return ctx, "contextvar"
     return None, "missing"
+
+
+def resolve_active_authorization() -> "AuthorizationContext | None":
+    """Resolve the frozen authorization context.
+
+    This is the authoritative source for authorization decisions,
+    independent of session_id heuristics or contextvar fallback.
+    Returns the currently-set AuthorizationContext or None if not set.
+    """
+    return _current_authorization.get()

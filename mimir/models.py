@@ -241,6 +241,28 @@ class SagaCallRecord:
         return out
 
 
+@dataclass(frozen=True)
+class AuthorizationContext:
+    """Frozen server-created authorization context carrying immutable authority.
+
+    Created at turn ingress (run_turn entry) and carried through every
+    tool request, MCP wrapper, subagent, and detached task WITHOUT relying
+    on model session_id, ContextVar fallback, or single-active-turn heuristics.
+
+    This context is the authoritative source for authorization decisions.
+    All mutable fields (trigger, source, resolver) must be captured at
+    context creation time — nothing mutable may be consulted after.
+    """
+
+    principal: str | None
+    roles: tuple[str, ...]
+    ingress_provenance: str | None
+    trigger: str
+    channel_id: str | None
+    interactivity: TurnInteractivity | None
+    policy_version: str | None = None
+
+
 @dataclass
 class TurnRecord:
     """One JSONL record per agent turn (SPEC §10.2)."""
