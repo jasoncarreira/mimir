@@ -340,9 +340,11 @@ If you're orienting yourself in the codebase:
 3. **[mimir/saga/\_\_init\_\_.py](./mimir/saga/__init__.py)** — memory
    backend operation surface (the module docstring is the public-API
    reference)
-4. **[docs/](./docs/)** — additional architectural notes (`docs/internal/`
-   holds historical process docs that may help when archeology is needed
-   but aren't part of the public contract)
+4. **[docs/](./docs/)** — additional architectural notes, including the
+   [Recent activity context](./docs/recent-activity-context.md) privacy and
+   cross-channel scoping contract (`docs/internal/` holds historical process
+   docs that may help when archeology is needed but aren't part of the public
+   contract)
 
 ## License
 

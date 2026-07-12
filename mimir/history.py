@@ -9,7 +9,8 @@ as open-strix. The on-disk file grows unbounded by default.
 
 ``recent_activity()`` produces the chronological merge that goes into the
 turn prompt under ``## Recent activity``: within-channel last N + cross-channel
-same-author last M (DM channels excluded from the cross pull — privacy rule).
+same-user last M with adjacent assistant replies (DM channels excluded from the
+cross pull — privacy rule).
 """
 
 from __future__ import annotations
@@ -237,7 +238,9 @@ class MessageBuffer:
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with self.history_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(msg.to_dict(), ensure_ascii=True, default=str) + "\n")
+                f.write(
+                    json.dumps(msg.to_dict(), ensure_ascii=True, default=str) + "\n"
+                )
         except OSError as exc:
             log.warning("chat_history.jsonl append failed: %s", exc)
 
@@ -275,10 +278,8 @@ class MessageBuffer:
     def recent_in_channel(self, channel_id: str, limit: int) -> list[Message]:
         """Last ``limit`` messages for exactly ``channel_id``, oldest→newest.
 
-        Unlike ``recent_for_channel`` — a cross-channel recency POOL assembled
-        for agent context — this returns only this one channel's own messages.
-        Used by the web chat history endpoint to restore a conversation when the
-        user re-opens the chat.
+        This is the web-history alias of ``recent_for_channel``. It restores a
+        conversation when the user re-opens the chat.
         """
         if limit <= 0:
             return []
@@ -297,51 +298,23 @@ class MessageBuffer:
         *,
         source_allowlist: frozenset[str] | None = None,
     ) -> list[Message]:
-        """Last ``limit`` recent messages, scoped per the Phase C
-        cross-channel-content rule (chainlink #40 / #43):
+        """Last ``limit`` messages from exactly ``channel_id``.
 
-        - **Public-channel target.** Pool is *all public channels'*
-          most-recent activity, ranked by recency. The current channel
-          contributes naturally; quiet channels are still represented
-          by their tail. Diverges from the prior "current-channel queue
-          with global fallback when empty" rule — operator-confirmed
-          dumb-recency global pool.
-        - **DM target.** Pool stays the global ``self._all`` window,
-          which the runtime still gates per-message via
-          ``_is_private_channel(msg.channel_id)`` upstream of any
-          cross-channel render. Behaviorally unchanged from before.
+        Cross-channel context is assembled separately by
+        :meth:`assemble_recent_activity`, where it can be scoped to the
+        initiating user's canonical identity. Keeping this primitive exact is
+        also the privacy boundary for DMs and contextual query rewriting.
 
-        Privacy: ``_is_private_channel(msg.channel_id)`` excludes any
-        message whose channel id is a DM when the target channel is
-        public — so a bot replying in ``#eng`` can never see its own DM
-        transcripts as "Recent activity," regardless of whether
-        ``#eng`` itself has prior history. The DM-into-public leak path
-        is closed at the source the same way it was before Phase C.
-
-        ``limit=0`` returns nothing (used to disable Recent activity in
-        benchmarks; bare slicing with ``[-0:]`` would return the full
-        list).
-
-        ``source_allowlist`` filters the candidate pool by
-        ``Message.source``. ``None`` means no filter; a frozenset means
-        "only these sources". Messages with ``source=None`` are
-        excluded when an allowlist is set.
+        ``source_allowlist`` filters by ``Message.source``. ``None`` means no
+        filter; messages with ``source=None`` are excluded when an allowlist
+        is set.
         """
         if limit <= 0:
             return []
-        if _is_private_channel(channel_id):
-            # DM target — pool is everything (its own DM + public). The
-            # runtime's outbound-render layer is responsible for any
-            # further DM-vs-public scoping.
-            pool = list(self._all)
-        else:
-            # Public target — pool is all public-channel messages, no
-            # per-channel preference. The current channel's tail will
-            # naturally dominate when it's busy; quieter peers
-            # contribute when they have recent activity.
-            pool = [
-                m for m in self._all if not _is_private_channel(m.channel_id)
-            ]
+        channel = self._by_channel.get(channel_id)
+        if not channel:
+            return []
+        pool = list(channel)
         if source_allowlist is not None:
             pool = [m for m in pool if m.source in source_allowlist]
         return pool[-limit:]
@@ -354,9 +327,11 @@ class MessageBuffer:
         limit: int,
         within_hours: int,
         source_allowlist: frozenset[str] | None = None,
+        include_private: bool = False,
     ) -> list[Message]:
         """Last ``limit`` messages by ``author`` on channels other than
-        ``exclude_channel``, within the time window. DMs always excluded.
+        ``exclude_channel``, within the time window. DMs are excluded unless
+        ``include_private`` is true for a private target.
 
         Author matching goes through the optional ``IdentityResolver``
         (FUTURE_WORK §6.1) — so ``slack-U123ABC`` and ``discord-456789``
@@ -385,7 +360,7 @@ class MessageBuffer:
                 break
             if msg.channel_id == exclude_channel:
                 continue
-            if _is_private_channel(msg.channel_id):
+            if _is_private_channel(msg.channel_id) and not include_private:
                 continue
             msg_canonical = resolve(msg.author) if resolve else msg.author
             if msg_canonical != target_canonical:
@@ -393,7 +368,9 @@ class MessageBuffer:
             if source_allowlist is not None and msg.source not in source_allowlist:
                 continue
             try:
-                msg_ts = datetime.fromisoformat(msg.ts.replace("Z", "+00:00")).timestamp()
+                msg_ts = datetime.fromisoformat(
+                    msg.ts.replace("Z", "+00:00")
+                ).timestamp()
             except (ValueError, AttributeError):
                 continue
             if msg_ts < cutoff:
@@ -403,6 +380,63 @@ class MessageBuffer:
             out.append(msg)
         out.reverse()
         return out
+
+    def cross_author_context(
+        self,
+        *,
+        author: str,
+        exclude_channel: str,
+        limit: int,
+        within_hours: int,
+        source_allowlist: frozenset[str] | None = None,
+        include_private: bool = False,
+    ) -> list[Message]:
+        """Cross-channel context anchored to ``author``'s messages.
+
+        Select the most recent ``limit`` messages written by the same
+        canonical user on other public channels, then include immediately
+        following assistant replies from those channels. This preserves enough
+        conversational context to understand an imported user message without
+        turning every public channel into one global transcript.
+        """
+        anchors = self.cross_author_messages(
+            author=author,
+            exclude_channel=exclude_channel,
+            limit=limit,
+            within_hours=within_hours,
+            source_allowlist=source_allowlist,
+            include_private=include_private,
+        )
+        if not anchors:
+            return []
+
+        anchor_ids = {id(msg) for msg in anchors}
+        selected: list[Message] = []
+        for channel_id, messages in self._by_channel.items():
+            if channel_id == exclude_channel:
+                continue
+            if _is_private_channel(channel_id) and not include_private:
+                continue
+            include_replies = False
+            for msg in messages:
+                if id(msg) in anchor_ids:
+                    selected.append(msg)
+                    include_replies = True
+                    continue
+                if msg.kind == "user_message":
+                    include_replies = False
+                    continue
+                if include_replies and msg.kind == "assistant_message":
+                    if source_allowlist is None or msg.source in source_allowlist:
+                        selected.append(msg)
+
+        def _timestamp(msg: Message) -> float:
+            try:
+                return datetime.fromisoformat(msg.ts.replace("Z", "+00:00")).timestamp()
+            except (ValueError, AttributeError):
+                return 0.0
+
+        return sorted(selected, key=_timestamp)
 
     def _resolve(self, author: str | None) -> str | None:
         """Map ``author`` through the resolver if one is wired; else return
@@ -456,20 +490,17 @@ class MessageBuffer:
             )
         cross: list[Message] = []
         if author:
-            # Cross-pull is one-directional: DM messages are excluded by
-            # ``cross_author_messages`` itself (source-side filter on
-            # ``_is_private_channel(msg.channel_id)``). The target channel
-            # being a DM does NOT block the pull — surfacing Alice's #eng
-            # context inside her private DM with the bot is just useful
-            # context, not a privacy leak. The leak would be the other
-            # direction (DM content into a public channel), and that's
-            # already prevented at the source.
-            cross = self.cross_author_messages(
+            # Public targets import only the same canonical user's public
+            # activity. Private targets may also import that same user's
+            # other DMs (for example, their Slack and Discord aliases), but
+            # never another canonical user's private conversation.
+            cross = self.cross_author_context(
                 author=author,
                 exclude_channel=channel_id,
                 limit=recent_author_cross,
                 within_hours=cross_hours,
                 source_allowlist=source_allowlist,
+                include_private=_is_private_channel(channel_id),
             )
 
         # Merge by ts (string ISO compares lexicographically).
@@ -529,8 +560,10 @@ def render_recent_activity(
         if resolver is not None and m.author and m.kind != "assistant_message":
             author = resolver.display_name(m.author)
         if not author:
-            author = m.author_display or m.author or (
-                "(assistant)" if m.kind == "assistant_message" else "(system)"
+            author = (
+                m.author_display
+                or m.author
+                or ("(assistant)" if m.kind == "assistant_message" else "(system)")
             )
         if m.kind == "assistant_message":
             author = "(assistant)"

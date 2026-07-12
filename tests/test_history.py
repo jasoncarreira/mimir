@@ -79,108 +79,110 @@ def test_deque_evicts_at_maxlen(tmp_path: Path):
     # Per-channel cap of 2 still applies to the per-channel deque…
     assert buf.total_count() == 3
     assert buf.channel_count("c1") == 2
-    # …but Phase C (chainlink #40 / #43) made ``recent_for_channel`` pull
-    # from the global pool unconditionally — the per-channel deque is no
-    # longer privileged. So a public-target lookup returns the global tail
-    # (which honors the global_max=3 cap), not just the per-channel slice.
+    # The exact-channel read honors the per-channel cap.
     contents = [m.content for m in buf.recent_for_channel("c1", 10)]
-    assert contents == ["2", "3", "4"]
+    assert contents == ["3", "4"]
 
 
 @pytest.mark.asyncio
-async def test_recent_for_channel_pulls_global_public_pool(tmp_path: Path):
-    """Phase C (chainlink #40 / #43): ``recent_for_channel`` pulls from
-    the global public-channel pool, not just the target channel's queue.
-    This previously only happened when the target channel was empty;
-    Phase C made it the default."""
+async def test_recent_for_channel_is_exactly_channel_scoped(tmp_path: Path):
     buf = _make_buffer(tmp_path)
-    msg = buf.make_message(
-        channel_id="c1", kind="user_message", content="x", author="alice"
-    )
-    await buf.append(msg)
-    out = buf.recent_for_channel("c2-empty", limit=5)
-    assert len(out) == 1
-    assert out[0].content == "x"
+    await buf.append(buf.make_message(
+        channel_id="eng", kind="user_message", content="local", author="alice",
+    ))
+    await buf.append(buf.make_message(
+        channel_id="ops", kind="user_message", content="unrelated", author="bob",
+    ))
+    assert [m.content for m in buf.recent_for_channel("eng", 10)] == ["local"]
+    assert buf.recent_for_channel("empty", 10) == []
 
 
 @pytest.mark.asyncio
-async def test_recent_for_channel_pulls_cross_channel_when_local_has_messages(
-    tmp_path: Path,
+async def test_assemble_public_activity_pulls_same_user_not_global_pool(tmp_path: Path):
+    buf = _make_buffer(tmp_path)
+    for channel, kind, content, author, offset in [
+        ("eng", "user_message", "alice-elsewhere", "alice", -3),
+        ("eng", "assistant_message", "assistant-reply", None, -2),
+        ("ops", "user_message", "bob-unrelated", "bob", -1),
+        ("help", "user_message", "alice-current", "alice", 0),
+    ]:
+        await buf.append(buf.make_message(
+            channel_id=channel, kind=kind, content=content, author=author,
+            ts=_now_iso(offset_minutes=offset),
+        ))
+    out = buf.assemble_recent_activity(
+        channel_id="help", author="alice", recent_per_channel=10,
+        recent_author_cross=10, cross_hours=24,
+    )
+    assert [m.content for m in out] == [
+        "alice-elsewhere", "assistant-reply", "alice-current",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_channel", ["help", "dm-slack-alice"])
+async def test_assemble_activity_excludes_other_users_adjacent_replies(
+    tmp_path: Path, target_channel: str,
 ):
-    """Phase C: even when the target channel has its own messages, the
-    pool now spans all public channels — quieter peers contribute when
-    their messages are recent enough to fall in the global tail."""
+    """Only assistant replies following the target user's anchor may cross channels."""
     buf = _make_buffer(tmp_path)
-    # Local channel has its own message …
-    await buf.append(
-        buf.make_message(
-            channel_id="eng", kind="user_message", content="local",
-            author="alice", ts=_now_iso(offset_minutes=-2),
-        )
+    for channel, kind, content, author, offset in [
+        ("general", "user_message", "alice-anchor", "alice", -4),
+        ("general", "assistant_message", "reply-to-alice", None, -3),
+        ("general", "user_message", "bob-secret", "bob", -2),
+        ("general", "assistant_message", "reply-to-bob", None, -1),
+        (target_channel, "user_message", "alice-current", "alice", 0),
+    ]:
+        await buf.append(buf.make_message(
+            channel_id=channel, kind=kind, content=content, author=author,
+            ts=_now_iso(offset_minutes=offset),
+        ))
+
+    out = buf.assemble_recent_activity(
+        channel_id=target_channel, author="alice", recent_per_channel=10,
+        recent_author_cross=10, cross_hours=24,
     )
-    # … and a peer public channel posted right after.
-    await buf.append(
-        buf.make_message(
-            channel_id="ops", kind="user_message", content="peer",
-            author="bob", ts=_now_iso(offset_minutes=-1),
-        )
-    )
-    out = buf.recent_for_channel("eng", limit=10)
-    contents = {m.content for m in out}
-    # Both surface — local no longer monopolises.
-    assert contents == {"local", "peer"}
+
+    assert [m.content for m in out] == [
+        "alice-anchor", "reply-to-alice", "alice-current",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_recent_for_channel_excludes_dms_for_public_target(
-    tmp_path: Path,
-):
-    """Phase C privacy guarantee: a DM channel's messages must never
-    surface in a public target's recent-activity, even when the public
-    target has no local messages of its own."""
-    buf = _make_buffer(tmp_path)
-    # Public peer message + a DM message.
-    await buf.append(
-        buf.make_message(
-            channel_id="eng", kind="user_message", content="public-msg",
-            author="alice", ts=_now_iso(offset_minutes=-2),
-        )
+async def test_assemble_public_activity_resolves_cross_platform_aliases(tmp_path: Path):
+    class Resolver:
+        def resolve(self, author):
+            return {"discord-alice": "alice", "slack-alice": "alice"}.get(author, author)
+
+    buf = MessageBuffer(history_path=tmp_path / "chat.jsonl", resolver=Resolver())
+    await buf.append(buf.make_message(
+        channel_id="discord-eng", kind="user_message", content="same-person",
+        author="discord-alice", ts=_now_iso(offset_minutes=-1),
+    ))
+    out = buf.assemble_recent_activity(
+        channel_id="slack-help", author="slack-alice", recent_per_channel=10,
+        recent_author_cross=10, cross_hours=24,
     )
-    await buf.append(
-        buf.make_message(
-            channel_id="dm-slack-bob", kind="user_message",
-            content="private-msg", author="bob",
-            ts=_now_iso(offset_minutes=-1),
-        )
-    )
-    out = buf.recent_for_channel("ops", limit=10)
-    contents = {m.content for m in out}
-    assert contents == {"public-msg"}
-    # The DM message is gone, even though its ts is more recent.
+    assert [m.content for m in out] == ["same-person"]
 
 
 @pytest.mark.asyncio
-async def test_recent_for_channel_dm_target_keeps_global_pool(tmp_path: Path):
-    """Phase C does not change DM-target behavior: the pool stays
-    ``self._all`` for a DM target. Per-message DM gating remains the
-    runtime layer's responsibility upstream of the render."""
+async def test_assemble_dm_activity_never_imports_other_users_dms(tmp_path: Path):
     buf = _make_buffer(tmp_path)
-    await buf.append(
-        buf.make_message(
-            channel_id="dm-slack-alice", kind="user_message",
-            content="dm-content", author="alice",
-        )
+    for channel, content, author, offset in [
+        ("dm-discord-alice", "alice-private", "alice", -2),
+        ("dm-discord-bob", "bob-secret", "bob", -1),
+        ("dm-slack-alice", "alice-current", "alice", 0),
+    ]:
+        await buf.append(buf.make_message(
+            channel_id=channel, kind="user_message", content=content, author=author,
+            ts=_now_iso(offset_minutes=offset),
+        ))
+    out = buf.assemble_recent_activity(
+        channel_id="dm-slack-alice", author="alice", recent_per_channel=10,
+        recent_author_cross=10, cross_hours=24,
     )
-    await buf.append(
-        buf.make_message(
-            channel_id="eng", kind="user_message",
-            content="public-content", author="bob",
-        )
-    )
-    out = buf.recent_for_channel("dm-slack-alice", limit=10)
-    contents = {m.content for m in out}
-    # DM target sees both — caller gates per-message before render.
-    assert contents == {"dm-content", "public-content"}
+    assert [m.content for m in out] == ["alice-private", "alice-current"]
 
 
 @pytest.mark.asyncio
@@ -206,32 +208,16 @@ async def test_cross_author_excludes_dms_and_current_channel(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_cross_author_skipped_for_dm_target(tmp_path: Path):
-    """A DM channel must not pull cross-channel public chatter into its prompt."""
+async def test_cross_author_excludes_dms_by_default(tmp_path: Path):
     buf = _make_buffer(tmp_path)
-    await buf.append(
-        buf.make_message(
-            channel_id="eng", kind="user_message", content="public", author="alice"
-        )
+    await buf.append(buf.make_message(
+        channel_id="dm-discord-alice", kind="user_message",
+        content="private", author="alice",
+    ))
+    out = buf.cross_author_messages(
+        author="alice", exclude_channel="dm-slack-alice", limit=5, within_hours=24,
     )
-    out = buf.assemble_recent_activity(
-        channel_id="dm-slack-alice",
-        author="alice",
-        recent_per_channel=10,
-        recent_author_cross=10,
-        cross_hours=24,
-    )
-    chans = {m.channel_id for m in out}
-    # The DM has no within-channel history; falls back to global tail (which
-    # contains the public eng message). The cross-author pull is suppressed.
-    # Verify: even though Alice posted in eng, the DM context doesn't pull
-    # her public chatter via cross-author logic.
-    # (Within-channel fallback is open-strix's exact rule and may include
-    # global messages; the privacy guarantee covers cross-author specifically.)
-    cross = buf.cross_author_messages(
-        author="alice", exclude_channel="dm-slack-alice", limit=5, within_hours=24
-    )
-    assert all(not c.channel_id.startswith("dm-") for c in cross)
+    assert out == []
 
 
 @pytest.mark.asyncio
@@ -765,8 +751,7 @@ async def test_outbound_source_none_excluded_by_allowlist(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_recent_in_channel_is_channel_scoped_and_ordered(tmp_path: Path):
-    """recent_in_channel returns ONLY that channel's messages (oldest→newest),
-    unlike recent_for_channel's cross-channel recency pool."""
+    """recent_in_channel returns only that channel, oldest to newest."""
     buf = _make_buffer(tmp_path)
     await buf.append(buf.make_message(channel_id="web-a", kind="user_message", content="a1", author="x"))
     await buf.append(buf.make_message(channel_id="web-b", kind="user_message", content="b1", author="y"))

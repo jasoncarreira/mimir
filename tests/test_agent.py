@@ -2242,6 +2242,23 @@ async def test_rewrite_context_from_buffer_maps_kind_to_role(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_rewrite_context_from_buffer_does_not_cross_channels(tmp_path: Path):
+    """Saga query rewrite receives only the active channel transcript."""
+    from mimir.agent import _rewrite_context_from_buffer
+
+    buf = MessageBuffer(history_path=tmp_path / "chat.jsonl")
+    await _seed_buffer(buf, "discord-thread-a", [
+        ("user_message", "alice", "UNRELATED_THREAD_SECRET"),
+    ])
+    await _seed_buffer(buf, "slack-thread-b", [
+        ("user_message", "bob", "What is 2+2?"),
+    ])
+    assert _rewrite_context_from_buffer(buf, "slack-thread-b") == [
+        {"role": "user", "content": "What is 2+2?"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_rewrite_context_from_buffer_drops_system_notes(tmp_path: Path):
     """``system_note`` is algedonic-signal scaffolding, not a reference
     antecedent — must not poison the rewrite context."""
