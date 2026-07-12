@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from textwrap import dedent
+from types import SimpleNamespace
+
+import pytest
 
 from mimir.access_control import (
     AccessStatus,
@@ -212,6 +216,11 @@ def test_auth_context_frozen_is_immutable(tmp_path: Path) -> None:
     assert auth_ctx.roles == ("user", "admin")
     assert auth_ctx.is_service is False
 
+    with pytest.raises(FrozenInstanceError):
+        auth_ctx.roles = ("user", "admin", "service")
+    with pytest.raises(FrozenInstanceError):
+        auth_ctx.enforcement_enabled = True
+
 
 def test_auth_context_carries_ingress_provenance(tmp_path: Path) -> None:
     """Verify AuthContext captures server-owned ingress metadata."""
@@ -260,11 +269,107 @@ def test_auth_context_service_identity(tmp_path: Path) -> None:
     assert "service" in auth_ctx.roles
 
 
-def test_auth_context_denies_forged_session_id(tmp_path: Path) -> None:
-    """Verify that forged session_ids cannot widen authority."""
-    from mimir._context import resolve_auth_context
+def test_service_only_identity_does_not_get_user_inbound_access(tmp_path: Path) -> None:
+    """Service classification alone must not widen USER-tier policy."""
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: external-service
+            aliases: [service-external]
+            access: {roles: [service], is_service: true}
+          - canonical: trusted-service-user
+            aliases: [service-trusted]
+            access: {roles: [service, user], is_service: true}
+        """,
+    )
 
-    # Create a real turn context with auth_context for alice (user only)
+    external = authorize_inbound(_event("service-external"), resolver, enforce=True)
+    trusted = authorize_inbound(_event("service-trusted"), resolver, enforce=True)
+
+    assert external.allowed is False
+    assert external.reason == DenialReason.USER_NOT_ALLOWLISTED
+    assert external.roles == ("service",)
+    assert trusted.allowed is True
+    assert trusted.status == AccessStatus.USER_ALLOWED
+    assert trusted.roles == ("service", "user")
+
+
+def _turn(turn_id: str, saga_session_id: str, auth_context: AuthContext) -> TurnContext:
+    return TurnContext(
+        turn_id=turn_id,
+        session_id=turn_id,
+        saga_session_id=saga_session_id,
+        trigger="user_message",
+        channel_id=auth_context.channel_id,
+        started_at=0.0,
+        auth_context=auth_context,
+        access_control_enforced=True,
+    )
+
+
+def _tool_request(auth_context: object | None, *, session_id: str = "forged"):
+    from langchain.agents.middleware import ToolCallRequest
+    from langgraph.runtime import Runtime
+
+    return ToolCallRequest(
+        tool_call={
+            "name": "shell_exec",
+            "args": {"command": "true", "session_id": session_id},
+            "id": "tc-auth",
+            "type": "tool_call",
+        },
+        tool=None,
+        state=None,
+        runtime=Runtime(context=auth_context),
+    )
+
+
+@pytest.mark.parametrize(
+    "malformed_carrier",
+    [
+        {},
+        object(),
+        SimpleNamespace(
+            roles=("admin",),
+            enforcement_enabled=False,
+            event_ingress=None,
+        ),
+    ],
+    ids=["empty-dict", "arbitrary-object", "auth-lookalike"],
+)
+def test_malformed_runtime_carrier_fails_closed_under_process_enforcement(
+    malformed_carrier: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only an actual AuthContext may carry authority for a tool request."""
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+    called = False
+
+    def handler(_request):
+        nonlocal called
+        called = True
+        return ToolMessage(content="ran", tool_call_id="tc-auth")
+
+    result = BudgetGateMiddleware().wrap_tool_call(
+        _tool_request(malformed_carrier), handler
+    )
+
+    assert called is False
+    assert result.status == "error"
+    assert "missing_auth_context" in str(result.content)
+
+
+def test_forged_session_id_cannot_select_concurrent_admin_turn(tmp_path: Path) -> None:
+    """Both principals are live; the request carrier, not model args, wins."""
+    import asyncio
+    from langchain_core.messages import ToolMessage
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
     resolver = _resolver(
         tmp_path,
         """
@@ -277,139 +382,165 @@ def test_auth_context_denies_forged_session_id(tmp_path: Path) -> None:
             access: {roles: [user, admin]}
         """,
     )
-
-    alice_event = _event("slack-U1")
-    alice_auth = create_auth_context(alice_event, resolver)
-
-    # Create bob's auth context
-    bob_event = AgentEvent(
-        trigger="user_message",
-        channel_id="slack-C2",
-        author="slack-U2",
-        content="hello",
+    alice = create_auth_context(_event("slack-U1"), resolver, enforce=True)
+    bob = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="slack-C2", author="slack-U2"),
+        resolver,
+        enforce=True,
     )
-    bob_auth = create_auth_context(bob_event, resolver)
+    alice_token = set_current_turn(_turn("turn-alice", "saga-alice", alice))
+    bob_token = set_current_turn(_turn("turn-bob", "saga-bob", bob))
+    called = False
 
-    # Create TurnContext for alice with her auth_context
-    from mimir.models import TurnContext
-
-    alice_turn = TurnContext(
-        turn_id="turn-alice",
-        session_id="session-alice",
-        saga_session_id="saga-session-alice",
-        trigger="user_message",
-        channel_id="slack-C1",
-        started_at=0.0,
-        auth_context=alice_auth,
-    )
-
-    # Create a DIFFERENT TurnContext for bob with his auth_context
-    # but NOT registered in _active_turns
-    bob_turn = TurnContext(
-        turn_id="turn-bob",
-        session_id="session-bob",
-        saga_session_id="saga-session-bob",
-        trigger="user_message",
-        channel_id="slack-C2",
-        started_at=0.0,
-        auth_context=bob_auth,
-    )
-
-    # Register only alice's turn
-    from mimir._context import set_current_turn, reset_current_turn
-    token = set_current_turn(alice_turn)
+    async def handler(_request):
+        nonlocal called
+        called = True
+        return ToolMessage(content="ran", tool_call_id="tc-auth")
 
     try:
-        # Try to resolve with bob's saga_session_id - should NOT return bob's auth_context
-        # because bob's turn is not registered in _active_turns
-        # The resolution should fall back to alice's active turn
-        forged_auth, path = resolve_auth_context({"session_id": "saga-session-bob"})
-        # Should get alice's context (the active turn), not bob's
-        assert forged_auth is not None
-        assert forged_auth.principal == "slack-U1"
-        # Path should be single_active (fallback to active turn)
-        assert path == "single_active"
+        result = asyncio.run(
+            BudgetGateMiddleware().awrap_tool_call(
+                _tool_request(alice, session_id="saga-bob"), handler
+            )
+        )
     finally:
-        reset_current_turn(token)
-
-
-def test_auth_context_denies_missing_carrier_under_enforcement() -> None:
-    """Verify operations are denied when auth_context is missing under enforcement."""
-    from mimir._context import resolve_auth_context, set_current_turn, reset_current_turn
-    from mimir.models import TurnContext, TurnInteractivity
-
-    # Create a TurnContext WITHOUT auth_context (legacy path)
-    turn_ctx = TurnContext(
-        turn_id="turn-1",
-        session_id="session-1",
-        trigger="user_message",
-        channel_id="slack-C1",
-        started_at=0.0,
-    )
-
-    token = set_current_turn(turn_ctx)
-    try:
-        # Under enforcement, missing auth_context should deny operations
-        auth_ctx, path = resolve_auth_context({})
-        assert auth_ctx is None
-        assert path == "missing"
-    finally:
-        reset_current_turn(token)
-
-
-def test_auth_context_denies_concurrent_turn_principal_swap(tmp_path: Path) -> None:
-    """Verify concurrent turns cannot swap principals to widen authority."""
-    from mimir._context import set_current_turn, reset_current_turn, resolve_auth_context
-    from mimir.models import TurnContext
-
-    resolver = _resolver(
-        tmp_path,
-        """
-        people:
-          - canonical: alice
-            aliases: [slack-U1]
-            access: {roles: [user]}
-          - canonical: bob
-            aliases: [slack-U2]
-            access: {roles: [user, admin]}
-        """,
-    )
-
-    # Create turn for alice (user only)
-    alice_event = _event("slack-U1")
-    alice_auth = create_auth_context(alice_event, resolver)
-
-    alice_turn = TurnContext(
-        turn_id="turn-alice",
-        session_id="session-alice",
-        trigger="user_message",
-        channel_id="slack-C1",
-        started_at=0.0,
-        auth_context=alice_auth,
-    )
-
-    # Register alice's turn
-    alice_token = set_current_turn(alice_turn)
-
-    try:
-        # Resolve alice's context using her correct session_id
-        alice_resolved, path = resolve_auth_context({"session_id": "session-alice"})
-        assert alice_resolved is not None
-        assert alice_resolved.canonical_principal == "alice"
-        assert "admin" not in alice_resolved.roles
-
-        # Try to resolve with bob's session_id while alice's turn is active
-        # This simulates trying to use another user's session to get elevated privileges
-        # The key security property: we should NOT get bob's auth context
-        # because we're looking up by session_id that exists in a DIFFERENT turn
-        # that isn't currently active in this task
-        swapped_auth, path = resolve_auth_context({"session_id": "session-bob"})
-
-        # Either returns None (no turn found with that session in this task)
-        # or returns the currently active turn's auth context
-        # It should NOT return bob's admin context
-        if swapped_auth is not None:
-            assert swapped_auth.canonical_principal == "alice", \
-                "Should not be able to swap principals via session_id"
-    finally:
+        reset_current_turn(bob_token)
         reset_current_turn(alice_token)
+
+    assert called is False
+    assert result.status == "error"
+    assert "requires an admin identity" in str(result.content)
+
+
+def test_exact_request_carrier_resists_concurrent_principal_swap(tmp_path: Path) -> None:
+    """An inherited/admin ContextVar cannot replace the user request carrier."""
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.tools.budget_gate import _auth_context_from_request
+
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+          - canonical: bob
+            aliases: [slack-U2]
+            access: {roles: [admin]}
+        """,
+    )
+    alice = create_auth_context(_event("slack-U1"), resolver, enforce=True)
+    bob = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="slack-C2", author="slack-U2"),
+        resolver,
+        enforce=True,
+    )
+    token = set_current_turn(_turn("turn-bob", "saga-bob", bob))
+    try:
+        resolved = _auth_context_from_request(_tool_request(alice))
+    finally:
+        reset_current_turn(token)
+
+    assert resolved is alice
+    assert resolved.canonical_principal == "alice"
+    assert "admin" not in resolved.roles
+
+
+def test_auth_context_ignores_mutated_resolver_and_event(tmp_path: Path) -> None:
+    """Roles/provenance remain the ingress snapshot after mutable inputs change."""
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    event = _event("slack-U1")
+    auth_context = create_auth_context(event, resolver, enforce=True)
+
+    event.author = "slack-UADMIN"
+    event.trigger = "scheduled_tick"
+    event.extra["event_ingress"] = "trusted-later"
+    (tmp_path / "state" / "identities.yaml").write_text(
+        "people:\n  - canonical: alice\n    aliases: [slack-U1]\n"
+        "    access: {roles: [user, admin]}\n",
+        encoding="utf-8",
+    )
+    resolver.reload()
+
+    assert auth_context.principal == "slack-U1"
+    assert auth_context.trigger == "user_message"
+    assert auth_context.event_ingress is None
+    assert auth_context.roles == ("user",)
+
+
+def test_detached_request_uses_explicit_carrier_not_inherited_context(tmp_path: Path) -> None:
+    """A detached task with an inherited admin turn still honors its user carrier."""
+    import asyncio
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.tools.budget_gate import _auth_context_from_request
+
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+          - canonical: bob
+            aliases: [slack-U2]
+            access: {roles: [admin]}
+        """,
+    )
+    alice = create_auth_context(_event("slack-U1"), resolver, enforce=True)
+    bob = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="slack-C2", author="slack-U2"),
+        resolver,
+        enforce=True,
+    )
+    token = set_current_turn(_turn("turn-bob", "saga-bob", bob))
+
+    async def run_detached():
+        task = asyncio.create_task(asyncio.sleep(0, result=_auth_context_from_request(_tool_request(alice))))
+        return await task
+
+    try:
+        resolved = asyncio.run(run_detached())
+    finally:
+        reset_current_turn(token)
+    assert resolved is alice
+    assert resolved.roles == ("user",)
+
+
+def test_missing_request_carrier_denies_admin_tool_under_enforcement(monkeypatch) -> None:
+    import asyncio
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    called = False
+
+    async def handler(_request):
+        nonlocal called
+        called = True
+        return ToolMessage(content="ran", tool_call_id="tc-auth")
+
+    result = asyncio.run(BudgetGateMiddleware().awrap_tool_call(_tool_request(None), handler))
+    assert called is False
+    assert result.status == "error"
+    assert "requires an admin identity" in str(result.content)
+
+
+def test_claude_sdk_hook_fails_closed_without_exact_carrier(monkeypatch) -> None:
+    """SDK built-in/MCP hooks never treat session_id or inherited turns as authz."""
+    from mimir import _langchain_claude_code_patches as patches
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    denial = patches._claude_code_pre_tool_enforcement(
+        "Bash", {"command": "true"}, "sdk-tool-1", session_id="saga-admin"
+    )
+
+    assert denial["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "missing_auth_context" in denial["hookSpecificOutput"]["permissionDecisionReason"]

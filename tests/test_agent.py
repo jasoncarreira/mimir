@@ -24,6 +24,7 @@ from typing import Any
 
 import pytest
 from langchain.agents.middleware import ToolCallRequest
+from langgraph.runtime import Runtime
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from mimir import mid_turn_injection as _mti
@@ -150,7 +151,7 @@ class _FakeAgent:
         # Echo the input + append response messages (mirrors LangGraph state).
         return {"messages": list(state.get("messages") or []) + self._response_messages}
 
-    async def astream(self, state: dict[str, Any], *, config: dict[str, Any], stream_mode: str = "values"):
+    async def astream(self, state: dict[str, Any], *, config: dict[str, Any], context=None, stream_mode: str = "values"):
         """Yield one cumulative-state chunk (matches stream_mode='values'
         semantics). Real LangGraph emits one chunk per node; for tests
         a single final yield is sufficient — the turn loop derives
@@ -173,7 +174,7 @@ class _BudgetExhaustingAgent(_FakeAgent):
         self._budget = budget
         self._denied_tools = denied_tools or ["Bash"]
 
-    async def astream(self, state: dict[str, Any], *, config: dict[str, Any], stream_mode: str = "values"):
+    async def astream(self, state: dict[str, Any], *, config: dict[str, Any], context=None, stream_mode: str = "values"):
         from mimir._context import get_current_turn
 
         _ctx = get_current_turn()
@@ -322,6 +323,7 @@ class _BoundaryFakeAgent(_FakeAgent):
         state: dict[str, Any],
         *,
         config: dict[str, Any],
+        context=None,
         stream_mode: str = "values",
     ):
         _mti._drain(config["configurable"]["channel_id"])
@@ -345,6 +347,7 @@ class _HttpEventAdminProbeAgent(_FakeAgent):
         state: dict[str, Any],
         *,
         config: dict[str, Any],
+        context=None,
         stream_mode: str = "values",
     ):
         from mimir._context import get_current_turn
@@ -374,7 +377,7 @@ class _HttpEventAdminProbeAgent(_FakeAgent):
                 },
                 tool=None,
                 state=None,
-                runtime=None,  # type: ignore[arg-type]
+                runtime=Runtime(context=context),
             ),
             _handler,
         )
@@ -595,6 +598,7 @@ async def test_run_turn_http_event_ingress_forces_non_interactive_on_bridge_user
             state: dict[str, Any],
             *,
             config: dict[str, Any],
+            context=None,
             stream_mode: str = "values",
         ):
             from mimir._context import get_current_turn
@@ -652,7 +656,7 @@ class _FoldingFakeAgent(_FakeAgent):
         super().__init__(response_messages)
         self._folded = folded
 
-    async def astream(self, state: dict[str, Any], *, config: dict[str, Any], stream_mode: str = "values"):
+    async def astream(self, state: dict[str, Any], *, config: dict[str, Any], context=None, stream_mode: str = "values"):
         ch = config["configurable"]["channel_id"]
         for ev in self._folded:
             assert _mti.inject_message(ch, ev) == "injected"
@@ -878,7 +882,7 @@ async def test_run_turn_defers_folded_message(tmp_path: Path):
     )
 
     class _DeferringFakeAgent(_FakeAgent):
-        async def astream(self, state, *, config, stream_mode="values"):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
             ch = config["configurable"]["channel_id"]
             assert _mti.inject_message(ch, folded) == "injected"
             _mti._drain(ch)                                   # fold it
@@ -1787,7 +1791,7 @@ async def test_run_turn_successful_send_suppresses_no_reply_signal(
         """Simulate a confirmed send by bumping send_message_count on the
         active turn context — exactly what the real tool does after the
         bridge reports SendResult.sent=True."""
-        async def astream(self, state, *, config, stream_mode="values"):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
             from mimir._context import get_current_turn
             _ctx = get_current_turn()
             if _ctx is not None:
@@ -1825,7 +1829,7 @@ async def test_run_turn_react_only_suppresses_no_reply_signal(tmp_path: Path):
     class _ReactingAgent(_FakeAgent):
         """Simulate a confirmed react by bumping react_count on the active turn
         context — exactly what the real react tool does on a successful react."""
-        async def astream(self, state, *, config, stream_mode="values"):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
             from mimir._context import get_current_turn
             _ctx = get_current_turn()
             if _ctx is not None:
@@ -2673,7 +2677,7 @@ async def test_run_turn_failed_event_includes_traceback_for_model_loop_errors(
     tmp_path: Path,
 ):
     class ExplodingAgent:
-        async def astream(self, state, *, config, stream_mode="values"):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
             raise UnicodeDecodeError("utf-8", b"bad \xa7", 4, 5, "invalid start byte")
             yield  # pragma: no cover - makes this an async generator
 
@@ -2713,7 +2717,7 @@ async def test_run_turn_failed_event_includes_request_summary_when_present(
             }
 
     class ExplodingAgent:
-        async def astream(self, state, *, config, stream_mode="values"):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
             raise _ErrWithSummary()
             yield  # pragma: no cover - makes this an async generator
 
@@ -3058,6 +3062,7 @@ async def test_run_turn_non_user_turn_does_not_arm_mid_turn_injection(
             state: dict[str, Any],
             *,
             config: dict[str, Any],
+            context=None,
             stream_mode: str = "values",
         ):
             self.inject_result = _mti.inject_message(
@@ -3200,7 +3205,7 @@ async def test_run_turn_cross_channel_only_delivery_still_flags(tmp_path: Path):
     from mimir.channel_registry import ChannelRegistry
 
     class _CrossChannelAgent(_FakeAgent):
-        async def astream(self, state, *, config, stream_mode="values"):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
             from mimir._context import get_current_turn
             _ctx = get_current_turn()
             if _ctx is not None:
@@ -3519,7 +3524,7 @@ async def test_run_turn_streams_tool_call_arg_deltas(tmp_path: Path):
     )
 
     class _StreamingFake:
-        async def astream(self, state, *, config, stream_mode="values"):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
             human = list(state.get("messages") or [])
             # messages-mode token chunks (tuples) — the reply args, fragmented.
             yield ("messages", (SimpleNamespace(tool_call_chunks=[

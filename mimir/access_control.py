@@ -170,7 +170,10 @@ def create_auth_context(
     event: "AgentEvent",
     resolver: "IdentityResolver | None" = None,
     policy_version: str | None = None,
-) -> "AuthContext | None":
+    *,
+    enforce: bool = False,
+    event_ingress: str | None = None,
+) -> "AuthContext":
     """Create a frozen AuthContext from an inbound event (chainlink #864).
 
     This is the server-owned authorization carrier created at ingress BEFORE
@@ -199,10 +202,15 @@ def create_auth_context(
         principal=author,
         canonical_principal=canonical,
         roles=roles,
-        event_ingress=event.extra.get("event_ingress") if isinstance(event.extra, dict) else None,
+        event_ingress=(
+            event_ingress
+            if event_ingress is not None
+            else event.extra.get("event_ingress") if isinstance(event.extra, dict) else None
+        ),
         trigger=event.trigger,
         channel_id=event.channel_id,
         interactivity=TurnInteractivity.NON_INTERACTIVE,
         policy_version=policy_version,
         is_service=is_service,
+        enforcement_enabled=enforce,
     )

@@ -79,6 +79,7 @@ class AuthContext:
     interactivity: "TurnInteractivity | None"
     policy_version: str | None = None
     is_service: bool = False
+    enforcement_enabled: bool = False
 
 
 @dataclass
@@ -153,9 +154,10 @@ class TurnContext:
     identity_resolver: Any | None = None
     access_control_enforced: bool = False
     # Frozen authorization context (chainlink #864). Created at ingress before
-    # model execution and carried through all tool requests, MCP wrappers, and
-    # subagents. Immutable - authority derives ONLY from this carrier, NOT from
-    # model session_id, ContextVar fallback, or single-active-turn heuristics.
+    # model execution and supplied as LangGraph runtime context for ordinary,
+    # built-in, and wrapped MCP tools. Immutable - authority derives ONLY from
+    # this carrier, NOT from model session_id, ContextVar fallback, or
+    # single-active-turn heuristics.
     auth_context: AuthContext | None = None
     # Number of successful send_message deliveries in this turn (incremented
     # only after the bridge confirms ``SendResult.sent``). The forgot-to-send

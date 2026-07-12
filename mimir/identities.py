@@ -116,7 +116,9 @@ class AccessMetadata:
 
     @property
     def is_authorized(self) -> bool:
-        return bool(self.roles)
+        # USER-tier inbound access must be explicit. Service metadata describes
+        # identity type; it does not make an external service a human user.
+        return "user" in self.roles or "admin" in self.roles
 
     @property
     def is_admin(self) -> bool:

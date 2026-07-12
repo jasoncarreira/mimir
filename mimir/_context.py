@@ -59,7 +59,7 @@ from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .models import AuthContext, TurnContext
+    from .models import TurnContext
 
 _current_turn: ContextVar["TurnContext | None"] = ContextVar(
     "mimir_current_turn", default=None
@@ -231,97 +231,3 @@ def resolve_active_ctx(args: dict[str, Any]) -> tuple["TurnContext | None", str]
     if ctx is not None:
         return ctx, "contextvar"
     return None, "missing"
-
-
-def get_auth_context() -> "AuthContext | None":
-    """Get the frozen AuthContext from the current turn (chainlink #864).
-
-    Returns the frozen auth_context from the active TurnContext, or None
-    if no turn is active. This is the authoritative source for authorization
-    decisions - authority derives ONLY from this carrier, NOT from:
-    - Model-passed session_id
-    - ContextVar fallback heuristics
-    - Single-active-turn heuristics
-    """
-    ctx = get_current_turn()
-    if ctx is not None:
-        return ctx.auth_context
-    return None
-
-
-def resolve_auth_context(args: dict[str, Any]) -> tuple["AuthContext | None", str]:
-    """Resolve AuthContext for tool handlers running on forked tasks (chainlink #864).
-
-    This is the secure resolution chain that does NOT trust model-passed session_id
-    or ContextVar fallback heuristics. It only returns the frozen AuthContext
-    from the TurnContext that was created at ingress.
-
-    Resolution order (strict - no fallbacks to insecure heuristics):
-    1. Look up the TurnContext by saga_session_id from args (if present)
-    2. Look up by get_only_active_turn() - but only return auth_context if present
-    3. Look up by get_current_turn() - but only return auth_context if present
-
-    Returns (auth_context, resolution_path). resolution_path is one of:
-    - "saga_session_id": resolved via saga_session_id in args
-    - "single_active": resolved via single active turn heuristic
-    - "contextvar": resolved via contextvar
-    - "missing": no valid auth_context found
-
-    IMPORTANT: Unlike resolve_active_ctx, this does NOT fall back to contextvar
-    if saga_session_id lookup fails. The key invariant is that authority
-    derives ONLY from the frozen carrier - we don't widen authority through
-    heuristics.
-    """
-    sid = args.get("session_id") if args else None
-
-    # Try to resolve via saga_session_id from args
-    if sid:
-        ctx = get_turn_by_saga_session_id(sid)
-        if ctx is not None and ctx.auth_context is not None:
-            return ctx.auth_context, "saga_session_id"
-
-    # Try to resolve via single active turn (only if we have a valid auth_context)
-    ctx = get_only_active_turn()
-    if ctx is not None and ctx.auth_context is not None:
-        return ctx.auth_context, "single_active"
-
-    # Try to resolve via contextvar (only if we have a valid auth_context)
-    ctx = get_current_turn()
-    if ctx is not None and ctx.auth_context is not None:
-        return ctx.auth_context, "contextvar"
-
-    return None, "missing"
-
-
-def require_auth_context(args: dict[str, Any], enforce: bool = False) -> "AuthContext":
-    """Resolve AuthContext or raise/deny under enforcement (chainlink #864).
-
-    This is the secure authorization check: when enforce=True, returns the
-    frozen auth_context or raises an error if not available. When enforce=False,
-    returns the auth_context if available, or None if not.
-
-    Under enforcement, operations should be denied when:
-    - No TurnContext is active
-    - The TurnContext has no auth_context
-    - The auth_context has insufficient roles
-    """
-    auth_ctx, resolution_path = resolve_auth_context(args)
-
-    if auth_ctx is not None:
-        return auth_ctx
-
-    if enforce:
-        from .models import AuthContext
-
-        # Return a denied auth context when enforcement is enabled
-        return AuthContext(
-            principal=None,
-            canonical_principal=None,
-            roles=(),
-            event_ingress=None,
-            trigger="",
-            channel_id=None,
-            interactivity=None,
-        )
-
-    return None

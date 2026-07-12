@@ -123,7 +123,7 @@ class _FakeGraph:
         self._deliver = deliver
         self.astream_calls = 0
 
-    async def astream(self, _inp, config=None, stream_mode=None):
+    async def astream(self, _inp, config=None, context=None, stream_mode=None):
         self.astream_calls += 1
         if self._deliver:
             self._ctx.delivered_channel_ids.add(self._channel)
@@ -157,7 +157,7 @@ def capture_events(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_noop_when_channel_not_allowlisted(tmp_path):
-    ctx = SimpleNamespace(delivered_channel_ids=set())
+    ctx = SimpleNamespace(delivered_channel_ids=set(), auth_context=None)
     g = _FakeGraph(ctx, "slack-1", deliver=False)
     await Agent._maybe_resend_nudge(
         _fake_self(tmp_path, channels=("discord-",)), g, {}, ctx, _event("slack-1"),
@@ -168,7 +168,7 @@ async def test_noop_when_channel_not_allowlisted(tmp_path):
 
 @pytest.mark.asyncio
 async def test_noop_when_auto_deliver_enabled_for_channel(tmp_path, capture_events):
-    ctx = SimpleNamespace(delivered_channel_ids=set())
+    ctx = SimpleNamespace(delivered_channel_ids=set(), auth_context=None)
     g = _FakeGraph(ctx, "discord-1", deliver=True)
     fake_self = _fake_self(tmp_path, channels=("discord-",))
     fake_self._config.auto_deliver_final_text_channels = ("discord-",)
@@ -193,7 +193,7 @@ async def test_noop_when_already_delivered(tmp_path):
 
 @pytest.mark.asyncio
 async def test_noop_when_not_interactive_or_no_output(tmp_path):
-    ctx = SimpleNamespace(delivered_channel_ids=set())
+    ctx = SimpleNamespace(delivered_channel_ids=set(), auth_context=None)
     g = _FakeGraph(ctx, "discord-1", deliver=False)
     # non-interactive
     await Agent._maybe_resend_nudge(
@@ -210,7 +210,7 @@ async def test_noop_when_not_interactive_or_no_output(tmp_path):
 
 @pytest.mark.asyncio
 async def test_reprompts_once_and_recovers(tmp_path, capture_events):
-    ctx = SimpleNamespace(delivered_channel_ids=set())
+    ctx = SimpleNamespace(delivered_channel_ids=set(), auth_context=None)
     g = _FakeGraph(ctx, "discord-1", deliver=True)  # the re-prompt sends
     await Agent._maybe_resend_nudge(
         _fake_self(tmp_path), g, {}, ctx, _event(),
@@ -224,7 +224,7 @@ async def test_reprompts_once_and_recovers(tmp_path, capture_events):
 
 @pytest.mark.asyncio
 async def test_reprompts_once_then_gives_up_and_logs_failed(tmp_path, capture_events):
-    ctx = SimpleNamespace(delivered_channel_ids=set())
+    ctx = SimpleNamespace(delivered_channel_ids=set(), auth_context=None)
     g = _FakeGraph(ctx, "discord-1", deliver=False)  # still doesn't send
     await Agent._maybe_resend_nudge(
         _fake_self(tmp_path), g, {}, ctx, _event(),

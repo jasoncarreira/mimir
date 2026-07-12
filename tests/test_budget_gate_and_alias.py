@@ -30,9 +30,10 @@ from typing import Any
 import pytest
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
+from langgraph.runtime import Runtime
 
-from mimir._context import reset_current_turn, set_current_turn
-from mimir.models import TurnContext
+from mimir._context import get_current_turn, reset_current_turn, set_current_turn
+from mimir.models import AuthContext, TurnContext
 from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
@@ -51,16 +52,38 @@ def _make_ctx(budget: int = 5) -> TurnContext:
     )
 
 
-def _make_request(tool_name: str = "fake_tool",
-                  tool_call_id: str = "tc-1") -> ToolCallRequest:
-    """Minimal ToolCallRequest for middleware tests. ``state`` /
-    ``runtime`` aren't read by the budget middleware so we pass
-    ``None`` for both — keeps the test surface small."""
+def _make_request(
+    tool_name: str = "fake_tool",
+    tool_call_id: str = "tc-1",
+    auth_context: AuthContext | None = None,
+) -> ToolCallRequest:
+    """Build a request with the exact frozen carrier LangGraph supplies."""
+    if auth_context is None:
+        turn = get_current_turn()
+        auth_context = getattr(turn, "auth_context", None) if turn is not None else None
     return ToolCallRequest(
         tool_call={"name": tool_name, "args": {}, "id": tool_call_id, "type": "tool_call"},
         tool=None,
         state=None,
-        runtime=None,  # type: ignore[arg-type]
+        runtime=Runtime(context=auth_context),
+    )
+
+
+def _attach_auth(ctx: TurnContext, resolver: IdentityResolver | None = None) -> None:
+    roles = ()
+    canonical = ctx.author
+    if resolver is not None and ctx.author is not None:
+        roles = resolver.access_metadata(ctx.author).roles
+        canonical = resolver.resolve(ctx.author)
+    ctx.auth_context = AuthContext(
+        principal=ctx.author,
+        canonical_principal=canonical,
+        roles=roles,
+        event_ingress=ctx.event_ingress,
+        trigger=ctx.trigger,
+        channel_id=ctx.channel_id,
+        interactivity=None,
+        enforcement_enabled=ctx.access_control_enforced,
     )
 
 
@@ -357,6 +380,7 @@ async def test_admin_sensitive_tool_denied_for_non_admin(
     ctx.author = "slack-U1"
     ctx.identity_resolver = resolver
     ctx.access_control_enforced = True
+    _attach_auth(ctx, locals().get("resolver"))
     mw = BudgetGateMiddleware()
     handler_calls = 0
 
@@ -411,6 +435,7 @@ async def test_http_event_ingress_denies_admin_tool_even_when_trigger_source_for
     ctx.author = "api-root"
     ctx.identity_resolver = resolver
     ctx.access_control_enforced = True
+    _attach_auth(ctx, locals().get("resolver"))
     mw = BudgetGateMiddleware()
     handler_calls = 0
 
@@ -463,6 +488,7 @@ async def test_http_event_ingress_denies_admin_tool_when_access_control_disabled
     ctx.author = "api-root"
     ctx.identity_resolver = resolver
     ctx.access_control_enforced = False
+    _attach_auth(ctx, locals().get("resolver"))
     mw = BudgetGateMiddleware()
     handler_calls = 0
 
@@ -489,12 +515,13 @@ async def test_http_event_ingress_denies_admin_tool_when_access_control_disabled
 
 
 @pytest.mark.asyncio
-async def test_admin_gate_allows_unstamped_internal_api_turn_when_enforced() -> None:
+async def test_admin_gate_denies_unstamped_internal_api_turn_without_admin_role() -> None:
     ctx = _make_ctx(budget=0)
     ctx.trigger = "scheduled_tick"
     ctx.channel_source = "api"
     ctx.author = None
     ctx.access_control_enforced = True
+    _attach_auth(ctx, locals().get("resolver"))
     mw = BudgetGateMiddleware()
     handler_calls = 0
 
@@ -510,12 +537,13 @@ async def test_admin_gate_allows_unstamped_internal_api_turn_when_enforced() -> 
         reset_current_turn(token)
 
     assert isinstance(out, ToolMessage)
-    assert out.content == "ran"
-    assert handler_calls == 1
+    assert out.status == "error"
+    assert "requires an admin identity" in str(out.content)
+    assert handler_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_admin_gate_uses_active_turn_resolution_when_contextvar_missing(
+async def test_admin_gate_uses_request_carrier_when_contextvar_missing(
     tmp_path: Path,
 ) -> None:
     resolver = _resolver(
@@ -531,6 +559,7 @@ async def test_admin_gate_uses_active_turn_resolution_when_contextvar_missing(
     ctx.author = "slack-U1"
     ctx.identity_resolver = resolver
     ctx.access_control_enforced = True
+    _attach_auth(ctx, locals().get("resolver"))
     mw = BudgetGateMiddleware()
     handler_calls = 0
 
@@ -542,7 +571,9 @@ async def test_admin_gate_uses_active_turn_resolution_when_contextvar_missing(
     turn_context = contextvars.Context()
     token = turn_context.run(set_current_turn, ctx)
     try:
-        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-active"), handler)
+        out = await mw.awrap_tool_call(
+            _make_request("shell_exec", "id-active", ctx.auth_context), handler
+        )
     finally:
         turn_context.run(reset_current_turn, token)
 
@@ -569,6 +600,7 @@ async def test_admin_sensitive_tool_allowed_via_canonical_discord_alias(
     ctx.author = "discord-42"
     ctx.identity_resolver = resolver
     ctx.access_control_enforced = True
+    _attach_auth(ctx, locals().get("resolver"))
     mw = BudgetGateMiddleware()
     handler_calls = 0
 
@@ -603,6 +635,7 @@ async def test_read_only_tool_remains_available_to_non_admin(tmp_path: Path) -> 
     ctx.author = "slack-U1"
     ctx.identity_resolver = resolver
     ctx.access_control_enforced = True
+    _attach_auth(ctx, locals().get("resolver"))
     mw = BudgetGateMiddleware()
     handler_calls = 0
 
@@ -655,11 +688,12 @@ async def test_middleware_catches_unregistered_tools():
 
 
 @pytest.mark.asyncio
-async def test_admin_gate_allows_authorless_system_turns_when_enforced() -> None:
+async def test_admin_gate_denies_authorless_system_turn_without_admin_role() -> None:
     ctx = _make_ctx(budget=0)
     ctx.trigger = "scheduled_tick"
     ctx.author = None
     ctx.access_control_enforced = True
+    _attach_auth(ctx, locals().get("resolver"))
     mw = BudgetGateMiddleware()
     handler_calls = 0
 
@@ -675,16 +709,18 @@ async def test_admin_gate_allows_authorless_system_turns_when_enforced() -> None
         reset_current_turn(token)
 
     assert isinstance(out, ToolMessage)
-    assert out.content == "ran"
-    assert handler_calls == 1
+    assert out.status == "error"
+    assert "requires an admin identity" in str(out.content)
+    assert handler_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_admin_gate_allows_trusted_web_user_message_without_author() -> None:
+async def test_admin_gate_denies_web_source_without_admin_role() -> None:
     ctx = _make_ctx(budget=0)
     ctx.channel_source = "web"
     ctx.author = None
     ctx.access_control_enforced = True
+    _attach_auth(ctx, locals().get("resolver"))
     mw = BudgetGateMiddleware()
     handler_calls = 0
 
@@ -700,8 +736,9 @@ async def test_admin_gate_allows_trusted_web_user_message_without_author() -> No
         reset_current_turn(token)
 
     assert isinstance(out, ToolMessage)
-    assert out.content == "ran"
-    assert handler_calls == 1
+    assert out.status == "error"
+    assert "requires an admin identity" in str(out.content)
+    assert handler_calls == 0
 
 
 @pytest.mark.asyncio
@@ -719,6 +756,7 @@ async def test_admin_gate_denies_write_file_for_non_admin(tmp_path: Path) -> Non
     ctx.author = "slack-U1"
     ctx.identity_resolver = resolver
     ctx.access_control_enforced = True
+    _attach_auth(ctx, locals().get("resolver"))
     mw = BudgetGateMiddleware()
     handler_calls = 0
 
@@ -762,14 +800,14 @@ async def test_admin_gate_denies_sensitive_tool_when_enforced_context_missing(
 
     assert isinstance(out, ToolMessage)
     assert out.status == "error"
-    assert "requires an admin identity (missing_turn_context)" in str(out.content)
+    assert "requires an admin identity (missing_auth_context)" in str(out.content)
     assert handler_calls == 0
     assert ("admin_tool_call_denied", {
         "tool": "shell_exec",
         "allowed": False,
         "status": "denied",
         "required_tier": "admin",
-        "denial_reason": "missing_turn_context",
+        "denial_reason": "missing_auth_context",
         "author": None,
         "canonical_author": None,
         "roles": [],
