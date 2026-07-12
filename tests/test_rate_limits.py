@@ -374,6 +374,35 @@ async def test_record_supports_multiple_types(tmp_path: Path):
     assert set(body.keys()) == {"five_hour", "seven_day_opus"}
 
 
+def test_reconcile_sync_drops_absent_owned_keys_and_spares_others(tmp_path: Path):
+    """``reconcile_sync`` writes the reported updates, drops owned keys the
+    update omitted (in one atomic write), and never touches keys outside the
+    owned set — so a co-resident provider's window survives."""
+    path = tmp_path / "rate_limits.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = int(time.time())
+    # Pre-state: a stale owned 5h key, plus a foreign (non-owned) key.
+    path.write_text(json.dumps({
+        "openai_five_hour": {"status": "allowed", "utilization": 0.09,
+                             "resets_at": now + 7 * 86400, "observed_at": "x"},
+        "anthropic_ignore_me": {"status": "allowed", "utilization": 0.5,
+                                "resets_at": now + 3600, "observed_at": "x"},
+    }))
+    store = RateLimitStore(path=path)
+    store.reconcile_sync(
+        {"openai_seven_day": RateLimitSnapshot(
+            status="allowed", utilization=0.09, resets_at=now + 7 * 86400)},
+        owned_keys=("openai_five_hour", "openai_seven_day"),
+    )
+    body = json.loads(path.read_text())
+    # Owned key present in the update is written.
+    assert body["openai_seven_day"]["utilization"] == 0.09
+    # Owned key absent from the update is removed (not merely staleness-hidden).
+    assert "openai_five_hour" not in body
+    # Non-owned key is untouched.
+    assert body["anthropic_ignore_me"]["utilization"] == 0.5
+
+
 def test_current_drops_stale_windows(tmp_path: Path):
     """Entries past resets_at are no longer relevant — drop them so
     the prompt doesn't show last-week's data."""

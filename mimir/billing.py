@@ -54,7 +54,7 @@ from .rate_limits import (
 # the agent's Resource-usage view (rate_limits.py) also reads. The provider
 # classes below derive their window-hours from it instead of each carrying
 # a duplicate literal dict.
-from .quota_windows import ANTHROPIC, CODEX_PLUS, MINIMAX
+from .quota_windows import ANTHROPIC, CODEX_PLUS, MINIMAX, provider_store_keys
 
 log = logging.getLogger(__name__)
 
@@ -420,41 +420,58 @@ def make_codex_plus_rate_limit_callback(
         # ``codex_plus_usage_ok`` event at the end — same shape as
         # ``minimax_usage_ok`` / ``oauth_usage_ok`` so ``usage_history``
         # treats all three providers uniformly.
+        # Route each window to its store key by WINDOW LENGTH, not by
+        # primary/secondary position. The Codex backend does not fix the
+        # position: on a Plus plan primary=5h + secondary=7d, but on a Pro plan
+        # the single window is the 7d one reported as PRIMARY (window_minutes
+        # 10080) with an empty secondary. Position-based mapping put the real
+        # 7d usage under the 5h key and left the 7d panel reading the empty
+        # secondary → a false 0%. Classify by window_minutes instead: >= 1 day
+        # is the long (7d) window, shorter is the 5h window. An empty window
+        # (window_minutes == 0) is skipped; unknown length (None) falls back to
+        # positional so Plus behavior is unchanged.
         recorded: dict[str, dict[str, Any]] = {}
-        primary = getattr(rl, "primary", None)
-        if primary is not None and primary.used_percent is not None:
-            util = float(primary.used_percent) / 100.0
-            store.record_sync(
-                "openai_five_hour",
-                RateLimitSnapshot(
-                    status="allowed",
-                    utilization=util,
-                    resets_at=primary.reset_at,
-                    observed_at=observed_at,
-                ),
+        updates: dict[str, RateLimitSnapshot] = {}
+        for window, positional_key, positional_short in (
+            (getattr(rl, "primary", None), "openai_five_hour", "five_hour"),
+            (getattr(rl, "secondary", None), "openai_seven_day", "seven_day"),
+        ):
+            if window is None or window.used_percent is None:
+                continue
+            minutes = getattr(window, "window_minutes", None)
+            if minutes == 0:
+                continue  # empty/absent window (e.g. Pro plan's unused secondary)
+            if minutes is None:
+                store_key, short = positional_key, positional_short
+            elif minutes >= 1440:  # >= 1 day → the long (weekly/7d) window
+                store_key, short = "openai_seven_day", "seven_day"
+            else:
+                store_key, short = "openai_five_hour", "five_hour"
+            util = float(window.used_percent) / 100.0
+            updates[store_key] = RateLimitSnapshot(
+                status="allowed",
+                utilization=util,
+                resets_at=window.reset_at,
+                observed_at=observed_at,
             )
-            recorded["five_hour"] = {
+            recorded[short] = {
                 "utilization": util,
-                "resets_at": primary.reset_at,
+                "resets_at": window.reset_at,
                 "status": "allowed",
             }
-        secondary = getattr(rl, "secondary", None)
-        if secondary is not None and secondary.used_percent is not None:
-            util = float(secondary.used_percent) / 100.0
-            store.record_sync(
-                "openai_seven_day",
-                RateLimitSnapshot(
-                    status="allowed",
-                    utilization=util,
-                    resets_at=secondary.reset_at,
-                    observed_at=observed_at,
-                ),
+        # Write the reported windows AND drop any Codex-owned key the snapshot
+        # did NOT report this round, in one atomic write (chainlink #874). On a
+        # Pro plan the callback reports only the 7d window; an older
+        # position-based mapper had already stored that 7d usage under
+        # ``openai_five_hour`` with the 7-day reset, so ``current()`` (which
+        # drops only by reset time) would keep that phantom 5h bucket live for
+        # up to a week. Reconciling removes the absent key in the same write.
+        # Guard on ``updates`` so a response carrying no usable window never
+        # blanks the panel.
+        if updates:
+            store.reconcile_sync(
+                updates, owned_keys=provider_store_keys(CODEX_PLUS.provider)
             )
-            recorded["seven_day"] = {
-                "utilization": util,
-                "resets_at": secondary.reset_at,
-                "status": "allowed",
-            }
         # Emit one event per response so the ops dashboard can build
         # a time series. Best-effort — log_event_sync's OSError path
         # already swallows file IO errors at WARN; we belt-and-suspender
