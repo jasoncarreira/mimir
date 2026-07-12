@@ -415,10 +415,12 @@ def _claude_code_pre_tool_enforcement(
 
     # Budget accounting still uses TurnContext bookkeeping. It is not an
     # authorization decision; the exact frozen carrier above is the sole authz
-    # source. ContextVar lookup remains acceptable for this non-authority counter.
-    from ._context import get_current_turn
+    # source. The SDK session id may therefore recover only this non-authority
+    # counter when the hook callback runs in a task without the turn ContextVar.
+    from ._context import get_current_turn, get_turn_by_session_id
 
-    denial = _check_and_increment_or_deny(tool_name, get_current_turn())
+    budget_ctx = get_current_turn() or get_turn_by_session_id(session_id)
+    denial = _check_and_increment_or_deny(tool_name, budget_ctx)
     if denial is not None:
         _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
         _record_claude_code_tool_result_denial(tool_name, tool_use_id, denial)
