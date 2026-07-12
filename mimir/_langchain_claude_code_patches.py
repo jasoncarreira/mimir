@@ -378,11 +378,13 @@ def _claude_code_pre_tool_enforcement(
         _emit_tool_call_sync,
     )
     from .tools.prohibited_action_guard import check_prohibited_bash, is_bash_tool
-    from ._context import get_current_turn, get_turn_by_session_id
-
-    ctx = get_current_turn() or get_turn_by_session_id(session_id)
-
-    admin_denial = _check_admin_authorized(tool_name, ctx)
+    # The SDK hook API does not expose LangGraph Runtime.context, and its
+    # callback task may be detached. Never substitute SDK/model session_id,
+    # active-turn registries, or inherited ContextVars as authorization. Under
+    # enforcement this missing exact carrier fails closed; in unenforced legacy
+    # mode behavior remains open. Adapter-level carrier plumbing is follow-up
+    # work before Claude SDK admin tools can be enabled under enforcement.
+    admin_denial = _check_admin_authorized(tool_name, None)
     if admin_denial is not None:
         _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
         _record_claude_code_tool_result_denial(tool_name, tool_use_id, admin_denial)
@@ -411,7 +413,14 @@ def _claude_code_pre_tool_enforcement(
                 )
                 return _claude_code_permission_denial(prohibition)
 
-    denial = _check_and_increment_or_deny(tool_name, ctx)
+    # Budget accounting still uses TurnContext bookkeeping. It is not an
+    # authorization decision; the exact frozen carrier above is the sole authz
+    # source. The SDK session id may therefore recover only this non-authority
+    # counter when the hook callback runs in a task without the turn ContextVar.
+    from ._context import get_current_turn, get_turn_by_session_id
+
+    budget_ctx = get_current_turn() or get_turn_by_session_id(session_id)
+    denial = _check_and_increment_or_deny(tool_name, budget_ctx)
     if denial is not None:
         _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
         _record_claude_code_tool_result_denial(tool_name, tool_use_id, denial)

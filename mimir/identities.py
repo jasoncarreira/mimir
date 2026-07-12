@@ -106,20 +106,26 @@ class AccessMetadata:
     """
 
     roles: tuple[str, ...] = ()
+    is_service: bool = False
 
     def as_dict(self) -> dict[str, object]:
-        return {"roles": list(self.roles)}
+        out = {"roles": list(self.roles)}
+        if self.is_service:
+            out["is_service"] = True
+        return out
 
     @property
     def is_authorized(self) -> bool:
-        return bool(self.roles)
+        # USER-tier inbound access must be explicit. Service metadata describes
+        # identity type; it does not make an external service a human user.
+        return "user" in self.roles or "admin" in self.roles
 
     @property
     def is_admin(self) -> bool:
         return "admin" in self.roles
 
 
-_KNOWN_ACCESS_VALUES = {"user", "admin"}
+_KNOWN_ACCESS_VALUES = {"user", "admin", "service"}
 
 
 @dataclass
@@ -236,7 +242,13 @@ class IdentityResolver:
             )
             return AccessMetadata()
 
-        return AccessMetadata(roles=tuple(roles))
+        # Parse is_service flag (chainlink #864)
+        is_service = False
+        raw_is_service = raw.get("is_service")
+        if isinstance(raw_is_service, bool):
+            is_service = raw_is_service
+
+        return AccessMetadata(roles=tuple(roles), is_service=is_service)
 
     def reload(self) -> int:
         """Re-read the YAML file. Returns the number of aliases loaded.

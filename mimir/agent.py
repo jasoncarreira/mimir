@@ -68,7 +68,8 @@ from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
 from ._jsonl_tail import tail_jsonl_records
 from .jsonl_snapshot import JsonlSnapshot
-from .models import AgentEvent, TurnInteractivity, TurnRecord
+from .models import AgentEvent, AuthContext, TurnInteractivity, TurnRecord
+from .access_control import create_auth_context
 from .prompts import build_system_prompt, build_turn_prompt
 from .rate_limits import RateLimitStore
 from .saga_client import SagaClient
@@ -1295,6 +1296,7 @@ class Agent:
                 skills=skill_sources or None,
                 middleware=self._agent_middleware,
                 subagents=build_mimir_subagents(),
+                context_schema=AuthContext,
             )
             self._cached_system_prompt = system_prompt
             self._cached_skill_catalog_fingerprint = skill_catalog_fingerprint
@@ -1404,6 +1406,22 @@ class Agent:
             from .models import TurnContext as _TurnContext
             from ._context import set_current_turn, reset_current_turn
             from .loop_detector import LoopDetector
+            # Create the frozen AuthContext at ingress BEFORE model execution.
+            # This carrier is immutable - authority derives ONLY from this carrier,
+            # NOT from model session_id, ContextVar fallback, or single-active-turn
+            # heuristics. LangGraph carries it through ordinary, built-in, and
+            # wrapped MCP tool requests; Claude SDK hooks fail closed while their
+            # API lacks an exact runtime carrier (chainlink #864).
+            auth_ctx = create_auth_context(
+                event,
+                getattr(self, "_identity_resolver", None),
+                policy_version=getattr(self._config, "policy_version", None),
+                enforce=self._config.access_control_enforced,
+                event_ingress=event_ingress,
+            )
+            # Update auth_ctx with the actual interactivity classification
+            if auth_ctx is not None:
+                auth_ctx = replace(auth_ctx, interactivity=turn_interactivity)
             ctx = _TurnContext(
                 turn_id=turn_id,
                 session_id=session_id,
@@ -1447,6 +1465,8 @@ class Agent:
                 author=event.author,
                 identity_resolver=getattr(self, "_identity_resolver", None),
                 access_control_enforced=self._config.access_control_enforced,
+                # Frozen authorization context (chainlink #864).
+                auth_context=auth_ctx,
             )
             ctx.turn_event_emitter = emitter
             # WikiBacklinksHook pre-snapshot — capture mtimes of every
@@ -1826,6 +1846,7 @@ class Agent:
             async for chunk in agent.astream(
                 {"messages": [HumanMessage(content=build_nudge_text(event.channel_id, count))]},
                 config=invoke_config,
+                context=ctx.auth_context,
                 stream_mode="values",
             ):
                 messages = list(chunk.get("messages", []))
@@ -2150,6 +2171,7 @@ class Agent:
                 async for item in agent.astream(
                     {"messages": [HumanMessage(content=turn_prompt)]},
                     config=invoke_config,
+                    context=ctx.auth_context,
                     stream_mode=["values", "messages"],
                 ):
                     if isinstance(item, tuple) and len(item) == 2:

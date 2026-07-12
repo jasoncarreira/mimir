@@ -16,7 +16,7 @@ from .identities import AccessMetadata
 
 if TYPE_CHECKING:
     from .identities import IdentityResolver
-    from .models import AgentEvent
+    from .models import AgentEvent, AuthContext
 
 
 class AccessTier(StrEnum):
@@ -164,3 +164,53 @@ def authorize_action(
     """
     tier = AccessTier.ADMIN if admin else AccessTier.USER
     return authorize(event_or_author, resolver, required_tier=tier, enforce=enforce)
+
+
+def create_auth_context(
+    event: "AgentEvent",
+    resolver: "IdentityResolver | None" = None,
+    policy_version: str | None = None,
+    *,
+    enforce: bool = False,
+    event_ingress: str | None = None,
+) -> "AuthContext":
+    """Create a frozen AuthContext from an inbound event (chainlink #864).
+
+    This is the server-owned authorization carrier created at ingress BEFORE
+    model execution. It carries immutable authorization state that cannot be
+    widened or mutated by the model, tools, or downstream handlers.
+
+    Authority is derived ONLY from this carrier - NOT from:
+    - Model-passed session_id
+    - ContextVar fallback heuristics
+    - Single-active-turn heuristics
+    """
+    from .models import AuthContext, TurnInteractivity
+
+    author = event.author
+    canonical = None
+    roles: tuple[str, ...] = ()
+    is_service = False
+
+    if author is not None and resolver is not None:
+        canonical = resolver.resolve(author)
+        access = resolver.access_metadata(author)
+        roles = access.roles
+        is_service = access.is_service
+
+    return AuthContext(
+        principal=author,
+        canonical_principal=canonical,
+        roles=roles,
+        event_ingress=(
+            event_ingress
+            if event_ingress is not None
+            else event.extra.get("event_ingress") if isinstance(event.extra, dict) else None
+        ),
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        policy_version=policy_version,
+        is_service=is_service,
+        enforcement_enabled=enforce,
+    )

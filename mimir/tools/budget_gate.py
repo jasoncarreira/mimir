@@ -45,7 +45,7 @@ from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
-from ..access_control import authorize_action
+from ..models import AuthContext
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
@@ -87,11 +87,19 @@ _ADMIN_TOOL_NAMES = frozenset(
     }
 )
 
-# Same trusted-source carve-out as dispatcher._authorize_bridge_event: these
-# sources are authenticated by their entrypoint rather than by a platform author
-# id. Non-user-message turns are likewise system/scheduler/poller work admitted
-# without an external author and must retain admin-tool access in enforced mode.
-_ADMIN_TRUSTED_INTERNAL_SOURCES = frozenset({"web", "api", "stdin"})
+def _auth_context_from_request(request: ToolCallRequest) -> AuthContext | None:
+    """Return the exact graph invocation's valid server-created auth carrier.
+
+    LangGraph constructs ``ToolCallRequest.runtime`` for the tool request being
+    executed.  Do not fall back to model arguments, active-turn registries, or
+    ContextVars here: none of those identify this exact request. Malformed
+    non-``None`` carriers are treated as missing so process-level enforcement
+    fails closed rather than trusting arbitrary lookalike objects.
+    """
+    runtime = getattr(request, "runtime", None)
+    context = getattr(runtime, "context", None) if runtime is not None else None
+    return context if isinstance(context, AuthContext) else None
+
 
 _ADMIN_BUILTIN_TOOL_NAMES = frozenset(
     {
@@ -259,23 +267,6 @@ def _env_access_control_enforced() -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
-def _resolve_admin_ctx(ctx: Any | None) -> Any | None:
-    if ctx is not None:
-        return ctx
-    from .._context import resolve_active_ctx
-
-    resolved, _resolution_path = resolve_active_ctx({})
-    return resolved
-
-
-def _turn_has_internal_admin_authority(ctx: Any) -> bool:
-    trigger = (getattr(ctx, "trigger", None) or "").strip()
-    if trigger != "user_message":
-        return True
-    source = (getattr(ctx, "channel_source", None) or "").strip().lower()
-    return source in _ADMIN_TRUSTED_INTERNAL_SOURCES
-
-
 def _turn_has_http_event_ingress(ctx: Any) -> bool:
     ingress = getattr(ctx, "event_ingress", None)
     return isinstance(ingress, str) and ingress.strip() == HTTP_EVENT_INGRESS_EXTRA_VALUE
@@ -284,13 +275,12 @@ def _turn_has_http_event_ingress(ctx: Any) -> bool:
 def _admin_identity_fields(ctx: Any | None) -> tuple[str | None, str | None, list[str]]:
     if ctx is None:
         return None, None, []
-    decision = authorize_action(
-        getattr(ctx, "author", None),
-        getattr(ctx, "identity_resolver", None),
-        admin=True,
-        enforce=True,
+
+    return (
+        getattr(ctx, "principal", None),
+        getattr(ctx, "canonical_principal", None),
+        list(getattr(ctx, "roles", ()) or ()),
     )
-    return decision.author, decision.canonical_author, list(decision.roles)
 
 
 def _deny_admin_tool(
@@ -328,39 +318,34 @@ def _check_admin_authorized(tool_name: str, ctx: Any | None = None) -> str | Non
     if not _is_admin_sensitive_tool(tool_name):
         return None
 
-    ctx = _resolve_admin_ctx(ctx)
     if ctx is None:
         if _env_access_control_enforced():
             return _deny_admin_tool(
                 tool_name,
-                "missing_turn_context",
+                "missing_auth_context",
                 ctx=None,
                 enforcement_enabled=True,
             )
         return None
+
+    # ``ctx`` is the frozen AuthContext bound to this exact tool request (or,
+    # on the Claude SDK path, the exact model invocation). Mutable TurnContext
+    # fields and identity resolvers are deliberately not consulted here.
+    enforce = bool(getattr(ctx, "enforcement_enabled", False))
     if _turn_has_http_event_ingress(ctx):
         return _deny_admin_tool(
             tool_name,
             _HTTP_EVENT_ADMIN_DENIAL_REASON,
             ctx=ctx,
-            enforcement_enabled=bool(getattr(ctx, "access_control_enforced", False)),
+            enforcement_enabled=enforce,
         )
-    enforce = bool(getattr(ctx, "access_control_enforced", False))
     if not enforce:
         return None
-    if _turn_has_internal_admin_authority(ctx):
-        return None
-    decision = authorize_action(
-        getattr(ctx, "author", None),
-        getattr(ctx, "identity_resolver", None),
-        admin=True,
-        enforce=True,
-    )
-    if decision.allowed:
+    if "admin" in (getattr(ctx, "roles", ()) or ()):
         return None
     return _deny_admin_tool(
         tool_name,
-        decision.denial_reason or "admin_required",
+        "admin_required",
         ctx=ctx,
         enforcement_enabled=True,
     )
@@ -420,9 +405,11 @@ def _check_prohibited(tool_name: str, request: "ToolCallRequest") -> str | None:
 
 
 class BudgetGateMiddleware(AgentMiddleware):
-    """Intercept every tool call (built-in or registered) for per-turn
-    budget enforcement. Pairs with ``TurnContext.tool_call_budget`` /
-    ``tool_call_count`` set by ``agent.run_turn``.
+    """Intercept model and tool calls at their exact LangGraph boundaries.
+
+    Ordinary, built-in, and LangGraph-wrapped MCP tools authorize from
+    ``ToolCallRequest.runtime.context``. Claude SDK tools have no exact carrier
+    in the current hook API and therefore fail closed under enforcement.
     """
 
     def wrap_tool_call(
@@ -432,7 +419,9 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
 
-        admin_denial = _check_admin_authorized(tool_name)
+        admin_denial = _check_admin_authorized(
+            tool_name, _auth_context_from_request(request)
+        )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
             return ToolMessage(
@@ -498,7 +487,9 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
 
-        admin_denial = _check_admin_authorized(tool_name)
+        admin_denial = _check_admin_authorized(
+            tool_name, _auth_context_from_request(request)
+        )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
             return ToolMessage(
