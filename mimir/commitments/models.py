@@ -131,6 +131,19 @@ EVENT_TO_TARGET_STATUS: dict[str, str] = {
 DEFAULT_SNOOZE_WINDOW_SECS = 7 * 86400
 
 
+class CommitmentVisibility(str, Enum):
+    """Visibility level for commitment ownership.
+
+    PUBLIC     — visible to all users, readable/writable by service
+    SERVICE    — service-owned, admin-only access
+    PRIVATE    — owner-only access (not yet enforced at storage layer)
+    """
+
+    PUBLIC = "public"
+    SERVICE = "service"
+    PRIVATE = "private"
+
+
 @dataclass
 class CommitmentRecord:
     """Replayed current state of a commitment. The store's append-only
@@ -155,14 +168,27 @@ class CommitmentRecord:
       fires, the surfacing layer @-mentions ``recipient_identity`` so
       the right person sees it. Resolved via ``identities.py`` at
       extraction time.
+    - ``owner_principal``: the principal (user/service) that owns this
+      commitment. Used for authorization and owner-inclusive dedupe.
+      For extracted commitments, this is the agent's owner. For CLI-added,
+      this is the operator.
+    - ``recipient_principal``: the principal this commitment is addressed
+      to. Distinct from ``recipient_identity`` (display name) — this is
+      the resolved principal identifier. Does NOT grant mutation authority.
+    - ``originating_channel``: the channel where the commitment originated.
+      May differ from ``channel_id`` for migrated/replayed records.
+    - ``visibility``: commitment visibility level (public/service/private).
+      Controls access patterns; service visibility for legacy/ambiguous.
+    - ``service_name``: name of service if service-owned commitment.
     - ``text``: natural-language description of the obligation,
       ≤120 chars by convention.
     - ``suggested_reminder``: what to say at delivery, ≤200 chars.
     - ``due_window_start_unix`` / ``due_window_end_unix``: range over
       which delivery is allowed. ``None`` = no time anchor (surface at
       every session boundary until resolved).
-    - ``dedupe_key``: hash of (channel_id, normalized_text, due-day) so
-      re-extraction of the same commitment is idempotent.
+    - ``dedupe_key``: hash of (owner_principal, channel_id, normalized_text,
+      due-day) so re-extraction of the same commitment is idempotent
+      and owner-specific.
     - ``confidence``: extractor confidence 0-1 (1.0 for manually-added
       commitments).
     - ``attempts``: number of delivery attempts (incremented by deliver).
@@ -174,17 +200,14 @@ class CommitmentRecord:
     kind: str = CommitmentKind.OPEN_LOOP.value
     sensitivity: str = CommitmentSensitivity.ROUTINE.value
     recipient_identity: str | None = None
+    owner_principal: str | None = None
+    recipient_principal: str | None = None
+    originating_channel: str | None = None
+    visibility: str = CommitmentVisibility.PUBLIC.value
+    service_name: str | None = None
     suggested_reminder: str = ""
     due_window_start_unix: float | None = None
     due_window_end_unix: float | None = None
-    # PR #125 review #4: natural-language time anchor as the LLM
-    # extracted it ("Thursday", "next sprint", "tomorrow", "once #108
-    # merges"). Phase 2b's due-check poller fires on unix-second
-    # windows; this preserves the operator-facing phrasing so Phase 3
-    # surfacing can render "remind me about X (Thursday)" verbatim
-    # and so a future hint-to-unix parser has the raw source available.
-    # ``None`` when the LLM extractor omitted the field OR the operator
-    # added the commitment manually without a hint.
     due_window_hint: str | None = None
     status: str = CommitmentStatus.PENDING.value
     created_at_unix: float = 0.0
@@ -194,20 +217,7 @@ class CommitmentRecord:
     snoozed_until_unix: float | None = None
     expired_at_unix: float | None = None
     attempts: int = 0
-    # Phase 2b: snooze counter. Replay increments on each
-    # ``commitment_snoozed`` event. The poller emits a
-    # ``commitment_snooze_pileup`` algedonic signal when this crosses
-    # the threshold (default 3, operator-tunable). Surfaces "the agent
-    # keeps punting this commitment" as a feedback signal at the next
-    # session boundary's synthesis — overcommitment / avoidance smell.
     snooze_count: int = 0
-    # PR #126 review #2: 24h cooldown for the snooze-pileup alarm.
-    # Without this, the poller emits a fresh
-    # ``commitment_snooze_pileup`` event every 5-min tick per
-    # above-threshold record — 6k+ rows/week/chronic in events.jsonl.
-    # Set by the ``commitment_pileup_alarmed`` lifecycle event; the
-    # poller skips emission until ``now - this > 86400``. ``None`` =
-    # never alarmed (eligible for first emission immediately).
     pileup_alarmed_at_unix: float | None = None
     confidence: float = 1.0
     dedupe_key: str = ""
@@ -216,12 +226,6 @@ class CommitmentRecord:
     completion_message_id: str | None = None
     dismiss_reason: str | None = None
     snooze_reason: str | None = None
-    # PR #125 review #1: which extraction prompt version produced this
-    # record. ``None`` for operator-added (CLI) records; set to the
-    # extractor's ``EXTRACTION_PROMPT_VERSION`` constant for
-    # LLM-extracted records. Lets a future backtest filter "all v3-
-    # extracted records before T" against "all v4-extracted after T"
-    # for side-by-side precision/recall comparison.
     extraction_prompt_version: str | None = None
 
     def is_terminal(self) -> bool:
@@ -250,10 +254,14 @@ def make_dedupe_key(
     text: str,
     due_window_start_unix: float | None,
     recipient_identity: str | None = None,
+    owner_principal: str | None = None,
 ) -> str:
     """Stable hash used to detect when the same commitment is extracted
-    twice. Same channel + recipient + normalized text + same due-day →
-    same key.
+    twice. Same owner + channel + recipient + normalized text + same due-day
+    → same key.
+
+    Including ``owner_principal`` ensures different owners cannot dedupe
+    together — each user's commitments are independent.
 
     Including ``recipient_identity`` means "remind Alice about X" and
     "remind Bob about X" in the same channel are distinct commitments
@@ -271,7 +279,7 @@ def make_dedupe_key(
     else:
         day_bucket = str(int(due_window_start_unix // 86400))
     payload = (
-        f"{channel_id or ''}|{recipient_identity or ''}|"
+        f"{owner_principal or ''}|{channel_id or ''}|{recipient_identity or ''}|"
         f"{text_norm}|{day_bucket}"
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

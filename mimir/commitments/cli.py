@@ -29,6 +29,7 @@ from .models import (
     CommitmentRecord,
     CommitmentSensitivity,
     CommitmentStatus,
+    CommitmentVisibility,
     make_commitment_id,
 )
 from .store import CommitmentsStore
@@ -95,6 +96,14 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
                  "dismissed", "snoozed", "expired", "all"],
         help='Filter by status. "all" disables status filter.',
     )
+    list_p.add_argument(
+        "--owner", type=str, default=None,
+        help="Filter by owner principal.",
+    )
+    list_p.add_argument(
+        "--include-service", action="store_true",
+        help="Include service-owned commitments (admin only).",
+    )
 
     add_p = sub.add_parser(
         "add", help="Manually create a commitment (operator entry).",
@@ -106,6 +115,24 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
         help="Canonical identity the commitment is for (resolves via "
              "identities.py at extraction time; manual entry passes "
              "through verbatim).",
+    )
+    add_p.add_argument(
+        "--owner", type=str, default=None,
+        help="Owner principal for this commitment (for ownership and dedupe).",
+    )
+    add_p.add_argument(
+        "--recipient-principal", type=str, default=None,
+        help="Principal this commitment is addressed to (distinct from recipient).",
+    )
+    add_p.add_argument(
+        "--visibility", type=str,
+        default=CommitmentVisibility.PUBLIC.value,
+        choices=[v.value for v in CommitmentVisibility],
+        help="Visibility level (public/service/private).",
+    )
+    add_p.add_argument(
+        "--service-name", type=str, default=None,
+        help="Service name for service-owned commitments.",
     )
     add_p.add_argument(
         "--text", type=str, required=True,
@@ -137,9 +164,6 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
         "--confidence", type=float, default=1.0,
         help="0-1 confidence (1.0 for manual entries).",
     )
-    # PR #120 review finding #5: forward-compat fields the model
-    # carries but the CLI didn't expose. Used for operator backfill
-    # when a Phase 2 extraction fails (the canonical recovery path).
     add_p.add_argument(
         "--dedupe-key", type=str, default=None,
         help="Override the auto-generated dedupe key. Use when "
@@ -165,16 +189,16 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
         "--message-id", type=str, default=None,
         help="Optional reference to the message that delivered.",
     )
+    complete_p.add_argument(
+        "--actor", type=str, default=None,
+        help="Actor principal performing the action (for authorization).",
+    )
 
     snooze_p = sub.add_parser(
         "snooze", help="Push a commitment to a later time.",
     )
     _add_home_flag(snooze_p)
     snooze_p.add_argument("id", type=str)
-    # PR #120 review nit: ISO is painful to type for the canonical
-    # "snooze 7 days" case. ``--for-days`` is the relative shortcut;
-    # ``--until-iso`` stays for absolute targets. Exactly one is
-    # required.
     snooze_mut = snooze_p.add_mutually_exclusive_group(required=True)
     snooze_mut.add_argument(
         "--until-iso", type=str, default=None,
@@ -185,6 +209,10 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
         help="Snooze for N days from now (relative; fractional OK).",
     )
     snooze_p.add_argument("--reason", type=str, default=None)
+    snooze_p.add_argument(
+        "--actor", type=str, default=None,
+        help="Actor principal performing the action (for authorization).",
+    )
 
     dismiss_p = sub.add_parser(
         "dismiss", help="Drop a commitment as no longer relevant.",
@@ -192,6 +220,10 @@ def add_argparse(p: argparse.ArgumentParser) -> None:
     _add_home_flag(dismiss_p)
     dismiss_p.add_argument("id", type=str)
     dismiss_p.add_argument("--reason", type=str, default=None)
+    dismiss_p.add_argument(
+        "--actor", type=str, default=None,
+        help="Actor principal performing the action (for authorization).",
+    )
 
     trim_p = sub.add_parser(
         "trim",
@@ -226,7 +258,13 @@ def _resolve_store(args: argparse.Namespace) -> CommitmentsStore:
 def cmd_list(args: argparse.Namespace) -> int:
     store = _resolve_store(args)
     status = None if args.status == "all" else args.status
-    rows = store.list(channel_id=args.channel, status=status)
+    rows = store.list(
+        channel_id=args.channel,
+        status=status,
+        actor_principal=args.owner,
+        include_service=args.include_service,
+        owner_principal=args.owner,
+    )
     if not rows:
         print("(no commitments match)")
         return 0
@@ -234,9 +272,10 @@ def cmd_list(args: argparse.Namespace) -> int:
         due = _short_iso(r.due_window_start_unix)
         ch = r.channel_id or "<unbound>"
         recipient = f" @{r.recipient_identity}" if r.recipient_identity else ""
+        owner = f" owner={r.owner_principal}" if r.owner_principal else ""
         print(
             f"{r.id}  [{r.status:9s}] {r.kind:14s} due={due}  "
-            f"({ch}{recipient}) — {r.text}"
+            f"({ch}{recipient}{owner}) — {r.text}"
         )
     return 0
 
@@ -247,7 +286,6 @@ def cmd_add(args: argparse.Namespace) -> int:
     if args.due_end_iso:
         end = _parse_iso(args.due_end_iso)
     elif start is not None:
-        # Default end: 7 days after start.
         end = start + 7 * 86400
     else:
         end = None
@@ -258,6 +296,10 @@ def cmd_add(args: argparse.Namespace) -> int:
         kind=args.kind,
         sensitivity=args.sensitivity,
         recipient_identity=args.recipient,
+        owner_principal=args.owner,
+        recipient_principal=args.recipient_principal,
+        visibility=args.visibility,
+        service_name=args.service_name,
         suggested_reminder=args.reminder,
         due_window_start_unix=start,
         due_window_end_unix=end,
@@ -295,7 +337,7 @@ def cmd_complete(args: argparse.Namespace) -> int:
     if args.id not in store.current_state():
         print(f"error: commitment {args.id!r} not found", file=sys.stderr)
         return 2
-    ok = asyncio.run(store.complete(args.id, message_id=args.message_id))
+    ok = asyncio.run(store.complete(args.id, message_id=args.message_id, actor_principal=args.actor))
     if not ok:
         return _report_transition_failure(args, "complete", store)
     print(f"completed {args.id}")
@@ -307,13 +349,13 @@ def cmd_snooze(args: argparse.Namespace) -> int:
     if args.id not in store.current_state():
         print(f"error: commitment {args.id!r} not found", file=sys.stderr)
         return 2
-    # Mutually-exclusive group already enforces exactly one of these.
     if args.for_days is not None:
         until_unix = time.time() + args.for_days * 86400
     else:
         until_unix = _parse_iso(args.until_iso)
     ok = asyncio.run(store.snooze(
         args.id, until_unix=until_unix, reason=args.reason,
+        actor_principal=args.actor,
     ))
     if not ok:
         return _report_transition_failure(args, "snooze", store)
@@ -326,7 +368,7 @@ def cmd_dismiss(args: argparse.Namespace) -> int:
     if args.id not in store.current_state():
         print(f"error: commitment {args.id!r} not found", file=sys.stderr)
         return 2
-    ok = asyncio.run(store.dismiss(args.id, reason=args.reason))
+    ok = asyncio.run(store.dismiss(args.id, reason=args.reason, actor_principal=args.actor))
     if not ok:
         return _report_transition_failure(args, "dismiss", store)
     print(f"dismissed {args.id}")

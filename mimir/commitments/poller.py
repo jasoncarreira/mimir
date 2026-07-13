@@ -193,7 +193,7 @@ async def check_due_and_expired(
         end = rec.due_window_end_unix
         if end is not None and now_unix > end:
             try:
-                ok = await store.expire(rec.id)
+                ok = await store.expire(rec.id, actor_principal="service:poller")
                 if ok:
                     result.expired_emitted += 1
                     await log_event(
@@ -213,17 +213,6 @@ async def check_due_and_expired(
                 )
             continue
 
-        # Due check: must be in the window AND not yet delivered. A
-        # record already in ``delivered`` status has been surfaced
-        # once; re-emitting on every poll tick would crowd the
-        # algedonic block. The agent acts on it via complete/snooze
-        # and the next sweep finds it terminal or in a new snooze
-        # window.
-        #
-        # SNOOZED records ARE eligible — snooze slides
-        # due_window_start_unix forward (PR #120 fix #3), so once
-        # the new window opens, we deliver again. That's the point
-        # of snooze: "remind me later."
         if rec.status == CommitmentStatus.DELIVERED.value:
             continue
         if now_unix < rec.due_window_start_unix:
@@ -231,7 +220,7 @@ async def check_due_and_expired(
             continue
 
         try:
-            ok = await store.deliver(rec.id)
+            ok = await store.deliver(rec.id, actor_principal="service:poller")
             if ok:
                 result.due_emitted += 1
                 await log_event(

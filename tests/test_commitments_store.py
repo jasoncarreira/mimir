@@ -13,6 +13,7 @@ from mimir.commitments import (
     CommitmentRecord,
     CommitmentSensitivity,
     CommitmentStatus,
+    CommitmentVisibility,
     CommitmentsStore,
     make_commitment_id,
     make_dedupe_key,
@@ -1097,3 +1098,292 @@ def test_current_state_warning_flag_per_instance(tmp_path: Path, caplog):
     assert len(scale_warnings) == 2, (
         f"expected 2 scale warnings (one per instance); got {scale_warnings}"
     )
+
+
+# ─── Ownership and authorization (chainlink #867) ───────────────────────
+
+
+def test_dedupe_key_includes_owner():
+    """Same channel + text + recipient but different owners must produce
+    different dedupe keys — different owners cannot dedupe together."""
+    k_alice = make_dedupe_key(
+        channel_id="c1", text="X", due_window_start_unix=None,
+        owner_principal="alice",
+    )
+    k_bob = make_dedupe_key(
+        channel_id="c1", text="X", due_window_start_unix=None,
+        owner_principal="bob",
+    )
+    k_no_owner = make_dedupe_key(
+        channel_id="c1", text="X", due_window_start_unix=None,
+    )
+    assert k_alice != k_bob
+    assert k_alice != k_no_owner
+    assert k_bob != k_no_owner
+
+
+@pytest.mark.asyncio
+async def test_add_persists_owner_principal(tmp_path: Path):
+    """Owner principal round-trips through JSONL → replay."""
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-1",
+        text="Review PR #111",
+        owner_principal="user:alice",
+    ))
+    state = store.current_state()
+    assert state[rec.id].owner_principal == "user:alice"
+
+
+@pytest.mark.asyncio
+async def test_add_persists_visibility(tmp_path: Path):
+    """Visibility field round-trips through JSONL → replay."""
+    from mimir.commitments import CommitmentVisibility
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-1",
+        text="Service task",
+        visibility=CommitmentVisibility.SERVICE.value,
+        service_name="poller",
+    ))
+    state = store.current_state()
+    assert state[rec.id].visibility == CommitmentVisibility.SERVICE.value
+    assert state[rec.id].service_name == "poller"
+
+
+@pytest.mark.asyncio
+async def test_add_persists_recipient_principal(tmp_path: Path):
+    """Recipient principal round-trips through JSONL → replay."""
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-1",
+        text="Remind about deploy",
+        recipient_identity="alice",
+        recipient_principal="user:alice@example.com",
+    ))
+    state = store.current_state()
+    assert state[rec.id].recipient_principal == "user:alice@example.com"
+
+
+@pytest.mark.asyncio
+async def test_add_persists_originating_channel(tmp_path: Path):
+    """Originating channel round-trips through JSONL → replay."""
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-2",
+        text="Migrated task",
+        originating_channel="chan-1",
+    ))
+    state = store.current_state()
+    assert state[rec.id].originating_channel == "chan-1"
+
+
+@pytest.mark.asyncio
+async def test_authorization_rejects_recipient_mutation(tmp_path: Path):
+    """Recipient identity does NOT grant mutation authority. Only owner
+    (or service actor) can mutate a commitment."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="X",
+        owner_principal="user:alice",
+        recipient_principal="user:bob",
+    ))
+    ok = await store.complete(rec.id, actor_principal="user:bob")
+    assert ok is False
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.PENDING.value
+
+
+@pytest.mark.asyncio
+async def test_authorization_allows_owner_mutation(tmp_path: Path):
+    """Owner principal CAN mutate their own commitments."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="X",
+        owner_principal="user:alice",
+    ))
+    ok = await store.complete(rec.id, actor_principal="user:alice")
+    assert ok is True
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.COMPLETED.value
+
+
+@pytest.mark.asyncio
+async def test_authorization_allows_service_mutation(tmp_path: Path):
+    """Service actors can mutate any commitment."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="X",
+        owner_principal="user:alice",
+    ))
+    ok = await store.complete(rec.id, actor_principal="service:poller")
+    assert ok is True
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.COMPLETED.value
+
+
+@pytest.mark.asyncio
+async def test_authorization_rejects_private_without_owner(tmp_path: Path):
+    """Private visibility requires owner or service actor."""
+    from mimir.commitments import CommitmentVisibility
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="X",
+        owner_principal="user:alice",
+        visibility=CommitmentVisibility.PRIVATE.value,
+    ))
+    ok = await store.complete(rec.id, actor_principal="user:bob")
+    assert ok is False
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.PENDING.value
+
+
+@pytest.mark.asyncio
+async def test_service_visibility_requires_service_actor(tmp_path: Path):
+    """Service visibility requires service actor for mutation."""
+    from mimir.commitments import CommitmentVisibility
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="Service task",
+        visibility=CommitmentVisibility.SERVICE.value,
+        service_name="poller",
+    ))
+    ok = await store.complete(rec.id, actor_principal="user:alice")
+    assert ok is False
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.PENDING.value
+
+
+@pytest.mark.asyncio
+async def test_list_filters_by_owner(tmp_path: Path):
+    """List can filter by owner principal."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Alice task",
+        owner_principal="user:alice",
+    ))
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Bob task",
+        owner_principal="user:bob",
+    ))
+    alice_rows = store.list(owner_principal="user:alice")
+    bob_rows = store.list(owner_principal="user:bob")
+    assert {r.text for r in alice_rows} == {"Alice task"}
+    assert {r.text for r in bob_rows} == {"Bob task"}
+
+
+@pytest.mark.asyncio
+async def test_list_excludes_service_by_default(tmp_path: Path):
+    """Service visibility commitments excluded from list by default."""
+    from mimir.commitments import CommitmentVisibility
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Public task",
+        visibility=CommitmentVisibility.PUBLIC.value,
+    ))
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Service task",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+    rows = store.list()
+    assert {r.text for r in rows} == {"Public task"}
+    rows_with_service = store.list(include_service=True)
+    assert {r.text for r in rows_with_service} == {"Public task", "Service task"}
+
+
+@pytest.mark.asyncio
+async def test_find_by_dedupe_key_respects_owner(tmp_path: Path):
+    """find_by_dedupe_key with owner_principal only returns matches with same owner."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    r1 = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Same text",
+        owner_principal="user:alice",
+    ))
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Same text",
+        owner_principal="user:bob",
+    ))
+    found = store.find_by_dedupe_key(r1.dedupe_key, owner_principal="user:alice")
+    assert found is not None
+    assert found.id == r1.id
+    found_bob = store.find_by_dedupe_key(r1.dedupe_key, owner_principal="user:bob")
+    assert found_bob is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_record_no_owner_is_admin_only(tmp_path: Path):
+    """Records without owner_principal are treated as legacy/ambiguous and
+    require service actor for mutation."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="Legacy task",
+    ))
+    ok = await store.complete(rec.id, actor_principal="user:any")
+    assert ok is False
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.PENDING.value
+    ok_service = await store.complete(rec.id, actor_principal="service:admin")
+    assert ok_service is True
+
+@pytest.mark.asyncio
+async def test_admin_can_mutate_legacy_and_service_commitments(tmp_path: Path):
+    """Admin authority is explicit, not inferred from a service-like name."""
+    from mimir.commitments import CommitmentVisibility
+
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    legacy = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Legacy task",
+    ))
+    service = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None, text="Poller task",
+        owner_principal="service:poller",
+        visibility=CommitmentVisibility.SERVICE.value,
+        service_name="poller",
+    ))
+
+    assert await store.complete(
+        legacy.id, actor_principal="user:jason", actor_is_admin=True,
+    ) is True
+    assert await store.dismiss(
+        service.id, actor_principal="user:jason", actor_is_admin=True,
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_admin_list_can_view_other_owner_private_and_service(tmp_path: Path):
+    from mimir.commitments import CommitmentVisibility
+
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    private = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Alice private",
+        owner_principal="user:alice",
+        visibility=CommitmentVisibility.PRIVATE.value,
+    ))
+    service = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None, text="Service private",
+        owner_principal="service:poller",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+
+    rows = store.list(
+        actor_principal="user:jason",
+        include_service=True,
+        actor_is_admin=True,
+    )
+    assert {row.id for row in rows} == {private.id, service.id}

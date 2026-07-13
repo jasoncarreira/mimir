@@ -16,6 +16,7 @@ from .models import (
     CommitmentRecord,
     CommitmentSensitivity,
     CommitmentStatus,
+    CommitmentVisibility,
     make_commitment_id,
     make_dedupe_key,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "CommitmentRecord",
     "CommitmentSensitivity",
     "CommitmentStatus",
+    "CommitmentVisibility",
     "CommitmentsStore",
     "make_commitment_id",
     "make_dedupe_key",

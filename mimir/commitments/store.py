@@ -33,6 +33,7 @@ from .models import (
     VALID_TRANSITIONS,
     CommitmentRecord,
     CommitmentStatus,
+    CommitmentVisibility,
     make_commitment_id,
     make_dedupe_key,
 )
@@ -131,7 +132,7 @@ class CommitmentsStore:
         Caller can pre-populate ``id`` (idempotent re-extraction) or
         let it default; ``created_at_unix`` defaults to now when 0.0.
         The ``dedupe_key`` is auto-filled from
-        (channel_id, text, due_window_start_unix) when empty.
+        (owner_principal, channel_id, text, due_window_start_unix) when empty.
         """
         if not record.id:
             record.id = make_commitment_id()
@@ -143,10 +144,10 @@ class CommitmentsStore:
                 text=record.text,
                 due_window_start_unix=record.due_window_start_unix,
                 recipient_identity=record.recipient_identity,
+                owner_principal=record.owner_principal,
             )
-        # Ensure starting status is pending — caller setting status to
-        # anything else on add() is a contract violation; we coerce
-        # so a stray copy-paste mistake doesn't poison the store.
+        if not record.originating_channel:
+            record.originating_channel = record.channel_id
         record.status = CommitmentStatus.PENDING.value
         await self._append({
             "type": "commitment_added",
@@ -156,8 +157,15 @@ class CommitmentsStore:
         })
         return record
 
-    def _can_apply(self, id: str, target_status: str) -> bool:
-        """Pre-write transition check. PR #120 re-review N2.
+    def _can_apply(
+        self,
+        id: str,
+        target_status: str,
+        *,
+        actor_principal: str | None = None,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Pre-write transition check with authorization. PR #120 re-review N2.
 
         Replay's ``VALID_TRANSITIONS`` guard already protects state
         correctness — an invalid lifecycle event is rejected on read.
@@ -168,14 +176,13 @@ class CommitmentsStore:
         adjacency, and returns False (with a warning log) on rejection.
         Public lifecycle methods consult it before appending.
 
-        Returns True if the transition is valid; False if the record
-        is unknown or the transition violates ``VALID_TRANSITIONS``.
+        Authorization: recipient_principal does NOT grant mutation authority.
+        Only the owner_principal (or service/admin) can mutate a commitment.
+        Service-owned (visibility=service) records require service actor.
 
-        Note on TOCTOU: a concurrent writer can land an event between
-        this check and the append. Replay's invariant still holds —
-        the append is rejected at read time. So the worst case under
-        a race is one stray no-op event in the JSONL; state stays
-        correct. The simple read-then-append shape is fine for Phase 1.
+        Returns True if the transition is valid and authorized; False
+        if the record is unknown, unauthorized, or the transition
+        violates ``VALID_TRANSITIONS``.
         """
         state = self.current_state()
         rec = state.get(id)
@@ -194,14 +201,66 @@ class CommitmentsStore:
                 rec.status, target_status, id,
             )
             return False
+        if not self._is_authorized(
+            rec, actor_principal, actor_is_admin=actor_is_admin,
+        ):
+            log.warning(
+                "commitments: lifecycle write rejected — unauthorized "
+                "mutation attempt on %s by %s (owner=%s)",
+                id, actor_principal, rec.owner_principal,
+            )
+            return False
         return True
 
-    async def deliver(self, id: str) -> bool:
+    def _is_authorized(
+        self,
+        record: CommitmentRecord,
+        actor_principal: str | None,
+        *,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Check if the actor is authorized to mutate this commitment.
+
+        Authorization rules (when actor_principal is provided):
+        - Admin actors can mutate any record, including service/legacy records
+        - Service visibility: only admin or service actors can mutate
+        - Private visibility: actor must be the owner (or admin)
+        - Public visibility: owner, service actor, or admin can mutate
+
+        If no actor_principal provided, allow by default (backward compat).
+        If no owner is set (legacy record), requires admin/service actor.
+        Recipient identity does NOT grant mutation authority.
+        """
+        if actor_principal is None:
+            return True
+        if actor_is_admin:
+            return True
+        if record.visibility == CommitmentVisibility.SERVICE.value:
+            return actor_principal.startswith("service:")
+        if record.visibility == CommitmentVisibility.PRIVATE.value:
+            return actor_principal == record.owner_principal
+        if record.visibility == CommitmentVisibility.PUBLIC.value:
+            if actor_principal.startswith("service:"):
+                return True
+            if record.owner_principal is None:
+                return actor_principal.startswith("service:")
+            return actor_principal == record.owner_principal
+        return False
+
+    async def deliver(
+        self, id: str, *, actor_principal: str | None = None,
+        actor_is_admin: bool = False,
+    ) -> bool:
         """Mark delivered (reminder fired). Bumps ``attempts``.
 
         Returns True if the event was appended; False if the
-        transition was rejected (unknown id, terminal record)."""
-        if not self._can_apply(id, CommitmentStatus.DELIVERED.value):
+        transition was rejected (unknown id, terminal record, unauthorized)."""
+        if not self._can_apply(
+            id,
+            CommitmentStatus.DELIVERED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        ):
             return False
         await self._append({
             "type": "commitment_delivered",
@@ -212,13 +271,23 @@ class CommitmentsStore:
         return True
 
     async def complete(
-        self, id: str, *, message_id: str | None = None,
+        self,
+        id: str,
+        *,
+        message_id: str | None = None,
+        actor_principal: str | None = None,
+        actor_is_admin: bool = False,
     ) -> bool:
         """Mark completed (agent followed through). Terminal.
 
         Returns True if the event was appended; False if the
-        transition was rejected."""
-        if not self._can_apply(id, CommitmentStatus.COMPLETED.value):
+        transition was rejected or unauthorized."""
+        if not self._can_apply(
+            id,
+            CommitmentStatus.COMPLETED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        ):
             return False
         await self._append({
             "type": "commitment_completed",
@@ -235,14 +304,21 @@ class CommitmentsStore:
         *,
         until_unix: float,
         reason: str | None = None,
+        actor_principal: str | None = None,
+        actor_is_admin: bool = False,
     ) -> bool:
         """Push out to a later time. ``until_unix`` becomes the new
         ``due_window_start_unix`` after replay (the original end stays
         unless explicitly re-snoozed past it).
 
         Returns True if the event was appended; False if the
-        transition was rejected."""
-        if not self._can_apply(id, CommitmentStatus.SNOOZED.value):
+        transition was rejected or unauthorized."""
+        if not self._can_apply(
+            id,
+            CommitmentStatus.SNOOZED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        ):
             return False
         await self._append({
             "type": "commitment_snoozed",
@@ -254,13 +330,23 @@ class CommitmentsStore:
         return True
 
     async def dismiss(
-        self, id: str, *, reason: str | None = None,
+        self,
+        id: str,
+        *,
+        reason: str | None = None,
+        actor_principal: str | None = None,
+        actor_is_admin: bool = False,
     ) -> bool:
         """Drop as no longer relevant. Terminal.
 
         Returns True if the event was appended; False if the
-        transition was rejected."""
-        if not self._can_apply(id, CommitmentStatus.DISMISSED.value):
+        transition was rejected or unauthorized."""
+        if not self._can_apply(
+            id,
+            CommitmentStatus.DISMISSED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        ):
             return False
         await self._append({
             "type": "commitment_dismissed",
@@ -271,13 +357,24 @@ class CommitmentsStore:
         })
         return True
 
-    async def expire(self, id: str) -> bool:
+    async def expire(
+        self,
+        id: str,
+        *,
+        actor_principal: str | None = None,
+        actor_is_admin: bool = False,
+    ) -> bool:
         """Mark expired (due_window_end passed without resolution).
         Typically called from a poller, not by the agent. Terminal.
 
         Returns True if the event was appended; False if the
-        transition was rejected."""
-        if not self._can_apply(id, CommitmentStatus.EXPIRED.value):
+        transition was rejected or unauthorized."""
+        if not self._can_apply(
+            id,
+            CommitmentStatus.EXPIRED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        ):
             return False
         await self._append({
             "type": "commitment_expired",
@@ -493,6 +590,10 @@ class CommitmentsStore:
         channel_id: str | None = None,
         status: str | None = None,
         include_unbound: bool = True,
+        actor_principal: str | None = None,
+        include_service: bool = False,
+        owner_principal: str | None = None,
+        actor_is_admin: bool = False,
     ) -> list[CommitmentRecord]:
         """Replay + filter.
 
@@ -502,6 +603,11 @@ class CommitmentsStore:
           (``channel_id is None``) are also returned — matches the
           design's "surface unbound everywhere" rule.
         - ``status``: filter by current status. ``None`` returns all.
+        - ``actor_principal``: for access control (view filtering).
+        - ``owner_principal``: filter by ownership. If provided, returns
+          only commitments owned by this principal.
+        - ``include_service``: include service-owned commitments.
+          Default False (admin/service-only access).
         Sorted by created_at_unix ascending."""
         state = self.current_state()
         out: list[CommitmentRecord] = []
@@ -512,19 +618,62 @@ class CommitmentsStore:
                     continue
             if status is not None and rec.status != status:
                 continue
+            if owner_principal is not None and rec.owner_principal != owner_principal:
+                continue
+            if not self._can_view(
+                rec, actor_principal, include_service,
+                actor_is_admin=actor_is_admin,
+            ):
+                continue
             out.append(rec)
         out.sort(key=lambda r: r.created_at_unix)
         return out
 
+    def _can_view(
+        self,
+        record: CommitmentRecord,
+        actor_principal: str | None,
+        include_service: bool,
+        *,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Check if the actor can view this commitment.
+
+        Visibility rules:
+        - Admin: visible regardless of visibility level
+        - Public: visible to all
+        - Service: only service actors or when include_service=True
+        - Private: only owner, service actors, or admin
+        """
+        if actor_is_admin:
+            return True
+        if record.visibility == CommitmentVisibility.SERVICE.value:
+            return include_service or (
+                actor_principal is not None and actor_principal.startswith("service:")
+            )
+        if record.visibility == CommitmentVisibility.PRIVATE.value:
+            return actor_principal == record.owner_principal or (
+                actor_principal is not None and actor_principal.startswith("service:")
+            )
+        return True
+
     def find_by_dedupe_key(
-        self, dedupe_key: str,
+        self,
+        dedupe_key: str,
+        *,
+        owner_principal: str | None = None,
     ) -> CommitmentRecord | None:
         """Return the (non-terminal) commitment with this dedupe key,
         or None. Used by the future extractor to skip re-adding the
-        same commitment surfaced in a later session."""
+        same commitment surfaced in a later session.
+
+        When owner_principal is provided, only returns matches with the
+        same owner (enforces owner-inclusive dedupe)."""
         state = self.current_state()
         for rec in state.values():
             if rec.dedupe_key == dedupe_key and not rec.is_terminal():
+                if owner_principal is not None and rec.owner_principal != owner_principal:
+                    continue
                 return rec
         return None
 
