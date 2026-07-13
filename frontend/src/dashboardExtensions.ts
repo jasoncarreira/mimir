@@ -42,6 +42,11 @@ const firstPartySurfaceMetadata: Record<
     tabs: ["board", "dependencies", "worklink"],
     filterLabel: "label"
   },
+  "factory-runs": {
+    detail: "Feature factory runs and diagnostics",
+    tabs: ["list", "detail"],
+    filterLabel: "status"
+  },
   scheduler: {
     detail: "Schedules, pollers, and commitments",
     tabs: ["schedules", "pollers", "commitments"],

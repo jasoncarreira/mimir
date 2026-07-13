@@ -174,6 +174,15 @@ def first_party_dashboard_extensions(
                 requires_role="admin",
             ),
             DashboardExtensionManifest(
+                id="factory-runs",
+                route_path="/factory-runs",
+                label="Factory Runs",
+                icon="package",
+                nav_position=36,
+                api_namespace="factory-runs",
+                requires_role="admin",
+            ),
+            DashboardExtensionManifest(
                 id="scheduler",
                 route_path="/scheduler",
                 label="Scheduler",

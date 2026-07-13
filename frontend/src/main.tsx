@@ -29,6 +29,7 @@ import { OpsRoute, UsageRoute } from "./routes/OpsRoute";
 import { SchedulerRoute } from "./routes/SchedulerRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { TurnsRoute } from "./routes/TurnsRoute";
+import { FactoryRunsRoute } from "./routes/FactoryRunsRoute";
 import { scrubSecretQueryParams, useRouteState } from "./routeState";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import type { AgentCharacterState, SkinId } from "./skins/types";
@@ -596,7 +597,9 @@ function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[
                   ? <OpsRoute />
                   : surface.id === "chainlink-board"
                   ? <ChainlinkBoardRoute />
-                  : surface.id === "turns"
+                  : surface.id === "factory-runs"
+                    ? <FactoryRunsRoute surface={surface} />
+                    : surface.id === "turns"
                     ? <TurnsRoute />
                     : surface.id === "admin-config"
                       ? <AdminConfigRoute />
