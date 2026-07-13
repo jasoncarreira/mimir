@@ -8,18 +8,23 @@ from __future__ import annotations
 
 from pathlib import Path
 from textwrap import dedent
-from unittest.mock import MagicMock
 
 import pytest
+from langchain.agents.middleware import ToolCallRequest
+from langgraph.runtime import Runtime
 
 from mimir.access_control import (
     ChannelResourceAdapter,
     OperationDecision,
-    ToolAuthorization,
     get_operation_catalog,
+    get_tool_registry,
 )
 from mimir.identities import IdentityResolver
-from mimir.models import AgentEvent, AuthContext
+from mimir.models import AuthContext
+from mimir.tools.budget_gate import (
+    _check_admin_authorized,
+    _extract_channel_from_args,
+)
 
 
 def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
@@ -120,25 +125,16 @@ class TestChannelResourceAdapterAuthorization:
         assert auth.allowed is False
         assert auth.reason == "missing_triggering_channel"
 
-    def test_missing_target_channel_denies(self):
+    @pytest.mark.parametrize("target_channel", [None, ""])
+    def test_implicit_target_resolves_to_triggering_channel(self, target_channel):
         auth = ChannelResourceAdapter.authorize_channel_operation(
             "send_message",
-            None,
+            target_channel,
             _auth_context("discord-C1"),
             enforce=True,
         )
-        assert auth.allowed is False
-        assert auth.reason == "missing_target_channel"
-
-    def test_empty_target_channel_denies(self):
-        auth = ChannelResourceAdapter.authorize_channel_operation(
-            "send_message",
-            "",
-            _auth_context("discord-C1"),
-            enforce=True,
-        )
-        assert auth.allowed is False
-        assert auth.reason == "missing_target_channel"
+        assert auth.allowed is True
+        assert auth.reason == "same_scope_channel"
 
     def test_unknown_channel_denies_regular_user(self):
         auth = ChannelResourceAdapter.authorize_channel_operation(
@@ -305,6 +301,36 @@ class TestChannelResourceAdapterAliasResolution:
 
 class TestOperationCatalogIntegration:
     """Test that OperationCatalog uses ChannelResourceAdapter."""
+
+    def test_omitted_channel_send_passes_gate_as_same_scope(self):
+        ctx = _auth_context("discord-C1", enforce=True)
+        request = ToolCallRequest(
+            tool_call={
+                "name": "send_message",
+                "args": {"text": "reply"},
+                "id": "reply-to-trigger",
+                "type": "tool_call",
+            },
+            tool=None,
+            state=None,
+            runtime=Runtime(context=ctx),
+        )
+        effective_target = _extract_channel_from_args(request, ctx)
+
+        assert effective_target == "discord-C1"
+        assert _check_admin_authorized(
+            "send_message", ctx, effective_target
+        ) is None
+
+    def test_omitted_channel_send_authorizes_as_same_scope(self):
+        ctx = _auth_context("discord-C1", enforce=True)
+        auth = get_tool_registry().authorize_tool(
+            "send_message", ctx, enforce=True, target_channel=None
+        )
+
+        assert auth.allowed is True
+        assert auth.decision == OperationDecision.RESOURCE_SCOPED
+        assert auth.reason == "same_scope_channel"
 
     def test_channel_operations_return_resource_scoped(self):
         catalog = get_operation_catalog()

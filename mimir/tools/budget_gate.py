@@ -239,15 +239,22 @@ def _tool_call_id(request: ToolCallRequest) -> str:
     return str(tc.get("id") or "")
 
 
-def _extract_channel_from_args(request: ToolCallRequest) -> str | None:
-    """Extract channel_id from tool arguments for channel operations.
+def _extract_channel_from_args(
+    request: ToolCallRequest,
+    auth_context: AuthContext | None = None,
+) -> str | None:
+    """Return the effective channel target for authorization.
 
-    For send_message, react, and fetch_channel_history, the channel_id
-    is passed as an argument. This extracts it for authorization checks.
+    Channel tools default an omitted/empty ``channel_id`` to the current turn's
+    channel. Mirror that server-owned resolution here so the gate authorizes an
+    implicit reply-to-trigger as same-scope rather than as a missing resource.
     """
     tc = getattr(request, "tool_call", None) or {}
     args = tc.get("args") or {}
-    return args.get("channel_id")
+    explicit_channel = args.get("channel_id")
+    if explicit_channel:
+        return explicit_channel
+    return auth_context.channel_id if auth_context is not None else None
 
 
 def _is_admin_sensitive_tool(
@@ -462,10 +469,11 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest], ToolMessage | Command],
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
-        target_channel = _extract_channel_from_args(request)
+        auth_context = _auth_context_from_request(request)
+        target_channel = _extract_channel_from_args(request, auth_context)
 
         admin_denial = _check_admin_authorized(
-            tool_name, _auth_context_from_request(request), target_channel
+            tool_name, auth_context, target_channel
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
@@ -531,10 +539,11 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
-        target_channel = _extract_channel_from_args(request)
+        auth_context = _auth_context_from_request(request)
+        target_channel = _extract_channel_from_args(request, auth_context)
 
         admin_denial = _check_admin_authorized(
-            tool_name, _auth_context_from_request(request), target_channel
+            tool_name, auth_context, target_channel
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)

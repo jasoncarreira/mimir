@@ -21,7 +21,7 @@ New in chainlink #866:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -181,21 +181,18 @@ class ChannelResourceAdapter:
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.RESOURCE_SCOPED,
-                allowed=False,
+                allowed=not enforce,
                 reason="missing_triggering_channel",
+                required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
             )
 
-        if not target_channel:
-            return ToolAuthorization(
-                tool_name=tool_name,
-                decision=OperationDecision.RESOURCE_SCOPED,
-                allowed=False,
-                reason="missing_target_channel",
-                enforcement_enabled=enforce,
-            )
-
-        resolved_target = cls._resolve_channel(target_channel)
+        # Channel tools resolve an omitted/empty target to the current turn's
+        # channel. Authorization must mirror that runtime behavior: an implicit
+        # reply-to-trigger is same-scope, not a missing-resource denial.
+        effective_target = target_channel or triggering_channel
+        resolved_target = cls._resolve_channel(effective_target)
         resolved_triggering = cls._resolve_channel(triggering_channel)
 
         same_scope = resolved_target == resolved_triggering
@@ -551,8 +548,8 @@ class ToolRegistry:
         are denied.
 
         For channel operations (send_message, react, fetch_channel_history),
-        target_channel can be provided to enable resource-scoped authorization
-        that compares the target against the triggering channel.
+        resource-scoped authorization always compares the effective target against
+        the triggering channel. An omitted target means reply-to-trigger.
         """
         catalog = get_operation_catalog()
         decision = catalog.get_decision(tool_name, auth_context)
@@ -587,7 +584,7 @@ class ToolRegistry:
                 allowed = True
                 is_shadow = True
         elif decision == OperationDecision.RESOURCE_SCOPED:
-            if tool_name in ChannelResourceAdapter._CHANNEL_OPERATIONS and target_channel:
+            if tool_name in ChannelResourceAdapter._CHANNEL_OPERATIONS:
                 channel_auth = ChannelResourceAdapter.authorize_channel_operation(
                     tool_name,
                     target_channel,
