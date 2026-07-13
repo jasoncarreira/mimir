@@ -275,6 +275,20 @@ class OperationCatalog:
         "write_file",
         "edit_file",
         "set_poller_overrides",
+        "read_file",
+        "aread",
+        "ls",
+        "als",
+        "glob",
+        "aglob",
+        "grep",
+        "agrep",
+        "download_files",
+        "adownload_files",
+        "file_search",
+        "rebuild_index",
+        "get_turn",
+        "mimir_get_turn",
     })
 
     _ADMIN_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset({
@@ -286,6 +300,10 @@ class OperationCatalog:
         "shell",
         "Write",
         "Edit",
+        "Read",
+        "Glob",
+        "Grep",
+        "download_files",
     })
 
     def __init__(self) -> None:
