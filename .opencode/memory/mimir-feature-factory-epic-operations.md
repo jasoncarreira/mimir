@@ -36,11 +36,13 @@ Before setting `MIMIR_FACTORY_EPICS_ENABLED` or adding dispatch labels:
 4. Verify GitHub write identity and reviewer access. PRs target `main`, require review, and must remain unmerged until the operator/reviewer approves them.
 5. Confirm no other live factory run, no conflicting PR for the epic, and no user-owned state in a checkout/worktree that cleanup could touch.
 
-## Readiness Snapshot (2026-07-13)
+## Readiness Snapshot (2026-07-13, mimirbot `/workspace/mimir` runtime)
+
+Point-in-time snapshot of a single runtime checkout. Regenerate it from the exact checkout/config before arming, capturing the `feature-factory doctor` command and its verbatim output — do not treat this dated snapshot as the live gate.
 
 - npm registry latest is `opencode-feature-factory@0.2.1`.
-- The host Mimir checkout has repo-local `.opencode/skills/feature/{SKILL.md,SCHEMA.md}` and an empty repository-root `.opencode/factory` directory.
-- `feature-factory doctor --profiles` currently fails readiness: `plugin configured (opencode-feature-factory)` is missing and every factory subagent reports non-interactive `task=deny`. Profiles also resolve to the opencode default model/variant, and provider smoke has not been run.
-- Do not arm autonomous epic dispatch yet. Configure the plugin/permissions in the actual Mimir runtime, rerun doctor to green, then perform one bounded canary epic before enabling a broader queue.
+- The runtime checkout has repo-local `.opencode/skills/feature/{SKILL.md,SCHEMA.md}`. The repository-root `.opencode/factory` directory is NOT empty: it holds a prior `chainlink-740` run (`run.json` plus `artifacts/`, `evidence/`, `gates/`, `plan/`, `reviews/`, dated 2026-07-05). Per "State And Recovery" above, repo-root is not where live runs execute (authoritative state is `.worklink/<issue>-<attempt>/.opencode/factory/chainlink-<id>/run.json`), so this is historical residue, not an active session.
+- On this runtime, `feature-factory doctor --profiles --repo /workspace/mimir` reports non-interactive factory permissions OK. The outstanding readiness gaps are: the `opencode-feature-factory` plugin is not registered, doctor emits ignored-path warnings, provider smoke has not been run, and profiles resolve to the opencode default model/variant.
+- Do not arm autonomous epic dispatch yet. Register the plugin and configure profiles in the actual runtime, run `feature-factory doctor --profiles` (and `--provider-smoke`) to green, then perform one bounded canary epic before enabling a broader queue.
 
 Primary sources: `mimir/worklink/backends/feature_factory.py`, `mimir/worklink/orchestrator.py`, `mimir/optional-skills/chainlink-orchestrator/poller.py`, `mimir/worklink/backends/registry.py`, and `docs/internal/WORKLINK.md`.
