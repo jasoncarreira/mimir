@@ -302,6 +302,8 @@ __CLAUDE_CODE_INSTALL__
 
 __CODEX_INSTALL__
 
+__OPENCODE_INSTALL__
+
 # uv handles dep resolution + virtualenv inside the workspace clone.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \\
  && mv /root/.local/bin/uv /usr/local/bin/uv \\
@@ -397,6 +399,8 @@ RUN npm install -g @mermaid-js/mermaid-cli@11.16.0
 __CLAUDE_CODE_INSTALL__
 
 __CODEX_INSTALL__
+
+__OPENCODE_INSTALL__
 
 # (No ``uv`` install — PyPI mode uses pip directly against a
 # user-owned venv. Saves ~30 MB of image and one moving part.)
@@ -507,12 +511,38 @@ def _codex_install_block(install_codex: bool) -> str:
     )
 
 
+def _opencode_install_block(install_opencode: bool) -> str:
+    """Dockerfile block installing OpenCode runtime when enabled.
+
+    Installs the pinned OpenCode runtime (opencode-ai + plugins) when
+    MIMIR_ENABLE_OPENCODE=1. The plugins provide feature-factory and
+    project-memory functionality for Worklink backends.
+    """
+    if not install_opencode:
+        return "# (OpenCode runtime not installed — MIMIR_ENABLE_OPENCODE not set)"
+    return (
+        "# OpenCode runtime — opt-in via MIMIR_ENABLE_OPENCODE=1.\n"
+        "# Pins: opencode-ai@1.17.15, opencode-feature-factory@0.2.1,\n"
+        "# opencode-project-memory@0.1.0, opencode-openai-codex-auth@4.4.0,\n"
+        "# opencode-anthropic-auth@0.0.13.\n"
+        "ARG MIMIR_ENABLE_OPENCODE=0\n"
+        "RUN if [ \"$MIMIR_ENABLE_OPENCODE\" = \"1\" ]; then \\\n"
+        "        npm install -g opencode-ai@1.17.15 ; \\\n"
+        "        npm install -g opencode-feature-factory@0.2.1 ; \\\n"
+        "        npm install -g opencode-project-memory@0.1.0 ; \\\n"
+        "        npm install -g opencode-openai-codex-auth@4.4.0 ; \\\n"
+        "        npm install -g opencode-anthropic-auth@0.0.13 ; \\\n"
+        "    fi"
+    )
+
+
 def render_dockerfile(
     fragments: list[Fragment],
     *,
     mode: ScaffoldMode = _DEFAULT_MODE,
     mimir_extras: list[str] | None = None,
     install_codex: bool = False,
+    install_opencode: bool = False,
 ) -> str:
     """Stitch fragments into the base template via sentinel split, so
     a fragment that happens to contain the literal sentinel-string
@@ -546,6 +576,7 @@ def render_dockerfile(
     base = base.replace("__USERDEL_BLOCK__", _USERDEL_BLOCK)
     base = base.replace("__CLAUDE_CODE_INSTALL__", _claude_code_install_block())
     base = base.replace("__CODEX_INSTALL__", _codex_install_block(install_codex))
+    base = base.replace("__OPENCODE_INSTALL__", _opencode_install_block(install_opencode))
     if not fragments:
         body = "# (no skills installed yet ship a dockerfile.fragment)"
     else:
@@ -1010,6 +1041,33 @@ def _sanitize_service_name(raw: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "-", raw)
 
 
+_OPENCODE_CONFIG_TEMPLATE = """\
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "opencode-feature-factory",
+    [
+      "opencode-project-memory",
+      {
+        "memoryDir": ".opencode/memory",
+        "index": "MEMORY.md",
+        "maxIndexBytes": 8192,
+        "maxIndexLines": 100,
+        "gitExclude": false
+      }
+    ],
+    "opencode-openai-codex-auth",
+    "opencode-anthropic-auth"
+  ]
+}
+"""
+
+
+def _render_opencode_config() -> str:
+    """Render OpenCode config for the feature-factory and project-memory plugins."""
+    return _OPENCODE_CONFIG_TEMPLATE
+
+
 def scaffold(
     home: Path,
     *,
@@ -1018,6 +1076,7 @@ def scaffold(
     uv_extras: list[str] | None = None,
     mode: ScaffoldMode = _DEFAULT_MODE,
     mimir_extras: list[str] | None = None,
+    install_opencode: bool = False,
 ) -> ScaffoldResult:
     """Generate / refresh Docker scaffolding for an agent home.
 
@@ -1089,6 +1148,7 @@ def scaffold(
     install_codex = "codex-plus" in _mode_extras
     df_text = render_dockerfile(
         fragments, mode=mode, mimir_extras=mimir_extras, install_codex=install_codex,
+        install_opencode=install_opencode,
     )
     _write_if_changed(home / "Dockerfile", df_text, "Dockerfile")
 
@@ -1127,6 +1187,22 @@ def scaffold(
     # accidentally start committing secrets.
     if _ensure_compose_env_gitignored(home):
         result.files_written.append(".gitignore (appended compose.env block)")
+
+    # OpenCode config — idempotent. Only written when install_opencode is True.
+    # The config file is placed in the home so it can be bind-mounted or
+    # copied into worktrees. Uses a fixed filename that OpenCode will pick up.
+    if install_opencode:
+        oc_path = home / "opencode.json"
+        oc_text = _render_opencode_config()
+        if oc_path.is_file():
+            existing = oc_path.read_text()
+            if "opencode-feature-factory" not in existing:
+                result.files_written.append("opencode.json (merge required)")
+            else:
+                result.files_skipped.append("opencode.json (no changes)")
+        else:
+            oc_path.write_text(oc_text)
+            result.files_written.append("opencode.json (created)")
 
     return result
 

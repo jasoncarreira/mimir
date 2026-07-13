@@ -392,6 +392,83 @@ def test_scaffold_installs_codex_for_workspace_uv_extra(tmp_path: Path):
     assert "npm install -g @openai/codex" not in (plain / "Dockerfile").read_text()
 
 
+def test_render_dockerfile_installs_opencode_when_enabled():
+    """install_opencode=True adds the OpenCode runtime install to both modes."""
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode, install_opencode=True)
+        assert "npm install -g opencode-ai@1.17.15" in out, mode
+        assert "npm install -g opencode-feature-factory@0.2.1" in out, mode
+        assert "npm install -g opencode-project-memory@0.1.0" in out, mode
+        assert "npm install -g opencode-openai-codex-auth@4.4.0" in out, mode
+        assert "npm install -g opencode-anthropic-auth@0.0.13" in out, mode
+
+
+def test_render_dockerfile_omits_opencode_by_default():
+    """Default (no opencode opt-in) leaves the OpenCode runtime out — and the
+    placeholder must always be substituted (no stray sentinel)."""
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode)
+        assert "npm install -g opencode-ai" not in out, mode
+        assert "__OPENCODE_INSTALL__" not in out, mode
+
+
+def test_scaffold_installs_opencode_when_flag_set(tmp_path: Path):
+    """A deployment with install_opencode=True gets the OpenCode runtime."""
+    home = tmp_path / "opencode-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", install_opencode=True)
+    assert "npm install -g opencode-ai@1.17.15" in (home / "Dockerfile").read_text()
+
+    plain = tmp_path / "plain-home"
+    plain.mkdir()
+    scaffold(plain, mode="pypi", install_opencode=False)
+    assert "npm install -g opencode-ai" not in (plain / "Dockerfile").read_text()
+
+
+def test_scaffold_installs_opencode_for_workspace_mode(tmp_path: Path):
+    """Workspace mode respects install_opencode flag."""
+    home = tmp_path / "ws-opencode-home"
+    home.mkdir()
+    scaffold(home, mode="workspace", install_opencode=True)
+    assert "npm install -g opencode-ai@1.17.15" in (home / "Dockerfile").read_text()
+
+
+def test_scaffold_creates_opencode_config_when_enabled(tmp_path: Path):
+    """When install_opencode=True, an opencode.json config is created."""
+    home = tmp_path / "oc-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", install_opencode=True)
+    oc_config = home / "opencode.json"
+    assert oc_config.is_file(), "opencode.json should be created"
+    content = oc_config.read_text()
+    assert "opencode-feature-factory" in content
+    assert "opencode-project-memory" in content
+    assert "opencode-openai-codex-auth" in content
+    assert "opencode-anthropic-auth" in content
+    assert '.opencode/memory' in content
+    assert '"maxIndexBytes": 8192' in content
+    assert '"maxIndexLines": 100' in content
+    assert '"gitExclude": false' in content
+
+
+def test_scaffold_skips_opencode_config_when_disabled(tmp_path: Path):
+    """When install_opencode=False, no opencode.json is created."""
+    home = tmp_path / "no-oc-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", install_opencode=False)
+    oc_config = home / "opencode.json"
+    assert not oc_config.is_file(), "opencode.json should NOT be created"
+
+
+def test_scaffold_opencode_config_is_idempotent(tmp_path: Path):
+    """Re-running scaffold with install_opencode=True should not rewrite the config."""
+    home = tmp_path / "idempotent-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", install_opencode=True)
+    first_result = scaffold(home, mode="pypi", install_opencode=True)
+    assert "opencode.json (no changes)" in first_result.files_skipped
+
+
 # ── scaffold() end-to-end ──────────────────────────────────────────
 
 

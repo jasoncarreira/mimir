@@ -39,13 +39,23 @@ class FailingResolver:
 def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -> None:
     pins = {pin.name: pin for pin in default_tool_pins()}
 
-    assert set(pins) == {"codex", "chainlink", "mermaid-cli", "claude-code", "osv-scanner", "gogcli"}
+    expected = {
+        "codex", "chainlink", "mermaid-cli", "claude-code", "osv-scanner", "gogcli",
+        "opencode", "opencode-feature-factory", "opencode-project-memory",
+        "opencode-openai-codex-auth", "opencode-anthropic-auth",
+    }
+    assert set(pins) == expected
     assert pins["codex"].category == "coding-cli"
     assert pins["claude-code"].category == "coding-cli"
     assert pins["chainlink"].category == "issue-cli"
     assert pins["mermaid-cli"].category == "renderer"
     assert pins["gogcli"].category == "integration-cli"
     assert pins["osv-scanner"].category == "security-scanner"
+    assert pins["opencode"].category == "coding-cli"
+    assert pins["opencode-feature-factory"].category == "coding-plugin"
+    assert pins["opencode-project-memory"].category == "coding-plugin"
+    assert pins["opencode-openai-codex-auth"].category == "coding-plugin"
+    assert pins["opencode-anthropic-auth"].category == "coding-plugin"
     for pin in pins.values():
         assert pin.pin
         assert pin.smoke
@@ -74,6 +84,9 @@ def test_default_tool_pin_inventory_matches_shipped_install_literals() -> None:
     assert f"@anthropic-ai/claude-code@{pins['claude-code'].pin}" in install_text
     assert f"github.com/steipete/gogcli/cmd/gog@{pins['gogcli'].pin}" in install_text
     assert pins["osv-scanner"].pin in install_text
+    assert f"opencode-ai@{pins['opencode'].pin}" in install_text
+    assert f"opencode-feature-factory@{pins['opencode-feature-factory'].pin}" in install_text
+    assert f"opencode-project-memory@{pins['opencode-project-memory'].pin}" in install_text
 
 
 def test_inventory_tool_pins_reports_drift_without_mutating_or_smoking() -> None:
