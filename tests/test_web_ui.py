@@ -198,6 +198,170 @@ async def test_chainlink_board_degrades_when_cli_unavailable(
     assert "chainlink CLI not on PATH" in payload["error"]
 
 
+@pytest.mark.asyncio
+async def test_factory_runs_list_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    app = web.Application()
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=home)
+
+    client = TestClient(TestServer(app))
+    async with client as cli:
+        resp = await cli.get("/api/v1/factory-runs")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["ok"] is True
+        assert data["data"]["runs"] == []
+
+
+@pytest.mark.asyncio
+async def test_factory_runs_list_with_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    factory_dir = tmp_path / ".opencode" / "factory"
+    run_dir = factory_dir / "chainlink-834"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({
+        "run_id": "chainlink-834",
+        "status": "running",
+        "heartbeat_at": "2026-07-13T10:00:00Z",
+        "pr_url": None,
+        "gates": {
+            "story": {"status": "approved"},
+            "brief": {"status": "pending"},
+        },
+        "steps": [
+            {"agent": "spec-writer", "status": "accepted"},
+        ],
+        "slices": [
+            {"id": "s1", "status": "merged"},
+        ],
+    }), encoding="utf-8")
+
+    app = web.Application()
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=home)
+
+    client = TestClient(TestServer(app))
+    async with client as cli:
+        resp = await cli.get("/api/v1/factory-runs")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["ok"] is True
+        assert len(data["data"]["runs"]) == 1
+        run = data["data"]["runs"][0]
+        assert run["run_id"] == "chainlink-834"
+        assert run["status"] == "running"
+        assert run["is_terminal"] is False
+
+
+@pytest.mark.asyncio
+async def test_factory_runs_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    factory_dir = tmp_path / ".opencode" / "factory"
+    run_dir = factory_dir / "chainlink-834"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({
+        "run_id": "chainlink-834",
+        "status": "completed",
+        "heartbeat_at": "2026-07-13T10:00:00Z",
+        "pr_url": "https://github.com/owner/repo/pull/42",
+        "gates": {
+            "story": {"status": "approved"},
+            "brief": {"status": "approved"},
+            "pre_pr": {"status": "approved"},
+        },
+        "steps": [
+            {"agent": "spec-writer", "status": "accepted"},
+            {"agent": "work-decomposer", "status": "completed"},
+        ],
+        "slices": [
+            {"id": "s1", "status": "merged"},
+        ],
+        "validator": {"verdict": "GO"},
+        "security_review": {"verdict": "PASS"},
+        "terminal_result": {
+            "status": "completed",
+            "pr_url": "https://github.com/owner/repo/pull/42",
+            "summary": "Successfully completed",
+        },
+    }), encoding="utf-8")
+
+    app = web.Application()
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=home)
+
+    client = TestClient(TestServer(app))
+    async with client as cli:
+        resp = await cli.get("/api/v1/factory-runs/chainlink-834")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["ok"] is True
+        run = data["data"]
+        assert run["run_id"] == "chainlink-834"
+        assert run["status"] == "completed"
+        assert run["is_terminal"] is True
+        assert run["pr_url"] == "https://github.com/owner/repo/pull/42"
+        assert run["validator_verdict"] == "GO"
+        assert run["security_verdict"] == "PASS"
+        assert len(run["steps"]) == 2
+        assert len(run["slices"]) == 1
+        assert run["terminal_result"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_factory_runs_detail_not_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    app = web.Application()
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=home)
+
+    client = TestClient(TestServer(app))
+    async with client as cli:
+        resp = await cli.get("/api/v1/factory-runs/nonexistent")
+        assert resp.status == 404
+        data = await resp.json()
+        assert data["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_factory_runs_malformed_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    factory_dir = tmp_path / ".opencode" / "factory"
+    run_dir = factory_dir / "chainlink-834"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text("not valid json", encoding="utf-8")
+
+    app = web.Application()
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=home)
+
+    client = TestClient(TestServer(app))
+    async with client as cli:
+        resp = await cli.get("/api/v1/factory-runs")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["ok"] is True
+        assert len(data["data"]["runs"]) == 1
+        run = data["data"]["runs"][0]
+        assert run["run_id"] == "chainlink-834"
+        assert run["status"] == "invalid"
+
+
 def test_dashboard_extension_route_path_allows_app_prefix_words_only():
     DashboardExtensionManifest(
         id="apple",

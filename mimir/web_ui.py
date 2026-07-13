@@ -56,6 +56,13 @@ from .chainlink_board import (
     build_chainlink_board_payload,
     resolve_worklink_artifact,
 )
+from .worklink.backends.feature_factory import (
+    FACTORY_DIR,
+    FactoryRunState,
+    _parse_run_state,
+    factory_run_dir,
+    read_factory_run_state,
+)
 from .live_events import read_live_event_items_since
 from .ops_dashboard import (
     build_dashboard_payload_async,
@@ -1366,6 +1373,153 @@ def register_routes(
         )
         return json_success(payload)
 
+    def _get_worklink_repo() -> Path | None:
+        """Get the worklink repo path from environment or home."""
+        if home is None:
+            return None
+        repo_env = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+        if repo_env:
+            return Path(repo_env)
+        return home
+
+    def _list_factory_runs() -> list[dict[str, Any]]:
+        """Enumerate factory runs from the configured worklink repository."""
+        repo = _get_worklink_repo()
+        if repo is None:
+            return []
+        factory_root = repo / FACTORY_DIR
+        if not factory_root.is_dir():
+            return []
+
+        runs: list[dict[str, Any]] = []
+        max_runs = 1000
+        try:
+            for run_dir in sorted(factory_root.iterdir())[:max_runs]:
+                if not run_dir.is_dir():
+                    continue
+                run_json = run_dir / "run.json"
+                if not run_json.exists():
+                    continue
+                try:
+                    data = json.loads(run_json.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, ValueError):
+                    runs.append({
+                        "run_id": run_dir.name,
+                        "status": "invalid",
+                        "error": "malformed run.json",
+                        "diagnostic": True,
+                    })
+                    continue
+                state = _parse_run_state(data)
+                if state is None:
+                    runs.append({
+                        "run_id": run_dir.name,
+                        "status": "invalid",
+                        "error": "unparseable run.json",
+                        "diagnostic": True,
+                    })
+                    continue
+                runs.append(_serialize_factory_run_summary(state))
+        except OSError:
+            pass
+        return runs
+
+    def _serialize_factory_run_summary(state: FactoryRunState) -> dict[str, Any]:
+        """Serialize a FactoryRunState to a summary dict for the API."""
+        result: dict[str, Any] = {
+            "run_id": state.run_id,
+            "status": state.status,
+            "heartbeat_at": state.heartbeat_at,
+            "is_terminal": state.is_terminal,
+            "is_stale": state.is_stale,
+            "pending_gate": state.pending_gate,
+            "gate_statuses": list(state.gate_statuses),
+            "validator_verdict": state.validator_verdict,
+            "security_verdict": state.security_verdict,
+        }
+        if state.pr_url:
+            result["pr_url"] = state.pr_url
+        if state.error:
+            result["error"] = state.error
+        if state.cost:
+            result["cost"] = {
+                "status": state.cost.status,
+                "total_tokens": state.cost.total_tokens,
+                "cost_total": state.cost.cost_total,
+                "cost_currency": state.cost.cost_currency,
+            }
+        if state.terminal_result:
+            result["terminal_result"] = {
+                "status": state.terminal_result.status,
+                "pr_url": state.terminal_result.pr_url,
+                "reason": state.terminal_result.reason,
+                "summary": state.terminal_result.summary,
+            }
+        return result
+
+    def _serialize_factory_run_detail(state: FactoryRunState) -> dict[str, Any]:
+        """Serialize a FactoryRunState to a detailed dict for the API."""
+        result = _serialize_factory_run_summary(state)
+        result["steps"] = list(state.steps)
+        result["slices"] = list(state.slices)
+        if state.debug:
+            result["debug"] = {
+                "created_at": state.debug.created_at,
+                "resumed_at": state.debug.resumed_at,
+                "resume_count": state.debug.resume_count,
+            }
+        if state.cost:
+            result["cost"] = {
+                "status": state.cost.status,
+                "updated_at": state.cost.updated_at,
+                "entry_count": state.cost.entry_count,
+                "request_count": state.cost.request_count,
+                "total_tokens": state.cost.total_tokens,
+                "cost_total": state.cost.cost_total,
+                "cost_currency": state.cost.cost_currency,
+                "mixed_currency": state.cost.mixed_currency,
+                "missing": list(state.cost.missing),
+            }
+        return result
+
+    async def factory_runs_list_v1(_request: web.Request) -> web.Response:
+        """GET /api/v1/factory-runs — list all factory runs."""
+        runs = await asyncio.to_thread(_list_factory_runs)
+        return json_success(
+            {"runs": runs},
+            meta=list_meta(cursor=None, limit=None, total=len(runs), truncated=False),
+        )
+
+    async def factory_runs_detail_v1(request: web.Request) -> web.Response:
+        """GET /api/v1/factory-runs/{run_id} — get a specific factory run."""
+        run_id = request.match_info.get("run_id", "").strip()
+        if not run_id:
+            return json_error("missing_run_id", "run_id is required", status=400)
+
+        repo = _get_worklink_repo()
+        if repo is None:
+            return json_error("home_not_configured", "home path not configured", status=503)
+
+        run_dir = factory_run_dir(repo, run_id)
+        run_json = run_dir / "run.json"
+
+        if not run_dir.exists():
+            return json_error("run_not_found", f"run directory not found: {run_id}", status=404)
+
+        if not run_json.exists():
+            return json_error("run_not_found", f"run.json not found for: {run_id}", status=404)
+
+        try:
+            data = json.loads(run_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return json_error("run_invalid", "run.json is malformed", status=400)
+
+        state = _parse_run_state(data)
+        if state is None:
+            return json_error("run_invalid", "run.json is unparseable", status=400)
+
+        return json_success(_serialize_factory_run_detail(state))
+
     async def chainlink_board_data_v1(_request: web.Request) -> web.Response:
         payload = await build_chainlink_board_payload(home)
         return json_success(payload)
@@ -1831,6 +1985,12 @@ def register_routes(
             DashboardBackendRoute("GET", "/api/v1/chainlink-board/artifact", chainlink_board_artifact_v1),
         ]
 
+    def factory_runs_backend_routes() -> list[DashboardBackendRoute]:
+        return [
+            DashboardBackendRoute("GET", "/api/v1/factory-runs", factory_runs_list_v1),
+            DashboardBackendRoute("GET", "/api/v1/factory-runs/{run_id}", factory_runs_detail_v1),
+        ]
+
     def scheduler_backend_routes() -> list[DashboardBackendRoute]:
         return [
             DashboardBackendRoute("GET", "/api/v1/scheduler", scheduler_data_v1),
@@ -1854,6 +2014,7 @@ def register_routes(
         hooks={
             "ops": ops_backend_routes,
             "chainlink-board": chainlink_board_backend_routes,
+            "factory-runs": factory_runs_backend_routes,
             "scheduler": scheduler_backend_routes,
             "admin-config": admin_config_backend_routes,
             "admin-users": admin_users_backend_routes,

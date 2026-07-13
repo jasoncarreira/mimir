@@ -358,3 +358,112 @@ export const chatReactionFixture: ChatReactionEvent = {
   message_id: "msg-abc123",
   emoji: "thumbs_up"
 };
+
+export const factoryRunsListFixture = {
+  ok: true,
+  version: "v1" as const,
+  data: {
+    runs: [
+      {
+        run_id: "chainlink-834",
+        status: "running",
+        heartbeat_at: "2026-07-13T10:00:00Z",
+        is_terminal: false,
+        is_stale: false,
+        pending_gate: "brief",
+        gate_statuses: [["story", "approved"], ["brief", "pending"], ["pre_pr", "pending"]],
+        validator_verdict: null,
+        security_verdict: null,
+        cost: {
+          status: "partial",
+          total_tokens: 150000,
+          cost_total: 0.45,
+          cost_currency: "USD"
+        }
+      },
+      {
+        run_id: "chainlink-833",
+        status: "completed",
+        heartbeat_at: "2026-07-12T15:30:00Z",
+        is_terminal: true,
+        is_stale: false,
+        pending_gate: null,
+        gate_statuses: [["story", "approved"], ["brief", "approved"], ["pre_pr", "approved"]],
+        validator_verdict: "GO",
+        security_verdict: "PASS",
+        pr_url: "https://github.com/owner/repo/pull/42",
+        terminal_result: {
+          status: "completed",
+          pr_url: "https://github.com/owner/repo/pull/42",
+          reason: null,
+          summary: "Successfully completed"
+        }
+      },
+      {
+        run_id: "chainlink-832",
+        status: "blocked",
+        heartbeat_at: "2026-07-11T09:00:00Z",
+        is_terminal: true,
+        is_stale: true,
+        pending_gate: null,
+        gate_statuses: [["story", "approved"], ["brief", "approved"], ["pre_pr", "pending"]],
+        validator_verdict: null,
+        security_verdict: null,
+        error: "Gate pre_pr requires human approval"
+      },
+      {
+        run_id: "chainlink-831",
+        status: "invalid",
+        heartbeat_at: "",
+        is_terminal: false,
+        is_stale: true,
+        pending_gate: null,
+        gate_statuses: [],
+        validator_verdict: null,
+        security_verdict: null,
+        error: "malformed run.json",
+        diagnostic: true
+      }
+    ]
+  },
+  meta: {
+    cursor: null,
+    limit: null,
+    total: 4,
+    truncated: false
+  }
+};
+
+export const factoryRunDetailFixture = {
+  ok: true,
+  version: "v1" as const,
+  data: {
+    run_id: "chainlink-834",
+    status: "running",
+    heartbeat_at: "2026-07-13T10:00:00Z",
+    is_terminal: false,
+    is_stale: false,
+    pending_gate: "brief",
+    gate_statuses: [["story", "approved"], ["brief", "pending"], ["pre_pr", "pending"]],
+    validator_verdict: null,
+    security_verdict: null,
+    steps: [["spec-writer", "accepted"], ["work-decomposer", "running"]],
+    slices: [["s1", "merged"], ["s2", "building"]],
+    cost: {
+      status: "partial",
+      updated_at: "2026-07-13T09:00:00Z",
+      entry_count: 5,
+      request_count: 120,
+      total_tokens: 150000,
+      cost_total: 0.45,
+      cost_currency: "USD",
+      mixed_currency: false,
+      missing: []
+    },
+    debug: {
+      created_at: "2026-07-13T08:00:00Z",
+      resumed_at: null,
+      resume_count: 0
+    }
+  }
+};

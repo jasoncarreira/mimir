@@ -1056,6 +1056,58 @@ export interface TurnStreamEvent {
   /** tool_result end: the result content. */
   content?: string;
 }
+
+export interface FactoryRunSummary {
+  run_id: string;
+  status: string;
+  heartbeat_at: string;
+  is_terminal: boolean;
+  is_stale: boolean;
+  pending_gate: string | null;
+  gate_statuses: Array<[string, string]>;
+  validator_verdict: string | null;
+  security_verdict: string | null;
+  pr_url?: string;
+  error?: string;
+  diagnostic?: boolean;
+  cost?: {
+    status: string;
+    total_tokens: number | null;
+    cost_total: number | null;
+    cost_currency: string | null;
+  };
+  terminal_result?: {
+    status: string;
+    pr_url: string | null;
+    reason: string | null;
+    summary: string | null;
+  };
+}
+
+export interface FactoryRunDetail extends FactoryRunSummary {
+  steps: Array<[string, string]>;
+  slices: Array<[string, string]>;
+  debug?: {
+    created_at: string | null;
+    resumed_at: string | null;
+    resume_count: number | null;
+  };
+  cost?: {
+    status: string;
+    updated_at: string | null;
+    entry_count: number | null;
+    request_count: number | null;
+    total_tokens: number | null;
+    cost_total: number | null;
+    cost_currency: string | null;
+    mixed_currency: boolean;
+    missing: string[];
+  };
+}
+
+export interface FactoryRunsData {
+  runs: FactoryRunSummary[];
+}
 """
 
 
