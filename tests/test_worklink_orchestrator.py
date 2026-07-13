@@ -1133,6 +1133,51 @@ class _CodexNamedBackend(FakeBackend):
 
 from mimir.worklink.compute import LaunchHandle as _LaunchHandle
 
+def test_run_epic_refuses_review_state_before_claim_or_factory_launch(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    epic_json = json.dumps(
+        {
+            "id": 701,
+            "title": "already under review",
+            "description": "build the thing",
+            "labels": ["worklink", "worklink:epic", "worklink:review", "worklink:ready"],
+            "parent_id": None,
+            "comments": [],
+        }
+    )
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list):
+            calls.append(args)
+            if args[:4] == ["chainlink", "issue", "show", "701"]:
+                return cp(args, stdout=epic_json)
+            if args[:4] == ["git", "-C", str(repo), "config"]:
+                return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        return cp(args)
+
+    class FactoryBackend(FakeBackend):
+        name = "feature_factory"
+
+    compute = FakeCompute(shared_filesystem=True)
+    registry = BackendRegistry(
+        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    )
+    registry.register(FactoryBackend(status="success"))
+    registry.register_compute(compute)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run_epic(701)
+    )
+
+    assert result.status == "failed"
+    assert result.reason == "lifecycle_state_incompatible"
+    assert not any(call[1:3] == ["locks", "claim"] for call in calls)
+    assert compute.specs == []
+    assert not (repo / ".worklink").exists()
+
+
 def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
     """Regression (mimir review on #1030): run_epic must call
     ``compute.wait(handle, timeout_s)`` — the same 2-arg signature run() uses —

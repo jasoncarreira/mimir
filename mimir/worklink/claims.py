@@ -129,12 +129,14 @@ class ChainlinkClaims:
         clock: Callable[[], datetime] | None = None,
         max_attempts: int = 3,
         duplicate_freshness_s: float = 600.0,
+        home_path: str | Path | None = None,
     ) -> None:
         self.chainlink_bin = chainlink_bin
         self.agent_id = agent_id
         self.runner = runner
         self.clock = clock or (lambda: datetime.now(UTC))
         self.max_attempts = max_attempts
+        self.home_path = Path(home_path) if home_path is not None else None
         # chainlink #822: a claim-comment heartbeat younger than this means the
         # owning process is alive (2x the max epic heartbeat interval of 300s).
         self.duplicate_freshness_s = duplicate_freshness_s
@@ -144,11 +146,11 @@ class ChainlinkClaims:
         issue_id: int,
         comments: Iterable[str] = (),
         *,
-        labels: Iterable[str] = (),
-        home_path: str | None = None,
+        labels: Iterable[str] | None = None,
+        home_path: str | Path | None = None,
         max_active_locks: int | None = None,
     ) -> ClaimResult:
-        """Claim ``issue_id`` if attempts and optional global cap allow it.
+        """Claim ``issue_id`` if its lifecycle, evidence, attempts, and cap allow it.
 
         ``max_active_locks`` is the autonomous-dispatch hard bound. The issue
         lock is acquired first, then the active lock count is checked while this
@@ -156,28 +158,29 @@ class ChainlinkClaims:
         the cap, the lock is released before any label/comment mutation or
         backend compute launch.
 
-        If ``labels`` is provided, admission also refuses leaves in
-        ``worklink:review`` state to prevent duplicate dispatch after a prior
-        attempt already created a review-ready PR (chainlink #873).
-        ``worklink:in-progress`` is allowed because it's used for legitimate
-        reattach scenarios.
-
-        If ``home_path`` is provided, admission also refuses when the issue
-        already has a durable review-ready PR/evidence association (even if
-        labels have drifted).
+        Admission resolves current labels itself when a caller does not supply
+        them and refuses ``worklink:review`` before claiming. It also reads the
+        latest persisted evidence under the configured home (or the per-call
+        override) and refuses completed evidence with an associated PR, even if
+        labels have drifted. ``worklink:in-progress`` remains admissible for
+        legitimate reattach scenarios.
         """
-        label_set = set(labels)
-        if label_set:
-            if "worklink:review" in label_set:
-                return ClaimResult(False, reason="lifecycle_state_incompatible")
+        label_set = self._issue_labels(issue_id)
+        if labels is not None:
+            label_set.update(labels)
+        if "worklink:review" in label_set:
+            return ClaimResult(False, reason="lifecycle_state_incompatible")
 
-        if home_path is not None:
+        effective_home = Path(home_path) if home_path is not None else self.home_path
+        if effective_home is not None:
             from .autonomy import _find_latest_evidence_for_issue
-            evidence = _find_latest_evidence_for_issue(Path(home_path), issue_id)
-            if evidence is not None and evidence.get("review_ready"):
-                pr_url = evidence.get("pr_url")
-                if pr_url:
-                    return ClaimResult(False, reason="review_ready_evidence_exists")
+            evidence = _find_latest_evidence_for_issue(effective_home, issue_id)
+            if (
+                evidence is not None
+                and evidence.get("status") == "completed"
+                and evidence.get("pr_url")
+            ):
+                return ClaimResult(False, reason="review_ready_evidence_exists")
 
         lock = self._run("locks", "claim", str(issue_id), check=False)
         if lock.returncode != 0:
@@ -344,6 +347,29 @@ class ChainlinkClaims:
             )
             reaped.append(record)
         return reaped
+
+    def _issue_labels(self, issue_id: int) -> set[str]:
+        """Return current labels when Chainlink exposes them, otherwise empty."""
+        result = self._run("issue", "show", str(issue_id), "--json", check=False)
+        if result.returncode != 0:
+            return set()
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return set()
+        raw_labels = data.get("labels")
+        labels: set[str] = set()
+        if isinstance(raw_labels, list):
+            for item in raw_labels:
+                if isinstance(item, str):
+                    labels.add(item)
+                elif isinstance(item, dict):
+                    name = item.get("name") or item.get("label")
+                    if name:
+                        labels.add(str(name))
+        elif isinstance(raw_labels, dict):
+            labels.update(str(name) for name in raw_labels)
+        return labels
 
     def _issue_has_label(self, issue_id: int, label: str) -> bool:
         """Best-effort current-label check for reaper race avoidance.

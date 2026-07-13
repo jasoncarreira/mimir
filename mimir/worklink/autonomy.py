@@ -89,6 +89,7 @@ def make_claims(home: Path, *, agent_id: str = DEFAULT_AGENT_ID) -> ChainlinkCla
         chainlink_bin=chainlink_bin(),
         agent_id=agent_id,
         runner=_home_runner(home),
+        home_path=home,
     )
 
 
