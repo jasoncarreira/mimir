@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..access_control import SinkGate
 from ..channel_registry import ChannelRegistry
 from ..turn_event_bus import TurnEventBus
 from ..turn_event_redaction import scrub_detail as _shared_scrub_detail
@@ -92,6 +93,8 @@ class ActivityPanelModel:
     in_flight: ActivityStep | None = None
     folded_inputs: list[FoldedInput] = field(default_factory=list)
     span_tool_names: dict[str, str] = field(default_factory=dict)
+    ifc_labels: Any = None
+    auth_context: Any = None
 
     @property
     def completed_count(self) -> int:
@@ -110,6 +113,8 @@ class ActivityPanel:
         debounce_seconds: float = 1.0,
         detail_levels: tuple[tuple[str, str], ...] = (),
         delete_grace_seconds: float = 2.0,
+        default_ifc_labels: Any = None,
+        default_auth_context: Any = None,
     ) -> None:
         self._bus = bus
         self._channels = channels
@@ -117,6 +122,8 @@ class ActivityPanel:
         self._debounce_seconds = max(0.0, debounce_seconds)
         self._detail_levels = detail_levels
         self._delete_grace_seconds = max(0.0, delete_grace_seconds)
+        self._default_ifc_labels = default_ifc_labels
+        self._default_auth_context = default_auth_context
         self._queue: asyncio.Queue[dict[str, Any]] | None = None
         self._task: asyncio.Task[Any] | None = None
         self._models: dict[str, ActivityPanelModel] = {}
@@ -181,6 +188,8 @@ class ActivityPanel:
                 reply_to_message_id=_clean(event.get("reply_to_message_id")),
                 thread_ts=_clean(event.get("thread_ts")),
                 detail_level=self._detail_level_for(channel_id),
+                ifc_labels=event.get("_ifc_labels", self._default_ifc_labels),
+                auth_context=event.get("_auth_context", self._default_auth_context),
             )
             model.in_flight = ActivityStep("Working")
             self._models[turn_id] = model
@@ -190,6 +199,13 @@ class ActivityPanel:
         model = self._models.get(turn_id)
         if model is None or not model.posted:
             return
+
+        event_labels = event.get("_ifc_labels")
+        if event_labels is not None:
+            model.ifc_labels = event_labels
+        event_auth = event.get("_auth_context")
+        if event_auth is not None:
+            model.auth_context = event_auth
 
         typ = event.get("type")
         phase = event.get("phase")
@@ -276,7 +292,27 @@ class ActivityPanel:
         model.steps.append(step)
         model.in_flight = None
 
+    @staticmethod
+    def _sink_allowed(model: ActivityPanelModel, sink_name: str) -> bool:
+        decision = SinkGate.check_sink_flow(
+            sink_name,
+            model.channel_id,
+            model.ifc_labels,
+            model.auth_context,
+            enforce=True,
+        )
+        if decision.allowed:
+            return True
+        log.warning(
+            "activity panel IFC sink blocked: sink=%s reason=%s",
+            sink_name,
+            decision.reason,
+        )
+        return False
+
     async def _post(self, model: ActivityPanelModel) -> None:
+        if not self._sink_allowed(model, "activity_panel_post"):
+            return
         bridge = self._channels.find(model.channel_id)
         if bridge is None:
             return
@@ -336,6 +372,8 @@ class ActivityPanel:
 
     async def _flush(self, model: ActivityPanelModel) -> None:
         if not model.message_id:
+            return
+        if not self._sink_allowed(model, "activity_panel_edit"):
             return
         current = asyncio.current_task()
         pending = self._pending.pop(model.turn_id, None)

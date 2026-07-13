@@ -79,6 +79,7 @@ class ShellJob:
     exit_code: Optional[int] = None  # None while running
     finished_at: Optional[float] = None
     channel_id: Optional[str] = None
+    ifc_labels: object | None = None
     _process: Optional[subprocess.Popen] = field(default=None, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 

@@ -1217,9 +1217,13 @@ def register_routes(
                 except asyncio.TimeoutError:
                     await resp.write(b": heartbeat\n\n")
                     continue
+                public_event = {
+                    key: value for key, value in event.items()
+                    if not str(key).startswith("_ifc_") and key != "_auth_context"
+                }
                 block = (
                     "event: turn-event\n"
-                    "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+                    "data: " + json.dumps(public_event, ensure_ascii=False) + "\n\n"
                 )
                 await resp.write(block.encode("utf-8"))
         except (ConnectionResetError, asyncio.CancelledError):

@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any
 from .turn_event_redaction import scrub_turn_event
 
 if TYPE_CHECKING:
-    from .models import AgentEvent
+    from .models import AgentEvent, AuthContext, InformationFlowLabels
 
 log = logging.getLogger(__name__)
 
@@ -132,10 +132,14 @@ class TurnEventEmitter:
         *,
         turn_id: str,
         channel_id: str | None,
+        ifc_labels: "InformationFlowLabels | None" = None,
+        auth_context: "AuthContext | None" = None,
     ) -> None:
         self._bus = bus
         self._turn_id = turn_id
         self._channel_id = channel_id or ""
+        self._ifc_labels = ifc_labels
+        self._auth_context = auth_context
         self._seq = 0
         self._block_n = 0
         # chainlink #587: parse only NEW messages per snapshot (incremental)
@@ -154,10 +158,28 @@ class TurnEventEmitter:
     def enabled(self) -> bool:
         return self._bus is not None
 
+    def bind_information_flow(
+        self,
+        ifc_labels: "InformationFlowLabels | None",
+        auth_context: "AuthContext | None",
+    ) -> None:
+        """Attach the current turn's server-owned IFC carrier to panel events."""
+        self._ifc_labels = ifc_labels
+        self._auth_context = auth_context
+
     def _emit(self, type_: str, phase: str, **payload: Any) -> None:
         if self._bus is None:
             return
         try:
+            # Pull the live carrier at emission time so folded inputs and
+            # protected tool/subagent results cannot leave the panel on the
+            # labels captured at turn start.
+            from ._context import get_current_turn
+
+            ctx = get_current_turn()
+            if ctx is not None and getattr(ctx, "turn_id", None) == self._turn_id:
+                self._ifc_labels = getattr(ctx, "ifc_labels", self._ifc_labels)
+                self._auth_context = getattr(ctx, "auth_context", self._auth_context)
             self._seq += 1
             event = {
                 "type": type_,
@@ -166,6 +188,8 @@ class TurnEventEmitter:
                 "channel_id": self._channel_id,
                 "seq": self._seq,
                 "ts": _now_iso(),
+                "_ifc_labels": self._ifc_labels,
+                "_auth_context": self._auth_context,
                 **payload,
             }
             self._bus.publish(event)

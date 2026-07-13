@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage
 
 from mimir.agent import Agent
 from mimir.config import Config
-from mimir.models import AgentEvent
+from mimir.models import AgentEvent, AuthContext, InformationFlowLabels, TurnInteractivity
 import json
 
 from mimir.resend_nudge import (
@@ -132,12 +132,37 @@ class _FakeGraph:
 
 def _fake_self(tmp_path, channels=("discord-",)):
     return SimpleNamespace(
+        _harness_sink_allowed=Agent._harness_sink_allowed,
         _config=SimpleNamespace(
             resend_nudge_channels=channels,
             auto_deliver_final_text_channels=(),
             home=tmp_path,
         )
     )
+
+
+def _ifc_context(channel="discord-1"):
+    return {
+        "ifc_labels": InformationFlowLabels(
+            labels=frozenset({"private"}),
+            source_channels=frozenset({channel}),
+        ),
+        "auth_context": AuthContext(
+            principal="discord-U1",
+            canonical_principal="user-1",
+            roles=(),
+            event_ingress=None,
+            trigger="user_message",
+            channel_id=channel,
+            interactivity=TurnInteractivity.INTERACTIVE,
+            enforcement_enabled=True,
+        ),
+    }
+
+
+def _ctx(channel="discord-1", **kwargs):
+    values = {"delivered_channel_ids": set(), **_ifc_context(channel), **kwargs}
+    return SimpleNamespace(**values)
 
 
 def _event(channel="discord-1", trigger="user_message"):
@@ -157,7 +182,7 @@ def capture_events(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_noop_when_channel_not_allowlisted(tmp_path):
-    ctx = SimpleNamespace(delivered_channel_ids=set(), auth_context=None)
+    ctx = _ctx("slack-1")
     g = _FakeGraph(ctx, "slack-1", deliver=False)
     await Agent._maybe_resend_nudge(
         _fake_self(tmp_path, channels=("discord-",)), g, {}, ctx, _event("slack-1"),
@@ -168,7 +193,7 @@ async def test_noop_when_channel_not_allowlisted(tmp_path):
 
 @pytest.mark.asyncio
 async def test_noop_when_auto_deliver_enabled_for_channel(tmp_path, capture_events):
-    ctx = SimpleNamespace(delivered_channel_ids=set(), auth_context=None)
+    ctx = _ctx()
     g = _FakeGraph(ctx, "discord-1", deliver=True)
     fake_self = _fake_self(tmp_path, channels=("discord-",))
     fake_self._config.auto_deliver_final_text_channels = ("discord-",)
@@ -182,7 +207,7 @@ async def test_noop_when_auto_deliver_enabled_for_channel(tmp_path, capture_even
 
 @pytest.mark.asyncio
 async def test_noop_when_already_delivered(tmp_path):
-    ctx = SimpleNamespace(delivered_channel_ids={"discord-1"})
+    ctx = _ctx(delivered_channel_ids={"discord-1"})
     g = _FakeGraph(ctx, "discord-1", deliver=False)
     await Agent._maybe_resend_nudge(
         _fake_self(tmp_path), g, {}, ctx, _event(),
@@ -193,7 +218,7 @@ async def test_noop_when_already_delivered(tmp_path):
 
 @pytest.mark.asyncio
 async def test_noop_when_not_interactive_or_no_output(tmp_path):
-    ctx = SimpleNamespace(delivered_channel_ids=set(), auth_context=None)
+    ctx = _ctx()
     g = _FakeGraph(ctx, "discord-1", deliver=False)
     # non-interactive
     await Agent._maybe_resend_nudge(
@@ -210,7 +235,7 @@ async def test_noop_when_not_interactive_or_no_output(tmp_path):
 
 @pytest.mark.asyncio
 async def test_reprompts_once_and_recovers(tmp_path, capture_events):
-    ctx = SimpleNamespace(delivered_channel_ids=set(), auth_context=None)
+    ctx = _ctx()
     g = _FakeGraph(ctx, "discord-1", deliver=True)  # the re-prompt sends
     await Agent._maybe_resend_nudge(
         _fake_self(tmp_path), g, {}, ctx, _event(),
@@ -224,7 +249,7 @@ async def test_reprompts_once_and_recovers(tmp_path, capture_events):
 
 @pytest.mark.asyncio
 async def test_reprompts_once_then_gives_up_and_logs_failed(tmp_path, capture_events):
-    ctx = SimpleNamespace(delivered_channel_ids=set(), auth_context=None)
+    ctx = _ctx()
     g = _FakeGraph(ctx, "discord-1", deliver=False)  # still doesn't send
     await Agent._maybe_resend_nudge(
         _fake_self(tmp_path), g, {}, ctx, _event(),

@@ -20,6 +20,79 @@ class TurnInteractivity(StrEnum):
     NON_INTERACTIVE = "non_interactive"
 
 
+class FlowLabel(StrEnum):
+    """Immutable information flow control labels (chainlink #871).
+
+    These labels track data sensitivity through the turn lifecycle. Labels
+    are monotonic - they can only be added, never removed (except via
+    explicit audited admin declassification). This ensures that private/
+    confidential data cannot leak to incompatible sinks.
+    """
+
+    PRIVATE = "private"
+    CONFIDENTIAL = "confidential"
+    INTERNAL = "internal"
+    PUBLIC = "public"
+
+
+@dataclass(frozen=True)
+class InformationFlowLabels:
+    """Immutable/monotonic information flow control labels (chainlink #871).
+
+    Tracks data sensitivity from various sources to enforce the sink gate.
+    Labels are monotonic - they can only be added, never removed except via
+    explicit audited admin declassification action. Unknown labels fail closed.
+
+    Sources:
+    - inbound/folded messages
+    - recent history
+    - automatic memory/session/skill/file injection
+    - attachments
+    - continuation context
+    - protected/partial tool/subagent results
+    """
+
+    labels: frozenset[str] = frozenset()
+    source_channels: frozenset[str] = frozenset()
+    created_at: float = field(default_factory=time.monotonic)
+
+    def with_label(self, label: str) -> "InformationFlowLabels":
+        """Return new instance with added label (monotonic - only adds)."""
+        if label in self.labels:
+            return self
+        return InformationFlowLabels(
+            labels=self.labels | frozenset({label}),
+            source_channels=self.source_channels,
+            created_at=self.created_at,
+        )
+
+    def with_channel(self, channel: str) -> "InformationFlowLabels":
+        """Return new instance with added source channel."""
+        if channel in self.source_channels:
+            return self
+        return InformationFlowLabels(
+            labels=self.labels,
+            source_channels=self.source_channels | frozenset({channel}),
+            created_at=self.created_at,
+        )
+
+    def can_flow_to(self, sink: str, allowed_sinks: frozenset[str]) -> bool:
+        """Check if labels permit flow to the given sink.
+
+        Unknown labels fail closed (deny). Unknown sinks fail closed (deny).
+        Same-principal/same-channel flows pass only when every label is
+        destination-compatible.
+        """
+        if not self.labels:
+            return True
+        if not allowed_sinks:
+            return False
+        for label in self.labels:
+            if label not in ("private", "confidential", "internal", "public"):
+                return False
+        return sink in allowed_sinks or "*" in allowed_sinks
+
+
 @dataclass
 class AgentEvent:
     """Inbound event from a bridge, scheduler tick, or HTTP injection.
@@ -52,6 +125,10 @@ class AgentEvent:
     source: str | None = None
     attachment_names: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
+    # Server-carried IFC state for continuations/resumed events. This must be
+    # propagated from a trusted TurnContext; generic ingress must not accept a
+    # client assertion as a declassification or authority signal.
+    ifc_labels: "InformationFlowLabels | None" = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +236,13 @@ class TurnContext:
     # this carrier, NOT from model session_id, ContextVar fallback, or
     # single-active-turn heuristics.
     auth_context: AuthContext | None = None
+    # Information flow control labels (chainlink #871). Immutable/monotonic
+    # labels tracking data sensitivity from various sources. Initialized before
+    # the first model call from inbound/folded messages, recent history,
+    # automatic memory/session/skill/file injection, attachments, and
+    # continuation context. Propagated to subagents, spawns, continuations,
+    # and resumed turns. Blocked at incompatible sinks.
+    ifc_labels: InformationFlowLabels | None = None
     # Number of successful send_message deliveries in this turn (incremented
     # only after the bridge confirms ``SendResult.sent``). The forgot-to-send
     # guard emits ``interactive_turn_no_send_message`` when an interactive turn

@@ -257,6 +257,29 @@ def _extract_channel_from_args(
     return auth_context.channel_id if auth_context is not None else None
 
 
+_IFC_DELEGATION_TOOLS = frozenset({
+    "task",
+    "spawn_claude_code",
+    "spawn_codex",
+    "spawn_open_code",
+    "bash_async",
+})
+
+
+def _get_current_turn_context() -> Any:
+    from .._context import get_current_turn
+
+    return get_current_turn()
+
+
+def _get_ifc_labels_from_context() -> Any:
+    """Get IFC labels from the active TurnContext."""
+    ctx = _get_current_turn_context()
+    if ctx is not None:
+        return getattr(ctx, "ifc_labels", None)
+    return None
+
+
 def _is_admin_sensitive_tool(
     tool_name: str,
     ctx: AuthContext | None = None,
@@ -338,6 +361,7 @@ def _check_admin_authorized(
     tool_name: str,
     ctx: Any | None = None,
     target_channel: str | None = None,
+    ifc_labels: Any = None,
 ) -> str | None:
     enforce = (
         bool(getattr(ctx, "enforcement_enabled", False))
@@ -345,7 +369,7 @@ def _check_admin_authorized(
         else _env_access_control_enforced()
     )
     auth = get_tool_registry().authorize_tool(
-        tool_name, ctx, enforce=enforce, target_channel=target_channel
+        tool_name, ctx, enforce=enforce, target_channel=target_channel, ifc_labels=ifc_labels
     )
     privileged = auth.required_tier.value == "admin" or not auth.allowed
     if not privileged:
@@ -471,9 +495,10 @@ class BudgetGateMiddleware(AgentMiddleware):
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
         target_channel = _extract_channel_from_args(request, auth_context)
+        ifc_labels = _get_ifc_labels_from_context()
 
         admin_denial = _check_admin_authorized(
-            tool_name, auth_context, target_channel
+            tool_name, auth_context, target_channel, ifc_labels
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
@@ -482,6 +507,19 @@ class BudgetGateMiddleware(AgentMiddleware):
                 tool_call_id=_tool_call_id(request),
                 name=tool_name,
                 status="error",
+            )
+
+        # Delegation inherits the current turn's monotonic IFC carrier. Built-in
+        # subagents execute under this same context; detached spawn/async tools
+        # preserve it for their continuation metadata.
+        active_ctx = _get_current_turn_context()
+        if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
+            from ..agent import _propagate_ifc_labels
+
+            active_ctx.ifc_labels = _propagate_ifc_labels(
+                active_ctx.ifc_labels,
+                getattr(auth_context, "channel_id", None),
+                auth_context,
             )
 
         # Destructive-action guardrail (chainlink #259): an accident
@@ -541,9 +579,10 @@ class BudgetGateMiddleware(AgentMiddleware):
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
         target_channel = _extract_channel_from_args(request, auth_context)
+        ifc_labels = _get_ifc_labels_from_context()
 
         admin_denial = _check_admin_authorized(
-            tool_name, auth_context, target_channel
+            tool_name, auth_context, target_channel, ifc_labels
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
@@ -552,6 +591,19 @@ class BudgetGateMiddleware(AgentMiddleware):
                 tool_call_id=_tool_call_id(request),
                 name=tool_name,
                 status="error",
+            )
+
+        # Delegation inherits the current turn's monotonic IFC carrier. Built-in
+        # subagents execute under this same context; detached spawn/async tools
+        # preserve it for their continuation metadata.
+        active_ctx = _get_current_turn_context()
+        if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
+            from ..agent import _propagate_ifc_labels
+
+            active_ctx.ifc_labels = _propagate_ifc_labels(
+                active_ctx.ifc_labels,
+                getattr(auth_context, "channel_id", None),
+                auth_context,
             )
 
         # Destructive-action guardrail (chainlink #259): an accident

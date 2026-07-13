@@ -67,6 +67,63 @@ class OperationDecision(StrEnum):
     UNKNOWN = "unknown"
 
 
+class SinkCategory(StrEnum):
+    """Sink categories for information flow control (chainlink #871).
+
+    Used to determine which sinks are compatible with which IFC labels.
+    """
+
+    SAME_CHANNEL = "same_channel"
+    CROSS_CHANNEL = "cross_channel"
+    PUBLIC = "public"
+    EXTERNAL_MCP = "external_mcp"
+    HTTP_WEBHOOK = "http_webhook"
+    SHELL_PROCESS = "shell_process"
+    NETWORK = "network"
+    SPAWN = "spawn"
+    NOTIFICATION = "notification"
+    FILE = "file"
+    DIRECT_MESSAGE = "direct_message"
+    UNKNOWN = "unknown"
+
+
+_SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
+    "send_message": SinkCategory.SAME_CHANNEL,
+    "react": SinkCategory.SAME_CHANNEL,
+    "fetch_channel_history": SinkCategory.SAME_CHANNEL,
+    # Harness-owned egress paths bypass model tool middleware, so they are
+    # named explicitly and checked at their final send/edit boundary.
+    "harness_auto_deliver": SinkCategory.SAME_CHANNEL,
+    "harness_resend_nudge": SinkCategory.SAME_CHANNEL,
+    "activity_panel_post": SinkCategory.SAME_CHANNEL,
+    "activity_panel_edit": SinkCategory.SAME_CHANNEL,
+    "post_message": SinkCategory.CROSS_CHANNEL,
+    "webhook": SinkCategory.HTTP_WEBHOOK,
+    "http_request": SinkCategory.HTTP_WEBHOOK,
+    "shell_exec": SinkCategory.SHELL_PROCESS,
+    "bash_async": SinkCategory.SHELL_PROCESS,
+    "spawn_claude_code": SinkCategory.SPAWN,
+    "spawn_codex": SinkCategory.SPAWN,
+    "spawn_open_code": SinkCategory.SPAWN,
+    "ntfy_send": SinkCategory.NOTIFICATION,
+    "write_file": SinkCategory.FILE,
+    "edit_file": SinkCategory.FILE,
+    "mcp__": SinkCategory.EXTERNAL_MCP,
+}
+
+
+def get_sink_category(tool_name: str) -> SinkCategory:
+    """Map a known egress operation to its sink category.
+
+    Unknown operations are not presumed public: doing so would make a newly
+    added harness send an implicit IFC bypass until the map was updated.
+    """
+    for prefix, category in _SINK_CATEGORY_MAP.items():
+        if tool_name.startswith(prefix):
+            return category
+    return SinkCategory.UNKNOWN
+
+
 @dataclass(frozen=True)
 class ResourceScope:
     """Defines a specific resource/domain that an operation scopes to."""
@@ -98,6 +155,205 @@ class ServicePrincipal:
 
     def has_capability(self, capability: str) -> bool:
         return capability in self.capabilities
+
+
+class SinkGate:
+    """Information flow control sink gate (chainlink #871).
+
+    Enforces that private/confidential data cannot flow to incompatible sinks.
+    Unknown labels/destinations fail closed (deny).
+
+    Propagation: Labels propagate to subagents, spawns, continuations, and
+    resumed turns. Same-principal/same-channel flows pass only when every
+    label is destination-compatible.
+    """
+
+    _global_resolver: Any = None
+
+    @classmethod
+    def set_identity_resolver(cls, resolver: Any) -> None:
+        cls._global_resolver = resolver
+
+    @classmethod
+    def check_sink_flow(
+        cls,
+        tool_name: str,
+        target: str | None,
+        ifc_labels: Any,
+        auth_context: Any,
+        *,
+        enforce: bool = False,
+    ) -> "ToolAuthorization":
+        """Check if IFC labels permit flow to the given sink.
+
+        Args:
+            tool_name: Name of the tool being called
+            target: Target destination (channel, file path, URL, etc.)
+            ifc_labels: InformationFlowLabels from the turn context
+            auth_context: AuthContext with principal and roles
+            enforce: Whether to enforce or allow in shadow mode
+
+        Returns:
+            ToolAuthorization with allowed/reason fields populated
+        """
+        from .models import InformationFlowLabels
+
+        if not isinstance(ifc_labels, InformationFlowLabels):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="missing_ifc_labels",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+
+        sink_category = get_sink_category(tool_name)
+        if sink_category == SinkCategory.UNKNOWN:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="unknown_sink_category",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+
+        if not target:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="unknown_sink_destination",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+
+        if not ifc_labels.labels:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.OPEN,
+                allowed=True,
+                reason="no_labels",
+                enforcement_enabled=enforce,
+            )
+
+        allowed_sinks = cls._get_allowed_sinks(
+            sink_category, auth_context, ifc_labels=ifc_labels,
+        )
+        effective_target = (
+            ChannelResourceAdapter._resolve_channel(target)
+            if sink_category == SinkCategory.SAME_CHANNEL
+            else target
+        )
+
+        can_flow = ifc_labels.can_flow_to(effective_target or "", allowed_sinks)
+
+        if not can_flow:
+            reason = f"ifc_label_blocked:{sink_category.value}"
+            is_shadow = not enforce
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason=reason,
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=is_shadow,
+            )
+
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.OPEN,
+            allowed=True,
+            reason="ifc_allowed",
+            enforcement_enabled=enforce,
+        )
+
+    @classmethod
+    def _get_allowed_sinks(
+        cls,
+        category: SinkCategory,
+        auth_context: Any,
+        *,
+        ifc_labels: Any,
+    ) -> frozenset[str]:
+        """Return concrete destinations compatible with every current label.
+
+        Ordinary admin authority deliberately does not widen this set. Admins
+        must use the distinct audited declassification action before egress.
+        """
+        if category != SinkCategory.SAME_CHANNEL or auth_context is None:
+            return frozenset()
+
+        triggering_channel = getattr(auth_context, "channel_id", None)
+        if not triggering_channel:
+            return frozenset()
+        resolved_triggering = ChannelResourceAdapter._resolve_channel(triggering_channel)
+        if not resolved_triggering:
+            return frozenset()
+
+        source_channels = getattr(ifc_labels, "source_channels", None)
+        if not isinstance(source_channels, frozenset) or not source_channels:
+            return frozenset()
+        resolved_sources = {
+            ChannelResourceAdapter._resolve_channel(channel)
+            for channel in source_channels
+            if channel
+        }
+        if not resolved_sources or None in resolved_sources:
+            return frozenset()
+        if resolved_sources != {resolved_triggering}:
+            return frozenset()
+
+        return frozenset({resolved_triggering})
+
+
+def audit_declassification(
+    labels: Any,
+    declassification_reason: str,
+    auth_context: Any,
+) -> Any:
+    """Audit admin declassification of IFC labels (chainlink #871).
+
+    This is the ONLY way to remove immutable/monotonic labels. Summarization,
+    model assertions, failures, and ordinary admin status do NOT erase labels.
+
+    Args:
+        labels: Current InformationFlowLabels
+        declassification_reason: Human-readable reason for declassification
+        auth_context: AuthContext with admin role
+
+    Returns:
+        New labels instance with declassification applied, or original if not admin
+    """
+    from .models import InformationFlowLabels
+
+    if not isinstance(labels, InformationFlowLabels):
+        return labels
+
+    is_admin = False
+    if auth_context is not None:
+        roles = getattr(auth_context, "roles", ()) or ()
+        is_admin = "admin" in roles
+
+    if not is_admin:
+        return labels
+
+    log.info(
+        "ifc_declassification",
+        reason=declassification_reason,
+        principal=getattr(auth_context, "principal", None),
+    )
+
+    return InformationFlowLabels(
+        labels=frozenset(),
+        source_channels=labels.source_channels,
+        created_at=labels.created_at,
+    )
 
 
 class ChannelResourceAdapter:
@@ -732,6 +988,7 @@ class ToolRegistry:
         *,
         enforce: bool = False,
         target_channel: str | None = None,
+        ifc_labels: Any = None,
     ) -> ToolAuthorization:
         """Authorize a tool call using the operation catalog.
 
@@ -742,7 +999,21 @@ class ToolRegistry:
         For channel operations (send_message, react, fetch_channel_history),
         resource-scoped authorization always compares the effective target against
         the triggering channel. An omitted target means reply-to-trigger.
+
+        The ifc_labels parameter enables information flow control sink gate
+        checks (chainlink #871).
         """
+        if ifc_labels is not None:
+            sink_check = SinkGate.check_sink_flow(
+                tool_name,
+                target_channel,
+                ifc_labels,
+                auth_context,
+                enforce=enforce,
+            )
+            if not sink_check.allowed and enforce:
+                return sink_check
+
         catalog = get_operation_catalog()
         decision = catalog.get_decision(tool_name, auth_context)
         service_principal = None

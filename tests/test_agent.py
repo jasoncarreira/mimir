@@ -38,7 +38,13 @@ from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.identities import IdentityResolver
 from mimir.index import IndexGenerator
-from mimir.models import AgentEvent, TurnContext, TurnInteractivity
+from mimir.models import (
+    AgentEvent,
+    AuthContext,
+    InformationFlowLabels,
+    TurnContext,
+    TurnInteractivity,
+)
 from mimir.skill_defs import home_builtin_skills_dir
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.turn_logger import TurnLogger
@@ -3331,8 +3337,9 @@ async def test_deliver_failure_notice_fires_on_early_phase_crash(
         await agent.run_turn(event)
 
     notices = [(c, t) for c, t in chans.sent if c == "rec-ops"]
-    assert len(notices) == 1, chans.sent  # exactly once, no double-post
-    assert "px failed" in notices[0][1] and "⚠️" in notices[0][1]
+    # The preloaded poller context is internal-labeled and the deliver target is
+    # cross-channel, so the harness failure notice is now correctly blocked.
+    assert notices == []
 
 
 async def test_no_deliver_notice_when_unset_on_early_crash(
@@ -3358,6 +3365,25 @@ async def test_no_deliver_notice_when_unset_on_early_crash(
 
 
 # ─── chainlink #511: iteration hard-stop channel notice ──────────────
+
+
+def _ifc_for_channel(channel_id: str, *, trigger: str = "user_message"):
+    return {
+        "ifc_labels": InformationFlowLabels(
+            labels=frozenset({"private"}),
+            source_channels=frozenset({channel_id}),
+        ),
+        "auth_context": AuthContext(
+            principal="test-user",
+            canonical_principal="test-user",
+            roles=(),
+            event_ingress=None,
+            trigger=trigger,
+            channel_id=channel_id,
+            interactivity=TurnInteractivity.INTERACTIVE,
+            enforcement_enabled=True,
+        ),
+    }
 
 
 class _FindSendChannels:
@@ -3393,6 +3419,7 @@ async def test_iteration_hard_stop_notifies_interactive_channel(tmp_path: Path):
         turn_id="t", session_id="discord-1", trigger="user_message",
         channel_id="discord-1", started_at=0.0,
         interactivity=TurnInteractivity.INTERACTIVE,
+        **_ifc_for_channel("discord-1"),
     )
     await agent._notify_iteration_hard_stop(event, 200, ctx)
     assert len(ch.sent) == 1
@@ -3419,10 +3446,11 @@ async def test_iteration_hard_stop_prefers_deliver_channel(tmp_path: Path):
     ctx = TurnContext(
         turn_id="t", session_id="poller:gh", trigger="poller",
         channel_id="poller:gh", started_at=0.0,
+        **_ifc_for_channel("poller:gh", trigger="poller"),
     )
     await agent._notify_iteration_hard_stop(event, 200, ctx)
-    assert ch.sent and ch.sent[0][0] == "slack-ops"
-    assert "slack-ops" in ctx.delivered_channel_ids
+    assert ch.sent == []  # cross-channel harness sink is incompatible
+    assert ctx.delivered_channel_ids == set()
 
 
 async def test_iteration_hard_stop_no_channel_no_send(tmp_path: Path):
@@ -3460,6 +3488,7 @@ async def test_iteration_hard_stop_soft_send_failure_not_recorded(tmp_path: Path
         turn_id="t", session_id="discord-1", trigger="user_message",
         channel_id="discord-1", started_at=0.0,
         interactivity=TurnInteractivity.INTERACTIVE,
+        **_ifc_for_channel("discord-1"),
     )
     await agent._notify_iteration_hard_stop(event, 200, ctx)
     assert len(ch.sent) == 1                       # the send was attempted
