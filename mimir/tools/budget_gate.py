@@ -239,12 +239,28 @@ def _tool_call_id(request: ToolCallRequest) -> str:
     return str(tc.get("id") or "")
 
 
-def _is_admin_sensitive_tool(tool_name: str, ctx: AuthContext | None = None) -> bool:
+def _extract_channel_from_args(request: ToolCallRequest) -> str | None:
+    """Extract channel_id from tool arguments for channel operations.
+
+    For send_message, react, and fetch_channel_history, the channel_id
+    is passed as an argument. This extracts it for authorization checks.
+    """
+    tc = getattr(request, "tool_call", None) or {}
+    args = tc.get("args") or {}
+    return args.get("channel_id")
+
+
+def _is_admin_sensitive_tool(
+    tool_name: str,
+    ctx: AuthContext | None = None,
+    target_channel: str | None = None,
+) -> bool:
     """Return whether the live decision surface requires a privileged check."""
     auth = get_tool_registry().authorize_tool(
         tool_name,
         ctx,
         enforce=bool(ctx is not None and ctx.enforcement_enabled),
+        target_channel=target_channel,
     )
     return auth.required_tier.value == "admin" or not auth.allowed
 
@@ -311,13 +327,19 @@ def _deny_admin_tool(
     return _admin_denial_message(tool_name, reason)
 
 
-def _check_admin_authorized(tool_name: str, ctx: Any | None = None) -> str | None:
+def _check_admin_authorized(
+    tool_name: str,
+    ctx: Any | None = None,
+    target_channel: str | None = None,
+) -> str | None:
     enforce = (
         bool(getattr(ctx, "enforcement_enabled", False))
         if ctx is not None
         else _env_access_control_enforced()
     )
-    auth = get_tool_registry().authorize_tool(tool_name, ctx, enforce=enforce)
+    auth = get_tool_registry().authorize_tool(
+        tool_name, ctx, enforce=enforce, target_channel=target_channel
+    )
     privileged = auth.required_tier.value == "admin" or not auth.allowed
     if not privileged:
         return None
@@ -440,9 +462,10 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest], ToolMessage | Command],
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
+        target_channel = _extract_channel_from_args(request)
 
         admin_denial = _check_admin_authorized(
-            tool_name, _auth_context_from_request(request)
+            tool_name, _auth_context_from_request(request), target_channel
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
@@ -508,9 +531,10 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
+        target_channel = _extract_channel_from_args(request)
 
         admin_denial = _check_admin_authorized(
-            tool_name, _auth_context_from_request(request)
+            tool_name, _auth_context_from_request(request), target_channel
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
