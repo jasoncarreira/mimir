@@ -420,11 +420,10 @@ class MCPResourceAdapter:
     ) -> OperationDecision | None:
         """Get decision for MCP tools.
 
-        Returns ADMIN_REQUIRED for MCP tools that:
-        - Have no provenance (not from bridged MCP)
-        - Have tombstoned (drifted) provenance
-
-        Returns OPEN for MCP tools with valid provenance (classified).
+        Returns ADMIN_REQUIRED for MCP tools that have no provenance,
+        tombstoned provenance, or no matching registered classifier.
+        A registered classifier supplies the explicit OPEN,
+        RESOURCE_SCOPED, or ADMIN_REQUIRED decision.
         Returns None for non-MCP tools to fall through to other adapters.
         """
         if not tool_name.startswith(cls._MCP_TOOL_PREFIX):
@@ -445,7 +444,52 @@ class MCPResourceAdapter:
             )
             return OperationDecision.ADMIN_REQUIRED
 
-        return OperationDecision.OPEN
+        adapter = cls._get_registered_adapter(provenance)
+        if adapter is None:
+            log.debug(
+                "MCP tool %s has no matching registered adapter - requiring admin",
+                tool_name,
+            )
+            return OperationDecision.ADMIN_REQUIRED
+
+        try:
+            decision = adapter.classify(tool_name, context)
+        except Exception:
+            log.exception(
+                "MCP adapter %s failed while classifying %s - requiring admin",
+                provenance.adapter_name,
+                tool_name,
+            )
+            return OperationDecision.ADMIN_REQUIRED
+
+        if not isinstance(decision, OperationDecision):
+            log.error(
+                "MCP adapter %s returned invalid decision for %s - requiring admin",
+                provenance.adapter_name,
+                tool_name,
+            )
+            return OperationDecision.ADMIN_REQUIRED
+        return decision
+
+    @staticmethod
+    def _get_registered_adapter(provenance: Any) -> Any | None:
+        """Resolve only the adapter registration named by preserved provenance."""
+        adapter_name = getattr(provenance, "adapter_name", "")
+        adapter_version = getattr(provenance, "adapter_version", "")
+        policy_version = getattr(provenance, "policy_version", "")
+        if not adapter_name or not adapter_version or not policy_version:
+            return None
+
+        from .mcp_client import get_mcp_adapter_info
+
+        adapter = get_mcp_adapter_info(adapter_name)
+        if adapter is None:
+            return None
+        if adapter.version != adapter_version:
+            return None
+        if adapter.policy_version != policy_version:
+            return None
+        return adapter
 
     @classmethod
     def _get_provenance_from_context(
@@ -520,21 +564,6 @@ class MCPResourceAdapter:
 _global_operation_catalog.register_adapter_hook(
     MCPResourceAdapter.get_decision,
 )
-
-
-_global_mcp_adapter_registry: dict[str, dict[str, str]] = {}
-
-
-def register_mcp_adapter(adapter_name: str, adapter_version: str) -> None:
-    """Register an MCP adapter for resource-scoped classification."""
-    _global_mcp_adapter_registry[adapter_name] = {
-        "version": adapter_version,
-    }
-
-
-def get_mcp_adapter(adapter_name: str) -> dict[str, str] | None:
-    """Get registered MCP adapter info."""
-    return _global_mcp_adapter_registry.get(adapter_name)
 
 
 def get_operation_catalog() -> OperationCatalog:

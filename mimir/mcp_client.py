@@ -40,9 +40,9 @@ import os
 import re
 import uuid
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from langchain_core.tools import StructuredTool, ToolException
 from mcp import ClientSession, StdioServerParameters
@@ -108,7 +108,8 @@ class MCPProvenance:
     config_digest: str = ""
     schema_digest: str = ""
     original_tool_name: str = ""
-    adapter_version: str = "mcp_client:v1"
+    adapter_name: str = ""
+    adapter_version: str = ""
     approval_version: str = ""
     policy_version: str = ""
     is_tombstoned: bool = False
@@ -164,6 +165,7 @@ class MCPProvenance:
             config_digest=new_config_digest,
             schema_digest=new_schema_digest,
             original_tool_name=tool_name,
+            adapter_name=self.adapter_name,
             adapter_version=self.adapter_version,
             approval_version=self.approval_version,
             policy_version=self.policy_version,
@@ -680,28 +682,45 @@ def check_tool_drift(
     )
 
 
+MCPAdapterClassifier = Callable[[str, Any | None], Any]
+
+
+@dataclass(frozen=True)
+class MCPAdapterRegistration:
+    """Registered classifier for tools carrying matching provenance."""
+
+    version: str
+    policy_version: str
+    classify: MCPAdapterClassifier
+
+
 def register_mcp_adapter(
     adapter_name: str,
     adapter_version: str,
     policy_version: str,
+    classify: MCPAdapterClassifier,
 ) -> None:
-    """Register an MCP adapter for resource-scoped classification.
+    """Register a classifier for MCP tools carrying ``adapter_name`` provenance."""
+    if not callable(classify):
+        raise TypeError("MCP adapter classifier must be callable")
+    _global_mcp_adapter_registry[adapter_name] = MCPAdapterRegistration(
+        version=adapter_version,
+        policy_version=policy_version,
+        classify=classify,
+    )
 
-    This creates a global adapter registration that MCP tools can use
-    to identify their classification source.
-    """
-    _global_mcp_adapter_registry[adapter_name] = {
-        "version": adapter_version,
-        "policy_version": policy_version,
-    }
 
-
-def get_mcp_adapter_info(adapter_name: str) -> dict[str, str] | None:
-    """Get registered adapter info by name."""
+def get_mcp_adapter_info(adapter_name: str) -> MCPAdapterRegistration | None:
+    """Get a registered MCP classifier by provenance adapter name."""
     return _global_mcp_adapter_registry.get(adapter_name)
 
 
-_global_mcp_adapter_registry: dict[str, dict[str, str]] = {}
+def clear_mcp_adapter_registry() -> None:
+    """Clear registered MCP classifiers. Used by tests."""
+    _global_mcp_adapter_registry.clear()
+
+
+_global_mcp_adapter_registry: dict[str, MCPAdapterRegistration] = {}
 
 
 def check_stale_policy_on_startup(

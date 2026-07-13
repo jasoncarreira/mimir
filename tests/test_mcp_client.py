@@ -13,10 +13,12 @@ don't attempt them in unit tests. We do cover:
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from mimir.access_control import OperationDecision
 from mimir.mcp_client import (
     MCPServerConfig,
     load_mcp_server_configs,
@@ -534,7 +536,7 @@ def test_bridge_tool_args_schema_fallback_on_no_properties() -> None:
 
     # Empty/missing properties → args_schema is None (StructuredTool
     # accepts arbitrary kwargs in that case).
-    tool = _bridge_mcp_tool(
+    _bridge_mcp_tool(
         server_name="s", tool_name="t", description="",
         input_schema={"type": "object"},
         session=_Dummy(),  # type: ignore[arg-type]
@@ -690,13 +692,28 @@ class TestMCPProvenance:
 class TestMCPAdapterRegistry:
     """Tests for MCP adapter registry."""
 
+    def setup_method(self) -> None:
+        from mimir.mcp_client import clear_mcp_adapter_registry
+
+        clear_mcp_adapter_registry()
+
+    def teardown_method(self) -> None:
+        from mimir.mcp_client import clear_mcp_adapter_registry
+
+        clear_mcp_adapter_registry()
+
     def test_register_and_get_adapter(self) -> None:
+        from mimir.access_control import OperationDecision
         from mimir.mcp_client import register_mcp_adapter, get_mcp_adapter_info
 
-        register_mcp_adapter("my-adapter", "v1.0", "policy-v1")
+        def classifier(_tool: str, _context: object) -> OperationDecision:
+            return OperationDecision.OPEN
+        register_mcp_adapter("my-adapter", "v1.0", "policy-v1", classifier)
         info = get_mcp_adapter_info("my-adapter")
         assert info is not None
-        assert info["version"] == "v1.0"
+        assert info.version == "v1.0"
+        assert info.policy_version == "policy-v1"
+        assert info.classify is classifier
 
     def test_get_nonexistent_adapter(self) -> None:
         from mimir.mcp_client import get_mcp_adapter_info
@@ -706,6 +723,20 @@ class TestMCPAdapterRegistry:
 
 class TestMCPResourceAdapter:
     """Tests for MCP authorization (chainlink #870)."""
+
+    def setup_method(self) -> None:
+        from mimir.mcp_client import clear_mcp_adapter_registry
+        from mimir.tools.mcp import clear_mcp_tools
+
+        clear_mcp_adapter_registry()
+        clear_mcp_tools()
+
+    def teardown_method(self) -> None:
+        from mimir.mcp_client import clear_mcp_adapter_registry
+        from mimir.tools.mcp import clear_mcp_tools
+
+        clear_mcp_adapter_registry()
+        clear_mcp_tools()
 
     def test_mcp_tool_requires_admin_when_no_tools_registered(self) -> None:
         from mimir.access_control import (
@@ -725,39 +756,133 @@ class TestMCPResourceAdapter:
         decision = MCPResourceAdapter.get_decision("bash", None)
         assert decision is None
 
-    def test_mcp_tool_with_registered_provenance_passes(self) -> None:
+    def test_provenanced_but_unclassified_tool_requires_admin(self) -> None:
         from mimir.access_control import MCPResourceAdapter, OperationDecision
         from mimir.mcp_client import MCPServerConfig, MCPProvenance
-        from mimir.tools.mcp import clear_mcp_tools
 
-        clear_mcp_tools()
-
-        from mimir.mcp_client import _bridge_mcp_tool, _tool_provenance_registry
-
-        class _Dummy:
-            pass
-
-        config = MCPServerConfig(name="test", command="x", args=[])
         provenance = MCPProvenance.create(
-            config=config,
-            tool_name="ping",
+            config=MCPServerConfig(name="github", command="x", args=[]),
+            tool_name="write_issue",
             input_schema={},
         )
 
-        tool = _bridge_mcp_tool(
-            server_name="test",
-            tool_name="ping",
-            description="",
-            input_schema={},
-            session=_Dummy(),
-            provenance=provenance,
+        class _Context:
+            mcp_provenance = provenance
+
+        decision = MCPResourceAdapter.get_decision(
+            "mcp_github_write_issue", _Context()
+        )
+        assert decision == OperationDecision.ADMIN_REQUIRED
+
+    @pytest.mark.parametrize(
+        "classified_decision",
+        [
+            OperationDecision.OPEN,
+            OperationDecision.RESOURCE_SCOPED,
+            OperationDecision.ADMIN_REQUIRED,
+        ],
+    )
+    def test_registered_adapter_supplies_explicit_decision(
+        self, classified_decision: OperationDecision
+    ) -> None:
+        from mimir.access_control import MCPResourceAdapter
+        from mimir.mcp_client import (
+            MCPServerConfig,
+            MCPProvenance,
+            register_mcp_adapter,
         )
 
-        from mimir.tools.mcp import set_mcp_tools
-        set_mcp_tools([tool])
+        register_mcp_adapter(
+            "github-policy",
+            "adapter-v1",
+            "policy-v1",
+            lambda _tool, _context: classified_decision,
+        )
+        provenance = replace(
+            MCPProvenance.create(
+                config=MCPServerConfig(name="github", command="x", args=[]),
+                tool_name="write_issue",
+                input_schema={},
+            ),
+            adapter_name="github-policy",
+            adapter_version="adapter-v1",
+            policy_version="policy-v1",
+        )
 
-        decision = MCPResourceAdapter.get_decision("mcp_test_ping", None)
-        assert decision == OperationDecision.OPEN
+        class _Context:
+            mcp_provenance = provenance
+
+        assert (
+            MCPResourceAdapter.get_decision(
+                "mcp_github_write_issue", _Context()
+            )
+            == classified_decision
+        )
+
+    def test_adapter_version_mismatch_requires_admin(self) -> None:
+        from mimir.access_control import MCPResourceAdapter, OperationDecision
+        from mimir.mcp_client import (
+            MCPServerConfig,
+            MCPProvenance,
+            register_mcp_adapter,
+        )
+
+        register_mcp_adapter(
+            "github-policy",
+            "adapter-v2",
+            "policy-v1",
+            lambda _tool, _context: OperationDecision.OPEN,
+        )
+        provenance = replace(
+            MCPProvenance.create(
+                config=MCPServerConfig(name="github", command="x", args=[]),
+                tool_name="write_issue",
+                input_schema={},
+            ),
+            adapter_name="github-policy",
+            adapter_version="adapter-v1",
+            policy_version="policy-v1",
+        )
+
+        class _Context:
+            mcp_provenance = provenance
+
+        assert (
+            MCPResourceAdapter.get_decision(
+                "mcp_github_write_issue", _Context()
+            )
+            == OperationDecision.ADMIN_REQUIRED
+        )
+
+    def test_regular_principal_cannot_call_arbitrary_provenanced_write_tool(self) -> None:
+        from mimir.access_control import OperationDecision, ToolRegistry
+        from mimir.mcp_client import MCPServerConfig, MCPProvenance
+        from mimir.models import AuthContext
+
+        provenance = MCPProvenance.create(
+            config=MCPServerConfig(name="github", command="x", args=[]),
+            tool_name="write_issue",
+            input_schema={},
+        )
+        context = AuthContext(
+            principal="alice",
+            canonical_principal="alice",
+            roles=("user",),
+            event_ingress="bridge",
+            trigger="user_message",
+            channel_id="discord-1",
+            interactivity=None,
+            enforcement_enabled=True,
+        )
+        object.__setattr__(context, "mcp_provenance", provenance)
+
+        authorization = ToolRegistry().authorize_tool(
+            "mcp_github_write_issue", context, enforce=True
+        )
+
+        assert authorization.decision == OperationDecision.ADMIN_REQUIRED
+        assert authorization.allowed is False
+        assert authorization.reason == "admin_required"
 
     def test_mcp_tool_with_tombstoned_provenance_requires_admin(self) -> None:
         from mimir.access_control import (
@@ -766,7 +891,7 @@ class TestMCPResourceAdapter:
         )
         from mimir.mcp_client import MCPServerConfig, MCPProvenance
         from mimir.tools.mcp import clear_mcp_tools, set_mcp_tools
-        from mimir.mcp_client import _bridge_mcp_tool, _tool_provenance_registry
+        from mimir.mcp_client import _bridge_mcp_tool
 
         clear_mcp_tools()
 
@@ -902,7 +1027,7 @@ class TestUnderscoreDisplayNameCollisions:
 
     def test_collision_detection_in_manager(self) -> None:
         from mimir.mcp_client import MCPManager, MCPServerConfig
-        from mimir.tools.mcp import clear_mcp_tools, set_mcp_tools
+        from mimir.tools.mcp import clear_mcp_tools
 
         clear_mcp_tools()
 
