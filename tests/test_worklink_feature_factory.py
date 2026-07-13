@@ -21,8 +21,13 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+_CHAINLINK_ORCHESTRATOR = Path(__file__).resolve().parent.parent / "mimir" / "optional-skills" / "chainlink-orchestrator"
+if str(_CHAINLINK_ORCHESTRATOR) not in sys.path:
+    sys.path.insert(0, str(_CHAINLINK_ORCHESTRATOR))
 
 from mimir.worklink.backends import ComputeCaps, ComputeResult
 from mimir.worklink.backends import feature_factory as ff
@@ -1457,3 +1462,320 @@ def test_interpret_run_json_as_list_fails_closed(tmp_path: Path) -> None:
     result = asyncio.run(backend.interpret(order, ComputeResult(exit_code=0, stdout="", stderr="")))
     assert result.backend_status == "failed"
     assert "not found" in (result.error or "")
+
+
+def test_lifecycle_cursor_persistence(tmp_path: Path) -> None:
+    from poller import (
+        LifecycleCursor,
+        CursorEntry,
+        _load_cursor,
+        _save_cursor,
+        CURSOR_VERSION,
+    )
+    cursor = LifecycleCursor()
+    assert cursor.version == CURSOR_VERSION
+    entry = CursorEntry(
+        run_id="chainlink-100",
+        issue_id=100,
+        attempt=1,
+        physical_path="/repo/.worklink/100-1/.opencode/factory/chainlink-100",
+        fingerprint="abc123",
+        last_observed="2026-01-01T00:00:00Z",
+        alerted=True,
+        alerted_at="2026-01-01T00:00:00Z",
+    )
+    cursor.entries["key1"] = entry
+    cursor.updated_at = "2026-01-01T00:00:00Z"
+    _save_cursor(tmp_path, cursor)
+    loaded = _load_cursor(tmp_path)
+    assert loaded.version == CURSOR_VERSION
+    assert "key1" in loaded.entries
+    assert loaded.entries["key1"].run_id == "chainlink-100"
+    assert loaded.entries["key1"].issue_id == 100
+    assert loaded.entries["key1"].attempt == 1
+
+
+def test_lifecycle_cursor_missing_file(tmp_path: Path) -> None:
+    from poller import (
+        LifecycleCursor,
+        _load_cursor,
+        CURSOR_VERSION,
+    )
+    loaded = _load_cursor(tmp_path)
+    assert loaded.version == CURSOR_VERSION
+    assert loaded.entries == {}
+
+
+def test_lifecycle_cursor_corrupted_file(tmp_path: Path) -> None:
+    from poller import (
+        LifecycleCursor,
+        _load_cursor,
+        CURSOR_VERSION,
+    )
+    (tmp_path / "lifecycle_cursor.json").write_text("not valid json", encoding="utf-8")
+    loaded = _load_cursor(tmp_path)
+    assert loaded.version == CURSOR_VERSION
+    assert loaded.entries == {}
+
+
+def test_discover_factory_runs_root_only(tmp_path: Path) -> None:
+    from poller import (
+        _discover_factory_runs,
+        FACTORY_DIR,
+        RUN_JSON,
+    )
+    factory_dir = tmp_path / FACTORY_DIR
+    run_dir = factory_dir / "chainlink-100"
+    run_dir.mkdir(parents=True)
+    (run_dir / RUN_JSON).write_text("{}", encoding="utf-8")
+    discovered = _discover_factory_runs(tmp_path)
+    assert len(discovered) == 1
+    assert discovered[0][2] == "chainlink-100"
+
+
+def test_discover_factory_runs_nested_attempt(tmp_path: Path) -> None:
+    from poller import (
+        _discover_factory_runs,
+        FACTORY_DIR,
+        WORKLINK_DIR,
+        RUN_JSON,
+    )
+    worklink_dir = tmp_path / WORKLINK_DIR
+    attempt_dir = worklink_dir / "100-1"
+    factory_dir = attempt_dir / FACTORY_DIR
+    run_dir = factory_dir / "chainlink-100-attempt1"
+    run_dir.mkdir(parents=True)
+    (run_dir / RUN_JSON).write_text("{}", encoding="utf-8")
+    discovered = _discover_factory_runs(tmp_path)
+    assert len(discovered) == 1
+    assert discovered[0][2] == "chainlink-100-attempt1"
+
+
+def test_discover_factory_runs_multiple(tmp_path: Path) -> None:
+    from poller import (
+        _discover_factory_runs,
+        FACTORY_DIR,
+        WORKLINK_DIR,
+        RUN_JSON,
+    )
+    factory_dir = tmp_path / FACTORY_DIR
+    run_dir1 = factory_dir / "chainlink-100"
+    run_dir1.mkdir(parents=True)
+    (run_dir1 / RUN_JSON).write_text("{}", encoding="utf-8")
+    worklink_dir = tmp_path / WORKLINK_DIR
+    attempt_dir = worklink_dir / "100-1"
+    factory_dir2 = attempt_dir / FACTORY_DIR
+    run_dir2 = factory_dir2 / "chainlink-100-attempt1"
+    run_dir2.mkdir(parents=True)
+    (run_dir2 / RUN_JSON).write_text("{}", encoding="utf-8")
+    discovered = _discover_factory_runs(tmp_path)
+    assert len(discovered) == 2
+
+
+def test_observe_factory_run_parsing(tmp_path: Path) -> None:
+    from poller import (
+        _observe_factory_run,
+        factory_run_dir,
+        RUN_JSON,
+    )
+    run_id = "chainlink-100"
+    run_dir = factory_run_dir(tmp_path, run_id)
+    run_dir.mkdir(parents=True)
+    now = datetime.now(UTC).isoformat()
+    (run_dir / RUN_JSON).write_text(
+        f'{{"run_id": "{run_id}", "status": "running", "heartbeat_at": "{now}", '
+        f'"pr_url": "https://github.com/owner/repo/pull/1", '
+        f'"gates": {{"story": {{"status": "approved"}}, "brief": {{"status": "pending"}}}}, '
+        f'"validator": {{"verdict": "GO"}}, "security_review": {{"verdict": "PASS"}}}}',
+        encoding="utf-8"
+    )
+    obs = _observe_factory_run(tmp_path, run_id)
+    assert obs is not None
+    assert obs.run_id == run_id
+    assert obs.issue_id == 100
+    assert obs.attempt is None
+    assert obs.status == "running"
+    assert obs.pr_url == "https://github.com/owner/repo/pull/1"
+    assert obs.pending_gate == "brief"
+    assert obs.validator_verdict == "GO"
+    assert obs.security_verdict == "PASS"
+    assert obs.is_terminal is False
+    assert obs.liveness_class == "healthy"
+
+
+def test_observe_factory_run_stale(tmp_path: Path) -> None:
+    from poller import (
+        _observe_factory_run,
+        factory_run_dir,
+        RUN_JSON,
+    )
+    run_id = "chainlink-100"
+    run_dir = factory_run_dir(tmp_path, run_id)
+    run_dir.mkdir(parents=True)
+    stale = (datetime.now(UTC) - timedelta(seconds=400)).isoformat()
+    (run_dir / RUN_JSON).write_text(
+        f'{{"run_id": "{run_id}", "status": "running", "heartbeat_at": "{stale}"}}',
+        encoding="utf-8"
+    )
+    obs = _observe_factory_run(tmp_path, run_id)
+    assert obs is not None
+    assert obs.liveness_class == "stale"
+
+
+def test_observe_factory_run_terminal_blocked(tmp_path: Path) -> None:
+    from poller import (
+        _observe_factory_run,
+        factory_run_dir,
+        RUN_JSON,
+    )
+    run_id = "chainlink-100"
+    run_dir = factory_run_dir(tmp_path, run_id)
+    run_dir.mkdir(parents=True)
+    (run_dir / RUN_JSON).write_text(
+        f'{{"run_id": "{run_id}", "status": "blocked", "heartbeat_at": "2026-01-01T00:00:00Z", '
+        f'"blocked_reason": "needs credentials"}}',
+        encoding="utf-8"
+    )
+    obs = _observe_factory_run(tmp_path, run_id)
+    assert obs is not None
+    assert obs.is_terminal is True
+    assert obs.status == "blocked"
+    assert obs.reason == "needs credentials"
+
+
+def test_observe_factory_run_with_terminal_result(tmp_path: Path) -> None:
+    from poller import (
+        _observe_factory_run,
+        factory_run_dir,
+        RUN_JSON,
+    )
+    run_id = "chainlink-100"
+    run_dir = factory_run_dir(tmp_path, run_id)
+    run_dir.mkdir(parents=True)
+    (run_dir / RUN_JSON).write_text(
+        f'{{"run_id": "{run_id}", "status": "completed", "heartbeat_at": "2026-01-01T00:00:00Z", '
+        f'"terminal_result": {{"status": "completed", "pr_url": "https://github.com/owner/repo/pull/1", '
+        f'"reason": "all done", "summary": "completed successfully"}}}}',
+        encoding="utf-8"
+    )
+    obs = _observe_factory_run(tmp_path, run_id)
+    assert obs is not None
+    assert obs.is_terminal is True
+    assert obs.status == "completed"
+    assert obs.pr_url == "https://github.com/owner/repo/pull/1"
+    assert obs.reason == "all done"
+    assert obs.summary == "completed successfully"
+
+
+def test_observe_factory_run_missing_json(tmp_path: Path) -> None:
+    from poller import (
+        _observe_factory_run,
+        factory_run_dir,
+    )
+    run_id = "chainlink-100"
+    run_dir = factory_run_dir(tmp_path, run_id)
+    run_dir.mkdir(parents=True)
+    obs = _observe_factory_run(tmp_path, run_id)
+    assert obs is None
+
+
+def test_observe_factory_run_malformed_json(tmp_path: Path) -> None:
+    from poller import (
+        _observe_factory_run,
+        factory_run_dir,
+        RUN_JSON,
+    )
+    run_id = "chainlink-100"
+    run_dir = factory_run_dir(tmp_path, run_id)
+    run_dir.mkdir(parents=True)
+    (run_dir / RUN_JSON).write_text("not valid json", encoding="utf-8")
+    obs = _observe_factory_run(tmp_path, run_id)
+    assert obs is None
+
+
+def test_run_id_to_issue_attempt_basic(tmp_path: Path) -> None:
+    from poller import (
+        _run_id_to_issue_attempt,
+    )
+    assert _run_id_to_issue_attempt("chainlink-100") == (100, None)
+    assert _run_id_to_issue_attempt("chainlink-100-attempt1") == (100, 1)
+    assert _run_id_to_issue_attempt("chainlink-100-attempt2") == (100, 2)
+    assert _run_id_to_issue_attempt("invalid") == (0, None)
+
+
+def test_fingerprint_deterministic(tmp_path: Path) -> None:
+    from poller import (
+        FactoryRunObservation,
+    )
+    obs1 = FactoryRunObservation(
+        run_id="chainlink-100",
+        issue_id=100,
+        attempt=None,
+        physical_path=tmp_path / "path1",
+        status="running",
+        pr_url=None,
+        reason=None,
+        summary=None,
+        pending_gate=None,
+        is_terminal=False,
+        is_stale=False,
+        validator_verdict=None,
+        security_verdict=None,
+        terminal_result=None,
+    )
+    obs2 = FactoryRunObservation(
+        run_id="chainlink-100",
+        issue_id=100,
+        attempt=None,
+        physical_path=tmp_path / "path1",
+        status="running",
+        pr_url=None,
+        reason=None,
+        summary=None,
+        pending_gate=None,
+        is_terminal=False,
+        is_stale=False,
+        validator_verdict=None,
+        security_verdict=None,
+        terminal_result=None,
+    )
+    assert obs1.fingerprint == obs2.fingerprint
+
+
+def test_fingerprint_changes_with_status(tmp_path: Path) -> None:
+    from poller import (
+        FactoryRunObservation,
+    )
+    obs1 = FactoryRunObservation(
+        run_id="chainlink-100",
+        issue_id=100,
+        attempt=None,
+        physical_path=tmp_path / "path1",
+        status="running",
+        pr_url=None,
+        reason=None,
+        summary=None,
+        pending_gate=None,
+        is_terminal=False,
+        is_stale=False,
+        validator_verdict=None,
+        security_verdict=None,
+        terminal_result=None,
+    )
+    obs2 = FactoryRunObservation(
+        run_id="chainlink-100",
+        issue_id=100,
+        attempt=None,
+        physical_path=tmp_path / "path1",
+        status="blocked",
+        pr_url=None,
+        reason=None,
+        summary=None,
+        pending_gate=None,
+        is_terminal=True,
+        is_stale=False,
+        validator_verdict=None,
+        security_verdict=None,
+        terminal_result=None,
+    )
+    assert obs1.fingerprint != obs2.fingerprint

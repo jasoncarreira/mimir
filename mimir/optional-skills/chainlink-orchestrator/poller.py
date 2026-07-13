@@ -39,13 +39,15 @@ Env (passed via pollers.json):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -97,11 +99,32 @@ def _ensure_mimir_import_path() -> None:
 
 _ensure_mimir_import_path()
 
+from mimir._atomic import atomic_write_json
+from mimir.worklink.backends import feature_factory as ff
+from mimir.worklink.backends.feature_factory import (
+    FactoryRunState,
+    FactoryTerminalResult,
+    epic_run_id,
+    factory_run_dir,
+    read_factory_run_state,
+)
 from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
+LIFECYCLE_RECONCILIATION_NAME = "worklink-lifecycle-reconciliation"
 READY_LABEL = "worklink:ready"
 EPIC_LABEL = "worklink:epic"
+
+WORKLINK_DIR = ".worklink"
+FACTORY_DIR = ".opencode/factory"
+RUN_JSON = "run.json"
+
+CURSOR_FILE = "lifecycle_cursor.json"
+CURSOR_VERSION = 1
+
+LIVENESS_CLASSES = frozenset({"healthy", "stale", "unknown"})
+VALIDITY_CLASSES = frozenset({"valid", "invalid", "unreadable"})
+ACTIONABLE_STATUSES = frozenset({"blocked", "partial", "needs-human", "invalid", "stale"})
 
 
 def _factory_epics_enabled() -> bool:
@@ -117,6 +140,93 @@ def _factory_epics_enabled() -> bool:
 
 BLOCKED_LABEL = "worklink:blocked"
 REVIEW_LABEL = "worklink:review"
+
+CLEANUP_RETENTION_DAYS = 30
+
+
+@dataclass(frozen=True)
+class FactoryRunObservation:
+    run_id: str
+    issue_id: int
+    attempt: int | None
+    physical_path: Path
+    status: str
+    pr_url: str | None
+    reason: str | None
+    summary: str | None
+    pending_gate: str | None
+    is_terminal: bool
+    is_stale: bool
+    validator_verdict: str | None
+    security_verdict: str | None
+    terminal_result: FactoryTerminalResult | None
+    fingerprint: str = ""
+    liveness_class: str = "unknown"
+    validity_class: str = "unknown"
+
+    def __post_init__(self) -> None:
+        if not self.fingerprint:
+            object.__setattr__(self, "fingerprint", self._compute_fingerprint())
+
+    def _compute_fingerprint(self) -> str:
+        parts = [
+            self.run_id,
+            self.status,
+            self.reason or "",
+            self.summary or "",
+            self.pr_url or "",
+            self.pending_gate or "",
+            self.liveness_class,
+            self.validity_class,
+            self.validator_verdict or "",
+            self.security_verdict or "",
+        ]
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass
+class CursorEntry:
+    run_id: str
+    issue_id: int
+    attempt: int | None
+    physical_path: str
+    fingerprint: str
+    last_observed: str
+    alerted: bool
+    alerted_at: str | None
+    cleaned: bool = False
+    cleaned_at: str | None = None
+    tombstone: bool = False
+
+
+@dataclass
+class LifecycleCursor:
+    version: int = CURSOR_VERSION
+    entries: dict[str, CursorEntry] = field(default_factory=dict)
+    updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+
+@dataclass(frozen=True)
+class LifecycleAlert:
+    source_id: str
+    signal: str
+    run_id: str
+    issue_id: int
+    attempt: int | None
+    physical_path: str
+    prior_fingerprint: str | None
+    current_fingerprint: str
+    status: str
+    prior_status: str | None
+    reason: str | None
+    pr_url: str | None
+    pending_gate: str | None
+    liveness_class: str
+    validity_class: str
+    validator_verdict: str | None
+    security_verdict: str | None
+    cleanup_eligible: bool
+    routing_instructions: str
 
 
 @dataclass(frozen=True)
@@ -364,6 +474,429 @@ def _configured_cap(home: Path) -> int:
     return WorklinkDefaults.max_concurrent
 
 
+def _run_id_to_issue_attempt(run_id: str) -> tuple[int, int | None]:
+    parts = run_id.removeprefix("chainlink-").split("-")
+    if not parts:
+        return 0, None
+    try:
+        issue_id = int(parts[0])
+    except ValueError:
+        return 0, None
+    attempt = None
+    if len(parts) > 1 and parts[-1].startswith("attempt"):
+        try:
+            attempt = int(parts[-1].removeprefix("attempt"))
+        except ValueError:
+            pass
+    return issue_id, attempt
+
+
+def _discover_factory_runs(repo: Path) -> list[tuple[Path, Path, str]]:
+    discovered: list[tuple[Path, Path, str]] = []
+    worklink_root = repo / WORKLINK_DIR
+    worktree_roots = [repo]
+    if worklink_root.is_dir():
+        try:
+            for attempt_dir in worklink_root.iterdir():
+                if attempt_dir.is_dir():
+                    worktree_roots.append(attempt_dir)
+        except OSError:
+            pass
+    for worktree_root in worktree_roots:
+        factory_dir = worktree_root / FACTORY_DIR
+        if not factory_dir.is_dir():
+            continue
+        try:
+            for run_dir in factory_dir.iterdir():
+                if run_dir.is_dir() and (run_dir / RUN_JSON).exists():
+                    discovered.append((worktree_root, run_dir, run_dir.name))
+        except OSError:
+            pass
+    return discovered
+
+
+def _observe_factory_run(worktree_root: Path, run_id: str) -> FactoryRunObservation | None:
+    state = read_factory_run_state(worktree_root, run_id)
+    if state is None:
+        return None
+    run_dir = factory_run_dir(worktree_root, run_id)
+    if state is None:
+        return None
+    issue_id, attempt = _run_id_to_issue_attempt(run_id)
+    liveness_class = "unknown"
+    if state.is_stale:
+        liveness_class = "stale"
+    elif state.status.strip().lower() == "running":
+        liveness_class = "healthy"
+    validity_class = "valid"
+    if state.error or not state.run_id:
+        validity_class = "invalid"
+    reason = state.error
+    if state.terminal_result and state.terminal_result.reason:
+        reason = state.terminal_result.reason
+    summary = None
+    if state.terminal_result and state.terminal_result.summary:
+        summary = state.terminal_result.summary
+    pr_url = state.pr_url
+    if state.terminal_result and state.terminal_result.pr_url:
+        pr_url = state.terminal_result.pr_url
+    return FactoryRunObservation(
+        run_id=run_id,
+        issue_id=issue_id,
+        attempt=attempt,
+        physical_path=run_dir,
+        status=state.status,
+        pr_url=pr_url,
+        reason=reason,
+        summary=summary,
+        pending_gate=state.pending_gate,
+        is_terminal=state.is_terminal,
+        is_stale=state.is_stale,
+        validator_verdict=state.validator_verdict,
+        security_verdict=state.security_verdict,
+        terminal_result=state.terminal_result,
+        liveness_class=liveness_class,
+        validity_class=validity_class,
+    )
+
+
+def _load_cursor(state_dir: Path) -> LifecycleCursor:
+    cursor_path = state_dir / CURSOR_FILE
+    if not cursor_path.exists():
+        return LifecycleCursor()
+    try:
+        data = json.loads(cursor_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return LifecycleCursor()
+        version = data.get("version")
+        if version != CURSOR_VERSION:
+            return LifecycleCursor()
+        entries = {}
+        for key, entry_data in data.get("entries", {}).items():
+            if not isinstance(entry_data, dict):
+                continue
+            try:
+                entries[key] = CursorEntry(
+                    run_id=entry_data.get("run_id", ""),
+                    issue_id=entry_data.get("issue_id", 0),
+                    attempt=entry_data.get("attempt"),
+                    physical_path=entry_data.get("physical_path", ""),
+                    fingerprint=entry_data.get("fingerprint", ""),
+                    last_observed=entry_data.get("last_observed", ""),
+                    alerted=entry_data.get("alerted", False),
+                    alerted_at=entry_data.get("alerted_at"),
+                    cleaned=entry_data.get("cleaned", False),
+                    cleaned_at=entry_data.get("cleaned_at"),
+                    tombstone=entry_data.get("tombstone", False),
+                )
+            except (TypeError, ValueError):
+                continue
+        return LifecycleCursor(
+            version=version,
+            entries=entries,
+            updated_at=data.get("updated_at", datetime.now(UTC).isoformat()),
+        )
+    except (OSError, json.JSONDecodeError, ValueError):
+        return LifecycleCursor()
+
+
+def _save_cursor(state_dir: Path, cursor: LifecycleCursor) -> None:
+    data = {
+        "version": cursor.version,
+        "entries": {
+            key: {
+                "run_id": entry.run_id,
+                "issue_id": entry.issue_id,
+                "attempt": entry.attempt,
+                "physical_path": entry.physical_path,
+                "fingerprint": entry.fingerprint,
+                "last_observed": entry.last_observed,
+                "alerted": entry.alerted,
+                "alerted_at": entry.alerted_at,
+                "cleaned": entry.cleaned,
+                "cleaned_at": entry.cleaned_at,
+                "tombstone": entry.tombstone,
+            }
+            for key, entry in cursor.entries.items()
+        },
+        "updated_at": cursor.updated_at,
+    }
+    atomic_write_json(state_dir / CURSOR_FILE, data)
+
+
+def _is_pr_merged(pr_url: str | None, repo: Path) -> bool:
+    if not pr_url:
+        return False
+    match = re.search(r"/pull/(\d+)", pr_url)
+    if not match:
+        return False
+    pr_number = match.group(1)
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "view", pr_number, "--state", "--json", "state", "-t", "{{.state}}"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    return proc.stdout.strip().lower() == "merged"
+
+
+def _run_factory_cleanup(
+    worktree: Path, dry_run: bool = True
+) -> tuple[bool, str, list[dict] | None]:
+    cmd = ["factory", "cleanup", "--all"]
+    if dry_run:
+        cmd.append("--dry-run")
+    cmd.append("--json")
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc), None
+    if proc.returncode != 0:
+        return False, proc.stderr or proc.stdout, None
+    try:
+        digest = json.loads(proc.stdout)
+        if not isinstance(digest, list):
+            return False, "invalid digest format", None
+        if dry_run:
+            return True, "dry-run success", digest
+        return True, "cleanup executed", None
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        return False, str(exc), None
+
+
+def _reconcile_factory_runs(
+    repo: Path, state_dir: Path
+) -> tuple[list[LifecycleAlert], list[LifecycleAlert]]:
+    observed = _discover_factory_runs(repo)
+    observations: list[FactoryRunObservation] = []
+    for worktree_root, run_dir, run_id in observed:
+        obs = _observe_factory_run(worktree_root, run_id)
+        if obs:
+            observations.append(obs)
+    cursor = _load_cursor(state_dir)
+    now = datetime.now(UTC).isoformat()
+    new_alerts: list[LifecycleAlert] = []
+    cleanup_alerts: list[LifecycleAlert] = []
+    updated_entries: dict[str, CursorEntry] = dict(cursor.entries)
+    for obs in observations:
+        key = f"{obs.run_id}:{obs.physical_path}"
+        prior = cursor.entries.get(key)
+        prior_fingerprint = prior.fingerprint if prior else None
+        prior_status = None
+        if prior:
+            prior_obs_data = prior.fingerprint
+            if prior_obs_data:
+                prior_status = "unknown"
+        cleanup_eligible = (
+            obs.is_terminal
+            and obs.status.strip().lower() == "completed"
+            and obs.pr_url
+            and _is_pr_merged(obs.pr_url, repo)
+        )
+        is_actionable = (
+            obs.status.strip().lower() in ACTIONABLE_STATUSES
+            or obs.validity_class == "invalid"
+            or obs.liveness_class == "stale"
+        )
+        should_alert = False
+        if not prior:
+            if is_actionable:
+                should_alert = True
+        elif prior.tombstone:
+            continue
+        elif prior.fingerprint != obs.fingerprint:
+            if is_actionable:
+                should_alert = True
+            elif prior.alerted and not is_actionable:
+                pass
+        elif prior.alerted and is_actionable:
+            should_alert = True
+        if should_alert:
+            status = obs.status.strip().lower()
+            routing = "Inspect and perform only safe/reversible remediation."
+            if cleanup_eligible:
+                routing += " This run is eligible for cleanup."
+            if is_actionable and status in ("blocked", "partial", "needs-human"):
+                routing += (
+                    " If credentials, an operator decision, destructive/force cleanup, "
+                    "or other operator authority is required, contact Jason with the exact blocker."
+                )
+            source_id = f"lifecycle:{obs.run_id}:{obs.physical_path}"
+            alert = LifecycleAlert(
+                source_id=source_id,
+                signal="worklink_factory_actionable",
+                run_id=obs.run_id,
+                issue_id=obs.issue_id,
+                attempt=obs.attempt,
+                physical_path=str(obs.physical_path),
+                prior_fingerprint=prior_fingerprint,
+                current_fingerprint=obs.fingerprint,
+                status=obs.status,
+                prior_status=prior_status,
+                reason=obs.reason,
+                pr_url=obs.pr_url,
+                pending_gate=obs.pending_gate,
+                liveness_class=obs.liveness_class,
+                validity_class=obs.validity_class,
+                validator_verdict=obs.validator_verdict,
+                security_verdict=obs.security_verdict,
+                cleanup_eligible=cleanup_eligible,
+                routing_instructions=routing,
+            )
+            new_alerts.append(alert)
+            if cleanup_eligible:
+                cleanup_alerts.append(alert)
+        entry = CursorEntry(
+            run_id=obs.run_id,
+            issue_id=obs.issue_id,
+            attempt=obs.attempt,
+            physical_path=str(obs.physical_path),
+            fingerprint=obs.fingerprint,
+            last_observed=now,
+            alerted=should_alert,
+            alerted_at=now if should_alert else (prior.alerted_at if prior else None),
+            cleaned=False,
+            cleaned_at=None,
+            tombstone=False,
+        )
+        updated_entries[key] = entry
+    new_cursor = LifecycleCursor(
+        version=CURSOR_VERSION,
+        entries=updated_entries,
+        updated_at=now,
+    )
+    _save_cursor(state_dir, new_cursor)
+    return new_alerts, cleanup_alerts
+
+
+def _attempt_cleanup(
+    repo: Path, state_dir: Path, cleanup_alerts: list[LifecycleAlert]
+) -> list[LifecycleAlert]:
+    failed_alerts: list[LifecycleAlert] = []
+    cursor = _load_cursor(state_dir)
+    now = datetime.now(UTC).isoformat()
+    updated_entries = dict(cursor.entries)
+    for alert in cleanup_alerts:
+        key = f"{alert.run_id}:{alert.physical_path}"
+        entry = cursor.entries.get(key)
+        if not entry or entry.cleaned:
+            continue
+        worktree = Path(alert.physical_path)
+        if not worktree.exists():
+            updated_entries[key] = CursorEntry(
+                run_id=entry.run_id,
+                issue_id=entry.issue_id,
+                attempt=entry.attempt,
+                physical_path=entry.physical_path,
+                fingerprint=entry.fingerprint,
+                last_observed=now,
+                alerted=False,
+                alerted_at=entry.alerted_at,
+                cleaned=True,
+                cleaned_at=now,
+                tombstone=True,
+            )
+            continue
+        success, msg, digest = _run_factory_cleanup(worktree, dry_run=True)
+        if not success:
+            failed_alerts.append(alert)
+            continue
+        if not digest:
+            updated_entries[key] = CursorEntry(
+                run_id=entry.run_id,
+                issue_id=entry.issue_id,
+                attempt=entry.attempt,
+                physical_path=entry.physical_path,
+                fingerprint=entry.fingerprint,
+                last_observed=now,
+                alerted=False,
+                alerted_at=entry.alerted_at,
+                cleaned=True,
+                cleaned_at=now,
+                tombstone=True,
+            )
+            continue
+        success, msg, _ = _run_factory_cleanup(worktree, dry_run=False)
+        if success:
+            updated_entries[key] = CursorEntry(
+                run_id=entry.run_id,
+                issue_id=entry.issue_id,
+                attempt=entry.attempt,
+                physical_path=entry.physical_path,
+                fingerprint=entry.fingerprint,
+                last_observed=now,
+                alerted=False,
+                alerted_at=entry.alerted_at,
+                cleaned=True,
+                cleaned_at=now,
+                tombstone=True,
+            )
+        else:
+            failed_alerts.append(alert)
+    new_cursor = LifecycleCursor(
+        version=CURSOR_VERSION,
+        entries=updated_entries,
+        updated_at=now,
+    )
+    _save_cursor(state_dir, new_cursor)
+    return failed_alerts
+
+
+def _run_lifecycle_reconciliation(
+    repo: Path, state_dir: Path
+) -> list[LifecycleAlert]:
+    all_alerts: list[LifecycleAlert] = []
+    new_alerts, cleanup_alerts = _reconcile_factory_runs(repo, state_dir)
+    all_alerts.extend(new_alerts)
+    if cleanup_alerts:
+        failed_cleanup = _attempt_cleanup(repo, state_dir, cleanup_alerts)
+        for alert in new_alerts:
+            if alert not in cleanup_alerts:
+                all_alerts.append(alert)
+        for alert in failed_cleanup:
+            all_alerts.append(
+                LifecycleAlert(
+                    source_id=alert.source_id + ":cleanup_failed",
+                    signal="worklink_factory_cleanup_failed",
+                    run_id=alert.run_id,
+                    issue_id=alert.issue_id,
+                    attempt=alert.attempt,
+                    physical_path=alert.physical_path,
+                    prior_fingerprint=alert.prior_fingerprint,
+                    current_fingerprint=alert.current_fingerprint,
+                    status=alert.status,
+                    prior_status=alert.prior_status,
+                    reason=f"Cleanup failed: {alert.reason}",
+                    pr_url=alert.pr_url,
+                    pending_gate=alert.pending_gate,
+                    liveness_class=alert.liveness_class,
+                    validity_class=alert.validity_class,
+                    validator_verdict=alert.validator_verdict,
+                    security_verdict=alert.security_verdict,
+                    cleanup_eligible=False,
+                    routing_instructions=(
+                        "Cleanup failed. Contact Jason with the exact blocker. "
+                        "Do NOT use --force, direct filesystem deletion, or direct branch deletion."
+                    ),
+                )
+            )
+    return all_alerts
+
+
 def main() -> int:
     home_env = os.environ.get("MIMIR_HOME")
     if not home_env:
@@ -371,10 +904,42 @@ def main() -> int:
         return 0
     home = Path(home_env)
 
+    repo = os.environ.get("WORKLINK_REPO")
+    state_dir = Path(os.environ.get("STATE_DIR") or (home / "state" / "pollers" / POLLER_NAME))
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    if repo:
+        try:
+            lifecycle_alerts = _run_lifecycle_reconciliation(Path(repo), state_dir)
+            for alert in lifecycle_alerts:
+                _emit({
+                    "signal": alert.signal,
+                    "source_id": alert.source_id,
+                    "run_id": alert.run_id,
+                    "issue_id": alert.issue_id,
+                    "attempt": alert.attempt,
+                    "physical_path": alert.physical_path,
+                    "prior_fingerprint": alert.prior_fingerprint,
+                    "current_fingerprint": alert.current_fingerprint,
+                    "status": alert.status,
+                    "prior_status": alert.prior_status,
+                    "reason": alert.reason,
+                    "pr_url": alert.pr_url,
+                    "pending_gate": alert.pending_gate,
+                    "liveness_class": alert.liveness_class,
+                    "validity_class": alert.validity_class,
+                    "validator_verdict": alert.validator_verdict,
+                    "security_verdict": alert.security_verdict,
+                    "cleanup_eligible": alert.cleanup_eligible,
+                    "routing_instructions": alert.routing_instructions,
+                })
+        except Exception as exc:
+            _emit({
+                "signal": "worklink_lifecycle_reconciliation_error",
+                "reason": str(exc),
+            })
+
     active_lock_ids = _active_lock_issue_ids(home)
-    # Fail closed: if we can't read either the ready queue, Chainlink's
-    # actionable set, or the active lock count, do not dispatch (an undercounted
-    # cap or blocked issue could over-admit workers).
     ready_result = (
         None
         if active_lock_ids is None
@@ -404,7 +969,6 @@ def main() -> int:
         })
         return 0
 
-    repo = os.environ.get("WORKLINK_REPO")
     if not repo:
         _emit({
             "signal": "worklink_poller_misconfigured",
@@ -417,8 +981,6 @@ def main() -> int:
         return 0
 
     run_bin = shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir")
-    state_dir = Path(os.environ.get("STATE_DIR") or (home / "state" / "pollers" / POLLER_NAME))
-    state_dir.mkdir(parents=True, exist_ok=True)
 
     dispatched = 0
     for item in ready[:slots]:
