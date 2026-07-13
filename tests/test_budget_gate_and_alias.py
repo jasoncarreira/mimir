@@ -515,7 +515,7 @@ async def test_http_event_ingress_denies_admin_tool_when_access_control_disabled
 
 
 @pytest.mark.asyncio
-async def test_admin_gate_denies_unstamped_internal_api_turn_without_admin_role() -> None:
+async def test_admin_gate_denies_unadmitted_operation_for_unstamped_scheduler_turn() -> None:
     ctx = _make_ctx(budget=0)
     ctx.trigger = "scheduled_tick"
     ctx.channel_source = "api"
@@ -532,7 +532,9 @@ async def test_admin_gate_denies_unstamped_internal_api_turn_without_admin_role(
 
     token = set_current_turn(ctx)
     try:
-        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-api-internal"), handler)
+        out = await mw.awrap_tool_call(
+            _make_request("request_mimir_update", "id-api-internal"), handler
+        )
     finally:
         reset_current_turn(token)
 
@@ -688,7 +690,7 @@ async def test_middleware_catches_unregistered_tools():
 
 
 @pytest.mark.asyncio
-async def test_admin_gate_denies_authorless_system_turn_without_admin_role() -> None:
+async def test_admin_gate_denies_unadmitted_operation_for_authorless_scheduler_turn() -> None:
     ctx = _make_ctx(budget=0)
     ctx.trigger = "scheduled_tick"
     ctx.author = None
@@ -704,7 +706,9 @@ async def test_admin_gate_denies_authorless_system_turn_without_admin_role() -> 
 
     token = set_current_turn(ctx)
     try:
-        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-system"), handler)
+        out = await mw.awrap_tool_call(
+            _make_request("request_mimir_update", "id-system"), handler
+        )
     finally:
         reset_current_turn(token)
 

@@ -47,6 +47,7 @@ from langgraph.types import Command
 
 from ..models import AuthContext
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
+from ..access_control import get_tool_registry
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
 log = logging.getLogger(__name__)
@@ -238,18 +239,14 @@ def _tool_call_id(request: ToolCallRequest) -> str:
     return str(tc.get("id") or "")
 
 
-def _is_admin_sensitive_tool(tool_name: str) -> bool:
-    if tool_name in _ADMIN_TOOL_NAMES or tool_name in _ADMIN_BUILTIN_TOOL_NAMES:
-        return True
-    # LangChain MCP bridge names have appeared in both double-underscore
-    # (`mcp__mimir__shell_exec`) and normalized single-underscore
-    # (`mcp_mimir_shell_exec`) forms. Match on the final tool component
-    # instead of one spelling so admin gating does not silently miss shell /
-    # scheduler / worklink aliases.
-    return any(
-        tool_name.endswith(f"__{name}") or tool_name.endswith(f"_{name}")
-        for name in _ADMIN_TOOL_NAMES
+def _is_admin_sensitive_tool(tool_name: str, ctx: AuthContext | None = None) -> bool:
+    """Return whether the live decision surface requires a privileged check."""
+    auth = get_tool_registry().authorize_tool(
+        tool_name,
+        ctx,
+        enforce=bool(ctx is not None and ctx.enforcement_enabled),
     )
+    return auth.required_tier.value == "admin" or not auth.allowed
 
 
 def _admin_denial_message(tool_name: str, reason: str | None) -> str:
@@ -315,39 +312,41 @@ def _deny_admin_tool(
 
 
 def _check_admin_authorized(tool_name: str, ctx: Any | None = None) -> str | None:
-    if not _is_admin_sensitive_tool(tool_name):
+    enforce = (
+        bool(getattr(ctx, "enforcement_enabled", False))
+        if ctx is not None
+        else _env_access_control_enforced()
+    )
+    auth = get_tool_registry().authorize_tool(tool_name, ctx, enforce=enforce)
+    privileged = auth.required_tier.value == "admin" or not auth.allowed
+    if not privileged:
         return None
 
-    if ctx is None:
-        if _env_access_control_enforced():
-            return _deny_admin_tool(
-                tool_name,
-                "missing_auth_context",
-                ctx=None,
-                enforcement_enabled=True,
-            )
-        return None
+    if ctx is None and enforce:
+        return _deny_admin_tool(
+            tool_name,
+            "missing_auth_context",
+            ctx=None,
+            enforcement_enabled=True,
+        )
 
-    # ``ctx`` is the frozen AuthContext bound to this exact tool request (or,
-    # on the Claude SDK path, the exact model invocation). Mutable TurnContext
-    # fields and identity resolvers are deliberately not consulted here.
-    enforce = bool(getattr(ctx, "enforcement_enabled", False))
-    if _turn_has_http_event_ingress(ctx):
+    # Generic HTTP events authenticate transport only. They cannot inherit a
+    # service principal from a client-controlled trigger or call a non-open op.
+    if ctx is not None and _turn_has_http_event_ingress(ctx):
         return _deny_admin_tool(
             tool_name,
             _HTTP_EVENT_ADMIN_DENIAL_REASON,
             ctx=ctx,
             enforcement_enabled=enforce,
         )
-    if not enforce:
-        return None
-    if "admin" in (getattr(ctx, "roles", ()) or ()):
+
+    if auth.allowed:
         return None
     return _deny_admin_tool(
         tool_name,
-        "admin_required",
+        auth.reason or "admin_required",
         ctx=ctx,
-        enforcement_enabled=True,
+        enforcement_enabled=enforce,
     )
 
 
@@ -411,6 +410,29 @@ class BudgetGateMiddleware(AgentMiddleware):
     ``ToolCallRequest.runtime.context``. Claude SDK tools have no exact carrier
     in the current hook API and therefore fail closed under enforcement.
     """
+
+    def __init__(self) -> None:
+        # Compatibility mode remains permissive, but every non-open decision is
+        # emitted so operators can inspect what enforcement would have done.
+        get_tool_registry().enable_shadow_logging()
+
+    def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        """Publish the final model-bound tool surface, then invoke the model.
+
+        Authorization decisions do not consult this observational inventory, so
+        replacing the snapshot cannot widen or narrow the current call's access.
+        """
+        get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
+        return handler(request)
+
+    async def awrap_model_call(
+        self,
+        request: Any,
+        handler: Callable[[Any], Awaitable[Any]],
+    ) -> Any:
+        """Async counterpart to :meth:`wrap_model_call`."""
+        get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
+        return await handler(request)
 
     def wrap_tool_call(
         self,
