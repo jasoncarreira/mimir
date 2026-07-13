@@ -21,19 +21,28 @@ hardening: per-server exit stacks (one server's hang doesn't block
 others), timeouts on ``initialize`` + ``call_tool``, regex-based
 ``${VAR}`` expansion (handles ``"Bearer ${TOKEN}"`` patterns), and
 warning-on collision for ``mcp_{server}_{tool}`` namespaced names.
+
+Chainlink #870 adds provenance tracking:
+- Versioned provenance record on each wrapper with immutable server_config_id,
+  transport/endpoint identity, canonical non-secret config and schema digests,
+  original tool name, adapter/version, approval and policy version
+- Classification via registered adapters for resource-scoped authorization
+- Drift detection that invalidates approval without logging secrets
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import uuid
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from langchain_core.tools import StructuredTool, ToolException
 from mcp import ClientSession, StdioServerParameters
@@ -53,6 +62,115 @@ DEFAULT_MCP_SHUTDOWN_TIMEOUT_S = 10.0
 # ``"Bearer ${TOKEN}"`` or ``"${A}${B}"`` were passed through literally,
 # shipping the placeholder to the subprocess instead of the secret.
 _ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+_SECRET_KEYWORDS = frozenset({
+    "token", "secret", "password", "key", "auth", "credential",
+    "api_key", "api-key", "access_token", "access-token",
+})
+
+
+def _is_secret_key(key: str) -> bool:
+    """Check if a config key name suggests a secret value."""
+    return any(kw in key.lower() for kw in _SECRET_KEYWORDS)
+
+
+def _canonical_config_digest(config: MCPServerConfig) -> str:
+    """Generate a deterministic digest of non-secret config fields.
+
+    Excludes env vars that contain secrets - only uses name, command,
+    and args to create a stable identity for the server configuration.
+    """
+    canonical_parts = [config.name, config.command, json.dumps(config.args, sort_keys=True)]
+    content = "|".join(canonical_parts)
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+
+def _schema_digest(input_schema: dict[str, Any]) -> str:
+    """Generate a deterministic digest of the tool's input schema.
+
+    Used for drift detection - any change to the schema will produce
+    a different digest, indicating the tool's contract has changed.
+    """
+    normalized = json.dumps(input_schema, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class MCPProvenance:
+    """Versioned provenance record for an MCP tool wrapper (chainlink #870).
+
+    Immutable metadata that identifies the tool's origin, configuration,
+    and approval state. Used for drift detection and authorization.
+    """
+    server_config_id: str
+    transport_type: str = "stdio"
+    endpoint_identity: str = ""
+    config_digest: str = ""
+    schema_digest: str = ""
+    original_tool_name: str = ""
+    adapter_name: str = ""
+    adapter_version: str = ""
+    approval_version: str = ""
+    policy_version: str = ""
+    is_tombstoned: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        config: MCPServerConfig,
+        tool_name: str,
+        input_schema: dict[str, Any],
+        *,
+        server_config_id: str | None = None,
+    ) -> "MCPProvenance":
+        """Create a new provenance record for an MCP tool."""
+        return cls(
+            server_config_id=server_config_id or str(uuid.uuid4()),
+            endpoint_identity=config.name,
+            config_digest=_canonical_config_digest(config),
+            schema_digest=_schema_digest(input_schema),
+            original_tool_name=tool_name,
+        )
+
+    def with_drift_detection(
+        self,
+        config: MCPServerConfig,
+        tool_name: str,
+        input_schema: dict[str, Any],
+    ) -> "MCPProvenance":
+        """Create a new provenance record with drift detection checks.
+
+        Returns a new provenance with is_tombstoned=True if:
+        - The tool name has changed
+        - The config digest has changed
+        - The schema digest has changed
+        """
+        new_config_digest = _canonical_config_digest(config)
+        new_schema_digest = _schema_digest(input_schema)
+
+        name_changed = tool_name != self.original_tool_name
+        config_changed = new_config_digest != self.config_digest
+        schema_changed = new_schema_digest != self.schema_digest
+
+        if name_changed or config_changed or schema_changed:
+            log.warning(
+                "MCP tool drift detected for %s: name_changed=%s, config_changed=%s, schema_changed=%s",
+                self.original_tool_name, name_changed, config_changed, schema_changed,
+            )
+
+        return MCPProvenance(
+            server_config_id=self.server_config_id,
+            transport_type=self.transport_type,
+            endpoint_identity=self.endpoint_identity,
+            config_digest=new_config_digest,
+            schema_digest=new_schema_digest,
+            original_tool_name=tool_name,
+            adapter_name=self.adapter_name,
+            adapter_version=self.adapter_version,
+            approval_version=self.approval_version,
+            policy_version=self.policy_version,
+            is_tombstoned=name_changed or config_changed or schema_changed,
+        )
 
 
 def _expand_env_refs(value: str) -> str:
@@ -131,18 +249,33 @@ class MCPConnection:
     async def discover_tools(
         self,
         call_timeout_s: float = DEFAULT_MCP_CALL_TIMEOUT_S,
+        server_config_id: str | None = None,
     ) -> list[StructuredTool]:
-        """Call ``list_tools`` and bridge each into a LangChain StructuredTool."""
+        """Call ``list_tools`` and bridge each into a LangChain StructuredTool.
+
+        Args:
+            call_timeout_s: Timeout for each tool call.
+            server_config_id: Optional immutable ID for this server config.
+                             If not provided, one will be generated.
+        """
         result = await self.session.list_tools()
         tools: list[StructuredTool] = []
+        config_id = server_config_id or str(uuid.uuid4())
         for mcp_tool in result.tools:
+            provenance = MCPProvenance.create(
+                config=self.config,
+                tool_name=mcp_tool.name,
+                input_schema=mcp_tool.inputSchema or {},
+                server_config_id=config_id,
+            )
             lc_tool = _bridge_mcp_tool(
                 server_name=self.config.name,
                 tool_name=mcp_tool.name,
                 description=mcp_tool.description or "",
-                input_schema=mcp_tool.inputSchema,
+                input_schema=mcp_tool.inputSchema or {},
                 session=self.session,
                 call_timeout_s=call_timeout_s,
+                provenance=provenance,
             )
             tools.append(lc_tool)
             self.tool_names.append(mcp_tool.name)
@@ -360,6 +493,7 @@ def _bridge_mcp_tool(
     input_schema: dict[str, Any],
     session: ClientSession,
     call_timeout_s: float = DEFAULT_MCP_CALL_TIMEOUT_S,
+    provenance: MCPProvenance | None = None,
 ) -> StructuredTool:
     """Wrap one MCP tool as a LangChain StructuredTool.
 
@@ -370,6 +504,9 @@ def _bridge_mcp_tool(
     coercion at call time. Falls back to schema-in-description when
     the JSON schema uses constructs pydantic can't accept (nested
     object schemas, complex anyOf unions, $ref).
+
+    Provenance is attached as a custom attribute for drift detection
+    and authorization (chainlink #870).
     """
     properties = input_schema.get("properties", {})
     required_fields = set(input_schema.get("required", []))
@@ -421,7 +558,10 @@ def _bridge_mcp_tool(
     }
     if args_schema is not None:
         kwargs["args_schema"] = args_schema
-    return StructuredTool.from_function(**kwargs)
+    tool = StructuredTool.from_function(**kwargs)
+    if provenance is not None:
+        _tool_provenance_registry[namespaced_name] = provenance
+    return tool
 
 
 def parse_mcp_server_configs(raw: Any) -> list[MCPServerConfig]:
@@ -501,3 +641,108 @@ def load_mcp_server_configs(*, json_inline: str | None, json_path: str | None) -
     if raw is None:
         return []
     return parse_mcp_server_configs(raw)
+
+
+_tool_provenance_registry: dict[str, MCPProvenance] = {}
+
+
+def clear_provenance_registry() -> None:
+    """Clear the provenance registry. Used by tests."""
+    global _tool_provenance_registry
+    _tool_provenance_registry.clear()
+
+
+def get_tool_provenance(tool: Any) -> MCPProvenance | None:
+    """Extract provenance from an MCP tool wrapper, if present."""
+    tool_name = getattr(tool, "name", None)
+    if tool_name is not None and tool_name in _tool_provenance_registry:
+        return _tool_provenance_registry[tool_name]
+    return getattr(tool, "mcp_provenance", None)
+
+
+def check_tool_drift(
+    tool: Any,
+    config: MCPServerConfig,
+    tool_name: str,
+    input_schema: dict[str, Any],
+) -> MCPProvenance | None:
+    """Check for drift between current tool state and original provenance.
+
+    Returns a new provenance record with is_tombstoned=True if drift is detected.
+    Returns None if the tool has no provenance (not an MCP tool).
+    """
+    provenance = get_tool_provenance(tool)
+    if provenance is None:
+        return None
+
+    return provenance.with_drift_detection(
+        config=config,
+        tool_name=tool_name,
+        input_schema=input_schema,
+    )
+
+
+MCPAdapterClassifier = Callable[[str, Any | None], Any]
+
+
+@dataclass(frozen=True)
+class MCPAdapterRegistration:
+    """Registered classifier for tools carrying matching provenance."""
+
+    version: str
+    policy_version: str
+    classify: MCPAdapterClassifier
+
+
+def register_mcp_adapter(
+    adapter_name: str,
+    adapter_version: str,
+    policy_version: str,
+    classify: MCPAdapterClassifier,
+) -> None:
+    """Register a classifier for MCP tools carrying ``adapter_name`` provenance."""
+    if not callable(classify):
+        raise TypeError("MCP adapter classifier must be callable")
+    _global_mcp_adapter_registry[adapter_name] = MCPAdapterRegistration(
+        version=adapter_version,
+        policy_version=policy_version,
+        classify=classify,
+    )
+
+
+def get_mcp_adapter_info(adapter_name: str) -> MCPAdapterRegistration | None:
+    """Get a registered MCP classifier by provenance adapter name."""
+    return _global_mcp_adapter_registry.get(adapter_name)
+
+
+def clear_mcp_adapter_registry() -> None:
+    """Clear registered MCP classifiers. Used by tests."""
+    _global_mcp_adapter_registry.clear()
+
+
+_global_mcp_adapter_registry: dict[str, MCPAdapterRegistration] = {}
+
+
+def check_stale_policy_on_startup(
+    tools: list[Any],
+    expected_policy_version: str,
+) -> list[dict[str, Any]]:
+    """Check for tools with stale policy versions on startup.
+
+    Returns a list of tools that have a different policy version than expected.
+    This allows administrators to identify tools that need re-approval.
+    """
+    stale_tools: list[dict[str, Any]] = []
+    for tool in tools:
+        provenance = get_tool_provenance(tool)
+        if provenance is None:
+            continue
+        if provenance.policy_version and provenance.policy_version != expected_policy_version:
+            stale_tools.append({
+                "tool_name": tool.name,
+                "expected_policy": expected_policy_version,
+                "actual_policy": provenance.policy_version,
+                "original_tool_name": provenance.original_tool_name,
+                "server_config_id": provenance.server_config_id,
+            })
+    return stale_tools
