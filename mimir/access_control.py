@@ -4,19 +4,27 @@ This module deliberately has no dispatcher or bridge side effects. Runtime
 callers pass the inbound ``AgentEvent`` (or an author id), an optional
 ``IdentityResolver``, and an explicit enforcement flag; the policy returns a
 structured decision suitable for logs and tool errors.
+
+New in chainlink #865:
+- OperationCatalog: stable open/admin-required/resource-scoped decisions for tools
+- ServicePrincipal: explicit trusted-autonomous service entries with capabilities
+- ToolAuthorization: runtime tool surface inventory with shadow-decision logging
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 from .identities import AccessMetadata
 
 if TYPE_CHECKING:
     from .identities import IdentityResolver
     from .models import AgentEvent, AuthContext
+
+log = logging.getLogger(__name__)
 
 
 class AccessTier(StrEnum):
@@ -36,6 +44,408 @@ class DenialReason(StrEnum):
     UNKNOWN_AUTHOR = "unknown_author"
     USER_NOT_ALLOWLISTED = "user_not_allowlisted"
     ADMIN_REQUIRED = "admin_required"
+
+
+class OperationDecision(StrEnum):
+    """Authorization decision for a tool/operation.
+
+    - OPEN: operation is accessible to any authorized user (no admin required)
+    - ADMIN_REQUIRED: operation requires admin role
+    - RESOURCE_SCOPED: operation requires specific resource/domain capability
+    - UNKNOWN: operation is unknown - denied by default when enforcement is on
+    """
+    OPEN = "open"
+    ADMIN_REQUIRED = "admin_required"
+    RESOURCE_SCOPED = "resource_scoped"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ResourceScope:
+    """Defines a specific resource/domain that an operation scopes to."""
+    domain: str
+    capabilities: frozenset[str] = frozenset()
+    sink_destinations: frozenset[str] = frozenset()
+
+
+@dataclass
+class ServicePrincipal:
+    """Trusted autonomous service principal (chainlink #865).
+
+    Defined by server-owned creation path, trigger, capabilities,
+    readable domains, and sink destinations. Unknown synthetic triggers
+    receive no privilege.
+    """
+    canonical: str
+    trigger: str
+    capabilities: tuple[str, ...] = ()
+    readable_domains: tuple[str, ...] = ()
+    sink_destinations: tuple[str, ...] = ()
+    creation_path: str | None = None
+
+    def can_read_domain(self, domain: str) -> bool:
+        if not self.readable_domains:
+            return False
+        return domain in self.readable_domains
+
+    def can_write_sink(self, sink: str) -> bool:
+        if not self.sink_destinations:
+            return False
+        return sink in self.sink_destinations
+
+    def has_capability(self, capability: str) -> bool:
+        return capability in self.capabilities
+
+
+class OperationCatalog:
+    """Catalog of tool/operation authorization decisions (chainlink #865).
+
+    Replaces the old allow-through admin-name matching. Unknown native,
+    built-in, dynamic, and external operations are never implicitly open -
+    they are denied by default when enforcement is on.
+    """
+
+    _OPEN_OPERATIONS: frozenset[str] = frozenset({
+        "send_message",
+        "react",
+        "fetch_channel_history",
+        "list_channels",
+        "list_schedules",
+        "commitment_list",
+    })
+
+    _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
+        "add_schedule",
+        "set_schedule_priority",
+        "remove_schedule",
+        "reload_pollers",
+        "open_proposal",
+        "submit_proposal",
+        "abandon_proposal",
+        "request_mimir_update",
+        "worklink_run",
+        "shell_exec",
+        "bash_async",
+        "spawn_claude_code",
+        "spawn_codex",
+        "saga_forget",
+        "write_file",
+        "edit_file",
+        "set_poller_overrides",
+    })
+
+    _ADMIN_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset({
+        "Bash",
+        "bash",
+        "bash_exec",
+        "execute",
+        "aexecute",
+        "shell",
+        "Write",
+        "Edit",
+    })
+
+    def __init__(self) -> None:
+        self._custom_decisions: dict[str, OperationDecision] = {}
+        self._resource_scoped_operations: dict[str, list[ResourceScope]] = {}
+        self._adapter_hooks: list[Callable[[str, Any], OperationDecision | None]] = []
+
+    def register_operation(
+        self,
+        name: str,
+        decision: OperationDecision,
+        scopes: list[ResourceScope] | None = None,
+    ) -> None:
+        """Register a custom decision for an operation."""
+        self._custom_decisions[name] = decision
+        if decision == OperationDecision.RESOURCE_SCOPED and scopes:
+            self._resource_scoped_operations[name] = scopes
+
+    def register_adapter_hook(
+        self,
+        hook: Callable[[str, Any], OperationDecision | None],
+    ) -> None:
+        """Register an adapter hook for custom authorization logic.
+
+        The hook receives (tool_name, context) and returns an OperationDecision
+        or None to fall through to catalog defaults.
+        """
+        self._adapter_hooks.append(hook)
+
+    def get_decision(
+        self,
+        tool_name: str,
+        context: Any | None = None,
+    ) -> OperationDecision:
+        """Get the authorization decision for a tool.
+
+        Order of resolution:
+        1. Custom registered decisions
+        2. Adapter hook results
+        3. Built-in OPEN operations
+        4. Built-in ADMIN_REQUIRED operations
+        5. MCP name variations (admin required)
+        6. Unknown operations -> UNKNOWN (fail closed when enforcement on)
+        """
+        if tool_name in self._custom_decisions:
+            return self._custom_decisions[tool_name]
+
+        for hook in self._adapter_hooks:
+            result = hook(tool_name, context)
+            if result is not None:
+                return result
+
+        if tool_name in self._OPEN_OPERATIONS:
+            return OperationDecision.OPEN
+
+        if tool_name in self._ADMIN_REQUIRED_OPERATIONS:
+            return OperationDecision.ADMIN_REQUIRED
+
+        if tool_name in self._ADMIN_BUILTIN_TOOL_NAMES:
+            return OperationDecision.ADMIN_REQUIRED
+
+        if any(
+            tool_name.endswith(f"__{name}") or tool_name.endswith(f"_{name}")
+            for name in self._ADMIN_REQUIRED_OPERATIONS
+        ):
+            return OperationDecision.ADMIN_REQUIRED
+
+        return OperationDecision.UNKNOWN
+
+    def get_scopes(
+        self,
+        tool_name: str,
+    ) -> list[ResourceScope] | None:
+        """Get resource scopes for a RESOURCE_SCOPED operation."""
+        return self._resource_scoped_operations.get(tool_name)
+
+    def is_known(self, tool_name: str) -> bool:
+        """Check if a tool is known (has a non-UNKNOWN decision)."""
+        return self.get_decision(tool_name) != OperationDecision.UNKNOWN
+
+
+_global_operation_catalog = OperationCatalog()
+
+
+def get_operation_catalog() -> OperationCatalog:
+    """Get the global operation catalog instance."""
+    return _global_operation_catalog
+
+
+@dataclass
+class ToolAuthorization:
+    """Authorization decision for a tool call (chainlink #865).
+
+    Carries the tool name, operation decision, service principal context,
+    and shadow-decision audit fields.
+    """
+    tool_name: str
+    decision: OperationDecision
+    allowed: bool
+    reason: str | None = None
+    service_principal: ServicePrincipal | None = None
+    required_tier: AccessTier = AccessTier.USER
+    enforcement_enabled: bool = False
+    is_shadow_decision: bool = False
+
+    def as_log_fields(self) -> dict[str, Any]:
+        """Return fields for audit logging."""
+        return {
+            "tool": self.tool_name,
+            "decision": self.decision.value,
+            "allowed": self.allowed,
+            "reason": self.reason,
+            "required_tier": self.required_tier.value,
+            "service_principal": self.service_principal.canonical if self.service_principal else None,
+            "enforcement_enabled": self.enforcement_enabled,
+            "is_shadow_decision": self.is_shadow_decision,
+        }
+
+
+class ToolRegistry:
+    """Registry of runtime tools for inventory and authorization (chainlink #865).
+
+    Maintains an executable inventory of the final assembled runtime tool surface.
+    Supports shadow-decision audit logging when compatibility enforcement is off.
+    """
+
+    def __init__(self) -> None:
+        self._tools: dict[str, dict[str, Any]] = {}
+        self._shadow_logging_enabled: bool = False
+
+    def register_tool(
+        self,
+        name: str,
+        *,
+        description: str | None = None,
+        category: str | None = None,
+        is_native: bool = False,
+        is_builtin: bool = False,
+        is_dynamic: bool = False,
+        is_external: bool = False,
+    ) -> None:
+        """Register a tool in the runtime inventory."""
+        self._tools[name] = {
+            "name": name,
+            "description": description,
+            "category": category,
+            "is_native": is_native,
+            "is_builtin": is_builtin,
+            "is_dynamic": is_dynamic,
+            "is_external": is_external,
+        }
+
+    def unregister_tool(self, name: str) -> None:
+        """Remove a tool from the inventory."""
+        self._tools.pop(name, None)
+
+    def get_tool(self, name: str) -> dict[str, Any] | None:
+        """Get tool metadata from inventory."""
+        return self._tools.get(name)
+
+    def list_tools(self) -> list[str]:
+        """List all registered tool names."""
+        return list(self._tools.keys())
+
+    def list_by_category(self, category: str) -> list[str]:
+        """List tools in a specific category."""
+        return [
+            name for name, meta in self._tools.items()
+            if meta.get("category") == category
+        ]
+
+    @property
+    def tool_count(self) -> int:
+        """Total number of registered tools."""
+        return len(self._tools)
+
+    def enable_shadow_logging(self) -> None:
+        """Enable shadow-decision audit logging."""
+        self._shadow_logging_enabled = True
+
+    def disable_shadow_logging(self) -> None:
+        """Disable shadow-decision audit logging."""
+        self._shadow_logging_enabled = False
+
+    @property
+    def is_shadow_logging_enabled(self) -> bool:
+        """Check if shadow logging is enabled."""
+        return self._shadow_logging_enabled
+
+    def _emit_shadow_decision(
+        self,
+        auth: ToolAuthorization,
+    ) -> None:
+        """Emit shadow-decision audit log (when enabled)."""
+        if not self._shadow_logging_enabled:
+            return
+        try:
+            from .event_logger import log_event
+            import asyncio
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(
+                log_event("shadow_tool_decision", **auth.as_log_fields())
+            )
+            task.add_done_callback(lambda t: t.exception() if not t.done() else None)
+        except RuntimeError:
+            log.debug("shadow decision logging skipped: no running event loop")
+
+    def authorize_tool(
+        self,
+        tool_name: str,
+        auth_context: "AuthContext | None" = None,
+        *,
+        enforce: bool = False,
+    ) -> ToolAuthorization:
+        """Authorize a tool call using the operation catalog.
+
+        When enforce=False (legacy mode), unknown operations are allowed but
+        logged as shadow decisions. When enforce=True, unknown operations
+        are denied.
+        """
+        catalog = get_operation_catalog()
+        decision = catalog.get_decision(tool_name, auth_context)
+        service_principal = None
+
+        if auth_context is not None:
+            trigger = getattr(auth_context, "trigger", None)
+            if trigger:
+                service_principal = _find_service_principal_for_trigger(trigger)
+
+        required_tier = AccessTier.USER
+        reason = None
+        is_shadow = False
+
+        if decision == OperationDecision.OPEN:
+            allowed = True
+        elif decision == OperationDecision.ADMIN_REQUIRED:
+            required_tier = AccessTier.ADMIN
+            if enforce:
+                if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
+                    allowed = True
+                else:
+                    allowed = False
+                    reason = "admin_required"
+            else:
+                allowed = True
+                is_shadow = True
+        elif decision == OperationDecision.RESOURCE_SCOPED:
+            required_tier = AccessTier.ADMIN
+            if enforce:
+                allowed = False
+                reason = "resource_scoped"
+            else:
+                allowed = True
+                is_shadow = True
+        else:
+            if enforce:
+                allowed = False
+                reason = "unknown_operation"
+            else:
+                allowed = True
+                is_shadow = True
+
+        auth = ToolAuthorization(
+            tool_name=tool_name,
+            decision=decision,
+            allowed=allowed,
+            reason=reason,
+            service_principal=service_principal,
+            required_tier=required_tier,
+            enforcement_enabled=enforce,
+            is_shadow_decision=is_shadow,
+        )
+
+        if is_shadow:
+            self._emit_shadow_decision(auth)
+
+        return auth
+
+
+_global_tool_registry = ToolRegistry()
+
+
+def get_tool_registry() -> ToolRegistry:
+    """Get the global tool registry instance."""
+    return _global_tool_registry
+
+
+_TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {}
+
+
+def register_service_principal(service: ServicePrincipal) -> None:
+    """Register a trusted autonomous service principal."""
+    _TRUSTED_SERVICE_PRINCIPALS[service.trigger] = service
+
+
+def get_service_principal(trigger: str) -> ServicePrincipal | None:
+    """Get a service principal by trigger."""
+    return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+
+
+def _find_service_principal_for_trigger(trigger: str) -> ServicePrincipal | None:
+    """Find a service principal that matches the given trigger."""
+    return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
 
 
 @dataclass(frozen=True)

@@ -47,6 +47,12 @@ from langgraph.types import Command
 
 from ..models import AuthContext
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
+from ..access_control import (
+    get_operation_catalog,
+    OperationDecision,
+    get_tool_registry,
+    ToolAuthorization,
+)
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
 log = logging.getLogger(__name__)
@@ -238,18 +244,24 @@ def _tool_call_id(request: ToolCallRequest) -> str:
     return str(tc.get("id") or "")
 
 
-def _is_admin_sensitive_tool(tool_name: str) -> bool:
-    if tool_name in _ADMIN_TOOL_NAMES or tool_name in _ADMIN_BUILTIN_TOOL_NAMES:
+def _is_admin_sensitive_tool(tool_name: str, ctx: AuthContext | None = None) -> bool:
+    """Check if a tool requires admin authorization.
+
+    Uses the OperationCatalog for authoritative decisions. Unknown tools
+    fail closed (return True) when enforcement is on, ensuring no implicit
+    open access for unknown operations.
+    """
+    catalog = get_operation_catalog()
+    decision = catalog.get_decision(tool_name, ctx)
+
+    if decision == OperationDecision.ADMIN_REQUIRED:
         return True
-    # LangChain MCP bridge names have appeared in both double-underscore
-    # (`mcp__mimir__shell_exec`) and normalized single-underscore
-    # (`mcp_mimir_shell_exec`) forms. Match on the final tool component
-    # instead of one spelling so admin gating does not silently miss shell /
-    # scheduler / worklink aliases.
-    return any(
-        tool_name.endswith(f"__{name}") or tool_name.endswith(f"_{name}")
-        for name in _ADMIN_TOOL_NAMES
-    )
+
+    if decision == OperationDecision.UNKNOWN:
+        enforce = ctx is not None and getattr(ctx, "enforcement_enabled", False)
+        return enforce
+
+    return False
 
 
 def _admin_denial_message(tool_name: str, reason: str | None) -> str:
@@ -315,7 +327,7 @@ def _deny_admin_tool(
 
 
 def _check_admin_authorized(tool_name: str, ctx: Any | None = None) -> str | None:
-    if not _is_admin_sensitive_tool(tool_name):
+    if not _is_admin_sensitive_tool(tool_name, ctx):
         return None
 
     if ctx is None:
