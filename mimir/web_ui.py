@@ -37,6 +37,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -61,7 +62,6 @@ from .worklink.backends.feature_factory import (
     FactoryRunState,
     _parse_run_state,
     factory_run_dir,
-    read_factory_run_state,
 )
 from .live_events import read_live_event_items_since
 from .ops_dashboard import (
@@ -102,6 +102,8 @@ from .wiki_backlinks import (
 )
 
 log = logging.getLogger(__name__)
+
+_SAFE_FACTORY_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}")
 
 _TURN_VIEWER_HTML: str | None = None
 _WEB_AUTH_JS: str | None = None
@@ -1495,12 +1497,17 @@ def register_routes(
         run_id = request.match_info.get("run_id", "").strip()
         if not run_id:
             return json_error("missing_run_id", "run_id is required", status=400)
+        if not _SAFE_FACTORY_RUN_ID_RE.fullmatch(run_id) or ".." in run_id:
+            return json_error("invalid_run_id", "run_id is invalid", status=400)
 
         repo = _get_worklink_repo()
         if repo is None:
             return json_error("home_not_configured", "home path not configured", status=503)
 
-        run_dir = factory_run_dir(repo, run_id)
+        factory_root = (repo / FACTORY_DIR).resolve()
+        run_dir = factory_run_dir(repo, run_id).resolve()
+        if not run_dir.is_relative_to(factory_root):
+            return json_error("invalid_run_id", "run_id is outside the factory root", status=400)
         run_json = run_dir / "run.json"
 
         if not run_dir.exists():
@@ -1988,7 +1995,7 @@ def register_routes(
     def factory_runs_backend_routes() -> list[DashboardBackendRoute]:
         return [
             DashboardBackendRoute("GET", "/api/v1/factory-runs", factory_runs_list_v1),
-            DashboardBackendRoute("GET", "/api/v1/factory-runs/{run_id}", factory_runs_detail_v1),
+            DashboardBackendRoute("GET", "/api/v1/factory-runs/{run_id:.+}", factory_runs_detail_v1),
         ]
 
     def scheduler_backend_routes() -> list[DashboardBackendRoute]:

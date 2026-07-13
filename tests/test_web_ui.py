@@ -318,6 +318,77 @@ async def test_factory_runs_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
+async def test_factory_runs_detail_rejects_traversal_to_existing_run_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    outside_dir = tmp_path / ".opencode" / "outside"
+    outside_dir.mkdir(parents=True)
+    (outside_dir / "run.json").write_text(
+        json.dumps({"run_id": "outside", "status": "completed"}),
+        encoding="utf-8",
+    )
+
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "turns",
+        events_log=tmp_path / "events",
+        home=home,
+    )
+
+    client = TestClient(TestServer(app))
+    async with client as cli:
+        resp = await cli.get("/api/v1/factory-runs/%2E%2E%2Foutside")
+        assert resp.status == 400
+        data = await resp.json()
+        assert data["ok"] is False
+        assert data["error"]["code"] == "invalid_run_id"
+
+
+@pytest.mark.asyncio
+async def test_factory_runs_detail_rejects_symlink_outside_factory_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    factory_dir = tmp_path / ".opencode" / "factory"
+    factory_dir.mkdir(parents=True)
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "run.json").write_text(
+        json.dumps({"run_id": "outside", "status": "completed"}),
+        encoding="utf-8",
+    )
+    (factory_dir / "escaped").symlink_to(outside_dir, target_is_directory=True)
+
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "turns",
+        events_log=tmp_path / "events",
+        home=home,
+    )
+
+    client = TestClient(TestServer(app))
+    async with client as cli:
+        resp = await cli.get("/api/v1/factory-runs/escaped")
+        assert resp.status == 400
+        data = await resp.json()
+        assert data["ok"] is False
+        assert data["error"]["code"] == "invalid_run_id"
+
+
+@pytest.mark.asyncio
 async def test_factory_runs_detail_not_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
     home = tmp_path / "home"
