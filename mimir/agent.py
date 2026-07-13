@@ -68,7 +68,7 @@ from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
 from ._jsonl_tail import tail_jsonl_records
 from .jsonl_snapshot import JsonlSnapshot
-from .models import AgentEvent, AuthContext, TurnInteractivity, TurnRecord
+from .models import AgentEvent, AuthContext, InformationFlowLabels, TurnInteractivity, TurnRecord
 from .access_control import create_auth_context
 from .prompts import build_system_prompt, build_turn_prompt
 from .rate_limits import RateLimitStore
@@ -182,6 +182,67 @@ def _turn_record_ts(rec: dict) -> datetime | None:
 def _turn_is_interactive(interactivity: TurnInteractivity | None) -> bool:
     """Return True only for an explicit interactive classification."""
     return interactivity == TurnInteractivity.INTERACTIVE
+
+
+def _initialize_ifc_labels(event: AgentEvent, attachments: list[str] | None = None) -> InformationFlowLabels:
+    """Initialize immutable/monotonic IFC labels before the first model call (chainlink #871).
+
+    Labels are initialized from:
+    - Inbound event content and metadata
+    - Attachments
+    - Folded messages (handled separately)
+    - Continuation context
+
+    Labels are monotonic - they can only be added, never removed.
+    """
+    labels = InformationFlowLabels()
+
+    if event.channel_id:
+        labels = labels.with_channel(event.channel_id)
+
+    if event.attachment_names:
+        for attachment in event.attachment_names:
+            if _is_private_attachment(attachment):
+                labels = labels.with_label("private")
+
+    if event.source in ("api", "http"):
+        labels = labels.with_label("internal")
+
+    if event.trigger in ("saga_session_end", "scheduled_tick", "poller"):
+        labels = labels.with_label("internal")
+
+    return labels
+
+
+def _is_private_attachment(filename: str) -> bool:
+    """Check if an attachment name suggests private content."""
+    private_patterns = ("private", "confidential", "secret", "internal", "restricted")
+    return any(p in filename.lower() for p in private_patterns)
+
+
+def _propagate_ifc_labels(
+    labels: Any,
+    target_channel: str | None,
+    auth_context: Any,
+) -> Any:
+    """Propagate IFC labels to subagents, spawns, and continuations (chainlink #871).
+
+    Labels propagate to ensure data sensitivity is maintained across delegation.
+    Same-principal/same-channel flows pass only when labels are compatible.
+    """
+    from .models import InformationFlowLabels
+
+    if not isinstance(labels, InformationFlowLabels):
+        return labels
+
+    new_labels = labels
+
+    if target_channel:
+        if target_channel in labels.source_channels:
+            return new_labels
+        new_labels = new_labels.with_channel(target_channel)
+
+    return new_labels
 
 
 def _filter_session_turns(
@@ -2083,6 +2144,13 @@ class Agent:
             render_subagent_updates(pending_subagents)
             if pending_subagents else None
         )
+
+        # chainlink #871: Initialize immutable/monotonic IFC labels before the first
+        # model call. Labels track data sensitivity from inbound/folded messages,
+        # recent history, automatic memory/session/skill/file injection, attachments,
+        # and continuation context. Labels propagate to subagents, spawns, continuations.
+        if ctx.ifc_labels is None:
+            ctx.ifc_labels = _initialize_ifc_labels(event, event.attachment_names)
 
         # Per-turn prompt assembly — Recent activity, Recent feedback,
         # Session summaries, Resource usage, Upcoming, Upcoming

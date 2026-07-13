@@ -257,6 +257,16 @@ def _extract_channel_from_args(
     return auth_context.channel_id if auth_context is not None else None
 
 
+def _get_ifc_labels_from_context() -> Any:
+    """Get IFC labels from the active TurnContext."""
+    from .._context import get_current_turn
+
+    ctx = get_current_turn()
+    if ctx is not None:
+        return getattr(ctx, "ifc_labels", None)
+    return None
+
+
 def _is_admin_sensitive_tool(
     tool_name: str,
     ctx: AuthContext | None = None,
@@ -338,6 +348,7 @@ def _check_admin_authorized(
     tool_name: str,
     ctx: Any | None = None,
     target_channel: str | None = None,
+    ifc_labels: Any = None,
 ) -> str | None:
     enforce = (
         bool(getattr(ctx, "enforcement_enabled", False))
@@ -345,7 +356,7 @@ def _check_admin_authorized(
         else _env_access_control_enforced()
     )
     auth = get_tool_registry().authorize_tool(
-        tool_name, ctx, enforce=enforce, target_channel=target_channel
+        tool_name, ctx, enforce=enforce, target_channel=target_channel, ifc_labels=ifc_labels
     )
     privileged = auth.required_tier.value == "admin" or not auth.allowed
     if not privileged:
@@ -471,9 +482,10 @@ class BudgetGateMiddleware(AgentMiddleware):
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
         target_channel = _extract_channel_from_args(request, auth_context)
+        ifc_labels = _get_ifc_labels_from_context()
 
         admin_denial = _check_admin_authorized(
-            tool_name, auth_context, target_channel
+            tool_name, auth_context, target_channel, ifc_labels
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
@@ -541,9 +553,10 @@ class BudgetGateMiddleware(AgentMiddleware):
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
         target_channel = _extract_channel_from_args(request, auth_context)
+        ifc_labels = _get_ifc_labels_from_context()
 
         admin_denial = _check_admin_authorized(
-            tool_name, auth_context, target_channel
+            tool_name, auth_context, target_channel, ifc_labels
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
