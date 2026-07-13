@@ -24,8 +24,6 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
-
 from mimir.worklink.backends import ComputeCaps, ComputeResult
 from mimir.worklink.backends import feature_factory as ff
 from mimir.worklink.backends.feature_factory import (
@@ -136,9 +134,34 @@ def test_read_factory_run_state_real_shape(tmp_path: Path) -> None:
                 "brief": {"status": "pending"},
                 "pre_pr": {"status": "pending", "override": None},
             },
+            "steps": [
+                {"agent": "spec-writer", "status": "accepted"},
+                {"agent": "work-decomposer", "status": "running"},
+            ],
             "slices": [{"id": "s1", "status": "merged"}, {"id": "s2", "status": "building"}],
             "validator": {"verdict": "GO", "report": "artifacts/validation-report.md", "loops": 0},
             "security_review": {"verdict": "PASS", "review_ref": "reviews/sec.json", "loops": 0},
+            "cost_attribution": {
+                "schema_version": 1,
+                "updated_at": "2026-07-09T12:00:00Z",
+                "status": "partial",
+                "totals": {
+                    "status": "partial",
+                    "entry_count": 2,
+                    "request_count": 2,
+                    "total_tokens": 12900,
+                    "cost_total": 1.23,
+                    "cost_currency": "USD",
+                    "mixed_currency": False,
+                    "missing": ["output_tokens"],
+                },
+                "entries": [],
+            },
+            "debug_snapshot": {
+                "created_with": {"collected_at": "2026-07-06T12:00:00Z"},
+                "last_resumed_with": {"collected_at": "2026-07-07T12:00:00Z"},
+                "resume_count": 1,
+            },
         },
     )
     st = read_factory_run_state(tmp_path, RUN_ID)
@@ -148,7 +171,20 @@ def test_read_factory_run_state_real_shape(tmp_path: Path) -> None:
     assert st.pending_gate == "brief"
     assert st.validator_verdict == "GO"
     assert st.security_verdict == "PASS"
+    assert st.steps == (("spec-writer", "accepted"), ("work-decomposer", "running"))
     assert st.slices == (("s1", "merged"), ("s2", "building"))
+    assert st.cost is not None
+    assert st.cost.status == "partial"
+    assert st.cost.entry_count == 2
+    assert st.cost.request_count == 2
+    assert st.cost.total_tokens == 12900
+    assert st.cost.cost_total == 1.23
+    assert st.cost.cost_currency == "USD"
+    assert st.cost.missing == ("output_tokens",)
+    assert st.debug is not None
+    assert st.debug.created_at == "2026-07-06T12:00:00Z"
+    assert st.debug.resumed_at == "2026-07-07T12:00:00Z"
+    assert st.debug.resume_count == 1
     assert st.terminal_result is None
     assert not st.is_terminal
 
@@ -163,8 +199,37 @@ def test_read_factory_run_state_verdicts_and_pr_absent(tmp_path: Path) -> None:
     assert st.validator_verdict is None
     assert st.security_verdict is None
     assert st.pr_url is None
+    assert st.steps == ()
     assert st.slices == ()
+    assert st.cost is None
+    assert st.debug is None
     assert st.pending_gate is None
+
+
+def test_read_factory_run_state_metadata_is_fail_soft(tmp_path: Path) -> None:
+    _write_run_json(
+        tmp_path,
+        {
+            "run_id": "r",
+            "status": "running",
+            "heartbeat_at": _now(),
+            "gates": {},
+            "steps": "not-a-list",
+            "slices": [{"id": "ok", "status": "running"}, "bad"],
+            "cost_attribution": {"status": 7, "totals": {"entry_count": True}},
+            "debug_snapshot": {"resume_count": -1, "created_with": "bad"},
+        },
+    )
+    st = read_factory_run_state(tmp_path, RUN_ID)
+    assert st is not None
+    assert st.steps == ()
+    assert st.slices == (("ok", "running"),)
+    assert st.cost is not None
+    assert st.cost.status == "unavailable"
+    assert st.cost.entry_count is None
+    assert st.debug is not None
+    assert st.debug.created_at is None
+    assert st.debug.resume_count is None
 
 
 def test_read_factory_run_state_completed_with_pr(tmp_path: Path) -> None:

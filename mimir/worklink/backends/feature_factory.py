@@ -63,14 +63,45 @@ class FactoryTerminalResult:
 
 
 @dataclass(frozen=True)
+class FactoryCostSummary:
+    """Fail-soft public summary of ``run.json.cost_attribution``.
+
+    The 0.2.1 package treats cost attribution as diagnostic metadata rather
+    than billing authority.  Keep the normalized surface small and preserve
+    missing values as ``None`` rather than inventing zeroes.
+    """
+
+    status: str
+    updated_at: str | None = None
+    entry_count: int | None = None
+    request_count: int | None = None
+    total_tokens: int | None = None
+    cost_total: float | None = None
+    cost_currency: str | None = None
+    mixed_currency: bool = False
+    missing: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FactoryDebugSummary:
+    """Fail-soft summary of optional ``run.json.debug_snapshot`` metadata."""
+
+    created_at: str | None = None
+    resumed_at: str | None = None
+    resume_count: int | None = None
+
+
+@dataclass(frozen=True)
 class FactoryRunState:
     """Parsed view of the factory's ``run.json`` control plane.
 
     Matches the REAL factory contract (there is no ``schema_version`` and no
     top-level ``gates_needed``): gates live under ``gates.<name>.status``, the
     panel verdicts under ``validator.verdict`` / ``security_review.verdict``,
-    slice progress under ``slices[].{id,status}``, and — at a terminal state —
-    the authoritative outcome under ``terminal_result``.
+    work progress under ``steps[].{agent,status}`` and
+    ``slices[].{id,status}``, diagnostic metadata under ``cost_attribution`` /
+    ``debug_snapshot``, and — at a terminal state — the authoritative outcome
+    under ``terminal_result``.
     """
 
     run_id: str
@@ -79,11 +110,17 @@ class FactoryRunState:
     pr_url: str | None = None
     # (gate-name, status) pairs, order-preserving, as read from run.json ``gates``.
     gate_statuses: tuple[tuple[str, str], ...] = ()
+    # (step-agent, status) pairs, order-preserving, from run.json ``steps``.
+    steps: tuple[tuple[str, str], ...] = ()
     # (slice-id, status) pairs, order-preserving, from run.json ``slices``.
     slices: tuple[tuple[str, str], ...] = ()
     validator_verdict: str | None = None
     security_verdict: str | None = None
     error: str | None = None
+    # Optional display/diagnostic metadata. Malformed values degrade to None or
+    # an empty tuple; they never participate in completion authority.
+    cost: FactoryCostSummary | None = None
+    debug: FactoryDebugSummary | None = None
     # Present only at a terminal state (agent-written; may be absent even then —
     # the adapter falls back to status/pr_url/gates when it is None).
     terminal_result: FactoryTerminalResult | None = None
@@ -140,14 +177,70 @@ def _parse_gate_statuses(gates: object) -> tuple[tuple[str, str], ...]:
     return tuple(parsed)
 
 
-def _parse_slices(slices: object) -> tuple[tuple[str, str], ...]:
-    if not isinstance(slices, list):
+def _parse_items(
+    items: object,
+    *,
+    identity_key: str,
+) -> tuple[tuple[str, str], ...]:
+    if not isinstance(items, list):
         return ()
     parsed: list[tuple[str, str]] = []
-    for item in slices:
+    for item in items:
         if isinstance(item, dict):
-            parsed.append((str(item.get("id") or ""), str(item.get("status") or "")))
+            parsed.append(
+                (str(item.get(identity_key) or ""), str(item.get("status") or ""))
+            )
     return tuple(parsed)
+
+
+def _optional_text(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _optional_nonnegative_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _optional_number(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        return float(value)
+    return None
+
+
+def _parse_cost_summary(cost: object) -> FactoryCostSummary | None:
+    """Normalize the package's optional diagnostic ``cost_attribution`` block."""
+    if not isinstance(cost, dict):
+        return None
+    totals = cost.get("totals")
+    if not isinstance(totals, dict):
+        totals = {}
+    missing = totals.get("missing", cost.get("missing"))
+    return FactoryCostSummary(
+        status=_optional_text(cost.get("status") or totals.get("status")) or "unavailable",
+        updated_at=_optional_text(cost.get("updated_at")),
+        entry_count=_optional_nonnegative_int(totals.get("entry_count")),
+        request_count=_optional_nonnegative_int(totals.get("request_count")),
+        total_tokens=_optional_nonnegative_int(totals.get("total_tokens")),
+        cost_total=_optional_number(totals.get("cost_total")),
+        cost_currency=_optional_text(totals.get("cost_currency")),
+        mixed_currency=totals.get("mixed_currency") is True,
+        missing=tuple(str(item) for item in missing) if isinstance(missing, list) else (),
+    )
+
+
+def _snapshot_time(snapshot: object) -> str | None:
+    return _optional_text(snapshot.get("collected_at")) if isinstance(snapshot, dict) else None
+
+
+def _parse_debug_summary(debug: object) -> FactoryDebugSummary | None:
+    """Normalize optional creation/resume diagnostics without retaining env data."""
+    if not isinstance(debug, dict):
+        return None
+    return FactoryDebugSummary(
+        created_at=_snapshot_time(debug.get("created_with")),
+        resumed_at=_snapshot_time(debug.get("last_resumed_with")),
+        resume_count=_optional_nonnegative_int(debug.get("resume_count")),
+    )
 
 
 def _parse_terminal_result(data: dict) -> FactoryTerminalResult | None:
@@ -229,10 +322,13 @@ def _parse_run_state(data: object) -> FactoryRunState | None:
         heartbeat_at=str(data.get("heartbeat_at") or ""),
         pr_url=pr_url,
         gate_statuses=_parse_gate_statuses(data.get("gates")),
-        slices=_parse_slices(data.get("slices")),
+        steps=_parse_items(data.get("steps"), identity_key="agent"),
+        slices=_parse_items(data.get("slices"), identity_key="id"),
         validator_verdict=_panel_verdict(data.get("validator")),
         security_verdict=_panel_verdict(data.get("security_review")),
         error=_blocked_reason(data),
+        cost=_parse_cost_summary(data.get("cost_attribution")),
+        debug=_parse_debug_summary(data.get("debug_snapshot")),
         terminal_result=_parse_terminal_result(data),
     )
 
