@@ -239,12 +239,35 @@ def _tool_call_id(request: ToolCallRequest) -> str:
     return str(tc.get("id") or "")
 
 
-def _is_admin_sensitive_tool(tool_name: str, ctx: AuthContext | None = None) -> bool:
+def _extract_channel_from_args(
+    request: ToolCallRequest,
+    auth_context: AuthContext | None = None,
+) -> str | None:
+    """Return the effective channel target for authorization.
+
+    Channel tools default an omitted/empty ``channel_id`` to the current turn's
+    channel. Mirror that server-owned resolution here so the gate authorizes an
+    implicit reply-to-trigger as same-scope rather than as a missing resource.
+    """
+    tc = getattr(request, "tool_call", None) or {}
+    args = tc.get("args") or {}
+    explicit_channel = args.get("channel_id")
+    if explicit_channel:
+        return explicit_channel
+    return auth_context.channel_id if auth_context is not None else None
+
+
+def _is_admin_sensitive_tool(
+    tool_name: str,
+    ctx: AuthContext | None = None,
+    target_channel: str | None = None,
+) -> bool:
     """Return whether the live decision surface requires a privileged check."""
     auth = get_tool_registry().authorize_tool(
         tool_name,
         ctx,
         enforce=bool(ctx is not None and ctx.enforcement_enabled),
+        target_channel=target_channel,
     )
     return auth.required_tier.value == "admin" or not auth.allowed
 
@@ -311,13 +334,19 @@ def _deny_admin_tool(
     return _admin_denial_message(tool_name, reason)
 
 
-def _check_admin_authorized(tool_name: str, ctx: Any | None = None) -> str | None:
+def _check_admin_authorized(
+    tool_name: str,
+    ctx: Any | None = None,
+    target_channel: str | None = None,
+) -> str | None:
     enforce = (
         bool(getattr(ctx, "enforcement_enabled", False))
         if ctx is not None
         else _env_access_control_enforced()
     )
-    auth = get_tool_registry().authorize_tool(tool_name, ctx, enforce=enforce)
+    auth = get_tool_registry().authorize_tool(
+        tool_name, ctx, enforce=enforce, target_channel=target_channel
+    )
     privileged = auth.required_tier.value == "admin" or not auth.allowed
     if not privileged:
         return None
@@ -440,9 +469,11 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest], ToolMessage | Command],
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
+        auth_context = _auth_context_from_request(request)
+        target_channel = _extract_channel_from_args(request, auth_context)
 
         admin_denial = _check_admin_authorized(
-            tool_name, _auth_context_from_request(request)
+            tool_name, auth_context, target_channel
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
@@ -508,9 +539,11 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
+        auth_context = _auth_context_from_request(request)
+        target_channel = _extract_channel_from_args(request, auth_context)
 
         admin_denial = _check_admin_authorized(
-            tool_name, _auth_context_from_request(request)
+            tool_name, auth_context, target_channel
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)

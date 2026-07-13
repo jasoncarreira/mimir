@@ -349,6 +349,8 @@ def set_identity_resolver(resolver: Any) -> None:
     """Inject the IdentityResolver so ``list_channels`` can surface
     operator-curated channels + captured DM channels. Set by server.py."""
     _STATE["identity_resolver"] = resolver
+    from ..access_control import ChannelResourceAdapter
+    ChannelResourceAdapter.set_identity_resolver(resolver)
 
 
 def set_dispatcher(dispatcher: Any) -> None:

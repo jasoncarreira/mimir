@@ -9,12 +9,19 @@ New in chainlink #865:
 - OperationCatalog: stable open/admin-required/resource-scoped decisions for tools
 - ServicePrincipal: explicit trusted-autonomous service entries with capabilities
 - ToolAuthorization: runtime tool surface inventory with shadow-decision logging
+
+New in chainlink #866:
+- ChannelResourceAdapter: resource-scoped authorization for send_message/react/
+  fetch_channel_history based on server-resolved triggering channel and bridge resources
+- Same-scope operations (target matches triggering channel) pass; cross-channel/
+  public/unknown operations require admin
+- Structured redacted denials without relying on model-supplied channel fields
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -93,6 +100,149 @@ class ServicePrincipal:
         return capability in self.capabilities
 
 
+class ChannelResourceAdapter:
+    """Resource-scoped adapter for channel messaging tools (chainlink #866).
+
+    Authorizes send_message/react/fetch_channel_history based on server-resolved
+    triggering channel and bridge resources. Same-scope operations (target matches
+    triggering channel) pass; cross-channel/public/unknown operations require admin.
+
+    Key invariants:
+    - Channel equality alone is not authority across bridge instances
+    - Aliases resolve server-side via IdentityResolver
+    - Cross-channel sends cannot inherit triggering-channel authority
+    - Denials are structured and redacted without relying on model-supplied fields
+    """
+
+    _CHANNEL_OPERATIONS: frozenset[str] = frozenset({
+        "send_message",
+        "react",
+        "fetch_channel_history",
+    })
+
+    _global_resolver: Any = None
+
+    @classmethod
+    def set_identity_resolver(cls, resolver: Any) -> None:
+        cls._global_resolver = resolver
+
+    @classmethod
+    def get_decision(
+        cls,
+        tool_name: str,
+        context: Any | None,
+    ) -> OperationDecision | None:
+        """Get resource-scoped decision for channel operations.
+
+        Returns RESOURCE_SCOPED for channel operations, or None to fall through
+        to catalog defaults.
+        """
+        if tool_name not in cls._CHANNEL_OPERATIONS:
+            return None
+
+        return OperationDecision.RESOURCE_SCOPED
+
+    @classmethod
+    def authorize_channel_operation(
+        cls,
+        tool_name: str,
+        target_channel: str | None,
+        auth_context: "AuthContext | None",
+        *,
+        enforce: bool = False,
+    ) -> ToolAuthorization:
+        """Authorize a channel operation against the triggering channel.
+
+        Same-scope (target matches triggering channel after server-side resolution)
+        passes for regular users. Cross-channel or unknown targets require admin.
+
+        Args:
+            tool_name: The channel operation (send_message/react/fetch_channel_history)
+            target_channel: The model-supplied target channel (may be None/empty)
+            auth_context: Server-created AuthContext with triggering channel
+            enforce: Whether to enforce or allow in shadow mode
+
+        Returns:
+            ToolAuthorization with allowed/reason fields populated
+        """
+        if tool_name not in cls._CHANNEL_OPERATIONS:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.UNKNOWN,
+                allowed=False,
+                reason="not_a_channel_operation",
+            )
+
+        triggering_channel = None
+        if auth_context is not None:
+            triggering_channel = getattr(auth_context, "channel_id", None)
+
+        if not triggering_channel:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=not enforce,
+                reason="missing_triggering_channel",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+
+        # Channel tools resolve an omitted/empty target to the current turn's
+        # channel. Authorization must mirror that runtime behavior: an implicit
+        # reply-to-trigger is same-scope, not a missing-resource denial.
+        effective_target = target_channel or triggering_channel
+        resolved_target = cls._resolve_channel(effective_target)
+        resolved_triggering = cls._resolve_channel(triggering_channel)
+
+        same_scope = resolved_target == resolved_triggering
+
+        if same_scope:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True,
+                reason="same_scope_channel",
+                enforcement_enabled=enforce,
+            )
+
+        is_admin = False
+        if auth_context is not None:
+            roles = getattr(auth_context, "roles", ()) or ()
+            is_admin = "admin" in roles
+
+        allowed = is_admin if enforce else True
+        is_shadow = not enforce and not is_admin and not same_scope
+        reason = "cross_channel_scope" if not is_admin else None
+
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=allowed,
+            reason=reason,
+            required_tier=AccessTier.ADMIN if not is_admin else AccessTier.USER,
+            enforcement_enabled=enforce,
+            is_shadow_decision=is_shadow,
+        )
+
+    @classmethod
+    def _resolve_channel(cls, channel_id: str | None) -> str | None:
+        """Resolve channel_id to canonical form using server-side IdentityResolver.
+
+        Unknown channels fall through unchanged - this is intentional so that
+        cross-channel operations to truly unknown channels require admin.
+        """
+        if not channel_id:
+            return None
+
+        if cls._global_resolver is not None:
+            resolved = getattr(cls._global_resolver, "resolve_channel", None)
+            if resolved:
+                return resolved(channel_id)
+
+        return channel_id
+
+
 class OperationCatalog:
     """Catalog of tool/operation authorization decisions (chainlink #865).
 
@@ -102,9 +252,6 @@ class OperationCatalog:
     """
 
     _OPEN_OPERATIONS: frozenset[str] = frozenset({
-        "send_message",
-        "react",
-        "fetch_channel_history",
         "list_channels",
         "list_schedules",
         "commitment_list",
@@ -221,6 +368,10 @@ class OperationCatalog:
 
 
 _global_operation_catalog = OperationCatalog()
+
+_global_operation_catalog.register_adapter_hook(
+    ChannelResourceAdapter.get_decision,
+)
 
 
 def get_operation_catalog() -> OperationCatalog:
@@ -388,12 +539,17 @@ class ToolRegistry:
         auth_context: "AuthContext | None" = None,
         *,
         enforce: bool = False,
+        target_channel: str | None = None,
     ) -> ToolAuthorization:
         """Authorize a tool call using the operation catalog.
 
         When enforce=False (legacy mode), unknown operations are allowed but
         logged as shadow decisions. When enforce=True, unknown operations
         are denied.
+
+        For channel operations (send_message, react, fetch_channel_history),
+        resource-scoped authorization always compares the effective target against
+        the triggering channel. An omitted target means reply-to-trigger.
         """
         catalog = get_operation_catalog()
         decision = catalog.get_decision(tool_name, auth_context)
@@ -428,6 +584,14 @@ class ToolRegistry:
                 allowed = True
                 is_shadow = True
         elif decision == OperationDecision.RESOURCE_SCOPED:
+            if tool_name in ChannelResourceAdapter._CHANNEL_OPERATIONS:
+                channel_auth = ChannelResourceAdapter.authorize_channel_operation(
+                    tool_name,
+                    target_channel,
+                    auth_context,
+                    enforce=enforce,
+                )
+                return channel_auth
             required_tier = AccessTier.ADMIN
             if enforce:
                 allowed = False
