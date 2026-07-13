@@ -87,6 +87,8 @@ def test_default_tool_pin_inventory_matches_shipped_install_literals() -> None:
     assert f"opencode-ai@{pins['opencode'].pin}" in install_text
     assert f"opencode-feature-factory@{pins['opencode-feature-factory'].pin}" in install_text
     assert f"opencode-project-memory@{pins['opencode-project-memory'].pin}" in install_text
+    assert f"opencode-openai-codex-auth@{pins['opencode-openai-codex-auth'].pin}" in install_text
+    assert f"opencode-anthropic-auth@{pins['opencode-anthropic-auth'].pin}" in install_text
 
 
 def test_inventory_tool_pins_reports_drift_without_mutating_or_smoking() -> None:

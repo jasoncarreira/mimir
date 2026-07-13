@@ -144,6 +144,12 @@ RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BA
 # recreate are no-ops.
 ENV MIMIR_HOME=/home/mimir/agent
 RUN mkdir -p /home/mimir/agent && mimir setup --home /home/mimir/agent || true
+# OpenCode reads this XDG-global config before walking project-local
+# opencode.json files, so the registrations apply in outer repos and nested
+# Worklink worktrees alike. The bootstrap is a preserving, idempotent merge.
+RUN if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then \
+        mimir opencode-bootstrap --home /home/mimir ; \
+    fi
 
 # Auto-update behavior on this image:
 #

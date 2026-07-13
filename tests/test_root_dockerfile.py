@@ -73,3 +73,5 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
     assert "npm install -g opencode-openai-codex-auth@4.4.0" in text
     assert "npm install -g opencode-anthropic-auth@0.0.13" in text
     assert 'if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then' in text
+    assert "mimir opencode-bootstrap --home /home/mimir" in text
+    assert "OpenCode reads this XDG-global config" in text
