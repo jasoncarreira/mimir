@@ -317,17 +317,27 @@ class ToolRegistry:
         self._tools.clear()
 
     def register_runtime_tools(self, tools: Any) -> None:
-        """Replace the inventory from a final model-bound runtime tool sequence."""
-        self.clear()
+        """Atomically replace inventory from a model-bound runtime tool sequence.
+
+        Authorization does not consult this observational inventory.  Callers
+        that maintain inventory may therefore publish a complete snapshot
+        without creating a transient empty or partially populated surface.
+        """
+        runtime_tools: dict[str, dict[str, Any]] = {}
         for tool in tools or ():
             name = getattr(tool, "name", None)
             if not isinstance(name, str) or not name:
                 continue
-            self.register_tool(
-                name,
-                description=getattr(tool, "description", None),
-                category="runtime",
-            )
+            runtime_tools[name] = {
+                "name": name,
+                "description": getattr(tool, "description", None),
+                "category": "runtime",
+                "is_native": False,
+                "is_builtin": False,
+                "is_dynamic": False,
+                "is_external": False,
+            }
+        self._tools = runtime_tools
 
     def list_by_category(self, category: str) -> list[str]:
         """List tools in a specific category."""
@@ -398,18 +408,15 @@ class ToolRegistry:
         required_tier = AccessTier.USER
         reason = None
         is_shadow = False
+        service_allowed = (
+            service_principal is not None
+            and service_principal.has_capability(tool_name)
+        )
 
         if decision == OperationDecision.OPEN:
             allowed = True
         elif decision == OperationDecision.ADMIN_REQUIRED:
             required_tier = AccessTier.ADMIN
-            service_allowed = service_principal is not None and (
-                service_principal.has_capability(tool_name)
-                or (
-                    service_principal.has_capability("admin_required")
-                    and self.get_tool(tool_name) is not None
-                )
-            )
             if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
                 allowed = True
             elif service_allowed:
@@ -429,7 +436,9 @@ class ToolRegistry:
                 allowed = True
                 is_shadow = True
         else:
-            if enforce:
+            if service_allowed:
+                allowed = True
+            elif enforce:
                 allowed = False
                 reason = "unknown_operation"
             else:
@@ -467,7 +476,19 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
         ServicePrincipal(
             canonical="scheduler",
             trigger="scheduled_tick",
-            capabilities=("admin_required",),
+            capabilities=(
+                "shell_exec",
+                "bash_async",
+                "spawn_claude_code",
+                "spawn_codex",
+                "saga_forget",
+                "write_file",
+                "edit_file",
+                "open_proposal",
+                "submit_proposal",
+                "abandon_proposal",
+                "worklink_run",
+            ),
             readable_domains=("configured_inputs",),
             sink_destinations=("configured_channel",),
             creation_path="mimir.scheduler.Scheduler._fire_job",
@@ -475,7 +496,18 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
         ServicePrincipal(
             canonical="poller",
             trigger="poller",
-            capabilities=("admin_required",),
+            capabilities=(
+                "shell_exec",
+                "bash_async",
+                "spawn_claude_code",
+                "spawn_codex",
+                "write_file",
+                "edit_file",
+                "open_proposal",
+                "submit_proposal",
+                "abandon_proposal",
+                "worklink_run",
+            ),
             readable_domains=("poller_payload",),
             sink_destinations=("configured_channel",),
             creation_path="mimir.pollers.run_poller",
@@ -491,7 +523,16 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
         ServicePrincipal(
             canonical="system",
             trigger="upgrade",
-            capabilities=("admin_required",),
+            capabilities=(
+                "shell_exec",
+                "write_file",
+                "edit_file",
+                "open_proposal",
+                "submit_proposal",
+                "abandon_proposal",
+                "add_schedule",
+                "set_schedule_priority",
+            ),
             readable_domains=("defaults", "proposal"),
             sink_destinations=("operator_alert",),
             creation_path="mimir.defaults_upgrade.enqueue_upgrade_prompt_turns",

@@ -417,8 +417,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         get_tool_registry().enable_shadow_logging()
 
     def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
-        """Inventory the exact final tool surface presented to the model."""
-        get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
+        """Pass through model calls without mutating global authorization state."""
         return handler(request)
 
     async def awrap_model_call(
@@ -427,7 +426,6 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[Any], Awaitable[Any]],
     ) -> Any:
         """Async counterpart to :meth:`wrap_model_call`."""
-        get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return await handler(request)
 
     def wrap_tool_call(

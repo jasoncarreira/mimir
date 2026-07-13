@@ -143,15 +143,20 @@ def test_runtime_inventory_replaced_from_final_model_surface() -> None:
     }
 
 
-def test_budget_middleware_inventories_model_bound_tools() -> None:
+def test_budget_middleware_does_not_mutate_global_inventory_per_model_call() -> None:
     registry = budget_gate.get_tool_registry()
+    registry.register_runtime_tools(
+        [SimpleNamespace(name="existing_tool", description="existing")]
+    )
     middleware = budget_gate.BudgetGateMiddleware()
-    request = SimpleNamespace(tools=[SimpleNamespace(name="assembled_tool", description="x")])
+    request = SimpleNamespace(
+        tools=[SimpleNamespace(name="narrow_surface_tool", description="narrow")]
+    )
 
     result = middleware.wrap_model_call(request, lambda value: value)
 
     assert result is request
-    assert registry.list_tools() == ["assembled_tool"]
+    assert registry.list_tools() == ["existing_tool"]
 
 
 def test_explicit_service_principals_are_separate_and_frozen() -> None:
@@ -169,16 +174,72 @@ def test_explicit_service_principals_are_separate_and_frozen() -> None:
         scheduler.trigger = "forged"
 
 
-def test_service_principal_can_use_only_inventoried_runtime_tools() -> None:
+@pytest.mark.parametrize(
+    ("trigger", "allowed_operation", "denied_operation"),
+    [
+        ("scheduled_tick", "shell_exec", "request_mimir_update"),
+        ("poller", "worklink_run", "remove_schedule"),
+        ("upgrade", "submit_proposal", "spawn_codex"),
+        ("saga_session_end", "saga_end_session", "shell_exec"),
+    ],
+)
+def test_service_principals_allow_only_explicit_operations_with_full_inventory(
+    trigger: str,
+    allowed_operation: str,
+    denied_operation: str,
+) -> None:
     registry = ToolRegistry()
-    registry.register_tool("shell_exec")
+    registry.register_runtime_tools(
+        [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
+    )
 
     admitted = registry.authorize_tool(
-        "shell_exec", _auth_context(trigger="scheduled_tick", enforce=True), enforce=True
+        allowed_operation, _auth_context(trigger=trigger, enforce=True), enforce=True
     )
-    unregistered = registry.authorize_tool(
-        "spawn_codex", _auth_context(trigger="scheduled_tick", enforce=True), enforce=True
+    denied = registry.authorize_tool(
+        denied_operation, _auth_context(trigger=trigger, enforce=True), enforce=True
     )
+
+    assert admitted.allowed is True
+    assert admitted.is_shadow_decision is False
+    assert admitted.service_principal is get_service_principal(trigger)
+    assert denied.allowed is False
+    assert denied.reason == "admin_required"
+    assert denied.service_principal is get_service_principal(trigger)
+
+
+def test_service_authorization_is_stable_under_inventory_mutation_and_surface_width() -> None:
+    registry = ToolRegistry()
+    scheduler = _auth_context(trigger="scheduled_tick", enforce=True)
+
+    before = registry.authorize_tool("shell_exec", scheduler, enforce=True)
+    registry.register_runtime_tools(
+        [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
+    )
+    with_full_surface = registry.authorize_tool("shell_exec", scheduler, enforce=True)
+    denied_with_full_surface = registry.authorize_tool(
+        "request_mimir_update", scheduler, enforce=True
+    )
+    registry.clear()
+    registry.register_runtime_tools([SimpleNamespace(name="send_message")])
+    with_narrow_surface = registry.authorize_tool("shell_exec", scheduler, enforce=True)
+    denied_with_narrow_surface = registry.authorize_tool(
+        "request_mimir_update", scheduler, enforce=True
+    )
+
+    assert before.allowed is True
+    assert with_full_surface.allowed is True
+    assert with_narrow_surface.allowed is True
+    assert denied_with_full_surface.allowed is False
+    assert denied_with_narrow_surface.allowed is False
+
+
+def test_unknown_and_http_triggers_cannot_inherit_service_capabilities() -> None:
+    registry = ToolRegistry()
+    registry.register_runtime_tools(
+        [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
+    )
+
     unknown_trigger = registry.authorize_tool(
         "shell_exec", _auth_context(trigger="unknown_synthetic", enforce=True), enforce=True
     )
@@ -188,10 +249,6 @@ def test_service_principal_can_use_only_inventoried_runtime_tools() -> None:
         enforce=True,
     )
 
-    assert admitted.allowed is True
-    assert admitted.is_shadow_decision is False
-    assert admitted.service_principal is get_service_principal("scheduled_tick")
-    assert unregistered.allowed is False
     assert unknown_trigger.allowed is False
     assert unknown_trigger.service_principal is None
     assert forged_http_trigger.allowed is False
