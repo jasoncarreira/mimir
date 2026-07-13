@@ -125,6 +125,10 @@ class AgentEvent:
     source: str | None = None
     attachment_names: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
+    # Server-carried IFC state for continuations/resumed events. This must be
+    # propagated from a trusted TurnContext; generic ingress must not accept a
+    # client assertion as a declassification or authority signal.
+    ifc_labels: "InformationFlowLabels | None" = None
 
 
 @dataclass(frozen=True)

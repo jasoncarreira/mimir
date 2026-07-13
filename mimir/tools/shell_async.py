@@ -313,6 +313,7 @@ async def bash_async(
             channel_id=channel_id,
             on_complete=_ON_COMPLETE,
         )
+        job.ifc_labels = getattr(ctx, "ifc_labels", None)
     except Exception as exc:  # noqa: BLE001
         return f"bash_async failed: {exc}"
 

@@ -69,7 +69,7 @@ from . import _langchain_claude_code_patches as _lcc_patches
 from ._jsonl_tail import tail_jsonl_records
 from .jsonl_snapshot import JsonlSnapshot
 from .models import AgentEvent, AuthContext, InformationFlowLabels, TurnInteractivity, TurnRecord
-from .access_control import create_auth_context
+from .access_control import SinkGate, create_auth_context
 from .prompts import build_system_prompt, build_turn_prompt
 from .rate_limits import RateLimitStore
 from .saga_client import SagaClient
@@ -184,26 +184,45 @@ def _turn_is_interactive(interactivity: TurnInteractivity | None) -> bool:
     return interactivity == TurnInteractivity.INTERACTIVE
 
 
-def _initialize_ifc_labels(event: AgentEvent, attachments: list[str] | None = None) -> InformationFlowLabels:
-    """Initialize immutable/monotonic IFC labels before the first model call (chainlink #871).
+def _merge_ifc_labels(
+    *label_sets: Any,
+    source_channel: str | None = None,
+) -> InformationFlowLabels:
+    """Union immutable IFC carriers without permitting label attenuation."""
+    merged = InformationFlowLabels()
+    for current in label_sets:
+        if not isinstance(current, InformationFlowLabels):
+            continue
+        for label in current.labels:
+            merged = merged.with_label(label)
+        for channel in current.source_channels:
+            merged = merged.with_channel(channel)
+    if source_channel:
+        merged = merged.with_channel(source_channel)
+    return merged
 
-    Labels are initialized from:
-    - Inbound event content and metadata
-    - Attachments
-    - Folded messages (handled separately)
-    - Continuation context
 
-    Labels are monotonic - they can only be added, never removed.
+def _initialize_ifc_labels(
+    event: AgentEvent,
+    attachments: list[str] | None = None,
+    *,
+    preloaded_labels: InformationFlowLabels | None = None,
+) -> InformationFlowLabels:
+    """Initialize monotonic IFC labels before prompt/model construction.
+
+    ``preloaded_labels`` covers server-supplied memory/history/session/skill/file
+    context. ``event.ifc_labels`` carries trusted continuation/resume state. Both
+    are unioned with ingress-derived labels; neither can replace or clear them.
     """
-    labels = InformationFlowLabels()
+    labels = _merge_ifc_labels(
+        event.ifc_labels,
+        preloaded_labels,
+        source_channel=event.channel_id,
+    )
 
-    if event.channel_id:
-        labels = labels.with_channel(event.channel_id)
-
-    if event.attachment_names:
-        for attachment in event.attachment_names:
-            if _is_private_attachment(attachment):
-                labels = labels.with_label("private")
+    for attachment in attachments or event.attachment_names:
+        if _is_private_attachment(attachment):
+            labels = labels.with_label("private")
 
     if event.source in ("api", "http"):
         labels = labels.with_label("internal")
@@ -222,27 +241,16 @@ def _is_private_attachment(filename: str) -> bool:
 
 def _propagate_ifc_labels(
     labels: Any,
-    target_channel: str | None,
-    auth_context: Any,
-) -> Any:
-    """Propagate IFC labels to subagents, spawns, and continuations (chainlink #871).
+    target_channel: str | None = None,
+    auth_context: Any = None,
+) -> InformationFlowLabels:
+    """Copy labels into subagents, spawns, continuations, and resumed turns.
 
-    Labels propagate to ensure data sensitivity is maintained across delegation.
-    Same-principal/same-channel flows pass only when labels are compatible.
+    Delegation may add a source channel but cannot remove sensitivity labels.
+    ``auth_context`` is accepted for call-site compatibility; admin authority is
+    intentionally irrelevant to propagation.
     """
-    from .models import InformationFlowLabels
-
-    if not isinstance(labels, InformationFlowLabels):
-        return labels
-
-    new_labels = labels
-
-    if target_channel:
-        if target_channel in labels.source_channels:
-            return new_labels
-        new_labels = new_labels.with_channel(target_channel)
-
-    return new_labels
+    return _merge_ifc_labels(labels, source_channel=target_channel)
 
 
 def _filter_session_turns(
@@ -1370,8 +1378,19 @@ class Agent:
         # chainlink #583 slice 1: bracket the whole turn on the live event bus
         # (no-op when unwired). turn_started here pairs with turn_ended in the
         # finally so every turn — even an early-phase crash — is bracketed.
+        initial_ifc_labels = _initialize_ifc_labels(event, event.attachment_names)
+        initial_auth_context = create_auth_context(
+            event,
+            getattr(self, "_identity_resolver", None),
+            policy_version=getattr(self._config, "policy_version", None),
+            enforce=self._config.access_control_enforced,
+        )
         emitter = TurnEventEmitter(
-            self._turn_event_bus, turn_id=turn_id, channel_id=event.channel_id
+            self._turn_event_bus,
+            turn_id=turn_id,
+            channel_id=event.channel_id,
+            ifc_labels=initial_ifc_labels,
+            auth_context=initial_auth_context,
         )
         emitter.turn_started(event)
         _turn_record = None
@@ -1473,16 +1492,21 @@ class Agent:
             # heuristics. LangGraph carries it through ordinary, built-in, and
             # wrapped MCP tool requests; Claude SDK hooks fail closed while their
             # API lacks an exact runtime carrier (chainlink #864).
-            auth_ctx = create_auth_context(
-                event,
-                getattr(self, "_identity_resolver", None),
-                policy_version=getattr(self._config, "policy_version", None),
-                enforce=self._config.access_control_enforced,
-                event_ingress=event_ingress,
-            )
+            auth_ctx = initial_auth_context
+            if event_ingress is not None:
+                auth_ctx = create_auth_context(
+                    event,
+                    getattr(self, "_identity_resolver", None),
+                    policy_version=getattr(self._config, "policy_version", None),
+                    enforce=self._config.access_control_enforced,
+                    event_ingress=event_ingress,
+                )
             # Update auth_ctx with the actual interactivity classification
             if auth_ctx is not None:
                 auth_ctx = replace(auth_ctx, interactivity=turn_interactivity)
+            # IFC exists before any model call or harness panel egress. A resumed
+            # event's trusted carrier is unioned with ingress-derived labels; a
+            # fresh turn cannot start with ``None`` and bypass the sink gate.
             ctx = _TurnContext(
                 turn_id=turn_id,
                 session_id=session_id,
@@ -1528,8 +1552,10 @@ class Agent:
                 access_control_enforced=self._config.access_control_enforced,
                 # Frozen authorization context (chainlink #864).
                 auth_context=auth_ctx,
+                ifc_labels=initial_ifc_labels,
             )
             ctx.turn_event_emitter = emitter
+            emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
             # WikiBacklinksHook pre-snapshot — capture mtimes of every
             # state/wiki/ content page BEFORE the model loop runs so the
             # finalize step can tell if any wiki page was edited this turn.
@@ -1625,7 +1651,7 @@ class Agent:
                     log.exception("early-phase chat-skill failure notice failed")
                 try:
                     await self._post_deliver_failure(
-                        event, f"{type(exc).__name__}: {exc}",
+                        event, f"{type(exc).__name__}: {exc}", ctx,
                     )
                 except Exception:  # noqa: BLE001 — never mask the original
                     log.exception("early-phase deliver notice failed")
@@ -1691,7 +1717,9 @@ class Agent:
             if cid_token is not None:
                 _reset_cid(cid_token)
 
-    async def _post_deliver_failure(self, event: AgentEvent, error: str) -> None:
+    async def _post_deliver_failure(
+        self, event: AgentEvent, error: str, ctx: Any = None,
+    ) -> None:
         """chainlink #508: best-effort ``⚠️ <job> failed`` notice to a poller/
         tick's ``deliver:`` channel. No-ops when no deliver channel is set (the
         common case) or it resolves to nothing. Called from BOTH terminal-
@@ -1704,6 +1732,8 @@ class Agent:
             getattr(self._config, "operator_alert_channel", ""),
         )
         if not deliver:
+            return
+        if not self._harness_sink_allowed(ctx, deliver, "send_message"):
             return
         label = (
             (event.extra or {}).get("schedule_name")
@@ -1777,6 +1807,8 @@ class Agent:
             return
         if self._channels is None or not event.channel_id:
             return
+        if not self._harness_sink_allowed(ctx, event.channel_id, "send_message"):
+            return
         try:
             result = await self._channels.send(
                 event.channel_id,
@@ -1816,6 +1848,8 @@ class Agent:
             target = event.channel_id
         if not target or self._channels is None:
             return
+        if not self._harness_sink_allowed(ctx, target, "send_message"):
+            return
         try:
             result = await self._channels.send(
                 target,
@@ -1839,6 +1873,25 @@ class Agent:
                 ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
             except Exception:  # noqa: BLE001 — bookkeeping must not break the turn
                 log.debug("hard-stop delivery bookkeeping failed", exc_info=True)
+
+    @staticmethod
+    def _harness_sink_allowed(ctx: Any, target: str | None, sink_name: str) -> bool:
+        """Apply enforced IFC to a harness-owned final egress boundary."""
+        decision = SinkGate.check_sink_flow(
+            sink_name,
+            target,
+            getattr(ctx, "ifc_labels", None),
+            getattr(ctx, "auth_context", None),
+            enforce=True,
+        )
+        if decision.allowed:
+            return True
+        log.warning(
+            "harness IFC sink blocked: sink=%s reason=%s",
+            sink_name,
+            decision.reason,
+        )
+        return False
 
     async def _maybe_resend_nudge(
         self,
@@ -1887,6 +1940,11 @@ class Agent:
         ):
             return messages, events, output
         if not nudge_enabled(event.channel_id, self._config.resend_nudge_channels):
+            return messages, events, output
+        # The nudge can cause a model tool delivery, but it is itself a harness
+        # continuation of labeled context. Refuse before the extra model call when
+        # that eventual channel sink is incompatible.
+        if not self._harness_sink_allowed(ctx, event.channel_id, "harness_resend_nudge"):
             return messages, events, output
 
         # 24h recidivism tally, counted from events.jsonl the same way the
@@ -1973,6 +2031,10 @@ class Agent:
             return
         bridge = self._channels.find(event.channel_id)
         if bridge is None:
+            return
+        if not self._harness_sink_allowed(
+            ctx, event.channel_id, "harness_auto_deliver",
+        ):
             return
 
         result = None
@@ -2145,13 +2207,6 @@ class Agent:
             if pending_subagents else None
         )
 
-        # chainlink #871: Initialize immutable/monotonic IFC labels before the first
-        # model call. Labels track data sensitivity from inbound/folded messages,
-        # recent history, automatic memory/session/skill/file injection, attachments,
-        # and continuation context. Labels propagate to subagents, spawns, continuations.
-        if ctx.ifc_labels is None:
-            ctx.ifc_labels = _initialize_ifc_labels(event, event.attachment_names)
-
         # Per-turn prompt assembly — Recent activity, Recent feedback,
         # Session summaries, Resource usage, Upcoming, Upcoming
         # commitments, Self-state, etc. Synthesis turns
@@ -2161,6 +2216,23 @@ class Agent:
             saga_block=memory_block,
             subagent_block=subagent_block,
         )
+
+        # Server-supplied prompt context is tainted before the first model call.
+        # Automatic retrieval/session/subagent/history blocks may contain protected
+        # data; the coarse turn-level label survives summaries and model claims.
+        preloaded_labels = InformationFlowLabels()
+        # Every server-supplied prompt block is conservatively protected until
+        # source-specific ownership labels exist. This includes recent history,
+        # automatic SAGA/session/skill/file injection, channel memory, feedback,
+        # commitments, self-state, and subagent completion context.
+        if turn_prompt:
+            preloaded_labels = preloaded_labels.with_label("private")
+        ctx.ifc_labels = _merge_ifc_labels(
+            ctx.ifc_labels,
+            preloaded_labels,
+            source_channel=event.channel_id,
+        )
+        emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
 
         # Build / reuse the agent singleton.
         agent = await self._build_agent_if_needed()
@@ -2425,7 +2497,7 @@ class Agent:
             # channel couldn't surface its own result — post the mechanical
             # failure notice there. (Mirrored in the outer early-failure guard
             # for crashes before the model loop; disjoint via outcome_emitted.)
-            await self._post_deliver_failure(event, error)
+            await self._post_deliver_failure(event, error, ctx)
         elif event.trigger == "poller":
             # Success counterpart to ``turn_failed`` for poller turns
             # (chainlink #262): records that this poller item's turn was
@@ -2633,11 +2705,17 @@ class Agent:
                     current_worktree = Path.cwd().resolve()
                 except OSError:
                     current_worktree = None
+                continuation_event = replace(
+                    event,
+                    ifc_labels=_propagate_ifc_labels(
+                        ctx.ifc_labels, event.channel_id, ctx.auth_context,
+                    ),
+                )
                 await asyncio.wait_for(
                     asyncio.to_thread(
                         maybe_create_worklink_budget_continuation,
                         home=self._config.home,
-                        event=event,
+                        event=continuation_event,
                         ctx=ctx,
                         record=record,
                         repo=current_worktree,
@@ -3016,6 +3094,9 @@ class Agent:
             source_id=f"shell_job:{job.job_id}",
             source="system",
             extra={"job_id": job.job_id, "exit_code": job.exit_code},
+            ifc_labels=_propagate_ifc_labels(
+                getattr(job, "ifc_labels", None), job.channel_id,
+            ),
         )
         try:
             accepted = await self._dispatcher.enqueue(event)

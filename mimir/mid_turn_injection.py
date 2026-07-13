@@ -189,6 +189,17 @@ def _drain(channel_id: str | None) -> list["AgentEvent"]:
         emitter = inflight.emitter
     if emitter is not None:
         try:
+            from ._context import get_current_turn
+            from .agent import _merge_ifc_labels, _initialize_ifc_labels
+
+            ctx = get_current_turn()
+            if ctx is not None:
+                folded_labels = _merge_ifc_labels(
+                    *(_initialize_ifc_labels(event) for event in drained),
+                    source_channel=getattr(ctx, "channel_id", None),
+                )
+                ctx.ifc_labels = _merge_ifc_labels(ctx.ifc_labels, folded_labels)
+                emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
             emitter.injected_input(drained)
         except Exception:  # noqa: BLE001 — panel telemetry is best-effort
             log.debug("turn-event injected-input emit failed", exc_info=True)

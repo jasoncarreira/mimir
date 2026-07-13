@@ -84,12 +84,19 @@ class SinkCategory(StrEnum):
     NOTIFICATION = "notification"
     FILE = "file"
     DIRECT_MESSAGE = "direct_message"
+    UNKNOWN = "unknown"
 
 
 _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "send_message": SinkCategory.SAME_CHANNEL,
     "react": SinkCategory.SAME_CHANNEL,
     "fetch_channel_history": SinkCategory.SAME_CHANNEL,
+    # Harness-owned egress paths bypass model tool middleware, so they are
+    # named explicitly and checked at their final send/edit boundary.
+    "harness_auto_deliver": SinkCategory.SAME_CHANNEL,
+    "harness_resend_nudge": SinkCategory.SAME_CHANNEL,
+    "activity_panel_post": SinkCategory.SAME_CHANNEL,
+    "activity_panel_edit": SinkCategory.SAME_CHANNEL,
     "post_message": SinkCategory.CROSS_CHANNEL,
     "webhook": SinkCategory.HTTP_WEBHOOK,
     "http_request": SinkCategory.HTTP_WEBHOOK,
@@ -97,6 +104,7 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "bash_async": SinkCategory.SHELL_PROCESS,
     "spawn_claude_code": SinkCategory.SPAWN,
     "spawn_codex": SinkCategory.SPAWN,
+    "spawn_open_code": SinkCategory.SPAWN,
     "ntfy_send": SinkCategory.NOTIFICATION,
     "write_file": SinkCategory.FILE,
     "edit_file": SinkCategory.FILE,
@@ -105,11 +113,15 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
 
 
 def get_sink_category(tool_name: str) -> SinkCategory:
-    """Map tool name to sink category for IFC checks."""
+    """Map a known egress operation to its sink category.
+
+    Unknown operations are not presumed public: doing so would make a newly
+    added harness send an implicit IFC bypass until the map was updated.
+    """
     for prefix, category in _SINK_CATEGORY_MAP.items():
         if tool_name.startswith(prefix):
             return category
-    return SinkCategory.PUBLIC
+    return SinkCategory.UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -189,10 +201,35 @@ class SinkGate:
         if not isinstance(ifc_labels, InformationFlowLabels):
             return ToolAuthorization(
                 tool_name=tool_name,
-                decision=OperationDecision.OPEN,
-                allowed=True,
-                reason="no_ifc_labels",
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="missing_ifc_labels",
+                required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+
+        sink_category = get_sink_category(tool_name)
+        if sink_category == SinkCategory.UNKNOWN:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="unknown_sink_category",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+
+        if not target:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="unknown_sink_destination",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
             )
 
         if not ifc_labels.labels:
@@ -204,10 +241,16 @@ class SinkGate:
                 enforcement_enabled=enforce,
             )
 
-        sink_category = get_sink_category(tool_name)
-        allowed_sinks = cls._get_allowed_sinks(sink_category, auth_context)
+        allowed_sinks = cls._get_allowed_sinks(
+            sink_category, auth_context, ifc_labels=ifc_labels,
+        )
+        effective_target = (
+            ChannelResourceAdapter._resolve_channel(target)
+            if sink_category == SinkCategory.SAME_CHANNEL
+            else target
+        )
 
-        can_flow = ifc_labels.can_flow_to(target or "", allowed_sinks)
+        can_flow = ifc_labels.can_flow_to(effective_target or "", allowed_sinks)
 
         if not can_flow:
             reason = f"ifc_label_blocked:{sink_category.value}"
@@ -231,31 +274,42 @@ class SinkGate:
         )
 
     @classmethod
-    def _get_allowed_sinks(cls, category: SinkCategory, auth_context: Any) -> frozenset[str]:
-        """Get allowed sinks based on sink category and auth context."""
-        is_admin = False
-        if auth_context is not None:
-            roles = getattr(auth_context, "roles", ()) or ()
-            is_admin = "admin" in roles
+    def _get_allowed_sinks(
+        cls,
+        category: SinkCategory,
+        auth_context: Any,
+        *,
+        ifc_labels: Any,
+    ) -> frozenset[str]:
+        """Return concrete destinations compatible with every current label.
 
-        if is_admin:
-            return frozenset({"*"})
+        Ordinary admin authority deliberately does not widen this set. Admins
+        must use the distinct audited declassification action before egress.
+        """
+        if category != SinkCategory.SAME_CHANNEL or auth_context is None:
+            return frozenset()
 
-        category_sinks: dict[SinkCategory, frozenset[str]] = {
-            SinkCategory.SAME_CHANNEL: frozenset({"same_channel"}),
-            SinkCategory.DIRECT_MESSAGE: frozenset({"dm"}),
-            SinkCategory.PUBLIC: frozenset({"public"}),
-            SinkCategory.EXTERNAL_MCP: frozenset(),
-            SinkCategory.HTTP_WEBHOOK: frozenset(),
-            SinkCategory.SHELL_PROCESS: frozenset(),
-            SinkCategory.NETWORK: frozenset(),
-            SinkCategory.SPAWN: frozenset(),
-            SinkCategory.NOTIFICATION: frozenset(),
-            SinkCategory.FILE: frozenset(),
-            SinkCategory.CROSS_CHANNEL: frozenset(),
+        triggering_channel = getattr(auth_context, "channel_id", None)
+        if not triggering_channel:
+            return frozenset()
+        resolved_triggering = ChannelResourceAdapter._resolve_channel(triggering_channel)
+        if not resolved_triggering:
+            return frozenset()
+
+        source_channels = getattr(ifc_labels, "source_channels", None)
+        if not isinstance(source_channels, frozenset) or not source_channels:
+            return frozenset()
+        resolved_sources = {
+            ChannelResourceAdapter._resolve_channel(channel)
+            for channel in source_channels
+            if channel
         }
+        if not resolved_sources or None in resolved_sources:
+            return frozenset()
+        if resolved_sources != {resolved_triggering}:
+            return frozenset()
 
-        return category_sinks.get(category, frozenset())
+        return frozenset({resolved_triggering})
 
 
 def audit_declassification(

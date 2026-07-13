@@ -38,13 +38,18 @@ def scrub_detail(value: Any, *, limit: int = 320) -> str | None:
 
 
 def scrub_turn_event(event: dict[str, Any]) -> dict[str, Any]:
-    """Return a redacted copy of a turn-event payload.
-
-    The bus is a shared boundary for the activity panel and SSE consumers, so
-    redact structured values without collapsing the event into panel text.
-    """
-    cleaned = scrub_value(event)
-    return cleaned if isinstance(cleaned, dict) else {}
+    """Return a redacted copy while preserving private IFC metadata in-process."""
+    private = {
+        key: event[key]
+        for key in ("_ifc_labels", "_auth_context")
+        if key in event
+    }
+    public = {key: value for key, value in event.items() if key not in private}
+    cleaned = scrub_value(public)
+    if not isinstance(cleaned, dict):
+        return private
+    cleaned.update(private)
+    return cleaned
 
 
 def scrub_value(value: Any, *, key: str | None = None) -> Any:

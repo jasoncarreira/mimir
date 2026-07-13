@@ -54,7 +54,7 @@ from typing import Any, Awaitable, Callable
 from ._atomic import atomic_write_json
 from ._jsonl_tail import tail_jsonl_records
 from .event_logger import log_event
-from .models import AgentEvent
+from .models import AgentEvent, InformationFlowLabels
 
 log = logging.getLogger(__name__)
 
@@ -168,8 +168,20 @@ def _event_from_stash(d: Any) -> AgentEvent | None:
     if not isinstance(d, dict):
         return None
     try:
-        return AgentEvent(**d)
-    except TypeError as exc:
+        payload = dict(d)
+        raw_labels = payload.get("ifc_labels")
+        if isinstance(raw_labels, dict):
+            payload["ifc_labels"] = InformationFlowLabels(
+                labels=frozenset(raw_labels.get("labels") or ()),
+                source_channels=frozenset(raw_labels.get("source_channels") or ()),
+                **(
+                    {"created_at": raw_labels["created_at"]}
+                    if isinstance(raw_labels.get("created_at"), (int, float))
+                    else {}
+                ),
+            )
+        return AgentEvent(**payload)
+    except (TypeError, ValueError) as exc:
         log.warning("poller recovery: could not rebuild AgentEvent from stash: %s", exc)
         return None
 

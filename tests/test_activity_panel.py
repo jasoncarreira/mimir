@@ -15,6 +15,7 @@ from mimir.bridges._activity_panel import (
     render_panel_text,
 )
 from mimir.bridges.base import Bridge, MessageUpdate, SendResult
+from mimir.models import AuthContext, InformationFlowLabels, TurnInteractivity
 from mimir.channel_registry import ChannelRegistry
 from mimir.turn_event_bus import TurnEventBus
 
@@ -128,6 +129,26 @@ class FakeDiscordBridge(Bridge):
         return False
 
 
+def _panel_auth(channel_id: str = "slack-C01") -> AuthContext:
+    return AuthContext(
+        principal="slack-U1",
+        canonical_principal="user-1",
+        roles=(),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=channel_id,
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+    )
+
+
+def _panel_labels(channel_id: str = "slack-C01") -> InformationFlowLabels:
+    return InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({channel_id}),
+    )
+
+
 def _panel(
     allowlist: tuple[str, ...] = ("slack-",),
     debounce: float = 0.0,
@@ -145,6 +166,8 @@ def _panel(
         debounce_seconds=debounce,
         detail_levels=detail_levels,
         delete_grace_seconds=delete_grace,
+        default_ifc_labels=_panel_labels(),
+        default_auth_context=_panel_auth(),
     ), bridge
 
 
@@ -153,7 +176,14 @@ def _discord_panel(allowlist: tuple[str, ...] = ("discord-",), debounce: float =
     channels = ChannelRegistry()
     bridge = FakeDiscordBridge()
     channels.register(bridge)
-    return ActivityPanel(bus, channels, allowlist, debounce_seconds=debounce), bridge
+    return ActivityPanel(
+        bus,
+        channels,
+        allowlist,
+        debounce_seconds=debounce,
+        default_ifc_labels=_panel_labels("discord-101"),
+        default_auth_context=_panel_auth("discord-101"),
+    ), bridge
 
 
 @pytest.mark.asyncio

@@ -257,11 +257,24 @@ def _extract_channel_from_args(
     return auth_context.channel_id if auth_context is not None else None
 
 
-def _get_ifc_labels_from_context() -> Any:
-    """Get IFC labels from the active TurnContext."""
+_IFC_DELEGATION_TOOLS = frozenset({
+    "task",
+    "spawn_claude_code",
+    "spawn_codex",
+    "spawn_open_code",
+    "bash_async",
+})
+
+
+def _get_current_turn_context() -> Any:
     from .._context import get_current_turn
 
-    ctx = get_current_turn()
+    return get_current_turn()
+
+
+def _get_ifc_labels_from_context() -> Any:
+    """Get IFC labels from the active TurnContext."""
+    ctx = _get_current_turn_context()
     if ctx is not None:
         return getattr(ctx, "ifc_labels", None)
     return None
@@ -496,6 +509,19 @@ class BudgetGateMiddleware(AgentMiddleware):
                 status="error",
             )
 
+        # Delegation inherits the current turn's monotonic IFC carrier. Built-in
+        # subagents execute under this same context; detached spawn/async tools
+        # preserve it for their continuation metadata.
+        active_ctx = _get_current_turn_context()
+        if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
+            from ..agent import _propagate_ifc_labels
+
+            active_ctx.ifc_labels = _propagate_ifc_labels(
+                active_ctx.ifc_labels,
+                getattr(auth_context, "channel_id", None),
+                auth_context,
+            )
+
         # Destructive-action guardrail (chainlink #259): an accident
         # deterrent against force-push-to-main/master, NOT a security
         # boundary — the regex screens the command arg and is bypassable
@@ -565,6 +591,19 @@ class BudgetGateMiddleware(AgentMiddleware):
                 tool_call_id=_tool_call_id(request),
                 name=tool_name,
                 status="error",
+            )
+
+        # Delegation inherits the current turn's monotonic IFC carrier. Built-in
+        # subagents execute under this same context; detached spawn/async tools
+        # preserve it for their continuation metadata.
+        active_ctx = _get_current_turn_context()
+        if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
+            from ..agent import _propagate_ifc_labels
+
+            active_ctx.ifc_labels = _propagate_ifc_labels(
+                active_ctx.ifc_labels,
+                getattr(auth_context, "channel_id", None),
+                auth_context,
             )
 
         # Destructive-action guardrail (chainlink #259): an accident
