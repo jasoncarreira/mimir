@@ -1340,3 +1340,50 @@ async def test_legacy_record_no_owner_is_admin_only(tmp_path: Path):
     assert state[rec.id].status == CommitmentStatus.PENDING.value
     ok_service = await store.complete(rec.id, actor_principal="service:admin")
     assert ok_service is True
+
+@pytest.mark.asyncio
+async def test_admin_can_mutate_legacy_and_service_commitments(tmp_path: Path):
+    """Admin authority is explicit, not inferred from a service-like name."""
+    from mimir.commitments import CommitmentVisibility
+
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    legacy = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Legacy task",
+    ))
+    service = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None, text="Poller task",
+        owner_principal="service:poller",
+        visibility=CommitmentVisibility.SERVICE.value,
+        service_name="poller",
+    ))
+
+    assert await store.complete(
+        legacy.id, actor_principal="user:jason", actor_is_admin=True,
+    ) is True
+    assert await store.dismiss(
+        service.id, actor_principal="user:jason", actor_is_admin=True,
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_admin_list_can_view_other_owner_private_and_service(tmp_path: Path):
+    from mimir.commitments import CommitmentVisibility
+
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    private = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Alice private",
+        owner_principal="user:alice",
+        visibility=CommitmentVisibility.PRIVATE.value,
+    ))
+    service = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None, text="Service private",
+        owner_principal="service:poller",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+
+    rows = store.list(
+        actor_principal="user:jason",
+        include_service=True,
+        actor_is_admin=True,
+    )
+    assert {row.id for row in rows} == {private.id, service.id}

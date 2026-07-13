@@ -41,6 +41,7 @@ from typing import Annotated, Any, Optional
 log = logging.getLogger(__name__)
 
 from langchain_core.runnables import RunnableConfig
+from langchain.tools import ToolRuntime
 
 from ..bridges._directives import (
     Directive,
@@ -54,7 +55,7 @@ from ..pollers import (
     PollerOverridesValidationError,
     validate_poller_overrides_text,
 )
-from ..models import TurnInteractivity
+from ..models import AuthContext, TurnInteractivity
 from ..scheduler import SchedulerJob
 
 # Per-task ContextVar for channel_id — isolated across concurrent asyncio
@@ -1303,8 +1304,37 @@ async def reload_pollers() -> str:
 # Commitments tools (mimir/committools.py)
 # ────────────────────────────────────────────────────────────────────
 
+
+def _commitment_actor(
+    runtime: ToolRuntime[AuthContext] | None,
+) -> tuple[str, bool, bool] | None:
+    """Resolve commitment authority from the exact tool runtime carrier.
+
+    Returns ``(principal, is_admin, is_service)``.  There is deliberately no
+    ContextVar or model-argument fallback: a missing/malformed carrier must not
+    turn into the store's legacy ``actor_principal=None`` compatibility path.
+    """
+    if runtime is None or not isinstance(runtime.context, AuthContext):
+        return None
+    context = runtime.context
+    if context.event_ingress is None:
+        from ..access_control import get_service_principal
+
+        service = get_service_principal(context.trigger)
+        if service is not None:
+            return f"service:{service.canonical}", False, True
+    principal = context.canonical_principal
+    if principal is None:
+        return None
+    return principal, "admin" in context.roles, context.is_service
+
+
 @tool
-async def commitment_complete(commitment_id: str, message_id: Optional[str] = None) -> str:
+async def commitment_complete(
+    commitment_id: str,
+    message_id: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
     """Mark a tracked commitment as completed.
 
     Args:
@@ -1314,8 +1344,17 @@ async def commitment_complete(commitment_id: str, message_id: Optional[str] = No
     store = _STATE["commitments_store"]
     if store is None:
         return "commitment_complete failed: no commitments store"
+    actor = _commitment_actor(runtime)
+    if actor is None:
+        return "commitment_complete failed: authorization context unavailable"
+    actor_principal, actor_is_admin, _ = actor
     try:
-        result = await store.complete(commitment_id, message_id=message_id)
+        result = await store.complete(
+            commitment_id,
+            message_id=message_id,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        )
     except Exception as exc:
         return f"commitment_complete failed: {exc}"
     if not result:
@@ -1328,6 +1367,7 @@ async def commitment_snooze(
     commitment_id: str,
     until_iso: str,
     reason: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Snooze a commitment until a future ISO datetime.
 
@@ -1339,6 +1379,10 @@ async def commitment_snooze(
     store = _STATE["commitments_store"]
     if store is None:
         return "commitment_snooze failed: no commitments store"
+    actor = _commitment_actor(runtime)
+    if actor is None:
+        return "commitment_snooze failed: authorization context unavailable"
+    actor_principal, actor_is_admin, _ = actor
     try:
         dt = datetime.fromisoformat(until_iso.replace("Z", "+00:00"))
         if dt.tzinfo is None:
@@ -1348,7 +1392,13 @@ async def commitment_snooze(
             # snooze lands hours off on a non-UTC host (#503).
             dt = dt.replace(tzinfo=timezone.utc)
         until_unix = dt.timestamp()
-        result = await store.snooze(commitment_id, until_unix=until_unix, reason=reason)
+        result = await store.snooze(
+            commitment_id,
+            until_unix=until_unix,
+            reason=reason,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        )
     except Exception as exc:
         return f"commitment_snooze failed: {exc}"
     if not result:
@@ -1357,7 +1407,11 @@ async def commitment_snooze(
 
 
 @tool
-async def commitment_dismiss(commitment_id: str, reason: Optional[str] = None) -> str:
+async def commitment_dismiss(
+    commitment_id: str,
+    reason: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
     """Dismiss a commitment without completing it.
 
     Args:
@@ -1367,8 +1421,17 @@ async def commitment_dismiss(commitment_id: str, reason: Optional[str] = None) -
     store = _STATE["commitments_store"]
     if store is None:
         return "commitment_dismiss failed: no commitments store"
+    actor = _commitment_actor(runtime)
+    if actor is None:
+        return "commitment_dismiss failed: authorization context unavailable"
+    actor_principal, actor_is_admin, _ = actor
     try:
-        result = await store.dismiss(commitment_id, reason=reason)
+        result = await store.dismiss(
+            commitment_id,
+            reason=reason,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        )
     except Exception as exc:
         return f"commitment_dismiss failed: {exc}"
     if not result:
@@ -1389,7 +1452,10 @@ _ACTIVE_STATUSES = frozenset({
 
 
 @tool
-async def commitment_list(due_within_days: int = 7) -> str:
+async def commitment_list(
+    due_within_days: int = 7,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
     """List active (non-terminal) commitments, optionally filtered by due window.
 
     Args:
@@ -1401,9 +1467,18 @@ async def commitment_list(due_within_days: int = 7) -> str:
     store = _STATE["commitments_store"]
     if store is None:
         return "commitment_list failed: no commitments store"
+    actor = _commitment_actor(runtime)
+    if actor is None:
+        return "commitment_list failed: authorization context unavailable"
+    actor_principal, actor_is_admin, actor_is_service = actor
     try:
-        # store.list() is synchronous
-        all_items = store.list()
+        # Filter in the store before any record text enters the tool result.
+        all_items = store.list(
+            actor_principal=actor_principal,
+            owner_principal=None if actor_is_admin or actor_is_service else actor_principal,
+            include_service=actor_is_admin or actor_is_service,
+            actor_is_admin=actor_is_admin,
+        )
     except Exception as exc:
         return f"commitment_list failed: {exc}"
     now = _time.time()

@@ -20,11 +20,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from langchain.tools import ToolRuntime
 import pytest
 
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.commitments.models import CommitmentStatus
-from mimir.models import TurnContext, TurnInteractivity
+from mimir.models import AuthContext, TurnContext, TurnInteractivity
 from mimir.scheduler import SchedulerJob
 from mimir.tools.registry import (
     _STATE,
@@ -62,6 +63,34 @@ def _reset_state():
     yield
     _STATE.clear()
     _STATE.update(snapshot)
+
+
+def _auth_runtime(
+    principal: str = "user:alice",
+    *,
+    roles: tuple[str, ...] = (),
+    trigger: str = "user_message",
+    event_ingress: str | None = "discord",
+    is_service: bool = False,
+) -> ToolRuntime[AuthContext]:
+    context = AuthContext(
+        principal=principal,
+        canonical_principal=principal,
+        roles=roles,
+        event_ingress=event_ingress,
+        trigger=trigger,
+        channel_id="chan-1",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        is_service=is_service,
+        enforcement_enabled=True,
+    )
+    return ToolRuntime(
+        state={}, context=context, config={}, stream_writer=lambda _: None,
+        tool_call_id="commitment-tool-test", store=None,
+    )
+
+
+_AUTH_ARGS = {"runtime": _auth_runtime()}
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -199,33 +228,34 @@ class _StubCommitmentsStore:
         # id / already terminal). Set reject=True to exercise that path (#485).
         self.reject: bool = False
 
-    async def complete(self, commitment_id: str, *, message_id=None):
+    async def complete(self, commitment_id: str, *, message_id=None, actor_principal=None, actor_is_admin=False):
         if self.raise_on == "complete":
             raise RuntimeError("complete boom")
         if self.reject:
             return False
-        self.complete_calls.append({"id": commitment_id, "message_id": message_id})
+        self.complete_calls.append({"id": commitment_id, "message_id": message_id, "actor_principal": actor_principal, "actor_is_admin": actor_is_admin})
         return True
 
-    async def snooze(self, commitment_id: str, *, until_unix: float, reason=None):
+    async def snooze(self, commitment_id: str, *, until_unix: float, reason=None, actor_principal=None, actor_is_admin=False):
         if self.raise_on == "snooze":
             raise RuntimeError("snooze boom")
         if self.reject:
             return False
-        self.snooze_calls.append({"id": commitment_id, "until_unix": until_unix})
+        self.snooze_calls.append({"id": commitment_id, "until_unix": until_unix, "actor_principal": actor_principal, "actor_is_admin": actor_is_admin})
         return True
 
-    async def dismiss(self, commitment_id: str, *, reason=None):
+    async def dismiss(self, commitment_id: str, *, reason=None, actor_principal=None, actor_is_admin=False):
         if self.raise_on == "dismiss":
             raise RuntimeError("dismiss boom")
         if self.reject:
             return False
-        self.dismiss_calls.append({"id": commitment_id, "reason": reason})
+        self.dismiss_calls.append({"id": commitment_id, "reason": reason, "actor_principal": actor_principal, "actor_is_admin": actor_is_admin})
         return True
 
-    def list(self):
+    def list(self, **kwargs):
         if self.raise_on == "list":
             raise RuntimeError("list boom")
+        self.list_kwargs = kwargs
         return list(self._items)
 
 
@@ -1001,11 +1031,80 @@ class TestSetPollerOverrides:
 # ────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "extra_args"),
+    [
+        ("complete", {}),
+        ("snooze", {"until_iso": "2030-06-01T10:00:00Z"}),
+        ("dismiss", {}),
+    ],
+)
+async def test_commitment_mutation_tools_pass_runtime_actor(
+    tool_name: str, extra_args: dict[str, str],
+) -> None:
+    store = _StubCommitmentsStore()
+    set_commitments_store(store)
+    tool = {
+        "complete": commitment_complete,
+        "snooze": commitment_snooze,
+        "dismiss": commitment_dismiss,
+    }[tool_name]
+    out = await tool.ainvoke({
+        "runtime": _auth_runtime("user:bob"),
+        "commitment_id": "c-owned",
+        **extra_args,
+    })
+    assert " ok:" in out
+    call = getattr(store, f"{tool_name}_calls")[0]
+    assert call["actor_principal"] == "user:bob"
+    assert call["actor_is_admin"] is False
+
+
+@pytest.mark.asyncio
+async def test_commitment_mutation_tools_fail_closed_without_runtime() -> None:
+    store = _StubCommitmentsStore()
+    set_commitments_store(store)
+    out = await commitment_complete.ainvoke({"commitment_id": "c-owned"})
+    assert out == "commitment_complete failed: authorization context unavailable"
+    assert store.complete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_commitment_list_scopes_regular_actor_before_rendering() -> None:
+    store = _StubCommitmentsStore()
+    store._items = []
+    set_commitments_store(store)
+    await commitment_list.ainvoke({"runtime": _auth_runtime("user:bob")})
+    assert store.list_kwargs == {
+        "actor_principal": "user:bob",
+        "owner_principal": "user:bob",
+        "include_service": False,
+        "actor_is_admin": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_commitment_list_admin_can_include_legacy_and_service() -> None:
+    store = _StubCommitmentsStore()
+    store._items = []
+    set_commitments_store(store)
+    await commitment_list.ainvoke({
+        "runtime": _auth_runtime("user:jason", roles=("admin",)),
+    })
+    assert store.list_kwargs == {
+        "actor_principal": "user:jason",
+        "owner_principal": None,
+        "include_service": True,
+        "actor_is_admin": True,
+    }
+
+
 class TestCommitmentComplete:
     @pytest.mark.asyncio
     async def test_no_store_returns_error(self) -> None:
         _STATE["commitments_store"] = None
-        out = await commitment_complete.ainvoke({"commitment_id": "c-1"})
+        out = await commitment_complete.ainvoke({**_AUTH_ARGS, "commitment_id": "c-1"})
         assert "commitment_complete failed: no commitments store" in out
 
     @pytest.mark.asyncio
@@ -1013,7 +1112,7 @@ class TestCommitmentComplete:
         store = _StubCommitmentsStore()
         store.raise_on = "complete"
         set_commitments_store(store)
-        out = await commitment_complete.ainvoke({"commitment_id": "c-1"})
+        out = await commitment_complete.ainvoke({**_AUTH_ARGS, "commitment_id": "c-1"})
         assert "commitment_complete failed" in out
         assert "boom" in out
 
@@ -1021,7 +1120,7 @@ class TestCommitmentComplete:
     async def test_happy_path_returns_ok(self) -> None:
         store = _StubCommitmentsStore()
         set_commitments_store(store)
-        out = await commitment_complete.ainvoke({"commitment_id": "c-42"})
+        out = await commitment_complete.ainvoke({**_AUTH_ARGS, "commitment_id": "c-42"})
         assert "commitment_complete ok:" in out
         assert "id=c-42" in out
 
@@ -1031,7 +1130,7 @@ class TestCommitmentComplete:
         store = _StubCommitmentsStore()
         store.reject = True
         set_commitments_store(store)
-        out = await commitment_complete.ainvoke({"commitment_id": "c-42"})
+        out = await commitment_complete.ainvoke({**_AUTH_ARGS, "commitment_id": "c-42"})
         assert "commitment_complete failed" in out
         assert "ok" not in out
 
@@ -1041,7 +1140,7 @@ class TestCommitmentSnooze:
     async def test_no_store_returns_error(self) -> None:
         _STATE["commitments_store"] = None
         out = await commitment_snooze.ainvoke(
-            {"commitment_id": "c-1", "until_iso": "2030-01-01T00:00:00Z"}
+            {**_AUTH_ARGS, "commitment_id": "c-1", "until_iso": "2030-01-01T00:00:00Z"}
         )
         assert "commitment_snooze failed: no commitments store" in out
 
@@ -1050,7 +1149,7 @@ class TestCommitmentSnooze:
         store = _StubCommitmentsStore()
         set_commitments_store(store)
         out = await commitment_snooze.ainvoke(
-            {"commitment_id": "c-1", "until_iso": "not-a-date"}
+            {**_AUTH_ARGS, "commitment_id": "c-1", "until_iso": "not-a-date"}
         )
         assert "commitment_snooze failed" in out
 
@@ -1059,7 +1158,7 @@ class TestCommitmentSnooze:
         store = _StubCommitmentsStore()
         set_commitments_store(store)
         out = await commitment_snooze.ainvoke(
-            {"commitment_id": "c-7", "until_iso": "2030-06-01T10:00:00Z"}
+            {**_AUTH_ARGS, "commitment_id": "c-7", "until_iso": "2030-06-01T10:00:00Z"}
         )
         assert "commitment_snooze ok:" in out
         assert "id=c-7" in out
@@ -1071,7 +1170,7 @@ class TestCommitmentSnooze:
         store.reject = True
         set_commitments_store(store)
         out = await commitment_snooze.ainvoke(
-            {"commitment_id": "c-7", "until_iso": "2030-06-01T10:00:00Z"}
+            {**_AUTH_ARGS, "commitment_id": "c-7", "until_iso": "2030-06-01T10:00:00Z"}
         )
         assert "commitment_snooze failed" in out
         assert "ok" not in out
@@ -1087,7 +1186,7 @@ class TestCommitmentSnooze:
         store = _StubCommitmentsStore()
         set_commitments_store(store)
         out = await commitment_snooze.ainvoke(
-            {"commitment_id": "c-9", "until_iso": "2030-06-01T10:00:00"}  # naive
+            {**_AUTH_ARGS, "commitment_id": "c-9", "until_iso": "2030-06-01T10:00:00"}  # naive
         )
         assert "commitment_snooze ok:" in out
         expected = datetime(2030, 6, 1, 10, 0, 0, tzinfo=timezone.utc).timestamp()
@@ -1101,7 +1200,7 @@ class TestCommitmentDismiss:
     @pytest.mark.asyncio
     async def test_no_store_returns_error(self) -> None:
         _STATE["commitments_store"] = None
-        out = await commitment_dismiss.ainvoke({"commitment_id": "c-1"})
+        out = await commitment_dismiss.ainvoke({**_AUTH_ARGS, "commitment_id": "c-1"})
         assert "commitment_dismiss failed: no commitments store" in out
 
     @pytest.mark.asyncio
@@ -1109,7 +1208,7 @@ class TestCommitmentDismiss:
         store = _StubCommitmentsStore()
         set_commitments_store(store)
         out = await commitment_dismiss.ainvoke(
-            {"commitment_id": "c-5", "reason": "no longer relevant"}
+            {**_AUTH_ARGS, "commitment_id": "c-5", "reason": "no longer relevant"}
         )
         assert "commitment_dismiss ok:" in out
         assert store.dismiss_calls[0]["id"] == "c-5"
@@ -1120,7 +1219,7 @@ class TestCommitmentDismiss:
         store = _StubCommitmentsStore()
         store.reject = True
         set_commitments_store(store)
-        out = await commitment_dismiss.ainvoke({"commitment_id": "c-5"})
+        out = await commitment_dismiss.ainvoke({**_AUTH_ARGS, "commitment_id": "c-5"})
         assert "commitment_dismiss failed" in out
         assert "ok" not in out
 
@@ -1129,7 +1228,7 @@ class TestCommitmentList:
     @pytest.mark.asyncio
     async def test_no_store_returns_error(self) -> None:
         _STATE["commitments_store"] = None
-        out = await commitment_list.ainvoke({})
+        out = await commitment_list.ainvoke({**_AUTH_ARGS})
         assert "commitment_list failed: no commitments store" in out
 
     @pytest.mark.asyncio
@@ -1137,7 +1236,7 @@ class TestCommitmentList:
         store = _StubCommitmentsStore()
         store._items = []
         set_commitments_store(store)
-        out = await commitment_list.ainvoke({})
+        out = await commitment_list.ainvoke({**_AUTH_ARGS})
         assert "no active commitments" in out
 
     @pytest.mark.asyncio
@@ -1165,7 +1264,7 @@ class TestCommitmentList:
             ),
         ]
         set_commitments_store(store)
-        out = await commitment_list.ainvoke({"due_within_days": 0})
+        out = await commitment_list.ainvoke({**_AUTH_ARGS, "due_within_days": 0})
         parsed = json.loads(out)
         ids = [c["id"] for c in parsed]
         assert "c-completed" not in ids
@@ -1195,7 +1294,7 @@ class TestCommitmentList:
             ),
         ]
         set_commitments_store(store)
-        out = await commitment_list.ainvoke({"due_within_days": 7})
+        out = await commitment_list.ainvoke({**_AUTH_ARGS, "due_within_days": 7})
         parsed = json.loads(out)
         ids = [c["id"] for c in parsed]
         assert "c-far" not in ids
@@ -1213,7 +1312,7 @@ class TestCommitmentList:
             ),
         ]
         set_commitments_store(store)
-        out = await commitment_list.ainvoke({"due_within_days": 7})
+        out = await commitment_list.ainvoke({**_AUTH_ARGS, "due_within_days": 7})
         parsed = json.loads(out)
         assert parsed[0]["id"] == "c-unbound"
 
@@ -1236,7 +1335,7 @@ class TestCommitmentList:
             ),
         ]
         set_commitments_store(store)
-        out = await commitment_list.ainvoke({"due_within_days": 0})
+        out = await commitment_list.ainvoke({**_AUTH_ARGS, "due_within_days": 0})
         parsed = json.loads(out)
         ids = [c["id"] for c in parsed]
         assert "c-past" in ids
@@ -1256,7 +1355,7 @@ class TestCommitmentList:
             ),
         ]
         set_commitments_store(store)
-        out = await commitment_list.ainvoke({"due_within_days": 0})
+        out = await commitment_list.ainvoke({**_AUTH_ARGS, "due_within_days": 0})
         parsed = json.loads(out)
         c = parsed[0]
         assert c["id"] == "c-1"
@@ -1270,7 +1369,7 @@ class TestCommitmentList:
         store = _StubCommitmentsStore()
         store.raise_on = "list"
         set_commitments_store(store)
-        out = await commitment_list.ainvoke({})
+        out = await commitment_list.ainvoke({**_AUTH_ARGS})
         assert "commitment_list failed" in out
         assert "boom" in out
 

@@ -163,6 +163,7 @@ class CommitmentsStore:
         target_status: str,
         *,
         actor_principal: str | None = None,
+        actor_is_admin: bool = False,
     ) -> bool:
         """Pre-write transition check with authorization. PR #120 re-review N2.
 
@@ -200,7 +201,9 @@ class CommitmentsStore:
                 rec.status, target_status, id,
             )
             return False
-        if not self._is_authorized(rec, actor_principal):
+        if not self._is_authorized(
+            rec, actor_principal, actor_is_admin=actor_is_admin,
+        ):
             log.warning(
                 "commitments: lifecycle write rejected — unauthorized "
                 "mutation attempt on %s by %s (owner=%s)",
@@ -213,19 +216,24 @@ class CommitmentsStore:
         self,
         record: CommitmentRecord,
         actor_principal: str | None,
+        *,
+        actor_is_admin: bool = False,
     ) -> bool:
         """Check if the actor is authorized to mutate this commitment.
 
         Authorization rules (when actor_principal is provided):
-        - Service visibility: only service actors can mutate
-        - Private visibility: actor must be the owner
-        - Public visibility: owner or service actor can mutate
+        - Admin actors can mutate any record, including service/legacy records
+        - Service visibility: only admin or service actors can mutate
+        - Private visibility: actor must be the owner (or admin)
+        - Public visibility: owner, service actor, or admin can mutate
 
         If no actor_principal provided, allow by default (backward compat).
-        If no owner is set (legacy record), requires service actor.
+        If no owner is set (legacy record), requires admin/service actor.
         Recipient identity does NOT grant mutation authority.
         """
         if actor_principal is None:
+            return True
+        if actor_is_admin:
             return True
         if record.visibility == CommitmentVisibility.SERVICE.value:
             return actor_principal.startswith("service:")
@@ -241,12 +249,18 @@ class CommitmentsStore:
 
     async def deliver(
         self, id: str, *, actor_principal: str | None = None,
+        actor_is_admin: bool = False,
     ) -> bool:
         """Mark delivered (reminder fired). Bumps ``attempts``.
 
         Returns True if the event was appended; False if the
         transition was rejected (unknown id, terminal record, unauthorized)."""
-        if not self._can_apply(id, CommitmentStatus.DELIVERED.value, actor_principal=actor_principal):
+        if not self._can_apply(
+            id,
+            CommitmentStatus.DELIVERED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        ):
             return False
         await self._append({
             "type": "commitment_delivered",
@@ -262,12 +276,18 @@ class CommitmentsStore:
         *,
         message_id: str | None = None,
         actor_principal: str | None = None,
+        actor_is_admin: bool = False,
     ) -> bool:
         """Mark completed (agent followed through). Terminal.
 
         Returns True if the event was appended; False if the
         transition was rejected or unauthorized."""
-        if not self._can_apply(id, CommitmentStatus.COMPLETED.value, actor_principal=actor_principal):
+        if not self._can_apply(
+            id,
+            CommitmentStatus.COMPLETED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        ):
             return False
         await self._append({
             "type": "commitment_completed",
@@ -285,6 +305,7 @@ class CommitmentsStore:
         until_unix: float,
         reason: str | None = None,
         actor_principal: str | None = None,
+        actor_is_admin: bool = False,
     ) -> bool:
         """Push out to a later time. ``until_unix`` becomes the new
         ``due_window_start_unix`` after replay (the original end stays
@@ -292,7 +313,12 @@ class CommitmentsStore:
 
         Returns True if the event was appended; False if the
         transition was rejected or unauthorized."""
-        if not self._can_apply(id, CommitmentStatus.SNOOZED.value, actor_principal=actor_principal):
+        if not self._can_apply(
+            id,
+            CommitmentStatus.SNOOZED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        ):
             return False
         await self._append({
             "type": "commitment_snoozed",
@@ -309,12 +335,18 @@ class CommitmentsStore:
         *,
         reason: str | None = None,
         actor_principal: str | None = None,
+        actor_is_admin: bool = False,
     ) -> bool:
         """Drop as no longer relevant. Terminal.
 
         Returns True if the event was appended; False if the
         transition was rejected or unauthorized."""
-        if not self._can_apply(id, CommitmentStatus.DISMISSED.value, actor_principal=actor_principal):
+        if not self._can_apply(
+            id,
+            CommitmentStatus.DISMISSED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        ):
             return False
         await self._append({
             "type": "commitment_dismissed",
@@ -330,13 +362,19 @@ class CommitmentsStore:
         id: str,
         *,
         actor_principal: str | None = None,
+        actor_is_admin: bool = False,
     ) -> bool:
         """Mark expired (due_window_end passed without resolution).
         Typically called from a poller, not by the agent. Terminal.
 
         Returns True if the event was appended; False if the
         transition was rejected or unauthorized."""
-        if not self._can_apply(id, CommitmentStatus.EXPIRED.value, actor_principal=actor_principal):
+        if not self._can_apply(
+            id,
+            CommitmentStatus.EXPIRED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        ):
             return False
         await self._append({
             "type": "commitment_expired",
@@ -555,6 +593,7 @@ class CommitmentsStore:
         actor_principal: str | None = None,
         include_service: bool = False,
         owner_principal: str | None = None,
+        actor_is_admin: bool = False,
     ) -> list[CommitmentRecord]:
         """Replay + filter.
 
@@ -581,7 +620,10 @@ class CommitmentsStore:
                 continue
             if owner_principal is not None and rec.owner_principal != owner_principal:
                 continue
-            if not self._can_view(rec, actor_principal, include_service):
+            if not self._can_view(
+                rec, actor_principal, include_service,
+                actor_is_admin=actor_is_admin,
+            ):
                 continue
             out.append(rec)
         out.sort(key=lambda r: r.created_at_unix)
@@ -592,14 +634,19 @@ class CommitmentsStore:
         record: CommitmentRecord,
         actor_principal: str | None,
         include_service: bool,
+        *,
+        actor_is_admin: bool = False,
     ) -> bool:
         """Check if the actor can view this commitment.
 
         Visibility rules:
+        - Admin: visible regardless of visibility level
         - Public: visible to all
         - Service: only service actors or when include_service=True
-        - Private: only owner or service actors
+        - Private: only owner, service actors, or admin
         """
+        if actor_is_admin:
+            return True
         if record.visibility == CommitmentVisibility.SERVICE.value:
             return include_service or (
                 actor_principal is not None and actor_principal.startswith("service:")
