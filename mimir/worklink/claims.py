@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
+from pathlib import Path
 import subprocess
 from typing import Any, Callable, Iterable, Sequence
 
@@ -143,6 +144,8 @@ class ChainlinkClaims:
         issue_id: int,
         comments: Iterable[str] = (),
         *,
+        labels: Iterable[str] = (),
+        home_path: str | None = None,
         max_active_locks: int | None = None,
     ) -> ClaimResult:
         """Claim ``issue_id`` if attempts and optional global cap allow it.
@@ -152,7 +155,30 @@ class ChainlinkClaims:
         claim is already reserved; if admitting this reservation would exceed
         the cap, the lock is released before any label/comment mutation or
         backend compute launch.
+
+        If ``labels`` is provided, admission also refuses leaves in
+        ``worklink:review`` state to prevent duplicate dispatch after a prior
+        attempt already created a review-ready PR (chainlink #873).
+        ``worklink:in-progress`` is allowed because it's used for legitimate
+        reattach scenarios.
+
+        If ``home_path`` is provided, admission also refuses when the issue
+        already has a durable review-ready PR/evidence association (even if
+        labels have drifted).
         """
+        label_set = set(labels)
+        if label_set:
+            if "worklink:review" in label_set:
+                return ClaimResult(False, reason="lifecycle_state_incompatible")
+
+        if home_path is not None:
+            from .autonomy import _find_latest_evidence_for_issue
+            evidence = _find_latest_evidence_for_issue(Path(home_path), issue_id)
+            if evidence is not None and evidence.get("review_ready"):
+                pr_url = evidence.get("pr_url")
+                if pr_url:
+                    return ClaimResult(False, reason="review_ready_evidence_exists")
+
         lock = self._run("locks", "claim", str(issue_id), check=False)
         if lock.returncode != 0:
             return ClaimResult(False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed")

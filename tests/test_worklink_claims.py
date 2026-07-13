@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 import json
+from pathlib import Path
 import subprocess
 from typing import Sequence
+
+import pytest
 
 from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, claim_records_from_comments
 
@@ -324,3 +327,97 @@ def test_duplicate_vs_live_final_attempt_never_labels_blocked():
     assert result.reason == "duplicate_run_live"
     assert result.attempts_exhausted is False
     assert not any(call[1:3] == ["issue", "label"] for call in calls)
+
+
+def test_claim_issue_refuses_worklink_review_label() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+
+    result = claims.claim_issue(100, labels=["worklink:review", "worklink:ready"])
+
+    assert result.claimed is False
+    assert result.reason == "lifecycle_state_incompatible"
+    assert not any(call[1:3] == ["locks", "claim"] for call in calls)
+
+
+def test_claim_issue_accepts_worklink_ready_label() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+
+    result = claims.claim_issue(102, labels=["worklink:ready"])
+
+    assert result.claimed is True
+    assert result.record is not None
+
+
+def test_claim_issue_accepts_worklink_in_progress_label() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+
+    result = claims.claim_issue(103, labels=["worklink:in-progress"])
+
+    assert result.claimed is True
+    assert result.record is not None
+
+
+def test_claim_issue_refuses_when_review_ready_evidence_exists(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    evidence_dir = tmp_path / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    evidence_file = evidence_dir / "200-1.json"
+    evidence_file.write_text(
+        json.dumps({
+            "issue": 200,
+            "attempt": 1,
+            "status": "completed",
+            "review_ready": True,
+            "pr_url": "https://github.com/owner/repo/pull/123",
+        }),
+        encoding="utf-8",
+    )
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+
+    result = claims.claim_issue(200, labels=["worklink:ready"], home_path=str(tmp_path))
+
+    assert result.claimed is False
+    assert result.reason == "review_ready_evidence_exists"
+    assert not any(call[1:3] == ["locks", "claim"] for call in calls)
+
+
+def test_claim_issue_allows_without_evidence_when_worklink_ready(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    evidence_dir = tmp_path / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+
+    result = claims.claim_issue(201, labels=["worklink:ready"], home_path=str(tmp_path))
+
+    assert result.claimed is True
+    assert result.record is not None

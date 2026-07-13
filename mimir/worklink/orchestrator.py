@@ -391,6 +391,8 @@ class WorklinkRunner:
         claim = claims.claim_issue(
             issue.issue_id,
             issue.comments,
+            labels=issue.labels,
+            home_path=str(self.home),
             max_active_locks=config.defaults.max_concurrent if autonomous else None,
         )
         if claim.attempts_exhausted:

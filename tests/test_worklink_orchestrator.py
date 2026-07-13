@@ -224,7 +224,7 @@ ISSUE_JSON = '''{
   "id": 441,
   "title": "worklink slice",
   "description": "Acceptance criteria:\\n- [ ] do it\\n- [ ] echo ok\\n\\nReview criteria:\\n- reviewer checks it\\n\\nWorklink notes:\\n- Scope: test fixture\\n- Out of scope: unrelated work\\n- Suggested test command: echo ok",
-  "labels": ["worklink"],
+  "labels": ["worklink", "worklink:ready"],
   "parent_id": 380,
   "comments": []
 }'''
