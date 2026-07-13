@@ -94,25 +94,39 @@ the two:
 - **Failure handling**: Stale heartbeat or failed factory run produces an actionable
   Chainlink comment/label and prevents duplicate concurrent factory sessions.
 
-The factory's `run.json` contract:
+The factory's `run.json` contract (0.2.1):
 
 ```json
 {
-  "schema_version": 1,
+  "run_id": "chainlink-<issue>",
+  "status": "running|completed|blocked|partial|needs-human",
   "heartbeat_at": "2026-01-01T00:00:00+00:00",
-  "status": "in_progress|completed|failed|cancelled",
   "pr_url": "https://github.com/owner/repo/pull/123",
-  "gates_needed": ["test-gate", "review-gate"],
-  "gates_complete": ["code-gate"],
-  "error": "optional error message"
+  "gates": {
+    "story": {"status": "approved|pending"},
+    "brief": {"status": "approved|pending"},
+    "pre_pr": {"status": "approved|pending"}
+  },
+  "slices": [{"id": "s1", "status": "merged|building|..."}],
+  "validator": {"verdict": "GO|NO_GO"},
+  "security_review": {"verdict": "PASS|FAIL"},
+  "terminal_result": {
+    "status": "completed|blocked|partial|needs-human",
+    "pr_url": "https://github.com/...",
+    "reason": "...",
+    "summary": "..."
+  }
 }
 ```
 
+- `run_id` must match the `--run-id` argv boundary (`chainlink-<issue>`)
 - `heartbeat_at` must be updated periodically by the factory; if it's stale
   (>5min old), the adapter marks the epic as failed with a stale heartbeat error.
-- `gates_needed` lists gates waiting for answers; the adapter mirrors these as
-  `blocked` status with the first gate name in the reason.
-- `gates_complete` lists gates that have been answered.
+- Gate statuses are under `gates.<name>.status`; pending gates block with the first
+  pending gate name in the reason.
+- `terminal_result` is the authoritative outcome at a terminal state; absent is
+  tolerated (the adapter falls back to status/pr_url/gates).
+- Terminal success requires validated `completed` status AND canonical PR URL.
 
 Per-leaf worklink (the rest of this document) is unaffected: file a
 `worklink:ready` leaf that satisfies the strict template (§2.5) and the poller

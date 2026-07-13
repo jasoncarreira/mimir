@@ -191,6 +191,24 @@ def _blocked_reason(data: dict) -> str | None:
     return None
 
 
+def _is_valid_pr_url(pr_url: str | None) -> bool:
+    """Validate a canonical PR URL per the 0.2.1 contract.
+
+    A valid PR URL must be a non-empty string matching the pattern
+    ``https://github.com/<owner>/<repo>/pull/<number>``.
+    """
+    if not pr_url or not isinstance(pr_url, str):
+        return False
+    pr_url = pr_url.strip()
+    if not pr_url:
+        return False
+    if not pr_url.startswith("https://github.com/"):
+        return False
+    if "/pull/" not in pr_url:
+        return False
+    return True
+
+
 def _parse_run_state(data: object) -> FactoryRunState | None:
     """Parse a decoded ``run.json`` payload into a FactoryRunState.
 
@@ -238,7 +256,7 @@ class FeatureFactoryBackend:
     <name>`` so the factory requests review itself; empty omits the flag.
     """
 
-    bin: str = "opencode"
+    bin: str = "feature-factory"
     extra_args: tuple[str, ...] = field(default_factory=tuple)
     name: str = "feature_factory"
     heartbeat_interval_s: int = 60
@@ -270,7 +288,7 @@ class FeatureFactoryBackend:
     ) -> WorkSpec:
         factory_path = order.worktree / FACTORY_DIR
         run_json_path = factory_path / RUN_JSON
-        command = self._factory_command(order.worktree, order.prompt)
+        command = self._factory_command(order.worktree, order.prompt, order.issue_id)
 
         return WorkSpec(
             issue_id=order.issue_id,
@@ -297,22 +315,26 @@ class FeatureFactoryBackend:
     def _bin_tokens(self) -> tuple[str, ...]:
         return tuple(shlex.split(self.bin)) if self.bin.strip() else ()
 
-    def _factory_command(self, worktree: Path, prompt: str) -> tuple[str, ...]:
+    def _factory_command(self, worktree: Path, prompt: str, issue_id: int) -> tuple[str, ...]:
         """Autonomous DETACHED factory START argv.
 
         ``<bin...> factory start --autonomous --detached --repo <worktree>
-        [extra_args] [--ready] [--reviewer <name>] <prompt>``. ``--detached``
-        makes the CLI spawn opencode BACKGROUNDED (``detached``/``unref``'d,
-        logging to ``.opencode/factory/processes/<ts>.log``) and RETURN
-        IMMEDIATELY — the launcher exits while the autonomous run keeps going, so
-        the orchestrator polls ``run.json`` to a terminal state rather than
-        holding the subprocess for the whole run (and a re-dispatch can resume
-        polling a still-running detached factory). There is no resume/gate-answer
-        step: the factory self-drives every gate and writes
-        ``run.json.terminal_result`` at a terminal state. The factory's opencode
-        PREFERS the codex OAuth subscription when available (codex-auth plugin)
-        and falls back to ``OPENAI_API_KEY`` only if that OAuth is absent.
+        --run-id chainlink-<issue> [extra_args] [--ready] [--reviewer <name>]
+        <prompt>``. ``--run-id`` is an argv boundary (not prompt text) so the factory
+        namespaces its control plane under the expected ``.opencode/factory/<run-id>/``
+        directory that the adapter then observes. ``--detached`` makes the CLI spawn
+        opencode BACKGROUNDED (``detached``/``unref``'d, logging to
+        ``.opencode/factory/processes/<ts>.log``) and RETURN IMMEDIATELY — the launcher
+        exits while the autonomous run keeps going, so the orchestrator polls
+        ``run.json`` to a terminal state rather than holding the subprocess for the
+        whole run (and a re-dispatch can resume polling a still-running detached
+        factory). There is no resume/gate-answer step: the factory self-drives every
+        gate and writes ``run.json.terminal_result`` at a terminal state. The
+        factory's opencode PREFERS the codex OAuth subscription when available
+        (codex-auth plugin) and falls back to ``OPENAI_API_KEY`` only if that OAuth
+        is absent.
         """
+        run_id = epic_run_id(issue_id)
         argv: list[str] = [
             *self._bin_tokens(),
             "factory",
@@ -321,6 +343,8 @@ class FeatureFactoryBackend:
             "--detached",
             "--repo",
             str(worktree),
+            "--run-id",
+            run_id,
             *self.extra_args,
         ]
         if self.ready_for_review:
@@ -340,14 +364,30 @@ class FeatureFactoryBackend:
         if result.launch_error:
             return RawResult(-1, None, "backend_error", result.launch_error)
 
-        state = self._read_run_json(order.worktree, epic_run_id(order.issue_id))
+        expected_run_id = epic_run_id(order.issue_id)
+        state = self._read_run_json(order.worktree, expected_run_id)
         if state is None:
             return RawResult(-1, None, "failed", "factory run.json not found")
         if state.is_stale:
             return RawResult(-1, None, "stale_heartbeat", f"factory heartbeat stale: {state.heartbeat_at}")
 
+        if state.run_id != expected_run_id:
+            return RawResult(
+                -1,
+                None,
+                "failed",
+                f"run-id mismatch: expected {expected_run_id}, got {state.run_id}",
+            )
+
         status = state.status.strip().lower()
         if status == "completed":
+            if not _is_valid_pr_url(state.pr_url):
+                return RawResult(
+                    -1,
+                    None,
+                    "failed",
+                    "completed state requires valid PR URL",
+                )
             return RawResult(0, None, "completed", None)
         if status in ("blocked", "partial", "needs-human"):
             return RawResult(0, None, "blocked", state.error or f"factory status: {status}")
