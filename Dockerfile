@@ -46,6 +46,7 @@ FROM python:3.11-slim AS base
 #     removes that ambiguity.
 ENV NODE_VERSION=22
 ARG MIMIR_ENABLE_CLAUDE_CODE=0
+ARG MIMIR_ENABLE_OPENCODE=0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg git jq ripgrep xz-utils \
         poppler-utils tesseract-ocr tesseract-ocr-eng \
@@ -53,6 +54,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends nodejs \
     && if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \
         npm install -g @anthropic-ai/claude-code@2.1.206 ; \
+    fi \
+    && if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then \
+        npm install -g opencode-ai@1.17.15 ; \
+        npm install -g opencode-feature-factory@0.2.1 ; \
+        npm install -g opencode-project-memory@0.1.0 ; \
+        npm install -g opencode-openai-codex-auth@4.4.0 ; \
+        npm install -g opencode-anthropic-auth@0.0.13 ; \
     fi \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -136,6 +144,12 @@ RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BA
 # recreate are no-ops.
 ENV MIMIR_HOME=/home/mimir/agent
 RUN mkdir -p /home/mimir/agent && mimir setup --home /home/mimir/agent || true
+# OpenCode reads this XDG-global config before walking project-local
+# opencode.json files, so the registrations apply in outer repos and nested
+# Worklink worktrees alike. The bootstrap is a preserving, idempotent merge.
+RUN if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then \
+        mimir opencode-bootstrap --home /home/mimir ; \
+    fi
 
 # Auto-update behavior on this image:
 #

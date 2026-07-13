@@ -21,9 +21,12 @@ from mimir.scaffold_docker import (
     Fragment,
     collect_fragments,
     collect_required_env_vars,
+    ensure_opencode_config,
     existing_env_keys,
+    opencode_config_path,
     render_compose_env,
     render_dockerfile,
+    render_start_sh,
     scaffold,
 )
 
@@ -390,6 +393,146 @@ def test_scaffold_installs_codex_for_workspace_uv_extra(tmp_path: Path):
     plain.mkdir()
     scaffold(plain, mode="workspace", uv_extras=["discord"])
     assert "npm install -g @openai/codex" not in (plain / "Dockerfile").read_text()
+
+
+def test_render_dockerfile_installs_opencode_when_enabled():
+    """install_opencode=True adds the OpenCode runtime install to both modes."""
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode, install_opencode=True)
+        assert "npm install -g opencode-ai@1.17.15" in out, mode
+        assert "npm install -g opencode-feature-factory@0.2.1" in out, mode
+        assert "npm install -g opencode-project-memory@0.1.0" in out, mode
+        assert "npm install -g opencode-openai-codex-auth@4.4.0" in out, mode
+        assert "npm install -g opencode-anthropic-auth@0.0.13" in out, mode
+        assert "/home/mimir/.config/opencode/opencode.json" in out, mode
+        assert '"memoryDir": ".opencode/memory"' in out, mode
+
+
+def test_render_dockerfile_omits_opencode_by_default():
+    """Default (no opencode opt-in) leaves the OpenCode runtime out — and the
+    placeholder must always be substituted (no stray sentinel)."""
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode)
+        assert "npm install -g opencode-ai" not in out, mode
+        assert "/home/mimir/.config/opencode/opencode.json" not in out, mode
+        assert "__OPENCODE_INSTALL__" not in out, mode
+        assert "__OPENCODE_CONFIG__" not in out, mode
+
+
+def test_scaffold_installs_opencode_when_flag_set(tmp_path: Path):
+    """A deployment with install_opencode=True gets the OpenCode runtime."""
+    home = tmp_path / "opencode-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", install_opencode=True)
+    assert "npm install -g opencode-ai@1.17.15" in (home / "Dockerfile").read_text()
+
+    plain = tmp_path / "plain-home"
+    plain.mkdir()
+    scaffold(plain, mode="pypi", install_opencode=False)
+    assert "npm install -g opencode-ai" not in (plain / "Dockerfile").read_text()
+
+
+def test_scaffold_installs_opencode_for_workspace_mode(tmp_path: Path):
+    """Workspace mode respects install_opencode flag."""
+    home = tmp_path / "ws-opencode-home"
+    home.mkdir()
+    scaffold(home, mode="workspace", install_opencode=True)
+    assert "npm install -g opencode-ai@1.17.15" in (home / "Dockerfile").read_text()
+
+
+def test_scaffold_creates_opencode_config_at_xdg_global_path(tmp_path: Path):
+    """The global XDG config applies from outer repos and nested worktrees."""
+    home = tmp_path / "oc-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", install_opencode=True)
+    oc_config = opencode_config_path(home)
+    assert oc_config == home / ".config" / "opencode" / "opencode.json"
+    assert oc_config.is_file(), "global opencode.json should be created"
+    content = oc_config.read_text()
+    assert "opencode-feature-factory" in content
+    assert "opencode-project-memory" in content
+    assert "opencode-openai-codex-auth" in content
+    assert "opencode-anthropic-auth" in content
+    assert '.opencode/memory' in content
+    assert '"maxIndexBytes": 8192' in content
+    assert '"maxIndexLines": 100' in content
+    assert '"gitExclude": false' in content
+
+
+def test_scaffold_skips_opencode_config_when_disabled(tmp_path: Path):
+    """When install_opencode=False, no global opencode.json is created."""
+    home = tmp_path / "no-oc-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", install_opencode=False)
+    assert not opencode_config_path(home).is_file()
+
+
+def test_ensure_opencode_config_preserves_existing_options_and_deduplicates(tmp_path: Path):
+    config_path = opencode_config_path(tmp_path)
+    config_path.parent.mkdir(parents=True)
+    existing_factory = [
+        "opencode-feature-factory",
+        {"profiles": {"review": ["openai", "gpt-5"]}},
+    ]
+    config_path.write_text(json.dumps({
+        "$schema": "custom-schema",
+        "theme": "tokyonight",
+        "plugin": [
+            "operator-plugin",
+            existing_factory,
+            "opencode-feature-factory",
+            ["opencode-project-memory", {"maxIndexLines": 17, "operator": True}],
+        ],
+    }))
+
+    assert ensure_opencode_config(config_path) is True
+    merged = json.loads(config_path.read_text())
+
+    assert merged["$schema"] == "custom-schema"
+    assert merged["theme"] == "tokyonight"
+    assert merged["plugin"][0] == "operator-plugin"
+    assert merged["plugin"][1] == existing_factory
+    assert sum(
+        1 for entry in merged["plugin"]
+        if entry == "opencode-feature-factory"
+        or isinstance(entry, list) and entry[0] == "opencode-feature-factory"
+    ) == 1
+    memory = next(
+        entry for entry in merged["plugin"]
+        if isinstance(entry, list) and entry[0] == "opencode-project-memory"
+    )
+    assert memory[1] == {
+        "memoryDir": ".opencode/memory",
+        "index": "MEMORY.md",
+        "maxIndexBytes": 8192,
+        "maxIndexLines": 100,
+        "gitExclude": False,
+        "operator": True,
+    }
+    assert merged["plugin"][-2:] == [
+        "opencode-openai-codex-auth",
+        "opencode-anthropic-auth",
+    ]
+    before = config_path.read_text()
+    assert ensure_opencode_config(config_path) is False
+    assert config_path.read_text() == before
+
+
+def test_scaffold_opencode_config_is_idempotent(tmp_path: Path):
+    home = tmp_path / "idempotent-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", install_opencode=True)
+    second_result = scaffold(home, mode="pypi", install_opencode=True)
+    assert ".config/opencode/opencode.json (no changes)" in second_result.files_skipped
+
+
+def test_start_scripts_bootstrap_the_global_config_when_opencode_is_enabled():
+    workspace = render_start_sh(mode="workspace")
+    pypi = render_start_sh(mode="pypi")
+    assert 'if [ "${MIMIR_ENABLE_OPENCODE:-0}" = "1" ]; then' in workspace
+    assert 'uv run mimir opencode-bootstrap --home "$HOME"' in workspace
+    assert 'if [ "${MIMIR_ENABLE_OPENCODE:-0}" = "1" ]; then' in pypi
+    assert 'mimir opencode-bootstrap --home "$HOME"' in pypi
 
 
 # ── scaffold() end-to-end ──────────────────────────────────────────
@@ -957,6 +1100,7 @@ def test_render_compose_yml_exposes_claude_code_build_switch():
     for mode in ("workspace", "pypi"):
         out = render_compose_yml(service_name="x", web_port=8080, mode=mode)
         assert "MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}" in out
+        assert "MIMIR_ENABLE_OPENCODE: ${MIMIR_ENABLE_OPENCODE:-0}" in out
 
 
 def test_render_dockerfile_pypi_mode_preserves_skill_fragments():

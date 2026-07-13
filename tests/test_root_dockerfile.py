@@ -61,3 +61,17 @@ def test_claude_code_build_arg_installs_cli_and_adapter_extra() -> None:
     assert "npm install -g @anthropic-ai/claude-code@2.1.206" in text
     assert 'pip install --no-cache-dir "mimir-agent[claude-code]"' in text
     assert "git+https://github.com/jasoncarreira/langchain-claude-code" not in text
+
+
+def test_opencode_build_arg_installs_pinned_runtime() -> None:
+    """One root-image switch should install OpenCode runtime with pinned plugins."""
+    text = _text()
+    assert "ARG MIMIR_ENABLE_OPENCODE=0" in text
+    assert "npm install -g opencode-ai@1.17.15" in text
+    assert "npm install -g opencode-feature-factory@0.2.1" in text
+    assert "npm install -g opencode-project-memory@0.1.0" in text
+    assert "npm install -g opencode-openai-codex-auth@4.4.0" in text
+    assert "npm install -g opencode-anthropic-auth@0.0.13" in text
+    assert 'if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then' in text
+    assert "mimir opencode-bootstrap --home /home/mimir" in text
+    assert "OpenCode reads this XDG-global config" in text

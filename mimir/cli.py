@@ -263,6 +263,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     from . import scaffold_docker as _scaffold_docker
     _scaffold_docker.add_argparse(scaffold_docker_p)
 
+    # `mimir opencode-bootstrap` — preserving global plugin-config merge.
+    opencode_bootstrap_p = sub.add_parser(
+        "opencode-bootstrap",
+        help=(
+            "Create or preserving-merge mimir's pinned plugins into "
+            "OpenCode's global XDG config path."
+        ),
+    )
+    opencode_bootstrap_p.add_argument(
+        "--home", type=Path, default=None,
+        help="User home containing .config/opencode (default: $HOME).",
+    )
+
     # `mimir commitments`
     commitments_p = sub.add_parser(
         "commitments",
@@ -560,6 +573,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         # Reuse the existing scaffold_docker_cmd reference set via
         # ``parser.set_defaults`` rather than re-importing here.
         sys.exit(args.scaffold_docker_cmd(args))
+
+    if args.command == "opencode-bootstrap":
+        user_home = (args.home or Path.home()).expanduser().resolve()
+        config_path = _scaffold_docker.opencode_config_path(user_home)
+        changed = _scaffold_docker.ensure_opencode_config(config_path)
+        print(f"{'updated' if changed else 'unchanged'} {config_path}")
+        return
 
     if args.command == "commitments":
         if args.commitments_action is None:

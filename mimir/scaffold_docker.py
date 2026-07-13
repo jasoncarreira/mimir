@@ -151,6 +151,7 @@ def collect_required_env_vars(home: Path) -> list[str]:
         "MIMIR_GIT_URL",           # mimir source clone URL — change for forks
         "MIMIR_DEFAULT_BRANCH",    # branch start.sh clones (default: main)
         "MIMIR_ENABLE_CLAUDE_CODE",# 1 installs Claude Code CLI + adapter
+        "MIMIR_ENABLE_OPENCODE",   # 1 installs + configures OpenCode runtime
     ]
     seen = set(baseline)
     extra: list[str] = []
@@ -302,6 +303,10 @@ __CLAUDE_CODE_INSTALL__
 
 __CODEX_INSTALL__
 
+__OPENCODE_INSTALL__
+
+__OPENCODE_CONFIG__
+
 # uv handles dep resolution + virtualenv inside the workspace clone.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \\
  && mv /root/.local/bin/uv /usr/local/bin/uv \\
@@ -397,6 +402,10 @@ RUN npm install -g @mermaid-js/mermaid-cli@11.16.0
 __CLAUDE_CODE_INSTALL__
 
 __CODEX_INSTALL__
+
+__OPENCODE_INSTALL__
+
+__OPENCODE_CONFIG__
 
 # (No ``uv`` install — PyPI mode uses pip directly against a
 # user-owned venv. Saves ~30 MB of image and one moving part.)
@@ -507,12 +516,38 @@ def _codex_install_block(install_codex: bool) -> str:
     )
 
 
+def _opencode_install_block(install_opencode: bool) -> str:
+    """Dockerfile block installing OpenCode runtime when enabled.
+
+    Installs the pinned OpenCode runtime (opencode-ai + plugins) when
+    MIMIR_ENABLE_OPENCODE=1. The plugins provide feature-factory and
+    project-memory functionality for Worklink backends.
+    """
+    if not install_opencode:
+        return "# (OpenCode runtime not installed — MIMIR_ENABLE_OPENCODE not set)"
+    return (
+        "# OpenCode runtime — opt-in via MIMIR_ENABLE_OPENCODE=1.\n"
+        "# Pins: opencode-ai@1.17.15, opencode-feature-factory@0.2.1,\n"
+        "# opencode-project-memory@0.1.0, opencode-openai-codex-auth@4.4.0,\n"
+        "# opencode-anthropic-auth@0.0.13.\n"
+        "ARG MIMIR_ENABLE_OPENCODE=0\n"
+        "RUN if [ \"$MIMIR_ENABLE_OPENCODE\" = \"1\" ]; then \\\n"
+        "        npm install -g opencode-ai@1.17.15 ; \\\n"
+        "        npm install -g opencode-feature-factory@0.2.1 ; \\\n"
+        "        npm install -g opencode-project-memory@0.1.0 ; \\\n"
+        "        npm install -g opencode-openai-codex-auth@4.4.0 ; \\\n"
+        "        npm install -g opencode-anthropic-auth@0.0.13 ; \\\n"
+        "    fi"
+    )
+
+
 def render_dockerfile(
     fragments: list[Fragment],
     *,
     mode: ScaffoldMode = _DEFAULT_MODE,
     mimir_extras: list[str] | None = None,
     install_codex: bool = False,
+    install_opencode: bool = False,
 ) -> str:
     """Stitch fragments into the base template via sentinel split, so
     a fragment that happens to contain the literal sentinel-string
@@ -546,6 +581,8 @@ def render_dockerfile(
     base = base.replace("__USERDEL_BLOCK__", _USERDEL_BLOCK)
     base = base.replace("__CLAUDE_CODE_INSTALL__", _claude_code_install_block())
     base = base.replace("__CODEX_INSTALL__", _codex_install_block(install_codex))
+    base = base.replace("__OPENCODE_INSTALL__", _opencode_install_block(install_opencode))
+    base = base.replace("__OPENCODE_CONFIG__", _opencode_build_config_block(install_opencode))
     if not fragments:
         body = "# (no skills installed yet ship a dockerfile.fragment)"
     else:
@@ -587,6 +624,9 @@ services:
         # One switch for Claude Code support: installs the npm CLI at
         # build time and makes workspace start.sh sync --extra claude-code.
         MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}
+        # Install the pinned OpenCode runtime + plugins. start.sh merges
+        # their config into OpenCode's XDG path when the same flag is set.
+        MIMIR_ENABLE_OPENCODE: ${MIMIR_ENABLE_OPENCODE:-0}
     container_name: {SERVICE_NAME}
     restart: unless-stopped
     # chainlink #510: give the graceful drain time to finish in-flight turns
@@ -652,6 +692,9 @@ services:
         # One switch for Claude Code support: installs the npm CLI and
         # mimir-agent[claude-code] adapter extra at build time.
         MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}
+        # Install the pinned OpenCode runtime + plugins. start.sh merges
+        # their config into OpenCode's XDG path when the same flag is set.
+        MIMIR_ENABLE_OPENCODE: ${MIMIR_ENABLE_OPENCODE:-0}
     container_name: {SERVICE_NAME}
     restart: unless-stopped
     # chainlink #510: give the graceful drain time to finish in-flight turns
@@ -799,6 +842,10 @@ echo "[start.sh] mimir setup (idempotent)"
 uv run mimir setup --home "${MIMIR_HOME}" || {
     echo "[start.sh] WARNING: mimir setup non-zero — home may be partial" >&2
 }
+if [ "${MIMIR_ENABLE_OPENCODE:-0}" = "1" ]; then
+    echo "[start.sh] merging OpenCode plugin config into the XDG config path"
+    uv run mimir opencode-bootstrap --home "$HOME"
+fi
 
 # ─── run ───────────────────────────────────────────────────────────
 echo "[start.sh] starting mimir run (home=${MIMIR_HOME}, port=${MIMIR_WEB_PORT:-8080})"
@@ -850,6 +897,10 @@ echo "[start.sh] mimir setup (idempotent)"
 mimir setup --home "${MIMIR_HOME}" || {
     echo "[start.sh] WARNING: mimir setup non-zero — home may be partial" >&2
 }
+if [ "${MIMIR_ENABLE_OPENCODE:-0}" = "1" ]; then
+    echo "[start.sh] merging OpenCode plugin config into the XDG config path"
+    mimir opencode-bootstrap --home "$HOME"
+fi
 
 # ─── run ───────────────────────────────────────────────────────────
 echo "[start.sh] starting mimir run (home=${MIMIR_HOME}, port=${MIMIR_WEB_PORT:-8080})"
@@ -1010,6 +1061,170 @@ def _sanitize_service_name(raw: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "-", raw)
 
 
+_OPENCODE_CONFIG_TEMPLATE = """\
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "opencode-feature-factory",
+    [
+      "opencode-project-memory",
+      {
+        "memoryDir": ".opencode/memory",
+        "index": "MEMORY.md",
+        "maxIndexBytes": 8192,
+        "maxIndexLines": 100,
+        "gitExclude": false
+      }
+    ],
+    "opencode-openai-codex-auth",
+    "opencode-anthropic-auth"
+  ]
+}
+"""
+
+_OPENCODE_REQUIRED_PLUGINS: tuple[object, ...] = (
+    "opencode-feature-factory",
+    (
+        "opencode-project-memory",
+        {
+            "memoryDir": ".opencode/memory",
+            "index": "MEMORY.md",
+            "maxIndexBytes": 8192,
+            "maxIndexLines": 100,
+            "gitExclude": False,
+        },
+    ),
+    "opencode-openai-codex-auth",
+    "opencode-anthropic-auth",
+)
+
+
+def _render_opencode_config() -> str:
+    """Render the canonical config used when no OpenCode config exists."""
+    return _OPENCODE_CONFIG_TEMPLATE
+
+
+def _opencode_build_config_block(install_opencode: bool) -> str:
+    """Bake global config into generated images under OpenCode's XDG path."""
+    if not install_opencode:
+        return "# (OpenCode config not baked — MIMIR_ENABLE_OPENCODE not set)"
+    payload = _OPENCODE_CONFIG_TEMPLATE.replace("\\", "\\\\").replace("%", "%%")
+    return (
+        "# Global OpenCode config: loaded from outer repos and Worklink worktrees.\n"
+        "RUN mkdir -p /home/mimir/.config/opencode \\\n"
+        f" && printf '%s' '{payload}' > /home/mimir/.config/opencode/opencode.json \\\n"
+        " && chown -R mimir:mimir /home/mimir/.config"
+    )
+
+
+def _plugin_name(entry: object) -> str | None:
+    """Return a plugin package name from OpenCode's string/tuple syntax."""
+    if isinstance(entry, str):
+        return entry
+    if (
+        isinstance(entry, (list, tuple))
+        and entry
+        and isinstance(entry[0], str)
+    ):
+        return entry[0]
+    return None
+
+
+def _required_plugin_entry(entry: object) -> object:
+    """Convert the internal immutable plugin declaration to JSON values."""
+    if isinstance(entry, tuple):
+        return [entry[0], dict(entry[1])]
+    return entry
+
+
+def merge_opencode_config(existing: str | None) -> tuple[str, bool]:
+    """Add mimir's pinned plugins without clobbering operator config.
+
+    OpenCode accepts plugin registrations as either package-name strings or
+    ``[package, options]`` tuples. Existing feature-factory registrations win
+    wholesale, including profile tuples/options. Project-memory preserves
+    unrelated operator options while converging mimir's managed memory keys.
+    Duplicate registrations are collapsed by package name while preserving the
+    first entry and the relative order of all unrelated plugins.
+    """
+    if existing is None:
+        return _render_opencode_config(), True
+
+    try:
+        config = json.loads(existing)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"existing OpenCode config is not valid JSON: {exc}") from exc
+    if not isinstance(config, dict):
+        raise ValueError("existing OpenCode config must be a JSON object")
+
+    raw_plugins = config.get("plugin", [])
+    if raw_plugins is None:
+        raw_plugins = []
+    if not isinstance(raw_plugins, list):
+        raise ValueError("existing OpenCode config 'plugin' must be a JSON array")
+
+    plugins: list[object] = []
+    seen: set[str] = set()
+    for entry in raw_plugins:
+        name = _plugin_name(entry)
+        if name is not None:
+            if name in seen:
+                continue
+            seen.add(name)
+        plugins.append(entry)
+
+    for required in _OPENCODE_REQUIRED_PLUGINS:
+        name = _plugin_name(required)
+        assert name is not None
+        if name not in seen:
+            plugins.append(_required_plugin_entry(required))
+            seen.add(name)
+            continue
+        if name == "opencode-project-memory":
+            # These values are the runtime contract, not optional defaults.
+            # Preserve unrelated operator options while converging the six
+            # managed keys to the values needed for tracked project memory.
+            index = next(
+                i for i, entry in enumerate(plugins)
+                if _plugin_name(entry) == name
+            )
+            current = plugins[index]
+            operator_options = (
+                dict(current[1])
+                if isinstance(current, list)
+                and len(current) > 1
+                and isinstance(current[1], dict)
+                else {}
+            )
+            managed_options = dict(required[1])
+            operator_options.update(managed_options)
+            plugins[index] = [name, operator_options]
+
+    config["plugin"] = plugins
+    merged = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+    return merged, merged != existing
+
+
+def ensure_opencode_config(config_path: Path) -> bool:
+    """Create or preserving-merge the resolved OpenCode config path."""
+    existing = config_path.read_text(encoding="utf-8") if config_path.is_file() else None
+    merged, changed = merge_opencode_config(existing)
+    if changed:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(merged, encoding="utf-8")
+    return changed
+
+
+def opencode_config_path(home: Path) -> Path:
+    """Resolved global config OpenCode reads from every project/worktree."""
+    return home / ".config" / "opencode" / "opencode.json"
+
+
+def bootstrap_opencode_config(home: Path) -> bool:
+    """Install the global plugin config under OpenCode's XDG search path."""
+    return ensure_opencode_config(opencode_config_path(home))
+
+
 def scaffold(
     home: Path,
     *,
@@ -1018,6 +1233,7 @@ def scaffold(
     uv_extras: list[str] | None = None,
     mode: ScaffoldMode = _DEFAULT_MODE,
     mimir_extras: list[str] | None = None,
+    install_opencode: bool = False,
 ) -> ScaffoldResult:
     """Generate / refresh Docker scaffolding for an agent home.
 
@@ -1089,6 +1305,7 @@ def scaffold(
     install_codex = "codex-plus" in _mode_extras
     df_text = render_dockerfile(
         fragments, mode=mode, mimir_extras=mimir_extras, install_codex=install_codex,
+        install_opencode=install_opencode,
     )
     _write_if_changed(home / "Dockerfile", df_text, "Dockerfile")
 
@@ -1127,6 +1344,20 @@ def scaffold(
     # accidentally start committing secrets.
     if _ensure_compose_env_gitignored(home):
         result.files_written.append(".gitignore (appended compose.env block)")
+
+    # OpenCode config — idempotent preserving merge.  This is the XDG path
+    # OpenCode reads before walking project-local configs, so the same plugin
+    # registrations apply from the outer repo and every Worklink worktree.
+    if install_opencode:
+        oc_path = opencode_config_path(home)
+        existed = oc_path.is_file()
+        if ensure_opencode_config(oc_path):
+            action = "merged" if existed else "created"
+            result.files_written.append(f".config/opencode/opencode.json ({action})")
+        else:
+            result.files_skipped.append(
+                ".config/opencode/opencode.json (no changes)"
+            )
 
     return result
 
