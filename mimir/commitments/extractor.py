@@ -322,6 +322,7 @@ def _coerce_to_record(
         text=rec.text,
         due_window_start_unix=due_window_start_unix,
         recipient_identity=recipient_identity,
+        owner_principal=rec.owner_principal,
     )
     return rec
 
