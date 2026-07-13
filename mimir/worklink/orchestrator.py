@@ -94,16 +94,14 @@ def _epic_probe_window_s() -> float:
 def _epic_prompt(issue: "IssueContext") -> str:
     """The factory's START prompt for a worklink:epic issue.
 
-    Includes an explicit ``Use factory run id`` line so the factory namespaces its
-    control plane under ``.opencode/factory/<run-id>/`` at the id the adapter then
-    OBSERVES, rather than relying on the factory deriving it from the prompt.
+    The run-id is passed as an argv boundary (``--run-id chainlink-<issue>``),
+    not as prompt text. The factory namespaces its control plane under
+    ``.opencode/factory/<run-id>/`` at the id the adapter observes.
     """
-    from .backends.feature_factory import epic_run_id
-
     header = f"Build chainlink #{issue.issue_id}: {issue.title}".strip()
     body = issue.description.strip()
     base = f"{header}\n\n{body}".strip() if body else header
-    return f"{base}\n\nUse factory run id `{epic_run_id(issue.issue_id)}` for the control plane."
+    return base
 
 
 @dataclass(frozen=True)

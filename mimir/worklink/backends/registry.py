@@ -550,7 +550,7 @@ class BackendRegistry:
 
     @staticmethod
     def _build_feature_factory(settings: Mapping[str, Any]) -> FeatureFactoryBackend:
-        bin_name = str(settings.get("bin", "opencode"))
+        bin_name = str(settings.get("bin", "feature-factory"))
         args = settings.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ValueError("worklink feature_factory args must be a list of strings")

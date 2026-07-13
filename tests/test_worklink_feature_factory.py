@@ -24,8 +24,6 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
-
 from mimir.worklink.backends import ComputeCaps, ComputeResult
 from mimir.worklink.backends import feature_factory as ff
 from mimir.worklink.backends.feature_factory import (
@@ -136,9 +134,34 @@ def test_read_factory_run_state_real_shape(tmp_path: Path) -> None:
                 "brief": {"status": "pending"},
                 "pre_pr": {"status": "pending", "override": None},
             },
+            "steps": [
+                {"agent": "spec-writer", "status": "accepted"},
+                {"agent": "work-decomposer", "status": "running"},
+            ],
             "slices": [{"id": "s1", "status": "merged"}, {"id": "s2", "status": "building"}],
             "validator": {"verdict": "GO", "report": "artifacts/validation-report.md", "loops": 0},
             "security_review": {"verdict": "PASS", "review_ref": "reviews/sec.json", "loops": 0},
+            "cost_attribution": {
+                "schema_version": 1,
+                "updated_at": "2026-07-09T12:00:00Z",
+                "status": "partial",
+                "totals": {
+                    "status": "partial",
+                    "entry_count": 2,
+                    "request_count": 2,
+                    "total_tokens": 12900,
+                    "cost_total": 1.23,
+                    "cost_currency": "USD",
+                    "mixed_currency": False,
+                    "missing": ["output_tokens"],
+                },
+                "entries": [],
+            },
+            "debug_snapshot": {
+                "created_with": {"collected_at": "2026-07-06T12:00:00Z"},
+                "last_resumed_with": {"collected_at": "2026-07-07T12:00:00Z"},
+                "resume_count": 1,
+            },
         },
     )
     st = read_factory_run_state(tmp_path, RUN_ID)
@@ -148,7 +171,20 @@ def test_read_factory_run_state_real_shape(tmp_path: Path) -> None:
     assert st.pending_gate == "brief"
     assert st.validator_verdict == "GO"
     assert st.security_verdict == "PASS"
+    assert st.steps == (("spec-writer", "accepted"), ("work-decomposer", "running"))
     assert st.slices == (("s1", "merged"), ("s2", "building"))
+    assert st.cost is not None
+    assert st.cost.status == "partial"
+    assert st.cost.entry_count == 2
+    assert st.cost.request_count == 2
+    assert st.cost.total_tokens == 12900
+    assert st.cost.cost_total == 1.23
+    assert st.cost.cost_currency == "USD"
+    assert st.cost.missing == ("output_tokens",)
+    assert st.debug is not None
+    assert st.debug.created_at == "2026-07-06T12:00:00Z"
+    assert st.debug.resumed_at == "2026-07-07T12:00:00Z"
+    assert st.debug.resume_count == 1
     assert st.terminal_result is None
     assert not st.is_terminal
 
@@ -163,8 +199,37 @@ def test_read_factory_run_state_verdicts_and_pr_absent(tmp_path: Path) -> None:
     assert st.validator_verdict is None
     assert st.security_verdict is None
     assert st.pr_url is None
+    assert st.steps == ()
     assert st.slices == ()
+    assert st.cost is None
+    assert st.debug is None
     assert st.pending_gate is None
+
+
+def test_read_factory_run_state_metadata_is_fail_soft(tmp_path: Path) -> None:
+    _write_run_json(
+        tmp_path,
+        {
+            "run_id": "r",
+            "status": "running",
+            "heartbeat_at": _now(),
+            "gates": {},
+            "steps": "not-a-list",
+            "slices": [{"id": "ok", "status": "running"}, "bad"],
+            "cost_attribution": {"status": 7, "totals": {"entry_count": True}},
+            "debug_snapshot": {"resume_count": -1, "created_with": "bad"},
+        },
+    )
+    st = read_factory_run_state(tmp_path, RUN_ID)
+    assert st is not None
+    assert st.steps == ()
+    assert st.slices == (("ok", "running"),)
+    assert st.cost is not None
+    assert st.cost.status == "unavailable"
+    assert st.cost.entry_count is None
+    assert st.debug is not None
+    assert st.debug.created_at is None
+    assert st.debug.resume_count is None
 
 
 def test_read_factory_run_state_completed_with_pr(tmp_path: Path) -> None:
@@ -315,7 +380,7 @@ def test_factory_command_autonomous_multitoken_bin_with_reviewer(tmp_path: Path)
         bin="node /opt/ff/cli.js", ready_for_review=True, reviewer="mimir-carreira"
     )
     wt = tmp_path / "wt"
-    cmd = backend._factory_command(wt, "Build chainlink #834: chat skills")
+    cmd = backend._factory_command(wt, "Build chainlink #834: chat skills", 834)
     assert cmd == (
         "node",
         "/opt/ff/cli.js",
@@ -325,6 +390,8 @@ def test_factory_command_autonomous_multitoken_bin_with_reviewer(tmp_path: Path)
         "--detached",
         "--repo",
         str(wt),
+        "--run-id",
+        "chainlink-834",
         "--ready",
         "--reviewer",
         "mimir-carreira",
@@ -336,7 +403,7 @@ def test_factory_command_autonomous_multitoken_bin_with_reviewer(tmp_path: Path)
 
 def test_factory_command_reviewer_absent_omits_flag(tmp_path: Path) -> None:
     backend = FeatureFactoryBackend(bin="feature-factory", ready_for_review=True, reviewer="")
-    cmd = backend._factory_command(tmp_path, "prompt")
+    cmd = backend._factory_command(tmp_path, "prompt", 123)
     assert cmd == (
         "feature-factory",
         "factory",
@@ -345,6 +412,8 @@ def test_factory_command_reviewer_absent_omits_flag(tmp_path: Path) -> None:
         "--detached",
         "--repo",
         str(tmp_path),
+        "--run-id",
+        "chainlink-123",
         "--ready",
         "prompt",
     )
@@ -353,15 +422,17 @@ def test_factory_command_reviewer_absent_omits_flag(tmp_path: Path) -> None:
 
 def test_factory_command_extra_args_and_ready_off(tmp_path: Path) -> None:
     backend = FeatureFactoryBackend(extra_args=("--flag",), ready_for_review=False, reviewer="alice")
-    cmd = backend._factory_command(tmp_path, "prompt")
+    cmd = backend._factory_command(tmp_path, "prompt", 456)
     assert cmd == (
-        "opencode",
+        "feature-factory",
         "factory",
         "start",
         "--autonomous",
         "--detached",
         "--repo",
         str(tmp_path),
+        "--run-id",
+        "chainlink-456",
         "--flag",
         "--reviewer",
         "alice",
@@ -373,8 +444,10 @@ def test_factory_command_extra_args_and_ready_off(tmp_path: Path) -> None:
 def test_factory_command_reviewer_default_from_env(monkeypatch) -> None:
     monkeypatch.setenv("MIMIR_FACTORY_REVIEWER", "env-reviewer")
     backend = FeatureFactoryBackend(bin="feature-factory")
-    cmd = backend._factory_command(Path("/wt"), "p")
+    cmd = backend._factory_command(Path("/wt"), "p", 999)
     assert "--detached" in cmd
+    assert "--run-id" in cmd
+    assert cmd[cmd.index("--run-id") + 1] == "chainlink-999"
     assert "--reviewer" in cmd
     assert cmd[cmd.index("--reviewer") + 1] == "env-reviewer"
 
@@ -395,8 +468,9 @@ def test_work_spec_carries_autonomous_command_and_worktree(tmp_path: Path) -> No
         branch="issue/834-a1", test_command="pytest",
     )
     assert spec.local_worktree == order.worktree
-    assert tuple(spec.local_argv) == backend._factory_command(order.worktree, order.prompt)
+    assert tuple(spec.local_argv) == backend._factory_command(order.worktree, order.prompt, order.issue_id)
     assert "--autonomous" in spec.local_argv and "--detached" in spec.local_argv
+    assert "--run-id" in spec.local_argv
     assert "--ready" in spec.local_argv
     assert "--headless" not in spec.local_argv
 
@@ -1258,4 +1332,128 @@ def test_feature_factory_backend_capabilities() -> None:
     caps = FeatureFactoryBackend().capabilities()
     assert caps.tool_category == "feature-factory"
     assert caps.persistent_sessions is True
-    assert caps.worktree_safe is False
+
+
+def test_is_valid_pr_url() -> None:
+    from mimir.worklink.backends.feature_factory import _is_valid_pr_url
+
+    assert _is_valid_pr_url("https://github.com/owner/repo/pull/123")
+    assert _is_valid_pr_url("  https://github.com/owner/repo/pull/456  ")
+    assert not _is_valid_pr_url(None)
+    assert not _is_valid_pr_url("")
+    assert not _is_valid_pr_url("  ")
+    assert not _is_valid_pr_url("not-a-url")
+    assert not _is_valid_pr_url("https://gitlab.com/owner/repo/pull/1")
+    assert not _is_valid_pr_url("https://github.com/owner/repo/issues/1")
+
+
+def test_default_bin_is_feature_factory() -> None:
+    backend = FeatureFactoryBackend()
+    assert backend.bin == "feature-factory"
+
+
+def test_interpret_run_id_mismatch_fails_closed(tmp_path: Path) -> None:
+    from mimir.worklink.backends.base import WorkOrder
+    from mimir.worklink.backends import ComputeResult
+    import asyncio
+
+    backend = FeatureFactoryBackend()
+    worktree = tmp_path / "wt"
+    order = WorkOrder(
+        issue_id=834,
+        worktree=worktree,
+        prompt="prompt",
+        rules=None,
+        timeout_s=1800,
+    )
+    _write_run_json(worktree, {"run_id": "chainlink-999", "status": "completed", "heartbeat_at": _now(), "pr_url": "https://github.com/o/r/pull/1"}, "chainlink-834")
+
+    result = asyncio.run(backend.interpret(order, ComputeResult(exit_code=0, stdout="", stderr="")))
+    assert result.backend_status == "failed"
+    assert "run-id mismatch" in (result.error or "")
+
+
+def test_interpret_completed_without_pr_url_fails_closed(tmp_path: Path) -> None:
+    from mimir.worklink.backends.base import WorkOrder
+    from mimir.worklink.backends import ComputeResult
+    import asyncio
+
+    backend = FeatureFactoryBackend()
+    worktree = tmp_path / "wt"
+    order = WorkOrder(
+        issue_id=834,
+        worktree=worktree,
+        prompt="prompt",
+        rules=None,
+        timeout_s=1800,
+    )
+    _write_run_json(worktree, {"run_id": "chainlink-834", "status": "completed", "heartbeat_at": _now()}, "chainlink-834")
+
+    result = asyncio.run(backend.interpret(order, ComputeResult(exit_code=0, stdout="", stderr="")))
+    assert result.backend_status == "failed"
+    assert "PR URL" in (result.error or "")
+
+
+def test_interpret_invalid_pr_url_fails_closed(tmp_path: Path) -> None:
+    from mimir.worklink.backends.base import WorkOrder
+    from mimir.worklink.backends import ComputeResult
+    import asyncio
+
+    backend = FeatureFactoryBackend()
+    worktree = tmp_path / "wt"
+    order = WorkOrder(
+        issue_id=834,
+        worktree=worktree,
+        prompt="prompt",
+        rules=None,
+        timeout_s=1800,
+    )
+    _write_run_json(worktree, {"run_id": "chainlink-834", "status": "completed", "heartbeat_at": _now(), "pr_url": "not-a-pr-url"}, "chainlink-834")
+
+    result = asyncio.run(backend.interpret(order, ComputeResult(exit_code=0, stdout="", stderr="")))
+    assert result.backend_status == "failed"
+    assert "PR URL" in (result.error or "")
+
+
+def test_interpret_malformed_run_json_fails_closed(tmp_path: Path) -> None:
+    from mimir.worklink.backends.base import WorkOrder
+    from mimir.worklink.backends import ComputeResult
+    import asyncio
+
+    backend = FeatureFactoryBackend()
+    worktree = tmp_path / "wt"
+    order = WorkOrder(
+        issue_id=834,
+        worktree=worktree,
+        prompt="prompt",
+        rules=None,
+        timeout_s=1800,
+    )
+    run_dir = factory_run_dir(worktree, "chainlink-834")
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text("not valid json", encoding="utf-8")
+
+    result = asyncio.run(backend.interpret(order, ComputeResult(exit_code=0, stdout="", stderr="")))
+    assert result.backend_status == "failed"
+    assert "not found" in (result.error or "")
+
+
+def test_interpret_run_json_as_list_fails_closed(tmp_path: Path) -> None:
+    from mimir.worklink.backends.base import WorkOrder
+    from mimir.worklink.backends import ComputeResult
+    import asyncio
+
+    backend = FeatureFactoryBackend()
+    worktree = tmp_path / "wt"
+    order = WorkOrder(
+        issue_id=834,
+        worktree=worktree,
+        prompt="prompt",
+        rules=None,
+        timeout_s=1800,
+    )
+    _write_run_json(worktree, ["not", "a", "dict"], "chainlink-834")
+
+    result = asyncio.run(backend.interpret(order, ComputeResult(exit_code=0, stdout="", stderr="")))
+    assert result.backend_status == "failed"
+    assert "not found" in (result.error or "")

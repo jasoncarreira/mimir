@@ -63,9 +63,10 @@ the two:
   starts or resumes the opencode feature-factory in the target repo. Until the
   flag is set, epics are only excluded from leaf dispatch and are never
   dispatched (no dispatch-then-refuse churn).
-- **State mirroring**: The adapter reads the factory's `run.json` atomically
-  (schema_version + heartbeat_at) and mirrors progress, gate-needed state, PR URL,
-  and terminal status into the Chainlink issue without creating leaf issues.
+- **State mirroring**: The adapter reads the factory's `run.json` atomically,
+  normalizes the published 0.2.1 heartbeat, steps/slices, gates, panel verdicts,
+  terminal state, PR URL, and optional cost/debug metadata, then mirrors progress
+  into the Chainlink issue without creating leaf issues.
 - **Gate protocol**: Gate answers flow through the factory's file protocol
   (`gates/<gate>.answer`) so manual and mimir-driven runs are identical. Review
   is **owned by the factory**: its in-package multi-agent pre_pr panel
@@ -94,25 +95,52 @@ the two:
 - **Failure handling**: Stale heartbeat or failed factory run produces an actionable
   Chainlink comment/label and prevents duplicate concurrent factory sessions.
 
-The factory's `run.json` contract:
+The factory's `run.json` contract (0.2.1):
 
 ```json
 {
-  "schema_version": 1,
+  "run_id": "chainlink-<issue>",
+  "status": "running|completed|blocked|partial|needs-human",
   "heartbeat_at": "2026-01-01T00:00:00+00:00",
-  "status": "in_progress|completed|failed|cancelled",
   "pr_url": "https://github.com/owner/repo/pull/123",
-  "gates_needed": ["test-gate", "review-gate"],
-  "gates_complete": ["code-gate"],
-  "error": "optional error message"
+  "gates": {
+    "story": {"status": "approved|pending"},
+    "brief": {"status": "approved|pending"},
+    "pre_pr": {"status": "approved|pending"}
+  },
+  "steps": [{"agent": "spec-writer", "status": "accepted|running|..."}],
+  "slices": [{"id": "s1", "status": "merged|running|..."}],
+  "validator": {"verdict": "GO|NO_GO"},
+  "security_review": {"verdict": "PASS|FAIL"},
+  "cost_attribution": {
+    "status": "available|partial|unavailable",
+    "totals": {"entry_count": 2, "total_tokens": 12900, "cost_total": 1.23}
+  },
+  "debug_snapshot": {
+    "created_with": {"collected_at": "..."},
+    "last_resumed_with": null,
+    "resume_count": 0
+  },
+  "terminal_result": {
+    "status": "completed|blocked|partial|needs-human",
+    "pr_url": "https://github.com/...",
+    "reason": "...",
+    "summary": "..."
+  }
 }
 ```
 
+- `run_id` must match the `--run-id` argv boundary (`chainlink-<issue>`)
 - `heartbeat_at` must be updated periodically by the factory; if it's stale
   (>5min old), the adapter marks the epic as failed with a stale heartbeat error.
-- `gates_needed` lists gates waiting for answers; the adapter mirrors these as
-  `blocked` status with the first gate name in the reason.
-- `gates_complete` lists gates that have been answered.
+- Gate statuses are under `gates.<name>.status`; pending gates block with the first
+  pending gate name in the reason. `steps[].{agent,status}` and
+  `slices[].{id,status}` are distinct progress collections and both are normalized.
+- `cost_attribution` and `debug_snapshot` are optional, fail-soft diagnostic/display
+  metadata; they never authorize completion, PR linkage, or billing decisions.
+- `terminal_result` is the authoritative outcome at a terminal state; absent is
+  tolerated (the adapter falls back to status/pr_url/gates).
+- Terminal success requires validated `completed` status AND canonical PR URL.
 
 Per-leaf worklink (the rest of this document) is unaffected: file a
 `worklink:ready` leaf that satisfies the strict template (§2.5) and the poller
