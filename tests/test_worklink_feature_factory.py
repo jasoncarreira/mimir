@@ -1779,3 +1779,309 @@ def test_fingerprint_changes_with_status(tmp_path: Path) -> None:
         terminal_result=None,
     )
     assert obs1.fingerprint != obs2.fingerprint
+
+
+CLEANUP_DIGEST = f"ff-cleanup-v1.{('a' * 64)}.{('b' * 64)}"
+
+
+def _cleanup_report(
+    run_id: str, *, mode: str = "preview", eligible: bool = True
+) -> dict:
+    return {
+        "mode": mode,
+        "status": "previewed" if mode == "preview" else "completed",
+        "authorization": {
+            "digest": CLEANUP_DIGEST,
+            "provided_digest": None if mode == "preview" else CLEANUP_DIGEST,
+            "matched": None if mode == "preview" else True,
+        },
+        "candidates": [
+            {
+                "run_id": run_id,
+                "classification": (
+                    "eligible" if eligible and mode == "preview"
+                    else "deleted" if eligible
+                    else "protected"
+                ),
+            }
+        ],
+    }
+
+
+def _lifecycle_alert(run_dir: Path, *, status: str = "completed"):
+    from poller import LifecycleAlert
+
+    return LifecycleAlert(
+        source_id=f"lifecycle:chainlink-100:{run_dir}",
+        signal="worklink_factory_actionable",
+        run_id="chainlink-100",
+        issue_id=100,
+        attempt=None,
+        physical_path=str(run_dir),
+        prior_fingerprint=None,
+        current_fingerprint="fingerprint",
+        status=status,
+        prior_status=None,
+        reason=None,
+        pr_url=PR_URL,
+        pending_gate=None,
+        liveness_class="unknown",
+        validity_class="valid",
+        validator_verdict="GO",
+        security_verdict="PASS",
+        cleanup_eligible=status == "completed",
+        routing_instructions="safe cleanup only",
+    )
+
+
+def _save_cleanup_cursor(state_dir: Path, run_dir: Path) -> None:
+    from poller import CursorEntry, LifecycleCursor, _save_cursor
+
+    key = f"chainlink-100:{run_dir}"
+    _save_cursor(
+        state_dir,
+        LifecycleCursor(
+            entries={
+                key: CursorEntry(
+                    run_id="chainlink-100",
+                    issue_id=100,
+                    attempt=None,
+                    physical_path=str(run_dir),
+                    fingerprint="fingerprint",
+                    last_observed=_now(),
+                    alerted=False,
+                    alerted_at=None,
+                )
+            }
+        ),
+    )
+
+
+def test_is_pr_merged_uses_canonical_url_and_fails_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import poller
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="MERGED\n", stderr="")
+
+    monkeypatch.setattr(poller.subprocess, "run", fake_run)
+    assert poller._is_pr_merged(PR_URL, tmp_path)
+    assert calls == [["gh", "pr", "view", PR_URL, "--json", "state", "--jq", ".state"]]
+
+    calls.clear()
+    assert not poller._is_pr_merged("https://example.com/pull/42", tmp_path)
+    assert calls == []
+
+    monkeypatch.setattr(
+        poller.subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="unavailable"
+        ),
+    )
+    assert not poller._is_pr_merged(PR_URL, tmp_path)
+
+
+def test_run_factory_cleanup_binds_execute_to_preview_digest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import poller
+
+    calls: list[list[str]] = []
+    reports = [
+        _cleanup_report("chainlink-100"),
+        _cleanup_report("chainlink-100", mode="execute"),
+    ]
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps(reports.pop(0)), stderr=""
+        )
+
+    monkeypatch.setattr(poller.subprocess, "run", fake_run)
+    success, _, preview = poller._run_factory_cleanup(tmp_path, dry_run=True)
+    assert success
+    digest = poller._cleanup_digest_for_run(preview, "chainlink-100")
+    assert digest == CLEANUP_DIGEST
+    success, _, _ = poller._run_factory_cleanup(
+        tmp_path, dry_run=False, digest=digest
+    )
+    assert success
+    assert calls == [
+        ["factory", "cleanup", "--all", "--dry-run", "--json"],
+        [
+            "factory",
+            "cleanup",
+            "--all",
+            "--digest",
+            CLEANUP_DIGEST,
+            "--json",
+        ],
+    ]
+    assert all("--force" not in call for call in calls)
+
+
+def test_run_factory_cleanup_refuses_unbound_execute(tmp_path: Path, monkeypatch) -> None:
+    import poller
+
+    called = False
+
+    def fake_run(cmd, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("factory must not run without an evidence digest")
+
+    monkeypatch.setattr(poller.subprocess, "run", fake_run)
+    success, message, report = poller._run_factory_cleanup(tmp_path, dry_run=False)
+    assert not success
+    assert "requires a valid preview digest" in message
+    assert report is None
+    assert not called
+
+
+def test_attempt_cleanup_dry_runs_then_executes_exact_digest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import poller
+
+    state_dir = tmp_path / "state"
+    run_dir = tmp_path / ".opencode" / "factory" / "chainlink-100"
+    run_dir.mkdir(parents=True)
+    _save_cleanup_cursor(state_dir, run_dir)
+    calls: list[tuple[Path, bool, str | None]] = []
+
+    def fake_cleanup(worktree, dry_run=True, *, digest=None):
+        calls.append((worktree, dry_run, digest))
+        if dry_run:
+            return True, "previewed", _cleanup_report("chainlink-100")
+        return True, "executed", _cleanup_report("chainlink-100", mode="execute")
+
+    monkeypatch.setattr(poller, "_run_factory_cleanup", fake_cleanup)
+    failed = poller._attempt_cleanup(
+        tmp_path, state_dir, [_lifecycle_alert(run_dir)]
+    )
+    assert failed == []
+    assert calls == [
+        (tmp_path, True, None),
+        (tmp_path, False, CLEANUP_DIGEST),
+    ]
+    cursor = poller._load_cursor(state_dir)
+    entry = cursor.entries[f"chainlink-100:{run_dir}"]
+    assert entry.cleaned and entry.tombstone
+
+
+def test_attempt_cleanup_alerts_on_empty_preview_without_executing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import poller
+
+    state_dir = tmp_path / "state"
+    run_dir = tmp_path / ".opencode" / "factory" / "chainlink-100"
+    run_dir.mkdir(parents=True)
+    _save_cleanup_cursor(state_dir, run_dir)
+    calls: list[tuple[Path, bool, str | None]] = []
+
+    def fake_cleanup(worktree, dry_run=True, *, digest=None):
+        calls.append((worktree, dry_run, digest))
+        assert dry_run
+        return True, "previewed", _cleanup_report("chainlink-100", eligible=False)
+
+    monkeypatch.setattr(poller, "_run_factory_cleanup", fake_cleanup)
+    alert = _lifecycle_alert(run_dir)
+    assert poller._attempt_cleanup(tmp_path, state_dir, [alert]) == [alert]
+    assert calls == [(tmp_path, True, None)]
+    entry = poller._load_cursor(state_dir).entries[f"chainlink-100:{run_dir}"]
+    assert not entry.cleaned and not entry.tombstone
+
+
+def test_attempt_cleanup_requires_execute_to_report_run_deleted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import poller
+
+    state_dir = tmp_path / "state"
+    run_dir = tmp_path / ".opencode" / "factory" / "chainlink-100"
+    run_dir.mkdir(parents=True)
+    _save_cleanup_cursor(state_dir, run_dir)
+
+    def fake_cleanup(worktree, dry_run=True, *, digest=None):
+        if dry_run:
+            return True, "previewed", _cleanup_report("chainlink-100")
+        return True, "executed", _cleanup_report(
+            "chainlink-100", mode="execute", eligible=False
+        )
+
+    monkeypatch.setattr(poller, "_run_factory_cleanup", fake_cleanup)
+    alert = _lifecycle_alert(run_dir)
+    assert poller._attempt_cleanup(tmp_path, state_dir, [alert]) == [alert]
+    entry = poller._load_cursor(state_dir).entries[f"chainlink-100:{run_dir}"]
+    assert not entry.cleaned and not entry.tombstone
+
+
+def test_reconcile_cleanup_eligible_only_for_completed_merged_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import poller
+
+    run_dir = tmp_path / ".opencode" / "factory" / "chainlink-100"
+    run_dir.mkdir(parents=True)
+
+    def observation(status: str) -> poller.FactoryRunObservation:
+        return poller.FactoryRunObservation(
+            run_id="chainlink-100",
+            issue_id=100,
+            attempt=None,
+            physical_path=run_dir,
+            status=status,
+            pr_url=PR_URL,
+            reason=None,
+            summary=None,
+            pending_gate=None,
+            is_terminal=status in {"completed", "blocked", "partial", "needs-human"},
+            is_stale=False,
+            validator_verdict="GO",
+            security_verdict="PASS",
+            terminal_result=None,
+            validity_class="valid",
+        )
+
+    current = observation("completed")
+    merged = True
+    monkeypatch.setattr(
+        poller,
+        "_discover_factory_runs",
+        lambda repo: [(tmp_path, run_dir, "chainlink-100")],
+    )
+    monkeypatch.setattr(poller, "_observe_factory_run", lambda root, run_id: current)
+    monkeypatch.setattr(poller, "_is_pr_merged", lambda pr_url, repo: merged)
+
+    alerts, cleanup = poller._reconcile_factory_runs(tmp_path, tmp_path / "merged")
+    assert alerts == []
+    assert [alert.run_id for alert in cleanup] == ["chainlink-100"]
+
+    merged = False
+    _, cleanup = poller._reconcile_factory_runs(tmp_path, tmp_path / "open")
+    assert cleanup == []
+
+    merged = True
+    for status in ("blocked", "partial", "needs-human"):
+        current = observation(status)
+        _, cleanup = poller._reconcile_factory_runs(
+            tmp_path, tmp_path / f"state-{status}"
+        )
+        assert cleanup == [], status
+
+    current = observation("completed")
+    object.__setattr__(current, "validity_class", "invalid")
+    _, cleanup = poller._reconcile_factory_runs(tmp_path, tmp_path / "invalid")
+    assert cleanup == []
+
+    current = observation("completed")
+    object.__setattr__(current, "liveness_class", "stale")
+    _, cleanup = poller._reconcile_factory_runs(tmp_path, tmp_path / "stale")
+    assert cleanup == []

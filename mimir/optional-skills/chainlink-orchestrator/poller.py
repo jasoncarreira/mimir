@@ -625,15 +625,13 @@ def _save_cursor(state_dir: Path, cursor: LifecycleCursor) -> None:
 
 
 def _is_pr_merged(pr_url: str | None, repo: Path) -> bool:
-    if not pr_url:
+    if not pr_url or not re.fullmatch(
+        r"https://github\.com/[^/]+/[^/]+/pull/[1-9]\d*", pr_url
+    ):
         return False
-    match = re.search(r"/pull/(\d+)", pr_url)
-    if not match:
-        return False
-    pr_number = match.group(1)
     try:
         proc = subprocess.run(
-            ["gh", "pr", "view", pr_number, "--state", "--json", "state", "-t", "{{.state}}"],
+            ["gh", "pr", "view", pr_url, "--json", "state", "--jq", ".state"],
             cwd=str(repo),
             capture_output=True,
             text=True,
@@ -647,13 +645,20 @@ def _is_pr_merged(pr_url: str | None, repo: Path) -> bool:
     return proc.stdout.strip().lower() == "merged"
 
 
+_CLEANUP_DIGEST = re.compile(r"ff-cleanup-v1\.[0-9a-f]{64}\.[0-9a-f]{64}")
+
+
 def _run_factory_cleanup(
-    worktree: Path, dry_run: bool = True
-) -> tuple[bool, str, list[dict] | None]:
-    cmd = ["factory", "cleanup", "--all"]
+    worktree: Path, dry_run: bool = True, *, digest: str | None = None
+) -> tuple[bool, str, dict | None]:
     if dry_run:
-        cmd.append("--dry-run")
-    cmd.append("--json")
+        if digest is not None:
+            return False, "dry-run cleanup cannot accept a digest", None
+        cmd = ["factory", "cleanup", "--all", "--dry-run", "--json"]
+    else:
+        if digest is None or not _CLEANUP_DIGEST.fullmatch(digest):
+            return False, "cleanup execution requires a valid preview digest", None
+        cmd = ["factory", "cleanup", "--all", "--digest", digest, "--json"]
     try:
         proc = subprocess.run(
             cmd,
@@ -668,14 +673,64 @@ def _run_factory_cleanup(
     if proc.returncode != 0:
         return False, proc.stderr or proc.stdout, None
     try:
-        digest = json.loads(proc.stdout)
-        if not isinstance(digest, list):
-            return False, "invalid digest format", None
-        if dry_run:
-            return True, "dry-run success", digest
-        return True, "cleanup executed", None
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        report = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError) as exc:
         return False, str(exc), None
+    if not isinstance(report, dict):
+        return False, "invalid cleanup report format", None
+    authorization = report.get("authorization")
+    if not isinstance(authorization, dict):
+        return False, "cleanup report is missing authorization", None
+    report_digest = authorization.get("digest")
+    if not isinstance(report_digest, str) or not _CLEANUP_DIGEST.fullmatch(report_digest):
+        return False, "cleanup report is missing a valid digest", None
+    if dry_run:
+        if report.get("mode") != "preview" or report.get("status") != "previewed":
+            return False, "cleanup preview did not complete", None
+        return True, "dry-run success", report
+    if (
+        report.get("mode") != "execute"
+        or report.get("status") != "completed"
+        or authorization.get("provided_digest") != digest
+        or authorization.get("matched") is not True
+        or report_digest != digest
+    ):
+        return False, "cleanup execution did not confirm the preview digest", None
+    return True, "cleanup executed", report
+
+
+def _cleanup_candidate_has_classification(
+    report: dict | None, run_id: str, classification: str
+) -> bool:
+    if not isinstance(report, dict):
+        return False
+    candidates = report.get("candidates")
+    return isinstance(candidates, list) and any(
+        isinstance(candidate, dict)
+        and candidate.get("run_id") == run_id
+        and candidate.get("classification") == classification
+        for candidate in candidates
+    )
+
+
+def _cleanup_digest_for_run(report: dict | None, run_id: str) -> str | None:
+    if not isinstance(report, dict):
+        return None
+    authorization = report.get("authorization")
+    if not isinstance(authorization, dict):
+        return None
+    digest = authorization.get("digest")
+    if not isinstance(digest, str) or not _CLEANUP_DIGEST.fullmatch(digest):
+        return None
+    if not _cleanup_candidate_has_classification(report, run_id, "eligible"):
+        return None
+    return digest
+
+
+def _factory_worktree_for_run(run_dir: Path) -> Path | None:
+    if run_dir.parent.name != "factory" or run_dir.parent.parent.name != ".opencode":
+        return None
+    return run_dir.parent.parent.parent
 
 
 def _reconcile_factory_runs(
@@ -704,6 +759,8 @@ def _reconcile_factory_runs(
         cleanup_eligible = (
             obs.is_terminal
             and obs.status.strip().lower() == "completed"
+            and obs.validity_class == "valid"
+            and obs.liveness_class != "stale"
             and obs.pr_url
             and _is_pr_merged(obs.pr_url, repo)
         )
@@ -725,7 +782,8 @@ def _reconcile_factory_runs(
                 pass
         elif prior.alerted and is_actionable:
             should_alert = True
-        if should_alert:
+        alert: LifecycleAlert | None = None
+        if should_alert or cleanup_eligible:
             status = obs.status.strip().lower()
             routing = "Inspect and perform only safe/reversible remediation."
             if cleanup_eligible:
@@ -757,9 +815,10 @@ def _reconcile_factory_runs(
                 cleanup_eligible=cleanup_eligible,
                 routing_instructions=routing,
             )
+        if should_alert and alert is not None:
             new_alerts.append(alert)
-            if cleanup_eligible:
-                cleanup_alerts.append(alert)
+        if cleanup_eligible and alert is not None:
+            cleanup_alerts.append(alert)
         entry = CursorEntry(
             run_id=obs.run_id,
             issue_id=obs.issue_id,
@@ -795,8 +854,8 @@ def _attempt_cleanup(
         entry = cursor.entries.get(key)
         if not entry or entry.cleaned:
             continue
-        worktree = Path(alert.physical_path)
-        if not worktree.exists():
+        run_dir = Path(alert.physical_path)
+        if not run_dir.exists():
             updated_entries[key] = CursorEntry(
                 run_id=entry.run_id,
                 issue_id=entry.issue_id,
@@ -811,27 +870,24 @@ def _attempt_cleanup(
                 tombstone=True,
             )
             continue
-        success, msg, digest = _run_factory_cleanup(worktree, dry_run=True)
+        worktree = _factory_worktree_for_run(run_dir)
+        if worktree is None:
+            failed_alerts.append(alert)
+            continue
+        success, msg, preview = _run_factory_cleanup(worktree, dry_run=True)
         if not success:
             failed_alerts.append(alert)
             continue
-        if not digest:
-            updated_entries[key] = CursorEntry(
-                run_id=entry.run_id,
-                issue_id=entry.issue_id,
-                attempt=entry.attempt,
-                physical_path=entry.physical_path,
-                fingerprint=entry.fingerprint,
-                last_observed=now,
-                alerted=False,
-                alerted_at=entry.alerted_at,
-                cleaned=True,
-                cleaned_at=now,
-                tombstone=True,
-            )
+        digest = _cleanup_digest_for_run(preview, alert.run_id)
+        if digest is None:
+            failed_alerts.append(alert)
             continue
-        success, msg, _ = _run_factory_cleanup(worktree, dry_run=False)
-        if success:
+        success, msg, execute_report = _run_factory_cleanup(
+            worktree, dry_run=False, digest=digest
+        )
+        if success and _cleanup_candidate_has_classification(
+            execute_report, alert.run_id, "deleted"
+        ):
             updated_entries[key] = CursorEntry(
                 run_id=entry.run_id,
                 issue_id=entry.issue_id,
