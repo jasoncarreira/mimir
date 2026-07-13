@@ -384,6 +384,7 @@ class WorklinkRunner:
             chainlink_bin=self.chainlink_bin,
             agent_id=self.agent_id,
             runner=_list_runner(runner),
+            home_path=self.home,
         )
         # Re-read immediately before claiming so retries in a long-lived caller do
         # not use stale comments and collide with prior attempt-scoped branches.
@@ -391,6 +392,7 @@ class WorklinkRunner:
         claim = claims.claim_issue(
             issue.issue_id,
             issue.comments,
+            labels=issue.labels,
             max_active_locks=config.defaults.max_concurrent if autonomous else None,
         )
         if claim.attempts_exhausted:
@@ -744,6 +746,7 @@ class WorklinkRunner:
             chainlink_bin=self.chainlink_bin,
             agent_id=self.agent_id,
             runner=_list_runner(runner),
+            home_path=self.home,
         )
         # Only resume a leaf still in-progress. If the reaper already recovered it
         # (or a prior run transitioned it) the work is no longer ours to finish —
@@ -943,6 +946,7 @@ class WorklinkRunner:
             chainlink_bin=self.chainlink_bin,
             agent_id=self.agent_id,
             runner=_list_runner(runner),
+            home_path=self.home,
         )
 
         if has_concurrent_factory_session(self.repo, exclude_run_id=epic_run_id(issue_id)):
@@ -957,6 +961,7 @@ class WorklinkRunner:
         claim = claims.claim_issue(
             issue.issue_id,
             issue.comments,
+            labels=issue.labels,
             max_active_locks=config.defaults.max_concurrent if autonomous else None,
         )
         if claim.attempts_exhausted:
