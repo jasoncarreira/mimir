@@ -181,7 +181,7 @@ class RateLimitStore:
         stale and must be removed, not left to linger. :meth:`current` only
         drops entries by ``resets_at``, so a misclassified key carrying a
         future reset — e.g. a 7-day reset written under ``openai_five_hour``
-        by an older position-based mapper (chainlink #874) — would otherwise
+        by an older position-based mapper (#1058) — would otherwise
         survive for the whole window and keep the panel/arbiter reading a
         phantom 5h bucket. Popping absent owned keys keeps the on-disk set
         for this provider exactly equal to what the snapshot reported.

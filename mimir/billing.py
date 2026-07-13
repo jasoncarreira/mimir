@@ -460,7 +460,7 @@ def make_codex_plus_rate_limit_callback(
                 "status": "allowed",
             }
         # Write the reported windows AND drop any Codex-owned key the snapshot
-        # did NOT report this round, in one atomic write (chainlink #874). On a
+        # did NOT report this round, in one atomic write (#1058). On a
         # Pro plan the callback reports only the 7d window; an older
         # position-based mapper had already stored that 7d usage under
         # ``openai_five_hour`` with the 7-day reset, so ``current()`` (which
