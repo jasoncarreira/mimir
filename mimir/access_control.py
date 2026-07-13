@@ -68,7 +68,7 @@ class ResourceScope:
     sink_destinations: frozenset[str] = frozenset()
 
 
-@dataclass
+@dataclass(frozen=True)
 class ServicePrincipal:
     """Trusted autonomous service principal (chainlink #865).
 
@@ -84,13 +84,9 @@ class ServicePrincipal:
     creation_path: str | None = None
 
     def can_read_domain(self, domain: str) -> bool:
-        if not self.readable_domains:
-            return False
         return domain in self.readable_domains
 
     def can_write_sink(self, sink: str) -> bool:
-        if not self.sink_destinations:
-            return False
         return sink in self.sink_destinations
 
     def has_capability(self, capability: str) -> bool:
@@ -262,6 +258,15 @@ class ToolAuthorization:
         }
 
 
+def _consume_task_exception(task: Any) -> None:
+    """Retrieve background logging failures so asyncio does not warn."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error("shadow decision logging failed", exc_info=exc)
+
+
 class ToolRegistry:
     """Registry of runtime tools for inventory and authorization (chainlink #865).
 
@@ -307,6 +312,23 @@ class ToolRegistry:
         """List all registered tool names."""
         return list(self._tools.keys())
 
+    def clear(self) -> None:
+        """Clear the inventory before registering a newly assembled surface."""
+        self._tools.clear()
+
+    def register_runtime_tools(self, tools: Any) -> None:
+        """Replace the inventory from a final model-bound runtime tool sequence."""
+        self.clear()
+        for tool in tools or ():
+            name = getattr(tool, "name", None)
+            if not isinstance(name, str) or not name:
+                continue
+            self.register_tool(
+                name,
+                description=getattr(tool, "description", None),
+                category="runtime",
+            )
+
     def list_by_category(self, category: str) -> list[str]:
         """List tools in a specific category."""
         return [
@@ -346,7 +368,7 @@ class ToolRegistry:
             task = loop.create_task(
                 log_event("shadow_tool_decision", **auth.as_log_fields())
             )
-            task.add_done_callback(lambda t: t.exception() if not t.done() else None)
+            task.add_done_callback(_consume_task_exception)
         except RuntimeError:
             log.debug("shadow decision logging skipped: no running event loop")
 
@@ -369,7 +391,8 @@ class ToolRegistry:
 
         if auth_context is not None:
             trigger = getattr(auth_context, "trigger", None)
-            if trigger:
+            event_ingress = getattr(auth_context, "event_ingress", None)
+            if trigger and event_ingress is None:
                 service_principal = _find_service_principal_for_trigger(trigger)
 
         required_tier = AccessTier.USER
@@ -380,12 +403,20 @@ class ToolRegistry:
             allowed = True
         elif decision == OperationDecision.ADMIN_REQUIRED:
             required_tier = AccessTier.ADMIN
-            if enforce:
-                if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
-                    allowed = True
-                else:
-                    allowed = False
-                    reason = "admin_required"
+            service_allowed = service_principal is not None and (
+                service_principal.has_capability(tool_name)
+                or (
+                    service_principal.has_capability("admin_required")
+                    and self.get_tool(tool_name) is not None
+                )
+            )
+            if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
+                allowed = True
+            elif service_allowed:
+                allowed = True
+            elif enforce:
+                allowed = False
+                reason = "admin_required"
             else:
                 allowed = True
                 is_shadow = True
@@ -430,7 +461,43 @@ def get_tool_registry() -> ToolRegistry:
     return _global_tool_registry
 
 
-_TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {}
+_TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
+    service.trigger: service
+    for service in (
+        ServicePrincipal(
+            canonical="scheduler",
+            trigger="scheduled_tick",
+            capabilities=("admin_required",),
+            readable_domains=("configured_inputs",),
+            sink_destinations=("configured_channel",),
+            creation_path="mimir.scheduler.Scheduler._fire_job",
+        ),
+        ServicePrincipal(
+            canonical="poller",
+            trigger="poller",
+            capabilities=("admin_required",),
+            readable_domains=("poller_payload",),
+            sink_destinations=("configured_channel",),
+            creation_path="mimir.pollers.run_poller",
+        ),
+        ServicePrincipal(
+            canonical="synthesis",
+            trigger="saga_session_end",
+            capabilities=("saga_end_session", "saga_mark_contributions"),
+            readable_domains=("session", "saga"),
+            sink_destinations=("session_boundary",),
+            creation_path="mimir.server._on_session_idle",
+        ),
+        ServicePrincipal(
+            canonical="system",
+            trigger="upgrade",
+            capabilities=("admin_required",),
+            readable_domains=("defaults", "proposal"),
+            sink_destinations=("operator_alert",),
+            creation_path="mimir.defaults_upgrade.enqueue_upgrade_prompt_turns",
+        ),
+    )
+}
 
 
 def register_service_principal(service: ServicePrincipal) -> None:

@@ -47,12 +47,7 @@ from langgraph.types import Command
 
 from ..models import AuthContext
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
-from ..access_control import (
-    get_operation_catalog,
-    OperationDecision,
-    get_tool_registry,
-    ToolAuthorization,
-)
+from ..access_control import get_tool_registry
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
 log = logging.getLogger(__name__)
@@ -245,23 +240,13 @@ def _tool_call_id(request: ToolCallRequest) -> str:
 
 
 def _is_admin_sensitive_tool(tool_name: str, ctx: AuthContext | None = None) -> bool:
-    """Check if a tool requires admin authorization.
-
-    Uses the OperationCatalog for authoritative decisions. Unknown tools
-    fail closed (return True) when enforcement is on, ensuring no implicit
-    open access for unknown operations.
-    """
-    catalog = get_operation_catalog()
-    decision = catalog.get_decision(tool_name, ctx)
-
-    if decision == OperationDecision.ADMIN_REQUIRED:
-        return True
-
-    if decision == OperationDecision.UNKNOWN:
-        enforce = ctx is not None and getattr(ctx, "enforcement_enabled", False)
-        return enforce
-
-    return False
+    """Return whether the live decision surface requires a privileged check."""
+    auth = get_tool_registry().authorize_tool(
+        tool_name,
+        ctx,
+        enforce=bool(ctx is not None and ctx.enforcement_enabled),
+    )
+    return auth.required_tier.value == "admin" or not auth.allowed
 
 
 def _admin_denial_message(tool_name: str, reason: str | None) -> str:
@@ -327,39 +312,41 @@ def _deny_admin_tool(
 
 
 def _check_admin_authorized(tool_name: str, ctx: Any | None = None) -> str | None:
-    if not _is_admin_sensitive_tool(tool_name, ctx):
+    enforce = (
+        bool(getattr(ctx, "enforcement_enabled", False))
+        if ctx is not None
+        else _env_access_control_enforced()
+    )
+    auth = get_tool_registry().authorize_tool(tool_name, ctx, enforce=enforce)
+    privileged = auth.required_tier.value == "admin" or not auth.allowed
+    if not privileged:
         return None
 
-    if ctx is None:
-        if _env_access_control_enforced():
-            return _deny_admin_tool(
-                tool_name,
-                "missing_auth_context",
-                ctx=None,
-                enforcement_enabled=True,
-            )
-        return None
+    if ctx is None and enforce:
+        return _deny_admin_tool(
+            tool_name,
+            "missing_auth_context",
+            ctx=None,
+            enforcement_enabled=True,
+        )
 
-    # ``ctx`` is the frozen AuthContext bound to this exact tool request (or,
-    # on the Claude SDK path, the exact model invocation). Mutable TurnContext
-    # fields and identity resolvers are deliberately not consulted here.
-    enforce = bool(getattr(ctx, "enforcement_enabled", False))
-    if _turn_has_http_event_ingress(ctx):
+    # Generic HTTP events authenticate transport only. They cannot inherit a
+    # service principal from a client-controlled trigger or call a non-open op.
+    if ctx is not None and _turn_has_http_event_ingress(ctx):
         return _deny_admin_tool(
             tool_name,
             _HTTP_EVENT_ADMIN_DENIAL_REASON,
             ctx=ctx,
             enforcement_enabled=enforce,
         )
-    if not enforce:
-        return None
-    if "admin" in (getattr(ctx, "roles", ()) or ()):
+
+    if auth.allowed:
         return None
     return _deny_admin_tool(
         tool_name,
-        "admin_required",
+        auth.reason or "admin_required",
         ctx=ctx,
-        enforcement_enabled=True,
+        enforcement_enabled=enforce,
     )
 
 
@@ -423,6 +410,25 @@ class BudgetGateMiddleware(AgentMiddleware):
     ``ToolCallRequest.runtime.context``. Claude SDK tools have no exact carrier
     in the current hook API and therefore fail closed under enforcement.
     """
+
+    def __init__(self) -> None:
+        # Compatibility mode remains permissive, but every non-open decision is
+        # emitted so operators can inspect what enforcement would have done.
+        get_tool_registry().enable_shadow_logging()
+
+    def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        """Inventory the exact final tool surface presented to the model."""
+        get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
+        return handler(request)
+
+    async def awrap_model_call(
+        self,
+        request: Any,
+        handler: Callable[[Any], Awaitable[Any]],
+    ) -> Any:
+        """Async counterpart to :meth:`wrap_model_call`."""
+        get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
+        return await handler(request)
 
     def wrap_tool_call(
         self,
