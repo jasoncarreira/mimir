@@ -568,3 +568,446 @@ async def test_bridge_tool_renders_text_content() -> None:
     )
     out = await tool.coroutine()
     assert out == "hello"
+
+
+class TestMCPProvenance:
+    """Tests for MCP provenance tracking (chainlink #870)."""
+
+    def test_provenance_creation(self) -> None:
+        from mimir.mcp_client import MCPServerConfig, MCPProvenance
+
+        config = MCPServerConfig(
+            name="github", command="uvx", args=["mcp-server-github"]
+        )
+        provenance = MCPProvenance.create(
+            config=config,
+            tool_name="search_repos",
+            input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+        )
+        assert provenance.server_config_id is not None
+        assert provenance.original_tool_name == "search_repos"
+        assert provenance.config_digest != ""
+        assert provenance.schema_digest != ""
+        assert provenance.is_tombstoned is False
+
+    def test_provenance_config_digest_excludes_secrets(self) -> None:
+        from mimir.mcp_client import MCPServerConfig, _canonical_config_digest
+
+        config_with_secret = MCPServerConfig(
+            name="github",
+            command="uvx",
+            args=["mcp-server-github"],
+            env={"GITHUB_TOKEN": "secret123"},
+        )
+        config_without_secret = MCPServerConfig(
+            name="github",
+            command="uvx",
+            args=["mcp-server-github"],
+            env={},
+        )
+        digest_with = _canonical_config_digest(config_with_secret)
+        digest_without = _canonical_config_digest(config_without_secret)
+        assert digest_with == digest_without
+
+    def test_provenance_schema_digest(self) -> None:
+        from mimir.mcp_client import _schema_digest
+
+        schema1 = {"type": "object", "properties": {"a": {"type": "string"}}}
+        schema2 = {"type": "object", "properties": {"a": {"type": "string"}}}
+        schema3 = {"type": "object", "properties": {"b": {"type": "integer"}}}
+
+        digest1 = _schema_digest(schema1)
+        digest2 = _schema_digest(schema2)
+        digest3 = _schema_digest(schema3)
+
+        assert digest1 == digest2
+        assert digest1 != digest3
+
+    def test_provenance_attached_to_tool(self) -> None:
+        from mimir.mcp_client import _bridge_mcp_tool, get_tool_provenance, MCPServerConfig, MCPProvenance
+        from mimir.tools.mcp import clear_mcp_tools
+
+        clear_mcp_tools()
+
+        class _Dummy:
+            pass
+
+        config = MCPServerConfig(name="test", command="x", args=[])
+        provenance = MCPProvenance.create(
+            config=config,
+            tool_name="ping",
+            input_schema={},
+        )
+        tool = _bridge_mcp_tool(
+            server_name="test",
+            tool_name="ping",
+            description="",
+            input_schema={},
+            session=_Dummy(),
+            provenance=provenance,
+        )
+        retrieved = get_tool_provenance(tool)
+        assert retrieved is not None
+        assert retrieved.original_tool_name == "ping"
+
+    def test_provenance_with_drift_detection(self) -> None:
+        from mimir.mcp_client import MCPServerConfig, MCPProvenance
+
+        config = MCPServerConfig(
+            name="github", command="uvx", args=["mcp-server-github"]
+        )
+        original = MCPProvenance.create(
+            config=config,
+            tool_name="search",
+            input_schema={"type": "object", "properties": {"q": {"type": "string"}}},
+        )
+        assert original.is_tombstoned is False
+
+        drifted = original.with_drift_detection(
+            config=config,
+            tool_name="search",
+            input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+        )
+        assert drifted.is_tombstoned is True
+
+    def test_provenance_name_change_triggers_tombstone(self) -> None:
+        from mimir.mcp_client import MCPServerConfig, MCPProvenance
+
+        config = MCPServerConfig(name="test", command="x", args=[])
+        original = MCPProvenance.create(
+            config=config,
+            tool_name="old_name",
+            input_schema={},
+        )
+        drifted = original.with_drift_detection(
+            config=config,
+            tool_name="new_name",
+            input_schema={},
+        )
+        assert drifted.is_tombstoned is True
+
+
+class TestMCPAdapterRegistry:
+    """Tests for MCP adapter registry."""
+
+    def test_register_and_get_adapter(self) -> None:
+        from mimir.mcp_client import register_mcp_adapter, get_mcp_adapter_info
+
+        register_mcp_adapter("my-adapter", "v1.0", "policy-v1")
+        info = get_mcp_adapter_info("my-adapter")
+        assert info is not None
+        assert info["version"] == "v1.0"
+
+    def test_get_nonexistent_adapter(self) -> None:
+        from mimir.mcp_client import get_mcp_adapter_info
+
+        assert get_mcp_adapter_info("nonexistent") is None
+
+
+class TestMCPResourceAdapter:
+    """Tests for MCP authorization (chainlink #870)."""
+
+    def test_mcp_tool_requires_admin_when_no_tools_registered(self) -> None:
+        from mimir.access_control import (
+            MCPResourceAdapter,
+            OperationDecision,
+        )
+        from mimir.tools.mcp import clear_mcp_tools
+
+        clear_mcp_tools()
+
+        decision = MCPResourceAdapter.get_decision("mcp_github_ping", None)
+        assert decision == OperationDecision.ADMIN_REQUIRED
+
+    def test_non_mcp_tool_passes_through(self) -> None:
+        from mimir.access_control import MCPResourceAdapter
+
+        decision = MCPResourceAdapter.get_decision("bash", None)
+        assert decision is None
+
+    def test_mcp_tool_with_registered_provenance_passes(self) -> None:
+        from mimir.access_control import MCPResourceAdapter, OperationDecision
+        from mimir.mcp_client import MCPServerConfig, MCPProvenance
+        from mimir.tools.mcp import clear_mcp_tools
+
+        clear_mcp_tools()
+
+        from mimir.mcp_client import _bridge_mcp_tool, _tool_provenance_registry
+
+        class _Dummy:
+            pass
+
+        config = MCPServerConfig(name="test", command="x", args=[])
+        provenance = MCPProvenance.create(
+            config=config,
+            tool_name="ping",
+            input_schema={},
+        )
+
+        tool = _bridge_mcp_tool(
+            server_name="test",
+            tool_name="ping",
+            description="",
+            input_schema={},
+            session=_Dummy(),
+            provenance=provenance,
+        )
+
+        from mimir.tools.mcp import set_mcp_tools
+        set_mcp_tools([tool])
+
+        decision = MCPResourceAdapter.get_decision("mcp_test_ping", None)
+        assert decision == OperationDecision.OPEN
+
+    def test_mcp_tool_with_tombstoned_provenance_requires_admin(self) -> None:
+        from mimir.access_control import (
+            MCPResourceAdapter,
+            OperationDecision,
+        )
+        from mimir.mcp_client import MCPServerConfig, MCPProvenance
+        from mimir.tools.mcp import clear_mcp_tools, set_mcp_tools
+        from mimir.mcp_client import _bridge_mcp_tool, _tool_provenance_registry
+
+        clear_mcp_tools()
+
+        class _Dummy:
+            pass
+
+        config = MCPServerConfig(name="test", command="x", args=[])
+        provenance = MCPProvenance.create(
+            config=config,
+            tool_name="ping",
+            input_schema={},
+        )
+        tombstoned = provenance.with_drift_detection(
+            config=config,
+            tool_name="ping",
+            input_schema={"type": "object"},
+        )
+
+        tool = _bridge_mcp_tool(
+            server_name="test",
+            tool_name="ping",
+            description="",
+            input_schema={"type": "object"},
+            session=_Dummy(),
+            provenance=tombstoned,
+        )
+
+        set_mcp_tools([tool])
+
+        decision = MCPResourceAdapter.get_decision("mcp_test_ping", None)
+        assert decision == OperationDecision.ADMIN_REQUIRED
+
+
+class TestStalePolicyReporting:
+    """Tests for stale policy detection on startup."""
+
+    def test_check_stale_policy_on_startup(self) -> None:
+        from dataclasses import replace
+        from mimir.mcp_client import (
+            MCPServerConfig,
+            MCPProvenance,
+            check_stale_policy_on_startup,
+        )
+
+        config = MCPServerConfig(name="test", command="x", args=[])
+        provenance_v1 = replace(
+            MCPProvenance.create(
+                config=config,
+                tool_name="ping",
+                input_schema={},
+            ),
+            policy_version="policy-v1",
+        )
+
+        provenance_v2 = replace(
+            MCPProvenance.create(
+                config=config,
+                tool_name="pong",
+                input_schema={},
+            ),
+            policy_version="policy-v2",
+        )
+
+        class FakeTool:
+            def __init__(self, name: str, prov: MCPProvenance):
+                self.name = name
+                self.mcp_provenance = prov
+
+        tools = [
+            FakeTool("mcp_test_ping", provenance_v1),
+            FakeTool("mcp_test_pong", provenance_v2),
+        ]
+
+        stale = check_stale_policy_on_startup(tools, "policy-v1")
+        assert len(stale) == 1
+        assert stale[0]["tool_name"] == "mcp_test_pong"
+
+    def test_no_stale_tools_when_all_match(self) -> None:
+        from dataclasses import replace
+        from mimir.mcp_client import (
+            MCPServerConfig,
+            MCPProvenance,
+            check_stale_policy_on_startup,
+        )
+
+        config = MCPServerConfig(name="test", command="x", args=[])
+        provenance = replace(
+            MCPProvenance.create(
+                config=config,
+                tool_name="ping",
+                input_schema={},
+            ),
+            policy_version="policy-v1",
+        )
+
+        class FakeTool:
+            def __init__(self, name: str, prov: MCPProvenance):
+                self.name = name
+                self.mcp_provenance = prov
+
+        tools = [FakeTool("mcp_test_ping", provenance)]
+
+        stale = check_stale_policy_on_startup(tools, "policy-v1")
+        assert stale == []
+
+    def test_non_mcp_tools_ignored(self) -> None:
+        from mimir.mcp_client import check_stale_policy_on_startup
+
+        class FakeTool:
+            name = "bash"
+
+        stale = check_stale_policy_on_startup([FakeTool()], "policy-v1")
+        assert stale == []
+
+
+class TestUnderscoreDisplayNameCollisions:
+    """Tests for underscore/display-name collision handling."""
+
+    def test_underscore_in_tool_name(self) -> None:
+        from mimir.mcp_client import _bridge_mcp_tool
+
+        class _Dummy:
+            pass
+
+        tool = _bridge_mcp_tool(
+            server_name="my_server",
+            tool_name="get_user_profile",
+            description="Get user profile",
+            input_schema={},
+            session=_Dummy(),
+        )
+        assert tool.name == "mcp_my_server_get_user_profile"
+
+    def test_collision_detection_in_manager(self) -> None:
+        from mimir.mcp_client import MCPManager, MCPServerConfig
+        from mimir.tools.mcp import clear_mcp_tools, set_mcp_tools
+
+        clear_mcp_tools()
+
+        class _FakeMCPTool:
+            def __init__(self, name: str):
+                self.name = name
+                self.description = ""
+                self.inputSchema = {}
+
+        class _FakeListResult:
+            def __init__(self, tools: list):
+                self.tools = tools
+
+        class _FakeSession:
+            async def initialize(self) -> None:
+                pass
+
+            async def list_tools(self) -> _FakeListResult:
+                return _FakeListResult([_FakeMCPTool("get_user")])
+
+        from contextlib import AsyncExitStack
+
+        async def fake_connect(self, config):  # type: ignore[no-untyped-def]
+            return MCPConnection(
+                config=config,
+                session=_FakeSession(),
+                exit_stack=AsyncExitStack(),
+            )
+
+        import asyncio
+        from mimir.mcp_client import MCPConnection
+
+        mgr = MCPManager()
+        cfg = MCPServerConfig(name="test", command="x", args=[])
+
+        orig_connect = MCPManager._connect
+        MCPManager._connect = fake_connect
+
+        async def run_test():
+            tools = await mgr.start_servers([cfg])
+            return tools
+
+        try:
+            tools = asyncio.run(run_test())
+            assert len(tools) == 1
+            assert tools[0].name == "mcp_test_get_user"
+        finally:
+            MCPManager._connect = orig_connect
+            clear_mcp_tools()
+
+
+class TestDuplicateProvenance:
+    """Tests for duplicate provenance detection."""
+
+    def test_different_servers_same_tool_name(self) -> None:
+        from mimir.mcp_client import MCPServerConfig, MCPProvenance
+
+        config_a = MCPServerConfig(name="server_a", command="x", args=[])
+        config_b = MCPServerConfig(name="server_b", command="y", args=[])
+
+        prov_a = MCPProvenance.create(
+            config=config_a,
+            tool_name="ping",
+            input_schema={},
+        )
+        prov_b = MCPProvenance.create(
+            config=config_b,
+            tool_name="ping",
+            input_schema={},
+        )
+
+        assert prov_a.server_config_id != prov_b.server_config_id
+        assert prov_a.config_digest != prov_b.config_digest
+
+    def test_immutable_server_config_id(self) -> None:
+        from mimir.mcp_client import MCPServerConfig, MCPProvenance
+
+        config = MCPServerConfig(name="test", command="x", args=[])
+        prov = MCPProvenance.create(
+            config=config,
+            tool_name="ping",
+            input_schema={},
+            server_config_id="fixed-id-123",
+        )
+        assert prov.server_config_id == "fixed-id-123"
+
+
+class TestWrapperMetadataLoss:
+    """Tests for wrapper metadata preservation."""
+
+    def test_tool_without_provenance_returns_none(self) -> None:
+        from mimir.mcp_client import get_tool_provenance
+
+        class FakeTool:
+            name = "regular_tool"
+
+        provenance = get_tool_provenance(FakeTool())
+        assert provenance is None
+
+    def test_drift_check_on_none_provenance(self) -> None:
+        from mimir.mcp_client import check_tool_drift, MCPServerConfig
+
+        class FakeTool:
+            name = "mcp_test_ping"
+
+        config = MCPServerConfig(name="test", command="x", args=[])
+        result = check_tool_drift(FakeTool(), config, "ping", {})
+        assert result is None

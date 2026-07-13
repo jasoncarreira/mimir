@@ -392,6 +392,151 @@ _global_operation_catalog.register_adapter_hook(
 )
 
 
+class MCPResourceAdapter:
+    """MCP tool resource adapter for authorization (chainlink #870).
+
+    Handles MCP tool classification:
+    - Missing provenance -> ADMIN_REQUIRED
+    - Tombstoned (drifted) provenance -> ADMIN_REQUIRED
+    - Unclassified MCP tools -> ADMIN_REQUIRED
+    - Resource-scoped classification requires registered adapter
+
+    This ensures bare regular-scoped tier cannot authorize arbitrary
+    MCP arguments without proper classification and provenance.
+    """
+
+    _MCP_TOOL_PREFIX = "mcp_"
+    _global_resolver: Any = None
+
+    @classmethod
+    def set_identity_resolver(cls, resolver: Any) -> None:
+        cls._global_resolver = resolver
+
+    @classmethod
+    def get_decision(
+        cls,
+        tool_name: str,
+        context: Any | None,
+    ) -> OperationDecision | None:
+        """Get decision for MCP tools.
+
+        Returns ADMIN_REQUIRED for MCP tools that:
+        - Have no provenance (not from bridged MCP)
+        - Have tombstoned (drifted) provenance
+
+        Returns OPEN for MCP tools with valid provenance (classified).
+        Returns None for non-MCP tools to fall through to other adapters.
+        """
+        if not tool_name.startswith(cls._MCP_TOOL_PREFIX):
+            return None
+
+        provenance = cls._get_provenance_from_context(tool_name, context)
+
+        if provenance is None:
+            log.debug(
+                "MCP tool %s has no provenance - requiring admin", tool_name
+            )
+            return OperationDecision.ADMIN_REQUIRED
+
+        if provenance.is_tombstoned:
+            log.warning(
+                "MCP tool %s has tombstoned provenance (drift detected) - requiring admin",
+                tool_name,
+            )
+            return OperationDecision.ADMIN_REQUIRED
+
+        return OperationDecision.OPEN
+
+    @classmethod
+    def _get_provenance_from_context(
+        cls,
+        tool_name: str,
+        context: Any | None,
+    ) -> Any | None:
+        """Extract MCP provenance from auth context or tool registry."""
+        if context is not None:
+            provenance = getattr(context, "mcp_provenance", None)
+            if provenance is not None:
+                return provenance
+
+        try:
+            from .mcp_client import get_tool_provenance
+            from .tools.mcp import get_mcp_tools
+
+            for tool in get_mcp_tools():
+                if getattr(tool, "name", None) == tool_name:
+                    return get_tool_provenance(tool)
+        except Exception:
+            pass
+
+        return None
+
+    @classmethod
+    def authorize_mcp_tool(
+        cls,
+        tool_name: str,
+        context: Any | None,
+        *,
+        enforce: bool = False,
+    ) -> "ToolAuthorization":
+        """Authorize an MCP tool call with full provenance checking.
+
+        Args:
+            tool_name: The namespaced MCP tool name (e.g., 'mcp_github_search')
+            context: AuthContext with provenance if available
+            enforce: Whether to enforce or allow in shadow mode
+
+        Returns:
+            ToolAuthorization with decision and reason fields populated
+        """
+        decision = cls.get_decision(tool_name, context)
+
+        if decision is None:
+            decision = OperationDecision.OPEN
+
+        provenance = cls._get_provenance_from_context(tool_name, context)
+
+        allowed = decision != OperationDecision.ADMIN_REQUIRED or not enforce
+
+        reason = None
+        if decision == OperationDecision.ADMIN_REQUIRED:
+            if provenance is None:
+                reason = "mcp_missing_provenance"
+            elif provenance.is_tombstoned:
+                reason = "mcp_drift_detected"
+            else:
+                reason = "mcp_unclassified"
+
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=decision,
+            allowed=allowed,
+            reason=reason,
+            enforcement_enabled=enforce,
+            is_shadow_decision=not enforce and not allowed,
+        )
+
+
+_global_operation_catalog.register_adapter_hook(
+    MCPResourceAdapter.get_decision,
+)
+
+
+_global_mcp_adapter_registry: dict[str, dict[str, str]] = {}
+
+
+def register_mcp_adapter(adapter_name: str, adapter_version: str) -> None:
+    """Register an MCP adapter for resource-scoped classification."""
+    _global_mcp_adapter_registry[adapter_name] = {
+        "version": adapter_version,
+    }
+
+
+def get_mcp_adapter(adapter_name: str) -> dict[str, str] | None:
+    """Get registered MCP adapter info."""
+    return _global_mcp_adapter_registry.get(adapter_name)
+
+
 def get_operation_catalog() -> OperationCatalog:
     """Get the global operation catalog instance."""
     return _global_operation_catalog

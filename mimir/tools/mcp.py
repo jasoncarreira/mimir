@@ -36,3 +36,5 @@ def clear_mcp_tools() -> None:
     """Reset the registry. Used by tests; harmless otherwise."""
     global _mcp_tools
     _mcp_tools = []
+    from mimir.mcp_client import clear_provenance_registry
+    clear_provenance_registry()
