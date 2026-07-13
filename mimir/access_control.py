@@ -436,6 +436,11 @@ class ToolRegistry:
                 allowed = True
                 is_shadow = True
         else:
+            # Explicit service capabilities are authoritative even if a newly
+            # added operation has not reached the catalog yet. This is a narrow
+            # exception to UNKNOWN's ordinary fail-closed rule: capabilities
+            # are fixed per trusted service principal, not inferred from the
+            # runtime inventory or supplied by the caller.
             if service_allowed:
                 allowed = True
             elif enforce:

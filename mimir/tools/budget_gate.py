@@ -417,7 +417,12 @@ class BudgetGateMiddleware(AgentMiddleware):
         get_tool_registry().enable_shadow_logging()
 
     def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
-        """Pass through model calls without mutating global authorization state."""
+        """Publish the final model-bound tool surface, then invoke the model.
+
+        Authorization decisions do not consult this observational inventory, so
+        replacing the snapshot cannot widen or narrow the current call's access.
+        """
+        get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return handler(request)
 
     async def awrap_model_call(
@@ -426,6 +431,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[Any], Awaitable[Any]],
     ) -> Any:
         """Async counterpart to :meth:`wrap_model_call`."""
+        get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return await handler(request)
 
     def wrap_tool_call(

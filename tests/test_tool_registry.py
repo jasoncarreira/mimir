@@ -143,7 +143,7 @@ def test_runtime_inventory_replaced_from_final_model_surface() -> None:
     }
 
 
-def test_budget_middleware_does_not_mutate_global_inventory_per_model_call() -> None:
+def test_budget_middleware_publishes_final_runtime_inventory_per_model_call() -> None:
     registry = budget_gate.get_tool_registry()
     registry.register_runtime_tools(
         [SimpleNamespace(name="existing_tool", description="existing")]
@@ -156,7 +156,25 @@ def test_budget_middleware_does_not_mutate_global_inventory_per_model_call() -> 
     result = middleware.wrap_model_call(request, lambda value: value)
 
     assert result is request
-    assert registry.list_tools() == ["existing_tool"]
+    assert registry.list_tools() == ["narrow_surface_tool"]
+    assert registry.get_tool("narrow_surface_tool")["description"] == "narrow"
+
+
+@pytest.mark.asyncio
+async def test_budget_middleware_publishes_inventory_on_async_model_path() -> None:
+    registry = budget_gate.get_tool_registry()
+    middleware = budget_gate.BudgetGateMiddleware()
+    request = SimpleNamespace(
+        tools=[SimpleNamespace(name="async_surface_tool", description="async")]
+    )
+
+    async def handler(value: object) -> object:
+        return value
+
+    result = await middleware.awrap_model_call(request, handler)
+
+    assert result is request
+    assert registry.list_tools() == ["async_surface_tool"]
 
 
 def test_explicit_service_principals_are_separate_and_frozen() -> None:
