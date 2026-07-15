@@ -196,9 +196,14 @@ def test_explicit_service_principals_are_separate_and_frozen() -> None:
     ("trigger", "allowed_operation", "denied_operation"),
     [
         ("scheduled_tick", "shell_exec", "request_mimir_update"),
+        ("scheduled_tick", "read_file", "request_mimir_update"),
         ("poller", "worklink_run", "remove_schedule"),
+        ("poller", "write_file", "remove_schedule"),
         ("upgrade", "submit_proposal", "spawn_codex"),
-        ("saga_session_end", "saga_end_session", "shell_exec"),
+        ("upgrade", "read_file", "spawn_codex"),
+        ("saga_session_end", "saga_end_session", "spawn_codex"),
+        ("saga_session_end", "read_file", "spawn_codex"),
+        ("saga_session_end", "memory_get", "spawn_codex"),
     ],
 )
 def test_service_principals_allow_only_explicit_operations_with_full_inventory(
@@ -288,3 +293,254 @@ def test_service_principal_capability_helpers_are_exact() -> None:
     assert not principal.can_read_domain("other")
     assert principal.can_write_sink("sink")
     assert not principal.can_write_sink("other")
+
+
+def test_capability_matrix_preflight_check_passes_with_complete_matrix() -> None:
+    from mimir.access_control import check_capability_matrix_complete
+
+    is_complete, errors = check_capability_matrix_complete(fail_closed=True)
+    assert is_complete is True
+    assert errors == []
+
+
+def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
+    from mimir.access_control import (
+        ServicePrincipal,
+        _TRUSTED_SERVICE_PRINCIPALS,
+        check_capability_matrix_complete,
+    )
+
+    original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
+    try:
+        _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
+            canonical="scheduler",
+            trigger="scheduled_tick",
+            capabilities=(),
+            readable_domains=(),
+            sink_destinations=(),
+        )
+
+        is_complete, errors = check_capability_matrix_complete(fail_closed=True)
+        assert is_complete is False
+        assert len(errors) > 0
+        assert any("no capabilities" in e for e in errors)
+    finally:
+        _TRUSTED_SERVICE_PRINCIPALS.clear()
+        _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+
+
+def test_enforcement_enablement_fails_closed_with_incomplete_matrix() -> None:
+    from mimir.access_control import (
+        CapabilityMatrixError,
+        ServicePrincipal,
+        _TRUSTED_SERVICE_PRINCIPALS,
+        resolve_access_control_enforcement,
+    )
+
+    original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
+    try:
+        scheduler = original_principals["scheduled_tick"]
+        _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
+            canonical=scheduler.canonical,
+            trigger=scheduler.trigger,
+            capabilities=scheduler.capabilities,
+            readable_domains=tuple(
+                domain for domain in scheduler.readable_domains
+                if domain != "filesystem"
+            ),
+            sink_destinations=scheduler.sink_destinations,
+            creation_path=scheduler.creation_path,
+        )
+
+        with pytest.raises(CapabilityMatrixError, match="read_file.*filesystem"):
+            resolve_access_control_enforcement(True)
+        assert resolve_access_control_enforcement(False) is False
+    finally:
+        _TRUSTED_SERVICE_PRINCIPALS.clear()
+        _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+
+
+def test_capability_matrix_report_generates_complete_report() -> None:
+    from mimir.access_control import get_capability_matrix_report
+
+    report = get_capability_matrix_report()
+
+    assert "scheduled_tick" in report
+    assert "poller" in report
+    assert "saga_session_end" in report
+    assert "upgrade" in report
+
+    for trigger, principal in report.items():
+        assert "canonical" in principal
+        assert "capabilities" in principal
+        assert "readable_domains" in principal
+        assert "sink_destinations" in principal
+        assert "creation_path" in principal
+        assert len(principal["capabilities"]) > 0
+
+
+def test_scheduler_principal_has_required_capabilities_for_heartbeat() -> None:
+    """Verify scheduler principal has all capabilities needed for heartbeat workflow.
+
+    Based on heartbeat.md production prompt:
+    - Reads memory/core files (read_file, ls, glob)
+    - Checks drift by reading files
+    - Reads backlog files
+    - Uses shell for jq analysis (shell_exec, bash_async)
+    - Writes/edits files (write_file, edit_file)
+    """
+    scheduler = get_service_principal("scheduled_tick")
+    assert scheduler is not None
+
+    read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn"}
+    write_ops = {"write_file", "edit_file"}
+    shell_ops = {"shell_exec", "bash_async"}
+    spawn_ops = {"spawn_claude_code", "spawn_codex"}
+    proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
+    saga_ops = {"saga_forget"}
+    worklink_ops = {"worklink_run"}
+
+    all_expected = read_ops | write_ops | shell_ops | spawn_ops | proposal_ops | saga_ops | worklink_ops
+    for cap in all_expected:
+        assert scheduler.has_capability(cap), f"scheduler missing {cap}"
+
+    forbidden = {"request_mimir_update", "remove_schedule", "reload_pollers"}
+    for cap in forbidden:
+        assert not scheduler.has_capability(cap), f"scheduler should NOT have {cap}"
+
+
+def test_poller_principal_has_required_capabilities() -> None:
+    """Verify poller principal has all capabilities needed for poller workflow.
+
+    Based on poller production:
+    - Reads poller payloads (read_file, ls, glob)
+    - Uses shell for analysis (shell_exec, bash_async)
+    - Writes results (write_file, edit_file)
+    - Sends messages to channels (send_message)
+    """
+    poller = get_service_principal("poller")
+    assert poller is not None
+
+    read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn"}
+    write_ops = {"write_file", "edit_file"}
+    shell_ops = {"shell_exec", "bash_async"}
+    spawn_ops = {"spawn_claude_code", "spawn_codex"}
+    proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
+    message_ops = {"send_message"}
+    worklink_ops = {"worklink_run"}
+
+    all_expected = read_ops | write_ops | shell_ops | spawn_ops | proposal_ops | message_ops | worklink_ops
+    for cap in all_expected:
+        assert poller.has_capability(cap), f"poller missing {cap}"
+
+    forbidden = {"remove_schedule", "reload_pollers", "add_schedule", "set_schedule_priority"}
+    for cap in forbidden:
+        assert not poller.has_capability(cap), f"poller should NOT have {cap}"
+
+
+def test_synthesis_principal_has_required_capabilities_for_session_end() -> None:
+    """Verify synthesis principal has all capabilities needed for saga_session_end workflow.
+
+    Based on saga_session_end.md production prompt:
+    - Gets turn content (mimir_get_turn, get_turn)
+    - Reads files for memory capture (read_file, ls, glob)
+    - Writes/edits memory files (write_file, edit_file)
+    - Uses shell for file ops (shell_exec)
+    - Stores atoms (memory_store)
+    - Gets atoms by ID (memory_get)
+    - Records feedback (saga_feedback)
+    - Records skill learnings (saga_record_skill_learning)
+    - Ends session (saga_end_session)
+    - Marks contributions (saga_mark_contributions)
+    """
+    synthesis = get_service_principal("saga_session_end")
+    assert synthesis is not None
+
+    turn_ops = {"mimir_get_turn", "get_turn"}
+    read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep"}
+    write_ops = {"write_file", "edit_file"}
+    memory_ops = {"memory_get", "memory_store"}
+    saga_ops = {"saga_feedback", "saga_end_session", "saga_mark_contributions", "saga_record_skill_learning"}
+
+    all_expected = turn_ops | read_ops | write_ops | memory_ops | saga_ops
+    for cap in all_expected:
+        assert synthesis.has_capability(cap), f"synthesis missing {cap}"
+
+    forbidden = {
+        "shell_exec",
+        "bash_async",
+        "spawn_claude_code",
+        "spawn_codex",
+        "add_schedule",
+        "remove_schedule",
+        "send_message",
+    }
+    for cap in forbidden:
+        assert not synthesis.has_capability(cap), f"synthesis should NOT have {cap}"
+
+
+def test_system_principal_has_required_capabilities_for_upgrade() -> None:
+    """Verify system principal has all capabilities needed for upgrade workflow.
+
+    Based on upgrade.md production prompt:
+    - Reads changed files (read_file, ls, glob)
+    - Uses shell for git commands (shell_exec, bash_async)
+    - Writes/edits files (write_file, edit_file)
+    - Submits proposals (submit_proposal)
+    - Sends operator notifications (send_message)
+    - Manages schedules (add_schedule, set_schedule_priority)
+    """
+    system = get_service_principal("upgrade")
+    assert system is not None
+
+    read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep"}
+    write_ops = {"write_file", "edit_file"}
+    shell_ops = {"shell_exec", "bash_async"}
+    proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
+    schedule_ops = {"add_schedule", "set_schedule_priority"}
+    message_ops = {"send_message"}
+
+    all_expected = read_ops | write_ops | shell_ops | proposal_ops | schedule_ops | message_ops
+    for cap in all_expected:
+        assert system.has_capability(cap), f"system missing {cap}"
+
+    forbidden = {"spawn_claude_code", "spawn_codex", "worklink_run", "saga_forget"}
+    for cap in forbidden:
+        assert not system.has_capability(cap), f"system should NOT have {cap}"
+
+
+def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
+    """Verify that unauthorized operations are denied for each service principal.
+
+    Tests boundary: each principal should only be able to use its defined
+    capabilities, and adjacent unauthorized operations should be denied.
+    """
+    registry = ToolRegistry()
+
+    test_cases = [
+        ("scheduled_tick", "shell_exec", True),
+        ("scheduled_tick", "remove_schedule", False),
+        ("scheduled_tick", "reload_pollers", False),
+        ("poller", "send_message", True),
+        ("poller", "add_schedule", False),
+        ("saga_session_end", "saga_end_session", True),
+        ("saga_session_end", "spawn_claude_code", False),
+        ("saga_session_end", "add_schedule", False),
+        ("upgrade", "submit_proposal", True),
+        ("upgrade", "spawn_codex", False),
+        ("upgrade", "worklink_run", False),
+    ]
+
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
+    for trigger, operation, should_allow in test_cases:
+        event = AgentEvent(trigger=trigger, channel_id=f"{trigger}:test")
+        ctx = create_auth_context(event, enforce=True)
+        result = registry.authorize_tool(operation, ctx, enforce=True)
+
+        if should_allow:
+            assert result.allowed is True, f"{trigger} should allow {operation}"
+        else:
+            assert result.allowed is False, f"{trigger} should deny {operation}"
+            assert result.reason in ("admin_required", "unknown_operation"), f"{trigger} {operation} denied for wrong reason: {result.reason}"

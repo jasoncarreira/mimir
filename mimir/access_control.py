@@ -1120,9 +1120,28 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "submit_proposal",
                 "abandon_proposal",
                 "worklink_run",
+                "read_file",
+                "aread",
+                "ls",
+                "als",
+                "glob",
+                "aglob",
+                "grep",
+                "agrep",
+                "file_search",
+                "get_turn",
+                "mimir_get_turn",
             ),
-            readable_domains=("configured_inputs",),
-            sink_destinations=("configured_channel",),
+            readable_domains=("configured_inputs", "filesystem", "turn_history"),
+            sink_destinations=(
+                "configured_channel",
+                "filesystem",
+                "shell_process",
+                "spawn_process",
+                "proposal",
+                "saga",
+                "worklink",
+            ),
             creation_path="mimir.scheduler.Scheduler._fire_job",
         ),
         ServicePrincipal(
@@ -1139,17 +1158,56 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "submit_proposal",
                 "abandon_proposal",
                 "worklink_run",
+                "read_file",
+                "aread",
+                "ls",
+                "als",
+                "glob",
+                "aglob",
+                "grep",
+                "agrep",
+                "file_search",
+                "get_turn",
+                "mimir_get_turn",
+                "send_message",
             ),
-            readable_domains=("poller_payload",),
-            sink_destinations=("configured_channel",),
+            readable_domains=("poller_payload", "filesystem", "turn_history"),
+            sink_destinations=(
+                "configured_channel",
+                "filesystem",
+                "shell_process",
+                "spawn_process",
+                "proposal",
+                "worklink",
+                "message",
+            ),
             creation_path="mimir.pollers.run_poller",
         ),
         ServicePrincipal(
             canonical="synthesis",
             trigger="saga_session_end",
-            capabilities=("saga_end_session", "saga_mark_contributions"),
-            readable_domains=("session", "saga"),
-            sink_destinations=("session_boundary",),
+            capabilities=(
+                "saga_end_session",
+                "saga_mark_contributions",
+                "saga_feedback",
+                "saga_record_skill_learning",
+                "memory_get",
+                "memory_store",
+                "mimir_get_turn",
+                "get_turn",
+                "read_file",
+                "aread",
+                "ls",
+                "als",
+                "glob",
+                "aglob",
+                "grep",
+                "agrep",
+                "write_file",
+                "edit_file",
+            ),
+            readable_domains=("session", "saga", "filesystem", "turn_history"),
+            sink_destinations=("session_boundary", "saga", "filesystem"),
             creation_path="mimir.server._on_session_idle",
         ),
         ServicePrincipal(
@@ -1157,6 +1215,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             trigger="upgrade",
             capabilities=(
                 "shell_exec",
+                "bash_async",
                 "write_file",
                 "edit_file",
                 "open_proposal",
@@ -1164,9 +1223,25 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "abandon_proposal",
                 "add_schedule",
                 "set_schedule_priority",
+                "read_file",
+                "aread",
+                "ls",
+                "als",
+                "glob",
+                "aglob",
+                "grep",
+                "agrep",
+                "send_message",
             ),
-            readable_domains=("defaults", "proposal"),
-            sink_destinations=("operator_alert",),
+            readable_domains=("defaults", "proposal", "filesystem"),
+            sink_destinations=(
+                "operator_alert",
+                "filesystem",
+                "shell_process",
+                "proposal",
+                "scheduler",
+                "message",
+            ),
             creation_path="mimir.defaults_upgrade.enqueue_upgrade_prompt_turns",
         ),
     )
@@ -1176,6 +1251,151 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
 def register_service_principal(service: ServicePrincipal) -> None:
     """Register a trusted autonomous service principal."""
     _TRUSTED_SERVICE_PRINCIPALS[service.trigger] = service
+
+
+_REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset({
+    "scheduled_tick",
+    "poller",
+    "saga_session_end",
+    "upgrade",
+})
+
+
+# Executable capabilities and information-flow metadata are one policy.
+_OPERATION_READABLE_DOMAIN: dict[str, str] = {
+    "read_file": "filesystem",
+    "aread": "filesystem",
+    "ls": "filesystem",
+    "als": "filesystem",
+    "glob": "filesystem",
+    "aglob": "filesystem",
+    "grep": "filesystem",
+    "agrep": "filesystem",
+    "file_search": "filesystem",
+    "get_turn": "turn_history",
+    "mimir_get_turn": "turn_history",
+    "memory_query": "saga",
+    "memory_get": "saga",
+}
+
+_OPERATION_SINK_DESTINATION: dict[str, str] = {
+    "write_file": "filesystem",
+    "edit_file": "filesystem",
+    "shell_exec": "shell_process",
+    "bash_async": "shell_process",
+    "spawn_claude_code": "spawn_process",
+    "spawn_codex": "spawn_process",
+    "open_proposal": "proposal",
+    "submit_proposal": "proposal",
+    "abandon_proposal": "proposal",
+    "add_schedule": "scheduler",
+    "set_schedule_priority": "scheduler",
+    "saga_feedback": "saga",
+    "saga_mark_contributions": "saga",
+    "saga_record_skill_learning": "saga",
+    "saga_forget": "saga",
+    "memory_store": "saga",
+    "send_message": "message",
+    "saga_end_session": "session_boundary",
+    "worklink_run": "worklink",
+}
+
+
+class CapabilityMatrixError(Exception):
+    """Raised when enforcement is requested with an incomplete matrix."""
+
+
+def _capability_matrix_errors() -> list[str]:
+    errors: list[str] = []
+    for trigger in sorted(_REQUIRED_SERVICE_PRINCIPALS):
+        principal = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+        if principal is None:
+            errors.append(f"Missing service principal for trigger: {trigger}")
+            continue
+        if principal.trigger != trigger:
+            errors.append(
+                f"Service principal '{principal.canonical}' is registered for "
+                f"{trigger} but declares trigger {principal.trigger}"
+            )
+        if not principal.capabilities:
+            errors.append(
+                f"Service principal '{principal.canonical}' ({trigger}) "
+                "has no capabilities defined"
+            )
+        if not principal.readable_domains:
+            errors.append(
+                f"Service principal '{principal.canonical}' ({trigger}) "
+                "has no readable domains defined"
+            )
+        if not principal.sink_destinations:
+            errors.append(
+                f"Service principal '{principal.canonical}' ({trigger}) "
+                "has no sink destinations defined"
+            )
+
+        readable_domains = set(principal.readable_domains)
+        sink_destinations = set(principal.sink_destinations)
+        for operation in sorted(set(principal.capabilities)):
+            required_domain = _OPERATION_READABLE_DOMAIN.get(operation)
+            if required_domain and required_domain not in readable_domains:
+                errors.append(
+                    f"Service principal '{principal.canonical}' capability "
+                    f"'{operation}' requires readable domain '{required_domain}'"
+                )
+            required_sink = _OPERATION_SINK_DESTINATION.get(operation)
+            if required_sink and required_sink not in sink_destinations:
+                errors.append(
+                    f"Service principal '{principal.canonical}' capability "
+                    f"'{operation}' requires sink destination '{required_sink}'"
+                )
+    return errors
+
+
+def check_capability_matrix_complete(
+    fail_closed: bool = True,
+) -> tuple[bool, list[str]]:
+    """Verify required principals and capability/domain/sink consistency."""
+    errors = _capability_matrix_errors()
+    if errors and not fail_closed:
+        for error in errors:
+            log.warning("capability_matrix_incomplete: %s", error)
+        return (True, [])
+    return (not errors, errors)
+
+
+def assert_capability_matrix_complete() -> None:
+    """Raise unless the enforcement matrix is complete and consistent."""
+    errors = _capability_matrix_errors()
+    if errors:
+        raise CapabilityMatrixError(
+            "Access-control enforcement blocked by incomplete capability matrix: "
+            + "; ".join(errors)
+        )
+
+
+def resolve_access_control_enforcement(requested: bool) -> bool:
+    """Fail closed at the enforcement enablement boundary."""
+    if requested:
+        assert_capability_matrix_complete()
+    return requested
+
+
+def get_capability_matrix_report() -> dict[str, dict[str, Any]]:
+    """Generate a report of the current capability matrix for audit purposes.
+
+    Returns:
+        A dictionary mapping trigger names to their principal configuration.
+    """
+    report: dict[str, dict[str, Any]] = {}
+    for trigger, principal in _TRUSTED_SERVICE_PRINCIPALS.items():
+        report[trigger] = {
+            "canonical": principal.canonical,
+            "capabilities": list(principal.capabilities),
+            "readable_domains": list(principal.readable_domains),
+            "sink_destinations": list(principal.sink_destinations),
+            "creation_path": principal.creation_path,
+        }
+    return report
 
 
 def get_service_principal(trigger: str) -> ServicePrincipal | None:

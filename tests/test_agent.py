@@ -339,6 +339,65 @@ class _BoundaryFakeAgent(_FakeAgent):
             yield chunk
 
 
+class _ServicePrincipalToolProbeAgent(_FakeAgent):
+    """Exercise one representative tool through live middleware."""
+
+    def __init__(self, tool_name: str) -> None:
+        super().__init__([AIMessage(content="probed")])
+        self.tool_name = tool_name
+        self.observed_principal: str | None = None
+        self.result: ToolMessage | None = None
+        self.handler_calls = 0
+
+    async def astream(
+        self,
+        state: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        context=None,
+        stream_mode: str = "values",
+    ):
+        from mimir._context import get_current_turn
+        from mimir.access_control import get_tool_registry
+
+        ctx = get_current_turn()
+        assert ctx is not None
+        auth = get_tool_registry().authorize_tool(
+            self.tool_name,
+            ctx.auth_context,
+            enforce=True,
+        )
+        self.observed_principal = (
+            auth.service_principal.canonical if auth.service_principal else None
+        )
+        gate = BudgetGateMiddleware()
+
+        async def _handler(req: ToolCallRequest) -> ToolMessage:
+            self.handler_calls += 1
+            return ToolMessage(content="ran", tool_call_id=req.tool_call["id"])
+
+        ctx.ifc_labels = None
+        self.result = await gate.awrap_tool_call(
+            ToolCallRequest(
+                tool_call={
+                    "name": self.tool_name,
+                    "args": {},
+                    "id": "tc-service-principal",
+                    "type": "tool_call",
+                },
+                tool=None,
+                state=None,
+                runtime=Runtime(context=ctx.auth_context),
+            ),
+            _handler,
+        )
+
+        async for chunk in super().astream(
+            state, config=config, stream_mode=stream_mode,
+        ):
+            yield chunk
+
+
 class _HttpEventAdminProbeAgent(_FakeAgent):
     """Probe the TurnContext Agent installs before admin-tool auth runs."""
 
@@ -529,6 +588,70 @@ async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
     # The TurnLogger appended one record
     turns = (tmp_path / "home" / "logs" / "turns.jsonl").read_text().splitlines()
     assert len(turns) == 1
+
+
+@pytest.mark.parametrize(
+    ("trigger", "tool_name", "principal"),
+    [
+        ("scheduled_tick", "shell_exec", "scheduler"),
+        ("poller", "worklink_run", "poller"),
+        ("saga_session_end", "saga_end_session", "synthesis"),
+        ("upgrade", "submit_proposal", "system"),
+    ],
+)
+async def test_server_owned_triggers_reach_live_tool_middleware_with_service_authority(
+    tmp_path: Path,
+    trigger: str,
+    tool_name: str,
+    principal: str,
+):
+    fake_agent = _ServicePrincipalToolProbeAgent(tool_name)
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._config.access_control_enforced = True
+
+    record = await agent.run_turn(
+        AgentEvent(
+            trigger=trigger,
+            channel_id=f"{trigger}:production-path",
+            content="probe",
+            source="system" if trigger == "upgrade" else None,
+            extra=(
+                {"saga_session_id": "saga-production-path"}
+                if trigger == "saga_session_end"
+                else {}
+            ),
+        )
+    )
+
+    assert record.error is None
+    assert fake_agent.observed_principal == principal
+    assert fake_agent.result is not None
+    assert fake_agent.handler_calls == 1, str(fake_agent.result.content)
+    assert fake_agent.result.status != "error"
+
+
+async def test_server_session_idle_event_reaches_live_synthesis_middleware(
+    tmp_path: Path,
+):
+    from mimir.server import _session_synthesis_event
+    from mimir.session_manager import ChannelSession
+
+    fake_agent = _ServicePrincipalToolProbeAgent("saga_end_session")
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._config.access_control_enforced = True
+    session = ChannelSession(
+        channel_id="discord-session-production-path",
+        saga_session_id="saga-production-path",
+        started_at=0.0,
+        last_message_at=0.0,
+    )
+
+    record = await agent.run_turn(_session_synthesis_event(session))
+
+    assert record.error is None
+    assert fake_agent.observed_principal == "synthesis"
+    assert fake_agent.result is not None
+    assert fake_agent.handler_calls == 1, str(fake_agent.result.content)
 
 
 async def test_run_turn_http_event_ingress_reaches_turn_context_before_admin_tool_auth(
