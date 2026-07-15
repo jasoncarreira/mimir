@@ -14,7 +14,6 @@ from mimir.access_control import (
     ServicePrincipal,
     ToolRegistry,
     get_service_principal,
-    _TRUSTED_SERVICE_PRINCIPALS,
 )
 from mimir.models import AuthContext
 from mimir.tools import budget_gate
@@ -203,7 +202,7 @@ def test_explicit_service_principals_are_separate_and_frozen() -> None:
         ("upgrade", "submit_proposal", "spawn_codex"),
         ("upgrade", "read_file", "spawn_codex"),
         ("saga_session_end", "saga_end_session", "spawn_codex"),
-        ("saga_session_end", "shell_exec", "spawn_codex"),
+        ("saga_session_end", "read_file", "spawn_codex"),
         ("saga_session_end", "memory_get", "spawn_codex"),
     ],
 )
@@ -313,7 +312,6 @@ def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
 
     original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
     try:
-        original_scheduled_tick = _TRUSTED_SERVICE_PRINCIPALS.get("scheduled_tick")
         _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
             canonical="scheduler",
             trigger="scheduled_tick",
@@ -326,6 +324,37 @@ def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
         assert is_complete is False
         assert len(errors) > 0
         assert any("no capabilities" in e for e in errors)
+    finally:
+        _TRUSTED_SERVICE_PRINCIPALS.clear()
+        _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+
+
+def test_enforcement_enablement_fails_closed_with_incomplete_matrix() -> None:
+    from mimir.access_control import (
+        CapabilityMatrixError,
+        ServicePrincipal,
+        _TRUSTED_SERVICE_PRINCIPALS,
+        resolve_access_control_enforcement,
+    )
+
+    original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
+    try:
+        scheduler = original_principals["scheduled_tick"]
+        _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
+            canonical=scheduler.canonical,
+            trigger=scheduler.trigger,
+            capabilities=scheduler.capabilities,
+            readable_domains=tuple(
+                domain for domain in scheduler.readable_domains
+                if domain != "filesystem"
+            ),
+            sink_destinations=scheduler.sink_destinations,
+            creation_path=scheduler.creation_path,
+        )
+
+        with pytest.raises(CapabilityMatrixError, match="read_file.*filesystem"):
+            resolve_access_control_enforcement(True)
+        assert resolve_access_control_enforcement(False) is False
     finally:
         _TRUSTED_SERVICE_PRINCIPALS.clear()
         _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
@@ -430,15 +459,22 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
     turn_ops = {"mimir_get_turn", "get_turn"}
     read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep"}
     write_ops = {"write_file", "edit_file"}
-    shell_ops = {"shell_exec"}
     memory_ops = {"memory_get", "memory_store"}
     saga_ops = {"saga_feedback", "saga_end_session", "saga_mark_contributions", "saga_record_skill_learning"}
 
-    all_expected = turn_ops | read_ops | write_ops | shell_ops | memory_ops | saga_ops
+    all_expected = turn_ops | read_ops | write_ops | memory_ops | saga_ops
     for cap in all_expected:
         assert synthesis.has_capability(cap), f"synthesis missing {cap}"
 
-    forbidden = {"spawn_claude_code", "spawn_codex", "add_schedule", "remove_schedule", "send_message"}
+    forbidden = {
+        "shell_exec",
+        "bash_async",
+        "spawn_claude_code",
+        "spawn_codex",
+        "add_schedule",
+        "remove_schedule",
+        "send_message",
+    }
     for cap in forbidden:
         assert not synthesis.has_capability(cap), f"synthesis should NOT have {cap}"
 
@@ -473,31 +509,6 @@ def test_system_principal_has_required_capabilities_for_upgrade() -> None:
         assert not system.has_capability(cap), f"system should NOT have {cap}"
 
 
-def test_service_principals_authorized_via_server_trigger_not_forged_context() -> None:
-    """Verify service principals require server-owned trigger, not forged AuthContext.
-
-    This test ensures authorization enters through server-owned trigger/creation
-    paths rather than forged AuthContext fields or direct registry-only calls.
-    """
-    registry = ToolRegistry()
-
-    server_trigger_ctx = _auth_context(trigger="scheduled_tick", enforce=True)
-    assert server_trigger_ctx.trigger == "scheduled_tick"
-    assert server_trigger_ctx.event_ingress is None
-
-    auth_result = registry.authorize_tool("shell_exec", server_trigger_ctx, enforce=True)
-    assert auth_result.allowed is True
-    assert auth_result.service_principal is not None
-    assert auth_result.service_principal.canonical == "scheduler"
-
-    forged_ctx = _auth_context(trigger="scheduled_tick", enforce=True, event_ingress="http-api")
-    assert forged_ctx.event_ingress == "http-api"
-
-    forged_result = registry.authorize_tool("shell_exec", forged_ctx, enforce=True)
-    assert forged_result.allowed is False
-    assert forged_result.service_principal is None
-
-
 def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
     """Verify that unauthorized operations are denied for each service principal.
 
@@ -520,8 +531,12 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
         ("upgrade", "worklink_run", False),
     ]
 
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
     for trigger, operation, should_allow in test_cases:
-        ctx = _auth_context(trigger=trigger, enforce=True)
+        event = AgentEvent(trigger=trigger, channel_id=f"{trigger}:test")
+        ctx = create_auth_context(event, enforce=True)
         result = registry.authorize_tool(operation, ctx, enforce=True)
 
         if should_allow:

@@ -128,6 +128,39 @@ class TestConfigBoolFieldsUniform:
             f"`in {{true,1,yes}}` parsers)."
         )
 
+    def test_access_control_enforcement_preflights_matrix(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.access_control import (
+            CapabilityMatrixError,
+            ServicePrincipal,
+            _TRUSTED_SERVICE_PRINCIPALS,
+        )
+
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+        original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
+        try:
+            scheduler = original_principals["scheduled_tick"]
+            _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
+                canonical=scheduler.canonical,
+                trigger=scheduler.trigger,
+                capabilities=scheduler.capabilities,
+                readable_domains=tuple(
+                    domain for domain in scheduler.readable_domains
+                    if domain != "filesystem"
+                ),
+                sink_destinations=scheduler.sink_destinations,
+                creation_path=scheduler.creation_path,
+            )
+
+            with pytest.raises(CapabilityMatrixError, match="read_file.*filesystem"):
+                Config.from_env()
+        finally:
+            _TRUSTED_SERVICE_PRINCIPALS.clear()
+            _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+
     @pytest.mark.parametrize("env_var, attr", _ALL_BOOL_FIELDS)
     @pytest.mark.parametrize("value", _FALSY_VALUES)
     def test_every_field_accepts_every_falsy_value(

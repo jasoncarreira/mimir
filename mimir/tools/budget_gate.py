@@ -304,10 +304,15 @@ def _admin_denial_message(tool_name: str, reason: str | None) -> str:
 
 
 def _env_access_control_enforced() -> bool:
+    from ..access_control import resolve_access_control_enforcement
+
     raw = os.environ.get("MIMIR_ACCESS_CONTROL_ENFORCED")
-    if raw is None or raw == "":
-        return False
-    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+    requested = bool(
+        raw is not None
+        and raw != ""
+        and raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+    )
+    return resolve_access_control_enforcement(requested)
 
 
 def _turn_has_http_event_ingress(ctx: Any) -> bool:

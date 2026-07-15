@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
+from .access_control import resolve_access_control_enforcement
 from .billing import BillingMode, detect_billing_mode
 
 
@@ -1111,7 +1112,9 @@ class Config:
             ),
 
             cross_platform_pull=_env_bool("MIMIR_CROSS_PLATFORM_PULL", True),
-            access_control_enforced=_env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False),
+            access_control_enforced=resolve_access_control_enforcement(
+                _env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False)
+            ),
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
             unauthorized_user_behavior=_env(

@@ -1132,8 +1132,16 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "get_turn",
                 "mimir_get_turn",
             ),
-            readable_domains=("configured_inputs",),
-            sink_destinations=("configured_channel",),
+            readable_domains=("configured_inputs", "filesystem", "turn_history"),
+            sink_destinations=(
+                "configured_channel",
+                "filesystem",
+                "shell_process",
+                "spawn_process",
+                "proposal",
+                "saga",
+                "worklink",
+            ),
             creation_path="mimir.scheduler.Scheduler._fire_job",
         ),
         ServicePrincipal(
@@ -1163,8 +1171,16 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "mimir_get_turn",
                 "send_message",
             ),
-            readable_domains=("poller_payload",),
-            sink_destinations=("configured_channel",),
+            readable_domains=("poller_payload", "filesystem", "turn_history"),
+            sink_destinations=(
+                "configured_channel",
+                "filesystem",
+                "shell_process",
+                "spawn_process",
+                "proposal",
+                "worklink",
+                "message",
+            ),
             creation_path="mimir.pollers.run_poller",
         ),
         ServicePrincipal(
@@ -1179,7 +1195,6 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "memory_store",
                 "mimir_get_turn",
                 "get_turn",
-                "shell_exec",
                 "read_file",
                 "aread",
                 "ls",
@@ -1191,8 +1206,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "write_file",
                 "edit_file",
             ),
-            readable_domains=("session", "saga"),
-            sink_destinations=("session_boundary",),
+            readable_domains=("session", "saga", "filesystem", "turn_history"),
+            sink_destinations=("session_boundary", "saga", "filesystem"),
             creation_path="mimir.server._on_session_idle",
         ),
         ServicePrincipal(
@@ -1218,8 +1233,15 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "agrep",
                 "send_message",
             ),
-            readable_domains=("defaults", "proposal"),
-            sink_destinations=("operator_alert",),
+            readable_domains=("defaults", "proposal", "filesystem"),
+            sink_destinations=(
+                "operator_alert",
+                "filesystem",
+                "shell_process",
+                "proposal",
+                "scheduler",
+                "message",
+            ),
             creation_path="mimir.defaults_upgrade.enqueue_upgrade_prompt_turns",
         ),
     )
@@ -1239,73 +1261,123 @@ _REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset({
 })
 
 
+# Executable capabilities and information-flow metadata are one policy.
+_OPERATION_READABLE_DOMAIN: dict[str, str] = {
+    "read_file": "filesystem",
+    "aread": "filesystem",
+    "ls": "filesystem",
+    "als": "filesystem",
+    "glob": "filesystem",
+    "aglob": "filesystem",
+    "grep": "filesystem",
+    "agrep": "filesystem",
+    "file_search": "filesystem",
+    "get_turn": "turn_history",
+    "mimir_get_turn": "turn_history",
+    "memory_query": "saga",
+    "memory_get": "saga",
+}
+
+_OPERATION_SINK_DESTINATION: dict[str, str] = {
+    "write_file": "filesystem",
+    "edit_file": "filesystem",
+    "shell_exec": "shell_process",
+    "bash_async": "shell_process",
+    "spawn_claude_code": "spawn_process",
+    "spawn_codex": "spawn_process",
+    "open_proposal": "proposal",
+    "submit_proposal": "proposal",
+    "abandon_proposal": "proposal",
+    "add_schedule": "scheduler",
+    "set_schedule_priority": "scheduler",
+    "saga_feedback": "saga",
+    "saga_mark_contributions": "saga",
+    "saga_record_skill_learning": "saga",
+    "saga_forget": "saga",
+    "memory_store": "saga",
+    "send_message": "message",
+    "saga_end_session": "session_boundary",
+    "worklink_run": "worklink",
+}
+
+
 class CapabilityMatrixError(Exception):
-    """Raised when the service principal capability matrix is incomplete."""
-    pass
+    """Raised when enforcement is requested with an incomplete matrix."""
+
+
+def _capability_matrix_errors() -> list[str]:
+    errors: list[str] = []
+    for trigger in sorted(_REQUIRED_SERVICE_PRINCIPALS):
+        principal = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+        if principal is None:
+            errors.append(f"Missing service principal for trigger: {trigger}")
+            continue
+        if principal.trigger != trigger:
+            errors.append(
+                f"Service principal '{principal.canonical}' is registered for "
+                f"{trigger} but declares trigger {principal.trigger}"
+            )
+        if not principal.capabilities:
+            errors.append(
+                f"Service principal '{principal.canonical}' ({trigger}) "
+                "has no capabilities defined"
+            )
+        if not principal.readable_domains:
+            errors.append(
+                f"Service principal '{principal.canonical}' ({trigger}) "
+                "has no readable domains defined"
+            )
+        if not principal.sink_destinations:
+            errors.append(
+                f"Service principal '{principal.canonical}' ({trigger}) "
+                "has no sink destinations defined"
+            )
+
+        readable_domains = set(principal.readable_domains)
+        sink_destinations = set(principal.sink_destinations)
+        for operation in sorted(set(principal.capabilities)):
+            required_domain = _OPERATION_READABLE_DOMAIN.get(operation)
+            if required_domain and required_domain not in readable_domains:
+                errors.append(
+                    f"Service principal '{principal.canonical}' capability "
+                    f"'{operation}' requires readable domain '{required_domain}'"
+                )
+            required_sink = _OPERATION_SINK_DESTINATION.get(operation)
+            if required_sink and required_sink not in sink_destinations:
+                errors.append(
+                    f"Service principal '{principal.canonical}' capability "
+                    f"'{operation}' requires sink destination '{required_sink}'"
+                )
+    return errors
 
 
 def check_capability_matrix_complete(
     fail_closed: bool = True,
 ) -> tuple[bool, list[str]]:
-    """Verify that all required service principals have capabilities defined.
+    """Verify required principals and capability/domain/sink consistency."""
+    errors = _capability_matrix_errors()
+    if errors and not fail_closed:
+        for error in errors:
+            log.warning("capability_matrix_incomplete: %s", error)
+        return (True, [])
+    return (not errors, errors)
 
-    This is the enforcement preflight check required by chainlink #879.
-    It ensures the principal × operation capability matrix is complete
-    before enforcement can be enabled.
 
-    Args:
-        fail_closed: If True, return (False, errors) when matrix is incomplete.
-                    If False, return (True, []) but log warnings.
-
-    Returns:
-        A tuple of (is_complete, error_messages). If is_complete is True,
-        the matrix is ready for enforcement. If False, enforcement should
-        fail closed or report blocked.
-    """
-    errors: list[str] = []
-
-    for trigger in _REQUIRED_SERVICE_PRINCIPALS:
-        principal = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
-        if principal is None:
-            errors.append(f"Missing service principal for trigger: {trigger}")
-            continue
-
-        if not principal.capabilities:
-            errors.append(
-                f"Service principal '{principal.canonical}' ({trigger}) has no capabilities defined"
-            )
-
-        if not principal.readable_domains:
-            log.warning(
-                "service_principal_missing_readable_domains: principal=%s trigger=%s",
-                principal.canonical,
-                trigger,
-            )
-
-        if not principal.sink_destinations:
-            log.warning(
-                "service_principal_missing_sink_destinations: principal=%s trigger=%s",
-                principal.canonical,
-                trigger,
-            )
-
-    for trigger, principal in _TRUSTED_SERVICE_PRINCIPALS.items():
-        if trigger not in _REQUIRED_SERVICE_PRINCIPALS:
-            log.debug(
-                "service_principal_not_required: principal=%s trigger=%s",
-                principal.canonical,
-                trigger,
-            )
-
+def assert_capability_matrix_complete() -> None:
+    """Raise unless the enforcement matrix is complete and consistent."""
+    errors = _capability_matrix_errors()
     if errors:
-        if fail_closed:
-            return (False, errors)
-        else:
-            for error in errors:
-                log.warning("capability_matrix_incomplete: %s", error)
-            return (True, [])
+        raise CapabilityMatrixError(
+            "Access-control enforcement blocked by incomplete capability matrix: "
+            + "; ".join(errors)
+        )
 
-    return (True, [])
+
+def resolve_access_control_enforcement(requested: bool) -> bool:
+    """Fail closed at the enforcement enablement boundary."""
+    if requested:
+        assert_capability_matrix_complete()
+    return requested
 
 
 def get_capability_matrix_report() -> dict[str, dict[str, Any]]:

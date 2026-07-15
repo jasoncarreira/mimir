@@ -245,6 +245,16 @@ class _PairingNotifier:
                 await asyncio.sleep(interval)
 
 
+def _session_synthesis_event(session: ChannelSession) -> AgentEvent:
+    """Build the server-owned session synthesis event."""
+    return AgentEvent(
+        trigger="saga_session_end",
+        channel_id=session.channel_id,
+        content="",
+        extra={"saga_session_id": session.saga_session_id},
+    )
+
+
 async def _handle_event(request: web.Request) -> web.Response:
     # Auth: gated at the app-level middleware. See ``_make_auth_middleware``.
     try:
@@ -1086,12 +1096,7 @@ def build_app(config: Config) -> web.Application:
     # When a session goes idle, enqueue the synthesis turn through the same
     # dispatcher so it runs in channel-FIFO order alongside any new traffic.
     async def _on_session_idle(session: ChannelSession) -> None:
-        synth_event = AgentEvent(
-            trigger="saga_session_end",
-            channel_id=session.channel_id,
-            content="",
-            extra={"saga_session_id": session.saga_session_id},
-        )
+        synth_event = _session_synthesis_event(session)
         accepted = await dispatcher.enqueue(synth_event)
         if not accepted:
             await log_event(
