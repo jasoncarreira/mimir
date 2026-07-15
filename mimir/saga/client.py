@@ -137,6 +137,7 @@ def _make_triple_search_fn(
     *,
     dim: int | None,
     reference_date=None,
+    auth_context: Any = None,
 ):
     """Closure over the connection matching recall.TripleSearchFn shape.
     Returns None when triples are disabled (the dim arg is None, meaning
@@ -153,6 +154,7 @@ def _make_triple_search_fn(
         return triple_augment_search(
             conn, query_emb, top_k=top_k, dim=dim,
             reference_date=reference_date,
+            auth_context=auth_context,
         )
     return _fn
 
@@ -648,6 +650,7 @@ class SagaStore:
         session_boundary_alpha: float | None = None,
         session_boundary_weight: float | None = None,
         session_boundary_atoms_per_session: int | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]:
         # Three paths into the rewrite:
         # 1. Caller pre-resolved the rewrite via ``contextual_rewrite()``
@@ -766,6 +769,7 @@ class SagaStore:
                     alpha=boundary_alpha or 0.0,
                     atoms_per_session=boundary_atoms_per_session or 0,
                     query_emb=query_emb,
+                    auth_context=auth_context,
                 )
                 if boundary_atom_ids:
                     extra_pathways = extra_pathways or {}
@@ -790,6 +794,7 @@ class SagaStore:
                 ),
                 triple_search_fn=_make_triple_search_fn(
                     conn, dim=triple_dim, reference_date=reference_date,
+                    auth_context=auth_context,
                 ),
                 extra_atom_ranked_pathways=extra_pathways,
                 rrf_pathway_weights=pathway_weights,
@@ -799,6 +804,7 @@ class SagaStore:
                 reference_date=reference_date,
                 min_confidence_tier=min_confidence_tier,
                 fire_access_events=False,
+                auth_context=auth_context,
             )
             returned_atom_ids = [
                 c.atom["id"] for c in (result.observations + result.raws)
@@ -823,6 +829,7 @@ class SagaStore:
                     conn, query_emb,
                     top_n=self._triples_top_n, dim=triple_dim,
                     reference_date=reference_date,
+                    auth_context=auth_context,
                 )
                 # Strip the internal _cosine field from the wire shape;
                 # keep it out of the agent-facing dict.
@@ -867,6 +874,7 @@ class SagaStore:
         alpha: float = 0.7,
         atoms_per_session: int = 30,
         query_emb: list[float] | None = None,
+        auth_context: Any = None,
     ) -> list[str]:
         """Search session boundaries and expand matched sessions to atom ids.
 
@@ -876,14 +884,17 @@ class SagaStore:
         connection so default-on boundary recall does not double per-query
         sqlite connection churn.
         """
+        from .ownership import (
+            authorization_predicate,
+            get_authorization_scope,
+        )
+
+        auth_scope = get_authorization_scope(auth_context)
+
         limit = max(0, int(limit))
         cap = max(0, int(atoms_per_session))
         if limit <= 0 or cap <= 0:
             return []
-        # New / cold homes have no session boundaries yet. Avoid the session
-        # vector-search/index path entirely in that common case; query() already
-        # computes one embedding for atom recall, and the boundary lane must not
-        # add an empty-session round trip on top.
         if conn.execute("SELECT 1 FROM sessions LIMIT 1").fetchone() is None:
             return []
 
@@ -894,12 +905,15 @@ class SagaStore:
                 alpha=alpha,
                 limit=limit,
                 query_emb=query_emb,
+                auth_context=auth_context,
             )
         except Exception:  # noqa: BLE001 — boundary recall is auxiliary
             log.warning("session-boundary RRF search failed", exc_info=True)
             return []
         if not matched_sessions:
             return []
+
+        auth_where, auth_params = authorization_predicate(auth_scope, table="atoms")
 
         atom_ids: list[str] = []
         seen: set[str] = set()
@@ -908,15 +922,16 @@ class SagaStore:
             if not sid:
                 continue
             rows = conn.execute(
-                """
+                f"""
                 SELECT id
                   FROM atoms
                  WHERE session_id = ?
                    AND tombstoned = 0
+                   AND {auth_where}
                  ORDER BY created_at, rowid
                  LIMIT ?
                 """,
-                (sid, cap),
+                (sid, cap) + tuple(auth_params),
             ).fetchall()
             for (atom_id,) in rows:
                 if atom_id not in seen:
@@ -951,7 +966,7 @@ class SagaStore:
         return await asyncio.to_thread(_do)
 
 
-    async def get_atoms(self, ids: list[str]) -> dict[str, Any]:
+    async def get_atoms(self, ids: list[str], auth_context: Any = None) -> dict[str, Any]:
         """Batch-load atoms by exact id. Pure read — no semantic search, no
         access events, no transaction.
 
@@ -978,25 +993,35 @@ class SagaStore:
         if not clean:
             return {"atoms": [], "missing": []}
 
+        from .ownership import (
+            AuthorizationScope,
+            authorization_predicate,
+            get_authorization_scope,
+        )
+
+        auth_scope = get_authorization_scope(auth_context)
+
         def _do_with_conn(conn: sqlite3.Connection):
             cols = ("id", "content", "stream", "profile", "memory_type",
                     "source_type", "topics", "metadata", "agent_id",
                     "is_pinned", "created_at", "session_id",
                     "encoding_confidence")
-            unique = list(dict.fromkeys(clean))  # de-dupe, keep order
+            unique = list(dict.fromkeys(clean))
             placeholders = ",".join(["?"] * len(unique))
-            rows = conn.execute(
+
+            auth_where, auth_params = authorization_predicate(auth_scope)
+            sql = (
                 f"SELECT {', '.join(cols)} FROM atoms "
-                f"WHERE id IN ({placeholders}) AND tombstoned = 0",
-                unique,
-            ).fetchall()
+                f"WHERE id IN ({placeholders}) AND tombstoned = 0 "
+                f"AND {auth_where}"
+            )
+            rows = conn.execute(sql, unique + auth_params).fetchall()
             found = {row[0]: dict(zip(cols, row)) for row in rows}
             atoms: list[dict[str, Any]] = []
             for aid in unique:
                 a = found.get(aid)
                 if a is None:
                     continue
-                # Match recall's visibility rules: own atoms + shared only.
                 if a["agent_id"] != self._agent_id and a["agent_id"] != "shared":
                     continue
                 atoms.append({
@@ -1984,12 +2009,14 @@ class SagaStore:
 
     async def recent_session_boundaries(
         self, *, channel_id: str | None = None, count: int = 3,
+        auth_context: Any = None,
     ) -> list[dict[str, Any]]:
         def _do():
             conn, should_close = self._operation_conn()
             try:
                 return _recent_boundaries(
                     conn, channel_id=channel_id, count=count,
+                    auth_context=auth_context,
                 )
             finally:
                 if should_close:
@@ -2008,6 +2035,7 @@ class SagaStore:
         alpha: float = 0.7,
         limit: int = 10,
         query_emb: list[float] | None = None,
+        auth_context: Any = None,
     ) -> list[dict]:
         """Connection-scoped implementation for :meth:`search_sessions`.
 
@@ -2016,6 +2044,13 @@ class SagaStore:
         recall, preserving the one-connection-per-read invariant.
         """
         import math
+
+        from .ownership import (
+            authorization_predicate_for_sessions,
+            get_authorization_scope,
+        )
+
+        auth_scope = get_authorization_scope(auth_context)
 
         if query_emb is None:
             query_emb = _query_embed_sync(query) if alpha > 0.0 else []
@@ -2060,14 +2095,17 @@ class SagaStore:
                         continue
 
         # ── Step 2: fetch sessions rows ──
-        channel_clause = "WHERE channel_id = ?" if channel_id else ""
-        params: list = [channel_id] if channel_id else []
+        auth_where, auth_params = authorization_predicate_for_sessions(auth_scope)
+        channel_clause = "AND channel_id = ?" if channel_id else ""
+        params: list = list(auth_params)
+        if channel_id:
+            params.append(channel_id)
 
         rows = conn.execute(
             f"""
             SELECT id, channel_id, started_at, ended_at, summary, reflected_at
             FROM sessions
-            {channel_clause}
+            WHERE {auth_where} {channel_clause}
             ORDER BY COALESCE(ended_at, reflected_at) DESC
             LIMIT 500
             """,
@@ -2127,6 +2165,7 @@ class SagaStore:
         channel_id: str | None = None,
         alpha: float = 0.7,
         limit: int = 10,
+        auth_context: Any = None,
     ) -> list[dict]:
         """Return sessions relevant to *query*, ranked by semantic + recency blend.
 
@@ -2174,6 +2213,7 @@ class SagaStore:
                     alpha=alpha,
                     limit=limit,
                     query_emb=query_emb,
+                    auth_context=auth_context,
                 )
             finally:
                 if should_close:

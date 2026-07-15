@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
+from mimir.models import AuthContext
 from mimir.saga.client import SagaStore
 from mimir.sagatools import _format_saga_payload
 
@@ -31,7 +33,11 @@ def set_memory_client(client: SagaStore) -> None:
 
 
 @tool
-async def memory_query(query: str, top_k: int = 12) -> str:
+async def memory_query(
+    query: str,
+    top_k: int = 12,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
     """Search the user's persistent memory for atoms relevant to the query.
 
     Returns a structured block containing observations (synthesized from
@@ -55,8 +61,15 @@ async def memory_query(query: str, top_k: int = 12) -> str:
     client = _MEMORY_STATE["client"]
     if client is None:
         return "memory_query failed: no SagaStore configured"
+
+    auth_context = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else None
+    )
+
     try:
-        payload = await client.query(query, top_k=top_k)
+        payload = await client.query(query, top_k=top_k, auth_context=auth_context)
     except Exception as exc:
         return f"memory_query failed: {exc}"
     return _format_saga_payload(payload)
@@ -91,7 +104,10 @@ def _format_get_atoms(payload: dict) -> str:
 
 
 @tool
-async def memory_get(atom_ids: list[str]) -> str:
+async def memory_get(
+    atom_ids: list[str],
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
     """Load specific memory atoms by their exact id — a batch by-id lookup.
 
     Use this when you ALREADY know the atom ids you want (e.g. ids cited in
@@ -122,8 +138,15 @@ async def memory_get(atom_ids: list[str]) -> str:
     ids = [a for a in atom_ids if a]
     if not ids:
         return "memory_get failed: atom_ids is empty"
+
+    auth_context = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else None
+    )
+
     try:
-        payload = await client.get_atoms(ids)
+        payload = await client.get_atoms(ids, auth_context=auth_context)
     except Exception as exc:  # noqa: BLE001 — SagaError surfaces via str
         return f"memory_get failed: {exc}"
     return _format_get_atoms(payload)

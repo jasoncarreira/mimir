@@ -258,6 +258,7 @@ def recent_session_boundaries(
     channel_id: str | None = None,
     count: int = 3,
     agent_id: str = "default",  # noqa: ARG001 — see note below
+    auth_context: Any = None,
 ) -> list[dict]:
     """Return the most recent session summaries (by ``reflected_at``),
     optionally scoped to a channel. Used by the prompt-build path to
@@ -298,25 +299,35 @@ def recent_session_boundaries(
     agents' sessions here. Non-issue under the single-agent-per-DB
     posture; revisit if a multi-agent DB shape lands.
     """
+    from .ownership import (
+        authorization_predicate_for_sessions,
+        get_authorization_scope,
+    )
+
+    auth_scope = get_authorization_scope(auth_context)
+    auth_where, auth_params = authorization_predicate_for_sessions(auth_scope)
+
     if channel_id is not None:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT id, channel_id, ended_at, reflected_at, summary,
                    topics_discussed, decisions_made, unfinished,
                    emotional_state, closed_since
             FROM sessions
-            WHERE channel_id = ?
+            WHERE {auth_where}
+              AND channel_id = ?
               AND reflected_at IS NOT NULL
             ORDER BY reflected_at DESC LIMIT ?
-        """, (channel_id, count)).fetchall()
+        """, (*auth_params, channel_id, count)).fetchall()
     else:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT id, channel_id, ended_at, reflected_at, summary,
                    topics_discussed, decisions_made, unfinished,
                    emotional_state, closed_since
             FROM sessions
-            WHERE reflected_at IS NOT NULL
+            WHERE {auth_where}
+              AND reflected_at IS NOT NULL
             ORDER BY reflected_at DESC LIMIT ?
-        """, (count,)).fetchall()
+        """, (*auth_params, count)).fetchall()
 
     out: list[dict] = []
     for r in rows:

@@ -30,6 +30,11 @@ from .activation import (
 )
 from .dedup import BASELINE_ENCODING_CONFIDENCE
 from .mark_access import AccessEvent, mark_access
+from .ownership import (
+    AuthorizationScope,
+    authorization_predicate,
+    get_authorization_scope,
+)
 from .retrieval_fusion import DEFAULT_K as RRF_DEFAULT_K, reciprocal_rank_fusion
 
 
@@ -216,6 +221,7 @@ def recall(
     fire_access_events: bool = True,
     reference_date=None,
     min_confidence_tier: str | None = None,
+    auth_context: Any = None,
 ) -> RecallResult:
     """Two-pass recall. See SCORING.md for the contract.
 
@@ -231,6 +237,9 @@ def recall(
     """
     thresholds = thresholds or DEFAULT_STREAM_THRESHOLDS
     weights = weights or DEFAULT_SCORING_WEIGHTS
+
+    # chainlink #883: authorization scope for read security
+    auth_scope = get_authorization_scope(auth_context)
 
     # ── Pass 1: candidate generation ────────────────────────────────
     query_emb = query_embed_fn(query)
@@ -313,12 +322,21 @@ def recall(
     # Fetch full atom rows + summaries in one pass.
     placeholders = ",".join(["?"] * len(candidate_ids))
     candidate_id_list = list(candidate_ids)
-    atom_rows = conn.execute(
+
+    # chainlink #883: apply authorization predicate - this is the security
+    # boundary that ensures unauthorized rows are filtered at SQL level
+    # before content/existence is exposed
+    auth_where, auth_params = authorization_predicate(auth_scope)
+    base_sql = (
         f"SELECT id, content, stream, profile, memory_type, source_type, "
         f"topics, metadata, agent_id, is_pinned, created_at, session_id, "
         f"encoding_confidence "
-        f"FROM atoms WHERE id IN ({placeholders}) AND tombstoned = 0",
-        candidate_id_list,
+        f"FROM atoms WHERE id IN ({placeholders}) AND tombstoned = 0 "
+        f"AND {auth_where}"
+    )
+    atom_rows = conn.execute(
+        base_sql,
+        candidate_id_list + auth_params,
     ).fetchall()
     cols = ("id", "content", "stream", "profile", "memory_type",
             "source_type", "topics", "metadata", "agent_id", "is_pinned",
