@@ -84,6 +84,11 @@ def store(
     encoding_confidence: float = 0.7,
     precomputed_embedding: tuple[bytes, str, str, int] | None = None,
     session_dedup_threshold: float | None = None,
+    owner_principal: str | None = None,
+    origin_channel: str | None = None,
+    origin_domain: str | None = None,
+    visibility: str | None = None,
+    provenance: dict | None = None,
 ) -> StoreResult:
     """Persist one atom + its embedding + the initial access event.
 
@@ -200,14 +205,20 @@ def store(
             "INSERT INTO atoms (id, content, content_hash, created_at, "
             "stream, profile, memory_type, arousal, valence, "
             "encoding_confidence, topics, source_type, metadata, "
-            "agent_id, session_id, is_pinned) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "agent_id, session_id, is_pinned, owner_principal, "
+            "origin_channel, origin_domain, visibility, provenance) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 atom_id, content, content_hash, created_at,
                 stream, profile, memory_type, arousal, valence,
                 encoding_confidence, json.dumps(topics or []),
                 source_type, json.dumps(metadata or {}),
                 agent_id, session_id, 1 if is_pinned else 0,
+                owner_principal or "legacy_admin",
+                origin_channel,
+                origin_domain,
+                visibility or "legacy_admin",
+                json.dumps(provenance or {}),
             ),
         )
         conn.execute(

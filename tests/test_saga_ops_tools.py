@@ -17,7 +17,8 @@ import pytest
 
 from mimir._context import reset_current_turn, set_current_turn
 from mimir import _context
-from mimir.models import TurnContext
+from mimir.access_control import get_service_principal
+from mimir.models import AuthContext, TurnContext
 from mimir.tools import saga_ops
 from mimir.tools.memory import _MEMORY_STATE
 from mimir.tools.saga_ops import _resolve_session_id
@@ -62,6 +63,11 @@ class _StubStore:
         emotional_state,
         closed_since,
         channel_id,
+        owner_principal=None,
+        origin_channel=None,
+        origin_domain=None,
+        visibility=None,
+        provenance=None,
     ):
         if self.raise_on == "end_session":
             raise RuntimeError("end_session boom")
@@ -92,6 +98,18 @@ def store() -> _StubStore:
 
 @pytest.fixture
 def turn_with_session() -> TurnContext:
+    auth_ctx = AuthContext(
+        principal="test-user",
+        canonical_principal="test-user",
+        roles=("admin",),
+        event_ingress="test",
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        policy_version=None,
+        is_service=False,
+        enforcement_enabled=False,
+    )
     ctx = TurnContext(
         turn_id="t-1",
         session_id="ch-1",
@@ -99,6 +117,7 @@ def turn_with_session() -> TurnContext:
         channel_id="ch-1",
         started_at=time.monotonic(),
         saga_session_id="sess-abc",
+        auth_context=auth_ctx,
     )
     token = set_current_turn(ctx)
     yield ctx

@@ -183,6 +183,11 @@ async def saga_end_session(
     during this session — the prompt builder substring-matches them
     and drops resolved items from later renderings.
     """
+    from ..access_control import (
+        can_write_saga,
+        get_provenance_from_auth_context,
+    )
+
     client = _MEMORY_STATE["client"]
     if client is None:
         return "saga_end_session failed: no SagaStore configured"
@@ -200,7 +205,29 @@ async def saga_end_session(
         return kept or None
 
     ctx, _resolution = _resolve_turn_ctx(session_id)
+
+    auth_context = getattr(ctx, "auth_context", None) if ctx is not None else None
+
+    if ctx is not None and not can_write_saga(auth_context):
+        return (
+            "saga_end_session failed: write access denied. "
+            "Session writes require admin role or trusted service principal."
+        )
+
+    current_saga_session_id = getattr(ctx, "saga_session_id", None) if ctx is not None else None
+    if ctx is not None and session_id != current_saga_session_id:
+        return (
+            f"saga_end_session failed: session_id mismatch. "
+            f"Provided '{session_id}' does not match current turn's "
+            f"saga_session_id '{current_saga_session_id}'. "
+            f"Model-supplied session_id is attribution-only and cannot "
+            f"choose an owner, channel, visibility, or another active turn's authority."
+        )
+
     channel_id = getattr(ctx, "channel_id", None) if ctx is not None else None
+
+    provenance = get_provenance_from_auth_context(auth_context)
+    owner_principal = provenance.get("created_by")
 
     try:
         payload = await client.end_session(
@@ -212,6 +239,11 @@ async def saga_end_session(
             emotional_state=(emotional_state or "").strip() or None,
             closed_since=_clean(closed_since),
             channel_id=channel_id,
+            owner_principal=owner_principal,
+            origin_channel=channel_id,
+            origin_domain=None,
+            visibility="service" if auth_context and getattr(auth_context, "is_service", False) else "private",
+            provenance=provenance,
         )
     except Exception as exc:  # noqa: BLE001
         return f"saga_end_session failed: {exc}"

@@ -19,11 +19,22 @@ the memory_tool.py uses (shared via _MEMORY_STATE).
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from langchain_core.tools import tool
 
+from ..access_control import (
+    can_write_saga,
+    get_provenance_from_auth_context,
+)
 from .memory import _MEMORY_STATE
+
+
+def _resolve_active_context() -> tuple[Any | None, str]:
+    """Resolve the active turn context for authorization checks."""
+    from .._context import resolve_active_ctx
+
+    return resolve_active_ctx({})
 
 
 @tool
@@ -53,8 +64,9 @@ async def memory_store(
     Args:
         content: The fact / event / pattern, one self-contained sentence.
         stream: One of ``"semantic"``, ``"episodic"``, ``"procedural"``.
-        session_id: Optional saga_session_id for scoping (informational
-            in this PoC — SagaStore.store doesn't filter by it today).
+        session_id: Optional saga_session_id for scoping. If provided, must
+            match the current turn's saga_session_id. If not provided, the
+            server will derive the session from the active turn context.
         source_type: How this atom was created. Defaults to
             ``"agent_authored"``.
 
@@ -64,12 +76,45 @@ async def memory_store(
     client = _MEMORY_STATE["client"]
     if client is None:
         return "memory_store failed: no SagaStore configured"
+
+    ctx, _resolution = _resolve_active_context()
+    auth_context = getattr(ctx, "auth_context", None) if ctx is not None else None
+
+    if ctx is not None and not can_write_saga(auth_context):
+        return (
+            "memory_store failed: write access denied. "
+            "Shared-memory writes require admin role or trusted service principal."
+        )
+
+    effective_session_id = session_id
+    if session_id is not None and ctx is not None:
+        current_saga_session_id = getattr(ctx, "saga_session_id", None) if ctx is not None else None
+        if session_id != current_saga_session_id:
+            return (
+                f"memory_store failed: session_id mismatch. "
+                f"Provided '{session_id}' does not match current turn's "
+                f"saga_session_id '{current_saga_session_id}'. "
+                f"Model-supplied session_id is attribution-only and cannot "
+                f"choose an owner, channel, visibility, or another active turn's authority."
+            )
+    elif ctx is not None:
+        effective_session_id = getattr(ctx, "saga_session_id", None)
+
+    provenance = get_provenance_from_auth_context(auth_context)
+    owner_principal = provenance.get("created_by")
+    origin_channel = getattr(ctx, "channel_id", None) if ctx is not None else None
+
     try:
         result = await client.store(
             content,
             stream=stream,
             source_type=source_type,
-            session_id=session_id,
+            session_id=effective_session_id,
+            owner_principal=owner_principal,
+            origin_channel=origin_channel,
+            origin_domain=None,
+            visibility="service" if auth_context and getattr(auth_context, "is_service", False) else "private",
+            provenance=provenance,
         )
     except Exception as exc:
         return f"memory_store failed: {exc}"
@@ -78,6 +123,5 @@ async def memory_store(
     atom_id = result.get("atom_id")
     stored = result.get("stored")
     if stored is False:
-        # Dedup hit — atom existed already
         return f"memory_store: atom already present (atom_id={atom_id})"
     return f"memory_store: stored atom_id={atom_id}"

@@ -1403,6 +1403,66 @@ def get_service_principal(trigger: str) -> ServicePrincipal | None:
     return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
 
 
+def is_admin(auth_context: Any) -> bool:
+    """Check if the auth context has admin role."""
+    if auth_context is None:
+        return False
+    roles = getattr(auth_context, "roles", None)
+    if not roles:
+        return False
+    return "admin" in roles
+
+
+def is_trusted_service(auth_context: Any) -> bool:
+    """Check if the auth context represents a trusted service principal.
+
+    A trusted service is identified by having is_service=True and a trigger
+    that matches a registered service principal.
+    """
+    if auth_context is None:
+        return False
+    if not getattr(auth_context, "is_service", False):
+        return False
+    trigger = getattr(auth_context, "trigger", None)
+    if trigger is None:
+        return False
+    return trigger in _TRUSTED_SERVICE_PRINCIPALS
+
+
+def can_write_saga(auth_context: Any) -> bool:
+    """Check if the auth context can write to SAGA (memory_store, saga_end_session).
+
+    Writes are allowed for:
+    - Admin users
+    - Trusted service principals
+
+    Regular users cannot write to shared memory.
+    """
+    return is_admin(auth_context) or is_trusted_service(auth_context)
+
+
+def get_provenance_from_auth_context(
+    auth_context: Any,
+) -> dict[str, Any]:
+    """Extract provenance metadata from a frozen AuthContext.
+
+    Returns a dict with:
+    - created_by: canonical principal or service name
+    - trigger: the event trigger
+    - event_ingress: server-owned ingress point
+    - is_service: whether this is a service principal
+    """
+    if auth_context is None:
+        return {}
+    return {
+        "created_by": getattr(auth_context, "canonical_principal", None)
+            or getattr(auth_context, "principal", None),
+        "trigger": getattr(auth_context, "trigger", None),
+        "event_ingress": getattr(auth_context, "event_ingress", None),
+        "is_service": getattr(auth_context, "is_service", False),
+    }
+
+
 def _find_service_principal_for_trigger(trigger: str) -> ServicePrincipal | None:
     """Find a service principal that matches the given trigger."""
     return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)

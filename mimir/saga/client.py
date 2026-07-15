@@ -1065,6 +1065,11 @@ class SagaStore:
         precomputed_embedding: EmbeddingTuple | None = None,
         session_id: str | None = None,
         session_dedup_threshold: float | None = None,
+        owner_principal: str | None = None,
+        origin_channel: str | None = None,
+        origin_domain: str | None = None,
+        visibility: str | None = None,
+        provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         # session_dedup_threshold is forwarded straight to store() — off
         # by default, opt-in by callers that want session-paraphrase
@@ -1110,6 +1115,11 @@ class SagaStore:
                 session_id=session_id,
                 precomputed_embedding=effective_embedding,
                 session_dedup_threshold=session_dedup_threshold,
+                owner_principal=owner_principal,
+                origin_channel=origin_channel,
+                origin_domain=origin_domain,
+                visibility=visibility,
+                provenance=provenance,
             )
             if result.stored:
                 # Incremental-add to the FAISS index if it's already
@@ -1201,6 +1211,11 @@ class SagaStore:
         emotional_state: str | None = None,
         closed_since: list[str] | None = None,
         channel_id: str | None = None,
+        owner_principal: str | None = None,
+        origin_channel: str | None = None,
+        origin_domain: str | None = None,
+        visibility: str | None = None,
+        provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Close a session. ``channel_id`` is persisted on the
         sessions row so ``recent_session_boundaries(channel_id=...)``
@@ -1227,9 +1242,11 @@ class SagaStore:
                 conn, session_id=session_id, channel_id=channel_id,
                 embed_fn=_embed_text_sync,
                 boundary_synth_fn=_stub_synth,
-                # No observation synth at session-end — that lives in
-                # consolidate() (cron-driven, cross-session). reflect's
-                # within-session synth hook was removed 2026-05-13.
+                owner_principal=owner_principal,
+                origin_channel=origin_channel,
+                origin_domain=origin_domain,
+                visibility=visibility,
+                provenance=provenance,
             )
             # Invalidate sessions index so the next search_sessions() call
             # picks up the newly-written session and its embedding.

@@ -27,7 +27,7 @@ from typing import Any
 import pytest
 
 from mimir._context import reset_current_turn, set_current_turn
-from mimir.models import TurnContext
+from mimir.models import AuthContext, TurnContext
 from mimir.tools import saga_ops
 from mimir.tools.memory import _MEMORY_STATE
 
@@ -64,6 +64,8 @@ class _StubStore:
     async def end_session(
         self, *, session_id, summary, topics_discussed, decisions_made,
         unfinished, emotional_state, closed_since, channel_id,
+        owner_principal=None, origin_channel=None, origin_domain=None,
+        visibility=None, provenance=None,
     ):
         if self.raise_on == "end_session":
             raise RuntimeError("end_session boom")
@@ -103,6 +105,18 @@ def store() -> _StubStore:
 def turn_with_session() -> TurnContext:
     """Register a TurnContext so ``session_id`` defaults to the turn's
     ``saga_session_id``."""
+    auth_ctx = AuthContext(
+        principal="test-user",
+        canonical_principal="test-user",
+        roles=("admin",),
+        event_ingress="test",
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        policy_version=None,
+        is_service=False,
+        enforcement_enabled=False,
+    )
     ctx = TurnContext(
         turn_id="t-1",
         session_id="ch-1",
@@ -110,6 +124,7 @@ def turn_with_session() -> TurnContext:
         channel_id="ch-1",
         started_at=time.monotonic(),
         saga_session_id="sess-abc",
+        auth_context=auth_ctx,
     )
     token = set_current_turn(ctx)
     yield ctx
