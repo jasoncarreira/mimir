@@ -1403,6 +1403,83 @@ def get_service_principal(trigger: str) -> ServicePrincipal | None:
     return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
 
 
+def is_admin(auth_context: Any) -> bool:
+    """Check if the auth context has admin role."""
+    if auth_context is None:
+        return False
+    roles = getattr(auth_context, "roles", None)
+    if not roles:
+        return False
+    return "admin" in roles
+
+
+def get_trusted_service_from_auth_context(
+    auth_context: Any,
+) -> ServicePrincipal | None:
+    """Resolve a registered service from the server-owned auth carrier.
+
+    Service authority exists only for internally-created events: public HTTP
+    ingress is stamped in ``event_ingress`` and therefore cannot gain service
+    authority merely by choosing a registered trigger string.
+    """
+    if auth_context is None or getattr(auth_context, "event_ingress", None) is not None:
+        return None
+    if not getattr(auth_context, "is_service", False):
+        return None
+    trigger = getattr(auth_context, "trigger", None)
+    if not isinstance(trigger, str):
+        return None
+    service = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+    if service is None or getattr(auth_context, "canonical_principal", None) != service.canonical:
+        return None
+    return service
+
+
+def is_trusted_service(auth_context: Any) -> bool:
+    """Check whether the exact auth carrier maps to a trusted service."""
+    return get_trusted_service_from_auth_context(auth_context) is not None
+
+
+def can_write_saga(auth_context: Any) -> bool:
+    """Check if the auth context can write to SAGA (memory_store, saga_end_session).
+
+    Writes are allowed for:
+    - Admin users
+    - Trusted service principals
+
+    Regular users cannot write to shared memory.
+    """
+    return is_admin(auth_context) or is_trusted_service(auth_context)
+
+
+def get_provenance_from_auth_context(
+    auth_context: Any,
+) -> dict[str, Any]:
+    """Extract provenance metadata from a frozen AuthContext.
+
+    Returns a dict with:
+    - created_by: canonical principal or service name
+    - trigger: the event trigger
+    - event_ingress: server-owned ingress point
+    - is_service: whether this is a service principal
+    """
+    if auth_context is None:
+        return {}
+    service = get_trusted_service_from_auth_context(auth_context)
+    created_by = (
+        f"service:{service.canonical}"
+        if service is not None
+        else getattr(auth_context, "canonical_principal", None)
+        or getattr(auth_context, "principal", None)
+    )
+    return {
+        "created_by": created_by,
+        "trigger": getattr(auth_context, "trigger", None),
+        "event_ingress": getattr(auth_context, "event_ingress", None),
+        "is_service": service is not None,
+    }
+
+
 def _find_service_principal_for_trigger(trigger: str) -> ServicePrincipal | None:
     """Find a service principal that matches the given trigger."""
     return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
@@ -1567,6 +1644,19 @@ def create_auth_context(
         access = resolver.access_metadata(author)
         roles = access.roles
         is_service = access.is_service
+
+    registered_service = _TRUSTED_SERVICE_PRINCIPALS.get(event.trigger)
+    if (
+        registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and event_ingress is None
+        and not (
+            isinstance(event.extra, dict)
+            and event.extra.get("event_ingress") is not None
+        )
+    ):
+        canonical = registered_service.canonical
+        is_service = True
 
     return AuthContext(
         principal=author,

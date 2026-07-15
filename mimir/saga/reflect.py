@@ -121,6 +121,11 @@ def reflect(
     boundary_synth_fn: BoundarySynthFn,
     boundary_context: dict | None = None,
     agent_id: str = "default",
+    owner_principal: str | None = None,
+    origin_channel: str | None = None,
+    origin_domain: str | None = None,
+    visibility: str | None = None,
+    provenance: dict | None = None,
 ) -> ReflectResult:
     """Session-end bookkeeping.
 
@@ -194,8 +199,9 @@ def reflect(
             INSERT INTO sessions
                 (id, channel_id, started_at, ended_at, summary, reflected_at,
                  topics_discussed, decisions_made, unfinished,
-                 emotional_state, closed_since, embedding, embedding_dim)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 emotional_state, closed_since, embedding, embedding_dim,
+                 owner_principal, origin_channel, origin_domain, visibility, provenance)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 ended_at         = excluded.ended_at,
                 -- Structured extraction fields: COALESCE(NULLIF(..., '[]'), existing)
@@ -210,7 +216,12 @@ def reflect(
                 emotional_state  = COALESCE(excluded.emotional_state, sessions.emotional_state),
                 closed_since     = COALESCE(NULLIF(excluded.closed_since, '[]'), sessions.closed_since),
                 embedding        = COALESCE(excluded.embedding, sessions.embedding),
-                embedding_dim    = COALESCE(excluded.embedding_dim, sessions.embedding_dim)
+                embedding_dim    = COALESCE(excluded.embedding_dim, sessions.embedding_dim),
+                owner_principal = COALESCE(excluded.owner_principal, sessions.owner_principal),
+                origin_channel  = COALESCE(excluded.origin_channel, sessions.origin_channel),
+                origin_domain   = COALESCE(excluded.origin_domain, sessions.origin_domain),
+                visibility      = COALESCE(excluded.visibility, sessions.visibility),
+                provenance      = COALESCE(excluded.provenance, sessions.provenance)
         """, (
             session_id, channel_id,
             atoms[0]["created_at"] if atoms else now,
@@ -224,6 +235,11 @@ def reflect(
             json.dumps(closed_since),
             emb_bytes,
             emb_dim,
+            owner_principal or "legacy_admin",
+            origin_channel,
+            origin_domain,
+            visibility or "legacy_admin",
+            json.dumps(provenance or {}),
         ))
         conn.commit()
     except Exception:

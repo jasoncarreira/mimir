@@ -21,8 +21,15 @@ from __future__ import annotations
 
 from typing import Optional
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
+from ..access_control import (
+    can_write_saga,
+    get_provenance_from_auth_context,
+    is_trusted_service,
+)
+from ..models import AuthContext
 from .memory import _MEMORY_STATE
 
 
@@ -32,6 +39,7 @@ async def memory_store(
     stream: str,
     session_id: Optional[str] = None,
     source_type: str = "agent_authored",
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Store a memory atom in persistent memory for cross-session retrieval.
 
@@ -53,8 +61,8 @@ async def memory_store(
     Args:
         content: The fact / event / pattern, one self-contained sentence.
         stream: One of ``"semantic"``, ``"episodic"``, ``"procedural"``.
-        session_id: Optional saga_session_id for scoping (informational
-            in this PoC — SagaStore.store doesn't filter by it today).
+        session_id: Optional saga_session_id attribution label. It never
+            participates in authorization or ownership selection.
         source_type: How this atom was created. Defaults to
             ``"agent_authored"``.
 
@@ -64,12 +72,37 @@ async def memory_store(
     client = _MEMORY_STATE["client"]
     if client is None:
         return "memory_store failed: no SagaStore configured"
+
+    auth_context = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else None
+    )
+    if not can_write_saga(auth_context):
+        return (
+            "memory_store failed: write access denied. "
+            "Shared-memory writes require server-provided admin or trusted-service authority."
+        )
+
+    # ``session_id`` is attribution-only. It may label the write, but cannot
+    # select a TurnContext or influence any authority/ownership field.
+    effective_session_id = (session_id or "").strip() or None
+    provenance = get_provenance_from_auth_context(auth_context)
+    owner_principal = provenance["created_by"]
+    origin_channel = auth_context.channel_id
+    visibility = "service" if is_trusted_service(auth_context) else "private"
+
     try:
         result = await client.store(
             content,
             stream=stream,
             source_type=source_type,
-            session_id=session_id,
+            session_id=effective_session_id,
+            owner_principal=owner_principal,
+            origin_channel=origin_channel,
+            origin_domain=None,
+            visibility=visibility,
+            provenance=provenance,
         )
     except Exception as exc:
         return f"memory_store failed: {exc}"
@@ -78,6 +111,5 @@ async def memory_store(
     atom_id = result.get("atom_id")
     stored = result.get("stored")
     if stored is False:
-        # Dedup hit — atom existed already
         return f"memory_store: atom already present (atom_id={atom_id})"
     return f"memory_store: stored atom_id={atom_id}"

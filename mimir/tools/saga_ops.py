@@ -11,10 +11,11 @@ SAGA verbs the SDK build exposed:
 * ``saga_forget``             — preview/run the intentional-forgetting engine
 
 All four route to the SagaStore instance installed by
-``mimir.tools.memory.set_memory_client``. They resolve the active
-TurnContext via ``_context.resolve_active_ctx()`` so MCP-dispatched
-tool calls that run on forked SDK tasks do not lose per-turn context;
-explicit ``session_id`` values still win.
+``mimir.tools.memory.set_memory_client``. Feedback operations use the
+active turn only to default optional attribution. The write operation
+``saga_end_session`` instead receives the exact server-created
+``AuthContext`` through LangGraph ``ToolRuntime``; model arguments and
+ambient turn-resolution fallbacks never participate in write authority.
 
 Best-effort failures: every tool surfaces SagaError + generic
 exception messages as a human-readable string. Failures never crash
@@ -27,8 +28,10 @@ import json
 import logging
 from typing import Any, Optional
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
+from ..models import AuthContext
 from .memory import _MEMORY_STATE
 
 log = logging.getLogger(__name__)
@@ -170,6 +173,7 @@ async def saga_end_session(
     unfinished: Optional[list[str]] = None,
     emotional_state: Optional[str] = None,
     closed_since: Optional[list[str]] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Close a SAGA session by writing the rendered boundary fields to
     the ``sessions`` table (replaces the legacy session_boundary atom).
@@ -183,6 +187,12 @@ async def saga_end_session(
     during this session — the prompt builder substring-matches them
     and drops resolved items from later renderings.
     """
+    from ..access_control import (
+        can_write_saga,
+        get_provenance_from_auth_context,
+        is_trusted_service,
+    )
+
     client = _MEMORY_STATE["client"]
     if client is None:
         return "saga_end_session failed: no SagaStore configured"
@@ -199,8 +209,23 @@ async def saga_end_session(
         kept = [x for x in lst if x.strip()]
         return kept or None
 
-    ctx, _resolution = _resolve_turn_ctx(session_id)
-    channel_id = getattr(ctx, "channel_id", None) if ctx is not None else None
+    auth_context = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else None
+    )
+    if not can_write_saga(auth_context):
+        return (
+            "saga_end_session failed: write access denied. "
+            "Session writes require server-provided admin or trusted-service authority."
+        )
+
+    # The model supplies only the session row identifier. Authority and all
+    # ownership fields come from this exact invocation's server carrier.
+    channel_id = auth_context.channel_id
+    provenance = get_provenance_from_auth_context(auth_context)
+    owner_principal = provenance["created_by"]
+    visibility = "service" if is_trusted_service(auth_context) else "private"
 
     try:
         payload = await client.end_session(
@@ -212,15 +237,14 @@ async def saga_end_session(
             emotional_state=(emotional_state or "").strip() or None,
             closed_since=_clean(closed_since),
             channel_id=channel_id,
+            owner_principal=owner_principal,
+            origin_channel=channel_id,
+            origin_domain=None,
+            visibility=visibility,
+            provenance=provenance,
         )
     except Exception as exc:  # noqa: BLE001
         return f"saga_end_session failed: {exc}"
-
-    # Flag the ctx so the synthesis-turn post-message hook can tell
-    # the model actually called this tool (Mimir review noted that
-    # the synthesis path needs this signal).
-    if ctx is not None:
-        ctx.saga_end_session_called = True
 
     written = (
         payload.get("session_summary_written")

@@ -17,7 +17,10 @@ import pytest
 
 from mimir._context import reset_current_turn, set_current_turn
 from mimir import _context
-from mimir.models import TurnContext
+from mimir.access_control import get_service_principal
+from langchain.tools import ToolRuntime
+
+from mimir.models import AuthContext, TurnContext
 from mimir.tools import saga_ops
 from mimir.tools.memory import _MEMORY_STATE
 from mimir.tools.saga_ops import _resolve_session_id
@@ -62,6 +65,11 @@ class _StubStore:
         emotional_state,
         closed_since,
         channel_id,
+        owner_principal=None,
+        origin_channel=None,
+        origin_domain=None,
+        visibility=None,
+        provenance=None,
     ):
         if self.raise_on == "end_session":
             raise RuntimeError("end_session boom")
@@ -92,6 +100,18 @@ def store() -> _StubStore:
 
 @pytest.fixture
 def turn_with_session() -> TurnContext:
+    auth_ctx = AuthContext(
+        principal="test-user",
+        canonical_principal="test-user",
+        roles=("admin",),
+        event_ingress="test",
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        policy_version=None,
+        is_service=False,
+        enforcement_enabled=False,
+    )
     ctx = TurnContext(
         turn_id="t-1",
         session_id="ch-1",
@@ -99,10 +119,18 @@ def turn_with_session() -> TurnContext:
         channel_id="ch-1",
         started_at=time.monotonic(),
         saga_session_id="sess-abc",
+        auth_context=auth_ctx,
     )
     token = set_current_turn(ctx)
     yield ctx
     reset_current_turn(token)
+
+
+def _runtime(ctx: TurnContext) -> ToolRuntime[AuthContext]:
+    return ToolRuntime(
+        state={}, context=ctx.auth_context, config={}, stream_writer=lambda _: None,
+        tool_call_id="saga-write-test", store=None,
+    )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -239,24 +267,20 @@ async def test_end_session_missing_session_id_returns_error(
 
 
 @pytest.mark.asyncio
-async def test_end_session_no_active_turn_channel_id_is_none(
+async def test_end_session_without_server_runtime_fails_closed(
     store: _StubStore,
 ) -> None:
-    # No TurnContext registered → channel_id passed to store should be None.
     out = await saga_ops.saga_end_session.ainvoke(
         {"session_id": "sess-xyz", "summary": "wrapping up"}
     )
-    assert "ok" in out.lower()
-    assert store.end_session_calls[0]["channel_id"] is None
+    assert "write access denied" in out
+    assert store.end_session_calls == []
 
 
 @pytest.mark.asyncio
-async def test_end_session_uses_active_registry_when_contextvar_missing(
+async def test_end_session_does_not_consult_active_registry(
     store: _StubStore, turn_with_session: TurnContext,
 ) -> None:
-    # MCP dispatch can lose the direct contextvar while _active_turns still has
-    # the turn.  saga_end_session must still thread channel_id and flip the ctx
-    # flag for the synthesis post-message hook.
     token = _context._current_turn.set(None)
     try:
         out = await saga_ops.saga_end_session.ainvoke(
@@ -264,9 +288,8 @@ async def test_end_session_uses_active_registry_when_contextvar_missing(
         )
     finally:
         _context._current_turn.reset(token)
-    assert "ok" in out.lower()
-    assert store.end_session_calls[0]["channel_id"] == "ch-1"
-    assert turn_with_session.saga_end_session_called is True
+    assert "write access denied" in out
+    assert store.end_session_calls == []
 
 
 @pytest.mark.asyncio
@@ -275,7 +298,7 @@ async def test_end_session_store_raises_surfaces_error(
 ) -> None:
     store.raise_on = "end_session"
     out = await saga_ops.saga_end_session.ainvoke(
-        {"session_id": "sess-abc", "summary": "done"}
+        {"runtime": _runtime(turn_with_session), "session_id": "sess-abc", "summary": "done"}
     )
     assert "saga_end_session failed" in out
     assert "boom" in out
@@ -288,7 +311,7 @@ async def test_end_session_ctx_flag_not_set_on_store_error(
     # saga_end_session_called should remain False when the store raises.
     store.raise_on = "end_session"
     await saga_ops.saga_end_session.ainvoke(
-        {"session_id": "sess-abc", "summary": "done"}
+        {"runtime": _runtime(turn_with_session), "session_id": "sess-abc", "summary": "done"}
     )
     assert getattr(turn_with_session, "saga_end_session_called", False) is False
 

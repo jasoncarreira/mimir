@@ -1726,6 +1726,7 @@ async def run_poller(
         event = AgentEvent(
             trigger="poller",
             channel_id=poller.channel_id(),
+            service_principal="poller",
             content=content,
             source="poller",
             source_id=f"{POLLER_CHANNEL_PREFIX}{poller.name}:{fire_ts_ms}:batch:{batch_idx}",

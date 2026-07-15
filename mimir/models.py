@@ -125,6 +125,11 @@ class AgentEvent:
     source: str | None = None
     attachment_names: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
+    # Server-owned service identity. Only trusted internal event constructors
+    # set this field; generic HTTP ingress deliberately never copies it from a
+    # request body. ``create_auth_context`` validates it against the registered
+    # principal for ``trigger`` before granting service authority.
+    service_principal: str | None = None
     # Server-carried IFC state for continuations/resumed events. This must be
     # propagated from a trusted TurnContext; generic ingress must not accept a
     # client assertion as a declassification or authority signal.

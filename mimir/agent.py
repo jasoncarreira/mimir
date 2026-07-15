@@ -2584,7 +2584,17 @@ class Agent:
         # and the model didn't call saga_end_session, emit the boundary-skip
         # signal so the next turn's algedonic block surfaces it for
         # self-correction.
-        if event.trigger == "saga_session_end" and not ctx.saga_end_session_called:
+        if (
+            event.trigger == "saga_session_end"
+            and not ctx.saga_end_session_called
+            and not any(
+                item.get("type") == "tool_result"
+                and item.get("name") == "saga_end_session"
+                and "saga_end_session ok:" in str(item.get("content", ""))
+                for item in events
+                if isinstance(item, dict)
+            )
+        ):
             await safe_log_event(
                 "saga_synthesis_skipped_boundary",
                 session_id=saga_session_id,
