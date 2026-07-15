@@ -1120,6 +1120,17 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "submit_proposal",
                 "abandon_proposal",
                 "worklink_run",
+                "read_file",
+                "aread",
+                "ls",
+                "als",
+                "glob",
+                "aglob",
+                "grep",
+                "agrep",
+                "file_search",
+                "get_turn",
+                "mimir_get_turn",
             ),
             readable_domains=("configured_inputs",),
             sink_destinations=("configured_channel",),
@@ -1139,6 +1150,18 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "submit_proposal",
                 "abandon_proposal",
                 "worklink_run",
+                "read_file",
+                "aread",
+                "ls",
+                "als",
+                "glob",
+                "aglob",
+                "grep",
+                "agrep",
+                "file_search",
+                "get_turn",
+                "mimir_get_turn",
+                "send_message",
             ),
             readable_domains=("poller_payload",),
             sink_destinations=("configured_channel",),
@@ -1147,7 +1170,27 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
         ServicePrincipal(
             canonical="synthesis",
             trigger="saga_session_end",
-            capabilities=("saga_end_session", "saga_mark_contributions"),
+            capabilities=(
+                "saga_end_session",
+                "saga_mark_contributions",
+                "saga_feedback",
+                "saga_record_skill_learning",
+                "memory_get",
+                "memory_store",
+                "mimir_get_turn",
+                "get_turn",
+                "shell_exec",
+                "read_file",
+                "aread",
+                "ls",
+                "als",
+                "glob",
+                "aglob",
+                "grep",
+                "agrep",
+                "write_file",
+                "edit_file",
+            ),
             readable_domains=("session", "saga"),
             sink_destinations=("session_boundary",),
             creation_path="mimir.server._on_session_idle",
@@ -1157,6 +1200,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             trigger="upgrade",
             capabilities=(
                 "shell_exec",
+                "bash_async",
                 "write_file",
                 "edit_file",
                 "open_proposal",
@@ -1164,6 +1208,15 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "abandon_proposal",
                 "add_schedule",
                 "set_schedule_priority",
+                "read_file",
+                "aread",
+                "ls",
+                "als",
+                "glob",
+                "aglob",
+                "grep",
+                "agrep",
+                "send_message",
             ),
             readable_domains=("defaults", "proposal"),
             sink_destinations=("operator_alert",),
@@ -1176,6 +1229,101 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
 def register_service_principal(service: ServicePrincipal) -> None:
     """Register a trusted autonomous service principal."""
     _TRUSTED_SERVICE_PRINCIPALS[service.trigger] = service
+
+
+_REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset({
+    "scheduled_tick",
+    "poller",
+    "saga_session_end",
+    "upgrade",
+})
+
+
+class CapabilityMatrixError(Exception):
+    """Raised when the service principal capability matrix is incomplete."""
+    pass
+
+
+def check_capability_matrix_complete(
+    fail_closed: bool = True,
+) -> tuple[bool, list[str]]:
+    """Verify that all required service principals have capabilities defined.
+
+    This is the enforcement preflight check required by chainlink #879.
+    It ensures the principal × operation capability matrix is complete
+    before enforcement can be enabled.
+
+    Args:
+        fail_closed: If True, return (False, errors) when matrix is incomplete.
+                    If False, return (True, []) but log warnings.
+
+    Returns:
+        A tuple of (is_complete, error_messages). If is_complete is True,
+        the matrix is ready for enforcement. If False, enforcement should
+        fail closed or report blocked.
+    """
+    errors: list[str] = []
+
+    for trigger in _REQUIRED_SERVICE_PRINCIPALS:
+        principal = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+        if principal is None:
+            errors.append(f"Missing service principal for trigger: {trigger}")
+            continue
+
+        if not principal.capabilities:
+            errors.append(
+                f"Service principal '{principal.canonical}' ({trigger}) has no capabilities defined"
+            )
+
+        if not principal.readable_domains:
+            log.warning(
+                "service_principal_missing_readable_domains: principal=%s trigger=%s",
+                principal.canonical,
+                trigger,
+            )
+
+        if not principal.sink_destinations:
+            log.warning(
+                "service_principal_missing_sink_destinations: principal=%s trigger=%s",
+                principal.canonical,
+                trigger,
+            )
+
+    for trigger, principal in _TRUSTED_SERVICE_PRINCIPALS.items():
+        if trigger not in _REQUIRED_SERVICE_PRINCIPALS:
+            log.debug(
+                "service_principal_not_required: principal=%s trigger=%s",
+                principal.canonical,
+                trigger,
+            )
+
+    if errors:
+        if fail_closed:
+            return (False, errors)
+        else:
+            for error in errors:
+                log.warning("capability_matrix_incomplete: %s", error)
+            return (True, [])
+
+    return (True, [])
+
+
+def get_capability_matrix_report() -> dict[str, dict[str, Any]]:
+    """Generate a report of the current capability matrix for audit purposes.
+
+    Returns:
+        A dictionary mapping trigger names to their principal configuration.
+    """
+    report: dict[str, dict[str, Any]] = {}
+    for trigger, principal in _TRUSTED_SERVICE_PRINCIPALS.items():
+        report[trigger] = {
+            "canonical": principal.canonical,
+            "capabilities": list(principal.capabilities),
+            "readable_domains": list(principal.readable_domains),
+            "sink_destinations": list(principal.sink_destinations),
+            "creation_path": principal.creation_path,
+        }
+    return report
 
 
 def get_service_principal(trigger: str) -> ServicePrincipal | None:
