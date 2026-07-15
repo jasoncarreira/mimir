@@ -418,38 +418,38 @@ def test_apply_pending_migrations_fresh_false_empty_applied_skips_when_db_is_cur
     monkeypatch, tmp_path,
 ):
     """The mid-init retry scenario: ``schema.sql`` ran (producing
-    v6-shape tables), then the migration step raised and the connection
+    v7-shape tables), then the migration step raised and the connection
     got closed before schema_version was stamped. Next ``_ensure_conn``
     sees ``fresh=False, applied={}``, but tables are already at
-    ``CURRENT_SCHEMA_VERSION``. ``_detect_schema_version`` returns 6
-    via the FK marker — stamp v1..v6 and skip the migrations loop
-    rather than re-running v6's DROP-and-rebuild on already-v6 tables.
+    ``CURRENT_SCHEMA_VERSION``. ``_detect_schema_version`` returns 7
+    via the visibility column marker — stamp v1..v7 and skip the migrations
+    loop rather than re-running v7's ALTER TABLE on already-v7 tables.
 
     Regression guard: under the naive "treat empty applied as v1"
-    fix, this test would attempt ``ALTER TABLE sessions ADD COLUMN
-    topics_discussed`` against a sessions table that already has it,
+    fix, this test would attempt ``ALTER TABLE atoms ADD COLUMN visibility``
+    against an atoms table that already has it,
     raising ``sqlite3.OperationalError: duplicate column name``.
     """
     from mimir.saga.client import SagaStore
 
-    # Real SagaStore against a real v6 DB (the file-backed path triggers
+    # Real SagaStore against a real v7 DB (the file-backed path triggers
     # schema.sql; we don't patch CURRENT_SCHEMA_VERSION or MIGRATIONS
     # here because we want the production schema to fire).
-    db_path = tmp_path / "v6.saga.db"
+    db_path = tmp_path / "v7.saga.db"
     store = SagaStore(db_path=db_path)
-    conn = store._ensure_conn()  # creates v6-shape tables + stamps v6
+    conn = store._ensure_conn()  # creates v7-shape tables + stamps v7
 
     # Simulate the mid-init failure by clearing schema_version.
     conn.execute("DELETE FROM schema_version")
     conn.commit()
 
     # Now call _apply_pending_migrations(fresh=False) — it should
-    # detect v6 via the FK marker and stamp without running anything.
+    # detect v7 via the visibility column and stamp without running anything.
     store._apply_pending_migrations(conn, fresh=False)
 
     versions = {r[0] for r in conn.execute("SELECT version FROM schema_version")}
-    assert versions == {1, 2, 3, 4, 5, 6}, (
-        f"all baselines 1..6 should be stamped on a v6-shape DB; "
+    assert versions == {1, 2, 3, 4, 5, 6, 7}, (
+        f"all baselines 1..7 should be stamped on a v7-shape DB; "
         f"got {sorted(versions)}"
     )
 
@@ -463,12 +463,12 @@ def test_detect_schema_version_returns_one_for_bare_db(tmp_path):
     assert store._detect_schema_version(conn) == 1
 
 
-def test_detect_schema_version_returns_six_for_current_schema(tmp_path):
-    """A DB created via the current ``schema.sql`` → v6 (FK marker)."""
+def test_detect_schema_version_returns_seven_for_current_schema(tmp_path):
+    """A DB created via the current ``schema.sql`` → v7 (visibility column)."""
     from mimir.saga.client import SagaStore
-    store = SagaStore(db_path=tmp_path / "v6.saga.db")
+    store = SagaStore(db_path=tmp_path / "v7.saga.db")
     conn = store._ensure_conn()
-    assert store._detect_schema_version(conn) == 6
+    assert store._detect_schema_version(conn) == 7
 
 
 def test_detect_schema_version_distinguishes_v2_v3_v4(tmp_path):
@@ -503,6 +503,14 @@ def test_detect_schema_version_distinguishes_v2_v3_v4(tmp_path):
         "embedding BLOB, embedding_dim INTEGER);"
     )
     assert store._detect_schema_version(conn4) == 4
+
+    # v7: atoms has visibility column
+    conn7 = sq.connect(":memory:")
+    conn7.executescript(
+        "CREATE TABLE atoms ("
+        "id TEXT PRIMARY KEY, visibility TEXT);"
+    )
+    assert store._detect_schema_version(conn7) == 7
 
 
 # ─── PRAGMA foreign_keys handling in _apply_pending_migrations ────────

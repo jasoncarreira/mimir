@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from typing import Callable, Iterator
 
 
-CURRENT_SCHEMA_VERSION: int = 6
+CURRENT_SCHEMA_VERSION: int = 7
 
 # Registry of post-greenfield schema changes. Keys are version
 # numbers (must be > 1, must be contiguous, must equal
@@ -295,7 +295,9 @@ WHERE a.source_type = 'session_boundary'
             FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
         );
         INSERT INTO new_atom_access_summary
-            SELECT * FROM atom_access_summary;
+            (atom_id, recent_ts_json, recent_weights_json, old_count, old_weight_sum, old_oldest_ts, last_updated_ts)
+            SELECT atom_id, recent_ts_json, recent_weights_json, old_count, old_weight_sum, old_oldest_ts, last_updated_ts
+            FROM atom_access_summary;
         DROP TABLE atom_access_summary;
         ALTER TABLE new_atom_access_summary RENAME TO atom_access_summary;
 
@@ -309,7 +311,10 @@ WHERE a.source_type = 'session_boundary'
             embedded_at TEXT NOT NULL,
             FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
         );
-        INSERT INTO new_embeddings SELECT * FROM embeddings;
+        INSERT INTO new_embeddings
+            (atom_id, provider, model, dim, vec, embedded_at)
+            SELECT atom_id, provider, model, dim, vec, embedded_at
+            FROM embeddings;
         DROP TABLE embeddings;
         ALTER TABLE new_embeddings RENAME TO embeddings;
         CREATE INDEX IF NOT EXISTS idx_emb_provider ON embeddings(provider);
@@ -325,7 +330,9 @@ WHERE a.source_type = 'session_boundary'
             FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
         );
         INSERT INTO new_observations_metadata
-            SELECT * FROM observations_metadata;
+            (atom_id, evidence_count, trend, last_evidence_at, consolidated_at, consolidation_session)
+            SELECT atom_id, evidence_count, trend, last_evidence_at, consolidated_at, consolidation_session
+            FROM observations_metadata;
         DROP TABLE observations_metadata;
         ALTER TABLE new_observations_metadata
             RENAME TO observations_metadata;
@@ -337,7 +344,8 @@ WHERE a.source_type = 'session_boundary'
             PRIMARY KEY (atom_id, topic),
             FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
         );
-        INSERT INTO new_atom_topics SELECT * FROM atom_topics;
+        INSERT INTO new_atom_topics (atom_id, topic)
+            SELECT atom_id, topic FROM atom_topics;
         DROP TABLE atom_topics;
         ALTER TABLE new_atom_topics RENAME TO atom_topics;
         CREATE INDEX IF NOT EXISTS idx_topics_topic ON atom_topics(topic);
@@ -354,7 +362,10 @@ WHERE a.source_type = 'session_boundary'
             FOREIGN KEY (source_id) REFERENCES atoms(id) ON DELETE CASCADE,
             FOREIGN KEY (target_id) REFERENCES atoms(id) ON DELETE CASCADE
         );
-        INSERT INTO new_atom_relations SELECT * FROM atom_relations;
+        INSERT INTO new_atom_relations
+            (source_id, target_id, relation_type, confidence, created_at, metadata)
+            SELECT source_id, target_id, relation_type, confidence, created_at, metadata
+            FROM atom_relations;
         DROP TABLE atom_relations;
         ALTER TABLE new_atom_relations RENAME TO atom_relations;
         CREATE INDEX IF NOT EXISTS idx_relations_source
@@ -382,7 +393,10 @@ WHERE a.source_type = 'session_boundary'
             FOREIGN KEY (source_atom_id) REFERENCES atoms(id)
                 ON DELETE SET NULL
         );
-        INSERT INTO new_triples SELECT * FROM triples;
+        INSERT INTO new_triples
+            (id, subject, predicate, object, source_atom_id, confidence, valid_from, valid_until, embedding, embedding_dim, tombstoned, created_at, metadata)
+            SELECT id, subject, predicate, object, source_atom_id, confidence, valid_from, valid_until, embedding, embedding_dim, tombstoned, created_at, metadata
+            FROM triples;
         DROP TABLE triples;
         ALTER TABLE new_triples RENAME TO triples;
         CREATE INDEX IF NOT EXISTS idx_triples_spo
@@ -392,6 +406,55 @@ WHERE a.source_type = 'session_boundary'
         CREATE INDEX IF NOT EXISTS idx_triples_current
             ON triples(subject, predicate)
             WHERE valid_until IS NULL AND tombstoned = 0;
+    """,
+    7: """
+        -- v7: Add ownership columns (chainlink #881)
+        -- Add owner_principal, origin_channel, origin_domain, visibility,
+        -- provenance to atoms, sessions, observations_metadata, and triples.
+        -- Pre-existing rows get fail-closed 'legacy_admin' visibility.
+
+        -- ── atoms ─────────────────────────────────────────────────
+        ALTER TABLE atoms ADD COLUMN owner_principal TEXT NOT NULL DEFAULT 'legacy_admin';
+        ALTER TABLE atoms ADD COLUMN origin_channel TEXT;
+        ALTER TABLE atoms ADD COLUMN origin_domain TEXT;
+        ALTER TABLE atoms ADD COLUMN visibility TEXT NOT NULL DEFAULT 'legacy_admin'
+            CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin'));
+        ALTER TABLE atoms ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';
+
+        -- ── sessions ───────────────────────────────────────────────
+        ALTER TABLE sessions ADD COLUMN owner_principal TEXT NOT NULL DEFAULT 'legacy_admin';
+        ALTER TABLE sessions ADD COLUMN origin_channel TEXT;
+        ALTER TABLE sessions ADD COLUMN origin_domain TEXT;
+        ALTER TABLE sessions ADD COLUMN visibility TEXT NOT NULL DEFAULT 'legacy_admin'
+            CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin'));
+        ALTER TABLE sessions ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';
+
+        -- ── observations_metadata ─────────────────────────────────
+        ALTER TABLE observations_metadata ADD COLUMN owner_principal TEXT NOT NULL DEFAULT 'legacy_admin';
+        ALTER TABLE observations_metadata ADD COLUMN origin_channel TEXT;
+        ALTER TABLE observations_metadata ADD COLUMN origin_domain TEXT;
+        ALTER TABLE observations_metadata ADD COLUMN visibility TEXT NOT NULL DEFAULT 'legacy_admin'
+            CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin'));
+        ALTER TABLE observations_metadata ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';
+
+        -- ── triples ────────────────────────────────────────────────
+        ALTER TABLE triples ADD COLUMN owner_principal TEXT NOT NULL DEFAULT 'legacy_admin';
+        ALTER TABLE triples ADD COLUMN origin_channel TEXT;
+        ALTER TABLE triples ADD COLUMN origin_domain TEXT;
+        ALTER TABLE triples ADD COLUMN visibility TEXT NOT NULL DEFAULT 'legacy_admin'
+            CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin'));
+        ALTER TABLE triples ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';
+
+        -- ── Indexes for ownership columns (chainlink #881) ────────
+        CREATE INDEX IF NOT EXISTS idx_atoms_visibility ON atoms(visibility);
+        CREATE INDEX IF NOT EXISTS idx_atoms_owner ON atoms(owner_principal);
+        CREATE INDEX IF NOT EXISTS idx_sessions_visibility ON sessions(visibility);
+        CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_principal);
+        CREATE INDEX IF NOT EXISTS idx_sessions_channel ON sessions(channel_id);
+        CREATE INDEX IF NOT EXISTS idx_obs_metadata_visibility ON observations_metadata(visibility);
+        CREATE INDEX IF NOT EXISTS idx_obs_metadata_owner ON observations_metadata(owner_principal);
+        CREATE INDEX IF NOT EXISTS idx_triples_visibility ON triples(visibility);
+        CREATE INDEX IF NOT EXISTS idx_triples_owner ON triples(owner_principal);
     """,
 }
 
@@ -407,6 +470,11 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
 
     Detection markers, highest version first:
 
+    - **v7**: ``atoms`` has ``visibility`` column. The v7 migration added
+      ownership columns (owner_principal, origin_channel, origin_domain,
+      visibility, provenance) to atoms, sessions, observations_metadata,
+      and triples. ``PRAGMA table_info(atoms)`` returns the visibility
+      column iff v7 ran.
     - **v6**: ``access_events`` carries a foreign key onto
       ``atoms(id)``. The v6 migration rebuilt every dependent
       table to add FK + ON DELETE CASCADE; pre-v6 they were
@@ -425,6 +493,16 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
     so this is robust to bare-bones DBs (like the in-memory
     fixtures used by unit tests).
     """
+    # v7 marker: atoms.visibility column exists.
+    try:
+        atoms_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(atoms)").fetchall()
+        }
+    except sqlite3.OperationalError:
+        atoms_cols = set()
+    if "visibility" in atoms_cols:
+        return 7
+
     # v6 marker: FK on access_events.atom_id → atoms(id).
     try:
         fks = conn.execute(

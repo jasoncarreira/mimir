@@ -46,7 +46,13 @@ CREATE TABLE IF NOT EXISTS atoms (
     agent_id TEXT DEFAULT 'default',
     session_id TEXT,                   -- session-of-origin (informational)
     -- Timestamps
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    -- Ownership (chainlink #881: fail-closed legacy scope for unproven rows)
+    owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',  -- 'legacy_admin' | 'service' | 'system' | user-id
+    origin_channel TEXT,               -- channel/source where atom originated
+    origin_domain TEXT,                -- domain/namespace of origin
+    visibility TEXT NOT NULL DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
+    provenance TEXT NOT NULL DEFAULT '{}'       -- JSON: {created_by, origin_url, etc.}
 );
 
 CREATE INDEX IF NOT EXISTS idx_atoms_memory_type ON atoms(memory_type);
@@ -61,6 +67,9 @@ CREATE INDEX IF NOT EXISTS idx_atoms_tombstoned ON atoms(tombstoned);
 -- the index lean. Matters at 10k+ atoms.
 CREATE INDEX IF NOT EXISTS idx_atoms_session
     ON atoms(session_id) WHERE session_id IS NOT NULL;
+-- Ownership indexes (chainlink #881)
+CREATE INDEX IF NOT EXISTS idx_atoms_visibility ON atoms(visibility);
+CREATE INDEX IF NOT EXISTS idx_atoms_owner ON atoms(owner_principal);
 
 -- ──────────────────────────────────────────────────────────────────
 -- Access events — Petrov OL backing
@@ -137,8 +146,18 @@ CREATE TABLE IF NOT EXISTS observations_metadata (
     last_evidence_at TEXT,
     consolidated_at TEXT NOT NULL,    -- when the observation was first synthesized
     consolidation_session TEXT,       -- which reflect session produced it
+    -- Ownership mirroring atoms (chainlink #881)
+    owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+    origin_channel TEXT,
+    origin_domain TEXT,
+    visibility TEXT NOT NULL DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
+    provenance TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
 );
+
+-- Ownership indexes (chainlink #881)
+CREATE INDEX IF NOT EXISTS idx_obs_metadata_visibility ON observations_metadata(visibility);
+CREATE INDEX IF NOT EXISTS idx_obs_metadata_owner ON observations_metadata(owner_principal);
 
 -- ──────────────────────────────────────────────────────────────────
 -- Relations between atoms (carry over from saga, simplified)
@@ -200,12 +219,21 @@ CREATE TABLE IF NOT EXISTS triples (
     tombstoned INTEGER DEFAULT 0,
     created_at TEXT NOT NULL,
     metadata TEXT DEFAULT '{}',
+    -- Ownership (chainlink #881: fail-closed legacy scope)
+    owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+    origin_channel TEXT,
+    origin_domain TEXT,
+    visibility TEXT NOT NULL DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
+    provenance TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (source_atom_id) REFERENCES atoms(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_triples_spo ON triples(subject, predicate, object);
 CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject) WHERE tombstoned = 0;
 CREATE INDEX IF NOT EXISTS idx_triples_current ON triples(subject, predicate) WHERE valid_until IS NULL AND tombstoned = 0;
+-- Ownership indexes (chainlink #881)
+CREATE INDEX IF NOT EXISTS idx_triples_visibility ON triples(visibility);
+CREATE INDEX IF NOT EXISTS idx_triples_owner ON triples(owner_principal);
 
 -- ──────────────────────────────────────────────────────────────────
 -- World state (P37, derived from triples)
@@ -295,8 +323,19 @@ CREATE TABLE IF NOT EXISTS sessions (
     emotional_state  TEXT,
     closed_since     TEXT NOT NULL DEFAULT '[]',   -- JSON array (chainlink #63)
     embedding        BLOB,                          -- session summary embedding (chainlink #148)
-    embedding_dim    INTEGER                        -- embedding dimension (chainlink #148)
+    embedding_dim    INTEGER,                        -- embedding dimension (chainlink #148)
+    -- Ownership (chainlink #881: fail-closed legacy scope)
+    owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+    origin_channel TEXT,
+    origin_domain TEXT,
+    visibility TEXT NOT NULL DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
+    provenance TEXT NOT NULL DEFAULT '{}'
 );
+
+-- Ownership indexes (chainlink #881)
+CREATE INDEX IF NOT EXISTS idx_sessions_visibility ON sessions(visibility);
+CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_principal);
+CREATE INDEX IF NOT EXISTS idx_sessions_channel ON sessions(channel_id);
 
 -- ──────────────────────────────────────────────────────────────────
 -- Schema version
