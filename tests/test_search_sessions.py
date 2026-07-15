@@ -349,7 +349,7 @@ async def test_migration_v5_clears_atom_topics_before_deleting_boundaries(
         f"residuals: {counts}"
     )
 
-    # Step 6: Verify migration was actually stamped (v5 then v6 both land,
+    # Step 6: Verify migration was actually stamped (v5 then v6 then v7 land,
     # so the final version equals CURRENT_SCHEMA_VERSION).
     from mimir.saga.client import SagaStore as _SS
     v = conn2.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
@@ -506,9 +506,9 @@ def test_migration_v6_cleans_orphaned_access_events_rows(tmp_path):
     ).fetchone()[0]
     assert real_access == 1, "real atom's access_events row must survive migration v6"
 
-    # Schema version must be stamped at v6.
+    # Schema version must be stamped at v7.
     v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-    assert v == 6, f"schema_version should be 6 post-migration, got {v}"
+    assert v == 7, f"schema_version should be 7 post-migration, got {v}"
 
     # PRAGMA foreign_key_check must return empty — no orphans remain.
     conn2 = sqlite3.connect(str(db_path))
@@ -611,20 +611,20 @@ def test_migration_v6_triples_source_atom_id_set_null_on_delete(tmp_path):
     )
 
 
-def test_migration_v6_is_idempotent_on_fresh_db(tmp_path):
-    """A fresh DB created at v6 (schema.sql already has CASCADE) should pass
+def test_migration_v7_is_idempotent_on_fresh_db(tmp_path):
+    """A fresh DB created at v7 (schema.sql already has ownership columns) should pass
     PRAGMA foreign_key_check without errors — the greenfield schema and the
     migration produce the same result."""
     import sqlite3
     from mimir.saga.client import SagaStore
 
-    db_path = tmp_path / "fresh_v6.db"
+    db_path = tmp_path / "fresh_v7.db"
     store = SagaStore(db_path=db_path, embedding_dim=4)
     conn = store._ensure_conn()
 
-    # Schema version must be stamped at v6 (CURRENT_SCHEMA_VERSION).
+    # Schema version must be stamped at v7 (CURRENT_SCHEMA_VERSION).
     v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-    assert v == 6, f"fresh DB must be at v6; got {v}"
+    assert v == 7, f"fresh DB must be at v7; got {v}"
 
     # Insert an atom and then delete it — dependents must cascade.
     now = "2026-05-24T03:00:00+00:00"
@@ -645,7 +645,7 @@ def test_migration_v6_is_idempotent_on_fresh_db(tmp_path):
     conn2.execute("PRAGMA foreign_keys=ON")
     orphans = conn2.execute("PRAGMA foreign_key_check").fetchall()
     conn2.close()
-    assert orphans == [], f"fresh v6 DB must have no orphans; got: {orphans}"
+    assert orphans == [], f"fresh v7 DB must have no orphans; got: {orphans}"
 
 
 # ── recency fallback: NULL ended_at (chainlink #253) ─────────────────

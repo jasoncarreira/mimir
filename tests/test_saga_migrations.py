@@ -72,6 +72,11 @@ class TestDetectSchemaVersion:
         )
         assert m.detect_schema_version(conn) == 6
 
+    def test_atoms_visibility_returns_v7(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE atoms (id TEXT PRIMARY KEY, visibility TEXT)")
+        assert m.detect_schema_version(conn) == 7
+
 
 class TestApplyPendingMigrations:
     def test_fresh_true_stamps_target_only(self) -> None:
@@ -223,3 +228,311 @@ class TestApplyPendingMigrations:
         )}
         assert table_exists is None
         assert versions == {1}
+
+
+class TestV7OwnershipMigration:
+    def test_v7_adds_ownership_columns_to_atoms(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                started_at TEXT NOT NULL,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                closed_since TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                consolidated_at TEXT NOT NULL
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (6, '2000-01-01T00:00:00+00:00');
+            """
+        )
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=7,
+            migrations={7: m.MIGRATIONS[7]},
+        )
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(atoms)")}
+        assert "owner_principal" in cols
+        assert "origin_channel" in cols
+        assert "origin_domain" in cols
+        assert "visibility" in cols
+        assert "provenance" in cols
+
+    def test_v7_sets_legacy_admin_visibility_default(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                started_at TEXT NOT NULL,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                closed_since TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                consolidated_at TEXT NOT NULL
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (6, '2000-01-01T00:00:00+00:00');
+            """
+        )
+        conn.execute("INSERT INTO atoms VALUES ('a1', 'test', 'hash', '2024-01-01')")
+        conn.execute("INSERT INTO sessions VALUES ('s1', NULL, '2024-01-01', '[]', '[]', '[]', '[]')")
+        conn.execute("INSERT INTO observations_metadata VALUES ('a1', '2024-01-01')")
+        conn.execute("INSERT INTO triples VALUES ('t1', 'subj', 'pred', 'obj', '2024-01-01')")
+        conn.commit()
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=7,
+            migrations={7: m.MIGRATIONS[7]},
+        )
+
+        atom_vis = conn.execute(
+            "SELECT visibility FROM atoms WHERE id = 'a1'"
+        ).fetchone()[0]
+        assert atom_vis == "legacy_admin"
+
+        sess_vis = conn.execute(
+            "SELECT visibility FROM sessions WHERE id = 's1'"
+        ).fetchone()[0]
+        assert sess_vis == "legacy_admin"
+
+        obs_vis = conn.execute(
+            "SELECT visibility FROM observations_metadata WHERE atom_id = 'a1'"
+        ).fetchone()[0]
+        assert obs_vis == "legacy_admin"
+
+        triple_vis = conn.execute(
+            "SELECT visibility FROM triples WHERE id = 't1'"
+        ).fetchone()[0]
+        assert triple_vis == "legacy_admin"
+
+    def test_v7_creates_ownership_indexes(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                started_at TEXT NOT NULL,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                closed_since TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                consolidated_at TEXT NOT NULL
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (6, '2000-01-01T00:00:00+00:00');
+            """
+        )
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=7,
+            migrations={7: m.MIGRATIONS[7]},
+        )
+        indexes = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        )}
+        assert "idx_atoms_visibility" in indexes
+        assert "idx_atoms_owner" in indexes
+        assert "idx_sessions_visibility" in indexes
+        assert "idx_sessions_owner" in indexes
+        assert "idx_sessions_channel" in indexes
+        assert "idx_obs_metadata_visibility" in indexes
+        assert "idx_obs_metadata_owner" in indexes
+        assert "idx_triples_visibility" in indexes
+        assert "idx_triples_owner" in indexes
+
+    def test_v7_preserves_existing_data(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                stream TEXT DEFAULT 'semantic',
+                profile TEXT DEFAULT 'standard',
+                memory_type TEXT DEFAULT 'raw',
+                arousal REAL DEFAULT 0.5,
+                valence REAL DEFAULT 0.0,
+                encoding_confidence REAL DEFAULT 0.7,
+                topics TEXT DEFAULT '[]',
+                source_type TEXT DEFAULT 'conversation',
+                metadata TEXT DEFAULT '{}',
+                tombstoned INTEGER DEFAULT 0,
+                is_pinned INTEGER DEFAULT 0,
+                agent_id TEXT DEFAULT 'default',
+                session_id TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                summary TEXT,
+                reflected_at TEXT,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                emotional_state TEXT,
+                closed_since TEXT NOT NULL DEFAULT '[]',
+                embedding BLOB,
+                embedding_dim INTEGER
+            );
+            CREATE TABLE observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                evidence_count INTEGER DEFAULT 0,
+                trend TEXT,
+                last_evidence_at TEXT,
+                consolidated_at TEXT NOT NULL,
+                consolidation_session TEXT
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                source_atom_id TEXT,
+                confidence REAL DEFAULT 1.0,
+                valid_from TEXT,
+                valid_until TEXT,
+                embedding BLOB,
+                embedding_dim INTEGER,
+                tombstoned INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                metadata TEXT DEFAULT '{}'
+            );
+            CREATE TABLE atom_relations (
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                confidence REAL DEFAULT 1.0,
+                created_at TEXT NOT NULL,
+                metadata TEXT DEFAULT '{}',
+                PRIMARY KEY (source_id, target_id, relation_type)
+            );
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (6, '2000-01-01T00:00:00+00:00');
+            """
+        )
+        conn.execute(
+            "INSERT INTO atoms VALUES "
+            "('a1', 'test content', 'hash123', 'semantic', 'standard', 'raw', "
+            "0.5, 0.0, 0.7, '[]', 'conversation', '{}', 0, 0, 'default', NULL, '2024-01-01')"
+        )
+        conn.execute(
+            "INSERT INTO sessions VALUES "
+            "('s1', 'ch1', '2024-01-01', '2024-01-02', 'summary', '2024-01-02', "
+            "'[]', '[]', '[]', NULL, '[]', NULL, 4)"
+        )
+        conn.execute(
+            "INSERT INTO observations_metadata VALUES "
+            "('a1', 5, 'stable', '2024-01-01', '2024-01-01', 's1')"
+        )
+        conn.execute(
+            "INSERT INTO triples VALUES "
+            "('t1', 'subject', 'predicate', 'object', 'a1', 1.0, NULL, NULL, NULL, NULL, 0, '2024-01-01', '{}')"
+        )
+        conn.execute(
+            "INSERT INTO atom_relations VALUES "
+            "('a1', 'a2', 'evidenced_by', 1.0, '2024-01-01', '{}')"
+        )
+        conn.commit()
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=7,
+            migrations={7: m.MIGRATIONS[7]},
+        )
+
+        atom = conn.execute("SELECT id, content, content_hash, stream FROM atoms WHERE id = 'a1'").fetchone()
+        assert atom == ("a1", "test content", "hash123", "semantic")
+
+        sess = conn.execute("SELECT id, channel_id, summary FROM sessions WHERE id = 's1'").fetchone()
+        assert sess == ("s1", "ch1", "summary")
+
+        obs = conn.execute("SELECT atom_id, evidence_count, trend FROM observations_metadata WHERE atom_id = 'a1'").fetchone()
+        assert obs == ("a1", 5, "stable")
+
+        triple = conn.execute("SELECT id, subject, predicate, object FROM triples WHERE id = 't1'").fetchone()
+        assert triple == ("t1", "subject", "predicate", "object")
+
+        rel = conn.execute("SELECT source_id, target_id, relation_type FROM atom_relations").fetchone()
+        assert rel == ("a1", "a2", "evidenced_by")
+
+        versions = {r[0] for r in conn.execute("SELECT version FROM schema_version")}
+        assert 7 in versions
