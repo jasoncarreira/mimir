@@ -414,36 +414,36 @@ WHERE a.source_type = 'session_boundary'
         -- Pre-existing rows get fail-closed 'legacy_admin' visibility.
 
         -- ── atoms ─────────────────────────────────────────────────
-        ALTER TABLE atoms ADD COLUMN owner_principal TEXT DEFAULT 'legacy_admin';
+        ALTER TABLE atoms ADD COLUMN owner_principal TEXT NOT NULL DEFAULT 'legacy_admin';
         ALTER TABLE atoms ADD COLUMN origin_channel TEXT;
         ALTER TABLE atoms ADD COLUMN origin_domain TEXT;
-        ALTER TABLE atoms ADD COLUMN visibility TEXT DEFAULT 'legacy_admin'
+        ALTER TABLE atoms ADD COLUMN visibility TEXT NOT NULL DEFAULT 'legacy_admin'
             CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin'));
-        ALTER TABLE atoms ADD COLUMN provenance TEXT DEFAULT '{}';
+        ALTER TABLE atoms ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';
 
         -- ── sessions ───────────────────────────────────────────────
-        ALTER TABLE sessions ADD COLUMN owner_principal TEXT DEFAULT 'legacy_admin';
+        ALTER TABLE sessions ADD COLUMN owner_principal TEXT NOT NULL DEFAULT 'legacy_admin';
         ALTER TABLE sessions ADD COLUMN origin_channel TEXT;
         ALTER TABLE sessions ADD COLUMN origin_domain TEXT;
-        ALTER TABLE sessions ADD COLUMN visibility TEXT DEFAULT 'legacy_admin'
+        ALTER TABLE sessions ADD COLUMN visibility TEXT NOT NULL DEFAULT 'legacy_admin'
             CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin'));
-        ALTER TABLE sessions ADD COLUMN provenance TEXT DEFAULT '{}';
+        ALTER TABLE sessions ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';
 
         -- ── observations_metadata ─────────────────────────────────
-        ALTER TABLE observations_metadata ADD COLUMN owner_principal TEXT DEFAULT 'legacy_admin';
+        ALTER TABLE observations_metadata ADD COLUMN owner_principal TEXT NOT NULL DEFAULT 'legacy_admin';
         ALTER TABLE observations_metadata ADD COLUMN origin_channel TEXT;
         ALTER TABLE observations_metadata ADD COLUMN origin_domain TEXT;
-        ALTER TABLE observations_metadata ADD COLUMN visibility TEXT DEFAULT 'legacy_admin'
+        ALTER TABLE observations_metadata ADD COLUMN visibility TEXT NOT NULL DEFAULT 'legacy_admin'
             CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin'));
-        ALTER TABLE observations_metadata ADD COLUMN provenance TEXT DEFAULT '{}';
+        ALTER TABLE observations_metadata ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';
 
         -- ── triples ────────────────────────────────────────────────
-        ALTER TABLE triples ADD COLUMN owner_principal TEXT DEFAULT 'legacy_admin';
+        ALTER TABLE triples ADD COLUMN owner_principal TEXT NOT NULL DEFAULT 'legacy_admin';
         ALTER TABLE triples ADD COLUMN origin_channel TEXT;
         ALTER TABLE triples ADD COLUMN origin_domain TEXT;
-        ALTER TABLE triples ADD COLUMN visibility TEXT DEFAULT 'legacy_admin'
+        ALTER TABLE triples ADD COLUMN visibility TEXT NOT NULL DEFAULT 'legacy_admin'
             CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin'));
-        ALTER TABLE triples ADD COLUMN provenance TEXT DEFAULT '{}';
+        ALTER TABLE triples ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';
 
         -- ── Indexes for ownership columns (chainlink #881) ────────
         CREATE INDEX IF NOT EXISTS idx_atoms_visibility ON atoms(visibility);

@@ -12,12 +12,13 @@ which is service/admin-only and not readable by regular users.
 
 from __future__ import annotations
 
-from enum import Enum
-from dataclasses import dataclass
-from typing import Literal
+import json
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any
 
 
-class Visibility(str, Enum):
+class Visibility(StrEnum):
     """Visibility levels for atoms, sessions, observations, and triples.
 
     'legacy_admin' is the fail-closed default for pre-v7 data that cannot
@@ -29,7 +30,7 @@ class Visibility(str, Enum):
     LEGACY_ADMIN = "legacy_admin"
 
 
-class OwnerPrincipal(str, Enum):
+class OwnerPrincipal(StrEnum):
     """Owner principal types.
 
     'legacy_admin' is the default for pre-v7 data that cannot prove provenance.
@@ -58,33 +59,33 @@ class Ownership:
     origin_channel: str | None = None
     origin_domain: str | None = None
     visibility: Visibility = Visibility.LEGACY_ADMIN
-    provenance: dict = None
-
-    def __post_init__(self) -> None:
-        if self.provenance is None:
-            object.__setattr__(self, 'provenance', {})
+    provenance: dict[str, Any] = field(default_factory=dict)
 
     def is_legacy_admin_only(self) -> bool:
         """Check if this entity is only accessible to admins/services."""
         return self.visibility == Visibility.LEGACY_ADMIN
 
-    def to_columns(self) -> dict[str, str]:
+    def to_columns(self) -> dict[str, str | None]:
         """Convert to column values for SQL insertion."""
         return {
-            "owner_principal": self.owner_principal,
+            "owner_principal": str(self.owner_principal),
             "origin_channel": self.origin_channel,
             "origin_domain": self.origin_domain,
-            "visibility": self.visibility,
-            "provenance": str(self.provenance) if self.provenance else "{}",
+            "visibility": str(self.visibility),
+            "provenance": json.dumps(
+                self.provenance, sort_keys=True, separators=(",", ":")
+            ),
         }
 
 
 def is_user_accessible(visibility: str) -> bool:
     """Check if a visibility level allows regular user access.
 
-    Returns False for 'legacy_admin' which is admin/service-only.
+    Visibility alone can only prove public access. Private rows require an
+    owner match, while service and legacy-admin rows require a trusted service
+    or admin principal; those checks belong in the authorization layer.
     """
-    return visibility in (Visibility.PUBLIC, Visibility.PRIVATE, Visibility.SERVICE)
+    return visibility == Visibility.PUBLIC
 
 
 __all__ = [

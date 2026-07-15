@@ -48,11 +48,11 @@ CREATE TABLE IF NOT EXISTS atoms (
     -- Timestamps
     created_at TEXT NOT NULL,
     -- Ownership (chainlink #881: fail-closed legacy scope for unproven rows)
-    owner_principal TEXT DEFAULT 'legacy_admin',  -- 'legacy_admin' | 'service' | 'system' | user-id
+    owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',  -- 'legacy_admin' | 'service' | 'system' | user-id
     origin_channel TEXT,               -- channel/source where atom originated
     origin_domain TEXT,                -- domain/namespace of origin
-    visibility TEXT DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
-    provenance TEXT DEFAULT '{}'       -- JSON: {created_by, origin_url, etc.}
+    visibility TEXT NOT NULL DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
+    provenance TEXT NOT NULL DEFAULT '{}'       -- JSON: {created_by, origin_url, etc.}
 );
 
 CREATE INDEX IF NOT EXISTS idx_atoms_memory_type ON atoms(memory_type);
@@ -147,11 +147,11 @@ CREATE TABLE IF NOT EXISTS observations_metadata (
     consolidated_at TEXT NOT NULL,    -- when the observation was first synthesized
     consolidation_session TEXT,       -- which reflect session produced it
     -- Ownership mirroring atoms (chainlink #881)
-    owner_principal TEXT DEFAULT 'legacy_admin',
+    owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
     origin_channel TEXT,
     origin_domain TEXT,
-    visibility TEXT DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
-    provenance TEXT DEFAULT '{}',
+    visibility TEXT NOT NULL DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
+    provenance TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
 );
 
@@ -220,11 +220,11 @@ CREATE TABLE IF NOT EXISTS triples (
     created_at TEXT NOT NULL,
     metadata TEXT DEFAULT '{}',
     -- Ownership (chainlink #881: fail-closed legacy scope)
-    owner_principal TEXT DEFAULT 'legacy_admin',
+    owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
     origin_channel TEXT,
     origin_domain TEXT,
-    visibility TEXT DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
-    provenance TEXT DEFAULT '{}',
+    visibility TEXT NOT NULL DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
+    provenance TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (source_atom_id) REFERENCES atoms(id) ON DELETE SET NULL
 );
 
@@ -325,11 +325,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     embedding        BLOB,                          -- session summary embedding (chainlink #148)
     embedding_dim    INTEGER,                        -- embedding dimension (chainlink #148)
     -- Ownership (chainlink #881: fail-closed legacy scope)
-    owner_principal TEXT DEFAULT 'legacy_admin',
+    owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
     origin_channel TEXT,
     origin_domain TEXT,
-    visibility TEXT DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
-    provenance TEXT DEFAULT '{}'
+    visibility TEXT NOT NULL DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
+    provenance TEXT NOT NULL DEFAULT '{}'
 );
 
 -- Ownership indexes (chainlink #881)
