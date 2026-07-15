@@ -298,6 +298,7 @@ async def test_upgrade_reconciliation_turn_renders_template_and_enqueues(tmp_pat
     assert len(events) == 1
     event = events[0]
     assert event.trigger == "upgrade"
+    assert event.service_principal == "system"
     assert event.channel_id == "upgrade:1.1.0"
     assert event.source == "system"
     assert "Upgrade 1.1.0 branch=upgrade/defaults" in event.content
@@ -493,6 +494,7 @@ async def test_enqueue_upgrade_prompts_dispatches_once_per_bump(
     ev = events[0]
     assert ev.channel_id == "upgrade-prompt:0.6.5"
     assert ev.trigger == du.UPGRADE_TRIGGER
+    assert ev.service_principal == "system"
     assert "body 0.6.4->0.6.5 (0.6.5)" in ev.content
     assert ev.extra["from_version"] == "0.6.4"
     assert ev.extra["to_version"] == "0.6.5"

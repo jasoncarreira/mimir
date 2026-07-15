@@ -946,6 +946,7 @@ class Scheduler:
         event = AgentEvent(
             trigger="scheduled_tick",
             channel_id=_scheduler_channel_id(job.name, job.channel_id),
+            service_principal="scheduler",
             content=content,
             extra={
                 "schedule_name": job.name,

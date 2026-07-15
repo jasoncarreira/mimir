@@ -514,6 +514,7 @@ print(json.dumps({"poller": "test", "prompt": "second event"}))
     assert len(enq.events) == 2
     assert enq.events[0].content == "first event"
     assert enq.events[0].trigger == "poller"
+    assert enq.events[0].service_principal == "poller"
     assert enq.events[0].channel_id == "poller:test"
     assert enq.events[0].source == "poller"
     assert enq.events[1].content == "second event"

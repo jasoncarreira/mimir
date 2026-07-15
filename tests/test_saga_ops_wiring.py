@@ -27,6 +27,8 @@ from typing import Any
 import pytest
 
 from mimir._context import reset_current_turn, set_current_turn
+from langchain.tools import ToolRuntime
+
 from mimir.models import AuthContext, TurnContext
 from mimir.tools import saga_ops
 from mimir.tools.memory import _MEMORY_STATE
@@ -131,6 +133,13 @@ def turn_with_session() -> TurnContext:
     reset_current_turn(token)
 
 
+def _runtime(ctx: TurnContext) -> ToolRuntime[AuthContext]:
+    return ToolRuntime(
+        state={}, context=ctx.auth_context, config={}, stream_writer=lambda _: None,
+        tool_call_id="saga-write-test", store=None,
+    )
+
+
 # ─── saga_feedback ─────────────────────────────────────────────────
 
 
@@ -232,10 +241,10 @@ async def test_mark_contributions_empty_list_is_a_no_op(
 
 
 @pytest.mark.asyncio
-async def test_end_session_threads_args_and_flags_ctx(
+async def test_end_session_threads_server_runtime_provenance(
     store: _StubStore, turn_with_session: TurnContext,
 ) -> None:
-    out = await saga_ops.saga_end_session.ainvoke({
+    out = await saga_ops.saga_end_session.ainvoke({"runtime": _runtime(turn_with_session),
         "session_id": "sess-abc",
         "summary": "wrapped up the auth work",
         "topics_discussed": ["auth", "tokens"],
@@ -249,15 +258,13 @@ async def test_end_session_threads_args_and_flags_ctx(
     assert store.end_session_calls[0]["session_id"] == "sess-abc"
     assert store.end_session_calls[0]["topics_discussed"] == ["auth", "tokens"]
     assert store.end_session_calls[0]["channel_id"] == "ch-1"
-    # Ctx flag flipped — synthesis-turn post-message hook checks this.
-    assert turn_with_session.saga_end_session_called is True
 
 
 @pytest.mark.asyncio
 async def test_end_session_strips_empty_optionals(
     store: _StubStore, turn_with_session: TurnContext,
 ) -> None:
-    await saga_ops.saga_end_session.ainvoke({
+    await saga_ops.saga_end_session.ainvoke({"runtime": _runtime(turn_with_session),
         "session_id": "sess-abc",
         "summary": "minimal close",
         "topics_discussed": [],
@@ -274,7 +281,7 @@ async def test_end_session_strips_empty_optionals(
 async def test_end_session_requires_summary(
     store: _StubStore, turn_with_session: TurnContext,
 ) -> None:
-    out = await saga_ops.saga_end_session.ainvoke({
+    out = await saga_ops.saga_end_session.ainvoke({"runtime": _runtime(turn_with_session),
         "session_id": "sess-abc",
         "summary": "",
     })

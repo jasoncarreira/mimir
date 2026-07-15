@@ -615,6 +615,12 @@ async def test_server_owned_triggers_reach_live_tool_middleware_with_service_aut
             channel_id=f"{trigger}:production-path",
             content="probe",
             source="system" if trigger == "upgrade" else None,
+            service_principal={
+                "scheduled_tick": "scheduler",
+                "poller": "poller",
+                "saga_session_end": "synthesis",
+                "upgrade": "system",
+            }[trigger],
             extra=(
                 {"saga_session_id": "saga-production-path"}
                 if trigger == "saga_session_end"
@@ -646,7 +652,9 @@ async def test_server_session_idle_event_reaches_live_synthesis_middleware(
         last_message_at=0.0,
     )
 
-    record = await agent.run_turn(_session_synthesis_event(session))
+    event = _session_synthesis_event(session)
+    assert event.service_principal == "synthesis"
+    record = await agent.run_turn(event)
 
     assert record.error is None
     assert fake_agent.observed_principal == "synthesis"

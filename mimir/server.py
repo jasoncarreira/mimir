@@ -250,6 +250,7 @@ def _session_synthesis_event(session: ChannelSession) -> AgentEvent:
     return AgentEvent(
         trigger="saga_session_end",
         channel_id=session.channel_id,
+        service_principal="synthesis",
         content="",
         extra={"saga_session_id": session.saga_session_id},
     )

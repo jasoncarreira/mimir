@@ -745,6 +745,7 @@ async def enqueue_upgrade_reconciliation_turn(
     event = AgentEvent(
         trigger=UPGRADE_TRIGGER,
         channel_id=f"{UPGRADE_CHANNEL_PREFIX}{result.version}",
+        service_principal="system",
         content=content,
         source="system",
         extra={
@@ -826,6 +827,7 @@ async def enqueue_upgrade_prompt_turns(
         event = AgentEvent(
             trigger=UPGRADE_TRIGGER,
             channel_id=f"{UPGRADE_PROMPT_CHANNEL_PREFIX}{ver}",
+            service_principal="system",
             content=content,
             source="system",
             extra={

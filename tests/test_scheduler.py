@@ -189,6 +189,7 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
     assert len(enqueued) == 1
     e = enqueued[0]
     assert e.trigger == "scheduled_tick"
+    assert e.service_principal == "scheduler"
     assert e.content == "review extended memory"
     assert e.channel_id == "scheduler:morning"
     assert e.extra["schedule_name"] == "morning"

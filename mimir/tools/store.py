@@ -19,22 +19,18 @@ the memory_tool.py uses (shared via _MEMORY_STATE).
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Optional
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
 from ..access_control import (
     can_write_saga,
     get_provenance_from_auth_context,
+    is_trusted_service,
 )
+from ..models import AuthContext
 from .memory import _MEMORY_STATE
-
-
-def _resolve_active_context() -> tuple[Any | None, str]:
-    """Resolve the active turn context for authorization checks."""
-    from .._context import resolve_active_ctx
-
-    return resolve_active_ctx({})
 
 
 @tool
@@ -43,6 +39,7 @@ async def memory_store(
     stream: str,
     session_id: Optional[str] = None,
     source_type: str = "agent_authored",
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Store a memory atom in persistent memory for cross-session retrieval.
 
@@ -64,9 +61,8 @@ async def memory_store(
     Args:
         content: The fact / event / pattern, one self-contained sentence.
         stream: One of ``"semantic"``, ``"episodic"``, ``"procedural"``.
-        session_id: Optional saga_session_id for scoping. If provided, must
-            match the current turn's saga_session_id. If not provided, the
-            server will derive the session from the active turn context.
+        session_id: Optional saga_session_id attribution label. It never
+            participates in authorization or ownership selection.
         source_type: How this atom was created. Defaults to
             ``"agent_authored"``.
 
@@ -77,32 +73,24 @@ async def memory_store(
     if client is None:
         return "memory_store failed: no SagaStore configured"
 
-    ctx, _resolution = _resolve_active_context()
-    auth_context = getattr(ctx, "auth_context", None) if ctx is not None else None
-
-    if ctx is not None and not can_write_saga(auth_context):
+    auth_context = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else None
+    )
+    if not can_write_saga(auth_context):
         return (
             "memory_store failed: write access denied. "
-            "Shared-memory writes require admin role or trusted service principal."
+            "Shared-memory writes require server-provided admin or trusted-service authority."
         )
 
-    effective_session_id = session_id
-    if session_id is not None and ctx is not None:
-        current_saga_session_id = getattr(ctx, "saga_session_id", None) if ctx is not None else None
-        if session_id != current_saga_session_id:
-            return (
-                f"memory_store failed: session_id mismatch. "
-                f"Provided '{session_id}' does not match current turn's "
-                f"saga_session_id '{current_saga_session_id}'. "
-                f"Model-supplied session_id is attribution-only and cannot "
-                f"choose an owner, channel, visibility, or another active turn's authority."
-            )
-    elif ctx is not None:
-        effective_session_id = getattr(ctx, "saga_session_id", None)
-
+    # ``session_id`` is attribution-only. It may label the write, but cannot
+    # select a TurnContext or influence any authority/ownership field.
+    effective_session_id = (session_id or "").strip() or None
     provenance = get_provenance_from_auth_context(auth_context)
-    owner_principal = provenance.get("created_by")
-    origin_channel = getattr(ctx, "channel_id", None) if ctx is not None else None
+    owner_principal = provenance["created_by"]
+    origin_channel = auth_context.channel_id
+    visibility = "service" if is_trusted_service(auth_context) else "private"
 
     try:
         result = await client.store(
@@ -113,7 +101,7 @@ async def memory_store(
             owner_principal=owner_principal,
             origin_channel=origin_channel,
             origin_domain=None,
-            visibility="service" if auth_context and getattr(auth_context, "is_service", False) else "private",
+            visibility=visibility,
             provenance=provenance,
         )
     except Exception as exc:
