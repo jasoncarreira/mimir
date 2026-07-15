@@ -120,15 +120,25 @@ def intersect_acl(acls: list[Ownership]) -> Ownership:
     if not acls:
         return Ownership()
 
-    if len(acls) == 1:
-        return acls[0]
-
     first = acls[0]
 
     owner_principal = first.owner_principal
     origin_domain = first.origin_domain
-    visibility = first.visibility
     provenance = dict(first.provenance)
+    vis_order = [
+        Visibility.PUBLIC,
+        Visibility.PRIVATE,
+        Visibility.SERVICE,
+        Visibility.LEGACY_ADMIN,
+    ]
+
+    def _visibility_rank(value: str) -> int:
+        try:
+            return vis_order.index(value)
+        except ValueError:
+            return len(vis_order) - 1
+
+    visibility = vis_order[_visibility_rank(first.visibility)]
 
     for acl in acls[1:]:
         if acl.owner_principal != owner_principal:
@@ -137,18 +147,9 @@ def intersect_acl(acls: list[Ownership]) -> Ownership:
         if acl.origin_domain != origin_domain:
             origin_domain = None
 
-        if acl.visibility != visibility:
-            vis_order = [
-                Visibility.PUBLIC,
-                Visibility.PRIVATE,
-                Visibility.SERVICE,
-                Visibility.LEGACY_ADMIN,
-            ]
-            vis_idx = max(
-                vis_order.index(v) if v in vis_order else 0
-                for v in [visibility, acl.visibility]
-            )
-            visibility = vis_order[vis_idx]
+        visibility = vis_order[
+            max(_visibility_rank(visibility), _visibility_rank(acl.visibility))
+        ]
 
         if not acl.provenance:
             provenance = {}

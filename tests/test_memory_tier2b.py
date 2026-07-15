@@ -20,6 +20,7 @@ from mimir.saga.cluster import cluster_by_similarity, make_default_cluster_fn
 from mimir.saga.consolidate import consolidate
 from mimir.saga.mark_access import AccessEvent, mark_access
 from mimir.saga.observations import refresh_trend
+from mimir.saga.ownership import Ownership
 from mimir.saga.recall import recall
 from mimir.saga.reflect import reflect
 from mimir.saga.store import store
@@ -274,6 +275,64 @@ def test_consolidate_groups_across_sessions(conn):
         )
     }
     assert set(ids) == evidence
+
+
+def test_consolidate_observation_inherits_intersected_acl(conn):
+    embed_fn = _embed_fn_factory({
+        "acl_a": [1.0, 0.05, 0.0, 0.0],
+        "acl_b": [0.97, 0.1, 0.05, 0.0],
+        "acl_c": [0.95, 0.0, 0.1, 0.05],
+    })
+    ids = []
+    for content, visibility in [
+        ("acl_a", "public"),
+        ("acl_b", "private"),
+        ("acl_c", "private"),
+    ]:
+        result = store(
+            conn,
+            content,
+            embed_fn=embed_fn,
+            owner_principal="user:123",
+            origin_channel="channel:one",
+            origin_domain="tenant:one",
+            visibility=visibility,
+            provenance={content: True},
+        )
+        ids.append(result.atom_id)
+
+    result = consolidate(
+        conn,
+        embed_fn=embed_fn,
+        cluster_fn=make_default_cluster_fn(conn, threshold=0.7),
+        observation_synth_fn=_stub_synth,
+    )
+
+    assert len(result.observations_emitted) == 1
+    acl = conn.execute(
+        "SELECT owner_principal, origin_domain, visibility, provenance "
+        "FROM atoms WHERE id = ?",
+        (result.observations_emitted[0],),
+    ).fetchone()
+    assert acl[:3] == ("user:123", "tenant:one", "private")
+    assert json.loads(acl[3]) == {"acl_a": True, "acl_b": True, "acl_c": True}
+
+
+def test_consolidate_missing_evidence_atom_fails_closed(conn):
+    from mimir.saga.consolidate import _compute_intersected_acl
+
+    embed_fn = _embed_fn_factory({"acl_a": [1.0, 0.0, 0.0, 0.0]})
+    atom_id = store(
+        conn,
+        "acl_a",
+        embed_fn=embed_fn,
+        owner_principal="user:123",
+        origin_domain="tenant:one",
+        visibility="public",
+        provenance={"acl_a": True},
+    ).atom_id
+
+    assert _compute_intersected_acl(conn, [atom_id, "missing"]) == Ownership()
 
 
 def test_consolidate_includes_already_cited_raws_in_pool(conn):

@@ -262,7 +262,8 @@ CREATE TABLE IF NOT EXISTS world_state (
     owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
     origin_channel TEXT,
     origin_domain TEXT,
-    visibility TEXT NOT NULL DEFAULT 'legacy_admin',
+    visibility TEXT NOT NULL DEFAULT 'legacy_admin'
+        CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
     provenance TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (subject, predicate, valid_from),
     FOREIGN KEY (source_triple_id) REFERENCES triples(id)

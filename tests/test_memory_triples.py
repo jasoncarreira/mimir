@@ -1,6 +1,7 @@
 """Tests for the P42 triples + temporal world model module."""
 from __future__ import annotations
 
+import json
 import sqlite3
 import struct
 from pathlib import Path
@@ -119,13 +120,24 @@ def test_parse_triples_handles_empty_input():
 # ─── store_triples ───────────────────────────────────────────────────
 
 
-def _seed_atom(conn, atom_id: str, content: str):
+def _seed_atom(
+    conn,
+    atom_id: str,
+    content: str,
+    *,
+    owner: str = "legacy_admin",
+    domain: str | None = None,
+    visibility: str = "legacy_admin",
+    provenance: dict | None = None,
+):
     from hashlib import sha256
     h = sha256(content.encode()).hexdigest()[:32]
     conn.execute(
-        "INSERT INTO atoms (id, content, content_hash, created_at) "
-        "VALUES (?, ?, ?, '2026-05-13T00:00:00Z')",
-        (atom_id, content, h),
+        "INSERT INTO atoms "
+        "(id, content, content_hash, created_at, owner_principal, "
+        " origin_channel, origin_domain, visibility, provenance) "
+        "VALUES (?, ?, ?, '2026-05-13T00:00:00Z', ?, 'channel:one', ?, ?, ?)",
+        (atom_id, content, h, owner, domain, visibility, json.dumps(provenance or {})),
     )
     conn.commit()
 
@@ -167,6 +179,73 @@ def test_store_triples_with_embedding(conn):
     ).fetchone()
     assert row[0] is not None
     assert row[1] == 4
+
+
+def test_store_triples_inherits_intersected_acl_and_world_state(conn):
+    _seed_atom(
+        conn, "raw1", "source one", owner="user:123", domain="tenant:one",
+        visibility="public", provenance={"raw1": True},
+    )
+    _seed_atom(
+        conn, "raw2", "source two", owner="user:123", domain="tenant:one",
+        visibility="private", provenance={"raw2": True},
+    )
+
+    store_triples(
+        conn,
+        [{"subject": "Alice", "predicate": "status", "object": "active"}],
+        source_atom_id="raw1",
+        evidence_ids=["raw1", "raw2"],
+    )
+
+    expected = ("user:123", "tenant:one", "private")
+    triple_acl = conn.execute(
+        "SELECT owner_principal, origin_domain, visibility FROM triples"
+    ).fetchone()
+    world_acl = conn.execute(
+        "SELECT owner_principal, origin_domain, visibility FROM world_state"
+    ).fetchone()
+    assert triple_acl == expected
+    assert world_acl == expected
+
+
+def test_store_triples_missing_evidence_atom_fails_closed(conn):
+    _seed_atom(
+        conn, "raw1", "source one", owner="user:123", domain="tenant:one",
+        visibility="public", provenance={"raw1": True},
+    )
+
+    store_triples(
+        conn,
+        [{"subject": "Alice", "predicate": "status", "object": "active"}],
+        source_atom_id="raw1",
+        evidence_ids=["raw1", "missing"],
+    )
+
+    assert conn.execute(
+        "SELECT owner_principal, visibility FROM triples"
+    ).fetchone() == ("legacy_admin", "legacy_admin")
+
+
+def test_store_triples_dedup_reassertion_only_narrows_acl(conn):
+    _seed_atom(
+        conn, "public", "public source", owner="user:123", domain="tenant:one",
+        visibility="public", provenance={"public": True},
+    )
+    _seed_atom(
+        conn, "private", "private source", owner="user:123", domain="tenant:one",
+        visibility="private", provenance={"private": True},
+    )
+    triple = {"subject": "Alice", "predicate": "status", "object": "active"}
+
+    store_triples(conn, [triple], source_atom_id="public", evidence_ids=["public"])
+    assert conn.execute("SELECT visibility FROM triples").fetchone()[0] == "public"
+
+    store_triples(conn, [triple], source_atom_id="private", evidence_ids=["private"])
+    assert conn.execute("SELECT visibility FROM triples").fetchone()[0] == "private"
+
+    store_triples(conn, [triple], source_atom_id="public", evidence_ids=["public"])
+    assert conn.execute("SELECT visibility FROM triples").fetchone()[0] == "private"
 
 
 # ─── World state ─────────────────────────────────────────────────────

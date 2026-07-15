@@ -144,7 +144,7 @@ def _compute_intersected_acl(
         evidence_ids,
     ).fetchall()
 
-    if not rows:
+    if len(rows) != len(set(evidence_ids)):
         from .ownership import Ownership
         return Ownership()
 

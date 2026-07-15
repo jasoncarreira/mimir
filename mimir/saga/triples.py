@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from ._like import escape_like_pattern
-from .ownership import intersect_acl_from_rows
+from .ownership import Ownership, intersect_acl, intersect_acl_from_rows
 
 
 logger = logging.getLogger("mimir.saga.triples")
@@ -201,7 +201,6 @@ def _compute_triple_acl(
     provenance, the result defaults to service/admin-only (legacy_admin).
     """
     if not evidence_ids:
-        from .ownership import Ownership
         return Ownership()
 
     placeholders = ",".join(["?"] * len(evidence_ids))
@@ -214,8 +213,7 @@ def _compute_triple_acl(
         evidence_ids,
     ).fetchall()
 
-    if not rows:
-        from .ownership import Ownership
+    if len(rows) != len(set(evidence_ids)):
         return Ownership()
 
     row_dicts = [
@@ -256,8 +254,6 @@ def _update_triple_acl_on_dedup(
     ).fetchone()
     if not existing:
         return
-
-    from .ownership import Ownership, intersect_acl
 
     existing_acl = Ownership(
         owner_principal=existing[0] or "legacy_admin",
@@ -354,7 +350,6 @@ def store_triples(
         if intersected_acl is not None:
             acl = intersected_acl
         else:
-            from .ownership import Ownership
             acl = Ownership()
         conn.execute(
             "INSERT INTO triples "
@@ -430,7 +425,6 @@ def _update_world_state(
     The ACL is inherited from the source triple (chainlink #884).
     """
     if acl is None:
-        from .ownership import Ownership
         acl = Ownership()
 
     current = conn.execute(
