@@ -89,7 +89,10 @@ def forget(
     ).fetchall()
     affected_obs_ids = [r[0] for r in affected_obs_rows]
 
-    # Tombstone the atoms in one transaction.
+    # Tombstones and all dependent observation metadata updates are one SQL
+    # mutation. Authorization is preflighted by SagaStore before entering this
+    # function; committing a partial dependency refresh would violate the same
+    # all-or-nothing boundary even if no unauthorized row were touched.
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.executemany(
@@ -97,44 +100,24 @@ def forget(
             "tombstoned_reason = ? WHERE id = ? AND tombstoned = 0",
             [(now, reason or "explicit_forget", aid) for aid in eligible_ids],
         )
+        for obs_id in affected_obs_ids:
+            refresh_trend(conn, obs_id, manage_transaction=False)
+            live_count = conn.execute(
+                "SELECT COUNT(*) FROM atom_relations ar "
+                "JOIN atoms t ON t.id = ar.target_id "
+                "WHERE ar.source_id = ? "
+                "  AND ar.relation_type = 'evidenced_by' "
+                "  AND t.tombstoned = 0",
+                (obs_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE observations_metadata SET evidence_count = ? WHERE atom_id = ?",
+                (live_count, obs_id),
+            )
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-
-    # Refresh trend for affected observations (each refresh_trend call
-    # manages its own transaction), then rebuild evidence_count from the
-    # SURVIVING evidence. chainlink #416: evidence_count means the
-    # number of live evidence atoms backing the observation — the
-    # "rebuilt from surviving relations" this module's docstring has
-    # always promised, matching dedup's end-of-pass sweep semantics
-    # (dedup.py). refresh_trend owns only the trend fields; the
-    # relation rows themselves are preserved on tombstone (historical
-    # record), so the rebuild joins atoms to count only edges whose
-    # target is still live.
-    for obs_id in affected_obs_ids:
-        refresh_trend(conn, obs_id)
-    if affected_obs_ids:
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            for obs_id in affected_obs_ids:
-                live_count = conn.execute(
-                    "SELECT COUNT(*) FROM atom_relations ar "
-                    "JOIN atoms t ON t.id = ar.target_id "
-                    "WHERE ar.source_id = ? "
-                    "  AND ar.relation_type = 'evidenced_by' "
-                    "  AND t.tombstoned = 0",
-                    (obs_id,),
-                ).fetchone()[0]
-                conn.execute(
-                    "UPDATE observations_metadata SET evidence_count = ? "
-                    "WHERE atom_id = ?",
-                    (live_count, obs_id),
-                )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
 
     return ForgetResult(
         tombstoned_count=len(eligible_ids),
@@ -158,6 +141,7 @@ def forget_by_criteria(
     reason: str | None = None,
     reference_date: datetime | None = None,
     owner_principal: str | None = None,
+    origin_domains: tuple[str, ...] | None = None,
 ) -> ForgetResult:
     """Bulk forget by predicate. Dry-run by default (preview the set
     without writing).
@@ -189,6 +173,12 @@ def forget_by_criteria(
     if owner_principal is not None:
         where.append("a.owner_principal = ?")
         params.append(owner_principal)
+    if origin_domains is not None:
+        if not origin_domains:
+            return ForgetResult(dry_run=dry_run)
+        placeholders = ",".join(["?"] * len(origin_domains))
+        where.append(f"a.origin_domain IN ({placeholders})")
+        params.extend(origin_domains)
     joins: list[str] = []
 
     # ``now`` for age + activation math. Defaults to wall clock; bench

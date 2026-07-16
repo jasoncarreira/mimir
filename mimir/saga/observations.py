@@ -24,7 +24,6 @@ of a periodic refresh.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -35,19 +34,19 @@ from typing import Iterable
 # against operator-perceived signal-vs-noise during bench iteration.
 STALE_THRESHOLD_DAYS = 30
 RECENT_WINDOW_DAYS = 7
-HISTORICAL_WINDOW_DAYS = 30           # window prior to the recent window
-STRENGTHENING_RATIO = 1.5             # recent_rate / historical_rate above this → strengthening
-WEAKENING_RATIO = 0.5                 # below this → weakening
+HISTORICAL_WINDOW_DAYS = 30  # window prior to the recent window
+STRENGTHENING_RATIO = 1.5  # recent_rate / historical_rate above this → strengthening
+WEAKENING_RATIO = 0.5  # below this → weakening
 
 
 @dataclass(frozen=True)
 class TrendResult:
     atom_id: str
-    trend: str                        # 'stable' | 'strengthening' | 'weakening' | 'stale'
+    trend: str  # 'stable' | 'strengthening' | 'weakening' | 'stale'
     last_access_days_ago: float
     recent_count: int
     historical_count: int
-    ratio: float | None               # None when historical_count == 0
+    ratio: float | None  # None when historical_count == 0
     rationale: str
 
 
@@ -83,9 +82,12 @@ def classify_trend(
     timestamps = sorted(_parse_iso(t) for t in access_timestamps)
     if not timestamps:
         return TrendResult(
-            atom_id=observation_id, trend="stale",
+            atom_id=observation_id,
+            trend="stale",
             last_access_days_ago=float("inf"),
-            recent_count=0, historical_count=0, ratio=None,
+            recent_count=0,
+            historical_count=0,
+            ratio=None,
             rationale="no access events recorded",
         )
 
@@ -93,9 +95,11 @@ def classify_trend(
     days_since = (now - last_access).total_seconds() / 86400.0
     if days_since > STALE_THRESHOLD_DAYS:
         return TrendResult(
-            atom_id=observation_id, trend="stale",
+            atom_id=observation_id,
+            trend="stale",
             last_access_days_ago=days_since,
-            recent_count=0, historical_count=len(timestamps),
+            recent_count=0,
+            historical_count=len(timestamps),
             ratio=None,
             rationale=(
                 f"last access {days_since:.1f}d ago, "
@@ -111,10 +115,7 @@ def classify_trend(
         days=RECENT_WINDOW_DAYS + HISTORICAL_WINDOW_DAYS,
     )
     recent = [t for t in timestamps if t >= recent_boundary]
-    historical = [
-        t for t in timestamps
-        if historical_boundary <= t < recent_boundary
-    ]
+    historical = [t for t in timestamps if historical_boundary <= t < recent_boundary]
 
     # Normalize counts to "events per day" so the windows can have
     # different lengths without skewing the comparison.
@@ -126,17 +127,23 @@ def classify_trend(
         # Treat as strengthening (the observation just started getting
         # picked up) rather than dividing by zero.
         return TrendResult(
-            atom_id=observation_id, trend="strengthening",
+            atom_id=observation_id,
+            trend="strengthening",
             last_access_days_ago=days_since,
-            recent_count=len(recent), historical_count=0, ratio=None,
+            recent_count=len(recent),
+            historical_count=0,
+            ratio=None,
             rationale="recent activity, no prior history",
         )
 
     if historical_rate == 0:
         return TrendResult(
-            atom_id=observation_id, trend="stable",
+            atom_id=observation_id,
+            trend="stable",
             last_access_days_ago=days_since,
-            recent_count=0, historical_count=0, ratio=None,
+            recent_count=0,
+            historical_count=0,
+            ratio=None,
             rationale="no activity in either window",
         )
 
@@ -160,10 +167,13 @@ def classify_trend(
             f"{historical_rate:.3f}/d (ratio {ratio:.2f})"
         )
     return TrendResult(
-        atom_id=observation_id, trend=trend,
+        atom_id=observation_id,
+        trend=trend,
         last_access_days_ago=days_since,
-        recent_count=len(recent), historical_count=len(historical),
-        ratio=ratio, rationale=rationale,
+        recent_count=len(recent),
+        historical_count=len(historical),
+        ratio=ratio,
+        rationale=rationale,
     )
 
 
@@ -172,6 +182,7 @@ def refresh_trend(
     observation_id: str,
     *,
     now: datetime | None = None,
+    manage_transaction: bool = True,
 ) -> TrendResult:
     """Compute the trend and persist to observations_metadata.
 
@@ -201,14 +212,16 @@ def refresh_trend(
         access_timestamps=timestamps,
         now=now,
     )
-    # Upsert observations_metadata in its own transaction.
+    # Upsert observations_metadata. Callers performing a larger atomic
+    # mutation may own the surrounding transaction.
     existing = conn.execute(
         "SELECT atom_id FROM observations_metadata WHERE atom_id = ?",
         (observation_id,),
     ).fetchone()
     last_evidence_at = timestamps[-1] if timestamps else None
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        if manage_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         if existing is None:
             # Missing row (periodic refresh on an observation whose
             # metadata was never written): seed evidence_count from the
@@ -226,12 +239,16 @@ def refresh_trend(
                 "INSERT INTO observations_metadata "
                 "(atom_id, evidence_count, trend, last_evidence_at, "
                 "consolidated_at) VALUES (?, ?, ?, ?, ?)",
-                (observation_id, live_evidence, result.trend,
-                 last_evidence_at,
-                 # consolidated_at filled by reflect when the observation
-                 # is first created; if missing on a periodic refresh,
-                 # use the earliest event time as a proxy.
-                 timestamps[0] if timestamps else (now or _utc_now()).isoformat()),
+                (
+                    observation_id,
+                    live_evidence,
+                    result.trend,
+                    last_evidence_at,
+                    # consolidated_at filled by reflect when the observation
+                    # is first created; if missing on a periodic refresh,
+                    # use the earliest event time as a proxy.
+                    timestamps[0] if timestamps else (now or _utc_now()).isoformat(),
+                ),
             )
         else:
             # evidence_count deliberately untouched (#416) — consolidate
@@ -242,9 +259,11 @@ def refresh_trend(
                 "last_evidence_at = ? WHERE atom_id = ?",
                 (result.trend, last_evidence_at, observation_id),
             )
-        conn.commit()
+        if manage_transaction:
+            conn.commit()
     except Exception:
-        conn.rollback()
+        if manage_transaction:
+            conn.rollback()
         raise
     return result
 
@@ -287,7 +306,8 @@ def find_equal_evidence_obs(
         if not is_live:
             continue
         obs_evidence = {
-            r[0] for r in conn.execute(
+            r[0]
+            for r in conn.execute(
                 "SELECT target_id FROM atom_relations "
                 "WHERE source_id = ? AND relation_type = 'evidenced_by'",
                 (obs_id,),
@@ -316,7 +336,8 @@ def find_superseded_observations(
     don't participate in supersession.
     """
     # Pull all current observation → their evidence sets in one query.
-    rows = conn.execute("""
+    rows = conn.execute(
+        """
         SELECT a.id, ar.target_id
         FROM atoms a
         JOIN atom_relations ar
@@ -325,7 +346,9 @@ def find_superseded_observations(
           AND a.tombstoned = 0
           AND a.id != ?
           AND ar.relation_type = 'evidenced_by'
-    """, (new_observation_id,)).fetchall()
+    """,
+        (new_observation_id,),
+    ).fetchall()
     by_obs: dict[str, set[str]] = {}
     for obs_id, raw_id in rows:
         by_obs.setdefault(obs_id, set()).add(raw_id)
