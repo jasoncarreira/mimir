@@ -23,6 +23,10 @@ from .config import Config
 from .event_logger import log_event
 from .models import AgentEvent
 from .scheduler import SCHEDULER_CHANNEL_PREFIX
+from .worklink.continuation import (
+    HTTP_EVENT_INGRESS_EXTRA_KEY,
+    HTTP_EVENT_INGRESS_EXTRA_VALUE,
+)
 
 if TYPE_CHECKING:
     from .identities import IdentityResolver
@@ -251,11 +255,33 @@ class Dispatcher:
             )
         return True
 
+    def _is_http_ingress(self, event: AgentEvent) -> bool:
+        """True iff the event came from generic HTTP /event ingress (client-controlled source)."""
+        ingress = event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY)
+        return isinstance(ingress, str) and ingress.strip() == HTTP_EVENT_INGRESS_EXTRA_VALUE
+
     async def _authorize_bridge_event(self, event: AgentEvent) -> bool:
         """Gate external user messages before any admission side effect."""
         source = (event.source or "").strip().lower()
-        if event.trigger != "user_message" or source in TRUSTED_INTERNAL_SOURCES:
+        if event.trigger != "user_message":
             return True
+
+        is_http_ingress = self._is_http_ingress(event)
+        if source in TRUSTED_INTERNAL_SOURCES:
+            if is_http_ingress:
+                pass
+            else:
+                await log_event(
+                    "inbound_event_allowed",
+                    source=source or "unknown",
+                    channel_id=event.channel_id,
+                    author=event.author,
+                    raw_author_handle=event.author,
+                    author_id=event.author_id,
+                    reason="trusted_internal_source",
+                    trigger=event.trigger,
+                )
+                return True
 
         decision = authorize_inbound(
             event,

@@ -718,3 +718,22 @@ class TestHandleEvent:
             )
         assert resp.status == 401
         stub.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_source_forwarded_but_http_ingress_marker_added(self) -> None:
+        """chainlink #890: client-supplied source is forwarded but the HTTP
+        ingress marker is added so the dispatcher knows it's untrusted."""
+        from mimir.worklink.continuation import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            await client.post(
+                "/event",
+                json={"channel_id": "ch", "source": "api", "author": "unknown"},
+            )
+        event = stub.enqueue.call_args.args[0]
+        assert event.source == "api"
+        assert event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) == HTTP_EVENT_INGRESS_EXTRA_VALUE
