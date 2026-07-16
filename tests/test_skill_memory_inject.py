@@ -12,10 +12,14 @@ skill on a non-poller turn. Coverage:
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
 
+from mimir._context import reset_current_turn, set_current_turn
+from mimir.models import AuthContext, TurnContext
 from mimir.saga.client import SagaStore
 from mimir.skill_memory import (
     SKILL_LEARNING_SOURCE_TYPE,
@@ -54,6 +58,28 @@ class TestSkillFromPath:
 
 
 # ── fixtures: real SagaStore via stub provider ───────────────────────
+
+
+ADMIN_AUTH = AuthContext(
+    principal="test-admin",
+    canonical_principal="test-admin",
+    roles=("admin",),
+    event_ingress="test",
+    trigger="user_message",
+    channel_id="test-channel",
+    interactivity=None,
+)
+
+
+def _turn_context(*, auth_context: AuthContext = ADMIN_AUTH) -> TurnContext:
+    return TurnContext(
+        turn_id="t",
+        session_id="test-channel",
+        trigger="user_message",
+        channel_id="test-channel",
+        started_at=time.monotonic(),
+        auth_context=auth_context,
+    )
 
 
 def _patch_provider(monkeypatch, dim: int = 4):
@@ -139,13 +165,17 @@ class TestAsyncInjection:
     @pytest.mark.asyncio
     async def test_augments_skill_md_with_learnings(self, store):
         await _add_learning(store, "memory", "failure-mode", "trips on empty input")
-        mw = SkillMemoryInjectionMiddleware()
-        _, ahandler, calls = _make_handler(
-            _read_result("1\tORIGINAL SKILL BODY")
-        )
-        out = await mw.awrap_tool_call(
-            _read_request("/home/x/skills/memory/SKILL.md"), ahandler,
-        )
+        token = set_current_turn(_turn_context())
+        try:
+            mw = SkillMemoryInjectionMiddleware()
+            _, ahandler, calls = _make_handler(
+                _read_result("1\tORIGINAL SKILL BODY")
+            )
+            out = await mw.awrap_tool_call(
+                _read_request("/home/x/skills/memory/SKILL.md"), ahandler,
+            )
+        finally:
+            reset_current_turn(token)
         assert calls["n"] == 1  # read still happened
         assert "ORIGINAL SKILL BODY" in out.content
         assert _LEARNINGS_HEADING in out.content
@@ -217,11 +247,15 @@ class TestSyncInjection:
     async def test_sync_augments_with_learnings(self, store):
         # store() is async; populate, then exercise the sync wrap path.
         await _add_learning(store, "alerts", "tip", "batch the pages")
-        mw = SkillMemoryInjectionMiddleware()
-        handler, _, calls = _make_handler(_read_result("ALERTS BODY"))
-        out = mw.wrap_tool_call(
-            _read_request("/x/skills/alerts/SKILL.md"), handler,
-        )
+        token = set_current_turn(_turn_context())
+        try:
+            mw = SkillMemoryInjectionMiddleware()
+            handler, _, calls = _make_handler(_read_result("ALERTS BODY"))
+            out = mw.wrap_tool_call(
+                _read_request("/x/skills/alerts/SKILL.md"), handler,
+            )
+        finally:
+            reset_current_turn(token)
         assert calls["n"] == 1
         assert "ALERTS BODY" in out.content
         assert "[tip] batch the pages" in out.content
@@ -248,15 +282,8 @@ class TestInjectedIdCapture:
         """After augmenting a SKILL.md read, the injected learning atom IDs
         must be recorded on the active turn's injected_skill_atom_ids so
         run_turn folds them into the TurnRecord for synthesis voting."""
-        import time as _time
-        from mimir._context import set_current_turn, reset_current_turn
-        from mimir.models import TurnContext
-
         sl = await _add_learning(store, "memory", "tip", "a useful tip")
-        ctx = TurnContext(
-            turn_id="t", session_id="c", trigger="user_message",
-            channel_id="c", started_at=_time.monotonic(),
-        )
+        ctx = _turn_context()
         tok = set_current_turn(ctx)
         try:
             mw = SkillMemoryInjectionMiddleware()

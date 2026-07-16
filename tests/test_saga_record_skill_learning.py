@@ -17,11 +17,24 @@ import time
 
 import pytest
 
+from langchain.tools import ToolRuntime
+
 from mimir._context import reset_current_turn, set_current_turn
-from mimir.models import TurnContext
+from mimir.models import AuthContext, TurnContext
 from mimir.skill_memory import SKILL_LEARNING_SOURCE_TYPE
 from mimir.tools.memory import _MEMORY_STATE
 from mimir.tools.saga_ops import saga_record_skill_learning
+
+
+ADMIN_AUTH = AuthContext(
+    principal="test-admin",
+    canonical_principal="test-admin",
+    roles=("admin",),
+    event_ingress="test",
+    trigger="user_message",
+    channel_id="test-channel",
+    interactivity=None,
+)
 
 
 class _StubStore:
@@ -59,19 +72,35 @@ def turn_with_session():
         turn_id="t-1", session_id="ch-1", trigger="user_message",
         channel_id="ch-1", started_at=time.monotonic(),
         saga_session_id="sess-abc",
+        auth_context=ADMIN_AUTH,
+        ifc_labels=None,
     )
     token = set_current_turn(ctx)
     yield ctx
     reset_current_turn(token)
 
 
-async def _call(**kwargs):
+def _runtime(ctx: TurnContext) -> ToolRuntime[AuthContext]:
+    return ToolRuntime(
+        state={},
+        context=ctx.auth_context,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="saga-record-skill-learning-test",
+        store=None,
+    )
+
+
+async def _call(turn_with_session=None, **kwargs):
+    if turn_with_session is not None:
+        kwargs["runtime"] = _runtime(turn_with_session)
     return await saga_record_skill_learning.ainvoke(kwargs)
 
 
 @pytest.mark.asyncio
 async def test_records_learning_with_validated_metadata(store, turn_with_session):
     msg = await _call(
+        turn_with_session,
         skill="memory", kind="failure-mode",
         content="  circuit-breaker trips on empty input  ",
     )
@@ -87,28 +116,28 @@ async def test_records_learning_with_validated_metadata(store, turn_with_session
 
 @pytest.mark.asyncio
 async def test_positive_kind_also_records(store, turn_with_session):
-    msg = await _call(skill="github-poller", kind="tip", content="x")
+    msg = await _call(turn_with_session, skill="github-poller", kind="tip", content="x")
     assert "ok" in msg
     assert store.calls[0]["metadata"] == {"skill": "github-poller", "kind": "tip"}
 
 
 @pytest.mark.asyncio
-async def test_rejects_unknown_kind_without_writing(store):
-    msg = await _call(skill="memory", kind="gotcha", content="x")
+async def test_rejects_unknown_kind_without_writing(store, turn_with_session):
+    msg = await _call(turn_with_session, skill="memory", kind="gotcha", content="x")
     assert "failed" in msg and "unknown skill-learning kind" in msg
     assert store.calls == []  # convention guarded BEFORE any write
 
 
 @pytest.mark.asyncio
-async def test_rejects_empty_skill_without_writing(store):
-    msg = await _call(skill="   ", kind="tip", content="x")
+async def test_rejects_empty_skill_without_writing(store, turn_with_session):
+    msg = await _call(turn_with_session, skill="   ", kind="tip", content="x")
     assert "failed" in msg
     assert store.calls == []
 
 
 @pytest.mark.asyncio
-async def test_rejects_empty_content_without_writing(store):
-    msg = await _call(skill="memory", kind="tip", content="   ")
+async def test_rejects_empty_content_without_writing(store, turn_with_session):
+    msg = await _call(turn_with_session, skill="memory", kind="tip", content="   ")
     assert "failed" in msg and "content is required" in msg
     assert store.calls == []
 
@@ -126,7 +155,7 @@ async def test_no_client_configured():
 
 @pytest.mark.asyncio
 async def test_explicit_session_id_override(store, turn_with_session):
-    await _call(skill="memory", kind="tip", content="x", session_id="override-1")
+    await _call(turn_with_session, skill="memory", kind="tip", content="x", session_id="override-1")
     assert store.calls[0]["session_id"] == "override-1"
 
 
@@ -136,7 +165,7 @@ async def test_dedup_hit_reports_already_present(turn_with_session):
     prev = _MEMORY_STATE.get("client")
     _MEMORY_STATE["client"] = stub
     try:
-        msg = await _call(skill="memory", kind="tip", content="dup")
+        msg = await _call(turn_with_session, skill="memory", kind="tip", content="dup")
         assert "already present" in msg
     finally:
         _MEMORY_STATE["client"] = prev
@@ -148,7 +177,7 @@ async def test_store_exception_surfaced(turn_with_session):
     prev = _MEMORY_STATE.get("client")
     _MEMORY_STATE["client"] = stub
     try:
-        msg = await _call(skill="memory", kind="tip", content="x")
+        msg = await _call(turn_with_session, skill="memory", kind="tip", content="x")
         assert "failed" in msg and "store boom" in msg
     finally:
         _MEMORY_STATE["client"] = prev

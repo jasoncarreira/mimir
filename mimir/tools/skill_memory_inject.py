@@ -110,9 +110,18 @@ def _compute_augmented(
     if skill is None or client is None or not isinstance(content, str):
         return None, []
     try:
+        from .._context import get_current_turn
+
+        ctx = get_current_turn()
+        auth_context = getattr(ctx, "auth_context", None) if ctx else None
+    except Exception:  # noqa: BLE001 — context resolution is best-effort
+        auth_context = None
+    try:
         from .. import skill_memory
         augmented, ids = client.run_locked_read(
-            lambda conn: skill_memory.augment_skill_body(conn, skill, content)
+            lambda conn: skill_memory.augment_skill_body(
+                conn, skill, content, auth_context=auth_context
+            )
         )
     except Exception:  # noqa: BLE001 — never break a file read
         return None, []

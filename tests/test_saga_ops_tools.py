@@ -38,6 +38,7 @@ class _StubStore:
         self.end_session_calls: list[dict] = []
         self.forget_calls: list[dict] = []
         self.mark_contributions_calls: list[dict] = []
+        self.store_calls: list[dict] = []
         self.raise_on: str | None = None
 
     async def outcome(self, atom_ids, *, feedback, session_id, auth_context=None):
@@ -115,6 +116,36 @@ class _StubStore:
             raise RuntimeError("forget boom")
         self.forget_calls.append(kwargs)
         return {"dry_run": kwargs.get("dry_run", True), "actions_taken": 0}
+
+    async def store(
+        self,
+        content,
+        *,
+        stream=None,
+        source_type=None,
+        metadata=None,
+        session_id=None,
+        owner_principal=None,
+        origin_channel=None,
+        origin_domain=None,
+        visibility=None,
+        provenance=None,
+    ):
+        if self.raise_on == "store":
+            raise RuntimeError("store boom")
+        self.store_calls.append(
+            {
+                "content": content,
+                "stream": stream,
+                "source_type": source_type,
+                "metadata": metadata,
+                "session_id": session_id,
+                "owner_principal": owner_principal,
+                "origin_channel": origin_channel,
+                "visibility": visibility,
+            }
+        )
+        return {"stored": True, "atom_id": "test-atom-id"}
 
 
 @pytest.fixture
@@ -474,3 +505,82 @@ async def test_saga_feedback_stale_emits_negative(
     assert "ok" in out and "negative" in out
     sent = [e for e in captured if e[0] == "saga_feedback_sent"]
     assert sent and sent[0][1].get("feedback") == "negative"
+
+
+# ────────────────────────────────────────────────────────────────────
+# saga_record_skill_learning authorization tests
+# ────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_record_skill_learning_without_runtime_fails_closed(
+    store: _StubStore,
+) -> None:
+    """Without a server-provided runtime (AuthContext), the write must be denied."""
+    out = await saga_ops.saga_record_skill_learning.ainvoke(
+        {"skill": "test-skill", "kind": "tip", "content": "Test learning"}
+    )
+    assert "write access denied" in out
+    assert store.store_calls == []
+
+
+@pytest.mark.asyncio
+async def test_record_skill_learning_non_admin_non_service_denied(
+    store: _StubStore,
+) -> None:
+    """A regular user without admin or trusted-service role must be denied."""
+    user_auth = AuthContext(
+        principal="regular-user",
+        canonical_principal="regular-user",
+        roles=(),
+        event_ingress="test",
+        trigger="user_message",
+        channel_id="test-channel",
+        interactivity=None,
+    )
+    user_ctx = TurnContext(
+        turn_id="turn-1",
+        session_id="sess-1",
+        trigger="user_message",
+        channel_id="test-channel",
+        started_at="2024-01-01T00:00:00Z",
+        agent_id="agent-1",
+        saga_session_id="sess-1",
+        auth_context=user_auth,
+        ifc_labels=None,
+    )
+    token = set_current_turn(user_ctx)
+    try:
+        out = await saga_ops.saga_record_skill_learning.ainvoke(
+            {
+                "skill": "test-skill",
+                "kind": "tip",
+                "content": "Test learning",
+                "runtime": _runtime(user_ctx),
+            }
+        )
+    finally:
+        reset_current_turn(token)
+    assert "write access denied" in out
+    assert store.store_calls == []
+
+
+@pytest.mark.asyncio
+async def test_record_skill_learning_admin_allowed(
+    store: _StubStore, turn_with_session: TurnContext
+) -> None:
+    """An admin user must be allowed to write skill learnings."""
+    out = await saga_ops.saga_record_skill_learning.ainvoke(
+        {
+            "skill": "test-skill",
+            "kind": "tip",
+            "content": "Test learning",
+            "runtime": _runtime(turn_with_session),
+        }
+    )
+    assert "ok" in out.lower()
+    assert len(store.store_calls) == 1
+    call = store.store_calls[0]
+    assert call["content"] == "Test learning"
+    assert call["source_type"] == "skill_learning"
+    assert call["visibility"] == "private"

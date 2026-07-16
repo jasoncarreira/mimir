@@ -3642,10 +3642,11 @@ class Agent:
             # access is segfault-class with FTS5 (#365/#386).
             # augment_skill_body itself swallows recall errors and
             # returns the body unaugmented.
+            _auth_ctx = ctx.auth_context
             _augmented, _injected_ids = await asyncio.to_thread(
                 self._saga_store.run_locked_read,
                 lambda _c: skill_memory.augment_skill_body(
-                    _c, _skill_name, _skill_body,
+                    _c, _skill_name, _skill_body, auth_context=_auth_ctx
                 ),
             )
             auto_skill_block = (_skill_name, _augmented)
