@@ -417,6 +417,23 @@ def test_scheduler_loop_lag_surfaces_as_negative(tmp_path: Path):
     assert "scheduler event loop lag: 1.234s over threshold 1.000s" in block
 
 
+def test_loop_stall_watchdog_surfaces_as_negative(tmp_path: Path):
+    from mimir.feedback import classify
+
+    assert classify("loop_stall_watchdog_fired") == (
+        "negative", "loop_stall_watchdog_fired",
+    )
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.1), "type": "loop_stall_watchdog_fired",
+        "stall_s": 305.2, "threshold_s": 300.0,
+        "terminate_on_stall": True,
+    }])
+    assert (
+        "event-loop stall watchdog alerted + requested restart: 305.2s over 300.0s"
+        in log.recent_block()
+    )
+
+
 def test_scheduler_loop_lag_host_is_not_a_negative_signal(tmp_path: Path):
     """chainlink #682: host/VM deschedules are informational only — classify()
     returns None so they never surface in the algedonic block or its ×N count."""

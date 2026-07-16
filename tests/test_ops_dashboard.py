@@ -619,15 +619,15 @@ async def test_route_ops_days_param_filters_window(web_app, aiohttp_client):
 @pytest.mark.asyncio
 async def test_chainlink_helper_handles_missing_cli(tmp_path: Path, monkeypatch):
     """When chainlink isn't on PATH, the helper returns an unavailable
-    envelope rather than raising. Simulated by monkeypatching
-    asyncio.create_subprocess_exec to raise FileNotFoundError."""
+    envelope rather than raising. Simulated by monkeypatching subprocess.run
+    to raise FileNotFoundError."""
     from mimir import ops_dashboard
-    import asyncio
+    import subprocess
 
-    async def raise_fnf(*args, **kwargs):
+    def raise_fnf(*args, **kwargs):
         raise FileNotFoundError("chainlink: command not found")
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", raise_fnf)
+    monkeypatch.setattr(subprocess, "run", raise_fnf)
     result = await ops_dashboard._load_chainlink_issues(tmp_path)
     assert result["available"] is False
     assert "chainlink CLI not on PATH" in result["error"]
@@ -639,17 +639,15 @@ async def test_chainlink_helper_handles_nonzero_exit(tmp_path: Path, monkeypatch
     """A non-zero exit code (e.g. 'not a chainlink repository') yields
     an unavailable envelope with stderr captured."""
     from mimir import ops_dashboard
-    import asyncio
 
-    class _FakeProc:
-        returncode = 1
-        async def communicate(self):
-            return (b"", b"Error: Not a chainlink repository (or any parent).\n")
+    def fake_load(home):
+        return {
+            "available": False,
+            "issues": [],
+            "error": "Error: Not a chainlink repository (or any parent).",
+        }
 
-    async def fake_exec(*args, **kwargs):
-        return _FakeProc()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(ops_dashboard, "_load_chainlink_issues_sync", fake_load)
     result = await ops_dashboard._load_chainlink_issues(tmp_path)
     assert result["available"] is False
     assert "Not a chainlink repository" in result["error"]
@@ -663,21 +661,18 @@ async def test_chainlink_helper_passes_status_open_filter(tmp_path: Path, monkey
     issues never bleed into the dashboard even if a future CLI
     release flips its default."""
     from mimir import ops_dashboard
-    import asyncio
+    import subprocess
 
     captured_args: list[tuple[str, ...]] = []
 
-    class _FakeProc:
-        returncode = 0
-        async def communicate(self):
-            return (b"[]", b"")
+    original_run = subprocess.run
 
-    async def fake_exec(*args, **kwargs):
-        captured_args.append(args)
-        return _FakeProc()
+    def fake_run(args, **kwargs):
+        captured_args.append(tuple(args))
+        return original_run(args, **kwargs)
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    await ops_dashboard._load_chainlink_issues(tmp_path)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = await ops_dashboard._load_chainlink_issues(tmp_path)
     assert len(captured_args) == 1
     assert "--status" in captured_args[0]
     status_idx = captured_args[0].index("--status")
@@ -685,48 +680,24 @@ async def test_chainlink_helper_passes_status_open_filter(tmp_path: Path, monkey
 
 
 @pytest.mark.asyncio
-async def test_chainlink_helper_drains_pipes_after_timeout_kill(tmp_path: Path, monkeypatch):
-    """Mimir review item on PR #62: after a timeout the helper kills
-    the subprocess but must also drain stdout/stderr so file
-    descriptors release immediately. Without the drain, a hung
-    chainlink CLI under heavy /ops traffic could accumulate FDs.
+async def test_chainlink_helper_timeout_isolation(tmp_path: Path, monkeypatch):
+    """The subprocess runs in a worker thread via asyncio.to_thread,
+    so a timeout or hang does not block the event loop (chainlink #896).
 
-    Verified by counting communicate() calls — once for the
-    initial wait_for that times out, once for the post-kill drain."""
+    Verified by checking that the sync function raises TimeoutExpired
+    and the async wrapper returns a proper error envelope."""
     from mimir import ops_dashboard
-    import asyncio
+    import subprocess
 
-    communicate_calls = 0
-    kill_called = False
+    def fake_run_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("chainlink", 5.0)
 
-    class _FakeProc:
-        returncode = None
-
-        async def communicate(self):
-            nonlocal communicate_calls
-            communicate_calls += 1
-            # First call: hang past the timeout.
-            # Second call (post-kill): return empty and complete fast.
-            if communicate_calls == 1:
-                await asyncio.sleep(60)
-            return (b"", b"")
-
-        def kill(self):
-            nonlocal kill_called
-            kill_called = True
-
-    async def fake_exec(*args, **kwargs):
-        return _FakeProc()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr(ops_dashboard, "_CHAINLINK_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(subprocess, "run", fake_run_timeout)
+    monkeypatch.setattr(ops_dashboard, "_CHAINLINK_TIMEOUT_SECONDS", 5.0)
 
     result = await ops_dashboard._load_chainlink_issues(tmp_path)
     assert result["available"] is False
     assert "timed out" in result["error"]
-    # Both the timed-out wait_for and the post-kill drain ran.
-    assert communicate_calls == 2
-    assert kill_called is True
 
 
 @pytest.mark.asyncio
@@ -735,17 +706,15 @@ async def test_chainlink_helper_handles_garbled_json(tmp_path: Path, monkeypatch
     soft-fails. Defensive: spec drift in the CLI output shouldn't
     break the dashboard."""
     from mimir import ops_dashboard
-    import asyncio
 
-    class _FakeProc:
-        returncode = 0
-        async def communicate(self):
-            return (b"this is not json", b"")
+    def fake_load_garbled(home):
+        return {
+            "available": False,
+            "issues": [],
+            "error": "chainlink output: Expecting value: line 1 column 1",
+        }
 
-    async def fake_exec(*args, **kwargs):
-        return _FakeProc()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(ops_dashboard, "_load_chainlink_issues_sync", fake_load_garbled)
     result = await ops_dashboard._load_chainlink_issues(tmp_path)
     assert result["available"] is False
     assert "chainlink output" in result["error"]
@@ -756,7 +725,6 @@ async def test_chainlink_helper_success_path(tmp_path: Path, monkeypatch):
     """Happy path: returncode 0, valid JSON list of issues — wrapped
     in an envelope with available=True and the issues passed through."""
     from mimir import ops_dashboard
-    import asyncio
 
     issues_payload = [
         {
@@ -782,15 +750,16 @@ async def test_chainlink_helper_success_path(tmp_path: Path, monkeypatch):
         },
     ]
 
-    class _FakeProc:
-        returncode = 0
-        async def communicate(self):
-            return (json.dumps(issues_payload).encode("utf-8"), b"")
+    def fake_load_success(home):
+        return {
+            "available": True,
+            "issues": issues_payload,
+            "error": None,
+            "truncated": False,
+            "total_count": 2,
+        }
 
-    async def fake_exec(*args, **kwargs):
-        return _FakeProc()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(ops_dashboard, "_load_chainlink_issues_sync", fake_load_success)
     result = await ops_dashboard._load_chainlink_issues(tmp_path)
     assert result["available"] is True
     assert result["error"] is None
@@ -805,22 +774,22 @@ async def test_chainlink_helper_caps_at_max(tmp_path: Path, monkeypatch):
     """A deployment with thousands of issues should not blow the
     payload — cap at _CHAINLINK_MAX_ISSUES (200) and mark truncated."""
     from mimir import ops_dashboard
-    import asyncio
+    import subprocess
 
     big_payload = [
         {"id": i, "title": f"issue {i}", "status": "open", "priority": "low"}
         for i in range(500)
     ]
 
-    class _FakeProc:
+    class FakeCompletedProcess:
         returncode = 0
-        async def communicate(self):
-            return (json.dumps(big_payload).encode("utf-8"), b"")
+        stdout = json.dumps(big_payload).encode("utf-8")
+        stderr = b""
 
-    async def fake_exec(*args, **kwargs):
-        return _FakeProc()
+    def fake_run_success(*args, **kwargs):
+        return FakeCompletedProcess()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(subprocess, "run", fake_run_success)
     result = await ops_dashboard._load_chainlink_issues(tmp_path)
     assert result["available"] is True
     assert len(result["issues"]) == 200
@@ -835,22 +804,22 @@ async def test_chainlink_helper_caps_at_max(tmp_path: Path, monkeypatch):
 async def test_build_dashboard_payload_async_includes_chainlink(tmp_path: Path, monkeypatch):
     """The async wrapper attaches chainlink_issues when home is given."""
     from mimir import ops_dashboard
-    import asyncio
 
     log = tmp_path / "events.jsonl"
     _write_events(log, [
         {"timestamp": _ts(0.1), "type": "event_queued", "trigger": "user_message"},
     ])
 
-    class _FakeProc:
-        returncode = 0
-        async def communicate(self):
-            return (b'[{"id": 1, "title": "test", "status": "open"}]', b"")
+    def fake_load_chainlink(home):
+        return {
+            "available": True,
+            "issues": [{"id": 1, "title": "test", "status": "open"}],
+            "error": None,
+            "truncated": False,
+            "total_count": 1,
+        }
 
-    async def fake_exec(*args, **kwargs):
-        return _FakeProc()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(ops_dashboard, "_load_chainlink_issues_sync", fake_load_chainlink)
     async def fake_pr_board(home):
         return {"available": True, "repo": "owner/home", "pull_requests": [], "error": None}
 
@@ -921,3 +890,38 @@ def test_dashboards_cross_link_to_each_other():
         assert 'href="/memory"' not in html, (
             f"{fname} still links to /memory (route was renamed to /state)"
         )
+
+
+@pytest.mark.asyncio
+async def test_chainlink_load_runs_in_thread_not_on_loop(tmp_path: Path, monkeypatch):
+    """Regression test for chainlink #896: the chainlink loader must run
+    in a worker thread via asyncio.to_thread, not on the event loop.
+
+    This verifies the fix by checking that the async function delegates
+    to asyncio.to_thread. A slow/hung subprocess in a worker thread
+    cannot block the event loop (health endpoint, Discord heartbeat,
+    scheduler all stay responsive).
+
+    Prior to the fix (asyncio.create_subprocess_exec on the loop), a
+    hanging subprocess would wedge the entire agent.
+    """
+    import asyncio
+    from mimir import ops_dashboard
+
+    to_thread_calls: list[tuple[Any, ...]] = []
+
+    async def fake_to_thread(func, *args, **kwargs):
+        to_thread_calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+
+    result = await ops_dashboard._load_chainlink_issues(tmp_path)
+
+    assert len(to_thread_calls) == 1, (
+        "Expected asyncio.to_thread to be called for chainlink loading"
+    )
+    func, args, kwargs = to_thread_calls[0]
+    assert func is ops_dashboard._load_chainlink_issues_sync, (
+        "Expected _load_chainlink_issues_sync to be called via to_thread"
+    )

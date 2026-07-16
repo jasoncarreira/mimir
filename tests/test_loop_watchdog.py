@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import signal
 import threading
 
+import pytest
+
+from mimir import loop_watchdog
 from mimir.loop_watchdog import (
     LoopStallWatchdog,
     stack_is_apscheduler_logging_flush,
@@ -111,3 +115,53 @@ def test_start_thread_then_stop_is_safe():
         assert wd._loop_thread_id == threading.get_ident()
     finally:
         wd.stop()
+
+
+def test_sustained_stall_fires_structured_alert_once_off_loop(monkeypatch):
+    events = []
+    alerts = []
+    main_thread_id = threading.get_ident()
+    monkeypatch.setattr(loop_watchdog, "log_event_sync",
+                        lambda event_type, **payload: events.append((event_type, payload)))
+    wd = LoopStallWatchdog(
+        stall_threshold_s=0.01, poll_s=0.005, alert_threshold_s=0.03,
+        notify=lambda stall_s, stack: alerts.append(
+            (stall_s, threading.get_ident())),
+    )
+    wd.start_thread(loop_thread_id=main_thread_id)
+    # start_thread() refreshes the beat to a real monotonic timestamp; move it
+    # just far enough into the past so this remains valid on fast and slow hosts.
+    wd._beat -= 1.0
+    try:
+        threading.Event().wait(0.15)
+    finally:
+        wd.stop()
+    assert len(alerts) == 1
+    assert alerts[0][0] >= 0.03
+    assert alerts[0][1] != main_thread_id
+    assert len(events) == 1
+    assert events[0][0] == "loop_stall_watchdog_fired"
+
+
+def test_sustained_stall_self_terminate_is_opt_in(monkeypatch):
+    restarts = []
+    monkeypatch.setattr(loop_watchdog, "log_event_sync", lambda *a, **kw: None)
+    wd = LoopStallWatchdog(
+        stall_threshold_s=1.0, alert_threshold_s=5.0,
+        terminate_on_stall=True, notify=lambda stall_s, stack: None,
+        terminate=lambda pid, sig: restarts.append((pid, sig)),
+    )
+    wd._beat = 100.0
+    wd._check_once(now=106.0)
+    assert restarts == [(1, signal.SIGTERM)]
+
+
+def test_sustained_stall_does_not_terminate_by_default(monkeypatch):
+    monkeypatch.setattr(loop_watchdog, "log_event_sync", lambda *a, **kw: None)
+    wd = LoopStallWatchdog(
+        stall_threshold_s=1.0, alert_threshold_s=5.0,
+        notify=lambda stall_s, stack: None,
+        terminate=lambda pid, sig: pytest.fail("termination must remain opt-in"),
+    )
+    wd._beat = 100.0
+    wd._check_once(now=106.0)

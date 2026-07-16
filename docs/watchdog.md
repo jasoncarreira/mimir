@@ -147,5 +147,11 @@ different failure domain:
 - an in-process **loop-watchdog thread** that force-exits a stalled loop so the
   `restart:` policy fires.
 
+The scheduler also starts an **in-process daemon-thread fallback**. If the event
+loop heartbeat is stale for `MIMIR_LOOP_STALL_ALERT_SECONDS` (default 300s),
+the thread sends a bounded direct ntfy/webhook alert without using the dead
+loop. `MIMIR_LOOP_STALL_SELF_TERMINATE=true` then signals PID 1 so the
+supervisor can restart the agent. Self-termination is opt-in.
+
 Whole-host failure is the one case nothing on-box can catch — that's the
 hosted-monitor-on-`/health` layer (option D above).

@@ -2795,6 +2795,8 @@ async def test_scheduler_loop_lag_monitor_flags_sub_cpu_block_just_over_threshol
 
 
 def test_scheduler_start_and_stop_manage_loop_lag_monitor(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("MIMIR_LOOP_STALL_ALERT_SECONDS", raising=False)
+    monkeypatch.delenv("MIMIR_LOOP_STALL_SELF_TERMINATE", raising=False)
     async def noop(event: AgentEvent) -> bool:
         return True
 
@@ -2828,6 +2830,8 @@ def test_scheduler_start_and_stop_manage_loop_lag_monitor(tmp_path: Path, monkey
     assert sched._loop_lag_task is task
     assert sched._loop_watchdog is not None
     assert sched._loop_watchdog._threshold == 0.5
+    assert sched._loop_watchdog._alert_threshold == 300.0
+    assert sched._loop_watchdog._terminate_on_stall is False
 
     sched.stop()
 

@@ -21,12 +21,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import signal
 import sys
 import threading
 import time
 import traceback
 from collections import deque
-from typing import Any
+from typing import Any, Callable
+
+from .event_logger import log_event_sync
+from .liveness import notify_loop_stall_sync
 
 log = logging.getLogger(__name__)
 
@@ -80,16 +85,25 @@ class LoopStallWatchdog:
         poll_s: float = 0.25,
         max_captures: int = 32,
         stack_limit: int = 25,
+        alert_threshold_s: float | None = None,
+        terminate_on_stall: bool = False,
+        notify: Callable[[float, str], None] = notify_loop_stall_sync,
+        terminate: Callable[[int, int], None] = os.kill,
     ) -> None:
         self._threshold = stall_threshold_s
         self._poll = poll_s
         self._stack_limit = stack_limit
+        self._alert_threshold = alert_threshold_s
+        self._terminate_on_stall = terminate_on_stall
+        self._notify = notify
+        self._terminate = terminate
         self._beat = time.monotonic()
         self._loop_thread_id: int | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._captures: deque[dict[str, Any]] = deque(maxlen=max_captures)
         self._last_captured_beat: float | None = None
+        self._last_alerted_beat: float | None = None
 
     def beat(self) -> None:
         """Mark the loop alive — called from :meth:`heartbeat_loop` on the loop."""
@@ -134,20 +148,32 @@ class LoopStallWatchdog:
                 log.debug("loop-stall watchdog check failed", exc_info=True)
 
     def _check_once(self, now: float) -> None:
-        """Capture the loop's stack if the heartbeat is stale past the threshold.
-
-        One capture per stall: keyed on the (frozen-while-blocked) heartbeat
-        value, so a single long stall yields one capture, not a burst.
-        """
+        """Capture and, for sustained stalls, alert or terminate off-loop."""
         beat = self._beat
-        if now - beat <= self._threshold:
+        stall_s = now - beat
+        if stall_s > self._threshold and self._last_captured_beat != beat:
+            self._last_captured_beat = beat
+            self._captures.append(
+                {"stall_s": round(stall_s, 3), "stack": self._capture_loop_stack()}
+            )
+        if (
+            self._alert_threshold is None
+            or stall_s <= self._alert_threshold
+            or self._last_alerted_beat == beat
+        ):
             return
-        if self._last_captured_beat == beat:
-            return
-        self._last_captured_beat = beat
-        self._captures.append(
-            {"stall_s": round(now - beat, 3), "stack": self._capture_loop_stack()}
+        self._last_alerted_beat = beat
+        stack = self._capture_loop_stack()
+        log_event_sync(
+            "loop_stall_watchdog_fired",
+            stall_s=round(stall_s, 3),
+            threshold_s=self._alert_threshold,
+            terminate_on_stall=self._terminate_on_stall,
+            stack=stack,
         )
+        self._notify(stall_s, stack)
+        if self._terminate_on_stall:
+            self._terminate(1, signal.SIGTERM)
 
     def _capture_loop_stack(self) -> str:
         tid = self._loop_thread_id

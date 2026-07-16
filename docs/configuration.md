@@ -191,6 +191,8 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_HEALTH_PROBE_CRON` | cron | `* * * * *` | Bind-mount stale-inode health probe. Empty disables. |
 | `MIMIR_HEALTH_PROBE_MAX_RESTARTS_PER_HOUR` | int | `3` | Guard: past N self-restarts/60min, stop and surface `bind_mount_stale_persistent`. |
 | `MIMIR_LIVENESS_BEAT_SECONDS` | int | `60` | Interval to rewrite `state/liveness.json` for the watchdog. `0` disables. |
+| `MIMIR_LOOP_STALL_ALERT_SECONDS` | float | `300` | Daemon-thread threshold for a direct ntfy/webhook alert. `0` disables. |
+| `MIMIR_LOOP_STALL_SELF_TERMINATE` | bool | `false` | After alerting, signal PID 1 so the supervisor can restart the agent. |
 | `MIMIR_IDENTITIES_POPULATE_CRON` | cron | `""` (off) | Identities populator (scrapes Discord/Slack into `state/identities.yaml`). Recommended `0 6 * * *`. |
 | `MIMIR_QUOTA_RECHECK_SECONDS` | int | `180` (floor `30`) | Quota-pause recheck probe cadence. |
 | `MIMIR_QUOTA_5H_BACKDERIVE_FACTOR` | float | `10.0` | Back-derive factor for the 5h quota-dollar estimator. |

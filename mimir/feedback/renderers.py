@@ -87,6 +87,13 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         name = _sanitize_field(ev.get("name") or "?")
         error = _sanitize_field(ev.get("error") or "(no detail)")
         return f"background task {name!r} failed: {error}"
+    if rule_kind == "loop_stall_watchdog_fired":
+        stall = ev.get("stall_s")
+        threshold = ev.get("threshold_s")
+        stall_s = f"{stall:.1f}s" if isinstance(stall, (int, float)) else "?"
+        threshold_s = f"{threshold:.1f}s" if isinstance(threshold, (int, float)) else "?"
+        action = "alerted + requested restart" if ev.get("terminate_on_stall") else "alerted"
+        return f"event-loop stall watchdog {action}: {stall_s} over {threshold_s}"
     if rule_kind == "scheduler_loop_lag":
         lag = ev.get("lag_s")
         threshold = ev.get("threshold_s")
