@@ -31,6 +31,7 @@ import logging
 import os
 import signal
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -318,6 +319,37 @@ async def notify_unclean_restart(
         priority=4,
         tags=["recycle", "warning"],
     )
+
+
+def notify_loop_stall_sync(stall_s: float, stack: str) -> None:
+    """Alert directly from the watchdog thread without using the wedged loop."""
+    title = "mimir event loop stalled"
+    leaf = next(
+        (line.strip() for line in reversed(stack.splitlines())
+         if line.lstrip().startswith("File ")),
+        "stack unavailable",
+    )
+    body = f"The event loop heartbeat has been stale for {stall_s:.1f}s. {leaf}"
+    requests: list[urllib.request.Request] = []
+    topic = os.environ.get("NTFY_TOPIC", "").strip()
+    if topic:
+        requests.append(urllib.request.Request(
+            f"https://ntfy.sh/{topic}", data=f"{title}\n{body}".encode(),
+            headers={"Title": "mimir watchdog", "Priority": "5",
+                     "Tags": "rotating_light"}, method="POST",
+        ))
+    url = os.environ.get(_WEBHOOK_ENV, "").strip()
+    if url:
+        requests.append(urllib.request.Request(
+            url, data=json.dumps({"text": f"{title}\n{body}"}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        ))
+    for request in requests:
+        try:
+            with urllib.request.urlopen(request, timeout=_WEBHOOK_TIMEOUT_S):  # noqa: S310
+                pass
+        except Exception as exc:  # noqa: BLE001 — watchdog alert must soft-fail
+            log.warning("loop-stall watchdog POST failed: %s", exc)
 
 
 async def notify_service_event(

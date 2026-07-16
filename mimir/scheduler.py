@@ -70,6 +70,22 @@ log = logging.getLogger(__name__)
 UTC = timezone.utc
 
 
+def _loop_stall_alert_threshold() -> float:
+    """Return sustained-stall paging threshold; non-positive disables it."""
+    raw = os.environ.get("MIMIR_LOOP_STALL_ALERT_SECONDS", "300")
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("invalid MIMIR_LOOP_STALL_ALERT_SECONDS=%r; using 300", raw)
+        return 300.0
+
+
+def _loop_stall_self_terminate_enabled() -> bool:
+    return os.environ.get("MIMIR_LOOP_STALL_SELF_TERMINATE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _scheduler_job_ids(scheduler: AsyncIOScheduler) -> list[str]:
     """Best-effort list of currently registered APScheduler job ids.
 
@@ -2867,7 +2883,13 @@ class Scheduler:
         # Keep the watchdog threshold strictly below the monitor threshold
         # (1.0s by default) so borderline on-loop blocking syscalls are sampled
         # before the lag monitor wakes and drains captures.
-        self._loop_watchdog = LoopStallWatchdog(stall_threshold_s=0.5, poll_s=0.25)
+        alert_threshold = _loop_stall_alert_threshold()
+        self._loop_watchdog = LoopStallWatchdog(
+            stall_threshold_s=0.5,
+            poll_s=0.25,
+            alert_threshold_s=alert_threshold if alert_threshold > 0 else None,
+            terminate_on_stall=_loop_stall_self_terminate_enabled(),
+        )
         self._loop_watchdog.start_thread()
         self._loop_watchdog_beat_task = self._spawn(
             self._loop_watchdog.heartbeat_loop(),
