@@ -1599,7 +1599,7 @@ class Agent:
             interactive_token = _set_interactive(_turn_is_interactive(ctx.interactivity))
             _turn_record = await self._run_turn_body(
                 event, ctx, ctx_token, turn_id, session_id, saga_session_id,
-                t_total_start, emitter,
+                t_total_start, emitter, initial_auth_context,
             )
             return _turn_record
         except Exception as exc:
@@ -2117,6 +2117,7 @@ class Agent:
         saga_session_id: str | None,
         t_total_start: float,
         emitter: TurnEventEmitter,
+        initial_auth_context: AuthContext,
     ) -> TurnRecord:
 
         # Persist the inbound event to the chat-history buffer + JSONL

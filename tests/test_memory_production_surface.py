@@ -14,6 +14,11 @@ from pathlib import Path
 
 import pytest
 
+from mimir.saga.ownership import AuthorizationScope
+
+
+ADMIN_SCOPE = AuthorizationScope(is_admin=True)
+
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"
 
@@ -87,7 +92,9 @@ def test_top_triples_with_payload_returns_rich_data(conn):
         {"subject": "Bob", "predicate": "enjoys", "object": "verbose"},
     ], source_atom_id="obs1", embed_fn=embed)
 
-    results = top_triples_with_payload(conn, [1.0, 0.0, 0.0, 0.0], top_n=10)
+    results = top_triples_with_payload(
+        conn, [1.0, 0.0, 0.0, 0.0], top_n=10, auth_context=ADMIN_SCOPE,
+    )
     assert len(results) == 2
     # Rich shape — full triple data, not collapsed by source_atom_id.
     alice = next(r for r in results if r["subject"] == "Alice")
@@ -109,7 +116,9 @@ def test_top_triples_with_payload_skips_no_embedding(conn):
     store_triples(conn, [
         {"subject": "Alice", "predicate": "prefers", "object": "concise"},
     ], source_atom_id="obs1", embed_fn=None)
-    results = top_triples_with_payload(conn, [1.0, 0.0, 0.0, 0.0], top_n=10)
+    results = top_triples_with_payload(
+        conn, [1.0, 0.0, 0.0, 0.0], top_n=10, auth_context=ADMIN_SCOPE,
+    )
     assert results == []
 
 
@@ -124,7 +133,9 @@ def test_top_triples_with_payload_respects_top_n(conn):
         {"subject": "Bob", "predicate": "enjoys", "object": "verbose"},
         {"subject": "Carol", "predicate": "likes", "object": "art"},
     ], source_atom_id="obs1", embed_fn=embed)
-    results = top_triples_with_payload(conn, [1.0, 0.0, 0.0, 0.0], top_n=2)
+    results = top_triples_with_payload(
+        conn, [1.0, 0.0, 0.0, 0.0], top_n=2, auth_context=ADMIN_SCOPE,
+    )
     assert len(results) == 2
 
 
@@ -148,7 +159,7 @@ def test_top_triples_with_payload_excludes_expired_triples(conn):
     ], source_atom_id="obs2", embed_fn=embed)
     ref = datetime(2026, 1, 1, tzinfo=timezone.utc)
     results = top_triples_with_payload(conn, [1.0, 0.0, 0.0, 0.0], top_n=10,
-                                       reference_date=ref)
+                                       reference_date=ref, auth_context=ADMIN_SCOPE)
     objects = {r["object"] for r in results}
     assert "CurrentCo" in objects   # live triple surfaces
     assert "OldCo" not in objects   # expired triple excluded
@@ -201,7 +212,7 @@ async def test_query_surfaces_triples_in_response(monkeypatch, tmp_path):
        embed_fn=lambda _t: (vec_bytes, "stub", "stub", 4))
     conn.commit()
 
-    result = await client.query("alice", top_k=5)
+    result = await client.query("alice", top_k=5, auth_context=ADMIN_SCOPE)
     assert isinstance(result.get("triples"), list)
     assert len(result["triples"]) == 1
     t = result["triples"][0]
@@ -236,7 +247,7 @@ async def test_query_with_triples_disabled_returns_empty_list(monkeypatch, tmp_p
        embed_fn=lambda _t: (vec_bytes, "stub", "stub", 4))
     conn.commit()
 
-    result = await client.query("alice", top_k=5)
+    result = await client.query("alice", top_k=5, auth_context=ADMIN_SCOPE)
     assert result["triples"] == []
 
 
@@ -251,7 +262,7 @@ async def test_atoms_carry_confidence_tier(monkeypatch, tmp_path):
     db = tmp_path / "mimir.saga.db"
     client = SagaStore(db_path=db, embedding_dim=4)
     await client.store("Alice prefers concise replies")
-    result = await client.query("alice", top_k=5)
+    result = await client.query("alice", top_k=5, auth_context=ADMIN_SCOPE)
     atoms = result["raws"] + result["observations"]
     assert atoms
     for a in atoms:
@@ -297,13 +308,16 @@ async def test_min_confidence_tier_filter_drops_weak_atoms(monkeypatch, tmp_path
     r_weak = await client.store("Bob enjoys verbose explanations")
 
     # Without filter: both atoms surface (BM25 may rank both).
-    bare = await client.query("alice", top_k=5)
+    bare = await client.query("alice", top_k=5, auth_context=ADMIN_SCOPE)
     bare_ids = {a["id"] for a in bare["raws"] + bare["observations"]}
     assert r_strong["atom_id"] in bare_ids
 
     # With min="medium": only atoms whose cosine ≥ 0.30 survive. The
     # Bob atom's cosine to "alice" is 0.0 → tier none → dropped.
-    filtered = await client.query("alice", top_k=5, min_confidence_tier="medium")
+    filtered = await client.query(
+        "alice", top_k=5, min_confidence_tier="medium",
+        auth_context=ADMIN_SCOPE,
+    )
     filtered_ids = {a["id"] for a in filtered["raws"] + filtered["observations"]}
     assert r_strong["atom_id"] in filtered_ids
     assert r_weak["atom_id"] not in filtered_ids
