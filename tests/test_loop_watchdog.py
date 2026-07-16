@@ -129,7 +129,9 @@ def test_sustained_stall_fires_structured_alert_once_off_loop(monkeypatch):
             (stall_s, threading.get_ident())),
     )
     wd.start_thread(loop_thread_id=main_thread_id)
-    wd._beat = 100.0
+    # start_thread() refreshes the beat to a real monotonic timestamp; move it
+    # just far enough into the past so this remains valid on fast and slow hosts.
+    wd._beat -= 1.0
     try:
         threading.Event().wait(0.15)
     finally:
