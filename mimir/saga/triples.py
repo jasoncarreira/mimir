@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from ._like import escape_like_pattern
+from .ownership import Ownership, intersect_acl, intersect_acl_from_rows
 
 
 logger = logging.getLogger("mimir.saga.triples")
@@ -188,12 +189,113 @@ TripleEmbedFn = Callable[[str], tuple[bytes, str, str, int]]
 # ─── Storage ─────────────────────────────────────────────────────────
 
 
+def _compute_triple_acl(
+    conn: sqlite3.Connection,
+    evidence_ids: list[str],
+) -> Ownership:
+    """Compute the intersected ACL from evidence atoms for a triple.
+
+    Fetches the ownership columns from the atoms table for all evidence
+    atoms and computes the intersection using the fail-closed ACL
+    intersection helper. If any evidence atom is missing or has ambiguous
+    provenance, the result defaults to service/admin-only (legacy_admin).
+    """
+    if not evidence_ids:
+        return Ownership()
+
+    placeholders = ",".join(["?"] * len(evidence_ids))
+    rows = conn.execute(
+        f"""SELECT id, owner_principal, origin_channel, origin_domain,
+                  visibility, provenance
+           FROM atoms
+           WHERE id IN ({placeholders})
+             AND tombstoned = 0""",
+        evidence_ids,
+    ).fetchall()
+
+    if len(rows) != len(set(evidence_ids)):
+        return Ownership()
+
+    row_dicts = [
+        {
+            "owner_principal": r[1],
+            "origin_channel": r[2],
+            "origin_domain": r[3],
+            "visibility": r[4],
+            "provenance": r[5],
+        }
+        for r in rows
+    ]
+    return intersect_acl_from_rows(row_dicts)
+
+
+def _update_triple_acl_on_dedup(
+    conn: sqlite3.Connection,
+    triple_id: str,
+    new_acl: Ownership,
+) -> None:
+    """Update triple ACL on content-addressed dedup.
+
+    When the same triple is derived from new sources, we need to
+    recompute the ACL as the intersection of the existing triple's ACL
+    and the new sources' ACL. This ensures the triple doesn't become
+    more readable than its least permissive source.
+
+    This is a fail-closed operation: if the intersection results in a
+    more restrictive ACL, we update the triple. If the intersection
+    results in a less restrictive ACL (widening), we do NOT update —
+    the existing restrictive ACL is preserved.
+    """
+    existing = conn.execute(
+        """SELECT owner_principal, origin_channel, origin_domain,
+                  visibility, provenance
+           FROM triples WHERE id = ?""",
+        (triple_id,),
+    ).fetchone()
+    if not existing:
+        return
+
+    existing_acl = Ownership(
+        owner_principal=existing[0] or "legacy_admin",
+        origin_channel=existing[1],
+        origin_domain=existing[2],
+        visibility=existing[3] or "legacy_admin",
+        provenance=json.loads(existing[4]) if existing[4] else {},
+    )
+
+    intersected = intersect_acl([existing_acl, new_acl])
+
+    if (
+        intersected.visibility != existing_acl.visibility
+        or intersected.owner_principal != existing_acl.owner_principal
+        or intersected.origin_domain != existing_acl.origin_domain
+    ):
+        conn.execute(
+            """UPDATE triples SET
+                owner_principal = ?,
+                origin_channel = ?,
+                origin_domain = ?,
+                visibility = ?,
+                provenance = ?
+            WHERE id = ?""",
+            (
+                intersected.owner_principal,
+                intersected.origin_channel,
+                intersected.origin_domain,
+                intersected.visibility,
+                json.dumps(intersected.provenance),
+                triple_id,
+            ),
+        )
+
+
 def store_triples(
     conn: sqlite3.Connection,
     triples: list[dict],
     *,
     source_atom_id: str | None,
     embed_fn: TripleEmbedFn | None = None,
+    evidence_ids: list[str] | None = None,
 ) -> list[str]:
     """Insert a batch of triples. Returns the triple IDs that were
     newly inserted (skips ones already present by content-hash).
@@ -203,18 +305,36 @@ def store_triples(
     each triple's ``{subject} {predicate} {object}`` text is embedded
     and the bytes stored alongside.
 
+    ``evidence_ids`` is the list of source atom IDs that were used to
+    synthesize the triple. If provided, the triple's ACL is computed
+    by intersecting the ACLs of all evidence atoms. This ensures the
+    triple is no more readable than its least permissive source.
+
+    When a triple already exists (content-addressed dedup), the existing
+    triple's ACL is updated to be the intersection of its current ACL
+    and the new sources' ACL. This prevents widening authority — if new
+    sources have narrower or incompatible ACLs, the triple becomes more
+    restrictive.
+
     Caller is responsible for the surrounding transaction. We don't
     BEGIN/COMMIT internally so the triples write composes with the
     observation write in consolidate().
     """
     inserted: list[str] = []
     now = datetime.now(timezone.utc).isoformat()
+
+    intersected_acl = None
+    if evidence_ids:
+        intersected_acl = _compute_triple_acl(conn, evidence_ids)
+
     for t in triples:
         triple_id = make_triple_id(t["subject"], t["predicate"], t["object"])
         existing = conn.execute(
             "SELECT id FROM triples WHERE id = ?", (triple_id,),
         ).fetchone()
         if existing is not None:
+            if intersected_acl is not None:
+                _update_triple_acl_on_dedup(conn, triple_id, intersected_acl)
             continue
         emb_bytes = None
         emb_dim = None
@@ -227,18 +347,28 @@ def store_triples(
                 logger.warning("triple embed failed: %s", exc)
                 emb_bytes = None
                 emb_dim = None
+        if intersected_acl is not None:
+            acl = intersected_acl
+        else:
+            acl = Ownership()
         conn.execute(
             "INSERT INTO triples "
             "(id, subject, predicate, object, source_atom_id, confidence, "
             " valid_from, valid_until, embedding, embedding_dim, "
-            " created_at, metadata) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " created_at, metadata, owner_principal, origin_channel, "
+            " origin_domain, visibility, provenance) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 triple_id, t["subject"], t["predicate"], t["object"],
                 source_atom_id, t.get("confidence", 1.0),
                 t.get("valid_from"), t.get("valid_until"),
                 emb_bytes, emb_dim,
                 now, json.dumps(t.get("metadata", {})),
+                acl.owner_principal,
+                acl.origin_channel,
+                acl.origin_domain,
+                acl.visibility,
+                json.dumps(acl.provenance),
             ),
         )
         inserted.append(triple_id)
@@ -252,6 +382,7 @@ def store_triples(
             valid_until=t.get("valid_until"),
             source_triple_id=triple_id,
             now=now,
+            acl=acl,
         )
     return inserted
 
@@ -266,6 +397,7 @@ def _update_world_state(
     valid_until: str | None,
     source_triple_id: str,
     now: str,
+    acl: Ownership | None = None,
 ) -> None:
     """Maintain ``world_state`` for the affected (subj, pred).
 
@@ -289,7 +421,12 @@ def _update_world_state(
     makes the new value win. Re-assertions of the SAME value are still a
     no-op via the ``cur_value == value`` early return above, so a triple
     appearing from multiple atoms stays idempotent.
+
+    The ACL is inherited from the source triple (chainlink #884).
     """
+    if acl is None:
+        acl = Ownership()
+
     current = conn.execute(
         "SELECT value, valid_from FROM world_state "
         "WHERE subject = ? AND predicate = ? AND is_current = 1",
@@ -314,10 +451,13 @@ def _update_world_state(
         # new value and leave no current row (chainlink #304).
         "INSERT OR REPLACE INTO world_state "
         "(subject, predicate, value, valid_from, valid_until, "
-        " is_current, source_triple_id, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+        " is_current, source_triple_id, updated_at, "
+        " owner_principal, origin_channel, origin_domain, visibility, provenance) "
+        "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
         (subject, predicate, value, new_valid_from, valid_until,
-         source_triple_id, now),
+         source_triple_id, now,
+         acl.owner_principal, acl.origin_channel, acl.origin_domain,
+         acl.visibility, json.dumps(acl.provenance)),
     )
 
 

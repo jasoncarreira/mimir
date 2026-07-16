@@ -845,3 +845,52 @@ class TestV7OwnershipMigration:
 
         with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
             conn.execute(seed_sql.format(column=required_column))
+
+    def test_v8_preserves_world_state_rows_and_defaults_acl(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE world_state (
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                value TEXT NOT NULL,
+                valid_from TEXT,
+                valid_until TEXT,
+                is_current INTEGER DEFAULT 1,
+                source_triple_id TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (subject, predicate, valid_from)
+            );
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version VALUES
+                (7, '2000-01-01T00:00:00+00:00');
+            INSERT INTO world_state
+                (subject, predicate, value, valid_from, updated_at)
+                VALUES ('Alice', 'status', 'active', '2024-01-01', '2024-01-01');
+            """
+        )
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=8,
+            migrations={8: m.MIGRATIONS[8]},
+        )
+
+        row = conn.execute(
+            "SELECT subject, predicate, value, owner_principal, visibility, provenance "
+            "FROM world_state"
+        ).fetchone()
+        assert row == (
+            "Alice", "status", "active", "legacy_admin", "legacy_admin", "{}"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            conn.execute(
+                "INSERT INTO world_state "
+                "(subject, predicate, value, valid_from, updated_at, visibility) "
+                "VALUES ('Bob', 'status', 'active', '2024-01-01', "
+                "'2024-01-01', 'unexpected')"
+            )

@@ -88,6 +88,147 @@ def is_user_accessible(visibility: str) -> bool:
     return visibility == Visibility.PUBLIC
 
 
+def intersect_acl(acls: list[Ownership]) -> Ownership:
+    """Intersect multiple ACLs to compute the most restrictive common authority.
+
+    This is a fail-closed operation: the result is the intersection of all
+    input ACLs. If any source has ambiguous, missing, or legacy provenance,
+    the result defaults to service/admin-only (legacy_admin visibility).
+
+    Intersection rules:
+    - owner_principal: all sources must have the same non-legacy owner.
+      Mixed owners → legacy_admin.
+    - origin_domain: all sources must have the same domain.
+      Mixed domains → None (becomes legacy_admin).
+    - visibility: most restrictive wins (public < private < service < legacy_admin).
+    - provenance: union of all source provenances; if any source lacks
+      provenance (empty dict), result has empty provenance (becomes legacy_admin).
+
+    A source is considered "ambiguous" if:
+    - Its owner_principal is legacy_admin (pre-v7 data)
+    - Its visibility is legacy_admin
+    - Its provenance is empty or missing
+    - It has mixed owner/domain with other sources
+
+    Args:
+        acls: List of Ownership objects to intersect.
+
+    Returns:
+        The intersected Ownership. Always valid (never None), but may have
+        restrictive visibility/owner indicating service/admin-only access.
+    """
+    if not acls:
+        return Ownership()
+
+    first = acls[0]
+
+    owner_principal = first.owner_principal
+    origin_domain = first.origin_domain
+    provenance = dict(first.provenance)
+    vis_order = [
+        Visibility.PUBLIC,
+        Visibility.PRIVATE,
+        Visibility.SERVICE,
+        Visibility.LEGACY_ADMIN,
+    ]
+
+    def _visibility_rank(value: str) -> int:
+        try:
+            return vis_order.index(value)
+        except ValueError:
+            return len(vis_order) - 1
+
+    visibility = vis_order[_visibility_rank(first.visibility)]
+
+    for acl in acls[1:]:
+        if acl.owner_principal != owner_principal:
+            owner_principal = OwnerPrincipal.LEGACY_ADMIN
+
+        if acl.origin_domain != origin_domain:
+            origin_domain = None
+
+        visibility = vis_order[
+            max(_visibility_rank(visibility), _visibility_rank(acl.visibility))
+        ]
+
+        if not acl.provenance:
+            provenance = {}
+        elif provenance:
+            provenance = {**provenance, **acl.provenance}
+
+    if (
+        owner_principal == OwnerPrincipal.LEGACY_ADMIN
+        or origin_domain is None
+        or not provenance
+        or visibility == Visibility.LEGACY_ADMIN
+    ):
+        return Ownership(
+            owner_principal=OwnerPrincipal.LEGACY_ADMIN,
+            origin_channel=None,
+            origin_domain=None,
+            visibility=Visibility.LEGACY_ADMIN,
+            provenance={},
+        )
+
+    return Ownership(
+        owner_principal=owner_principal,
+        origin_channel=first.origin_channel,
+        origin_domain=origin_domain,
+        visibility=visibility,
+        provenance=provenance,
+    )
+
+
+def intersect_acl_from_rows(
+    rows: list[dict],
+    owner_col: str = "owner_principal",
+    domain_col: str = "origin_domain",
+    visibility_col: str = "visibility",
+    provenance_col: str = "provenance",
+) -> Ownership:
+    """Intersect ACLs from database rows.
+
+    A convenience wrapper around intersect_acl that extracts ownership
+    fields from database row dictionaries.
+
+    Handles missing columns gracefully (treats missing as legacy_admin).
+    """
+    if not rows:
+        return Ownership()
+
+    def row_to_ownership(row: dict) -> Ownership:
+        try:
+            provenance = {}
+            prov_str = row.get(provenance_col)
+            if prov_str:
+                if isinstance(prov_str, str):
+                    provenance = json.loads(prov_str)
+                elif isinstance(prov_str, dict):
+                    provenance = prov_str
+        except (json.JSONDecodeError, TypeError):
+            provenance = {}
+
+        owner = row.get(owner_col, OwnerPrincipal.LEGACY_ADMIN)
+        if not owner:
+            owner = OwnerPrincipal.LEGACY_ADMIN
+
+        domain = row.get(domain_col)
+
+        visibility = row.get(visibility_col, Visibility.LEGACY_ADMIN)
+        if not visibility:
+            visibility = Visibility.LEGACY_ADMIN
+
+        return Ownership(
+            owner_principal=owner,
+            origin_channel=row.get("origin_channel"),
+            origin_domain=domain,
+            visibility=visibility,
+            provenance=provenance,
+        )
+
+    return intersect_acl([row_to_ownership(r) for r in rows])
+
+
 __all__ = [
     "Visibility",
     "OwnerPrincipal",
@@ -95,4 +236,6 @@ __all__ = [
     "DEFAULT_VISIBILITY",
     "DEFAULT_OWNER",
     "is_user_accessible",
+    "intersect_acl",
+    "intersect_acl_from_rows",
 ]

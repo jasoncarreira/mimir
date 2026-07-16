@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from typing import Callable, Iterator
 
 
-CURRENT_SCHEMA_VERSION: int = 7
+CURRENT_SCHEMA_VERSION: int = 8
 
 # Registry of post-greenfield schema changes. Keys are version
 # numbers (must be > 1, must be contiguous, must equal
@@ -456,6 +456,21 @@ WHERE a.source_type = 'session_boundary'
         CREATE INDEX IF NOT EXISTS idx_triples_visibility ON triples(visibility);
         CREATE INDEX IF NOT EXISTS idx_triples_owner ON triples(owner_principal);
     """,
+    8: """
+        -- v8: Add ownership columns to world_state (chainlink #884)
+        -- Add owner_principal, origin_channel, origin_domain, visibility,
+        -- provenance to world_state for ACL inheritance from source triples.
+
+        ALTER TABLE world_state ADD COLUMN owner_principal TEXT NOT NULL DEFAULT 'legacy_admin';
+        ALTER TABLE world_state ADD COLUMN origin_channel TEXT;
+        ALTER TABLE world_state ADD COLUMN origin_domain TEXT;
+        ALTER TABLE world_state ADD COLUMN visibility TEXT NOT NULL DEFAULT 'legacy_admin'
+            CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin'));
+        ALTER TABLE world_state ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';
+
+        CREATE INDEX IF NOT EXISTS idx_world_visibility ON world_state(visibility);
+        CREATE INDEX IF NOT EXISTS idx_world_owner ON world_state(owner_principal);
+    """,
 }
 
 
@@ -470,6 +485,11 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
 
     Detection markers, highest version first:
 
+    - **v8**: ``world_state`` has ``visibility`` column. The v8 migration
+      added ownership columns (owner_principal, origin_channel, origin_domain,
+      visibility, provenance) to world_state for ACL inheritance from
+      source triples. ``PRAGMA table_info(world_state)`` returns the
+      visibility column iff v8 ran.
     - **v7**: ``atoms`` has ``visibility`` column. The v7 migration added
       ownership columns (owner_principal, origin_channel, origin_domain,
       visibility, provenance) to atoms, sessions, observations_metadata,
@@ -493,6 +513,16 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
     so this is robust to bare-bones DBs (like the in-memory
     fixtures used by unit tests).
     """
+    # v8 marker: world_state.visibility column exists (chainlink #884).
+    try:
+        world_state_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(world_state)").fetchall()
+        }
+    except sqlite3.OperationalError:
+        world_state_cols = set()
+    if "visibility" in world_state_cols:
+        return 8
+
     # v7 marker: atoms.visibility column exists.
     try:
         atoms_cols = {

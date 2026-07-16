@@ -1569,7 +1569,8 @@ class SagaStore:
         # thread so SQLite stays on one writer thread.
         def _restructure():
             from .consolidate import (
-                find_equal_evidence_obs, find_superseded_observations,
+                _compute_intersected_acl, find_equal_evidence_obs,
+                find_superseded_observations,
             )
             from .observations import refresh_trend
             from .store import store as _store_atom
@@ -1597,6 +1598,8 @@ class SagaStore:
                     # for external-access record only.
                     continue
 
+                intersected_acl = _compute_intersected_acl(conn, evidence_ids)
+
                 store_result = _store_atom(
                     conn, content,
                     # chainlink #417: embedding was precomputed above,
@@ -1610,6 +1613,11 @@ class SagaStore:
                     topics=topics,
                     agent_id=self._agent_id,
                     session_id=None,
+                    owner_principal=intersected_acl.owner_principal,
+                    origin_channel=intersected_acl.origin_channel,
+                    origin_domain=intersected_acl.origin_domain,
+                    visibility=intersected_acl.visibility,
+                    provenance=intersected_acl.provenance,
                 )
                 if not store_result.stored:
                     # Dedupe hit on the observation content — relations
@@ -1668,6 +1676,9 @@ class SagaStore:
                             # chainlink #417: precomputed-vector lookup —
                             # no network I/O inside this transaction.
                             embed_fn=_lookup_triple_embed,
+                            # chainlink #884: pass evidence atoms so triples
+                            # inherit their intersected ACL.
+                            evidence_ids=evidence_ids,
                         )
                         triples_stored += len(added)
                     # Contradiction edges: map LLM-emitted 1-based atom
