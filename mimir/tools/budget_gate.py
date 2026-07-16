@@ -506,6 +506,8 @@ class BudgetGateMiddleware(AgentMiddleware):
         auth_context = _auth_context_from_request(request)
         target_channel = _extract_channel_from_args(request, auth_context)
         ifc_labels = _get_ifc_labels_from_context()
+        if ifc_labels is None and auth_context is not None:
+            ifc_labels = getattr(auth_context, "ifc_labels", None)
 
         admin_denial = _check_admin_authorized(
             tool_name, auth_context, target_channel, ifc_labels
@@ -590,6 +592,8 @@ class BudgetGateMiddleware(AgentMiddleware):
         auth_context = _auth_context_from_request(request)
         target_channel = _extract_channel_from_args(request, auth_context)
         ifc_labels = _get_ifc_labels_from_context()
+        if ifc_labels is None and auth_context is not None:
+            ifc_labels = getattr(auth_context, "ifc_labels", None)
 
         admin_denial = _check_admin_authorized(
             tool_name, auth_context, target_channel, ifc_labels

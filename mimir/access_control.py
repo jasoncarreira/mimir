@@ -200,7 +200,17 @@ class SinkGate:
         """
         from .models import InformationFlowLabels
 
+        is_service = getattr(auth_context, "is_service", False) if auth_context else False
+
         if not isinstance(ifc_labels, InformationFlowLabels):
+            if is_service:
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.OPEN,
+                    allowed=True,
+                    reason="service_principal_no_labels",
+                    enforcement_enabled=enforce,
+                )
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
@@ -213,6 +223,14 @@ class SinkGate:
 
         sink_category = get_sink_category(tool_name)
         if sink_category == SinkCategory.UNKNOWN:
+            if is_service:
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.OPEN,
+                    allowed=True,
+                    reason="service_principal_unknown_sink",
+                    enforcement_enabled=enforce,
+                )
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
@@ -221,6 +239,15 @@ class SinkGate:
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
+            )
+
+        if is_service:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.OPEN,
+                allowed=True,
+                reason="service_principal",
+                enforcement_enabled=enforce,
             )
 
         if not target:
@@ -1620,6 +1647,7 @@ def create_auth_context(
     *,
     enforce: bool = False,
     event_ingress: str | None = None,
+    ifc_labels: "InformationFlowLabels | None" = None,
 ) -> "AuthContext":
     """Create a frozen AuthContext from an inbound event (chainlink #864).
 
@@ -1673,4 +1701,5 @@ def create_auth_context(
         policy_version=policy_version,
         is_service=is_service,
         enforcement_enabled=enforce,
+        ifc_labels=ifc_labels,
     )
