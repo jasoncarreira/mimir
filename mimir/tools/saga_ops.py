@@ -353,6 +353,7 @@ async def saga_record_skill_learning(
     kind: str,
     content: str,
     session_id: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Record a durable, skill-specific learning as a SAGA atom (#266).
 
@@ -382,9 +383,27 @@ async def saga_record_skill_learning(
     Returns:
         A short confirmation with the atom_id, or an error message.
     """
+    from ..access_control import (
+        can_write_saga,
+        get_provenance_from_auth_context,
+        is_trusted_service,
+    )
+
     client = _MEMORY_STATE["client"]
     if client is None:
         return "saga_record_skill_learning failed: no SagaStore configured"
+
+    auth_context = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else None
+    )
+    if not can_write_saga(auth_context):
+        return (
+            "saga_record_skill_learning failed: write access denied. "
+            "Skill-learning writes require server-provided admin or trusted-service authority."
+        )
+
     from .. import skill_memory
 
     try:
@@ -393,6 +412,12 @@ async def saga_record_skill_learning(
         return f"saga_record_skill_learning failed: {exc}"
     if not content or not content.strip():
         return "saga_record_skill_learning failed: content is required"
+
+    provenance = get_provenance_from_auth_context(auth_context)
+    owner_principal = provenance["created_by"]
+    origin_channel = auth_context.channel_id
+    visibility = "service" if is_trusted_service(auth_context) else "private"
+
     try:
         result = await client.store(
             content.strip(),
@@ -400,6 +425,11 @@ async def saga_record_skill_learning(
             source_type=skill_memory.SKILL_LEARNING_SOURCE_TYPE,
             metadata=metadata,
             session_id=_resolve_session_id(session_id),
+            owner_principal=owner_principal,
+            origin_channel=origin_channel,
+            origin_domain=None,
+            visibility=visibility,
+            provenance=provenance,
         )
     except Exception as exc:  # noqa: BLE001
         return f"saga_record_skill_learning failed: {exc}"

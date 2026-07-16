@@ -158,6 +158,105 @@ class TestRecallSkillLearnings:
         assert recall_skill_learnings(conn, "") == []
         assert recall_skill_learnings(conn, "never-used") == []
 
+    @pytest.mark.asyncio
+    async def test_recall_filters_by_visibility_and_owner(self, store):
+        """Learnings with different visibility/owner are filtered by auth_context."""
+        await store.store(
+            "public tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="public",
+            owner_principal="user-a",
+        )
+        await store.store(
+            "private user-a tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="private",
+            owner_principal="user-a",
+        )
+        await store.store(
+            "private user-b tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="private",
+            owner_principal="user-b",
+        )
+        conn = store._ensure_conn()
+
+        user_a_auth = AuthContext(
+            principal="user-a",
+            canonical_principal="user-a",
+            roles=(),
+            event_ingress="test",
+            trigger="user_message",
+            channel_id="test-channel",
+            interactivity=None,
+        )
+        user_b_auth = AuthContext(
+            principal="user-b",
+            canonical_principal="user-b",
+            roles=(),
+            event_ingress="test",
+            trigger="user_message",
+            channel_id="test-channel",
+            interactivity=None,
+        )
+
+        user_a_results = recall_skill_learnings(
+            conn, "test-skill", auth_context=user_a_auth
+        )
+        user_b_results = recall_skill_learnings(
+            conn, "test-skill", auth_context=user_b_auth
+        )
+
+        user_a_contents = {r["content"] for r in user_a_results}
+        user_b_contents = {r["content"] for r in user_b_results}
+
+        assert "public tip" in user_a_contents
+        assert "public tip" in user_b_contents
+        assert "private user-a tip" in user_a_contents
+        assert "private user-a tip" not in user_b_contents
+        assert "private user-b tip" in user_b_contents
+        assert "private user-b tip" not in user_a_contents
+
+    @pytest.mark.asyncio
+    async def test_recall_admin_sees_all(self, store):
+        """Admin auth_context bypasses owner filtering."""
+        await store.store(
+            "private user-a tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="private",
+            owner_principal="user-a",
+        )
+        await store.store(
+            "private user-b tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="private",
+            owner_principal="user-b",
+        )
+        conn = store._ensure_conn()
+
+        admin_auth = AuthContext(
+            principal="admin-user",
+            canonical_principal="admin-user",
+            roles=("admin",),
+            event_ingress="test",
+            trigger="user_message",
+            channel_id="test-channel",
+            interactivity=None,
+        )
+
+        admin_results = recall_skill_learnings(
+            conn, "test-skill", auth_context=admin_auth
+        )
+        admin_contents = {r["content"] for r in admin_results}
+
+        assert "private user-a tip" in admin_contents
+        assert "private user-b tip" in admin_contents
+
 
 # ── negative-learning count (#267 surfacing input) ───────────────────
 
