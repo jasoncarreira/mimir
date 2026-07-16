@@ -12,7 +12,7 @@ import subprocess
 from typing import Any, Callable, Mapping, Sequence
 
 from .._atomic import atomic_write_json
-from ..access_control import authorize_action
+from ..access_control import HTTP_EVENT_INGRESS_EXTRA_KEY, authorize_action
 from ..models import AgentEvent, TurnContext, TurnRecord
 from .run_state import load_run_state, run_state_path
 
@@ -28,7 +28,6 @@ WORKLINK_HINT_EXTRA_KEYS = frozenset({
     "schedule_name",
     "run_id",
 })
-HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 HTTP_EVENT_INGRESS_EXTRA_VALUE = "http_event"
 _MAX_RECENT_TURNS = 10
 _MAX_CHANGED_PATHS = 25
