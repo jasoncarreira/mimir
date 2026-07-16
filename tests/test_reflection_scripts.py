@@ -35,6 +35,7 @@ class _FakeClient:
         channel_id: str | None,
         contributed_only: bool,
         trend: str | None = None,
+        auth_context: Any = None,
     ) -> list[dict[str, Any]]:
         self.calls.append(
             {
@@ -43,6 +44,7 @@ class _FakeClient:
                 "channel_id": channel_id,
                 "contributed_only": contributed_only,
                 "trend": trend,
+                "auth_context": auth_context,
             }
         )
         return self.payload
@@ -68,10 +70,15 @@ async def test_default_args_pass_expected_kwargs(monkeypatch: pytest.MonkeyPatch
     with redirect_stdout(out):
         rc = await script._amain()
     assert rc == 0
-    assert fake.calls == [
-        {"days": 7, "count": 10, "channel_id": None, "contributed_only": False,
-         "trend": None}
-    ]
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["days"] == 7
+    assert call["count"] == 10
+    assert call["channel_id"] is None
+    assert call["contributed_only"] is False
+    assert call["trend"] is None
+    assert call["auth_context"] is not None
+    assert call["auth_context"].roles == ("admin",)
     assert fake.closed
 
 
@@ -88,10 +95,14 @@ async def test_all_flags_threaded_through(monkeypatch: pytest.MonkeyPatch):
     with redirect_stdout(out):
         rc = await script._amain()
     assert rc == 0
-    assert fake.calls == [
-        {"days": 14, "count": 20, "channel_id": "slack-eng",
-         "contributed_only": True, "trend": None}
-    ]
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["days"] == 14
+    assert call["count"] == 20
+    assert call["channel_id"] == "slack-eng"
+    assert call["contributed_only"] is True
+    assert call["trend"] is None
+    assert call["auth_context"] is not None
 
 
 @pytest.mark.asyncio
@@ -139,7 +150,12 @@ def test_cli_subcommand_dispatches_to_script(monkeypatch: pytest.MonkeyPatch):
         cli.main(["reflection", "most-retrieved", "--days", "3",
                   "--count", "5", "--contributed-only"])
     assert exc_info.value.code == 0
-    assert fake.calls == [
-        {"days": 3, "count": 5, "channel_id": None, "contributed_only": True,
-         "trend": None}
-    ]
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["days"] == 3
+    assert call["count"] == 5
+    assert call["channel_id"] is None
+    assert call["contributed_only"] is True
+    assert call["trend"] is None
+    assert call["auth_context"] is not None
+    assert call["auth_context"].roles == ("admin",)

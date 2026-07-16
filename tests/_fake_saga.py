@@ -180,13 +180,16 @@ class FakeSaga:
         count: int = 10,
         channel_id: str | None = None,
         contributed_only: bool = False,
+        trend: str | None = None,
+        auth_context: Any = None,
     ) -> list[dict[str, Any]]:
         self.calls.append(
             _Call(
                 "most_retrieved_atoms",
                 {
                     "days": days, "count": count, "channel_id": channel_id,
-                    "contributed_only": contributed_only,
+                    "contributed_only": contributed_only, "trend": trend,
+                    "auth_context": auth_context,
                 },
             )
         )
