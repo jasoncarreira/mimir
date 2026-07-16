@@ -129,11 +129,22 @@ def _authorization_predicate(
         grants.append(f"{table}.owner_principal = ?")
         params.append(scope.principal)
 
-    if scope.is_service and scope.readable_domains:
-        domains = list(scope.readable_domains)
-        placeholders = ",".join(["?"] * len(domains))
-        grants.append(f"{table}.origin_domain IN ({placeholders})")
-        params.extend(domains)
+    if scope.is_service:
+        # Trusted services may read service-owned and fail-closed legacy rows.
+        # Legacy rows have no trustworthy origin_domain after migration, so a
+        # domain-only grant would make the service/admin-only migration bucket
+        # unreadable by every non-admin service.
+        grants.append(f"{table}.visibility IN (?, ?)")
+        params.extend([
+            Visibility.SERVICE.value,
+            Visibility.LEGACY_ADMIN.value,
+        ])
+
+        if scope.readable_domains:
+            domains = list(scope.readable_domains)
+            placeholders = ",".join(["?"] * len(domains))
+            grants.append(f"{table}.origin_domain IN ({placeholders})")
+            params.extend(domains)
 
     return (f"({' OR '.join(grants)})", params)
 
@@ -145,9 +156,10 @@ def authorization_predicate(
     """Generate the parameterized SAGA read predicate for an atom-like table.
 
     Authorization happens in SQL before content/existence is exposed:
-    admins can read everything; trusted services can read public rows, rows in
-    their readable domains, and their owned rows; regular users can read public
-    rows and their own rows.  Capability names never widen readable domains.
+    admins can read everything; trusted services can read public rows,
+    service/admin-only rows, rows in their readable domains, and their owned
+    rows; regular users can read public rows and their own rows. Capability
+    names never widen readable domains.
     """
     return _authorization_predicate(scope, table=table)
 

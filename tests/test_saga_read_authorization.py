@@ -93,7 +93,39 @@ def test_owner_and_service_domain_grants_are_alternatives(conn: sqlite3.Connecti
     assert foreign not in service_ids
 
 
-def test_unauthorized_candidates_are_removed_before_rrf_and_access(conn: sqlite3.Connection) -> None:
+def test_trusted_service_reads_service_and_fail_closed_legacy_rows(
+    conn: sqlite3.Connection,
+) -> None:
+    public = _store(conn, "public", owner="user:alice", visibility="public")
+    service = _store(conn, "service", owner="synthesis", visibility="service")
+    legacy = _store(
+        conn, "legacy", owner="legacy_admin", visibility="legacy_admin",
+    )
+    private = _store(conn, "private", owner="user:alice", visibility="private")
+
+    where, params = authorization_predicate(
+        AuthorizationScope(
+            principal="scheduler",
+            is_service=True,
+            readable_domains=("configured_inputs", "filesystem", "turn_history"),
+            service_canonical="scheduler",
+        ),
+        table="a",
+    )
+    service_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+
+    assert service_ids == {public, service, legacy}
+    assert private not in service_ids
+
+
+def test_unauthorized_candidates_are_removed_before_rrf_and_access(
+    conn: sqlite3.Connection,
+) -> None:
     hidden = _store(conn, "hidden query term", owner="user:bob", visibility="private")
     visible = _store(conn, "visible query term", owner="user:alice", visibility="private")
     scope = AuthorizationScope(principal="user:alice")

@@ -102,6 +102,7 @@ class SagaClient(Protocol):
 
     async def recent_session_boundaries(
         self, *, channel_id: str | None = None, count: int = 3,
+        auth_context: Any = None,
     ) -> list[dict[str, Any]]: ...
 
     async def most_retrieved_atoms(

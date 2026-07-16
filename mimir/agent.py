@@ -3408,6 +3408,7 @@ class Agent:
 
     async def _assemble_session_summaries(
         self, *, channel_id: str | None,
+        auth_context: AuthContext | None = None,
     ) -> str | None:
         """Render the Recent session summaries block from SagaStore's
         ``recent_session_boundaries()``."""
@@ -3424,7 +3425,9 @@ class Agent:
                 )
                 if recent_fn is not None:
                     boundaries = await recent_fn(
-                        channel_id=channel_id, count=count,
+                        channel_id=channel_id,
+                        count=count,
+                        auth_context=auth_context,
                     )
             except Exception:  # noqa: BLE001
                 log.exception(
@@ -3544,6 +3547,7 @@ class Agent:
             core_proposals_block = None
         session_summaries_block = await self._assemble_session_summaries(
             channel_id=event.channel_id,
+            auth_context=ctx.auth_context,
         )
         usage_block, deferred_usage_events = await asyncio.to_thread(
             self._assemble_usage_block

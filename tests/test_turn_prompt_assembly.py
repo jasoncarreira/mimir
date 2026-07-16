@@ -27,7 +27,7 @@ from mimir.agent import Agent, _filter_session_turns
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
-from mimir.models import AgentEvent, TurnContext
+from mimir.models import AgentEvent, AuthContext, TurnContext, TurnInteractivity
 from mimir.turn_logger import TurnLogger
 
 
@@ -430,7 +430,7 @@ async def test_agent_build_turn_prompt_threads_all_helper_outputs(
         lambda **_kw: "SELFSTATE_SENTINEL",
     )
 
-    async def _fake_session_summaries(*, channel_id):
+    async def _fake_session_summaries(*, channel_id, auth_context=None):
         return "SESSIONS_SENTINEL"
 
     monkeypatch.setattr(
@@ -537,7 +537,7 @@ async def test_feedback_block_renders_off_event_loop(
     monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id: None)
     monkeypatch.setattr(agent, "_assemble_self_state_block", lambda **_kw: None)
 
-    async def _none_summaries(*, channel_id):
+    async def _none_summaries(*, channel_id, auth_context=None):
         return None
 
     monkeypatch.setattr(agent, "_assemble_session_summaries", _none_summaries)
@@ -579,11 +579,25 @@ async def test_session_summaries_counts_turns_off_event_loop(
     on the event loop.
     """
     agent = _make_agent(tmp_path)
+    service_auth = AuthContext(
+        principal=None,
+        canonical_principal="scheduler",
+        roles=(),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id="ch-1",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
 
     class _StubSaga:
-        async def recent_session_boundaries(self, *, channel_id, count):
+        async def recent_session_boundaries(
+            self, *, channel_id, count, auth_context=None,
+        ):
             assert channel_id == "ch-1"
             assert count == agent._config.recent_boundaries
+            assert auth_context is service_auth
             return [
                 {
                     "ts": "2026-06-21T09:00:00+00:00",
@@ -606,7 +620,9 @@ async def test_session_summaries_counts_turns_off_event_loop(
 
     monkeypatch.setattr("mimir.agent.asyncio.to_thread", fake_to_thread)
 
-    block = await agent._assemble_session_summaries(channel_id="ch-1")
+    block = await agent._assemble_session_summaries(
+        channel_id="ch-1", auth_context=service_auth,
+    )
 
     assert block is not None
     assert len(to_thread_calls) == 1
@@ -638,7 +654,7 @@ async def test_agent_build_turn_prompt_omits_blocks_for_none_helpers(
     monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id: None)
     monkeypatch.setattr(agent, "_assemble_self_state_block", lambda **_kw: None)
 
-    async def _none_summaries(*, channel_id):
+    async def _none_summaries(*, channel_id, auth_context=None):
         return None
 
     monkeypatch.setattr(agent, "_assemble_session_summaries", _none_summaries)

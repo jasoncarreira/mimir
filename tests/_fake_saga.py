@@ -162,9 +162,17 @@ class FakeSaga:
 
     async def recent_session_boundaries(
         self, *, channel_id: str | None = None, count: int = 3,
+        auth_context: Any = None,
     ) -> list[dict[str, Any]]:
         self.calls.append(
-            _Call("recent_session_boundaries", {"channel_id": channel_id, "count": count})
+            _Call(
+                "recent_session_boundaries",
+                {
+                    "channel_id": channel_id,
+                    "count": count,
+                    "auth_context": auth_context,
+                },
+            )
         )
         if "recent_session_boundaries" in self.fail_on:
             raise SagaError("synthetic recent_session_boundaries failure")
