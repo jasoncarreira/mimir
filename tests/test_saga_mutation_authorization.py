@@ -490,3 +490,26 @@ async def test_trusted_service_requires_capability_and_readable_domain(
     assert allowed_result["marked"] == 1
     assert denied_result == {"marked": 0, "total": 1, "authorized": 0}
     assert forget_result["preview_ids"] == []
+
+
+@pytest.mark.parametrize(
+    "sentinel_principal",
+    ["legacy_admin", "service", "system"],
+)
+def test_sentinel_principal_cannot_mutation_owner_match(
+    client: SagaStore,
+    sentinel_principal: str,
+) -> None:
+    """Reserved sentinel principals cannot use owner-match to mutate rows.
+
+    A caller whose principal is a reserved sentinel value (legacy_admin, service,
+    system) should NOT be able to mutate rows via the owner-match grant.
+    This prevents a regular user who happens to have a sentinel principal from
+    mutating the legacy/default-owned corpus.
+    """
+    from mimir.saga.client import _saga_mutation_scope
+
+    auth_context = _auth(sentinel_principal)
+    scope = _saga_mutation_scope(auth_context, "saga_forget")
+
+    assert scope is None

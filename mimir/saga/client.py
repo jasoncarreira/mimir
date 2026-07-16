@@ -41,6 +41,7 @@ from typing import Any
 
 from . import migrations as _migrations
 from .mark_access import AccessEvent, mark_access
+from .ownership import RESERVED_SENTINEL_PRINCIPALS
 from .recall import recall as _recall
 from .store import _hash_content as _store_hash_content
 from .store import store as _store
@@ -78,7 +79,10 @@ def _saga_mutation_scope(
         domains = tuple(d for d in service.readable_domains if isinstance(d, str))
         return domains or None
     principal = getattr(auth_context, "canonical_principal", None)
-    return principal if isinstance(principal, str) and principal else None
+    if isinstance(principal, str) and principal:
+        if principal not in RESERVED_SENTINEL_PRINCIPALS:
+            return principal
+    return None
 
 
 def _authorized_atom_ids(

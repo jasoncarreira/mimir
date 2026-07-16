@@ -336,3 +336,80 @@ def test_platform_service_gets_full_read_without_admin_role(
     assert params == []
     assert owned in readable_ids
     assert other_owned in readable_ids
+
+
+@pytest.mark.parametrize(
+    "sentinel_principal",
+    ["legacy_admin", "service", "system"],
+)
+def test_sentinel_principal_cannot_owner_match_legacy_admin_rows(
+    conn: sqlite3.Connection,
+    sentinel_principal: str,
+) -> None:
+    """Reserved sentinel principals cannot use owner-match to read legacy rows.
+
+    A caller whose principal is a reserved sentinel value (legacy_admin, service,
+    system) should NOT be able to read rows owned by legacy_admin via the
+    owner-match grant. This prevents a regular user who happens to have a
+    sentinel principal from accessing the entire legacy/default-owned corpus.
+    """
+    public = _store(conn, "public", owner="other", visibility="public")
+    legacy_admin_owned = _store(
+        conn, "legacy-owned", owner="legacy_admin", visibility="legacy_admin",
+    )
+    service_owned = _store(
+        conn, "service-owned", owner="service", visibility="service",
+    )
+    system_owned = _store(
+        conn, "system-owned", owner="system", visibility="service",
+    )
+    regular_owned = _store(
+        conn, "regular-owned", owner="user:alice", visibility="private",
+    )
+
+    scope = AuthorizationScope(principal=sentinel_principal)
+    where, params = authorization_predicate(scope, table="a")
+
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+
+    assert public in readable_ids
+    assert legacy_admin_owned not in readable_ids
+    assert service_owned not in readable_ids
+    assert system_owned not in readable_ids
+    assert regular_owned not in readable_ids
+
+
+@pytest.mark.parametrize(
+    "sentinel_principal",
+    ["legacy_admin", "service", "system"],
+)
+def test_sentinel_principal_cannot_owner_match_own_rows(
+    conn: sqlite3.Connection,
+    sentinel_principal: str,
+) -> None:
+    """Reserved sentinel principals cannot use owner-match to read their own rows.
+
+    Even if a principal has the same name as a sentinel, they should not get
+    owner-match grants. This is defense-in-depth - the guard is at the
+    predicate level, not just at ingress.
+    """
+    my_row = _store(
+        conn, "my-row", owner=sentinel_principal, visibility="private",
+    )
+
+    scope = AuthorizationScope(principal=sentinel_principal)
+    where, params = authorization_predicate(scope, table="a")
+
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+
+    assert my_row not in readable_ids
