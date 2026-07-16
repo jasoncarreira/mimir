@@ -1363,3 +1363,96 @@ async def test_enqueue_rejected_after_drain(tmp_path: Path):
         AgentEvent(trigger="x", channel_id="c1", content="late")
     )
     assert accepted is False
+
+
+@pytest.mark.asyncio
+async def test_http_ingress_with_client_source_does_not_skip_inbound_auth(tmp_path: Path):
+    """chainlink #890: client-supplied source on HTTP ingress cannot bypass
+    inbound allowlist. Even if client sets source="api", it must go through
+    authorize_inbound."""
+    from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
+
+    cfg = _make_config(tmp_path, access_control_enforced=True)
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    ran: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        ran.append(event.content)
+
+    disp = Dispatcher(cfg, runner, resolver=resolver)
+    accepted = await disp.enqueue(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="api-C1",
+            content="client forged source",
+            author="unknown-author",
+            source="api",
+            extra={'_mimir_event_ingress': HTTP_EVENT_INGRESS_EXTRA_VALUE},
+        )
+    )
+
+    assert accepted is False
+    await disp.drain()
+    assert ran == []
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    denied = [row for row in rows if row.get("type") == "inbound_event_denied"]
+    assert len(denied) == 1
+    assert denied[0]["source"] == "api"
+    assert denied[0]["reason"] == "unknown_author"
+
+
+@pytest.mark.asyncio
+async def test_server_owned_source_bypasses_with_audit(tmp_path: Path):
+    """chainlink #890: server-owned source (not from HTTP ingress) still
+    bypasses authorize_inbound and emits an audit event."""
+    cfg = _make_config(tmp_path, access_control_enforced=True)
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+    ran: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        ran.append(event.content)
+
+    disp = Dispatcher(cfg, runner, resolver=resolver)
+    assert await disp.enqueue(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="api-C1",
+            content="server-owned api",
+            author="api-unknown",
+            source="api",
+        )
+    )
+
+    await disp.drain()
+    assert ran == ["server-owned api"]
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    allowed = [row for row in rows if row.get("type") == "inbound_event_allowed"]
+    assert len(allowed) == 1
+    assert allowed[0]["source"] == "api"
+    assert allowed[0]["reason"] == "trusted_internal_source"
