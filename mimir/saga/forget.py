@@ -157,6 +157,7 @@ def forget_by_criteria(
     max_atoms: int = 1000,
     reason: str | None = None,
     reference_date: datetime | None = None,
+    owner_principal: str | None = None,
 ) -> ForgetResult:
     """Bulk forget by predicate. Dry-run by default (preview the set
     without writing).
@@ -172,6 +173,9 @@ def forget_by_criteria(
     less than* this value. Atoms never retrieved (no access_events row)
     count as 0 and are included when the filter is active.
 
+    ``owner_principal``: if provided, only forget atoms owned by this
+    principal. This enables authorization filtering for non-admin users.
+
     Activation-based filtering requires reading atom_access_summary;
     the test below uses a SQL view to avoid pulling all atoms into
     Python. Approximate — the stored activation may be stale between
@@ -181,6 +185,10 @@ def forget_by_criteria(
     """
     where = ["a.agent_id = ?", "a.tombstoned = 0"]
     params: list = [agent_id]
+
+    if owner_principal is not None:
+        where.append("a.owner_principal = ?")
+        params.append(owner_principal)
     joins: list[str] = []
 
     # ``now`` for age + activation math. Defaults to wall clock; bench
