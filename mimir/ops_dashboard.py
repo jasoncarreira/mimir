@@ -391,6 +391,56 @@ _CHAINLINK_TIMEOUT_SECONDS = 5.0
 _CHAINLINK_MAX_ISSUES = 200
 
 
+def _load_chainlink_issues_sync(home: Path) -> dict[str, Any]:
+    """Synchronous implementation of chainlink issue loading.
+
+    Runs in a worker thread via asyncio.to_thread() to keep the event loop
+    from being blocked by subprocess fork/exec. The fork/exec can stall
+    under system pressure (chainlink #896), so it must not run on the loop.
+    """
+    try:
+        proc = subprocess.run(
+            ["chainlink", "issue", "list", "--status", "open", "--json"],
+            cwd=str(home),
+            capture_output=True,
+            timeout=_CHAINLINK_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError:
+        return {"available": False, "issues": [], "error": "chainlink CLI not on PATH"}
+    except subprocess.TimeoutExpired:
+        return {
+            "available": False,
+            "issues": [],
+            "error": f"chainlink timed out after {_CHAINLINK_TIMEOUT_SECONDS}s",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "issues": [], "error": str(exc)[:500]}
+
+    if proc.returncode != 0:
+        err_text = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        return {
+            "available": False,
+            "issues": [],
+            "error": err_text[:500] or f"chainlink exit code {proc.returncode}",
+        }
+
+    try:
+        issues = json.loads(proc.stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        return {"available": False, "issues": [], "error": f"chainlink output: {exc}"}
+
+    if not isinstance(issues, list):
+        return {"available": False, "issues": [], "error": "chainlink returned non-list payload"}
+
+    return {
+        "available": True,
+        "issues": issues[:_CHAINLINK_MAX_ISSUES],
+        "error": None,
+        "truncated": len(issues) > _CHAINLINK_MAX_ISSUES,
+        "total_count": len(issues),
+    }
+
+
 async def _load_chainlink_issues(home: Path) -> dict[str, Any]:
     """Run ``chainlink issue list --json`` against ``home`` and return
     a structured envelope.
@@ -405,70 +455,11 @@ async def _load_chainlink_issues(home: Path) -> dict[str, Any]:
     Soft-fails on every error path: chainlink not on PATH, repo not
     initialized, JSON garbled, subprocess hangs. The dashboard's own
     Backlog tab handles the "chainlink unavailable" message.
+
+    The subprocess runs in a worker thread via asyncio.to_thread() to
+    prevent fork/exec from blocking the event loop (chainlink #896).
     """
-    try:
-        # ``--status open`` is defensive — chainlink's current default
-        # is ``open`` but pinning it at the call site means a future
-        # CLI default change can't silently start filling the dashboard
-        # tab with closed/archived issues.
-        proc = await asyncio.create_subprocess_exec(
-            "chainlink", "issue", "list", "--status", "open", "--json",
-            cwd=str(home),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        return {"available": False, "issues": [], "error": "chainlink CLI not on PATH"}
-    except Exception as exc:  # noqa: BLE001
-        return {"available": False, "issues": [], "error": str(exc)[:500]}
-
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=_CHAINLINK_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        # Drain the stdout/stderr pipes after kill so file descriptors
-        # release immediately rather than lingering until GC. Under
-        # heavy /ops traffic with a hung chainlink CLI the FD count
-        # could otherwise climb. Swallow exceptions — the kill already
-        # happened; we're just cleaning up.
-        try:
-            await proc.communicate()
-        except Exception:  # noqa: BLE001
-            pass
-        return {
-            "available": False,
-            "issues": [],
-            "error": f"chainlink timed out after {_CHAINLINK_TIMEOUT_SECONDS}s",
-        }
-
-    if proc.returncode != 0:
-        err_text = (stderr or b"").decode("utf-8", errors="replace").strip()
-        return {
-            "available": False,
-            "issues": [],
-            "error": err_text[:500] or f"chainlink exit code {proc.returncode}",
-        }
-
-    try:
-        issues = json.loads(stdout.decode("utf-8", errors="replace"))
-    except json.JSONDecodeError as exc:
-        return {"available": False, "issues": [], "error": f"chainlink output: {exc}"}
-
-    if not isinstance(issues, list):
-        return {"available": False, "issues": [], "error": "chainlink returned non-list payload"}
-
-    return {
-        "available": True,
-        "issues": issues[:_CHAINLINK_MAX_ISSUES],
-        "error": None,
-        "truncated": len(issues) > _CHAINLINK_MAX_ISSUES,
-        "total_count": len(issues),
-    }
+    return await asyncio.to_thread(_load_chainlink_issues_sync, home)
 
 
 def build_dashboard_payload(
