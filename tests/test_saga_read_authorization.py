@@ -174,3 +174,112 @@ async def test_get_atoms_missing_context_does_not_reveal_legacy_or_private(
 
     assert [atom["id"] for atom in payload["atoms"]] == [public]
     assert payload["missing"] == [private, legacy]
+
+
+def test_platform_service_can_read_legacy_admin_memory(conn: sqlite3.Connection) -> None:
+    """Platform services (scheduler, poller, synthesis, upgrade) can read legacy_admin corpus.
+
+    This is the core fix for chainlink #897: after migration #881, existing memory
+    has visibility=legacy_admin. Platform services need to read this memory to
+    function properly. Tenant isolation is enforced on outputs via #884 + #871.
+    """
+    public = _store(conn, "public", owner="other", visibility="public")
+    legacy = _store(conn, "legacy", owner="legacy_admin", visibility="legacy_admin")
+    service = _store(conn, "service-scoped", owner="scheduler", visibility="service")
+    private = _store(conn, "private", owner="user:alice", visibility="private")
+
+    platform_scope = AuthorizationScope(
+        principal="service:scheduler",
+        is_service=True,
+        is_platform_service=True,
+    )
+
+    where, params = authorization_predicate(platform_scope, table="a")
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+
+    assert public in readable_ids
+    assert legacy in readable_ids
+    assert service in readable_ids
+    assert private not in readable_ids
+
+
+def test_platform_service_can_read_service_scoped_memory(conn: sqlite3.Connection) -> None:
+    """Platform services can read service-scoped memory."""
+    service_scoped = _store(conn, "service-scoped", owner="poller", visibility="service")
+
+    platform_scope = AuthorizationScope(
+        principal="service:poller",
+        is_service=True,
+        is_platform_service=True,
+    )
+
+    where, params = authorization_predicate(platform_scope, table="a")
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+
+    assert service_scoped in readable_ids
+
+
+def test_regular_service_still_restricted_by_readable_domains(conn: sqlite3.Connection) -> None:
+    """Non-platform services with readable_domains get domain-restricted access.
+
+    This verifies that we haven't broken the existing service model - regular
+    services (e.g., external integration services) still get domain-restricted
+    access via readable_domains.
+    """
+    public = _store(conn, "public", owner="other", visibility="public")
+    other_domain = _store(
+        conn, "other_domain", owner="service:writer", visibility="service", domain="other",
+    )
+    allowed_domain = _store(
+        conn, "allowed_domain", owner="service:writer", visibility="service", domain="memory",
+    )
+
+    regular_service_scope = AuthorizationScope(
+        principal="service:reader",
+        is_service=True,
+        is_platform_service=False,
+        readable_domains=("memory",),
+    )
+
+    where, params = authorization_predicate(regular_service_scope, table="a")
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+
+    assert public in readable_ids
+    assert allowed_domain in readable_ids
+    assert other_domain not in readable_ids
+
+
+def test_platform_service_includes_owned_rows(conn: sqlite3.Connection) -> None:
+    """Platform services can read their own owned rows."""
+    owned = _store(conn, "owned-by-scheduler", owner="scheduler", visibility="private")
+
+    platform_scope = AuthorizationScope(
+        principal="scheduler",
+        is_service=True,
+        is_platform_service=True,
+    )
+
+    where, params = authorization_predicate(platform_scope, table="a")
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+
+    assert owned in readable_ids
