@@ -60,6 +60,7 @@ from .mark_access import AccessEvent, mark_access
 from .observations import (
     find_equal_evidence_obs, find_superseded_observations, refresh_trend,
 )
+from .ownership import Ownership, intersect_acl_from_rows
 from .store import store
 
 
@@ -113,6 +114,51 @@ class ConsolidateResult:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _compute_intersected_acl(
+    conn: sqlite3.Connection,
+    evidence_ids: list[str],
+) -> Ownership:
+    """Compute the intersected ACL from evidence atoms.
+
+    Fetches the ownership columns from the atoms table for all evidence
+    atoms and computes the intersection using the fail-closed ACL
+    intersection helper. If any evidence atom is missing or has ambiguous
+    provenance, the result defaults to service/admin-only (legacy_admin).
+
+    This ensures that observations are no more readable than their least
+    permissive source atom.
+    """
+    if not evidence_ids:
+        from .ownership import Ownership
+        return Ownership()
+
+    placeholders = ",".join(["?"] * len(evidence_ids))
+    rows = conn.execute(
+        f"""SELECT id, owner_principal, origin_channel, origin_domain,
+                  visibility, provenance
+           FROM atoms
+           WHERE id IN ({placeholders})
+             AND tombstoned = 0""",
+        evidence_ids,
+    ).fetchall()
+
+    if len(rows) != len(set(evidence_ids)):
+        from .ownership import Ownership
+        return Ownership()
+
+    row_dicts = [
+        {
+            "owner_principal": r[1],
+            "origin_channel": r[2],
+            "origin_domain": r[3],
+            "visibility": r[4],
+            "provenance": r[5],
+        }
+        for r in rows
+    ]
+    return intersect_acl_from_rows(row_dicts)
 
 
 def _candidate_raws(
@@ -269,6 +315,8 @@ def consolidate(
 
         evidence_ids = [a["id"] for a in cluster]
 
+        intersected_acl = _compute_intersected_acl(conn, evidence_ids)
+
         # Pre-check: an observation with exactly this evidence set
         # already exists? Skip synthesis (no LLM cost) and continue.
         # No access_event fired: consolidation is system-internal; the
@@ -295,6 +343,11 @@ def consolidate(
             # cross-session by construction. The atom is created
             # outside any session's scope.
             session_id=None,
+            owner_principal=intersected_acl.owner_principal,
+            origin_channel=intersected_acl.origin_channel,
+            origin_domain=intersected_acl.origin_domain,
+            visibility=intersected_acl.visibility,
+            provenance=intersected_acl.provenance,
         )
         if not store_result.stored:
             # Content-hash dedupe hit on the observation. Relations

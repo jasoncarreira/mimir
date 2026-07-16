@@ -259,12 +259,20 @@ CREATE TABLE IF NOT EXISTS world_state (
     is_current INTEGER DEFAULT 1,
     source_triple_id TEXT,
     updated_at TEXT NOT NULL,
+    owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+    origin_channel TEXT,
+    origin_domain TEXT,
+    visibility TEXT NOT NULL DEFAULT 'legacy_admin'
+        CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
+    provenance TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (subject, predicate, valid_from),
     FOREIGN KEY (source_triple_id) REFERENCES triples(id)
 );
 CREATE INDEX IF NOT EXISTS idx_world_current
     ON world_state(subject, predicate) WHERE is_current = 1;
 CREATE INDEX IF NOT EXISTS idx_world_subject ON world_state(subject);
+CREATE INDEX IF NOT EXISTS idx_world_visibility ON world_state(visibility);
+CREATE INDEX IF NOT EXISTS idx_world_owner ON world_state(owner_principal);
 
 -- ──────────────────────────────────────────────────────────────────
 -- FTS5 keyword search on atoms (carry over)
