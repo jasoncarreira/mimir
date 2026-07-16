@@ -1210,23 +1210,48 @@ class SagaStore:
     async def feedback(
         self, atom_ids: list[str], response_text: str, *,
         session_id: str | None = None, feedback: str | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]:
-        # Saga's feedback contract is "credit pass after generating a
-        # response." Map atom_ids → feedback_positive events
-        # (the response_text was generated using these; that's the
-        # endorsement). 'feedback' parameter (positive/negative) maps
-        # to our signal kwarg.
+        from ..access_control import is_admin, is_trusted_service
+
         signal = (feedback or "positive").lower()
+
+        def _filter_authorized_atoms(conn, ids, principal):
+            if not ids:
+                return []
+            placeholders = ",".join(["?"] * len(ids))
+            rows = conn.execute(
+                f"SELECT id, owner_principal FROM atoms WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            authorized = []
+            for row in rows:
+                atom_id, owner_principal = row
+                if owner_principal == principal:
+                    authorized.append(atom_id)
+            return authorized
+
+        is_authorized = is_admin(auth_context) or is_trusted_service(auth_context)
+        principal = getattr(auth_context, "canonical_principal", None) if auth_context else None
+
         def _do():
             from . import feedback as _feedback
             conn = self._ensure_conn()
-            n = _feedback(conn, atom_ids, signal=signal, session_id=session_id)
-            return {"marked": n, "total": len(atom_ids)}
+            authorized_ids = atom_ids
+            if not is_authorized and principal:
+                authorized_ids = _filter_authorized_atoms(conn, atom_ids, principal)
+                if len(authorized_ids) != len(atom_ids):
+                    return {"marked": 0, "total": len(atom_ids), "authorized": len(authorized_ids)}
+            if not authorized_ids:
+                return {"marked": 0, "total": len(atom_ids)}
+            n = _feedback(conn, authorized_ids, signal=signal, session_id=session_id)
+            return {"marked": n, "total": len(atom_ids), "authorized": len(authorized_ids)}
         return await self._write_locked(_do)
 
     async def outcome(
         self, atom_ids: list[str], feedback: str, *,
         session_id: str | None = None, query: str | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]:
         """Outcome is saga's "after the response was delivered, was it
         well-received?" signal.
@@ -1244,21 +1269,49 @@ class SagaStore:
 
         Returns ``{"marked": n, "total": len(atom_ids), "signal": ...}``.
         """
+        from ..access_control import is_admin, is_trusted_service
+
         signal = (feedback or "").lower()
         if signal == "positive":
             return await self.feedback(
                 atom_ids, "", session_id=session_id, feedback="positive",
+                auth_context=auth_context,
             )
         if signal == "negative":
+            is_authorized = is_admin(auth_context) or is_trusted_service(auth_context)
+            principal = getattr(auth_context, "canonical_principal", None) if auth_context else None
+
+            def _filter_authorized_atoms(conn, ids, princ):
+                if not ids:
+                    return []
+                placeholders = ",".join(["?"] * len(ids))
+                rows = conn.execute(
+                    f"SELECT id, owner_principal FROM atoms WHERE id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                authorized = []
+                for row in rows:
+                    atom_id, owner_principal = row
+                    if owner_principal == princ:
+                        authorized.append(atom_id)
+                return authorized
+
             def _do():
                 conn = self._ensure_conn()
+                authorized_ids = atom_ids
+                if not is_authorized and principal:
+                    authorized_ids = _filter_authorized_atoms(conn, atom_ids, principal)
+                    if len(authorized_ids) != len(atom_ids):
+                        return {"marked": 0, "total": len(atom_ids), "signal": "negative", "authorized": len(authorized_ids)}
+                if not authorized_ids:
+                    return {"marked": 0, "total": len(atom_ids), "signal": "negative"}
                 events = [AccessEvent(
                     atom_id=aid, source="feedback_negative",
                     session_id=session_id,
                     metadata={"reason": "outcome_negative"},
-                ) for aid in atom_ids]
+                ) for aid in authorized_ids]
                 if not events:
-                    return {"marked": 0, "total": 0, "signal": "negative"}
+                    return {"marked": 0, "total": len(atom_ids), "signal": "negative"}
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     n = mark_access(conn, events)
@@ -1266,7 +1319,7 @@ class SagaStore:
                 except Exception:
                     conn.rollback()
                     raise
-                return {"marked": n, "total": len(atom_ids), "signal": "negative"}
+                return {"marked": n, "total": len(atom_ids), "signal": "negative", "authorized": len(authorized_ids)}
             return await self._write_locked(_do)
         return {"marked": 0, "total": len(atom_ids), "signal": signal or "noop"}
 
@@ -1980,7 +2033,13 @@ class SagaStore:
         contradiction_threshold: float | None = None,
         confidence_floor: float | None = None,
         grace_days: int | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]:
+        from ..access_control import is_admin, is_trusted_service
+
+        is_authorized = is_admin(auth_context) or is_trusted_service(auth_context)
+        principal = getattr(auth_context, "canonical_principal", None) if auth_context else None
+
         # Map saga's criteria-based forget to forget_by_criteria. Also
         # synchronizes the in-memory FAISS index — ``forget_by_criteria``
         # tombstones the SQLite rows but doesn't know about the index,
@@ -2028,7 +2087,21 @@ class SagaStore:
                 min_retrievals=min_retrievals,
                 activation_below=confidence_floor,
                 dry_run=dry_run,
+                owner_principal=principal if not is_authorized and principal else None,
             )
+
+            # For non-authorized users, filter results to only their atoms
+            # This ensures dry-run previews don't reveal unauthorized IDs
+            filtered_tombstoned_ids = result.tombstoned_ids
+            if not is_authorized and principal:
+                if result.tombstoned_ids:
+                    placeholders = ",".join(["?"] * len(result.tombstoned_ids))
+                    rows = conn.execute(
+                        f"SELECT id FROM atoms WHERE id IN ({placeholders}) AND owner_principal = ?",
+                        list(result.tombstoned_ids) + [principal],
+                    ).fetchall()
+                    filtered_tombstoned_ids = [r[0] for r in rows]
+
             # Remove tombstoned atoms from the FAISS index (not a dry-run,
             # and the index has been built — otherwise there's nothing
             # to remove). Failures are logged but non-fatal: the SQL
@@ -2036,12 +2109,12 @@ class SagaStore:
             # missed index-side removal degrades gracefully.
             if (
                 not result.dry_run
-                and result.tombstoned_ids
+                and filtered_tombstoned_ids
                 and self._index is not None
                 and self._index.built
             ):
                 with self._index_lock:
-                    for atom_id in result.tombstoned_ids:
+                    for atom_id in filtered_tombstoned_ids:
                         try:
                             self._index.remove(atom_id)
                         except Exception:  # noqa: BLE001
@@ -2054,8 +2127,8 @@ class SagaStore:
             if not result.dry_run:
                 self._rebuild_index_if_needed(conn)
             return {
-                "tombstoned_count": result.tombstoned_count,
-                "preview_ids": result.tombstoned_ids if dry_run else [],
+                "tombstoned_count": len(filtered_tombstoned_ids),
+                "preview_ids": filtered_tombstoned_ids if dry_run else [],
                 "dry_run": dry_run,
             }
         return await self._write_locked(_do)
@@ -2367,6 +2440,7 @@ class SagaStore:
         *,
         session_id: str | None = None,
         threshold: float | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]:
         """Credit-pass: identify which retrieved atoms contributed to a
         response and fire ``feedback_positive`` events on them. See
@@ -2377,16 +2451,54 @@ class SagaStore:
         Opt-in by call site. The bench harness doesn't call this (saga's
         bench has it off too).
         """
+        from ..access_control import is_admin, is_trusted_service
         from .contributions import (
             mark_contributions as _mc, DEFAULT_CONTRIBUTION_THRESHOLD,
         )
+
+        is_authorized = is_admin(auth_context) or is_trusted_service(auth_context)
+        principal = getattr(auth_context, "canonical_principal", None) if auth_context else None
+
         thr = threshold if threshold is not None else DEFAULT_CONTRIBUTION_THRESHOLD
+
+        def _filter_authorized_atoms(conn, atoms, princ):
+            if not atoms:
+                return []
+            ids = [a.get("id") for a in atoms if a.get("id")]
+            if not ids:
+                return []
+            placeholders = ",".join(["?"] * len(ids))
+            rows = conn.execute(
+                f"SELECT id, owner_principal FROM atoms WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            authorized_ids = set()
+            for row in rows:
+                atom_id, owner_principal = row
+                if owner_principal == princ:
+                    authorized_ids.add(atom_id)
+            return [a for a in atoms if a.get("id") in authorized_ids]
+
         def _do():
             conn = self._ensure_conn()
-            return _mc(
-                conn, retrieved_atoms, response_text,
+            authorized_atoms = retrieved_atoms
+            authorized_count = len(retrieved_atoms)
+            if not is_authorized and principal:
+                authorized_atoms = _filter_authorized_atoms(conn, retrieved_atoms, principal)
+                authorized_count = len(authorized_atoms)
+            if not authorized_atoms:
+                return {
+                    "contributed_atom_ids": [],
+                    "contribution_rate": 0.0,
+                    "total": len(retrieved_atoms),
+                    "authorized_count": authorized_count,
+                }
+            result = _mc(
+                conn, authorized_atoms, response_text,
                 session_id=session_id, threshold=thr,
             )
+            result.authorized_count = authorized_count
+            return result
         result = await self._write_locked(_do)
         return {
             "contributed_count": len(result.contributed_atom_ids),
@@ -2394,6 +2506,7 @@ class SagaStore:
             "contribution_rate": result.contribution_rate,
             "contributed": result.contributed_atom_ids,
             "threshold": result.threshold,
+            "authorized": getattr(result, "authorized_count", len(retrieved_atoms)),
         }
 
     async def health(self) -> bool:

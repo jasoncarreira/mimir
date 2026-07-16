@@ -97,6 +97,7 @@ async def saga_feedback(
     atom_id: str,
     signal: str,
     session_id: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Mark a single atom as useful/incorrect/stale.
 
@@ -109,6 +110,8 @@ async def saga_feedback(
         signal: One of ``useful``, ``incorrect``, ``stale``.
         session_id: Optional override; defaults to the active turn's.
     """
+    from ..access_control import can_write_saga
+
     client = _MEMORY_STATE["client"]
     if client is None:
         return "saga_feedback failed: no SagaStore configured"
@@ -120,9 +123,21 @@ async def saga_feedback(
             f"saga_feedback failed: signal must be useful|incorrect|stale "
             f"(got {signal!r})"
         )
+
+    auth_context = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else None
+    )
+    if not can_write_saga(auth_context):
+        return (
+            "saga_feedback failed: write access denied. "
+            "Feedback requires server-provided admin or trusted-service authority."
+        )
+
     sid = _resolve_session_id(session_id)
     try:
-        await client.outcome([atom_id], feedback=wire, session_id=sid)
+        await client.outcome([atom_id], feedback=wire, session_id=sid, auth_context=auth_context)
     except Exception as exc:  # noqa: BLE001 — SagaError surfaces via str
         return f"saga_feedback failed: {exc}"
     await _emit_feedback_sent(1, wire, sid)
@@ -134,6 +149,7 @@ async def saga_mark_contributions(
     atom_ids: list[str],
     response_text: str,
     session_id: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Manually credit a list of atom_ids against a response.
 
@@ -148,6 +164,8 @@ async def saga_mark_contributions(
         response_text: The response body the atoms contributed to.
         session_id: Optional override; defaults to the active turn's.
     """
+    from ..access_control import can_write_saga
+
     client = _MEMORY_STATE["client"]
     if client is None:
         return "saga_mark_contributions failed: no SagaStore configured"
@@ -155,9 +173,24 @@ async def saga_mark_contributions(
         return "saga_mark_contributions failed: atom_ids must be a list of strings"
     if not isinstance(response_text, str):
         return "saga_mark_contributions failed: response_text must be a string"
+
+    auth_context = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else None
+    )
+    if not can_write_saga(auth_context):
+        return (
+            "saga_mark_contributions failed: write access denied. "
+            "Contribution credit requires server-provided admin or trusted-service authority."
+        )
+
     sid = _resolve_session_id(session_id)
     try:
-        await client.feedback(atom_ids, response_text, session_id=sid)
+        await client.mark_contributions(
+            [{"id": aid} for aid in atom_ids], response_text,
+            session_id=sid, auth_context=auth_context,
+        )
     except Exception as exc:  # noqa: BLE001
         return f"saga_mark_contributions failed: {exc}"
     await _emit_feedback_sent(len(atom_ids), "positive", sid)
@@ -264,6 +297,7 @@ async def saga_forget(
     contradiction_threshold: Optional[float] = None,
     confidence_floor: Optional[float] = None,
     grace_days: Optional[int] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Run SAGA's intentional-forgetting engine.
 
@@ -273,10 +307,24 @@ async def saga_forget(
     state`` reports pending forget candidates; a successful non-dry-
     run call clears that line until the next decay cycle.
     """
+    from ..access_control import can_write_saga
+
     client = _MEMORY_STATE["client"]
     if client is None:
         return "saga_forget failed: no SagaStore configured"
-    kwargs: dict[str, Any] = {"dry_run": bool(dry_run)}
+
+    auth_context = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else None
+    )
+    if not can_write_saga(auth_context):
+        return (
+            "saga_forget failed: write access denied. "
+            "Forget operations require server-provided admin or trusted-service authority."
+        )
+
+    kwargs: dict[str, Any] = {"dry_run": bool(dry_run), "auth_context": auth_context}
     if min_retrievals is not None:
         kwargs["min_retrievals"] = min_retrievals
     if contribution_threshold is not None:

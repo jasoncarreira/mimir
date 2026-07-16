@@ -43,9 +43,10 @@ class _StubStore:
         self.feedback_calls: list[dict] = []
         self.end_session_calls: list[dict] = []
         self.forget_calls: list[dict] = []
+        self.mark_contributions_calls: list[dict] = []
         self.raise_on: str | None = None
 
-    async def outcome(self, atom_ids, *, feedback, session_id):
+    async def outcome(self, atom_ids, *, feedback, session_id, auth_context=None):
         if self.raise_on == "outcome":
             raise RuntimeError("outcome boom")
         self.outcome_calls.append({
@@ -54,7 +55,7 @@ class _StubStore:
             "session_id": session_id,
         })
 
-    async def feedback(self, atom_ids, response_text, *, session_id):
+    async def feedback(self, atom_ids, response_text, *, session_id, auth_context=None):
         if self.raise_on == "feedback":
             raise RuntimeError("feedback boom")
         self.feedback_calls.append({
@@ -62,6 +63,20 @@ class _StubStore:
             "response_text": response_text,
             "session_id": session_id,
         })
+
+    async def mark_contributions(self, retrieved_atoms, response_text, *, session_id, threshold=None, auth_context=None):
+        if self.raise_on == "mark_contributions":
+            raise RuntimeError("mark_contributions boom")
+        self.mark_contributions_calls.append({
+            "retrieved_atoms": retrieved_atoms,
+            "response_text": response_text,
+            "session_id": session_id,
+        })
+        return {
+            "contributed_atom_ids": [a.get("id") for a in retrieved_atoms],
+            "contribution_rate": 1.0 if retrieved_atoms else 0.0,
+            "total": len(retrieved_atoms),
+        }
 
     async def end_session(
         self, *, session_id, summary, topics_discussed, decisions_made,
@@ -86,11 +101,19 @@ class _StubStore:
             "session_summary_written": True,
         }
 
-    async def forget(self, **kwargs):
+    async def forget(self, *, dry_run=True, min_retrievals=None, contribution_threshold=None, contradiction_threshold=None, confidence_floor=None, grace_days=None, auth_context=None):
         if self.raise_on == "forget":
             raise RuntimeError("forget boom")
-        self.forget_calls.append(kwargs)
-        return {"dry_run": kwargs.get("dry_run", True), "actions_taken": 0, "total_candidates": 7}
+        self.forget_calls.append({
+            "dry_run": dry_run,
+            "min_retrievals": min_retrievals,
+            "contribution_threshold": contribution_threshold,
+            "contradiction_threshold": contradiction_threshold,
+            "confidence_floor": confidence_floor,
+            "grace_days": grace_days,
+            "auth_context": auth_context,
+        })
+        return {"dry_run": dry_run, "actions_taken": 0, "total_candidates": 7}
 
 
 @pytest.fixture
@@ -148,7 +171,7 @@ async def test_feedback_useful_maps_to_positive(
     store: _StubStore, turn_with_session: TurnContext,
 ) -> None:
     out = await saga_ops.saga_feedback.ainvoke(
-        {"atom_id": "atom-1", "signal": "useful"}
+        {"atom_id": "atom-1", "signal": "useful", "runtime": _runtime(turn_with_session)}
     )
     assert "ok" in out.lower()
     assert store.outcome_calls == [{
@@ -163,7 +186,7 @@ async def test_feedback_incorrect_maps_to_negative(
     store: _StubStore, turn_with_session: TurnContext,
 ) -> None:
     await saga_ops.saga_feedback.ainvoke(
-        {"atom_id": "atom-2", "signal": "incorrect"}
+        {"atom_id": "atom-2", "signal": "incorrect", "runtime": _runtime(turn_with_session)}
     )
     assert store.outcome_calls[0]["feedback"] == "negative"
 
@@ -173,7 +196,7 @@ async def test_feedback_stale_maps_to_negative(
     store: _StubStore, turn_with_session: TurnContext,
 ) -> None:
     await saga_ops.saga_feedback.ainvoke(
-        {"atom_id": "atom-3", "signal": "stale"}
+        {"atom_id": "atom-3", "signal": "stale", "runtime": _runtime(turn_with_session)}
     )
     assert store.outcome_calls[0]["feedback"] == "negative"
 
@@ -214,10 +237,11 @@ async def test_mark_contributions_routes_to_feedback(
     out = await saga_ops.saga_mark_contributions.ainvoke({
         "atom_ids": ["a1", "a2"],
         "response_text": "thanks",
+        "runtime": _runtime(turn_with_session),
     })
     assert "credited 2 atoms" in out
-    assert store.feedback_calls == [{
-        "atom_ids": ["a1", "a2"],
+    assert store.mark_contributions_calls == [{
+        "retrieved_atoms": [{"id": "a1"}, {"id": "a2"}],
         "response_text": "thanks",
         "session_id": "sess-abc",
     }]
@@ -227,14 +251,15 @@ async def test_mark_contributions_routes_to_feedback(
 async def test_mark_contributions_empty_list_is_a_no_op(
     store: _StubStore, turn_with_session: TurnContext,
 ) -> None:
-    """An empty atom_ids list still calls feedback (caller may want a
+    """An empty atom_ids list still calls mark_contributions (caller may want a
     no-op feedback ping for protocol reasons), reporting 0 credited."""
     out = await saga_ops.saga_mark_contributions.ainvoke({
         "atom_ids": [],
         "response_text": "noop",
+        "runtime": _runtime(turn_with_session),
     })
     assert "credited 0 atoms" in out
-    assert store.feedback_calls[0]["atom_ids"] == []
+    assert store.mark_contributions_calls[0]["retrieved_atoms"] == []
 
 
 # ─── saga_end_session ─────────────────────────────────────────────
@@ -296,8 +321,8 @@ async def test_end_session_requires_summary(
 async def test_forget_defaults_to_dry_run(
     store: _StubStore, turn_with_session: TurnContext,
 ) -> None:
-    out = await saga_ops.saga_forget.ainvoke({})
-    assert store.forget_calls == [{"dry_run": True}]
+    out = await saga_ops.saga_forget.ainvoke({"runtime": _runtime(turn_with_session)})
+    assert store.forget_calls == [{"dry_run": True, "min_retrievals": None, "contribution_threshold": None, "contradiction_threshold": None, "confidence_floor": None, "grace_days": None, "auth_context": turn_with_session.auth_context}]
     # Payload comes back as JSON.
     import json
     parsed = json.loads(out)
@@ -314,6 +339,7 @@ async def test_forget_threads_optional_args(
         "contribution_threshold": -0.5,
         "confidence_floor": 0.2,
         "grace_days": 30,
+        "runtime": _runtime(turn_with_session),
     })
     call = store.forget_calls[0]
     assert call["dry_run"] is False
@@ -327,7 +353,7 @@ async def test_forget_raise_surfaces_in_message(
     store: _StubStore, turn_with_session: TurnContext,
 ) -> None:
     store.raise_on = "forget"
-    out = await saga_ops.saga_forget.ainvoke({"dry_run": True})
+    out = await saga_ops.saga_forget.ainvoke({"dry_run": True, "runtime": _runtime(turn_with_session)})
     assert "saga_forget failed" in out
     assert "boom" in out
 

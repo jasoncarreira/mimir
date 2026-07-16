@@ -38,21 +38,34 @@ class _StubStore:
         self.feedback_calls: list[dict] = []
         self.end_session_calls: list[dict] = []
         self.forget_calls: list[dict] = []
+        self.mark_contributions_calls: list[dict] = []
         self.raise_on: str | None = None
 
-    async def outcome(self, atom_ids, *, feedback, session_id):
+    async def outcome(self, atom_ids, *, feedback, session_id, auth_context=None):
         if self.raise_on == "outcome":
             raise RuntimeError("outcome boom")
         self.outcome_calls.append(
             {"atom_ids": atom_ids, "feedback": feedback, "session_id": session_id}
         )
 
-    async def feedback(self, atom_ids, response_text, *, session_id):
+    async def feedback(self, atom_ids, response_text, *, session_id, auth_context=None):
         if self.raise_on == "feedback":
             raise RuntimeError("feedback boom")
         self.feedback_calls.append(
             {"atom_ids": atom_ids, "response_text": response_text, "session_id": session_id}
         )
+
+    async def mark_contributions(self, retrieved_atoms, response_text, *, session_id, threshold=None, auth_context=None):
+        if self.raise_on == "mark_contributions":
+            raise RuntimeError("mark_contributions boom")
+        self.mark_contributions_calls.append(
+            {"retrieved_atoms": retrieved_atoms, "response_text": response_text, "session_id": session_id}
+        )
+        return {
+            "contributed_atom_ids": [a.get("id") for a in retrieved_atoms],
+            "contribution_rate": 1.0 if retrieved_atoms else 0.0,
+            "total": len(retrieved_atoms),
+        }
 
     async def end_session(
         self,
@@ -197,7 +210,7 @@ async def test_feedback_explicit_session_id_overrides_turn(
     store: _StubStore, turn_with_session: TurnContext
 ) -> None:
     out = await saga_ops.saga_feedback.ainvoke(
-        {"atom_id": "atom-x", "signal": "useful", "session_id": "override-sess"}
+        {"atom_id": "atom-x", "signal": "useful", "session_id": "override-sess", "runtime": _runtime(turn_with_session)}
     )
     assert "ok" in out.lower()
     assert store.outcome_calls[0]["session_id"] == "override-sess"
@@ -227,9 +240,9 @@ async def test_mark_contributions_non_list_atom_ids_returns_error(
 async def test_mark_contributions_store_raises_surfaces_error(
     store: _StubStore, turn_with_session: TurnContext
 ) -> None:
-    store.raise_on = "feedback"
+    store.raise_on = "mark_contributions"
     out = await saga_ops.saga_mark_contributions.ainvoke(
-        {"atom_ids": ["a1"], "response_text": "context"}
+        {"atom_ids": ["a1"], "response_text": "context", "runtime": _runtime(turn_with_session)}
     )
     assert "saga_mark_contributions failed" in out
     assert "boom" in out
@@ -352,7 +365,7 @@ async def test_saga_feedback_emits_feedback_sent(
 
     monkeypatch.setattr(_ev, "log_event", _fake_log_event)
     out = await saga_ops.saga_feedback.ainvoke(
-        {"atom_id": "a" * 16, "signal": "useful"}
+        {"atom_id": "a" * 16, "signal": "useful", "runtime": _runtime(turn_with_session)}
     )
     assert "ok" in out
     sent = [e for e in captured if e[0] == "saga_feedback_sent"]
@@ -372,7 +385,7 @@ async def test_mark_contributions_emits_feedback_sent(
 
     monkeypatch.setattr(_ev, "log_event", _fake_log_event)
     out = await saga_ops.saga_mark_contributions.ainvoke(
-        {"atom_ids": ["a" * 16, "b" * 16], "response_text": "resp"}
+        {"atom_ids": ["a" * 16, "b" * 16], "response_text": "resp", "runtime": _runtime(turn_with_session)}
     )
     assert "credited 2" in out
     sent = [e for e in captured if e[0] == "saga_feedback_sent"]
@@ -413,7 +426,7 @@ async def test_saga_feedback_stale_emits_negative(
 
     monkeypatch.setattr(_ev, "log_event", _fake_log_event)
     out = await saga_ops.saga_feedback.ainvoke(
-        {"atom_id": "a" * 16, "signal": "stale"}
+        {"atom_id": "a" * 16, "signal": "stale", "runtime": _runtime(turn_with_session)}
     )
     assert "ok" in out and "negative" in out
     sent = [e for e in captured if e[0] == "saga_feedback_sent"]
