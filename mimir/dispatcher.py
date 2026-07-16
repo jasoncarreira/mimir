@@ -263,6 +263,18 @@ class Dispatcher:
             enforce=self._config.access_control_enforced,
         )
         if decision.allowed:
+            await log_event(
+                "inbound_event_allowed",
+                source=source or "unknown",
+                channel_id=event.channel_id,
+                author=decision.author,
+                raw_author_handle=event.author,
+                author_id=event.author_id,
+                canonical_author=decision.canonical_author,
+                status=decision.status.value,
+                trigger=event.trigger,
+                enforcement_enabled=decision.enforcement_enabled,
+            )
             return True
 
         await log_event(
@@ -276,6 +288,7 @@ class Dispatcher:
             reason=decision.denial_reason,
             status=decision.status.value,
             trigger=event.trigger,
+            enforcement_enabled=decision.enforcement_enabled,
         )
         is_dm = self._is_dm_channel(event.channel_id)
         if is_dm:

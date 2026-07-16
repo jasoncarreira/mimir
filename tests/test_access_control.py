@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import (
     AccessStatus,
     DenialReason,
@@ -544,3 +545,183 @@ def test_claude_sdk_hook_fails_closed_without_exact_carrier(monkeypatch) -> None
 
     assert denial["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "missing_auth_context" in denial["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_http_event_ingress_denies_without_server_owned_principal_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generic HTTP credentials authenticate transport only - no server-owned principal."""
+    import asyncio
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    captured: list[tuple[str, dict]] = []
+
+    def _capture(kind: str, **kw: dict):
+        captured.append((kind, kw))
+
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", _capture)
+
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+
+    ctx = TurnContext(
+        turn_id="turn-1",
+        session_id="saga-1",
+        trigger="user_message",
+        channel_id="slack-C1",
+        started_at=0.0,
+        tool_call_budget=10,
+    )
+    ctx.author = "slack-U1"
+    ctx.identity_resolver = resolver
+    ctx.access_control_enforced = True
+    ctx.auth_context = AuthContext(
+        principal="slack-U1",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress="http-api",
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+
+    mw = BudgetGateMiddleware()
+    token = set_current_turn(ctx)
+    try:
+        async def handler(req):
+            return ToolMessage(content="ran", tool_call_id=req.tool_call["id"])
+
+        result = asyncio.run(
+            mw.awrap_tool_call(
+                _tool_request(ctx.auth_context, session_id="saga-1"), handler
+            )
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    kinds = [kind for kind, _kw in captured]
+    assert "admin_tool_call_denied" in kinds
+    admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
+    assert admin_event["denial_reason"] is not None
+
+
+def test_enforcement_on_missing_context_denies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enforcement-on with missing auth context denies all non-open operations."""
+    import asyncio
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+    captured: list[tuple[str, dict]] = []
+
+    def _capture(kind: str, **kw: dict):
+        captured.append((kind, kw))
+
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", _capture)
+
+    mw = BudgetGateMiddleware()
+
+    async def handler(req):
+        return ToolMessage(content="ran", tool_call_id=req.tool_call["id"])
+
+    result = asyncio.run(mw.awrap_tool_call(_tool_request(None), handler))
+
+    assert result.status == "error"
+    assert "missing_auth_context" in str(result.content).lower()
+    kinds = [kind for kind, _kw in captured]
+    assert "admin_tool_call_denied" in kinds
+    admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
+    assert admin_event["denial_reason"] == "missing_auth_context"
+
+
+def test_enforcement_on_unknown_context_denies(tmp_path: Path) -> None:
+    """Enforcement-on with unknown author denies at inbound."""
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+
+    event = _event("unknown-user-123")
+    decision = authorize_inbound(event, resolver, enforce=True)
+
+    assert decision.allowed is False
+    assert decision.status == AccessStatus.DENIED
+    assert decision.reason in (DenialReason.UNKNOWN_AUTHOR, DenialReason.USER_NOT_ALLOWLISTED)
+
+
+def test_unknown_mcp_tool_denies_under_enforcement(tmp_path: Path) -> None:
+    """Unknown MCP tools are denied under enforcement."""
+    from mimir.access_control import MCPResourceAdapter
+
+    auth_ctx = AuthContext(
+        principal="slack-U1",
+        canonical_principal="user-1",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+
+    result = MCPResourceAdapter.authorize_mcp_tool(
+        "mcp__unknown_tool",
+        auth_ctx,
+        enforce=True,
+    )
+
+    assert result.allowed is False
+    assert result.decision.value == "admin_required"
+    assert result.reason is not None
+
+
+def test_allow_event_fields_are_stable_and_redacted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify inbound allow events have stable, redacted fields without secrets."""
+    captured: list[dict] = []
+
+    async def capture_event(event_type: str, **payload: dict):
+        captured.append({"type": event_type, **payload})
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture_event)
+
+    resolver = _resolver(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U1]
+            access: {roles: [user]}
+        """,
+    )
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-C1",
+        author="slack-U1",
+        source="slack",
+    )
+
+    decision = authorize_inbound(event, resolver, enforce=True)
+    assert decision.allowed is True
+    assert decision.status == AccessStatus.USER_ALLOWED
+    assert decision.canonical_author == "alice"
+    assert decision.enforcement_enabled is True
