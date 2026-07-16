@@ -120,10 +120,13 @@ def store(
     # Dedupe check FIRST. The UNIQUE index would catch it on insert,
     # but explicit check lets us emit a clean access_event on the
     # existing atom and report stored=False without an exception path.
+    # Scoped by owner_principal to prevent cross-owner existence oracle
+    # (item #7 of chainlink #895).
+    effective_owner = owner_principal or "legacy_admin"
     existing = conn.execute(
         "SELECT id FROM atoms WHERE content_hash = ? "
-        "AND agent_id = ? AND tombstoned = 0",
-        (content_hash, agent_id),
+        "AND agent_id = ? AND owner_principal = ? AND tombstoned = 0",
+        (content_hash, agent_id, effective_owner),
     ).fetchone()
     if existing is not None:
         atom_id = existing[0]

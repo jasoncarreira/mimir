@@ -252,7 +252,7 @@ def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
         is_admin as check_is_admin,
     )
 
-    principal = getattr(auth_context, "principal", None)
+    principal = getattr(auth_context, "canonical_principal", None) or getattr(auth_context, "principal", None)
     is_admin = check_is_admin(auth_context)
     service = get_trusted_service_from_auth_context(auth_context)
 

@@ -63,7 +63,7 @@ log = logging.getLogger(__name__)
 # is exempt for the same operator-facing-acknowledgement reason.
 _BUDGET_EXEMPT_TOOLS = frozenset({"send_message", "react"})
 
-_ADMIN_TOOL_NAMES = frozenset(
+_ADMIN_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "add_schedule",
         "set_schedule_priority",
@@ -88,6 +88,11 @@ _ADMIN_TOOL_NAMES = frozenset(
     }
 )
 
+# PRODUCTION-DEAD (chainlink #895): This frozenset is never consulted in
+# the production code path. The authoritative admin-tool set lives in
+# access_control.py OperationCatalog._ADMIN_REQUIRED_OPERATIONS. Retained
+# for backwards compatibility with any external callers that might reference it.
+
 def _auth_context_from_request(request: ToolCallRequest) -> AuthContext | None:
     """Return the exact graph invocation's valid server-created auth carrier.
 
@@ -102,7 +107,7 @@ def _auth_context_from_request(request: ToolCallRequest) -> AuthContext | None:
     return context if isinstance(context, AuthContext) else None
 
 
-_ADMIN_BUILTIN_TOOL_NAMES = frozenset(
+_ADMIN_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "Bash",
         "bash",
@@ -114,6 +119,12 @@ _ADMIN_BUILTIN_TOOL_NAMES = frozenset(
         "Edit",
     }
 )
+
+# PRODUCTION-DEAD (chainlink #895): This frozenset diverges from
+# access_control.py OperationCatalog._ADMIN_BUILTIN_TOOL_NAMES (which includes
+# "Read", "Glob", "Grep", "download_files") and is never consulted in the
+# production code path. The authoritative set is in access_control.py.
+# Retained for test compatibility but marked as deprecated.
 
 _HTTP_EVENT_ADMIN_DENIAL_REASON = "http_event_author_untrusted"
 

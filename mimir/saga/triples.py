@@ -652,6 +652,13 @@ def triple_augment_search(
     ``reference_date`` (datetime or None) anchors the ``valid_until``
     expiry filter. Expired triples (valid_until ≤ reference_date) are
     excluded from the candidate set — they represent superseded facts
+
+    Authorization: This function authorizes on the source atom's ACL (joined
+    via t.source_atom_id = a.id), not the triple's own ACL columns. The
+    triple table maintains ACL columns for potential future narrow-granularity
+    access control, but currently the read path derives authorization from
+    the source atom's ownership. This means a triple is accessible if the
+    user can read its source atom, regardless of the triple's own owner_principal.
     and should not surface in retrieval. Defaults to utcnow when None.
 
     chainlink #883: authorization filters triples based on source atom ownership.
@@ -725,6 +732,9 @@ def top_triples_with_payload(
     Defaults to utcnow when None. Documents the behaviour the config
     key ``include_triples_in_response`` claims: "Filters out triples
     whose valid_until has expired."
+
+    Authorization: See ``triple_augment_search`` — authorizes on the source
+    atom's ACL, not the triple's own ACL columns.
 
     chainlink #883: authorization filters triples based on source atom ownership.
     """
@@ -810,6 +820,9 @@ def retrieve_by_entity(
     *names* the entity and we can skip the embedding path.
 
     chainlink #883: authorization filters triples based on source atom ownership.
+
+    Authorization: See ``triple_augment_search`` — authorizes on the source
+    atom's ACL, not the triple's own ACL columns.
     """
     from .ownership import (
         authorization_predicate,
