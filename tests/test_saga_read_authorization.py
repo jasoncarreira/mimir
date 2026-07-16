@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from mimir.access_control import create_auth_context
+from mimir.models import AgentEvent
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import (
     AuthorizationScope,
@@ -174,3 +176,163 @@ async def test_get_atoms_missing_context_does_not_reveal_legacy_or_private(
 
     assert [atom["id"] for atom in payload["atoms"]] == [public]
     assert payload["missing"] == [private, legacy]
+
+
+@pytest.mark.parametrize(
+    ("trigger", "principal"),
+    [
+        ("scheduled_tick", "scheduler"),
+        ("poller", "poller"),
+        ("saga_session_end", "synthesis"),
+        ("upgrade", "system"),
+    ],
+)
+def test_trusted_platform_auth_context_can_read_legacy_admin_memory(
+    conn: sqlite3.Connection,
+    trigger: str,
+    principal: str,
+) -> None:
+    """Each server-created platform carrier can read the migrated legacy corpus."""
+    public = _store(conn, "public", owner="other", visibility="public")
+    legacy = _store(conn, "legacy", owner="legacy_admin", visibility="legacy_admin")
+    service = _store(conn, "service-scoped", owner="scheduler", visibility="service")
+    private = _store(conn, "private", owner="user:alice", visibility="private")
+
+    auth_context = create_auth_context(
+        AgentEvent(
+            trigger=trigger,
+            channel_id=f"service:{trigger}",
+            service_principal=principal,
+        ),
+        enforce=True,
+    )
+    platform_scope = get_authorization_scope(auth_context)
+
+    assert platform_scope.is_service is True
+    assert platform_scope.is_platform_service is True
+    assert platform_scope.is_admin is False
+    assert platform_scope.service_canonical == principal
+
+    where, params = authorization_predicate(platform_scope, table="a")
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+
+    assert public in readable_ids
+    assert legacy in readable_ids
+    assert service in readable_ids
+    assert private in readable_ids
+
+
+def test_forged_platform_trigger_does_not_widen_read_scope(
+    conn: sqlite3.Connection,
+) -> None:
+    legacy = _store(conn, "legacy", owner="legacy_admin", visibility="legacy_admin")
+    auth_context = create_auth_context(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="api-request",
+            service_principal="scheduler",
+        ),
+        event_ingress="http-api",
+        enforce=True,
+    )
+    scope = get_authorization_scope(auth_context)
+
+    assert scope.is_service is False
+    assert scope.is_platform_service is False
+    where, params = authorization_predicate(scope, table="a")
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+    assert legacy not in readable_ids
+
+
+def test_platform_service_can_read_service_scoped_memory(conn: sqlite3.Connection) -> None:
+    """Platform services can read service-scoped memory."""
+    service_scoped = _store(conn, "service-scoped", owner="poller", visibility="service")
+
+    platform_scope = AuthorizationScope(
+        principal="service:poller",
+        is_service=True,
+        is_platform_service=True,
+    )
+
+    where, params = authorization_predicate(platform_scope, table="a")
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+
+    assert service_scoped in readable_ids
+
+
+def test_regular_service_still_restricted_by_readable_domains(conn: sqlite3.Connection) -> None:
+    """Non-platform services with readable_domains get domain-restricted access.
+
+    This verifies that we haven't broken the existing service model - regular
+    services (e.g., external integration services) still get domain-restricted
+    access via readable_domains.
+    """
+    public = _store(conn, "public", owner="other", visibility="public")
+    other_domain = _store(
+        conn, "other_domain", owner="service:writer", visibility="service", domain="other",
+    )
+    allowed_domain = _store(
+        conn, "allowed_domain", owner="service:writer", visibility="service", domain="memory",
+    )
+
+    regular_service_scope = AuthorizationScope(
+        principal="service:reader",
+        is_service=True,
+        is_platform_service=False,
+        readable_domains=("memory",),
+    )
+
+    where, params = authorization_predicate(regular_service_scope, table="a")
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+
+    assert public in readable_ids
+    assert allowed_domain in readable_ids
+    assert other_domain not in readable_ids
+
+
+def test_platform_service_gets_full_read_without_admin_role(
+    conn: sqlite3.Connection,
+) -> None:
+    """Platform read scope includes other owners without conferring admin role."""
+    owned = _store(conn, "owned-by-scheduler", owner="scheduler", visibility="private")
+    other_owned = _store(conn, "owned-by-user", owner="user:alice", visibility="private")
+
+    platform_scope = AuthorizationScope(
+        principal="scheduler",
+        is_service=True,
+        is_platform_service=True,
+    )
+
+    assert platform_scope.is_admin is False
+    where, params = authorization_predicate(platform_scope, table="a")
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+
+    assert where == "1=1"
+    assert params == []
+    assert owned in readable_ids
+    assert other_owned in readable_ids
