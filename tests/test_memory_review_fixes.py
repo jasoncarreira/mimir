@@ -18,6 +18,10 @@ from pathlib import Path
 import pytest
 
 from mimir.saga.client import SagaStore
+from mimir.saga.ownership import AuthorizationScope
+
+
+ADMIN_SCOPE = AuthorizationScope(is_admin=True)
 
 
 # Stub provider so we don't need real voyage credentials in unit tests.
@@ -107,7 +111,7 @@ async def test_recent_session_boundaries_scopes_to_channel(client, monkeypatch):
     await client.end_session("sA", "channel A session", channel_id="CHAN_A")
     await client.end_session("sB", "channel B session", channel_id="CHAN_B")
     boundaries_a = await client.recent_session_boundaries(
-        channel_id="CHAN_A", count=10,
+        channel_id="CHAN_A", count=10, auth_context=ADMIN_SCOPE,
     )
     sids = [b["session_id"] for b in boundaries_a]
     assert "sA" in sids
@@ -127,8 +131,8 @@ async def test_most_retrieved_filters_contributed_only(client, monkeypatch):
     # r1 gets one feedback_positive (credit pass)
     await client.feedback([r1["atom_id"]], "response", feedback="positive")
     # r2 gets two plain retrievals via query
-    await client.query("beta", top_k=5)
-    await client.query("beta", top_k=5)
+    await client.query("beta", top_k=5, auth_context=ADMIN_SCOPE)
+    await client.query("beta", top_k=5, auth_context=ADMIN_SCOPE)
     # Without filter: r2 has more events than r1 (store + 2 retrieval = 3 vs 2)
     bare = await client.most_retrieved_atoms(days=7, count=5)
     bare_ids = [a["id"] for a in bare]

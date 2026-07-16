@@ -13,9 +13,19 @@ from pathlib import Path
 import pytest
 
 from mimir.saga.mark_access import AccessEvent, mark_access
+from mimir.saga.ownership import AuthorizationScope
 from mimir.saga.recall import recall
 from mimir.saga.client import SagaStore
 from mimir.saga.store import store
+
+
+ADMIN_SCOPE = AuthorizationScope(is_admin=True)
+
+
+def _admin_recall(*args, **kwargs):
+    """Exercise internal recall with explicit system authority."""
+    kwargs.setdefault("auth_scope", ADMIN_SCOPE)
+    return recall(*args, **kwargs)
 
 
 @pytest.fixture
@@ -193,7 +203,7 @@ def test_recall_returns_stored_atom(conn):
     """End-to-end: store an atom, recall it via mocked FAISS, get it back."""
     r = store(conn, "Alice prefers concise replies", embed_fn=_fake_embed,
               stream="semantic")
-    result = recall(
+    result = _admin_recall(
         conn, "what does Alice prefer",
         query_embed_fn=_fake_query_embed,
         faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
@@ -213,8 +223,8 @@ def test_recall_default_output_unchanged_with_no_extra_pathways(conn):
         fts_search_fn=lambda q, k: [(r2.atom_id, 7.0)],
         fire_access_events=False,
     )
-    baseline = recall(conn, "concise replies", **kwargs)
-    with_empty = recall(
+    baseline = _admin_recall(conn, "concise replies", **kwargs)
+    with_empty = _admin_recall(
         conn, "concise replies",
         extra_atom_ranked_pathways={},
         **kwargs,
@@ -229,7 +239,7 @@ def test_recall_extra_pathway_can_admit_atom_absent_from_builtin_candidates(conn
     semantic = store(conn, "semantic candidate", embed_fn=_fake_embed)
     extra = store(conn, "extra-only candidate", embed_fn=_fake_embed)
 
-    result = recall(
+    result = _admin_recall(
         conn, "unmatched query",
         query_embed_fn=_fake_query_embed,
         faiss_search_fn=lambda emb, k: [(semantic.atom_id, 0.9)],
@@ -263,7 +273,7 @@ def test_recall_extra_pathway_rejects_reserved_triple_without_triples(conn):
 def test_recall_extra_pathway_dedupes_duplicate_atom_ids_before_rrf(conn):
     extra = store(conn, "extra-only candidate", embed_fn=_fake_embed)
 
-    result = recall(
+    result = _admin_recall(
         conn, "unmatched query",
         query_embed_fn=_fake_query_embed,
         faiss_search_fn=lambda emb, k: [],
@@ -283,7 +293,7 @@ def test_recall_extra_pathway_weight_changes_ordering_and_score(conn):
     extra = store(conn, "extra-only candidate", embed_fn=_fake_embed)
     scoring_weights = {"w_rrf": 20.0, "w_topic": 0.0, "w_act": 0.0}
 
-    low_weight = recall(
+    low_weight = _admin_recall(
         conn, "ranking query",
         query_embed_fn=_fake_query_embed,
         faiss_search_fn=lambda emb, k: [(semantic.atom_id, 0.9)],
@@ -293,7 +303,7 @@ def test_recall_extra_pathway_weight_changes_ordering_and_score(conn):
         weights=scoring_weights,
         fire_access_events=False,
     )
-    high_weight = recall(
+    high_weight = _admin_recall(
         conn, "ranking query",
         query_embed_fn=_fake_query_embed,
         faiss_search_fn=lambda emb, k: [(semantic.atom_id, 0.9)],
@@ -326,7 +336,7 @@ def test_recall_extra_pathway_still_applies_skill_and_confidence_filters(conn):
     )
     low_conf = store(conn, "extra-only low confidence", embed_fn=_fake_embed)
 
-    result = recall(
+    result = _admin_recall(
         conn, "unmatched query",
         query_embed_fn=_fake_query_embed,
         faiss_search_fn=lambda emb, k: [],
@@ -353,6 +363,7 @@ async def test_sagastore_query_accepts_extra_atom_ranked_pathways(
         top_k=5,
         extra_atom_ranked_pathways={"session_boundary": [stored["atom_id"]]},
         rrf_pathway_weights={"session_boundary": 0.5},
+        auth_context=ADMIN_SCOPE,
     )
 
     assert [a["id"] for a in result["raws"]] == [stored["atom_id"]]
@@ -377,7 +388,7 @@ def test_recall_filters_below_activation_threshold(conn):
         )
     )
     conn.commit()
-    result = recall(
+    result = _admin_recall(
         conn, "ancient memory",
         query_embed_fn=_fake_query_embed,
         faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
@@ -390,7 +401,7 @@ def test_recall_filters_below_activation_threshold(conn):
 def test_recall_fires_retrieval_access_event(conn):
     """Pass 4: returned atoms get a 'retrieval' access_event."""
     r = store(conn, "test atom", embed_fn=_fake_embed)
-    recall(
+    _admin_recall(
         conn, "test query",
         query_embed_fn=_fake_query_embed,
         faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
@@ -409,7 +420,7 @@ def test_recall_skips_access_event_when_disabled(conn):
     """fire_access_events=False (used by the migration importer) skips
     Pass 4."""
     r = store(conn, "test atom", embed_fn=_fake_embed)
-    recall(
+    _admin_recall(
         conn, "test query",
         query_embed_fn=_fake_query_embed,
         faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
@@ -448,7 +459,7 @@ def test_recall_pinned_atoms_bypass_activation_threshold(conn):
         )
     )
     conn.commit()
-    result = recall(
+    result = _admin_recall(
         conn, "remember",
         query_embed_fn=_fake_query_embed,
         faiss_search_fn=lambda emb, k: [(r.atom_id, 0.9)],
@@ -464,7 +475,7 @@ def test_recall_two_tier_splits_observations_and_raws(conn):
     raw_r = store(conn, "Alice likes pizza", embed_fn=_fake_embed)
     obs_r = store(conn, "Alice has food preferences", embed_fn=_fake_embed,
                   memory_type="observation")
-    result = recall(
+    result = _admin_recall(
         conn, "Alice food",
         query_embed_fn=_fake_query_embed,
         faiss_search_fn=lambda emb, k: [(raw_r.atom_id, 0.85), (obs_r.atom_id, 0.9)],
@@ -492,7 +503,7 @@ def test_recall_evidence_boost_lifts_evidenced_raws(conn):
         (obs_r.atom_id, raw_r.atom_id, now)
     )
     conn.commit()
-    result = recall(
+    result = _admin_recall(
         conn, "Alice preferences",
         query_embed_fn=_fake_query_embed,
         faiss_search_fn=lambda emb, k: [(raw_r.atom_id, 0.5), (obs_r.atom_id, 0.9)],

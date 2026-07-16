@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from mimir.saga.mark_access import AccessEvent, mark_access
+from mimir.saga.ownership import AuthorizationScope
 from mimir.saga.observations import (
     HISTORICAL_WINDOW_DAYS, RECENT_WINDOW_DAYS, STALE_THRESHOLD_DAYS,
     classify_trend, find_superseded_observations, refresh_trend,
@@ -23,6 +24,9 @@ from mimir.saga.observations import (
 from mimir.saga.recall import recall
 from mimir.saga.reflect import recent_session_boundaries, reflect
 from mimir.saga.store import store
+
+
+ADMIN_SCOPE = AuthorizationScope(is_admin=True)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -343,7 +347,7 @@ def test_recent_session_boundaries_returns_in_recency_order(conn):
     reflect(conn, session_id="s2", channel_id="c1",
             embed_fn=_fake_embed,
             boundary_synth_fn=_stub_boundary_synth)
-    boundaries = recent_session_boundaries(conn, channel_id="c1", count=10)
+    boundaries = recent_session_boundaries(conn, auth_context=ADMIN_SCOPE, channel_id="c1", count=10)
     assert len(boundaries) == 2
     ids = {b["id"] for b in boundaries}
     assert {"s1", "s2"} <= ids
@@ -378,7 +382,7 @@ def test_recent_session_boundaries_pipeline_renders_correctly(conn):
             embed_fn=_fake_embed,
             boundary_synth_fn=_synth_with_unfinished)
 
-    boundaries = recent_session_boundaries(conn, channel_id="c1", count=10)
+    boundaries = recent_session_boundaries(conn, auth_context=ADMIN_SCOPE, channel_id="c1", count=10)
     assert len(boundaries) == 1
     b = boundaries[0]
 
@@ -407,8 +411,8 @@ def test_recent_session_boundaries_filters_by_channel(conn):
     reflect(conn, session_id="s2", channel_id="c2",
             embed_fn=_fake_embed,
             boundary_synth_fn=_stub_boundary_synth)
-    c1_only = recent_session_boundaries(conn, channel_id="c1", count=10)
-    c2_only = recent_session_boundaries(conn, channel_id="c2", count=10)
+    c1_only = recent_session_boundaries(conn, auth_context=ADMIN_SCOPE, channel_id="c1", count=10)
+    c2_only = recent_session_boundaries(conn, auth_context=ADMIN_SCOPE, channel_id="c2", count=10)
     assert len(c1_only) == 1
     assert len(c2_only) == 1
     assert c1_only[0]["session_id"] == "s1"
