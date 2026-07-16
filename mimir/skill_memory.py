@@ -141,9 +141,9 @@ def recall_skill_learnings(
     *kinds* optionally restricts to a valence subset (e.g.
     ``NEGATIVE_KINDS`` for the #267 surfacing path). ``None`` = all kinds.
     *now* is injectable for deterministic tests.
-    *auth_context* optionally filters results by authorization scope (visibility/
-    owner). When omitted, returns all readable atoms (legacy behavior for
-    backwards compatibility with non-authenticated callers).
+    *auth_context* filters results by authorization scope (visibility/owner).
+    When omitted, recall fails closed to public atoms only; an unavailable
+    request context must never widen a skill load to private or service memory.
 
     Each result: ``{"id", "content", "kind", "created_at"}``. Tombstoned
     atoms are excluded.
@@ -160,8 +160,12 @@ def recall_skill_learnings(
         )
         params.extend(kind_list)
 
-    auth_clause = ""
-    if auth_context is not None:
+    if auth_context is None:
+        # Context resolution is best-effort at skill-load time.  Missing context
+        # must narrow recall, not silently restore the pre-auth unfiltered path.
+        auth_clause = " AND atoms.visibility = ?"
+        params.append("public")
+    else:
         from mimir.saga.ownership import (
             authorization_predicate,
             get_authorization_scope,
@@ -267,8 +271,8 @@ def augment_skill_body(
     gotcha both help the next invocation, activation-ranked) and appends
     them under ``_LEARNINGS_HEADING``.
 
-    *auth_context* optionally filters recalled learnings by authorization
-    scope (visibility/owner). When omitted, returns all readable atoms.
+    *auth_context* filters recalled learnings by authorization scope
+    (visibility/owner). When omitted, recall fails closed to public atoms only.
 
     Returns ``(augmented_body, injected_atom_ids)``. The atom IDs let the
     caller record which learnings were injected this turn so the
