@@ -1019,10 +1019,7 @@ class ToolRegistry:
         service_principal = None
 
         if auth_context is not None:
-            trigger = getattr(auth_context, "trigger", None)
-            event_ingress = getattr(auth_context, "event_ingress", None)
-            if trigger and event_ingress is None:
-                service_principal = _find_service_principal_for_trigger(trigger)
+            service_principal = get_trusted_service_from_auth_context(auth_context)
 
         required_tier = AccessTier.USER
         reason = None
@@ -1040,6 +1037,7 @@ class ToolRegistry:
                 allowed = True
             elif service_allowed:
                 allowed = True
+                is_shadow = not enforce
             elif enforce:
                 allowed = False
                 reason = "admin_required"
