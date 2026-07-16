@@ -240,6 +240,76 @@ Each implementation issue must use the Worklink leaf template, preserve the sing
 
 Leaves 3-7 may proceed in parallel after their dependencies; leaf 8 should define the common label/sink interfaces early and can be implemented alongside them, but cannot close until every protected source and sink adapter is integrated. Leaf 9 is the integration gate. #854 closes only after all implementation leaves and the #855 policy-management surface (or an explicit decision to defer that UI while retaining operator configuration) are reconciled.
 
+## Chainlink #872 integration-gate status
+
+**Status: not ready for enforcement or multi-user ingress.** The implementation
+leaves now have an adversarial integration inventory, but this gate deliberately
+does not set `MIMIR_ACCESS_CONTROL_ENFORCED`, does not change its default, and
+does not expose multi-user ingress.
+
+### Configuration/default reconciliation
+
+- `Config.from_env()` reads `MIMIR_ACCESS_CONTROL_ENFORCED` with the default
+  `false`; `docs/configuration.md` documents the same default. No deployment,
+  compose, example-env, or test configuration in this gate sets it to true.
+- Enforcement-off remains compatibility mode for ordinary non-HTTP
+  single-operator turns. Prohibited-action guards remain active.
+- Generic `/event` credentials authenticate transport only. Server stamping
+  marks that ingress untrusted for principal authority, so every non-open call
+  is denied in both compatibility and enforcement modes unless a future
+  server-owned credential-to-principal mapping is introduced.
+- Unknown or missing authorization carriers fail closed under enforcement.
+  Unknown native, built-in/dynamically assembled, and MCP operations are not
+  implicitly open.
+
+### Adversarial matrix and exact evidence
+
+“Gate” below means a #872 integration test added at the final gate. “Inherited”
+means an exact earlier-leaf test that remains the primary proof; the gate does
+not duplicate it.
+
+| Adversarial row | Exact pytest node(s) | Evidence |
+|---|---|---|
+| Enforcement-off non-HTTP compatibility | `tests/test_dispatcher.py::test_default_compat_allows_non_allowlisted_discord_user`; `tests/test_budget_gate_and_alias.py::test_admin_gate_missing_context_allows_sensitive_tool_when_not_enforced` | Inherited: bridge dispatch and a non-open built-in preserve existing behavior. |
+| Generic HTTP is transport-only; forged author/source/trigger/extra cannot grant non-open authority | `tests/test_server.py::TestHandleEvent::test_event_stamps_http_ingress_as_untrusted_for_privileged_side_effects`; `tests/test_agent.py::test_run_turn_http_event_ingress_reaches_turn_context_before_admin_tool_auth`; `tests/test_access_control.py::test_http_transport_principal_mapping_absence_denies_every_non_open_call` | Gate + inherited: server overwrites forged ingress, the live turn carries it, and resource-scoped/unknown calls deny with enforcement both off and on. |
+| Enforcement-on missing/unknown contexts | `tests/test_access_control.py::test_enforcement_on_missing_context_denies`; `tests/test_access_control.py::test_enforcement_on_unknown_context_denies` | Gate. |
+| Structured redacted allow/deny events | `tests/test_access_control.py::test_inbound_audit_events_are_structured_and_redacted` | Gate: invokes the live dispatcher gate for allow and deny, asserts the exact schema, and proves message/extra secrets are absent. |
+| Forged session ids and mutable fields | `tests/test_access_control.py::test_forged_session_id_cannot_select_concurrent_admin_turn`; `tests/test_access_control.py::test_auth_context_ignores_mutated_resolver_and_event`; `tests/test_access_control.py::test_malformed_runtime_carrier_fails_closed_under_process_enforcement` | Inherited: model selectors, post-ingress mutation, and auth-lookalikes do not become authority. |
+| Concurrent turns | `tests/test_access_control.py::test_concurrent_turns_keep_authority_and_ifc_scope_isolated`; `tests/test_access_control.py::test_exact_request_carrier_resists_concurrent_principal_swap` | Gate + inherited: genuinely concurrent middleware calls keep principal and IFC carriers isolated; the regular turn cannot borrow admin execution. |
+| Unknown native/built-in/dynamic operation | `tests/test_tool_registry.py::test_unknown_operation_fails_closed_only_when_enforced`; `tests/test_tool_registry.py::test_runtime_inventory_replaced_from_final_model_surface`; `tests/test_tool_registry.py::test_budget_middleware_publishes_final_runtime_inventory_per_model_call`; `tests/test_budget_gate_and_alias.py::test_middleware_catches_unregistered_tools` | Inherited: unknown operation denies under enforcement and the final model-bound surface includes native/built-in/unregistered tools. |
+| Unknown MCP operation | `tests/test_access_control.py::test_unknown_mcp_tool_denies_under_enforcement`; `tests/test_mcp_client.py::TestMCPResourceAdapter::test_regular_principal_cannot_call_arbitrary_provenanced_write_tool` | Gate + inherited: an unclassified MCP name is admin-required and denied to a regular principal. |
+| Unknown/forged synthetic trigger | `tests/test_tool_registry.py::test_unknown_and_http_triggers_cannot_inherit_service_capabilities`; `tests/test_access_control.py::test_http_transport_principal_mapping_absence_denies_every_non_open_call` | Inherited + gate: unknown triggers have no service principal and a forged registered trigger over HTTP gains none. |
+| Legacy records | `tests/test_commitments_store.py::test_legacy_record_no_owner_is_admin_only`; `tests/test_saga_read_authorization.py::test_get_atoms_missing_context_does_not_reveal_legacy_or_private` | Inherited: ownerless commitments reject regular mutation; legacy-admin SAGA rows are filtered before rendering. |
+| Preloaded private context | `tests/test_information_flow.py::test_initializes_before_first_model_call_from_ingress_and_preloaded_context`; `tests/test_information_flow.py::test_preloaded_private_context_blocked_at_incompatible_auto_delivery_without_tool_call` | Inherited integration: pre-model labels initialize monotonically and block harness egress without relying on a tool call. |
+| Same-scope success | `tests/test_access_control.py::test_same_scope_private_egress_succeeds_through_live_middleware`; `tests/test_channel_resource_adapter.py::TestOperationCatalogIntegration::test_omitted_channel_send_passes_gate_as_same_scope` | Gate + inherited: the live middleware permits labeled content back to its source/trigger channel. |
+| Incompatible egress denial | `tests/test_access_control.py::test_concurrent_turns_keep_authority_and_ifc_scope_isolated`; `tests/test_information_flow.py::test_preloaded_private_context_blocked_at_incompatible_auto_delivery_without_tool_call`; `tests/test_information_flow.py::test_activity_panel_post_and_detailed_edit_use_live_labels_and_fail_closed` | Gate + inherited integration: tool egress, final auto-delivery, and activity-panel edits all fail closed for incompatible labels/destinations. |
+
+### Deferred #855 UI gate
+
+The #855 React policy-management UI/API remains intentionally deferred. This
+is not a missing runtime switch to compensate for by enabling enforcement:
+operator configuration stays the only current policy-management surface, and
+multi-user ingress stays disabled. The MCP provenance/classification substrate
+must remain the authority source if/when #855 is implemented; UI-supplied names
+alone cannot confer authority.
+
+### Enforcement-enablement blocker: trusted service recall
+
+Enforcement is **not ready** because trusted service-triggered turns
+(`scheduled_tick`, `poller`, `saga_session_end`, and `upgrade`) currently derive
+SAGA read scope from owned/public rows plus their configured
+`readable_domains`. Most existing SAGA data is migrated as
+`legacy_admin`/admin-owned, so those turns cannot recall it under enforcement
+and would become memory-blind even though parts of their tool capability matrix
+are admitted.
+
+A broad policy allowing every trusted service to read all `service` and
+`legacy_admin` memory was considered but is **not adopted here**. It may be too
+broad once services are partitioned. Enforcement must remain off until a
+narrow, reviewed service-recall policy and migration strategy preserve required
+autonomous recall without granting unrelated services each other's memory.
+Passing capability-matrix preflight does not resolve this data-plane blocker.
+
 ## Out of scope for #856
 
 This artifact does not implement the policy, migrate schemas, add the #855 UI/API, enable access-control enforcement, or enable multi-user ingress. Those changes are follow-on leaves gated by focused tests and review.

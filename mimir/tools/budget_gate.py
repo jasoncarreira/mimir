@@ -47,7 +47,7 @@ from langgraph.types import Command
 
 from ..models import AuthContext
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
-from ..access_control import get_tool_registry
+from ..access_control import OperationDecision, get_tool_registry
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
 log = logging.getLogger(__name__)
@@ -376,6 +376,21 @@ def _check_admin_authorized(
     auth = get_tool_registry().authorize_tool(
         tool_name, ctx, enforce=enforce, target_channel=target_channel, ifc_labels=ifc_labels
     )
+    # Generic HTTP credentials authenticate transport only.  Check operation
+    # class before compatibility-mode shadow allowances: resource-scoped and
+    # unknown calls are non-open even when their shadow decision says allowed.
+    if (
+        ctx is not None
+        and _turn_has_http_event_ingress(ctx)
+        and auth.decision is not OperationDecision.OPEN
+    ):
+        return _deny_admin_tool(
+            tool_name,
+            _HTTP_EVENT_ADMIN_DENIAL_REASON,
+            ctx=ctx,
+            enforcement_enabled=enforce,
+        )
+
     privileged = auth.required_tier.value == "admin" or not auth.allowed
     if not privileged:
         return None
@@ -386,16 +401,6 @@ def _check_admin_authorized(
             "missing_auth_context",
             ctx=None,
             enforcement_enabled=True,
-        )
-
-    # Generic HTTP events authenticate transport only. They cannot inherit a
-    # service principal from a client-controlled trigger or call a non-open op.
-    if ctx is not None and _turn_has_http_event_ingress(ctx):
-        return _deny_admin_tool(
-            tool_name,
-            _HTTP_EVENT_ADMIN_DENIAL_REASON,
-            ctx=ctx,
-            enforcement_enabled=enforce,
         )
 
     if auth.allowed:

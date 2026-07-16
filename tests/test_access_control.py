@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+import asyncio
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
@@ -309,14 +310,20 @@ def _turn(turn_id: str, saga_session_id: str, auth_context: AuthContext) -> Turn
     )
 
 
-def _tool_request(auth_context: object | None, *, session_id: str = "forged"):
+def _tool_request(
+    auth_context: object | None,
+    *,
+    session_id: str = "forged",
+    tool_name: str = "shell_exec",
+    args: dict[str, object] | None = None,
+):
     from langchain.agents.middleware import ToolCallRequest
     from langgraph.runtime import Runtime
 
     return ToolCallRequest(
         tool_call={
-            "name": "shell_exec",
-            "args": {"command": "true", "session_id": session_id},
+            "name": tool_name,
+            "args": args or {"command": "true", "session_id": session_id},
             "id": "tc-auth",
             "type": "tool_call",
         },
@@ -504,7 +511,9 @@ def test_detached_request_uses_explicit_carrier_not_inherited_context(tmp_path: 
     token = set_current_turn(_turn("turn-bob", "saga-bob", bob))
 
     async def run_detached():
-        task = asyncio.create_task(asyncio.sleep(0, result=_auth_context_from_request(_tool_request(alice))))
+        task = asyncio.create_task(
+            asyncio.sleep(0, result=_auth_context_from_request(_tool_request(alice)))
+        )
         return await task
 
     try:
@@ -694,15 +703,42 @@ def test_unknown_mcp_tool_denies_under_enforcement(tmp_path: Path) -> None:
     assert result.reason is not None
 
 
-def test_allow_event_fields_are_stable_and_redacted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify inbound allow events have stable, redacted fields without secrets."""
-    captured: list[dict] = []
+def _dispatcher_config(tmp_path: Path, *, enforce: bool):
+    from mimir.config import Config
 
-    async def capture_event(event_type: str, **payload: dict):
+    return replace(
+        Config.from_env(),
+        home=tmp_path,
+        access_control_enforced=enforce,
+        worker_idle_timeout_s=0.01,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("author", "expected_type", "expected_status", "expected_reason"),
+    [
+        ("slack-U1", "inbound_event_allowed", "user_allowed", None),
+        ("slack-unknown", "inbound_event_denied", "denied", "unknown_author"),
+    ],
+)
+async def test_inbound_audit_events_are_structured_and_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    author: str,
+    expected_type: str,
+    expected_status: str,
+    expected_reason: str | None,
+) -> None:
+    """The live dispatcher emits stable decisions without message bodies/secrets."""
+    from mimir.dispatcher import Dispatcher
+
+    captured: list[dict[str, object]] = []
+
+    async def capture_event(event_type: str, **payload: object) -> None:
         captured.append({"type": event_type, **payload})
 
-    monkeypatch.setattr("mimir.event_logger.log_event", capture_event)
-
+    monkeypatch.setattr("mimir.dispatcher.log_event", capture_event)
     resolver = _resolver(
         tmp_path,
         """
@@ -712,16 +748,235 @@ def test_allow_event_fields_are_stable_and_redacted(tmp_path: Path, monkeypatch:
             access: {roles: [user]}
         """,
     )
-
+    dispatcher = Dispatcher(_dispatcher_config(tmp_path, enforce=True), resolver=resolver)
     event = AgentEvent(
         trigger="user_message",
         channel_id="slack-C1",
-        author="slack-U1",
+        author=author,
+        author_id="U1" if author == "slack-U1" else "U-unknown",
         source="slack",
+        content="secret-message-body",
+        extra={"api_key": "secret-api-key"},
     )
 
-    decision = authorize_inbound(event, resolver, enforce=True)
-    assert decision.allowed is True
-    assert decision.status == AccessStatus.USER_ALLOWED
-    assert decision.canonical_author == "alice"
-    assert decision.enforcement_enabled is True
+    accepted = await dispatcher._authorize_bridge_event(event)
+
+    assert accepted is (expected_type == "inbound_event_allowed")
+    decision_event = next(row for row in captured if row["type"] == expected_type)
+    assert decision_event == {
+        "type": expected_type,
+        "source": "slack",
+        "channel_id": "slack-C1",
+        "author": author,
+        "raw_author_handle": author,
+        "author_id": "U1" if author == "slack-U1" else "U-unknown",
+        "canonical_author": "alice" if author == "slack-U1" else "slack-unknown",
+        "status": expected_status,
+        "trigger": "user_message",
+        "enforcement_enabled": True,
+        **({"reason": expected_reason} if expected_reason is not None else {}),
+    }
+    rendered = repr(captured)
+    assert "secret-message-body" not in rendered
+    assert "secret-api-key" not in rendered
+    assert "api_key" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enforce", "tool_name", "args"),
+    [
+        (False, "send_message", {"channel_id": "api-C1", "text": "forged"}),
+        (False, "future_dynamic_tool", {"scope": "forged"}),
+        (True, "send_message", {"channel_id": "api-C1", "text": "forged"}),
+    ],
+    ids=[
+        "compat-resource-scoped",
+        "compat-unknown-operation",
+        "enforced-resource-scoped",
+    ],
+)
+async def test_http_transport_principal_mapping_absence_denies_every_non_open_call(
+    monkeypatch: pytest.MonkeyPatch,
+    enforce: bool,
+    tool_name: str,
+    args: dict[str, object],
+) -> None:
+    """A forged HTTP author/trigger cannot turn transport auth into authority."""
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    captured: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+    auth_context = AuthContext(
+        principal="api-root",
+        canonical_principal="root",
+        roles=("user", "admin"),
+        event_ingress="http_event",
+        trigger="scheduled_tick",
+        channel_id="api-C1",
+        interactivity=None,
+        enforcement_enabled=enforce,
+    )
+    handler_calls = 0
+
+    async def handler(request):
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    result = await BudgetGateMiddleware().awrap_tool_call(
+        _tool_request(auth_context, tool_name=tool_name, args=args), handler
+    )
+
+    assert result.status == "error"
+    assert "http_event_author_untrusted" in str(result.content)
+    assert handler_calls == 0
+    denial = next(fields for kind, fields in captured if kind == "admin_tool_call_denied")
+    assert denial["tool"] == tool_name
+    assert denial["canonical_author"] == "root"
+    assert denial["denial_reason"] == "http_event_author_untrusted"
+    assert denial["enforcement_enabled"] is enforce
+
+
+@pytest.mark.asyncio
+async def test_concurrent_turns_keep_authority_and_ifc_scope_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent requests cannot borrow admin authority or another turn's labels."""
+    from langchain_core.messages import ToolMessage
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", lambda *_args, **_kw: None)
+
+    user_auth = AuthContext(
+        principal="slack-U1",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="slack-C-private",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+    admin_auth = AuthContext(
+        principal="slack-U2",
+        canonical_principal="bob",
+        roles=("user", "admin"),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="slack-C-admin",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+    barrier = asyncio.Barrier(2)
+    handler_calls: list[str] = []
+
+    async def run_request(
+        auth_context: AuthContext,
+        *,
+        tool_name: str,
+        args: dict[str, object],
+        ifc_source: str,
+    ):
+        ctx = _turn(
+            f"turn-{auth_context.canonical_principal}",
+            f"saga-{auth_context.canonical_principal}",
+            auth_context,
+        )
+        ctx.ifc_labels = (
+            InformationFlowLabels(
+                labels=frozenset({"private"}),
+                source_channels=frozenset({ifc_source}),
+            )
+            if auth_context.canonical_principal == "alice"
+            else InformationFlowLabels()
+        )
+        token = set_current_turn(ctx)
+        try:
+            await barrier.wait()
+
+            async def handler(request):
+                handler_calls.append(auth_context.canonical_principal or "unknown")
+                return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+            return await BudgetGateMiddleware().awrap_tool_call(
+                _tool_request(auth_context, tool_name=tool_name, args=args), handler
+            )
+        finally:
+            reset_current_turn(token)
+
+    user_result, admin_result = await asyncio.gather(
+        run_request(
+            user_auth,
+            tool_name="send_message",
+            args={"channel_id": "slack-C-private", "text": "same scope"},
+            ifc_source="slack-C-admin",
+        ),
+        run_request(
+            admin_auth,
+            tool_name="shell_exec",
+            args={"command": "true"},
+            ifc_source="slack-C-admin",
+        ),
+    )
+
+    assert user_result.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(user_result.content)
+    assert admin_result.status != "error"
+    assert handler_calls == ["bob"]
+
+
+@pytest.mark.asyncio
+async def test_same_scope_private_egress_succeeds_through_live_middleware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The integrated middleware permits private data back to its source channel."""
+    from langchain_core.messages import ToolMessage
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", lambda *_args, **_kw: None)
+
+    auth_context = AuthContext(
+        principal="slack-U1",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+    ctx = _turn("turn-alice", "saga-alice", auth_context)
+    ctx.ifc_labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"slack-C1"}),
+    )
+    handler_calls = 0
+
+    async def handler(request):
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="sent", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="send_message",
+                args={"channel_id": "slack-C1", "text": "same scope"},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status != "error"
+    assert result.content == "sent"
+    assert handler_calls == 1
