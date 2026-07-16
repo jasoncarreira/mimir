@@ -112,9 +112,9 @@ class AuthorizationScope:
         is_admin: Whether the caller has admin role
         is_service: Whether the caller is a trusted service
         is_platform_service: Whether the caller is a platform/maintenance service
-            with broad internal read (scheduler, poller, synthesis, upgrade).
-            These services can read the agent's own memory including legacy_admin
-            corpus. Tenant isolation is enforced on their outputs.
+            with full internal read (scheduler, poller, synthesis, upgrade).
+            These services can read the complete internal corpus without becoming
+            admins. Tenant isolation is enforced on their outputs.
         readable_domains: Tuple of domain names the service can read
         service_canonical: Canonical name of the service (if is_service)
     """
@@ -133,10 +133,10 @@ def _authorization_predicate(
 ) -> tuple[str, list]:
     """Build the shared owner/visibility/domain predicate for a resource table.
 
-    Platform/maintenance services (is_platform_service=True) get broad internal
-    read access: public + owned + service + legacy_admin. This allows autonomous
-    turns to recall the agent's own memory, including legacy_admin corpus from
-    pre-v7 data. Tenant isolation is enforced on their OUTPUTS via #884 + #871.
+    Platform/maintenance services (is_platform_service=True) get full internal
+    read access, matching the admin read predicate without acquiring admin role
+    or mutation authority. Tenant isolation is enforced on their OUTPUTS via
+    #884 + #871.
 
     Regular services with readable_domains get domain-restricted access plus
     public and owned rows. readable_domains is reserved for narrow external
@@ -146,23 +146,10 @@ def _authorization_predicate(
         return ("1=1", [])
 
     # Platform/maintenance services (scheduler, poller, synthesis, system) get
-    # broad internal read. They can read the agent's own memory including
-    # legacy_admin corpus. Tenant isolation is enforced on outputs.
+    # the full internal read view. This does not widen role or mutation authority;
+    # tenant isolation remains enforced on derived outputs.
     if scope.is_platform_service:
-        grants = [f"{table}.visibility = ?"]
-        params: list = [Visibility.PUBLIC.value]
-
-        grants.append(f"{table}.visibility = ?")
-        params.append(Visibility.SERVICE.value)
-
-        grants.append(f"{table}.visibility = ?")
-        params.append(Visibility.LEGACY_ADMIN.value)
-
-        if scope.principal:
-            grants.append(f"{table}.owner_principal = ?")
-            params.append(scope.principal)
-
-        return (f"({' OR '.join(grants)})", params)
+        return ("1=1", [])
 
     # Every grant is an alternative.  Combining the owner grant with the public
     # grant using AND collapses ``private + owned`` to public-only and makes a
@@ -239,8 +226,8 @@ def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
     admin or trusted-service context; omission is never ambient authority.
 
     Platform/maintenance services (scheduled_tick, poller, saga_session_end, upgrade)
-    get broad internal read access via is_platform_service=True. Tenant isolation
-    is enforced on their outputs via #884 + #871.
+    get full internal read access via is_platform_service=True without acquiring
+    admin role. Tenant isolation is enforced on their outputs via #884 + #871.
 
     Args:
         auth_context: AuthContext from mimir.models or similar

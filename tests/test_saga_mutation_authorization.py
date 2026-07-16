@@ -418,6 +418,39 @@ async def test_forgeable_read_scopes_cannot_authorize_mutation(
 
 
 @pytest.mark.asyncio
+async def test_platform_service_full_read_does_not_widen_mutation_scope(
+    client: SagaStore,
+):
+    """A platform service still cannot mutate an atom outside its domains."""
+    denied = await _atom(client, "tenant b", owner="owner-b", domain="tenant:b")
+    trigger = "test_platform_saga_service"
+    original = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+    _TRUSTED_SERVICE_PRINCIPALS[trigger] = ServicePrincipal(
+        canonical="test-platform-service",
+        trigger=trigger,
+        capabilities=("saga_feedback",),
+        readable_domains=("tenant:a",),
+        sink_destinations=("saga",),
+        creation_path="test",
+    )
+    auth_context = _service_auth(trigger, "test-platform-service")
+    try:
+        result = await client.feedback(
+            [denied],
+            "reply",
+            feedback="positive",
+            auth_context=auth_context,
+        )
+    finally:
+        if original is None:
+            _TRUSTED_SERVICE_PRINCIPALS.pop(trigger, None)
+        else:
+            _TRUSTED_SERVICE_PRINCIPALS[trigger] = original
+
+    assert result == {"marked": 0, "total": 1, "authorized": 0}
+
+
+@pytest.mark.asyncio
 async def test_trusted_service_requires_capability_and_readable_domain(
     client: SagaStore,
 ):

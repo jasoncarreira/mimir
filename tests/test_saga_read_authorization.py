@@ -210,6 +210,7 @@ def test_trusted_platform_auth_context_can_read_legacy_admin_memory(
 
     assert platform_scope.is_service is True
     assert platform_scope.is_platform_service is True
+    assert platform_scope.is_admin is False
     assert platform_scope.service_canonical == principal
 
     where, params = authorization_predicate(platform_scope, table="a")
@@ -223,7 +224,7 @@ def test_trusted_platform_auth_context_can_read_legacy_admin_memory(
     assert public in readable_ids
     assert legacy in readable_ids
     assert service in readable_ids
-    assert private not in readable_ids
+    assert private in readable_ids
 
 
 def test_forged_platform_trigger_does_not_widen_read_scope(
@@ -309,9 +310,12 @@ def test_regular_service_still_restricted_by_readable_domains(conn: sqlite3.Conn
     assert other_domain not in readable_ids
 
 
-def test_platform_service_includes_owned_rows(conn: sqlite3.Connection) -> None:
-    """Platform services can read their own owned rows."""
+def test_platform_service_gets_full_read_without_admin_role(
+    conn: sqlite3.Connection,
+) -> None:
+    """Platform read scope includes other owners without conferring admin role."""
     owned = _store(conn, "owned-by-scheduler", owner="scheduler", visibility="private")
+    other_owned = _store(conn, "owned-by-user", owner="user:alice", visibility="private")
 
     platform_scope = AuthorizationScope(
         principal="scheduler",
@@ -319,6 +323,7 @@ def test_platform_service_includes_owned_rows(conn: sqlite3.Connection) -> None:
         is_platform_service=True,
     )
 
+    assert platform_scope.is_admin is False
     where, params = authorization_predicate(platform_scope, table="a")
     readable_ids = {
         row[0]
@@ -327,4 +332,7 @@ def test_platform_service_includes_owned_rows(conn: sqlite3.Connection) -> None:
         ).fetchall()
     }
 
+    assert where == "1=1"
+    assert params == []
     assert owned in readable_ids
+    assert other_owned in readable_ids
