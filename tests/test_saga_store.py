@@ -15,6 +15,10 @@ import sqlite3
 import pytest
 
 from mimir.saga.client import SagaStore
+from mimir.saga.ownership import AuthorizationScope
+
+
+ADMIN_SCOPE = AuthorizationScope(is_admin=True)
 
 
 @pytest.fixture
@@ -147,7 +151,7 @@ async def test_store_exact_duplicate_fast_path_still_skips_embedding(client, mon
 async def test_client_query_returns_two_tier_shape(client, monkeypatch):
     _patch_provider(monkeypatch)
     await client.store("Alice prefers concise replies")
-    result = await client.query("Alice", top_k=5)
+    result = await client.query("Alice", top_k=5, auth_context=ADMIN_SCOPE)
     # Saga-compatible shape.
     assert "observations" in result
     assert "raws" in result
@@ -173,7 +177,7 @@ async def test_query_enables_session_boundary_rrf_by_default(tmp_path, monkeypat
     monkeypatch.setattr(client, "_search_sessions_with_conn", fake_search_sessions)
     monkeypatch.setattr(client, "_ensure_index", lambda conn: None)
 
-    result = await client.query("unmatched-query", top_k=5)
+    result = await client.query("unmatched-query", top_k=5, auth_context=ADMIN_SCOPE)
 
     assert [a["id"] for a in result["raws"]] == [boundary_atom["atom_id"]]
 
@@ -193,6 +197,7 @@ async def test_query_can_disable_session_boundary_rrf(tmp_path, monkeypatch):
 
     result = await client.query(
         "unmatched-query", top_k=5, enable_session_boundary_rrf=False,
+        auth_context=ADMIN_SCOPE,
     )
 
     assert result["raws"] == []
@@ -238,7 +243,7 @@ async def test_get_atoms_batch_load_preserves_order(client, monkeypatch):
     _patch_provider(monkeypatch)
     a = await client.store("first atom about apples")
     b = await client.store("second atom about bridges")
-    res = await client.get_atoms([b["atom_id"], a["atom_id"]])
+    res = await client.get_atoms([b["atom_id"], a["atom_id"]], auth_context=ADMIN_SCOPE)
     assert [x["id"] for x in res["atoms"]] == [b["atom_id"], a["atom_id"]]
     assert res["missing"] == []
     contents = {x["id"]: x["content"] for x in res["atoms"]}
@@ -249,7 +254,7 @@ async def test_get_atoms_batch_load_preserves_order(client, monkeypatch):
 async def test_get_atoms_reports_missing(client, monkeypatch):
     _patch_provider(monkeypatch)
     a = await client.store("a real atom")
-    res = await client.get_atoms([a["atom_id"], "0000nonexistent0000"])
+    res = await client.get_atoms([a["atom_id"], "0000nonexistent0000"], auth_context=ADMIN_SCOPE)
     assert [x["id"] for x in res["atoms"]] == [a["atom_id"]]
     assert res["missing"] == ["0000nonexistent0000"]
 
@@ -261,7 +266,7 @@ async def test_get_atoms_excludes_tombstoned(client, monkeypatch):
     conn = client.connection()
     conn.execute("UPDATE atoms SET tombstoned = 1 WHERE id = ?", (a["atom_id"],))
     conn.commit()
-    res = await client.get_atoms([a["atom_id"]])
+    res = await client.get_atoms([a["atom_id"]], auth_context=ADMIN_SCOPE)
     assert res["atoms"] == []
     assert res["missing"] == [a["atom_id"]]
 
@@ -273,7 +278,7 @@ async def test_get_atoms_fires_no_access_events(client, monkeypatch):
     a = await client.store("atom we will load by id")
     conn = client.connection()
     before = conn.execute("SELECT COUNT(*) FROM access_events").fetchone()[0]
-    await client.get_atoms([a["atom_id"]])
+    await client.get_atoms([a["atom_id"]], auth_context=ADMIN_SCOPE)
     after = conn.execute("SELECT COUNT(*) FROM access_events").fetchone()[0]
     assert after == before
 
@@ -283,7 +288,7 @@ async def test_get_atoms_empty_and_dedupe(client, monkeypatch):
     _patch_provider(monkeypatch)
     assert await client.get_atoms([]) == {"atoms": [], "missing": []}
     a = await client.store("dedupe me")
-    res = await client.get_atoms([a["atom_id"], a["atom_id"]])
+    res = await client.get_atoms([a["atom_id"], a["atom_id"]], auth_context=ADMIN_SCOPE)
     assert [x["id"] for x in res["atoms"]] == [a["atom_id"]]  # deduped
 
 
@@ -309,7 +314,7 @@ async def test_query_access_write_is_best_effort(client, monkeypatch):
     # An uncommitted write owned by THIS (the caller's) transaction.
     conn.execute("UPDATE atoms SET arousal = 0.99 WHERE id = ?", (r["atom_id"],))
     try:
-        result = await client.query("Alice", top_k=5)  # must NOT raise
+        result = await client.query("Alice", top_k=5, auth_context=ADMIN_SCOPE)  # must NOT raise
         # recall's skipped access-event write must NOT have rolled us back.
         arousal = conn.execute(
             "SELECT arousal FROM atoms WHERE id = ?", (r["atom_id"],)
@@ -341,6 +346,12 @@ async def test_memory_get_tool_formats_and_reports_missing(client, monkeypatch):
     from mimir.tools.memory import memory_get, set_memory_client
     a = await client.store("apple atom content")
     set_memory_client(client)
+    original_get_atoms = client.get_atoms
+
+    async def admin_get_atoms(ids, **_kwargs):
+        return await original_get_atoms(ids, auth_context=ADMIN_SCOPE)
+
+    monkeypatch.setattr(client, "get_atoms", admin_get_atoms)
     try:
         out = await memory_get.ainvoke({"atom_ids": [a["atom_id"], "missing-id"]})
     finally:
@@ -363,7 +374,7 @@ async def test_client_recent_session_boundaries(client, monkeypatch):
     _patch_provider(monkeypatch)
     await client.end_session("s1", "first")
     await client.end_session("s2", "second")
-    boundaries = await client.recent_session_boundaries(count=10)
+    boundaries = await client.recent_session_boundaries(count=10, auth_context=ADMIN_SCOPE)
     assert len(boundaries) == 2
 
 

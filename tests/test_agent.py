@@ -276,7 +276,7 @@ class _FakeSaga:
         )
         return {"atoms": self._hits, "triples": self._triples}
 
-    async def get_atoms(self, ids: list[str]):
+    async def get_atoms(self, ids: list[str], **_ignored: object):
         self.get_atoms_calls.append(list(ids))
         if self._raise_on_get_atoms:
             raise RuntimeError("saga unavailable")

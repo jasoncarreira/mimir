@@ -17,8 +17,9 @@ def _install_minimal_atom(conn: sqlite3.Connection, *, atom_id: str = "atom1") -
     """Insert enough data for FTS recall without invoking the embedding provider."""
     conn.execute(
         "INSERT INTO atoms (id, content, content_hash, created_at, stream, profile, "
-        "memory_type, source_type, metadata, agent_id) "
-        "VALUES (?, ?, ?, ?, 'semantic', 'standard', 'raw', 'test', '{}', 'default')",
+        "memory_type, source_type, metadata, agent_id, owner_principal, visibility) "
+        "VALUES (?, ?, ?, ?, 'semantic', 'standard', 'raw', 'test', '{}', 'default', "
+        "'system', 'public')",
         (atom_id, "concurrent query smoke term", atom_id, "2026-06-03T00:00:00+00:00"),
     )
     conn.commit()

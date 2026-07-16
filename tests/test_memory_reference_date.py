@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from mimir.saga.activation import compute_activation
+from mimir.saga.ownership import AuthorizationScope
 from mimir.saga.recall import recall
 
 
@@ -117,6 +118,7 @@ def test_recall_passes_reference_date_to_activation(conn):
         k=5,
         reference_date=ref_then,
         fire_access_events=False,
+        auth_scope=AuthorizationScope(is_admin=True),
     )
     ids_then = [c.atom["id"] for c in result_then.raws]
     assert "a1" in ids_then
@@ -132,6 +134,7 @@ def test_recall_passes_reference_date_to_activation(conn):
         k=5,
         reference_date=ref_now,
         fire_access_events=False,
+        auth_scope=AuthorizationScope(is_admin=True),
     )
     # The 2026-anchored retrieval should either drop the atom entirely
     # or score it strictly below the 2023-anchored retrieval. Either
@@ -171,6 +174,7 @@ def test_recall_writes_access_events_at_reference_date(conn):
         k=5,
         reference_date=ref_then,
         fire_access_events=True,
+        auth_scope=AuthorizationScope(is_admin=True),
     )
 
     # Inspect the freshest access_event for a1 — should be at ref_then,
@@ -219,6 +223,7 @@ def test_recall_default_no_reference_date_uses_wall_clock(conn):
         k=5,
         reference_date=None,
         fire_access_events=True,
+        auth_scope=AuthorizationScope(is_admin=True),
     )
     t_after = datetime.now(timezone.utc)
 

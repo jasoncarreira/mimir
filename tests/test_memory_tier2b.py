@@ -21,6 +21,7 @@ from mimir.saga.consolidate import consolidate
 from mimir.saga.mark_access import AccessEvent, mark_access
 from mimir.saga.observations import refresh_trend
 from mimir.saga.ownership import Ownership
+from mimir.saga.ownership import AuthorizationScope
 from mimir.saga.recall import recall
 from mimir.saga.reflect import reflect
 from mimir.saga.store import store
@@ -99,6 +100,7 @@ def test_strengthening_observation_outranks_weakening_at_equal_similarity(conn):
         query_embed_fn=qf,
         faiss_search_fn=lambda emb, k: [(strong, 0.85), (weak, 0.85)],
         fts_search_fn=lambda q, k: [],
+        auth_scope=AuthorizationScope(is_admin=True),
     )
     obs_order = [c.atom["id"] for c in result.observations]
     assert obs_order == [strong, weak]
@@ -142,6 +144,7 @@ def test_stale_trend_applies_largest_penalty(conn):
         query_embed_fn=qf,
         faiss_search_fn=lambda emb, k: [(weakening, 0.85), (stale, 0.85)],
         fts_search_fn=lambda q, k: [],
+        auth_scope=AuthorizationScope(is_admin=True),
     )
     weakening_c = next(c for c in result.observations
                        if c.atom["id"] == weakening)
@@ -163,6 +166,7 @@ def test_raws_have_no_trend_modifier(conn):
         query_embed_fn=qf,
         faiss_search_fn=lambda emb, k: [(raw, 0.9)],
         fts_search_fn=lambda q, k: [],
+        auth_scope=AuthorizationScope(is_admin=True),
     )
     raw_c = next(c for c in result.raws if c.atom["id"] == raw)
     assert raw_c.trend_modifier == 0.0

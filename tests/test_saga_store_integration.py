@@ -8,13 +8,14 @@ These probe the recall pipeline:
 """
 from __future__ import annotations
 
-import struct
-from pathlib import Path
-
 import pytest
 
 from mimir.saga.client import SagaStore
+from mimir.saga.ownership import AuthorizationScope
 from mimir.saga.vector_index import FAISS_AVAILABLE
+
+
+ADMIN_SCOPE = AuthorizationScope(is_admin=True)
 
 
 # Deterministic 4d "embedding" derived from text hash. Tests that need
@@ -72,9 +73,9 @@ def client(tmp_path):
 async def test_query_returns_semantically_similar_atom(client, monkeypatch):
     _patch_provider(monkeypatch)
     r1 = await client.store("Alice prefers concise replies")
-    r2 = await client.store("Bob enjoys verbose explanations")
+    await client.store("Bob enjoys verbose explanations")
     # Query that embeds close to atom #1.
-    result = await client.query("alice concise", top_k=5)
+    result = await client.query("alice concise", top_k=5, auth_context=ADMIN_SCOPE)
     ids = [a["id"] for a in result["raws"]]
     assert r1["atom_id"] in ids
 
@@ -85,7 +86,7 @@ async def test_query_returns_keyword_match_via_fts(client, monkeypatch):
     _patch_provider(monkeypatch)
     r1 = await client.store("Alice prefers concise replies")
     await client.store("Bob enjoys verbose explanations")
-    result = await client.query("concise", top_k=5)
+    result = await client.query("concise", top_k=5, auth_context=ADMIN_SCOPE)
     ids = [a["id"] for a in result["raws"]]
     assert r1["atom_id"] in ids
 
@@ -101,6 +102,7 @@ async def test_store_then_query_in_same_session_session_boost(
     r1 = await client.store("Alice prefers concise replies")
     result = await client.query(
         "alice concise", top_k=5, session_id="session-1",
+        auth_context=ADMIN_SCOPE,
     )
     ids = [a["id"] for a in result["raws"]]
     assert r1["atom_id"] in ids
@@ -119,11 +121,11 @@ async def test_index_rebuild_picks_up_new_atoms_after_rebuild(
     _patch_provider(monkeypatch)
     r1 = await client.store("Alice prefers concise replies")
     # Trigger initial build via query.
-    await client.query("alice", top_k=3)
+    await client.query("alice", top_k=3, auth_context=ADMIN_SCOPE)
     # Rebuild.
     client.rebuild_index()
     # New query should still find the atom.
-    result = await client.query("concise", top_k=5)
+    result = await client.query("concise", top_k=5, auth_context=ADMIN_SCOPE)
     ids = [a["id"] for a in result["raws"]]
     assert r1["atom_id"] in ids
 
@@ -143,6 +145,6 @@ async def test_tombstoned_atoms_dropped_from_recall(client, monkeypatch):
     from mimir.saga.forget import forget as _forget
     conn = client._ensure_conn()
     _forget(conn, [r["atom_id"]], reason="test")
-    result = await client.query("alice concise", top_k=5)
+    result = await client.query("alice concise", top_k=5, auth_context=ADMIN_SCOPE)
     ids = [a["id"] for a in result["raws"]]
     assert r["atom_id"] not in ids

@@ -10,6 +10,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from mimir.saga.client import SagaStore
+from mimir.saga.ownership import AuthorizationScope
+
+
+ADMIN_SCOPE = AuthorizationScope(is_admin=True)
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -68,7 +72,7 @@ async def test_search_sessions_basic_result_shape(store):
     await store.end_session("sess-b", "Cooking pasta and risotto",
                             channel_id="discord-test")
 
-    results = await store.search_sessions("programming patterns")
+    results = await store.search_sessions("programming patterns", auth_context=ADMIN_SCOPE)
     assert isinstance(results, list)
     assert len(results) >= 1, (
         "expected at least one result after two end_session calls; "
@@ -106,7 +110,7 @@ async def test_search_sessions_skips_mismatched_dim_embedding(store, tmp_path, m
     con.commit()
     con.close()
 
-    results = await store.search_sessions("programming patterns", alpha=1.0)
+    results = await store.search_sessions("programming patterns", alpha=1.0, auth_context=ADMIN_SCOPE)
     by_id = {r["session_id"]: r for r in results}
     # The mismatched-dim session is skipped → similarity 0, not garbage.
     assert by_id["sess-bad"]["similarity_score"] == 0.0
@@ -127,7 +131,7 @@ async def test_search_sessions_recency_ordering(store):
                  (old_ts, "sess-older"))
     conn.commit()
 
-    results = await store.search_sessions("topics", alpha=0.0, limit=10)
+    results = await store.search_sessions("topics", alpha=0.0, limit=10, auth_context=ADMIN_SCOPE)
     test_results = [r for r in results
                     if r["session_id"] in ("sess-recent", "sess-older")]
     assert len(test_results) == 2, "both test sessions must be returned"
@@ -145,8 +149,8 @@ async def test_search_sessions_channel_filter(store):
     await store.end_session("sess-beta", "Beta channel session",
                             channel_id="ch-beta")
 
-    alpha_results = await store.search_sessions("session", channel_id="ch-alpha")
-    beta_results = await store.search_sessions("session", channel_id="ch-beta")
+    alpha_results = await store.search_sessions("session", channel_id="ch-alpha", auth_context=ADMIN_SCOPE)
+    beta_results = await store.search_sessions("session", channel_id="ch-beta", auth_context=ADMIN_SCOPE)
 
     alpha_ids = {r["session_id"] for r in alpha_results}
     beta_ids = {r["session_id"] for r in beta_results}
@@ -164,7 +168,7 @@ async def test_search_sessions_limit(store):
         await store.end_session(f"sess-{i}", f"Session {i} summary",
                                 channel_id="ch-limit")
 
-    results = await store.search_sessions("session summary", limit=3)
+    results = await store.search_sessions("session summary", limit=3, auth_context=ADMIN_SCOPE)
     assert len(results) <= 3
 
 
@@ -257,7 +261,9 @@ async def test_search_sessions_schema_migration_adds_embedding_columns(
 
     # Step 6: Verify the original session row survived and is searchable
     # (recency path, alpha=0 avoids needing an embedding).
-    results = await s2.search_sessions("migration test", alpha=0.0)
+    results = await s2.search_sessions(
+        "migration test", alpha=0.0, auth_context=ADMIN_SCOPE,
+    )
     session_ids = {r["session_id"] for r in results}
     assert "sess-migrate" in session_ids, \
         "search_sessions should return the session via the recency path after migration"
@@ -681,7 +687,9 @@ async def test_search_sessions_null_ended_at_falls_back_to_reflected_at(
     )
     conn.commit()
 
-    results = await store.search_sessions("anything", limit=10, alpha=0.0)
+    results = await store.search_sessions(
+        "anything", limit=10, alpha=0.0, auth_context=ADMIN_SCOPE,
+    )
     by_id = {r["session_id"]: r for r in results}
     # A (recent reflected_at) must out-score B (old reflected_at) —
     # neither should be 1.0-by-accident.
@@ -709,7 +717,9 @@ async def test_search_sessions_no_timestamp_ranks_last(store, monkeypatch):
     )
     conn.commit()
 
-    results = await store.search_sessions("anything", limit=10, alpha=0.0)
+    results = await store.search_sessions(
+        "anything", limit=10, alpha=0.0, auth_context=ADMIN_SCOPE,
+    )
     by_id = {r["session_id"]: r for r in results}
     assert by_id["sess-null"]["recency_score"] == 0.0
     assert by_id["sess-real"]["recency_score"] > 0.0

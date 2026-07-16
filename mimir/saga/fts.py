@@ -33,8 +33,12 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from typing import TYPE_CHECKING
 
 from ._like import escape_like_pattern
+
+if TYPE_CHECKING:
+    from .ownership import AuthorizationScope
 
 
 # Same stopword list saga uses — empirically tuned for English
@@ -152,6 +156,7 @@ def fts_search(
     memory_type: str | None = None,
     agent_id: str = "default",
     synonyms: dict[str, list[str]] | None = None,
+    auth_scope: "AuthorizationScope | None" = None,
 ) -> list[tuple[str, float]]:
     """Run an FTS5-backed keyword search. Returns
     ``[(atom_id, keyword_score)]`` sorted by score (highest first).
@@ -181,6 +186,12 @@ def fts_search(
     # shared atom silently miss. The agent_id value stays parameterized.
     where = ["a.tombstoned = 0", "a.agent_id IN (?, 'shared')"]
     params: list = [fts_q, agent_id]
+    if auth_scope is not None:
+        from .ownership import authorization_predicate
+
+        auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+        where.append(auth_where)
+        params.extend(auth_params)
     if memory_type:
         where.append("a.memory_type = ?")
         params.append(memory_type)
@@ -204,6 +215,7 @@ def fts_search(
             top_k=top_k,
             memory_type=memory_type,
             agent_id=agent_id,
+            auth_scope=auth_scope,
         )
 
     return [(r[0], -float(r[1]) * 100.0) for r in rows]
@@ -216,6 +228,7 @@ def _fts_fallback(
     top_k: int,
     memory_type: str | None,
     agent_id: str,
+    auth_scope: "AuthorizationScope | None" = None,
 ) -> list[tuple[str, float]]:
     """Plain LIKE search, term-count score. Used when FTS5 is missing
     (pre-trigger schema migration) or when fts5_query produced syntax
@@ -231,11 +244,18 @@ def _fts_fallback(
         ["LOWER(a.content) LIKE ? ESCAPE '\\'"] * len(terms)
     )
     where = [like_clauses, "a.tombstoned = 0", "a.agent_id IN (?, 'shared')"]  # #491
+    auth_params: list = []
+    if auth_scope is not None:
+        from .ownership import authorization_predicate
+
+        auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+        where.append(auth_where)
     if memory_type:
         where.append("a.memory_type = ?")
     where_sql = " AND ".join(where)
 
     params: list = [f"%{escape_like_pattern(t)}%" for t in terms] + [agent_id]
+    params.extend(auth_params)
     if memory_type:
         params.append(memory_type)
     params.append(top_k)

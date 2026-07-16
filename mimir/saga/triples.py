@@ -41,7 +41,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from ._like import escape_like_pattern
 from .ownership import Ownership, intersect_acl, intersect_acl_from_rows
@@ -597,6 +597,7 @@ def triple_augment_search(
     top_k: int = 10,
     dim: int | None = None,
     reference_date=None,
+    auth_context: Any = None,
 ) -> list[tuple[str, float]]:
     """P41-style triple-augmented retrieval.
 
@@ -614,28 +615,38 @@ def triple_augment_search(
     expiry filter. Expired triples (valid_until ≤ reference_date) are
     excluded from the candidate set — they represent superseded facts
     and should not surface in retrieval. Defaults to utcnow when None.
+
+    chainlink #883: authorization filters triples based on source atom ownership.
     """
+    from .ownership import (
+        authorization_predicate,
+        get_authorization_scope,
+    )
+
+    auth_scope = get_authorization_scope(auth_context)
+    auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+
     ref_iso = (
         reference_date.isoformat()
         if reference_date is not None
         else datetime.now(timezone.utc).isoformat()
     )
     rows = conn.execute(
-        "SELECT id, source_atom_id, embedding, embedding_dim "
-        "FROM triples WHERE tombstoned = 0 AND embedding IS NOT NULL "
-        "AND (valid_until IS NULL OR valid_until > ?)",
-        (ref_iso,),
+        f"""SELECT t.id, t.source_atom_id, t.embedding, t.embedding_dim
+            FROM triples t
+            JOIN atoms a ON t.source_atom_id = a.id
+            WHERE t.tombstoned = 0 AND t.embedding IS NOT NULL
+              AND (t.valid_until IS NULL OR t.valid_until > ?)
+              AND {auth_where}
+        """,
+        (ref_iso,) + tuple(auth_params),
     ).fetchall()
     if not rows:
         return []
-    # Candidates with a real source_atom_id (others can't surface an atom).
     candidates = [r for r in rows if r[1] is not None]
-    # Vectorized cosine (chainlink #257): embedding=col 2, embedding_dim=col 3.
     scores = _cosine_scores(
         query_emb, [(r[2], r[3]) for r in candidates], dim=dim,
     )
-    # Multiple triples may point at the same source_atom_id; keep the best
-    # match per atom (atoms surface via their *strongest* triple).
     best: dict[str, float] = {}
     for i, sim in scores:
         source_atom_id = candidates[i][1]
@@ -652,6 +663,7 @@ def top_triples_with_payload(
     top_n: int = 10,
     dim: int | None = None,
     reference_date=None,
+    auth_context: Any = None,
 ) -> list[dict]:
     """Same cosine match as ``triple_augment_search`` but returns the
     FULL triple data — subject/predicate/object/source_atom_id/valid
@@ -672,23 +684,36 @@ def top_triples_with_payload(
     Defaults to utcnow when None. Documents the behaviour the config
     key ``include_triples_in_response`` claims: "Filters out triples
     whose valid_until has expired."
+
+    chainlink #883: authorization filters triples based on source atom ownership.
     """
+    from .ownership import (
+        authorization_predicate,
+        get_authorization_scope,
+    )
+
+    auth_scope = get_authorization_scope(auth_context)
+    auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+
     ref_iso = (
         reference_date.isoformat()
         if reference_date is not None
         else datetime.now(timezone.utc).isoformat()
     )
     rows = conn.execute(
-        "SELECT id, source_atom_id, subject, predicate, object, "
-        "valid_from, valid_until, confidence, embedding, embedding_dim "
-        "FROM triples WHERE tombstoned = 0 AND embedding IS NOT NULL "
-        "AND (valid_until IS NULL OR valid_until > ?)",
-        (ref_iso,),
+        f"""SELECT t.id, t.source_atom_id, t.subject, t.predicate, t.object,
+                  t.valid_from, t.valid_until, t.confidence, t.embedding, t.embedding_dim
+            FROM triples t
+            JOIN atoms a ON t.source_atom_id = a.id
+            WHERE t.tombstoned = 0 AND t.embedding IS NOT NULL
+              AND (t.valid_until IS NULL OR t.valid_until > ?)
+              AND {auth_where}
+        """,
+        (ref_iso,) + tuple(auth_params),
     ).fetchall()
     if not rows:
         return []
     candidates = [r for r in rows if r[1] is not None]
-    # Vectorized cosine (chainlink #257): embedding=col 8, embedding_dim=col 9.
     scores = _cosine_scores(
         query_emb, [(r[8], r[9]) for r in candidates], dim=dim,
     )
@@ -719,18 +744,33 @@ def retrieve_by_entity(
     entity: str,
     *,
     top_k: int = 50,
+    auth_context: Any = None,
 ) -> list[dict]:
     """Substring match on subject or object. Used for direct entity
     probes ("what did the user say about Alice?") where the query
-    *names* the entity and we can skip the embedding path."""
+    *names* the entity and we can skip the embedding path.
+
+    chainlink #883: authorization filters triples based on source atom ownership.
+    """
+    from .ownership import (
+        authorization_predicate,
+        get_authorization_scope,
+    )
+
+    auth_scope = get_authorization_scope(auth_context)
+    auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+
     pat = f"%{escape_like_pattern(entity)}%"
     rows = conn.execute(
-        "SELECT id, subject, predicate, object, source_atom_id, "
-        "valid_from, valid_until "
-        "FROM triples WHERE tombstoned = 0 "
-        "AND (subject LIKE ? ESCAPE '\\' OR object LIKE ? ESCAPE '\\') "
-        "LIMIT ?",
-        (pat, pat, top_k),
+        f"""SELECT t.id, t.subject, t.predicate, t.object, t.source_atom_id,
+                  t.valid_from, t.valid_until
+            FROM triples t
+            JOIN atoms a ON t.source_atom_id = a.id
+            WHERE t.tombstoned = 0
+              AND (t.subject LIKE ? ESCAPE '\\' OR t.object LIKE ? ESCAPE '\\')
+              AND {auth_where}
+            LIMIT ?""",
+        (pat, pat, *auth_params, top_k),
     ).fetchall()
     return [
         {
