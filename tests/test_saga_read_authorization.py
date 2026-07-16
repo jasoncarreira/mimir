@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from mimir.access_control import create_auth_context
+from mimir.models import AgentEvent
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import (
     AuthorizationScope,
@@ -176,23 +178,39 @@ async def test_get_atoms_missing_context_does_not_reveal_legacy_or_private(
     assert payload["missing"] == [private, legacy]
 
 
-def test_platform_service_can_read_legacy_admin_memory(conn: sqlite3.Connection) -> None:
-    """Platform services (scheduler, poller, synthesis, upgrade) can read legacy_admin corpus.
-
-    This is the core fix for chainlink #897: after migration #881, existing memory
-    has visibility=legacy_admin. Platform services need to read this memory to
-    function properly. Tenant isolation is enforced on outputs via #884 + #871.
-    """
+@pytest.mark.parametrize(
+    ("trigger", "principal"),
+    [
+        ("scheduled_tick", "scheduler"),
+        ("poller", "poller"),
+        ("saga_session_end", "synthesis"),
+        ("upgrade", "system"),
+    ],
+)
+def test_trusted_platform_auth_context_can_read_legacy_admin_memory(
+    conn: sqlite3.Connection,
+    trigger: str,
+    principal: str,
+) -> None:
+    """Each server-created platform carrier can read the migrated legacy corpus."""
     public = _store(conn, "public", owner="other", visibility="public")
     legacy = _store(conn, "legacy", owner="legacy_admin", visibility="legacy_admin")
     service = _store(conn, "service-scoped", owner="scheduler", visibility="service")
     private = _store(conn, "private", owner="user:alice", visibility="private")
 
-    platform_scope = AuthorizationScope(
-        principal="service:scheduler",
-        is_service=True,
-        is_platform_service=True,
+    auth_context = create_auth_context(
+        AgentEvent(
+            trigger=trigger,
+            channel_id=f"service:{trigger}",
+            service_principal=principal,
+        ),
+        enforce=True,
     )
+    platform_scope = get_authorization_scope(auth_context)
+
+    assert platform_scope.is_service is True
+    assert platform_scope.is_platform_service is True
+    assert platform_scope.service_canonical == principal
 
     where, params = authorization_predicate(platform_scope, table="a")
     readable_ids = {
@@ -206,6 +224,33 @@ def test_platform_service_can_read_legacy_admin_memory(conn: sqlite3.Connection)
     assert legacy in readable_ids
     assert service in readable_ids
     assert private not in readable_ids
+
+
+def test_forged_platform_trigger_does_not_widen_read_scope(
+    conn: sqlite3.Connection,
+) -> None:
+    legacy = _store(conn, "legacy", owner="legacy_admin", visibility="legacy_admin")
+    auth_context = create_auth_context(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="api-request",
+            service_principal="scheduler",
+        ),
+        event_ingress="http-api",
+        enforce=True,
+    )
+    scope = get_authorization_scope(auth_context)
+
+    assert scope.is_service is False
+    assert scope.is_platform_service is False
+    where, params = authorization_predicate(scope, table="a")
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+    assert legacy not in readable_ids
 
 
 def test_platform_service_can_read_service_scoped_memory(conn: sqlite3.Connection) -> None:
