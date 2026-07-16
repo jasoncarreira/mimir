@@ -12,6 +12,7 @@ from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import (
     AccessStatus,
     DenialReason,
+    HTTP_EVENT_INGRESS_EXTRA_KEY,
     authorize_action,
     authorize_inbound,
     create_auth_context,
@@ -241,7 +242,7 @@ def test_auth_context_carries_ingress_provenance(tmp_path: Path) -> None:
         channel_id="slack-C1",
         author="slack-U1",
         content="hello",
-        extra={"event_ingress": "http-api"},
+        extra={HTTP_EVENT_INGRESS_EXTRA_KEY: "http-api"},
     )
     auth_ctx = create_auth_context(event, resolver)
 
@@ -295,6 +296,26 @@ def test_service_only_identity_does_not_get_user_inbound_access(tmp_path: Path) 
     assert trusted.allowed is True
     assert trusted.status == AccessStatus.USER_ALLOWED
     assert trusted.roles == ("service", "user")
+
+
+def test_http_ingress_extra_key_blocks_service_grant() -> None:
+    """Verify that HTTP ingress via extra[HTTP_EVENT_INGRESS_EXTRA_KEY] blocks service authority.
+
+    This is a defense-in-depth check: even when an event matches a registered
+    service principal (trigger + canonical), if it came via HTTP ingress
+    (detected via the canonical extra key), service authority should NOT be granted.
+    """
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+        extra={HTTP_EVENT_INGRESS_EXTRA_KEY: "http-api"},
+    )
+
+    auth_ctx = create_auth_context(event, enforce=True)
+
+    assert auth_ctx.event_ingress is not None, "HTTP ingress should be detected from extra"
+    assert auth_ctx.is_service is False, "Service authority should NOT be granted for HTTP ingress"
 
 
 def _turn(turn_id: str, saga_session_id: str, auth_context: AuthContext) -> TurnContext:

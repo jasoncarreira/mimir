@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from .identities import AccessMetadata
 
+HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
+
 if TYPE_CHECKING:
     from .identities import IdentityResolver
     from .models import AgentEvent, AuthContext
@@ -1650,7 +1652,7 @@ def create_auth_context(
         and event_ingress is None
         and not (
             isinstance(event.extra, dict)
-            and event.extra.get("event_ingress") is not None
+            and event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is not None
         )
     ):
         canonical = registered_service.canonical
@@ -1663,7 +1665,7 @@ def create_auth_context(
         event_ingress=(
             event_ingress
             if event_ingress is not None
-            else event.extra.get("event_ingress") if isinstance(event.extra, dict) else None
+            else event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) if isinstance(event.extra, dict) else None
         ),
         trigger=event.trigger,
         channel_id=event.channel_id,
