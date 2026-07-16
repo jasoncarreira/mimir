@@ -200,17 +200,7 @@ class SinkGate:
         """
         from .models import InformationFlowLabels
 
-        is_service = getattr(auth_context, "is_service", False) if auth_context else False
-
         if not isinstance(ifc_labels, InformationFlowLabels):
-            if is_service:
-                return ToolAuthorization(
-                    tool_name=tool_name,
-                    decision=OperationDecision.OPEN,
-                    allowed=True,
-                    reason="service_principal_no_labels",
-                    enforcement_enabled=enforce,
-                )
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
@@ -223,14 +213,6 @@ class SinkGate:
 
         sink_category = get_sink_category(tool_name)
         if sink_category == SinkCategory.UNKNOWN:
-            if is_service:
-                return ToolAuthorization(
-                    tool_name=tool_name,
-                    decision=OperationDecision.OPEN,
-                    allowed=True,
-                    reason="service_principal_unknown_sink",
-                    enforcement_enabled=enforce,
-                )
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
@@ -239,15 +221,6 @@ class SinkGate:
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
-            )
-
-        if is_service:
-            return ToolAuthorization(
-                tool_name=tool_name,
-                decision=OperationDecision.OPEN,
-                allowed=True,
-                reason="service_principal",
-                enforcement_enabled=enforce,
             )
 
         if not target:
@@ -1032,7 +1005,8 @@ class ToolRegistry:
         The ifc_labels parameter enables information flow control sink gate
         checks (chainlink #871).
         """
-        if ifc_labels is not None:
+        sink_category = get_sink_category(tool_name)
+        if ifc_labels is not None or sink_category != SinkCategory.UNKNOWN:
             sink_check = SinkGate.check_sink_flow(
                 tool_name,
                 target_channel,
