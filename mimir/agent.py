@@ -567,6 +567,8 @@ def _extract_atom_ids_from_tool_results(messages: list[Any]) -> list[str]:
 async def _resolve_heuristic_atom_ids(
     saga_client: SagaClient,
     atom_ids: list[str],
+    *,
+    auth_context: Any = None,
 ) -> list[str]:
     """Keep only heuristic ids that resolve to live SAGA atoms.
 
@@ -582,7 +584,7 @@ async def _resolve_heuristic_atom_ids(
     if not callable(get_atoms):
         return clean
     try:
-        payload = await get_atoms(clean)
+        payload = await get_atoms(clean, auth_context=auth_context)
     except Exception as exc:  # noqa: BLE001
         log.debug("heuristic saga atom id validation failed: %s", exc)
         return clean
@@ -2177,6 +2179,7 @@ class Agent:
                     top_k=12,
                     session_id=saga_session_id,
                     context=rewrite_context,
+                    auth_context=initial_auth_context,
                 )
                 raw_block = _format_saga_payload(payload)
                 if raw_block and raw_block != "(no atoms)":
@@ -2191,7 +2194,9 @@ class Agent:
                     if aid not in seen:
                         seen.add(aid)
                         saga_atom_ids.append(aid)
-                for aid in await _resolve_heuristic_atom_ids(self._saga, triple_ids):
+                for aid in await _resolve_heuristic_atom_ids(
+                    self._saga, triple_ids, auth_context=initial_auth_context,
+                ):
                     if aid not in seen:
                         seen.add(aid)
                         saga_atom_ids.append(aid)
@@ -2544,6 +2549,7 @@ class Agent:
             tool_atom_ids = await _resolve_heuristic_atom_ids(
                 self._saga,
                 _extract_atom_ids_from_tool_results(messages),
+                auth_context=ctx.auth_context,
             )
             for aid in tool_atom_ids:
                 if aid not in saga_atom_ids:

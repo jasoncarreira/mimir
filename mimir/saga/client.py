@@ -107,12 +107,46 @@ def _query_embed_sync(text: str) -> list[float]:
         return []
 
 
-def _make_faiss_search_fn(index: VectorIndex | None):
-    """Closure over the VectorIndex matching recall.FaissSearchFn shape."""
+def _make_faiss_search_fn(
+    index: VectorIndex | None,
+    conn: sqlite3.Connection | None = None,
+    *,
+    auth_scope=None,
+    agent_id: str = "default",
+):
+    """Return an authorization-scoped VectorIndex search adapter.
+
+    FAISS cannot express the SQL ownership predicate itself, so the adapter
+    materializes the caller's authorized live-id set before search and removes
+    unauthorized IDs before they reach RRF.  It over-fetches to the index size
+    so authorized results are not truncated merely because hidden vectors rank
+    above them.
+    """
     def _fn(query_emb: list[float], top_k: int) -> list[tuple[str, float]]:
         if index is None:
             return []
-        return index.search(query_emb, top_k=top_k)
+        if conn is None or auth_scope is None:
+            return index.search(query_emb, top_k=top_k)
+
+        from .ownership import authorization_predicate
+
+        auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+        allowed = {
+            row[0]
+            for row in conn.execute(
+                f"SELECT a.id FROM atoms a WHERE a.tombstoned = 0 "
+                f"AND a.agent_id IN (?, 'shared') AND {auth_where}",
+                [agent_id] + auth_params,
+            ).fetchall()
+        }
+        if not allowed:
+            return []
+        search_k = max(top_k, index.total_vectors)
+        return [
+            (atom_id, similarity)
+            for atom_id, similarity in index.search(query_emb, top_k=search_k)
+            if atom_id in allowed
+        ][:top_k]
     return _fn
 
 
@@ -121,6 +155,7 @@ def _make_fts_search_fn(
     *,
     agent_id: str = "default",
     synonyms: dict[str, list[str]] | None = None,
+    auth_scope=None,
 ):
     """Closure over the connection matching recall.FtsSearchFn shape.
     ``synonyms`` is the P12 query-expansion dict (FTS-only pathway)."""
@@ -128,6 +163,7 @@ def _make_fts_search_fn(
         return fts_search(
             conn, query, top_k=top_k,
             agent_id=agent_id, synonyms=synonyms,
+            auth_scope=auth_scope,
         )
     return _fn
 
@@ -779,6 +815,9 @@ class SagaStore:
 
             with self._index_lock:
                 index = self._ensure_index(conn)
+            from .ownership import get_authorization_scope
+
+            auth_scope = get_authorization_scope(auth_context)
             # Triple-augment pathway uses the SAME embedding dim as the
             # atom-level FAISS index (triples are embedded under the
             # same provider). Pass dim through so triples with a stale
@@ -787,10 +826,13 @@ class SagaStore:
             result = _recall(
                 conn, effective_query,
                 query_embed_fn=lambda _q: query_emb,
-                faiss_search_fn=_make_faiss_search_fn(index),
+                faiss_search_fn=_make_faiss_search_fn(
+                    index, conn, auth_scope=auth_scope, agent_id=self._agent_id,
+                ),
                 fts_search_fn=_make_fts_search_fn(
                     conn, agent_id=self._agent_id,
                     synonyms=self._synonyms,
+                    auth_scope=auth_scope,
                 ),
                 triple_search_fn=_make_triple_search_fn(
                     conn, dim=triple_dim, reference_date=reference_date,
@@ -805,6 +847,7 @@ class SagaStore:
                 min_confidence_tier=min_confidence_tier,
                 fire_access_events=False,
                 auth_context=auth_context,
+                auth_scope=auth_scope,
             )
             returned_atom_ids = [
                 c.atom["id"] for c in (result.observations + result.raws)
@@ -931,7 +974,7 @@ class SagaStore:
                  ORDER BY created_at, rowid
                  LIMIT ?
                 """,
-                (sid, cap) + tuple(auth_params),
+                (sid, *auth_params, cap),
             ).fetchall()
             for (atom_id,) in rows:
                 if atom_id not in seen:
@@ -994,7 +1037,6 @@ class SagaStore:
             return {"atoms": [], "missing": []}
 
         from .ownership import (
-            AuthorizationScope,
             authorization_predicate,
             get_authorization_scope,
         )

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from mimir.saga.ownership import AuthorizationScope
 from mimir.saga.triples import (
     detect_contradictions,
     get_current_value,
@@ -22,6 +23,7 @@ from mimir.saga.triples import (
 
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"
+ADMIN_SCOPE = AuthorizationScope(is_admin=True)
 
 
 @pytest.fixture
@@ -372,7 +374,9 @@ def test_triple_augment_search_returns_atom_ids(conn):
     store_triples(conn, [
         {"subject": "Alice", "predicate": "prefers", "object": "concise"},
     ], source_atom_id="obs1", embed_fn=embed_fn)
-    results = triple_augment_search(conn, [1.0, 0.0, 0.0, 0.0], top_k=5)
+    results = triple_augment_search(
+        conn, [1.0, 0.0, 0.0, 0.0], top_k=5, auth_context=ADMIN_SCOPE,
+    )
     assert results
     assert results[0][0] == "obs1"
     # Cosine of identical vectors is 1.0.
@@ -387,7 +391,9 @@ def test_triple_augment_search_skips_tombstoned(conn):
     ], source_atom_id="obs1", embed_fn=embed_fn)
     conn.execute("UPDATE triples SET tombstoned = 1")
     conn.commit()
-    results = triple_augment_search(conn, [1.0, 0.0, 0.0, 0.0], top_k=5)
+    results = triple_augment_search(
+        conn, [1.0, 0.0, 0.0, 0.0], top_k=5, auth_context=ADMIN_SCOPE,
+    )
     assert results == []
 
 
@@ -396,7 +402,9 @@ def test_triple_augment_search_skips_no_embedding(conn):
     store_triples(conn, [
         {"subject": "Alice", "predicate": "prefers", "object": "concise"},
     ], source_atom_id="obs1", embed_fn=None)
-    results = triple_augment_search(conn, [1.0, 0.0, 0.0, 0.0], top_k=5)
+    results = triple_augment_search(
+        conn, [1.0, 0.0, 0.0, 0.0], top_k=5, auth_context=ADMIN_SCOPE,
+    )
     assert results == []
 
 
@@ -417,7 +425,7 @@ def test_triple_augment_search_excludes_expired_triples(conn):
     ], source_atom_id="obs2", embed_fn=embed_fn)
     ref = datetime(2026, 1, 1, tzinfo=timezone.utc)
     results = triple_augment_search(conn, [1.0, 0.0, 0.0, 0.0], top_k=5,
-                                    reference_date=ref)
+                                    reference_date=ref, auth_context=ADMIN_SCOPE)
     atom_ids = [r[0] for r in results]
     assert "obs1" in atom_ids   # live triple surfaces
     assert "obs2" not in atom_ids  # expired triple excluded
@@ -434,7 +442,7 @@ def test_triple_augment_search_includes_future_valid_until(conn):
     ], source_atom_id="obs1", embed_fn=embed_fn)
     ref = datetime(2026, 1, 1, tzinfo=timezone.utc)
     results = triple_augment_search(conn, [1.0, 0.0, 0.0, 0.0], top_k=5,
-                                    reference_date=ref)
+                                    reference_date=ref, auth_context=ADMIN_SCOPE)
     assert results  # not expired
 
 
@@ -447,7 +455,7 @@ def test_retrieve_by_entity_substring(conn):
         {"subject": "Alice", "predicate": "prefers", "object": "concise"},
         {"subject": "Bob", "predicate": "enjoys", "object": "verbose"},
     ], source_atom_id="obs1")
-    results = retrieve_by_entity(conn, "Alice")
+    results = retrieve_by_entity(conn, "Alice", auth_context=ADMIN_SCOPE)
     assert any(r["subject"] == "Alice" for r in results)
     assert not any(r["subject"] == "Bob" for r in results)
 
@@ -460,7 +468,7 @@ def test_retrieve_by_entity_escapes_like_percent(conn):
         {"subject": "Bob", "predicate": "enjoys", "object": "verbose"},
     ], source_atom_id="obs1")
 
-    results = retrieve_by_entity(conn, "%")
+    results = retrieve_by_entity(conn, "%", auth_context=ADMIN_SCOPE)
 
     assert [r["subject"] for r in results] == ["Discount%"]
 
@@ -472,7 +480,7 @@ def test_retrieve_by_entity_escapes_like_underscore(conn):
         {"subject": "AxB", "predicate": "means", "object": "wildcard_only"},
     ], source_atom_id="obs1")
 
-    results = retrieve_by_entity(conn, "A_B")
+    results = retrieve_by_entity(conn, "A_B", auth_context=ADMIN_SCOPE)
 
     assert [r["subject"] for r in results] == ["A_B"]
 

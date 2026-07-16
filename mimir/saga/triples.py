@@ -41,7 +41,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from ._like import escape_like_pattern
 
@@ -630,7 +630,7 @@ def retrieve_by_entity(
               AND (t.subject LIKE ? ESCAPE '\\' OR t.object LIKE ? ESCAPE '\\')
               AND {auth_where}
             LIMIT ?""",
-        (pat, pat, top_k) + tuple(auth_params),
+        (pat, pat, *auth_params, top_k),
     ).fetchall()
     return [
         {

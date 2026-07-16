@@ -222,6 +222,7 @@ def recall(
     reference_date=None,
     min_confidence_tier: str | None = None,
     auth_context: Any = None,
+    auth_scope: AuthorizationScope | None = None,
 ) -> RecallResult:
     """Two-pass recall. See SCORING.md for the contract.
 
@@ -238,8 +239,11 @@ def recall(
     thresholds = thresholds or DEFAULT_STREAM_THRESHOLDS
     weights = weights or DEFAULT_SCORING_WEIGHTS
 
-    # chainlink #883: authorization scope for read security
-    auth_scope = get_authorization_scope(auth_context)
+    # chainlink #883: authorization scope for read security. Candidate
+    # adapters are responsible for applying this scope before returning IDs;
+    # the hydration predicate below is a defense-in-depth recheck, not the
+    # ranking boundary.
+    auth_scope = auth_scope or get_authorization_scope(auth_context)
 
     # ── Pass 1: candidate generation ────────────────────────────────
     query_emb = query_embed_fn(query)
@@ -261,6 +265,33 @@ def recall(
             )
         except Exception:
             triple_candidates = []
+
+    # Defense-in-depth for injected/custom candidate adapters (including the
+    # in-memory callables used by tests): compress every ranked list to IDs the
+    # SQL predicate authorizes BEFORE rank maps or RRF scores are computed.
+    # Production FTS/triple adapters already apply the predicate in their own
+    # candidate SQL; FAISS has no SQL predicate surface, so its adapter filters
+    # against a SQL-materialized allowed-id set before returning here.
+    raw_candidate_ids = {
+        aid for aid, _ in (faiss_candidates + fts_candidates + triple_candidates)
+        if isinstance(aid, str) and aid
+    }
+    authorized_ids: set[str] = set()
+    if raw_candidate_ids:
+        placeholders = ",".join(["?"] * len(raw_candidate_ids))
+        auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+        authorized_ids = {
+            row[0]
+            for row in conn.execute(
+                f"SELECT a.id FROM atoms a WHERE a.id IN ({placeholders}) "
+                f"AND a.tombstoned = 0 AND {auth_where}",
+                list(raw_candidate_ids) + auth_params,
+            ).fetchall()
+        }
+    faiss_candidates = [item for item in faiss_candidates if item[0] in authorized_ids]
+    fts_candidates = [item for item in fts_candidates if item[0] in authorized_ids]
+    triple_candidates = [item for item in triple_candidates if item[0] in authorized_ids]
+
     sim_map = {aid: sim for aid, sim in faiss_candidates}
     kw_map = {aid: kw for aid, kw in fts_candidates}
     triple_sim_map = {aid: sim for aid, sim in triple_candidates}
@@ -271,7 +302,26 @@ def recall(
     keyword_rank_map = {aid: i + 1 for i, (aid, _) in enumerate(fts_candidates)}
     triple_rank_map = {aid: i + 1 for i, (aid, _) in enumerate(triple_candidates)}
     extra_ranked_lists: dict[str, list[str]] = {}
-    for pathway, atom_ids in (extra_atom_ranked_pathways or {}).items():
+    raw_extra_pathways = extra_atom_ranked_pathways or {}
+    raw_extra_ids = {
+        aid
+        for atom_ids in raw_extra_pathways.values()
+        for aid in atom_ids
+        if isinstance(aid, str) and aid
+    }
+    authorized_extra_ids: set[str] = set()
+    if raw_extra_ids:
+        placeholders = ",".join(["?"] * len(raw_extra_ids))
+        auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+        authorized_extra_ids = {
+            row[0]
+            for row in conn.execute(
+                f"SELECT a.id FROM atoms a WHERE a.id IN ({placeholders}) "
+                f"AND a.tombstoned = 0 AND {auth_where}",
+                list(raw_extra_ids) + auth_params,
+            ).fetchall()
+        }
+    for pathway, atom_ids in raw_extra_pathways.items():
         if not pathway:
             continue
         if pathway in _RESERVED_RRF_PATHWAYS:
@@ -282,7 +332,12 @@ def recall(
         seen_atom_ids: set[str] = set()
         extra_ranked_lists[pathway] = []
         for aid in atom_ids:
-            if not isinstance(aid, str) or not aid or aid in seen_atom_ids:
+            if (
+                not isinstance(aid, str)
+                or not aid
+                or aid in seen_atom_ids
+                or aid not in authorized_extra_ids
+            ):
                 continue
             seen_atom_ids.add(aid)
             extra_ranked_lists[pathway].append(aid)

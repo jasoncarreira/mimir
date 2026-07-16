@@ -1,0 +1,176 @@
+from __future__ import annotations
+
+import sqlite3
+import struct
+from pathlib import Path
+
+import pytest
+
+from mimir.saga.client import SagaStore
+from mimir.saga.ownership import (
+    AuthorizationScope,
+    Visibility,
+    authorization_predicate,
+    get_authorization_scope,
+)
+from mimir.saga.recall import recall
+from mimir.saga.store import store
+
+
+def _embed(_text: str) -> tuple[bytes, str, str, int]:
+    return struct.pack("4f", 1.0, 0.0, 0.0, 0.0), "fake", "fake", 4
+
+
+@pytest.fixture
+def conn() -> sqlite3.Connection:
+    db = sqlite3.connect(":memory:", check_same_thread=False)
+    schema = Path("mimir/saga/schema.sql").read_text()
+    db.executescript(schema)
+    yield db
+    db.close()
+
+
+def _store(
+    conn: sqlite3.Connection,
+    content: str,
+    *,
+    owner: str,
+    visibility: str,
+    domain: str | None = None,
+) -> str:
+    return store(
+        conn,
+        content,
+        embed_fn=_embed,
+        owner_principal=owner,
+        visibility=visibility,
+        origin_domain=domain,
+    ).atom_id
+
+
+def test_missing_auth_context_is_public_only_and_never_admin() -> None:
+    scope = get_authorization_scope(None)
+    assert scope == AuthorizationScope()
+    where, params = authorization_predicate(scope, table="a")
+    assert "1=1" not in where
+    assert params == [Visibility.PUBLIC.value]
+
+
+def test_owner_and_service_domain_grants_are_alternatives(conn: sqlite3.Connection) -> None:
+    public = _store(conn, "public", owner="other", visibility="public")
+    owned = _store(conn, "owned", owner="user:alice", visibility="private")
+    foreign = _store(conn, "foreign", owner="user:bob", visibility="private")
+    domain = _store(
+        conn, "domain", owner="service:writer", visibility="service", domain="memory",
+    )
+
+    user_where, user_params = authorization_predicate(
+        AuthorizationScope(principal="user:alice"), table="a",
+    )
+    user_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {user_where}", user_params,
+        ).fetchall()
+    }
+    assert user_ids == {public, owned}
+
+    service_where, service_params = authorization_predicate(
+        AuthorizationScope(
+            principal="service:reader",
+            is_service=True,
+            readable_domains=("memory",),
+        ),
+        table="a",
+    )
+    service_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {service_where}", service_params,
+        ).fetchall()
+    }
+    assert service_ids == {public, domain}
+    assert foreign not in service_ids
+
+
+def test_unauthorized_candidates_are_removed_before_rrf_and_access(conn: sqlite3.Connection) -> None:
+    hidden = _store(conn, "hidden query term", owner="user:bob", visibility="private")
+    visible = _store(conn, "visible query term", owner="user:alice", visibility="private")
+    scope = AuthorizationScope(principal="user:alice")
+
+    result = recall(
+        conn,
+        "query term",
+        query_embed_fn=lambda _q: [1.0, 0.0, 0.0, 0.0],
+        faiss_search_fn=lambda _emb, _k: [(hidden, 0.99), (visible, 0.8)],
+        fts_search_fn=lambda _q, _k: [(hidden, 10.0), (visible, 9.0)],
+        triple_search_fn=lambda _emb, _k: [(hidden, 0.95), (visible, 0.7)],
+        auth_scope=scope,
+        fire_access_events=True,
+    )
+
+    candidates = result.observations + result.raws
+    assert [candidate.atom["id"] for candidate in candidates] == [visible]
+    assert candidates[0].semantic_rank == 1
+    assert candidates[0].keyword_rank == 1
+    assert candidates[0].triple_rank == 1
+
+    hidden_retrievals = conn.execute(
+        "SELECT COUNT(*) FROM access_events WHERE atom_id = ? AND source = 'retrieval'",
+        (hidden,),
+    ).fetchone()[0]
+    assert hidden_retrievals == 0
+
+
+def test_session_boundary_expansion_binds_authorization_before_limit(
+    conn: sqlite3.Connection,
+) -> None:
+    session_id = "session-owned"
+    conn.execute(
+        "INSERT INTO sessions (id, channel_id, started_at, ended_at, summary, "
+        "reflected_at, owner_principal, visibility) "
+        "VALUES (?, 'channel', '2026-01-01T00:00:00+00:00', "
+        "'2026-01-01T00:01:00+00:00', 'summary', "
+        "'2026-01-01T00:01:00+00:00', 'user:alice', 'private')",
+        (session_id,),
+    )
+    conn.commit()
+    first = _store(conn, "first", owner="user:alice", visibility="private")
+    second = _store(conn, "second", owner="user:alice", visibility="private")
+    conn.execute(
+        "UPDATE atoms SET session_id = ?, created_at = ? WHERE id = ?",
+        (session_id, "2026-01-01T00:00:00+00:00", first),
+    )
+    conn.execute(
+        "UPDATE atoms SET session_id = ?, created_at = ? WHERE id = ?",
+        (session_id, "2026-01-01T00:00:01+00:00", second),
+    )
+    conn.commit()
+
+    client = SagaStore(conn=conn, embedding_dim=4)
+    auth_scope = AuthorizationScope(principal="user:alice")
+    atom_ids = client._session_boundary_atom_pathway_with_conn(
+        conn,
+        "summary",
+        limit=1,
+        alpha=0.0,
+        atoms_per_session=1,
+        auth_context=auth_scope,
+    )
+
+    assert atom_ids == [first]
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_missing_context_does_not_reveal_legacy_or_private(
+    conn: sqlite3.Connection,
+) -> None:
+    public = _store(conn, "public", owner="other", visibility="public")
+    private = _store(conn, "private", owner="user:alice", visibility="private")
+    legacy = _store(conn, "legacy", owner="legacy_admin", visibility="legacy_admin")
+    client = SagaStore(conn=conn, embedding_dim=4)
+
+    payload = await client.get_atoms([public, private, legacy])
+
+    assert [atom["id"] for atom in payload["atoms"]] == [public]
+    assert payload["missing"] == [private, legacy]

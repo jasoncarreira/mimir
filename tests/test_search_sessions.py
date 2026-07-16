@@ -10,6 +10,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from mimir.saga.client import SagaStore
+from mimir.saga.ownership import AuthorizationScope
+
+
+ADMIN_SCOPE = AuthorizationScope(is_admin=True)
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -257,7 +261,9 @@ async def test_search_sessions_schema_migration_adds_embedding_columns(
 
     # Step 6: Verify the original session row survived and is searchable
     # (recency path, alpha=0 avoids needing an embedding).
-    results = await s2.search_sessions("migration test", alpha=0.0)
+    results = await s2.search_sessions(
+        "migration test", alpha=0.0, auth_context=ADMIN_SCOPE,
+    )
     session_ids = {r["session_id"] for r in results}
     assert "sess-migrate" in session_ids, \
         "search_sessions should return the session via the recency path after migration"
@@ -681,7 +687,9 @@ async def test_search_sessions_null_ended_at_falls_back_to_reflected_at(
     )
     conn.commit()
 
-    results = await store.search_sessions("anything", limit=10, alpha=0.0)
+    results = await store.search_sessions(
+        "anything", limit=10, alpha=0.0, auth_context=ADMIN_SCOPE,
+    )
     by_id = {r["session_id"]: r for r in results}
     # A (recent reflected_at) must out-score B (old reflected_at) —
     # neither should be 1.0-by-accident.
@@ -709,7 +717,9 @@ async def test_search_sessions_no_timestamp_ranks_last(store, monkeypatch):
     )
     conn.commit()
 
-    results = await store.search_sessions("anything", limit=10, alpha=0.0)
+    results = await store.search_sessions(
+        "anything", limit=10, alpha=0.0, auth_context=ADMIN_SCOPE,
+    )
     by_id = {r["session_id"]: r for r in results}
     assert by_id["sess-null"]["recency_score"] == 0.0
     assert by_id["sess-real"]["recency_score"] > 0.0

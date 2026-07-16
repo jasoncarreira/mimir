@@ -109,141 +109,63 @@ class AuthorizationScope:
     service_canonical: str | None = None
 
 
+def _authorization_predicate(
+    scope: AuthorizationScope,
+    *,
+    table: str,
+) -> tuple[str, list]:
+    """Build the shared owner/visibility/domain predicate for a resource table."""
+    if scope.is_admin:
+        return ("1=1", [])
+
+    # Every grant is an alternative.  Combining the owner grant with the public
+    # grant using AND collapses ``private + owned`` to public-only and makes a
+    # user's own private rows unreadable.  Keep one OR group so no grant narrows
+    # another grant accidentally.
+    grants = [f"{table}.visibility = ?"]
+    params: list = [Visibility.PUBLIC.value]
+
+    if scope.principal:
+        grants.append(f"{table}.owner_principal = ?")
+        params.append(scope.principal)
+
+    if scope.is_service and scope.readable_domains:
+        domains = list(scope.readable_domains)
+        placeholders = ",".join(["?"] * len(domains))
+        grants.append(f"{table}.origin_domain IN ({placeholders})")
+        params.extend(domains)
+
+    return (f"({' OR '.join(grants)})", params)
+
+
 def authorization_predicate(
     scope: AuthorizationScope,
     table: str = "atoms",
 ) -> tuple[str, list]:
-    """Generate SQL WHERE clause for SAGA read authorization (chainlink #883).
+    """Generate the parameterized SAGA read predicate for an atom-like table.
 
-    This is the security boundary: authorization happens BEFORE content/existence
-    is exposed to the caller. The predicate is applied in the SQL query itself
-    so unauthorized rows are never fetched, scored, or returned.
-
-    Authorization rules:
-    - Admins can read everything (legacy_admin included)
-    - Trusted services can read: PUBLIC + their readable_domains + owned atoms
-    - Regular users can read: PUBLIC + their own owned atoms (PRIVATE or PUBLIC)
-
-    Args:
-        scope: AuthorizationScope with caller's permissions
-        table: Table name prefix for column references (default "atoms")
-
-    Returns:
-        Tuple of (WHERE clause string, list of parameter values)
+    Authorization happens in SQL before content/existence is exposed:
+    admins can read everything; trusted services can read public rows, rows in
+    their readable domains, and their owned rows; regular users can read public
+    rows and their own rows.  Capability names never widen readable domains.
     """
-    if scope.is_admin:
-        return ("1=1", [])
-
-    conditions: list[str] = []
-    params: list = []
-
-    if scope.is_service and scope.readable_domains:
-        domains = list(scope.readable_domains)
-        domain_placeholders = ",".join(["?"] * len(domains))
-        conditions.append(
-            f"({table}.visibility = ? OR "
-            f"({table}.origin_domain IN ({domain_placeholders})) OR "
-            f"({table}.visibility = 'service' AND {table}.origin_domain IN ({domain_placeholders})))"
-        )
-        params.append(Visibility.PUBLIC.value)
-        params.extend(domains)
-        params.extend(domains)
-    else:
-        conditions.append(f"{table}.visibility = ?")
-        params.append(Visibility.PUBLIC.value)
-
-    if scope.principal:
-        conditions.append(f"({table}.owner_principal = ? OR {table}.visibility = ?)")
-        params.append(scope.principal)
-        params.append(Visibility.PUBLIC.value)
-
-    where_clause = " AND ".join(conditions)
-    return (where_clause, params)
+    return _authorization_predicate(scope, table=table)
 
 
 def authorization_predicate_for_triples(
     scope: AuthorizationScope,
     table: str = "triples",
 ) -> tuple[str, list]:
-    """Generate SQL WHERE clause for triple read authorization (chainlink #883).
-
-    Triple read authorization follows the same rules as atoms, but operates
-    on the triples table. The authorization links back to the source_atom_id
-    via the atoms table, so triples inherit the visibility of their source.
-
-    Returns:
-        Tuple of (WHERE clause string, list of parameter values)
-    """
-    if scope.is_admin:
-        return ("1=1", [])
-
-    conditions: list[str] = []
-    params: list = []
-
-    if scope.is_service and scope.readable_domains:
-        domains = list(scope.readable_domains)
-        domain_placeholders = ",".join(["?"] * len(domains))
-        conditions.append(
-            f"({table}.visibility = ? OR "
-            f"({table}.origin_domain IN ({domain_placeholders})) OR "
-            f"({table}.visibility = 'service' AND {table}.origin_domain IN ({domain_placeholders})))"
-        )
-        params.append(Visibility.PUBLIC.value)
-        params.extend(domains)
-        params.extend(domains)
-    else:
-        conditions.append(f"{table}.visibility = ?")
-        params.append(Visibility.PUBLIC.value)
-
-    if scope.principal:
-        conditions.append(f"({table}.owner_principal = ? OR {table}.visibility = ?)")
-        params.append(scope.principal)
-        params.append(Visibility.PUBLIC.value)
-
-    where_clause = " AND ".join(conditions)
-    return (where_clause, params)
+    """Generate the parameterized read predicate for a triple resource table."""
+    return _authorization_predicate(scope, table=table)
 
 
 def authorization_predicate_for_sessions(
     scope: AuthorizationScope,
     table: str = "sessions",
 ) -> tuple[str, list]:
-    """Generate SQL WHERE clause for session read authorization (chainlink #883).
-
-    Session authorization follows the same rules as atoms. Sessions have
-    their own ownership/visibility fields that parallel atoms.
-
-    Returns:
-        Tuple of (WHERE clause string, list of parameter values)
-    """
-    if scope.is_admin:
-        return ("1=1", [])
-
-    conditions: list[str] = []
-    params: list = []
-
-    if scope.is_service and scope.readable_domains:
-        domains = list(scope.readable_domains)
-        domain_placeholders = ",".join(["?"] * len(domains))
-        conditions.append(
-            f"({table}.visibility = ? OR "
-            f"({table}.origin_domain IN ({domain_placeholders})) OR "
-            f"({table}.visibility = 'service' AND {table}.origin_domain IN ({domain_placeholders})))"
-        )
-        params.append(Visibility.PUBLIC.value)
-        params.extend(domains)
-        params.extend(domains)
-    else:
-        conditions.append(f"{table}.visibility = ?")
-        params.append(Visibility.PUBLIC.value)
-
-    if scope.principal:
-        conditions.append(f"({table}.owner_principal = ? OR {table}.visibility = ?)")
-        params.append(scope.principal)
-        params.append(Visibility.PUBLIC.value)
-
-    where_clause = " AND ".join(conditions)
-    return (where_clause, params)
+    """Generate the parameterized read predicate for a session table."""
+    return _authorization_predicate(scope, table=table)
 
 
 def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
@@ -252,9 +174,9 @@ def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
     Extracts the relevant authorization information from an auth_context
     object for use in SAGA read authorization.
 
-    When auth_context is None (no authentication), defaults to admin scope
-    to maintain backwards compatibility with internal calls and tests.
-    Production calls through tools always provide auth_context.
+    A missing carrier grants nothing beyond explicitly public rows. Internal
+    system reads that need wider access must pass an explicit server-created
+    admin or trusted-service context; omission is never ambient authority.
 
     Args:
         auth_context: AuthContext from mimir.models or similar
@@ -262,8 +184,10 @@ def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
     Returns:
         AuthorizationScope with caller's authorization details
     """
+    if isinstance(auth_context, AuthorizationScope):
+        return auth_context
     if auth_context is None:
-        return AuthorizationScope(is_admin=True)
+        return AuthorizationScope()
 
     from mimir.access_control import (
         get_trusted_service_from_auth_context,
