@@ -8,17 +8,14 @@ These probe the recall pipeline:
 """
 from __future__ import annotations
 
-import struct
-from pathlib import Path
-
 import pytest
 
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import AuthorizationScope
+from mimir.saga.vector_index import FAISS_AVAILABLE
 
 
 ADMIN_SCOPE = AuthorizationScope(is_admin=True)
-from mimir.saga.vector_index import FAISS_AVAILABLE
 
 
 # Deterministic 4d "embedding" derived from text hash. Tests that need
@@ -76,7 +73,7 @@ def client(tmp_path):
 async def test_query_returns_semantically_similar_atom(client, monkeypatch):
     _patch_provider(monkeypatch)
     r1 = await client.store("Alice prefers concise replies")
-    r2 = await client.store("Bob enjoys verbose explanations")
+    await client.store("Bob enjoys verbose explanations")
     # Query that embeds close to atom #1.
     result = await client.query("alice concise", top_k=5, auth_context=ADMIN_SCOPE)
     ids = [a["id"] for a in result["raws"]]
