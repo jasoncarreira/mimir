@@ -211,17 +211,30 @@ def test_service_principals_allow_only_explicit_operations_with_full_inventory(
     allowed_operation: str,
     denied_operation: str,
 ) -> None:
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
     registry = ToolRegistry()
     registry.register_runtime_tools(
         [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
     )
 
-    admitted = registry.authorize_tool(
-        allowed_operation, _auth_context(trigger=trigger, enforce=True), enforce=True
+    service_principals = {
+        "scheduled_tick": "scheduler",
+        "poller": "poller",
+        "saga_session_end": "synthesis",
+        "upgrade": "system",
+    }
+
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id=f"{trigger}:test",
+        service_principal=service_principals.get(trigger),
     )
-    denied = registry.authorize_tool(
-        denied_operation, _auth_context(trigger=trigger, enforce=True), enforce=True
-    )
+    ctx = create_auth_context(event, enforce=True)
+
+    admitted = registry.authorize_tool(allowed_operation, ctx, enforce=True)
+    denied = registry.authorize_tool(denied_operation, ctx, enforce=True)
 
     assert admitted.allowed is True
     assert admitted.is_shadow_decision is False
@@ -232,8 +245,16 @@ def test_service_principals_allow_only_explicit_operations_with_full_inventory(
 
 
 def test_service_authorization_is_stable_under_inventory_mutation_and_surface_width() -> None:
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
     registry = ToolRegistry()
-    scheduler = _auth_context(trigger="scheduled_tick", enforce=True)
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    scheduler = create_auth_context(event, enforce=True)
 
     before = registry.authorize_tool("shell_exec", scheduler, enforce=True)
     registry.register_runtime_tools(
@@ -534,8 +555,19 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
     from mimir.access_control import create_auth_context
     from mimir.models import AgentEvent
 
+    service_principals = {
+        "scheduled_tick": "scheduler",
+        "poller": "poller",
+        "saga_session_end": "synthesis",
+        "upgrade": "system",
+    }
+
     for trigger, operation, should_allow in test_cases:
-        event = AgentEvent(trigger=trigger, channel_id=f"{trigger}:test")
+        event = AgentEvent(
+            trigger=trigger,
+            channel_id=f"{trigger}:test",
+            service_principal=service_principals.get(trigger),
+        )
         ctx = create_auth_context(event, enforce=True)
         result = registry.authorize_tool(operation, ctx, enforce=True)
 
@@ -544,3 +576,143 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
         else:
             assert result.allowed is False, f"{trigger} should deny {operation}"
             assert result.reason in ("admin_required", "unknown_operation"), f"{trigger} {operation} denied for wrong reason: {result.reason}"
+
+
+def test_service_authorization_requires_two_factor_validation() -> None:
+    """Verify that service authorization requires both is_service=True AND canonical_principal match.
+
+    This tests the fix for the security issue where authorize_tool granted service
+    capabilities based only on trigger matching, without validating the full two-factor
+    proof (is_service + canonical_principal match).
+    """
+    from mimir.access_control import create_auth_context, get_trusted_service_from_auth_context
+    from mimir.models import AgentEvent
+
+    registry = ToolRegistry()
+    registry.register_runtime_tools(
+        [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
+    )
+
+    event_correct = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    ctx_correct = create_auth_context(event_correct, enforce=True)
+    result_correct = registry.authorize_tool("shell_exec", ctx_correct, enforce=True)
+    assert result_correct.allowed is True, "Correctly-stamped service should get capabilities"
+    assert result_correct.service_principal is not None
+    assert result_correct.service_principal.canonical == "scheduler"
+
+    event_wrong_principal = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="wrong_principal",
+    )
+    ctx_wrong_principal = create_auth_context(event_wrong_principal, enforce=True)
+    result_wrong_principal = registry.authorize_tool("shell_exec", ctx_wrong_principal, enforce=True)
+    assert result_wrong_principal.allowed is False, "Mismatched service_principal should be denied"
+    assert result_wrong_principal.reason == "admin_required"
+
+    event_no_service_principal = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+    )
+    ctx_no_service_principal = create_auth_context(event_no_service_principal, enforce=True)
+    result_no_service_principal = registry.authorize_tool("shell_exec", ctx_no_service_principal, enforce=True)
+    assert result_no_service_principal.allowed is False, "Missing service_principal should be denied"
+    assert result_no_service_principal.reason == "admin_required"
+
+    event_http_ingress = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+        extra={"event_ingress": "http-api"},
+    )
+    ctx_http_ingress = create_auth_context(event_http_ingress, enforce=True)
+    result_http_ingress = registry.authorize_tool("shell_exec", ctx_http_ingress, enforce=True)
+    assert result_http_ingress.allowed is False, "HTTP ingress should be denied even with correct service_principal"
+    assert result_http_ingress.reason == "admin_required"
+
+
+def test_service_authorization_shadow_mode_emits_decision_event() -> None:
+    """Verify that service-capability grants in shadow mode emit decision events.
+
+    This ensures the enforcement-off audit is not blind to the service path.
+    """
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
+    registry = ToolRegistry()
+    registry.register_runtime_tools(
+        [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
+    )
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    ctx = create_auth_context(event, enforce=False)
+    result = registry.authorize_tool("shell_exec", ctx, enforce=False)
+    assert result.allowed is True
+    assert result.is_shadow_decision is True, "Service capability grant in shadow mode should emit shadow decision"
+
+
+def test_commitment_actor_requires_two_factor_validation() -> None:
+    """Verify that _commitment_actor requires two-factor validation for service authority.
+
+    This tests the fix for the security issue where _commitment_actor granted service
+    authority based only on trigger matching, without validating the full two-factor
+    proof (is_service + canonical_principal match).
+    """
+    from mimir.tools.registry import _commitment_actor
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+    from types import SimpleNamespace
+
+    class MockRuntime:
+        def __init__(self, context):
+            self.context = context
+
+    event_correct = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    ctx_correct = create_auth_context(event_correct, enforce=True)
+    runtime_correct = MockRuntime(ctx_correct)
+    actor_correct = _commitment_actor(runtime_correct)
+    assert actor_correct is not None
+    assert actor_correct[0] == "service:scheduler"
+    assert actor_correct[2] is True
+
+    event_wrong_principal = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="wrong_principal",
+    )
+    ctx_wrong_principal = create_auth_context(event_wrong_principal, enforce=True)
+    runtime_wrong_principal = MockRuntime(ctx_wrong_principal)
+    actor_wrong_principal = _commitment_actor(runtime_wrong_principal)
+    assert actor_wrong_principal is None or actor_wrong_principal[0] != "service:scheduler"
+
+    event_no_service_principal = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+    )
+    ctx_no_service_principal = create_auth_context(event_no_service_principal, enforce=True)
+    runtime_no_service_principal = MockRuntime(ctx_no_service_principal)
+    actor_no_service_principal = _commitment_actor(runtime_no_service_principal)
+    assert actor_no_service_principal is None or actor_no_service_principal[0] != "service:scheduler"
+
+    event_http_ingress = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+        extra={"event_ingress": "http-api"},
+    )
+    ctx_http_ingress = create_auth_context(event_http_ingress, enforce=True)
+    runtime_http_ingress = MockRuntime(ctx_http_ingress)
+    actor_http_ingress = _commitment_actor(runtime_http_ingress)
+    assert actor_http_ingress is None or actor_http_ingress[0] != "service:scheduler"

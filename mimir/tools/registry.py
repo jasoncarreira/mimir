@@ -1317,12 +1317,11 @@ def _commitment_actor(
     if runtime is None or not isinstance(runtime.context, AuthContext):
         return None
     context = runtime.context
-    if context.event_ingress is None:
-        from ..access_control import get_service_principal
+    from ..access_control import get_trusted_service_from_auth_context
 
-        service = get_service_principal(context.trigger)
-        if service is not None:
-            return f"service:{service.canonical}", False, True
+    service = get_trusted_service_from_auth_context(context)
+    if service is not None:
+        return f"service:{service.canonical}", False, True
     principal = context.canonical_principal
     if principal is None:
         return None
