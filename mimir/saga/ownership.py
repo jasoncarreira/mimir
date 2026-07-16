@@ -43,6 +43,12 @@ class OwnerPrincipal(StrEnum):
 DEFAULT_VISIBILITY = Visibility.LEGACY_ADMIN
 DEFAULT_OWNER = OwnerPrincipal.LEGACY_ADMIN
 
+RESERVED_SENTINEL_PRINCIPALS: frozenset[str] = frozenset({
+    OwnerPrincipal.LEGACY_ADMIN,
+    OwnerPrincipal.SERVICE,
+    OwnerPrincipal.SYSTEM,
+})
+
 
 @dataclass(frozen=True)
 class Ownership:
@@ -159,8 +165,9 @@ def _authorization_predicate(
     params = [Visibility.PUBLIC.value]
 
     if scope.principal:
-        grants.append(f"{table}.owner_principal = ?")
-        params.append(scope.principal)
+        if scope.principal not in RESERVED_SENTINEL_PRINCIPALS:
+            grants.append(f"{table}.owner_principal = ?")
+            params.append(scope.principal)
 
     if scope.is_service and scope.readable_domains:
         domains = list(scope.readable_domains)
