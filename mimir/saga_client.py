@@ -26,7 +26,9 @@ log = logging.getLogger(__name__)
 
 
 class SagaError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None, body: str | None = None) -> None:
+    def __init__(
+        self, message: str, status: int | None = None, body: str | None = None
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.body = body
@@ -45,8 +47,13 @@ class SagaClient(Protocol):
     """
 
     async def query(
-        self, query: str, *, top_k: int = 12, mode: str = "task",
-        token_budget: int = 500, session_id: str | None = None,
+        self,
+        query: str,
+        *,
+        top_k: int = 12,
+        mode: str = "task",
+        token_budget: int = 500,
+        session_id: str | None = None,
         min_confidence_tier: str | None = None,
         context: list[dict[str, str]] | None = None,
         extra_atom_ranked_pathways: Mapping[str, Iterable[str]] | None = None,
@@ -59,24 +66,41 @@ class SagaClient(Protocol):
     ) -> dict[str, Any]: ...
 
     async def store(
-        self, content: str, *, stream: str | None = None,
-        profile: str | None = None, source_type: str = "api",
+        self,
+        content: str,
+        *,
+        stream: str | None = None,
+        profile: str | None = None,
+        source_type: str = "api",
         use_llm_annotate: bool = False,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
     async def feedback(
-        self, atom_ids: list[str], response_text: str, *,
-        session_id: str | None = None, feedback: str | None = None,
+        self,
+        atom_ids: list[str],
+        response_text: str,
+        *,
+        session_id: str | None = None,
+        feedback: str | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]: ...
 
     async def outcome(
-        self, atom_ids: list[str], feedback: str, *,
-        session_id: str | None = None, query: str | None = None,
+        self,
+        atom_ids: list[str],
+        feedback: str,
+        *,
+        session_id: str | None = None,
+        query: str | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]: ...
 
     async def end_session(
-        self, session_id: str, summary: str, *,
+        self,
+        session_id: str,
+        summary: str,
+        *,
         topics_discussed: list[str] | None = None,
         decisions_made: list[str] | None = None,
         unfinished: list[str] | None = None,
@@ -86,27 +110,39 @@ class SagaClient(Protocol):
     ) -> dict[str, Any]: ...
 
     async def consolidate(
-        self, *, dry_run: bool = False, max_clusters: int | None = None,
+        self,
+        *,
+        dry_run: bool = False,
+        max_clusters: int | None = None,
         extra_canonical_subjects: list[str] | None = None,
     ) -> dict[str, Any]: ...
 
     async def forget(
-        self, *,
+        self,
+        *,
         dry_run: bool = True,
         min_retrievals: int | None = None,
         contribution_threshold: float | None = None,
         contradiction_threshold: float | None = None,
         confidence_floor: float | None = None,
         grace_days: int | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]: ...
 
     async def recent_session_boundaries(
-        self, *, channel_id: str | None = None, count: int = 3,
+        self,
+        *,
+        channel_id: str | None = None,
+        count: int = 3,
     ) -> list[dict[str, Any]]: ...
 
     async def most_retrieved_atoms(
-        self, *, days: int = 7, count: int = 10,
-        channel_id: str | None = None, contributed_only: bool = False,
+        self,
+        *,
+        days: int = 7,
+        count: int = 10,
+        channel_id: str | None = None,
+        contributed_only: bool = False,
         trend: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
@@ -148,10 +184,18 @@ class RecordingSagaClient:
     # ``agent.py:_post_message_hook``, line 1859). There's no
     # ``mark_contributions`` method on ``SagaStore``; adding it to this
     # set would AttributeError at runtime.
-    _RECORDED_METHODS = frozenset({
-        "query", "store", "feedback", "outcome", "end_session",
-        "consolidate", "consolidate_skill_memories", "forget",
-    })
+    _RECORDED_METHODS = frozenset(
+        {
+            "query",
+            "store",
+            "feedback",
+            "outcome",
+            "end_session",
+            "consolidate",
+            "consolidate_skill_memories",
+            "forget",
+        }
+    )
 
     def __init__(self, inner: SagaClient) -> None:
         self._inner = inner
@@ -178,12 +222,18 @@ class RecordingSagaClient:
 
     async def end_session(self, *args, **kwargs):
         return await self._call(
-            "end_session", self._inner.end_session, args, kwargs,
+            "end_session",
+            self._inner.end_session,
+            args,
+            kwargs,
         )
 
     async def consolidate(self, *args, **kwargs):
         return await self._call(
-            "consolidate", self._inner.consolidate, args, kwargs,
+            "consolidate",
+            self._inner.consolidate,
+            args,
+            kwargs,
         )
 
     async def consolidate_skill_memories(self, *args, **kwargs):
@@ -194,19 +244,26 @@ class RecordingSagaClient:
         # "skipped" marker (see scheduler.py).
         return await self._call(
             "consolidate_skill_memories",
-            self._inner.consolidate_skill_memories, args, kwargs,
+            self._inner.consolidate_skill_memories,
+            args,
+            kwargs,
         )
 
     async def forget(self, *args, **kwargs):
         return await self._call("forget", self._inner.forget, args, kwargs)
 
     async def _call(
-        self, call_type: str, fn, args: tuple, kwargs: dict,
+        self,
+        call_type: str,
+        fn,
+        args: tuple,
+        kwargs: dict,
     ):
         """Common dispatch — time the call, capture args + result,
         append to TurnContext.saga_calls, re-raise any exception."""
         import time as _time
         from .models import SagaCallRecord
+
         started = _time.monotonic()
         error: str | None = None
         result: Any = None
@@ -231,14 +288,16 @@ class RecordingSagaClient:
                     ctx_started = getattr(ctx, "started_at", None)
                     if ctx_started is not None:
                         t_ms = (started - ctx_started) * 1000.0
-                    ctx.saga_calls.append(SagaCallRecord(
-                        call_type=call_type,
-                        args=_summarize_args(call_type, args, kwargs),
-                        result=_summarize_result(call_type, result, error),
-                        latency_ms=elapsed_ms,
-                        error=error,
-                        t_ms=t_ms,
-                    ))
+                    ctx.saga_calls.append(
+                        SagaCallRecord(
+                            call_type=call_type,
+                            args=_summarize_args(call_type, args, kwargs),
+                            result=_summarize_result(call_type, result, error),
+                            latency_ms=elapsed_ms,
+                            error=error,
+                            t_ms=t_ms,
+                        )
+                    )
             except Exception:  # noqa: BLE001
                 # Observability must never break the loop. Swallow.
                 pass
@@ -272,6 +331,7 @@ def _resolve_turn_ctx(kwargs: dict):
     cron, decay sweeps, etc., have no active turn — that's by design).
     """
     from ._context import resolve_active_ctx
+
     ctx, _resolution = resolve_active_ctx(kwargs or {})
     return ctx
 
@@ -327,9 +387,7 @@ def _summarize_args(call_type: str, args: tuple, kwargs: dict) -> dict:
     if call_type == "end_session":
         return {
             "session_id": args[0] if args else kwargs.get("session_id"),
-            "summary": _trunc(
-                args[1] if len(args) > 1 else kwargs.get("summary", "")
-            ),
+            "summary": _trunc(args[1] if len(args) > 1 else kwargs.get("summary", "")),
             "topics_discussed": kwargs.get("topics_discussed") or [],
             "decisions_made_count": len(kwargs.get("decisions_made") or []),
             "unfinished_count": len(kwargs.get("unfinished") or []),
@@ -338,11 +396,16 @@ def _summarize_args(call_type: str, args: tuple, kwargs: dict) -> dict:
     # decay / forget — the per-call shapes are operator-tunable enough
     # that hardcoded summarizers would drift faster than the dict shape
     # itself. The 200-char string truncation bounds size regardless.
-    return {"args": [_trunc(a) for a in args], **{k: _trunc(v) for k, v in kwargs.items()}}
+    return {
+        "args": [_trunc(a) for a in args],
+        **{k: _trunc(v) for k, v in kwargs.items()},
+    }
 
 
 def _summarize_result(
-    call_type: str, result: Any, error: str | None,
+    call_type: str,
+    result: Any,
+    error: str | None,
 ) -> dict:
     """Compact, bounded summary of the call's output."""
     if error is not None:
@@ -355,7 +418,7 @@ def _summarize_result(
         # saga returns {atoms: [...]} or {observations, raws, triples}.
         atom_ids = []
         for k in ("atoms", "observations", "raws"):
-            for a in (result.get(k) or []):
+            for a in result.get(k) or []:
                 if isinstance(a, dict) and a.get("id"):
                     atom_ids.append(a["id"])
         return {
@@ -399,6 +462,7 @@ def make_saga_client(
     """
     import os
     from .saga.client import SagaStore
+
     if db_path is not None:
         resolved_db = Path(db_path)
     else:

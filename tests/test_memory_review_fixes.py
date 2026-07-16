@@ -8,20 +8,28 @@ Pins the behaviors that addressed reviewer findings #4, #5, #7, #9, #10:
 - #9: schema_version column removed from atoms (the table remains)
 - #10: provisional column removed from atoms
 """
+
 from __future__ import annotations
 
-import asyncio
-import sqlite3
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 
+from mimir.models import AuthContext
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import AuthorizationScope
 
 
 ADMIN_SCOPE = AuthorizationScope(is_admin=True)
+ADMIN_AUTH = AuthContext(
+    principal="test-admin",
+    canonical_principal="test-admin",
+    roles=("admin",),
+    event_ingress="test",
+    trigger="user_message",
+    channel_id="test-channel",
+    interactivity=None,
+)
 
 
 # Stub provider so we don't need real voyage credentials in unit tests.
@@ -30,9 +38,12 @@ def _patch_provider(monkeypatch):
         def embed(self, text, *, input_type="passage"):
             h = abs(hash(text)) % 1000
             return [float(h % 7), float(h % 11), float(h % 13), float(h % 17)]
+
         def dimensions(self):
             return 4
+
     monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: _StubProvider())
+
     def fake_get_config():
         def cfg(section, key, default=None):
             return {
@@ -40,7 +51,9 @@ def _patch_provider(monkeypatch):
                 ("embedding", "provider"): "stub",
                 ("embedding", "model"): "stub-4d",
             }.get((section, key), default)
+
         return cfg
+
     monkeypatch.setattr("mimir.saga._config_io.get_config", fake_get_config)
 
 
@@ -69,9 +82,12 @@ def test_atoms_schema_version_column_removed(client):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(atoms)").fetchall()}
     assert "schema_version" not in cols
     # The TABLE schema_version still exists (operator/migration history).
-    tables = {r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()}
+    tables = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
     assert "schema_version" in tables
 
 
@@ -82,13 +98,13 @@ def test_atoms_schema_version_column_removed(client):
 async def test_end_session_persists_channel_id(client, monkeypatch):
     _patch_provider(monkeypatch)
     result = await client.end_session(
-        "s1", "summary", channel_id="C123",
+        "s1",
+        "summary",
+        channel_id="C123",
     )
     assert result["channel"] == "C123"
     conn = client._ensure_conn()
-    row = conn.execute(
-        "SELECT channel_id FROM sessions WHERE id = 's1'"
-    ).fetchone()
+    row = conn.execute("SELECT channel_id FROM sessions WHERE id = 's1'").fetchone()
     assert row is not None
     assert row[0] == "C123"
 
@@ -111,7 +127,9 @@ async def test_recent_session_boundaries_scopes_to_channel(client, monkeypatch):
     await client.end_session("sA", "channel A session", channel_id="CHAN_A")
     await client.end_session("sB", "channel B session", channel_id="CHAN_B")
     boundaries_a = await client.recent_session_boundaries(
-        channel_id="CHAN_A", count=10, auth_context=ADMIN_SCOPE,
+        channel_id="CHAN_A",
+        count=10,
+        auth_context=ADMIN_SCOPE,
     )
     sids = [b["session_id"] for b in boundaries_a]
     assert "sA" in sids
@@ -129,7 +147,12 @@ async def test_most_retrieved_filters_contributed_only(client, monkeypatch):
     r1 = await client.store("alpha")
     r2 = await client.store("beta")
     # r1 gets one feedback_positive (credit pass)
-    await client.feedback([r1["atom_id"]], "response", feedback="positive")
+    await client.feedback(
+        [r1["atom_id"]],
+        "response",
+        feedback="positive",
+        auth_context=ADMIN_AUTH,
+    )
     # r2 gets two plain retrievals via query
     await client.query("beta", top_k=5, auth_context=ADMIN_SCOPE)
     await client.query("beta", top_k=5, auth_context=ADMIN_SCOPE)
@@ -139,7 +162,9 @@ async def test_most_retrieved_filters_contributed_only(client, monkeypatch):
     assert r2["atom_id"] in bare_ids
     # With contributed_only: r2 has zero feedback events; r1 has one.
     contributed = await client.most_retrieved_atoms(
-        days=7, count=5, contributed_only=True,
+        days=7,
+        count=5,
+        contributed_only=True,
     )
     contributed_ids = [a["id"] for a in contributed]
     assert r1["atom_id"] in contributed_ids
@@ -180,13 +205,17 @@ async def test_most_retrieved_filters_by_channel_id(client, monkeypatch):
     conn.commit()
     # Channel A: the atom should show.
     a = await client.most_retrieved_atoms(
-        days=7, count=5, channel_id="CHAN_A",
+        days=7,
+        count=5,
+        channel_id="CHAN_A",
     )
     assert aid in [x["id"] for x in a]
     # Channel B: no retrieval events tied to its session; the atom should NOT
     # show.
     b = await client.most_retrieved_atoms(
-        days=7, count=5, channel_id="CHAN_B",
+        days=7,
+        count=5,
+        channel_id="CHAN_B",
     )
     assert aid not in [x["id"] for x in b]
 
@@ -195,7 +224,9 @@ async def test_most_retrieved_filters_by_channel_id(client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_outcome_negative_writes_event_with_subtractive_weight(client, monkeypatch):
+async def test_outcome_negative_writes_event_with_subtractive_weight(
+    client, monkeypatch
+):
     """outcome("negative") fires a feedback_negative access event with
     weight −1.0. Updated 2026-05-13: previous design used weight 0.0
     (flag-only), but that left the retrieval event's +1.0 activation
@@ -205,7 +236,11 @@ async def test_outcome_negative_writes_event_with_subtractive_weight(client, mon
     neutral relative to never having been touched."""
     _patch_provider(monkeypatch)
     r = await client.store("test atom")
-    result = await client.outcome([r["atom_id"]], "negative")
+    result = await client.outcome(
+        [r["atom_id"]],
+        "negative",
+        auth_context=ADMIN_AUTH,
+    )
     assert result["marked"] == 1
     assert result["signal"] == "negative"
     conn = client._ensure_conn()
@@ -232,7 +267,7 @@ async def test_outcome_negative_cancels_retrieval_boost(client, monkeypatch):
     r = await client.store("test atom")
     aid = r["atom_id"]
     # Atom has just one 'store' event so far. Mark negative.
-    await client.outcome([aid], "negative")
+    await client.outcome([aid], "negative", auth_context=ADMIN_AUTH)
     conn = client._ensure_conn()
     # Read the current summary; activation should be -inf (sum is 0).
     row = conn.execute(
@@ -245,7 +280,8 @@ async def test_outcome_negative_cancels_retrieval_boost(client, monkeypatch):
     activation = compute_activation(
         recent_ts=_json.loads(row[0]),
         recent_weights=_json.loads(row[1]),
-        old_count=row[2], old_weight_sum=row[3],
+        old_count=row[2],
+        old_weight_sum=row[3],
         old_oldest_ts=row[4],
     )
     assert activation == float("-inf")
@@ -253,11 +289,16 @@ async def test_outcome_negative_cancels_retrieval_boost(client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_outcome_positive_still_writes_feedback_positive(
-    client, monkeypatch,
+    client,
+    monkeypatch,
 ):
     _patch_provider(monkeypatch)
     r = await client.store("test atom")
-    await client.outcome([r["atom_id"]], "positive")
+    await client.outcome(
+        [r["atom_id"]],
+        "positive",
+        auth_context=ADMIN_AUTH,
+    )
     conn = client._ensure_conn()
     row = conn.execute(
         "SELECT weight FROM access_events "

@@ -54,6 +54,56 @@ from .vector_index import VectorIndex
 log = logging.getLogger(__name__)
 
 
+_ALL_SAGA_ATOMS = object()
+
+
+def _saga_mutation_scope(
+    auth_context: Any, operation: str
+) -> object | str | tuple[str, ...] | None:
+    """Return the atom-row scope for a destructive SAGA operation."""
+    from ..access_control import get_trusted_service_from_auth_context
+    from ..models import AuthContext
+
+    # Mutation authority must come from the frozen server carrier. Read-side
+    # AuthorizationScope values and arbitrary duck-typed objects are publicly
+    # constructible and therefore cannot prove destructive authority.
+    if not isinstance(auth_context, AuthContext):
+        return None
+    if "admin" in auth_context.roles:
+        return _ALL_SAGA_ATOMS
+    service = get_trusted_service_from_auth_context(auth_context)
+    if service is not None:
+        if not service.has_capability(operation):
+            return None
+        domains = tuple(d for d in service.readable_domains if isinstance(d, str))
+        return domains or None
+    principal = getattr(auth_context, "canonical_principal", None)
+    return principal if isinstance(principal, str) and principal else None
+
+
+def _authorized_atom_ids(
+    conn: sqlite3.Connection,
+    atom_ids: list[str],
+    scope: object | str | tuple[str, ...] | None,
+) -> list[str] | None:
+    """Return all requested IDs only when the entire set is authorized."""
+    requested = list(dict.fromkeys(atom_ids))
+    if not requested or scope is None:
+        return [] if not requested else None
+    placeholders = ",".join(["?"] * len(requested))
+    sql = f"SELECT id FROM atoms WHERE id IN ({placeholders})"
+    params: list[Any] = list(requested)
+    if isinstance(scope, str):
+        sql += " AND owner_principal = ?"
+        params.append(scope)
+    elif isinstance(scope, tuple):
+        domain_placeholders = ",".join(["?"] * len(scope))
+        sql += f" AND origin_domain IN ({domain_placeholders})"
+        params.extend(scope)
+    found = {row[0] for row in conn.execute(sql, params).fetchall()}
+    return requested if found == set(requested) else None
+
+
 # ─── Provider/index adapters ─────────────────────────────────────────
 
 
@@ -71,16 +121,17 @@ def _embed_text_sync(text: str) -> EmbeddingTuple:
 
     cfg = get_config()
     provider = get_provider()
-    vec = provider.embed(text[:cfg("embedding", "max_input_chars", 2000)],
-                          input_type="passage")
+    vec = provider.embed(
+        text[: cfg("embedding", "max_input_chars", 2000)], input_type="passage"
+    )
     # #493: read provenance off the LIVE provider, not config. The #681 keyless
     # fallback can swap a configured voyage provider for ONNX (BGE 384); config
     # would stamp those rows provider=voyage / model=voyage-4-lite over BGE
     # vectors, misleading any future re-embed-on-provider-change or analytics.
     provider_name = getattr(provider, "provider_name", None) or cfg(
-        "embedding", "provider", "unknown")
-    model = getattr(provider, "model_id", None) or cfg(
-        "embedding", "model", "unknown")
+        "embedding", "provider", "unknown"
+    )
+    model = getattr(provider, "model_id", None) or cfg("embedding", "model", "unknown")
     dim = provider.dimensions()
     vec_bytes = struct.pack(f"{dim}f", *vec)
     return vec_bytes, provider_name, model, dim
@@ -101,8 +152,9 @@ def _query_embed_sync(text: str) -> list[float]:
 
         cfg = get_config()
         provider = get_provider()
-        return provider.embed(text[:cfg("embedding", "max_input_chars", 2000)],
-                              input_type="query")
+        return provider.embed(
+            text[: cfg("embedding", "max_input_chars", 2000)], input_type="query"
+        )
     except Exception:
         return []
 
@@ -122,6 +174,7 @@ def _make_faiss_search_fn(
     so authorized results are not truncated merely because hidden vectors rank
     above them.
     """
+
     def _fn(query_emb: list[float], top_k: int) -> list[tuple[str, float]]:
         if index is None:
             return []
@@ -147,6 +200,7 @@ def _make_faiss_search_fn(
             for atom_id, similarity in index.search(query_emb, top_k=search_k)
             if atom_id in allowed
         ][:top_k]
+
     return _fn
 
 
@@ -159,12 +213,17 @@ def _make_fts_search_fn(
 ):
     """Closure over the connection matching recall.FtsSearchFn shape.
     ``synonyms`` is the P12 query-expansion dict (FTS-only pathway)."""
+
     def _fn(query: str, top_k: int) -> list[tuple[str, float]]:
         return fts_search(
-            conn, query, top_k=top_k,
-            agent_id=agent_id, synonyms=synonyms,
+            conn,
+            query,
+            top_k=top_k,
+            agent_id=agent_id,
+            synonyms=synonyms,
             auth_scope=auth_scope,
         )
+
     return _fn
 
 
@@ -188,10 +247,14 @@ def _make_triple_search_fn(
 
     def _fn(query_emb: list[float], top_k: int) -> list[tuple[str, float]]:
         return triple_augment_search(
-            conn, query_emb, top_k=top_k, dim=dim,
+            conn,
+            query_emb,
+            top_k=top_k,
+            dim=dim,
             reference_date=reference_date,
             auth_context=auth_context,
         )
+
     return _fn
 
 
@@ -290,13 +353,17 @@ class SagaStore:
         # when ``db_path`` is available. The shared connection remains the
         # canonical write/migration connection and is protected by locks.
         import threading as _threading
+
         self._write_lock = _threading.Lock()
         self._db_lock = _threading.RLock()
         self._index_lock = _threading.RLock()
         self._sessions_index_lock = _threading.RLock()
 
     def _configure_connection(
-        self, conn: sqlite3.Connection, *, enable_wal: bool = True,
+        self,
+        conn: sqlite3.Connection,
+        *,
+        enable_wal: bool = True,
     ) -> None:
         """Apply runtime pragmas to SagaStore sqlite connections.
 
@@ -314,6 +381,7 @@ class SagaStore:
         # without busy_timeout the loser sees "database is locked" on the
         # first millisecond of contention.
         from ._config_io import get_config
+
         _cfg = get_config()
         _busy_timeout_ms = int(_cfg("storage", "db_busy_timeout_ms", 5000))
         conn.execute(f"PRAGMA busy_timeout = {_busy_timeout_ms}")
@@ -388,7 +456,8 @@ class SagaStore:
                         except Exception:  # noqa: BLE001
                             pass
                     log.warning(
-                        "retrieval access-event write skipped (%s)", exc,
+                        "retrieval access-event write skipped (%s)",
+                        exc,
                     )
 
     async def _db_locked(self, fn):
@@ -399,9 +468,11 @@ class SagaStore:
         production query() reads through this helper; use per-call connections
         so SAGA read concurrency stays >1.
         """
+
         def _locked():
             with self._db_lock:
                 return fn()
+
         return await asyncio.to_thread(_locked)
 
     async def _write_locked(self, fn):
@@ -410,10 +481,12 @@ class SagaStore:
         protects the shared sqlite3 connection object; ``_write_lock``
         preserves the stronger transaction-level write serialization contract.
         """
+
         def _locked():
             with self._db_lock:
                 with self._write_lock:
                     return fn()
+
         return await asyncio.to_thread(_locked)
 
     def connection(self) -> sqlite3.Connection:
@@ -506,7 +579,10 @@ class SagaStore:
         return _migrations.detect_schema_version(conn)
 
     def _apply_pending_migrations(
-        self, conn: sqlite3.Connection, *, fresh: bool,
+        self,
+        conn: sqlite3.Connection,
+        *,
+        fresh: bool,
     ) -> None:
         """Delegates to :func:`mimir.saga.migrations.apply_pending_migrations`.
 
@@ -527,7 +603,9 @@ class SagaStore:
         )
 
     def _add_atom_to_index_locked(
-        self, conn: sqlite3.Connection, atom_id: str,
+        self,
+        conn: sqlite3.Connection,
+        atom_id: str,
     ) -> None:
         """Incrementally add ``atom_id``'s stored vector to the FAISS index,
         holding ``_index_lock`` (#492). No-op when the index isn't built.
@@ -579,6 +657,7 @@ class SagaStore:
             else:
                 try:
                     from .embeddings import get_provider
+
                     dim = get_provider().dimensions()
                 except Exception:
                     # Provider unavailable and DB is genuinely empty.
@@ -654,6 +733,7 @@ class SagaStore:
                 else:
                     try:
                         from .embeddings import get_provider
+
                         dim = get_provider().dimensions()
                     except Exception:
                         # Provider unavailable and DB is genuinely empty.
@@ -672,8 +752,13 @@ class SagaStore:
     # ── SagaClient surface ──────────────────────────────────────────
 
     async def query(
-        self, query: str, *, top_k: int = 12, mode: str = "task",
-        token_budget: int = 500, session_id: str | None = None,
+        self,
+        query: str,
+        *,
+        top_k: int = 12,
+        mode: str = "task",
+        token_budget: int = 500,
+        session_id: str | None = None,
         min_confidence_tier: str | None = None,
         context: list[dict[str, str]] | None = None,
         reference_date=None,
@@ -707,6 +792,7 @@ class SagaStore:
         #    force-off by passing ``enable_contextual_rewrite=False``.
         if enable_contextual_rewrite is None:
             from ._config_io import get_config
+
             enable_contextual_rewrite = bool(
                 get_config()("retrieval", "enable_contextual_rewrite", False)
             )
@@ -724,6 +810,7 @@ class SagaStore:
         rewritten_query: str | None = pre_rewritten_query
         if rewritten_query is None and enable_contextual_rewrite and context:
             from .query_rewrite import rewrite_query
+
             try:
                 rewritten_query = await rewrite_query(query, context)
             except Exception:
@@ -733,6 +820,7 @@ class SagaStore:
         cfg = None
         if enable_session_boundary_rrf is None:
             from ._config_io import get_config
+
             cfg = get_config()
             enable_session_boundary_rrf = bool(
                 cfg("retrieval", "enable_session_boundary_rrf", True)
@@ -744,9 +832,7 @@ class SagaStore:
             else None
         )
         pathway_weights_base = (
-            dict(rrf_pathway_weights)
-            if rrf_pathway_weights is not None
-            else None
+            dict(rrf_pathway_weights) if rrf_pathway_weights is not None else None
         )
         boundary_limit = boundary_alpha = boundary_weight = None
         boundary_atoms_per_session = None
@@ -760,6 +846,7 @@ class SagaStore:
         if should_add_boundary_pathway:
             if cfg is None:
                 from ._config_io import get_config
+
                 cfg = get_config()
             boundary_limit = int(
                 session_boundary_limit
@@ -788,14 +875,10 @@ class SagaStore:
             # call (~50-300ms on voyage) is the heaviest non-LLM step.
             query_emb = _query_embed_sync(effective_query)
             extra_pathways = (
-                dict(extra_pathways_base)
-                if extra_pathways_base is not None
-                else None
+                dict(extra_pathways_base) if extra_pathways_base is not None else None
             )
             pathway_weights = (
-                dict(pathway_weights_base)
-                if pathway_weights_base is not None
-                else None
+                dict(pathway_weights_base) if pathway_weights_base is not None else None
             )
             if should_add_boundary_pathway:
                 boundary_atom_ids = self._session_boundary_atom_pathway_with_conn(
@@ -824,18 +907,25 @@ class SagaStore:
             # dim get filtered.
             triple_dim = self._embedding_dim
             result = _recall(
-                conn, effective_query,
+                conn,
+                effective_query,
                 query_embed_fn=lambda _q: query_emb,
                 faiss_search_fn=_make_faiss_search_fn(
-                    index, conn, auth_scope=auth_scope, agent_id=self._agent_id,
+                    index,
+                    conn,
+                    auth_scope=auth_scope,
+                    agent_id=self._agent_id,
                 ),
                 fts_search_fn=_make_fts_search_fn(
-                    conn, agent_id=self._agent_id,
+                    conn,
+                    agent_id=self._agent_id,
                     synonyms=self._synonyms,
                     auth_scope=auth_scope,
                 ),
                 triple_search_fn=_make_triple_search_fn(
-                    conn, dim=triple_dim, reference_date=reference_date,
+                    conn,
+                    dim=triple_dim,
+                    reference_date=reference_date,
                     auth_context=auth_context,
                 ),
                 extra_atom_ranked_pathways=extra_pathways,
@@ -868,32 +958,34 @@ class SagaStore:
             triples_payload: list[dict[str, Any]] = []
             if self._include_triples_in_response:
                 from .triples import top_triples_with_payload
+
                 rich = top_triples_with_payload(
-                    conn, query_emb,
-                    top_n=self._triples_top_n, dim=triple_dim,
+                    conn,
+                    query_emb,
+                    top_n=self._triples_top_n,
+                    dim=triple_dim,
                     reference_date=reference_date,
                     auth_context=auth_context,
                 )
                 # Strip the internal _cosine field from the wire shape;
                 # keep it out of the agent-facing dict.
                 for t in rich:
-                    triples_payload.append({
-                        k: v for k, v in t.items() if not k.startswith("_")
-                    })
+                    triples_payload.append(
+                        {k: v for k, v in t.items() if not k.startswith("_")}
+                    )
             # Translate the RecallResult into saga's response shape so
             # mimir's call sites don't change.
             return {
-                "query": query, "mode": mode, "two_tier": True,
+                "query": query,
+                "mode": mode,
+                "two_tier": True,
                 "gated": result.gated,
                 "gated_reason": result.gated_reason,
                 "observations": [_candidate_to_atom(c) for c in result.observations],
                 "raws": [_candidate_to_atom(c) for c in result.raws],
                 "triples": triples_payload,
                 "items_returned": len(result.observations) + len(result.raws),
-                "rewritten_query": (
-                    rewritten_query
-                    or (result.rewritten_query or "")
-                ),
+                "rewritten_query": (rewritten_query or (result.rewritten_query or "")),
             }
 
         def _do():
@@ -1008,8 +1100,9 @@ class SagaStore:
             return await self._db_locked(_do)
         return await asyncio.to_thread(_do)
 
-
-    async def get_atoms(self, ids: list[str], auth_context: Any = None) -> dict[str, Any]:
+    async def get_atoms(
+        self, ids: list[str], auth_context: Any = None
+    ) -> dict[str, Any]:
         """Batch-load atoms by exact id. Pure read — no semantic search, no
         access events, no transaction.
 
@@ -1044,10 +1137,21 @@ class SagaStore:
         auth_scope = get_authorization_scope(auth_context)
 
         def _do_with_conn(conn: sqlite3.Connection):
-            cols = ("id", "content", "stream", "profile", "memory_type",
-                    "source_type", "topics", "metadata", "agent_id",
-                    "is_pinned", "created_at", "session_id",
-                    "encoding_confidence")
+            cols = (
+                "id",
+                "content",
+                "stream",
+                "profile",
+                "memory_type",
+                "source_type",
+                "topics",
+                "metadata",
+                "agent_id",
+                "is_pinned",
+                "created_at",
+                "session_id",
+                "encoding_confidence",
+            )
             unique = list(dict.fromkeys(clean))
             placeholders = ",".join(["?"] * len(unique))
 
@@ -1066,16 +1170,18 @@ class SagaStore:
                     continue
                 if a["agent_id"] != self._agent_id and a["agent_id"] != "shared":
                     continue
-                atoms.append({
-                    "id": a["id"],
-                    "content": a["content"],
-                    "stream": a.get("stream"),
-                    "memory_type": a.get("memory_type"),
-                    "source_type": a.get("source_type"),
-                    "created_at": a.get("created_at"),
-                    "topics": _safe_json_load(a.get("topics")),
-                    "metadata": _safe_json_load(a.get("metadata")),
-                })
+                atoms.append(
+                    {
+                        "id": a["id"],
+                        "content": a["content"],
+                        "stream": a.get("stream"),
+                        "memory_type": a.get("memory_type"),
+                        "source_type": a.get("source_type"),
+                        "created_at": a.get("created_at"),
+                        "topics": _safe_json_load(a.get("topics")),
+                        "metadata": _safe_json_load(a.get("metadata")),
+                    }
+                )
             returned = {a["id"] for a in atoms}
             missing = [i for i in unique if i not in returned]
             return {"atoms": atoms, "missing": missing}
@@ -1117,6 +1223,7 @@ class SagaStore:
             return None
         try:
             from .query_rewrite import rewrite_query
+
             rewritten = await rewrite_query(query, context)
         except Exception:
             return None
@@ -1125,8 +1232,12 @@ class SagaStore:
         return rewritten
 
     async def store(
-        self, content: str, *, stream: str | None = None,
-        profile: str | None = None, source_type: str = "api",
+        self,
+        content: str,
+        *,
+        stream: str | None = None,
+        profile: str | None = None,
+        source_type: str = "api",
         use_llm_annotate: bool = False,
         metadata: dict[str, Any] | None = None,
         precomputed_embedding: EmbeddingTuple | None = None,
@@ -1167,13 +1278,16 @@ class SagaStore:
             duplicate_exists = await self._db_locked(_exact_duplicate_exists)
             if not duplicate_exists:
                 effective_embedding = await asyncio.to_thread(
-                    _embed_text_sync, content,
+                    _embed_text_sync,
+                    content,
                 )
 
         def _do():
             conn = self._ensure_conn()
             result = _store(
-                conn, content, embed_fn=_embed_text_sync,
+                conn,
+                content,
+                embed_fn=_embed_text_sync,
                 stream=stream or "semantic",
                 profile=profile or "standard",
                 source_type=source_type,
@@ -1202,31 +1316,51 @@ class SagaStore:
                             self._index.add(result.atom_id, row[0])
                 return {"stored": True, "atom_id": result.atom_id}
             return {
-                "stored": False, "atom_id": result.atom_id,
+                "stored": False,
+                "atom_id": result.atom_id,
                 "reason": result.reason or "duplicate",
             }
+
         return await self._write_locked(_do)
 
     async def feedback(
-        self, atom_ids: list[str], response_text: str, *,
-        session_id: str | None = None, feedback: str | None = None,
+        self,
+        atom_ids: list[str],
+        response_text: str,
+        *,
+        session_id: str | None = None,
+        feedback: str | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]:
-        # Saga's feedback contract is "credit pass after generating a
-        # response." Map atom_ids → feedback_positive events
-        # (the response_text was generated using these; that's the
-        # endorsement). 'feedback' parameter (positive/negative) maps
-        # to our signal kwarg.
         signal = (feedback or "positive").lower()
+        scope = _saga_mutation_scope(auth_context, "saga_feedback")
+
         def _do():
             from . import feedback as _feedback
+
             conn = self._ensure_conn()
-            n = _feedback(conn, atom_ids, signal=signal, session_id=session_id)
-            return {"marked": n, "total": len(atom_ids)}
+            authorized_ids = _authorized_atom_ids(conn, atom_ids, scope)
+            if authorized_ids is None:
+                return {"marked": 0, "total": len(atom_ids), "authorized": 0}
+            if not authorized_ids:
+                return {"marked": 0, "total": len(atom_ids), "authorized": 0}
+            n = _feedback(conn, authorized_ids, signal=signal, session_id=session_id)
+            return {
+                "marked": n,
+                "total": len(atom_ids),
+                "authorized": len(authorized_ids),
+            }
+
         return await self._write_locked(_do)
 
     async def outcome(
-        self, atom_ids: list[str], feedback: str, *,
-        session_id: str | None = None, query: str | None = None,
+        self,
+        atom_ids: list[str],
+        feedback: str,
+        *,
+        session_id: str | None = None,
+        query: str | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]:
         """Outcome is saga's "after the response was delivered, was it
         well-received?" signal.
@@ -1247,18 +1381,41 @@ class SagaStore:
         signal = (feedback or "").lower()
         if signal == "positive":
             return await self.feedback(
-                atom_ids, "", session_id=session_id, feedback="positive",
+                atom_ids,
+                "",
+                session_id=session_id,
+                feedback="positive",
+                auth_context=auth_context,
             )
         if signal == "negative":
+            scope = _saga_mutation_scope(auth_context, "saga_feedback")
+
             def _do():
                 conn = self._ensure_conn()
-                events = [AccessEvent(
-                    atom_id=aid, source="feedback_negative",
-                    session_id=session_id,
-                    metadata={"reason": "outcome_negative"},
-                ) for aid in atom_ids]
-                if not events:
-                    return {"marked": 0, "total": 0, "signal": "negative"}
+                authorized_ids = _authorized_atom_ids(conn, atom_ids, scope)
+                if authorized_ids is None:
+                    return {
+                        "marked": 0,
+                        "total": len(atom_ids),
+                        "signal": "negative",
+                        "authorized": 0,
+                    }
+                if not authorized_ids:
+                    return {
+                        "marked": 0,
+                        "total": len(atom_ids),
+                        "signal": "negative",
+                        "authorized": 0,
+                    }
+                events = [
+                    AccessEvent(
+                        atom_id=aid,
+                        source="feedback_negative",
+                        session_id=session_id,
+                        metadata={"reason": "outcome_negative"},
+                    )
+                    for aid in authorized_ids
+                ]
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     n = mark_access(conn, events)
@@ -1266,12 +1423,21 @@ class SagaStore:
                 except Exception:
                     conn.rollback()
                     raise
-                return {"marked": n, "total": len(atom_ids), "signal": "negative"}
+                return {
+                    "marked": n,
+                    "total": len(atom_ids),
+                    "signal": "negative",
+                    "authorized": len(authorized_ids),
+                }
+
             return await self._write_locked(_do)
         return {"marked": 0, "total": len(atom_ids), "signal": signal or "noop"}
 
     async def end_session(
-        self, session_id: str, summary: str, *,
+        self,
+        session_id: str,
+        summary: str,
+        *,
         topics_discussed: list[str] | None = None,
         decisions_made: list[str] | None = None,
         unfinished: list[str] | None = None,
@@ -1290,6 +1456,7 @@ class SagaStore:
         sessions can't filter (every boundary's channel_id would be
         NULL).
         """
+
         # The agent has already done the synthesis — it's calling
         # end_session with the rendered fields. The new reflect()
         # would re-derive them via LLM; here we just persist what was
@@ -1303,10 +1470,13 @@ class SagaStore:
                 "unfinished": unfinished or [],
                 "emotional_state": emotional_state,
             }
+
         def _do():
             conn = self._ensure_conn()
             result = _reflect(
-                conn, session_id=session_id, channel_id=channel_id,
+                conn,
+                session_id=session_id,
+                channel_id=channel_id,
                 embed_fn=_embed_text_sync,
                 boundary_synth_fn=_stub_synth,
                 owner_principal=owner_principal,
@@ -1324,10 +1494,14 @@ class SagaStore:
                 "channel": channel_id,
                 "session_summary_written": result.session_summary_written,
             }
+
         return await self._write_locked(_do)
 
     async def consolidate(
-        self, *, dry_run: bool = False, max_clusters: int | None = None,
+        self,
+        *,
+        dry_run: bool = False,
+        max_clusters: int | None = None,
         extra_canonical_subjects: list[str] | None = None,
         lookback_days: int = 30,
         min_cluster_size: int = 3,
@@ -1379,6 +1553,7 @@ class SagaStore:
         # once per process is fine).
         if self._rich_synth_fn is None:
             from .synthesize import make_async_rich_synth_fn
+
             self._rich_synth_fn = make_async_rich_synth_fn()
 
         # Synth is async, but consolidate() runs synchronously under
@@ -1405,6 +1580,7 @@ class SagaStore:
             from .dedup import dedup_pass, DEFAULT_DEDUP_THRESHOLD
             from .embeddings import resolve_auto_threshold
             from ._config_io import get_config
+
             cfg = get_config()
             provider_name = cfg("embedding", "provider", "unknown")
             # 0.92 floor for all providers. The per-provider thematic
@@ -1424,8 +1600,10 @@ class SagaStore:
                 )
             )
             dedup_cluster_fn = make_default_cluster_fn(
-                conn, threshold=effective_dedup_threshold,
+                conn,
+                threshold=effective_dedup_threshold,
             )
+
             def _do_dedup():
                 return dedup_pass(
                     conn,
@@ -1437,6 +1615,7 @@ class SagaStore:
                     max_clusters=dedup_max_clusters,
                     reference_date=reference_date,
                 )
+
             dedup_result = await self._write_locked(_do_dedup)
             dedup_payload = {
                 "candidates_scanned": dedup_result.candidates_scanned,
@@ -1464,15 +1643,19 @@ class SagaStore:
                         except Exception:  # noqa: BLE001
                             log.warning(
                                 "FAISS index remove failed for dedup-tombstoned "
-                                "atom_id=%r", atom_id, exc_info=True,
+                                "atom_id=%r",
+                                atom_id,
+                                exc_info=True,
                             )
 
         # 1. Candidate selection + clustering (sync; reads only).
         # Re-fetches raws so the tombstoned duplicates from pass 1
         # don't appear as candidates for thematic clustering.
         from .consolidate import (
-            _candidate_raws, MAX_OBSERVATIONS_PER_RUN,
+            _candidate_raws,
+            MAX_OBSERVATIONS_PER_RUN,
         )
+
         # chainlink #386: shared-connection reads run under _db_lock so a
         # concurrent turn's write (also _db_lock-guarded) never touches the same
         # sqlite3 connection object at the same time — Python's sqlite3 + FTS5
@@ -1499,6 +1682,7 @@ class SagaStore:
         world_state_repairs: list = []
         if not dry_run:
             from .triples import repair_world_state_dual_current
+
             world_state_repairs = await self._write_locked(
                 lambda: repair_world_state_dual_current(conn)
             )
@@ -1508,9 +1692,7 @@ class SagaStore:
             # early exit too — the dedup pass above may have soft-removed
             # vectors even when too few candidates remain for synthesis.
             if not dry_run:
-                await self._db_locked(
-                    lambda: self._rebuild_index_if_needed(conn)
-                )
+                await self._db_locked(lambda: self._rebuild_index_if_needed(conn))
             return {
                 "clusters_formed": 0,
                 "observations_emitted": [],
@@ -1542,7 +1724,8 @@ class SagaStore:
                 "consolidate: max_clusters cap (%d) bound — %d cluster(s) "
                 "skipped this run; rerun with a higher max_clusters to "
                 "catch the remainder.",
-                max_obs, len(eligible_unbounded) - max_obs,
+                max_obs,
+                len(eligible_unbounded) - max_obs,
             )
         sem = asyncio.Semaphore(4)
 
@@ -1550,9 +1733,11 @@ class SagaStore:
         # cluster. Both inject into the rich prompt. Empty when DB is
         # cold or there are no priors — bench-neutral.
         from .synthesize import build_vocab_block, build_prior_block
+
         vocab_block = await self._db_locked(  # chainlink #386
             lambda: build_vocab_block(
-                conn, extra_subjects=list(extra_canonical_subjects or []),
+                conn,
+                extra_subjects=list(extra_canonical_subjects or []),
             )
         )
         prior_blocks: list[str] = []
@@ -1572,8 +1757,12 @@ class SagaStore:
                         vocab_block=vocab_block,
                     )
                 except Exception:
-                    return {"content": "", "topics": [],
-                            "triples": [], "contradictions": []}
+                    return {
+                        "content": "",
+                        "topics": [],
+                        "triples": [],
+                        "contradictions": [],
+                    }
 
         results = await asyncio.gather(
             *[_synth(c, pb) for c, pb in zip(eligible, prior_blocks)]
@@ -1607,7 +1796,9 @@ class SagaStore:
                 for t in result.get("triples", []):
                     try:
                         text = _triple_text(
-                            t["subject"], t["predicate"], t["object"],
+                            t["subject"],
+                            t["predicate"],
+                            t["object"],
                         )
                         if text in triple_vecs:
                             continue
@@ -1625,9 +1816,7 @@ class SagaStore:
             store_triples to its existing store-unembedded fallback."""
             vec = triple_vecs.get(text)
             if vec is None:
-                raise RuntimeError(
-                    f"no precomputed embedding for triple text {text!r}"
-                )
+                raise RuntimeError(f"no precomputed embedding for triple text {text!r}")
             return vec
 
         # 3. Per-cluster restructure: store observation, link evidence,
@@ -1636,13 +1825,15 @@ class SagaStore:
         # thread so SQLite stays on one writer thread.
         def _restructure():
             from .consolidate import (
-                _compute_intersected_acl, find_equal_evidence_obs,
+                _compute_intersected_acl,
+                find_equal_evidence_obs,
                 find_superseded_observations,
             )
             from .observations import refresh_trend
             from .store import store as _store_atom
             from .triples import store_triples
             from datetime import datetime, timezone
+
             now = datetime.now(timezone.utc).isoformat()
             emitted: list[str] = []
             superseded: list[tuple[str, str]] = []
@@ -1668,7 +1859,8 @@ class SagaStore:
                 intersected_acl = _compute_intersected_acl(conn, evidence_ids)
 
                 store_result = _store_atom(
-                    conn, content,
+                    conn,
+                    content,
                     # chainlink #417: embedding was precomputed above,
                     # before the write lock / transactions; embed_fn is
                     # the unused fallback (store never calls it when
@@ -1713,7 +1905,9 @@ class SagaStore:
                     # a pure external-access record.
 
                     old_obs = find_superseded_observations(
-                        conn, observation_id, set(evidence_ids),
+                        conn,
+                        observation_id,
+                        set(evidence_ids),
                     )
                     for old_id in old_obs:
                         conn.execute(
@@ -1721,15 +1915,18 @@ class SagaStore:
                             "(source_id, target_id, relation_type, confidence, "
                             "created_at, metadata) "
                             "VALUES (?, ?, 'supersedes', 1.0, ?, ?)",
-                            (observation_id, old_id, now,
-                             json.dumps({"trigger": "consolidate"})),
+                            (
+                                observation_id,
+                                old_id,
+                                now,
+                                json.dumps({"trigger": "consolidate"}),
+                            ),
                         )
                     conn.execute(
                         "INSERT INTO observations_metadata "
                         "(atom_id, evidence_count, trend, last_evidence_at, "
                         "consolidated_at) VALUES (?, ?, ?, ?, ?)",
-                        (observation_id, len(evidence_ids),
-                         "strengthening", now, now),
+                        (observation_id, len(evidence_ids), "strengthening", now, now),
                     )
                     # P42: store any triples the LLM extracted. Source
                     # them to the new observation atom (not the raws)
@@ -1738,7 +1935,8 @@ class SagaStore:
                     # existing evidenced_by boost in recall.py.
                     if triples:
                         added = store_triples(
-                            conn, triples,
+                            conn,
+                            triples,
                             source_atom_id=observation_id,
                             # chainlink #417: precomputed-vector lookup —
                             # no network I/O inside this transaction.
@@ -1773,11 +1971,17 @@ class SagaStore:
                                 "(source_id, target_id, relation_type, "
                                 " confidence, created_at, metadata) "
                                 "VALUES (?, ?, 'contradicts', 1.0, ?, ?)",
-                                (aid_a, aid_b, now,
-                                 json.dumps({
-                                     "summary": c.get("summary", ""),
-                                     "trigger": "consolidate",
-                                 })),
+                                (
+                                    aid_a,
+                                    aid_b,
+                                    now,
+                                    json.dumps(
+                                        {
+                                            "summary": c.get("summary", ""),
+                                            "trigger": "consolidate",
+                                        }
+                                    ),
+                                ),
                             )
                             if cursor.rowcount > 0:
                                 contradicts_stored += 1
@@ -1808,7 +2012,9 @@ class SagaStore:
                             pass
                         log.warning(
                             "failed to tombstone orphaned observation %s after "
-                            "restructure rollback", observation_id, exc_info=True,
+                            "restructure rollback",
+                            observation_id,
+                            exc_info=True,
                         )
                     raise
 
@@ -1828,18 +2034,27 @@ class SagaStore:
             # at end of consolidate so the run sees a consistent view
             # of all contradictions discovered together.
             from .triples import resolve_contradictions_to_supersedes
+
             new_supersedes_from_contra = (
-                resolve_contradictions_to_supersedes(conn) if contradicts_stored
-                else 0
+                resolve_contradictions_to_supersedes(conn) if contradicts_stored else 0
             )
-            return (emitted, superseded, triples_stored,
-                    contradicts_stored, new_supersedes_from_contra)
+            return (
+                emitted,
+                superseded,
+                triples_stored,
+                contradicts_stored,
+                new_supersedes_from_contra,
+            )
 
         # _restructure mutates atoms/observations/triples — write lock
         # serializes it against any concurrent agent-loop store / feedback.
-        emitted, superseded, n_triples, n_contra, n_supersedes_contra = (
-            await self._write_locked(_restructure)
-        )
+        (
+            emitted,
+            superseded,
+            n_triples,
+            n_contra,
+            n_supersedes_contra,
+        ) = await self._write_locked(_restructure)
         # chainlink #425: end-of-cycle FAISS backstop — when soft removals
         # (dedup tombstones mirrored out of the index above) exceed 10% of
         # positions, run the full rebuild ``rebuild_if_needed`` promises.
@@ -1859,7 +2074,9 @@ class SagaStore:
         }
 
     async def consolidate_skill_memories(
-        self, *, dry_run: bool = False,
+        self,
+        *,
+        dry_run: bool = False,
         lookback_days: int | None = None,
         min_cluster_size: int = 2,
         dedup_threshold: float | None = None,
@@ -1926,10 +2143,12 @@ class SagaStore:
         # dedup_pass (skill_scope) restricts each call to one skill's
         # atoms, so a shared cluster_fn never crosses skills.
         cluster_fn = make_default_cluster_fn(
-            conn, threshold=effective_threshold,
+            conn,
+            threshold=effective_threshold,
         )
 
         for skill in skills:
+
             def _do_dedup(skill=skill):
                 return dedup_pass(
                     conn,
@@ -1941,6 +2160,7 @@ class SagaStore:
                     max_clusters=dedup_max_clusters,
                     skill_scope=skill,
                 )
+
             res = await self._write_locked(_do_dedup)
             # chainlink #425: mirror the #390 fix here — the general
             # consolidate() removes dedup-tombstoned raws from the FAISS
@@ -1961,7 +2181,8 @@ class SagaStore:
                         except Exception:  # noqa: BLE001
                             log.warning(
                                 "FAISS index remove failed for dedup-tombstoned "
-                                "skill-learning atom_id=%r", atom_id,
+                                "skill-learning atom_id=%r",
+                                atom_id,
                                 exc_info=True,
                             )
             summary["skills"][skill] = {
@@ -1973,14 +2194,18 @@ class SagaStore:
         return summary
 
     async def forget(
-        self, *,
+        self,
+        *,
         dry_run: bool = True,
         min_retrievals: int | None = None,
         contribution_threshold: float | None = None,
         contradiction_threshold: float | None = None,
         confidence_floor: float | None = None,
         grace_days: int | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]:
+        scope = _saga_mutation_scope(auth_context, "saga_forget")
+
         # Map saga's criteria-based forget to forget_by_criteria. Also
         # synchronizes the in-memory FAISS index — ``forget_by_criteria``
         # tombstones the SQLite rows but doesn't know about the index,
@@ -2019,16 +2244,56 @@ class SagaStore:
                 contradiction_threshold,
             )
         from .forget import forget_by_criteria
+
         def _do():
+            from .forget import forget as forget_atoms
+
             conn = self._ensure_conn()
-            result = forget_by_criteria(
+            if scope is None:
+                return {
+                    "tombstoned_count": 0,
+                    "preview_ids": [],
+                    "dry_run": dry_run,
+                }
+            preview = forget_by_criteria(
                 conn,
                 agent_id=self._agent_id,
                 min_age_days=grace_days,
                 min_retrievals=min_retrievals,
                 activation_below=confidence_floor,
-                dry_run=dry_run,
+                dry_run=True,
+                owner_principal=scope if isinstance(scope, str) else None,
+                origin_domains=scope if isinstance(scope, tuple) else None,
             )
+            candidate_ids = preview.tombstoned_ids
+            affected_observation_ids: list[str] = []
+            if candidate_ids:
+                placeholders = ",".join(["?"] * len(candidate_ids))
+                affected_observation_ids = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT DISTINCT source_id FROM atom_relations "
+                        f"WHERE target_id IN ({placeholders}) "
+                        "AND relation_type = 'evidenced_by'",
+                        candidate_ids,
+                    ).fetchall()
+                ]
+            closure = list(dict.fromkeys(candidate_ids + affected_observation_ids))
+            if _authorized_atom_ids(conn, closure, scope) is None:
+                return {
+                    "tombstoned_count": 0,
+                    "preview_ids": [],
+                    "dry_run": dry_run,
+                }
+            if dry_run:
+                return {
+                    "tombstoned_count": len(candidate_ids),
+                    "preview_ids": candidate_ids,
+                    "dry_run": True,
+                }
+            result = forget_atoms(conn, candidate_ids, reason="bulk_criteria")
+            authorized_ids = result.tombstoned_ids
+
             # Remove tombstoned atoms from the FAISS index (not a dry-run,
             # and the index has been built — otherwise there's nothing
             # to remove). Failures are logged but non-fatal: the SQL
@@ -2036,39 +2301,46 @@ class SagaStore:
             # missed index-side removal degrades gracefully.
             if (
                 not result.dry_run
-                and result.tombstoned_ids
+                and authorized_ids
                 and self._index is not None
                 and self._index.built
             ):
                 with self._index_lock:
-                    for atom_id in result.tombstoned_ids:
+                    for atom_id in authorized_ids:
                         try:
                             self._index.remove(atom_id)
                         except Exception:  # noqa: BLE001
                             log.warning(
                                 "FAISS index remove failed for atom_id=%r",
-                                atom_id, exc_info=True,
+                                atom_id,
+                                exc_info=True,
                             )
             # chainlink #425: end-of-cycle FAISS backstop. _do runs under
             # _write_locked (so _db_lock is held, as the helper requires).
             if not result.dry_run:
                 self._rebuild_index_if_needed(conn)
             return {
-                "tombstoned_count": result.tombstoned_count,
-                "preview_ids": result.tombstoned_ids if dry_run else [],
+                "tombstoned_count": len(authorized_ids),
+                "preview_ids": authorized_ids if dry_run else [],
                 "dry_run": dry_run,
             }
+
         return await self._write_locked(_do)
 
     async def recent_session_boundaries(
-        self, *, channel_id: str | None = None, count: int = 3,
+        self,
+        *,
+        channel_id: str | None = None,
+        count: int = 3,
         auth_context: Any = None,
     ) -> list[dict[str, Any]]:
         def _do():
             conn, should_close = self._operation_conn()
             try:
                 return _recent_boundaries(
-                    conn, channel_id=channel_id, count=count,
+                    conn,
+                    channel_id=channel_id,
+                    count=count,
                     auth_context=auth_context,
                 )
             finally:
@@ -2123,9 +2395,10 @@ class SagaStore:
             if not sim_map:
                 # Python cosine fallback (FAISS unavailable or empty).
                 import struct as _struct
+
                 q_norm = math.sqrt(sum(x * x for x in query_emb)) + 1e-9
                 dim = len(query_emb)
-                for (sess_id, emb_blob) in conn.execute(
+                for sess_id, emb_blob in conn.execute(
                     "SELECT id, embedding FROM sessions WHERE embedding IS NOT NULL"
                 ).fetchall():
                     if not emb_blob:
@@ -2168,7 +2441,7 @@ class SagaStore:
         # ── Step 3: score each session ──
         now_ts = datetime.now(tz=timezone.utc).timestamp()
         results: list[dict] = []
-        for (sess_id, ch_id, started_at, ended_at, summary, reflected_at) in rows:
+        for sess_id, ch_id, started_at, ended_at, summary, reflected_at in rows:
             sim = sim_map.get(sess_id, 0.0)
 
             # Recency reference: ended_at, falling back to reflected_at —
@@ -2197,16 +2470,18 @@ class SagaStore:
                 recency = math.exp(-math.log(2) / 30.0 * age_days)
 
             blended = alpha * sim + (1.0 - alpha) * recency
-            results.append({
-                "session_id": sess_id,
-                "channel_id": ch_id,
-                "started_at": started_at,
-                "ended_at": ended_at,
-                "summary": summary or "",
-                "similarity_score": round(sim, 6),
-                "recency_score": round(recency, 6),
-                "blended_score": round(blended, 6),
-            })
+            results.append(
+                {
+                    "session_id": sess_id,
+                    "channel_id": ch_id,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "summary": summary or "",
+                    "similarity_score": round(sim, 6),
+                    "recency_score": round(recency, 6),
+                    "blended_score": round(blended, 6),
+                }
+            )
 
         results.sort(key=lambda r: r["blended_score"], reverse=True)
         return results[:limit]
@@ -2277,8 +2552,12 @@ class SagaStore:
         return await asyncio.to_thread(_do)
 
     async def most_retrieved_atoms(
-        self, *, days: int = 7, count: int = 10,
-        channel_id: str | None = None, contributed_only: bool = False,
+        self,
+        *,
+        days: int = 7,
+        count: int = 10,
+        channel_id: str | None = None,
+        contributed_only: bool = False,
         trend: str | None = None,
     ) -> list[dict[str, Any]]:
         """Count retrieval / feedback events per atom in the last N days.
@@ -2296,6 +2575,7 @@ class SagaStore:
           (strengthening / stable / weakening / stale).
         """
         from datetime import datetime, timedelta, timezone
+
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
         def _do():
@@ -2352,8 +2632,7 @@ class SagaStore:
             )
             rows = conn.execute(sql, params).fetchall()
             return [
-                {"id": r[0], "content": r[1], "retrieval_count": r[2]}
-                for r in rows
+                {"id": r[0], "content": r[1], "retrieval_count": r[2]} for r in rows
             ]
 
         if self._db_path is None:
@@ -2367,33 +2646,55 @@ class SagaStore:
         *,
         session_id: str | None = None,
         threshold: float | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]:
-        """Credit-pass: identify which retrieved atoms contributed to a
-        response and fire ``feedback_positive`` events on them. See
-        ``mimir.saga.contributions.mark_contributions`` for the
-        heuristic. Returns a dict the bench harness can log
-        (``contribution_rate``, ``contributed_count``, ``total``).
-
-        Opt-in by call site. The bench harness doesn't call this (saga's
-        bench has it off too).
-        """
+        """Credit only when authority covers every referenced atom."""
         from .contributions import (
-            mark_contributions as _mc, DEFAULT_CONTRIBUTION_THRESHOLD,
+            mark_contributions as _mc,
+            DEFAULT_CONTRIBUTION_THRESHOLD,
         )
+
+        scope = _saga_mutation_scope(auth_context, "saga_mark_contributions")
         thr = threshold if threshold is not None else DEFAULT_CONTRIBUTION_THRESHOLD
+
         def _do():
             conn = self._ensure_conn()
-            return _mc(
-                conn, retrieved_atoms, response_text,
-                session_id=session_id, threshold=thr,
+            atom_ids = [a.get("id") for a in retrieved_atoms if a.get("id")]
+            if len(atom_ids) != len(retrieved_atoms) or len(set(atom_ids)) != len(
+                atom_ids
+            ):
+                return None
+            if _authorized_atom_ids(conn, atom_ids, scope) is None:
+                return None
+            return (
+                _mc(
+                    conn,
+                    retrieved_atoms,
+                    response_text,
+                    session_id=session_id,
+                    threshold=thr,
+                )
+                if atom_ids
+                else None
             )
+
         result = await self._write_locked(_do)
+        if result is None:
+            return {
+                "contributed_count": 0,
+                "total": len(retrieved_atoms),
+                "contribution_rate": 0.0,
+                "contributed": [],
+                "threshold": thr,
+                "authorized": 0,
+            }
         return {
             "contributed_count": len(result.contributed_atom_ids),
             "total": len(retrieved_atoms),
             "contribution_rate": result.contribution_rate,
             "contributed": result.contributed_atom_ids,
             "threshold": result.threshold,
+            "authorized": len(retrieved_atoms),
         }
 
     async def health(self) -> bool:

@@ -6,10 +6,12 @@ count that drives #267's reflection surfacing, and — through the real
 SagaStore — that skill_learning atoms are EXCLUDED from general recall
 (a skill's gotcha must not surface as a memory in an unrelated turn).
 """
+
 from __future__ import annotations
 
 import pytest
 
+from mimir.models import AuthContext
 from mimir.saga.client import SagaStore
 from mimir.skill_memory import (
     ALL_KINDS,
@@ -20,6 +22,17 @@ from mimir.skill_memory import (
     count_negative_learnings,
     is_negative_kind,
     recall_skill_learnings,
+)
+
+
+ADMIN_AUTH = AuthContext(
+    principal="test-admin",
+    canonical_principal="test-admin",
+    roles=("admin",),
+    event_ingress="test",
+    trigger="user_message",
+    channel_id="test-channel",
+    interactivity=None,
 )
 
 
@@ -35,9 +48,7 @@ def _patch_provider(monkeypatch, dim: int = 4):
         def dimensions(self):
             return dim
 
-    monkeypatch.setattr(
-        "mimir.saga.embeddings.get_provider", lambda: _StubProvider()
-    )
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: _StubProvider())
 
     def fake_get_config():
         def cfg(section, key, default=None):
@@ -46,6 +57,7 @@ def _patch_provider(monkeypatch, dim: int = 4):
                 ("embedding", "provider"): "stub",
                 ("embedding", "model"): f"stub-{dim}d",
             }.get((section, key), default)
+
         return cfg
 
     monkeypatch.setattr("mimir.saga._config_io.get_config", fake_get_config)
@@ -81,7 +93,8 @@ class TestValence:
 
     def test_build_metadata_ok(self):
         assert build_metadata("circuit-breaker", "failure-mode") == {
-            "skill": "circuit-breaker", "kind": "failure-mode",
+            "skill": "circuit-breaker",
+            "kind": "failure-mode",
         }
 
     def test_build_metadata_trims_skill(self):
@@ -184,7 +197,9 @@ class TestGeneralRecallExcludesSkillLearning:
         Store a skill_learning atom and a normal atom with overlapping text;
         the normal one may surface, the skill_learning one must not."""
         sl = await _add_learning(
-            store, "circuit-breaker", "failure-mode",
+            store,
+            "circuit-breaker",
+            "failure-mode",
             "circuit breaker backoff resets on reconnect",
         )
         await store.store(
@@ -205,18 +220,23 @@ class TestGeneralRecallExcludesSkillLearning:
 class TestRenderAndAugment:
     def test_render_empty(self):
         from mimir.skill_memory import render_skill_learnings
+
         assert render_skill_learnings([]) == ""
 
     def test_render_one_bullet_per_learning_with_kind(self):
         from mimir.skill_memory import render_skill_learnings
-        out = render_skill_learnings([
-            {"kind": "failure-mode", "content": "resets on reconnect"},
-            {"kind": "tip", "content": "pass --foo"},
-        ])
+
+        out = render_skill_learnings(
+            [
+                {"kind": "failure-mode", "content": "resets on reconnect"},
+                {"kind": "tip", "content": "pass --foo"},
+            ]
+        )
         assert out == "- [failure-mode] resets on reconnect\n- [tip] pass --foo"
 
     def test_render_single_lines_multiline_content(self):
         from mimir.skill_memory import render_skill_learnings
+
         out = render_skill_learnings([{"kind": "tip", "content": "line1\n\nline2"}])
         assert "\n" not in out.split("] ", 1)[1]  # content portion is one line
         assert out == "- [tip] line1 line2"
@@ -225,6 +245,7 @@ class TestRenderAndAugment:
     async def test_augment_appends_learnings(self, store):
         sl = await _add_learning(store, "cb", "failure-mode", "resets on reconnect")
         from mimir.skill_memory import augment_skill_body
+
         conn = store._ensure_conn()
         out, ids = augment_skill_body(conn, "cb", "ORIGINAL BODY")
         assert out.startswith("ORIGINAL BODY")
@@ -237,6 +258,7 @@ class TestRenderAndAugment:
     @pytest.mark.asyncio
     async def test_augment_no_learnings_returns_body_unchanged(self, store):
         from mimir.skill_memory import augment_skill_body
+
         conn = store._ensure_conn()
         assert augment_skill_body(conn, "never-used", "ORIGINAL") == ("ORIGINAL", [])
 
@@ -244,8 +266,12 @@ class TestRenderAndAugment:
     async def test_augment_swallows_db_error(self, store, monkeypatch):
         """A recall error must not fail the skill load — body returned as-is."""
         import mimir.skill_memory as sm
-        monkeypatch.setattr(sm, "recall_skill_learnings",
-                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        monkeypatch.setattr(
+            sm,
+            "recall_skill_learnings",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
         conn = store._ensure_conn()
         assert sm.augment_skill_body(conn, "cb", "BODY") == ("BODY", [])
 
@@ -255,6 +281,7 @@ class TestSagaStoreConnection:
     async def test_connection_accessor_returns_usable_conn(self, store):
         await _add_learning(store, "cb", "tip", "x")
         from mimir.skill_memory import recall_skill_learnings
+
         conn = store.connection()
         # The public accessor returns a conn the skill_memory helpers can use.
         assert recall_skill_learnings(conn, "cb")[0]["content"] == "x"
@@ -270,8 +297,11 @@ class TestRunLockedRead:
     async def test_run_locked_read_matches_direct_augment(self, store):
         sl = await _add_learning(store, "cb", "tip", "pass --foo")
         from mimir import skill_memory
+
         direct = skill_memory.augment_skill_body(
-            store._ensure_conn(), "cb", "BODY",
+            store._ensure_conn(),
+            "cb",
+            "BODY",
         )
         via_store = store.run_locked_read(
             lambda conn: skill_memory.augment_skill_body(conn, "cb", "BODY")
@@ -298,6 +328,7 @@ class TestRunLockedRead:
                 if got:
                     real_lock.release()
                 observed["contended"] = not got
+
             t = threading.Thread(target=_probe)
             t.start()
             t.join()
@@ -327,7 +358,11 @@ class TestActivationRanking:
         assert before[0]["content"] == "newer but unused"
 
         # The agent curates: marks the OLD learning useful (weight-2.0 event).
-        await store.outcome([old["atom_id"]], feedback="positive")
+        await store.outcome(
+            [old["atom_id"]],
+            feedback="positive",
+            auth_context=ADMIN_AUTH,
+        )
 
         after = recall_skill_learnings(conn, "s")
         assert after[0]["content"] == "old but useful", (

@@ -14,11 +14,21 @@ import sqlite3
 
 import pytest
 
+from mimir.models import AuthContext
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import AuthorizationScope
 
 
 ADMIN_SCOPE = AuthorizationScope(is_admin=True)
+ADMIN_AUTH = AuthContext(
+    principal="test-admin",
+    canonical_principal="test-admin",
+    roles=("admin",),
+    event_ingress="test",
+    trigger="user_message",
+    channel_id="test-channel",
+    interactivity=None,
+)
 
 
 @pytest.fixture
@@ -36,6 +46,7 @@ def _patch_provider(monkeypatch, *, enable_session_boundary_rrf: bool = False):
     real retrieval; sufficient to exercise the embed → store → recall
     pipeline.
     """
+
     class _StubProvider:
         def embed(self, text, *, input_type="passage"):
             h = abs(hash(text)) % 1000
@@ -53,8 +64,12 @@ def _patch_provider(monkeypatch, *, enable_session_boundary_rrf: bool = False):
                 ("embedding", "max_input_chars"): 2000,
                 ("embedding", "provider"): "stub",
                 ("embedding", "model"): "stub-4d",
-                ("retrieval", "enable_session_boundary_rrf"): enable_session_boundary_rrf,
+                (
+                    "retrieval",
+                    "enable_session_boundary_rrf",
+                ): enable_session_boundary_rrf,
             }.get((section, key), default)
+
         return cfg
 
     monkeypatch.setattr("mimir.saga.embeddings.get_provider", fake_get_provider)
@@ -72,7 +87,8 @@ async def test_client_health_returns_true_on_fresh_db(client, monkeypatch):
 async def test_client_store_returns_atom_id(client, monkeypatch):
     _patch_provider(monkeypatch)
     result = await client.store(
-        "Alice prefers concise replies", stream="semantic",
+        "Alice prefers concise replies",
+        stream="semantic",
     )
     assert result["stored"] is True
     assert "atom_id" in result
@@ -131,7 +147,9 @@ async def test_store_embedding_runs_outside_write_lock(client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_store_exact_duplicate_fast_path_still_skips_embedding(client, monkeypatch):
+async def test_store_exact_duplicate_fast_path_still_skips_embedding(
+    client, monkeypatch
+):
     """Exact content-hash duplicates still dedupe without another embed."""
     _patch_provider(monkeypatch)
 
@@ -196,7 +214,9 @@ async def test_query_can_disable_session_boundary_rrf(tmp_path, monkeypatch):
     monkeypatch.setattr(client, "_ensure_index", lambda conn: None)
 
     result = await client.query(
-        "unmatched-query", top_k=5, enable_session_boundary_rrf=False,
+        "unmatched-query",
+        top_k=5,
+        enable_session_boundary_rrf=False,
         auth_context=ADMIN_SCOPE,
     )
 
@@ -208,7 +228,10 @@ async def test_client_feedback_records_event(client, monkeypatch):
     _patch_provider(monkeypatch)
     r = await client.store("test atom")
     result = await client.feedback(
-        [r["atom_id"]], "agent reply text", feedback="positive",
+        [r["atom_id"]],
+        "agent reply text",
+        feedback="positive",
+        auth_context=ADMIN_AUTH,
     )
     assert result["marked"] == 1
     assert result["total"] == 1
@@ -218,7 +241,8 @@ async def test_client_feedback_records_event(client, monkeypatch):
 async def test_client_end_session_writes_summary(client, monkeypatch):
     _patch_provider(monkeypatch)
     result = await client.end_session(
-        "s1", "we discussed PR review",
+        "s1",
+        "we discussed PR review",
         topics_discussed=["pr-review"],
     )
     assert result["session_id"] == "s1"
@@ -254,7 +278,9 @@ async def test_get_atoms_batch_load_preserves_order(client, monkeypatch):
 async def test_get_atoms_reports_missing(client, monkeypatch):
     _patch_provider(monkeypatch)
     a = await client.store("a real atom")
-    res = await client.get_atoms([a["atom_id"], "0000nonexistent0000"], auth_context=ADMIN_SCOPE)
+    res = await client.get_atoms(
+        [a["atom_id"], "0000nonexistent0000"], auth_context=ADMIN_SCOPE
+    )
     assert [x["id"] for x in res["atoms"]] == [a["atom_id"]]
     assert res["missing"] == ["0000nonexistent0000"]
 
@@ -314,7 +340,9 @@ async def test_query_access_write_is_best_effort(client, monkeypatch):
     # An uncommitted write owned by THIS (the caller's) transaction.
     conn.execute("UPDATE atoms SET arousal = 0.99 WHERE id = ?", (r["atom_id"],))
     try:
-        result = await client.query("Alice", top_k=5, auth_context=ADMIN_SCOPE)  # must NOT raise
+        result = await client.query(
+            "Alice", top_k=5, auth_context=ADMIN_SCOPE
+        )  # must NOT raise
         # recall's skipped access-event write must NOT have rolled us back.
         arousal = conn.execute(
             "SELECT arousal FROM atoms WHERE id = ?", (r["atom_id"],)
@@ -344,6 +372,7 @@ async def test_query_access_write_is_best_effort(client, monkeypatch):
 async def test_memory_get_tool_formats_and_reports_missing(client, monkeypatch):
     _patch_provider(monkeypatch)
     from mimir.tools.memory import memory_get, set_memory_client
+
     a = await client.store("apple atom content")
     set_memory_client(client)
     original_get_atoms = client.get_atoms
@@ -364,6 +393,7 @@ async def test_memory_get_tool_formats_and_reports_missing(client, monkeypatch):
 @pytest.mark.asyncio
 async def test_memory_get_tool_no_client():
     from mimir.tools.memory import memory_get, set_memory_client
+
     set_memory_client(None)
     out = await memory_get.ainvoke({"atom_ids": ["x"]})
     assert "no SagaStore configured" in out
@@ -374,7 +404,9 @@ async def test_client_recent_session_boundaries(client, monkeypatch):
     _patch_provider(monkeypatch)
     await client.end_session("s1", "first")
     await client.end_session("s2", "second")
-    boundaries = await client.recent_session_boundaries(count=10, auth_context=ADMIN_SCOPE)
+    boundaries = await client.recent_session_boundaries(
+        count=10, auth_context=ADMIN_SCOPE
+    )
     assert len(boundaries) == 2
 
 
@@ -382,7 +414,7 @@ async def test_client_recent_session_boundaries(client, monkeypatch):
 async def test_client_forget_dry_run(client, monkeypatch):
     _patch_provider(monkeypatch)
     await client.store("stale atom")
-    result = await client.forget(dry_run=True)
+    result = await client.forget(dry_run=True, auth_context=ADMIN_AUTH)
     assert result["dry_run"] is True
     # Returns count + preview ids without writing.
 
@@ -406,6 +438,7 @@ async def test_saga_store_async_context_manager(tmp_path, monkeypatch):
     ergonomics fix so callers don't have to remember
     ``await store.close()`` manually."""
     from mimir.saga.client import SagaStore
+
     _patch_provider(monkeypatch)
     db_path = tmp_path / "ctx_mgr.db"
 
@@ -421,12 +454,14 @@ async def test_saga_store_async_context_manager(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_saga_store_async_context_manager_propagates_exceptions(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     """An exception raised in the ``async with`` body propagates —
     ``__aexit__`` must not suppress. Defends against accidentally
     introducing exception swallow in close-on-exit."""
     from mimir.saga.client import SagaStore
+
     _patch_provider(monkeypatch)
     db_path = tmp_path / "ctx_mgr_exc.db"
 
@@ -443,6 +478,7 @@ async def test_saga_store_async_context_manager_propagates_exceptions(
 def _patch_provider_with_rewrite_flag(monkeypatch, *, rewrite_enabled: bool):
     """Like ``_patch_provider`` but the stubbed saga.toml config also
     reports ``[retrieval].enable_contextual_rewrite``."""
+
     class _StubProvider:
         def embed(self, text, *, input_type="passage"):
             return [0.1, 0.2, 0.3, 0.4]
@@ -461,6 +497,7 @@ def _patch_provider_with_rewrite_flag(monkeypatch, *, rewrite_enabled: bool):
                 ("embedding", "model"): "stub-4d",
                 ("retrieval", "enable_contextual_rewrite"): rewrite_enabled,
             }.get((section, key), default)
+
         return cfg
 
     monkeypatch.setattr("mimir.saga.embeddings.get_provider", fake_get_provider)
@@ -469,7 +506,8 @@ def _patch_provider_with_rewrite_flag(monkeypatch, *, rewrite_enabled: bool):
 
 @pytest.mark.asyncio
 async def test_query_reads_rewrite_flag_from_config_when_kwarg_omitted(
-    client, monkeypatch,
+    client,
+    monkeypatch,
 ):
     """When the caller omits ``enable_contextual_rewrite=`` and passes
     ``context=``, SagaStore.query consults saga.toml's
@@ -484,7 +522,8 @@ async def test_query_reads_rewrite_flag_from_config_when_kwarg_omitted(
         return "anchor for X"
 
     monkeypatch.setattr(
-        "mimir.saga.query_rewrite.rewrite_query", fake_rewrite,
+        "mimir.saga.query_rewrite.rewrite_query",
+        fake_rewrite,
     )
     payload = await client.query(
         "what about that?",
@@ -507,7 +546,8 @@ async def test_query_skips_rewrite_when_config_disabled(client, monkeypatch):
         return "should not be used"
 
     monkeypatch.setattr(
-        "mimir.saga.query_rewrite.rewrite_query", fake_rewrite,
+        "mimir.saga.query_rewrite.rewrite_query",
+        fake_rewrite,
     )
     payload = await client.query(
         "what about that?",
@@ -530,7 +570,8 @@ async def test_query_explicit_kwarg_overrides_config_flag(client, monkeypatch):
         return "anchor"
 
     monkeypatch.setattr(
-        "mimir.saga.query_rewrite.rewrite_query", fake_rewrite,
+        "mimir.saga.query_rewrite.rewrite_query",
+        fake_rewrite,
     )
     await client.query(
         "what about that?",
@@ -545,7 +586,8 @@ async def test_query_explicit_kwarg_overrides_config_flag(client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_forget_warns_when_contribution_threshold_passed(
-    tmp_path, caplog,
+    tmp_path,
+    caplog,
 ):
     """``SagaStore.forget(contribution_threshold=...)`` accepts the
     param at the surface (so HTTP-path-shape callsites don't break)
@@ -556,6 +598,7 @@ async def test_forget_warns_when_contribution_threshold_passed(
     """
     import logging
     from mimir.saga.client import SagaStore
+
     db_path = tmp_path / "test.saga.db"
     store = SagaStore(db_path=db_path)
 
@@ -565,9 +608,9 @@ async def test_forget_warns_when_contribution_threshold_passed(
             contribution_threshold=0.3,
         )
     warning_msgs = [
-        r.getMessage() for r in caplog.records
-        if r.levelno >= logging.WARNING
-        and "contribution_threshold" in r.getMessage()
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "contribution_threshold" in r.getMessage()
     ]
     assert warning_msgs, (
         f"expected a WARNING mentioning contribution_threshold; got: "
@@ -578,11 +621,13 @@ async def test_forget_warns_when_contribution_threshold_passed(
 
 @pytest.mark.asyncio
 async def test_forget_warns_when_contradiction_threshold_passed(
-    tmp_path, caplog,
+    tmp_path,
+    caplog,
 ):
     """Same shape for the contradiction_threshold param."""
     import logging
     from mimir.saga.client import SagaStore
+
     db_path = tmp_path / "test.saga.db"
     store = SagaStore(db_path=db_path)
 
@@ -592,9 +637,9 @@ async def test_forget_warns_when_contradiction_threshold_passed(
             contradiction_threshold=0.5,
         )
     warning_msgs = [
-        r.getMessage() for r in caplog.records
-        if r.levelno >= logging.WARNING
-        and "contradiction_threshold" in r.getMessage()
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "contradiction_threshold" in r.getMessage()
     ]
     assert warning_msgs
     assert "ignored" in warning_msgs[0].lower()
@@ -602,13 +647,15 @@ async def test_forget_warns_when_contradiction_threshold_passed(
 
 @pytest.mark.asyncio
 async def test_forget_silent_when_only_implemented_params_passed(
-    tmp_path, caplog,
+    tmp_path,
+    caplog,
 ):
     """Regression guard: a forget call that only uses the supported
     params (agent_id is injected automatically, plus min_retrievals /
     grace_days / confidence_floor) must NOT emit a warning."""
     import logging
     from mimir.saga.client import SagaStore
+
     db_path = tmp_path / "test.saga.db"
     store = SagaStore(db_path=db_path)
 
@@ -619,7 +666,8 @@ async def test_forget_silent_when_only_implemented_params_passed(
             min_retrievals=5,
         )
     nyi_warnings = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.levelno >= logging.WARNING
         and (
             "contribution_threshold" in r.getMessage()

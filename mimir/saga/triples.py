@@ -32,6 +32,7 @@ the RRF in ``recall.py``. Saga's bench config defaults to triples
 extraction OFF + graph pathway OFF, but the canonical that hit 81.6%
 ran with P42 triples ON per the operator note (2026-05-03).
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -71,7 +72,9 @@ def make_triple_id(subject: str, predicate: str, obj: str) -> str:
     triple's ``source_atom_id`` tracks the FIRST atom that emitted it;
     a separate relation could record the rest if we ever need fan-out.
     """
-    norm = f"{subject.lower().strip()}:{predicate.lower().strip()}:{obj.lower().strip()}"
+    norm = (
+        f"{subject.lower().strip()}:{predicate.lower().strip()}:{obj.lower().strip()}"
+    )
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
 
 
@@ -130,7 +133,11 @@ def parse_triples(text: str) -> list[dict]:
         obj = obj.strip().strip("\"'")
         if not subj or not pred or not obj:
             continue
-        if len(subj) < MIN_TERM_CHARS or len(obj) < MIN_TERM_CHARS or len(pred) < MIN_TERM_CHARS:
+        if (
+            len(subj) < MIN_TERM_CHARS
+            or len(obj) < MIN_TERM_CHARS
+            or len(pred) < MIN_TERM_CHARS
+        ):
             continue
         if len(subj) > MAX_SUBJECT_CHARS or len(obj) > MAX_OBJECT_CHARS:
             continue
@@ -146,7 +153,11 @@ def parse_triples(text: str) -> list[dict]:
                 k, _, v = kv.partition("=")
                 k = k.strip().lower()
                 v = v.strip().strip("\"'")
-                if k in ("valid_from", "valid_until") and v and v.lower() not in ("null", "none"):
+                if (
+                    k in ("valid_from", "valid_until")
+                    and v
+                    and v.lower() not in ("null", "none")
+                ):
                     triple[k] = v
         out.append(triple)
     return out
@@ -330,7 +341,8 @@ def store_triples(
     for t in triples:
         triple_id = make_triple_id(t["subject"], t["predicate"], t["object"])
         existing = conn.execute(
-            "SELECT id FROM triples WHERE id = ?", (triple_id,),
+            "SELECT id FROM triples WHERE id = ?",
+            (triple_id,),
         ).fetchone()
         if existing is not None:
             if intersected_acl is not None:
@@ -359,11 +371,18 @@ def store_triples(
             " origin_domain, visibility, provenance) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                triple_id, t["subject"], t["predicate"], t["object"],
-                source_atom_id, t.get("confidence", 1.0),
-                t.get("valid_from"), t.get("valid_until"),
-                emb_bytes, emb_dim,
-                now, json.dumps(t.get("metadata", {})),
+                triple_id,
+                t["subject"],
+                t["predicate"],
+                t["object"],
+                source_atom_id,
+                t.get("confidence", 1.0),
+                t.get("valid_from"),
+                t.get("valid_until"),
+                emb_bytes,
+                emb_dim,
+                now,
+                json.dumps(t.get("metadata", {})),
                 acl.owner_principal,
                 acl.origin_channel,
                 acl.origin_domain,
@@ -376,7 +395,8 @@ def store_triples(
         # for the same (subj, pred), insert the new value as current.
         _update_world_state(
             conn,
-            subject=t["subject"], predicate=t["predicate"],
+            subject=t["subject"],
+            predicate=t["predicate"],
             value=t["object"],
             valid_from=t.get("valid_from"),
             valid_until=t.get("valid_until"),
@@ -454,10 +474,20 @@ def _update_world_state(
         " is_current, source_triple_id, updated_at, "
         " owner_principal, origin_channel, origin_domain, visibility, provenance) "
         "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
-        (subject, predicate, value, new_valid_from, valid_until,
-         source_triple_id, now,
-         acl.owner_principal, acl.origin_channel, acl.origin_domain,
-         acl.visibility, json.dumps(acl.provenance)),
+        (
+            subject,
+            predicate,
+            value,
+            new_valid_from,
+            valid_until,
+            source_triple_id,
+            now,
+            acl.owner_principal,
+            acl.origin_channel,
+            acl.origin_domain,
+            acl.visibility,
+            json.dumps(acl.provenance),
+        ),
     )
 
 
@@ -496,9 +526,13 @@ def get_current_value(
     if row is None:
         return None
     return WorldFact(
-        subject=row[0], predicate=row[1], value=row[2],
-        valid_from=row[3], valid_until=row[4],
-        is_current=bool(row[5]), source_triple_id=row[6],
+        subject=row[0],
+        predicate=row[1],
+        value=row[2],
+        valid_from=row[3],
+        valid_until=row[4],
+        is_current=bool(row[5]),
+        source_triple_id=row[6],
     )
 
 
@@ -518,9 +552,13 @@ def get_history(
     ).fetchall()
     return [
         WorldFact(
-            subject=r[0], predicate=r[1], value=r[2],
-            valid_from=r[3], valid_until=r[4],
-            is_current=bool(r[5]), source_triple_id=r[6],
+            subject=r[0],
+            predicate=r[1],
+            value=r[2],
+            valid_from=r[3],
+            valid_until=r[4],
+            is_current=bool(r[5]),
+            source_triple_id=r[6],
         )
         for r in rows
     ]
@@ -635,7 +673,8 @@ def triple_augment_search(
         f"""SELECT t.id, t.source_atom_id, t.embedding, t.embedding_dim
             FROM triples t
             JOIN atoms a ON t.source_atom_id = a.id
-            WHERE t.tombstoned = 0 AND t.embedding IS NOT NULL
+            WHERE t.tombstoned = 0 AND a.tombstoned = 0
+              AND t.embedding IS NOT NULL
               AND (t.valid_until IS NULL OR t.valid_until > ?)
               AND {auth_where}
         """,
@@ -645,7 +684,9 @@ def triple_augment_search(
         return []
     candidates = [r for r in rows if r[1] is not None]
     scores = _cosine_scores(
-        query_emb, [(r[2], r[3]) for r in candidates], dim=dim,
+        query_emb,
+        [(r[2], r[3]) for r in candidates],
+        dim=dim,
     )
     best: dict[str, float] = {}
     for i, sim in scores:
@@ -705,7 +746,8 @@ def top_triples_with_payload(
                   t.valid_from, t.valid_until, t.confidence, t.embedding, t.embedding_dim
             FROM triples t
             JOIN atoms a ON t.source_atom_id = a.id
-            WHERE t.tombstoned = 0 AND t.embedding IS NOT NULL
+            WHERE t.tombstoned = 0 AND a.tombstoned = 0
+              AND t.embedding IS NOT NULL
               AND (t.valid_until IS NULL OR t.valid_until > ?)
               AND {auth_where}
         """,
@@ -715,23 +757,40 @@ def top_triples_with_payload(
         return []
     candidates = [r for r in rows if r[1] is not None]
     scores = _cosine_scores(
-        query_emb, [(r[8], r[9]) for r in candidates], dim=dim,
+        query_emb,
+        [(r[8], r[9]) for r in candidates],
+        dim=dim,
     )
     scored: list[tuple[float, dict]] = []
     for i, sim in scores:
-        (triple_id, source_atom_id, subj, pred, obj,
-         valid_from, valid_until, confidence, _blob, _t_dim) = candidates[i]
-        scored.append((sim, {
-            "id": triple_id,
-            "source_atom_id": source_atom_id,
-            "subject": subj,
-            "predicate": pred,
-            "object": obj,
-            "valid_from": valid_from,
-            "valid_until": valid_until,
-            "confidence": confidence,
-            "_cosine": sim,
-        }))
+        (
+            triple_id,
+            source_atom_id,
+            subj,
+            pred,
+            obj,
+            valid_from,
+            valid_until,
+            confidence,
+            _blob,
+            _t_dim,
+        ) = candidates[i]
+        scored.append(
+            (
+                sim,
+                {
+                    "id": triple_id,
+                    "source_atom_id": source_atom_id,
+                    "subject": subj,
+                    "predicate": pred,
+                    "object": obj,
+                    "valid_from": valid_from,
+                    "valid_until": valid_until,
+                    "confidence": confidence,
+                    "_cosine": sim,
+                },
+            )
+        )
     scored.sort(key=lambda x: -x[0])
     return [t for _, t in scored[:top_n]]
 
@@ -766,7 +825,7 @@ def retrieve_by_entity(
                   t.valid_from, t.valid_until
             FROM triples t
             JOIN atoms a ON t.source_atom_id = a.id
-            WHERE t.tombstoned = 0
+            WHERE t.tombstoned = 0 AND a.tombstoned = 0
               AND (t.subject LIKE ? ESCAPE '\\' OR t.object LIKE ? ESCAPE '\\')
               AND {auth_where}
             LIMIT ?""",
@@ -774,9 +833,13 @@ def retrieve_by_entity(
     ).fetchall()
     return [
         {
-            "id": r[0], "subject": r[1], "predicate": r[2], "object": r[3],
+            "id": r[0],
+            "subject": r[1],
+            "predicate": r[2],
+            "object": r[3],
             "source_atom_id": r[4],
-            "valid_from": r[5], "valid_until": r[6],
+            "valid_from": r[5],
+            "valid_until": r[6],
         }
         for r in rows
     ]
@@ -826,8 +889,10 @@ def detect_contradictions(
     ).fetchall()
     return [
         {
-            "subject": r[0], "predicate": r[1],
-            "values": r[2].split("|||"), "count": r[3],
+            "subject": r[0],
+            "predicate": r[1],
+            "values": r[2].split("|||"),
+            "count": r[3],
         }
         for r in rows
     ]
@@ -888,8 +953,12 @@ def resolve_contradictions_to_supersedes(
                 "(source_id, target_id, relation_type, confidence, "
                 " created_at, metadata) "
                 "VALUES (?, ?, 'supersedes', 1.0, ?, ?)",
-                (winner, loser, now,
-                 json.dumps({"trigger": "contradiction_resolution"})),
+                (
+                    winner,
+                    loser,
+                    now,
+                    json.dumps({"trigger": "contradiction_resolution"}),
+                ),
             )
             if cursor.rowcount > 0:
                 added += 1
@@ -960,16 +1029,22 @@ def repair_world_state_dual_current(conn: sqlite3.Connection) -> list[dict]:
             logger.warning(
                 "world_state_dual_current_repaired: (%r, %r) kept %r "
                 "(valid_from=%s); end-dated %d stale current row(s): %s",
-                subject, predicate, kept_value, kept_valid_from,
-                len(superseded), [s["value"] for s in superseded],
+                subject,
+                predicate,
+                kept_value,
+                kept_valid_from,
+                len(superseded),
+                [s["value"] for s in superseded],
             )
-            repairs.append({
-                "subject": subject,
-                "predicate": predicate,
-                "kept_value": kept_value,
-                "kept_valid_from": kept_valid_from,
-                "superseded": superseded,
-            })
+            repairs.append(
+                {
+                    "subject": subject,
+                    "predicate": predicate,
+                    "kept_value": kept_value,
+                    "kept_valid_from": kept_valid_from,
+                    "superseded": superseded,
+                }
+            )
         conn.commit()
     except Exception:
         conn.rollback()

@@ -30,7 +30,19 @@ from pathlib import Path
 
 import pytest
 
+from mimir.models import AuthContext
 from mimir.saga.activation import compute_activation
+
+
+ADMIN_AUTH = AuthContext(
+    principal="test-admin",
+    canonical_principal="test-admin",
+    roles=("admin",),
+    event_ingress="test",
+    trigger="user_message",
+    channel_id="test-channel",
+    interactivity=None,
+)
 
 
 # ─── FAISS index tombstone sync ──────────────────────────────────────
@@ -42,7 +54,8 @@ def _iso(dt: datetime) -> str:
 
 @pytest.mark.asyncio
 async def test_saga_forget_removes_tombstoned_atoms_from_faiss_index(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """After ``SagaStore.forget(dry_run=False)`` tombstones atoms,
     the FAISS index must have those positions removed so over-fetches
@@ -69,11 +82,13 @@ async def test_saga_forget_removes_tombstoned_atoms_from_faiss_index(
     )
     monkeypatch.setattr(
         "mimir.saga._config_io.get_config",
-        lambda: lambda s, k, d=None: {
-            ("embedding", "max_input_chars"): 2000,
-            ("embedding", "provider"): "stub",
-            ("embedding", "model"): "stub-4d",
-        }.get((s, k), d),
+        lambda: (
+            lambda s, k, d=None: {
+                ("embedding", "max_input_chars"): 2000,
+                ("embedding", "provider"): "stub",
+                ("embedding", "model"): "stub-4d",
+            }.get((s, k), d)
+        ),
     )
 
     store = SagaStore(db_path=tmp_path / "test.saga.db", embedding_dim=4)
@@ -102,7 +117,11 @@ async def test_saga_forget_removes_tombstoned_atoms_from_faiss_index(
     assert pre_positions == 3, f"expected 3 indexed atoms, got {pre_positions}"
 
     # Forget with grace_days=1 — all 3 atoms qualify (aged 365 days).
-    result = await store.forget(grace_days=1, dry_run=False)
+    result = await store.forget(
+        grace_days=1,
+        dry_run=False,
+        auth_context=ADMIN_AUTH,
+    )
     assert result["tombstoned_count"] == 3, f"expected 3 tombstoned; got {result}"
 
     # ── The regression guard: index positions for tombstoned atoms
@@ -118,7 +137,8 @@ async def test_saga_forget_removes_tombstoned_atoms_from_faiss_index(
 
 @pytest.mark.asyncio
 async def test_consolidate_repairs_dual_current_world_state_with_few_raws(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """chainlink #331: the world_state dual-current repair must run on EVERY
     non-dry-run consolidate — including when there are too few raw atoms to
@@ -131,11 +151,13 @@ async def test_consolidate_repairs_dual_current_world_state_with_few_raws(
 
     monkeypatch.setattr(
         "mimir.saga._config_io.get_config",
-        lambda: lambda s, k, d=None: {
-            ("embedding", "max_input_chars"): 2000,
-            ("embedding", "provider"): "stub",
-            ("embedding", "model"): "stub-4d",
-        }.get((s, k), d),
+        lambda: (
+            lambda s, k, d=None: {
+                ("embedding", "max_input_chars"): 2000,
+                ("embedding", "provider"): "stub",
+                ("embedding", "model"): "stub-4d",
+            }.get((s, k), d)
+        ),
     )
     store = SagaStore(db_path=tmp_path / "test.saga.db", embedding_dim=4)
     conn = store._ensure_conn()
@@ -168,7 +190,8 @@ async def test_consolidate_repairs_dual_current_world_state_with_few_raws(
 
 @pytest.mark.asyncio
 async def test_consolidate_reads_hold_db_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """chainlink #386: consolidate's shared-connection reads must run while
     _db_lock is held, so a concurrent turn's write (also _db_lock-guarded) can
@@ -182,11 +205,13 @@ async def test_consolidate_reads_hold_db_lock(
 
     monkeypatch.setattr(
         "mimir.saga._config_io.get_config",
-        lambda: lambda s, k, d=None: {
-            ("embedding", "max_input_chars"): 2000,
-            ("embedding", "provider"): "stub",
-            ("embedding", "model"): "stub-4d",
-        }.get((s, k), d),
+        lambda: (
+            lambda s, k, d=None: {
+                ("embedding", "max_input_chars"): 2000,
+                ("embedding", "provider"): "stub",
+                ("embedding", "model"): "stub-4d",
+            }.get((s, k), d)
+        ),
     )
     store = SagaStore(db_path=tmp_path / "test.saga.db", embedding_dim=4)
 
@@ -243,9 +268,7 @@ def test_compute_activation_d_equals_1_uses_log_integral():
     )
     # Activation must be finite (not -inf, not NaN). Sign is
     # determined by whether the integral pushes Σ above 0.0.
-    assert math.isfinite(act), (
-        f"d=1 special case produced non-finite activation {act}"
-    )
+    assert math.isfinite(act), f"d=1 special case produced non-finite activation {act}"
 
 
 def test_compute_activation_negative_recent_weight_subtracts():
@@ -264,7 +287,9 @@ def test_compute_activation_negative_recent_weight_subtracts():
     act_pos = compute_activation(
         recent_ts=[one_hour_ago],
         recent_weights=[1.0],
-        old_count=0, old_weight_sum=0.0, old_oldest_ts=None,
+        old_count=0,
+        old_weight_sum=0.0,
+        old_oldest_ts=None,
         now=now,
     )
     assert math.isfinite(act_pos)
@@ -275,7 +300,9 @@ def test_compute_activation_negative_recent_weight_subtracts():
     act_neg = compute_activation(
         recent_ts=[one_hour_ago],
         recent_weights=[-1.0],
-        old_count=0, old_weight_sum=0.0, old_oldest_ts=None,
+        old_count=0,
+        old_weight_sum=0.0,
+        old_oldest_ts=None,
         now=now,
     )
     assert act_neg == float("-inf"), (
@@ -288,7 +315,9 @@ def test_compute_activation_negative_recent_weight_subtracts():
     act_cancel = compute_activation(
         recent_ts=[one_hour_ago, one_hour_ago],
         recent_weights=[1.0, -1.0],
-        old_count=0, old_weight_sum=0.0, old_oldest_ts=None,
+        old_count=0,
+        old_weight_sum=0.0,
+        old_oldest_ts=None,
         now=now,
     )
     assert act_cancel == float("-inf")
@@ -298,7 +327,9 @@ def test_compute_activation_negative_recent_weight_subtracts():
     act_net = compute_activation(
         recent_ts=[one_hour_ago, one_hour_ago],
         recent_weights=[2.0, -1.0],
-        old_count=0, old_weight_sum=0.0, old_oldest_ts=None,
+        old_count=0,
+        old_weight_sum=0.0,
+        old_oldest_ts=None,
         now=now,
     )
     assert math.isclose(act_net, act_pos, rel_tol=1e-9)
@@ -316,7 +347,9 @@ def test_compute_activation_zero_weight_recent_event_contributes_zero():
     act_baseline = compute_activation(
         recent_ts=[one_hour_ago],
         recent_weights=[1.0],
-        old_count=0, old_weight_sum=0.0, old_oldest_ts=None,
+        old_count=0,
+        old_weight_sum=0.0,
+        old_oldest_ts=None,
         now=now,
     )
 
@@ -325,7 +358,9 @@ def test_compute_activation_zero_weight_recent_event_contributes_zero():
     act_with_zero = compute_activation(
         recent_ts=[one_hour_ago, _iso(now - timedelta(minutes=5))],
         recent_weights=[1.0, 0.0],
-        old_count=0, old_weight_sum=0.0, old_oldest_ts=None,
+        old_count=0,
+        old_weight_sum=0.0,
+        old_oldest_ts=None,
         now=now,
     )
     assert math.isclose(act_with_zero, act_baseline, rel_tol=1e-9)
@@ -415,7 +450,8 @@ def test_apply_pending_migrations_fresh_false_empty_applied_runs_migrations(
 
 
 def test_apply_pending_migrations_fresh_false_empty_applied_skips_when_db_is_current(
-    monkeypatch, tmp_path,
+    monkeypatch,
+    tmp_path,
 ):
     """The mid-init retry scenario: ``schema.sql`` ran (producing
     v8-shape tables), then the migration step raised and the connection
@@ -449,8 +485,7 @@ def test_apply_pending_migrations_fresh_false_empty_applied_skips_when_db_is_cur
 
     versions = {r[0] for r in conn.execute("SELECT version FROM schema_version")}
     assert versions == {1, 2, 3, 4, 5, 6, 7, 8}, (
-        f"all baselines 1..8 should be stamped on a v8-shape DB; "
-        f"got {sorted(versions)}"
+        f"all baselines 1..8 should be stamped on a v8-shape DB; got {sorted(versions)}"
     )
 
 
@@ -458,6 +493,7 @@ def test_detect_schema_version_returns_one_for_bare_db(tmp_path):
     """No sessions table, no access_events table → v1."""
     from mimir.saga.client import SagaStore
     import sqlite3 as sq
+
     store = SagaStore.__new__(SagaStore)
     conn = sq.connect(":memory:")
     assert store._detect_schema_version(conn) == 1
@@ -466,6 +502,7 @@ def test_detect_schema_version_returns_one_for_bare_db(tmp_path):
 def test_detect_schema_version_returns_eight_for_current_schema(tmp_path):
     """A DB created via the current ``schema.sql`` → v8 (world_state visibility column)."""
     from mimir.saga.client import SagaStore
+
     store = SagaStore(db_path=tmp_path / "v8.saga.db")
     conn = store._ensure_conn()
     assert store._detect_schema_version(conn) == 8
@@ -506,10 +543,7 @@ def test_detect_schema_version_distinguishes_v2_v3_v4(tmp_path):
 
     # v7: atoms has visibility column
     conn7 = sq.connect(":memory:")
-    conn7.executescript(
-        "CREATE TABLE atoms ("
-        "id TEXT PRIMARY KEY, visibility TEXT);"
-    )
+    conn7.executescript("CREATE TABLE atoms (id TEXT PRIMARY KEY, visibility TEXT);")
     assert store._detect_schema_version(conn7) == 7
 
 
@@ -624,7 +658,10 @@ def test_migrate_init_includes_busy_timeout_pragma():
     place. Brittle to refactors but pins the contract.
     """
     from pathlib import Path
-    src = Path(__import__("mimir.saga.migrate", fromlist=["__file__"]).__file__).read_text()
+
+    src = Path(
+        __import__("mimir.saga.migrate", fromlist=["__file__"]).__file__
+    ).read_text()
     # Look for the chainlink #227 marker + the PRAGMA call together.
     assert "chainlink #227" in src, (
         "chainlink #227 marker missing from saga/migrate.py — the fix may have been removed"
@@ -642,6 +679,7 @@ def test_migrate_init_includes_busy_timeout_pragma():
 
 def _stub_embeddings(monkeypatch):
     """All-identical 4-d embeddings + stub config, so atoms cluster."""
+
     class _StubProvider:
         def embed(self, text, *, input_type="passage"):
             return [1.0, 0.0, 0.0, 0.0]
@@ -652,17 +690,20 @@ def _stub_embeddings(monkeypatch):
     monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: _StubProvider())
     monkeypatch.setattr(
         "mimir.saga._config_io.get_config",
-        lambda: lambda s, k, d=None: {
-            ("embedding", "max_input_chars"): 2000,
-            ("embedding", "provider"): "stub",
-            ("embedding", "model"): "stub-4d",
-        }.get((s, k), d),
+        lambda: (
+            lambda s, k, d=None: {
+                ("embedding", "max_input_chars"): 2000,
+                ("embedding", "provider"): "stub",
+                ("embedding", "model"): "stub-4d",
+            }.get((s, k), d)
+        ),
     )
 
 
 @pytest.mark.asyncio
 async def test_consolidate_removes_dedup_tombstoned_from_faiss_index(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """chainlink #390: dedup-tombstoned raws must be removed from the FAISS index
     (mirror forget) so their vectors don't keep consuming top_k slots."""
@@ -692,7 +733,8 @@ async def test_consolidate_removes_dedup_tombstoned_from_faiss_index(
 
 @pytest.mark.asyncio
 async def test_consolidate_keeps_rollback_branch_live_atom_in_faiss_index(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """chainlink #748: if a stale overlapping dedup cluster picks a canonical
     already tombstoned by an earlier cluster, the rolled-back cluster must not
@@ -728,7 +770,8 @@ async def test_consolidate_keeps_rollback_branch_live_atom_in_faiss_index(
         return [[by_id[a], by_id[b]], [by_id[b], by_id[c]]]
 
     monkeypatch.setattr(
-        cluster_mod, "make_default_cluster_fn",
+        cluster_mod,
+        "make_default_cluster_fn",
         lambda *_args, **_kwargs: forced_cluster_fn,
     )
 
@@ -742,18 +785,27 @@ async def test_consolidate_keeps_rollback_branch_live_atom_in_faiss_index(
     tombstoned = result["dedup"]["duplicates_tombstoned"]
     assert tombstoned == [b]
     assert c not in tombstoned
-    assert conn.execute(
-        "SELECT tombstoned FROM atoms WHERE id = ?", (c,),
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute(
+            "SELECT tombstoned FROM atoms WHERE id = ?",
+            (c,),
+        ).fetchone()[0]
+        == 0
+    )
     assert c in index._id_to_pos
-    assert c in {atom_id for atom_id, _score in index.search(
-        [1.0, 0.0, 0.0, 0.0], top_k=20,
-    )}
+    assert c in {
+        atom_id
+        for atom_id, _score in index.search(
+            [1.0, 0.0, 0.0, 0.0],
+            top_k=20,
+        )
+    }
 
 
 @pytest.mark.asyncio
 async def test_consolidate_restructure_tombstones_orphan_on_rollback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """chainlink #391: if the relations transaction fails after the observation
     atom was already committed by _store_atom, the orphan must be tombstoned (not
@@ -766,8 +818,12 @@ async def test_consolidate_restructure_tombstones_orphan_on_rollback(
         await store.store(content=f"observation seed {i}", stream="semantic")
 
     async def _stub_synth(cluster, *, prior_block="", vocab_block=""):
-        return {"content": "synthesized observation", "topics": [],
-                "triples": [], "contradictions": []}
+        return {
+            "content": "synthesized observation",
+            "topics": [],
+            "triples": [],
+            "contradictions": [],
+        }
 
     store._rich_synth_fn = _stub_synth
     # Force the relations transaction to fail AFTER the observation atom is
@@ -798,7 +854,8 @@ async def test_consolidate_restructure_tombstones_orphan_on_rollback(
 
 @pytest.mark.asyncio
 async def test_consolidate_skill_memories_removes_tombstoned_from_faiss_index(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """chainlink #425: the per-skill dedup pass must mirror dedup tombstones
     into ``VectorIndex.remove`` — the #390 fix was applied to consolidate()
@@ -833,7 +890,8 @@ async def test_consolidate_skill_memories_removes_tombstoned_from_faiss_index(
 
 @pytest.mark.asyncio
 async def test_forget_triggers_index_rebuild_past_removal_threshold(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """chainlink #425: ``rebuild_if_needed`` (>10% soft-removed → full
     rebuild) had zero callers. forget() must invoke it at end-of-pass so
@@ -848,12 +906,20 @@ async def test_forget_triggers_index_rebuild_past_removal_threshold(
         r = await store.store(content=f"fact number {i}", stream="semantic")
         atom_ids.append(r["atom_id"])
     # Protect 3 of 4 from the min_retrievals criterion below.
-    await store.outcome(atom_ids[:3], feedback="positive")
+    await store.outcome(
+        atom_ids[:3],
+        feedback="positive",
+        auth_context=ADMIN_AUTH,
+    )
     conn = store._ensure_conn()
     index = store._ensure_index(conn)
     assert index is not None and len(index._id_to_pos) == 4
 
-    result = await store.forget(dry_run=False, min_retrievals=1)
+    result = await store.forget(
+        dry_run=False,
+        min_retrievals=1,
+        auth_context=ADMIN_AUTH,
+    )
 
     assert result["tombstoned_count"] == 1
     # 1/4 = 25% > 10% → the end-of-forget backstop rebuilt from disk:
@@ -868,7 +934,8 @@ async def test_forget_triggers_index_rebuild_past_removal_threshold(
 
 @pytest.mark.asyncio
 async def test_consolidate_triggers_index_rebuild_past_removal_threshold(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """chainlink #425: consolidate() must run the same end-of-cycle rebuild
     backstop — a dedup pass that tombstones >10% of indexed vectors leaves a
@@ -899,7 +966,8 @@ async def test_consolidate_triggers_index_rebuild_past_removal_threshold(
 
 @pytest.mark.asyncio
 async def test_consolidate_never_embeds_inside_a_transaction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """chainlink #417: _restructure held BEGIN IMMEDIATE + the global write
     lock across per-triple network embedding calls (store_triples embedded
