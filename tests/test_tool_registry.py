@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from mimir.access_control import (
+    HTTP_EVENT_INGRESS_EXTRA_KEY,
     OperationCatalog,
     OperationDecision,
     ResourceScope,
@@ -627,7 +628,7 @@ def test_service_authorization_requires_two_factor_validation() -> None:
         trigger="scheduled_tick",
         channel_id="scheduler:test",
         service_principal="scheduler",
-        extra={"event_ingress": "http-api"},
+        extra={HTTP_EVENT_INGRESS_EXTRA_KEY: "http-api"},
     )
     ctx_http_ingress = create_auth_context(event_http_ingress, enforce=True)
     result_http_ingress = registry.authorize_tool("shell_exec", ctx_http_ingress, enforce=True)
@@ -710,7 +711,7 @@ def test_commitment_actor_requires_two_factor_validation() -> None:
         trigger="scheduled_tick",
         channel_id="scheduler:test",
         service_principal="scheduler",
-        extra={"event_ingress": "http-api"},
+        extra={HTTP_EVENT_INGRESS_EXTRA_KEY: "http-api"},
     )
     ctx_http_ingress = create_auth_context(event_http_ingress, enforce=True)
     runtime_http_ingress = MockRuntime(ctx_http_ingress)
