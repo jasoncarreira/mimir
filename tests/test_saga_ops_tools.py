@@ -8,16 +8,15 @@ Fills gaps NOT already in test_saga_ops_wiring.py:
     store raises, saga_end_session_called not set on error
   - saga_forget: no store path
 """
+
 from __future__ import annotations
 
 import time
-from typing import Any
 
 import pytest
 
 from mimir._context import reset_current_turn, set_current_turn
 from mimir import _context
-from mimir.access_control import get_service_principal
 from langchain.tools import ToolRuntime
 
 from mimir.models import AuthContext, TurnContext
@@ -52,14 +51,30 @@ class _StubStore:
         if self.raise_on == "feedback":
             raise RuntimeError("feedback boom")
         self.feedback_calls.append(
-            {"atom_ids": atom_ids, "response_text": response_text, "session_id": session_id}
+            {
+                "atom_ids": atom_ids,
+                "response_text": response_text,
+                "session_id": session_id,
+            }
         )
 
-    async def mark_contributions(self, retrieved_atoms, response_text, *, session_id, threshold=None, auth_context=None):
+    async def mark_contributions(
+        self,
+        retrieved_atoms,
+        response_text,
+        *,
+        session_id,
+        threshold=None,
+        auth_context=None,
+    ):
         if self.raise_on == "mark_contributions":
             raise RuntimeError("mark_contributions boom")
         self.mark_contributions_calls.append(
-            {"retrieved_atoms": retrieved_atoms, "response_text": response_text, "session_id": session_id}
+            {
+                "retrieved_atoms": retrieved_atoms,
+                "response_text": response_text,
+                "session_id": session_id,
+            }
         )
         return {
             "contributed_atom_ids": [a.get("id") for a in retrieved_atoms],
@@ -141,8 +156,12 @@ def turn_with_session() -> TurnContext:
 
 def _runtime(ctx: TurnContext) -> ToolRuntime[AuthContext]:
     return ToolRuntime(
-        state={}, context=ctx.auth_context, config={}, stream_writer=lambda _: None,
-        tool_call_id="saga-write-test", store=None,
+        state={},
+        context=ctx.auth_context,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="saga-write-test",
+        store=None,
     )
 
 
@@ -163,9 +182,7 @@ class TestResolveSessionId:
         result = _resolve_session_id("explicit-123")
         assert result == "explicit-123"
 
-    def test_whitespace_falls_back_to_ctx(
-        self, turn_with_session: TurnContext
-    ) -> None:
+    def test_whitespace_falls_back_to_ctx(self, turn_with_session: TurnContext) -> None:
         # Whitespace-only explicit is treated as empty → fall back to ctx.
         result = _resolve_session_id("  ")
         assert result == "sess-abc"
@@ -198,9 +215,7 @@ class TestResolveSessionId:
 async def test_feedback_missing_atom_id_returns_error(
     store: _StubStore, turn_with_session: TurnContext
 ) -> None:
-    out = await saga_ops.saga_feedback.ainvoke(
-        {"atom_id": "", "signal": "useful"}
-    )
+    out = await saga_ops.saga_feedback.ainvoke({"atom_id": "", "signal": "useful"})
     assert "atom_id is required" in out
     assert store.outcome_calls == []
 
@@ -210,7 +225,12 @@ async def test_feedback_explicit_session_id_overrides_turn(
     store: _StubStore, turn_with_session: TurnContext
 ) -> None:
     out = await saga_ops.saga_feedback.ainvoke(
-        {"atom_id": "atom-x", "signal": "useful", "session_id": "override-sess", "runtime": _runtime(turn_with_session)}
+        {
+            "atom_id": "atom-x",
+            "signal": "useful",
+            "session_id": "override-sess",
+            "runtime": _runtime(turn_with_session),
+        }
     )
     assert "ok" in out.lower()
     assert store.outcome_calls[0]["session_id"] == "override-sess"
@@ -242,7 +262,11 @@ async def test_mark_contributions_store_raises_surfaces_error(
 ) -> None:
     store.raise_on = "mark_contributions"
     out = await saga_ops.saga_mark_contributions.ainvoke(
-        {"atom_ids": ["a1"], "response_text": "context", "runtime": _runtime(turn_with_session)}
+        {
+            "atom_ids": ["a1"],
+            "response_text": "context",
+            "runtime": _runtime(turn_with_session),
+        }
     )
     assert "saga_mark_contributions failed" in out
     assert "boom" in out
@@ -272,9 +296,7 @@ async def test_end_session_no_store_returns_error(
 async def test_end_session_missing_session_id_returns_error(
     store: _StubStore, turn_with_session: TurnContext
 ) -> None:
-    out = await saga_ops.saga_end_session.ainvoke(
-        {"session_id": "", "summary": "done"}
-    )
+    out = await saga_ops.saga_end_session.ainvoke({"session_id": "", "summary": "done"})
     assert "session_id is required" in out
     assert store.end_session_calls == []
 
@@ -292,7 +314,8 @@ async def test_end_session_without_server_runtime_fails_closed(
 
 @pytest.mark.asyncio
 async def test_end_session_does_not_consult_active_registry(
-    store: _StubStore, turn_with_session: TurnContext,
+    store: _StubStore,
+    turn_with_session: TurnContext,
 ) -> None:
     token = _context._current_turn.set(None)
     try:
@@ -311,7 +334,11 @@ async def test_end_session_store_raises_surfaces_error(
 ) -> None:
     store.raise_on = "end_session"
     out = await saga_ops.saga_end_session.ainvoke(
-        {"runtime": _runtime(turn_with_session), "session_id": "sess-abc", "summary": "done"}
+        {
+            "runtime": _runtime(turn_with_session),
+            "session_id": "sess-abc",
+            "summary": "done",
+        }
     )
     assert "saga_end_session failed" in out
     assert "boom" in out
@@ -324,7 +351,11 @@ async def test_end_session_ctx_flag_not_set_on_store_error(
     # saga_end_session_called should remain False when the store raises.
     store.raise_on = "end_session"
     await saga_ops.saga_end_session.ainvoke(
-        {"runtime": _runtime(turn_with_session), "session_id": "sess-abc", "summary": "done"}
+        {
+            "runtime": _runtime(turn_with_session),
+            "session_id": "sess-abc",
+            "summary": "done",
+        }
     )
     assert getattr(turn_with_session, "saga_end_session_called", False) is False
 
@@ -358,6 +389,7 @@ async def test_saga_feedback_emits_feedback_sent(
     store: _StubStore, turn_with_session: TurnContext, monkeypatch
 ) -> None:
     import mimir.event_logger as _ev
+
     captured: list[tuple] = []
 
     async def _fake_log_event(etype, **kw):
@@ -365,7 +397,11 @@ async def test_saga_feedback_emits_feedback_sent(
 
     monkeypatch.setattr(_ev, "log_event", _fake_log_event)
     out = await saga_ops.saga_feedback.ainvoke(
-        {"atom_id": "a" * 16, "signal": "useful", "runtime": _runtime(turn_with_session)}
+        {
+            "atom_id": "a" * 16,
+            "signal": "useful",
+            "runtime": _runtime(turn_with_session),
+        }
     )
     assert "ok" in out
     sent = [e for e in captured if e[0] == "saga_feedback_sent"]
@@ -378,6 +414,7 @@ async def test_mark_contributions_emits_feedback_sent(
     store: _StubStore, turn_with_session: TurnContext, monkeypatch
 ) -> None:
     import mimir.event_logger as _ev
+
     captured: list[tuple] = []
 
     async def _fake_log_event(etype, **kw):
@@ -385,7 +422,11 @@ async def test_mark_contributions_emits_feedback_sent(
 
     monkeypatch.setattr(_ev, "log_event", _fake_log_event)
     out = await saga_ops.saga_mark_contributions.ainvoke(
-        {"atom_ids": ["a" * 16, "b" * 16], "response_text": "resp", "runtime": _runtime(turn_with_session)}
+        {
+            "atom_ids": ["a" * 16, "b" * 16],
+            "response_text": "resp",
+            "runtime": _runtime(turn_with_session),
+        }
     )
     assert "credited 2" in out
     sent = [e for e in captured if e[0] == "saga_feedback_sent"]
@@ -398,6 +439,7 @@ async def test_saga_feedback_no_event_on_failure(
 ) -> None:
     """A failed outcome() must NOT emit saga_feedback_sent."""
     import mimir.event_logger as _ev
+
     captured: list[tuple] = []
 
     async def _fake_log_event(etype, **kw):
@@ -419,6 +461,7 @@ async def test_saga_feedback_stale_emits_negative(
     """#268: the stale signal (→ negative wire) must emit
     saga_feedback_sent with feedback=negative, not just the useful path."""
     import mimir.event_logger as _ev
+
     captured: list[tuple] = []
 
     async def _fake_log_event(etype, **kw):

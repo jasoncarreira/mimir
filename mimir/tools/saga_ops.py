@@ -69,7 +69,9 @@ def _resolve_session_id(explicit: str | None) -> str | None:
 
 
 async def _emit_feedback_sent(
-    atom_count: int, feedback: str, session_id: str | None,
+    atom_count: int,
+    feedback: str,
+    session_id: str | None,
 ) -> None:
     """Best-effort ``saga_feedback_sent`` emit for the agent-curated
     feedback path.
@@ -82,6 +84,7 @@ async def _emit_feedback_sent(
     blanket "the turn didn't fail" boost. Never raises."""
     try:
         from ..event_logger import log_event
+
         await log_event(
             "saga_feedback_sent",
             atom_count=atom_count,
@@ -137,7 +140,9 @@ async def saga_feedback(
 
     sid = _resolve_session_id(session_id)
     try:
-        await client.outcome([atom_id], feedback=wire, session_id=sid, auth_context=auth_context)
+        await client.outcome(
+            [atom_id], feedback=wire, session_id=sid, auth_context=auth_context
+        )
     except Exception as exc:  # noqa: BLE001 — SagaError surfaces via str
         return f"saga_feedback failed: {exc}"
     await _emit_feedback_sent(1, wire, sid)
@@ -188,8 +193,10 @@ async def saga_mark_contributions(
     sid = _resolve_session_id(session_id)
     try:
         await client.mark_contributions(
-            [{"id": aid} for aid in atom_ids], response_text,
-            session_id=sid, auth_context=auth_context,
+            [{"id": aid} for aid in atom_ids],
+            response_text,
+            session_id=sid,
+            auth_context=auth_context,
         )
     except Exception as exc:  # noqa: BLE001
         return f"saga_mark_contributions failed: {exc}"
@@ -280,12 +287,10 @@ async def saga_end_session(
         return f"saga_end_session failed: {exc}"
 
     written = (
-        payload.get("session_summary_written")
-        if isinstance(payload, dict) else None
+        payload.get("session_summary_written") if isinstance(payload, dict) else None
     )
     return (
-        f"saga_end_session ok: session_id={session_id} "
-        f"summary_written={bool(written)}"
+        f"saga_end_session ok: session_id={session_id} summary_written={bool(written)}"
     )
 
 
@@ -381,6 +386,7 @@ async def saga_record_skill_learning(
     if client is None:
         return "saga_record_skill_learning failed: no SagaStore configured"
     from .. import skill_memory
+
     try:
         metadata = skill_memory.build_metadata(skill, kind)
     except ValueError as exc:
@@ -402,8 +408,7 @@ async def saga_record_skill_learning(
     atom_id = result.get("atom_id")
     if result.get("stored") is False:
         return (
-            f"saga_record_skill_learning: learning already present "
-            f"(atom_id={atom_id})"
+            f"saga_record_skill_learning: learning already present (atom_id={atom_id})"
         )
     return f"saga_record_skill_learning ok: {skill}/{kind} atom_id={atom_id}"
 
