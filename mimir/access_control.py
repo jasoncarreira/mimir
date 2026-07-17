@@ -1065,8 +1065,6 @@ class ToolRegistry:
             )
             if not sink_check.allowed and enforce:
                 return sink_check
-            if sink_check.service_principal is not None and enforce:
-                return sink_check
 
         decision = preliminary_decision
         service_principal = None

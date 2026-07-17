@@ -95,7 +95,9 @@ def test_scheduler_service_principal_can_invoke_factory_operations(
         channel_id="scheduler:test",
         service_principal="scheduler",
     )
-    auth = create_auth_context(event, enforce=True)
+    auth = create_auth_context(
+        event, enforce=True, ifc_labels=_service_labels(event),
+    )
 
     decision = ToolRegistry().authorize_tool(operation, auth, enforce=True)
 
