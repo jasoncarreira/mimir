@@ -177,8 +177,7 @@ class CommitmentsStore:
         Public lifecycle methods consult it before appending.
 
         Authorization: recipient_principal does NOT grant mutation authority.
-        Only the owner_principal (or service/admin) can mutate a commitment.
-        Service-owned (visibility=service) records require service actor.
+        Only the exact owner_principal (or admin) can mutate a commitment.
 
         Returns True if the transition is valid and authorized; False
         if the record is unknown, unauthorized, or the transition
@@ -223,29 +222,20 @@ class CommitmentsStore:
 
         Authorization rules (when actor_principal is provided):
         - Admin actors can mutate any record, including service/legacy records
-        - Service visibility: only admin or service actors can mutate
-        - Private visibility: actor must be the owner (or admin)
-        - Public visibility: owner, service actor, or admin can mutate
+        - Non-admin actors must exactly match owner_principal
+        - Ownerless legacy records are admin-only
 
         If no actor_principal provided, allow by default (backward compat).
-        If no owner is set (legacy record), requires admin/service actor.
         Recipient identity does NOT grant mutation authority.
         """
         if actor_principal is None:
             return True
         if actor_is_admin:
             return True
-        if record.visibility == CommitmentVisibility.SERVICE.value:
-            return actor_principal.startswith("service:")
-        if record.visibility == CommitmentVisibility.PRIVATE.value:
-            return actor_principal == record.owner_principal
-        if record.visibility == CommitmentVisibility.PUBLIC.value:
-            if actor_principal.startswith("service:"):
-                return True
-            if record.owner_principal is None:
-                return actor_principal.startswith("service:")
-            return actor_principal == record.owner_principal
-        return False
+        return (
+            record.owner_principal is not None
+            and actor_principal == record.owner_principal
+        )
 
     async def deliver(
         self, id: str, *, actor_principal: str | None = None,
@@ -606,8 +596,9 @@ class CommitmentsStore:
         - ``actor_principal``: for access control (view filtering).
         - ``owner_principal``: filter by ownership. If provided, returns
           only commitments owned by this principal.
-        - ``include_service``: include service-owned commitments.
-          Default False (admin/service-only access).
+        - ``include_service``: opt into service-visibility commitments when the
+          actor is also authorized for their owner. It never grants cross-owner
+          access. Default False.
         Sorted by created_at_unix ascending."""
         state = self.current_state()
         out: list[CommitmentRecord] = []
@@ -639,23 +630,35 @@ class CommitmentsStore:
     ) -> bool:
         """Check if the actor can view this commitment.
 
-        Visibility rules:
-        - Admin: visible regardless of visibility level
-        - Public: visible to all
-        - Service: only service actors or when include_service=True
-        - Private: only owner, service actors, or admin
+        Visibility rules for an authenticated actor:
+        - Admin: visible regardless of visibility level or owner
+        - Service actor: exact-owner records, plus deliberately public records
+        - Ordinary actor: exact-owner records only
+        - Ownerless service records: admin-only
+
+        ``include_service`` opts into service visibility but does not grant
+        authority over another service principal's records.
         """
         if actor_is_admin:
             return True
+        actor_is_service = (
+            actor_principal is not None
+            and actor_principal.startswith("service:")
+        )
         if record.visibility == CommitmentVisibility.SERVICE.value:
-            return include_service or (
-                actor_principal is not None and actor_principal.startswith("service:")
+            return (
+                include_service
+                and record.owner_principal is not None
+                and actor_principal == record.owner_principal
             )
-        if record.visibility == CommitmentVisibility.PRIVATE.value:
-            return actor_principal == record.owner_principal or (
-                actor_principal is not None and actor_principal.startswith("service:")
-            )
-        return True
+        if actor_principal is None:
+            return record.visibility == CommitmentVisibility.PUBLIC.value
+        if actor_principal == record.owner_principal:
+            return True
+        return (
+            actor_is_service
+            and record.visibility == CommitmentVisibility.PUBLIC.value
+        )
 
     def find_by_dedupe_key(
         self,
