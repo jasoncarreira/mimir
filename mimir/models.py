@@ -7,6 +7,7 @@ TurnRecord is the on-disk turns.jsonl shape (SPEC §10.2).
 from __future__ import annotations
 
 import time
+import threading
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -169,6 +170,39 @@ class InformationFlowLabels:
 
 
 @dataclass
+class InformationFlowState:
+    """Turn-local monotonic IFC state shared by frozen runtime carriers."""
+
+    labels: InformationFlowLabels | None = None
+    _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def current(self, fallback: InformationFlowLabels | None = None) -> InformationFlowLabels | None:
+        with self._lock:
+            return self.labels if self.labels is not None else fallback
+
+    def merge(
+        self,
+        added: InformationFlowLabels,
+        fallback: InformationFlowLabels | None = None,
+    ) -> InformationFlowLabels:
+        """Atomically union labels so concurrent tool results cannot attenuate state."""
+        with self._lock:
+            current = self.labels if self.labels is not None else fallback
+            merged = InformationFlowLabels()
+            for carrier in (current, added):
+                if not isinstance(carrier, InformationFlowLabels):
+                    continue
+                for label in carrier.labels:
+                    merged = merged.with_label(label)
+                for channel in carrier.source_channels:
+                    merged = merged.with_channel(channel)
+                for source in carrier.sources:
+                    merged = merged.with_source(source)
+            self.labels = merged
+            return merged
+
+
+@dataclass
 class AgentEvent:
     """Inbound event from a bridge, scheduler tick, or HTTP injection.
 
@@ -245,6 +279,12 @@ class AuthContext:
     domain: str | None = None
     resource_id: str | None = None
     bridge_instance: str | None = None
+    # Mutable only through its monotonic merge API. Keeping this cell on the
+    # frozen carrier lets later forked requests observe post-tool taint without
+    # making identity, roles, or any authority field mutable.
+    ifc_state: InformationFlowState = field(
+        default_factory=InformationFlowState, repr=False, compare=False,
+    )
 
 
 @dataclass
