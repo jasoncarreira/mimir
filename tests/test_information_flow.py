@@ -236,6 +236,43 @@ def test_service_principal_cannot_bypass_incompatible_sink_labels():
     assert decision.reason == "ifc_label_blocked:same_channel"
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "target", "sink_category"),
+    [
+        ("shell_exec", "printf untrusted", "shell_process"),
+        ("spawn_codex", "untrusted task", "spawn"),
+        ("write_file", "/tmp/untrusted", "file"),
+    ],
+)
+def test_poller_payload_cannot_bypass_active_sink_ifc(
+    tool_name: str,
+    target: str,
+    sink_category: str,
+):
+    poller = AuthContext(
+        principal="service:poller",
+        canonical_principal="poller",
+        roles=("service",),
+        event_ingress=None,
+        trigger="poller",
+        channel_id="poller:external",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+
+    decision = SinkGate.check_sink_flow(
+        tool_name,
+        target,
+        _labels(sources=frozenset({"poller:external"})),
+        poller,
+        enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == f"ifc_label_blocked:{sink_category}"
+
+
 def test_ordinary_admin_cannot_bypass_or_erase_labels():
     labels = _labels(sources=frozenset({"slack-C-private"}))
     admin = _auth("slack-C-public", roles=("admin",))
