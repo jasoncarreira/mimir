@@ -34,6 +34,8 @@ _OLD_ADMIN_TOOLS = {
     "bash_async",
     "spawn_claude_code",
     "spawn_codex",
+    "spawn_open_code",
+    "task",
     "saga_forget",
     "write_file",
     "edit_file",
@@ -65,6 +67,35 @@ def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
     assert _OLD_ADMIN_TOOLS <= catalog._ADMIN_REQUIRED_OPERATIONS
     assert catalog.get_decision("mcp__mimir__shell_exec") == OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("mcp_mimir_shell_exec") == OperationDecision.ADMIN_REQUIRED
+
+
+@pytest.mark.parametrize("operation", ["spawn_open_code", "task"])
+def test_factory_operations_are_cataloged_as_admin_required(operation: str) -> None:
+    catalog = OperationCatalog()
+
+    assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
+
+
+@pytest.mark.parametrize("operation", ["spawn_open_code", "task"])
+def test_scheduler_service_principal_can_invoke_factory_operations(
+    operation: str,
+) -> None:
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    auth = create_auth_context(event, enforce=True)
+
+    decision = ToolRegistry().authorize_tool(operation, auth, enforce=True)
+
+    assert decision.allowed is True
+    assert decision.decision == OperationDecision.ADMIN_REQUIRED
+    assert decision.reason is None
+    assert decision.service_principal is get_service_principal("scheduled_tick")
 
 
 def test_unknown_operation_fails_closed_only_when_enforced() -> None:
@@ -586,7 +617,7 @@ def test_service_authorization_requires_two_factor_validation() -> None:
     capabilities based only on trigger matching, without validating the full two-factor
     proof (is_service + canonical_principal match).
     """
-    from mimir.access_control import create_auth_context, get_trusted_service_from_auth_context
+    from mimir.access_control import create_auth_context
     from mimir.models import AgentEvent
 
     registry = ToolRegistry()
@@ -670,7 +701,6 @@ def test_commitment_actor_requires_two_factor_validation() -> None:
     from mimir.tools.registry import _commitment_actor
     from mimir.access_control import create_auth_context
     from mimir.models import AgentEvent
-    from types import SimpleNamespace
 
     class MockRuntime:
         def __init__(self, context):
