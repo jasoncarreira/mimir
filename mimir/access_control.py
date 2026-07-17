@@ -1055,11 +1055,15 @@ class ToolRegistry:
             else None
         )
         service_capability_denied = (
-            preliminary_decision == OperationDecision.ADMIN_REQUIRED
-            and not (
-                preliminary_service is not None
-                and preliminary_service.has_capability(tool_name)
-            )
+            preliminary_service is not None
+            and preliminary_decision == OperationDecision.ADMIN_REQUIRED
+            and not preliminary_service.has_capability(tool_name)
+        )
+        trigger = getattr(auth_context, "trigger", None) if auth_context else None
+        attempted_service = (
+            trigger is not None
+            and trigger in _TRUSTED_SERVICE_PRINCIPALS
+            and preliminary_service is None
         )
         sink_target = target_channel
         if (
@@ -1068,7 +1072,7 @@ class ToolRegistry:
             and auth_context is not None
         ):
             sink_target = getattr(auth_context, "channel_id", None)
-        if sink_category != SinkCategory.UNKNOWN and not service_capability_denied:
+        if sink_category != SinkCategory.UNKNOWN and not service_capability_denied and not attempted_service:
             sink_check = SinkGate.check_sink_flow(
                 tool_name,
                 sink_target,
