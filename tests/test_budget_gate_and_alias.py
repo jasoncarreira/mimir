@@ -723,7 +723,7 @@ async def test_admin_sensitive_tool_allowed_via_canonical_discord_alias(
 
 
 @pytest.mark.asyncio
-async def test_read_only_tool_remains_available_to_non_admin(tmp_path: Path) -> None:
+async def test_protected_metadata_tool_is_denied_to_non_admin(tmp_path: Path) -> None:
     resolver = _resolver(
         tmp_path,
         """
@@ -744,7 +744,7 @@ async def test_read_only_tool_remains_available_to_non_admin(tmp_path: Path) -> 
     async def handler(req: ToolCallRequest) -> ToolMessage:
         nonlocal handler_calls
         handler_calls += 1
-        return ToolMessage(content="listed", tool_call_id=req.tool_call["id"])
+        return ToolMessage(content="protected-schedule", tool_call_id=req.tool_call["id"])
 
     token = set_current_turn(ctx)
     try:
@@ -753,8 +753,9 @@ async def test_read_only_tool_remains_available_to_non_admin(tmp_path: Path) -> 
         reset_current_turn(token)
 
     assert isinstance(out, ToolMessage)
-    assert out.content == "listed"
-    assert handler_calls == 1
+    assert out.status == "error"
+    assert "protected-schedule" not in str(out.content)
+    assert handler_calls == 0
 
 
 @pytest.mark.asyncio
@@ -920,7 +921,7 @@ async def test_admin_gate_denies_sensitive_tool_when_enforced_context_missing(
 
 
 @pytest.mark.asyncio
-async def test_admin_gate_missing_context_still_allows_non_admin_tools_when_enforced(
+async def test_admin_gate_missing_context_denies_protected_metadata_when_enforced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
@@ -930,13 +931,15 @@ async def test_admin_gate_missing_context_still_allows_non_admin_tools_when_enfo
     async def handler(req: ToolCallRequest) -> ToolMessage:
         nonlocal handler_calls
         handler_calls += 1
-        return ToolMessage(content="listed", tool_call_id=req.tool_call["id"])
+        return ToolMessage(content="protected-schedule", tool_call_id=req.tool_call["id"])
 
     out = await mw.awrap_tool_call(_make_request("list_schedules", "id-read"), handler)
 
     assert isinstance(out, ToolMessage)
-    assert out.content == "listed"
-    assert handler_calls == 1
+    assert out.status == "error"
+    assert "missing_auth_context" in str(out.content)
+    assert "protected-schedule" not in str(out.content)
+    assert handler_calls == 0
 
 
 @pytest.mark.asyncio

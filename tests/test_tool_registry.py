@@ -49,7 +49,7 @@ _NEWLY_CATALOGED_TOOLS = {
     "saga_mark_contributions": OperationDecision.ADMIN_REQUIRED,
     "saga_end_session": OperationDecision.ADMIN_REQUIRED,
     "saga_record_skill_learning": OperationDecision.ADMIN_REQUIRED,
-    "bash_jobs_list": OperationDecision.OPEN,
+    "bash_jobs_list": OperationDecision.ADMIN_REQUIRED,
     "bash_job_output": OperationDecision.ADMIN_REQUIRED,
     "write_todos": OperationDecision.OPEN,
     "defer_injected_message": OperationDecision.OPEN,
@@ -91,6 +91,19 @@ def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
     assert _OLD_ADMIN_TOOLS <= catalog._ADMIN_REQUIRED_OPERATIONS
     assert catalog.get_decision("mcp__mimir__shell_exec") == OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("mcp_mimir_shell_exec") == OperationDecision.ADMIN_REQUIRED
+
+
+def test_open_catalog_excludes_protected_global_metadata() -> None:
+    catalog = OperationCatalog()
+
+    assert not (
+        catalog._OPEN_OPERATIONS & catalog._PROTECTED_METADATA_OPERATIONS
+    )
+    assert catalog._PROTECTED_METADATA_OPERATIONS <= catalog._ADMIN_REQUIRED_OPERATIONS
+    assert {
+        catalog.get_decision("bash_jobs_list"),
+        catalog.get_decision("bash_job_output"),
+    } == {OperationDecision.ADMIN_REQUIRED}
 
 
 @pytest.mark.parametrize(
@@ -614,6 +627,7 @@ def test_scheduler_principal_has_required_capabilities_for_heartbeat() -> None:
     - Checks drift by reading files
     - Reads backlog files
     - Uses shell for jq analysis (shell_exec, bash_async)
+    - Inspects async shell job status/output
     - Writes/edits files (write_file, edit_file)
     """
     scheduler = get_service_principal("scheduled_tick")
@@ -621,7 +635,7 @@ def test_scheduler_principal_has_required_capabilities_for_heartbeat() -> None:
 
     read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn"}
     write_ops = {"write_file", "edit_file"}
-    shell_ops = {"shell_exec", "bash_async"}
+    shell_ops = {"shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"}
     spawn_ops = {"spawn_claude_code", "spawn_codex"}
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
     saga_ops = {"saga_forget"}
@@ -644,6 +658,7 @@ def test_poller_principal_has_required_capabilities() -> None:
     - Uses shell for analysis (shell_exec, bash_async)
     - Writes results (write_file, edit_file)
     - Sends messages to channels (send_message)
+    - Resolves configured channel and DM destinations (list_channels)
     """
     poller = get_service_principal("poller")
     assert poller is not None
@@ -653,7 +668,7 @@ def test_poller_principal_has_required_capabilities() -> None:
     shell_ops = {"shell_exec", "bash_async"}
     spawn_ops = {"spawn_claude_code", "spawn_codex"}
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
-    message_ops = {"send_message"}
+    message_ops = {"send_message", "list_channels"}
     worklink_ops = {"worklink_run"}
 
     all_expected = read_ops | write_ops | shell_ops | spawn_ops | proposal_ops | message_ops | worklink_ops
@@ -716,6 +731,7 @@ def test_system_principal_has_required_capabilities_for_upgrade() -> None:
     - Submits proposals (submit_proposal)
     - Sends operator notifications (send_message)
     - Manages schedules (add_schedule, set_schedule_priority)
+    - Lists schedules before and after migration changes (list_schedules)
     """
     system = get_service_principal("upgrade")
     assert system is not None
@@ -724,7 +740,7 @@ def test_system_principal_has_required_capabilities_for_upgrade() -> None:
     write_ops = {"write_file", "edit_file"}
     shell_ops = {"shell_exec", "bash_async"}
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
-    schedule_ops = {"add_schedule", "set_schedule_priority"}
+    schedule_ops = {"add_schedule", "set_schedule_priority", "list_schedules"}
     message_ops = {"send_message"}
 
     all_expected = read_ops | write_ops | shell_ops | proposal_ops | schedule_ops | message_ops
