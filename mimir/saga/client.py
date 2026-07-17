@@ -2563,6 +2563,7 @@ class SagaStore:
         channel_id: str | None = None,
         contributed_only: bool = False,
         trend: str | None = None,
+        auth_context: Any = None,
     ) -> list[dict[str, Any]]:
         """Count retrieval / feedback events per atom in the last N days.
 
@@ -2577,10 +2578,18 @@ class SagaStore:
         - ``trend``: join observations_metadata.trend = ?. Filters to
           observation-typed atoms with the given trend label
           (strengthening / stable / weakening / stale).
+        - ``auth_context``: applies authorization predicate to filter
+          results by visibility/owner/domain scope.
         """
         from datetime import datetime, timedelta, timezone
 
+        from .ownership import (
+            authorization_predicate,
+            get_authorization_scope,
+        )
+
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        auth_scope = get_authorization_scope(auth_context)
 
         def _do():
             conn, should_close = self._operation_conn()
@@ -2607,12 +2616,6 @@ class SagaStore:
             params: list = [self._agent_id, cutoff, *sources]
 
             if channel_id is not None:
-                # access_events.session_id → sessions.id → channel_id.
-                # LEFT JOIN so atoms with NULL session_id (consolidation-
-                # synthesized observations etc.) don't get dropped by
-                # an INNER JOIN when channel_id is unfiltered — but
-                # WHERE clause ensures they ARE dropped when channel_id
-                # is filtered, which is the right semantics.
                 joins.append("JOIN sessions s ON s.id = e.session_id")
                 where.append("s.channel_id = ?")
                 params.append(channel_id)
@@ -2621,6 +2624,10 @@ class SagaStore:
                 joins.append("JOIN observations_metadata om ON om.atom_id = a.id")
                 where.append("om.trend = ?")
                 params.append(trend)
+
+            auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+            where.append(auth_where)
+            params.extend(auth_params)
 
             join_sql = " ".join(joins)
             where_sql = " AND ".join(where)
