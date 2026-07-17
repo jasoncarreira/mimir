@@ -492,17 +492,36 @@ class SinkGate:
         if not resolved_triggering:
             return frozenset()
 
-        source_channels = getattr(ifc_labels, "source_channels", None)
-        if not isinstance(source_channels, frozenset) or not source_channels:
+        canonical_principal = getattr(auth_context, "canonical_principal", None)
+        service = get_trusted_service_from_auth_context(auth_context)
+        service_source_principal = (
+            f"service:{service.canonical}" if service is not None else None
+        )
+        domain = getattr(auth_context, "domain", None)
+        resource_id = getattr(auth_context, "resource_id", None)
+        bridge_instance = getattr(auth_context, "bridge_instance", None)
+        sources = getattr(ifc_labels, "sources", None)
+        effective_principal = service_source_principal or canonical_principal
+        if not all((effective_principal, domain, resource_id, bridge_instance)):
             return frozenset()
-        resolved_sources = {
-            ChannelResourceAdapter._resolve_channel(channel)
-            for channel in source_channels
-            if channel
-        }
-        if not resolved_sources or None in resolved_sources:
+        if not isinstance(sources, frozenset) or not sources:
             return frozenset()
-        if resolved_sources != {resolved_triggering}:
+
+        for source in sources:
+            if not getattr(source, "is_complete", False):
+                return frozenset()
+            if effective_principal not in source.authorized_principals:
+                return frozenset()
+            if (
+                getattr(source, "source_kind", "channel") == "channel"
+                and source.principal != effective_principal
+            ):
+                return frozenset()
+            if source.domain != domain or source.bridge_instance != bridge_instance:
+                return frozenset()
+            if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
+                return frozenset()
+        if ChannelResourceAdapter._resolve_channel(resource_id) != resolved_triggering:
             return frozenset()
 
         return frozenset({resolved_triggering})
@@ -548,6 +567,7 @@ def audit_declassification(
     return InformationFlowLabels(
         labels=frozenset(),
         source_channels=labels.source_channels,
+        sources=labels.sources,
         created_at=labels.created_at,
     )
 
@@ -2209,7 +2229,7 @@ def create_auth_context(
     from .models import AuthContext, TurnInteractivity
 
     author = event.author
-    canonical = None
+    canonical = author
     roles: tuple[str, ...] = ()
     is_service = False
 
@@ -2232,6 +2252,26 @@ def create_auth_context(
         canonical = registered_service.canonical
         is_service = True
 
+    canonical_resource = event.channel_id
+    if resolver is not None:
+        canonical_resource = resolver.resolve_channel(event.channel_id)
+    extra = event.extra if isinstance(event.extra, dict) else {}
+    visibility = extra.get("channel_visibility")
+    domain = (
+        f"channel:{visibility}"
+        if isinstance(visibility, str) and visibility
+        else "channel"
+    )
+    bridge_instance = extra.get("bridge_instance")
+    if not isinstance(bridge_instance, str) or not bridge_instance:
+        bridge_instance = event.source
+    if (
+        (not isinstance(bridge_instance, str) or not bridge_instance)
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+    ):
+        bridge_instance = f"service:{registered_service.canonical}"
+
     return AuthContext(
         principal=author,
         canonical_principal=canonical,
@@ -2248,4 +2288,7 @@ def create_auth_context(
         is_service=is_service,
         enforcement_enabled=enforce,
         ifc_labels=ifc_labels,
+        domain=domain,
+        resource_id=canonical_resource,
+        bridge_instance=bridge_instance,
     )

@@ -33,7 +33,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
-from mimir.models import AuthContext, InformationFlowLabels, TurnContext
+from mimir.models import AuthContext, InformationFlowLabels, SourceLabel, TurnContext
 from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
@@ -306,9 +306,15 @@ def _ifc_labels(
     *,
     sources: frozenset[str] | None = None,
 ) -> InformationFlowLabels:
+    channels = sources if sources is not None else frozenset({channel})
     return InformationFlowLabels(
         labels=frozenset({"private"}),
-        source_channels=sources if sources is not None else frozenset({channel}),
+        source_channels=channels,
+        sources=frozenset(SourceLabel(
+            principal="user-1", domain="channel", resource_id=source,
+            bridge_instance="test", sensitivity="private",
+            authorized_principals=frozenset({"user-1"}),
+        ) for source in channels),
     )
 
 
@@ -327,6 +333,9 @@ def _attach_auth(ctx: TurnContext, resolver: IdentityResolver | None = None) -> 
         channel_id=ctx.channel_id,
         interactivity=None,
         enforcement_enabled=ctx.access_control_enforced,
+        domain="channel",
+        resource_id=ctx.channel_id,
+        bridge_instance="test",
     )
 
 
@@ -489,6 +498,9 @@ async def test_forked_task_uses_auth_context_ifc_labels_when_contextvar_is_unset
         interactivity=None,
         enforcement_enabled=True,
         ifc_labels=_ifc_labels(),
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
     )
     handler_calls: list[ToolCallRequest] = []
 

@@ -592,7 +592,20 @@ class BudgetGateMiddleware(AgentMiddleware):
                 active_ctx.ifc_labels,
                 getattr(auth_context, "channel_id", None),
                 auth_context,
+                derived_by=tool_name,
             )
+            if getattr(active_ctx, "auth_context", None) is not None:
+                from dataclasses import replace
+
+                active_ctx.auth_context = replace(
+                    active_ctx.auth_context, ifc_labels=active_ctx.ifc_labels,
+                )
+            emitter = getattr(active_ctx, "turn_event_emitter", None)
+            if emitter is not None:
+                emitter.bind_information_flow(
+                    active_ctx.ifc_labels,
+                    getattr(active_ctx, "auth_context", None),
+                )
 
         # Destructive-action guardrail (chainlink #259): an accident
         # deterrent against force-push-to-main/master, NOT a security
@@ -683,7 +696,20 @@ class BudgetGateMiddleware(AgentMiddleware):
                 active_ctx.ifc_labels,
                 getattr(auth_context, "channel_id", None),
                 auth_context,
+                derived_by=tool_name,
             )
+            if getattr(active_ctx, "auth_context", None) is not None:
+                from dataclasses import replace
+
+                active_ctx.auth_context = replace(
+                    active_ctx.auth_context, ifc_labels=active_ctx.ifc_labels,
+                )
+            emitter = getattr(active_ctx, "turn_event_emitter", None)
+            if emitter is not None:
+                emitter.bind_information_flow(
+                    active_ctx.ifc_labels,
+                    getattr(active_ctx, "auth_context", None),
+                )
 
         # Destructive-action guardrail (chainlink #259): an accident
         # deterrent against force-push-to-main/master, NOT a security

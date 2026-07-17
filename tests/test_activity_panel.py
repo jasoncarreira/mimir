@@ -15,7 +15,7 @@ from mimir.bridges._activity_panel import (
     render_panel_text,
 )
 from mimir.bridges.base import Bridge, MessageUpdate, SendResult
-from mimir.models import AuthContext, InformationFlowLabels, TurnInteractivity
+from mimir.models import AuthContext, InformationFlowLabels, SourceLabel, TurnInteractivity
 from mimir.channel_registry import ChannelRegistry
 from mimir.turn_event_bus import TurnEventBus
 
@@ -130,6 +130,7 @@ class FakeDiscordBridge(Bridge):
 
 
 def _panel_auth(channel_id: str = "slack-C01") -> AuthContext:
+    bridge = channel_id.split("-", 1)[0]
     return AuthContext(
         principal="slack-U1",
         canonical_principal="user-1",
@@ -139,13 +140,25 @@ def _panel_auth(channel_id: str = "slack-C01") -> AuthContext:
         channel_id=channel_id,
         interactivity=TurnInteractivity.INTERACTIVE,
         enforcement_enabled=True,
+        domain="channel",
+        resource_id=channel_id,
+        bridge_instance=bridge,
     )
 
 
 def _panel_labels(channel_id: str = "slack-C01") -> InformationFlowLabels:
+    bridge = channel_id.split("-", 1)[0]
     return InformationFlowLabels(
         labels=frozenset({"private"}),
         source_channels=frozenset({channel_id}),
+        sources=frozenset({SourceLabel(
+            principal="user-1",
+            domain="channel",
+            resource_id=channel_id,
+            bridge_instance=bridge,
+            sensitivity="private",
+            authorized_principals=frozenset({"user-1"}),
+        )}),
     )
 
 

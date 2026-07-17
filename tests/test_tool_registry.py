@@ -16,7 +16,7 @@ from mimir.access_control import (
     ToolRegistry,
     get_service_principal,
 )
-from mimir.models import AuthContext, InformationFlowLabels
+from mimir.models import AuthContext, InformationFlowLabels, SourceLabel
 from mimir.tools import budget_gate
 
 
@@ -79,9 +79,18 @@ def _auth_context(
 
 
 def _service_labels(event) -> InformationFlowLabels:
+    principal = f"service:{event.service_principal}" if event.service_principal else None
     return InformationFlowLabels(
         labels=frozenset({"internal"}),
         source_channels=frozenset({event.channel_id}) if event.channel_id else frozenset(),
+        sources=frozenset({SourceLabel(
+            principal=principal,
+            domain="channel",
+            resource_id=event.channel_id,
+            bridge_instance=event.source,
+            sensitivity="internal",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+        )}),
     )
 
 
@@ -859,6 +868,7 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
             trigger=trigger,
             channel_id=f"{trigger}:test",
             service_principal=service_principals.get(trigger),
+            source=trigger,
         )
         ctx = create_auth_context(event, enforce=True, ifc_labels=_service_labels(event))
         result = registry.authorize_tool(

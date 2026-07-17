@@ -54,7 +54,7 @@ from typing import Any, Awaitable, Callable
 from ._atomic import atomic_write_json
 from ._jsonl_tail import tail_jsonl_records
 from .event_logger import log_event
-from .models import AgentEvent, InformationFlowLabels
+from .models import AgentEvent, InformationFlowLabels, SourceLabel
 
 log = logging.getLogger(__name__)
 
@@ -141,6 +141,41 @@ def _save_state(persist_dir: Path, state: dict) -> None:
         log.warning("poller recovery: state save failed for %s: %s", persist_dir, exc)
 
 
+def _event_to_stash(event: AgentEvent) -> dict[str, Any]:
+    """Return a JSON-native event payload without stringifying IFC sets."""
+    payload = asdict(event)
+    labels = event.ifc_labels
+    if isinstance(labels, InformationFlowLabels):
+        payload["ifc_labels"] = {
+            "labels": sorted(labels.labels),
+            "source_channels": sorted(labels.source_channels),
+            "sources": [
+                {
+                    "principal": source.principal,
+                    "domain": source.domain,
+                    "resource_id": source.resource_id,
+                    "bridge_instance": source.bridge_instance,
+                    "sensitivity": source.sensitivity,
+                    "authorized_principals": sorted(source.authorized_principals),
+                    "source_kind": source.source_kind,
+                }
+                for source in sorted(
+                    labels.sources,
+                    key=lambda source: (
+                        source.principal or "",
+                        source.domain or "",
+                        source.resource_id or "",
+                        source.bridge_instance or "",
+                        source.sensitivity,
+                        source.source_kind,
+                    ),
+                )
+            ],
+            "created_at": labels.created_at,
+        }
+    return payload
+
+
 def stash_enqueued_event(persist_dir: Path, event: AgentEvent) -> None:
     """Record an enqueued poller ``AgentEvent`` as in-flight, keyed by its
     ``source_id``, so a later failed turn can re-enqueue it.
@@ -155,7 +190,7 @@ def stash_enqueued_event(persist_dir: Path, event: AgentEvent) -> None:
         "attempts": 0,
         # First-seen timestamp drives the GC TTL (#310).
         "stashed_at": _utc_now_iso(),
-        "event": asdict(event),
+        "event": _event_to_stash(event),
     }
     _save_state(persist_dir, state)
 
@@ -171,9 +206,24 @@ def _event_from_stash(d: Any) -> AgentEvent | None:
         payload = dict(d)
         raw_labels = payload.get("ifc_labels")
         if isinstance(raw_labels, dict):
+            raw_sources = raw_labels.get("sources") or ()
+            sources = frozenset(
+                SourceLabel(
+                    principal=source.get("principal"),
+                    domain=source.get("domain"),
+                    resource_id=source.get("resource_id"),
+                    bridge_instance=source.get("bridge_instance"),
+                    sensitivity=source.get("sensitivity", ""),
+                    authorized_principals=frozenset(source.get("authorized_principals") or ()),
+                    source_kind=source.get("source_kind", "channel"),
+                )
+                for source in raw_sources
+                if isinstance(source, dict)
+            )
             payload["ifc_labels"] = InformationFlowLabels(
                 labels=frozenset(raw_labels.get("labels") or ()),
                 source_channels=frozenset(raw_labels.get("source_channels") or ()),
+                sources=sources,
                 **(
                     {"created_at": raw_labels["created_at"]}
                     if isinstance(raw_labels.get("created_at"), (int, float))

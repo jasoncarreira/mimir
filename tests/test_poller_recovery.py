@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mimir import event_logger, poller_recovery
-from mimir.models import AgentEvent
+from mimir.models import AgentEvent, InformationFlowLabels, SourceLabel
 
 
 def _ts(seconds_ago: float) -> str:
@@ -66,6 +66,32 @@ def test_stash_noop_without_source_id(tmp_path: Path):
     ev.source_id = None
     poller_recovery.stash_enqueued_event(tmp_path, ev)
     assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+
+
+def test_stash_roundtrips_ifc_sources_without_stringifying_frozensets(tmp_path: Path):
+    source = SourceLabel(
+        principal="service:poller",
+        domain="channel",
+        resource_id="poller:gmail",
+        bridge_instance="poller",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:poller"}),
+        source_kind="service",
+    )
+    event = _make_event("sid-ifc")
+    event.service_principal = "poller"
+    event.ifc_labels = InformationFlowLabels().with_source(source)
+
+    poller_recovery.stash_enqueued_event(tmp_path, event)
+    raw_event = poller_recovery._load_state(tmp_path)["inflight"]["sid-ifc"]["event"]
+    restored = poller_recovery._event_from_stash(raw_event)
+
+    assert raw_event["ifc_labels"]["sources"][0]["authorized_principals"] == [
+        "service:poller"
+    ]
+    assert restored is not None
+    assert restored.ifc_labels is not None
+    assert restored.ifc_labels.sources == frozenset({source})
 
 
 # ── reconcile ────────────────────────────────────────────────────────

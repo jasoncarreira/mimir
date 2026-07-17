@@ -36,6 +36,64 @@ class FlowLabel(StrEnum):
 
 
 @dataclass(frozen=True)
+class SourceLabel:
+    """Server-authoritative provenance for one protected input.
+
+    ``authorized_principals`` is the effective read ACL. Derived service data
+    must carry the intersection of its inputs' ACLs; an empty ACL is unknown,
+    not public. All identity fields are required for ordinary channel egress.
+    """
+
+    principal: str | None
+    domain: str | None
+    resource_id: str | None
+    bridge_instance: str | None
+    sensitivity: str
+    authorized_principals: frozenset[str] = frozenset()
+    source_kind: str = "channel"
+
+    @property
+    def is_complete(self) -> bool:
+        return bool(
+            self.principal
+            and self.domain
+            and self.resource_id
+            and self.bridge_instance
+            and self.sensitivity in FlowLabel._value2member_map_
+            and self.authorized_principals
+        )
+
+    @classmethod
+    def derived(
+        cls,
+        inputs: frozenset["SourceLabel"],
+        *,
+        principal: str,
+        domain: str,
+        resource_id: str,
+        bridge_instance: str,
+        sensitivity: str,
+        source_kind: str = "service",
+    ) -> "SourceLabel":
+        """Create service-derived provenance with the inputs' intersected ACL."""
+        acl: frozenset[str] = frozenset()
+        if inputs and all(source.is_complete for source in inputs):
+            iterator = iter(inputs)
+            acl = next(iterator).authorized_principals
+            for source in iterator:
+                acl &= source.authorized_principals
+        return cls(
+            principal=principal,
+            domain=domain,
+            resource_id=resource_id,
+            bridge_instance=bridge_instance,
+            sensitivity=sensitivity,
+            authorized_principals=acl,
+            source_kind=source_kind,
+        )
+
+
+@dataclass(frozen=True)
 class InformationFlowLabels:
     """Immutable/monotonic information flow control labels (chainlink #871).
 
@@ -54,6 +112,7 @@ class InformationFlowLabels:
 
     labels: frozenset[str] = frozenset()
     source_channels: frozenset[str] = frozenset()
+    sources: frozenset[SourceLabel] = frozenset()
     created_at: float = field(default_factory=time.monotonic)
 
     def with_label(self, label: str) -> "InformationFlowLabels":
@@ -63,6 +122,7 @@ class InformationFlowLabels:
         return InformationFlowLabels(
             labels=self.labels | frozenset({label}),
             source_channels=self.source_channels,
+            sources=self.sources,
             created_at=self.created_at,
         )
 
@@ -73,6 +133,21 @@ class InformationFlowLabels:
         return InformationFlowLabels(
             labels=self.labels,
             source_channels=self.source_channels | frozenset({channel}),
+            sources=self.sources,
+            created_at=self.created_at,
+        )
+
+    def with_source(self, source: SourceLabel) -> "InformationFlowLabels":
+        """Return a carrier with one immutable source record added."""
+        if source in self.sources:
+            return self
+        channels = self.source_channels
+        if source.source_kind == "channel" and source.resource_id:
+            channels |= frozenset({source.resource_id})
+        return InformationFlowLabels(
+            labels=self.labels | frozenset({source.sensitivity}),
+            source_channels=channels,
+            sources=self.sources | frozenset({source}),
             created_at=self.created_at,
         )
 
@@ -167,6 +242,9 @@ class AuthContext:
     is_service: bool = False
     enforcement_enabled: bool = False
     ifc_labels: "InformationFlowLabels | None" = None
+    domain: str | None = None
+    resource_id: str | None = None
+    bridge_instance: str | None = None
 
 
 @dataclass
