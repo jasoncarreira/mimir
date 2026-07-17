@@ -694,6 +694,7 @@ def _bridge_mcp_tool(
     tool = StructuredTool.from_function(**kwargs)
     if provenance is not None:
         _tool_provenance_registry[id(tool)] = provenance
+        object.__setattr__(tool, "mcp_provenance", provenance)
     return tool
 
 
@@ -902,7 +903,7 @@ def _configured_resource_classifier(
         if not isinstance(resource, str) or not resource.strip():
             return MCPAuthorizationResult(decision=decision, allowed=False, reason="mcp_resource_unknown")
         resource = resource.strip()
-        if resource == "*" or any(char in resource for char in ("?", "[", "]")):
+        if any(char in resource for char in ("*", "?", "[", "]")):
             return MCPAuthorizationResult(decision=decision, allowed=False, reason="mcp_resource_wildcard")
         if not isinstance(owner, str) or not owner.strip() or not isinstance(principal, str):
             return MCPAuthorizationResult(decision=decision, allowed=False, reason="mcp_owner_unknown")

@@ -165,6 +165,10 @@ async def test_mcp_resource_adapter_runs_before_remote_handler() -> None:
     clear_mcp_adapter_registry()
     register_configured_mcp_adapters([config])
     middleware = BudgetGateMiddleware()
+    turn = _make_ctx()
+    turn.auth_context = context
+    turn.ifc_labels = InformationFlowLabels()
+    token = set_current_turn(turn)
     try:
         valid = await middleware.awrap_tool_call(
             request("valid", {"owner": "alice", "repository": "repo-1"}),
@@ -179,6 +183,7 @@ async def test_mcp_resource_adapter_runs_before_remote_handler() -> None:
             handler,
         )
     finally:
+        reset_current_turn(token)
         clear_mcp_adapter_registry()
 
     assert valid.content == "ok"
@@ -187,6 +192,113 @@ async def test_mcp_resource_adapter_runs_before_remote_handler() -> None:
     assert malformed.status == "error"
     assert "mcp_malformed_arguments" in str(malformed.content)
     assert handler_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_resource_adapter_still_enforces_external_sink_ifc() -> None:
+    from dataclasses import replace
+
+    from mimir.mcp_client import (
+        MCPAdapterConfig,
+        MCPProvenance,
+        MCPServerConfig,
+        _bridge_mcp_tool,
+        clear_mcp_adapter_registry,
+        register_configured_mcp_adapters,
+    )
+
+    config = MCPServerConfig(
+        name="github",
+        command="x",
+        args=[],
+        server_config_id="github-production",
+        policy_version="policy-v1",
+        adapters=(MCPAdapterConfig(
+            name="github-owner",
+            version="adapter-v1",
+            policy_version="policy-v1",
+            resource_argument="repository",
+            owner_argument="owner",
+            source=True,
+            sink=True,
+        ),),
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string"},
+            "repository": {"type": "string"},
+        },
+        "required": ["owner", "repository"],
+    }
+    provenance = replace(
+        MCPProvenance.create(
+            config,
+            "update_repository",
+            input_schema,
+            server_config_id=config.server_config_id,
+        ),
+        classification="resource_scoped",
+        adapter_name="github-owner",
+        adapter_version="adapter-v1",
+        approval_version="approval-v1",
+        policy_version="policy-v1",
+    )
+    tool = _bridge_mcp_tool(
+        server_name="github",
+        tool_name="update_repository",
+        description="",
+        input_schema=input_schema,
+        session=object(),
+        provenance=provenance,
+    )
+    context = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress="bridge",
+        trigger="user_message",
+        channel_id="untrusted-channel",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+    turn = _make_ctx()
+    turn.auth_context = context
+    turn.ifc_labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"untrusted-channel"}),
+    )
+    handler_calls = 0
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    request = ToolCallRequest(
+        tool_call={
+            "name": tool.name,
+            "args": {"owner": "alice", "repository": "repo-1"},
+            "id": "tainted",
+            "type": "tool_call",
+        },
+        tool=tool,
+        state=None,
+        runtime=Runtime(context=context),
+    )
+
+    clear_mcp_adapter_registry()
+    register_configured_mcp_adapters([config])
+    token = set_current_turn(turn)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+    finally:
+        reset_current_turn(token)
+        clear_mcp_adapter_registry()
+
+    assert result.status == "error"
+    assert "ifc_label_blocked:external_mcp" in str(result.content)
+    assert handler_calls == 0
 
 
 def _ifc_labels(

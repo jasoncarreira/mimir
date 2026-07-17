@@ -812,8 +812,9 @@ class MCPResourceAdapter:
         context: Any | None,
         *,
         enforce: bool,
+        ifc_labels: Any = None,
     ) -> "ToolAuthorization":
-        """Execute the provenance-bound adapter on one concrete invocation."""
+        """Execute the provenance-bound adapter and IFC gate on one invocation."""
         from .mcp_client import (
             MCPAuthorizationRequest,
             MCPAuthorizationResult,
@@ -862,19 +863,37 @@ class MCPResourceAdapter:
                             decision = OperationDecision.ADMIN_REQUIRED
                             reason = "mcp_adapter_decision_mismatch"
                         elif result.allowed:
+                            if ifc_labels is None and context is not None:
+                                ifc_labels = getattr(context, "ifc_labels", None)
+                            sink_target = ",".join(result.sink_resources or result.resources)
+                            sink_check = SinkGate.check_sink_flow(
+                                tool_name,
+                                sink_target or tool_name,
+                                ifc_labels,
+                                context,
+                                enforce=enforce,
+                            )
+                            if not sink_check.allowed:
+                                return sink_check
                             return ToolAuthorization(
                                 tool_name=tool_name,
                                 decision=decision,
                                 allowed=True,
+                                reason=(
+                                    sink_check.reason
+                                    if sink_check.is_shadow_decision
+                                    else None
+                                ),
                                 enforcement_enabled=enforce,
+                                is_shadow_decision=sink_check.is_shadow_decision,
                             )
                         else:
                             reason = result.reason or "mcp_resource_denied"
 
         is_admin = decision is OperationDecision.ADMIN_REQUIRED
         admin = context is not None and "admin" in (getattr(context, "roles", ()) or ())
-        denied_by_policy = not is_admin
-        allowed = admin if is_admin else not enforce
+        denied_by_policy = not admin
+        allowed = admin or not enforce
         return ToolAuthorization(
             tool_name=tool_name,
             decision=decision,
@@ -1179,6 +1198,7 @@ class ToolRegistry:
                 arguments,
                 auth_context,
                 enforce=enforce,
+                ifc_labels=ifc_labels,
             )
             if auth.is_shadow_decision:
                 self._emit_shadow_decision(auth)

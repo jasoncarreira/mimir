@@ -1226,6 +1226,12 @@ class TestProductionMCPPolicyWiring:
         assert second_provenance.server_config_id == first_provenance.server_config_id
         assert first_provenance.classification == "resource_scoped"
         assert first_provenance.is_tombstoned is False
+        assert getattr(first[0], "mcp_provenance") is first_provenance
+
+        from mimir.mcp_client import clear_provenance_registry
+
+        clear_provenance_registry()
+        assert get_tool_provenance(first[0]) is first_provenance
 
     @pytest.mark.asyncio
     async def test_discovery_marks_schema_drift_stale(self) -> None:
@@ -1264,6 +1270,7 @@ class TestProductionMCPPolicyWiring:
             ({"owner": "alice", "repository": "repo-1"}, True, None),
             ({"owner": "bob", "repository": "repo-1"}, False, "mcp_wrong_owner"),
             ({"owner": "alice", "repository": "*"}, False, "mcp_resource_wildcard"),
+            ({"owner": "alice", "repository": "secrets/*"}, False, "mcp_resource_wildcard"),
             ({"owner": "alice", "repository": ["a", "b"]}, False, "mcp_resource_unknown"),
             ({"owner": "alice"}, False, "mcp_resource_unknown"),
         ],
@@ -1278,7 +1285,7 @@ class TestProductionMCPPolicyWiring:
             clear_mcp_adapter_registry,
             register_configured_mcp_adapters,
         )
-        from mimir.models import AuthContext
+        from mimir.models import AuthContext, InformationFlowLabels
 
         config = self._config()
         register_configured_mcp_adapters([config])
@@ -1325,6 +1332,7 @@ class TestProductionMCPPolicyWiring:
             enforce=True,
             mcp_tool=tool,
             arguments=arguments,
+            ifc_labels=InformationFlowLabels(),
         )
         assert authorization.allowed is allowed
         assert authorization.reason == reason
@@ -1365,6 +1373,15 @@ class TestProductionMCPPolicyWiring:
             arguments={"owner": "alice", "repository": "repo-1"},
         )
         assert missing.reason == "mcp_missing_adapter"
+        assert missing.allowed is False
+
+        shadow_missing = ToolRegistry().authorize_tool(
+            tool.name, context, enforce=False, mcp_tool=tool,
+            arguments={"owner": "alice", "repository": "repo-1"},
+        )
+        assert shadow_missing.allowed is True
+        assert shadow_missing.is_shadow_decision is True
+        assert shadow_missing.reason == "mcp_missing_adapter"
 
         def explode(_request):  # type: ignore[no-untyped-def]
             raise RuntimeError("secret must not authorize")
@@ -1375,4 +1392,13 @@ class TestProductionMCPPolicyWiring:
             arguments={"owner": "alice", "repository": "repo-1"},
         )
         assert failed.reason == "mcp_adapter_exception"
+        assert failed.allowed is False
+
+        shadow_failed = ToolRegistry().authorize_tool(
+            tool.name, context, enforce=False, mcp_tool=tool,
+            arguments={"owner": "alice", "repository": "repo-1"},
+        )
+        assert shadow_failed.allowed is True
+        assert shadow_failed.is_shadow_decision is True
+        assert shadow_failed.reason == "mcp_adapter_exception"
         clear_mcp_adapter_registry()
