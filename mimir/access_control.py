@@ -229,15 +229,148 @@ def _target_within_configured_write_roots(target: str, _destination: str) -> boo
     return True
 
 
-def _target_matches_shell_profile(target: str, destination: str) -> bool:
-    """Admit one command in the service's named, non-network shell profile.
+_SHELL_CONTROL_CHARACTERS = frozenset(";|&`$><\n\r")
 
-    ``shell_exec`` ultimately hands the string to ``bash -lc``. Newlines and
-    carriage returns therefore delimit additional commands even though
-    ``shlex.split`` treats them as ordinary whitespace; reject every shell
-    control character before considering the allow-listed argv prefix.
+
+def _arguments_match_allowlist(
+    arguments: list[str],
+    *,
+    exact_options: frozenset[str],
+    option_prefixes: tuple[str, ...] = (),
+) -> bool:
+    """Reject every option not explicitly admitted by a command profile.
+
+    Operands remain available after ``--``. An option-looking operand before
+    that marker is rejected rather than guessed at; this keeps future binary
+    flags from silently widening a trusted service's authority.
     """
-    if any(token in target for token in (";", "|", "&", "`", "$", ">", "<", "\n", "\r")):
+    options_ended = False
+    for argument in arguments:
+        if options_ended:
+            continue
+        if argument == "--":
+            options_ended = True
+            continue
+        if not argument.startswith("-") or argument == "-":
+            continue
+        if argument in exact_options or argument.startswith(option_prefixes):
+            continue
+        return False
+    return True
+
+
+def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
+    """Validate an argv against the scheduler/poller read-only profile."""
+    # Do not accept ``/tmp/git`` merely because its basename is allow-listed.
+    # The login shell may resolve bare names through its operator-controlled PATH,
+    # but a model-supplied path must never select an arbitrary executable.
+    command = argv[0]
+    arguments = argv[1:]
+
+    if command == "pwd":
+        return set(arguments) <= {"-L", "-P"}
+    if command == "ls":
+        return _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "-1", "-A", "-a", "-d", "-F", "-h", "-l", "-la", "-al",
+                "-lh", "-hl", "--all", "--almost-all", "--directory",
+                "--classify", "--human-readable",
+            }),
+            option_prefixes=("--color=",),
+        )
+    if command == "wc":
+        return _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "-c", "-l", "-L", "-m", "-w", "--bytes", "--chars",
+                "--lines", "--max-line-length", "--words",
+            }),
+        )
+    if command == "grep":
+        return _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "-E", "-F", "-H", "-h", "-i", "-l", "-n", "-q", "-s",
+                "-v", "-w", "-x", "--extended-regexp", "--fixed-strings",
+                "--files-with-matches", "--ignore-case", "--line-number",
+                "--no-messages", "--quiet", "--recursive", "--invert-match",
+                "--with-filename", "--no-filename", "--word-regexp",
+                "--line-regexp",
+            }),
+            option_prefixes=("--exclude=", "--include=", "--exclude-dir="),
+        )
+    if command == "jq":
+        return _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "-C", "-M", "-R", "-S", "-c", "-e", "-j", "-r", "-s",
+                "--ascii-output", "--compact-output", "--exit-status",
+                "--join-output", "--monochrome-output", "--null-input",
+                "--raw-input", "--raw-output", "--slurp", "--sort-keys",
+            }),
+        )
+    if command == "rg":
+        # ripgrep's config file can inject --pre. Require --no-config in the
+        # command itself so the allowlist is independent of ambient process env.
+        if not arguments or arguments[0] != "--no-config":
+            return False
+        return _arguments_match_allowlist(
+            arguments[1:],
+            exact_options=frozenset({
+                "-F", "-H", "-L", "-S", "-g", "-h", "-i", "-l", "-n",
+                "-s", "-u", "-v", "-w", "--case-sensitive", "--files",
+                "--files-with-matches", "--fixed-strings", "--glob", "--hidden",
+                "--ignore-case", "--line-number", "--no-heading", "--no-ignore",
+                "--smart-case", "--type", "--type-not", "--word-regexp",
+            }),
+        )
+    if command != "git" or not arguments:
+        return False
+
+    subcommand = arguments[0]
+    subcommand_arguments = arguments[1:]
+    if subcommand == "status":
+        return _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset({
+                "-b", "-s", "--ahead-behind", "--branch", "--ignore-submodules",
+                "--long", "--no-ahead-behind", "--porcelain", "--short",
+                "--show-stash", "--untracked-files", "--verbose",
+            }),
+            option_prefixes=("--ignore-submodules=", "--porcelain=", "--untracked-files="),
+        )
+    if subcommand not in {"diff", "log", "show"}:
+        return False
+
+    # These commands can invoke repository-configured helpers unless both
+    # controls are explicit. Requiring them makes the argv safe independently
+    # of .gitconfig/.gitattributes in the inspected checkout.
+    required_safety_options = {"--no-ext-diff", "--no-textconv"}
+    if not required_safety_options.issubset(subcommand_arguments):
+        return False
+    return _arguments_match_allowlist(
+        subcommand_arguments,
+        exact_options=frozenset({
+            "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+            "--exit-code", "--full-index", "--name-only", "--name-status",
+            "--no-color", "--no-ext-diff", "--no-merges", "--no-patch",
+            "--no-textconv", "--oneline", "--quiet", "--raw", "--stat",
+            "--staged",
+        }),
+        option_prefixes=("-U", "--max-count=", "--since=", "--until=", "--unified="),
+    )
+
+
+def _target_matches_shell_profile(target: str, destination: str) -> bool:
+    """Admit one command in the service's strict per-command argv profile.
+
+    The service shell tools run through ``bash -lc``, so validating only argv[0]
+    and argv[1] is not a security boundary: later flags can write files, execute
+    helpers, or make a nominally read-only command read arbitrary sources. Reject
+    shell grammar first, then require every binary option to be allow-listed.
+    """
+    if any(character in target for character in _SHELL_CONTROL_CHARACTERS):
         return False
     try:
         argv = shlex.split(target)
@@ -246,15 +379,12 @@ def _target_matches_shell_profile(target: str, destination: str) -> bool:
     if not argv:
         return False
 
-    command = Path(argv[0]).name
-    git_read = command == "git" and len(argv) > 1 and argv[1] in {
-        "diff", "log", "show", "status",
-    }
     if destination == "scheduler_read_only":
-        return command in {"jq", "rg", "grep", "ls", "wc", "pwd"} or git_read
+        return _target_matches_read_only_shell_command(argv)
     if destination == "upgrade_workspace":
-        return git_read or (
-            command == "uv" and len(argv) > 1 and argv[1] in {"lock", "sync"}
+        return _target_matches_read_only_shell_command(argv) or (
+            argv[0] == "uv"
+            and argv[1:] in (["lock"], ["sync"])
         )
     return False
 

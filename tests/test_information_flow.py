@@ -488,7 +488,17 @@ def test_service_file_policy_requires_configured_root_and_compatible_source(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    home = tmp_path / "home"
+    configured_root = tmp_path / "configured"
+    outside_root = tmp_path / "outside"
+    home.mkdir()
+    configured_root.mkdir()
+    outside_root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{configured_root}:rw")
+    # This test needs a genuinely unconfigured sibling. The live parser's
+    # default /tmp route would otherwise encompass pytest's entire tmp_path.
+    monkeypatch.setattr("mimir.config._ALWAYS_RW_FILE_TOOL_ROOTS", ())
     channel = f"{trigger}:configured"
     service = AuthContext(
         principal=f"service:{canonical}",
@@ -501,7 +511,7 @@ def test_service_file_policy_requires_configured_root_and_compatible_source(
         is_service=True,
         enforcement_enabled=True,
     )
-    admitted_path = str(tmp_path / "state" / "result.txt")
+    admitted_path = str(configured_root / "result.txt")
 
     admitted = SinkGate.check_sink_flow(
         tool_name,
@@ -517,9 +527,16 @@ def test_service_file_policy_requires_configured_root_and_compatible_source(
         service,
         enforce=True,
     )
-    outside_root = SinkGate.check_sink_flow(
+    outside_root_decision = SinkGate.check_sink_flow(
         tool_name,
-        "/tmp/arbitrary-service-write",
+        str(outside_root / "arbitrary-service-write"),
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+    tmp_decision = SinkGate.check_sink_flow(
+        tool_name,
+        "/tmp/explicit-always-rw-service-write",
         _labels(channel, sources=frozenset({channel})),
         service,
         enforce=True,
@@ -528,7 +545,8 @@ def test_service_file_policy_requires_configured_root_and_compatible_source(
     assert admitted.allowed is True
     assert admitted.reason == "ifc_allowed"
     assert wrong_source.reason == "ifc_label_blocked:file"
-    assert outside_root.reason == "service_sink_destination_denied"
+    assert outside_root_decision.reason == "service_sink_destination_denied"
+    assert tmp_decision.reason == "service_sink_destination_denied"
 
 
 def test_service_file_policy_uses_live_file_tool_roots(
@@ -640,6 +658,42 @@ def test_service_shell_policy_admits_profile_not_arbitrary_command(
     assert admitted.allowed is True
     assert arbitrary.reason == "service_sink_destination_denied"
     assert missing.reason == "unknown_sink_destination"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git log --no-ext-diff --no-textconv --format=format:pwned --output=/tmp/.bash_profile",
+        "git diff --no-ext-diff --no-textconv --output=/tmp/arbitrary-write",
+        "git diff --no-ext-diff --no-textconv --no-index /etc/passwd /tmp/copy",
+        "rg --no-config --pre=touch /tmp/pwned pattern .",
+        "/tmp/git status --short",
+    ],
+)
+def test_service_shell_policy_rejects_write_read_and_exec_flags(command: str):
+    channel = "scheduled_tick:configured"
+    service = AuthContext(
+        principal="service:scheduler",
+        canonical_principal="scheduler",
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "shell_exec",
+        command,
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
 
 
 @pytest.mark.parametrize("separator", ["\n", "\r"])

