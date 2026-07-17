@@ -104,6 +104,28 @@ async def test_client_store_dedupes(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_client_store_does_not_dedupe_same_content_across_owners(
+    client, monkeypatch,
+):
+    _patch_provider(monkeypatch)
+
+    alice = await client.store(
+        "shared content",
+        owner_principal="user:alice",
+        visibility="private",
+    )
+    bob = await client.store(
+        "shared content",
+        owner_principal="user:bob",
+        visibility="private",
+    )
+
+    assert alice["stored"] is True
+    assert bob["stored"] is True
+    assert alice["atom_id"] != bob["atom_id"]
+
+
+@pytest.mark.asyncio
 async def test_store_embedding_runs_outside_write_lock(client, monkeypatch):
     """#602: slow provider embedding must not hold SagaStore's write lock."""
     import time

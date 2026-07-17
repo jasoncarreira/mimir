@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from typing import Callable, Iterator
 
 
-CURRENT_SCHEMA_VERSION: int = 8
+CURRENT_SCHEMA_VERSION: int = 9
 
 # Registry of post-greenfield schema changes. Keys are version
 # numbers (must be > 1, must be contiguous, must equal
@@ -471,6 +471,15 @@ WHERE a.source_type = 'session_boundary'
         CREATE INDEX IF NOT EXISTS idx_world_visibility ON world_state(visibility);
         CREATE INDEX IF NOT EXISTS idx_world_owner ON world_state(owner_principal);
     """,
+    9: """
+        -- v9: exact-content dedup is owner-scoped (chainlink #895).
+        -- The old index made a different owner's equal content conflict even
+        -- though the read-side dedup lookup correctly excluded that row.
+        DROP INDEX IF EXISTS idx_atoms_dedup;
+        CREATE UNIQUE INDEX idx_atoms_dedup
+            ON atoms(content_hash, agent_id, owner_principal)
+            WHERE tombstoned = 0;
+    """,
 }
 
 
@@ -513,6 +522,17 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
     so this is robust to bare-bones DBs (like the in-memory
     fixtures used by unit tests).
     """
+    # v9 marker: owner-scoped exact-content dedup index (chainlink #895).
+    try:
+        dedup_columns = [
+            row[2]
+            for row in conn.execute("PRAGMA index_info(idx_atoms_dedup)").fetchall()
+        ]
+    except sqlite3.OperationalError:
+        dedup_columns = []
+    if dedup_columns == ["content_hash", "agent_id", "owner_principal"]:
+        return 9
+
     # v8 marker: world_state.visibility column exists (chainlink #884).
     try:
         world_state_cols = {

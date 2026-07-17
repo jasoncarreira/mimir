@@ -1026,9 +1026,9 @@ class ToolRegistry:
                 auth_context,
                 enforce=enforce,
             )
-            if not sink_check.allowed:
-                if enforce:
-                    return sink_check
+            if not sink_check.allowed and enforce:
+                return sink_check
+            if sink_check.is_shadow_decision:
                 self._emit_shadow_decision(sink_check)
 
         catalog = get_operation_catalog()

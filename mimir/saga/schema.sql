@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS atoms (
 CREATE INDEX IF NOT EXISTS idx_atoms_memory_type ON atoms(memory_type);
 CREATE INDEX IF NOT EXISTS idx_atoms_agent ON atoms(agent_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_atoms_dedup
-    ON atoms(content_hash, agent_id) WHERE tombstoned = 0;
+    ON atoms(content_hash, agent_id, owner_principal) WHERE tombstoned = 0;
 CREATE INDEX IF NOT EXISTS idx_atoms_created ON atoms(created_at);
 CREATE INDEX IF NOT EXISTS idx_atoms_tombstoned ON atoms(tombstoned);
 -- session_id index: reflect._session_atoms + recall's recent-session

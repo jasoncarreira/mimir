@@ -351,6 +351,79 @@ def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
         _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
 
 
+@pytest.mark.parametrize("fail_closed", [True, False])
+def test_capability_matrix_reports_seeded_errors_for_both_modes(
+    fail_closed: bool,
+) -> None:
+    from mimir.access_control import (
+        ServicePrincipal,
+        _TRUSTED_SERVICE_PRINCIPALS,
+        check_capability_matrix_complete,
+    )
+
+    original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
+    try:
+        scheduler = original_principals["scheduled_tick"]
+        _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
+            canonical=scheduler.canonical,
+            trigger=scheduler.trigger,
+            capabilities=(),
+            readable_domains=scheduler.readable_domains,
+            sink_destinations=scheduler.sink_destinations,
+            creation_path=scheduler.creation_path,
+        )
+
+        is_complete, errors = check_capability_matrix_complete(
+            fail_closed=fail_closed,
+        )
+
+        assert is_complete is False
+        assert any("no capabilities" in error for error in errors)
+    finally:
+        _TRUSTED_SERVICE_PRINCIPALS.clear()
+        _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+
+
+@pytest.mark.asyncio
+async def test_sink_gate_denial_emits_shadow_decision_when_not_enforced() -> None:
+    from mimir.access_control import AccessTier, SinkGate, ToolAuthorization
+
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+    sink_denial = ToolAuthorization(
+        tool_name="write_file",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        reason="ifc_label_blocked:file",
+        required_tier=AccessTier.ADMIN,
+        enforcement_enabled=False,
+        is_shadow_decision=True,
+    )
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    with (
+        patch.object(SinkGate, "check_sink_flow", return_value=sink_denial),
+        patch("mimir.event_logger.log_event", new=capture),
+    ):
+        decision = registry.authorize_tool(
+            "write_file",
+            enforce=False,
+            target_channel="/tmp/example",
+            ifc_labels=object(),
+        )
+        await asyncio.sleep(0)
+
+    assert decision.allowed is True
+    assert any(
+        kind == "shadow_tool_decision"
+        and fields["reason"] == "ifc_label_blocked:file"
+        for kind, fields in captured
+    )
+
+
 def test_enforcement_enablement_fails_closed_with_incomplete_matrix() -> None:
     from mimir.access_control import (
         CapabilityMatrixError,
@@ -586,7 +659,7 @@ def test_service_authorization_requires_two_factor_validation() -> None:
     capabilities based only on trigger matching, without validating the full two-factor
     proof (is_service + canonical_principal match).
     """
-    from mimir.access_control import create_auth_context, get_trusted_service_from_auth_context
+    from mimir.access_control import create_auth_context
     from mimir.models import AgentEvent
 
     registry = ToolRegistry()
@@ -670,7 +743,6 @@ def test_commitment_actor_requires_two_factor_validation() -> None:
     from mimir.tools.registry import _commitment_actor
     from mimir.access_control import create_auth_context
     from mimir.models import AgentEvent
-    from types import SimpleNamespace
 
     class MockRuntime:
         def __init__(self, context):

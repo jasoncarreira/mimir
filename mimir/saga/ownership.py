@@ -72,7 +72,11 @@ class Ownership:
         return self.visibility == Visibility.LEGACY_ADMIN
 
     def to_columns(self) -> dict[str, str | None]:
-        """Convert to column values for SQL insertion."""
+        """Convert to column values for SQL insertion.
+
+        PRODUCTION-DEAD (chainlink #895): retained for API stability; current
+        production writers pass ownership columns directly.
+        """
         return {
             "owner_principal": str(self.owner_principal),
             "origin_channel": self.origin_channel,

@@ -7,7 +7,6 @@ search are mocked.
 from __future__ import annotations
 
 import sqlite3
-import time
 from pathlib import Path
 
 import pytest
@@ -131,6 +130,37 @@ def test_store_dedupes_by_content_hash(conn):
         (r1.atom_id,)
     ).fetchall()
     assert [r[0] for r in rows] == ["store", "store"]
+
+
+def test_store_does_not_dedupe_same_content_across_owners(conn):
+    alice = store(
+        conn,
+        "shared text",
+        embed_fn=_fake_embed,
+        owner_principal="user:alice",
+        visibility="private",
+    )
+    bob = store(
+        conn,
+        "shared text",
+        embed_fn=_fake_embed,
+        owner_principal="user:bob",
+        visibility="private",
+    )
+
+    assert alice.atom_id != bob.atom_id
+    assert alice.stored is True
+    assert bob.stored is True
+    alice_events = conn.execute(
+        "SELECT COUNT(*) FROM access_events WHERE atom_id = ?",
+        (alice.atom_id,),
+    ).fetchone()[0]
+    bob_events = conn.execute(
+        "SELECT COUNT(*) FROM access_events WHERE atom_id = ?",
+        (bob.atom_id,),
+    ).fetchone()[0]
+    assert alice_events == 1
+    assert bob_events == 1
 
 
 def test_store_empty_content_raises(conn):

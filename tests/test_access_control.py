@@ -724,6 +724,21 @@ def test_unknown_mcp_tool_denies_under_enforcement(tmp_path: Path) -> None:
     assert result.reason is not None
 
 
+@pytest.mark.parametrize("enforce", [False, True])
+def test_non_mcp_name_never_falls_through_mcp_adapter(enforce: bool) -> None:
+    from mimir.access_control import MCPResourceAdapter, OperationDecision
+
+    result = MCPResourceAdapter.authorize_mcp_tool(
+        "shell_exec",
+        None,
+        enforce=enforce,
+    )
+
+    assert result.allowed is False
+    assert result.decision == OperationDecision.ADMIN_REQUIRED
+    assert result.reason == "non_mcp_tool_name"
+
+
 def _dispatcher_config(tmp_path: Path, *, enforce: bool):
     from mimir.config import Config
 
