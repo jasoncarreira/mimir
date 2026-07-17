@@ -2240,6 +2240,8 @@ class Agent:
             preloaded_labels,
             source_channel=event.channel_id,
         )
+        if ctx.auth_context is not None:
+            ctx.auth_context = replace(ctx.auth_context, ifc_labels=ctx.ifc_labels)
         emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
 
         # Build / reuse the agent singleton.

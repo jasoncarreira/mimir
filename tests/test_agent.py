@@ -453,6 +453,55 @@ class _HttpEventAdminProbeAgent(_FakeAgent):
             yield chunk
 
 
+class _ForkedIFCProbeAgent(_FakeAgent):
+    """Dispatch a sink call without the turn ContextVar, as SDK/MCP tasks do."""
+
+    def __init__(self) -> None:
+        super().__init__([AIMessage(content="blocked")])
+        self.result: ToolMessage | None = None
+        self.handler_calls = 0
+
+    async def astream(
+        self,
+        state: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        context=None,
+        stream_mode: str = "values",
+    ):
+        import contextvars
+
+        gate = BudgetGateMiddleware()
+
+        async def _handler(req: ToolCallRequest) -> ToolMessage:
+            self.handler_calls += 1
+            return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+        async def _forked_call() -> ToolMessage:
+            return await gate.awrap_tool_call(
+                ToolCallRequest(
+                    tool_call={
+                        "name": "send_message",
+                        "args": {"channel_id": "ch-public", "text": "protected"},
+                        "id": "tc-forked-ifc",
+                        "type": "tool_call",
+                    },
+                    tool=None,
+                    state=None,
+                    runtime=Runtime(context=context),
+                ),
+                _handler,
+            )
+
+        task = asyncio.create_task(_forked_call(), context=contextvars.Context())
+        self.result = await task
+
+        async for chunk in super().astream(
+            state, config=config, stream_mode=stream_mode,
+        ):
+            yield chunk
+
+
 class _FakeChannelSession:
     """Tiny ChannelSession stand-in. Real ChannelSession is a dataclass
     in session_manager.py; we only need the ``saga_session_id`` attribute
@@ -660,6 +709,29 @@ async def test_server_session_idle_event_reaches_live_synthesis_middleware(
     assert fake_agent.observed_principal == "synthesis"
     assert fake_agent.result is not None
     assert fake_agent.handler_calls == 1, str(fake_agent.result.content)
+
+
+async def test_run_turn_forked_tool_uses_merged_ifc_labels_from_auth_carrier(
+    tmp_path: Path,
+):
+    fake_agent = _ForkedIFCProbeAgent()
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._config.access_control_enforced = True
+
+    record = await agent.run_turn(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="ch-private",
+            content="protected prompt context",
+            source="slack",
+        )
+    )
+
+    assert record.error is None
+    assert fake_agent.result is not None
+    assert fake_agent.result.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(fake_agent.result.content)
+    assert fake_agent.handler_calls == 0
 
 
 async def test_run_turn_http_event_ingress_reaches_turn_context_before_admin_tool_auth(
