@@ -49,6 +49,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from pydantic import Field, create_model
 
+from ._atomic import atomic_write_json
+
 log = logging.getLogger(__name__)
 
 # Timeouts. Servers and tools that hang past these silently shouldn't
@@ -62,6 +64,9 @@ DEFAULT_MCP_SHUTDOWN_TIMEOUT_S = 10.0
 # ``"Bearer ${TOKEN}"`` or ``"${A}${B}"`` were passed through literally,
 # shipping the placeholder to the subprocess instead of the secret.
 _ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_SERVER_CONFIG_NAMESPACE = uuid.UUID("4797522a-a5f1-47ef-9716-bfd7408b0b85")
+_TOOL_ID_NAMESPACE = uuid.UUID("4d87c6fe-7512-43f7-97b7-e1376f0b092a")
+MCP_POLICY_STORE_VERSION = 1
 
 _SECRET_KEYWORDS = frozenset({
     "token", "secret", "password", "key", "auth", "credential",
@@ -74,15 +79,54 @@ def _is_secret_key(key: str) -> bool:
     return any(kw in key.lower() for kw in _SECRET_KEYWORDS)
 
 
+def _canonical_env_value(key: str, value: str) -> dict[str, Any]:
+    """Return identity-bearing env metadata without resolved secret values."""
+    references = _ENV_VAR_RE.findall(value)
+    if _is_secret_key(key):
+        return {"secret_references": references}
+    parts: list[dict[str, str]] = []
+    offset = 0
+    for match in _ENV_VAR_RE.finditer(value):
+        if match.start() > offset:
+            parts.append({"literal": value[offset:match.start()]})
+        parts.append({"secret_reference": match.group(1)})
+        offset = match.end()
+    if offset < len(value):
+        parts.append({"literal": value[offset:]})
+    return {"parts": parts or [{"literal": value}]}
+
+
 def _canonical_config_digest(config: MCPServerConfig) -> str:
     """Generate a deterministic digest of non-secret config fields.
 
-    Excludes env vars that contain secrets - only uses name, command,
-    and args to create a stable identity for the server configuration.
+    Includes environment keys, non-secret literals, and secret-reference
+    names. Resolved secret values are never part of the canonical payload.
     """
-    canonical_parts = [config.name, config.command, json.dumps(config.args, sort_keys=True)]
-    content = "|".join(canonical_parts)
+    env_identity = config.env_identity
+    if env_identity is None:
+        env_identity = {
+            key: _canonical_env_value(key, value)
+            for key, value in sorted((config.env or {}).items())
+        }
+    canonical = {
+        "args": config.args,
+        "command": config.command,
+        "env": env_identity,
+        "name": config.name,
+        "transport_type": "stdio",
+    }
+    content = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+
+def _derived_server_config_id(name: str) -> str:
+    """Derive a restart-stable ID from the operator-owned logical name."""
+    return str(uuid.uuid5(_SERVER_CONFIG_NAMESPACE, name))
+
+
+def _tool_identity(server_config_id: str, tool_name: str) -> str:
+    canonical = json.dumps([server_config_id, tool_name], separators=(",", ":"))
+    return str(uuid.uuid5(_TOOL_ID_NAMESPACE, canonical))
 
 
 def _schema_digest(input_schema: dict[str, Any]) -> str:
@@ -103,6 +147,7 @@ class MCPProvenance:
     and approval state. Used for drift detection and authorization.
     """
     server_config_id: str
+    tool_id: str = ""
     transport_type: str = "stdio"
     endpoint_identity: str = ""
     config_digest: str = ""
@@ -126,7 +171,8 @@ class MCPProvenance:
     ) -> "MCPProvenance":
         """Create a new provenance record for an MCP tool."""
         return cls(
-            server_config_id=server_config_id or str(uuid.uuid4()),
+            server_config_id=server_config_id or config.server_config_id,
+            tool_id=_tool_identity(server_config_id or config.server_config_id, tool_name),
             endpoint_identity=config.name,
             config_digest=_canonical_config_digest(config),
             schema_digest=_schema_digest(input_schema),
@@ -161,6 +207,7 @@ class MCPProvenance:
 
         return MCPProvenance(
             server_config_id=self.server_config_id,
+            tool_id=self.tool_id,
             transport_type=self.transport_type,
             endpoint_identity=self.endpoint_identity,
             config_digest=new_config_digest,
@@ -278,6 +325,11 @@ class MCPServerConfig:
     policy_version: str = ""
     adapters: tuple[MCPAdapterConfig, ...] = ()
     tool_policies: tuple[MCPToolPolicy, ...] = ()
+    env_identity: dict[str, dict[str, Any]] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.server_config_id:
+            self.server_config_id = _derived_server_config_id(self.name)
 
     @classmethod
     def from_dict(
@@ -305,11 +357,17 @@ class MCPServerConfig:
         args = [str(a) for a in raw_args] if isinstance(raw_args, list) else []
         raw_env = data.get("env")
         env: dict[str, str] | None = None
+        env_identity: dict[str, dict[str, Any]] | None = None
         if isinstance(raw_env, dict):
-            env = {str(k): _expand_env_refs(str(v)) for k, v in raw_env.items()}
+            raw_values = {str(k): str(v) for k, v in raw_env.items()}
+            env = {key: _expand_env_refs(value) for key, value in raw_values.items()}
+            env_identity = {
+                key: _canonical_env_value(key, value)
+                for key, value in sorted(raw_values.items())
+            }
         server_config_id = str(
             data.get("server_config_id", data.get("serverConfigId", ""))
-        ).strip()
+        ).strip() or _derived_server_config_id(name)
         policy_version = str(
             data.get("policy_version", data.get("policyVersion", ""))
         ).strip()
@@ -325,8 +383,6 @@ class MCPServerConfig:
             for item in raw_policies
             if isinstance(item, dict)
         ) if isinstance(raw_policies, list) else ()
-        if (adapters or tool_policies or policy_version) and not server_config_id:
-            raise ValueError(f"MCP server '{name}' policy requires server_config_id")
         return cls(
             name=name,
             command=command,
@@ -336,6 +392,7 @@ class MCPServerConfig:
             policy_version=policy_version,
             adapters=adapters,
             tool_policies=tool_policies,
+            env_identity=env_identity,
         )
 
 
@@ -367,7 +424,7 @@ class MCPConnection:
         """
         result = await self.session.list_tools()
         tools: list[StructuredTool] = []
-        config_id = server_config_id or self.config.server_config_id or str(uuid.uuid4())
+        config_id = server_config_id or self.config.server_config_id
         for mcp_tool in result.tools:
             provenance = MCPProvenance.create(
                 config=self.config,
@@ -411,6 +468,56 @@ class MCPConnection:
         return tools
 
 
+class MCPPolicyStore:
+    """Durable, non-secret inventory of discovered MCP tool identities."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def load(self) -> dict[str, dict[str, Any]]:
+        if not self.path.exists():
+            return {}
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid MCP policy store {self.path}: {exc}") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != MCP_POLICY_STORE_VERSION
+            or not isinstance(payload.get("tools"), dict)
+        ):
+            raise ValueError(f"invalid MCP policy store format: {self.path}")
+        records = payload["tools"]
+        if not all(isinstance(key, str) and isinstance(value, dict) for key, value in records.items()):
+            raise ValueError(f"invalid MCP policy records: {self.path}")
+        return records
+
+    def save(self, records: dict[str, dict[str, Any]]) -> None:
+        atomic_write_json(
+            self.path,
+            {"version": MCP_POLICY_STORE_VERSION, "tools": records},
+        )
+
+
+def _provenance_record(tool: StructuredTool, provenance: MCPProvenance) -> dict[str, Any]:
+    return {
+        "tool_id": provenance.tool_id,
+        "server_config_id": provenance.server_config_id,
+        "transport_type": provenance.transport_type,
+        "endpoint_identity": provenance.endpoint_identity,
+        "config_digest": provenance.config_digest,
+        "schema_digest": provenance.schema_digest,
+        "original_tool_name": provenance.original_tool_name,
+        "display_name": tool.name,
+        "classification": provenance.classification,
+        "adapter_name": provenance.adapter_name,
+        "adapter_version": provenance.adapter_version,
+        "approval_version": provenance.approval_version,
+        "policy_version": provenance.policy_version,
+        "is_tombstoned": provenance.is_tombstoned,
+    }
+
+
 class MCPManager:
     """Lifecycle owner for all MCP server connections.
 
@@ -428,25 +535,54 @@ class MCPManager:
         initialize_timeout_s: float = DEFAULT_MCP_INITIALIZE_TIMEOUT_S,
         call_timeout_s: float = DEFAULT_MCP_CALL_TIMEOUT_S,
         shutdown_timeout_s: float = DEFAULT_MCP_SHUTDOWN_TIMEOUT_S,
+        policy_store_path: Path | None = None,
     ) -> None:
         self.connections: list[MCPConnection] = []
         self._init_timeout = initialize_timeout_s
         self._call_timeout = call_timeout_s
         self._shutdown_timeout = shutdown_timeout_s
+        self._policy_store = MCPPolicyStore(policy_store_path) if policy_store_path else None
+        self.policy_records: dict[str, dict[str, Any]] = {}
+
+    def _validate_identities(
+        self,
+        configs: list[MCPServerConfig],
+        records: dict[str, dict[str, Any]],
+    ) -> None:
+        seen: dict[str, MCPServerConfig] = {}
+        for config in configs:
+            prior = seen.get(config.server_config_id)
+            if prior is not None:
+                raise ValueError(
+                    "duplicate MCP server_config_id "
+                    f"{config.server_config_id!r} for {prior.name!r} and {config.name!r}"
+                )
+            seen[config.server_config_id] = config
+            endpoints = {
+                str(record.get("endpoint_identity", ""))
+                for record in records.values()
+                if record.get("server_config_id") == config.server_config_id
+            }
+            if endpoints and endpoints != {config.name}:
+                raise ValueError(
+                    f"MCP server_config_id {config.server_config_id!r} endpoint mismatch"
+                )
 
     async def start_servers(self, configs: list[MCPServerConfig]) -> list[StructuredTool]:
         """Start every configured server, bridge their tools, return flat list.
 
         Detects ``mcp_{server}_{tool}`` namespaced-name collisions
-        across servers and skips the duplicate (warning logged). Two
+        across servers and rejects the ambiguous tool set. Two
         servers can legitimately share a tool name as long as the
         server names differ; collision only happens when an operator
         configures the same server name twice or when underscore-laden
         tool names happen to produce the same namespaced string.
         """
+        records = self._policy_store.load() if self._policy_store else {}
+        self._validate_identities(configs, records)
         register_configured_mcp_adapters(configs)
         all_tools: list[StructuredTool] = []
-        seen_names: set[str] = set()
+        successful_config_ids: set[str] = set()
         for config in configs:
             try:
                 conn = await self._connect(config)
@@ -455,20 +591,11 @@ class MCPManager:
                     server_config_id=config.server_config_id or None,
                 )
                 self.connections.append(conn)
-                accepted_tool_names: list[str] = []
-                for t in tools:
-                    if t.name in seen_names:
-                        log.warning(
-                            "MCP tool name collision: %r already registered — "
-                            "dropping duplicate from server %r", t.name, config.name,
-                        )
-                        continue
-                    seen_names.add(t.name)
-                    accepted_tool_names.append(t.name)
-                    all_tools.append(t)
+                successful_config_ids.add(config.server_config_id)
+                all_tools.extend(tools)
                 log.info(
                     "MCP server connected: name=%s tools=%s",
-                    config.name, accepted_tool_names,
+                    config.name, [tool.name for tool in tools],
                 )
             except asyncio.TimeoutError:
                 log.warning(
@@ -481,6 +608,35 @@ class MCPManager:
                 log.warning(
                     "MCP server '%s' failed to start: %s", config.name, exc,
                 )
+        display_identities: dict[str, str] = {}
+        for tool in all_tools:
+            provenance = get_tool_provenance(tool)
+            if provenance is None:
+                raise ValueError(f"MCP tool {tool.name!r} is missing provenance")
+            if tool.name in display_identities:
+                raise ValueError(
+                    f"MCP display-name collision for {tool.name!r}; "
+                    "display names are not authoritative identities"
+                )
+            display_identities[tool.name] = provenance.tool_id
+
+        for tool in all_tools:
+            provenance = get_tool_provenance(tool)
+            assert provenance is not None
+            _tool_provenance_registry.setdefault(provenance.tool_id, provenance)
+
+        if self._policy_store:
+            configured_ids = {config.server_config_id for config in configs}
+            for record in records.values():
+                server_id = str(record.get("server_config_id", ""))
+                if server_id not in configured_ids or server_id in successful_config_ids:
+                    record["is_tombstoned"] = True
+            for tool in all_tools:
+                provenance = get_tool_provenance(tool)
+                assert provenance is not None
+                records[provenance.tool_id] = _provenance_record(tool, provenance)
+            self._policy_store.save(records)
+        self.policy_records = records
         return all_tools
 
     async def _connect(self, config: MCPServerConfig) -> MCPConnection:
@@ -693,8 +849,8 @@ def _bridge_mcp_tool(
         kwargs["args_schema"] = args_schema
     tool = StructuredTool.from_function(**kwargs)
     if provenance is not None:
-        _tool_provenance_registry[id(tool)] = provenance
         object.__setattr__(tool, "mcp_provenance", provenance)
+        object.__setattr__(tool, "mcp_tool_id", provenance.tool_id)
     return tool
 
 
@@ -777,7 +933,7 @@ def load_mcp_server_configs(*, json_inline: str | None, json_path: str | None) -
     return parse_mcp_server_configs(raw)
 
 
-_tool_provenance_registry: dict[int, MCPProvenance] = {}
+_tool_provenance_registry: dict[str, MCPProvenance] = {}
 
 
 def clear_provenance_registry() -> None:
@@ -788,8 +944,11 @@ def clear_provenance_registry() -> None:
 
 def get_tool_provenance(tool: Any) -> MCPProvenance | None:
     """Extract provenance from an MCP tool wrapper, if present."""
-    provenance = _tool_provenance_registry.get(id(tool))
-    return provenance if provenance is not None else getattr(tool, "mcp_provenance", None)
+    provenance = getattr(tool, "mcp_provenance", None)
+    if provenance is not None:
+        return provenance
+    tool_id = getattr(tool, "mcp_tool_id", "")
+    return _tool_provenance_registry.get(tool_id)
 
 
 def check_tool_drift(
