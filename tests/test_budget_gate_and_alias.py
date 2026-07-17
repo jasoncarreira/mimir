@@ -21,6 +21,7 @@ These tests exercise the middleware via two surfaces:
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import time
 from pathlib import Path
@@ -56,13 +57,19 @@ def _make_request(
     tool_name: str = "fake_tool",
     tool_call_id: str = "tc-1",
     auth_context: AuthContext | None = None,
+    args: dict[str, Any] | None = None,
 ) -> ToolCallRequest:
     """Build a request with the exact frozen carrier LangGraph supplies."""
     if auth_context is None:
         turn = get_current_turn()
         auth_context = getattr(turn, "auth_context", None) if turn is not None else None
     return ToolCallRequest(
-        tool_call={"name": tool_name, "args": {}, "id": tool_call_id, "type": "tool_call"},
+        tool_call={
+            "name": tool_name,
+            "args": args or {},
+            "id": tool_call_id,
+            "type": "tool_call",
+        },
         tool=None,
         state=None,
         runtime=Runtime(context=auth_context),
@@ -316,6 +323,31 @@ def _ifc_labels(
             authorized_principals=frozenset({"user-1"}),
         ) for source in channels),
     )
+
+
+def _ifc_auth(*, roles: tuple[str, ...] = ("admin",)) -> AuthContext:
+    labels = _ifc_labels()
+    return AuthContext(
+        principal="slack-U1",
+        canonical_principal="user-1",
+        roles=roles,
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=True,
+        ifc_labels=labels,
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+    )
+
+
+def _ifc_turn(auth: AuthContext) -> TurnContext:
+    ctx = _make_ctx()
+    ctx.auth_context = auth
+    ctx.ifc_labels = auth.ifc_labels
+    return ctx
 
 
 def _attach_auth(ctx: TurnContext, resolver: IdentityResolver | None = None) -> None:
@@ -622,6 +654,146 @@ def test_middleware_sync_wrap_passes_through_under_budget():
     assert out.content == "ok"
     assert len(handler_calls) == 1
     assert ctx.tool_call_count == 1
+
+
+def test_sync_protected_read_taints_live_turn_before_harness_egress():
+    from mimir.agent import Agent
+
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+
+    def handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="protected file", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = middleware.wrap_tool_call(
+            _make_request("read_file", "read-sync", auth, {"path": "/private/data"}),
+            handler,
+        )
+        allowed = Agent._harness_sink_allowed(ctx, "ch-1", "harness_auto_deliver")
+    finally:
+        reset_current_turn(token)
+
+    assert result.content == "protected file"
+    assert any(source.domain == "filesystem" for source in ctx.ifc_labels.sources)
+    assert allowed is False
+
+
+@pytest.mark.asyncio
+async def test_async_partial_error_taints_and_blocks_next_same_channel_send():
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+
+    async def partial(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="partial protected output before failure",
+            tool_call_id=req.tool_call["id"],
+            status="error",
+        )
+
+    send_calls = 0
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        nonlocal send_calls
+        send_calls += 1
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        partial_result = await middleware.awrap_tool_call(
+            _make_request("memory_get", "partial", auth, {"atom_id": "other-user"}),
+            partial,
+        )
+        denied = await middleware.awrap_tool_call(
+            _make_request("send_message", "send", auth, {"channel_id": "ch-1"}),
+            send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert partial_result.status == "error"
+    assert any(source.domain == "saga" for source in ctx.ifc_labels.sources)
+    assert denied.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(denied.content)
+    assert send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_same_channel_history_reply_succeeds_and_public_tool_does_not_overtaint():
+    auth = _ifc_auth(roles=())
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request("write_todos", "public", auth), handler,
+        )
+        before = ctx.ifc_labels
+        await middleware.awrap_tool_call(
+            _make_request(
+                "fetch_channel_history", "history", auth, {"channel_id": "ch-1"},
+            ),
+            handler,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert before == auth.ifc_labels
+    assert reply.status != "error"
+    assert all(source.domain == "channel" for source in ctx.ifc_labels.sources)
+
+
+@pytest.mark.asyncio
+async def test_result_taint_is_fork_visible_and_isolated_between_concurrent_turns():
+    middleware = BudgetGateMiddleware()
+    protected_auth = _ifc_auth()
+    public_auth = _ifc_auth(roles=())
+    protected_ctx = _ifc_turn(protected_auth)
+    public_ctx = _ifc_turn(public_auth)
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        await asyncio.sleep(0)
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
+    async def invoke(ctx: TurnContext, request: ToolCallRequest) -> None:
+        token = set_current_turn(ctx)
+        try:
+            await middleware.awrap_tool_call(request, handler)
+        finally:
+            reset_current_turn(token)
+
+    await asyncio.gather(
+        invoke(
+            protected_ctx,
+            _make_request("get_turn", "protected-turn", protected_auth, {"turn_id": "t0"}),
+        ),
+        invoke(public_ctx, _make_request("write_todos", "public-turn", public_auth)),
+    )
+
+    assert any(source.domain == "turn_history" for source in protected_ctx.ifc_labels.sources)
+    assert not any(source.domain == "turn_history" for source in public_ctx.ifc_labels.sources)
+
+    # No ContextVar: the original frozen request carrier still sees post-read taint.
+    async def should_not_send(req: ToolCallRequest) -> ToolMessage:
+        raise AssertionError("forked incompatible sink executed")
+
+    denied = await middleware.awrap_tool_call(
+        _make_request("send_message", "forked-send", protected_auth, {"channel_id": "ch-1"}),
+        should_not_send,
+    )
+    assert denied.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(denied.content)
 
 
 def test_middleware_sync_wrap_refuses_at_cap():

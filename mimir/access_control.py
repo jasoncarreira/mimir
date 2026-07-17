@@ -31,7 +31,7 @@ HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 
 if TYPE_CHECKING:
     from .identities import IdentityResolver
-    from .models import AgentEvent, AuthContext
+    from .models import AgentEvent, AuthContext, InformationFlowLabels
 
 log = logging.getLogger(__name__)
 
@@ -885,15 +885,16 @@ class MCPResourceAdapter:
                         elif result.allowed:
                             if ifc_labels is None and context is not None:
                                 ifc_labels = getattr(context, "ifc_labels", None)
-                            sink_target = ",".join(result.sink_resources or result.resources)
-                            sink_check = SinkGate.check_sink_flow(
-                                tool_name,
-                                sink_target or tool_name,
-                                ifc_labels,
-                                context,
-                                enforce=enforce,
-                            )
-                            if not sink_check.allowed:
+                            sink_check = None
+                            if result.sink_resources:
+                                sink_check = SinkGate.check_sink_flow(
+                                    tool_name,
+                                    ",".join(result.sink_resources),
+                                    ifc_labels,
+                                    context,
+                                    enforce=enforce,
+                                )
+                            if sink_check is not None and not sink_check.allowed:
                                 return sink_check
                             return ToolAuthorization(
                                 tool_name=tool_name,
@@ -901,11 +902,14 @@ class MCPResourceAdapter:
                                 allowed=True,
                                 reason=(
                                     sink_check.reason
-                                    if sink_check.is_shadow_decision
+                                    if sink_check is not None and sink_check.is_shadow_decision
                                     else None
                                 ),
                                 enforcement_enabled=enforce,
-                                is_shadow_decision=sink_check.is_shadow_decision,
+                                is_shadow_decision=(
+                                    sink_check.is_shadow_decision if sink_check is not None else False
+                                ),
+                                protected_source_resources=result.source_resources,
                             )
                         else:
                             reason = result.reason or "mcp_resource_denied"
@@ -1048,6 +1052,9 @@ class ToolAuthorization:
     required_tier: AccessTier = AccessTier.USER
     enforcement_enabled: bool = False
     is_shadow_decision: bool = False
+    # ``None`` means provenance is unknown; ``()`` authoritatively classifies
+    # the call as not reading a protected MCP source.
+    protected_source_resources: tuple[str, ...] | None = None
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return fields for audit logging."""
@@ -1358,6 +1365,115 @@ class ToolRegistry:
             self._emit_shadow_decision(auth)
 
         return auth
+
+
+_PROTECTED_RESULT_DOMAINS: dict[str, str] = {
+    "list_channels": "channel_metadata",
+    "list_schedules": "schedule_metadata",
+    "bash_jobs_list": "shell_jobs",
+    "bash_job_output": "shell_jobs",
+    "read_file": "filesystem",
+    "aread": "filesystem",
+    "ls": "filesystem",
+    "als": "filesystem",
+    "glob": "filesystem",
+    "aglob": "filesystem",
+    "grep": "filesystem",
+    "agrep": "filesystem",
+    "download_files": "filesystem",
+    "adownload_files": "filesystem",
+    "Read": "filesystem",
+    "Glob": "filesystem",
+    "Grep": "filesystem",
+    "file_search": "filesystem",
+    "get_turn": "turn_history",
+    "mimir_get_turn": "turn_history",
+    "memory_query": "saga",
+    "memory_get": "saga",
+    "commitment_list": "commitments",
+}
+
+
+def classify_protected_result(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+    auth_context: "AuthContext | None",
+    authorization: ToolAuthorization,
+) -> "InformationFlowLabels | None":
+    """Return server-authoritative labels for content a protected call may expose.
+
+    The contract is based only on the authorized operation and validated
+    arguments. Tool success text, model assertions, and error wording cannot
+    downgrade it. Unknown provenance is intentionally incomplete and therefore
+    fails closed at every egress gate.
+    """
+    from .models import InformationFlowLabels, SourceLabel
+
+    args = arguments or {}
+    if tool_name == "fetch_channel_history":
+        resource = args.get("channel_id") or getattr(auth_context, "channel_id", None)
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        source = SourceLabel(
+            principal=principal,
+            domain=getattr(auth_context, "domain", None),
+            resource_id=ChannelResourceAdapter._resolve_channel(resource),
+            bridge_instance=getattr(auth_context, "bridge_instance", None),
+            sensitivity="private",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            source_kind="channel",
+        )
+        return InformationFlowLabels().with_source(source)
+
+    if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
+        resources = authorization.protected_source_resources
+        if resources == ():
+            return None
+        principal = getattr(auth_context, "canonical_principal", None)
+        labels = InformationFlowLabels()
+        for resource in resources or ("unknown",):
+            labels = labels.with_source(SourceLabel(
+                principal=principal if resources is not None else None,
+                domain="mcp",
+                resource_id=resource,
+                bridge_instance=tool_name.split("_", 2)[1] if "_" in tool_name else None,
+                sensitivity="internal",
+                authorized_principals=(
+                    frozenset({principal}) if principal and resources is not None else frozenset()
+                ),
+                source_kind="mcp",
+            ))
+        return labels
+
+    domain = _PROTECTED_RESULT_DOMAINS.get(tool_name)
+    if domain is None:
+        # Native aliases may be namespaced by a tool server. Do not apply this
+        # suffix rule to MCP calls, which are classified above from provenance.
+        for candidate, candidate_domain in _PROTECTED_RESULT_DOMAINS.items():
+            if tool_name.endswith(f"__{candidate}"):
+                domain = candidate_domain
+                break
+    if domain is None:
+        return None
+
+    resource = next(
+        (
+            args.get(key)
+            for key in ("path", "file_path", "query", "turn_id", "atom_id", "job_id")
+            if isinstance(args.get(key), str) and args.get(key)
+        ),
+        "unknown",
+    )
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal=None,
+        domain=domain,
+        resource_id=str(resource),
+        bridge_instance=None,
+        sensitivity="internal",
+        authorized_principals=frozenset(),
+        source_kind="protected_tool",
+    ))
 
 
 _global_tool_registry = ToolRegistry()
