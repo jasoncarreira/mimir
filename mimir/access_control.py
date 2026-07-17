@@ -551,13 +551,8 @@ class OperationCatalog:
         "list_channels",
         "list_schedules",
         "commitment_list",
-        "memory_store",
         "memory_query",
         "memory_get",
-        "saga_feedback",
-        "saga_mark_contributions",
-        "saga_end_session",
-        "saga_record_skill_learning",
         "bash_jobs_list",
         "write_todos",
         "defer_injected_message",
@@ -583,6 +578,11 @@ class OperationCatalog:
         "spawn_codex",
         "spawn_open_code",
         "task",
+        "memory_store",
+        "saga_feedback",
+        "saga_mark_contributions",
+        "saga_end_session",
+        "saga_record_skill_learning",
         "saga_forget",
         "write_file",
         "edit_file",
@@ -1083,11 +1083,10 @@ class ToolRegistry:
         service_capability_denied = (
             preliminary_service is not None
             and preliminary_decision == OperationDecision.ADMIN_REQUIRED
-            and not preliminary_service.has_capability(tool_name)
+            and not service_can_invoke_operation(preliminary_service, tool_name)
         )
         service_allowed_preliminary = (
-            preliminary_service is not None
-            and preliminary_service.has_capability(tool_name)
+            service_can_invoke_operation(preliminary_service, tool_name)
         )
         preliminary_admin_denied = (
             preliminary_decision == OperationDecision.ADMIN_REQUIRED
@@ -1141,8 +1140,7 @@ class ToolRegistry:
         reason = None
         is_shadow = False
         service_allowed = (
-            service_principal is not None
-            and service_principal.has_capability(tool_name)
+            service_can_invoke_operation(service_principal, tool_name)
         )
 
         if decision == OperationDecision.OPEN:
@@ -1418,6 +1416,15 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "worklink_run": "worklink",
 }
 
+_SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset({
+    "memory_store",
+    "saga_feedback",
+    "saga_mark_contributions",
+    "saga_end_session",
+    "saga_record_skill_learning",
+    "saga_forget",
+})
+
 
 class CapabilityMatrixError(Exception):
     """Raised when enforcement is requested with an incomplete matrix."""
@@ -1429,6 +1436,17 @@ class ProviderEnforcementCompatibilityError(Exception):
 
 def _capability_matrix_errors() -> list[str]:
     errors: list[str] = []
+    for operation in sorted(_SAGA_MUTATION_OPERATIONS):
+        if operation not in _OPERATION_SINK_DESTINATION:
+            errors.append(
+                f"SAGA mutation '{operation}' has no sink destination mapping"
+            )
+        if operation in OperationCatalog._OPEN_OPERATIONS:
+            errors.append(f"SAGA mutation '{operation}' must not be cataloged OPEN")
+        if operation not in OperationCatalog._ADMIN_REQUIRED_OPERATIONS:
+            errors.append(
+                f"SAGA mutation '{operation}' must be cataloged ADMIN_REQUIRED"
+            )
     for trigger in sorted(_REQUIRED_SERVICE_PRINCIPALS):
         principal = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
         if principal is None:
@@ -1588,16 +1606,30 @@ def is_trusted_service(auth_context: Any) -> bool:
     return get_trusted_service_from_auth_context(auth_context) is not None
 
 
-def can_write_saga(auth_context: Any) -> bool:
-    """Check if the auth context can write to SAGA (memory_store, saga_end_session).
+def service_can_invoke_operation(
+    service: ServicePrincipal | None,
+    operation: str,
+) -> bool:
+    """Check an exact service capability and its declared flow constraints."""
+    if service is None or not service.has_capability(operation):
+        return False
+    required_domain = _OPERATION_READABLE_DOMAIN.get(operation)
+    if required_domain and not service.can_read_domain(required_domain):
+        return False
+    required_sink = _OPERATION_SINK_DESTINATION.get(operation)
+    if required_sink and not service.can_write_sink(required_sink):
+        return False
+    return True
 
-    Writes are allowed for:
-    - Admin users
-    - Trusted service principals
 
-    Regular users cannot write to shared memory.
-    """
-    return is_admin(auth_context) or is_trusted_service(auth_context)
+def can_write_saga(auth_context: Any, operation: str) -> bool:
+    """Authorize one canonical SAGA mutation for an admin or service."""
+    if operation not in _SAGA_MUTATION_OPERATIONS:
+        return False
+    if is_admin(auth_context):
+        return True
+    service = get_trusted_service_from_auth_context(auth_context)
+    return service_can_invoke_operation(service, operation)
 
 
 def get_provenance_from_auth_context(
