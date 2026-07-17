@@ -177,8 +177,9 @@ class CommitmentsStore:
         Public lifecycle methods consult it before appending.
 
         Authorization: recipient_principal does NOT grant mutation authority.
-        Only the owner_principal (or service/admin) can mutate a commitment.
-        Service-owned (visibility=service) records require service actor.
+        Owner mutations require an exact owner match (or admin). The trusted
+        commitment poller has a narrow exception for its own system lifecycle
+        transitions (deliver / expire), which sweep commitments across owners.
 
         Returns True if the transition is valid and authorized; False
         if the record is unknown, unauthorized, or the transition
@@ -202,7 +203,10 @@ class CommitmentsStore:
             )
             return False
         if not self._is_authorized(
-            rec, actor_principal, actor_is_admin=actor_is_admin,
+            rec,
+            actor_principal,
+            target_status=target_status,
+            actor_is_admin=actor_is_admin,
         ):
             log.warning(
                 "commitments: lifecycle write rejected — unauthorized "
@@ -217,35 +221,37 @@ class CommitmentsStore:
         record: CommitmentRecord,
         actor_principal: str | None,
         *,
+        target_status: str,
         actor_is_admin: bool = False,
     ) -> bool:
-        """Check if the actor is authorized to mutate this commitment.
+        """Check if the actor may apply one lifecycle transition.
 
         Authorization rules (when actor_principal is provided):
-        - Admin actors can mutate any record, including service/legacy records
-        - Service visibility: only admin or service actors can mutate
-        - Private visibility: actor must be the owner (or admin)
-        - Public visibility: owner, service actor, or admin can mutate
+        - Admin actors can apply any valid transition
+        - The trusted commitment poller may deliver or expire any record; these
+          are system lifecycle transitions, not owner mutations
+        - Every other non-admin transition requires an exact owner match
+        - Ownerless records remain admin-only for owner mutations
 
-        If no actor_principal provided, allow by default (backward compat).
-        If no owner is set (legacy record), requires admin/service actor.
+        If no actor_principal is provided, allow by default (backward compat).
         Recipient identity does NOT grant mutation authority.
         """
         if actor_principal is None:
             return True
         if actor_is_admin:
             return True
-        if record.visibility == CommitmentVisibility.SERVICE.value:
-            return actor_principal.startswith("service:")
-        if record.visibility == CommitmentVisibility.PRIVATE.value:
-            return actor_principal == record.owner_principal
-        if record.visibility == CommitmentVisibility.PUBLIC.value:
-            if actor_principal.startswith("service:"):
-                return True
-            if record.owner_principal is None:
-                return actor_principal.startswith("service:")
-            return actor_principal == record.owner_principal
-        return False
+        if (
+            actor_principal == "service:poller"
+            and target_status in {
+                CommitmentStatus.DELIVERED.value,
+                CommitmentStatus.EXPIRED.value,
+            }
+        ):
+            return True
+        return (
+            record.owner_principal is not None
+            and actor_principal == record.owner_principal
+        )
 
     async def deliver(
         self, id: str, *, actor_principal: str | None = None,
@@ -606,8 +612,9 @@ class CommitmentsStore:
         - ``actor_principal``: for access control (view filtering).
         - ``owner_principal``: filter by ownership. If provided, returns
           only commitments owned by this principal.
-        - ``include_service``: include service-owned commitments.
-          Default False (admin/service-only access).
+        - ``include_service``: opt into service-visibility commitments when the
+          actor is also authorized for their owner. It never grants cross-owner
+          access. Default False.
         Sorted by created_at_unix ascending."""
         state = self.current_state()
         out: list[CommitmentRecord] = []
@@ -639,22 +646,25 @@ class CommitmentsStore:
     ) -> bool:
         """Check if the actor can view this commitment.
 
-        Visibility rules:
-        - Admin: visible regardless of visibility level
-        - Public: visible to all
-        - Service: only service actors or when include_service=True
-        - Private: only owner, service actors, or admin
+        Visibility rules for an authenticated actor:
+        - Admin: visible regardless of visibility level or owner
+        - Any actor: exact-owner records
+        - Anonymous/backward-compatible reads: public records
+        - Ownerless and cross-owner records: hidden from authenticated actors
+        - Ownerless service records: admin-only
+
+        ``include_service`` opts into the actor's own service-visibility records;
+        it never grants cross-owner access. Public is a legacy visibility label,
+        not an implicit grant to every authenticated service principal.
         """
         if actor_is_admin:
             return True
+        if actor_principal is None:
+            return record.visibility == CommitmentVisibility.PUBLIC.value
+        if actor_principal != record.owner_principal:
+            return False
         if record.visibility == CommitmentVisibility.SERVICE.value:
-            return include_service or (
-                actor_principal is not None and actor_principal.startswith("service:")
-            )
-        if record.visibility == CommitmentVisibility.PRIVATE.value:
-            return actor_principal == record.owner_principal or (
-                actor_principal is not None and actor_principal.startswith("service:")
-            )
+            return include_service
         return True
 
     def find_by_dedupe_key(
