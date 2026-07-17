@@ -548,12 +548,9 @@ class OperationCatalog:
     """
 
     _OPEN_OPERATIONS: frozenset[str] = frozenset({
-        "list_channels",
-        "list_schedules",
         "commitment_list",
         "memory_query",
         "memory_get",
-        "bash_jobs_list",
         "write_todos",
         "defer_injected_message",
         "commitment_complete",
@@ -562,6 +559,8 @@ class OperationCatalog:
     })
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
+        "list_channels",
+        "list_schedules",
         "add_schedule",
         "set_schedule_priority",
         "remove_schedule",
@@ -573,6 +572,7 @@ class OperationCatalog:
         "worklink_run",
         "shell_exec",
         "bash_async",
+        "bash_jobs_list",
         "bash_job_output",
         "spawn_claude_code",
         "spawn_codex",
@@ -601,6 +601,15 @@ class OperationCatalog:
         "rebuild_index",
         "get_turn",
         "mimir_get_turn",
+    })
+
+    # Global rows from these operations contain protected identities,
+    # configuration, or process metadata and must never become OPEN.
+    _PROTECTED_METADATA_OPERATIONS: frozenset[str] = frozenset({
+        "list_channels",
+        "list_schedules",
+        "bash_jobs_list",
+        "bash_job_output",
     })
 
     _ADMIN_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset({
@@ -1223,6 +1232,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             capabilities=(
                 "shell_exec",
                 "bash_async",
+                "bash_jobs_list",
+                "bash_job_output",
                 "spawn_claude_code",
                 "spawn_codex",
                 "spawn_open_code",
@@ -1246,7 +1257,12 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "get_turn",
                 "mimir_get_turn",
             ),
-            readable_domains=("configured_inputs", "filesystem", "turn_history"),
+            readable_domains=(
+                "configured_inputs",
+                "filesystem",
+                "turn_history",
+                "shell_jobs",
+            ),
             sink_destinations=(
                 "configured_channel",
                 "filesystem",
@@ -1286,8 +1302,14 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "get_turn",
                 "mimir_get_turn",
                 "send_message",
+                "list_channels",
             ),
-            readable_domains=("poller_payload", "filesystem", "turn_history"),
+            readable_domains=(
+                "poller_payload",
+                "filesystem",
+                "turn_history",
+                "channel_metadata",
+            ),
             sink_destinations=(
                 "configured_channel",
                 "filesystem",
@@ -1339,6 +1361,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "abandon_proposal",
                 "add_schedule",
                 "set_schedule_priority",
+                "list_schedules",
                 "read_file",
                 "aread",
                 "ls",
@@ -1349,7 +1372,12 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "agrep",
                 "send_message",
             ),
-            readable_domains=("defaults", "proposal", "filesystem"),
+            readable_domains=(
+                "defaults",
+                "proposal",
+                "filesystem",
+                "schedule_metadata",
+            ),
             sink_destinations=(
                 "operator_alert",
                 "filesystem",
@@ -1379,6 +1407,10 @@ _REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset({
 
 # Executable capabilities and information-flow metadata are one policy.
 _OPERATION_READABLE_DOMAIN: dict[str, str] = {
+    "list_channels": "channel_metadata",
+    "list_schedules": "schedule_metadata",
+    "bash_jobs_list": "shell_jobs",
+    "bash_job_output": "shell_jobs",
     "read_file": "filesystem",
     "aread": "filesystem",
     "ls": "filesystem",

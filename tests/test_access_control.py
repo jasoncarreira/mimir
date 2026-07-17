@@ -173,6 +173,87 @@ def test_admin_turn_can_use_routine_cataloged_tools_when_enforced(
     assert result.reason is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "service_trigger", "service_principal"),
+    [
+        ("list_channels", "poller", "poller"),
+        ("list_schedules", "upgrade", "system"),
+        ("bash_jobs_list", "scheduled_tick", "scheduler"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("caller", "should_render"),
+    [
+        ("regular", False),
+        ("admin", True),
+        ("service", True),
+        ("missing", False),
+        ("http", False),
+    ],
+)
+async def test_protected_metadata_reads_authorize_before_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    service_trigger: str,
+    service_principal: str,
+    caller: str,
+    should_render: bool,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync", lambda *_args, **_kwargs: None
+    )
+    if caller == "service":
+        auth_context = create_auth_context(
+            AgentEvent(
+                trigger=service_trigger,
+                channel_id=f"{service_trigger}:test",
+                service_principal=service_principal,
+            ),
+            enforce=True,
+        )
+    elif caller == "missing":
+        auth_context = None
+    else:
+        auth_context = AuthContext(
+            principal=f"{caller}-principal",
+            canonical_principal=caller,
+            roles=("user", "admin") if caller in {"admin", "http"} else ("user",),
+            event_ingress="http_event" if caller == "http" else None,
+            trigger="user_message",
+            channel_id="slack-C1",
+            interactivity=None,
+            enforcement_enabled=True,
+        )
+
+    protected_result = f"protected-metadata:{tool_name}"
+    handler_calls = 0
+
+    async def handler(request):
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(
+            content=protected_result,
+            tool_call_id=request.tool_call["id"],
+        )
+
+    result = await BudgetGateMiddleware().awrap_tool_call(
+        _tool_request(auth_context, tool_name=tool_name, args={}), handler
+    )
+
+    assert handler_calls == int(should_render)
+    if should_render:
+        assert result.status != "error"
+        assert result.content == protected_result
+    else:
+        assert result.status == "error"
+        assert protected_result not in str(result.content)
+
+
 def test_legacy_default_allows_but_reports_would_deny_reason(
     tmp_path: Path,
 ) -> None:

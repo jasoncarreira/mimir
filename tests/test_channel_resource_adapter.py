@@ -338,10 +338,10 @@ class TestOperationCatalogIntegration:
         decision = catalog.get_decision("send_message", None)
         assert decision == OperationDecision.RESOURCE_SCOPED
 
-    def test_non_channel_operations_return_open(self):
+    def test_channel_metadata_listing_requires_admin(self):
         catalog = get_operation_catalog()
         decision = catalog.get_decision("list_channels", None)
-        assert decision == OperationDecision.OPEN
+        assert decision == OperationDecision.ADMIN_REQUIRED
 
 
 class TestShadowMode:
