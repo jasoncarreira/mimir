@@ -37,6 +37,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from mimir.saga.ownership import AuthorizationScope
 
 # Atom source_type tag for skill-learning atoms. Recall (mimir/saga/recall.py)
 # excludes this source_type from general candidate hydration.
@@ -119,6 +123,7 @@ def recall_skill_learnings(
     limit: int = 10,
     kinds: frozenset[str] | set[str] | None = None,
     now=None,
+    auth_context: Any = None,
 ) -> list[dict]:
     """Return a skill's learning atoms, activation-ranked, for load injection.
 
@@ -136,6 +141,9 @@ def recall_skill_learnings(
     *kinds* optionally restricts to a valence subset (e.g.
     ``NEGATIVE_KINDS`` for the #267 surfacing path). ``None`` = all kinds.
     *now* is injectable for deterministic tests.
+    *auth_context* filters results by authorization scope (visibility/owner).
+    When omitted, recall fails closed to public atoms only; an unavailable
+    request context must never widen a skill load to private or service memory.
 
     Each result: ``{"id", "content", "kind", "created_at"}``. Tombstoned
     atoms are excluded.
@@ -151,6 +159,23 @@ def recall_skill_learnings(
             f"({','.join(['?'] * len(kind_list))})"
         )
         params.extend(kind_list)
+
+    if auth_context is None:
+        # Context resolution is best-effort at skill-load time.  Missing context
+        # must narrow recall, not silently restore the pre-auth unfiltered path.
+        auth_clause = " AND atoms.visibility = ?"
+        params.append("public")
+    else:
+        from mimir.saga.ownership import (
+            authorization_predicate,
+            get_authorization_scope,
+        )
+
+        auth_scope = get_authorization_scope(auth_context)
+        auth_predicate, auth_params = authorization_predicate(auth_scope)
+        auth_clause = f" AND {auth_predicate}"
+        params.extend(auth_params)
+
     # No SQL LIMIT: skill atoms are sparse, and we rank by activation in
     # Python before taking the top-*limit*. A SQL ``LIMIT`` on created_at
     # would drop a high-activation older learning before it could be
@@ -168,6 +193,7 @@ def recall_skill_learnings(
           AND json_extract(metadata, '$.skill') = ?
           AND tombstoned = 0
           {kind_clause}
+          {auth_clause}
         ORDER BY created_at DESC
         """,
         params,
@@ -236,6 +262,7 @@ def augment_skill_body(
     *,
     limit: int = 8,
     now=None,
+    auth_context: Any = None,
 ) -> tuple[str, list[str]]:
     """Append a skill's recalled learnings to its SKILL.md *body* for
     load-time injection (chainlink #266 read path).
@@ -243,6 +270,9 @@ def augment_skill_body(
     Recalls up to *limit* learnings for *skill* (ALL kinds — a tip and a
     gotcha both help the next invocation, activation-ranked) and appends
     them under ``_LEARNINGS_HEADING``.
+
+    *auth_context* filters recalled learnings by authorization scope
+    (visibility/owner). When omitted, recall fails closed to public atoms only.
 
     Returns ``(augmented_body, injected_atom_ids)``. The atom IDs let the
     caller record which learnings were injected this turn so the
@@ -253,7 +283,9 @@ def augment_skill_body(
     failing the skill load.
     """
     try:
-        learnings = recall_skill_learnings(conn, skill, limit=limit, now=now)
+        learnings = recall_skill_learnings(
+            conn, skill, limit=limit, now=now, auth_context=auth_context
+        )
     except Exception:  # noqa: BLE001 — skill load must not fail on a recall error
         return body, []
     rendered = render_skill_learnings(learnings)

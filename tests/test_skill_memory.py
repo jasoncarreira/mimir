@@ -120,7 +120,7 @@ class TestRecallSkillLearnings:
         await _add_learning(store, "circuit-breaker", "failure-mode", "cb gotcha")
         await _add_learning(store, "memory", "tip", "mem tip")
         conn = store._ensure_conn()
-        cb = recall_skill_learnings(conn, "circuit-breaker")
+        cb = recall_skill_learnings(conn, "circuit-breaker", auth_context=ADMIN_AUTH)
         assert [r["content"] for r in cb] == ["cb gotcha"]
         assert cb[0]["kind"] == "failure-mode"
 
@@ -130,7 +130,7 @@ class TestRecallSkillLearnings:
         await _add_learning(store, "s", "failure-mode", "second")
         await _add_learning(store, "s", "perf-caveat", "third")
         conn = store._ensure_conn()
-        got = recall_skill_learnings(conn, "s")
+        got = recall_skill_learnings(conn, "s", auth_context=ADMIN_AUTH)
         # Both valences surface on load (a tip and a gotcha both help).
         assert "tip" in {r["kind"] for r in got}
         assert "failure-mode" in {r["kind"] for r in got}
@@ -142,7 +142,9 @@ class TestRecallSkillLearnings:
         await _add_learning(store, "s", "tip", "a tip")
         await _add_learning(store, "s", "failure-mode", "a failure")
         conn = store._ensure_conn()
-        negs = recall_skill_learnings(conn, "s", kinds=NEGATIVE_KINDS)
+        negs = recall_skill_learnings(
+            conn, "s", kinds=NEGATIVE_KINDS, auth_context=ADMIN_AUTH
+        )
         assert [r["content"] for r in negs] == ["a failure"]
 
     @pytest.mark.asyncio
@@ -150,13 +152,142 @@ class TestRecallSkillLearnings:
         for i in range(5):
             await _add_learning(store, "s", "tip", f"tip-{i}")
         conn = store._ensure_conn()
-        assert len(recall_skill_learnings(conn, "s", limit=2)) == 2
+        assert len(recall_skill_learnings(conn, "s", limit=2, auth_context=ADMIN_AUTH)) == 2
 
     @pytest.mark.asyncio
     async def test_empty_skill_returns_empty(self, store):
         conn = store._ensure_conn()
         assert recall_skill_learnings(conn, "") == []
         assert recall_skill_learnings(conn, "never-used") == []
+
+    @pytest.mark.asyncio
+    async def test_recall_filters_by_visibility_and_owner(self, store):
+        """Learnings with different visibility/owner are filtered by auth_context."""
+        await store.store(
+            "public tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="public",
+            owner_principal="user-a",
+        )
+        await store.store(
+            "private user-a tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="private",
+            owner_principal="user-a",
+        )
+        await store.store(
+            "private user-b tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="private",
+            owner_principal="user-b",
+        )
+        conn = store._ensure_conn()
+
+        user_a_auth = AuthContext(
+            principal="user-a",
+            canonical_principal="user-a",
+            roles=(),
+            event_ingress="test",
+            trigger="user_message",
+            channel_id="test-channel",
+            interactivity=None,
+        )
+        user_b_auth = AuthContext(
+            principal="user-b",
+            canonical_principal="user-b",
+            roles=(),
+            event_ingress="test",
+            trigger="user_message",
+            channel_id="test-channel",
+            interactivity=None,
+        )
+
+        user_a_results = recall_skill_learnings(
+            conn, "test-skill", auth_context=user_a_auth
+        )
+        user_b_results = recall_skill_learnings(
+            conn, "test-skill", auth_context=user_b_auth
+        )
+
+        user_a_contents = {r["content"] for r in user_a_results}
+        user_b_contents = {r["content"] for r in user_b_results}
+
+        assert "public tip" in user_a_contents
+        assert "public tip" in user_b_contents
+        assert "private user-a tip" in user_a_contents
+        assert "private user-a tip" not in user_b_contents
+        assert "private user-b tip" in user_b_contents
+        assert "private user-b tip" not in user_a_contents
+
+    @pytest.mark.asyncio
+    async def test_recall_without_auth_context_returns_public_only(self, store):
+        """Missing request context narrows recall instead of exposing all atoms."""
+        await store.store(
+            "public tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="public",
+            owner_principal="user-a",
+        )
+        await store.store(
+            "private user tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="private",
+            owner_principal="user-a",
+        )
+        await store.store(
+            "service tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="service",
+            owner_principal="service",
+        )
+        conn = store._ensure_conn()
+
+        results = recall_skill_learnings(conn, "test-skill", auth_context=None)
+
+        assert [item["content"] for item in results] == ["public tip"]
+
+    @pytest.mark.asyncio
+    async def test_recall_admin_sees_all(self, store):
+        """Admin auth_context bypasses owner filtering."""
+        await store.store(
+            "private user-a tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="private",
+            owner_principal="user-a",
+        )
+        await store.store(
+            "private user-b tip",
+            source_type=SKILL_LEARNING_SOURCE_TYPE,
+            metadata=build_metadata("test-skill", "tip"),
+            visibility="private",
+            owner_principal="user-b",
+        )
+        conn = store._ensure_conn()
+
+        admin_auth = AuthContext(
+            principal="admin-user",
+            canonical_principal="admin-user",
+            roles=("admin",),
+            event_ingress="test",
+            trigger="user_message",
+            channel_id="test-channel",
+            interactivity=None,
+        )
+
+        admin_results = recall_skill_learnings(
+            conn, "test-skill", auth_context=admin_auth
+        )
+        admin_contents = {r["content"] for r in admin_results}
+
+        assert "private user-a tip" in admin_contents
+        assert "private user-b tip" in admin_contents
 
 
 # ── negative-learning count (#267 surfacing input) ───────────────────
@@ -247,7 +378,9 @@ class TestRenderAndAugment:
         from mimir.skill_memory import augment_skill_body
 
         conn = store._ensure_conn()
-        out, ids = augment_skill_body(conn, "cb", "ORIGINAL BODY")
+        out, ids = augment_skill_body(
+            conn, "cb", "ORIGINAL BODY", auth_context=ADMIN_AUTH
+        )
         assert out.startswith("ORIGINAL BODY")
         assert "## Learnings from past runs" in out
         assert "[failure-mode] resets on reconnect" in out
@@ -284,7 +417,7 @@ class TestSagaStoreConnection:
 
         conn = store.connection()
         # The public accessor returns a conn the skill_memory helpers can use.
-        assert recall_skill_learnings(conn, "cb")[0]["content"] == "x"
+        assert recall_skill_learnings(conn, "cb", auth_context=ADMIN_AUTH)[0]["content"] == "x"
 
 
 class TestRunLockedRead:
@@ -302,9 +435,12 @@ class TestRunLockedRead:
             store._ensure_conn(),
             "cb",
             "BODY",
+            auth_context=ADMIN_AUTH,
         )
         via_store = store.run_locked_read(
-            lambda conn: skill_memory.augment_skill_body(conn, "cb", "BODY")
+            lambda conn: skill_memory.augment_skill_body(
+                conn, "cb", "BODY", auth_context=ADMIN_AUTH
+            )
         )
         assert via_store == direct
         assert via_store[1] == [sl["atom_id"]]
@@ -354,7 +490,7 @@ class TestActivationRanking:
         conn = store._ensure_conn()
 
         # Pre-vote: recency wins → newest first.
-        before = recall_skill_learnings(conn, "s")
+        before = recall_skill_learnings(conn, "s", auth_context=ADMIN_AUTH)
         assert before[0]["content"] == "newer but unused"
 
         # The agent curates: marks the OLD learning useful (weight-2.0 event).
@@ -364,7 +500,7 @@ class TestActivationRanking:
             auth_context=ADMIN_AUTH,
         )
 
-        after = recall_skill_learnings(conn, "s")
+        after = recall_skill_learnings(conn, "s", auth_context=ADMIN_AUTH)
         assert after[0]["content"] == "old but useful", (
             "a useful-voted learning should rise above a newer un-voted one"
         )
@@ -377,5 +513,5 @@ class TestActivationRanking:
         await _add_learning(store, "s", "tip", "second")
         await _add_learning(store, "s", "tip", "third")
         conn = store._ensure_conn()
-        got = recall_skill_learnings(conn, "s")
+        got = recall_skill_learnings(conn, "s", auth_context=ADMIN_AUTH)
         assert [r["content"] for r in got] == ["third", "second", "first"]
