@@ -1032,21 +1032,41 @@ class ToolRegistry:
         sink_category = get_sink_category(tool_name)
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)
-        if sink_category != SinkCategory.UNKNOWN:
+        catalog = get_operation_catalog()
+        preliminary_decision = catalog.get_decision(tool_name, auth_context)
+        preliminary_service = (
+            get_trusted_service_from_auth_context(auth_context)
+            if auth_context is not None
+            else None
+        )
+        service_capability_denied = (
+            preliminary_decision == OperationDecision.ADMIN_REQUIRED
+            and not (
+                preliminary_service is not None
+                and preliminary_service.has_capability(tool_name)
+            )
+        )
+        sink_target = target_channel
+        if (
+            sink_category == SinkCategory.SAME_CHANNEL
+            and not sink_target
+            and auth_context is not None
+        ):
+            sink_target = getattr(auth_context, "channel_id", None)
+        if sink_category != SinkCategory.UNKNOWN and not service_capability_denied:
             sink_check = SinkGate.check_sink_flow(
                 tool_name,
-                target_channel,
+                sink_target,
                 ifc_labels,
                 auth_context,
                 enforce=enforce,
             )
             if not sink_check.allowed and enforce:
                 return sink_check
-            if sink_check.service_principal is not None:
+            if sink_check.service_principal is not None and enforce:
                 return sink_check
 
-        catalog = get_operation_catalog()
-        decision = catalog.get_decision(tool_name, auth_context)
+        decision = preliminary_decision
         service_principal = None
 
         if auth_context is not None:
