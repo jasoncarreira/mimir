@@ -1032,7 +1032,7 @@ class ToolRegistry:
         sink_category = get_sink_category(tool_name)
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)
-        if ifc_labels is not None:
+        if sink_category != SinkCategory.UNKNOWN and ifc_labels is not None:
             sink_check = SinkGate.check_sink_flow(
                 tool_name,
                 target_channel,
