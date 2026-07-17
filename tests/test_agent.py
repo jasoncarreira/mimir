@@ -743,6 +743,7 @@ async def test_run_turn_http_event_ingress_reaches_turn_context_before_admin_too
     def _capture(kind: str, **kw: Any) -> None:
         captured.append((kind, kw))
 
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:claude-sonnet-4-6")
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
     monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", _capture)
 
