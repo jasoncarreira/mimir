@@ -512,9 +512,9 @@ def test_migration_v6_cleans_orphaned_access_events_rows(tmp_path):
     ).fetchone()[0]
     assert real_access == 1, "real atom's access_events row must survive migration v6"
 
-    # Schema version must be stamped at v8.
+    # Schema version must be stamped at v9.
     v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-    assert v == 8, f"schema_version should be 8 post-migration, got {v}"
+    assert v == 9, f"schema_version should be 9 post-migration, got {v}"
 
     # PRAGMA foreign_key_check must return empty — no orphans remain.
     conn2 = sqlite3.connect(str(db_path))
@@ -628,9 +628,9 @@ def test_migration_v7_is_idempotent_on_fresh_db(tmp_path):
     store = SagaStore(db_path=db_path, embedding_dim=4)
     conn = store._ensure_conn()
 
-    # Schema version must be stamped at v8 (CURRENT_SCHEMA_VERSION).
+    # Schema version must be stamped at v9 (CURRENT_SCHEMA_VERSION).
     v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-    assert v == 8, f"fresh DB must be at v8; got {v}"
+    assert v == 9, f"fresh DB must be at v9; got {v}"
 
     # Insert an atom and then delete it — dependents must cascade.
     now = "2026-05-24T03:00:00+00:00"
