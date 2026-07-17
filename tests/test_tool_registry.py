@@ -16,7 +16,7 @@ from mimir.access_control import (
     ToolRegistry,
     get_service_principal,
 )
-from mimir.models import AuthContext
+from mimir.models import AuthContext, InformationFlowLabels
 from mimir.tools import budget_gate
 
 
@@ -232,7 +232,11 @@ def test_service_principals_allow_only_explicit_operations_with_full_inventory(
         channel_id=f"{trigger}:test",
         service_principal=service_principals.get(trigger),
     )
-    ctx = create_auth_context(event, enforce=True)
+    labels = InformationFlowLabels(
+        labels=frozenset({"internal"}),
+        source_channels=frozenset({event.channel_id}),
+    )
+    ctx = create_auth_context(event, enforce=True, ifc_labels=labels)
 
     admitted = registry.authorize_tool(allowed_operation, ctx, enforce=True)
     denied = registry.authorize_tool(denied_operation, ctx, enforce=True)
