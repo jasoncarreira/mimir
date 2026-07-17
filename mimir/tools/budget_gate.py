@@ -250,11 +250,11 @@ def _tool_call_id(request: ToolCallRequest) -> str:
     return str(tc.get("id") or "")
 
 
-def _extract_channel_from_args(
+def _extract_sink_target(
     request: ToolCallRequest,
     auth_context: AuthContext | None = None,
 ) -> str | None:
-    """Return the effective channel target for authorization.
+    """Return the concrete operation destination for sink authorization.
 
     Channel tools default an omitted/empty ``channel_id`` to the current turn's
     channel. Mirror that server-owned resolution here so the gate authorizes an
@@ -262,10 +262,29 @@ def _extract_channel_from_args(
     """
     tc = getattr(request, "tool_call", None) or {}
     args = tc.get("args") or {}
-    explicit_channel = args.get("channel_id")
-    if explicit_channel:
-        return explicit_channel
-    return auth_context.channel_id if auth_context is not None else None
+    tool_name = _tool_name_from_request(request)
+    if tool_name in {"send_message", "react", "fetch_channel_history"}:
+        explicit_channel = args.get("channel_id")
+        if explicit_channel:
+            return str(explicit_channel)
+        return auth_context.channel_id if auth_context is not None else None
+    if tool_name in {"write_file", "edit_file"}:
+        target = args.get("file_path") or args.get("path")
+    elif tool_name in {"shell_exec", "bash_async"}:
+        target = args.get("command")
+    elif tool_name in {"spawn_claude_code", "spawn_codex", "spawn_open_code"}:
+        target = args.get("cwd") or os.environ.get("MIMIR_HOME")
+    elif tool_name in {"fetch_url", "http_request", "webhook"}:
+        target = args.get("url")
+    elif tool_name.startswith("mcp_"):
+        target = tool_name
+    else:
+        target = args.get("target") or args.get("destination")
+    return str(target) if target else None
+
+
+# Compatibility alias for callers that only exercise channel operations.
+_extract_channel_from_args = _extract_sink_target
 
 
 def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
@@ -540,7 +559,7 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
-        target_channel = _extract_channel_from_args(request, auth_context)
+        target_channel = _extract_sink_target(request, auth_context)
         ifc_labels = _get_ifc_labels_from_context()
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)
@@ -631,7 +650,7 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
-        target_channel = _extract_channel_from_args(request, auth_context)
+        target_channel = _extract_sink_target(request, auth_context)
         ifc_labels = _get_ifc_labels_from_context()
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)

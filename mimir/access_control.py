@@ -21,8 +21,11 @@ New in chainlink #866:
 from __future__ import annotations
 
 import logging
+import os
+import shlex
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from .identities import AccessMetadata
@@ -137,6 +140,15 @@ class ResourceScope:
 
 
 @dataclass(frozen=True)
+class ServiceSinkPolicy:
+    """One executable, operation-specific service destination grant."""
+
+    operation: str
+    adapter: str
+    destination: str
+
+
+@dataclass(frozen=True)
 class ServicePrincipal:
     """Trusted autonomous service principal (chainlink #865).
 
@@ -149,6 +161,7 @@ class ServicePrincipal:
     capabilities: tuple[str, ...] = ()
     readable_domains: tuple[str, ...] = ()
     sink_destinations: tuple[str, ...] = ()
+    sink_policies: tuple[ServiceSinkPolicy, ...] = ()
     creation_path: str | None = None
 
     def can_read_domain(self, domain: str) -> bool:
@@ -159,6 +172,74 @@ class ServicePrincipal:
 
     def has_capability(self, capability: str) -> bool:
         return capability in self.capabilities
+
+    def sink_policy_for(self, operation: str) -> ServiceSinkPolicy | None:
+        return next(
+            (policy for policy in self.sink_policies if policy.operation == operation),
+            None,
+        )
+
+
+def _configured_file_roots() -> list[Path]:
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+    roots = [Path(home)]
+    roots.extend(
+        Path(value)
+        for value in os.environ.get("MIMIR_FILE_OP_ROOTS", "").split(":")
+        if value.strip()
+    )
+    return roots
+
+
+def _target_within_configured_roots(target: str, _destination: str) -> bool:
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    try:
+        resolve_within_roots(_configured_file_roots(), target)
+    except (OSError, PathOutsideHomeError):
+        return False
+    return True
+
+
+def _target_matches_shell_profile(target: str, destination: str) -> bool:
+    """Admit only commands in the service's named, non-network shell profile."""
+    try:
+        argv = shlex.split(target)
+    except ValueError:
+        return False
+    if not argv or any(token in target for token in (";", "|", "&", "`", "$", ">", "<")):
+        return False
+
+    command = Path(argv[0]).name
+    git_read = command == "git" and len(argv) > 1 and argv[1] in {
+        "diff", "log", "show", "status",
+    }
+    if destination == "scheduler_read_only":
+        return command in {"jq", "rg", "grep", "ls", "wc", "pwd"} or git_read
+    if destination == "upgrade_workspace":
+        return git_read or (
+            command == "uv" and len(argv) > 1 and argv[1] in {"lock", "sync"}
+        )
+    return False
+
+
+_SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
+    "configured_file_roots": _target_within_configured_roots,
+    "shell_profile": _target_matches_shell_profile,
+    "spawn_workspace": _target_within_configured_roots,
+}
+
+_ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
+    SinkCategory.SHELL_PROCESS: "shell_process",
+    SinkCategory.SPAWN: "spawn_process",
+    SinkCategory.FILE: "filesystem",
+    SinkCategory.NOTIFICATION: "notification",
+    SinkCategory.HTTP_WEBHOOK: "network",
+    SinkCategory.NETWORK: "network",
+    SinkCategory.EXTERNAL_MCP: "external_mcp",
+}
 
 
 class SinkGate:
@@ -228,39 +309,6 @@ class SinkGate:
             )
 
         service = get_trusted_service_from_auth_context(auth_context)
-        service_sink = {
-            SinkCategory.SHELL_PROCESS: "shell_process",
-            SinkCategory.SPAWN: "spawn_process",
-            SinkCategory.FILE: "filesystem",
-            SinkCategory.NOTIFICATION: "notification",
-            SinkCategory.HTTP_WEBHOOK: "network",
-            SinkCategory.NETWORK: "network",
-            SinkCategory.EXTERNAL_MCP: "external_mcp",
-        }.get(sink_category)
-        if (
-            service is not None
-            and service_sink is not None
-            and service.can_write_sink(service_sink)
-            # Poller payloads contain attacker-controlled external content, so
-            # their service authority must not bypass IFC on active sinks.
-            and not (
-                "poller_payload" in service.readable_domains
-                and sink_category in {
-                    SinkCategory.SHELL_PROCESS,
-                    SinkCategory.SPAWN,
-                    SinkCategory.FILE,
-                }
-            )
-        ):
-            return ToolAuthorization(
-                tool_name=tool_name,
-                decision=OperationDecision.OPEN,
-                allowed=True,
-                reason="ifc_service_sink_allowed",
-                service_principal=service,
-                enforcement_enabled=enforce,
-            )
-
         if not target:
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -272,6 +320,51 @@ class SinkGate:
                 is_shadow_decision=not enforce,
             )
 
+        service_policy: ServiceSinkPolicy | None = None
+        if service is not None and sink_category in {
+            SinkCategory.SHELL_PROCESS,
+            SinkCategory.SPAWN,
+            SinkCategory.FILE,
+            SinkCategory.NOTIFICATION,
+            SinkCategory.HTTP_WEBHOOK,
+            SinkCategory.NETWORK,
+            SinkCategory.EXTERNAL_MCP,
+        }:
+            # Preserve #906's fail-closed treatment and decision reason before
+            # considering any concrete poller destination.
+            if "poller_payload" in service.readable_domains and sink_category in {
+                SinkCategory.SHELL_PROCESS,
+                SinkCategory.SPAWN,
+                SinkCategory.FILE,
+            }:
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason=f"ifc_label_blocked:{sink_category.value}",
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                )
+            service_policy = service.sink_policy_for(tool_name)
+            adapter = (
+                _SERVICE_SINK_ADAPTERS.get(service_policy.adapter)
+                if service_policy is not None
+                else None
+            )
+            if adapter is None or not adapter(target, service_policy.destination):
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason="service_sink_destination_denied",
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                )
+
         if not ifc_labels.labels:
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -282,7 +375,11 @@ class SinkGate:
             )
 
         allowed_sinks = cls._get_allowed_sinks(
-            sink_category, auth_context, ifc_labels=ifc_labels,
+            sink_category,
+            auth_context,
+            ifc_labels=ifc_labels,
+            service_policy=service_policy,
+            target=target,
         )
         effective_target = (
             ChannelResourceAdapter._resolve_channel(target)
@@ -320,13 +417,38 @@ class SinkGate:
         auth_context: Any,
         *,
         ifc_labels: Any,
+        service_policy: ServiceSinkPolicy | None = None,
+        target: str | None = None,
     ) -> frozenset[str]:
         """Return concrete destinations compatible with every current label.
 
         Ordinary admin authority deliberately does not widen this set. Admins
         must use the distinct audited declassification action before egress.
         """
-        if category != SinkCategory.SAME_CHANNEL or auth_context is None:
+        if auth_context is None:
+            return frozenset()
+
+        service = get_trusted_service_from_auth_context(auth_context)
+        if service is not None and service_policy is not None and target is not None:
+            # Poller payloads remain attacker-controlled external content (#906).
+            if "poller_payload" in service.readable_domains and category in {
+                SinkCategory.SHELL_PROCESS,
+                SinkCategory.SPAWN,
+                SinkCategory.FILE,
+            }:
+                return frozenset()
+            source_channels = getattr(ifc_labels, "source_channels", None)
+            service_channel = getattr(auth_context, "channel_id", None)
+            if (
+                isinstance(source_channels, frozenset)
+                and source_channels
+                and service_channel
+                and source_channels == frozenset({service_channel})
+            ):
+                return frozenset({target})
+            return frozenset()
+
+        if category != SinkCategory.SAME_CHANNEL:
             return frozenset()
 
         triggering_channel = getattr(auth_context, "channel_id", None)
@@ -1397,6 +1519,15 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "saga",
                 "worklink",
             ),
+            sink_policies=(
+                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("shell_exec", "shell_profile", "scheduler_read_only"),
+                ServiceSinkPolicy("bash_async", "shell_profile", "scheduler_read_only"),
+                ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+            ),
             creation_path="mimir.scheduler.Scheduler._fire_job",
         ),
         ServicePrincipal(
@@ -1444,6 +1575,15 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "worklink",
                 "message",
             ),
+            sink_policies=(
+                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("shell_exec", "shell_profile", "scheduler_read_only"),
+                ServiceSinkPolicy("bash_async", "shell_profile", "scheduler_read_only"),
+                ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+            ),
             creation_path="mimir.pollers.run_poller",
         ),
         ServicePrincipal(
@@ -1471,6 +1611,10 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             ),
             readable_domains=("session", "saga", "filesystem", "turn_history"),
             sink_destinations=("session_boundary", "saga", "filesystem"),
+            sink_policies=(
+                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+            ),
             creation_path="mimir.server._on_session_idle",
         ),
         ServicePrincipal(
@@ -1510,6 +1654,12 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "proposal",
                 "scheduler",
                 "message",
+            ),
+            sink_policies=(
+                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("shell_exec", "shell_profile", "upgrade_workspace"),
+                ServiceSinkPolicy("bash_async", "shell_profile", "upgrade_workspace"),
             ),
             creation_path="mimir.defaults_upgrade.enqueue_upgrade_prompt_turns",
         ),
@@ -1632,6 +1782,37 @@ def _capability_matrix_errors() -> list[str]:
 
         readable_domains = set(principal.readable_domains)
         sink_destinations = set(principal.sink_destinations)
+        policies_by_operation = {policy.operation: policy for policy in principal.sink_policies}
+        if len(policies_by_operation) != len(principal.sink_policies):
+            errors.append(
+                f"Service principal '{principal.canonical}' has duplicate sink policies"
+            )
+        for policy in principal.sink_policies:
+            if policy.operation not in principal.capabilities:
+                errors.append(
+                    f"Service principal '{principal.canonical}' sink policy "
+                    f"'{policy.operation}' has no matching capability"
+                )
+            if policy.adapter not in _SERVICE_SINK_ADAPTERS:
+                errors.append(
+                    f"Service principal '{principal.canonical}' sink policy "
+                    f"'{policy.operation}' has no executable destination adapter "
+                    f"'{policy.adapter}'"
+                )
+        policy_sink_destinations = {
+            _ACTIVE_SERVICE_SINK_DESTINATIONS[category]
+            for policy in principal.sink_policies
+            if (category := get_sink_category(policy.operation))
+            in _ACTIVE_SERVICE_SINK_DESTINATIONS
+        }
+        for sink_destination in sorted(
+            sink_destinations & set(_ACTIVE_SERVICE_SINK_DESTINATIONS.values())
+        ):
+            if sink_destination not in policy_sink_destinations:
+                errors.append(
+                    f"Service principal '{principal.canonical}' sink destination "
+                    f"'{sink_destination}' has no executable destination policy"
+                )
         for operation in sorted(set(principal.capabilities)):
             required_domain = _OPERATION_READABLE_DOMAIN.get(operation)
             if required_domain and required_domain not in readable_domains:
@@ -1644,6 +1825,19 @@ def _capability_matrix_errors() -> list[str]:
                 errors.append(
                     f"Service principal '{principal.canonical}' capability "
                     f"'{operation}' requires sink destination '{required_sink}'"
+                )
+            if get_sink_category(operation) in {
+                SinkCategory.SHELL_PROCESS,
+                SinkCategory.SPAWN,
+                SinkCategory.FILE,
+                SinkCategory.NOTIFICATION,
+                SinkCategory.HTTP_WEBHOOK,
+                SinkCategory.NETWORK,
+                SinkCategory.EXTERNAL_MCP,
+            } and operation not in policies_by_operation:
+                errors.append(
+                    f"Service principal '{principal.canonical}' capability "
+                    f"'{operation}' has no executable destination policy"
                 )
     return errors
 
@@ -1716,6 +1910,14 @@ def get_capability_matrix_report() -> dict[str, dict[str, Any]]:
             "capabilities": list(principal.capabilities),
             "readable_domains": list(principal.readable_domains),
             "sink_destinations": list(principal.sink_destinations),
+            "sink_policies": [
+                {
+                    "operation": policy.operation,
+                    "adapter": policy.adapter,
+                    "destination": policy.destination,
+                }
+                for policy in principal.sink_policies
+            ],
             "creation_path": principal.creation_path,
         }
     return report
