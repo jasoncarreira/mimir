@@ -680,6 +680,12 @@ class WriteGuardBackend:
         if ctx is not None:
             denial["turn_id"] = ctx.turn_id
         self._denials.append(denial)
+        # Bound the buffer: denials with no turn_id (setup/non-turn
+        # callables) and denials from turns that died before the post-turn
+        # drain are never drained by the turn-scoped path — drop oldest so
+        # they can't accumulate for process lifetime.
+        if len(self._denials) > 512:
+            del self._denials[: len(self._denials) - 512]
 
     def __getattr__(self, name: str) -> Any:
         # Default-deny passthrough: only explicit reads forward.

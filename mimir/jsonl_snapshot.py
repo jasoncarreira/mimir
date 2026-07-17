@@ -24,13 +24,14 @@ without an Agent.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
-from ._jsonl_tail import tail_jsonl_records
+from ._jsonl_tail import _tail_lines, tail_jsonl_records
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +65,15 @@ _DEFAULT_TTL_S = 5.0
 # window.
 _DEFAULT_MAX_RECORDS = 10000
 
+# Byte budget for the cached tail. A record-count cap alone doesn't bound
+# memory: turn records have unbounded-ish sizes (observed 600 KB+ before
+# args/reasoning capping), and this cached tail lives parsed in RAM for
+# process lifetime — a busy deployment measured ~600 MB resident from
+# turns.jsonl alone. 64 MiB of raw JSONL (~2x that parsed) keeps every
+# legitimate reader (stats/feedback/arbiter want recent records) while
+# bounding the resident set even over legacy fat logs.
+_DEFAULT_MAX_BYTES = 64 * 1024 * 1024
+
 
 class JsonlSnapshot:
     """Mtime+TTL-cached newest-first list of decoded JSONL records.
@@ -83,10 +93,21 @@ class JsonlSnapshot:
         *,
         ttl_s: float = _DEFAULT_TTL_S,
         max_records: int = _DEFAULT_MAX_RECORDS,
+        max_bytes: int = _DEFAULT_MAX_BYTES,
+        slim: Callable[[dict], dict] | None = None,
     ) -> None:
         self._path = path
         self._ttl = ttl_s
         self._max = max_records
+        self._max_bytes = max_bytes
+        # Optional per-record transform applied as records enter the
+        # cache — lets the on-disk file keep full fidelity (audit trail,
+        # read directly by the turn viewer) while the RETAINED in-RAM
+        # view is slim (e.g. turn_logger.slim_turn_record caps tool-call
+        # args + reasoning). Must return a new/equal record, never
+        # mutate; a failing transform falls back to the raw record.
+        self._slim = slim
+        self._byte_capped = False
         self._records: list[dict] = []
         self._cached_mtime: float = -1.0
         self._cache_until: float = 0.0
@@ -150,14 +171,15 @@ class JsonlSnapshot:
             # extend past what we cached, so time-windowed scans can be
             # truncated (chainlink #259 item 15). Warn once per process
             # per path so a too-tight cap is visible without log spam.
-            self._saturated = len(self._records) >= self._max
+            self._saturated = len(self._records) >= self._max or self._byte_capped
             if self._saturated and not self._saturation_warned:
                 self._saturation_warned = True
                 log.warning(
-                    "JsonlSnapshot saturated: %s capped at %d records; "
-                    "time-windowed scans may see a shorter window than "
-                    "requested. Raise max_records or tighten retention.",
-                    self._path, self._max,
+                    "JsonlSnapshot saturated: %s hit its cap (%d records / "
+                    "%d bytes); time-windowed scans may see a shorter "
+                    "window than requested. Raise the caps or tighten "
+                    "retention.",
+                    self._path, self._max, self._max_bytes,
                 )
             return self._records
 
@@ -175,12 +197,36 @@ class JsonlSnapshot:
             self._cache_until = 0.0
 
     def _collect_tail(self) -> Iterator[dict]:
+        # Reads raw lines (not pre-decoded records) so the byte budget is
+        # counted on the wire size, newest-first; the count cap and the
+        # byte cap both stop the drain, and either sets saturation.
         count = 0
-        for rec in tail_jsonl_records(self._path):
-            yield rec
-            count += 1
-            if count >= self._max:
-                break
+        consumed = 0
+        self._byte_capped = False
+        try:
+            for line in _tail_lines(self._path):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                consumed += len(stripped)
+                if count and consumed > self._max_bytes:
+                    self._byte_capped = True
+                    return
+                try:
+                    rec = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if self._slim is not None:
+                    try:
+                        rec = self._slim(rec)
+                    except Exception:  # noqa: BLE001 — cache survives one bad record
+                        pass
+                yield rec
+                count += 1
+                if count >= self._max:
+                    return
+        except OSError:
+            return
 
 
 def iter_snapshot_or_tail(

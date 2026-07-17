@@ -2347,6 +2347,69 @@ class Scheduler:
             coalesce=True,
         )
 
+    # ---- Scratch retention janitor cron -------------------------------
+
+    def add_scratch_janitor_job(
+        self,
+        home: Path,
+        cron_expr: str = "13 4 * * *",
+        *,
+        job_id: str = "scratch-janitor",
+    ) -> bool:
+        """Register the daily scratch-retention sweep.
+
+        ``scratch/`` is ephemeral by contract but nothing deleted it —
+        poller-driven per-task clones left a live home with 140 GB in six
+        weeks. Delegates to :func:`mimir.scratch_janitor.sweep_scratch_roots`
+        (mtime-TTL over each root's top-level entries, symlinks unlinked
+        not followed, best-effort) in a worker thread — deleting multi-GB
+        trees must not block the event loop.
+
+        Default-**on** (daily). Operators disable with
+        ``MIMIR_SCRATCH_JANITOR_CRON=""`` or ``MIMIR_SCRATCH_TTL_DAYS=0``,
+        tune TTL via ``MIMIR_SCRATCH_TTL_DAYS`` (default 1), and extend the
+        swept roots via ``MIMIR_SCRATCH_JANITOR_ROOTS`` (comma-separated
+        home-relative paths). Env is read at registration — changes need a
+        restart, same as every other ``MIMIR_*_CRON`` knob.
+        """
+        from .scratch_janitor import (
+            resolve_scratch_roots,
+            resolve_scratch_ttl_days,
+            sweep_scratch_roots,
+        )
+
+        ttl_days = resolve_scratch_ttl_days()
+        if ttl_days <= 0:
+            return False
+        roots = resolve_scratch_roots()
+
+        async def _fire() -> None:
+            result = await asyncio.to_thread(
+                sweep_scratch_roots, home, ttl_days=ttl_days, roots=roots
+            )
+            if result.removed or result.errors:
+                await log_event(
+                    "scratch_janitor_swept",
+                    removed=len(result.removed),
+                    kept=result.kept,
+                    bytes_reclaimed=result.bytes_reclaimed,
+                    ttl_days=ttl_days,
+                    # Cap list payloads — a first sweep of a long-neglected
+                    # home can remove hundreds of entries.
+                    paths=list(result.removed[:20]),
+                    errors=list(result.errors[:5]),
+                )
+
+        return self.register_callable(
+            name=job_id,
+            fn=_fire,
+            default_cron=cron_expr,
+            job_id=job_id,
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # ---- Index-integrity cron ----------------------------------------
 
     def add_index_integrity_job(

@@ -448,14 +448,68 @@ def _apply_identity(home: Path, user_name: str, user_email: str) -> None:
     )
 
 
+# Re-block entries that every home's ``.gitignore`` must carry even after the
+# template stops being reseeded. Existing homes never re-copy the template
+# (operators may have hand-edited it), so a template addition otherwise reaches
+# new installs only. ``_ensure_gitignore`` appends any missing entry to an
+# existing file — idempotent, preserving operator edits — so the addition also
+# lands on already-provisioned homes. Each entry: (ignore-line, comment).
+_REQUIRED_GITIGNORE_ENTRIES: tuple[tuple[str, str], ...] = (
+    (
+        "state/worklink/transcripts/",
+        "# Worklink backend transcripts are full sub-agent stdout dumps "
+        "(MBs/attempt) —\n# debugging material, not durable state; tracking "
+        "them grows .git/objects forever.",
+    ),
+)
+
+
+def _append_missing_gitignore_entries(target: Path) -> bool:
+    """Append any missing :data:`_REQUIRED_GITIGNORE_ENTRIES` to ``target``.
+
+    Idempotent and edit-preserving: reads the existing file, appends only
+    entries whose ignore-line is absent (matched trimmed, with or without a
+    leading slash), and never rewrites existing content. Returns True iff it
+    changed the file. Mirrors ``proposals._ensure_scratch_ignored``.
+    """
+    try:
+        existing = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("could not read %s for gitignore upgrade: %s", target, exc)
+        return False
+    present = {line.strip().strip("/") for line in existing.splitlines()}
+    missing = [
+        (line, comment)
+        for line, comment in _REQUIRED_GITIGNORE_ENTRIES
+        if line.strip("/") not in present
+    ]
+    if not missing:
+        return False
+    try:
+        with target.open("a", encoding="utf-8") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            for line, comment in missing:
+                f.write(f"\n{comment}\n{line}\n")
+    except OSError as exc:
+        log.warning("could not upgrade %s: %s", target, exc)
+        return False
+    return True
+
+
 def _ensure_gitignore(home: Path, result: BootstrapResult) -> None:
     """Copy the gitignore template into ``home/.gitignore`` if missing.
 
     Doesn't overwrite an existing gitignore — operators may have hand-
     edited it. The template ships under ``mimir/templates/git/gitignore``
-    (no leading dot, so the source tree doesn't honor it itself)."""
+    (no leading dot, so the source tree doesn't honor it itself). For an
+    existing file, appends any missing required re-block entries in place so
+    template additions reach already-provisioned homes (not just new
+    installs), preserving operator edits."""
     target = home / ".gitignore"
     if target.exists():
+        if _append_missing_gitignore_entries(target):
+            result.gitignore_written = True
         return
     src = _TEMPLATES_DIR / "gitignore"
     if not src.is_file():

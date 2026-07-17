@@ -1336,3 +1336,63 @@ def test_bootstrap_surfaces_dirty_live_home_feature_branch_without_checkout(
     assert matches[-1]["observed"] == "tighten-pr5"
     assert matches[-1]["action"] == "manual_reconcile_required"
     assert matches[-1]["dirty"] is True
+
+
+# ── existing-home .gitignore upgrade (transcripts re-block) ──────────
+# Regression for the PR #1105 review: _ensure_gitignore is seed-if-missing,
+# so a template addition (state/worklink/transcripts/) never reached homes
+# that already had a .gitignore — i.e. exactly the deployed homes with the
+# tracked-transcripts leak. The append path migrates them idempotently.
+
+
+def test_existing_gitignore_gets_missing_required_entry_appended(
+    tmp_path: Path,
+) -> None:
+    from mimir.git_bootstrap import BootstrapResult, _ensure_gitignore
+
+    gi = tmp_path / ".gitignore"
+    gi.write_text("# operator's own file\n*.secret\nscratch/\n", encoding="utf-8")
+
+    result = BootstrapResult(
+        initialized=False, cloned=False, pulled=False, pull_blocked=False,
+        bootstrap_commit=False, gitignore_written=False, hook_written=False,
+        remote_configured=False, credentials_written=False,
+        legacy_token_url_migrated=False, upstream_set=False,
+        initial_push=False, skipped=False,
+    )
+    _ensure_gitignore(tmp_path, result)
+
+    text = gi.read_text(encoding="utf-8")
+    # Operator content preserved.
+    assert "# operator's own file" in text
+    assert "*.secret" in text
+    assert "scratch/" in text
+    # Required entry appended.
+    assert "state/worklink/transcripts/" in text
+    assert result.gitignore_written is True
+
+
+def test_gitignore_upgrade_is_idempotent(tmp_path: Path) -> None:
+    from mimir.git_bootstrap import (
+        BootstrapResult,
+        _append_missing_gitignore_entries,
+    )
+
+    gi = tmp_path / ".gitignore"
+    gi.write_text("scratch/\n", encoding="utf-8")
+
+    assert _append_missing_gitignore_entries(gi) is True
+    after_first = gi.read_text(encoding="utf-8")
+    # Second run is a no-op — already present, no duplicate line.
+    assert _append_missing_gitignore_entries(gi) is False
+    assert gi.read_text(encoding="utf-8") == after_first
+    assert after_first.count("state/worklink/transcripts/") == 1
+
+
+def test_gitignore_upgrade_matches_leading_slash_variant(tmp_path: Path) -> None:
+    from mimir.git_bootstrap import _append_missing_gitignore_entries
+
+    gi = tmp_path / ".gitignore"
+    # Operator already ignores it with a leading slash — must not duplicate.
+    gi.write_text("/state/worklink/transcripts/\n", encoding="utf-8")
+    assert _append_missing_gitignore_entries(gi) is False

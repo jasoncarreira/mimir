@@ -210,6 +210,13 @@ _REVIEW_SUBMISSION_RULE = (
     "fires."
 )
 
+# Scratch cleanup is NOT instructed here. A same-turn `rm -rf` of the event's
+# scratch clone is behaviorally unreachable: the agent's action boundary makes
+# every delete under /mimir-home escalate-first, and a poller event is not
+# operator approval — so a conforming turn would have to stop and ask. The
+# scheduler's scratch janitor (harness code, not bound by that rule) is the
+# mechanism instead; see mimir/scratch_janitor.py (MIMIR_SCRATCH_TTL_DAYS).
+
 
 #: Marker dict the framework reads at turn finalization. When the
 #: turn's tool_calls don't match any of these tool names / Bash

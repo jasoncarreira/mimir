@@ -897,3 +897,15 @@ class TestFileToolRouter:
         assert "/state/home.txt" in paths
         assert f"{repo}/repo.txt" in paths
         assert len([p for p in paths if p.startswith(str(data))]) == 1
+
+
+def test_denial_buffer_is_bounded(tmp_path: Path):
+    """Denials with no turn_id (non-turn callables) and denials from
+    crashed turns are never drained by the turn-scoped path — the buffer
+    drops oldest past 512 so it can't grow for process lifetime."""
+    b = WriteGuardBackend(root_dir=tmp_path, writable_dirs=["state"])
+    for i in range(600):
+        b._record_denial("write", f"/logs/blocked-{i}.txt")
+    assert len(b._denials) == 512
+    assert b._denials[0]["file_path"] == "/logs/blocked-88.txt"
+    assert b._denials[-1]["file_path"] == "/logs/blocked-599.txt"

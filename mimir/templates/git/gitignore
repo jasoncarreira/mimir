@@ -45,6 +45,10 @@
 # Re-block any binary/log artifact that slipped past the include rules
 # above (belt-and-suspenders; if a future change drops atoms.db into
 # memory/, the include rule for memory/** would otherwise pick it up).
+# Worklink backend transcripts are full sub-agent stdout dumps (MBs per
+# attempt, one timestamped file per attempt) — debugging material, not
+# durable state; tracking them grows .git/objects permanently.
+state/worklink/transcripts/
 *.db
 *.db-shm
 *.db-wal

@@ -330,3 +330,69 @@ def test_saturated_clears_when_file_shrinks_under_cap(tmp_path: Path):
     _bump_mtime(path)
     snap.records()
     assert snap.saturated is False
+
+
+# ── byte budget ──────────────────────────────────────────────────────
+
+
+def test_byte_budget_caps_tail_and_sets_saturated(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    _write_jsonl(path, [{"i": i, "pad": "z" * 1000} for i in range(50)])
+
+    snap = JsonlSnapshot(path, max_bytes=5000)
+    out = snap.records()
+
+    assert 0 < len(out) < 50
+    assert out[0]["i"] == 49  # newest-first: newest kept, oldest dropped
+    assert snap.saturated is True
+
+
+def test_byte_budget_admits_newest_record_even_if_oversized(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    _write_jsonl(
+        path,
+        [{"i": 0, "pad": "z" * 10_000}, {"i": 1, "pad": "z" * 10_000}],
+    )
+
+    snap = JsonlSnapshot(path, max_bytes=100)
+    out = snap.records()
+
+    # The count guard admits the newest record before the budget check,
+    # so the snapshot is never empty for a non-empty file.
+    assert [r["i"] for r in out] == [1]
+    assert snap.saturated is True
+
+
+def test_default_byte_budget_leaves_small_files_unsaturated(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    _write_jsonl(path, [{"i": i} for i in range(5)])
+
+    snap = JsonlSnapshot(path)
+    assert len(snap.records()) == 5
+    assert snap.saturated is False
+
+
+def test_slim_transform_applied_to_cached_records_only(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    _write_jsonl(path, [{"i": 0, "big": "z" * 100}])
+
+    def slim(rec: dict) -> dict:
+        return {**rec, "big": rec["big"][:10]}
+
+    snap = JsonlSnapshot(path, slim=slim)
+    (rec,) = snap.records()
+    assert rec["big"] == "z" * 10
+    # Disk record untouched — full fidelity preserved for direct readers.
+    on_disk = json.loads(path.read_text().splitlines()[0])
+    assert on_disk["big"] == "z" * 100
+
+
+def test_slim_transform_failure_falls_back_to_raw_record(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    _write_jsonl(path, [{"i": 0}])
+
+    def broken(rec: dict) -> dict:
+        raise RuntimeError("boom")
+
+    snap = JsonlSnapshot(path, slim=broken)
+    assert snap.records() == [{"i": 0}]

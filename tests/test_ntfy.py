@@ -1075,3 +1075,28 @@ class TestParseEventTs:
         assert _parse_event_ts("garbage") is None
         assert _parse_event_ts("") is None
         assert _parse_event_ts(None) is None
+
+
+@pytest.mark.asyncio
+async def test_last_post_table_prunes_stale_entries(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """The per-process dedup table is pruned on successful posts so
+    non-repeating dedupe keys can't grow it for process lifetime."""
+    from datetime import timedelta
+
+    monkeypatch.setenv("NTFY_TOPIC", "mimir-alarms-xyz")
+    session = _MockSession(post_resp=_MockResponse(200, "ok"))
+    _install_session(monkeypatch, session)
+    ntfy._LAST_POST["ancient:key"] = ntfy._now_utc() - timedelta(days=8)
+
+    await ntfy.post_algedonic_alarm(
+        category="c",
+        title="t",
+        body="b",
+        dedupe_key="fresh:key",
+    )
+
+    assert "fresh:key" in ntfy._LAST_POST
+    assert "ancient:key" not in ntfy._LAST_POST

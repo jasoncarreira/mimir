@@ -373,12 +373,15 @@ async def test_tool_result_end_uses_real_tool_name_and_call_row_is_not_completed
             "status": "ok",
         }
     )
+    # Capture before turn end — finalization evicts the model from the
+    # registry (the pre-fix per-turn retention was a memory leak).
+    model = panel.models["t1"]
     await panel.handle_event(
         {"type": "turn", "phase": "end", "turn_id": "t1", "channel_id": "slack-C01"}
     )
 
     assert bridge.edits[-1].text == "✓ 1 steps"
-    assert panel.models["t1"].steps[0].label == "Ran shell_exec"
+    assert model.steps[0].label == "Ran shell_exec"
     rendered = "\n".join(update.text or "" for update in bridge.edits)
     assert "Skill shell_exec" not in rendered
     assert "Ran skill" not in rendered
@@ -1011,3 +1014,51 @@ def test_render_discord_final_reply_posted_title_and_description():
     assert text == ""
     assert embed["title"] == "Done"
     assert embed["description"] == "Done Reply posted"
+
+
+@pytest.mark.asyncio
+async def test_panel_evicts_model_after_turn_end():
+    """``_models`` previously retained one entry per turn for process
+    lifetime. End-of-turn must drop the entry — immediately when no
+    grace-delete is scheduled, after the grace delete otherwise."""
+    panel, bridge = _panel(delete_grace=0.0)
+
+    # No outbound reply → no grace-delete task → popped at turn end.
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {"type": "turn", "phase": "end", "turn_id": "t1", "channel_id": "slack-C01"}
+    )
+    assert "t1" not in panel._models
+
+    # Real reply → popped once the grace delete has run.
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t2",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "outbound_message",
+            "phase": "end",
+            "turn_id": "t2",
+            "channel_id": "slack-C01",
+            "sent": True,
+        }
+    )
+    await panel.handle_event(
+        {"type": "turn", "phase": "end", "turn_id": "t2", "channel_id": "slack-C01"}
+    )
+    await asyncio.sleep(0.01)
+    assert "t2" not in panel._models

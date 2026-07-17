@@ -1156,3 +1156,82 @@ def test_multiple_thinking_blocks_preserve_order():
         if e.get("source") == "model_thinking_block"
     ]
     assert thinking_texts == ["first thought", "second thought"]
+
+
+# ── slim_turn_record (RAM-view caps; disk keeps full fidelity) ───────
+
+
+def test_turn_events_keep_full_args_and_reasoning_for_disk():
+    """turns.jsonl is the audit trail: extract_turn_events must NOT cap
+    args/reasoning — slimming happens only in the RAM-cache view via
+    slim_turn_record."""
+    from mimir.turn_logger import MAX_REASONING_BYTES, MAX_TOOL_ARGS_BYTES
+
+    big_think = "y" * (MAX_REASONING_BYTES * 2)
+    big_body = "x" * (MAX_TOOL_ARGS_BYTES * 3)
+    msgs = [
+        AIMessage(
+            content=big_think,
+            tool_calls=[
+                {"id": "tc_1", "name": "write_file", "args": {"content": big_body}},
+            ],
+        ),
+        AIMessage(content="done"),
+    ]
+    events, output = extract_turn_events(msgs)
+    reason = next(e for e in events if e["type"] == "reasoning")
+    assert reason["content"] == big_think
+    tc = next(e for e in events if e["type"] == "tool_call")
+    assert tc["args"] == {"content": big_body}
+    assert output == "done"
+
+
+def test_slim_turn_record_caps_args_and_reasoning_in_a_copy():
+    from mimir.turn_logger import (
+        MAX_REASONING_BYTES,
+        MAX_TOOL_ARGS_BYTES,
+        slim_turn_record,
+    )
+
+    big_think = "y" * (MAX_REASONING_BYTES * 2)
+    big_body = "x" * (MAX_TOOL_ARGS_BYTES * 3)
+    record = {
+        "turn_id": "t1",
+        "events": [
+            {"type": "reasoning", "content": big_think},
+            {
+                "type": "tool_call",
+                "id": "c1",
+                "name": "write_file",
+                "args": {"content": big_body},
+            },
+            {"type": "tool_result", "id": "c1", "name": "write_file", "content": "ok"},
+        ],
+    }
+
+    slim = slim_turn_record(record)
+
+    assert slim is not record
+    reason, tc, tr = slim["events"]
+    assert len(reason["content"]) == MAX_REASONING_BYTES + len("…[truncated]")
+    assert reason["content"].endswith("…[truncated]")
+    assert tc["args"]["truncated"] is True
+    assert tc["args"]["bytes"] > MAX_TOOL_ARGS_BYTES
+    assert tr == record["events"][2]
+    # Input record untouched — the full-fidelity dict is what the disk
+    # writer serializes.
+    assert record["events"][0]["content"] == big_think
+    assert record["events"][1]["args"] == {"content": big_body}
+
+
+def test_slim_turn_record_returns_input_when_nothing_to_cap():
+    from mimir.turn_logger import slim_turn_record
+
+    record = {
+        "turn_id": "t1",
+        "events": [
+            {"type": "reasoning", "content": "short"},
+            {"type": "tool_call", "id": "c1", "name": "ls", "args": {"path": "/x"}},
+        ],
+    }
+    assert slim_turn_record(record) is record

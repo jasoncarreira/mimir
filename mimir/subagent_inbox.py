@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -56,6 +56,14 @@ class SubagentInbox:
         return self._lock
 
     async def push(self, channel_id: str, result: SubagentResult) -> None:
+        if len(result.summary or "") > MAX_SUMMARY_BYTES:
+            # Cap at store time, not just render time — a stored result
+            # lingers until the channel's next turn (possibly forever for
+            # a channel that never turns again).
+            result = replace(
+                result,
+                summary=result.summary[:MAX_SUMMARY_BYTES] + "…[truncated]",
+            )
         async with self._ensure_lock():
             self.by_channel.setdefault(channel_id, []).append(result)
 

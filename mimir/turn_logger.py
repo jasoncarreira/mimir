@@ -35,8 +35,82 @@ from .models import TurnRecord
 log = logging.getLogger(__name__)
 
 MAX_TOOL_RESULT_BYTES = 4 * 1024
+MAX_TOOL_ARGS_BYTES = 4 * 1024
+MAX_REASONING_BYTES = 16 * 1024
 MAX_INPUT_BYTES = 2 * 1024
 DEFAULT_MAX_TURNS = 1000
+
+
+def _cap_reasoning(text: str) -> str:
+    """Cap reasoning content for the in-RAM view (see ``slim_turn_record``).
+
+    Returns the input object unchanged when under the cap, so callers can
+    use identity to detect "nothing capped"."""
+    if len(text) > MAX_REASONING_BYTES:
+        return text[:MAX_REASONING_BYTES] + "…[truncated]"
+    return text
+
+
+def _cap_args(args: Any) -> Any:
+    """Cap tool-call args for the in-RAM view (see ``slim_turn_record``).
+
+    Args can embed entire file bodies (``write_file``/``edit_file``);
+    above the cap the structure is replaced with a JSON preview marker.
+    Returns the input object unchanged when under the cap."""
+    if args is None:
+        return None
+    try:
+        blob = json.dumps(args, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        blob = repr(args)
+    if len(blob) <= MAX_TOOL_ARGS_BYTES:
+        return args
+    return {
+        "truncated": True,
+        "bytes": len(blob),
+        "preview": blob[:MAX_TOOL_ARGS_BYTES] + "…[truncated]",
+    }
+
+
+def slim_turn_record(record: dict) -> dict:
+    """Memory-slim copy of a turns.jsonl record for in-RAM caches.
+
+    turns.jsonl keeps FULL tool_call args and reasoning on disk — it is
+    the audit/introspection trail, and the turn viewer reads the file
+    directly. In-RAM holders must not pay for that fidelity: single
+    records reach 600 KB+, and ``JsonlSnapshot``'s cached tail lives for
+    process lifetime (~600 MB resident on a busy deployment pre-fix).
+
+    Caps tool_call ``args`` (:data:`MAX_TOOL_ARGS_BYTES` JSON preview)
+    and reasoning ``content`` (:data:`MAX_REASONING_BYTES`) in a copied
+    record. The input record is NEVER mutated; when nothing exceeds a
+    cap the input object is returned as-is.
+    """
+    events = record.get("events")
+    if not isinstance(events, list) or not events:
+        return record
+    slim_events: list[Any] = []
+    changed = False
+    for ev in events:
+        if isinstance(ev, dict):
+            typ = ev.get("type")
+            if typ == "tool_call":
+                args = ev.get("args")
+                capped = _cap_args(args)
+                if capped is not args:
+                    ev = {**ev, "args": capped}
+                    changed = True
+            elif typ == "reasoning":
+                content = ev.get("content")
+                if isinstance(content, str):
+                    capped_text = _cap_reasoning(content)
+                    if capped_text is not content:
+                        ev = {**ev, "content": capped_text}
+                        changed = True
+        slim_events.append(ev)
+    if not changed:
+        return record
+    return {**record, "events": slim_events}
 
 
 def truncate_input(prompt: str) -> str:
