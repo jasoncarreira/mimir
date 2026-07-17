@@ -102,6 +102,8 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "post_message": SinkCategory.CROSS_CHANNEL,
     "webhook": SinkCategory.HTTP_WEBHOOK,
     "http_request": SinkCategory.HTTP_WEBHOOK,
+    "fetch_url": SinkCategory.NETWORK,
+    "web_search": SinkCategory.NETWORK,
     "shell_exec": SinkCategory.SHELL_PROCESS,
     "bash_async": SinkCategory.SHELL_PROCESS,
     "spawn_claude_code": SinkCategory.SPAWN,
@@ -110,7 +112,7 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "ntfy_send": SinkCategory.NOTIFICATION,
     "write_file": SinkCategory.FILE,
     "edit_file": SinkCategory.FILE,
-    "mcp__": SinkCategory.EXTERNAL_MCP,
+    "mcp_": SinkCategory.EXTERNAL_MCP,
 }
 
 
@@ -1059,6 +1061,17 @@ class ToolRegistry:
             and preliminary_decision == OperationDecision.ADMIN_REQUIRED
             and not preliminary_service.has_capability(tool_name)
         )
+        service_allowed_preliminary = (
+            preliminary_service is not None
+            and preliminary_service.has_capability(tool_name)
+        )
+        preliminary_admin_denied = (
+            preliminary_decision == OperationDecision.ADMIN_REQUIRED
+            and not service_allowed_preliminary
+            and "admin" not in (
+                (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
+            )
+        )
         trigger = getattr(auth_context, "trigger", None) if auth_context else None
         attempted_service = (
             trigger is not None
@@ -1072,7 +1085,16 @@ class ToolRegistry:
             and auth_context is not None
         ):
             sink_target = getattr(auth_context, "channel_id", None)
-        if sink_category != SinkCategory.UNKNOWN and not service_capability_denied and not attempted_service:
+        is_ifc_sink = sink_category != SinkCategory.UNKNOWN or (
+            ifc_labels is not None
+            and preliminary_decision == OperationDecision.UNKNOWN
+            and not service_allowed_preliminary
+        )
+        if (
+            is_ifc_sink
+            and not service_capability_denied
+            and not attempted_service
+        ):
             sink_check = SinkGate.check_sink_flow(
                 tool_name,
                 sink_target,
@@ -1080,7 +1102,7 @@ class ToolRegistry:
                 auth_context,
                 enforce=enforce,
             )
-            if not sink_check.allowed and enforce:
+            if not sink_check.allowed and enforce and not preliminary_admin_denied:
                 return sink_check
             if sink_check.is_shadow_decision:
                 self._emit_shadow_decision(sink_check)
