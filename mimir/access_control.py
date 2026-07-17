@@ -174,6 +174,8 @@ class SinkGate:
 
     @classmethod
     def set_identity_resolver(cls, resolver: Any) -> None:
+        # PRODUCTION-DEAD (chainlink #895): Never called in production.
+        # Retained for API stability; the resolver is not used by check_sink_flow.
         cls._global_resolver = resolver
 
     @classmethod
@@ -694,6 +696,8 @@ class MCPResourceAdapter:
 
     @classmethod
     def set_identity_resolver(cls, resolver: Any) -> None:
+        # PRODUCTION-DEAD (chainlink #895): Never called in production.
+        # Retained for API stability; the resolver is not used by get_decision.
         cls._global_resolver = resolver
 
     @classmethod
@@ -820,7 +824,16 @@ class MCPResourceAdapter:
         decision = cls.get_decision(tool_name, context)
 
         if decision is None:
-            decision = OperationDecision.OPEN
+            if not tool_name.startswith(cls._MCP_TOOL_PREFIX):
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=False,
+                    reason="non_mcp_tool_name",
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                )
+            decision = OperationDecision.ADMIN_REQUIRED
 
         provenance = cls._get_provenance_from_context(tool_name, context)
 
@@ -1065,6 +1078,8 @@ class ToolRegistry:
             )
             if not sink_check.allowed and enforce:
                 return sink_check
+            if sink_check.is_shadow_decision:
+                self._emit_shadow_decision(sink_check)
 
         decision = preliminary_decision
         service_principal = None
@@ -1407,13 +1422,20 @@ def _capability_matrix_errors() -> list[str]:
 def check_capability_matrix_complete(
     fail_closed: bool = True,
 ) -> tuple[bool, list[str]]:
-    """Verify required principals and capability/domain/sink consistency."""
+    """Verify required principals and capability/domain/sink consistency.
+
+    When fail_closed=True (default), returns (False, errors) if any errors exist.
+    When fail_closed=False, still returns (False, errors) if errors exist - the
+    fail_closed parameter only controls whether an exception is raised in the
+    assert_capability_matrix_complete() variant. A matrix with errors is never
+    considered complete, regardless of fail_closed setting.
+    """
     errors = _capability_matrix_errors()
-    if errors and not fail_closed:
+    if errors:
         for error in errors:
             log.warning("capability_matrix_incomplete: %s", error)
-        return (True, [])
-    return (not errors, errors)
+        return (False, errors)
+    return (True, [])
 
 
 def assert_capability_matrix_complete() -> None:

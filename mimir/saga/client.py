@@ -1267,6 +1267,7 @@ class SagaStore:
         # SAGA writer. Preserve the exact-duplicate fast path (no embed needed)
         # by doing the same cheap content-hash check under only ``_db_lock``.
         effective_embedding = precomputed_embedding
+        effective_owner = owner_principal or "legacy_admin"
         if effective_embedding is None:
             content_hash = _store_hash_content(content)
 
@@ -1274,8 +1275,8 @@ class SagaStore:
                 conn = self._ensure_conn()
                 row = conn.execute(
                     "SELECT 1 FROM atoms WHERE content_hash = ? "
-                    "AND agent_id = ? AND tombstoned = 0",
-                    (content_hash, self._agent_id),
+                    "AND agent_id = ? AND owner_principal = ? AND tombstoned = 0",
+                    (content_hash, self._agent_id, effective_owner),
                 ).fetchone()
                 return row is not None
 

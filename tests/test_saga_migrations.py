@@ -894,3 +894,20 @@ class TestV7OwnershipMigration:
                 "VALUES ('Bob', 'status', 'active', '2024-01-01', "
                 "'2024-01-01', 'unexpected')"
             )
+
+
+def test_v9_migration_scopes_atom_dedup_index_by_owner() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        from pathlib import Path
+
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        columns = [
+            row[2] for row in conn.execute(
+                "PRAGMA index_info(idx_atoms_dedup)"
+            ).fetchall()
+        ]
+        assert columns == ["content_hash", "agent_id", "owner_principal"]
+        assert m.detect_schema_version(conn) == 9
+    finally:
+        conn.close()

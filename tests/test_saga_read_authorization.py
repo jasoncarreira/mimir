@@ -58,6 +58,24 @@ def test_missing_auth_context_is_public_only_and_never_admin() -> None:
     assert params == [Visibility.PUBLIC.value]
 
 
+def test_read_scope_uses_canonical_principal_for_owner_match() -> None:
+    from mimir.models import AuthContext
+
+    auth = AuthContext(
+        principal="slack-U1",
+        canonical_principal="user:alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=None,
+    )
+
+    scope = get_authorization_scope(auth)
+
+    assert scope.principal == "user:alice"
+
+
 def test_owner_and_service_domain_grants_are_alternatives(conn: sqlite3.Connection) -> None:
     public = _store(conn, "public", owner="other", visibility="public")
     owned = _store(conn, "owned", owner="user:alice", visibility="private")

@@ -72,7 +72,11 @@ class Ownership:
         return self.visibility == Visibility.LEGACY_ADMIN
 
     def to_columns(self) -> dict[str, str | None]:
-        """Convert to column values for SQL insertion."""
+        """Convert to column values for SQL insertion.
+
+        PRODUCTION-DEAD (chainlink #895): retained for API stability; current
+        production writers pass ownership columns directly.
+        """
         return {
             "owner_principal": str(self.owner_principal),
             "origin_channel": self.origin_channel,
@@ -252,7 +256,7 @@ def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
         is_admin as check_is_admin,
     )
 
-    principal = getattr(auth_context, "principal", None)
+    principal = getattr(auth_context, "canonical_principal", None) or getattr(auth_context, "principal", None)
     is_admin = check_is_admin(auth_context)
     service = get_trusted_service_from_auth_context(auth_context)
 

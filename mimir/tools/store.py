@@ -68,6 +68,16 @@ async def memory_store(
 
     Returns:
         A short string with the resulting atom_id, or an error message.
+
+    Note:
+        ``origin_domain`` is set to None, meaning all atoms stored via
+        memory_store have no domain identity. This causes the visibility
+        intersection in ``intersect_acl`` to collapse to legacy_admin when
+        reading back atoms that were derived from other atoms with different
+        origin_domains. Private owner visibility is not preserved across
+        domain-boundary derivations. This is the current degenerate behavior;
+        threading a real origin_domain would require turn-context propagation
+        not currently available in the memory_store call path.
     """
     client = _MEMORY_STATE["client"]
     if client is None:
