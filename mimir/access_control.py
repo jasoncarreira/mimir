@@ -223,6 +223,30 @@ class SinkGate:
                 is_shadow_decision=not enforce,
             )
 
+        service = get_trusted_service_from_auth_context(auth_context)
+        service_sink = {
+            SinkCategory.SHELL_PROCESS: "shell_process",
+            SinkCategory.SPAWN: "spawn_process",
+            SinkCategory.FILE: "filesystem",
+            SinkCategory.NOTIFICATION: "notification",
+            SinkCategory.HTTP_WEBHOOK: "network",
+            SinkCategory.NETWORK: "network",
+            SinkCategory.EXTERNAL_MCP: "external_mcp",
+        }.get(sink_category)
+        if (
+            service is not None
+            and service_sink is not None
+            and service.can_write_sink(service_sink)
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.OPEN,
+                allowed=True,
+                reason="ifc_service_sink_allowed",
+                service_principal=service,
+                enforcement_enabled=enforce,
+            )
+
         if not target:
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -1006,7 +1030,9 @@ class ToolRegistry:
         checks (chainlink #871).
         """
         sink_category = get_sink_category(tool_name)
-        if ifc_labels is not None or sink_category != SinkCategory.UNKNOWN:
+        if ifc_labels is None and auth_context is not None:
+            ifc_labels = getattr(auth_context, "ifc_labels", None)
+        if sink_category != SinkCategory.UNKNOWN:
             sink_check = SinkGate.check_sink_flow(
                 tool_name,
                 target_channel,
@@ -1015,6 +1041,8 @@ class ToolRegistry:
                 enforce=enforce,
             )
             if not sink_check.allowed and enforce:
+                return sink_check
+            if sink_check.service_principal is not None:
                 return sink_check
 
         catalog = get_operation_catalog()
