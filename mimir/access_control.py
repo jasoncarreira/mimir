@@ -775,6 +775,15 @@ class MCPResourceAdapter:
             )
             return OperationDecision.ADMIN_REQUIRED
 
+        classification = getattr(provenance, "classification", "")
+        if classification:
+            try:
+                return OperationDecision(classification)
+            except ValueError:
+                return OperationDecision.ADMIN_REQUIRED
+
+        # Compatibility for pre-policy callers. Production approvals always
+        # carry classification and never authorize resources through this path.
         try:
             decision = adapter.classify(tool_name, context)
         except Exception:
@@ -793,6 +802,107 @@ class MCPResourceAdapter:
             )
             return OperationDecision.ADMIN_REQUIRED
         return decision
+
+    @classmethod
+    def authorize_call(
+        cls,
+        tool_name: str,
+        tool: Any,
+        arguments: dict[str, Any] | None,
+        context: Any | None,
+        *,
+        enforce: bool,
+        ifc_labels: Any = None,
+    ) -> "ToolAuthorization":
+        """Execute the provenance-bound adapter and IFC gate on one invocation."""
+        from .mcp_client import (
+            MCPAuthorizationRequest,
+            MCPAuthorizationResult,
+            get_tool_provenance,
+        )
+
+        provenance = get_tool_provenance(tool) if tool is not None else None
+        decision = OperationDecision.ADMIN_REQUIRED
+        reason = "mcp_missing_provenance"
+        if provenance is not None and provenance.is_tombstoned:
+            reason = "mcp_drift_detected"
+        elif provenance is not None:
+            try:
+                decision = OperationDecision(provenance.classification)
+            except ValueError:
+                reason = "mcp_unclassified"
+            else:
+                adapter = cls._get_registered_adapter(provenance)
+                if adapter is None:
+                    decision = OperationDecision.ADMIN_REQUIRED
+                    reason = "mcp_missing_adapter"
+                elif arguments is None:
+                    decision = OperationDecision.ADMIN_REQUIRED
+                    reason = "mcp_malformed_arguments"
+                else:
+                    try:
+                        result = adapter.classify(MCPAuthorizationRequest(
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            auth_context=context,
+                            provenance=provenance,
+                        ))
+                    except Exception:
+                        log.exception(
+                            "MCP adapter %s failed while authorizing %s",
+                            provenance.adapter_name,
+                            tool_name,
+                        )
+                        decision = OperationDecision.ADMIN_REQUIRED
+                        reason = "mcp_adapter_exception"
+                    else:
+                        if not isinstance(result, MCPAuthorizationResult):
+                            decision = OperationDecision.ADMIN_REQUIRED
+                            reason = "mcp_invalid_adapter_result"
+                        elif result.decision is not decision:
+                            decision = OperationDecision.ADMIN_REQUIRED
+                            reason = "mcp_adapter_decision_mismatch"
+                        elif result.allowed:
+                            if ifc_labels is None and context is not None:
+                                ifc_labels = getattr(context, "ifc_labels", None)
+                            sink_target = ",".join(result.sink_resources or result.resources)
+                            sink_check = SinkGate.check_sink_flow(
+                                tool_name,
+                                sink_target or tool_name,
+                                ifc_labels,
+                                context,
+                                enforce=enforce,
+                            )
+                            if not sink_check.allowed:
+                                return sink_check
+                            return ToolAuthorization(
+                                tool_name=tool_name,
+                                decision=decision,
+                                allowed=True,
+                                reason=(
+                                    sink_check.reason
+                                    if sink_check.is_shadow_decision
+                                    else None
+                                ),
+                                enforcement_enabled=enforce,
+                                is_shadow_decision=sink_check.is_shadow_decision,
+                            )
+                        else:
+                            reason = result.reason or "mcp_resource_denied"
+
+        is_admin = decision is OperationDecision.ADMIN_REQUIRED
+        admin = context is not None and "admin" in (getattr(context, "roles", ()) or ())
+        denied_by_policy = not admin
+        allowed = admin or not enforce
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=decision,
+            allowed=allowed,
+            reason=None if admin else reason,
+            required_tier=AccessTier.ADMIN if is_admin else AccessTier.USER,
+            enforcement_enabled=enforce,
+            is_shadow_decision=not enforce and denied_by_policy,
+        )
 
     @staticmethod
     def _get_registered_adapter(provenance: Any) -> Any | None:
@@ -1065,6 +1175,8 @@ class ToolRegistry:
         enforce: bool = False,
         target_channel: str | None = None,
         ifc_labels: Any = None,
+        mcp_tool: Any = None,
+        arguments: dict[str, Any] | None = None,
     ) -> ToolAuthorization:
         """Authorize a tool call using the operation catalog.
 
@@ -1079,6 +1191,19 @@ class ToolRegistry:
         The ifc_labels parameter enables information flow control sink gate
         checks (chainlink #871).
         """
+        if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX) and mcp_tool is not None:
+            auth = MCPResourceAdapter.authorize_call(
+                tool_name,
+                mcp_tool,
+                arguments,
+                auth_context,
+                enforce=enforce,
+                ifc_labels=ifc_labels,
+            )
+            if auth.is_shadow_decision:
+                self._emit_shadow_decision(auth)
+            return auth
+
         sink_category = get_sink_category(tool_name)
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)

@@ -40,7 +40,7 @@ import os
 import re
 import uuid
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -108,6 +108,7 @@ class MCPProvenance:
     config_digest: str = ""
     schema_digest: str = ""
     original_tool_name: str = ""
+    classification: str = ""
     adapter_name: str = ""
     adapter_version: str = ""
     approval_version: str = ""
@@ -165,6 +166,7 @@ class MCPProvenance:
             config_digest=new_config_digest,
             schema_digest=new_schema_digest,
             original_tool_name=tool_name,
+            classification=self.classification,
             adapter_name=self.adapter_name,
             adapter_version=self.adapter_version,
             approval_version=self.approval_version,
@@ -192,6 +194,78 @@ def _expand_env_refs(value: str) -> str:
     return _ENV_VAR_RE.sub(_sub, value)
 
 
+@dataclass(frozen=True)
+class MCPToolPolicy:
+    """Operator approval bound to immutable discovery provenance."""
+
+    tool_name: str
+    classification: str
+    adapter_name: str
+    adapter_version: str
+    approval_version: str
+    policy_version: str
+    config_digest: str
+    schema_digest: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MCPToolPolicy":
+        def value(*names: str) -> str:
+            for name in names:
+                if name in data:
+                    return str(data[name]).strip()
+            return ""
+
+        policy = cls(
+            tool_name=value("tool_name", "toolName", "original_tool_name"),
+            classification=value("classification").lower(),
+            adapter_name=value("adapter_name", "adapterName", "adapter_id", "adapterId"),
+            adapter_version=value("adapter_version", "adapterVersion"),
+            approval_version=value("approval_version", "approvalVersion"),
+            policy_version=value("policy_version", "policyVersion"),
+            config_digest=value("config_digest", "configDigest"),
+            schema_digest=value("schema_digest", "schemaDigest"),
+        )
+        if not all(vars(policy).values()):
+            raise ValueError("MCP tool policy requires all provenance and version fields")
+        if policy.classification not in {"open", "resource_scoped", "admin_required"}:
+            raise ValueError(f"invalid MCP classification: {policy.classification}")
+        return policy
+
+
+@dataclass(frozen=True)
+class MCPAdapterConfig:
+    """Durable configuration for the built-in argument/resource adapter."""
+
+    name: str
+    version: str
+    policy_version: str
+    resource_argument: str = ""
+    owner_argument: str = ""
+    source: bool = False
+    sink: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MCPAdapterConfig":
+        def value(*names: str) -> str:
+            for name in names:
+                if name in data:
+                    return str(data[name]).strip()
+            return ""
+
+        adapter = cls(
+            name=value("name", "id", "adapter_name", "adapterName"),
+            version=value("version", "adapter_version", "adapterVersion"),
+            policy_version=value("policy_version", "policyVersion"),
+            resource_argument=value("resource_argument", "resourceArgument"),
+            owner_argument=value("owner_argument", "ownerArgument"),
+            source=bool(data.get("source", False)),
+            sink=bool(data.get("sink", False)),
+        )
+        if not adapter.name or not adapter.version or not adapter.policy_version:
+            raise ValueError("MCP adapter requires name, version, and policy_version")
+        return adapter
+
+
 @dataclass
 class MCPServerConfig:
     """Per-server config — command, args, and environment for one stdio MCP subprocess."""
@@ -200,6 +274,10 @@ class MCPServerConfig:
     command: str
     args: list[str]
     env: dict[str, str] | None = None
+    server_config_id: str = ""
+    policy_version: str = ""
+    adapters: tuple[MCPAdapterConfig, ...] = ()
+    tool_policies: tuple[MCPToolPolicy, ...] = ()
 
     @classmethod
     def from_dict(
@@ -229,7 +307,36 @@ class MCPServerConfig:
         env: dict[str, str] | None = None
         if isinstance(raw_env, dict):
             env = {str(k): _expand_env_refs(str(v)) for k, v in raw_env.items()}
-        return cls(name=name, command=command, args=args, env=env)
+        server_config_id = str(
+            data.get("server_config_id", data.get("serverConfigId", ""))
+        ).strip()
+        policy_version = str(
+            data.get("policy_version", data.get("policyVersion", ""))
+        ).strip()
+        raw_adapters = data.get("adapters", [])
+        raw_policies = data.get("tool_policies", data.get("toolPolicies", []))
+        adapters = tuple(
+            MCPAdapterConfig.from_dict(item)
+            for item in raw_adapters
+            if isinstance(item, dict)
+        ) if isinstance(raw_adapters, list) else ()
+        tool_policies = tuple(
+            MCPToolPolicy.from_dict(item)
+            for item in raw_policies
+            if isinstance(item, dict)
+        ) if isinstance(raw_policies, list) else ()
+        if (adapters or tool_policies or policy_version) and not server_config_id:
+            raise ValueError(f"MCP server '{name}' policy requires server_config_id")
+        return cls(
+            name=name,
+            command=command,
+            args=args,
+            env=env,
+            server_config_id=server_config_id,
+            policy_version=policy_version,
+            adapters=adapters,
+            tool_policies=tool_policies,
+        )
 
 
 class MCPConnection:
@@ -260,7 +367,7 @@ class MCPConnection:
         """
         result = await self.session.list_tools()
         tools: list[StructuredTool] = []
-        config_id = server_config_id or str(uuid.uuid4())
+        config_id = server_config_id or self.config.server_config_id or str(uuid.uuid4())
         for mcp_tool in result.tools:
             provenance = MCPProvenance.create(
                 config=self.config,
@@ -268,6 +375,28 @@ class MCPConnection:
                 input_schema=mcp_tool.inputSchema or {},
                 server_config_id=config_id,
             )
+            policy = next(
+                (
+                    item for item in self.config.tool_policies
+                    if item.tool_name == mcp_tool.name
+                ),
+                None,
+            )
+            if policy is not None:
+                identity_matches = (
+                    policy.config_digest == provenance.config_digest
+                    and policy.schema_digest == provenance.schema_digest
+                    and policy.policy_version == self.config.policy_version
+                )
+                provenance = replace(
+                    provenance,
+                    classification=policy.classification,
+                    adapter_name=policy.adapter_name,
+                    adapter_version=policy.adapter_version,
+                    approval_version=policy.approval_version,
+                    policy_version=policy.policy_version,
+                    is_tombstoned=not identity_matches,
+                )
             lc_tool = _bridge_mcp_tool(
                 server_name=self.config.name,
                 tool_name=mcp_tool.name,
@@ -315,12 +444,16 @@ class MCPManager:
         configures the same server name twice or when underscore-laden
         tool names happen to produce the same namespaced string.
         """
+        register_configured_mcp_adapters(configs)
         all_tools: list[StructuredTool] = []
         seen_names: set[str] = set()
         for config in configs:
             try:
                 conn = await self._connect(config)
-                tools = await conn.discover_tools(call_timeout_s=self._call_timeout)
+                tools = await conn.discover_tools(
+                    call_timeout_s=self._call_timeout,
+                    server_config_id=config.server_config_id or None,
+                )
                 self.connections.append(conn)
                 accepted_tool_names: list[str] = []
                 for t in tools:
@@ -560,7 +693,8 @@ def _bridge_mcp_tool(
         kwargs["args_schema"] = args_schema
     tool = StructuredTool.from_function(**kwargs)
     if provenance is not None:
-        _tool_provenance_registry[namespaced_name] = provenance
+        _tool_provenance_registry[id(tool)] = provenance
+        object.__setattr__(tool, "mcp_provenance", provenance)
     return tool
 
 
@@ -643,7 +777,7 @@ def load_mcp_server_configs(*, json_inline: str | None, json_path: str | None) -
     return parse_mcp_server_configs(raw)
 
 
-_tool_provenance_registry: dict[str, MCPProvenance] = {}
+_tool_provenance_registry: dict[int, MCPProvenance] = {}
 
 
 def clear_provenance_registry() -> None:
@@ -654,10 +788,8 @@ def clear_provenance_registry() -> None:
 
 def get_tool_provenance(tool: Any) -> MCPProvenance | None:
     """Extract provenance from an MCP tool wrapper, if present."""
-    tool_name = getattr(tool, "name", None)
-    if tool_name is not None and tool_name in _tool_provenance_registry:
-        return _tool_provenance_registry[tool_name]
-    return getattr(tool, "mcp_provenance", None)
+    provenance = _tool_provenance_registry.get(id(tool))
+    return provenance if provenance is not None else getattr(tool, "mcp_provenance", None)
 
 
 def check_tool_drift(
@@ -682,7 +814,29 @@ def check_tool_drift(
     )
 
 
-MCPAdapterClassifier = Callable[[str, Any | None], Any]
+@dataclass(frozen=True)
+class MCPAuthorizationRequest:
+    """Exact validated MCP invocation presented to an adapter."""
+
+    tool_name: str
+    arguments: dict[str, Any]
+    auth_context: Any
+    provenance: MCPProvenance
+
+
+@dataclass(frozen=True)
+class MCPAuthorizationResult:
+    """Structured adapter result; protected resources require ``allowed``."""
+
+    decision: Any
+    allowed: bool
+    reason: str | None = None
+    resources: tuple[str, ...] = ()
+    source_resources: tuple[str, ...] = ()
+    sink_resources: tuple[str, ...] = ()
+
+
+MCPAdapterClassifier = Callable[[MCPAuthorizationRequest], MCPAuthorizationResult]
 
 
 @dataclass(frozen=True)
@@ -721,6 +875,97 @@ def clear_mcp_adapter_registry() -> None:
 
 
 _global_mcp_adapter_registry: dict[str, MCPAdapterRegistration] = {}
+
+
+def _configured_resource_classifier(
+    config: MCPAdapterConfig,
+) -> MCPAdapterClassifier:
+    """Build a strict same-owner scalar-resource classifier."""
+    def classify(request: MCPAuthorizationRequest) -> MCPAuthorizationResult:
+        from .access_control import OperationDecision
+
+        decision = OperationDecision(request.provenance.classification)
+        if decision is not OperationDecision.RESOURCE_SCOPED:
+            return MCPAuthorizationResult(
+                decision=decision,
+                allowed=decision is OperationDecision.OPEN,
+                reason=(
+                    None
+                    if decision is OperationDecision.OPEN
+                    else "admin_required"
+                ),
+            )
+
+        arguments = request.arguments
+        resource = arguments.get(config.resource_argument) if config.resource_argument else None
+        owner = arguments.get(config.owner_argument) if config.owner_argument else None
+        principal = getattr(request.auth_context, "canonical_principal", None)
+        if not isinstance(resource, str) or not resource.strip():
+            return MCPAuthorizationResult(decision=decision, allowed=False, reason="mcp_resource_unknown")
+        resource = resource.strip()
+        if any(char in resource for char in ("*", "?", "[", "]")):
+            return MCPAuthorizationResult(decision=decision, allowed=False, reason="mcp_resource_wildcard")
+        if not isinstance(owner, str) or not owner.strip() or not isinstance(principal, str):
+            return MCPAuthorizationResult(decision=decision, allowed=False, reason="mcp_owner_unknown")
+        if owner.strip() != principal:
+            return MCPAuthorizationResult(decision=decision, allowed=False, reason="mcp_wrong_owner")
+        resources = (resource,)
+        return MCPAuthorizationResult(
+            decision=decision,
+            allowed=True,
+            resources=resources,
+            source_resources=resources if config.source else (),
+            sink_resources=resources if config.sink else (),
+        )
+    return classify
+
+
+def register_configured_mcp_adapters(configs: list[MCPServerConfig]) -> None:
+    """Register only explicit operator-configured adapter definitions."""
+    for server in configs:
+        for adapter in server.adapters:
+            existing = get_mcp_adapter_info(adapter.name)
+            if existing is not None:
+                if (
+                    existing.version != adapter.version
+                    or existing.policy_version != adapter.policy_version
+                ):
+                    log.warning("MCP adapter configuration conflict: name=%s", adapter.name)
+                else:
+                    continue
+            register_mcp_adapter(
+                adapter.name,
+                adapter.version,
+                adapter.policy_version,
+                _configured_resource_classifier(adapter),
+            )
+
+
+def validate_mcp_policy(tools: list[Any]) -> list[dict[str, Any]]:
+    """Return redacted actionable startup policy issues."""
+    issues: list[dict[str, Any]] = []
+    for tool in tools:
+        provenance = get_tool_provenance(tool)
+        if provenance is None:
+            continue
+        reason = None
+        if provenance.is_tombstoned:
+            reason = "drift"
+        elif not provenance.classification:
+            reason = "unclassified"
+        elif not provenance.adapter_name:
+            reason = "missing_adapter"
+        elif get_mcp_adapter_info(provenance.adapter_name) is None:
+            reason = "unregistered_adapter"
+        if reason:
+            issues.append({
+                "reason": reason,
+                "server_config_id": provenance.server_config_id,
+                "original_tool_name": provenance.original_tool_name,
+                "adapter_name": provenance.adapter_name or None,
+                "policy_version": provenance.policy_version or None,
+            })
+    return issues
 
 
 def check_stale_policy_on_startup(

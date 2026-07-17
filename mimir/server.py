@@ -62,6 +62,58 @@ log = logging.getLogger(__name__)
 _STARTUP_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 
+async def _start_mcp_servers(
+    app: web.Application,
+    mcp_configs: list[Any],
+) -> None:
+    """Wire configured MCP policy, tools, startup validation, and lifecycle."""
+    from .mcp_client import (
+        MCPManager,
+        check_stale_policy_on_startup,
+        get_tool_provenance,
+        validate_mcp_policy,
+    )
+    from .tools import set_mcp_tools
+
+    mcp_manager = MCPManager()
+    try:
+        mcp_tools = await mcp_manager.start_servers(mcp_configs)
+    except Exception as exc:  # noqa: BLE001 — log + continue
+        log.warning("MCP startup failed: %s", exc)
+        mcp_tools = []
+        await mcp_manager.shutdown()
+        mcp_manager = None
+    set_mcp_tools(mcp_tools)
+    if mcp_tools:
+        await log_event(
+            "mcp_servers_ready",
+            count=len(mcp_tools),
+            tool_names=[tool.name for tool in mcp_tools],
+        )
+    policy_issues = validate_mcp_policy(mcp_tools)
+    for mcp_config in mcp_configs:
+        if not mcp_config.policy_version:
+            continue
+        matching_tools = [
+            tool for tool in mcp_tools
+            if (
+                (provenance := get_tool_provenance(tool)) is not None
+                and provenance.server_config_id == mcp_config.server_config_id
+            )
+        ]
+        policy_issues.extend(check_stale_policy_on_startup(
+            matching_tools,
+            mcp_config.policy_version,
+        ))
+    if policy_issues:
+        await log_event(
+            "mcp_policy_attention_required",
+            count=len(policy_issues),
+            issues=policy_issues,
+        )
+    app["mcp_manager"] = mcp_manager
+
+
 def _skill_auto_update_event(result: Any) -> tuple[str, dict[str, Any]] | None:
     """Return the startup event payload for optional-skill auto-refresh."""
     if not getattr(result, "any_updates", False):
@@ -1341,26 +1393,11 @@ def build_app(config: Config) -> web.Application:
         # mimir.tools.mcp setter. A single server failing to start is
         # logged + skipped — the agent still boots with native tools.
         # Lifecycle owner stored on app so _on_cleanup can shut it down.
-        if config.mcp_servers:
-            from .mcp_client import MCPManager
-            from .tools import set_mcp_tools
+        from .tools import set_mcp_tools
 
-            mcp_manager = MCPManager()
-            try:
-                mcp_tools = await mcp_manager.start_servers(config.mcp_servers)
-            except Exception as exc:  # noqa: BLE001 — log + continue
-                log.warning("MCP startup failed: %s", exc)
-                mcp_tools = []
-                await mcp_manager.shutdown()
-                mcp_manager = None
-            if mcp_tools:
-                set_mcp_tools(mcp_tools)
-                await log_event(
-                    "mcp_servers_ready",
-                    count=len(mcp_tools),
-                    tool_names=[t.name for t in mcp_tools],
-                )
-            app["mcp_manager"] = mcp_manager
+        set_mcp_tools([])
+        if config.mcp_servers:
+            await _start_mcp_servers(app, config.mcp_servers)
 
         # Register SAGA weekly consolidation. Bad cron logs and continues.
         # Pass home so the closure can read identities.yaml at fire time
