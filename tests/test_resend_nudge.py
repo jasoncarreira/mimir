@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage
 
 from mimir.agent import Agent
 from mimir.config import Config
-from mimir.models import AgentEvent, AuthContext, InformationFlowLabels, TurnInteractivity
+from mimir.models import AgentEvent, AuthContext, InformationFlowLabels, SourceLabel, TurnInteractivity
 import json
 
 from mimir.resend_nudge import (
@@ -146,6 +146,11 @@ def _ifc_context(channel="discord-1"):
         "ifc_labels": InformationFlowLabels(
             labels=frozenset({"private"}),
             source_channels=frozenset({channel}),
+            sources=frozenset({SourceLabel(
+                principal="user-1", domain="channel", resource_id=channel,
+                bridge_instance="discord", sensitivity="private",
+                authorized_principals=frozenset({"user-1"}),
+            )}),
         ),
         "auth_context": AuthContext(
             principal="discord-U1",
@@ -156,6 +161,9 @@ def _ifc_context(channel="discord-1"):
             channel_id=channel,
             interactivity=TurnInteractivity.INTERACTIVE,
             enforcement_enabled=True,
+            domain="channel",
+            resource_id=channel,
+            bridge_instance="discord",
         ),
     }
 

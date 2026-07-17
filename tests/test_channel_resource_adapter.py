@@ -20,7 +20,7 @@ from mimir.access_control import (
     get_tool_registry,
 )
 from mimir.identities import IdentityResolver
-from mimir.models import AuthContext, InformationFlowLabels
+from mimir.models import AuthContext, InformationFlowLabels, SourceLabel
 from mimir.tools.budget_gate import (
     _check_admin_authorized,
     _extract_channel_from_args,
@@ -41,6 +41,15 @@ def _auth_context(
     roles: tuple[str, ...] = (),
     enforce: bool = False,
 ) -> AuthContext:
+    bridge = channel_id.split("-", 1)[0] if channel_id and "-" in channel_id else None
+    source = SourceLabel(
+        principal="alice",
+        domain="channel",
+        resource_id=channel_id,
+        bridge_instance=bridge,
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+    ) if channel_id else None
     return AuthContext(
         principal="slack-U1",
         canonical_principal="alice",
@@ -50,7 +59,14 @@ def _auth_context(
         channel_id=channel_id,
         interactivity=None,
         enforcement_enabled=enforce,
-        ifc_labels=InformationFlowLabels(source_channels=frozenset({channel_id}) if channel_id else frozenset()),
+        ifc_labels=InformationFlowLabels(
+            labels=frozenset({"private"}) if source else frozenset(),
+            source_channels=frozenset({channel_id}) if channel_id else frozenset(),
+            sources=frozenset({source}) if source else frozenset(),
+        ),
+        domain="channel",
+        resource_id=channel_id,
+        bridge_instance=bridge,
     )
 
 

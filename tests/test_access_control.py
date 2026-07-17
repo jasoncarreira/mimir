@@ -20,7 +20,7 @@ from mimir.access_control import (
     create_auth_context,
 )
 from mimir.identities import IdentityResolver
-from mimir.models import AgentEvent, AuthContext, TurnContext
+from mimir.models import AgentEvent, AuthContext, SourceLabel, TurnContext
 
 
 def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
@@ -164,6 +164,9 @@ def test_admin_turn_can_use_routine_cataloged_tools_when_enforced(
         channel_id="slack-C1",
         interactivity=None,
         enforcement_enabled=True,
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
     )
 
     result = ToolRegistry().authorize_tool(tool_name, auth, enforce=True)
@@ -1021,6 +1024,9 @@ async def test_concurrent_turns_keep_authority_and_ifc_scope_isolated(
         channel_id="slack-C-private",
         interactivity=None,
         enforcement_enabled=True,
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
     )
     admin_auth = AuthContext(
         principal="slack-U2",
@@ -1110,11 +1116,22 @@ async def test_same_scope_private_egress_succeeds_through_live_middleware(
         channel_id="slack-C1",
         interactivity=None,
         enforcement_enabled=True,
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
     )
     ctx = _turn("turn-alice", "saga-alice", auth_context)
     ctx.ifc_labels = InformationFlowLabels(
         labels=frozenset({"private"}),
         source_channels=frozenset({"slack-C1"}),
+        sources=frozenset({SourceLabel(
+            principal="alice",
+            domain="channel",
+            resource_id="slack-C1",
+            bridge_instance="slack",
+            sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+        )}),
     )
     handler_calls = 0
 

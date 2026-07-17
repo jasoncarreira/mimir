@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from mimir.access_control import SinkGate, ToolRegistry, audit_declassification
+from mimir.access_control import (
+    SinkGate,
+    ToolRegistry,
+    audit_declassification,
+    create_auth_context,
+)
 from mimir.agent import (
     Agent,
     _initialize_ifc_labels,
@@ -20,6 +25,7 @@ from mimir.models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    SourceLabel,
     TurnInteractivity,
 )
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
@@ -38,6 +44,9 @@ def _auth(channel: str = "slack-C1", *, roles: tuple[str, ...] = ()) -> AuthCont
         channel_id=channel,
         interactivity=TurnInteractivity.INTERACTIVE,
         enforcement_enabled=True,
+        domain="channel",
+        resource_id=channel,
+        bridge_instance="slack",
     )
 
 
@@ -46,10 +55,25 @@ def _labels(
     *,
     labels: frozenset[str] = frozenset({"private"}),
     sources: frozenset[str] | None = None,
+    principal: str = "user-1",
+    bridge_instance: str = "slack",
 ) -> InformationFlowLabels:
+    channels = sources if sources is not None else frozenset({channel})
     return InformationFlowLabels(
         labels=labels,
-        source_channels=sources if sources is not None else frozenset({channel}),
+        source_channels=channels,
+        sources=frozenset(
+            SourceLabel(
+                principal=principal,
+                domain="channel",
+                resource_id=source,
+                bridge_instance=bridge_instance,
+                sensitivity=label,
+                authorized_principals=frozenset({principal}),
+            )
+            for source in channels
+            for label in labels
+        ),
     )
 
 
@@ -71,6 +95,181 @@ def test_initializes_before_first_model_call_from_ingress_and_preloaded_context(
 
     assert initialized.labels == frozenset({"private", "internal"})
     assert initialized.source_channels == frozenset({"slack-C1"})
+
+
+def test_two_principals_in_shared_channel_fail_closed():
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "slack-C1",
+        _labels(principal="user-2"),
+        _auth(),
+        enforce=True,
+    )
+    assert decision.allowed is False
+
+
+def test_same_textual_channel_on_different_bridge_instance_fails_closed():
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "slack-C1",
+        _labels(bridge_instance="slack-workspace-2"),
+        _auth(),
+        enforce=True,
+    )
+    assert decision.allowed is False
+
+
+def test_labels_without_source_provenance_fail_closed():
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"slack-C1"}),
+    )
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+    assert decision.allowed is False
+
+
+@pytest.mark.parametrize(
+    ("trigger", "service_principal", "channel_id", "source"),
+    [
+        ("scheduled_tick", "scheduler", "scheduler:heartbeat", None),
+        ("poller", "poller", "poller:github-activity", "poller"),
+    ],
+)
+def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enforce(
+    trigger: str,
+    service_principal: str,
+    channel_id: str,
+    source: str | None,
+):
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id=channel_id,
+        source=source,
+        service_principal=service_principal,
+    )
+    labels = _initialize_ifc_labels(event)
+    auth = create_auth_context(event, enforce=True, ifc_labels=labels)
+
+    assert labels.sources == frozenset({
+        SourceLabel(
+            principal=f"service:{service_principal}",
+            domain="channel",
+            resource_id=channel_id,
+            bridge_instance=source or f"service:{service_principal}",
+            sensitivity="internal",
+            authorized_principals=frozenset({f"service:{service_principal}"}),
+            source_kind="service",
+        )
+    })
+    decision = SinkGate.check_sink_flow(
+        "send_message", channel_id, labels, auth, enforce=True,
+    )
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
+def test_unstamped_authorless_synthetic_event_still_fails_closed():
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        source="poller",
+    )
+    labels = _initialize_ifc_labels(event)
+    auth = create_auth_context(event, enforce=True, ifc_labels=labels)
+
+    decision = SinkGate.check_sink_flow(
+        "send_message", event.channel_id, labels, auth, enforce=True,
+    )
+    assert decision.allowed is False
+
+
+def test_mixed_principal_sources_fail_closed_without_declassification():
+    labels = _merge_ifc_labels(_labels(), _labels(principal="user-2"))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+    assert decision.allowed is False
+
+
+def test_service_derived_source_intersects_input_acls():
+    from mimir.models import SourceLabel
+
+    alice_and_ops = SourceLabel(
+        principal="service-a", domain="memory", resource_id="a",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"alice", "ops"}),
+    )
+    alice_and_bob = SourceLabel(
+        principal="service-b", domain="memory", resource_id="b",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"alice", "bob"}),
+    )
+    derived = SourceLabel.derived(
+        frozenset({alice_and_ops, alice_and_bob}),
+        principal="summarizer", domain="memory", resource_id="summary",
+        bridge_instance="saga", sensitivity="private",
+    )
+    assert derived.authorized_principals == frozenset({"alice"})
+
+
+def test_delegation_wires_service_derived_acl_intersection_into_carrier():
+    alice_and_ops = SourceLabel(
+        principal="alice", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"alice", "ops"}),
+    )
+    alice_and_bob = SourceLabel(
+        principal="alice", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"alice", "bob"}),
+    )
+    parent = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"slack-C1"}),
+        sources=frozenset({alice_and_ops, alice_and_bob}),
+    )
+
+    propagated = _propagate_ifc_labels(
+        parent,
+        "slack-C1",
+        _auth(),
+        derived_by="task",
+    )
+
+    derived = [source for source in propagated.sources if source.source_kind == "service"]
+    assert len(derived) == 1
+    assert derived[0].principal == "service:task"
+    assert derived[0].authorized_principals == frozenset({"alice"})
+    assert parent.sources <= propagated.sources
+
+
+def test_service_derived_source_can_flow_when_destination_principal_is_in_intersection():
+    ingress = SourceLabel(
+        principal="user-1", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-1", "ops"}),
+    )
+    derived = SourceLabel.derived(
+        frozenset({ingress}),
+        principal="service:task",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        sensitivity="private",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"slack-C1"}),
+        sources=frozenset({ingress, derived}),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+
+    assert decision.allowed is True
 
 
 def test_propagates_monotonically_to_subagents_spawns_continuations_and_resumed_turns():

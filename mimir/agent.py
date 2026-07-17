@@ -68,8 +68,8 @@ from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
 from ._jsonl_tail import tail_jsonl_records
 from .jsonl_snapshot import JsonlSnapshot
-from .models import AgentEvent, AuthContext, InformationFlowLabels, TurnInteractivity, TurnRecord
-from .access_control import SinkGate, create_auth_context
+from .models import AgentEvent, AuthContext, InformationFlowLabels, SourceLabel, TurnInteractivity, TurnRecord
+from .access_control import SinkGate, create_auth_context, get_service_principal
 from .prompts import build_system_prompt, build_turn_prompt
 from .rate_limits import RateLimitStore
 from .saga_client import SagaClient
@@ -198,6 +198,8 @@ def _merge_ifc_labels(
             merged = merged.with_label(label)
         for channel in current.source_channels:
             merged = merged.with_channel(channel)
+        for source in current.sources:
+            merged = merged.with_source(source)
     if source_channel:
         merged = merged.with_channel(source_channel)
     return merged
@@ -208,6 +210,7 @@ def _initialize_ifc_labels(
     attachments: list[str] | None = None,
     *,
     preloaded_labels: InformationFlowLabels | None = None,
+    resolver: Any = None,
 ) -> InformationFlowLabels:
     """Initialize monotonic IFC labels before prompt/model construction.
 
@@ -220,6 +223,54 @@ def _initialize_ifc_labels(
         preloaded_labels,
         source_channel=event.channel_id,
     )
+
+    canonical_principal = event.author
+    source_kind = "channel"
+    registered_service = get_service_principal(event.trigger)
+    if (
+        canonical_principal is None
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+    ):
+        # Trusted constructors stamp service_principal; generic HTTP ingress does
+        # not copy it from the request. Complete service provenance lets an
+        # author-less scheduled/poller/synthesis turn flow back to its own
+        # triggering channel without inventing human ownership.
+        canonical_principal = f"service:{registered_service.canonical}"
+        source_kind = "service"
+    canonical_resource = event.channel_id
+    if resolver is not None:
+        if event.author:
+            canonical_principal = resolver.resolve(event.author)
+        canonical_resource = resolver.resolve_channel(event.channel_id)
+    extra = event.extra if isinstance(event.extra, dict) else {}
+    visibility = extra.get("channel_visibility")
+    domain = f"channel:{visibility}" if isinstance(visibility, str) and visibility else "channel"
+    bridge_instance = extra.get("bridge_instance")
+    if not isinstance(bridge_instance, str) or not bridge_instance:
+        bridge_instance = event.source
+    if (
+        (not isinstance(bridge_instance, str) or not bridge_instance)
+        and source_kind == "service"
+        and registered_service is not None
+    ):
+        bridge_instance = f"service:{registered_service.canonical}"
+    sensitivity = "private"
+    if event.source in ("api", "http") or event.trigger in (
+        "saga_session_end", "scheduled_tick", "poller",
+    ):
+        sensitivity = "internal"
+    labels = labels.with_source(SourceLabel(
+        principal=canonical_principal,
+        domain=domain,
+        resource_id=canonical_resource,
+        bridge_instance=bridge_instance,
+        sensitivity=sensitivity,
+        authorized_principals=(
+            frozenset({canonical_principal}) if canonical_principal else frozenset()
+        ),
+        source_kind=source_kind,
+    ))
 
     for attachment in attachments or event.attachment_names:
         if _is_private_attachment(attachment):
@@ -244,14 +295,38 @@ def _propagate_ifc_labels(
     labels: Any,
     target_channel: str | None = None,
     auth_context: Any = None,
+    *,
+    derived_by: str | None = None,
+    source_kind: str = "service",
 ) -> InformationFlowLabels:
-    """Copy labels into subagents, spawns, continuations, and resumed turns.
+    """Copy labels into delegation/continuation carriers monotonically.
 
-    Delegation may add a source channel but cannot remove sensitivity labels.
-    ``auth_context`` is accepted for call-site compatibility; admin authority is
-    intentionally irrelevant to propagation.
+    When a service actually transforms protected inputs, ``derived_by`` stamps a
+    production source whose ACL is the intersection of every input ACL. Unknown
+    or incomplete input provenance therefore yields an incomplete derived source
+    and fails closed at egress instead of silently inheriting broad authority.
     """
-    return _merge_ifc_labels(labels, source_channel=target_channel)
+    propagated = _merge_ifc_labels(labels, source_channel=target_channel)
+    if not derived_by or not propagated.sources:
+        return propagated
+
+    domain = getattr(auth_context, "domain", None) or "service"
+    resource_id = target_channel or getattr(auth_context, "resource_id", None)
+    bridge_instance = getattr(auth_context, "bridge_instance", None) or derived_by
+    sensitivity = (
+        "private"
+        if "private" in propagated.labels or "confidential" in propagated.labels
+        else "internal" if "internal" in propagated.labels else "public"
+    )
+    return propagated.with_source(SourceLabel.derived(
+        propagated.sources,
+        principal=f"service:{derived_by}",
+        domain=domain,
+        resource_id=resource_id or "unknown",
+        bridge_instance=bridge_instance,
+        sensitivity=sensitivity,
+        source_kind=source_kind,
+    ))
 
 
 def _filter_session_turns(
@@ -1387,7 +1462,11 @@ class Agent:
         # chainlink #583 slice 1: bracket the whole turn on the live event bus
         # (no-op when unwired). turn_started here pairs with turn_ended in the
         # finally so every turn — even an early-phase crash — is bracketed.
-        initial_ifc_labels = _initialize_ifc_labels(event, event.attachment_names)
+        initial_ifc_labels = _initialize_ifc_labels(
+            event,
+            event.attachment_names,
+            resolver=getattr(self, "_identity_resolver", None),
+        )
         initial_auth_context = create_auth_context(
             event,
             getattr(self, "_identity_resolver", None),
