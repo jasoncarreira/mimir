@@ -9,11 +9,19 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from mimir.models import AuthContext
 from mimir.saga.client import SagaStore
-from mimir.saga.ownership import AuthorizationScope
 
 
-ADMIN_SCOPE = AuthorizationScope(is_admin=True)
+ADMIN_SCOPE = AuthContext(
+    principal="test-admin",
+    canonical_principal="test-admin",
+    roles=("admin",),
+    event_ingress="test",
+    trigger="test",
+    channel_id=None,
+    interactivity=None,
+)
 
 
 # ── helpers ──────────────────────────────────────────────────────────

@@ -14,10 +14,18 @@ from pathlib import Path
 
 import pytest
 
-from mimir.saga.ownership import AuthorizationScope
+from mimir.models import AuthContext
 
 
-ADMIN_SCOPE = AuthorizationScope(is_admin=True)
+ADMIN_SCOPE = AuthContext(
+    principal="test-admin",
+    canonical_principal="test-admin",
+    roles=("admin",),
+    event_ingress="test",
+    trigger="test",
+    channel_id=None,
+    interactivity=None,
+)
 
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"

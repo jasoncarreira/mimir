@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.saga.ownership import AuthorizationScope
+from mimir.models import AuthContext
 from mimir.saga.triples import (
     detect_contradictions,
     get_current_value,
@@ -24,7 +24,15 @@ from mimir.saga.triples import (
 
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"
-ADMIN_SCOPE = AuthorizationScope(is_admin=True)
+ADMIN_SCOPE = AuthContext(
+    principal="admin",
+    canonical_principal="admin",
+    roles=("admin",),
+    event_ingress=None,
+    trigger="test",
+    channel_id=None,
+    interactivity=None,
+)
 
 
 @pytest.fixture
@@ -259,7 +267,7 @@ def test_world_state_initial_insert(conn):
         {"subject": "Alice", "predicate": "lives_in", "object": "Boston",
          "valid_from": "2023-01-01"},
     ], source_atom_id="obs1")
-    fact = get_current_value(conn, "Alice", "lives_in")
+    fact = get_current_value(conn, "Alice", "lives_in", auth_context=ADMIN_SCOPE)
     assert fact is not None
     assert fact.value == "Boston"
     assert fact.is_current is True
@@ -276,7 +284,7 @@ def test_world_state_end_dates_prior_on_change(conn):
         {"subject": "Alice", "predicate": "lives_in", "object": "SF",
          "valid_from": "2024-06-01"},
     ], source_atom_id="obs2")
-    history = get_history(conn, "Alice", "lives_in")
+    history = get_history(conn, "Alice", "lives_in", auth_context=ADMIN_SCOPE)
     assert len(history) == 2
     # Oldest first — Boston should be first and now closed.
     assert history[0].value == "Boston"
@@ -299,7 +307,7 @@ def test_world_state_no_op_on_reassertion(conn):
         {"subject": "Alice", "predicate": "lives_in", "object": "Boston",
          "valid_from": "2023-06-01"},
     ], source_atom_id="obs2")
-    history = get_history(conn, "Alice", "lives_in")
+    history = get_history(conn, "Alice", "lives_in", auth_context=ADMIN_SCOPE)
     # The dedupe at triple-storage level (same content hash) means the
     # second triple isn't even inserted; world_state has 1 entry.
     assert len(history) == 1
@@ -322,7 +330,7 @@ def test_world_state_same_valid_from_value_change_keeps_new_current(conn):
         {"subject": "Alice", "predicate": "status", "object": "inactive",
          "valid_from": "2024-01-01"},
     ], source_atom_id="obs2")
-    fact = get_current_value(conn, "Alice", "status")
+    fact = get_current_value(conn, "Alice", "status", auth_context=ADMIN_SCOPE)
     assert fact is not None, "new value dropped — no current row (the #304 bug)"
     assert fact.value == "inactive"
     assert fact.is_current is True
@@ -348,7 +356,7 @@ def test_get_current_value_is_deterministic_with_dual_current_rows(conn):
         )
     conn.commit()
 
-    fact = get_current_value(conn, "Alice", "lives_in")
+    fact = get_current_value(conn, "Alice", "lives_in", auth_context=ADMIN_SCOPE)
 
     assert fact is not None
     assert fact.value == "NYC"
@@ -370,7 +378,9 @@ def test_detect_contradictions_finds_dual_current_values(conn):
             "VALUES (?, ?, ?, ?, NULL, 1, ?, ?)",
             ("Alice", "lives_in", val, vf, tid, now),
         )
-    conflicts = detect_contradictions(conn, subject="Alice")
+    conflicts = detect_contradictions(
+        conn, subject="Alice", auth_context=ADMIN_SCOPE
+    )
     assert len(conflicts) == 1
     assert conflicts[0]["subject"] == "Alice"
     assert conflicts[0]["count"] == 2
@@ -422,7 +432,9 @@ def test_repair_world_state_dual_current_keeps_newest_end_dates_rest(conn):
     assert {s["value"] for s in r["superseded"]} == {"Boston", "SF"}
 
     # get_current_value is now unambiguous, and a second pass is a no-op.
-    assert get_current_value(conn, "Alice", "lives_in").value == "NYC"
+    assert get_current_value(
+        conn, "Alice", "lives_in", auth_context=ADMIN_SCOPE
+    ).value == "NYC"
     assert repair_world_state_dual_current(conn) == []
 
 

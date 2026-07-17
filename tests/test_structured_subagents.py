@@ -23,13 +23,30 @@ def test_build_mimir_subagents_registers_structured_critic_without_replacing_gp(
 
     # The Worklink epic roles are per-run tool-armed agents constructed inside
     # the retired epic roles module (removed #830).
-    assert [spec["name"] for spec in specs] == ["critic-structured"]
-    assert "general-purpose" not in {spec["name"] for spec in specs}
-    assert specs[0]["response_format"] is CriticFindings
-    assert all(spec["tools"] == [] for spec in specs)
-    assert len(specs[0]["middleware"]) == 1
-    assert specs[0]["middleware"][0].__class__.__name__ == "StructuredOutputRetryMiddleware"
-    assert all("Read-only" in spec["description"] for spec in specs)
+    assert [spec["name"] for spec in specs] == [
+        "general-purpose",
+        "critic-structured",
+    ]
+    critic = specs[1]
+    assert critic["response_format"] is CriticFindings
+    assert critic["tools"] == []
+    assert [middleware.__class__.__name__ for middleware in critic["middleware"]] == [
+        "BudgetGateMiddleware",
+        "StructuredOutputRetryMiddleware",
+    ]
+    assert "Read-only" in critic["description"]
+
+
+def test_every_subagent_runs_tool_calls_through_budget_gate() -> None:
+    specs = build_mimir_subagents()
+
+    assert all(
+        any(
+            middleware.__class__.__name__ == "BudgetGateMiddleware"
+            for middleware in spec["middleware"]
+        )
+        for spec in specs
+    )
 
 
 def test_readonly_permissions_deny_write_catchall() -> None:

@@ -509,19 +509,28 @@ def get_current_value(
     conn: sqlite3.Connection,
     subject: str,
     predicate: str,
+    *,
+    auth_context: Any = None,
 ) -> WorldFact | None:
     """Look up the current value of (subject, predicate). Returns None
     if no row exists. Subject + predicate match is case-sensitive on
     subject (proper noun) and case-folded on predicate (snake_case
-    normalized at write time)."""
+    normalized at write time). Authorization is enforced against the
+    world-state row's inherited, intersected source ACL."""
+    from .ownership import authorization_predicate, get_authorization_scope
+
+    auth_where, auth_params = authorization_predicate(
+        get_authorization_scope(auth_context), table="ws"
+    )
     pred = _PREDICATE_NORM.sub("_", predicate.lower()).strip("_")
     row = conn.execute(
         "SELECT subject, predicate, value, valid_from, valid_until, "
         "is_current, source_triple_id "
-        "FROM world_state WHERE subject = ? AND predicate = ? "
+        "FROM world_state ws WHERE subject = ? AND predicate = ? "
         "AND is_current = 1 "
+        f"AND {auth_where} "
         "ORDER BY valid_from DESC, rowid DESC LIMIT 1",
-        (subject, pred),
+        (subject, pred, *auth_params),
     ).fetchone()
     if row is None:
         return None
@@ -540,15 +549,23 @@ def get_history(
     conn: sqlite3.Connection,
     subject: str,
     predicate: str,
+    *,
+    auth_context: Any = None,
 ) -> list[WorldFact]:
-    """All historical values for (subject, predicate), oldest first."""
+    """Authorized historical values for (subject, predicate), oldest first."""
+    from .ownership import authorization_predicate, get_authorization_scope
+
+    auth_where, auth_params = authorization_predicate(
+        get_authorization_scope(auth_context), table="ws"
+    )
     pred = _PREDICATE_NORM.sub("_", predicate.lower()).strip("_")
     rows = conn.execute(
         "SELECT subject, predicate, value, valid_from, valid_until, "
         "is_current, source_triple_id "
-        "FROM world_state WHERE subject = ? AND predicate = ? "
+        "FROM world_state ws WHERE subject = ? AND predicate = ? "
+        f"AND {auth_where} "
         "ORDER BY valid_from ASC",
-        (subject, pred),
+        (subject, pred, *auth_params),
     ).fetchall()
     return [
         WorldFact(
@@ -866,6 +883,7 @@ def detect_contradictions(
     *,
     subject: str | None = None,
     predicate: str | None = None,
+    auth_context: Any = None,
 ) -> list[dict]:
     """Find (subj, pred) pairs with multiple distinct CURRENT values.
 
@@ -885,8 +903,39 @@ def detect_contradictions(
     ``resolve_contradictions_to_supersedes``. Callers that want the
     full picture should walk both this and that table.
     """
+    from .ownership import authorization_predicate, get_authorization_scope
+
+    auth_where, auth_params = authorization_predicate(
+        get_authorization_scope(auth_context), table="ws"
+    )
+    return _detect_contradictions_unscoped(
+        conn,
+        subject=subject,
+        predicate=predicate,
+        extra_where=auth_where,
+        extra_params=auth_params,
+    )
+
+
+def _detect_contradictions_unscoped(
+    conn: sqlite3.Connection,
+    *,
+    subject: str | None = None,
+    predicate: str | None = None,
+    extra_where: str | None = None,
+    extra_params: list | None = None,
+) -> list[dict]:
+    """Internal database-integrity scan; never expose as a read surface.
+
+    ``repair_world_state_dual_current`` must inspect every row so it can restore
+    a global storage invariant. User-facing callers must use the authorized
+    ``detect_contradictions`` wrapper above.
+    """
     where = ["is_current = 1"]
     params: list = []
+    if extra_where is not None:
+        where.append(extra_where)
+        params.extend(extra_params or [])
     if subject is not None:
         where.append("subject = ?")
         params.append(subject)
@@ -896,7 +945,7 @@ def detect_contradictions(
     rows = conn.execute(
         f"SELECT subject, predicate, GROUP_CONCAT(value, '|||') AS vals, "
         f"COUNT(*) AS n "
-        f"FROM world_state WHERE {' AND '.join(where)} "
+        f"FROM world_state ws WHERE {' AND '.join(where)} "
         f"GROUP BY subject, predicate HAVING n > 1",
         params,
     ).fetchall()
@@ -1005,7 +1054,9 @@ def repair_world_state_dual_current(conn: sqlite3.Connection) -> list[dict]:
     consolidation pass without leaving an open implicit transaction for the next
     ``BEGIN IMMEDIATE`` caller to trip over.
     """
-    conflicts = detect_contradictions(conn)  # read-only; identifies candidate keys
+    # Database-wide integrity repair deliberately bypasses user read scope. The
+    # unscoped helper is private and returns data only to this internal mutator.
+    conflicts = _detect_contradictions_unscoped(conn)
     if not conflicts:
         return []
     now = datetime.now(timezone.utc).isoformat()

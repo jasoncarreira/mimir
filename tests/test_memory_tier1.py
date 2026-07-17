@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from mimir.models import AuthContext
 from mimir.saga.mark_access import AccessEvent, mark_access
 from mimir.saga.ownership import AuthorizationScope
 from mimir.saga.recall import recall
@@ -19,6 +20,15 @@ from mimir.saga.store import store
 
 
 ADMIN_SCOPE = AuthorizationScope(is_admin=True)
+ADMIN_AUTH = AuthContext(
+    principal="test-admin",
+    canonical_principal="test-admin",
+    roles=("admin",),
+    event_ingress="test",
+    trigger="test",
+    channel_id=None,
+    interactivity=None,
+)
 
 
 def _admin_recall(*args, **kwargs):
@@ -393,7 +403,7 @@ async def test_sagastore_query_accepts_extra_atom_ranked_pathways(
         top_k=5,
         extra_atom_ranked_pathways={"session_boundary": [stored["atom_id"]]},
         rrf_pathway_weights={"session_boundary": 0.5},
-        auth_context=ADMIN_SCOPE,
+        auth_context=ADMIN_AUTH,
     )
 
     assert [a["id"] for a in result["raws"]] == [stored["atom_id"]]
