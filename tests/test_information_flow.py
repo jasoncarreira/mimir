@@ -20,6 +20,7 @@ from mimir.models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    SourceLabel,
     TurnInteractivity,
 )
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
@@ -38,6 +39,9 @@ def _auth(channel: str = "slack-C1", *, roles: tuple[str, ...] = ()) -> AuthCont
         channel_id=channel,
         interactivity=TurnInteractivity.INTERACTIVE,
         enforcement_enabled=True,
+        domain="channel",
+        resource_id=channel,
+        bridge_instance="slack",
     )
 
 
@@ -46,10 +50,25 @@ def _labels(
     *,
     labels: frozenset[str] = frozenset({"private"}),
     sources: frozenset[str] | None = None,
+    principal: str = "user-1",
+    bridge_instance: str = "slack",
 ) -> InformationFlowLabels:
+    channels = sources if sources is not None else frozenset({channel})
     return InformationFlowLabels(
         labels=labels,
-        source_channels=sources if sources is not None else frozenset({channel}),
+        source_channels=channels,
+        sources=frozenset(
+            SourceLabel(
+                principal=principal,
+                domain="channel",
+                resource_id=source,
+                bridge_instance=bridge_instance,
+                sensitivity=label,
+                authorized_principals=frozenset({principal}),
+            )
+            for source in channels
+            for label in labels
+        ),
     )
 
 
@@ -71,6 +90,68 @@ def test_initializes_before_first_model_call_from_ingress_and_preloaded_context(
 
     assert initialized.labels == frozenset({"private", "internal"})
     assert initialized.source_channels == frozenset({"slack-C1"})
+
+
+def test_two_principals_in_shared_channel_fail_closed():
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "slack-C1",
+        _labels(principal="user-2"),
+        _auth(),
+        enforce=True,
+    )
+    assert decision.allowed is False
+
+
+def test_same_textual_channel_on_different_bridge_instance_fails_closed():
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "slack-C1",
+        _labels(bridge_instance="slack-workspace-2"),
+        _auth(),
+        enforce=True,
+    )
+    assert decision.allowed is False
+
+
+def test_unknown_provenance_fails_closed():
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"slack-C1"}),
+    )
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+    assert decision.allowed is False
+
+
+def test_mixed_principal_sources_fail_closed_without_declassification():
+    labels = _merge_ifc_labels(_labels(), _labels(principal="user-2"))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+    assert decision.allowed is False
+
+
+def test_service_derived_source_intersects_input_acls():
+    from mimir.models import SourceLabel
+
+    alice_and_ops = SourceLabel(
+        principal="service-a", domain="memory", resource_id="a",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"alice", "ops"}),
+    )
+    alice_and_bob = SourceLabel(
+        principal="service-b", domain="memory", resource_id="b",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"alice", "bob"}),
+    )
+    derived = SourceLabel.derived(
+        frozenset({alice_and_ops, alice_and_bob}),
+        principal="summarizer", domain="memory", resource_id="summary",
+        bridge_instance="saga", sensitivity="private",
+    )
+    assert derived.authorized_principals == frozenset({"alice"})
 
 
 def test_propagates_monotonically_to_subagents_spawns_continuations_and_resumed_turns():

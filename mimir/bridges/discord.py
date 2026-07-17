@@ -18,6 +18,7 @@ deployments don't pay the dep cost.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -316,6 +317,7 @@ class DiscordBridge(Bridge):
     respond_to_bots: bool = False
     attachments_dir: Path | None = None
     attachments_max_bytes: int | None = None
+    bridge_instance: str | None = None
     _client: _DiscordClient | None = field(default=None, init=False, repr=False)
     _runner: asyncio.Task | None = field(default=None, init=False, repr=False)
     _background_tasks: set[asyncio.Task[Any]] = field(
@@ -1029,6 +1031,9 @@ class DiscordBridge(Bridge):
             source="discord",
             attachment_names=attachment_paths,
             extra={
+                "bridge_instance": self.bridge_instance or (
+                    "discord:" + hashlib.sha256(self.token.encode()).hexdigest()[:16]
+                ),
                 "channel_conversation_type": conv_type,
                 "channel_visibility": visibility,
                 "channel_name": channel_name,

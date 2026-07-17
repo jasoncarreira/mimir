@@ -54,7 +54,7 @@ from typing import Any, Awaitable, Callable
 from ._atomic import atomic_write_json
 from ._jsonl_tail import tail_jsonl_records
 from .event_logger import log_event
-from .models import AgentEvent, InformationFlowLabels
+from .models import AgentEvent, InformationFlowLabels, SourceLabel
 
 log = logging.getLogger(__name__)
 
@@ -171,9 +171,24 @@ def _event_from_stash(d: Any) -> AgentEvent | None:
         payload = dict(d)
         raw_labels = payload.get("ifc_labels")
         if isinstance(raw_labels, dict):
+            raw_sources = raw_labels.get("sources") or ()
+            sources = frozenset(
+                SourceLabel(
+                    principal=source.get("principal"),
+                    domain=source.get("domain"),
+                    resource_id=source.get("resource_id"),
+                    bridge_instance=source.get("bridge_instance"),
+                    sensitivity=source.get("sensitivity", ""),
+                    authorized_principals=frozenset(source.get("authorized_principals") or ()),
+                    source_kind=source.get("source_kind", "channel"),
+                )
+                for source in raw_sources
+                if isinstance(source, dict)
+            )
             payload["ifc_labels"] = InformationFlowLabels(
                 labels=frozenset(raw_labels.get("labels") or ()),
                 source_channels=frozenset(raw_labels.get("source_channels") or ()),
+                sources=sources,
                 **(
                     {"created_at": raw_labels["created_at"]}
                     if isinstance(raw_labels.get("created_at"), (int, float))
