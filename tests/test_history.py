@@ -21,6 +21,7 @@ def _make_buffer(tmp_path: Path, **kwargs) -> MessageBuffer:
         history_path=tmp_path / "messages" / "chat_history.jsonl",
         global_max=kwargs.get("global_max", 50),
         per_channel_max=kwargs.get("per_channel_max", 20),
+        disk_max=kwargs.get("disk_max", 5000),
     )
 
 
@@ -39,6 +40,65 @@ async def test_append_writes_jsonl_and_updates_deques(tmp_path: Path):
     assert len(lines) == 1
     parsed = json.loads(lines[0])
     assert parsed["content"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_disk_history_trims_to_newest_records(tmp_path: Path):
+    buf = _make_buffer(tmp_path, disk_max=3)
+    for i in range(4):
+        await buf.append(buf.make_message(
+            channel_id="bench-1", kind="user_message", content=f"msg-{i}"
+        ))
+
+    records = [
+        json.loads(line)
+        for line in buf.history_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["content"] for record in records] == ["msg-1", "msg-2", "msg-3"]
+
+
+def test_evict_channel_rehydrates_from_bounded_global_history(tmp_path: Path):
+    buf = _make_buffer(tmp_path)
+    buf._append_in_memory(
+        buf.make_message(channel_id="c1", kind="user_message", content="old")
+    )
+
+    assert buf.evict_channel("c1") is True
+    assert buf.channel_count("c1") == 0
+    buf._append_in_memory(
+        buf.make_message(channel_id="c1", kind="user_message", content="new")
+    )
+
+    assert [m.content for m in buf.recent_for_channel("c1", 10)] == ["old", "new"]
+
+
+def test_cross_author_context_survives_idle_channel_eviction(tmp_path: Path):
+    buf = _make_buffer(tmp_path)
+    user = buf.make_message(
+        channel_id="c1",
+        kind="user_message",
+        author="alice",
+        content="question",
+        ts=_now_iso(),
+    )
+    reply = buf.make_message(
+        channel_id="c1",
+        kind="assistant_message",
+        content="answer",
+        ts=_now_iso(),
+    )
+    buf._append_in_memory(user)
+    buf._append_in_memory(reply)
+
+    assert buf.evict_channel("c1") is True
+    context = buf.cross_author_context(
+        author="alice",
+        exclude_channel="c2",
+        limit=5,
+        within_hours=1,
+    )
+
+    assert [message.content for message in context] == ["question", "answer"]
 
 
 def test_replay_rehydrates_deques(tmp_path: Path):

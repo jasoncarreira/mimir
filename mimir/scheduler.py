@@ -2136,6 +2136,30 @@ class Scheduler:
             coalesce=False,
         )
 
+    def add_saga_index_rebuild_job(
+        self,
+        saga_client: SagaClient,
+        cron_expr: str = "15 * * * *",
+        *,
+        job_id: str = "saga-index-rebuild",
+    ) -> bool:
+        """Register an independent soft-removed FAISS rebuild check."""
+
+        async def _check() -> None:
+            rebuilt = await saga_client.rebuild_index_if_needed()
+            if rebuilt:
+                await log_event("saga_index_rebuilt", reason="soft_removal_threshold")
+
+        return self.register_callable(
+            name=job_id,
+            fn=_check,
+            default_cron=cron_expr,
+            job_id=job_id,
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # ---- Viability-report cron ---------------------------------------
 
     def add_viability_report_job(

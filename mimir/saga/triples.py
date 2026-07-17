@@ -597,9 +597,9 @@ def _cosine_scores(
     chainlink #257 perf half: replaces the former O(N·dim) pure-Python
     cosine loop (``struct.unpack`` + ``math.sqrt`` + ``zip`` dot per
     triple) with a single vectorized matmul, so the hot ``query()`` path
-    no longer scales linearly *in Python* with the triple corpus. The math
-    runs in float64 to match the original loop's precision (embeddings are
-    stored float32; upcast for the dot/norm).
+    no longer scales linearly *in Python* with the triple corpus. Embeddings
+    are stored and scored in float32, avoiding a per-vector float64 copy while
+    remaining within float32 tolerance of the original calculation.
 
     Row-skip semantics are preserved exactly: a candidate is dropped when
     its ``t_dim`` mismatches *dim*, its blob is too short, its unpacked
@@ -611,7 +611,7 @@ def _cosine_scores(
     """
     import numpy as np
 
-    q = np.asarray(query_emb, dtype=np.float64)
+    q = np.asarray(query_emb, dtype=np.float32)
     q_norm = float(np.linalg.norm(q))
     if q_norm == 0.0:
         return []
@@ -629,7 +629,7 @@ def _cosine_scores(
         if v.shape[0] != q_dim:
             continue
         kept_idx.append(i)
-        vecs.append(v.astype(np.float64))
+        vecs.append(v)
     if not vecs:
         return []
 

@@ -307,10 +307,12 @@ class VectorIndex:
                     break
         return out
 
-    def rebuild_if_needed(self, conn: sqlite3.Connection) -> None:
+    def rebuild_if_needed(self, conn: sqlite3.Connection) -> bool:
         """Rebuild from disk if accumulated removals exceed 10% of total."""
         if self._next_pos > 0 and len(self._removed) > self._next_pos * 0.1:
             self.build_from_db(conn)
+            return True
+        return False
 
 
 def faiss_search_atoms(

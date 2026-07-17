@@ -591,6 +591,14 @@ class WorklinkRunner:
         persisted handle)."""
         selected_name = backend.name
         raw = await backend.interpret(order, compute_result)
+        if raw.output_overflow:
+            _log_event(
+                "worklink_output_overflow",
+                issue_id=issue.issue_id,
+                attempt=attempt,
+                backend=selected_name,
+                transcript=str(raw.transcript_path) if raw.transcript_path else None,
+            )
         pr_url = None
         # After the #832 substrate cleanup local_subprocess is the only Worklink
         # compute substrate. Its capabilities declare shared_filesystem=True, so
@@ -687,20 +695,26 @@ class WorklinkRunner:
             review_ready=validation.review_ready,
             reasons=list(validation.reasons),
         )
+        transition_status = "blocked" if raw.output_overflow else validation.status
+        transition_reason = (
+            raw.error
+            if raw.output_overflow
+            else validation.evidence.blocked_reason
+            if validation.status == "blocked"
+            else (", ".join(validation.reasons) if validation.reasons else None)
+        )
         claims.transition_issue(
             issue.issue_id,
-            status=validation.status,
+            status=transition_status,
             review_ready=validation.review_ready,
             attempt=attempt,
-            reason=validation.evidence.blocked_reason
-            if validation.status == "blocked"
-            else (", ".join(validation.reasons) if validation.reasons else None),
+            reason=transition_reason,
         )
         _log_event(
             "worklink_transition",
             issue_id=issue.issue_id,
             attempt=attempt,
-            status=validation.status,
+            status=transition_status,
             review_ready=validation.review_ready,
             pr_url=pr_url,
         )
@@ -714,7 +728,7 @@ class WorklinkRunner:
         return WorklinkRunResult(
             issue.issue_id,
             attempt,
-            validation.status,
+            transition_status,
             review_ready=validation.review_ready,
             pr_url=pr_url,
             evidence_path=evidence_path,

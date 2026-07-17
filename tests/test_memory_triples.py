@@ -951,3 +951,65 @@ class TestCosineScoresVectorized:
         scores = _cosine_scores([1.0, 0.0, 0.0, 0.0],
                                 [(self._blob([1.0, 0.0, 0.0, 0.0]), None)], dim=None)
         assert scores and scores[0][1] == pytest.approx(1.0, abs=1e-4)
+
+    def test_scores_float32_matrix_without_per_vector_upcast(self, monkeypatch):
+        import numpy as np
+        from mimir.saga.triples import _cosine_scores
+
+        seen: dict[str, object] = {}
+        real_vstack = np.vstack
+
+        def recording_vstack(vecs):
+            seen["input_dtypes"] = [v.dtype for v in vecs]
+            matrix = real_vstack(vecs)
+            seen["matrix_dtype"] = matrix.dtype
+            return matrix
+
+        monkeypatch.setattr(np, "vstack", recording_vstack)
+        _cosine_scores(
+            [0.25, -0.5, 0.75, 1.0],
+            [(self._blob([1.0, 2.0, 3.0, 4.0]), 4)],
+            dim=4,
+        )
+
+        assert seen == {
+            "input_dtypes": [np.dtype(np.float32)],
+            "matrix_dtype": np.dtype(np.float32),
+        }
+
+    def test_float32_scores_preserve_float64_ranking_within_tolerance(self):
+        import numpy as np
+        from mimir.saga.triples import _cosine_scores
+
+        query = [0.123456789, -0.987654321, 0.333333333, 0.777777777]
+        vectors = [
+            [0.12, -0.98, 0.34, 0.78],
+            [0.8, 0.1, -0.2, 0.3],
+            [-0.4, 0.6, 0.7, -0.1],
+            [0.0, -0.5, 0.2, 0.9],
+        ]
+        actual = _cosine_scores(
+            query,
+            [(self._blob(vector), 4) for vector in vectors],
+            dim=4,
+        )
+        q64 = np.asarray(query, dtype=np.float64)
+        expected = []
+        for i, vector in enumerate(vectors):
+            v64 = np.asarray(vector, dtype=np.float32).astype(np.float64)
+            expected.append(
+                (
+                    i,
+                    float(
+                        v64 @ q64
+                        / (np.linalg.norm(v64) * np.linalg.norm(q64))
+                    ),
+                )
+            )
+
+        assert [i for i, _ in sorted(actual, key=lambda item: -item[1])] == [
+            i for i, _ in sorted(expected, key=lambda item: -item[1])
+        ]
+        assert [score for _, score in actual] == pytest.approx(
+            [score for _, score in expected], abs=2e-7
+        )

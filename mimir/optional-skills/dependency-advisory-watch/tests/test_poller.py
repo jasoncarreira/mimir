@@ -59,6 +59,13 @@ class TestFirstRunSeed:
         cursor_data = json.loads(cursor_path.read_text())
         assert cursor_data["advisory_ids"] == []
 
+        active_ignores = {
+            line.strip()
+            for line in (state_dir / ".gitignore").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+        assert active_ignores == {"dependency-advisory-cursor.json", "*.tmp"}
+
     def test_first_run_with_advisories_seeds_only(self, state_dir, fresh_poller, monkeypatch, capsys):
         (state_dir.parent / "uv.lock").write_text("", encoding="utf-8")
         advisories = [_advisory(vuln_id="VULN-001"), _advisory(vuln_id="VULN-002", package="other-pkg")]
@@ -74,6 +81,22 @@ class TestFirstRunSeed:
         cursor_path = state_dir / "dependency-advisory-cursor.json"
         cursor_data = json.loads(cursor_path.read_text())
         assert set(cursor_data["advisory_ids"]) == {"VULN-001", "VULN-002"}
+
+    def test_main_preserves_existing_state_gitignore_and_writes_cursor(
+        self, state_dir, fresh_poller, capsys
+    ):
+        gitignore = state_dir / ".gitignore"
+        gitignore.write_text("operator-custom\n", encoding="utf-8")
+
+        with patch("scanner.find_lockfiles", return_value=[]):
+            assert fresh_poller.main() == 0
+
+        assert _events(capsys) == []
+        assert gitignore.read_text(encoding="utf-8") == "operator-custom\n"
+        cursor = json.loads(
+            (state_dir / "dependency-advisory-cursor.json").read_text(encoding="utf-8")
+        )
+        assert cursor["advisory_ids"] == []
 
 
 class TestNewMatch:

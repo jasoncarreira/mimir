@@ -4,8 +4,8 @@ On startup ``chat_history.jsonl`` is replayed into two ``deque``s:
 - ``message_history_all`` (bounded, default 500)
 - ``message_history_by_channel[channel_id]`` (each bounded, default 250)
 
-New messages append to both. Eviction is ``deque.maxlen`` only — same model
-as open-strix. The on-disk file grows unbounded by default.
+New messages append to both. In-memory retention uses ``deque.maxlen`` and the
+on-disk file periodically rotates to its newest bounded tail.
 
 ``recent_activity()`` produces the chronological merge that goes into the
 turn prompt under ``## Recent activity``: within-channel last N + cross-channel
@@ -18,12 +18,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Literal
 
+from ._jsonl_tail import _tail_lines, count_lines_chunked
 from .pollers import POLLER_CHANNEL_PREFIX
 from .scheduler import SCHEDULER_CHANNEL_PREFIX
 
@@ -33,6 +35,7 @@ from .scheduler import SCHEDULER_CHANNEL_PREFIX
 #: within-channel pull for these channels. Chainlink #78 (2026-05-11)
 #: extended via PR #127 review (poller:* added 2026-05-11).
 SYNTHETIC_CHANNEL_PREFIXES = (SCHEDULER_CHANNEL_PREFIX, POLLER_CHANNEL_PREFIX)
+DEFAULT_HISTORY_DISK_MAX = 5000
 
 log = logging.getLogger(__name__)
 
@@ -140,11 +143,18 @@ class MessageBuffer:
     resolver: object | None = None  # IdentityResolver | None — typed loosely to
     # avoid a hard import dep in this module (history.py loads early).
     cross_platform_pull: bool = True
+    disk_max: int = DEFAULT_HISTORY_DISK_MAX
     _all: deque[Message] = field(default_factory=deque)
     _by_channel: dict[str, deque[Message]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._all = deque(maxlen=self.global_max)
+        self.disk_max = max(1, self.disk_max)
+        self._line_count = count_lines_chunked(self.history_path)
+        self._trim_lock: asyncio.Lock | None = None
+        self._io_condition = threading.Condition()
+        self._active_writers = 0
+        self._trimming = False
         # Per-channel deques are created lazily on first message for that channel.
 
     def replay(self) -> int:
@@ -176,19 +186,21 @@ class MessageBuffer:
         return loaded
 
     def _append_in_memory(self, msg: Message) -> None:
-        self._all.append(msg)
         ch = self._by_channel.get(msg.channel_id)
         if ch is None:
             ch = deque(maxlen=self.per_channel_max)
+            ch.extend(m for m in self._all if m.channel_id == msg.channel_id)
             self._by_channel[msg.channel_id] = ch
+        self._all.append(msg)
         ch.append(msg)
 
     async def append(self, msg: Message) -> None:
         """Append to disk + both deques.
 
-        No lock: the in-memory deque mutation is single-threaded under
-        asyncio (synchronous, no awaits inside ``_append_in_memory``),
-        and the disk write goes through ``asyncio.to_thread``. Each
+        The in-memory deque mutation is single-threaded under asyncio
+        (synchronous, no awaits inside ``_append_in_memory``), and the disk
+        write goes through ``asyncio.to_thread``. Concurrent writes share a
+        condition only with the infrequent exclusive retention trim. Each
         ``_append_disk`` call opens the file with ``"a"`` and writes one
         JSON line — POSIX guarantees ``O_APPEND`` writes are atomic at
         the kernel level for a single ``write(2)`` syscall, so concurrent
@@ -196,8 +208,7 @@ class MessageBuffer:
         byte level. They may land out of call order on disk (whichever
         thread wins the inode-lock race), but each line is whole.
 
-        Removing the lock — which previously held *across* the
-        ``await asyncio.to_thread(...)`` — lets concurrent callers
+        Avoiding an asyncio lock across ``await asyncio.to_thread(...)`` lets callers
         actually fan out to separate threads instead of serializing
         through one. See CR#17.
 
@@ -209,6 +220,13 @@ class MessageBuffer:
         buffer instance plus test-side flush hooks)."""
         self._append_in_memory(msg)
         await asyncio.to_thread(self._append_disk, msg)
+        self._line_count += 1
+        if self._line_count > int(self.disk_max * 1.1):
+            if self._trim_lock is None:
+                self._trim_lock = asyncio.Lock()
+            async with self._trim_lock:
+                if self._line_count > int(self.disk_max * 1.1):
+                    await asyncio.to_thread(self._trim_sync)
 
     def _append_disk(self, msg: Message) -> None:
         """Append one JSONL record. **Interleave-atomicity, not
@@ -236,6 +254,10 @@ class MessageBuffer:
         to call sync explicitly.
         """
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._io_condition:
+            while self._trimming:
+                self._io_condition.wait()
+            self._active_writers += 1
         try:
             with self.history_path.open("a", encoding="utf-8") as f:
                 f.write(
@@ -243,6 +265,42 @@ class MessageBuffer:
                 )
         except OSError as exc:
             log.warning("chat_history.jsonl append failed: %s", exc)
+        finally:
+            with self._io_condition:
+                self._active_writers -= 1
+                if self._active_writers == 0:
+                    self._io_condition.notify_all()
+
+    def _trim_sync(self) -> None:
+        with self._io_condition:
+            self._trimming = True
+            while self._active_writers:
+                self._io_condition.wait()
+        try:
+            kept_reversed: list[str] = []
+            for line in _tail_lines(self.history_path):
+                stripped = line.strip()
+                if stripped:
+                    kept_reversed.append(stripped)
+                if len(kept_reversed) >= self.disk_max:
+                    break
+            if kept_reversed:
+                tmp = self.history_path.with_suffix(".jsonl.tmp")
+                tmp.write_text(
+                    "\n".join(reversed(kept_reversed)) + "\n", encoding="utf-8"
+                )
+                tmp.replace(self.history_path)
+            self._line_count = len(kept_reversed)
+        except OSError as exc:
+            log.warning("chat_history.jsonl trim failed: %s", exc)
+        finally:
+            with self._io_condition:
+                self._trimming = False
+                self._io_condition.notify_all()
+
+    def evict_channel(self, channel_id: str) -> bool:
+        """Drop an idle channel's dedicated deque; global/disk history remains."""
+        return self._by_channel.pop(channel_id, None) is not None
 
     def make_message(
         self,
@@ -412,23 +470,27 @@ class MessageBuffer:
 
         anchor_ids = {id(msg) for msg in anchors}
         selected: list[Message] = []
-        for channel_id, messages in self._by_channel.items():
+        include_replies_by_channel: dict[str, bool] = {}
+        # Walk the bounded global deque rather than only the per-channel deques:
+        # idle-channel eviction intentionally drops those dedicated deques, but
+        # cross-channel context must remain available until the global window
+        # itself ages the conversation out.
+        for msg in self._all:
+            channel_id = msg.channel_id
             if channel_id == exclude_channel:
                 continue
             if _is_private_channel(channel_id) and not include_private:
                 continue
-            include_replies = False
-            for msg in messages:
-                if id(msg) in anchor_ids:
+            if id(msg) in anchor_ids:
+                selected.append(msg)
+                include_replies_by_channel[channel_id] = True
+                continue
+            if msg.kind == "user_message":
+                include_replies_by_channel[channel_id] = False
+                continue
+            if include_replies_by_channel.get(channel_id) and msg.kind == "assistant_message":
+                if source_allowlist is None or msg.source in source_allowlist:
                     selected.append(msg)
-                    include_replies = True
-                    continue
-                if msg.kind == "user_message":
-                    include_replies = False
-                    continue
-                if include_replies and msg.kind == "assistant_message":
-                    if source_allowlist is None or msg.source in source_allowlist:
-                        selected.append(msg)
 
         def _timestamp(msg: Message) -> float:
             try:

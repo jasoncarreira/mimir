@@ -15,6 +15,12 @@ from typing import Any, Callable, Iterable
 from ._jsonl_tail import tail_jsonl_records
 
 
+# Match the shipped React client's default backfillLimit. Larger explicit
+# requests lift this floor in read_live_event_items_since().
+FRESH_BACKFILL_MAX_RECORDS = 500
+CURSOR_BACKFILL_MAX_RECORDS = 5000
+
+
 @dataclass(frozen=True)
 class LiveEventItem:
     id: str
@@ -145,7 +151,7 @@ def read_live_event_items_since(
     *,
     since: str | None = None,
     limit: int | None = None,
-    max_records: int = 5000,
+    max_records: int | None = None,
     tail_reader: Callable[[Path], Iterable[dict[str, Any]]] = tail_jsonl_records,
 ) -> list[LiveEventItem]:
     """Read the newest turn-log tail and return live events after ``since``.
@@ -158,6 +164,14 @@ def read_live_event_items_since(
         return []
 
     records: list[dict[str, Any]] = []
+    record_limit = max_records
+    if record_limit is None:
+        if since:
+            record_limit = CURSOR_BACKFILL_MAX_RECORDS
+        else:
+            # A record yields at least one lifecycle item, so scanning fewer
+            # records than the requested item limit can never satisfy it.
+            record_limit = max(FRESH_BACKFILL_MAX_RECORDS, limit or 0)
     since_ts = _cursor_ts(since)
     try:
         for record in tail_reader(turns_log):
@@ -171,7 +185,7 @@ def read_live_event_items_since(
                 if items and items[-1].cursor <= since:
                     break
             records.append(record)
-            if len(records) >= max_records:
+            if len(records) >= record_limit:
                 break
     except OSError:
         return []

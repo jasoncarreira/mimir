@@ -26,6 +26,11 @@ import scanner
 
 POLLER_NAME = "dependency-advisory-watch"
 CURSOR_FILE = "dependency-advisory-cursor.json"
+_STATE_GITIGNORE = f"""\
+# Transient dependency-advisory-watch state (write-if-missing; edit freely).
+{CURSOR_FILE}
+*.tmp
+"""
 
 
 def _cursor_path() -> Path | None:
@@ -58,6 +63,20 @@ def _write_cursor(path: Path, advisory_ids: tuple[str, ...]) -> None:
     )
     temp.write_text(content, encoding="utf-8")
     temp.replace(path)
+
+
+def _seed_state_gitignore() -> None:
+    """Best-effort seed of STATE_DIR/.gitignore without replacing user edits."""
+    cursor_path = _cursor_path()
+    if cursor_path is None:
+        return
+    try:
+        cursor_path.parent.mkdir(parents=True, exist_ok=True)
+        gitignore = cursor_path.parent / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text(_STATE_GITIGNORE, encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _advisory_id(advisory: scanner.Advisory) -> str:
@@ -149,6 +168,7 @@ def _run_scan_with_cursor() -> tuple[int, tuple[str, ...] | None]:
 
 
 def main() -> int:
+    _seed_state_gitignore()
     exit_code, _ = _run_scan_with_cursor()
     return exit_code
 

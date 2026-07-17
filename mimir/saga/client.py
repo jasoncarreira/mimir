@@ -703,7 +703,7 @@ class SagaStore:
         else:
             self._index.build_from_db(conn)
 
-    def _rebuild_index_if_needed(self, conn: sqlite3.Connection) -> None:
+    def _rebuild_index_if_needed(self, conn: sqlite3.Connection) -> bool:
         """Invoke the documented >10%-soft-removed FAISS rebuild backstop.
 
         chainlink #425: ``VectorIndex.rebuild_if_needed`` existed but had
@@ -719,9 +719,18 @@ class SagaStore:
         threshold; one bulk ``build_from_db`` above it.
         """
         if self._index is None or not self._index.built:
-            return
+            return False
         with self._index_lock:
-            self._index.rebuild_if_needed(conn)
+            return self._index.rebuild_if_needed(conn)
+
+    async def rebuild_index_if_needed(self) -> bool:
+        """Check the soft-removal threshold and rebuild the atom index if due.
+
+        This public maintenance entry point lets the scheduler run the check
+        independently of consolidation and forgetting cycles.
+        """
+        conn = self._ensure_conn()
+        return await self._db_locked(lambda: self._rebuild_index_if_needed(conn))
 
     def _ensure_sessions_index(self, conn: sqlite3.Connection) -> VectorIndex | None:
         """Lazily build the sessions FAISS index from sessions.embedding.
@@ -2142,6 +2151,8 @@ class SagaStore:
             "skills": {},
         }
         if not skills:
+            if not dry_run:
+                await self.rebuild_index_if_needed()
             return summary
 
         # Same 0.92-floor threshold resolution as consolidate()'s dedup
@@ -2210,6 +2221,8 @@ class SagaStore:
                 "canonicals_kept": res.canonicals_kept,
                 "duplicates_tombstoned": res.duplicates_tombstoned,
             }
+        if not dry_run:
+            await self.rebuild_index_if_needed()
         return summary
 
     async def forget(

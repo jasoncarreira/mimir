@@ -21,7 +21,6 @@ empirically: SDK ``_internal/message_parser.py:191-203`` parses
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -76,6 +75,14 @@ class SubagentInbox:
     def peek(self, channel_id: str) -> list[SubagentResult]:
         """Non-destructive view (used by tests + the viewer in later phases)."""
         return list(self.by_channel.get(channel_id, []))
+
+    def evict_channel(self, channel_id: str) -> bool:
+        """Drop only an empty bucket; pending completions outlive worker idle."""
+        bucket = self.by_channel.get(channel_id)
+        if bucket is None or bucket:
+            return False
+        del self.by_channel[channel_id]
+        return True
 
 
 def render_subagent_updates(results: Iterable[SubagentResult]) -> str:

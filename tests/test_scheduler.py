@@ -374,6 +374,30 @@ def test_add_introspection_report_job_registers(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_saga_index_rebuild_job_is_independent_named_callable(tmp_path: Path):
+    called = 0
+
+    class _FakeSagaClient:
+        async def rebuild_index_if_needed(self):
+            nonlocal called
+            called += 1
+            return False
+
+    async def noop(_e):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched.add_saga_index_rebuild_job(_FakeSagaClient()) is True
+    assert "saga-index-rebuild" in sched.registered_callables()
+    job = sched._scheduler.get_job("saga-index-rebuild")
+    assert job is not None
+
+    await job.func()
+
+    assert called == 1
+
+
+@pytest.mark.asyncio
 async def test_saga_consolidate_threads_canonical_subjects(tmp_path: Path):
     """P48 + Option A: when home is provided, the consolidate cron
     reads identities.yaml at fire time and threads canonical names

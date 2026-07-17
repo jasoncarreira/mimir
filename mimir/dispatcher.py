@@ -40,6 +40,7 @@ InjectCallback = Callable[[AgentEvent], Awaitable[None]]
 # raise into enqueue and must not block it.
 EventObserver = Callable[[AgentEvent], Awaitable[None]]
 PairingObserver = Callable[[AgentEvent, AccessDecision], Awaitable[None]]
+ChannelIdleCallback = Callable[[str], None]
 # Inbound user-message admission is fail-closed for bridge/external sources.
 # Only sources that are already authenticated/trusted by the server path bypass
 # the identity allowlist gate. ``web`` is covered by the API-key middleware on
@@ -105,6 +106,7 @@ class Dispatcher:
         # (the asyncio strong-ref gotcha, chainlink #118).
         self._on_event: EventObserver | None = None
         self._on_pairing_required: PairingObserver | None = None
+        self._on_channel_idle: ChannelIdleCallback | None = None
         self._bg_tasks: set[asyncio.Task] = set()
         self._queues: dict[str, asyncio.Queue[AgentEvent]] = {}
         self._workers: dict[str, asyncio.Task] = {}
@@ -161,6 +163,10 @@ class Dispatcher:
         ``enqueue``. It is best-effort and cannot queue a normal agent turn.
         """
         self._on_pairing_required = on_pairing_required
+
+    def set_on_channel_idle(self, on_channel_idle: ChannelIdleCallback) -> None:
+        """Late-bind cleanup for state keyed by retired channel IDs."""
+        self._on_channel_idle = on_channel_idle
 
     def _injection_enabled(self, channel_id: str) -> bool:
         """True iff ``channel_id`` opts into mid-turn message injection
@@ -513,6 +519,11 @@ class Dispatcher:
                     # reference to this queue while waiting on
                     # ``queue.join()`` (``self._closed``).
                     if not self._closed:
+                        if self._on_channel_idle is not None:
+                            try:
+                                self._on_channel_idle(channel_id)
+                            except Exception:
+                                log.exception("idle channel cleanup failed for %s", channel_id)
                         self._queues.pop(channel_id, None)
                         self._high_water_logged.pop(channel_id, None)
                         # CR2 completion: also pop the worker task entry.

@@ -90,6 +90,7 @@ class RawResult:
     backend_status: str
     error: str | None
     blocked_reason: str | None = None
+    output_overflow: bool = False
 
 
 class ToolBackend(Protocol):

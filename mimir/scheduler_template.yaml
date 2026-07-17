@@ -31,6 +31,7 @@
 #
 #   - saga-consolidate: nightly atom merge / synthesis pass
 #     (MIMIR_SAGA_CONSOLIDATE_CRON, default 04:00 daily).
+#   - saga-index-rebuild: hourly FAISS soft-removal threshold check.
 #   - introspection-report: weekly behavioral / health snapshot
 #     written to state/reports/ with algedonic emit on degraded
 #     heartbeat success rate (MIMIR_INTROSPECTION_REPORT_CRON,

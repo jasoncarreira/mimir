@@ -129,6 +129,8 @@ class SagaClient(Protocol):
         auth_context: Any = None,
     ) -> dict[str, Any]: ...
 
+    async def rebuild_index_if_needed(self) -> bool: ...
+
     async def recent_session_boundaries(
         self,
         *,
