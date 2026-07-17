@@ -289,12 +289,27 @@ async def _handle_event(request: web.Request) -> web.Response:
             {"error": "attachment_names must be an array"}, status=400,
         )
 
+    # Per-user HTTP attribution is server-owned. The request body is not an
+    # identity assertion and must not select another user's roles.
+    identity = request.get("auth_identity")
+    if identity is not None:
+        author = identity.canonical
+        author_display = identity.display_name
+        author_id = identity.canonical
+    else:
+        # Preserve master-key and dev/open automation compatibility. Neither
+        # path has a per-user identity to bind here.
+        author = body.get("author")
+        author_display = body.get("author_display")
+        author_id = body.get("author_id")
+
     event = AgentEvent(
         trigger=body.get("trigger", "user_message"),
         channel_id=channel_id,
         content=body.get("content", ""),
-        author=body.get("author"),
-        author_id=body.get("author_id"),
+        author=author,
+        author_display=author_display,
+        author_id=author_id,
         source_id=body.get("source_id"),
         source=body.get("source"),
         attachment_names=attachment_names or [],

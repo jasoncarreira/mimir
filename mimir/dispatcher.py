@@ -263,10 +263,10 @@ class Dispatcher:
     async def _authorize_bridge_event(self, event: AgentEvent) -> bool:
         """Gate external user messages before any admission side effect."""
         source = (event.source or "").strip().lower()
-        if event.trigger != "user_message":
+        is_http_ingress = self._is_http_ingress(event)
+        if event.trigger != "user_message" and not is_http_ingress:
             return True
 
-        is_http_ingress = self._is_http_ingress(event)
         if source in TRUSTED_INTERNAL_SOURCES:
             if is_http_ingress:
                 pass
