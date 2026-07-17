@@ -41,6 +41,23 @@ _OLD_ADMIN_TOOLS = {
     "edit_file",
 }
 
+_NEWLY_CATALOGED_TOOLS = {
+    "memory_store": OperationDecision.OPEN,
+    "memory_query": OperationDecision.OPEN,
+    "memory_get": OperationDecision.OPEN,
+    "saga_feedback": OperationDecision.OPEN,
+    "saga_mark_contributions": OperationDecision.OPEN,
+    "saga_end_session": OperationDecision.OPEN,
+    "saga_record_skill_learning": OperationDecision.OPEN,
+    "bash_jobs_list": OperationDecision.OPEN,
+    "bash_job_output": OperationDecision.ADMIN_REQUIRED,
+    "write_todos": OperationDecision.OPEN,
+    "defer_injected_message": OperationDecision.OPEN,
+    "commitment_complete": OperationDecision.OPEN,
+    "commitment_snooze": OperationDecision.OPEN,
+    "commitment_dismiss": OperationDecision.OPEN,
+}
+
 
 def _auth_context(
     *,
@@ -74,6 +91,17 @@ def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
     assert _OLD_ADMIN_TOOLS <= catalog._ADMIN_REQUIRED_OPERATIONS
     assert catalog.get_decision("mcp__mimir__shell_exec") == OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("mcp_mimir_shell_exec") == OperationDecision.ADMIN_REQUIRED
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    _NEWLY_CATALOGED_TOOLS.items(),
+)
+def test_routine_tools_have_explicit_catalog_decisions(
+    operation: str,
+    expected: OperationDecision,
+) -> None:
+    assert OperationCatalog().get_decision(operation) == expected
 
 
 @pytest.mark.parametrize("operation", ["spawn_open_code", "task"])
