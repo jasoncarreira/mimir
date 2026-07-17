@@ -13,6 +13,8 @@ from mimir.access_control import (
     AccessStatus,
     DenialReason,
     HTTP_EVENT_INGRESS_EXTRA_KEY,
+    OperationDecision,
+    ToolRegistry,
     authorize_action,
     authorize_inbound,
     create_auth_context,
@@ -129,6 +131,46 @@ def test_admin_action_follows_canonical_aliases_across_slack_discord(
     assert discord.canonical_author == "root"
     assert slack.roles == ("user", "admin")
     assert discord.roles == ("user", "admin")
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "memory_store",
+        "memory_query",
+        "memory_get",
+        "saga_feedback",
+        "saga_mark_contributions",
+        "saga_end_session",
+        "saga_record_skill_learning",
+        "bash_jobs_list",
+        "bash_job_output",
+        "write_todos",
+        "defer_injected_message",
+        "commitment_complete",
+        "commitment_snooze",
+        "commitment_dismiss",
+    ],
+)
+def test_admin_turn_can_use_routine_cataloged_tools_when_enforced(
+    tool_name: str,
+) -> None:
+    auth = AuthContext(
+        principal="slack-UADMIN",
+        canonical_principal="root",
+        roles=("user", "admin"),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+
+    result = ToolRegistry().authorize_tool(tool_name, auth, enforce=True)
+
+    assert result.allowed is True
+    assert result.decision is not OperationDecision.UNKNOWN
+    assert result.reason is None
 
 
 def test_legacy_default_allows_but_reports_would_deny_reason(

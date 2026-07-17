@@ -541,6 +541,19 @@ class OperationCatalog:
         "list_channels",
         "list_schedules",
         "commitment_list",
+        "memory_store",
+        "memory_query",
+        "memory_get",
+        "saga_feedback",
+        "saga_mark_contributions",
+        "saga_end_session",
+        "saga_record_skill_learning",
+        "bash_jobs_list",
+        "write_todos",
+        "defer_injected_message",
+        "commitment_complete",
+        "commitment_snooze",
+        "commitment_dismiss",
     })
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
@@ -555,6 +568,7 @@ class OperationCatalog:
         "worklink_run",
         "shell_exec",
         "bash_async",
+        "bash_job_output",
         "spawn_claude_code",
         "spawn_codex",
         "spawn_open_code",
