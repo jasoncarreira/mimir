@@ -6,9 +6,11 @@ import re
 from typing import Any, Literal
 
 from deepagents.middleware.filesystem import FilesystemPermission
+from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mimir.structured_output_retry import StructuredOutputRetryMiddleware
+from mimir.tools.budget_gate import BudgetGateMiddleware
 
 
 _SEVERITY_SYNONYMS = {
@@ -179,11 +181,17 @@ def readonly_filesystem_permissions() -> list[FilesystemPermission]:
 def build_mimir_subagents() -> list[dict]:
     """Build explicit Mimir subagent specs for ``create_deep_agent``.
 
-    The default DeepAgents ``general-purpose`` subagent is still auto-added because
-    this list intentionally does not include a spec named ``general-purpose``.
+    Both child agents explicitly carry the authorization/budget gate because
+    DeepAgents does not inherit the parent agent's middleware into subagents.
+    Registering ``general-purpose`` here suppresses its otherwise ungated
+    auto-added equivalent while preserving its standard prompt and tool inheritance.
     """
 
     return [
+        {
+            **GENERAL_PURPOSE_SUBAGENT,
+            "middleware": [BudgetGateMiddleware()],
+        },
         {
             "name": "critic-structured",
             "description": (
@@ -198,7 +206,10 @@ def build_mimir_subagents() -> list[dict]:
             # permissions below.
             "tools": [],
             "permissions": readonly_filesystem_permissions(),
-            "middleware": [StructuredOutputRetryMiddleware()],
+            "middleware": [
+                BudgetGateMiddleware(),
+                StructuredOutputRetryMiddleware(),
+            ],
             "response_format": CriticFindings,
         },
     ]

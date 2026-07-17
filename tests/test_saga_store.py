@@ -16,10 +16,6 @@ import pytest
 
 from mimir.models import AuthContext
 from mimir.saga.client import SagaStore
-from mimir.saga.ownership import AuthorizationScope
-
-
-ADMIN_SCOPE = AuthorizationScope(is_admin=True)
 ADMIN_AUTH = AuthContext(
     principal="test-admin",
     canonical_principal="test-admin",
@@ -29,6 +25,7 @@ ADMIN_AUTH = AuthContext(
     channel_id="test-channel",
     interactivity=None,
 )
+ADMIN_SCOPE = ADMIN_AUTH
 
 
 @pytest.fixture

@@ -10,12 +10,20 @@ from __future__ import annotations
 
 import pytest
 
+from mimir.models import AuthContext
 from mimir.saga.client import SagaStore
-from mimir.saga.ownership import AuthorizationScope
 from mimir.saga.vector_index import FAISS_AVAILABLE
 
 
-ADMIN_SCOPE = AuthorizationScope(is_admin=True)
+ADMIN_SCOPE = AuthContext(
+    principal="test-admin",
+    canonical_principal="test-admin",
+    roles=("admin",),
+    event_ingress="test",
+    trigger="test",
+    channel_id=None,
+    interactivity=None,
+)
 
 
 # Deterministic 4d "embedding" derived from text hash. Tests that need

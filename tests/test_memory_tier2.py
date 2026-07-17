@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from mimir.models import AuthContext
 from mimir.saga.mark_access import AccessEvent, mark_access
-from mimir.saga.ownership import AuthorizationScope
 from mimir.saga.observations import (
     HISTORICAL_WINDOW_DAYS, RECENT_WINDOW_DAYS, STALE_THRESHOLD_DAYS,
     classify_trend, find_superseded_observations, refresh_trend,
@@ -26,7 +26,15 @@ from mimir.saga.reflect import recent_session_boundaries, reflect
 from mimir.saga.store import store
 
 
-ADMIN_SCOPE = AuthorizationScope(is_admin=True)
+ADMIN_SCOPE = AuthContext(
+    principal="test-admin",
+    canonical_principal="test-admin",
+    roles=("admin",),
+    event_ingress="test",
+    trigger="test",
+    channel_id=None,
+    interactivity=None,
+)
 
 
 # ────────────────────────────────────────────────────────────────────

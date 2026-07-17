@@ -241,14 +241,18 @@ def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
     admin role. Tenant isolation is enforced on their outputs via #884 + #871.
 
     Args:
-        auth_context: AuthContext from mimir.models or similar
+        auth_context: Frozen, server-created ``mimir.models.AuthContext``
 
     Returns:
         AuthorizationScope with caller's authorization details
     """
-    if isinstance(auth_context, AuthorizationScope):
-        return auth_context
-    if auth_context is None:
+    from mimir.models import AuthContext
+
+    # AuthorizationScope is a query value object, not an authority carrier. It
+    # is publicly constructible, so accepting one here would let a caller assert
+    # is_admin/is_platform_service. Arbitrary duck-typed carriers fail closed for
+    # the same reason; read authority must come from the frozen server carrier.
+    if not isinstance(auth_context, AuthContext):
         return AuthorizationScope()
 
     from mimir.access_control import (

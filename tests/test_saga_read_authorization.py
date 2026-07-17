@@ -17,6 +17,7 @@ from mimir.saga.ownership import (
 )
 from mimir.saga.recall import recall
 from mimir.saga.store import store
+from mimir.saga.triples import detect_contradictions, get_current_value, get_history
 
 
 def _embed(_text: str) -> tuple[bytes, str, str, int]:
@@ -56,6 +57,57 @@ def test_missing_auth_context_is_public_only_and_never_admin() -> None:
     where, params = authorization_predicate(scope, table="a")
     assert "1=1" not in where
     assert params == [Visibility.PUBLIC.value]
+
+
+def test_public_authorization_scope_cannot_assert_read_authority() -> None:
+    scope = get_authorization_scope(
+        AuthorizationScope(
+            principal="user:attacker",
+            is_admin=True,
+            is_service=True,
+            is_platform_service=True,
+            readable_domains=("private",),
+        )
+    )
+
+    assert scope == AuthorizationScope()
+
+
+def test_world_state_readers_filter_cross_owner_rows(
+    conn: sqlite3.Connection,
+) -> None:
+    for value, valid_from, owner in (
+        ("alice-value", "2026-01-01", "user:alice"),
+        ("bob-value", "2026-02-01", "user:bob"),
+    ):
+        conn.execute(
+            "INSERT INTO world_state "
+            "(subject, predicate, value, valid_from, is_current, updated_at, "
+            "owner_principal, visibility) VALUES (?, ?, ?, ?, 1, ?, ?, 'private')",
+            ("Shared", "status", value, valid_from, valid_from, owner),
+        )
+    alice = AuthContext(
+        principal="alice",
+        canonical_principal="user:alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="channel",
+        interactivity=None,
+    )
+
+    current = get_current_value(
+        conn, "Shared", "status", auth_context=alice
+    )
+
+    assert current is not None
+    assert current.value == "alice-value"
+    assert [fact.value for fact in get_history(
+        conn, "Shared", "status", auth_context=alice
+    )] == ["alice-value"]
+    assert detect_contradictions(
+        conn, subject="Shared", auth_context=alice
+    ) == []
 
 
 def test_read_scope_uses_canonical_principal_for_owner_match() -> None:
@@ -168,14 +220,22 @@ def test_session_boundary_expansion_binds_authorization_before_limit(
     conn.commit()
 
     client = SagaStore(conn=conn, embedding_dim=4)
-    auth_scope = AuthorizationScope(principal="user:alice")
+    auth_context = AuthContext(
+        principal="alice",
+        canonical_principal="user:alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="channel",
+        interactivity=None,
+    )
     atom_ids = client._session_boundary_atom_pathway_with_conn(
         conn,
         "summary",
         limit=1,
         alpha=0.0,
         atoms_per_session=1,
-        auth_context=auth_scope,
+        auth_context=auth_context,
     )
 
     assert atom_ids == [first]

@@ -376,7 +376,7 @@ async def test_forgotten_source_atom_hides_derived_triples(client: SagaStore):
     assert retrieve_by_entity(
         conn,
         "Alice",
-        auth_context=AuthorizationScope(is_admin=True),
+        auth_context=_auth("admin", admin=True),
     )
 
     result = await client.forget(dry_run=False, auth_context=_auth("alice"))
@@ -386,7 +386,7 @@ async def test_forgotten_source_atom_hides_derived_triples(client: SagaStore):
         retrieve_by_entity(
             conn,
             "Alice",
-            auth_context=AuthorizationScope(is_admin=True),
+            auth_context=_auth("admin", admin=True),
         )
         == []
     )
