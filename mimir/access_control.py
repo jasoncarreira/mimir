@@ -196,11 +196,34 @@ def _configured_file_roots() -> list[Path]:
     return [Path(home), *(Path(path) for path, _mode in extra_roots)]
 
 
+def _configured_file_write_roots() -> list[Path]:
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home)
+    )
+    return [Path(home), *(Path(path) for path, mode in extra_roots if mode == "rw")]
+
+
 def _target_within_configured_roots(target: str, _destination: str) -> bool:
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
     try:
         resolve_within_roots(_configured_file_roots(), target)
+    except (OSError, PathOutsideHomeError):
+        return False
+    return True
+
+
+def _target_within_configured_write_roots(target: str, _destination: str) -> bool:
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    try:
+        resolve_within_roots(_configured_file_write_roots(), target)
     except (OSError, PathOutsideHomeError):
         return False
     return True
@@ -237,7 +260,7 @@ def _target_matches_shell_profile(target: str, destination: str) -> bool:
 
 
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
-    "configured_file_roots": _target_within_configured_roots,
+    "configured_file_roots": _target_within_configured_write_roots,
     "shell_profile": _target_matches_shell_profile,
     "spawn_workspace": _target_within_configured_roots,
 }

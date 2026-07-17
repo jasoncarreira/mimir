@@ -367,6 +367,41 @@ def test_service_file_policy_uses_live_file_tool_roots(
     assert decision.reason == "ifc_allowed"
 
 
+def test_service_file_policy_rejects_read_only_file_tool_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{workspace}:ro")
+    channel = "scheduled_tick:configured"
+    service = AuthContext(
+        principal="service:scheduler",
+        canonical_principal="scheduler",
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "write_file",
+        str(workspace / "result.txt"),
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
 @pytest.mark.parametrize(
     ("trigger", "canonical", "admitted_command"),
     [
