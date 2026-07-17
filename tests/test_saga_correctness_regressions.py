@@ -886,6 +886,33 @@ async def test_consolidate_skill_memories_removes_tombstoned_from_faiss_index(
                 f"dedup-tombstoned skill-learning {atom_id} still active in "
                 "FAISS — #425 (the #390 regression, per-skill pass)"
             )
+    assert not index._removed
+
+
+@pytest.mark.asyncio
+async def test_public_index_rebuild_check_runs_without_other_maintenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.saga.client import SagaStore
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "t.saga.db", embedding_dim=4)
+    atom_ids = []
+    for i in range(4):
+        result = await store.store(content=f"fact number {i}", stream="semantic")
+        atom_ids.append(result["atom_id"])
+    conn = store._ensure_conn()
+    index = store._ensure_index(conn)
+    assert index is not None
+
+    conn.execute("UPDATE atoms SET tombstoned = 1 WHERE id = ?", (atom_ids[0],))
+    conn.commit()
+    index.remove(atom_ids[0])
+
+    assert await store.rebuild_index_if_needed() is True
+    assert not index._removed
+    assert atom_ids[0] not in index._id_to_pos
 
 
 @pytest.mark.asyncio

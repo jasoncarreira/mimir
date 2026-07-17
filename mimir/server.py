@@ -861,6 +861,12 @@ def build_app(config: Config) -> web.Application:
         chat_skill_registry=chat_skill_registry,
     )
     dispatcher.set_run_turn(agent.run_turn)
+    dispatcher.set_on_channel_idle(
+        lambda channel_id: (
+            message_buffer.evict_channel(channel_id),
+            inbox.evict_channel(channel_id),
+        )
+    )
     # chainlink #376 (PR 4): record mid-turn injected messages in chat history at
     # inject time so they thread chronologically with the turn's mid-flight replies.
     dispatcher.set_on_inject(agent.on_message_injected)
@@ -1368,6 +1374,15 @@ def build_app(config: Config) -> web.Application:
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc))
             consolidate_registered = False
+
+        # Check FAISS soft-removal fragmentation independently of the
+        # consolidation and forgetting schedules.
+        try:
+            scheduler.add_saga_index_rebuild_job(saga_client)
+        except ValueError as exc:
+            await log_event(
+                "scheduler_invalid_cron", error=str(exc), job="saga-index-rebuild"
+            )
 
         # Register the daily index-integrity check (SPEC §8.3,
         # §16 item 16). Runs 30 min after saga-consolidate so any

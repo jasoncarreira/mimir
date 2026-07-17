@@ -37,9 +37,20 @@ class FakeProcess:
         self._stdout = stdout
         self._stderr = stderr
         self.killed = False
+        self.stdout = asyncio.StreamReader()
+        self.stdout.feed_data(stdout)
+        self.stdout.feed_eof()
+        self.stderr = asyncio.StreamReader()
+        self.stderr.feed_data(stderr)
+        self.stderr.feed_eof()
 
     async def communicate(self) -> tuple[bytes, bytes]:
         return self._stdout, self._stderr
+
+    async def wait(self) -> int:
+        while self.returncode is None:
+            await asyncio.sleep(0)
+        return self.returncode
 
     def kill(self) -> None:
         self.killed = True
@@ -150,15 +161,11 @@ async def test_codex_backend_maps_quota_and_auth_errors(
 async def test_codex_backend_enforces_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    process = FakeProcess(stdout=b"partial", stderr=b"")
+    process = FakeProcess(returncode=None, stdout=b"partial", stderr=b"")
     killed: list[FakeProcess] = []
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
         return process
-
-    async def fake_wait_for(awaitable: Any, *, timeout: float) -> Any:
-        awaitable.close()
-        raise TimeoutError
 
     async def fake_kill_process_group(proc: FakeProcess) -> None:
         killed.append(proc)
@@ -166,7 +173,6 @@ async def test_codex_backend_enforces_timeout(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
-    monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
     monkeypatch.setattr(compute_module, "_kill_process_group", fake_kill_process_group)
     order = WorkOrder(
         issue_id=440,
@@ -186,7 +192,7 @@ async def test_codex_backend_enforces_timeout(
     )
     compute = LocalSubprocessComputeBackend()
     handle = await compute.launch(spec)
-    compute_result = await compute.wait(handle, spec.timeout_s)
+    compute_result = await compute.wait(handle, 0.01)
     await compute.cleanup(handle)
     result = await CodexBackend().interpret(order, compute_result)
 
@@ -777,6 +783,57 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    process = FakeProcess(returncode=None, stdout=b"abcdefgh", stderr=b"err")
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr(compute_module, "MAX_WORKLINK_STDOUT_BYTES", 4)
+    backend = LocalSubprocessComputeBackend()
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="true",
+        backend="opencode",
+        timeout_s=5,
+        local_worktree=tmp_path,
+        local_argv=("opencode", "run"),
+    )
+
+    handle = await backend.launch(spec)
+    result = await backend.wait(handle, 5)
+
+    assert process.killed is True
+    assert result.stdout == "abcd"
+    assert result.stderr == "err"
+    assert result.output_overflow is True
+
+    order = WorkOrder(
+        issue_id=1,
+        worktree=tmp_path,
+        prompt="prompt",
+        rules=None,
+        timeout_s=5,
+        transcript_root=tmp_path / "transcripts",
+    )
+    raw = await OpenCodeBackend().interpret(order, result)
+    assert raw.transcript_path is not None
+    transcript = json.loads(raw.transcript_path.read_text(encoding="utf-8"))
+    assert transcript["stdout"] == "abcd"
+    assert transcript["output_overflow"] is True
 
 
 

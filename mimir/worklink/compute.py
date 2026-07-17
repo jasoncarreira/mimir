@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import signal
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 @dataclass(frozen=True)
@@ -72,6 +72,7 @@ class ComputeResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    output_overflow: bool = False
     launch_error: str | None = None
     handle: LaunchHandle | None = None
     command: tuple[str, ...] = ()
@@ -111,6 +112,29 @@ _LOCAL_ENV_CRED_PREFIXES = (
     "MINIMAX_", "OPENROUTER_", "GROQ_", "GEMINI_", "GOOGLE_",
     "VOYAGE_", "GITHUB_TOKEN", "GH_TOKEN",
 )
+
+MAX_WORKLINK_STDOUT_BYTES = 16 * 1024 * 1024
+MAX_WORKLINK_STDERR_BYTES = 1 * 1024 * 1024
+
+
+async def _drain_capped(
+    stream: asyncio.StreamReader | None,
+    limit: int,
+    on_overflow: Callable[[], None],
+) -> bytes:
+    """Retain at most ``limit`` bytes while always draining the pipe."""
+    if stream is None:
+        return b""
+    retained = bytearray()
+    overflowed = False
+    while chunk := await stream.read(64 * 1024):
+        remaining = limit - len(retained)
+        if remaining > 0:
+            retained.extend(chunk[:remaining])
+        if len(chunk) > remaining and not overflowed:
+            overflowed = True
+            on_overflow()
+    return bytes(retained)
 
 
 def _local_child_env() -> dict[str, str]:
@@ -186,12 +210,41 @@ class LocalSubprocessComputeBackend:
     async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
         proc, _spec, command = self._job(handle)
         timed_out = False
+        output_overflow = False
+        kill_task: asyncio.Task[None] | None = None
+
+        def overflow() -> None:
+            nonlocal output_overflow, kill_task
+            if output_overflow:
+                return
+            output_overflow = True
+            kill_task = asyncio.create_task(self.cancel(handle))
+
+        async def collect() -> tuple[bytes, bytes]:
+            stdout_task = asyncio.create_task(
+                _drain_capped(
+                    getattr(proc, "stdout", None), MAX_WORKLINK_STDOUT_BYTES, overflow
+                )
+            )
+            stderr_task = asyncio.create_task(
+                _drain_capped(
+                    getattr(proc, "stderr", None), MAX_WORKLINK_STDERR_BYTES, overflow
+                )
+            )
+            await getattr(proc, "wait")()
+            return await asyncio.gather(stdout_task, stderr_task)
+
+        collect_task = asyncio.create_task(collect())
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            stdout_b, stderr_b = await asyncio.wait_for(
+                asyncio.shield(collect_task), timeout=timeout_s
+            )
         except TimeoutError:
             timed_out = True
             await self.cancel(handle)
-            stdout_b, stderr_b = await proc.communicate()
+            stdout_b, stderr_b = await collect_task
+        if kill_task is not None:
+            await kill_task
 
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
@@ -201,6 +254,7 @@ class LocalSubprocessComputeBackend:
             stdout=stdout,
             stderr=stderr,
             timed_out=timed_out,
+            output_overflow=output_overflow,
             handle=handle,
             command=command,
         )

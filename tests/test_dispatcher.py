@@ -349,6 +349,8 @@ async def test_idle_worker_retires_and_cleans_up_per_channel_dicts(
         return None
 
     disp = Dispatcher(cfg, runner)
+    retired: list[str] = []
+    disp.set_on_channel_idle(retired.append)
     assert await disp.enqueue(
         AgentEvent(trigger="x", channel_id="c-ephemeral", content="hi"),
     )
@@ -362,6 +364,7 @@ async def test_idle_worker_retires_and_cleans_up_per_channel_dicts(
     # chainlink #255: _workers was missing from the CR2 cleanup — the
     # done() Task lingered forever for ephemeral channel_ids.
     assert "c-ephemeral" not in disp._workers
+    assert retired == ["c-ephemeral"]
     await disp.drain()
 
 

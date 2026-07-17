@@ -77,6 +77,10 @@ class SubagentInbox:
         """Non-destructive view (used by tests + the viewer in later phases)."""
         return list(self.by_channel.get(channel_id, []))
 
+    def evict_channel(self, channel_id: str) -> bool:
+        """Drop pending state for a channel whose dispatcher worker retired."""
+        return self.by_channel.pop(channel_id, None) is not None
+
 
 def render_subagent_updates(results: Iterable[SubagentResult]) -> str:
     """Format pending notifications as a turn-prompt section."""

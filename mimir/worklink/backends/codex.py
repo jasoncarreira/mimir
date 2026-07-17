@@ -73,6 +73,7 @@ class CodexBackend:
                 stdout=result.stdout,
                 stderr=result.stderr,
                 timed_out=False,
+                output_overflow=False,
             )
             return RawResult(-1, transcript_path, "backend_error", result.launch_error)
 
@@ -91,6 +92,7 @@ class CodexBackend:
             stdout=result.stdout,
             stderr=result.stderr,
             timed_out=result.timed_out,
+            output_overflow=result.output_overflow,
         )
         return RawResult(result.exit_code, transcript_path, status, error, blocked_reason)
 
@@ -130,6 +132,7 @@ def _write_transcript(
     stdout: str,
     stderr: str,
     timed_out: bool,
+    output_overflow: bool,
 ) -> None:
     payload = {
         "backend": "codex",
@@ -139,6 +142,7 @@ def _write_transcript(
         "stdout": stdout,
         "stderr": stderr,
         "timed_out": timed_out,
+        "output_overflow": output_overflow,
         "recorded_at": datetime.now(UTC).isoformat(),
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
