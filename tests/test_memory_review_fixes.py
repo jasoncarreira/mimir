@@ -157,7 +157,7 @@ async def test_most_retrieved_filters_contributed_only(client, monkeypatch):
     await client.query("beta", top_k=5, auth_context=ADMIN_SCOPE)
     await client.query("beta", top_k=5, auth_context=ADMIN_SCOPE)
     # Without filter: r2 has more events than r1 (store + 2 retrieval = 3 vs 2)
-    bare = await client.most_retrieved_atoms(days=7, count=5)
+    bare = await client.most_retrieved_atoms(days=7, count=5, auth_context=ADMIN_SCOPE)
     bare_ids = [a["id"] for a in bare]
     assert r2["atom_id"] in bare_ids
     # With contributed_only: r2 has zero feedback events; r1 has one.
@@ -165,6 +165,7 @@ async def test_most_retrieved_filters_contributed_only(client, monkeypatch):
         days=7,
         count=5,
         contributed_only=True,
+        auth_context=ADMIN_SCOPE,
     )
     contributed_ids = [a["id"] for a in contributed]
     assert r1["atom_id"] in contributed_ids
@@ -208,6 +209,7 @@ async def test_most_retrieved_filters_by_channel_id(client, monkeypatch):
         days=7,
         count=5,
         channel_id="CHAN_A",
+        auth_context=ADMIN_SCOPE,
     )
     assert aid in [x["id"] for x in a]
     # Channel B: no retrieval events tied to its session; the atom should NOT
@@ -216,6 +218,7 @@ async def test_most_retrieved_filters_by_channel_id(client, monkeypatch):
         days=7,
         count=5,
         channel_id="CHAN_B",
+        auth_context=ADMIN_SCOPE,
     )
     assert aid not in [x["id"] for x in b]
 

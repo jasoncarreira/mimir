@@ -144,6 +144,7 @@ class SagaClient(Protocol):
         channel_id: str | None = None,
         contributed_only: bool = False,
         trend: str | None = None,
+        auth_context: Any = None,
     ) -> list[dict[str, Any]]: ...
 
     async def health(self) -> bool: ...

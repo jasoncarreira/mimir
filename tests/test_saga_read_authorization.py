@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from mimir.access_control import create_auth_context
-from mimir.models import AgentEvent
+from mimir.models import AgentEvent, AuthContext
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import (
     AuthorizationScope,
@@ -431,3 +431,108 @@ def test_sentinel_principal_cannot_owner_match_own_rows(
     }
 
     assert my_row not in readable_ids
+def _store_with_access_event(
+    conn: sqlite3.Connection,
+    content: str,
+    *,
+    owner: str,
+    visibility: str,
+    domain: str | None = None,
+    agent_id: str,
+    source: str = "retrieval",
+) -> str:
+    atom_id = store(
+        conn,
+        content,
+        embed_fn=_embed,
+        owner_principal=owner,
+        visibility=visibility,
+        origin_domain=domain,
+    ).atom_id
+    conn.execute(
+        "INSERT INTO access_events (atom_id, session_id, ts, source) "
+        "VALUES (?, ?, ?, ?)",
+        (atom_id, "test-session", "2026-07-01T00:00:00+00:00", source),
+    )
+    conn.commit()
+    return atom_id
+
+
+@pytest.mark.asyncio
+async def test_most_retrieved_atoms_admin_sees_all(conn: sqlite3.Connection) -> None:
+    public = _store_with_access_event(
+        conn, "public atom", owner="user:alice", visibility="public", agent_id="test-agent",
+    )
+    private = _store_with_access_event(
+        conn, "private atom", owner="user:bob", visibility="private", agent_id="test-agent",
+    )
+    admin_auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="test",
+        channel_id=None,
+        interactivity=None,
+    )
+    client = SagaStore(conn=conn, embedding_dim=4)
+    result = await client.most_retrieved_atoms(
+        days=30,
+        count=10,
+        auth_context=admin_auth,
+    )
+    result_ids = {r["id"] for r in result}
+    assert public in result_ids
+    assert private in result_ids
+
+
+@pytest.mark.asyncio
+async def test_most_retrieved_atoms_scoped_principal_sees_only_authorized(
+    conn: sqlite3.Connection,
+) -> None:
+    public = _store_with_access_event(
+        conn, "public atom", owner="user:other", visibility="public", agent_id="test-agent",
+    )
+    private_owned = _store_with_access_event(
+        conn, "my private atom", owner="user:alice", visibility="private", agent_id="test-agent",
+    )
+    private_other = _store_with_access_event(
+        conn, "other private atom", owner="user:bob", visibility="private", agent_id="test-agent",
+    )
+    alice_auth = AuthContext(
+        principal="user:alice",
+        canonical_principal="user:alice",
+        roles=(),
+        event_ingress=None,
+        trigger="test",
+        channel_id=None,
+        interactivity=None,
+    )
+    client = SagaStore(conn=conn, embedding_dim=4)
+    result = await client.most_retrieved_atoms(
+        days=30,
+        count=10,
+        auth_context=alice_auth,
+    )
+    result_ids = {r["id"] for r in result}
+    assert public in result_ids
+    assert private_owned in result_ids
+    assert private_other not in result_ids
+
+
+@pytest.mark.asyncio
+async def test_most_retrieved_atoms_no_auth_sees_only_public(conn: sqlite3.Connection) -> None:
+    public = _store_with_access_event(
+        conn, "public atom", owner="user:other", visibility="public", agent_id="test-agent",
+    )
+    private = _store_with_access_event(
+        conn, "private atom", owner="user:bob", visibility="private", agent_id="test-agent",
+    )
+    client = SagaStore(conn=conn, embedding_dim=4)
+    result = await client.most_retrieved_atoms(
+        days=30,
+        count=10,
+    )
+    result_ids = {r["id"] for r in result}
+    assert public in result_ids
+    assert private not in result_ids
