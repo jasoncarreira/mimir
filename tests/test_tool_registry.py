@@ -42,13 +42,13 @@ _OLD_ADMIN_TOOLS = {
 }
 
 _NEWLY_CATALOGED_TOOLS = {
-    "memory_store": OperationDecision.OPEN,
+    "memory_store": OperationDecision.ADMIN_REQUIRED,
     "memory_query": OperationDecision.OPEN,
     "memory_get": OperationDecision.OPEN,
-    "saga_feedback": OperationDecision.OPEN,
-    "saga_mark_contributions": OperationDecision.OPEN,
-    "saga_end_session": OperationDecision.OPEN,
-    "saga_record_skill_learning": OperationDecision.OPEN,
+    "saga_feedback": OperationDecision.ADMIN_REQUIRED,
+    "saga_mark_contributions": OperationDecision.ADMIN_REQUIRED,
+    "saga_end_session": OperationDecision.ADMIN_REQUIRED,
+    "saga_record_skill_learning": OperationDecision.ADMIN_REQUIRED,
     "bash_jobs_list": OperationDecision.OPEN,
     "bash_job_output": OperationDecision.ADMIN_REQUIRED,
     "write_todos": OperationDecision.OPEN,
@@ -430,6 +430,38 @@ def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
     finally:
         _TRUSTED_SERVICE_PRINCIPALS.clear()
         _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+
+
+def test_capability_matrix_rejects_saga_mutation_without_sink_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    sinks = access_control._OPERATION_SINK_DESTINATION.copy()
+    sinks.pop("memory_store")
+    monkeypatch.setattr(access_control, "_OPERATION_SINK_DESTINATION", sinks)
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert "SAGA mutation 'memory_store' has no sink destination mapping" in errors
+
+
+def test_capability_matrix_rejects_open_saga_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    monkeypatch.setattr(
+        access_control.OperationCatalog,
+        "_OPEN_OPERATIONS",
+        access_control.OperationCatalog._OPEN_OPERATIONS | {"memory_store"},
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert "SAGA mutation 'memory_store' must not be cataloged OPEN" in errors
 
 
 @pytest.mark.parametrize("fail_closed", [True, False])

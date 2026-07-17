@@ -9,8 +9,11 @@ import pytest
 
 from mimir.access_control import (
     ServicePrincipal,
+    ToolRegistry,
     _TRUSTED_SERVICE_PRINCIPALS,
+    can_write_saga,
     get_provenance_from_auth_context,
+    get_service_principal,
 )
 from mimir.models import AuthContext
 from mimir.saga.client import SagaStore
@@ -41,6 +44,86 @@ def _service_auth(trigger: str, canonical: str) -> AuthContext:
         interactivity=None,
         is_service=True,
     )
+
+
+_SAGA_MUTATIONS = (
+    "memory_store",
+    "saga_feedback",
+    "saga_mark_contributions",
+    "saga_end_session",
+    "saga_record_skill_learning",
+    "saga_forget",
+)
+
+
+@pytest.mark.parametrize(
+    ("trigger", "allowed_operations"),
+    [
+        ("scheduled_tick", {"saga_forget"}),
+        ("poller", set()),
+        (
+            "saga_session_end",
+            {
+                "memory_store",
+                "saga_feedback",
+                "saga_mark_contributions",
+                "saga_end_session",
+                "saga_record_skill_learning",
+            },
+        ),
+        ("upgrade", set()),
+    ],
+)
+@pytest.mark.parametrize("operation", _SAGA_MUTATIONS)
+def test_saga_mutation_service_capability_matrix_matches_at_both_guards(
+    trigger: str,
+    allowed_operations: set[str],
+    operation: str,
+) -> None:
+    service = get_service_principal(trigger)
+    assert service is not None
+    auth_context = _service_auth(trigger, service.canonical)
+    expected = operation in allowed_operations
+
+    middleware = ToolRegistry().authorize_tool(
+        operation,
+        auth_context,
+        enforce=True,
+    )
+
+    assert middleware.allowed is expected
+    assert can_write_saga(auth_context, operation) is expected
+    if not expected:
+        assert middleware.reason == "admin_required"
+
+
+@pytest.mark.parametrize("operation", _SAGA_MUTATIONS)
+def test_saga_mutation_admin_allowed_and_regular_user_denied(operation: str) -> None:
+    assert can_write_saga(_auth("admin", admin=True), operation) is True
+    assert can_write_saga(_auth("alice"), operation) is False
+
+
+def test_saga_mutation_service_requires_declared_sink() -> None:
+    trigger = "test_missing_saga_sink"
+    _TRUSTED_SERVICE_PRINCIPALS[trigger] = ServicePrincipal(
+        canonical="missing-saga-sink",
+        trigger=trigger,
+        capabilities=("memory_store",),
+        readable_domains=("saga",),
+        sink_destinations=(),
+        creation_path="test",
+    )
+    try:
+        auth_context = _service_auth(trigger, "missing-saga-sink")
+        middleware = ToolRegistry().authorize_tool(
+            "memory_store", auth_context, enforce=True
+        )
+
+        assert middleware.allowed is False
+        assert middleware.reason == "admin_required"
+        assert can_write_saga(auth_context, "memory_store") is False
+    finally:
+        _TRUSTED_SERVICE_PRINCIPALS.pop(trigger, None)
 
 
 @pytest.fixture
