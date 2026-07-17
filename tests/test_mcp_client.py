@@ -1136,3 +1136,243 @@ class TestWrapperMetadataLoss:
         config = MCPServerConfig(name="test", command="x", args=[])
         result = check_tool_drift(FakeTool(), config, "ping", {})
         assert result is None
+
+
+class TestProductionMCPPolicyWiring:
+    """Durable policy is applied by the same manager path production uses."""
+
+    @staticmethod
+    def _config(*, schema: dict | None = None) -> MCPServerConfig:
+        from mimir.mcp_client import _canonical_config_digest, _schema_digest
+
+        schema = schema or {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repository": {"type": "string"},
+            },
+            "required": ["owner", "repository"],
+        }
+        base = MCPServerConfig(name="github", command="x", args=[])
+        return MCPServerConfig.from_dict({
+            "name": "github",
+            "command": "x",
+            "server_config_id": "github-production",
+            "policy_version": "policy-v1",
+            "adapters": [{
+                "name": "github-owner",
+                "version": "adapter-v1",
+                "policy_version": "policy-v1",
+                "owner_argument": "owner",
+                "resource_argument": "repository",
+                "source": True,
+            }],
+            "tool_policies": [{
+                "tool_name": "get_repository",
+                "classification": "resource_scoped",
+                "adapter_name": "github-owner",
+                "adapter_version": "adapter-v1",
+                "approval_version": "approval-v1",
+                "policy_version": "policy-v1",
+                "config_digest": _canonical_config_digest(base),
+                "schema_digest": _schema_digest(schema),
+            }],
+        })
+
+    @pytest.mark.asyncio
+    async def test_manager_applies_policy_and_preserves_identity_on_restart(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from contextlib import AsyncExitStack
+        from mimir.mcp_client import (
+            MCPConnection,
+            MCPManager,
+            clear_mcp_adapter_registry,
+            get_tool_provenance,
+        )
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repository": {"type": "string"},
+            },
+            "required": ["owner", "repository"],
+        }
+
+        class Tool:
+            name = "get_repository"
+            description = ""
+            inputSchema = schema
+
+        class Session:
+            async def list_tools(self):  # type: ignore[no-untyped-def]
+                return type("Result", (), {"tools": [Tool()]})()
+
+        async def connect(_manager, config):  # type: ignore[no-untyped-def]
+            return MCPConnection(config, Session(), AsyncExitStack())
+
+        clear_mcp_adapter_registry()
+        monkeypatch.setattr(MCPManager, "_connect", connect)
+        config = self._config(schema=schema)
+        first = await MCPManager().start_servers([config])
+        second = await MCPManager().start_servers([config])
+
+        first_provenance = get_tool_provenance(first[0])
+        second_provenance = get_tool_provenance(second[0])
+        assert first_provenance is not None
+        assert second_provenance is not None
+        assert first_provenance.server_config_id == "github-production"
+        assert second_provenance.server_config_id == first_provenance.server_config_id
+        assert first_provenance.classification == "resource_scoped"
+        assert first_provenance.is_tombstoned is False
+
+    @pytest.mark.asyncio
+    async def test_discovery_marks_schema_drift_stale(self) -> None:
+        from contextlib import AsyncExitStack
+        from mimir.mcp_client import MCPConnection, get_tool_provenance, validate_mcp_policy
+
+        approved_schema = {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repository": {"type": "string"},
+            },
+            "required": ["owner", "repository"],
+        }
+        changed_schema = {**approved_schema, "required": ["repository"]}
+
+        class Tool:
+            name = "get_repository"
+            description = ""
+            inputSchema = changed_schema
+
+        class Session:
+            async def list_tools(self):  # type: ignore[no-untyped-def]
+                return type("Result", (), {"tools": [Tool()]})()
+
+        tools = await MCPConnection(
+            self._config(schema=approved_schema), Session(), AsyncExitStack()
+        ).discover_tools()
+        provenance = get_tool_provenance(tools[0])
+        assert provenance is not None and provenance.is_tombstoned
+        assert validate_mcp_policy(tools)[0]["reason"] == "drift"
+
+    @pytest.mark.parametrize(
+        ("arguments", "allowed", "reason"),
+        [
+            ({"owner": "alice", "repository": "repo-1"}, True, None),
+            ({"owner": "bob", "repository": "repo-1"}, False, "mcp_wrong_owner"),
+            ({"owner": "alice", "repository": "*"}, False, "mcp_resource_wildcard"),
+            ({"owner": "alice", "repository": ["a", "b"]}, False, "mcp_resource_unknown"),
+            ({"owner": "alice"}, False, "mcp_resource_unknown"),
+        ],
+    )
+    def test_argument_resource_authorization(
+        self, arguments: dict, allowed: bool, reason: str | None,
+    ) -> None:
+        from mimir.access_control import ToolRegistry
+        from mimir.mcp_client import (
+            MCPProvenance,
+            _bridge_mcp_tool,
+            clear_mcp_adapter_registry,
+            register_configured_mcp_adapters,
+        )
+        from mimir.models import AuthContext
+
+        config = self._config()
+        register_configured_mcp_adapters([config])
+        policy = config.tool_policies[0]
+        provenance = replace(
+            MCPProvenance.create(
+                config, "get_repository", {
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string"},
+                        "repository": {"type": "string"},
+                    },
+                    "required": ["owner", "repository"],
+                },
+                server_config_id=config.server_config_id,
+            ),
+            classification=policy.classification,
+            adapter_name=policy.adapter_name,
+            adapter_version=policy.adapter_version,
+            approval_version=policy.approval_version,
+            policy_version=policy.policy_version,
+        )
+        tool = _bridge_mcp_tool(
+            server_name="github",
+            tool_name="get_repository",
+            description="",
+            input_schema={},
+            session=object(),
+            provenance=provenance,
+        )
+        context = AuthContext(
+            principal="alice",
+            canonical_principal="alice",
+            roles=("user",),
+            event_ingress="bridge",
+            trigger="user_message",
+            channel_id="ch-1",
+            interactivity=None,
+            enforcement_enabled=True,
+        )
+        authorization = ToolRegistry().authorize_tool(
+            tool.name,
+            context,
+            enforce=True,
+            mcp_tool=tool,
+            arguments=arguments,
+        )
+        assert authorization.allowed is allowed
+        assert authorization.reason == reason
+        clear_mcp_adapter_registry()
+
+    def test_missing_adapter_and_exception_fail_closed(self) -> None:
+        from mimir.access_control import ToolRegistry
+        from mimir.mcp_client import (
+            MCPProvenance,
+            _bridge_mcp_tool,
+            clear_mcp_adapter_registry,
+            register_mcp_adapter,
+        )
+        from mimir.models import AuthContext
+
+        config = self._config()
+        policy = config.tool_policies[0]
+        provenance = replace(
+            MCPProvenance.create(config, "get_repository", {}, server_config_id=config.server_config_id),
+            classification=policy.classification,
+            adapter_name=policy.adapter_name,
+            adapter_version=policy.adapter_version,
+            approval_version=policy.approval_version,
+            policy_version=policy.policy_version,
+        )
+        tool = _bridge_mcp_tool(
+            server_name="github", tool_name="get_repository", description="",
+            input_schema={}, session=object(), provenance=provenance,
+        )
+        context = AuthContext(
+            principal="alice", canonical_principal="alice", roles=("user",),
+            event_ingress="bridge", trigger="user_message", channel_id="ch-1",
+            interactivity=None, enforcement_enabled=True,
+        )
+        clear_mcp_adapter_registry()
+        missing = ToolRegistry().authorize_tool(
+            tool.name, context, enforce=True, mcp_tool=tool,
+            arguments={"owner": "alice", "repository": "repo-1"},
+        )
+        assert missing.reason == "mcp_missing_adapter"
+
+        def explode(_request):  # type: ignore[no-untyped-def]
+            raise RuntimeError("secret must not authorize")
+
+        register_mcp_adapter("github-owner", "adapter-v1", "policy-v1", explode)
+        failed = ToolRegistry().authorize_tool(
+            tool.name, context, enforce=True, mcp_tool=tool,
+            arguments={"owner": "alice", "repository": "repo-1"},
+        )
+        assert failed.reason == "mcp_adapter_exception"
+        clear_mcp_adapter_registry()

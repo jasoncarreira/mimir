@@ -69,6 +69,126 @@ def _make_request(
     )
 
 
+@pytest.mark.asyncio
+async def test_mcp_resource_adapter_runs_before_remote_handler() -> None:
+    from dataclasses import replace
+
+    from mimir.mcp_client import (
+        MCPAdapterConfig,
+        MCPProvenance,
+        MCPServerConfig,
+        _bridge_mcp_tool,
+        clear_mcp_adapter_registry,
+        register_configured_mcp_adapters,
+    )
+
+    config = MCPServerConfig(
+        name="github",
+        command="x",
+        args=[],
+        server_config_id="github-production",
+        policy_version="policy-v1",
+        adapters=(MCPAdapterConfig(
+            name="github-owner",
+            version="adapter-v1",
+            policy_version="policy-v1",
+            resource_argument="repository",
+            owner_argument="owner",
+            source=True,
+        ),),
+    )
+    provenance = replace(
+        MCPProvenance.create(
+            config,
+            "get_repository",
+            {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repository": {"type": "string"},
+                },
+                "required": ["owner", "repository"],
+            },
+            server_config_id=config.server_config_id,
+        ),
+        classification="resource_scoped",
+        adapter_name="github-owner",
+        adapter_version="adapter-v1",
+        approval_version="approval-v1",
+        policy_version="policy-v1",
+    )
+    tool = _bridge_mcp_tool(
+        server_name="github",
+        tool_name="get_repository",
+        description="",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repository": {"type": "string"},
+            },
+            "required": ["owner", "repository"],
+        },
+        session=object(),
+        provenance=provenance,
+    )
+    context = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress="bridge",
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+    handler_calls = 0
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    def request(call_id: str, arguments: dict[str, Any]) -> ToolCallRequest:
+        return ToolCallRequest(
+            tool_call={
+                "name": tool.name,
+                "args": arguments,
+                "id": call_id,
+                "type": "tool_call",
+            },
+            tool=tool,
+            state=None,
+            runtime=Runtime(context=context),
+        )
+
+    clear_mcp_adapter_registry()
+    register_configured_mcp_adapters([config])
+    middleware = BudgetGateMiddleware()
+    try:
+        valid = await middleware.awrap_tool_call(
+            request("valid", {"owner": "alice", "repository": "repo-1"}),
+            handler,
+        )
+        wrong_owner = await middleware.awrap_tool_call(
+            request("wrong", {"owner": "bob", "repository": "repo-1"}),
+            handler,
+        )
+        malformed = await middleware.awrap_tool_call(
+            request("malformed", {"owner": "alice", "repository": ["repo-1"]}),
+            handler,
+        )
+    finally:
+        clear_mcp_adapter_registry()
+
+    assert valid.content == "ok"
+    assert wrong_owner.status == "error"
+    assert "mcp_wrong_owner" in str(wrong_owner.content)
+    assert malformed.status == "error"
+    assert "mcp_malformed_arguments" in str(malformed.content)
+    assert handler_calls == 1
+
+
 def _ifc_labels(
     channel: str = "ch-1",
     *,

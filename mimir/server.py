@@ -1341,9 +1341,16 @@ def build_app(config: Config) -> web.Application:
         # mimir.tools.mcp setter. A single server failing to start is
         # logged + skipped — the agent still boots with native tools.
         # Lifecycle owner stored on app so _on_cleanup can shut it down.
+        from .tools import set_mcp_tools
+
+        set_mcp_tools([])
         if config.mcp_servers:
-            from .mcp_client import MCPManager
-            from .tools import set_mcp_tools
+            from .mcp_client import (
+                MCPManager,
+                check_stale_policy_on_startup,
+                get_tool_provenance,
+                validate_mcp_policy,
+            )
 
             mcp_manager = MCPManager()
             try:
@@ -1353,12 +1360,33 @@ def build_app(config: Config) -> web.Application:
                 mcp_tools = []
                 await mcp_manager.shutdown()
                 mcp_manager = None
+            set_mcp_tools(mcp_tools)
             if mcp_tools:
-                set_mcp_tools(mcp_tools)
                 await log_event(
                     "mcp_servers_ready",
                     count=len(mcp_tools),
                     tool_names=[t.name for t in mcp_tools],
+                )
+            policy_issues = validate_mcp_policy(mcp_tools)
+            for mcp_config in config.mcp_servers:
+                if not mcp_config.policy_version:
+                    continue
+                matching_tools = [
+                    tool for tool in mcp_tools
+                    if (
+                        (provenance := get_tool_provenance(tool)) is not None
+                        and provenance.server_config_id == mcp_config.server_config_id
+                    )
+                ]
+                policy_issues.extend(check_stale_policy_on_startup(
+                    matching_tools,
+                    mcp_config.policy_version,
+                ))
+            if policy_issues:
+                await log_event(
+                    "mcp_policy_attention_required",
+                    count=len(policy_issues),
+                    issues=policy_issues,
                 )
             app["mcp_manager"] = mcp_manager
 

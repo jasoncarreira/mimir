@@ -268,6 +268,23 @@ def _extract_channel_from_args(
     return auth_context.channel_id if auth_context is not None else None
 
 
+def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
+    """Validate and normalize the concrete call arguments before authz."""
+    tool_call = getattr(request, "tool_call", None) or {}
+    arguments = tool_call.get("args", {})
+    if not isinstance(arguments, dict):
+        return None
+    tool = getattr(request, "tool", None)
+    schema = getattr(tool, "args_schema", None)
+    if schema is None:
+        return dict(arguments)
+    try:
+        validated = schema.model_validate(arguments)
+    except Exception:
+        return None
+    return validated.model_dump(exclude_unset=False)
+
+
 _IFC_DELEGATION_TOOLS = frozenset({
     "task",
     "spawn_claude_code",
@@ -378,6 +395,8 @@ def _check_admin_authorized(
     ctx: Any | None = None,
     target_channel: str | None = None,
     ifc_labels: Any = None,
+    mcp_tool: Any = None,
+    arguments: dict[str, Any] | None = None,
 ) -> str | None:
     enforce = (
         bool(getattr(ctx, "enforcement_enabled", False))
@@ -385,7 +404,13 @@ def _check_admin_authorized(
         else _env_access_control_enforced()
     )
     auth = get_tool_registry().authorize_tool(
-        tool_name, ctx, enforce=enforce, target_channel=target_channel, ifc_labels=ifc_labels
+        tool_name,
+        ctx,
+        enforce=enforce,
+        target_channel=target_channel,
+        ifc_labels=ifc_labels,
+        mcp_tool=mcp_tool,
+        arguments=arguments,
     )
     # Generic HTTP credentials authenticate transport only.  Check operation
     # class before compatibility-mode shadow allowances: resource-scoped and
@@ -521,7 +546,12 @@ class BudgetGateMiddleware(AgentMiddleware):
             ifc_labels = getattr(auth_context, "ifc_labels", None)
 
         admin_denial = _check_admin_authorized(
-            tool_name, auth_context, target_channel, ifc_labels
+            tool_name,
+            auth_context,
+            target_channel,
+            ifc_labels,
+            getattr(request, "tool", None),
+            _validated_arguments(request),
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
@@ -607,7 +637,12 @@ class BudgetGateMiddleware(AgentMiddleware):
             ifc_labels = getattr(auth_context, "ifc_labels", None)
 
         admin_denial = _check_admin_authorized(
-            tool_name, auth_context, target_channel, ifc_labels
+            tool_name,
+            auth_context,
+            target_channel,
+            ifc_labels,
+            getattr(request, "tool", None),
+            _validated_arguments(request),
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
