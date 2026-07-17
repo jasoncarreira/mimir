@@ -937,3 +937,39 @@ def test_seeds_state_gitignore(tmp_path, monkeypatch):
     gi.write_text("operator-custom\n")
     poller._seed_state_gitignore()  # write-if-missing → not clobbered
     assert gi.read_text() == "operator-custom\n"
+
+
+def test_scratch_cleanup_rule_on_repo_work_events(monkeypatch):
+    """Poller-driven repo work must clean up its scratch clone — the
+    per-event leftovers reached 140 GB on a live home. The rule rides
+    every repo-work event type; informational events stay clean."""
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.delenv("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL", raising=False)
+
+    poller._emit(
+        "New PR on o/r: #1 t (by @a)",
+        event_type="pr_opened", repo="o/r", number=1,
+    )
+    poller._emit(
+        "Review posted on your PR #2",
+        event_type="pr_review", repo="o/r", number=2,
+    )
+    poller._emit(
+        "New issue on o/r: #3",
+        event_type="issue_opened", repo="o/r", number=3,
+    )
+
+    pr_opened, pr_review, issue_opened = captured
+    assert "SCRATCH CLEANUP RULE" in pr_opened["prompt"]
+    assert "REVIEW SUBMISSION RULE" in pr_opened["prompt"]
+    # Cleanup rule precedes the submission rule so it survives any
+    # downstream tail truncation.
+    assert (
+        pr_opened["prompt"].index("SCRATCH CLEANUP RULE")
+        < pr_opened["prompt"].index("REVIEW SUBMISSION RULE")
+    )
+    # Own-PR revision work clones too — cleanup rule, no submission rule.
+    assert "SCRATCH CLEANUP RULE" in pr_review["prompt"]
+    assert "REVIEW SUBMISSION RULE" not in pr_review["prompt"]
+    # Informational events don't get the rule.
+    assert "SCRATCH CLEANUP RULE" not in issue_opened["prompt"]

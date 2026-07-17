@@ -174,3 +174,24 @@ def test_parse_vsm_config_user_override_wins_over_bundled(tmp_path: Path):
     )
     vsm = parse_vsm_config(tmp_path, "critic")
     assert vsm == {"s3_tool_budget": 999, "s4_foresight": True}
+
+
+@pytest.mark.asyncio
+async def test_inbox_push_caps_summary_at_store_time():
+    """Stored results linger until the channel's next turn (possibly
+    forever) — cap the summary at push, not just at render."""
+    from mimir.subagent_inbox import MAX_SUMMARY_BYTES
+
+    inbox = SubagentInbox()
+    await inbox.push(
+        "ch",
+        SubagentResult(
+            task_id="t",
+            status="completed",
+            summary="x" * (MAX_SUMMARY_BYTES * 3),
+            output_file=None,
+        ),
+    )
+    (stored,) = inbox.peek("ch")
+    assert stored.summary.endswith("…[truncated]")
+    assert len(stored.summary) == MAX_SUMMARY_BYTES + len("…[truncated]")

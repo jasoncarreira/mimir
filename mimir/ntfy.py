@@ -186,6 +186,15 @@ async def post_algedonic_alarm(
         # feedback layer means events.jsonl carries one record per
         # successful send but only the latest renders.
         _LAST_POST[dedupe_key] = now
+        # Prune entries far older than any plausible dedup window so the
+        # per-process table can't grow without bound if a caller mints
+        # non-repeating dedupe keys.
+        stale = [
+            key for key, ts in _LAST_POST.items()
+            if (now - ts).total_seconds() > 7 * 86400
+        ]
+        for key in stale:
+            del _LAST_POST[key]
         await log_event(
             "ntfy_post_ok",
             category=category,

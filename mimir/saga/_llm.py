@@ -57,6 +57,12 @@ from mimir._llm_retry import _retry_async, _retry_sync
 
 log = logging.getLogger(__name__)
 
+# Reused across calls. A fresh ``Anthropic()`` per call is reclaimed by GC
+# (no leak) but rebuilds an httpx pool + SSL context ~17k times/month on a
+# busy deployment — pure allocator churn. Config is stable per process, so
+# key cardinality is ~1; keyed on (api_key, timeout) for correctness.
+_ANTHROPIC_CLIENTS: dict[tuple[str, Any], Any] = {}
+
 
 def _call_anthropic(
     llm: dict[str, Any], *,
@@ -78,7 +84,11 @@ def _call_anthropic(
             temperature=temperature, system=system,
         )
 
-    client = Anthropic(api_key=api_key, timeout=llm.get("timeout", 30))
+    cache_key = (api_key, llm.get("timeout", 30))
+    client = _ANTHROPIC_CLIENTS.get(cache_key)
+    if client is None:
+        client = Anthropic(api_key=api_key, timeout=llm.get("timeout", 30))
+        _ANTHROPIC_CLIENTS[cache_key] = client
     try:
         msg = client.messages.create(
             model=llm.get("model") or "claude-haiku-4-5",

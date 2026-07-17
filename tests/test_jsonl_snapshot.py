@@ -330,3 +330,43 @@ def test_saturated_clears_when_file_shrinks_under_cap(tmp_path: Path):
     _bump_mtime(path)
     snap.records()
     assert snap.saturated is False
+
+
+# ── byte budget ──────────────────────────────────────────────────────
+
+
+def test_byte_budget_caps_tail_and_sets_saturated(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    _write_jsonl(path, [{"i": i, "pad": "z" * 1000} for i in range(50)])
+
+    snap = JsonlSnapshot(path, max_bytes=5000)
+    out = snap.records()
+
+    assert 0 < len(out) < 50
+    assert out[0]["i"] == 49  # newest-first: newest kept, oldest dropped
+    assert snap.saturated is True
+
+
+def test_byte_budget_admits_newest_record_even_if_oversized(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    _write_jsonl(
+        path,
+        [{"i": 0, "pad": "z" * 10_000}, {"i": 1, "pad": "z" * 10_000}],
+    )
+
+    snap = JsonlSnapshot(path, max_bytes=100)
+    out = snap.records()
+
+    # The count guard admits the newest record before the budget check,
+    # so the snapshot is never empty for a non-empty file.
+    assert [r["i"] for r in out] == [1]
+    assert snap.saturated is True
+
+
+def test_default_byte_budget_leaves_small_files_unsaturated(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    _write_jsonl(path, [{"i": i} for i in range(5)])
+
+    snap = JsonlSnapshot(path)
+    assert len(snap.records()) == 5
+    assert snap.saturated is False

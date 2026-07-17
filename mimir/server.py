@@ -1391,6 +1391,19 @@ def build_app(config: Config) -> web.Application:
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc), job="worklink-reaper")
 
+        # Scratch retention janitor: scratch/ is ephemeral by contract
+        # (config.py writable-dirs table) but nothing deleted it — poller-
+        # driven per-task clones left a live home with 140 GB in six weeks.
+        # Default-ON daily sweep; opt out with MIMIR_SCRATCH_JANITOR_CRON=""
+        # or MIMIR_SCRATCH_TTL_DAYS=0. Bad cron logs and continues.
+        try:
+            scheduler.add_scratch_janitor_job(
+                home=config.home,
+                cron_expr=os.environ.get("MIMIR_SCRATCH_JANITOR_CRON", "13 4 * * *"),
+            )
+        except ValueError as exc:
+            await log_event("scheduler_invalid_cron", error=str(exc), job="scratch-janitor")
+
         # Resume Worklink runs orphaned by a restart (#561). After the #832
         # substrate cleanup local_subprocess is the only Worklink compute and
         # its runs die with the controller, so no run state is persisted today

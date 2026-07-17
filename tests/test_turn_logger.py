@@ -1156,3 +1156,51 @@ def test_multiple_thinking_blocks_preserve_order():
         if e.get("source") == "model_thinking_block"
     ]
     assert thinking_texts == ["first thought", "second thought"]
+
+
+# ── record-size caps (args + reasoning) ──────────────────────────────
+
+
+def test_tool_call_args_and_reasoning_capped():
+    """Unbounded args (full write_file bodies) and reasoning drove turn
+    records past 600 KB — and the retained turns.jsonl tail lives parsed
+    in RAM via JsonlSnapshot, so record size is resident-set size."""
+    from mimir.turn_logger import MAX_REASONING_BYTES, MAX_TOOL_ARGS_BYTES
+
+    big_think = "y" * (MAX_REASONING_BYTES * 2)
+    big_body = "x" * (MAX_TOOL_ARGS_BYTES * 3)
+    msgs = [
+        AIMessage(
+            content=big_think,
+            tool_calls=[
+                {"id": "tc_1", "name": "write_file", "args": {"content": big_body}},
+            ],
+        ),
+        AIMessage(content="done"),
+    ]
+    events, output = extract_turn_events(msgs)
+
+    reason = next(e for e in events if e["type"] == "reasoning")
+    assert len(reason["content"]) == MAX_REASONING_BYTES + len("…[truncated]")
+    assert reason["content"].endswith("…[truncated]")
+
+    tc = next(e for e in events if e["type"] == "tool_call")
+    assert tc["args"]["truncated"] is True
+    assert tc["args"]["bytes"] > MAX_TOOL_ARGS_BYTES
+    assert tc["args"]["preview"].endswith("…[truncated]")
+    assert output == "done"
+
+
+def test_small_args_and_reasoning_pass_through_unmodified():
+    msgs = [
+        AIMessage(
+            content="thinking a bit",
+            tool_calls=[{"id": "tc_1", "name": "ls", "args": {"path": "/x"}}],
+        ),
+        AIMessage(content="done"),
+    ]
+    events, _ = extract_turn_events(msgs)
+    reason = next(e for e in events if e["type"] == "reasoning")
+    assert reason["content"] == "thinking a bit"
+    tc = next(e for e in events if e["type"] == "tool_call")
+    assert tc["args"] == {"path": "/x"}

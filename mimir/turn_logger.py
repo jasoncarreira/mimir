@@ -35,8 +35,43 @@ from .models import TurnRecord
 log = logging.getLogger(__name__)
 
 MAX_TOOL_RESULT_BYTES = 4 * 1024
+MAX_TOOL_ARGS_BYTES = 4 * 1024
+MAX_REASONING_BYTES = 16 * 1024
 MAX_INPUT_BYTES = 2 * 1024
 DEFAULT_MAX_TURNS = 1000
+
+
+def _cap_reasoning(text: str) -> str:
+    """Cap reasoning content the same way tool results are capped.
+
+    Unbounded thinking blocks (plus unbounded tool args) drove single
+    turn records past 600 KB — and the retained turns.jsonl tail lives
+    parsed in RAM via ``JsonlSnapshot``, so record size is directly
+    resident-set size on a long-running deployment.
+    """
+    if len(text) > MAX_REASONING_BYTES:
+        return text[:MAX_REASONING_BYTES] + "…[truncated]"
+    return text
+
+
+def _cap_args(args: Any) -> Any:
+    """Cap tool-call args, which can embed entire file bodies
+    (``write_file``/``edit_file``). Above the cap the structure is
+    replaced with a JSON preview — turns.jsonl is an audit log, not the
+    tool transport, and results were already capped this way."""
+    if args is None:
+        return None
+    try:
+        blob = json.dumps(args, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        blob = repr(args)
+    if len(blob) <= MAX_TOOL_ARGS_BYTES:
+        return args
+    return {
+        "truncated": True,
+        "bytes": len(blob),
+        "preview": blob[:MAX_TOOL_ARGS_BYTES] + "…[truncated]",
+    }
 
 
 def truncate_input(prompt: str) -> str:
@@ -197,7 +232,7 @@ def extract_turn_events(
                 events.append({
                     "type": "reasoning",
                     "source": "model_thinking_block",
-                    "content": _think_text,
+                    "content": _cap_reasoning(_think_text),
                 })
             content_text = _coerce_content(msg.content)
             # ChatClaudeCode executes tools inside the ``claude`` CLI
@@ -239,10 +274,10 @@ def extract_turn_events(
             if tool_events:
                 is_final_ai = i == last_ai_idx
                 if content_text and not is_final_ai:
-                    events.append({"type": "reasoning", "content": content_text})
+                    events.append({"type": "reasoning", "content": _cap_reasoning(content_text)})
                 elif content_text:
                     output_parts.append(content_text)
-                    events.append({"type": "reasoning", "content": content_text})
+                    events.append({"type": "reasoning", "content": _cap_reasoning(content_text)})
                 for te in tool_events:
                     te_type = te.get("type")
                     if te_type == "tool_call":
@@ -250,7 +285,7 @@ def extract_turn_events(
                             "type": "tool_call",
                             "id": te.get("tool_use_id", ""),
                             "name": te.get("name", "unknown"),
-                            "args": te.get("input"),
+                            "args": _cap_args(te.get("input")),
                         })
                     elif te_type == "tool_result":
                         # Use ``is not None`` rather than truthiness so an
@@ -295,7 +330,7 @@ def extract_turn_events(
             is_final_ai = i == last_ai_idx
             if content_text and tcs and not is_final_ai:
                 # Intermediate "thinking out loud" between tool calls.
-                events.append({"type": "reasoning", "content": content_text})
+                events.append({"type": "reasoning", "content": _cap_reasoning(content_text)})
             elif content_text:
                 # Either a text-only AIMessage OR the final AIMessage
                 # (whose content is the agent's answer even if it also
@@ -307,13 +342,13 @@ def extract_turn_events(
                     # commentary on the final AIMessage. The output
                     # field carries the user-visible reply; this gives
                     # operators the full picture in the turn log.
-                    events.append({"type": "reasoning", "content": content_text})
+                    events.append({"type": "reasoning", "content": _cap_reasoning(content_text)})
             for tc in tcs:
                 events.append({
                     "type": "tool_call",
                     "id": tc.get("id", ""),
                     "name": tc.get("name", "unknown"),
-                    "args": tc.get("args") or tc.get("input"),
+                    "args": _cap_args(tc.get("args") or tc.get("input")),
                 })
             for tr in internal_trs:
                 # Use ``is not None`` rather than truthiness — empty-string

@@ -254,6 +254,9 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 |---|---|---|---|
 | `MIMIR_WORKLINK_REPO` | str | unset | Repo autonomous Worklink dispatch works in (back-compat alias of `WORKLINK_REPO`, which wins). |
 | `MIMIR_WORKLINK_REAPER_CRON` | cron | `""` (off) | Stale-claim TTL reaper cron; empty registers no job (non-Worklink homes). |
+| `MIMIR_SCRATCH_JANITOR_CRON` | cron | `13 4 * * *` (on) | Daily scratch-retention sweep of the home's ephemeral roots; empty disables. |
+| `MIMIR_SCRATCH_TTL_DAYS` | int | `7` | Age (newest contained mtime, days) before a scratch entry is swept; `<= 0` disables the janitor. |
+| `MIMIR_SCRATCH_JANITOR_ROOTS` | list | `scratch` | Comma-separated home-relative roots to sweep (nested paths allowed, e.g. `state/worklink/transcripts`); absolute or `..` entries are rejected. |
 | `MIMIR_CHAINLINK_AUTOINIT` | bool | `1` (on) | Auto-run `chainlink init` on boot if `.chainlink` absent and the CLI is present. |
 | `MIMIR_FACTORY_EPICS_ENABLED` | bool | off | Feature-factory epic dispatch in the chainlink-orchestrator poller (`worklink:epic`). |
 | `MIMIR_FACTORY_RUN_TIMEOUT_S` | float | `14400` (4h) | Wall-clock timeout for a feature-factory run before the orchestrator treats it as failed. |

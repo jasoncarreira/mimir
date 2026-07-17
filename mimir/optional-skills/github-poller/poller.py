@@ -211,6 +211,27 @@ _REVIEW_SUBMISSION_RULE = (
 )
 
 
+#: Event types whose handling typically clones/builds a repo under
+#: ``scratch/`` — reviews AND revision work on the agent's own PRs.
+#: Superset of ``REVIEW_NEEDED_EVENT_TYPES``.
+REPO_WORK_EVENT_TYPES = frozenset(REVIEW_NEEDED_EVENT_TYPES | {
+    "pr_review",                 # review posted on the agent's own PR
+    "pr_changes_requested_stale",  # own PR still has changes requested
+    "pr_review_comment",         # inline diff comment → often a code fix
+})
+
+
+_SCRATCH_CLEANUP_RULE = (
+    "\n\n──── SCRATCH CLEANUP RULE ────\n"
+    "If you clone, check out, or build anything under `scratch/` for "
+    "this event, `rm -rf` that working directory once the review/fix "
+    "is submitted — same turn. Leftover per-event clones (repo + "
+    "node_modules + venv) grow the filesystem by gigabytes per day. "
+    "The scheduler's scratch janitor eventually removes stale entries, "
+    "but same-turn cleanup is the contract."
+)
+
+
 #: Marker dict the framework reads at turn finalization. When the
 #: turn's tool_calls don't match any of these tool names / Bash
 #: substrings, ``signal_on_missing`` is emitted into events.jsonl
@@ -303,6 +324,10 @@ def _emit(prompt: str, **extras: object) -> None:
     ``poller_review_missed_submission`` algedonically.
     """
     event_type = extras.get("event_type")
+    if isinstance(event_type, str) and event_type in REPO_WORK_EVENT_TYPES:
+        # Ahead of the (longer) submission rule so it survives any
+        # downstream prompt-size truncation of the tail.
+        prompt = prompt + _SCRATCH_CLEANUP_RULE
     if isinstance(event_type, str) and event_type in REVIEW_NEEDED_EVENT_TYPES:
         prompt = prompt + _REVIEW_SUBMISSION_RULE
         preload = os.environ.get("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL", "").strip().lower()
