@@ -225,7 +225,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `MIMIR_ACCESS_CONTROL_ENFORCED` | bool | `false` | Enforce the allow/deny policy (reject unknown/non-allowlisted authors); also gates the admin-sensitive tool path. |
+| `MIMIR_ACCESS_CONTROL_ENFORCED` | bool | `false` | Enforce the allow/deny policy (reject unknown/non-allowlisted authors); also gates the admin-sensitive tool path. Startup rejects this setting when `MIMIR_MODEL_SPEC` uses `claude-code:` because that subprocess provider cannot carry the server-created per-turn authorization context. Use `anthropic:`, `openai:`, or `codex-plus:`, or leave enforcement disabled. |
 | `MIMIR_CROSS_PLATFORM_PULL` | bool | `true` | Identity reconciliation cross-platform pull. `false` = strict per-platform isolation. |
 | `MIMIR_UNAUTHORIZED_USER_BEHAVIOR` | enum | `ignore` | Unauthorized bridge users: `ignore` (log only) or `prompt-to-pair`. |
 | `MIMIR_OPERATOR_ALERT_CHANNEL` | str | `""` | Channel id for high-priority operator alerts. Empty = inactive. |

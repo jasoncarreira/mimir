@@ -536,6 +536,25 @@ def test_enforcement_enablement_fails_closed_with_incomplete_matrix() -> None:
         _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
 
 
+@pytest.mark.parametrize(
+    "model_spec",
+    ["claude-code:claude-sonnet-4-6", "claude_code:claude-sonnet-4-6"],
+)
+def test_enforcement_enablement_rejects_claude_code_provider(
+    model_spec: str,
+) -> None:
+    from mimir.access_control import (
+        ProviderEnforcementCompatibilityError,
+        resolve_access_control_enforcement,
+    )
+
+    with pytest.raises(
+        ProviderEnforcementCompatibilityError,
+        match="claude-code subprocess.*per-turn AuthContext",
+    ):
+        resolve_access_control_enforcement(True, model_spec=model_spec)
+
+
 def test_capability_matrix_report_generates_complete_report() -> None:
     from mimir.access_control import get_capability_matrix_report
 
