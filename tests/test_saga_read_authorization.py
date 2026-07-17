@@ -113,6 +113,33 @@ def test_owner_and_service_domain_grants_are_alternatives(conn: sqlite3.Connecti
     assert foreign not in service_ids
 
 
+def test_service_owner_grant_uses_prefixed_canonical_identity(
+    conn: sqlite3.Connection,
+) -> None:
+    owned = _store(
+        conn,
+        "service-owned",
+        owner="service:external-reader",
+        visibility="service",
+    )
+    scope = AuthorizationScope(
+        principal="external-reader",
+        is_service=True,
+        service_canonical="external-reader",
+    )
+
+    where, params = authorization_predicate(scope, table="a")
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+
+    assert owned in readable_ids
+    assert "service:external-reader" in params
+
+
 def test_unauthorized_candidates_are_removed_before_rrf_and_access(conn: sqlite3.Connection) -> None:
     hidden = _store(conn, "hidden query term", owner="user:bob", visibility="private")
     visible = _store(conn, "visible query term", owner="user:alice", visibility="private")
