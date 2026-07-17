@@ -406,9 +406,7 @@ async def test_manager_starts_servers_and_bridges_tools(
 
 
 @pytest.mark.asyncio
-async def test_manager_skips_collisions(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Same server name registered twice (operator misconfig) → second
-    # set's tools all collide and get dropped with a warning.
+async def test_manager_rejects_duplicate_derived_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     from mimir.mcp_client import MCPManager, MCPServerConfig
 
     mgr = MCPManager()
@@ -417,8 +415,8 @@ async def test_manager_skips_collisions(monkeypatch: pytest.MonkeyPatch) -> None
     sessions = {"dup": _FakeSession([_FakeMCPTool("ping")])}
     # _connect is called twice but both go through the same fake session
     _patch_connect(monkeypatch, sessions)
-    tools = await mgr.start_servers([cfg_a, cfg_b])
-    assert [t.name for t in tools] == ["mcp_dup_ping"]
+    with pytest.raises(ValueError, match="duplicate MCP server_config_id"):
+        await mgr.start_servers([cfg_a, cfg_b])
 
 
 @pytest.mark.asyncio
@@ -592,7 +590,7 @@ class TestMCPProvenance:
         assert provenance.schema_digest != ""
         assert provenance.is_tombstoned is False
 
-    def test_provenance_config_digest_excludes_secrets(self) -> None:
+    def test_provenance_config_digest_includes_secret_key_not_value(self) -> None:
         from mimir.mcp_client import MCPServerConfig, _canonical_config_digest
 
         config_with_secret = MCPServerConfig(
@@ -609,7 +607,15 @@ class TestMCPProvenance:
         )
         digest_with = _canonical_config_digest(config_with_secret)
         digest_without = _canonical_config_digest(config_without_secret)
-        assert digest_with == digest_without
+        assert digest_with != digest_without
+
+        rotated = MCPServerConfig(
+            name="github",
+            command="uvx",
+            args=["mcp-server-github"],
+            env={"GITHUB_TOKEN": "rotated-secret"},
+        )
+        assert _canonical_config_digest(rotated) == digest_with
 
     def test_provenance_schema_digest(self) -> None:
         from mimir.mcp_client import _schema_digest
@@ -687,6 +693,154 @@ class TestMCPProvenance:
             input_schema={},
         )
         assert drifted.is_tombstoned is True
+
+    def test_secret_rotation_is_stable_but_reference_and_key_changes_drift(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.mcp_client import MCPServerConfig, _canonical_config_digest
+
+        monkeypatch.setenv("GMAIL_TOKEN", "first-secret")
+        original = MCPServerConfig.from_dict({
+            "name": "mail", "command": "mail-mcp",
+            "env": {"AUTH_TOKEN": "Bearer ${GMAIL_TOKEN}"},
+        })
+        monkeypatch.setenv("GMAIL_TOKEN", "rotated-secret")
+        rotated = MCPServerConfig.from_dict({
+            "name": "mail", "command": "mail-mcp",
+            "env": {"AUTH_TOKEN": "Bearer ${GMAIL_TOKEN}"},
+        })
+        changed_ref = MCPServerConfig.from_dict({
+            "name": "mail", "command": "mail-mcp",
+            "env": {"AUTH_TOKEN": "Bearer ${OTHER_TOKEN}"},
+        })
+        changed_key = MCPServerConfig.from_dict({
+            "name": "mail", "command": "mail-mcp",
+            "env": {"CREDENTIAL": "Bearer ${GMAIL_TOKEN}"},
+        })
+
+        digest = _canonical_config_digest(original)
+        assert _canonical_config_digest(rotated) == digest
+        assert _canonical_config_digest(changed_ref) != digest
+        assert _canonical_config_digest(changed_key) != digest
+        assert "first-secret" not in json.dumps(original.env_identity)
+
+    def test_derived_server_and_tool_ids_are_stable(self) -> None:
+        from mimir.mcp_client import MCPProvenance, MCPServerConfig
+
+        first_config = MCPServerConfig(name="mail", command="mail-mcp", args=[])
+        second_config = MCPServerConfig(name="mail", command="mail-mcp", args=[])
+        first = MCPProvenance.create(first_config, "send", {})
+        second = MCPProvenance.create(second_config, "send", {})
+
+        assert first_config.server_config_id == second_config.server_config_id
+        assert first.server_config_id == second.server_config_id
+        assert first.tool_id == second.tool_id
+
+
+class TestMCPDurableIdentity:
+    @pytest.mark.asyncio
+    async def test_ambiguous_display_name_collision_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.mcp_client import MCPManager, MCPServerConfig
+
+        configs = [
+            MCPServerConfig(name="a_b", command="x", args=[], server_config_id="server-ab"),
+            MCPServerConfig(name="a", command="y", args=[], server_config_id="server-a"),
+        ]
+        _patch_connect(monkeypatch, {
+            "a_b": _FakeSession([_FakeMCPTool("c")]),
+            "a": _FakeSession([_FakeMCPTool("b_c")]),
+        })
+
+        with pytest.raises(ValueError, match="display-name collision"):
+            await MCPManager().start_servers(configs)
+
+    @pytest.mark.asyncio
+    async def test_duplicate_explicit_id_fails_before_connect(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.mcp_client import MCPManager, MCPServerConfig
+
+        called = False
+
+        async def connect(*_args):  # type: ignore[no-untyped-def]
+            nonlocal called
+            called = True
+
+        monkeypatch.setattr(MCPManager, "_connect", connect)
+        configs = [
+            MCPServerConfig(name="one", command="x", args=[], server_config_id="shared"),
+            MCPServerConfig(name="two", command="y", args=[], server_config_id="shared"),
+        ]
+        with pytest.raises(ValueError, match="duplicate MCP server_config_id"):
+            await MCPManager().start_servers(configs)
+        assert called is False
+
+    @pytest.mark.asyncio
+    async def test_restart_persists_identity_and_tombstones_removed_tool(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        from mimir.mcp_client import MCPManager, MCPServerConfig, get_tool_provenance
+
+        path = tmp_path / "mcp-policy.json"
+        config = MCPServerConfig(
+            name="mail", command="mail-mcp", args=[], server_config_id="mail-production",
+        )
+        sessions = {"mail": _FakeSession([_FakeMCPTool("send"), _FakeMCPTool("draft")])}
+        _patch_connect(monkeypatch, sessions)
+        first_tools = await MCPManager(policy_store_path=path).start_servers([config])
+        first_ids = {
+            get_tool_provenance(tool).original_tool_name: get_tool_provenance(tool).tool_id
+            for tool in first_tools
+        }
+
+        sessions["mail"] = _FakeSession([_FakeMCPTool("send")])
+        second_manager = MCPManager(policy_store_path=path)
+        second_tools = await second_manager.start_servers([config])
+        second = get_tool_provenance(second_tools[0])
+        assert second is not None
+        assert second.tool_id == first_ids["send"]
+        assert second_manager.policy_records[first_ids["draft"]]["is_tombstoned"] is True
+        assert second_manager.policy_records[first_ids["draft"]]["original_tool_name"] == "draft"
+
+    @pytest.mark.asyncio
+    async def test_policy_store_never_contains_expanded_secret(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        from mimir.mcp_client import MCPManager, MCPServerConfig
+
+        monkeypatch.setenv("GMAIL_TOKEN", "expanded-super-secret")
+        config = MCPServerConfig.from_dict({
+            "name": "mail", "command": "mail-mcp",
+            "env": {"AUTH_TOKEN": "${GMAIL_TOKEN}"},
+        })
+        path = tmp_path / "mcp-policy.json"
+        _patch_connect(monkeypatch, {"mail": _FakeSession([_FakeMCPTool("send")])})
+
+        await MCPManager(policy_store_path=path).start_servers([config])
+
+        persisted = path.read_text(encoding="utf-8")
+        assert "expanded-super-secret" not in persisted
+
+    @pytest.mark.asyncio
+    async def test_persisted_endpoint_mismatch_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        from mimir.mcp_client import MCPManager, MCPServerConfig
+
+        path = tmp_path / "mcp-policy.json"
+        original = MCPServerConfig(
+            name="mail", command="mail-mcp", args=[], server_config_id="shared-id",
+        )
+        _patch_connect(monkeypatch, {"mail": _FakeSession([_FakeMCPTool("send")])})
+        await MCPManager(policy_store_path=path).start_servers([original])
+
+        changed = MCPServerConfig(
+            name="calendar", command="calendar-mcp", args=[], server_config_id="shared-id",
+        )
+        with pytest.raises(ValueError, match="endpoint mismatch"):
+            await MCPManager(policy_store_path=path).start_servers([changed])
 
 
 class TestMCPAdapterRegistry:

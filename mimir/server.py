@@ -65,6 +65,8 @@ _STARTUP_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 async def _start_mcp_servers(
     app: web.Application,
     mcp_configs: list[Any],
+    *,
+    home: Path | None = None,
 ) -> None:
     """Wire configured MCP policy, tools, startup validation, and lifecycle."""
     from .mcp_client import (
@@ -75,7 +77,9 @@ async def _start_mcp_servers(
     )
     from .tools import set_mcp_tools
 
-    mcp_manager = MCPManager()
+    mcp_manager = MCPManager(
+        policy_store_path=home / "state" / "mcp-policy.json"
+    ) if home is not None else MCPManager()
     try:
         mcp_tools = await mcp_manager.start_servers(mcp_configs)
     except Exception as exc:  # noqa: BLE001 — log + continue
@@ -1397,7 +1401,7 @@ def build_app(config: Config) -> web.Application:
 
         set_mcp_tools([])
         if config.mcp_servers:
-            await _start_mcp_servers(app, config.mcp_servers)
+            await _start_mcp_servers(app, config.mcp_servers, home=config.home)
 
         # Register SAGA weekly consolidation. Bad cron logs and continues.
         # Pass home so the closure can read identities.yaml at fire time
