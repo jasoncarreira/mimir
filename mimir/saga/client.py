@@ -35,6 +35,7 @@ import logging
 import sqlite3
 import struct
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -58,9 +59,15 @@ log = logging.getLogger(__name__)
 _ALL_SAGA_ATOMS = object()
 
 
+@dataclass(frozen=True)
+class _ServiceMutationScope:
+    owner_principal: str
+    readable_domains: tuple[str, ...]
+
+
 def _saga_mutation_scope(
     auth_context: Any, operation: str
-) -> object | str | tuple[str, ...] | None:
+) -> object | str | _ServiceMutationScope | None:
     """Return the atom-row scope for a destructive SAGA operation."""
     from ..access_control import get_trusted_service_from_auth_context
     from ..models import AuthContext
@@ -77,7 +84,10 @@ def _saga_mutation_scope(
         if not service.has_capability(operation):
             return None
         domains = tuple(d for d in service.readable_domains if isinstance(d, str))
-        return domains or None
+        return _ServiceMutationScope(
+            owner_principal=f"service:{service.canonical}",
+            readable_domains=domains,
+        )
     principal = getattr(auth_context, "canonical_principal", None)
     if isinstance(principal, str) and principal:
         if principal not in RESERVED_SENTINEL_PRINCIPALS:
@@ -88,7 +98,7 @@ def _saga_mutation_scope(
 def _authorized_atom_ids(
     conn: sqlite3.Connection,
     atom_ids: list[str],
-    scope: object | str | tuple[str, ...] | None,
+    scope: object | str | _ServiceMutationScope | None,
 ) -> list[str] | None:
     """Return all requested IDs only when the entire set is authorized."""
     requested = list(dict.fromkeys(atom_ids))
@@ -100,10 +110,14 @@ def _authorized_atom_ids(
     if isinstance(scope, str):
         sql += " AND owner_principal = ?"
         params.append(scope)
-    elif isinstance(scope, tuple):
-        domain_placeholders = ",".join(["?"] * len(scope))
-        sql += f" AND origin_domain IN ({domain_placeholders})"
-        params.extend(scope)
+    elif isinstance(scope, _ServiceMutationScope):
+        grants = ["owner_principal = ?"]
+        params.append(scope.owner_principal)
+        if scope.readable_domains:
+            domain_placeholders = ",".join(["?"] * len(scope.readable_domains))
+            grants.append(f"origin_domain IN ({domain_placeholders})")
+            params.extend(scope.readable_domains)
+        sql += f" AND ({' OR '.join(grants)})"
     found = {row[0] for row in conn.execute(sql, params).fetchall()}
     return requested if found == set(requested) else None
 
@@ -2267,8 +2281,16 @@ class SagaStore:
                 min_retrievals=min_retrievals,
                 activation_below=confidence_floor,
                 dry_run=True,
-                owner_principal=scope if isinstance(scope, str) else None,
-                origin_domains=scope if isinstance(scope, tuple) else None,
+                owner_principal=(
+                    scope.owner_principal
+                    if isinstance(scope, _ServiceMutationScope)
+                    else scope if isinstance(scope, str) else None
+                ),
+                origin_domains=(
+                    scope.readable_domains
+                    if isinstance(scope, _ServiceMutationScope)
+                    else None
+                ),
             )
             candidate_ids = preview.tombstoned_ids
             affected_observation_ids: list[str] = []

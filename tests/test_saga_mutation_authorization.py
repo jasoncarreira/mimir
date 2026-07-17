@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from mimir.access_control import ServicePrincipal, _TRUSTED_SERVICE_PRINCIPALS
+from mimir.access_control import (
+    ServicePrincipal,
+    _TRUSTED_SERVICE_PRINCIPALS,
+    get_provenance_from_auth_context,
+)
 from mimir.models import AuthContext
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import AuthorizationScope
@@ -490,6 +494,59 @@ async def test_trusted_service_requires_capability_and_readable_domain(
     assert allowed_result["marked"] == 1
     assert denied_result == {"marked": 0, "total": 1, "authorized": 0}
     assert forget_result["preview_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_non_platform_service_can_read_and_forget_own_domainless_write(
+    client: SagaStore,
+) -> None:
+    trigger = "test_external_saga_service"
+    canonical = "external-saga-service"
+    original = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+    _TRUSTED_SERVICE_PRINCIPALS[trigger] = ServicePrincipal(
+        canonical=canonical,
+        trigger=trigger,
+        capabilities=("saga_forget",),
+        readable_domains=("tenant:a",),
+        sink_destinations=("saga",),
+        creation_path="test",
+    )
+    auth_context = _service_auth(trigger, canonical)
+    try:
+        provenance = get_provenance_from_auth_context(auth_context)
+        stored = await client.store(
+            "external service owned memory",
+            owner_principal=provenance["created_by"],
+            origin_domain=None,
+            visibility="service",
+            provenance=provenance,
+        )
+        atom_id = stored["atom_id"]
+
+        read_result = await client.get_atoms([atom_id], auth_context=auth_context)
+        forget_preview = await client.forget(
+            dry_run=True,
+            auth_context=auth_context,
+        )
+        forget_result = await client.forget(
+            dry_run=False,
+            auth_context=auth_context,
+        )
+    finally:
+        if original is None:
+            _TRUSTED_SERVICE_PRINCIPALS.pop(trigger, None)
+        else:
+            _TRUSTED_SERVICE_PRINCIPALS[trigger] = original
+
+    row = client._ensure_conn().execute(
+        "SELECT owner_principal, origin_domain, tombstoned FROM atoms WHERE id = ?",
+        (atom_id,),
+    ).fetchone()
+    assert provenance["created_by"] == f"service:{canonical}"
+    assert [atom["id"] for atom in read_result["atoms"]] == [atom_id]
+    assert forget_preview["preview_ids"] == [atom_id]
+    assert forget_result["tombstoned_count"] == 1
+    assert row == (f"service:{canonical}", None, 1)
 
 
 @pytest.mark.parametrize(

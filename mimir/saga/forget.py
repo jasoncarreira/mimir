@@ -146,8 +146,9 @@ def forget_by_criteria(
     """Bulk forget by predicate. Dry-run by default (preview the set
     without writing).
 
-    Criteria are AND'd. Returns the atom IDs that match (and are
-    tombstoned, unless dry_run=True).
+    Criteria are AND'd. ``owner_principal`` and ``origin_domains`` are
+    authorization grants and are OR'd when both are provided. Returns the atom
+    IDs that match (and are tombstoned, unless dry_run=True).
 
     ``max_atoms`` is a hard cap to prevent runaway forgetting from a
     misconfigured criterion.
@@ -170,15 +171,18 @@ def forget_by_criteria(
     where = ["a.agent_id = ?", "a.tombstoned = 0"]
     params: list = [agent_id]
 
+    authorization_grants: list[str] = []
     if owner_principal is not None:
-        where.append("a.owner_principal = ?")
+        authorization_grants.append("a.owner_principal = ?")
         params.append(owner_principal)
-    if origin_domains is not None:
-        if not origin_domains:
-            return ForgetResult(dry_run=dry_run)
+    if origin_domains:
         placeholders = ",".join(["?"] * len(origin_domains))
-        where.append(f"a.origin_domain IN ({placeholders})")
+        authorization_grants.append(f"a.origin_domain IN ({placeholders})")
         params.extend(origin_domains)
+    if authorization_grants:
+        where.append(f"({' OR '.join(authorization_grants)})")
+    elif origin_domains is not None:
+        return ForgetResult(dry_run=dry_run)
     joins: list[str] = []
 
     # ``now`` for age + activation math. Defaults to wall clock; bench

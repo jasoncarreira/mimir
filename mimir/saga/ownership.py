@@ -168,10 +168,15 @@ def _authorization_predicate(
     grants = [f"{table}.visibility = ?"]
     params = [Visibility.PUBLIC.value]
 
-    if scope.principal:
-        if scope.principal not in RESERVED_SENTINEL_PRINCIPALS:
+    owner_principal = (
+        f"service:{scope.service_canonical}"
+        if scope.is_service and scope.service_canonical
+        else scope.principal
+    )
+    if owner_principal:
+        if owner_principal not in RESERVED_SENTINEL_PRINCIPALS:
             grants.append(f"{table}.owner_principal = ?")
-            params.append(scope.principal)
+            params.append(owner_principal)
 
     if scope.is_service and scope.readable_domains:
         domains = list(scope.readable_domains)
