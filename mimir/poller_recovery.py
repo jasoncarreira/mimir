@@ -141,6 +141,41 @@ def _save_state(persist_dir: Path, state: dict) -> None:
         log.warning("poller recovery: state save failed for %s: %s", persist_dir, exc)
 
 
+def _event_to_stash(event: AgentEvent) -> dict[str, Any]:
+    """Return a JSON-native event payload without stringifying IFC sets."""
+    payload = asdict(event)
+    labels = event.ifc_labels
+    if isinstance(labels, InformationFlowLabels):
+        payload["ifc_labels"] = {
+            "labels": sorted(labels.labels),
+            "source_channels": sorted(labels.source_channels),
+            "sources": [
+                {
+                    "principal": source.principal,
+                    "domain": source.domain,
+                    "resource_id": source.resource_id,
+                    "bridge_instance": source.bridge_instance,
+                    "sensitivity": source.sensitivity,
+                    "authorized_principals": sorted(source.authorized_principals),
+                    "source_kind": source.source_kind,
+                }
+                for source in sorted(
+                    labels.sources,
+                    key=lambda source: (
+                        source.principal or "",
+                        source.domain or "",
+                        source.resource_id or "",
+                        source.bridge_instance or "",
+                        source.sensitivity,
+                        source.source_kind,
+                    ),
+                )
+            ],
+            "created_at": labels.created_at,
+        }
+    return payload
+
+
 def stash_enqueued_event(persist_dir: Path, event: AgentEvent) -> None:
     """Record an enqueued poller ``AgentEvent`` as in-flight, keyed by its
     ``source_id``, so a later failed turn can re-enqueue it.
@@ -155,7 +190,7 @@ def stash_enqueued_event(persist_dir: Path, event: AgentEvent) -> None:
         "attempts": 0,
         # First-seen timestamp drives the GC TTL (#310).
         "stashed_at": _utc_now_iso(),
-        "event": asdict(event),
+        "event": _event_to_stash(event),
     }
     _save_state(persist_dir, state)
 

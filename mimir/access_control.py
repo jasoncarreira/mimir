@@ -337,11 +337,16 @@ class SinkGate:
             return frozenset()
 
         canonical_principal = getattr(auth_context, "canonical_principal", None)
+        service = get_trusted_service_from_auth_context(auth_context)
+        service_source_principal = (
+            f"service:{service.canonical}" if service is not None else None
+        )
         domain = getattr(auth_context, "domain", None)
         resource_id = getattr(auth_context, "resource_id", None)
         bridge_instance = getattr(auth_context, "bridge_instance", None)
         sources = getattr(ifc_labels, "sources", None)
-        if not all((canonical_principal, domain, resource_id, bridge_instance)):
+        effective_principal = service_source_principal or canonical_principal
+        if not all((effective_principal, domain, resource_id, bridge_instance)):
             return frozenset()
         if not isinstance(sources, frozenset) or not sources:
             return frozenset()
@@ -349,9 +354,12 @@ class SinkGate:
         for source in sources:
             if not getattr(source, "is_complete", False):
                 return frozenset()
-            if canonical_principal not in source.authorized_principals:
+            if effective_principal not in source.authorized_principals:
                 return frozenset()
-            if source.principal != canonical_principal:
+            if (
+                getattr(source, "source_kind", "channel") == "channel"
+                and source.principal != effective_principal
+            ):
                 return frozenset()
             if source.domain != domain or source.bridge_instance != bridge_instance:
                 return frozenset()
@@ -2021,6 +2029,12 @@ def create_auth_context(
     bridge_instance = extra.get("bridge_instance")
     if not isinstance(bridge_instance, str) or not bridge_instance:
         bridge_instance = event.source
+    if (
+        (not isinstance(bridge_instance, str) or not bridge_instance)
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+    ):
+        bridge_instance = f"service:{registered_service.canonical}"
 
     return AuthContext(
         principal=author,

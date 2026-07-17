@@ -79,7 +79,7 @@ def _auth_context(
 
 
 def _service_labels(event) -> InformationFlowLabels:
-    principal = event.service_principal
+    principal = f"service:{event.service_principal}" if event.service_principal else None
     return InformationFlowLabels(
         labels=frozenset({"internal"}),
         source_channels=frozenset({event.channel_id}) if event.channel_id else frozenset(),
