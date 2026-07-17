@@ -74,18 +74,18 @@ async def test_inbox_isolates_channels():
 
 
 @pytest.mark.asyncio
-async def test_inbox_evicts_only_idle_channel():
+async def test_inbox_idle_eviction_preserves_pending_notifications():
     inbox = SubagentInbox()
     result = SubagentResult(
         task_id="t1", status="completed", summary="", output_file=None
     )
     await inbox.push("c1", result)
-    await inbox.push("c2", result)
+    inbox.by_channel["empty"] = []
 
-    assert inbox.evict_channel("c1") is True
+    assert inbox.evict_channel("c1") is False
+    assert inbox.evict_channel("empty") is True
     assert inbox.evict_channel("missing") is False
-    assert inbox.peek("c1") == []
-    assert inbox.peek("c2") == [result]
+    assert inbox.peek("c1") == [result]
 
 
 def test_render_subagent_updates_includes_status_and_summary():

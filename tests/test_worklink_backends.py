@@ -796,7 +796,7 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
-    monkeypatch.setattr(compute_module, "MAX_WORKLINK_STDOUT_BYTES", 4)
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "4")
     backend = LocalSubprocessComputeBackend()
     spec = WorkSpec(
         issue_id=1,
@@ -830,12 +830,29 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
         transcript_root=tmp_path / "transcripts",
     )
     raw = await OpenCodeBackend().interpret(order, result)
+    assert raw.backend_status == "output_overflow"
+    assert raw.output_overflow is True
+    assert raw.error == "backend output exceeded configured Worklink limit"
     assert raw.transcript_path is not None
     transcript = json.loads(raw.transcript_path.read_text(encoding="utf-8"))
     assert transcript["stdout"] == "abcd"
     assert transcript["output_overflow"] is True
 
 
+def test_worklink_output_limits_use_safe_defaults_and_env_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", raising=False)
+    monkeypatch.delenv("MIMIR_WORKLINK_MAX_STDERR_BYTES", raising=False)
+    assert compute_module._worklink_output_limits() == (64 * 1024 * 1024, 16 * 1024 * 1024)
+
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "123")
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDERR_BYTES", "456")
+    assert compute_module._worklink_output_limits() == (123, 456)
+
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "invalid")
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDERR_BYTES", "0")
+    assert compute_module._worklink_output_limits() == (64 * 1024 * 1024, 16 * 1024 * 1024)
 
 
 def test_coding_backends_parse_structured_worklink_blocked_marker(tmp_path: Path) -> None:

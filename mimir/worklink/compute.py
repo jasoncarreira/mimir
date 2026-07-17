@@ -113,8 +113,27 @@ _LOCAL_ENV_CRED_PREFIXES = (
     "VOYAGE_", "GITHUB_TOKEN", "GH_TOKEN",
 )
 
-MAX_WORKLINK_STDOUT_BYTES = 16 * 1024 * 1024
-MAX_WORKLINK_STDERR_BYTES = 1 * 1024 * 1024
+DEFAULT_WORKLINK_STDOUT_BYTES = 64 * 1024 * 1024
+DEFAULT_WORKLINK_STDERR_BYTES = 16 * 1024 * 1024
+
+
+def _output_limit(env_name: str, default: int) -> int:
+    """Return a positive output cap, falling back on invalid overrides."""
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _worklink_output_limits() -> tuple[int, int]:
+    return (
+        _output_limit("MIMIR_WORKLINK_MAX_STDOUT_BYTES", DEFAULT_WORKLINK_STDOUT_BYTES),
+        _output_limit("MIMIR_WORKLINK_MAX_STDERR_BYTES", DEFAULT_WORKLINK_STDERR_BYTES),
+    )
 
 
 async def _drain_capped(
@@ -212,6 +231,7 @@ class LocalSubprocessComputeBackend:
         timed_out = False
         output_overflow = False
         kill_task: asyncio.Task[None] | None = None
+        stdout_limit, stderr_limit = _worklink_output_limits()
 
         def overflow() -> None:
             nonlocal output_overflow, kill_task
@@ -222,14 +242,10 @@ class LocalSubprocessComputeBackend:
 
         async def collect() -> tuple[bytes, bytes]:
             stdout_task = asyncio.create_task(
-                _drain_capped(
-                    getattr(proc, "stdout", None), MAX_WORKLINK_STDOUT_BYTES, overflow
-                )
+                _drain_capped(getattr(proc, "stdout", None), stdout_limit, overflow)
             )
             stderr_task = asyncio.create_task(
-                _drain_capped(
-                    getattr(proc, "stderr", None), MAX_WORKLINK_STDERR_BYTES, overflow
-                )
+                _drain_capped(getattr(proc, "stderr", None), stderr_limit, overflow)
             )
             await getattr(proc, "wait")()
             return await asyncio.gather(stdout_task, stderr_task)

@@ -21,7 +21,6 @@ empirically: SDK ``_internal/message_parser.py:191-203`` parses
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -78,8 +77,12 @@ class SubagentInbox:
         return list(self.by_channel.get(channel_id, []))
 
     def evict_channel(self, channel_id: str) -> bool:
-        """Drop pending state for a channel whose dispatcher worker retired."""
-        return self.by_channel.pop(channel_id, None) is not None
+        """Drop only an empty bucket; pending completions outlive worker idle."""
+        bucket = self.by_channel.get(channel_id)
+        if bucket is None or bucket:
+            return False
+        del self.by_channel[channel_id]
+        return True
 
 
 def render_subagent_updates(results: Iterable[SubagentResult]) -> str:

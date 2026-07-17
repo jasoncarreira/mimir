@@ -989,7 +989,34 @@ async def test_api_v1_live_events_fresh_backfill_is_bounded(app):
     items = _sse_data_items(body)
     assert len(items) == FRESH_BACKFILL_MAX_RECORDS
     assert items[0]["event"]["turn_id"] == "t002"
-    assert items[-1]["event"]["turn_id"] == "t101"
+    assert items[-1]["event"]["turn_id"] == f"t{FRESH_BACKFILL_MAX_RECORDS + 1:03d}"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_fresh_backfill_honors_larger_client_limit(app):
+    from mimir.live_events import FRESH_BACKFILL_MAX_RECORDS
+
+    a, turns_log, _ = app
+    requested = FRESH_BACKFILL_MAX_RECORDS + 25
+    rows = [
+        {
+            "turn_id": f"t{index:03d}",
+            "ts": f"2026-01-01T00:{index // 60:02d}:{index % 60:02d}Z",
+        }
+        for index in range(requested + 10)
+    ]
+    turns_log.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(f"/api/v1/live-events?once=1&limit={requested}")
+        body = await resp.text()
+
+    items = _sse_data_items(body)
+    assert len(items) == requested
+    assert items[0]["event"]["turn_id"] == "t010"
+    assert items[-1]["event"]["turn_id"] == f"t{requested + 9:03d}"
 
 
 @pytest.mark.asyncio
@@ -1099,7 +1126,7 @@ def test_read_live_event_items_bounds_fresh_backfill_without_cursor_regression(t
     fresh = read_live_event_items_since(path)
     assert len(fresh) == FRESH_BACKFILL_MAX_RECORDS
     assert fresh[0].event["turn_id"] == "t025"
-    assert fresh[-1].event["turn_id"] == "t124"
+    assert fresh[-1].event["turn_id"] == f"t{FRESH_BACKFILL_MAX_RECORDS + 24:03d}"
 
     # An explicit cursor retains the larger reconnect window and strict
     # comparison, including records older than the bounded fresh backfill.

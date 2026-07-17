@@ -470,23 +470,27 @@ class MessageBuffer:
 
         anchor_ids = {id(msg) for msg in anchors}
         selected: list[Message] = []
-        for channel_id, messages in self._by_channel.items():
+        include_replies_by_channel: dict[str, bool] = {}
+        # Walk the bounded global deque rather than only the per-channel deques:
+        # idle-channel eviction intentionally drops those dedicated deques, but
+        # cross-channel context must remain available until the global window
+        # itself ages the conversation out.
+        for msg in self._all:
+            channel_id = msg.channel_id
             if channel_id == exclude_channel:
                 continue
             if _is_private_channel(channel_id) and not include_private:
                 continue
-            include_replies = False
-            for msg in messages:
-                if id(msg) in anchor_ids:
+            if id(msg) in anchor_ids:
+                selected.append(msg)
+                include_replies_by_channel[channel_id] = True
+                continue
+            if msg.kind == "user_message":
+                include_replies_by_channel[channel_id] = False
+                continue
+            if include_replies_by_channel.get(channel_id) and msg.kind == "assistant_message":
+                if source_allowlist is None or msg.source in source_allowlist:
                     selected.append(msg)
-                    include_replies = True
-                    continue
-                if msg.kind == "user_message":
-                    include_replies = False
-                    continue
-                if include_replies and msg.kind == "assistant_message":
-                    if source_allowlist is None or msg.source in source_allowlist:
-                        selected.append(msg)
 
         def _timestamp(msg: Message) -> float:
             try:

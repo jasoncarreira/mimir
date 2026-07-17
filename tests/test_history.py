@@ -72,6 +72,35 @@ def test_evict_channel_rehydrates_from_bounded_global_history(tmp_path: Path):
     assert [m.content for m in buf.recent_for_channel("c1", 10)] == ["old", "new"]
 
 
+def test_cross_author_context_survives_idle_channel_eviction(tmp_path: Path):
+    buf = _make_buffer(tmp_path)
+    user = buf.make_message(
+        channel_id="c1",
+        kind="user_message",
+        author="alice",
+        content="question",
+        ts=_now_iso(),
+    )
+    reply = buf.make_message(
+        channel_id="c1",
+        kind="assistant_message",
+        content="answer",
+        ts=_now_iso(),
+    )
+    buf._append_in_memory(user)
+    buf._append_in_memory(reply)
+
+    assert buf.evict_channel("c1") is True
+    context = buf.cross_author_context(
+        author="alice",
+        exclude_channel="c2",
+        limit=5,
+        within_hours=1,
+    )
+
+    assert [message.content for message in context] == ["question", "answer"]
+
+
 def test_replay_rehydrates_deques(tmp_path: Path):
     path = tmp_path / "messages" / "chat_history.jsonl"
     path.parent.mkdir()

@@ -15,7 +15,9 @@ from typing import Any, Callable, Iterable
 from ._jsonl_tail import tail_jsonl_records
 
 
-FRESH_BACKFILL_MAX_RECORDS = 100
+# Match the shipped React client's default backfillLimit. Larger explicit
+# requests lift this floor in read_live_event_items_since().
+FRESH_BACKFILL_MAX_RECORDS = 500
 CURSOR_BACKFILL_MAX_RECORDS = 5000
 
 
@@ -164,7 +166,12 @@ def read_live_event_items_since(
     records: list[dict[str, Any]] = []
     record_limit = max_records
     if record_limit is None:
-        record_limit = CURSOR_BACKFILL_MAX_RECORDS if since else FRESH_BACKFILL_MAX_RECORDS
+        if since:
+            record_limit = CURSOR_BACKFILL_MAX_RECORDS
+        else:
+            # A record yields at least one lifecycle item, so scanning fewer
+            # records than the requested item limit can never satisfy it.
+            record_limit = max(FRESH_BACKFILL_MAX_RECORDS, limit or 0)
     since_ts = _cursor_ts(since)
     try:
         for record in tail_reader(turns_log):
