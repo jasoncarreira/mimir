@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mimir.access_control import SinkGate, audit_declassification
+from mimir.access_control import SinkGate, ToolRegistry, audit_declassification
 from mimir.agent import (
     Agent,
     _initialize_ifc_labels,
@@ -165,6 +165,43 @@ def test_unknown_labels_or_destinations_fail_closed(
     )
     assert decision.allowed is False
     assert decision.reason == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_reason"),
+    [
+        ("mcp_slack_send", "ifc_label_blocked:external_mcp"),
+        ("fetch_url", "ifc_label_blocked:network"),
+        ("web_search", "ifc_label_blocked:network"),
+    ],
+)
+def test_private_turn_is_blocked_from_external_egress_tools(
+    tool_name: str,
+    expected_reason: str,
+):
+    decision = ToolRegistry().authorize_tool(
+        tool_name,
+        _auth(roles=("admin",)),
+        enforce=True,
+        target_channel="https://external.example",
+        ifc_labels=_labels(),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == expected_reason
+
+
+def test_unknown_sink_category_reaches_fail_closed_gate_from_authorization():
+    decision = ToolRegistry().authorize_tool(
+        "future_egress_tool",
+        _auth(roles=("admin",)),
+        enforce=True,
+        target_channel="https://external.example",
+        ifc_labels=_labels(),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "unknown_sink_category"
 
 
 def test_cross_principal_or_cross_channel_taint_is_blocked_at_triggering_harness_sink():
