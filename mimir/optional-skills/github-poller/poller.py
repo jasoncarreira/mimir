@@ -210,26 +210,12 @@ _REVIEW_SUBMISSION_RULE = (
     "fires."
 )
 
-
-#: Event types whose handling typically clones/builds a repo under
-#: ``scratch/`` — reviews AND revision work on the agent's own PRs.
-#: Superset of ``REVIEW_NEEDED_EVENT_TYPES``.
-REPO_WORK_EVENT_TYPES = frozenset(REVIEW_NEEDED_EVENT_TYPES | {
-    "pr_review",                 # review posted on the agent's own PR
-    "pr_changes_requested_stale",  # own PR still has changes requested
-    "pr_review_comment",         # inline diff comment → often a code fix
-})
-
-
-_SCRATCH_CLEANUP_RULE = (
-    "\n\n──── SCRATCH CLEANUP RULE ────\n"
-    "If you clone, check out, or build anything under `scratch/` for "
-    "this event, `rm -rf` that working directory once the review/fix "
-    "is submitted — same turn. Leftover per-event clones (repo + "
-    "node_modules + venv) grow the filesystem by gigabytes per day. "
-    "The scheduler's scratch janitor eventually removes stale entries, "
-    "but same-turn cleanup is the contract."
-)
+# Scratch cleanup is NOT instructed here. A same-turn `rm -rf` of the event's
+# scratch clone is behaviorally unreachable: the agent's action boundary makes
+# every delete under /mimir-home escalate-first, and a poller event is not
+# operator approval — so a conforming turn would have to stop and ask. The
+# scheduler's scratch janitor (harness code, not bound by that rule) is the
+# mechanism instead; see mimir/scratch_janitor.py (MIMIR_SCRATCH_TTL_DAYS).
 
 
 #: Marker dict the framework reads at turn finalization. When the
@@ -324,10 +310,6 @@ def _emit(prompt: str, **extras: object) -> None:
     ``poller_review_missed_submission`` algedonically.
     """
     event_type = extras.get("event_type")
-    if isinstance(event_type, str) and event_type in REPO_WORK_EVENT_TYPES:
-        # Ahead of the (longer) submission rule so it survives any
-        # downstream prompt-size truncation of the tail.
-        prompt = prompt + _SCRATCH_CLEANUP_RULE
     if isinstance(event_type, str) and event_type in REVIEW_NEEDED_EVENT_TYPES:
         prompt = prompt + _REVIEW_SUBMISSION_RULE
         preload = os.environ.get("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL", "").strip().lower()

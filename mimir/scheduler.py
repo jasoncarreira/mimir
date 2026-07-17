@@ -2367,7 +2367,7 @@ class Scheduler:
 
         Default-**on** (daily). Operators disable with
         ``MIMIR_SCRATCH_JANITOR_CRON=""`` or ``MIMIR_SCRATCH_TTL_DAYS=0``,
-        tune TTL via ``MIMIR_SCRATCH_TTL_DAYS`` (default 7), and extend the
+        tune TTL via ``MIMIR_SCRATCH_TTL_DAYS`` (default 1), and extend the
         swept roots via ``MIMIR_SCRATCH_JANITOR_ROOTS`` (comma-separated
         home-relative paths). Env is read at registration — changes need a
         restart, same as every other ``MIMIR_*_CRON`` knob.

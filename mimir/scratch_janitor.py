@@ -43,8 +43,11 @@ __all__ = [
     "sweep_scratch_roots",
 ]
 
-#: Default entry age (days, by newest contained mtime) before removal.
-DEFAULT_SCRATCH_TTL_DAYS = 7
+#: Default entry age (days, by newest contained mtime) before removal. The
+#: recency check keeps any entry touched within the window, so a tight default
+#: safely reclaims abandoned per-event clones (the 140 GB driver) while an
+#: in-use checkout survives on its fresh mtimes.
+DEFAULT_SCRATCH_TTL_DAYS = 1
 
 #: Home-relative roots swept by default. Operators add agent-invented
 #: variants (e.g. ``.review-scratch``) via ``MIMIR_SCRATCH_JANITOR_ROOTS``.
