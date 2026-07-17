@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -27,7 +28,8 @@ from mimir.agent import Agent, _filter_session_turns
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
-from mimir.models import AgentEvent, TurnContext
+from mimir.models import AgentEvent, AuthContext, TurnContext
+from mimir.saga.client import SagaStore
 from mimir.turn_logger import TurnLogger
 
 
@@ -430,7 +432,8 @@ async def test_agent_build_turn_prompt_threads_all_helper_outputs(
         lambda **_kw: "SELFSTATE_SENTINEL",
     )
 
-    async def _fake_session_summaries(*, channel_id):
+    async def _fake_session_summaries(*, channel_id, auth_context):
+        assert auth_context is admin_auth
         return "SESSIONS_SENTINEL"
 
     monkeypatch.setattr(
@@ -479,10 +482,20 @@ async def test_agent_build_turn_prompt_threads_all_helper_outputs(
         source_id="msg-now",
     )
     ctx = _make_ctx(event)
+    admin_auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-cover",
+        interactivity=None,
+    )
     turn_prompt, _ = await agent._build_turn_prompt(
         ctx, event,
         saga_block="SAGA_SENTINEL",
         subagent_block="SUBAGENT_SENTINEL",
+        initial_auth_context=admin_auth,
     )
 
     # Each labeled section must be threaded with the helper's output.
@@ -537,7 +550,8 @@ async def test_feedback_block_renders_off_event_loop(
     monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id: None)
     monkeypatch.setattr(agent, "_assemble_self_state_block", lambda **_kw: None)
 
-    async def _none_summaries(*, channel_id):
+    async def _none_summaries(*, channel_id, auth_context):
+        assert auth_context is None
         return None
 
     monkeypatch.setattr(agent, "_assemble_session_summaries", _none_summaries)
@@ -581,9 +595,12 @@ async def test_session_summaries_counts_turns_off_event_loop(
     agent = _make_agent(tmp_path)
 
     class _StubSaga:
-        async def recent_session_boundaries(self, *, channel_id, count):
+        async def recent_session_boundaries(
+            self, *, channel_id, count, auth_context,
+        ):
             assert channel_id == "ch-1"
             assert count == agent._config.recent_boundaries
+            assert auth_context is admin_auth
             return [
                 {
                     "ts": "2026-06-21T09:00:00+00:00",
@@ -598,6 +615,15 @@ async def test_session_summaries_counts_turns_off_event_loop(
             ]
 
     agent._saga = _StubSaga()
+    admin_auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+    )
     to_thread_calls: list[tuple[object, tuple, dict]] = []
 
     async def fake_to_thread(func, /, *args, **kwargs):
@@ -606,7 +632,9 @@ async def test_session_summaries_counts_turns_off_event_loop(
 
     monkeypatch.setattr("mimir.agent.asyncio.to_thread", fake_to_thread)
 
-    block = await agent._assemble_session_summaries(channel_id="ch-1")
+    block = await agent._assemble_session_summaries(
+        channel_id="ch-1", auth_context=admin_auth,
+    )
 
     assert block is not None
     assert len(to_thread_calls) == 1
@@ -624,6 +652,76 @@ async def test_session_summaries_counts_turns_off_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_session_summary_assembly_is_authorization_scoped(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    agent._config.access_control_enforced = True
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.executescript(Path("mimir/saga/schema.sql").read_text())
+    rows = [
+        ("public", "public summary", "user:bob", "public"),
+        ("alice", "alice summary", "user:alice", "private"),
+        ("bob", "bob summary", "user:bob", "private"),
+        ("service", "service summary", "service:synthesis", "service"),
+    ]
+    for index, (session_id, summary, owner, visibility) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO sessions (id, channel_id, started_at, ended_at, "
+            "summary, reflected_at, owner_principal, visibility) "
+            "VALUES (?, 'ch-auth', '2026-07-01T00:00:00+00:00', ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                f"2026-07-01T00:0{index}:00+00:00",
+                summary,
+                f"2026-07-01T00:0{index}:00+00:00",
+                owner,
+                visibility,
+            ),
+        )
+    conn.commit()
+    agent._saga = SagaStore(conn=conn, embedding_dim=4)
+    agent._config.recent_boundaries = len(rows)
+
+    admin_auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-auth",
+        interactivity=None,
+    )
+    alice_auth = AuthContext(
+        principal="user:alice",
+        canonical_principal="user:alice",
+        roles=(),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-auth",
+        interactivity=None,
+    )
+
+    try:
+        admin_block = await agent._assemble_session_summaries(
+            channel_id="ch-auth", auth_context=admin_auth,
+        )
+        alice_block = await agent._assemble_session_summaries(
+            channel_id="ch-auth", auth_context=alice_auth,
+        )
+    finally:
+        conn.close()
+
+    assert admin_block is not None
+    assert all(summary in admin_block for _, summary, _, _ in rows)
+    assert alice_block is not None
+    assert "public summary" in alice_block
+    assert "alice summary" in alice_block
+    assert "bob summary" not in alice_block
+    assert "service summary" not in alice_block
+
+
+@pytest.mark.asyncio
 async def test_agent_build_turn_prompt_omits_blocks_for_none_helpers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -638,7 +736,8 @@ async def test_agent_build_turn_prompt_omits_blocks_for_none_helpers(
     monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id: None)
     monkeypatch.setattr(agent, "_assemble_self_state_block", lambda **_kw: None)
 
-    async def _none_summaries(*, channel_id):
+    async def _none_summaries(*, channel_id, auth_context):
+        assert auth_context is None
         return None
 
     monkeypatch.setattr(agent, "_assemble_session_summaries", _none_summaries)

@@ -241,6 +241,16 @@ class SinkGate:
             service is not None
             and service_sink is not None
             and service.can_write_sink(service_sink)
+            # Poller payloads contain attacker-controlled external content, so
+            # their service authority must not bypass IFC on active sinks.
+            and not (
+                "poller_payload" in service.readable_domains
+                and sink_category in {
+                    SinkCategory.SHELL_PROCESS,
+                    SinkCategory.SPAWN,
+                    SinkCategory.FILE,
+                }
+            )
         ):
             return ToolAuthorization(
                 tool_name=tool_name,

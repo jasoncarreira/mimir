@@ -262,23 +262,24 @@ def test_explicit_service_principals_are_separate_and_frozen() -> None:
 
 
 @pytest.mark.parametrize(
-    ("trigger", "allowed_operation", "denied_operation"),
+    ("trigger", "allowed_operation", "denied_operation", "ifc_allows"),
     [
-        ("scheduled_tick", "shell_exec", "request_mimir_update"),
-        ("scheduled_tick", "read_file", "request_mimir_update"),
-        ("poller", "worklink_run", "remove_schedule"),
-        ("poller", "write_file", "remove_schedule"),
-        ("upgrade", "submit_proposal", "spawn_codex"),
-        ("upgrade", "read_file", "spawn_codex"),
-        ("saga_session_end", "saga_end_session", "spawn_codex"),
-        ("saga_session_end", "read_file", "spawn_codex"),
-        ("saga_session_end", "memory_get", "spawn_codex"),
+        ("scheduled_tick", "shell_exec", "request_mimir_update", True),
+        ("scheduled_tick", "read_file", "request_mimir_update", True),
+        ("poller", "worklink_run", "remove_schedule", True),
+        ("poller", "write_file", "remove_schedule", False),
+        ("upgrade", "submit_proposal", "spawn_codex", True),
+        ("upgrade", "read_file", "spawn_codex", True),
+        ("saga_session_end", "saga_end_session", "spawn_codex", True),
+        ("saga_session_end", "read_file", "spawn_codex", True),
+        ("saga_session_end", "memory_get", "spawn_codex", True),
     ],
 )
-def test_service_principals_allow_only_explicit_operations_with_full_inventory(
+def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
     trigger: str,
     allowed_operation: str,
     denied_operation: str,
+    ifc_allows: bool,
 ) -> None:
     from mimir.access_control import create_auth_context
     from mimir.models import AgentEvent
@@ -306,12 +307,20 @@ def test_service_principals_allow_only_explicit_operations_with_full_inventory(
     )
     ctx = create_auth_context(event, enforce=True, ifc_labels=labels)
 
-    admitted = registry.authorize_tool(allowed_operation, ctx, enforce=True)
+    admitted = registry.authorize_tool(
+        allowed_operation,
+        ctx,
+        enforce=True,
+        target_channel=f"{trigger}:target",
+    )
     denied = registry.authorize_tool(denied_operation, ctx, enforce=True)
 
-    assert admitted.allowed is True
+    assert admitted.allowed is ifc_allows
     assert admitted.is_shadow_decision is False
-    assert admitted.service_principal is get_service_principal(trigger)
+    if ifc_allows:
+        assert admitted.service_principal is get_service_principal(trigger)
+    else:
+        assert admitted.reason == "ifc_label_blocked:file"
     assert denied.allowed is False
     assert denied.reason == "admin_required"
     assert denied.service_principal is get_service_principal(trigger)
