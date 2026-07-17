@@ -370,3 +370,29 @@ def test_default_byte_budget_leaves_small_files_unsaturated(tmp_path: Path):
     snap = JsonlSnapshot(path)
     assert len(snap.records()) == 5
     assert snap.saturated is False
+
+
+def test_slim_transform_applied_to_cached_records_only(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    _write_jsonl(path, [{"i": 0, "big": "z" * 100}])
+
+    def slim(rec: dict) -> dict:
+        return {**rec, "big": rec["big"][:10]}
+
+    snap = JsonlSnapshot(path, slim=slim)
+    (rec,) = snap.records()
+    assert rec["big"] == "z" * 10
+    # Disk record untouched — full fidelity preserved for direct readers.
+    on_disk = json.loads(path.read_text().splitlines()[0])
+    assert on_disk["big"] == "z" * 100
+
+
+def test_slim_transform_failure_falls_back_to_raw_record(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    _write_jsonl(path, [{"i": 0}])
+
+    def broken(rec: dict) -> dict:
+        raise RuntimeError("boom")
+
+    snap = JsonlSnapshot(path, slim=broken)
+    assert snap.records() == [{"i": 0}]

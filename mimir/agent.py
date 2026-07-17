@@ -114,6 +114,7 @@ from .turn_logger import (
     derive_result_fields,
     extract_turn_events,
     make_turn_id,
+    slim_turn_record,
     truncate_input,
 )
 from .worklink.continuation import (
@@ -926,7 +927,13 @@ class Agent:
         # within one turn (~1s wall-clock) all those readers share one
         # cached parse.
         self._events_snapshot = JsonlSnapshot(config.events_log)
-        self._turns_snapshot = JsonlSnapshot(config.turns_log)
+        # Turn records keep FULL tool-call args + reasoning on disk (the
+        # audit trail; the turn viewer reads the file). The RETAINED
+        # in-RAM view is slimmed as records enter the cache — pre-fix
+        # this cache held ~600 MB parsed on a busy deployment.
+        self._turns_snapshot = JsonlSnapshot(
+            config.turns_log, slim=slim_turn_record
+        )
 
         # Recent feedback signals block — algedonic surface for the
         # turn prompt (v0.4 §2).

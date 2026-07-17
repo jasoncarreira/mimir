@@ -42,23 +42,21 @@ DEFAULT_MAX_TURNS = 1000
 
 
 def _cap_reasoning(text: str) -> str:
-    """Cap reasoning content the same way tool results are capped.
+    """Cap reasoning content for the in-RAM view (see ``slim_turn_record``).
 
-    Unbounded thinking blocks (plus unbounded tool args) drove single
-    turn records past 600 KB — and the retained turns.jsonl tail lives
-    parsed in RAM via ``JsonlSnapshot``, so record size is directly
-    resident-set size on a long-running deployment.
-    """
+    Returns the input object unchanged when under the cap, so callers can
+    use identity to detect "nothing capped"."""
     if len(text) > MAX_REASONING_BYTES:
         return text[:MAX_REASONING_BYTES] + "…[truncated]"
     return text
 
 
 def _cap_args(args: Any) -> Any:
-    """Cap tool-call args, which can embed entire file bodies
-    (``write_file``/``edit_file``). Above the cap the structure is
-    replaced with a JSON preview — turns.jsonl is an audit log, not the
-    tool transport, and results were already capped this way."""
+    """Cap tool-call args for the in-RAM view (see ``slim_turn_record``).
+
+    Args can embed entire file bodies (``write_file``/``edit_file``);
+    above the cap the structure is replaced with a JSON preview marker.
+    Returns the input object unchanged when under the cap."""
     if args is None:
         return None
     try:
@@ -72,6 +70,47 @@ def _cap_args(args: Any) -> Any:
         "bytes": len(blob),
         "preview": blob[:MAX_TOOL_ARGS_BYTES] + "…[truncated]",
     }
+
+
+def slim_turn_record(record: dict) -> dict:
+    """Memory-slim copy of a turns.jsonl record for in-RAM caches.
+
+    turns.jsonl keeps FULL tool_call args and reasoning on disk — it is
+    the audit/introspection trail, and the turn viewer reads the file
+    directly. In-RAM holders must not pay for that fidelity: single
+    records reach 600 KB+, and ``JsonlSnapshot``'s cached tail lives for
+    process lifetime (~600 MB resident on a busy deployment pre-fix).
+
+    Caps tool_call ``args`` (:data:`MAX_TOOL_ARGS_BYTES` JSON preview)
+    and reasoning ``content`` (:data:`MAX_REASONING_BYTES`) in a copied
+    record. The input record is NEVER mutated; when nothing exceeds a
+    cap the input object is returned as-is.
+    """
+    events = record.get("events")
+    if not isinstance(events, list) or not events:
+        return record
+    slim_events: list[Any] = []
+    changed = False
+    for ev in events:
+        if isinstance(ev, dict):
+            typ = ev.get("type")
+            if typ == "tool_call":
+                args = ev.get("args")
+                capped = _cap_args(args)
+                if capped is not args:
+                    ev = {**ev, "args": capped}
+                    changed = True
+            elif typ == "reasoning":
+                content = ev.get("content")
+                if isinstance(content, str):
+                    capped_text = _cap_reasoning(content)
+                    if capped_text is not content:
+                        ev = {**ev, "content": capped_text}
+                        changed = True
+        slim_events.append(ev)
+    if not changed:
+        return record
+    return {**record, "events": slim_events}
 
 
 def truncate_input(prompt: str) -> str:
@@ -232,7 +271,7 @@ def extract_turn_events(
                 events.append({
                     "type": "reasoning",
                     "source": "model_thinking_block",
-                    "content": _cap_reasoning(_think_text),
+                    "content": _think_text,
                 })
             content_text = _coerce_content(msg.content)
             # ChatClaudeCode executes tools inside the ``claude`` CLI
@@ -274,10 +313,10 @@ def extract_turn_events(
             if tool_events:
                 is_final_ai = i == last_ai_idx
                 if content_text and not is_final_ai:
-                    events.append({"type": "reasoning", "content": _cap_reasoning(content_text)})
+                    events.append({"type": "reasoning", "content": content_text})
                 elif content_text:
                     output_parts.append(content_text)
-                    events.append({"type": "reasoning", "content": _cap_reasoning(content_text)})
+                    events.append({"type": "reasoning", "content": content_text})
                 for te in tool_events:
                     te_type = te.get("type")
                     if te_type == "tool_call":
@@ -285,7 +324,7 @@ def extract_turn_events(
                             "type": "tool_call",
                             "id": te.get("tool_use_id", ""),
                             "name": te.get("name", "unknown"),
-                            "args": _cap_args(te.get("input")),
+                            "args": te.get("input"),
                         })
                     elif te_type == "tool_result":
                         # Use ``is not None`` rather than truthiness so an
@@ -330,7 +369,7 @@ def extract_turn_events(
             is_final_ai = i == last_ai_idx
             if content_text and tcs and not is_final_ai:
                 # Intermediate "thinking out loud" between tool calls.
-                events.append({"type": "reasoning", "content": _cap_reasoning(content_text)})
+                events.append({"type": "reasoning", "content": content_text})
             elif content_text:
                 # Either a text-only AIMessage OR the final AIMessage
                 # (whose content is the agent's answer even if it also
@@ -342,13 +381,13 @@ def extract_turn_events(
                     # commentary on the final AIMessage. The output
                     # field carries the user-visible reply; this gives
                     # operators the full picture in the turn log.
-                    events.append({"type": "reasoning", "content": _cap_reasoning(content_text)})
+                    events.append({"type": "reasoning", "content": content_text})
             for tc in tcs:
                 events.append({
                     "type": "tool_call",
                     "id": tc.get("id", ""),
                     "name": tc.get("name", "unknown"),
-                    "args": _cap_args(tc.get("args") or tc.get("input")),
+                    "args": tc.get("args") or tc.get("input"),
                 })
             for tr in internal_trs:
                 # Use ``is not None`` rather than truthiness — empty-string

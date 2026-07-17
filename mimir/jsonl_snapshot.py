@@ -29,7 +29,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from ._jsonl_tail import _tail_lines, tail_jsonl_records
 
@@ -94,11 +94,19 @@ class JsonlSnapshot:
         ttl_s: float = _DEFAULT_TTL_S,
         max_records: int = _DEFAULT_MAX_RECORDS,
         max_bytes: int = _DEFAULT_MAX_BYTES,
+        slim: Callable[[dict], dict] | None = None,
     ) -> None:
         self._path = path
         self._ttl = ttl_s
         self._max = max_records
         self._max_bytes = max_bytes
+        # Optional per-record transform applied as records enter the
+        # cache — lets the on-disk file keep full fidelity (audit trail,
+        # read directly by the turn viewer) while the RETAINED in-RAM
+        # view is slim (e.g. turn_logger.slim_turn_record caps tool-call
+        # args + reasoning). Must return a new/equal record, never
+        # mutate; a failing transform falls back to the raw record.
+        self._slim = slim
         self._byte_capped = False
         self._records: list[dict] = []
         self._cached_mtime: float = -1.0
@@ -208,6 +216,11 @@ class JsonlSnapshot:
                     rec = json.loads(stripped)
                 except json.JSONDecodeError:
                     continue
+                if self._slim is not None:
+                    try:
+                        rec = self._slim(rec)
+                    except Exception:  # noqa: BLE001 — cache survives one bad record
+                        pass
                 yield rec
                 count += 1
                 if count >= self._max:
