@@ -223,6 +223,30 @@ class SinkGate:
                 is_shadow_decision=not enforce,
             )
 
+        service = get_trusted_service_from_auth_context(auth_context)
+        service_sink = {
+            SinkCategory.SHELL_PROCESS: "shell_process",
+            SinkCategory.SPAWN: "spawn_process",
+            SinkCategory.FILE: "filesystem",
+            SinkCategory.NOTIFICATION: "notification",
+            SinkCategory.HTTP_WEBHOOK: "network",
+            SinkCategory.NETWORK: "network",
+            SinkCategory.EXTERNAL_MCP: "external_mcp",
+        }.get(sink_category)
+        if (
+            service is not None
+            and service_sink is not None
+            and service.can_write_sink(service_sink)
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.OPEN,
+                allowed=True,
+                reason="ifc_service_sink_allowed",
+                service_principal=service,
+                enforcement_enabled=enforce,
+            )
+
         if not target:
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -1007,10 +1031,34 @@ class ToolRegistry:
         The ifc_labels parameter enables information flow control sink gate
         checks (chainlink #871).
         """
-        if ifc_labels is not None:
+        sink_category = get_sink_category(tool_name)
+        if ifc_labels is None and auth_context is not None:
+            ifc_labels = getattr(auth_context, "ifc_labels", None)
+        catalog = get_operation_catalog()
+        preliminary_decision = catalog.get_decision(tool_name, auth_context)
+        preliminary_service = (
+            get_trusted_service_from_auth_context(auth_context)
+            if auth_context is not None
+            else None
+        )
+        service_capability_denied = (
+            preliminary_decision == OperationDecision.ADMIN_REQUIRED
+            and not (
+                preliminary_service is not None
+                and preliminary_service.has_capability(tool_name)
+            )
+        )
+        sink_target = target_channel
+        if (
+            sink_category == SinkCategory.SAME_CHANNEL
+            and not sink_target
+            and auth_context is not None
+        ):
+            sink_target = getattr(auth_context, "channel_id", None)
+        if sink_category != SinkCategory.UNKNOWN and not service_capability_denied:
             sink_check = SinkGate.check_sink_flow(
                 tool_name,
-                target_channel,
+                sink_target,
                 ifc_labels,
                 auth_context,
                 enforce=enforce,
@@ -1018,8 +1066,7 @@ class ToolRegistry:
             if not sink_check.allowed and enforce:
                 return sink_check
 
-        catalog = get_operation_catalog()
-        decision = catalog.get_decision(tool_name, auth_context)
+        decision = preliminary_decision
         service_principal = None
 
         if auth_context is not None:
@@ -1626,6 +1673,7 @@ def create_auth_context(
     *,
     enforce: bool = False,
     event_ingress: str | None = None,
+    ifc_labels: "InformationFlowLabels | None" = None,
 ) -> "AuthContext":
     """Create a frozen AuthContext from an inbound event (chainlink #864).
 
@@ -1679,4 +1727,5 @@ def create_auth_context(
         policy_version=policy_version,
         is_service=is_service,
         enforcement_enabled=enforce,
+        ifc_labels=ifc_labels,
     )

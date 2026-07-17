@@ -16,7 +16,7 @@ from mimir.access_control import (
     ToolRegistry,
     get_service_principal,
 )
-from mimir.models import AuthContext
+from mimir.models import AuthContext, InformationFlowLabels
 from mimir.tools import budget_gate
 
 
@@ -61,6 +61,13 @@ def _auth_context(
     )
 
 
+def _service_labels(event) -> InformationFlowLabels:
+    return InformationFlowLabels(
+        labels=frozenset({"internal"}),
+        source_channels=frozenset({event.channel_id}) if event.channel_id else frozenset(),
+    )
+
+
 def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
     catalog = OperationCatalog()
 
@@ -88,7 +95,9 @@ def test_scheduler_service_principal_can_invoke_factory_operations(
         channel_id="scheduler:test",
         service_principal="scheduler",
     )
-    auth = create_auth_context(event, enforce=True)
+    auth = create_auth_context(
+        event, enforce=True, ifc_labels=_service_labels(event),
+    )
 
     decision = ToolRegistry().authorize_tool(operation, auth, enforce=True)
 
@@ -263,7 +272,11 @@ def test_service_principals_allow_only_explicit_operations_with_full_inventory(
         channel_id=f"{trigger}:test",
         service_principal=service_principals.get(trigger),
     )
-    ctx = create_auth_context(event, enforce=True)
+    labels = InformationFlowLabels(
+        labels=frozenset({"internal"}),
+        source_channels=frozenset({event.channel_id}),
+    )
+    ctx = create_auth_context(event, enforce=True, ifc_labels=labels)
 
     admitted = registry.authorize_tool(allowed_operation, ctx, enforce=True)
     denied = registry.authorize_tool(denied_operation, ctx, enforce=True)
@@ -286,7 +299,7 @@ def test_service_authorization_is_stable_under_inventory_mutation_and_surface_wi
         channel_id="scheduler:test",
         service_principal="scheduler",
     )
-    scheduler = create_auth_context(event, enforce=True)
+    scheduler = create_auth_context(event, enforce=True, ifc_labels=_service_labels(event))
 
     before = registry.authorize_tool("shell_exec", scheduler, enforce=True)
     registry.register_runtime_tools(
@@ -600,7 +613,7 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
             channel_id=f"{trigger}:test",
             service_principal=service_principals.get(trigger),
         )
-        ctx = create_auth_context(event, enforce=True)
+        ctx = create_auth_context(event, enforce=True, ifc_labels=_service_labels(event))
         result = registry.authorize_tool(operation, ctx, enforce=True)
 
         if should_allow:
@@ -630,7 +643,7 @@ def test_service_authorization_requires_two_factor_validation() -> None:
         channel_id="scheduler:test",
         service_principal="scheduler",
     )
-    ctx_correct = create_auth_context(event_correct, enforce=True)
+    ctx_correct = create_auth_context(event_correct, enforce=True, ifc_labels=_service_labels(event_correct))
     result_correct = registry.authorize_tool("shell_exec", ctx_correct, enforce=True)
     assert result_correct.allowed is True, "Correctly-stamped service should get capabilities"
     assert result_correct.service_principal is not None
@@ -641,7 +654,7 @@ def test_service_authorization_requires_two_factor_validation() -> None:
         channel_id="scheduler:test",
         service_principal="wrong_principal",
     )
-    ctx_wrong_principal = create_auth_context(event_wrong_principal, enforce=True)
+    ctx_wrong_principal = create_auth_context(event_wrong_principal, enforce=True, ifc_labels=_service_labels(event_wrong_principal))
     result_wrong_principal = registry.authorize_tool("shell_exec", ctx_wrong_principal, enforce=True)
     assert result_wrong_principal.allowed is False, "Mismatched service_principal should be denied"
     assert result_wrong_principal.reason == "admin_required"
@@ -650,7 +663,7 @@ def test_service_authorization_requires_two_factor_validation() -> None:
         trigger="scheduled_tick",
         channel_id="scheduler:test",
     )
-    ctx_no_service_principal = create_auth_context(event_no_service_principal, enforce=True)
+    ctx_no_service_principal = create_auth_context(event_no_service_principal, enforce=True, ifc_labels=_service_labels(event_no_service_principal))
     result_no_service_principal = registry.authorize_tool("shell_exec", ctx_no_service_principal, enforce=True)
     assert result_no_service_principal.allowed is False, "Missing service_principal should be denied"
     assert result_no_service_principal.reason == "admin_required"
@@ -661,7 +674,7 @@ def test_service_authorization_requires_two_factor_validation() -> None:
         service_principal="scheduler",
         extra={HTTP_EVENT_INGRESS_EXTRA_KEY: "http-api"},
     )
-    ctx_http_ingress = create_auth_context(event_http_ingress, enforce=True)
+    ctx_http_ingress = create_auth_context(event_http_ingress, enforce=True, ifc_labels=_service_labels(event_http_ingress))
     result_http_ingress = registry.authorize_tool("shell_exec", ctx_http_ingress, enforce=True)
     assert result_http_ingress.allowed is False, "HTTP ingress should be denied even with correct service_principal"
     assert result_http_ingress.reason == "admin_required"
@@ -685,7 +698,7 @@ def test_service_authorization_shadow_mode_emits_decision_event() -> None:
         channel_id="scheduler:test",
         service_principal="scheduler",
     )
-    ctx = create_auth_context(event, enforce=False)
+    ctx = create_auth_context(event, enforce=False, ifc_labels=_service_labels(event))
     result = registry.authorize_tool("shell_exec", ctx, enforce=False)
     assert result.allowed is True
     assert result.is_shadow_decision is True, "Service capability grant in shadow mode should emit shadow decision"
@@ -711,7 +724,7 @@ def test_commitment_actor_requires_two_factor_validation() -> None:
         channel_id="scheduler:test",
         service_principal="scheduler",
     )
-    ctx_correct = create_auth_context(event_correct, enforce=True)
+    ctx_correct = create_auth_context(event_correct, enforce=True, ifc_labels=_service_labels(event_correct))
     runtime_correct = MockRuntime(ctx_correct)
     actor_correct = _commitment_actor(runtime_correct)
     assert actor_correct is not None
@@ -723,7 +736,7 @@ def test_commitment_actor_requires_two_factor_validation() -> None:
         channel_id="scheduler:test",
         service_principal="wrong_principal",
     )
-    ctx_wrong_principal = create_auth_context(event_wrong_principal, enforce=True)
+    ctx_wrong_principal = create_auth_context(event_wrong_principal, enforce=True, ifc_labels=_service_labels(event_wrong_principal))
     runtime_wrong_principal = MockRuntime(ctx_wrong_principal)
     actor_wrong_principal = _commitment_actor(runtime_wrong_principal)
     assert actor_wrong_principal is None or actor_wrong_principal[0] != "service:scheduler"
@@ -732,7 +745,7 @@ def test_commitment_actor_requires_two_factor_validation() -> None:
         trigger="scheduled_tick",
         channel_id="scheduler:test",
     )
-    ctx_no_service_principal = create_auth_context(event_no_service_principal, enforce=True)
+    ctx_no_service_principal = create_auth_context(event_no_service_principal, enforce=True, ifc_labels=_service_labels(event_no_service_principal))
     runtime_no_service_principal = MockRuntime(ctx_no_service_principal)
     actor_no_service_principal = _commitment_actor(runtime_no_service_principal)
     assert actor_no_service_principal is None or actor_no_service_principal[0] != "service:scheduler"
@@ -743,7 +756,7 @@ def test_commitment_actor_requires_two_factor_validation() -> None:
         service_principal="scheduler",
         extra={HTTP_EVENT_INGRESS_EXTRA_KEY: "http-api"},
     )
-    ctx_http_ingress = create_auth_context(event_http_ingress, enforce=True)
+    ctx_http_ingress = create_auth_context(event_http_ingress, enforce=True, ifc_labels=_service_labels(event_http_ingress))
     runtime_http_ingress = MockRuntime(ctx_http_ingress)
     actor_http_ingress = _commitment_actor(runtime_http_ingress)
     assert actor_http_ingress is None or actor_http_ingress[0] != "service:scheduler"

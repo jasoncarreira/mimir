@@ -1386,6 +1386,7 @@ class Agent:
             getattr(self, "_identity_resolver", None),
             policy_version=getattr(self._config, "policy_version", None),
             enforce=self._config.access_control_enforced,
+            ifc_labels=initial_ifc_labels,
         )
         emitter = TurnEventEmitter(
             self._turn_event_bus,
@@ -1502,6 +1503,7 @@ class Agent:
                     policy_version=getattr(self._config, "policy_version", None),
                     enforce=self._config.access_control_enforced,
                     event_ingress=event_ingress,
+                    ifc_labels=initial_ifc_labels,
                 )
             # Update auth_ctx with the actual interactivity classification
             if auth_ctx is not None:

@@ -150,6 +150,10 @@ class AuthContext:
     - Single-active-turn heuristics
 
     Fields are immutable (frozen=True) to prevent post-creation widening.
+
+    The ifc_labels field carries per-turn IFC labels on the durable carrier,
+    ensuring sink-flow checks survive forked SDK/MCP tasks where the
+    _current_turn ContextVar is lost (chainlink #891).
     """
 
     principal: str | None
@@ -162,6 +166,7 @@ class AuthContext:
     policy_version: str | None = None
     is_service: bool = False
     enforcement_enabled: bool = False
+    ifc_labels: "InformationFlowLabels | None" = None
 
 
 @dataclass

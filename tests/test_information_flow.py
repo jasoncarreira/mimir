@@ -175,6 +175,30 @@ def test_cross_principal_or_cross_channel_taint_is_blocked_at_triggering_harness
     assert decision.allowed is False
 
 
+def test_service_principal_cannot_bypass_incompatible_sink_labels():
+    service = AuthContext(
+        principal="service:scheduler",
+        canonical_principal="scheduler",
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id="slack-C-public",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "slack-C-public",
+        _labels(sources=frozenset({"slack-C-private"})),
+        service,
+        enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
 def test_ordinary_admin_cannot_bypass_or_erase_labels():
     labels = _labels(sources=frozenset({"slack-C-private"}))
     admin = _auth("slack-C-public", roles=("admin",))

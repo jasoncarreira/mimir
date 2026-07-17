@@ -33,7 +33,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
-from mimir.models import AuthContext, TurnContext
+from mimir.models import AuthContext, InformationFlowLabels, TurnContext
 from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
@@ -66,6 +66,17 @@ def _make_request(
         tool=None,
         state=None,
         runtime=Runtime(context=auth_context),
+    )
+
+
+def _ifc_labels(
+    channel: str = "ch-1",
+    *,
+    sources: frozenset[str] | None = None,
+) -> InformationFlowLabels:
+    return InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=sources if sources is not None else frozenset({channel}),
     )
 
 
@@ -230,6 +241,95 @@ async def test_middleware_awrap_passes_through_under_budget():
     assert out.content == "ok"
     assert len(handler_calls) == 1
     assert ctx.tool_call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_forked_task_uses_auth_context_ifc_labels_when_contextvar_is_unset():
+    """The frozen request carrier keeps the sink gate active across task forks."""
+    mw = BudgetGateMiddleware()
+    auth = AuthContext(
+        principal="slack-U1",
+        canonical_principal="user-1",
+        roles=(),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=True,
+        ifc_labels=_ifc_labels(),
+    )
+    handler_calls: list[ToolCallRequest] = []
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        handler_calls.append(req)
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
+    # No set_current_turn(): this mirrors a forked SDK/MCP task whose ContextVar
+    # did not propagate. Authorization must recover labels from AuthContext.
+    out = await mw.awrap_tool_call(
+        _make_request("send_message", "ifc-carrier", auth), handler,
+    )
+
+    assert out.content == "ok"
+    assert len(handler_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_forked_task_blocks_incompatible_egress_from_auth_context_labels():
+    mw = BudgetGateMiddleware()
+    auth = AuthContext(
+        principal="slack-U1",
+        canonical_principal="user-1",
+        roles=(),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=True,
+        ifc_labels=_ifc_labels(sources=frozenset({"ch-private"})),
+    )
+    handler_calls: list[ToolCallRequest] = []
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        handler_calls.append(req)
+        return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+    out = await mw.awrap_tool_call(
+        _make_request("send_message", "ifc-block", auth), handler,
+    )
+
+    assert out.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(out.content)
+    assert handler_calls == []
+
+
+@pytest.mark.asyncio
+async def test_real_turn_without_ifc_labels_fails_closed_under_enforcement():
+    mw = BudgetGateMiddleware()
+    auth = AuthContext(
+        principal="slack-U1",
+        canonical_principal="user-1",
+        roles=(),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=True,
+        ifc_labels=None,
+    )
+    handler_calls: list[ToolCallRequest] = []
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        handler_calls.append(req)
+        return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+    out = await mw.awrap_tool_call(
+        _make_request("send_message", "ifc-missing", auth), handler,
+    )
+
+    assert out.status == "error"
+    assert "missing_ifc_labels" in str(out.content)
+    assert handler_calls == []
 
 
 @pytest.mark.asyncio

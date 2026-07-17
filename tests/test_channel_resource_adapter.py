@@ -20,7 +20,7 @@ from mimir.access_control import (
     get_tool_registry,
 )
 from mimir.identities import IdentityResolver
-from mimir.models import AuthContext
+from mimir.models import AuthContext, InformationFlowLabels
 from mimir.tools.budget_gate import (
     _check_admin_authorized,
     _extract_channel_from_args,
@@ -50,6 +50,7 @@ def _auth_context(
         channel_id=channel_id,
         interactivity=None,
         enforcement_enabled=enforce,
+        ifc_labels=InformationFlowLabels(source_channels=frozenset({channel_id}) if channel_id else frozenset()),
     )
 
 
