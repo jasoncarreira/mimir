@@ -7,6 +7,7 @@ module-level surface directly.
 """
 from __future__ import annotations
 
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -228,6 +229,64 @@ class TestApplyPendingMigrations:
         )}
         assert table_exists is None
         assert versions == {1}
+
+    def test_current_stamp_with_missing_ownership_columns_is_rejected(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            f"""
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version VALUES
+                ({m.CURRENT_SCHEMA_VERSION}, '2000-01-01T00:00:00+00:00');
+            CREATE TABLE atoms (id TEXT PRIMARY KEY);
+            """
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"schema_version reports version .*atoms\.visibility",
+        ):
+            m.apply_pending_migrations(conn, fresh=False)
+
+    def test_current_schema_with_current_stamp_is_unchanged(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (m.CURRENT_SCHEMA_VERSION, "2000-01-01T00:00:00+00:00"),
+        )
+
+        m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchall() == [(m.CURRENT_SCHEMA_VERSION,)]
+
+    def test_add_column_migration_identifies_missing_table(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE schema_version ("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO schema_version VALUES "
+            "(6, '2000-01-01T00:00:00+00:00')"
+        )
+
+        with pytest.raises(
+            sqlite3.OperationalError,
+            match="required table 'triples' does not exist",
+        ):
+            m.apply_pending_migrations(
+                conn,
+                fresh=False,
+                target_version=7,
+                migrations={
+                    7: "ALTER TABLE triples ADD COLUMN visibility TEXT;"
+                },
+            )
 
 
 class TestV6RebuildDataPreservation:

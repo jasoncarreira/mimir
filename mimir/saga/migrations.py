@@ -634,6 +634,19 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(str(row[1]).casefold() == column.casefold() for row in rows)
 
 
+def _add_column_target(statement: str) -> tuple[str, str] | None:
+    match = _ADD_COLUMN_RE.match(statement)
+    if match is None:
+        return None
+    table = _identifier_from_match(
+        match, "table_dq", "table_bt", "table_br", "table"
+    )
+    column = _identifier_from_match(
+        match, "col_dq", "col_bt", "col_br", "col"
+    )
+    return table, column
+
+
 def _is_duplicate_add_column(
     conn: sqlite3.Connection,
     statement: str,
@@ -641,15 +654,10 @@ def _is_duplicate_add_column(
 ) -> bool:
     if "duplicate column name" not in str(exc).casefold():
         return False
-    match = _ADD_COLUMN_RE.match(statement)
-    if match is None:
+    target = _add_column_target(statement)
+    if target is None:
         return False
-    table = _identifier_from_match(
-        match, "table_dq", "table_bt", "table_br", "table"
-    )
-    column = _identifier_from_match(
-        match, "col_dq", "col_bt", "col_br", "col"
-    )
+    table, column = target
     return _column_exists(conn, table, column)
 
 
@@ -660,7 +668,59 @@ def _execute_migration_script(conn: sqlite3.Connection, ddl: str) -> None:
         except sqlite3.OperationalError as exc:
             if _is_duplicate_add_column(conn, statement, exc):
                 continue
+            target = _add_column_target(statement)
+            if "no such table" in str(exc).casefold() and target is not None:
+                table, column = target
+                raise sqlite3.OperationalError(
+                    f"migration cannot add column {column!r}: "
+                    f"required table {table!r} does not exist"
+                ) from exc
             raise
+
+
+_OWNERSHIP_COLUMNS = {
+    "owner_principal",
+    "origin_channel",
+    "origin_domain",
+    "visibility",
+    "provenance",
+}
+
+
+def _validate_ownership_schema(
+    conn: sqlite3.Connection,
+    *,
+    stamped_version: int,
+    target_version: int,
+) -> None:
+    required_tables = (
+        ("atoms", 7),
+        ("sessions", 7),
+        ("observations_metadata", 7),
+        ("triples", 7),
+        ("world_state", 8),
+    )
+    missing: list[str] = []
+    for table, introduced_in in required_tables:
+        if target_version < introduced_in:
+            continue
+        columns = {
+            str(row[1])
+            for row in conn.execute(f"PRAGMA table_info({table!r})").fetchall()
+        }
+        if not columns:
+            missing.append(f"{table} (table missing)")
+            continue
+        missing.extend(
+            f"{table}.{column}" for column in sorted(_OWNERSHIP_COLUMNS - columns)
+        )
+
+    if missing:
+        raise RuntimeError(
+            f"schema_version reports version {stamped_version}, but the "
+            f"ownership schema required by version {target_version} is incomplete: "
+            + ", ".join(missing)
+        )
 
 
 def apply_pending_migrations(
@@ -752,12 +812,19 @@ def apply_pending_migrations(
             )
         conn.commit()
         applied = set(range(1, inferred + 1))
-        if inferred >= target_version:
-            # Tables are already at current shape (the half-init
-            # retry case) — nothing more to do.
-            return
         # Else fall through to the migrations loop below, which
         # will apply versions max(applied)+1 .. target_version.
+
+    stamped_version = max(applied)
+    if stamped_version >= target_version:
+        # A stamp from another lineage or a manually edited/restored DB is
+        # not proof that the security-sensitive ownership schema exists.
+        _validate_ownership_schema(
+            conn,
+            stamped_version=stamped_version,
+            target_version=target_version,
+        )
+        return
 
     for version, ddl in sorted(migrations.items()):
         if version <= max(applied):
