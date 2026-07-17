@@ -382,8 +382,8 @@ def _claude_code_pre_tool_enforcement(
     # callback task may be detached. Never substitute SDK/model session_id,
     # active-turn registries, or inherited ContextVars as authorization. Under
     # enforcement this missing exact carrier fails closed; in unenforced legacy
-    # mode behavior remains open. Adapter-level carrier plumbing is follow-up
-    # work before Claude SDK admin tools can be enabled under enforcement.
+    # mode behavior remains open. Config startup rejects claude-code combined
+    # with enforcement until adapter-level carrier plumbing exists.
     admin_denial = _check_admin_authorized(tool_name, None)
     if admin_denial is not None:
         _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)

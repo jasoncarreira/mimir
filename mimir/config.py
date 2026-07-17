@@ -1019,6 +1019,7 @@ class Config:
         _load_home_dotenv(home)
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
+        model_spec = _env("MIMIR_MODEL_SPEC", "claude-code:claude-sonnet-4-6")
         # Resolve once — used by both ``billing_mode`` (to detect QUOTA
         # vs API_KEY billing) and ``oauth_credentials_path`` (the field
         # itself). Computing it twice was redundant and could in theory
@@ -1029,7 +1030,7 @@ class Config:
             home=home,
             agent_id=_env("MIMIR_AGENT_ID", "mimir"),
             model=_env("MIMIR_MODEL", "claude-opus-4-7"),
-            model_spec=_env("MIMIR_MODEL_SPEC", "claude-code:claude-sonnet-4-6"),
+            model_spec=model_spec,
             model_max_retries=_env_int("MIMIR_MODEL_MAX_RETRIES", 6),
             model_max_tokens=_env_int("MIMIR_MODEL_MAX_TOKENS", 0),
             model_reasoning_effort=_env("MIMIR_MODEL_REASONING_EFFORT", ""),
@@ -1113,7 +1114,8 @@ class Config:
 
             cross_platform_pull=_env_bool("MIMIR_CROSS_PLATFORM_PULL", True),
             access_control_enforced=resolve_access_control_enforcement(
-                _env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False)
+                _env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False),
+                model_spec=model_spec,
             ),
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
@@ -1188,7 +1190,7 @@ class Config:
                 # chainlink #315: a codex-plus subscription spec is itself a
                 # QUOTA signal, so a Codex-only install keeps its quota view
                 # without relying on stale Anthropic creds.
-                model_spec=_env("MIMIR_MODEL_SPEC", "claude-code:claude-sonnet-4-6"),
+                model_spec=model_spec,
             ),
 
             capture_rate_limits=_env_bool("MIMIR_CAPTURE_RATE_LIMITS", True),

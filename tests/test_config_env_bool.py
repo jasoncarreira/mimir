@@ -120,6 +120,8 @@ class TestConfigBoolFieldsUniform:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _clear_env(monkeypatch)
+        if env_var == "MIMIR_ACCESS_CONTROL_ENFORCED":
+            monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.3-codex")
         monkeypatch.setenv(env_var, value)
         cfg = Config.from_env()
         assert getattr(cfg, attr) is True, (
@@ -139,6 +141,7 @@ class TestConfigBoolFieldsUniform:
         )
 
         _clear_env(monkeypatch)
+        monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.3-codex")
         monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
         original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
         try:
@@ -160,6 +163,27 @@ class TestConfigBoolFieldsUniform:
         finally:
             _TRUSTED_SERVICE_PRINCIPALS.clear()
             _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+
+    @pytest.mark.parametrize(
+        "model_spec",
+        ["claude-code:claude-sonnet-4-6", "claude_code:claude-sonnet-4-6"],
+    )
+    def test_enforcement_rejects_claude_code_provider(
+        self,
+        model_spec: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.access_control import ProviderEnforcementCompatibilityError
+
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("MIMIR_MODEL_SPEC", model_spec)
+        monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+
+        with pytest.raises(
+            ProviderEnforcementCompatibilityError,
+            match="claude-code subprocess.*per-turn AuthContext",
+        ):
+            Config.from_env()
 
     @pytest.mark.parametrize("env_var, attr", _ALL_BOOL_FIELDS)
     @pytest.mark.parametrize("value", _FALSY_VALUES)
