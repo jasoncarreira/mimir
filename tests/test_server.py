@@ -694,6 +694,49 @@ class TestHandleEvent:
         assert event.author_id == "u123"
 
     @pytest.mark.asyncio
+    async def test_per_user_key_ignores_spoofed_admin_and_service_authority(
+        self, tmp_path,
+    ) -> None:
+        from mimir.access_control import create_auth_context
+        from mimir.identities import IdentityResolver
+        from mimir.identities_populator import issue_web_key
+
+        user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+        issue_web_key(tmp_path, "operator", roles=["admin"])
+        resolver = IdentityResolver(tmp_path)
+        resolver.reload()
+
+        stub = MagicMock()
+        stub.enqueue = AsyncMock(return_value=True)
+        app = web.Application(middlewares=[_make_auth_middleware("master-secret")])
+        app["dispatcher"] = stub
+        app["identity_resolver"] = resolver
+        app.router.add_post("/event", _handle_event)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                headers={"X-API-Key": user_key},
+                json={
+                    "channel_id": "ch",
+                    "author": "operator",
+                    "author_id": "operator",
+                    "trigger": "scheduled_tick",
+                    "source": "api",
+                    "service_principal": "scheduler",
+                },
+            )
+
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.author == "alice"
+        assert event.author_id == "alice"
+        assert event.service_principal is None
+        auth_context = create_auth_context(event, resolver, enforce=True)
+        assert auth_context.roles == ("user",)
+        assert auth_context.is_service is False
+
+    @pytest.mark.asyncio
     async def test_empty_body_returns_400(self) -> None:
         """A totally empty JSON object has no channel_id → 400."""
         app, _ = _event_app()
