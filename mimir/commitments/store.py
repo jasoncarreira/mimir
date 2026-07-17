@@ -177,7 +177,9 @@ class CommitmentsStore:
         Public lifecycle methods consult it before appending.
 
         Authorization: recipient_principal does NOT grant mutation authority.
-        Only the exact owner_principal (or admin) can mutate a commitment.
+        Owner mutations require an exact owner match (or admin). The trusted
+        commitment poller has a narrow exception for its own system lifecycle
+        transitions (deliver / expire), which sweep commitments across owners.
 
         Returns True if the transition is valid and authorized; False
         if the record is unknown, unauthorized, or the transition
@@ -201,7 +203,10 @@ class CommitmentsStore:
             )
             return False
         if not self._is_authorized(
-            rec, actor_principal, actor_is_admin=actor_is_admin,
+            rec,
+            actor_principal,
+            target_status=target_status,
+            actor_is_admin=actor_is_admin,
         ):
             log.warning(
                 "commitments: lifecycle write rejected — unauthorized "
@@ -216,21 +221,32 @@ class CommitmentsStore:
         record: CommitmentRecord,
         actor_principal: str | None,
         *,
+        target_status: str,
         actor_is_admin: bool = False,
     ) -> bool:
-        """Check if the actor is authorized to mutate this commitment.
+        """Check if the actor may apply one lifecycle transition.
 
         Authorization rules (when actor_principal is provided):
-        - Admin actors can mutate any record, including service/legacy records
-        - Non-admin actors must exactly match owner_principal
-        - Ownerless legacy records are admin-only
+        - Admin actors can apply any valid transition
+        - The trusted commitment poller may deliver or expire any record; these
+          are system lifecycle transitions, not owner mutations
+        - Every other non-admin transition requires an exact owner match
+        - Ownerless records remain admin-only for owner mutations
 
-        If no actor_principal provided, allow by default (backward compat).
+        If no actor_principal is provided, allow by default (backward compat).
         Recipient identity does NOT grant mutation authority.
         """
         if actor_principal is None:
             return True
         if actor_is_admin:
+            return True
+        if (
+            actor_principal == "service:poller"
+            and target_status in {
+                CommitmentStatus.DELIVERED.value,
+                CommitmentStatus.EXPIRED.value,
+            }
+        ):
             return True
         return (
             record.owner_principal is not None
@@ -632,33 +648,24 @@ class CommitmentsStore:
 
         Visibility rules for an authenticated actor:
         - Admin: visible regardless of visibility level or owner
-        - Service actor: exact-owner records, plus deliberately public records
-        - Ordinary actor: exact-owner records only
+        - Any actor: exact-owner records
+        - Anonymous/backward-compatible reads: public records
+        - Ownerless and cross-owner records: hidden from authenticated actors
         - Ownerless service records: admin-only
 
-        ``include_service`` opts into service visibility but does not grant
-        authority over another service principal's records.
+        ``include_service`` opts into the actor's own service-visibility records;
+        it never grants cross-owner access. Public is a legacy visibility label,
+        not an implicit grant to every authenticated service principal.
         """
         if actor_is_admin:
             return True
-        actor_is_service = (
-            actor_principal is not None
-            and actor_principal.startswith("service:")
-        )
-        if record.visibility == CommitmentVisibility.SERVICE.value:
-            return (
-                include_service
-                and record.owner_principal is not None
-                and actor_principal == record.owner_principal
-            )
         if actor_principal is None:
             return record.visibility == CommitmentVisibility.PUBLIC.value
-        if actor_principal == record.owner_principal:
-            return True
-        return (
-            actor_is_service
-            and record.visibility == CommitmentVisibility.PUBLIC.value
-        )
+        if actor_principal != record.owner_principal:
+            return False
+        if record.visibility == CommitmentVisibility.SERVICE.value:
+            return include_service
+        return True
 
     def find_by_dedupe_key(
         self,

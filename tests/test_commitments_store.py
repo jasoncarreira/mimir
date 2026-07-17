@@ -1375,7 +1375,41 @@ async def test_legacy_record_no_owner_is_admin_only(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_service_list_is_owner_scoped_and_public_aware(tmp_path: Path):
+async def test_poller_lifecycle_is_cross_owner_but_owner_mutations_are_not(
+    tmp_path: Path,
+):
+    """The poller sweeps lifecycle state without becoming the record owner."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    ownerless_due = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Ownerless due",
+    ))
+    user_due = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Alice due",
+        owner_principal="user:alice",
+    ))
+    ownerless_expired = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Ownerless expired",
+    ))
+
+    assert await store.deliver(
+        ownerless_due.id, actor_principal="service:poller",
+    ) is True
+    assert await store.deliver(
+        user_due.id, actor_principal="service:poller",
+    ) is True
+    assert await store.expire(
+        ownerless_expired.id, actor_principal="service:poller",
+    ) is True
+    assert await store.complete(
+        user_due.id, actor_principal="service:poller",
+    ) is False
+    assert await store.deliver(
+        ownerless_due.id, actor_principal="service:scheduler",
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_service_list_is_exact_owner_scoped(tmp_path: Path):
     store = CommitmentsStore(path=tmp_path / "c.jsonl")
     poller = await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id=None, text="Poller private",
@@ -1388,8 +1422,12 @@ async def test_service_list_is_owner_scoped_and_public_aware(tmp_path: Path):
         visibility=CommitmentVisibility.SERVICE.value,
     ))
     public = await store.add(CommitmentRecord(
-        id=make_commitment_id(), channel_id="c1", text="Public grant",
+        id=make_commitment_id(), channel_id="c1", text="User public",
         owner_principal="user:alice",
+        visibility=CommitmentVisibility.PUBLIC.value,
+    ))
+    ownerless_public = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Ownerless public",
         visibility=CommitmentVisibility.PUBLIC.value,
     ))
     legacy = await store.add(CommitmentRecord(
@@ -1400,8 +1438,10 @@ async def test_service_list_is_owner_scoped_and_public_aware(tmp_path: Path):
     rows = store.list(
         actor_principal="service:poller", include_service=True,
     )
-    assert {row.id for row in rows} == {poller.id, public.id}
+    assert {row.id for row in rows} == {poller.id}
     assert scheduler.id not in {row.id for row in rows}
+    assert public.id not in {row.id for row in rows}
+    assert ownerless_public.id not in {row.id for row in rows}
     assert legacy.id not in {row.id for row in rows}
 
     admin_rows = store.list(
@@ -1409,7 +1449,7 @@ async def test_service_list_is_owner_scoped_and_public_aware(tmp_path: Path):
         actor_is_admin=True,
     )
     assert {row.id for row in admin_rows} == {
-        poller.id, scheduler.id, public.id, legacy.id,
+        poller.id, scheduler.id, public.id, ownerless_public.id, legacy.id,
     }
 
 @pytest.mark.asyncio

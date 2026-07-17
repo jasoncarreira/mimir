@@ -141,7 +141,6 @@ async def test_emits_due_when_window_open(tmp_path: Path, home: Path):
     rec = await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id="chan-1",
         text="Review PR #111", kind=CommitmentKind.AGENT_PROMISE.value,
-        owner_principal="service:poller",
         recipient_identity="alice",
         due_window_start_unix=now - 60,  # just-opened
         due_window_end_unix=now + 86400,
@@ -190,7 +189,6 @@ async def test_does_not_re_emit_due_on_already_delivered(
     now = time.time()
     await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id="c1", text="X",
-        owner_principal="service:poller",
         due_window_start_unix=now - 60,
         due_window_end_unix=now + 86400,
     ))
@@ -213,7 +211,6 @@ async def test_emits_expired_when_window_ends(tmp_path: Path, home: Path):
     end = base - 60
     rec = await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id="c1", text="X",
-        owner_principal="service:poller",
         due_window_start_unix=base - 86400,
         due_window_end_unix=end,
     ))
@@ -243,7 +240,6 @@ async def test_expired_after_delivered_still_fires(
     now = time.time()
     rec = await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id="c1", text="X",
-        owner_principal="service:poller",
         due_window_start_unix=now - 86400,
         due_window_end_unix=now + 60,
     ))
@@ -494,7 +490,6 @@ async def test_emit_at_exact_end_uses_due_branch(tmp_path: Path, home: Path):
     now = time.time()
     rec = await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id="c1", text="boundary",
-        owner_principal="service:poller",
         due_window_start_unix=now - 86400,
         due_window_end_unix=now,  # exactly equal to now
     ))

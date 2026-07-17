@@ -1123,7 +1123,12 @@ async def test_commitment_list_service_filters_protected_text_before_rendering(
     ))
     await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id="chan-1",
-        text="deliberately-public-text", owner_principal="user:alice",
+        text="cross-owner-public-text", owner_principal="user:alice",
+        visibility=CommitmentVisibility.PUBLIC.value,
+    ))
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="chan-1",
+        text="ownerless-public-text",
         visibility=CommitmentVisibility.PUBLIC.value,
     ))
     set_commitments_store(store)
@@ -1136,8 +1141,9 @@ async def test_commitment_list_service_filters_protected_text_before_rendering(
     })
 
     assert "poller-visible-text" in out
-    assert "deliberately-public-text" in out
     assert "scheduler-protected-text" not in out
+    assert "cross-owner-public-text" not in out
+    assert "ownerless-public-text" not in out
 
 
 class TestCommitmentComplete:
