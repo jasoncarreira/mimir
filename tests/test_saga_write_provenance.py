@@ -197,14 +197,15 @@ async def test_saga_end_session_uses_runtime_not_model_session_for_authority(
         ),
         enforce=True,
     )
+    context = replace(context, saga_session_id="active-synthesis-session")
     assert context.source_session_acl == source_acl
     out = await saga_ops.saga_end_session.ainvoke({
-        "session_id": "model-provided-row-id", "summary": "done",
+        "session_id": "active-synthesis-session", "summary": "done",
         "runtime": _runtime(context, "synthesis-end"),
     })
     assert "ok" in out
     call = write_store.session_calls[-1]
-    assert call["session_id"] == "model-provided-row-id"
+    assert call["session_id"] == "active-synthesis-session"
     assert call["owner_principal"] == "regular"
     assert call["origin_channel"] == "discord-synthesis"
     assert call["origin_domain"] == "discord"
@@ -217,7 +218,10 @@ async def test_saga_end_session_uses_runtime_not_model_session_for_authority(
 async def test_saga_end_session_missing_or_mixed_source_acl_fails_closed(
     write_store: _WriteStore,
 ) -> None:
-    context = _service_context("saga_session_end", "discord-synthesis")
+    context = replace(
+        _service_context("saga_session_end", "discord-synthesis"),
+        saga_session_id="mixed-session",
+    )
     out = await saga_ops.saga_end_session.ainvoke({
         "session_id": "mixed-session", "summary": "done",
         "runtime": _runtime(context, "mixed-end"),
