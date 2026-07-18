@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -147,6 +148,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
 }
 
 IFC_POLICY_VERSION = "ifc-v1"
+DECLASSIFICATION_LIFETIME_SECONDS = 30.0
 
 
 def get_sink_category(tool_name: str) -> SinkCategory:
@@ -622,6 +624,28 @@ class SinkGate:
         can_flow = ifc_labels.can_flow_to(effective_target or "", allowed_sinks)
 
         if not can_flow:
+            normalized_target = normalize_sink_destination(sink_category, target)
+            state = getattr(auth_context, "ifc_state", None)
+            canonical_principal = getattr(auth_context, "canonical_principal", None)
+            if (
+                enforce
+                and normalized_target is not None
+                and isinstance(canonical_principal, str)
+                and state is not None
+                and state.consume_sink_approval(
+                    current=ifc_labels,
+                    sink_category=sink_category.value,
+                    destination=normalized_target,
+                    canonical_principal=canonical_principal,
+                )
+            ):
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.OPEN,
+                    allowed=True,
+                    reason="ifc_declassification_approved",
+                    enforcement_enabled=enforce,
+                )
             reason = f"ifc_label_blocked:{sink_category.value}"
             is_shadow = not enforce
             return ToolAuthorization(
@@ -760,6 +784,139 @@ class SinkGate:
         return frozenset({resolved_triggering})
 
 
+def normalize_sink_destination(
+    sink_category: SinkCategory | str,
+    destination: Any,
+) -> str | None:
+    """Return the canonical exact destination used by approval and enforcement."""
+    try:
+        category = SinkCategory(sink_category)
+    except (TypeError, ValueError):
+        return None
+    if category is SinkCategory.UNKNOWN or not isinstance(destination, str):
+        return None
+    value = destination.strip()
+    if not value or "\x00" in value:
+        return None
+    if category in {SinkCategory.SAME_CHANNEL, SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE}:
+        return ChannelResourceAdapter._resolve_channel(value) or None
+    if category in {SinkCategory.FILE, SinkCategory.SPAWN}:
+        try:
+            return str(Path(value).expanduser().resolve())
+        except (OSError, RuntimeError):
+            return None
+    if category in {SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK}:
+        try:
+            parsed = urlsplit(value)
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+                return None
+            if parsed.username is not None or parsed.password is not None:
+                return None
+            port = parsed.port
+            host = parsed.hostname.lower()
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            default_port = 80 if parsed.scheme.lower() == "http" else 443
+            netloc = host if port in {None, default_port} else f"{host}:{port}"
+            return urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, ""))
+        except ValueError:
+            return None
+    return value
+
+
+def approve_live_declassification(
+    auth_context: Any,
+    *,
+    sink_category: Any,
+    destination: Any,
+    reason: Any,
+) -> tuple[bool, str]:
+    """Approve one exact sink on the exact live admin request carrier."""
+    from .models import AuthContext, InformationFlowLabels, InformationFlowState
+
+    if not isinstance(auth_context, AuthContext):
+        return False, "missing_auth_context"
+    if "admin" not in auth_context.roles:
+        return False, "admin_required"
+    principal = auth_context.principal
+    canonical_principal = auth_context.canonical_principal
+    if not isinstance(principal, str) or not principal.strip():
+        return False, "missing_authenticated_admin"
+    if not isinstance(canonical_principal, str) or not canonical_principal.strip():
+        return False, "missing_authenticated_admin"
+    if not isinstance(reason, str) or not reason.strip():
+        return False, "invalid_reason"
+    try:
+        category = SinkCategory(sink_category)
+    except (TypeError, ValueError):
+        return False, "unknown_sink_category"
+    normalized = normalize_sink_destination(category, destination)
+    if normalized is None:
+        return False, "malformed_destination"
+    state = auth_context.ifc_state
+    if not isinstance(state, InformationFlowState):
+        return False, "missing_ifc_state"
+
+    def durable_audit(
+        labels: InformationFlowLabels, issued_at: float, expires_at: float,
+    ) -> bool:
+        source_labels = [
+            {
+                "principal": source.principal,
+                "domain": source.domain,
+                "resource_id": source.resource_id,
+                "bridge_instance": source.bridge_instance,
+                "sensitivity": source.sensitivity,
+                "authorized_principals": sorted(source.authorized_principals),
+                "source_kind": source.source_kind,
+            }
+            for source in sorted(
+                labels.sources,
+                key=lambda item: (
+                    str(item.domain), str(item.resource_id), str(item.principal),
+                    str(item.sensitivity),
+                ),
+            )
+        ]
+        try:
+            from .event_logger import log_durable_event_sync
+
+            log_durable_event_sync(
+                "ifc_declassification",
+                source_labels=source_labels,
+                labels=sorted(labels.labels),
+                source_channels=sorted(labels.source_channels),
+                authenticated_admin={
+                    "principal": principal,
+                    "canonical_principal": canonical_principal,
+                    "roles": sorted(auth_context.roles),
+                },
+                reason=reason.strip(),
+                destination=normalized,
+                sink_category=category.value,
+                policy_version=IFC_POLICY_VERSION,
+                outcome="approved",
+                use_limit=1,
+                lifetime_seconds=DECLASSIFICATION_LIFETIME_SECONDS,
+                issued_at_monotonic=issued_at,
+                expires_at_monotonic=expires_at,
+            )
+        except Exception as exc:
+            log.warning("ifc declassification audit failed: %s", exc)
+            return False
+        return True
+
+    approved = state.approve_sink_once(
+        fallback=auth_context.ifc_labels,
+        sink_category=category.value,
+        destination=normalized,
+        canonical_principal=canonical_principal,
+        lifetime_seconds=DECLASSIFICATION_LIFETIME_SECONDS,
+        durable_audit=durable_audit,
+    )
+    return (True, "approved") if approved else (False, "approval_failed")
+
+
 def audit_declassification(
     labels: Any,
     declassification_reason: str,
@@ -768,86 +925,8 @@ def audit_declassification(
     destination: str,
     policy_version: str = IFC_POLICY_VERSION,
 ) -> Any:
-    """Audit admin declassification of IFC labels (chainlink #871).
-
-    This is the ONLY way to remove immutable/monotonic labels. Summarization,
-    model assertions, failures, and ordinary admin status do NOT erase labels.
-
-    Args:
-        labels: Current InformationFlowLabels
-        declassification_reason: Human-readable reason for declassification
-        auth_context: AuthContext with admin role
-
-    Returns:
-        New labels instance with declassification applied, or original if not admin
-    """
-    from .models import InformationFlowLabels
-
-    if not isinstance(labels, InformationFlowLabels):
-        return labels
-
-    is_admin = False
-    if auth_context is not None:
-        roles = getattr(auth_context, "roles", ()) or ()
-        is_admin = "admin" in roles
-
-    principal = getattr(auth_context, "principal", None)
-    canonical_principal = getattr(auth_context, "canonical_principal", None)
-    if (
-        not is_admin
-        or not isinstance(principal, str) or not principal.strip()
-        or not isinstance(canonical_principal, str) or not canonical_principal.strip()
-        or not isinstance(declassification_reason, str) or not declassification_reason.strip()
-        or not isinstance(destination, str) or not destination.strip()
-        or not isinstance(policy_version, str) or not policy_version.strip()
-    ):
-        return labels
-
-    source_labels = [
-        {
-            "principal": source.principal,
-            "domain": source.domain,
-            "resource_id": source.resource_id,
-            "bridge_instance": source.bridge_instance,
-            "sensitivity": source.sensitivity,
-            "authorized_principals": sorted(source.authorized_principals),
-            "source_kind": source.source_kind,
-        }
-        for source in sorted(
-            labels.sources,
-            key=lambda item: (
-                str(item.domain), str(item.resource_id), str(item.principal),
-                str(item.sensitivity),
-            ),
-        )
-    ]
-    try:
-        from .event_logger import log_durable_event_sync
-
-        log_durable_event_sync(
-            "ifc_declassification",
-            source_labels=source_labels,
-            labels=sorted(labels.labels),
-            authenticated_admin={
-                "principal": principal,
-                "canonical_principal": canonical_principal,
-                "roles": sorted(getattr(auth_context, "roles", ()) or ()),
-            },
-            reason=declassification_reason.strip(),
-            destination=destination,
-            policy_version=policy_version,
-            outcome="approved",
-        )
-    except Exception as exc:  # fail closed without breaking the admin action caller
-        log.warning("ifc declassification audit failed: %s", exc)
-        return labels
-
-    return InformationFlowLabels(
-        labels=frozenset(),
-        source_channels=labels.source_channels,
-        sources=labels.sources,
-        created_at=labels.created_at,
-    )
+    """Deprecated no-op; only the live middleware action can authorize egress."""
+    return labels
 
 
 class ChannelResourceAdapter:
@@ -1017,6 +1096,7 @@ class OperationCatalog:
     })
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
+        "approve_declassification",
         "list_channels",
         "list_schedules",
         "add_schedule",
