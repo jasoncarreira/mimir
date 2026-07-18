@@ -32,6 +32,26 @@ def set_memory_client(client: SagaStore) -> None:
     _MEMORY_STATE["client"] = client
 
 
+def _publish_memory_provenance(payload: dict, auth_context: AuthContext | None) -> None:
+    """Publish ownership rows selected by the same authorized SAGA query."""
+    metadata = payload.get("_ifc_sources")
+    if not isinstance(metadata, list):
+        return
+    from mimir.access_control import protected_result_source, publish_protected_result
+
+    publish_protected_result(tuple(
+        protected_result_source(
+            auth_context,
+            principal=item.get("owner_principal") if isinstance(item, dict) else None,
+            domain="saga",
+            resource_id=item.get("resource_id") if isinstance(item, dict) else None,
+            bridge_instance="saga",
+            sensitivity="private",
+        )
+        for item in metadata
+    ))
+
+
 @tool
 async def memory_query(
     query: str,
@@ -72,6 +92,7 @@ async def memory_query(
         payload = await client.query(query, top_k=top_k, auth_context=auth_context)
     except Exception as exc:
         return f"memory_query failed: {exc}"
+    _publish_memory_provenance(payload, auth_context)
     return _format_saga_payload(payload)
 
 
@@ -149,4 +170,5 @@ async def memory_get(
         payload = await client.get_atoms(ids, auth_context=auth_context)
     except Exception as exc:  # noqa: BLE001 — SagaError surfaces via str
         return f"memory_get failed: {exc}"
+    _publish_memory_provenance(payload, auth_context)
     return _format_get_atoms(payload)

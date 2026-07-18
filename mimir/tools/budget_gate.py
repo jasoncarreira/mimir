@@ -459,9 +459,19 @@ def _result_labels_for_call(
     request: ToolCallRequest,
     auth_context: AuthContext | None,
     authorization: ToolAuthorization,
+    *,
+    result: ToolMessage | Command | None = None,
+    provenance: Any = None,
+    failed: bool = False,
 ) -> Any:
     return classify_protected_result(
-        tool_name, _validated_arguments(request), auth_context, authorization,
+        tool_name,
+        _validated_arguments(request),
+        auth_context,
+        authorization,
+        result=result,
+        provenance=provenance,
+        failed=failed,
     )
 
 
@@ -656,7 +666,14 @@ def _emit_tool_call_sync(
 
 
 def _result_is_error(result: ToolMessage | Command) -> bool:
-    return isinstance(result, ToolMessage) and getattr(result, "status", None) == "error"
+    if isinstance(result, ToolMessage):
+        return getattr(result, "status", None) == "error"
+    update = getattr(result, "update", None)
+    messages = update.get("messages", ()) if isinstance(update, dict) else ()
+    return any(
+        isinstance(message, ToolMessage) and getattr(message, "status", None) == "error"
+        for message in messages
+    )
 
 
 def _result_error_text(result: ToolMessage | Command) -> str | None:
@@ -741,10 +758,6 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
-        result_labels = _result_labels_for_call(
-            tool_name, request, auth_context, authorization,
-        )
-
         # Delegation inherits the current turn's monotonic IFC carrier. Built-in
         # subagents execute under this same context; detached spawn/async tools
         # preserve it for their continuation metadata.
@@ -792,9 +805,19 @@ class BudgetGateMiddleware(AgentMiddleware):
         execution_request = _request_for_authorized_execution(
             request, tool_name, auth_context,
         )
+        from ..access_control import (
+            begin_protected_result_capture,
+            end_protected_result_capture,
+        )
+
+        capture_token = begin_protected_result_capture()
         try:
             result = handler(execution_request)
         except Exception as exc:
+            end_protected_result_capture(capture_token)
+            result_labels = _result_labels_for_call(
+                tool_name, request, auth_context, authorization, failed=True,
+            )
             _merge_result_labels(auth_context, result_labels)
             _emit_tool_call_sync(
                 tool_name,
@@ -803,9 +826,19 @@ class BudgetGateMiddleware(AgentMiddleware):
                 error=str(exc),
             )
             raise
+        provenance = end_protected_result_capture(capture_token)
+        is_error = _result_is_error(result)
+        result_labels = _result_labels_for_call(
+            tool_name,
+            request,
+            auth_context,
+            authorization,
+            result=result,
+            provenance=provenance,
+            failed=is_error,
+        )
         _merge_result_labels(auth_context, result_labels)
         duration_ms = (time.monotonic() - started) * 1000.0
-        is_error = _result_is_error(result)
         _emit_tool_call_sync(
             tool_name,
             ok=not is_error,
@@ -845,10 +878,6 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
-        result_labels = _result_labels_for_call(
-            tool_name, request, auth_context, authorization,
-        )
-
         # Delegation inherits the current turn's monotonic IFC carrier. Built-in
         # subagents execute under this same context; detached spawn/async tools
         # preserve it for their continuation metadata.
@@ -896,9 +925,19 @@ class BudgetGateMiddleware(AgentMiddleware):
         execution_request = _request_for_authorized_execution(
             request, tool_name, auth_context,
         )
+        from ..access_control import (
+            begin_protected_result_capture,
+            end_protected_result_capture,
+        )
+
+        capture_token = begin_protected_result_capture()
         try:
             result = await handler(execution_request)
         except Exception as exc:
+            end_protected_result_capture(capture_token)
+            result_labels = _result_labels_for_call(
+                tool_name, request, auth_context, authorization, failed=True,
+            )
             _merge_result_labels(auth_context, result_labels)
             _emit_tool_call_sync(
                 tool_name,
@@ -907,9 +946,19 @@ class BudgetGateMiddleware(AgentMiddleware):
                 error=str(exc),
             )
             raise
+        provenance = end_protected_result_capture(capture_token)
+        is_error = _result_is_error(result)
+        result_labels = _result_labels_for_call(
+            tool_name,
+            request,
+            auth_context,
+            authorization,
+            result=result,
+            provenance=provenance,
+            failed=is_error,
+        )
         _merge_result_labels(auth_context, result_labels)
         duration_ms = (time.monotonic() - started) * 1000.0
-        is_error = _result_is_error(result)
         _emit_tool_call_sync(
             tool_name,
             ok=not is_error,

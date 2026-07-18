@@ -108,7 +108,28 @@ async def file_search(
         # readable tool error rather than a generic failure.
         return f"file_search failed: {exc}"
     if not results:
+        from ..access_control import publish_protected_result
+
+        publish_protected_result(())
         return "(no matches)"
+    from .._context import get_current_turn
+    from ..access_control import (
+        protected_result_source,
+        publish_protected_result,
+    )
+
+    turn = get_current_turn()
+    auth_context = getattr(turn, "auth_context", None)
+    publish_protected_result(tuple(
+        protected_result_source(
+            auth_context,
+            principal="filesystem",
+            domain="filesystem",
+            resource_id=r.path,
+            bridge_instance="filesystem",
+        )
+        for r in results
+    ))
     payload = [r.to_dict() for r in results]
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
@@ -213,6 +234,21 @@ def _read_turn_record(turn_id: str) -> str:
                 # reader can see what the turn absorbed beyond ``input``.
                 for k in ("input", "saga_atom_ids", "usage"):
                     row.pop(k, None)
+                from .._context import get_current_turn
+                from ..access_control import (
+                    protected_result_source,
+                    publish_protected_result,
+                )
+
+                turn = get_current_turn()
+                auth_context = getattr(turn, "auth_context", None)
+                publish_protected_result((protected_result_source(
+                    auth_context,
+                    principal="mimir:turn-log",
+                    domain="turn_history",
+                    resource_id=f"turn:{target}",
+                    bridge_instance="mimir",
+                ),))
                 return json.dumps(row, indent=2, ensure_ascii=False)
     return f"get_turn: no turn found with id {target!r}"
 

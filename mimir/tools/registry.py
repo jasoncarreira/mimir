@@ -898,6 +898,27 @@ async def list_channels(platform: Optional[str] = None) -> str:
                 )
     if channels is not None and hasattr(channels, "prefixes"):
         out["live_prefixes"] = [p for p in channels.prefixes() if _belongs(p)]
+    from .._context import get_current_turn
+    from ..access_control import protected_result_source, publish_protected_result
+
+    turn = get_current_turn()
+    auth_context = getattr(turn, "auth_context", None)
+    resource_ids = [
+        str(item["channel_id"])
+        for collection in (out["channels"], out["dms"])
+        for item in collection
+        if item.get("channel_id")
+    ] + [f"prefix:{prefix}" for prefix in out["live_prefixes"]]
+    publish_protected_result(tuple(
+        protected_result_source(
+            auth_context,
+            principal="mimir:channel-registry",
+            domain="channel_metadata",
+            resource_id=resource_id,
+            bridge_instance="mimir",
+        )
+        for resource_id in resource_ids
+    ))
     return json.dumps(out, indent=2, ensure_ascii=False, default=str)
 
 
@@ -1052,7 +1073,26 @@ async def list_schedules() -> str:
     # pollers are appended so a poller-only deployment isn't reported as empty
     # (the #522 visibility gap; mimir-carreira review on PR #728).
     if not out:
+        from ..access_control import publish_protected_result
+
+        publish_protected_result(())
         return "(no scheduled jobs)"
+    from .._context import get_current_turn
+    from ..access_control import protected_result_source, publish_protected_result
+
+    turn = get_current_turn()
+    auth_context = getattr(turn, "auth_context", None)
+    publish_protected_result(tuple(
+        protected_result_source(
+            auth_context,
+            principal="mimir:scheduler",
+            domain="schedule_metadata",
+            resource_id=f"{entry.get('type', 'job')}:{entry.get('name')}",
+            bridge_instance="mimir",
+        )
+        for entry in out
+        if entry.get("name")
+    ))
     return json.dumps(out, indent=2, ensure_ascii=False, default=str)
 
 
@@ -1495,8 +1535,25 @@ async def commitment_list(
         )
     ]
     if not items:
+        from ..access_control import publish_protected_result
+
+        publish_protected_result(())
         label = "all active" if due_within_days == 0 else f"due within {due_within_days} days"
         return f"(no active commitments — {label})"
+    from ..access_control import protected_result_source, publish_protected_result
+
+    auth_context = runtime.context if runtime is not None else None
+    publish_protected_result(tuple(
+        protected_result_source(
+            auth_context,
+            principal=getattr(c, "owner_principal", None),
+            domain="commitments",
+            resource_id=f"commitment:{c.id}",
+            bridge_instance="mimir",
+            sensitivity="private",
+        )
+        for c in items
+    ))
     return json.dumps(
         [
             {

@@ -469,27 +469,125 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         if self._is_outside_root(file_path):
             return ReadResult(error=self._outside_root_msg(file_path))
         try:
-            return super().read(file_path, offset, limit)
+            result = super().read(file_path, offset, limit)
         except ValueError as e:
             return ReadResult(error=self._path_value_error_msg(file_path, e))
+        if result.error is None:
+            self._publish_read_provenance(file_path)
+        return result
 
     async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
             return ReadResult(error=self._outside_root_msg(file_path))
-        return await super().aread(file_path, offset, limit)
+        result = await super().aread(file_path, offset, limit)
+        if result.error is None:
+            self._publish_read_provenance(file_path)
+        return result
+
+    def _publish_read_provenance(self, file_path: str) -> None:
+        """Publish the path only after backend resolution and a successful read."""
+        self._publish_read_paths([file_path])
+
+    def _publish_read_paths(self, file_paths: list[str]) -> None:
+        """Publish every exact resource in a successful backend collection result."""
+        from ._context import get_current_turn
+        from .access_control import protected_result_source, publish_protected_result
+
+        turn = get_current_turn()
+        auth_context = getattr(turn, "auth_context", None)
+        resolved_paths = []
+        for file_path in dict.fromkeys(file_paths):
+            try:
+                resolved_paths.append(str(self._resolve_path(file_path).resolve(strict=True)))
+            except (OSError, RuntimeError, ValueError):
+                return
+        publish_protected_result(tuple(
+            protected_result_source(
+                auth_context,
+                principal="filesystem",
+                domain="filesystem",
+                resource_id=resolved,
+                bridge_instance="filesystem",
+            )
+            for resolved in resolved_paths
+        ))
 
     def ls(self, path: str) -> LsResult:
         if self._is_outside_root(path):
             return LsResult(error=self._outside_root_msg(path))
         try:
-            return super().ls(path)
+            result = super().ls(path)
         except ValueError as e:
             return LsResult(error=self._path_value_error_msg(path, e))
+        if result.error is None:
+            self._publish_read_paths([
+                str(entry.get("path"))
+                for entry in result.entries or ()
+                if entry.get("path")
+            ])
+        return result
 
     async def als(self, path: str) -> LsResult:
         if self._is_outside_root(path):
             return LsResult(error=self._outside_root_msg(path))
-        return await super().als(path)
+        result = await super().als(path)
+        if result.error is None:
+            self._publish_read_paths([
+                str(entry.get("path"))
+                for entry in result.entries or ()
+                if entry.get("path")
+            ])
+        return result
+
+    def glob(self, pattern: str, path: str = "/") -> GlobResult:
+        result = super().glob(pattern, path)
+        if result.error is None:
+            self._publish_read_paths([
+                str(match.get("path"))
+                for match in result.matches or ()
+                if match.get("path")
+            ])
+        return result
+
+    async def aglob(self, pattern: str, path: str = "/") -> GlobResult:
+        result = await super().aglob(pattern, path)
+        if result.error is None:
+            self._publish_read_paths([
+                str(match.get("path"))
+                for match in result.matches or ()
+                if match.get("path")
+            ])
+        return result
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+    ) -> GrepResult:
+        result = super().grep(pattern, path, glob)
+        if result.error is None:
+            self._publish_read_paths([
+                str(match.get("path"))
+                for match in result.matches or ()
+                if match.get("path")
+            ])
+        return result
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+    ) -> GrepResult:
+        result = await super().agrep(pattern, path, glob)
+        if result.error is None:
+            self._publish_read_paths([
+                str(match.get("path"))
+                for match in result.matches or ()
+                if match.get("path")
+            ])
+        return result
 
     def write(self, file_path: str, content: str) -> WriteResult:
         try:
