@@ -211,13 +211,16 @@ def _prompt_source_labels(
     source_kind: str = "protected_prompt",
 ) -> InformationFlowLabels:
     """Create one complete, server-authoritative protected prompt source."""
-    owner = principal or auth_context.canonical_principal or auth_context.principal
+    requester = auth_context.canonical_principal or auth_context.principal
+    effective_requester = (
+        f"service:{requester}" if auth_context.is_service and requester else requester
+    )
+    owner = principal or effective_requester
     target_channel = channel_id or auth_context.resource_id or auth_context.channel_id
     bridge_instance = bridge or auth_context.bridge_instance or "mimir"
     acl = authorized_principals
     if acl is None:
-        requester = auth_context.canonical_principal or auth_context.principal
-        acl = frozenset({requester}) if requester else frozenset()
+        acl = frozenset({effective_requester}) if effective_requester else frozenset()
     return InformationFlowLabels().with_source(SourceLabel(
         principal=owner,
         domain=domain,
@@ -231,6 +234,24 @@ def _prompt_source_labels(
 
 def _is_prompt_operator(auth_context: AuthContext) -> bool:
     return auth_context.is_service or "admin" in auth_context.roles
+
+
+def _protected_owner_acl(
+    auth_context: AuthContext,
+    owner: str | None,
+    *,
+    requester_visible: bool = False,
+) -> frozenset[str]:
+    """Return an owner-anchored ACL, preserving explicit privileged access."""
+    requester = auth_context.canonical_principal or auth_context.principal
+    effective_requester = (
+        f"service:{requester}" if auth_context.is_service and requester else requester
+    )
+    principals = {owner} if owner else set()
+    if requester_visible or _is_prompt_operator(auth_context):
+        if effective_requester:
+            principals.add(effective_requester)
+    return frozenset(principals)
 
 
 def _merge_ifc_labels(
@@ -3513,7 +3534,9 @@ class Agent:
                         resource=f"commitment:{record.id}",
                         channel_id=record.originating_channel or record.channel_id,
                         principal=owner,
-                        authorized_principals=None,
+                        authorized_principals=_protected_owner_acl(
+                            auth_context, owner,
+                        ),
                     ),
                 )
             return PromptBlock(content, labels)
@@ -3656,6 +3679,7 @@ class Agent:
             channel = boundary.get("channel_id")
             owner = boundary.get("owner_principal")
             owner = owner if isinstance(owner, str) and owner else None
+            visibility = boundary.get("visibility")
             labels = _merge_ifc_labels(
                 labels,
                 _prompt_source_labels(
@@ -3664,7 +3688,11 @@ class Agent:
                     resource=f"session:{boundary.get('session_id') or boundary.get('id') or 'unknown'}",
                     channel_id=channel if isinstance(channel, str) else None,
                     principal=owner,
-                    authorized_principals=None,
+                    authorized_principals=_protected_owner_acl(
+                        auth_context,
+                        owner,
+                        requester_visible=visibility == "public",
+                    ),
                 ),
             )
         return PromptBlock(content, labels)
@@ -3759,6 +3787,7 @@ class Agent:
             self._config.home,
             event.channel_id or "",
         )
+        channel_memory_owner = auth_context.canonical_principal or auth_context.principal
         channel_memory_block = use(
             PromptBlock(
                 channel_memory_content,
@@ -3769,7 +3798,7 @@ class Agent:
                     channel_id=event.channel_id,
                     bridge=event.source,
                 ),
-            ) if channel_memory_content else None
+            ) if channel_memory_content and channel_memory_owner else None
         )
         feedback_block = use(
             await asyncio.to_thread(self._feedback.recent_prompt_block, auth_context)

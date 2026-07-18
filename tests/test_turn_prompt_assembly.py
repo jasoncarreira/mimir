@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.agent import Agent, _filter_session_turns
+from mimir.agent import Agent, _filter_session_turns, _prompt_source_labels
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
@@ -98,6 +98,24 @@ def _block(content: str) -> PromptBlock:
             source_kind="protected_prompt",
         )),
     )
+
+
+def test_service_prompt_labels_use_sink_gate_effective_principal() -> None:
+    auth = AuthContext(
+        principal=None, canonical_principal="scheduler", roles=(),
+        event_ingress=None, trigger="scheduled_tick", channel_id="scheduler:heartbeat",
+        interactivity=None, is_service=True, enforcement_enabled=True,
+        domain="channel", resource_id="scheduler:heartbeat",
+        bridge_instance="service:scheduler",
+    )
+
+    labels = _prompt_source_labels(
+        auth, domain="usage", resource="global:usage", principal="service:mimir",
+    )
+
+    assert {source.authorized_principals for source in labels.sources} == {
+        frozenset({"service:scheduler"})
+    }
 
 
 # ─── User-message branch ────────────────────────────────────────────
@@ -573,6 +591,33 @@ async def test_agent_build_turn_prompt_threads_all_helper_outputs(
 
 
 @pytest.mark.asyncio
+async def test_channel_memory_omits_for_principal_less_auth_context(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    channel_dir = tmp_path / "memory" / "channels" / "ch-ownerless"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "notes.md").write_text("PRIVATE CHANNEL MEMORY")
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-ownerless", content="hello",
+        author=None, source="discord",
+    )
+    auth = AuthContext(
+        principal=None, canonical_principal=None, roles=(), event_ingress=None,
+        trigger="user_message", channel_id="ch-ownerless", interactivity=None,
+        enforcement_enabled=True,
+    )
+
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, saga_block=None, subagent_block=None,
+        initial_auth_context=auth,
+    )
+
+    assert "PRIVATE CHANNEL MEMORY" not in prompt
+    assert "## Today's date" in prompt
+
+
+@pytest.mark.asyncio
 async def test_feedback_block_renders_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -762,6 +807,41 @@ async def test_session_summary_assembly_is_authorization_scoped(
     assert "alice summary" in alice_block
     assert "bob summary" not in alice_block
     assert "service summary" not in alice_block
+    assert all(
+        "user:alice" in source.authorized_principals
+        for source in alice_source.labels.sources
+    )
+    assert all(
+        source.principal in source.authorized_principals
+        for source in alice_source.labels.sources
+    )
+
+
+@pytest.mark.asyncio
+async def test_commitment_prompt_labels_are_owned_by_record_principal(
+    tmp_path: Path,
+) -> None:
+    from mimir.commitments import CommitmentRecord, CommitmentsStore, make_commitment_id
+
+    agent = _make_agent(tmp_path)
+    agent._commitments = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    await agent._commitments.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="ch-auth", text="alice reminder",
+        owner_principal="user:alice",
+    ))
+    auth = AuthContext(
+        principal="user:alice", canonical_principal="user:alice", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="ch-auth",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    block = agent._assemble_commitments_block("ch-auth", auth)
+
+    assert block is not None
+    assert {source.principal for source in block.labels.sources} == {"user:alice"}
+    assert {source.authorized_principals for source in block.labels.sources} == {
+        frozenset({"user:alice"})
+    }
 
 
 @pytest.mark.asyncio

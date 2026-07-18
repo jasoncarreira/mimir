@@ -88,18 +88,62 @@ from .resolved import (  # noqa: F401
 log = logging.getLogger(__name__)
 
 
-class _RecordSnapshot:
-    """Minimal immutable snapshot adapter for an authorization-filtered view."""
+_AGENT_SELF_EVENT_KINDS = frozenset({
+    "algedonic_escalation",
+    "cross_turn_loop",
+    "cross_turn_send_duplicate",
+    "error",
+    "loop_stop",
+    "loop_warn",
+    "send_message_loop_hard_stop",
+    "send_message_loop_warning",
+    "scheduler_invalid_cron",
+    "turn_error",
+    "wiki_backlinks_unhealthy",
+})
+_AGENT_SELF_EVENT_PREFIXES = ("claude_code_spawn_",)
 
-    def __init__(self, records: list[dict]) -> None:
+
+def _is_agent_self_record(record: dict) -> bool:
+    """Return whether a principal-less record is agent self-regulation data.
+
+    This is intentionally an explicit kind allowlist.  User-owned events such as
+    ``commitment_due`` can be principal-less in legacy logs and must not become
+    visible merely because ownership metadata is absent.
+    """
+    kind = record.get("type") or record.get("event_kind") or record.get("kind")
+    if not isinstance(kind, str):
+        # turns.jsonl records express ``turn_error`` structurally rather than
+        # carrying an event kind.
+        return isinstance(record.get("error"), str) and bool(record["error"])
+    return kind in _AGENT_SELF_EVENT_KINDS or kind.startswith(_AGENT_SELF_EVENT_PREFIXES)
+
+
+class _RecordSnapshot:
+    """Immutable authorization-filtered view preserving saturation fallback."""
+
+    def __init__(
+        self,
+        records: list[dict],
+        *,
+        saturated: bool = False,
+        window_records: object = None,
+    ) -> None:
         self._records = records
+        self._saturated = saturated
+        self._window_records = window_records
 
     def records(self) -> list[dict]:
         return self._records
 
     @property
     def saturated(self) -> bool:
-        return False
+        return self._saturated
+
+    def iter_window_records(self, path: Path):
+        if not callable(self._window_records):
+            return iter(self._records)
+        return self._window_records(path)
 
 
 def _record_principal(record: dict) -> str | None:
@@ -238,11 +282,11 @@ class FeedbackLog:
         event_snapshot = self.events_snapshot
         turn_snapshot = self.turns_snapshot
         if auth_context is not None:
-            event_snapshot = _RecordSnapshot(
-                self._authorized_records(self.events_snapshot, self.events_path, auth_context)
+            event_snapshot = self._authorized_snapshot(
+                self.events_snapshot, self.events_path, auth_context,
             )
-            turn_snapshot = _RecordSnapshot(
-                self._authorized_records(self.turns_snapshot, self.turns_path, auth_context)
+            turn_snapshot = self._authorized_snapshot(
+                self.turns_snapshot, self.turns_path, auth_context,
             )
 
         window_hours = window_hours if window_hours is not None else self.default_window_hours
@@ -491,25 +535,56 @@ class FeedbackLog:
         return _collapse_feedback_signals(negatives), _collapse_feedback_signals(positives)
 
     @staticmethod
+    def _record_authorized(record: dict, auth_context: AuthContext) -> bool:
+        if _is_privileged(auth_context):
+            return True
+        principal = auth_context.canonical_principal or auth_context.principal
+        channel_id = auth_context.channel_id
+        if not principal or not channel_id:
+            return False
+        # Agent-self signals are global self-regulation inputs, not user data.
+        # Keep the explicit kind gate independent of channel; do not generalize
+        # this to all principal-less records.
+        if _record_principal(record) is None and _is_agent_self_record(record):
+            return True
+        return (
+            record.get("channel_id") == channel_id
+            and _record_principal(record) in {principal, auth_context.principal}
+        )
+
+    @classmethod
     def _authorized_records(
+        cls,
         snapshot: JsonlSnapshot | None,
         path: Path,
         auth_context: AuthContext,
     ) -> list[dict]:
-        records = list(iter_snapshot_or_tail(snapshot, path))
-        if _is_privileged(auth_context):
-            return records
-        principal = auth_context.canonical_principal or auth_context.principal
-        allowed_principals = {principal, auth_context.principal}
-        channel_id = auth_context.channel_id
-        if not principal or not channel_id:
-            return []
         return [
             record
-            for record in records
-            if record.get("channel_id") == channel_id
-            and _record_principal(record) in allowed_principals
+            for record in iter_snapshot_or_tail(snapshot, path)
+            if cls._record_authorized(record, auth_context)
         ]
+
+    @classmethod
+    def _authorized_snapshot(
+        cls,
+        snapshot: JsonlSnapshot | None,
+        path: Path,
+        auth_context: AuthContext,
+    ) -> _RecordSnapshot:
+        records = cls._authorized_records(snapshot, path, auth_context)
+        saturated = bool(snapshot is not None and snapshot.saturated)
+
+        def stream_filtered(window_path: Path):
+            for record in iter_window_records(snapshot, window_path):
+                if cls._record_authorized(record, auth_context):
+                    yield record
+
+        return _RecordSnapshot(
+            records,
+            saturated=saturated,
+            window_records=stream_filtered if saturated else None,
+        )
 
     def recent_block(
         self,
@@ -550,17 +625,34 @@ class FeedbackLog:
             return None
         labels = InformationFlowLabels()
         requester = auth_context.canonical_principal or auth_context.principal
+        service = (
+            f"service:{auth_context.canonical_principal or auth_context.principal}"
+            if auth_context.is_service
+            and (auth_context.canonical_principal or auth_context.principal)
+            else None
+        )
         for resource, records in (("events", events), ("turns", turns)):
             for record in records:
-                principal = _record_source_principal(record, auth_context) or requester
+                record_owner = _record_source_principal(record, auth_context)
+                principal = record_owner or service or requester
                 bridge = record.get("bridge") or record.get("source")
+                # The label ACL is an independent guard: user-owned records are
+                # readable by their owner, agent-self records by this requester's
+                # effective identity, and service turns by the prefixed service
+                # identity SinkGate uses.
+                acl_principals = {record_owner} if record_owner else set()
+                effective_requester = service or requester
+                if _is_privileged(auth_context) and effective_requester:
+                    acl_principals.add(effective_requester)
+                elif not record_owner and effective_requester:
+                    acl_principals.add(effective_requester)
                 labels = labels.with_source(SourceLabel(
                     principal=principal,
                     domain="feedback",
                     resource_id=f"{resource}:{record.get('id') or record.get('turn_id') or record.get('timestamp') or record.get('ts')}",
                     bridge_instance=(bridge if isinstance(bridge, str) and bridge else auth_context.bridge_instance),
                     sensitivity="private",
-                    authorized_principals=(frozenset({requester}) if requester else frozenset()),
+                    authorized_principals=frozenset(acl_principals),
                     source_kind="protected_prompt",
                 ))
         return PromptBlock(content=content, labels=labels)

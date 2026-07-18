@@ -141,7 +141,7 @@ async def test_emits_due_when_window_open(tmp_path: Path, home: Path):
     rec = await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id="chan-1",
         text="Review PR #111", kind=CommitmentKind.AGENT_PROMISE.value,
-        recipient_identity="alice",
+        recipient_identity="alice", owner_principal="user:alice",
         due_window_start_unix=now - 60,  # just-opened
         due_window_end_unix=now + 86400,
     ))
@@ -159,6 +159,7 @@ async def test_emits_due_when_window_open(tmp_path: Path, home: Path):
     assert due_events[0]["commitment_id"] == rec.id
     assert due_events[0]["text"] == "Review PR #111"
     assert due_events[0]["recipient_identity"] == "alice"
+    assert due_events[0]["owner_principal"] == "user:alice"
 
 
 @pytest.mark.asyncio
@@ -211,6 +212,7 @@ async def test_emits_expired_when_window_ends(tmp_path: Path, home: Path):
     end = base - 60
     rec = await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id="c1", text="X",
+        owner_principal="user:alice",
         due_window_start_unix=base - 86400,
         due_window_end_unix=end,
     ))
@@ -227,6 +229,7 @@ async def test_emits_expired_when_window_ends(tmp_path: Path, home: Path):
     ]
     assert len(expired_events) == 1
     assert expired_events[0]["commitment_id"] == rec.id
+    assert expired_events[0]["owner_principal"] == "user:alice"
 
 
 @pytest.mark.asyncio

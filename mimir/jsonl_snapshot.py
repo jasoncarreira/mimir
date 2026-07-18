@@ -273,7 +273,14 @@ def iter_window_records(
             for rec in list(records):
                 yield rec
             return
-    # No snapshot, or a saturated one — stream the full file tail so the
-    # windowed scan reaches its cutoff.
+        # Authorization-filtered adapters must preserve the saturated fallback
+        # without falling back to an *unfiltered* file stream.  They expose a
+        # stream-filtering hook that delegates to their underlying snapshot.
+        filtered_window = getattr(snapshot, "iter_window_records", None)
+        if callable(filtered_window):
+            yield from filtered_window(path)
+            return
+    # No snapshot, or a saturated ordinary snapshot — stream the full file tail
+    # so the windowed scan reaches its cutoff.
     for rec in tail_jsonl_records(path):
         yield rec
