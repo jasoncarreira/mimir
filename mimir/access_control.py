@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+from contextvars import ContextVar, Token
 from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from enum import StrEnum
@@ -869,7 +870,7 @@ class SinkGate:
                         return frozenset()
                     if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
                         return frozenset()
-            elif source_kind != "protected_prompt":
+            elif source_kind not in {"protected_prompt", "protected_tool"}:
                 # Other derived/tool sources require their own destination adapter;
                 # an ACL alone must not silently widen arbitrary provenance kinds.
                 return frozenset()
@@ -2090,11 +2091,106 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
 }
 
 
+@dataclass(frozen=True)
+class ProtectedResultProvenance:
+    """Non-model-visible provenance for the exact resources a native read returned."""
+
+    sources: tuple["SourceLabel", ...]
+
+
+_protected_result_provenance: ContextVar[ProtectedResultProvenance | None] = ContextVar(
+    "protected_result_provenance", default=None,
+)
+
+
+def begin_protected_result_capture() -> Token[ProtectedResultProvenance | None]:
+    """Start an isolated result-provenance capture around one tool execution."""
+    return _protected_result_provenance.set(None)
+
+
+def publish_protected_result(sources: tuple["SourceLabel", ...]) -> None:
+    """Publish exact server-derived sources, including an authoritative empty set."""
+    from .models import SourceLabel
+
+    if not isinstance(sources, tuple) or not all(
+        isinstance(source, SourceLabel) for source in sources
+    ):
+        raise TypeError("protected result provenance must be a tuple of SourceLabel")
+    _protected_result_provenance.set(ProtectedResultProvenance(sources))
+
+
+def end_protected_result_capture(
+    token: Token[ProtectedResultProvenance | None],
+) -> ProtectedResultProvenance | None:
+    """Return the captured provenance and restore any enclosing capture."""
+    captured = _protected_result_provenance.get()
+    _protected_result_provenance.reset(token)
+    return captured
+
+
+def protected_result_source(
+    auth_context: "AuthContext | None",
+    *,
+    principal: str | None,
+    domain: str,
+    resource_id: str | None,
+    bridge_instance: str,
+    sensitivity: str = "internal",
+) -> "SourceLabel":
+    """Build a result source from a resource owner and the exact authorized reader."""
+    from .models import SourceLabel
+
+    requester = getattr(auth_context, "canonical_principal", None)
+    if getattr(auth_context, "is_service", False) and requester:
+        requester = f"service:{requester}"
+    acl = {principal} if principal else set()
+    if requester:
+        acl.add(requester)
+    return SourceLabel(
+        principal=principal,
+        domain=domain,
+        resource_id=resource_id,
+        bridge_instance=bridge_instance,
+        sensitivity=sensitivity,
+        authorized_principals=frozenset(acl),
+        source_kind="protected_tool",
+    )
+
+
+def _incomplete_protected_result(
+    domain: str,
+    arguments: dict[str, Any],
+) -> "InformationFlowLabels":
+    from .models import InformationFlowLabels, SourceLabel
+
+    resource = next(
+        (
+            arguments.get(key)
+            for key in ("path", "file_path", "query", "turn_id", "atom_id", "job_id")
+            if isinstance(arguments.get(key), str) and arguments.get(key)
+        ),
+        "unknown",
+    )
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal=None,
+        domain=domain,
+        resource_id=str(resource),
+        bridge_instance=None,
+        sensitivity="internal",
+        authorized_principals=frozenset(),
+        source_kind="protected_tool",
+    ))
+
+
 def classify_protected_result(
     tool_name: str,
     arguments: dict[str, Any] | None,
     auth_context: "AuthContext | None",
     authorization: ToolAuthorization,
+    *,
+    result: Any = None,
+    provenance: ProtectedResultProvenance | None = None,
+    failed: bool = False,
 ) -> "InformationFlowLabels | None":
     """Return server-authoritative labels for content a protected call may expose.
 
@@ -2153,23 +2249,21 @@ def classify_protected_result(
     if domain is None:
         return None
 
-    resource = next(
-        (
-            args.get(key)
-            for key in ("path", "file_path", "query", "turn_id", "atom_id", "job_id")
-            if isinstance(args.get(key), str) and args.get(key)
-        ),
-        "unknown",
-    )
-    return InformationFlowLabels().with_source(SourceLabel(
-        principal=None,
-        domain=domain,
-        resource_id=str(resource),
-        bridge_instance=None,
-        sensitivity="internal",
-        authorized_principals=frozenset(),
-        source_kind="protected_tool",
-    ))
+    if failed:
+        return _incomplete_protected_result(domain, args)
+
+    artifact = getattr(result, "artifact", None)
+    if provenance is None and isinstance(artifact, ProtectedResultProvenance):
+        provenance = artifact
+    if provenance is not None:
+        if not provenance.sources:
+            return None
+        labels = InformationFlowLabels()
+        for source in provenance.sources:
+            labels = labels.with_source(source)
+        return labels
+
+    return _incomplete_protected_result(domain, args)
 
 
 _global_tool_registry = ToolRegistry()
