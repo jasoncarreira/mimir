@@ -346,6 +346,7 @@ class _ServicePrincipalToolProbeAgent(_FakeAgent):
         super().__init__([AIMessage(content="probed")])
         self.tool_name = tool_name
         self.observed_principal: str | None = None
+        self.observed_saga_session_id: str | None = None
         self.result: ToolMessage | None = None
         self.handler_calls = 0
         self.auth_context: AuthContext | None = None
@@ -373,6 +374,7 @@ class _ServicePrincipalToolProbeAgent(_FakeAgent):
         self.observed_principal = (
             auth.service_principal.canonical if auth.service_principal else None
         )
+        self.observed_saga_session_id = ctx.auth_context.saga_session_id
         gate = BudgetGateMiddleware()
 
         async def _handler(req: ToolCallRequest) -> ToolMessage:
@@ -735,6 +737,9 @@ async def test_server_owned_triggers_reach_live_tool_middleware_with_service_aut
 
     assert record.error is None
     assert fake_agent.observed_principal == principal
+    assert fake_agent.observed_saga_session_id == (
+        "saga-production-path" if trigger == "saga_session_end" else None
+    )
     assert fake_agent.result is not None
     assert fake_agent.handler_calls == 1, str(fake_agent.result.content)
     assert fake_agent.result.status != "error"
@@ -762,6 +767,7 @@ async def test_server_session_idle_event_reaches_live_synthesis_middleware(
 
     assert record.error is None
     assert fake_agent.observed_principal == "synthesis"
+    assert fake_agent.observed_saga_session_id == "saga-production-path"
     assert fake_agent.result is not None
     assert fake_agent.handler_calls == 1, str(fake_agent.result.content)
 

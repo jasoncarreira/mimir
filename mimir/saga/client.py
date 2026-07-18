@@ -1477,6 +1477,7 @@ class SagaStore:
         origin_domain: str | None = None,
         visibility: str | None = None,
         provenance: dict[str, Any] | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]:
         """Close a session. ``channel_id`` is persisted on the
         sessions row so ``recent_session_boundaries(channel_id=...)``
@@ -1484,6 +1485,22 @@ class SagaStore:
         sessions can't filter (every boundary's channel_id would be
         NULL).
         """
+
+        mutation_scope = None
+        if auth_context is not None:
+            mutation_scope = _saga_mutation_scope(auth_context, "saga_end_session")
+            if (
+                mutation_scope is None
+                or getattr(auth_context, "saga_session_id", None) != session_id
+            ):
+                raise PermissionError("session write denied")
+            if isinstance(mutation_scope, str) and owner_principal != mutation_scope:
+                raise PermissionError("session write denied")
+            if isinstance(mutation_scope, _ServiceMutationScope) and not (
+                owner_principal == mutation_scope.owner_principal
+                or origin_domain in mutation_scope.readable_domains
+            ):
+                raise PermissionError("session write denied")
 
         # The agent has already done the synthesis — it's calling
         # end_session with the rendered fields. The new reflect()

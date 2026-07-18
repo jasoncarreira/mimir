@@ -1672,7 +1672,11 @@ class Agent:
                 )
             # Update auth_ctx with the actual interactivity classification
             if auth_ctx is not None:
-                auth_ctx = replace(auth_ctx, interactivity=turn_interactivity)
+                auth_ctx = replace(
+                    auth_ctx,
+                    interactivity=turn_interactivity,
+                    saga_session_id=saga_session_id,
+                )
             # IFC exists before any model call or harness panel egress. A resumed
             # event's trusted carrier is unioned with ingress-derived labels; a
             # fresh turn cannot start with ``None`` and bypass the sink gate.
