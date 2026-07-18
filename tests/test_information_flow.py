@@ -446,6 +446,10 @@ def test_service_principal_cannot_bypass_incompatible_sink_labels():
         ("worklink_run", "/operator/worklink", "spawn"),
         ("write_file", "/tmp/untrusted", "file"),
         ("submit_proposal", "proposal", "proposal"),
+        ("ntfy_send", "alerts", "notification"),
+        ("webhook", "https://example.invalid/hook", "http_webhook"),
+        ("fetch_url", "https://example.invalid", "network"),
+        ("external_tool", "external-server", "external_mcp"),
     ],
 )
 def test_poller_payload_cannot_bypass_active_sink_ifc(
@@ -471,10 +475,43 @@ def test_poller_payload_cannot_bypass_active_sink_ifc(
         _labels(sources=frozenset({"poller:external"})),
         poller,
         enforce=True,
+        sink_category=(
+            SinkCategory.EXTERNAL_MCP if sink_category == "external_mcp" else None
+        ),
     )
 
     assert decision.allowed is False
     assert decision.reason == f"ifc_label_blocked:{sink_category}"
+
+
+def test_visibility_qualified_service_source_is_bound_to_triggering_channel():
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        service_principal="scheduler",
+        extra={"channel_visibility": "private"},
+    )
+    auth = create_auth_context(event, enforce=True)
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({event.channel_id}),
+        sources=frozenset({SourceLabel(
+            principal="service:scheduler",
+            domain="channel:private",
+            resource_id="scheduler:other",
+            bridge_instance="service:scheduler",
+            sensitivity="private",
+            authorized_principals=frozenset({"service:scheduler"}),
+            source_kind="service",
+        )}),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "send_message", event.channel_id, labels, auth, enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
 
 
 @pytest.mark.parametrize(
@@ -900,14 +937,16 @@ class _Channels:
 @pytest.mark.asyncio
 async def test_preloaded_private_context_blocked_at_incompatible_auto_delivery_without_tool_call():
     channels = _Channels()
+    auth = _auth("slack-C-public")
     ctx = SimpleNamespace(
-        ifc_labels=_labels(sources=frozenset({"slack-C-private"})),
-        auth_context=_auth("slack-C-public"),
+        ifc_labels=_labels("slack-C-public"),
+        auth_context=auth,
         delivered_channel_ids=set(),
         send_message_count=0,
         turn_event_emitter=None,
         last_assistant_message_id=None,
     )
+    auth.ifc_state.merge(_labels(sources=frozenset({"slack-C-private"})))
     agent = SimpleNamespace(
         _config=SimpleNamespace(auto_deliver_final_text_channels=("slack-",)),
         _channels=channels,
@@ -953,6 +992,11 @@ async def test_activity_panel_post_and_detailed_edit_use_live_labels_and_fail_cl
             "_auth_context": auth,
         }
     )
+    assert len(bridge.sends) == 1
+
+    # A detached tool result can update only the shared monotonic state while
+    # the panel model and subsequent event still carry the pre-fork labels.
+    auth.ifc_state.merge(_labels(sources=frozenset({"slack-C-private"})))
     await panel.handle_event(
         {
             "type": "tool_result",
@@ -961,12 +1005,11 @@ async def test_activity_panel_post_and_detailed_edit_use_live_labels_and_fail_cl
             "channel_id": "slack-C1",
             "tool_name": "read_file",
             "content": "protected preview",
-            "_ifc_labels": _labels(sources=frozenset({"slack-C-private"})),
+            "_ifc_labels": compatible,
             "_auth_context": auth,
         }
     )
 
-    assert len(bridge.sends) == 1
     assert bridge.edits == []
 
 

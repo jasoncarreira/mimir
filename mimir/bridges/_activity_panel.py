@@ -304,10 +304,13 @@ class ActivityPanel:
 
     @staticmethod
     def _sink_allowed(model: ActivityPanelModel, sink_name: str) -> bool:
+        ifc_labels = model.ifc_labels
+        if model.auth_context is not None:
+            ifc_labels = model.auth_context.ifc_state.current(ifc_labels)
         decision = SinkGate.check_sink_flow(
             sink_name,
             model.channel_id,
-            model.ifc_labels,
+            ifc_labels,
             model.auth_context,
             enforce=True,
         )

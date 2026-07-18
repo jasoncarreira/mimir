@@ -258,13 +258,20 @@ def _target_within_configured_roots(target: str, _destination: str) -> bool:
 
 
 def _target_within_configured_write_roots(target: str, _destination: str) -> bool:
-    from ._paths import PathOutsideHomeError, resolve_within_roots
+    from ._paths import PathOutsideHomeError
 
     try:
-        resolve_within_roots(_configured_file_write_roots(), target)
+        resolve_configured_write_target(target)
     except (OSError, PathOutsideHomeError):
         return False
     return True
+
+
+def resolve_configured_write_target(target: str) -> Path:
+    """Resolve a write sink exactly as the configured-roots adapter does."""
+    from ._paths import resolve_within_roots
+
+    return resolve_within_roots(_configured_file_write_roots(), target)
 
 
 _SHELL_CONTROL_CHARACTERS = frozenset(";|&`$><{}[],*?~\n\r")
@@ -447,7 +454,7 @@ def _target_matches_worklink_repo(target: str, destination: str) -> bool:
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "configured_file_roots": _target_within_configured_write_roots,
     "shell_profile": _target_matches_shell_profile,
-    "spawn_workspace": _target_within_configured_roots,
+    "spawn_workspace": _target_within_configured_write_roots,
     "worklink_repo": _target_matches_worklink_repo,
 }
 
@@ -557,6 +564,10 @@ class SinkGate:
                 SinkCategory.SHELL_PROCESS,
                 SinkCategory.SPAWN,
                 SinkCategory.FILE,
+                SinkCategory.NOTIFICATION,
+                SinkCategory.HTTP_WEBHOOK,
+                SinkCategory.NETWORK,
+                SinkCategory.EXTERNAL_MCP,
             }:
                 return ToolAuthorization(
                     tool_name=tool_name,
@@ -675,6 +686,10 @@ class SinkGate:
                 SinkCategory.SHELL_PROCESS,
                 SinkCategory.SPAWN,
                 SinkCategory.FILE,
+                SinkCategory.NOTIFICATION,
+                SinkCategory.HTTP_WEBHOOK,
+                SinkCategory.NETWORK,
+                SinkCategory.EXTERNAL_MCP,
             }:
                 return frozenset()
             source_channels = getattr(ifc_labels, "source_channels", None)
@@ -730,7 +745,7 @@ class SinkGate:
                 # Trusted service/derived data retains its input ACL. It may
                 # return only to the triggering channel when the effective
                 # destination principal remains in that intersection.
-                if source.domain == "channel":
+                if source.domain.startswith("channel"):
                     if source.bridge_instance != bridge_instance:
                         return frozenset()
                     if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
@@ -990,6 +1005,10 @@ class OperationCatalog:
         "commitment_list",
         "memory_query",
         "memory_get",
+        # Web research is available to authorized users; calls remain subject
+        # to the NETWORK information-flow sink gate before authorization.
+        "web_search",
+        "fetch_url",
         "write_todos",
         "defer_injected_message",
         "commitment_complete",
@@ -1078,6 +1097,22 @@ class OperationCatalog:
         scopes: list[ResourceScope] | None = None,
     ) -> None:
         """Register a custom decision for an operation."""
+        saga_mutations = globals().get("_SAGA_MUTATION_OPERATIONS", frozenset())
+        is_admin_catalogued = (
+            name in self._ADMIN_REQUIRED_OPERATIONS
+            or name in self._ADMIN_BUILTIN_TOOL_NAMES
+            or any(
+                name.endswith(f"__{catalogued}")
+                or name.endswith(f"_{catalogued}")
+                for catalogued in self._ADMIN_REQUIRED_OPERATIONS
+            )
+        )
+        if (
+            is_admin_catalogued or name in saga_mutations
+        ) and decision != OperationDecision.ADMIN_REQUIRED:
+            raise ValueError(
+                f"cannot downgrade protected operation {name!r} from ADMIN_REQUIRED"
+            )
         self._custom_decisions[name] = decision
         if decision == OperationDecision.RESOURCE_SCOPED and scopes:
             self._resource_scoped_operations[name] = scopes
@@ -2194,6 +2229,7 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "bash_async": "shell_process",
     "spawn_claude_code": "spawn_process",
     "spawn_codex": "spawn_process",
+    "spawn_open_code": "spawn_process",
     "open_proposal": "proposal",
     "submit_proposal": "proposal",
     "abandon_proposal": "proposal",
@@ -2239,9 +2275,10 @@ def _capability_matrix_errors() -> list[str]:
             errors.append(
                 f"SAGA mutation '{operation}' has no sink destination mapping"
             )
-        if operation in OperationCatalog._OPEN_OPERATIONS:
+        effective_decision = _global_operation_catalog.get_decision(operation)
+        if effective_decision == OperationDecision.OPEN:
             errors.append(f"SAGA mutation '{operation}' must not be cataloged OPEN")
-        if operation not in OperationCatalog._ADMIN_REQUIRED_OPERATIONS:
+        if effective_decision != OperationDecision.ADMIN_REQUIRED:
             errors.append(
                 f"SAGA mutation '{operation}' must be cataloged ADMIN_REQUIRED"
             )
@@ -2362,6 +2399,23 @@ def assert_capability_matrix_complete() -> None:
         )
 
 
+def assert_model_tool_inventory_cataloged(*, model_spec: str | None = None) -> None:
+    """Raise if the assembled model-bound Mimir tool surface is uncataloged."""
+    from .tools.registry import all_mimir_tools
+
+    catalog = get_operation_catalog()
+    unknown_tools = sorted({
+        tool.name
+        for tool in all_mimir_tools(model_spec=model_spec)
+        if catalog.get_decision(tool.name) == OperationDecision.UNKNOWN
+    })
+    if unknown_tools:
+        raise CapabilityMatrixError(
+            "Access-control enforcement blocked by UNKNOWN model-bound tools: "
+            + ", ".join(unknown_tools)
+        )
+
+
 def resolve_access_control_enforcement(
     requested: bool,
     *,
@@ -2385,6 +2439,7 @@ def resolve_access_control_enforcement(
                 "or codex-plus:."
             )
         assert_capability_matrix_complete()
+        assert_model_tool_inventory_cataloged(model_spec=model_spec)
     return requested
 
 

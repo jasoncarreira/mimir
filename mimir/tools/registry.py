@@ -2334,13 +2334,17 @@ async def worklink_run(
     return " ".join(parts)
 
 
-def all_mimir_tools() -> list:
+def all_mimir_tools(model_spec: str | None = None) -> list:
     """Return the full mimir tool surface for create_deep_agent.
 
     Combines tools from memory_tool, store_tool, extra_tools, and
     this module. Production cutover would wire the dep-injection
     setters in mimir/server.py:build_app once and let the agent
     discover them all at construction time.
+
+    ``model_spec`` lets startup authorization inspect the same provider-gated
+    surface before the agent is constructed. Runtime callers may omit it and
+    use ``MIMIR_MODEL_SPEC`` as before.
 
     Web tools (Tavily ``web_search`` + ``fetch_url``) are appended
     only when the active LLM provider is not ``claude_code`` — Claude
@@ -2410,7 +2414,7 @@ def all_mimir_tools() -> list:
         # next restart). See mimir/update_on_start.py.
         request_mimir_update,
     ]
-    web_search_on, fetch_url_on = web_tools_enabled()
+    web_search_on, fetch_url_on = web_tools_enabled(model_spec)
     if web_search_on or fetch_url_on:
         from .web import fetch_url, web_search
         if web_search_on:

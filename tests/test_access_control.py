@@ -1281,6 +1281,77 @@ async def test_service_shell_executes_the_exact_authorized_argv() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args_factory", "allowed"),
+    [
+        (lambda _home, _readonly, _outside: {"cwd": ".", "artifact_root": "artifacts"}, True),
+        (lambda _home, readonly, _outside: {"cwd": str(readonly)}, False),
+        (
+            lambda home, _readonly, outside: {
+                "cwd": str(home),
+                "artifact_root": str(outside),
+            },
+            False,
+        ),
+    ],
+    ids=["write-root", "read-only-cwd", "outside-artifact-root"],
+)
+async def test_service_spawn_destinations_are_confined_to_write_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args_factory,
+    allowed: bool,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    home = tmp_path / "home"
+    readonly = tmp_path / "readonly"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    readonly.mkdir()
+    outside.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{readonly}:ro")
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", lambda *_args, **_kw: None)
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    seen_args: dict[str, object] = {}
+
+    async def handler(request):
+        seen_args.update(request.tool_call["args"])
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    result = await BudgetGateMiddleware().awrap_tool_call(
+        _tool_request(
+            auth_context,
+            tool_name="spawn_open_code",
+            args={"prompt": "task", **args_factory(home, readonly, outside)},
+        ),
+        handler,
+    )
+
+    if allowed:
+        assert result.status != "error"
+        assert seen_args["cwd"] == str(home.resolve())
+        assert seen_args["artifact_root"] == str((home / "artifacts").resolve())
+    else:
+        assert result.status == "error"
+        assert "service_sink_destination_denied" in str(result.content)
+        assert seen_args == {}
+
+
+@pytest.mark.asyncio
 async def test_same_scope_private_egress_succeeds_through_live_middleware(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
