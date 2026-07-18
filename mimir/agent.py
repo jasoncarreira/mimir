@@ -2050,11 +2050,15 @@ class Agent:
     @staticmethod
     def _harness_sink_allowed(ctx: Any, target: str | None, sink_name: str) -> bool:
         """Apply enforced IFC to a harness-owned final egress boundary."""
+        auth_context = getattr(ctx, "auth_context", None)
+        ifc_labels = getattr(ctx, "ifc_labels", None)
+        if auth_context is not None:
+            ifc_labels = auth_context.ifc_state.current(ifc_labels)
         decision = SinkGate.check_sink_flow(
             sink_name,
             target,
-            getattr(ctx, "ifc_labels", None),
-            getattr(ctx, "auth_context", None),
+            ifc_labels,
+            auth_context,
             enforce=True,
         )
         if decision.allowed:

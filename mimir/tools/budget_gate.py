@@ -383,7 +383,7 @@ def _current_ifc_labels(auth_context: AuthContext | None) -> Any:
     ):
         labels = getattr(active_ctx, "ifc_labels", None)
         if labels is not None:
-            return labels
+            return auth_context.ifc_state.current(labels)
     if auth_context is None:
         return None
     return auth_context.ifc_state.current(auth_context.ifc_labels)
