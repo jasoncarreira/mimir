@@ -1988,6 +1988,28 @@ async def spawn_codex(
     return json.dumps({"result": stdout.strip()[:2000], "name": name}, indent=2)
 
 
+def _confined_artifact_base(artifact_root: str, home: str | Path) -> Path:
+    """Resolve a model-supplied ``artifact_root``, confined to the agent home.
+
+    ``spawn_open_code`` persists run artifacts (prompt.md / stdout.txt /
+    stderr.txt / manifest.json) with raw filesystem writes that BYPASS the
+    file-tool WriteGuard, at a path the model chose. Confine them to the home
+    so a steered / prompt-injected call can't persist the task prompt and
+    subprocess output to an arbitrary (e.g. externally-synced or world-readable)
+    location outside the sandbox. ``resolve()`` collapses ``..`` and follows
+    symlinks, so a link that escapes the home is caught. Raises ``ValueError``
+    if the resolved root is not the home or under it.
+    """
+    base = Path(artifact_root).expanduser().resolve()
+    home_resolved = Path(home).expanduser().resolve()
+    if base != home_resolved and not base.is_relative_to(home_resolved):
+        raise ValueError(
+            "artifact_root must be within the agent home "
+            f"({home_resolved}); got {base}"
+        )
+    return base
+
+
 @tool
 async def spawn_open_code(
     prompt: str,
@@ -2043,6 +2065,18 @@ async def spawn_open_code(
     rate_token, rate_err = await _spawn_acquire_rate_slot(guard)
     if rate_err is not None:
         return rate_err.replace("spawn_claude_code", "spawn_open_code")
+
+    # Validate the (model-controlled) artifact_root BEFORE spawning so a
+    # bad/escaping path is refused up front rather than after burning a run.
+    artifact_base: Optional[Path] = None
+    if artifact_root:
+        home = cfg.get("default_cwd")
+        if not home:
+            return "spawn_open_code refused: artifact_root set but no home is configured"
+        try:
+            artifact_base = _confined_artifact_base(artifact_root, home)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return f"spawn_open_code refused: {exc}"
 
     cwd_path = Path(cwd).expanduser() if cwd else cfg.get("default_cwd")
     import shlex
@@ -2112,9 +2146,9 @@ async def spawn_open_code(
         )
 
     artifact_dir: Optional[Path] = None
-    if artifact_root:
+    if artifact_base is not None:
         try:
-            artifact_dir = Path(artifact_root).expanduser() / ".factory" / "runs" / run_id
+            artifact_dir = artifact_base / ".factory" / "runs" / run_id
             artifact_dir.mkdir(parents=True, exist_ok=True)
             (artifact_dir / "prompt.md").write_text(prompt, encoding="utf-8")
             (artifact_dir / "stdout.txt").write_text(stdout, encoding="utf-8")
