@@ -283,6 +283,10 @@ def _extract_sink_target(
         target = args.get("cwd") or os.environ.get("MIMIR_HOME")
     elif tool_name in {"fetch_url", "http_request", "webhook"}:
         target = args.get("url")
+    elif tool_name == "web_search":
+        from .web import DEFAULT_TAVILY_SEARCH_URL
+
+        target = os.environ.get("TAVILY_SEARCH_URL", "").strip() or DEFAULT_TAVILY_SEARCH_URL
     elif tool_name.startswith("mcp_"):
         target = tool_name
     else:

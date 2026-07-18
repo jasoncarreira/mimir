@@ -944,6 +944,10 @@ class OperationCatalog:
         "commitment_list",
         "memory_query",
         "memory_get",
+        # Web research is available to authorized users; calls remain subject
+        # to the NETWORK information-flow sink gate before authorization.
+        "web_search",
+        "fetch_url",
         "write_todos",
         "defer_injected_message",
         "commitment_complete",
@@ -2307,6 +2311,23 @@ def assert_capability_matrix_complete() -> None:
         )
 
 
+def assert_model_tool_inventory_cataloged(*, model_spec: str | None = None) -> None:
+    """Raise if the assembled model-bound Mimir tool surface is uncataloged."""
+    from .tools.registry import all_mimir_tools
+
+    catalog = get_operation_catalog()
+    unknown_tools = sorted({
+        tool.name
+        for tool in all_mimir_tools(model_spec=model_spec)
+        if catalog.get_decision(tool.name) == OperationDecision.UNKNOWN
+    })
+    if unknown_tools:
+        raise CapabilityMatrixError(
+            "Access-control enforcement blocked by UNKNOWN model-bound tools: "
+            + ", ".join(unknown_tools)
+        )
+
+
 def resolve_access_control_enforcement(
     requested: bool,
     *,
@@ -2330,6 +2351,7 @@ def resolve_access_control_enforcement(
                 "or codex-plus:."
             )
         assert_capability_matrix_complete()
+        assert_model_tool_inventory_cataloged(model_spec=model_spec)
     return requested
 
 

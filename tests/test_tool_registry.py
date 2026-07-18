@@ -47,6 +47,8 @@ _NEWLY_CATALOGED_TOOLS = {
     "memory_store": OperationDecision.ADMIN_REQUIRED,
     "memory_query": OperationDecision.OPEN,
     "memory_get": OperationDecision.OPEN,
+    "web_search": OperationDecision.OPEN,
+    "fetch_url": OperationDecision.OPEN,
     "saga_feedback": OperationDecision.ADMIN_REQUIRED,
     "saga_mark_contributions": OperationDecision.ADMIN_REQUIRED,
     "saga_end_session": OperationDecision.ADMIN_REQUIRED,
@@ -133,6 +135,38 @@ def test_routine_tools_have_explicit_catalog_decisions(
     expected: OperationDecision,
 ) -> None:
     assert OperationCatalog().get_decision(operation) == expected
+
+
+@pytest.mark.parametrize("tool_name", ["web_search", "fetch_url"])
+@pytest.mark.parametrize("roles", [("user",), ("user", "admin")])
+def test_web_tools_are_open_but_remain_network_sinks_when_enforced(
+    tool_name: str,
+    roles: tuple[str, ...],
+) -> None:
+    from mimir.access_control import SinkCategory, get_sink_category
+
+    result = ToolRegistry().authorize_tool(
+        tool_name,
+        _auth_context(roles=roles, enforce=True),
+        enforce=True,
+        target_channel="https://external.example",
+        ifc_labels=InformationFlowLabels(),
+    )
+
+    assert result.allowed is True
+    assert result.decision == OperationDecision.OPEN
+    assert get_sink_category(tool_name) == SinkCategory.NETWORK
+
+
+def test_web_search_ifc_target_is_the_configured_search_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools.budget_gate import _extract_sink_target
+
+    monkeypatch.setenv("TAVILY_SEARCH_URL", "https://search.example/api")
+    request = SimpleNamespace(tool_call={"name": "web_search", "args": {"query": "mimir"}})
+
+    assert _extract_sink_target(request) == "https://search.example/api"
 
 
 @pytest.mark.parametrize("operation", ["spawn_open_code", "task"])
@@ -667,6 +701,26 @@ def test_enforcement_enablement_fails_closed_with_incomplete_matrix() -> None:
     finally:
         _TRUSTED_SERVICE_PRINCIPALS.clear()
         _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+
+
+def test_enforcement_enablement_rejects_uncataloged_model_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import (
+        CapabilityMatrixError,
+        resolve_access_control_enforcement,
+    )
+
+    monkeypatch.setattr(
+        "mimir.tools.registry.all_mimir_tools",
+        lambda model_spec=None: [SimpleNamespace(name="deliberately_uncataloged")],
+    )
+
+    with pytest.raises(
+        CapabilityMatrixError,
+        match="UNKNOWN model-bound tools: deliberately_uncataloged",
+    ):
+        resolve_access_control_enforcement(True, model_spec="openai:test")
 
 
 @pytest.mark.parametrize(
