@@ -32,6 +32,7 @@ from .config import Config
 from .dispatcher import Dispatcher
 from .event_logger import init_logger, log_event
 from .history import MessageBuffer
+from .http_ingress import strip_bridge_authority_extra
 from .identities import IdentityResolver
 from .index import IndexGenerator
 from .models import AgentEvent, make_process_session_id
@@ -332,13 +333,14 @@ async def _handle_event(request: web.Request) -> web.Response:
     extra = body.get("extra")
     if extra is not None and not isinstance(extra, dict):
         return web.json_response({"error": "extra must be an object"}, status=400)
-    # chainlink #783 / #740 / #926 (security): the generic /event ingress is
+    # chainlink #783 / #740 / #926 / #928 (security): HTTP ingress is
     # client-controlled, so strip server-owned chat-skill keys, Worklink
-    # continuation hints, and bridge-owned visibility before constructing the
-    # AgentEvent. Otherwise a client could forge privileged metadata or
+    # continuation hints, and bridge-owned authority metadata before constructing
+    # the AgentEvent. Otherwise a client could forge privileged metadata or
     # declassify its synthesized durable outputs as public.
-    extra = strip_worklink_hint_extra(strip_chat_skill_extra(extra))
-    extra.pop("channel_visibility", None)
+    extra = strip_bridge_authority_extra(
+        strip_worklink_hint_extra(strip_chat_skill_extra(extra))
+    )
     extra = stamp_http_event_ingress_extra(extra)
     attachment_names = body.get("attachment_names")
     if attachment_names is not None and not isinstance(attachment_names, list):

@@ -11,6 +11,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from mimir.access_control import create_auth_context
 from mimir.chat_skills import (
     CHAT_SKILL_EXTRA_KEY,
     ChatSkillDescriptor,
@@ -18,7 +19,8 @@ from mimir.chat_skills import (
     ChatSkillInvocation,
 )
 from mimir.bridges.web_chat import DEFAULT_CHANNEL, WebChatBridge, _Subscriber
-from mimir.models import AgentEvent
+from mimir.models import AgentEvent, SessionACL
+from mimir.saga.ownership import is_user_accessible
 from mimir.web_contracts import validate_api_envelope, validate_live_event
 from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY
 
@@ -271,6 +273,43 @@ async def test_post_chat_v1_strips_forged_http_event_ingress_marker(tmp_path):
     validate_api_envelope(body, expect_ok=True)
     assert len(enqueued) == 1
     assert enqueued[0].extra == {"keep": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_post_chat_strips_bridge_authority_and_keeps_durable_acl_private(tmp_path):
+    _, app, enqueued = _authed_bridge_app(
+        tmp_path, canonical="alice", display_name="alice"
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/chat",
+            json={
+                "content": "do not publish this",
+                "extra": {
+                    "channel_visibility": "public",
+                    "bridge_instance": "forged-bridge",
+                    "keep": "ok",
+                },
+            },
+        )
+
+    assert resp.status == 200
+    event = enqueued[0]
+    assert event.extra == {"keep": "ok"}
+    context = create_auth_context(event, enforce=True)
+    assert context.bridge_instance == "web"
+    durable_acl = SessionACL.from_auth_context(
+        context,
+        origin_domain=event.source,
+        visibility=event.extra.get("channel_visibility", "private"),
+    )
+    assert durable_acl.owner_principal == "alice"
+    assert durable_acl.visibility == "private"
+    # Session boundaries and extracted commitments inherit this ACL. An
+    # unrelated user has no owner match, and private visibility grants no read.
+    assert durable_acl.owner_principal != "bob"
+    assert is_user_accessible(durable_acl.visibility) is False
 
 
 @pytest.mark.asyncio
