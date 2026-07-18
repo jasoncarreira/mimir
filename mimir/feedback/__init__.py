@@ -39,6 +39,7 @@ from ..jsonl_snapshot import (
     iter_snapshot_or_tail,
     iter_window_records,
 )
+from ..models import AuthContext, InformationFlowLabels, PromptBlock
 
 # --- Sub-module imports + backward-compat re-exports ---
 from ._models import (  # noqa: F401
@@ -85,6 +86,39 @@ from .resolved import (  # noqa: F401
 )
 
 log = logging.getLogger(__name__)
+
+
+class _RecordSnapshot:
+    """Minimal immutable snapshot adapter for an authorization-filtered view."""
+
+    def __init__(self, records: list[dict]) -> None:
+        self._records = records
+
+    def records(self) -> list[dict]:
+        return self._records
+
+    @property
+    def saturated(self) -> bool:
+        return False
+
+
+def _record_principal(record: dict) -> str | None:
+    for key in ("owner_principal", "canonical_author", "principal", "author"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _is_privileged(auth_context: AuthContext) -> bool:
+    return auth_context.is_service or "admin" in auth_context.roles
+
+
+def _record_source_principal(record: dict, auth_context: AuthContext) -> str | None:
+    value = _record_principal(record)
+    if value and value == auth_context.principal and auth_context.canonical_principal:
+        return auth_context.canonical_principal
+    return value
 
 
 _QUOTA_RATIO_RE = re.compile(r"@\d+(?:\.\d+)?")
@@ -194,10 +228,23 @@ class FeedbackLog:
         *,
         window_hours: int | None = None,
         limit_per_polarity: int | None = None,
+        auth_context: AuthContext | None = None,
     ) -> tuple[list[FeedbackSignal], list[FeedbackSignal]]:
         """Return (negative, positive), each reverse-chronological and
         capped at ``limit_per_polarity``. Records older than
         ``window_hours`` are dropped."""
+        if auth_context is not None and not isinstance(auth_context, AuthContext):
+            raise TypeError("feedback authorization requires the exact AuthContext")
+        event_snapshot = self.events_snapshot
+        turn_snapshot = self.turns_snapshot
+        if auth_context is not None:
+            event_snapshot = _RecordSnapshot(
+                self._authorized_records(self.events_snapshot, self.events_path, auth_context)
+            )
+            turn_snapshot = _RecordSnapshot(
+                self._authorized_records(self.turns_snapshot, self.turns_path, auth_context)
+            )
+
         window_hours = window_hours if window_hours is not None else self.default_window_hours
         limit = (
             limit_per_polarity
@@ -231,7 +278,7 @@ class FeedbackLog:
             else _AROUSAL_THRESHOLDS
         )
         kind_counts = _count_kinds_in_window(
-            self.events_snapshot, self.events_path, cutoff_iso
+            event_snapshot, self.events_path, cutoff_iso
         )
 
         # Alg-3: emit algedonic_escalation events for negative kinds that
@@ -246,11 +293,11 @@ class FeedbackLog:
         )
         if _esc_thresholds:
             _already_escalated = _escalated_kinds_in_window(
-                self.events_snapshot, self.events_path, cutoff_iso
+                event_snapshot, self.events_path, cutoff_iso
             )
             escalation_counts = dict(kind_counts)
             for kind, count in _count_escalation_only_events_in_window(
-                self.events_snapshot, self.events_path, cutoff_iso
+                event_snapshot, self.events_path, cutoff_iso
             ).items():
                 escalation_counts[kind] = escalation_counts.get(kind, 0) + count
             escalation_thresholds = dict(_esc_thresholds)
@@ -271,7 +318,7 @@ class FeedbackLog:
         # loop must skip those individual events so they don't duplicate.
         # Chain signals are always-surface (bypass the per-polarity limit).
         group_runs = _compute_group_runs(
-            self.events_snapshot, self.events_path, cutoff_iso, _VALENCE_GROUPS
+            event_snapshot, self.events_path, cutoff_iso, _VALENCE_GROUPS
         )
         chain_signals, chain_consumed_kinds = _synthesize_chain_signals(
             group_runs, _VALENCE_GROUPS
@@ -298,7 +345,7 @@ class FeedbackLog:
         seen_content: dict[str, set[str]] = {"negative": set(), "positive": set()}
 
         # 1) events.jsonl — known event-type rules.
-        for ev in iter_window_records(self.events_snapshot, self.events_path):  # #498
+        for ev in iter_window_records(event_snapshot, self.events_path):  # #498
             ts = ev.get("timestamp")
             if not isinstance(ts, str) or ts < cutoff_iso:
                 # tail-first scan: as soon as a record predates the window
@@ -395,7 +442,7 @@ class FeedbackLog:
         # it doesn't interfere with the within-turn loop_stop / loop_warn
         # signals that the individual-event pass already handles.
         for sig in _detect_cross_turn_send_loops(
-            self.events_snapshot, self.events_path, cutoff_iso
+            event_snapshot, self.events_path, cutoff_iso
         ):
             negatives.append(sig)
         if any(s.kind == "cross_turn_loop" for s in negatives):
@@ -412,7 +459,7 @@ class FeedbackLog:
             if not sig.kind.endswith("_chain") and sig.kind != "cross_turn_loop"
         )
         if bounded_negative_count < limit:
-            for rec in iter_window_records(self.turns_snapshot, self.turns_path):  # #498
+            for rec in iter_window_records(turn_snapshot, self.turns_path):  # #498
                 ts = rec.get("ts")
                 if not isinstance(ts, str) or ts < cutoff_iso:
                     if isinstance(ts, str):
@@ -443,11 +490,33 @@ class FeedbackLog:
 
         return _collapse_feedback_signals(negatives), _collapse_feedback_signals(positives)
 
+    @staticmethod
+    def _authorized_records(
+        snapshot: JsonlSnapshot | None,
+        path: Path,
+        auth_context: AuthContext,
+    ) -> list[dict]:
+        records = list(iter_snapshot_or_tail(snapshot, path))
+        if _is_privileged(auth_context):
+            return records
+        principal = auth_context.canonical_principal or auth_context.principal
+        allowed_principals = {principal, auth_context.principal}
+        channel_id = auth_context.channel_id
+        if not principal or not channel_id:
+            return []
+        return [
+            record
+            for record in records
+            if record.get("channel_id") == channel_id
+            and _record_principal(record) in allowed_principals
+        ]
+
     def recent_block(
         self,
         *,
         window_hours: int | None = None,
         limit_per_polarity: int | None = None,
+        auth_context: AuthContext | None = None,
     ) -> str | None:
         """Returns the rendered block (without the leading ``## `` header
         — that's added by ``build_turn_prompt``), or ``None`` if both
@@ -456,6 +525,7 @@ class FeedbackLog:
         negatives, positives = self.recent(
             window_hours=window_hours,
             limit_per_polarity=limit_per_polarity,
+            auth_context=auth_context,
         )
         return render_feedback_block(
             negatives,
@@ -464,6 +534,34 @@ class FeedbackLog:
             if window_hours is not None
             else self.default_window_hours,
         )
+
+    def recent_prompt_block(self, auth_context: AuthContext) -> PromptBlock | None:
+        """Load authorized feedback and return content with record provenance."""
+        if not isinstance(auth_context, AuthContext):
+            raise TypeError("feedback prompt loading requires the exact AuthContext")
+        events = self._authorized_records(
+            self.events_snapshot, self.events_path, auth_context,
+        )
+        turns = self._authorized_records(
+            self.turns_snapshot, self.turns_path, auth_context,
+        )
+        content = self.recent_block(auth_context=auth_context)
+        if not content:
+            return None
+        labels = InformationFlowLabels(labels=frozenset({"private"}))
+        labels = labels.with_source("domain", "feedback")
+        for resource, records in (("events", events), ("turns", turns)):
+            if records:
+                labels = labels.with_source("resource", resource)
+            for record in records:
+                channel = record.get("channel_id")
+                principal = _record_source_principal(record, auth_context)
+                labels = labels.with_channel(channel if isinstance(channel, str) and channel else "unknown")
+                labels = labels.with_source("principal", principal or "unknown")
+                bridge = record.get("bridge") or record.get("source")
+                if isinstance(bridge, str) and bridge:
+                    labels = labels.with_source("bridge", bridge)
+        return PromptBlock(content=content, labels=labels)
 
 
 # VSM: algedonic — bypass channel for self-feedback signals; surfaces

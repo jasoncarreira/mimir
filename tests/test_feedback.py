@@ -20,6 +20,7 @@ from mimir.feedback import (
     pending_forget_candidates_count,
     render_feedback_block,
 )
+from mimir.models import AuthContext
 
 
 def _ts(hours_ago: float = 0) -> str:
@@ -125,6 +126,40 @@ def test_mixed_polarity_renders_both_subsections_with_blank_separator(tmp_path: 
     pos_idx = block.index("Positive")
     assert neg_idx < pos_idx
     assert "\n\nPositive" in block
+
+
+def test_prompt_feedback_is_owner_and_channel_scoped_before_rendering(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.3), "type": "commitment_due",
+            "channel_id": "shared", "owner_principal": "alice",
+            "text": "ALICE-SECRET", "commitment_id": "c-alice",
+        },
+        {
+            "timestamp": _ts(0.2), "type": "commitment_due",
+            "channel_id": "other", "owner_principal": "bob",
+            "text": "BOB-OTHER-CHANNEL", "commitment_id": "c-other",
+        },
+        {
+            "timestamp": _ts(0.1), "type": "commitment_due",
+            "channel_id": "shared", "owner_principal": "bob",
+            "text": "BOB-OWN", "commitment_id": "c-bob",
+        },
+    ])
+    auth = AuthContext(
+        principal="slack-UB", canonical_principal="bob", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert "BOB-OWN" in block.content
+    assert "ALICE-SECRET" not in block.content
+    assert "BOB-OTHER-CHANNEL" not in block.content
+    assert block.labels.source_principals == frozenset({"bob"})
+    assert block.labels.source_channels == frozenset({"shared"})
 
 
 # ---- Window cutoff -------------------------------------------------------

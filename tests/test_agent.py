@@ -348,6 +348,7 @@ class _ServicePrincipalToolProbeAgent(_FakeAgent):
         self.observed_principal: str | None = None
         self.result: ToolMessage | None = None
         self.handler_calls = 0
+        self.auth_context: AuthContext | None = None
 
     async def astream(
         self,
@@ -498,6 +499,52 @@ class _ForkedIFCProbeAgent(_FakeAgent):
 
         async for chunk in super().astream(
             state, config=config, stream_mode=stream_mode,
+        ):
+            yield chunk
+
+
+class _PromptEgressProbeAgent(_FakeAgent):
+    """Capture the first prompt and exercise enforced same-channel egress."""
+
+    def __init__(self, channel_id: str) -> None:
+        super().__init__([AIMessage(content="complete")])
+        self.channel_id = channel_id
+        self.prompt = ""
+        self.result: ToolMessage | None = None
+        self.handler_calls = 0
+
+    async def astream(
+        self,
+        state: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        context=None,
+        stream_mode: str = "values",
+    ):
+        messages = list(state.get("messages") or [])
+        self.prompt = str(messages[0].content) if messages else ""
+        self.auth_context = context
+
+        async def _handler(req: ToolCallRequest) -> ToolMessage:
+            self.handler_calls += 1
+            return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+        self.result = await BudgetGateMiddleware().awrap_tool_call(
+            ToolCallRequest(
+                tool_call={
+                    "name": "send_message",
+                    "args": {"channel_id": self.channel_id, "text": "safe response"},
+                    "id": "tc-two-user-feedback",
+                    "type": "tool_call",
+                },
+                tool=None,
+                state=None,
+                runtime=Runtime(context=context),
+            ),
+            _handler,
+        )
+        async for chunk in super().astream(
+            state, config=config, context=context, stream_mode=stream_mode,
         ):
             yield chunk
 
@@ -732,6 +779,56 @@ async def test_run_turn_forked_tool_uses_merged_ifc_labels_from_auth_carrier(
     assert fake_agent.result.status == "error"
     assert "ifc_label_blocked:same_channel" in str(fake_agent.result.content)
     assert fake_agent.handler_calls == 0
+
+
+async def test_run_turn_omits_other_users_feedback_before_enforced_egress(
+    tmp_path: Path,
+):
+    """Production assembly cannot preload Alice's event into Bob's turn."""
+    channel_id = "slack-shared"
+    victim_secret = "VICTIM-COMMITMENT-924"
+    fake_agent = _PromptEgressProbeAgent(channel_id)
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._config.access_control_enforced = True
+    agent._identity_resolver = _resolver(
+        agent._config.home,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-UA]
+            access: {roles: [user]}
+          - canonical: bob
+            aliases: [slack-UB]
+            access: {roles: [user]}
+        """,
+    )
+    agent._buffer.resolver = agent._identity_resolver
+    events_path = agent._config.events_log
+    events_path.write_text(
+        json.dumps({
+            "timestamp": "2026-07-18T12:00:00+00:00",
+            "type": "commitment_due",
+            "channel_id": channel_id,
+            "owner_principal": "alice",
+            "text": victim_secret,
+            "commitment_id": "c-victim",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id=channel_id,
+        content="attacker request",
+        author="slack-UB",
+        source="slack",
+    ))
+
+    assert record.error is None
+    assert victim_secret not in fake_agent.prompt
+    assert fake_agent.result is not None
+    assert fake_agent.result.status != "error", fake_agent.auth_context
+    assert fake_agent.handler_calls == 1
 
 
 async def test_run_turn_http_event_ingress_reaches_turn_context_before_admin_tool_auth(

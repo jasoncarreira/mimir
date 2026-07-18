@@ -349,6 +349,15 @@ class SinkGate:
         if resolved_sources != {resolved_triggering}:
             return frozenset()
 
+        source_principals = getattr(ifc_labels, "source_principals", None)
+        if source_principals:
+            effective_principal = (
+                getattr(auth_context, "canonical_principal", None)
+                or getattr(auth_context, "principal", None)
+            )
+            if not effective_principal or source_principals != {effective_principal}:
+                return frozenset()
+
         return frozenset({resolved_triggering})
 
 
@@ -392,6 +401,10 @@ def audit_declassification(
     return InformationFlowLabels(
         labels=frozenset(),
         source_channels=labels.source_channels,
+        source_principals=labels.source_principals,
+        source_domains=labels.source_domains,
+        source_resources=labels.source_resources,
+        source_bridges=labels.source_bridges,
         created_at=labels.created_at,
     )
 

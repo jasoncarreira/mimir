@@ -68,7 +68,14 @@ from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
 from ._jsonl_tail import tail_jsonl_records
 from .jsonl_snapshot import JsonlSnapshot
-from .models import AgentEvent, AuthContext, InformationFlowLabels, TurnInteractivity, TurnRecord
+from .models import (
+    AgentEvent,
+    AuthContext,
+    InformationFlowLabels,
+    PromptBlock,
+    TurnInteractivity,
+    TurnRecord,
+)
 from .access_control import SinkGate, create_auth_context
 from .prompts import build_system_prompt, build_turn_prompt
 from .rate_limits import RateLimitStore
@@ -185,6 +192,37 @@ def _turn_is_interactive(interactivity: TurnInteractivity | None) -> bool:
     return interactivity == TurnInteractivity.INTERACTIVE
 
 
+def _require_auth_context(auth_context: AuthContext | None) -> AuthContext:
+    if not isinstance(auth_context, AuthContext):
+        raise TypeError("protected prompt loading requires the exact AuthContext")
+    return auth_context
+
+
+def _prompt_source_labels(
+    auth_context: AuthContext,
+    *,
+    domain: str,
+    resource: str,
+    channel_id: str | None = None,
+    principal: str | None = None,
+    bridge: str | None = None,
+) -> InformationFlowLabels:
+    """Create a protected source label set without inventing provenance."""
+    labels = InformationFlowLabels(labels=frozenset({"private"}))
+    labels = labels.with_source("domain", domain).with_source("resource", resource)
+    if channel_id:
+        labels = labels.with_channel(channel_id)
+    if principal:
+        labels = labels.with_source("principal", principal)
+    if bridge:
+        labels = labels.with_source("bridge", bridge)
+    return labels
+
+
+def _is_prompt_operator(auth_context: AuthContext) -> bool:
+    return auth_context.is_service or "admin" in auth_context.roles
+
+
 def _merge_ifc_labels(
     *label_sets: Any,
     source_channel: str | None = None,
@@ -198,6 +236,14 @@ def _merge_ifc_labels(
             merged = merged.with_label(label)
         for channel in current.source_channels:
             merged = merged.with_channel(channel)
+        for kind, values in (
+            ("principal", current.source_principals),
+            ("domain", current.source_domains),
+            ("resource", current.source_resources),
+            ("bridge", current.source_bridges),
+        ):
+            for value in values:
+                merged = merged.with_source(kind, value)
     if source_channel:
         merged = merged.with_channel(source_channel)
     return merged
@@ -232,6 +278,23 @@ def _initialize_ifc_labels(
         labels = labels.with_label("internal")
 
     return labels
+
+
+def _labels_for_ingress(
+    labels: InformationFlowLabels,
+    event: AgentEvent,
+    auth_context: AuthContext,
+) -> InformationFlowLabels:
+    """Attach server-resolved ingress provenance after identity resolution."""
+    result = labels.with_source("domain", "ingress")
+    principal = auth_context.canonical_principal or auth_context.principal
+    if principal:
+        result = result.with_source("principal", principal)
+    if event.channel_id:
+        result = result.with_source("resource", f"channel:{event.channel_id}")
+    if event.source:
+        result = result.with_source("bridge", event.source)
+    return result
 
 
 def _is_private_attachment(filename: str) -> bool:
@@ -1395,6 +1458,12 @@ class Agent:
             enforce=self._config.access_control_enforced,
             ifc_labels=initial_ifc_labels,
         )
+        initial_ifc_labels = _labels_for_ingress(
+            initial_ifc_labels, event, initial_auth_context,
+        )
+        initial_auth_context = replace(
+            initial_auth_context, ifc_labels=initial_ifc_labels,
+        )
         emitter = TurnEventEmitter(
             self._turn_event_bus,
             turn_id=turn_id,
@@ -2233,21 +2302,9 @@ class Agent:
             initial_auth_context=initial_auth_context,
         )
 
-        # Server-supplied prompt context is tainted before the first model call.
-        # Automatic retrieval/session/subagent/history blocks may contain protected
-        # data; the coarse turn-level label survives summaries and model claims.
-        preloaded_labels = InformationFlowLabels()
-        # Every server-supplied prompt block is conservatively protected until
-        # source-specific ownership labels exist. This includes recent history,
-        # automatic SAGA/session/skill/file injection, channel memory, feedback,
-        # commitments, self-state, and subagent completion context.
-        if turn_prompt:
-            preloaded_labels = preloaded_labels.with_label("private")
-        ctx.ifc_labels = _merge_ifc_labels(
-            ctx.ifc_labels,
-            preloaded_labels,
-            source_channel=event.channel_id,
-        )
+        # Protected loaders merge their authoritative provenance into the turn
+        # during assembly. Do not relabel the assembled prompt as if every source
+        # belonged to the requester channel.
         if ctx.auth_context is not None:
             ctx.auth_context = replace(ctx.auth_context, ifc_labels=ctx.ifc_labels)
         emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
@@ -3237,7 +3294,8 @@ class Agent:
 
     def _assemble_usage_block(
         self,
-    ) -> tuple[str | None, list[tuple[str, dict]]]:
+        auth_context: AuthContext,
+    ) -> tuple[PromptBlock | None, list[tuple[str, dict]]]:
         """Aggregate over 1h / 5h / 7d, render the Resource usage prompt
         section, return ``(block_text, deferred_events)``.
 
@@ -3246,7 +3304,10 @@ class Agent:
         deferred_events on the running loop because this method runs
         inside ``asyncio.to_thread``.
         """
+        auth_context = _require_auth_context(auth_context)
         deferred: list[tuple[str, dict]] = []
+        if not _is_prompt_operator(auth_context):
+            return None, deferred
         if not self._config.usage_block_enabled:
             return None, deferred
 
@@ -3317,26 +3378,47 @@ class Agent:
                 )
             )
 
-        return result.body, deferred
+        if not result.body:
+            return None, deferred
+        return PromptBlock(
+            result.body,
+            _prompt_source_labels(
+                auth_context, domain="usage", resource="global:usage",
+                principal="service:mimir",
+            ),
+        ), deferred
 
-    def _assemble_upcoming_block(self) -> str | None:
+    def _assemble_upcoming_block(self, auth_context: AuthContext) -> PromptBlock | None:
         """v0.5+ §12.1: render the ``## Upcoming`` block."""
+        auth_context = _require_auth_context(auth_context)
+        if not _is_prompt_operator(auth_context):
+            return None
         try:
             from .upcoming import render_upcoming_block
-            return render_upcoming_block(
+            content = render_upcoming_block(
                 scheduler=self._scheduler,
                 rate_limit_store=self._rate_limits,
+            )
+            if not content:
+                return None
+            return PromptBlock(
+                content,
+                _prompt_source_labels(
+                    auth_context, domain="schedules", resource="global:upcoming",
+                    principal="service:mimir",
+                ),
             )
         except Exception:  # noqa: BLE001
             log.exception("_assemble_upcoming_block failed; skipping")
             return None
 
     def _assemble_commitments_block(
-        self, channel_id: str | None,
-    ) -> str | None:
+        self, channel_id: str | None, auth_context: AuthContext,
+    ) -> PromptBlock | None:
         """Phase 3: ``## Upcoming commitments`` block — active records
         for this channel (+ unbound). Suppressed on synthetic
         scheduler:* / poller:* channels and when no store is wired."""
+        auth_context = _require_auth_context(auth_context)
         if channel_id is None or self._commitments is None:
             return None
         from .history import SYNTHETIC_CHANNEL_PREFIXES
@@ -3346,9 +3428,29 @@ class Agent:
             from .commitments.render import render_commitments_block
             records = self._commitments.list(
                 channel_id=channel_id,
-                include_unbound=True,
+                include_unbound=_is_prompt_operator(auth_context),
+                actor_principal=(
+                    auth_context.canonical_principal or auth_context.principal
+                ),
+                owner_principal=(
+                    None
+                    if _is_prompt_operator(auth_context)
+                    else auth_context.canonical_principal or auth_context.principal
+                ),
+                actor_is_admin="admin" in auth_context.roles,
+                include_service=auth_context.is_service,
             )
-            return render_commitments_block(records)
+            content = render_commitments_block(records)
+            if not content:
+                return None
+            labels = _prompt_source_labels(
+                auth_context, domain="commitments", resource="commitments",
+            )
+            for record in records:
+                labels = labels.with_channel(
+                    record.originating_channel or record.channel_id or "unknown"
+                ).with_source("principal", record.owner_principal or "unknown")
+            return PromptBlock(content, labels)
         except Exception:  # noqa: BLE001
             log.exception(
                 "_assemble_commitments_block failed; skipping",
@@ -3356,13 +3458,17 @@ class Agent:
             return None
 
     def _assemble_self_state_block(
-        self, *, event_loop: "asyncio.AbstractEventLoop | None" = None,
-    ) -> str | None:
+        self, auth_context: AuthContext, *,
+        event_loop: "asyncio.AbstractEventLoop | None" = None,
+    ) -> PromptBlock | None:
         """v0.5+ §12.4: render the ``## Self-state`` block — homeostat
         view + uncommitted-files line + per-turn skill telemetry.
 
         ``event_loop`` is threaded to the arbiter so a lazy-expiry
         ``quota_recovered`` emit isn't dropped on this worker thread (#489)."""
+        auth_context = _require_auth_context(auth_context)
+        if not _is_prompt_operator(auth_context):
+            return None
         try:
             arbiter_body = self._arbiter.render_self_state_block(
                 event_loop=event_loop,
@@ -3377,7 +3483,13 @@ class Agent:
         parts = [s for s in (arbiter_body, git_line, skill_body) if s]
         if not parts:
             return None
-        return "\n".join(parts)
+        return PromptBlock(
+            "\n".join(parts),
+            _prompt_source_labels(
+                auth_context, domain="self_state", resource="global:self_state",
+                principal="service:mimir",
+            ),
+        )
 
     def _assemble_git_status_line(self) -> str | None:
         """``- uncommitted in /mimir-home: <count> file(s) — <topN>`` line.
@@ -3423,9 +3535,10 @@ class Agent:
         *,
         channel_id: str | None,
         auth_context: AuthContext | None = None,
-    ) -> str | None:
+    ) -> PromptBlock | None:
         """Render the Recent session summaries block from SagaStore's
         ``recent_session_boundaries()``."""
+        auth_context = _require_auth_context(auth_context)
         count = self._config.recent_boundaries
         if count <= 0:
             return None
@@ -3463,13 +3576,27 @@ class Agent:
                 snapshot_records=self._turns_snapshot.records,
             )
         now = datetime.now(tz=timezone.utc)
-        return render_session_summaries(
+        content = render_session_summaries(
             boundaries,
             now=now,
             turn_counts=turn_counts,
             stale_age_hours=self._config.unfinished_stale_age_hours,
             stale_turns=self._config.unfinished_stale_turns,
         )
+        if not content:
+            return None
+        labels = _prompt_source_labels(
+            auth_context, domain="saga", resource="session_boundaries",
+        )
+        for boundary in boundaries:
+            channel = boundary.get("channel_id")
+            owner = boundary.get("owner_principal")
+            labels = labels.with_channel(
+                channel if isinstance(channel, str) and channel else "unknown"
+            ).with_source(
+                "principal", owner if isinstance(owner, str) and owner else "unknown",
+            )
+        return PromptBlock(content, labels)
 
     async def _build_synthesis_prompt(
         self, ctx: Any, event: AgentEvent,
@@ -3523,6 +3650,24 @@ class Agent:
         if event.trigger == "saga_session_end":
             return await self._build_synthesis_prompt(ctx, event), []
 
+        auth_context = _require_auth_context(initial_auth_context or ctx.auth_context)
+        source_blocks: list[PromptBlock] = []
+
+        def use(block: PromptBlock | None) -> str | None:
+            if block is None:
+                return None
+            if not isinstance(block, PromptBlock):
+                raise TypeError("protected prompt loader omitted provenance")
+            if (
+                "private" not in block.labels.labels
+                or not block.labels.source_domains
+                or not block.labels.source_resources
+                or not (block.labels.source_channels or block.labels.source_principals)
+            ):
+                raise ValueError("protected prompt loader returned incomplete provenance")
+            source_blocks.append(block)
+            return block.content
+
         recent = self._buffer.assemble_recent_activity(
             channel_id=event.channel_id or "",
             author=event.author,
@@ -3539,13 +3684,25 @@ class Agent:
         # Load before Recent feedback so the over-cap algedonic signal emitted
         # by load_channel_memory() is visible on the same turn, not the next.
         from .core_blocks import load_channel_memory
-        channel_memory_block = await asyncio.to_thread(
+        channel_memory_content = await asyncio.to_thread(
             load_channel_memory,
             self._config.home,
             event.channel_id or "",
         )
-        feedback_block = (
-            await asyncio.to_thread(self._feedback.recent_block)
+        channel_memory_block = use(
+            PromptBlock(
+                channel_memory_content,
+                _prompt_source_labels(
+                    auth_context,
+                    domain="channel_memory",
+                    resource=f"memory/channels/{event.channel_id or ''}",
+                    channel_id=event.channel_id,
+                    bridge=event.source,
+                ),
+            ) if channel_memory_content else None
+        )
+        feedback_block = use(
+            await asyncio.to_thread(self._feedback.recent_prompt_block, auth_context)
             if self._config.feedback_limit_per_polarity > 0
             else None
         )
@@ -3555,18 +3712,32 @@ class Agent:
         # break the turn, hence the broad guard.
         try:
             from .proposals import render_open_proposals_block
-            core_proposals_block = await asyncio.to_thread(
-                render_open_proposals_block, self._config.home
+            proposal_content = (
+                await asyncio.to_thread(render_open_proposals_block, self._config.home)
+                if _is_prompt_operator(auth_context)
+                else None
+            )
+            core_proposals_block = use(
+                PromptBlock(
+                    proposal_content,
+                    _prompt_source_labels(
+                        auth_context, domain="proposals", resource="global:proposals",
+                        principal="service:mimir",
+                    ),
+                ) if proposal_content else None
             )
         except Exception:  # noqa: BLE001 — prompt assembly must not fail a turn
             core_proposals_block = None
-        session_summaries_block = await self._assemble_session_summaries(
-            channel_id=event.channel_id,
-            auth_context=initial_auth_context,
+        session_summaries_block = use(
+            await self._assemble_session_summaries(
+                channel_id=event.channel_id,
+                auth_context=auth_context,
+            )
         )
-        usage_block, deferred_usage_events = await asyncio.to_thread(
-            self._assemble_usage_block
+        usage_source, deferred_usage_events = await asyncio.to_thread(
+            self._assemble_usage_block, auth_context,
         )
+        usage_block = use(usage_source)
         # Flush deferred events on the running loop.
         from .ntfy import fire_cost_runaway_alarm_if_warranted
         for event_kind, event_kwargs in deferred_usage_events:
@@ -3577,17 +3748,19 @@ class Agent:
             self._spawn_bg_task(
                 fire_cost_runaway_alarm_if_warranted(event_kind, event_kwargs)
             )
-        upcoming_block = self._assemble_upcoming_block()
-        commitments_block = self._assemble_commitments_block(
+        upcoming_block = use(self._assemble_upcoming_block(auth_context))
+        commitments_block = use(self._assemble_commitments_block(
             channel_id=event.channel_id,
-        )
+            auth_context=auth_context,
+        ))
         # Thread the running loop into the worker thread so the arbiter's
         # lazy-expiry quota_recovered emit can bridge back via
         # run_coroutine_threadsafe instead of being dropped (#489).
-        self_state_block = await asyncio.to_thread(
+        self_state_block = use(await asyncio.to_thread(
             self._assemble_self_state_block,
+            auth_context,
             event_loop=asyncio.get_running_loop(),
-        )
+        ))
         # Auto-surface the relevant SKILL.md when this turn is on a
         # ``poller:<name>`` channel — the agent gets the skill's
         # content inline without needing a ``find-skills`` lookup.
@@ -3676,6 +3849,63 @@ class Agent:
             for _aid in _injected_ids:
                 if _aid not in ctx.injected_skill_atom_ids:
                     ctx.injected_skill_atom_ids.append(_aid)
+
+        effective_principal = auth_context.canonical_principal or auth_context.principal
+        resolver = self._buffer.resolver
+        identity_principals: set[str] = set()
+        if resolver is not None:
+            for author in [event.author, *(message.author for message in recent)]:
+                if not author:
+                    continue
+                canonical = resolver.resolve(author)
+                if canonical and canonical != author:
+                    identity_principals.add(canonical)
+        if identity_principals:
+            identity_labels = _prompt_source_labels(
+                auth_context, domain="identities", resource="state/identities.yaml",
+            )
+            for principal in identity_principals:
+                identity_labels = identity_labels.with_source("principal", principal)
+            source_blocks.append(PromptBlock("known identities", identity_labels))
+        for message in recent:
+            message_principal = message.author
+            if resolver is not None and message_principal:
+                message_principal = resolver.resolve(message_principal)
+            source_blocks.append(PromptBlock(
+                message.content,
+                _prompt_source_labels(
+                    auth_context,
+                    domain="recent_activity",
+                    resource=f"message:{message.msg_id}",
+                    channel_id=message.channel_id,
+                    principal=message_principal,
+                    bridge=message.source,
+                ),
+            ))
+        if saga_block:
+            source_blocks.append(PromptBlock(
+                saga_block,
+                _prompt_source_labels(
+                    auth_context, domain="saga", resource="query",
+                    channel_id=event.channel_id, principal=effective_principal,
+                ),
+            ))
+        if subagent_block:
+            source_blocks.append(PromptBlock(
+                subagent_block,
+                _prompt_source_labels(
+                    auth_context, domain="subagents", resource="channel_inbox",
+                    channel_id=event.channel_id, principal=effective_principal,
+                ),
+            ))
+        if auto_skill_block is not None:
+            source_blocks.append(PromptBlock(
+                auto_skill_block[1],
+                _prompt_source_labels(
+                    auth_context, domain="skills", resource=f"skill:{auto_skill_block[0]}",
+                    principal=effective_principal,
+                ),
+            ))
         # chainlink #508: resolve an optional deliver: channel (poller / tick),
         # mapping the OPERATOR_CHANNEL sentinel → the operator alert channel.
         deliver_channel = resolve_deliver_channel(
@@ -3700,5 +3930,8 @@ class Agent:
             saga_session_id=ctx.saga_session_id,
             channel_memory_block=channel_memory_block,
             deliver_channel=deliver_channel,
+        )
+        ctx.ifc_labels = _merge_ifc_labels(
+            ctx.ifc_labels, *(block.labels for block in source_blocks),
         )
         return turn_prompt, recent

@@ -28,7 +28,13 @@ from mimir.agent import Agent, _filter_session_turns
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
-from mimir.models import AgentEvent, AuthContext, TurnContext
+from mimir.models import (
+    AgentEvent,
+    AuthContext,
+    InformationFlowLabels,
+    PromptBlock,
+    TurnContext,
+)
 from mimir.saga.client import SagaStore
 from mimir.turn_logger import TurnLogger
 
@@ -50,6 +56,15 @@ def _make_agent(tmp_path: Path) -> Agent:
 
 
 def _make_ctx(event: AgentEvent, saga_session_id: str | None = None) -> TurnContext:
+    auth_context = AuthContext(
+        principal=event.author,
+        canonical_principal=event.author,
+        roles=(),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+    )
     return TurnContext(
         turn_id="turn-test",
         session_id=event.channel_id or "default",
@@ -57,6 +72,25 @@ def _make_ctx(event: AgentEvent, saga_session_id: str | None = None) -> TurnCont
         channel_id=event.channel_id,
         started_at=time.monotonic(),
         saga_session_id=saga_session_id,
+        auth_context=auth_context,
+        ifc_labels=InformationFlowLabels(
+            source_channels=frozenset({event.channel_id}) if event.channel_id else frozenset(),
+            source_principals=frozenset({event.author}) if event.author else frozenset(),
+            source_domains=frozenset({"ingress"}),
+        ),
+    )
+
+
+def _block(content: str) -> PromptBlock:
+    return PromptBlock(
+        content,
+        InformationFlowLabels(
+            labels=frozenset({"private"}),
+            source_channels=frozenset({"ch-cover"}),
+            source_principals=frozenset({"operator"}),
+            source_domains=frozenset({"test"}),
+            source_resources=frozenset({"test:block"}),
+        ),
     )
 
 
@@ -417,31 +451,31 @@ async def test_agent_build_turn_prompt_threads_all_helper_outputs(
     # the rest are scalar str | None.
     monkeypatch.setattr(
         agent, "_assemble_usage_block",
-        lambda: ("USAGE_SENTINEL", []),
+        lambda auth_context: (_block("USAGE_SENTINEL"), []),
     )
     monkeypatch.setattr(
         agent, "_assemble_upcoming_block",
-        lambda: "UPCOMING_SENTINEL",
+        lambda auth_context: _block("UPCOMING_SENTINEL"),
     )
     monkeypatch.setattr(
         agent, "_assemble_commitments_block",
-        lambda channel_id: "COMMITMENTS_SENTINEL",
+        lambda channel_id, auth_context: _block("COMMITMENTS_SENTINEL"),
     )
     monkeypatch.setattr(
         agent, "_assemble_self_state_block",
-        lambda **_kw: "SELFSTATE_SENTINEL",
+        lambda auth_context, **_kw: _block("SELFSTATE_SENTINEL"),
     )
 
     async def _fake_session_summaries(*, channel_id, auth_context):
         assert auth_context is admin_auth
-        return "SESSIONS_SENTINEL"
+        return _block("SESSIONS_SENTINEL")
 
     monkeypatch.setattr(
         agent, "_assemble_session_summaries", _fake_session_summaries,
     )
     monkeypatch.setattr(
-        agent._feedback, "recent_block",
-        lambda: "FEEDBACK_SENTINEL",
+        agent._feedback, "recent_prompt_block",
+        lambda auth_context: _block("FEEDBACK_SENTINEL"),
     )
 
     # Stub a resolver on the buffer so the identity branch fires.
@@ -545,21 +579,21 @@ async def test_feedback_block_renders_off_event_loop(
     agent = _make_agent(tmp_path)
     calls: list[str] = []
 
-    monkeypatch.setattr(agent, "_assemble_usage_block", lambda: (None, []))
-    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda: None)
-    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id: None)
-    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda **_kw: None)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda auth_context: (None, []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda auth_context: None)
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id, auth_context: None)
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda auth_context, **_kw: None)
 
     async def _none_summaries(*, channel_id, auth_context):
-        assert auth_context is None
+        assert isinstance(auth_context, AuthContext)
         return None
 
     monkeypatch.setattr(agent, "_assemble_session_summaries", _none_summaries)
 
-    def recent_block_stub():
-        return "FEEDBACK_SENTINEL"
+    def recent_block_stub(auth_context):
+        return _block("FEEDBACK_SENTINEL")
 
-    monkeypatch.setattr(agent._feedback, "recent_block", recent_block_stub)
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", recent_block_stub)
 
     async def fake_to_thread(func, /, *args, **kwargs):
         calls.append(getattr(func, "__name__", repr(func)))
@@ -637,6 +671,7 @@ async def test_session_summaries_counts_turns_off_event_loop(
     )
 
     assert block is not None
+    block = block.content
     assert len(to_thread_calls) == 1
     func, args, kwargs = to_thread_calls[0]
     assert func.__name__ == "count_turns_since_many"
@@ -703,18 +738,20 @@ async def test_session_summary_assembly_is_authorization_scoped(
     )
 
     try:
-        admin_block = await agent._assemble_session_summaries(
+        admin_source = await agent._assemble_session_summaries(
             channel_id="ch-auth", auth_context=admin_auth,
         )
-        alice_block = await agent._assemble_session_summaries(
+        alice_source = await agent._assemble_session_summaries(
             channel_id="ch-auth", auth_context=alice_auth,
         )
     finally:
         conn.close()
 
-    assert admin_block is not None
+    assert admin_source is not None
+    admin_block = admin_source.content
     assert all(summary in admin_block for _, summary, _, _ in rows)
-    assert alice_block is not None
+    assert alice_source is not None
+    alice_block = alice_source.content
     assert "public summary" in alice_block
     assert "alice summary" in alice_block
     assert "bob summary" not in alice_block
@@ -731,17 +768,17 @@ async def test_agent_build_turn_prompt_omits_blocks_for_none_helpers(
     eat prompt cache and confuse the model).
     """
     agent = _make_agent(tmp_path)
-    monkeypatch.setattr(agent, "_assemble_usage_block", lambda: (None, []))
-    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda: None)
-    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id: None)
-    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda **_kw: None)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda auth_context: (None, []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda auth_context: None)
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id, auth_context: None)
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda auth_context, **_kw: None)
 
     async def _none_summaries(*, channel_id, auth_context):
-        assert auth_context is None
+        assert isinstance(auth_context, AuthContext)
         return None
 
     monkeypatch.setattr(agent, "_assemble_session_summaries", _none_summaries)
-    monkeypatch.setattr(agent._feedback, "recent_block", lambda: None)
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda auth_context: None)
 
     event = AgentEvent(
         trigger="user_message",

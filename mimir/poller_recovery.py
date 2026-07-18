@@ -174,6 +174,10 @@ def _event_from_stash(d: Any) -> AgentEvent | None:
             payload["ifc_labels"] = InformationFlowLabels(
                 labels=frozenset(raw_labels.get("labels") or ()),
                 source_channels=frozenset(raw_labels.get("source_channels") or ()),
+                source_principals=frozenset(raw_labels.get("source_principals") or ()),
+                source_domains=frozenset(raw_labels.get("source_domains") or ()),
+                source_resources=frozenset(raw_labels.get("source_resources") or ()),
+                source_bridges=frozenset(raw_labels.get("source_bridges") or ()),
                 **(
                     {"created_at": raw_labels["created_at"]}
                     if isinstance(raw_labels.get("created_at"), (int, float))

@@ -14,13 +14,14 @@ from mimir.access_control import (
     DenialReason,
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     OperationDecision,
+    SinkGate,
     ToolRegistry,
     authorize_action,
     authorize_inbound,
     create_auth_context,
 )
 from mimir.identities import IdentityResolver
-from mimir.models import AgentEvent, AuthContext, TurnContext
+from mimir.models import AgentEvent, AuthContext, InformationFlowLabels, TurnContext
 
 
 def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
@@ -1058,3 +1059,25 @@ async def test_same_scope_private_egress_succeeds_through_live_middleware(
     assert result.status != "error"
     assert result.content == "sent"
     assert handler_calls == 1
+
+
+def test_same_channel_cross_principal_provenance_is_denied() -> None:
+    auth_context = AuthContext(
+        principal="slack-UB", canonical_principal="bob", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="slack-shared",
+        interactivity=None, enforcement_enabled=True,
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"slack-shared"}),
+        source_principals=frozenset({"alice"}),
+        source_domains=frozenset({"feedback"}),
+        source_resources=frozenset({"events"}),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "send_message", "slack-shared", labels, auth_context, enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"

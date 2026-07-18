@@ -54,6 +54,10 @@ class InformationFlowLabels:
 
     labels: frozenset[str] = frozenset()
     source_channels: frozenset[str] = frozenset()
+    source_principals: frozenset[str] = frozenset()
+    source_domains: frozenset[str] = frozenset()
+    source_resources: frozenset[str] = frozenset()
+    source_bridges: frozenset[str] = frozenset()
     created_at: float = field(default_factory=time.monotonic)
 
     def with_label(self, label: str) -> "InformationFlowLabels":
@@ -63,6 +67,10 @@ class InformationFlowLabels:
         return InformationFlowLabels(
             labels=self.labels | frozenset({label}),
             source_channels=self.source_channels,
+            source_principals=self.source_principals,
+            source_domains=self.source_domains,
+            source_resources=self.source_resources,
+            source_bridges=self.source_bridges,
             created_at=self.created_at,
         )
 
@@ -73,8 +81,40 @@ class InformationFlowLabels:
         return InformationFlowLabels(
             labels=self.labels,
             source_channels=self.source_channels | frozenset({channel}),
+            source_principals=self.source_principals,
+            source_domains=self.source_domains,
+            source_resources=self.source_resources,
+            source_bridges=self.source_bridges,
             created_at=self.created_at,
         )
+
+    def with_source(self, kind: str, value: str) -> "InformationFlowLabels":
+        """Add one authoritative provenance component without attenuation."""
+        field_name = {
+            "principal": "source_principals",
+            "domain": "source_domains",
+            "resource": "source_resources",
+            "bridge": "source_bridges",
+        }.get(kind)
+        if field_name is None or not value:
+            raise ValueError(f"unknown or empty provenance component: {kind}")
+        current = getattr(self, field_name)
+        if value in current:
+            return self
+        values = {
+            "source_principals": self.source_principals,
+            "source_domains": self.source_domains,
+            "source_resources": self.source_resources,
+            "source_bridges": self.source_bridges,
+        }
+        values[field_name] = current | frozenset({value})
+        return InformationFlowLabels(
+            labels=self.labels,
+            source_channels=self.source_channels,
+            created_at=self.created_at,
+            **values,
+        )
+
 
     def can_flow_to(self, sink: str, allowed_sinks: frozenset[str]) -> bool:
         """Check if labels permit flow to the given sink.
@@ -91,6 +131,14 @@ class InformationFlowLabels:
             if label not in ("private", "confidential", "internal", "public"):
                 return False
         return sink in allowed_sinks or "*" in allowed_sinks
+
+
+@dataclass(frozen=True)
+class PromptBlock:
+    """Authorized automatic prompt content and its authoritative provenance."""
+
+    content: str
+    labels: InformationFlowLabels
 
 
 @dataclass
