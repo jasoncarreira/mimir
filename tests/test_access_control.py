@@ -20,7 +20,14 @@ from mimir.access_control import (
     create_auth_context,
 )
 from mimir.identities import IdentityResolver
-from mimir.models import AgentEvent, AuthContext, SessionACL, SourceLabel, TurnContext
+from mimir.models import (
+    AgentEvent,
+    AuthContext,
+    InformationFlowLabels,
+    SessionACL,
+    SourceLabel,
+    TurnContext,
+)
 
 
 def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
@@ -169,7 +176,12 @@ def test_admin_turn_can_use_routine_cataloged_tools_when_enforced(
         bridge_instance="slack",
     )
 
-    result = ToolRegistry().authorize_tool(tool_name, auth, enforce=True)
+    result = ToolRegistry().authorize_tool(
+        tool_name,
+        auth,
+        enforce=True,
+        ifc_labels=InformationFlowLabels(),
+    )
 
     assert result.allowed is True
     assert result.decision is not OperationDecision.UNKNOWN

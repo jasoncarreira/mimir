@@ -89,6 +89,9 @@ class SinkCategory(StrEnum):
     NOTIFICATION = "notification"
     FILE = "file"
     DIRECT_MESSAGE = "direct_message"
+    SAGA = "saga"
+    SCHEDULER = "scheduler"
+    PROPOSAL = "proposal"
     UNKNOWN = "unknown"
 
 
@@ -121,9 +124,21 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "spawn_claude_code": SinkCategory.SPAWN,
     "spawn_codex": SinkCategory.SPAWN,
     "spawn_open_code": SinkCategory.SPAWN,
+    "worklink_run": SinkCategory.SPAWN,
     "ntfy_send": SinkCategory.NOTIFICATION,
     "write_file": SinkCategory.FILE,
     "edit_file": SinkCategory.FILE,
+    "memory_store": SinkCategory.SAGA,
+    "saga_record_skill_learning": SinkCategory.SAGA,
+    "saga_feedback": SinkCategory.SAGA,
+    "saga_mark_contributions": SinkCategory.SAGA,
+    "saga_forget": SinkCategory.SAGA,
+    "saga_end_session": SinkCategory.SAGA,
+    "add_schedule": SinkCategory.SCHEDULER,
+    "set_schedule_priority": SinkCategory.SCHEDULER,
+    "open_proposal": SinkCategory.PROPOSAL,
+    "submit_proposal": SinkCategory.PROPOSAL,
+    "abandon_proposal": SinkCategory.PROPOSAL,
 }
 
 _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
@@ -418,10 +433,22 @@ def _target_matches_shell_profile(target: str, destination: str) -> bool:
     return parse_service_shell_argv(target, destination) is not None
 
 
+def _target_matches_worklink_repo(target: str, destination: str) -> bool:
+    """Authorize Worklink dispatch only to its operator-configured repository."""
+    configured = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    if not configured:
+        return False
+    try:
+        return Path(target).expanduser().resolve() == Path(configured).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "configured_file_roots": _target_within_configured_write_roots,
     "shell_profile": _target_matches_shell_profile,
     "spawn_workspace": _target_within_configured_roots,
+    "worklink_repo": _target_matches_worklink_repo,
 }
 
 _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
@@ -623,6 +650,20 @@ class SinkGate:
             return frozenset()
 
         service = get_trusted_service_from_auth_context(auth_context)
+        if service is not None and target is not None and category in {
+            SinkCategory.SAGA,
+            SinkCategory.SCHEDULER,
+            SinkCategory.PROPOSAL,
+        }:
+            source_channels = getattr(ifc_labels, "source_channels", None)
+            service_channel = getattr(auth_context, "channel_id", None)
+            if (
+                isinstance(source_channels, frozenset)
+                and source_channels
+                and source_channels == frozenset({service_channel})
+            ):
+                return frozenset({target})
+            return frozenset()
         if service is not None and service_policy is not None and target is not None:
             # Poller payloads remain attacker-controlled external content (#906).
             if "poller_payload" in service.readable_domains and category in {
@@ -1686,6 +1727,8 @@ class ToolRegistry:
             and auth_context is not None
         ):
             sink_target = getattr(auth_context, "channel_id", None)
+        if not sink_target:
+            sink_target = _OPERATION_SINK_DESTINATION.get(tool_name)
         is_ifc_sink = flow_direction in {
             ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
         } or (
@@ -1963,6 +2006,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"),
             ),
             creation_path="mimir.scheduler.Scheduler._fire_job",
         ),
@@ -2019,6 +2063,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"),
             ),
             creation_path="mimir.pollers.run_poller",
         ),
@@ -2179,6 +2224,11 @@ class ProviderEnforcementCompatibilityError(Exception):
 
 def _capability_matrix_errors() -> list[str]:
     errors: list[str] = []
+    for operation in sorted(_OPERATION_SINK_DESTINATION):
+        if get_sink_category(operation) is SinkCategory.UNKNOWN:
+            errors.append(
+                f"Sink operation '{operation}' has no IFC sink category mapping"
+            )
     for operation in sorted(_SAGA_MUTATION_OPERATIONS):
         if operation not in _OPERATION_SINK_DESTINATION:
             errors.append(

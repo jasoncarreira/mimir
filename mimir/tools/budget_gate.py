@@ -281,6 +281,8 @@ def _extract_sink_target(
         target = args.get("command")
     elif tool_name in {"spawn_claude_code", "spawn_codex", "spawn_open_code"}:
         target = args.get("cwd") or os.environ.get("MIMIR_HOME")
+    elif tool_name == "worklink_run":
+        target = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
     elif tool_name in {"fetch_url", "http_request", "webhook"}:
         target = args.get("url")
     elif tool_name.startswith("mcp_"):

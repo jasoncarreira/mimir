@@ -305,7 +305,7 @@ def test_explicit_service_principals_are_separate_and_frozen() -> None:
     [
         ("scheduled_tick", "shell_exec", "request_mimir_update", True),
         ("scheduled_tick", "read_file", "request_mimir_update", True),
-        ("poller", "worklink_run", "remove_schedule", True),
+        ("poller", "worklink_run", "remove_schedule", False),
         ("poller", "write_file", "remove_schedule", False),
         ("upgrade", "submit_proposal", "spawn_codex", True),
         ("upgrade", "read_file", "spawn_codex", True),
@@ -361,7 +361,8 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
     if ifc_allows:
         assert admitted.service_principal is get_service_principal(trigger)
     else:
-        assert admitted.reason == "ifc_label_blocked:file"
+        blocked_category = "spawn" if allowed_operation == "worklink_run" else "file"
+        assert admitted.reason == f"ifc_label_blocked:{blocked_category}"
     assert denied.allowed is False
     assert denied.reason == "admin_required"
     assert denied.service_principal is get_service_principal(trigger)
@@ -492,6 +493,21 @@ def test_capability_matrix_rejects_saga_mutation_without_sink_mapping(
 
     assert is_complete is False
     assert "SAGA mutation 'memory_store' has no sink destination mapping" in errors
+
+
+def test_capability_matrix_rejects_declared_sink_without_ifc_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    categories = access_control._SINK_CATEGORY_MAP.copy()
+    categories.pop("memory_store")
+    monkeypatch.setattr(access_control, "_SINK_CATEGORY_MAP", categories)
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert "Sink operation 'memory_store' has no IFC sink category mapping" in errors
 
 
 def test_capability_matrix_rejects_open_saga_mutation(

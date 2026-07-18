@@ -15,7 +15,7 @@ from mimir.access_control import (
     get_provenance_from_auth_context,
     get_service_principal,
 )
-from mimir.models import AuthContext
+from mimir.models import AuthContext, InformationFlowLabels
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import AuthorizationScope
 from mimir.saga.triples import retrieve_by_entity, store_triples
@@ -96,6 +96,7 @@ def test_saga_mutation_service_capability_matrix_matches_at_both_guards(
         operation,
         auth_context,
         enforce=True,
+        ifc_labels=InformationFlowLabels(),
     )
 
     assert middleware.allowed is expected

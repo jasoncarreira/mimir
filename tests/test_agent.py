@@ -697,12 +697,12 @@ async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
-    ("trigger", "tool_name", "principal"),
+    ("trigger", "tool_name", "principal", "allowed"),
     [
-        ("scheduled_tick", "shell_exec", "scheduler"),
-        ("poller", "worklink_run", "poller"),
-        ("saga_session_end", "saga_end_session", "synthesis"),
-        ("upgrade", "submit_proposal", "system"),
+        ("scheduled_tick", "shell_exec", "scheduler", True),
+        ("poller", "worklink_run", "poller", False),
+        ("saga_session_end", "saga_end_session", "synthesis", True),
+        ("upgrade", "submit_proposal", "system", True),
     ],
 )
 async def test_server_owned_triggers_reach_live_tool_middleware_with_service_authority(
@@ -710,6 +710,7 @@ async def test_server_owned_triggers_reach_live_tool_middleware_with_service_aut
     trigger: str,
     tool_name: str,
     principal: str,
+    allowed: bool,
 ):
     fake_agent = _ServicePrincipalToolProbeAgent(tool_name)
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
@@ -741,8 +742,12 @@ async def test_server_owned_triggers_reach_live_tool_middleware_with_service_aut
         "saga-production-path" if trigger == "saga_session_end" else None
     )
     assert fake_agent.result is not None
-    assert fake_agent.handler_calls == 1, str(fake_agent.result.content)
-    assert fake_agent.result.status != "error"
+    assert fake_agent.handler_calls == int(allowed), str(fake_agent.result.content)
+    if allowed:
+        assert fake_agent.result.status != "error"
+    else:
+        assert fake_agent.result.status == "error"
+        assert "ifc_label_blocked:spawn" in str(fake_agent.result.content)
 
 
 async def test_server_session_idle_event_reaches_live_synthesis_middleware(
