@@ -20,9 +20,9 @@ import os
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
-from langchain_core.tools import tool
+from langchain_core.tools import InjectedToolArg, tool
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -309,7 +309,10 @@ def _cd_target(command: str, cwd: Path | None) -> Path | None:
 
 
 @tool
-def shell_exec(command: str, mimir_direct_argv: list[str] | None = None) -> str:
+def shell_exec(
+    command: str,
+    mimir_direct_argv: Annotated[list[str] | None, InjectedToolArg] = None,
+) -> str:
     """Execute a shell command and return stdout + stderr + exit code.
 
     Runs the command through ``bash -lc`` (a real login shell), so shell

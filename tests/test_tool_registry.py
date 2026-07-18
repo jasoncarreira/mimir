@@ -18,6 +18,8 @@ from mimir.access_control import (
 )
 from mimir.models import AuthContext, InformationFlowLabels, SourceLabel
 from mimir.tools import budget_gate
+from mimir.tools.extra import shell_exec
+from mimir.tools.shell_async import bash_async
 
 
 _OLD_ADMIN_TOOLS = {
@@ -92,6 +94,13 @@ def _service_labels(event) -> InformationFlowLabels:
             authorized_principals=frozenset({principal}) if principal else frozenset(),
         )}),
     )
+
+
+@pytest.mark.parametrize("shell_tool", [shell_exec, bash_async])
+def test_direct_argv_is_hidden_from_model_tool_schema(shell_tool) -> None:
+    properties = shell_tool.tool_call_schema.model_json_schema()["properties"]
+
+    assert "mimir_direct_argv" not in properties
 
 
 def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
