@@ -39,6 +39,7 @@ from ..jsonl_snapshot import (
     iter_snapshot_or_tail,
     iter_window_records,
 )
+from ..models import AuthContext, InformationFlowLabels, PromptBlock, SourceLabel
 
 # --- Sub-module imports + backward-compat re-exports ---
 from ._models import (  # noqa: F401
@@ -85,6 +86,83 @@ from .resolved import (  # noqa: F401
 )
 
 log = logging.getLogger(__name__)
+
+
+_AGENT_SELF_EVENT_KINDS = frozenset({
+    "algedonic_escalation",
+    "cross_turn_loop",
+    "cross_turn_send_duplicate",
+    "error",
+    "loop_stop",
+    "loop_warn",
+    "send_message_loop_hard_stop",
+    "send_message_loop_warning",
+    "scheduler_invalid_cron",
+    "turn_error",
+    "wiki_backlinks_unhealthy",
+})
+_AGENT_SELF_EVENT_PREFIXES = ("claude_code_spawn_",)
+
+
+def _is_agent_self_record(record: dict) -> bool:
+    """Return whether a principal-less record is agent self-regulation data.
+
+    This is intentionally an explicit kind allowlist.  User-owned events such as
+    ``commitment_due`` can be principal-less in legacy logs and must not become
+    visible merely because ownership metadata is absent.
+    """
+    kind = record.get("type") or record.get("event_kind") or record.get("kind")
+    if not isinstance(kind, str):
+        # turns.jsonl records express ``turn_error`` structurally rather than
+        # carrying an event kind.
+        return isinstance(record.get("error"), str) and bool(record["error"])
+    return kind in _AGENT_SELF_EVENT_KINDS or kind.startswith(_AGENT_SELF_EVENT_PREFIXES)
+
+
+class _RecordSnapshot:
+    """Immutable authorization-filtered view preserving saturation fallback."""
+
+    def __init__(
+        self,
+        records: list[dict],
+        *,
+        saturated: bool = False,
+        window_records: object = None,
+    ) -> None:
+        self._records = records
+        self._saturated = saturated
+        self._window_records = window_records
+
+    def records(self) -> list[dict]:
+        return self._records
+
+    @property
+    def saturated(self) -> bool:
+        return self._saturated
+
+    def iter_window_records(self, path: Path):
+        if not callable(self._window_records):
+            return iter(self._records)
+        return self._window_records(path)
+
+
+def _record_principal(record: dict) -> str | None:
+    for key in ("owner_principal", "canonical_author", "principal", "author"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _is_privileged(auth_context: AuthContext) -> bool:
+    return auth_context.is_service or "admin" in auth_context.roles
+
+
+def _record_source_principal(record: dict, auth_context: AuthContext) -> str | None:
+    value = _record_principal(record)
+    if value and value == auth_context.principal and auth_context.canonical_principal:
+        return auth_context.canonical_principal
+    return value
 
 
 _QUOTA_RATIO_RE = re.compile(r"@\d+(?:\.\d+)?")
@@ -194,10 +272,23 @@ class FeedbackLog:
         *,
         window_hours: int | None = None,
         limit_per_polarity: int | None = None,
+        auth_context: AuthContext | None = None,
     ) -> tuple[list[FeedbackSignal], list[FeedbackSignal]]:
         """Return (negative, positive), each reverse-chronological and
         capped at ``limit_per_polarity``. Records older than
         ``window_hours`` are dropped."""
+        if auth_context is not None and not isinstance(auth_context, AuthContext):
+            raise TypeError("feedback authorization requires the exact AuthContext")
+        event_snapshot = self.events_snapshot
+        turn_snapshot = self.turns_snapshot
+        if auth_context is not None:
+            event_snapshot = self._authorized_snapshot(
+                self.events_snapshot, self.events_path, auth_context,
+            )
+            turn_snapshot = self._authorized_snapshot(
+                self.turns_snapshot, self.turns_path, auth_context,
+            )
+
         window_hours = window_hours if window_hours is not None else self.default_window_hours
         limit = (
             limit_per_polarity
@@ -231,7 +322,7 @@ class FeedbackLog:
             else _AROUSAL_THRESHOLDS
         )
         kind_counts = _count_kinds_in_window(
-            self.events_snapshot, self.events_path, cutoff_iso
+            event_snapshot, self.events_path, cutoff_iso
         )
 
         # Alg-3: emit algedonic_escalation events for negative kinds that
@@ -246,11 +337,11 @@ class FeedbackLog:
         )
         if _esc_thresholds:
             _already_escalated = _escalated_kinds_in_window(
-                self.events_snapshot, self.events_path, cutoff_iso
+                event_snapshot, self.events_path, cutoff_iso
             )
             escalation_counts = dict(kind_counts)
             for kind, count in _count_escalation_only_events_in_window(
-                self.events_snapshot, self.events_path, cutoff_iso
+                event_snapshot, self.events_path, cutoff_iso
             ).items():
                 escalation_counts[kind] = escalation_counts.get(kind, 0) + count
             escalation_thresholds = dict(_esc_thresholds)
@@ -271,7 +362,7 @@ class FeedbackLog:
         # loop must skip those individual events so they don't duplicate.
         # Chain signals are always-surface (bypass the per-polarity limit).
         group_runs = _compute_group_runs(
-            self.events_snapshot, self.events_path, cutoff_iso, _VALENCE_GROUPS
+            event_snapshot, self.events_path, cutoff_iso, _VALENCE_GROUPS
         )
         chain_signals, chain_consumed_kinds = _synthesize_chain_signals(
             group_runs, _VALENCE_GROUPS
@@ -298,7 +389,7 @@ class FeedbackLog:
         seen_content: dict[str, set[str]] = {"negative": set(), "positive": set()}
 
         # 1) events.jsonl — known event-type rules.
-        for ev in iter_window_records(self.events_snapshot, self.events_path):  # #498
+        for ev in iter_window_records(event_snapshot, self.events_path):  # #498
             ts = ev.get("timestamp")
             if not isinstance(ts, str) or ts < cutoff_iso:
                 # tail-first scan: as soon as a record predates the window
@@ -395,7 +486,7 @@ class FeedbackLog:
         # it doesn't interfere with the within-turn loop_stop / loop_warn
         # signals that the individual-event pass already handles.
         for sig in _detect_cross_turn_send_loops(
-            self.events_snapshot, self.events_path, cutoff_iso
+            event_snapshot, self.events_path, cutoff_iso
         ):
             negatives.append(sig)
         if any(s.kind == "cross_turn_loop" for s in negatives):
@@ -412,7 +503,7 @@ class FeedbackLog:
             if not sig.kind.endswith("_chain") and sig.kind != "cross_turn_loop"
         )
         if bounded_negative_count < limit:
-            for rec in iter_window_records(self.turns_snapshot, self.turns_path):  # #498
+            for rec in iter_window_records(turn_snapshot, self.turns_path):  # #498
                 ts = rec.get("ts")
                 if not isinstance(ts, str) or ts < cutoff_iso:
                     if isinstance(ts, str):
@@ -443,11 +534,64 @@ class FeedbackLog:
 
         return _collapse_feedback_signals(negatives), _collapse_feedback_signals(positives)
 
+    @staticmethod
+    def _record_authorized(record: dict, auth_context: AuthContext) -> bool:
+        if _is_privileged(auth_context):
+            return True
+        principal = auth_context.canonical_principal or auth_context.principal
+        channel_id = auth_context.channel_id
+        if not principal or not channel_id:
+            return False
+        # Agent-self signals are global self-regulation inputs, not user data.
+        # Keep the explicit kind gate independent of channel; do not generalize
+        # this to all principal-less records.
+        if _record_principal(record) is None and _is_agent_self_record(record):
+            return True
+        return (
+            record.get("channel_id") == channel_id
+            and _record_principal(record) in {principal, auth_context.principal}
+        )
+
+    @classmethod
+    def _authorized_records(
+        cls,
+        snapshot: JsonlSnapshot | None,
+        path: Path,
+        auth_context: AuthContext,
+    ) -> list[dict]:
+        return [
+            record
+            for record in iter_snapshot_or_tail(snapshot, path)
+            if cls._record_authorized(record, auth_context)
+        ]
+
+    @classmethod
+    def _authorized_snapshot(
+        cls,
+        snapshot: JsonlSnapshot | None,
+        path: Path,
+        auth_context: AuthContext,
+    ) -> _RecordSnapshot:
+        records = cls._authorized_records(snapshot, path, auth_context)
+        saturated = bool(snapshot is not None and snapshot.saturated)
+
+        def stream_filtered(window_path: Path):
+            for record in iter_window_records(snapshot, window_path):
+                if cls._record_authorized(record, auth_context):
+                    yield record
+
+        return _RecordSnapshot(
+            records,
+            saturated=saturated,
+            window_records=stream_filtered if saturated else None,
+        )
+
     def recent_block(
         self,
         *,
         window_hours: int | None = None,
         limit_per_polarity: int | None = None,
+        auth_context: AuthContext | None = None,
     ) -> str | None:
         """Returns the rendered block (without the leading ``## `` header
         — that's added by ``build_turn_prompt``), or ``None`` if both
@@ -456,6 +600,7 @@ class FeedbackLog:
         negatives, positives = self.recent(
             window_hours=window_hours,
             limit_per_polarity=limit_per_polarity,
+            auth_context=auth_context,
         )
         return render_feedback_block(
             negatives,
@@ -464,6 +609,53 @@ class FeedbackLog:
             if window_hours is not None
             else self.default_window_hours,
         )
+
+    def recent_prompt_block(self, auth_context: AuthContext) -> PromptBlock | None:
+        """Load authorized feedback and return content with record provenance."""
+        if not isinstance(auth_context, AuthContext):
+            raise TypeError("feedback prompt loading requires the exact AuthContext")
+        events = self._authorized_records(
+            self.events_snapshot, self.events_path, auth_context,
+        )
+        turns = self._authorized_records(
+            self.turns_snapshot, self.turns_path, auth_context,
+        )
+        content = self.recent_block(auth_context=auth_context)
+        if not content:
+            return None
+        labels = InformationFlowLabels()
+        requester = auth_context.canonical_principal or auth_context.principal
+        service = (
+            f"service:{auth_context.canonical_principal or auth_context.principal}"
+            if auth_context.is_service
+            and (auth_context.canonical_principal or auth_context.principal)
+            else None
+        )
+        for resource, records in (("events", events), ("turns", turns)):
+            for record in records:
+                record_owner = _record_source_principal(record, auth_context)
+                principal = record_owner or service or requester
+                bridge = record.get("bridge") or record.get("source")
+                # The label ACL is an independent guard: user-owned records are
+                # readable by their owner, agent-self records by this requester's
+                # effective identity, and service turns by the prefixed service
+                # identity SinkGate uses.
+                acl_principals = {record_owner} if record_owner else set()
+                effective_requester = service or requester
+                if _is_privileged(auth_context) and effective_requester:
+                    acl_principals.add(effective_requester)
+                elif not record_owner and effective_requester:
+                    acl_principals.add(effective_requester)
+                labels = labels.with_source(SourceLabel(
+                    principal=principal,
+                    domain="feedback",
+                    resource_id=f"{resource}:{record.get('id') or record.get('turn_id') or record.get('timestamp') or record.get('ts')}",
+                    bridge_instance=(bridge if isinstance(bridge, str) and bridge else auth_context.bridge_instance),
+                    sensitivity="private",
+                    authorized_principals=frozenset(acl_principals),
+                    source_kind="protected_prompt",
+                ))
+        return PromptBlock(content=content, labels=labels)
 
 
 # VSM: algedonic — bypass channel for self-feedback signals; surfaces

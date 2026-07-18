@@ -353,6 +353,14 @@ class AuthContext:
     source_session_acl: SessionACL | None = None
 
 
+@dataclass(frozen=True)
+class PromptBlock:
+    """Protected prompt content paired with immutable source provenance."""
+
+    content: str
+    labels: InformationFlowLabels
+
+
 @dataclass
 class TurnContext:
     """Per-turn state. One instance per run_turn — never shared across turns."""

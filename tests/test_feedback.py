@@ -20,6 +20,8 @@ from mimir.feedback import (
     pending_forget_candidates_count,
     render_feedback_block,
 )
+from mimir.jsonl_snapshot import JsonlSnapshot
+from mimir.models import AuthContext
 
 
 def _ts(hours_ago: float = 0) -> str:
@@ -125,6 +127,100 @@ def test_mixed_polarity_renders_both_subsections_with_blank_separator(tmp_path: 
     pos_idx = block.index("Positive")
     assert neg_idx < pos_idx
     assert "\n\nPositive" in block
+
+
+def test_prompt_feedback_is_owner_and_channel_scoped_before_rendering(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.3), "type": "commitment_due",
+            "channel_id": "shared", "owner_principal": "alice",
+            "text": "ALICE-SECRET", "commitment_id": "c-alice",
+        },
+        {
+            "timestamp": _ts(0.2), "type": "commitment_due",
+            "channel_id": "other", "owner_principal": "bob",
+            "text": "BOB-OTHER-CHANNEL", "commitment_id": "c-other",
+        },
+        {
+            "timestamp": _ts(0.1), "type": "commitment_due",
+            "channel_id": "shared", "owner_principal": "bob",
+            "text": "BOB-OWN", "commitment_id": "c-bob",
+        },
+    ])
+    auth = AuthContext(
+        principal="slack-UB", canonical_principal="bob", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert "BOB-OWN" in block.content
+    assert "ALICE-SECRET" not in block.content
+    assert "BOB-OTHER-CHANNEL" not in block.content
+    assert {source.principal for source in block.labels.sources} == {"bob"}
+    assert all(source.domain == "feedback" for source in block.labels.sources)
+
+
+def test_non_admin_sees_principal_less_agent_self_but_not_user_event(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.2), "type": "send_message_loop_warning",
+            "channel_id": "another-channel", "count": 3,
+        },
+        {
+            "timestamp": _ts(0.1), "type": "commitment_due",
+            "channel_id": "shared", "text": "OWNERLESS-USER-SECRET",
+            "commitment_id": "legacy-ownerless",
+        },
+    ])
+    auth = AuthContext(
+        principal="bob", canonical_principal="bob", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert "loop" in block.content.lower()
+    assert "OWNERLESS-USER-SECRET" not in block.content
+    assert {source.authorized_principals for source in block.labels.sources} == {
+        frozenset({"bob"})
+    }
+
+
+def test_authorized_feedback_preserves_saturated_window_fallback(tmp_path: Path):
+    events_path = tmp_path / "logs" / "events.jsonl"
+    records = [
+        {
+            "timestamp": _ts(0.01 * i), "type": "tool_call_denied",
+            "tool": "owned", "reason": "denied", "channel_id": "shared",
+            "owner_principal": "bob",
+        }
+        for i in range(6)
+    ]
+    _write_jsonl(events_path, list(reversed(records)))
+    snapshot = JsonlSnapshot(events_path, ttl_s=60, max_records=2)
+    log = FeedbackLog(
+        events_path=events_path,
+        turns_path=tmp_path / "logs" / "turns.jsonl",
+        events_snapshot=snapshot,
+        arousal_thresholds={"tool_denied": 5},
+        escalation_thresholds={},
+    )
+    auth = AuthContext(
+        principal="bob", canonical_principal="bob", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    negatives, _ = log.recent(auth_context=auth)
+
+    assert snapshot.saturated
+    assert negatives
+    assert negatives[0].count == 6
 
 
 # ---- Window cutoff -------------------------------------------------------

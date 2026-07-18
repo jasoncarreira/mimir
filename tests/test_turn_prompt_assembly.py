@@ -24,11 +24,18 @@ from pathlib import Path
 
 import pytest
 
-from mimir.agent import Agent, _filter_session_turns
+from mimir.agent import Agent, _filter_session_turns, _prompt_source_labels
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
-from mimir.models import AgentEvent, AuthContext, TurnContext
+from mimir.models import (
+    AgentEvent,
+    AuthContext,
+    InformationFlowLabels,
+    PromptBlock,
+    SourceLabel,
+    TurnContext,
+)
 from mimir.saga.client import SagaStore
 from mimir.turn_logger import TurnLogger
 
@@ -50,6 +57,15 @@ def _make_agent(tmp_path: Path) -> Agent:
 
 
 def _make_ctx(event: AgentEvent, saga_session_id: str | None = None) -> TurnContext:
+    auth_context = AuthContext(
+        principal=event.author,
+        canonical_principal=event.author,
+        roles=(),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+    )
     return TurnContext(
         turn_id="turn-test",
         session_id=event.channel_id or "default",
@@ -57,7 +73,49 @@ def _make_ctx(event: AgentEvent, saga_session_id: str | None = None) -> TurnCont
         channel_id=event.channel_id,
         started_at=time.monotonic(),
         saga_session_id=saga_session_id,
+        auth_context=auth_context,
+        ifc_labels=InformationFlowLabels().with_source(SourceLabel(
+            principal=event.author,
+            domain="channel",
+            resource_id=event.channel_id,
+            bridge_instance=event.source or "test",
+            sensitivity="private",
+            authorized_principals=(frozenset({event.author}) if event.author else frozenset()),
+        )),
     )
+
+
+def _block(content: str) -> PromptBlock:
+    return PromptBlock(
+        content,
+        InformationFlowLabels().with_source(SourceLabel(
+            principal="operator",
+            domain="test",
+            resource_id="test:block",
+            bridge_instance="test",
+            sensitivity="private",
+            authorized_principals=frozenset({"operator"}),
+            source_kind="protected_prompt",
+        )),
+    )
+
+
+def test_service_prompt_labels_use_sink_gate_effective_principal() -> None:
+    auth = AuthContext(
+        principal=None, canonical_principal="scheduler", roles=(),
+        event_ingress=None, trigger="scheduled_tick", channel_id="scheduler:heartbeat",
+        interactivity=None, is_service=True, enforcement_enabled=True,
+        domain="channel", resource_id="scheduler:heartbeat",
+        bridge_instance="service:scheduler",
+    )
+
+    labels = _prompt_source_labels(
+        auth, domain="usage", resource="global:usage", principal="service:mimir",
+    )
+
+    assert {source.authorized_principals for source in labels.sources} == {
+        frozenset({"service:scheduler"})
+    }
 
 
 # ─── User-message branch ────────────────────────────────────────────
@@ -417,31 +475,31 @@ async def test_agent_build_turn_prompt_threads_all_helper_outputs(
     # the rest are scalar str | None.
     monkeypatch.setattr(
         agent, "_assemble_usage_block",
-        lambda: ("USAGE_SENTINEL", []),
+        lambda auth_context: (_block("USAGE_SENTINEL"), []),
     )
     monkeypatch.setattr(
         agent, "_assemble_upcoming_block",
-        lambda: "UPCOMING_SENTINEL",
+        lambda auth_context: _block("UPCOMING_SENTINEL"),
     )
     monkeypatch.setattr(
         agent, "_assemble_commitments_block",
-        lambda channel_id: "COMMITMENTS_SENTINEL",
+        lambda channel_id, auth_context: _block("COMMITMENTS_SENTINEL"),
     )
     monkeypatch.setattr(
         agent, "_assemble_self_state_block",
-        lambda **_kw: "SELFSTATE_SENTINEL",
+        lambda auth_context, **_kw: _block("SELFSTATE_SENTINEL"),
     )
 
     async def _fake_session_summaries(*, channel_id, auth_context):
         assert auth_context is admin_auth
-        return "SESSIONS_SENTINEL"
+        return _block("SESSIONS_SENTINEL")
 
     monkeypatch.setattr(
         agent, "_assemble_session_summaries", _fake_session_summaries,
     )
     monkeypatch.setattr(
-        agent._feedback, "recent_block",
-        lambda: "FEEDBACK_SENTINEL",
+        agent._feedback, "recent_prompt_block",
+        lambda auth_context: _block("FEEDBACK_SENTINEL"),
     )
 
     # Stub a resolver on the buffer so the identity branch fires.
@@ -533,6 +591,33 @@ async def test_agent_build_turn_prompt_threads_all_helper_outputs(
 
 
 @pytest.mark.asyncio
+async def test_channel_memory_omits_for_principal_less_auth_context(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    channel_dir = tmp_path / "memory" / "channels" / "ch-ownerless"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "notes.md").write_text("PRIVATE CHANNEL MEMORY")
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-ownerless", content="hello",
+        author=None, source="discord",
+    )
+    auth = AuthContext(
+        principal=None, canonical_principal=None, roles=(), event_ingress=None,
+        trigger="user_message", channel_id="ch-ownerless", interactivity=None,
+        enforcement_enabled=True,
+    )
+
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, saga_block=None, subagent_block=None,
+        initial_auth_context=auth,
+    )
+
+    assert "PRIVATE CHANNEL MEMORY" not in prompt
+    assert "## Today's date" in prompt
+
+
+@pytest.mark.asyncio
 async def test_feedback_block_renders_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -545,21 +630,21 @@ async def test_feedback_block_renders_off_event_loop(
     agent = _make_agent(tmp_path)
     calls: list[str] = []
 
-    monkeypatch.setattr(agent, "_assemble_usage_block", lambda: (None, []))
-    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda: None)
-    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id: None)
-    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda **_kw: None)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda auth_context: (None, []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda auth_context: None)
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id, auth_context: None)
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda auth_context, **_kw: None)
 
     async def _none_summaries(*, channel_id, auth_context):
-        assert auth_context is None
+        assert isinstance(auth_context, AuthContext)
         return None
 
     monkeypatch.setattr(agent, "_assemble_session_summaries", _none_summaries)
 
-    def recent_block_stub():
-        return "FEEDBACK_SENTINEL"
+    def recent_block_stub(auth_context):
+        return _block("FEEDBACK_SENTINEL")
 
-    monkeypatch.setattr(agent._feedback, "recent_block", recent_block_stub)
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", recent_block_stub)
 
     async def fake_to_thread(func, /, *args, **kwargs):
         calls.append(getattr(func, "__name__", repr(func)))
@@ -637,6 +722,7 @@ async def test_session_summaries_counts_turns_off_event_loop(
     )
 
     assert block is not None
+    block = block.content
     assert len(to_thread_calls) == 1
     func, args, kwargs = to_thread_calls[0]
     assert func.__name__ == "count_turns_since_many"
@@ -703,22 +789,59 @@ async def test_session_summary_assembly_is_authorization_scoped(
     )
 
     try:
-        admin_block = await agent._assemble_session_summaries(
+        admin_source = await agent._assemble_session_summaries(
             channel_id="ch-auth", auth_context=admin_auth,
         )
-        alice_block = await agent._assemble_session_summaries(
+        alice_source = await agent._assemble_session_summaries(
             channel_id="ch-auth", auth_context=alice_auth,
         )
     finally:
         conn.close()
 
-    assert admin_block is not None
+    assert admin_source is not None
+    admin_block = admin_source.content
     assert all(summary in admin_block for _, summary, _, _ in rows)
-    assert alice_block is not None
+    assert alice_source is not None
+    alice_block = alice_source.content
     assert "public summary" in alice_block
     assert "alice summary" in alice_block
     assert "bob summary" not in alice_block
     assert "service summary" not in alice_block
+    assert all(
+        "user:alice" in source.authorized_principals
+        for source in alice_source.labels.sources
+    )
+    assert all(
+        source.principal in source.authorized_principals
+        for source in alice_source.labels.sources
+    )
+
+
+@pytest.mark.asyncio
+async def test_commitment_prompt_labels_are_owned_by_record_principal(
+    tmp_path: Path,
+) -> None:
+    from mimir.commitments import CommitmentRecord, CommitmentsStore, make_commitment_id
+
+    agent = _make_agent(tmp_path)
+    agent._commitments = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    await agent._commitments.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="ch-auth", text="alice reminder",
+        owner_principal="user:alice",
+    ))
+    auth = AuthContext(
+        principal="user:alice", canonical_principal="user:alice", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="ch-auth",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    block = agent._assemble_commitments_block("ch-auth", auth)
+
+    assert block is not None
+    assert {source.principal for source in block.labels.sources} == {"user:alice"}
+    assert {source.authorized_principals for source in block.labels.sources} == {
+        frozenset({"user:alice"})
+    }
 
 
 @pytest.mark.asyncio
@@ -731,17 +854,17 @@ async def test_agent_build_turn_prompt_omits_blocks_for_none_helpers(
     eat prompt cache and confuse the model).
     """
     agent = _make_agent(tmp_path)
-    monkeypatch.setattr(agent, "_assemble_usage_block", lambda: (None, []))
-    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda: None)
-    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id: None)
-    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda **_kw: None)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda auth_context: (None, []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda auth_context: None)
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id, auth_context: None)
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda auth_context, **_kw: None)
 
     async def _none_summaries(*, channel_id, auth_context):
-        assert auth_context is None
+        assert isinstance(auth_context, AuthContext)
         return None
 
     monkeypatch.setattr(agent, "_assemble_session_summaries", _none_summaries)
-    monkeypatch.setattr(agent._feedback, "recent_block", lambda: None)
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda auth_context: None)
 
     event = AgentEvent(
         trigger="user_message",
