@@ -772,6 +772,51 @@ def test_enforcement_enablement_rejects_uncataloged_model_tool(
         resolve_access_control_enforcement(True, model_spec="openai:test")
 
 
+def test_enforcement_enablement_rejects_cataloged_tool_without_flow_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    name = "deliberately_uncataloged_flow_mutation"
+    monkeypatch.setitem(
+        access_control._global_operation_catalog._custom_decisions,
+        name,
+        OperationDecision.ADMIN_REQUIRED,
+    )
+    monkeypatch.setattr(
+        "mimir.tools.registry.all_mimir_tools",
+        lambda model_spec=None: [SimpleNamespace(name=name)],
+    )
+
+    with pytest.raises(
+        access_control.CapabilityMatrixError,
+        match=f"without explicit IFC flow metadata: {name}",
+    ):
+        access_control.resolve_access_control_enforcement(
+            True, model_spec="openai:test"
+        )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args", "expected"),
+    [
+        ("remove_schedule", {"name": "daily"}, "scheduler:job:daily"),
+        ("reload_pollers", {}, "scheduler:pollers"),
+        ("commitment_snooze", {"commitment_id": "c-1"}, "commitment:c-1"),
+        ("rebuild_index", {"scope": "MEMORY"}, "index:memory"),
+    ],
+)
+def test_mutation_sink_destinations_are_normalized(
+    tool_name: str,
+    args: dict[str, object],
+    expected: str,
+) -> None:
+    from mimir.tools.budget_gate import _extract_sink_target
+
+    request = SimpleNamespace(tool_call={"name": tool_name, "args": args})
+    assert _extract_sink_target(request) == expected
+
+
 @pytest.mark.parametrize(
     "model_spec",
     ["claude-code:claude-sonnet-4-6", "claude_code:claude-sonnet-4-6"],

@@ -574,6 +574,7 @@ def _attach_auth(ctx: TurnContext, resolver: IdentityResolver | None = None) -> 
         domain="channel",
         resource_id=ctx.channel_id,
         bridge_instance="test",
+        ifc_labels=InformationFlowLabels(),
     )
 
 
