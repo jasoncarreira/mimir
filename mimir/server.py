@@ -438,15 +438,18 @@ def _is_auth_exempt(method: str, path: str) -> bool:
 # dashboards expose global operational/project state and Worklink artifacts
 # (chainlink #593). SAGA and file-backed memory/state dashboards expose global
 # cross-channel history and raw markdown content (chainlink #592); wiki viewer
-# APIs expose global markdown state and graph health (chainlink #690). This is
-# the SECURITY gate; React section-hiding is UX only and must never be the sole
-# control.
+# APIs expose global markdown state and graph health (chainlink #690). The
+# factory-runs dashboard exposes global Worklink factory artifacts — run.json,
+# prompts, transcripts, PR URLs — across all runs (not per-user scoped). This
+# is the SECURITY gate; React section-hiding (a manifest ``requires_role``) is
+# UX only and must never be the sole control.
 _ADMIN_REQUIRED_PREFIXES: tuple[str, ...] = (
     "/api/v1/admin",
     "/api/ops",
     "/api/v1/ops",
     "/api/v1/scheduler",
     "/api/v1/chainlink-board",
+    "/api/v1/factory-runs",
     "/api/v1/saga",
     "/api/v1/memory",
     "/api/v1/wiki",

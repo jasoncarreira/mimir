@@ -52,6 +52,8 @@ def _app(home: Path, master_key: str) -> web.Application:
     app.router.add_get(
         "/api/v1/chainlink-board/artifact", _echo,
     )  # Worklink artifacts
+    app.router.add_get("/api/v1/factory-runs", _echo)  # global factory artifacts
+    app.router.add_get("/api/v1/factory-runs/{run_id:.+}", _echo)
     app.router.add_get("/health", _echo)               # exempt
     return app
 
@@ -107,6 +109,8 @@ async def test_global_dashboard_routes_are_admin_only(tmp_path: Path) -> None:
         "/api/v1/scheduler",
         "/api/v1/chainlink-board",
         "/api/v1/chainlink-board/artifact",
+        "/api/v1/factory-runs",
+        "/api/v1/factory-runs/chainlink-834",
     )
     async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
         for path in admin_only_paths:
@@ -132,6 +136,8 @@ def test_admin_required_prefix_matching_is_segment_aware() -> None:
         "/api/v1/scheduler/jobs",
         "/api/v1/chainlink-board",
         "/api/v1/chainlink-board/artifact",
+        "/api/v1/factory-runs",
+        "/api/v1/factory-runs/chainlink-834",
         "/api/v1/saga",
         "/api/v1/saga/sql",
         "/api/v1/memory",
@@ -152,6 +158,7 @@ def test_admin_required_prefix_matching_is_segment_aware() -> None:
         "/api/v1/schedulerish",
         "/api/v1/chainlink-boardwalk",
         "/api/v1/chainlink",
+        "/api/v1/factory-runsish",
         "/api/v1/sagacity",
         "/api/v1/memoryless",
         "/api/v1/wikilinks",
@@ -160,6 +167,36 @@ def test_admin_required_prefix_matching_is_segment_aware() -> None:
         "/api/v1/turns",
     ):
         assert not _is_admin_required(path), path
+
+
+def test_admin_dashboard_sections_are_server_gated() -> None:
+    """Every admin-only dashboard section must be enforced by the server-side
+    ``_ADMIN_REQUIRED_PREFIXES`` gate — not merely hidden from the React nav.
+
+    A manifest ``requires_role="admin"`` is UX only; the real boundary is the
+    server gate. This drift guard catches an admin section being added (or a
+    namespace renamed) without a matching server prefix — the exact shape of
+    the ``factory-runs`` gap, where the section was admin in the React nav but
+    ``/api/v1/factory-runs`` was reachable by any authenticated non-admin.
+    """
+    from mimir.dashboard_extensions import first_party_dashboard_extensions
+
+    registry = first_party_dashboard_extensions()
+    for manifest in registry.manifests:
+        if manifest.requires_role != "admin" or not manifest.api_namespace:
+            continue
+        ns = manifest.api_namespace
+        # admin-config / admin-users register their backend routes under
+        # /api/v1/admin/… (already covered by the /api/v1/admin prefix); their
+        # namespace deliberately differs from their route prefix.
+        if ns.startswith("admin"):
+            assert _is_admin_required("/api/v1/admin/config"), ns
+            continue
+        assert _is_admin_required(f"/api/v1/{ns}"), (
+            f"dashboard section {manifest.id!r} is admin-only in the manifest "
+            f"but /api/v1/{ns} is not covered by _ADMIN_REQUIRED_PREFIXES "
+            f"(React nav hiding is UX only)"
+        )
 
 
 async def test_admin_key_allowed_on_admin_route(tmp_path: Path) -> None:
