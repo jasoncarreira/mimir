@@ -41,6 +41,7 @@ from .saga_client import SagaClient, make_saga_client
 from .scheduler import Scheduler
 from .search import Indexer
 from .session_manager import ChannelSession, SessionManager
+from .web_channels import web_channel_for_identity
 from .skill_defs import (
     home_skills_dir,
     migrate_legacy_skills_dir,
@@ -355,6 +356,21 @@ async def _handle_event(request: web.Request) -> web.Response:
         author = identity.canonical
         author_display = identity.display_name
         author_id = identity.canonical
+        # Security: a per-user web key may target ONLY its own channel. The
+        # request-body channel_id is spoofable (the modern /chat path binds it
+        # to the authenticated identity for exactly this reason — web_chat.py).
+        # Without this bind, one authorized non-admin key could POST /event with
+        # another user's channel_id, run a turn on that channel, and pull that
+        # user's private history into context (or steer its egress). The master
+        # key (identity is None, below) and admins may target any channel for
+        # automation/operator use.
+        if not request.get("auth_is_admin", False):
+            own_channel = web_channel_for_identity(identity.canonical)
+            if channel_id != own_channel:
+                return web.json_response(
+                    {"error": "channel_id not permitted for this identity"},
+                    status=403,
+                )
     else:
         # Preserve master-key and dev/open automation compatibility. Neither
         # path has a per-user identity to bind here.
