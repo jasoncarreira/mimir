@@ -445,6 +445,7 @@ def test_service_principal_cannot_bypass_incompatible_sink_labels():
         ("spawn_codex", "untrusted task", "spawn"),
         ("worklink_run", "/operator/worklink", "spawn"),
         ("write_file", "/tmp/untrusted", "file"),
+        ("submit_proposal", "proposal", "proposal"),
     ],
 )
 def test_poller_payload_cannot_bypass_active_sink_ifc(

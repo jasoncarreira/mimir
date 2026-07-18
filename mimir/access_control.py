@@ -655,6 +655,11 @@ class SinkGate:
             SinkCategory.SCHEDULER,
             SinkCategory.PROPOSAL,
         }:
+            # Poller payloads are attacker-controlled external content (#906).
+            # Persistent mutation categories must fail closed too, especially
+            # proposal operations that are otherwise available to pollers.
+            if "poller_payload" in service.readable_domains:
+                return frozenset()
             source_channels = getattr(ifc_labels, "source_channels", None)
             service_channel = getattr(auth_context, "channel_id", None)
             if (
