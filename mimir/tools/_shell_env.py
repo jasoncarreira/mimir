@@ -1,13 +1,8 @@
-"""Shared helper: keep the project venv bin on PATH for agent shell commands.
+"""Shared helpers for shell subprocess argv and environment handling.
 
-The agent's shell tools (``shell_exec``, ``bash_async``) run commands through
-a login shell (``bash -lc``), which re-sources the login profile and resets
-PATH — dropping the project venv's ``bin`` dir, where the ``mimir`` console
-script and the venv ``python`` live. Framework features assume ``mimir`` is on
-PATH (e.g. the reflection skill's ``mimir reflection introspection-report``
-calls). To make that hold regardless of how the server was launched or what
-the login profile sets, prepend the running interpreter's bin dir to PATH
-*inside* the command, so the export runs after the profile load.
+Interactive/admin shell calls preserve the full ``bash -lc`` surface. Trusted
+service calls are different: their access-control profile validates one parsed
+argv, so execution must use that exact argv with no shell expansion layer.
 """
 
 from __future__ import annotations
@@ -18,14 +13,23 @@ import sys
 
 
 def login_shell_command(command: str) -> str:
-    """Wrap ``command`` (destined for ``bash -lc``) so the venv bin — where
-    ``mimir`` and the venv ``python`` live — is on PATH when it runs.
-
-    The prepended ``export`` runs *after* the login profile, so it survives a
-    profile that resets PATH. Returns ``command`` unchanged if the interpreter
-    path can't be determined (defensive; never breaks the command).
-    """
+    """Wrap an interactive/admin command so the venv bin survives login init."""
     venv_bin = os.path.dirname(sys.executable or "")
     if not venv_bin:
         return command
     return f'export PATH={shlex.quote(venv_bin)}:"$PATH"\n{command}'
+
+
+def direct_exec_env() -> dict[str, str]:
+    """Return a child environment with the running interpreter's bin first.
+
+    Service-shell execution deliberately avoids a login shell. Put the venv bin
+    on PATH through the subprocess environment instead, so environment setup
+    cannot change the validated argv.
+    """
+    env = os.environ.copy()
+    venv_bin = os.path.dirname(sys.executable or "")
+    if venv_bin:
+        current_path = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(part for part in (venv_bin, current_path) if part)
+    return env

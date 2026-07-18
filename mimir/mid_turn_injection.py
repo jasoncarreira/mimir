@@ -195,10 +195,19 @@ def _drain(channel_id: str | None) -> list["AgentEvent"]:
             ctx = get_current_turn()
             if ctx is not None:
                 folded_labels = _merge_ifc_labels(
-                    *(_initialize_ifc_labels(event) for event in drained),
+                    *(
+                        _initialize_ifc_labels(
+                            event, resolver=getattr(ctx, "identity_resolver", None),
+                        )
+                        for event in drained
+                    ),
                     source_channel=getattr(ctx, "channel_id", None),
                 )
                 ctx.ifc_labels = _merge_ifc_labels(ctx.ifc_labels, folded_labels)
+                if ctx.auth_context is not None:
+                    from dataclasses import replace
+                    ctx.ifc_labels = ctx.auth_context.ifc_state.merge(ctx.ifc_labels)
+                    ctx.auth_context = replace(ctx.auth_context, ifc_labels=ctx.ifc_labels)
                 emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
             emitter.injected_input(drained)
         except Exception:  # noqa: BLE001 — panel telemetry is best-effort

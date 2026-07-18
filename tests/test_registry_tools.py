@@ -24,7 +24,13 @@ from langchain.tools import ToolRuntime
 import pytest
 
 from mimir._context import reset_current_turn, set_current_turn
-from mimir.commitments.models import CommitmentStatus
+from mimir.commitments.models import (
+    CommitmentRecord,
+    CommitmentStatus,
+    CommitmentVisibility,
+    make_commitment_id,
+)
+from mimir.commitments.store import CommitmentsStore
 from mimir.models import AuthContext, TurnContext, TurnInteractivity
 from mimir.scheduler import SchedulerJob
 from mimir.tools.registry import (
@@ -1098,6 +1104,46 @@ async def test_commitment_list_admin_can_include_legacy_and_service() -> None:
         "include_service": True,
         "actor_is_admin": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_commitment_list_service_filters_protected_text_before_rendering(
+    tmp_path: Path,
+) -> None:
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None,
+        text="poller-visible-text", owner_principal="service:poller",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None,
+        text="scheduler-protected-text", owner_principal="service:scheduler",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="chan-1",
+        text="cross-owner-public-text", owner_principal="user:alice",
+        visibility=CommitmentVisibility.PUBLIC.value,
+    ))
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="chan-1",
+        text="ownerless-public-text",
+        visibility=CommitmentVisibility.PUBLIC.value,
+    ))
+    set_commitments_store(store)
+
+    runtime = _auth_runtime(
+        "poller", trigger="poller", event_ingress=None, is_service=True,
+    )
+    out = await commitment_list.ainvoke({
+        "runtime": runtime, "due_within_days": 0,
+    })
+
+    assert "poller-visible-text" in out
+    assert "scheduler-protected-text" not in out
+    assert "cross-owner-public-text" not in out
+    assert "ownerless-public-text" not in out
 
 
 class TestCommitmentComplete:

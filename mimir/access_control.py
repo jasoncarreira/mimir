@@ -21,8 +21,11 @@ New in chainlink #866:
 from __future__ import annotations
 
 import logging
+import os
+import shlex
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from .identities import AccessMetadata
@@ -31,7 +34,7 @@ HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 
 if TYPE_CHECKING:
     from .identities import IdentityResolver
-    from .models import AgentEvent, AuthContext
+    from .models import AgentEvent, AuthContext, InformationFlowLabels
 
 log = logging.getLogger(__name__)
 
@@ -89,10 +92,19 @@ class SinkCategory(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ToolFlowDirection(StrEnum):
+    """Whether a tool reads protected data, emits data, does both, or neither."""
+
+    SOURCE = "source"
+    SINK = "sink"
+    BOTH = "both"
+    NEITHER = "neither"
+    UNKNOWN = "unknown"
+
+
 _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "send_message": SinkCategory.SAME_CHANNEL,
     "react": SinkCategory.SAME_CHANNEL,
-    "fetch_channel_history": SinkCategory.SAME_CHANNEL,
     # Harness-owned egress paths bypass model tool middleware, so they are
     # named explicitly and checked at their final send/edit boundary.
     "harness_auto_deliver": SinkCategory.SAME_CHANNEL,
@@ -112,8 +124,14 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "ntfy_send": SinkCategory.NOTIFICATION,
     "write_file": SinkCategory.FILE,
     "edit_file": SinkCategory.FILE,
-    "mcp_": SinkCategory.EXTERNAL_MCP,
 }
+
+_TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
+    **{name: ToolFlowDirection.SINK for name in _SINK_CATEGORY_MAP},
+    "fetch_channel_history": ToolFlowDirection.SOURCE,
+}
+
+IFC_POLICY_VERSION = "ifc-v1"
 
 
 def get_sink_category(tool_name: str) -> SinkCategory:
@@ -128,12 +146,29 @@ def get_sink_category(tool_name: str) -> SinkCategory:
     return SinkCategory.UNKNOWN
 
 
+def get_tool_flow_direction(tool_name: str) -> ToolFlowDirection:
+    """Return explicit native-tool flow metadata without name-prefix inference."""
+    for prefix, direction in _TOOL_FLOW_MAP.items():
+        if tool_name.startswith(prefix):
+            return direction
+    return ToolFlowDirection.UNKNOWN
+
+
 @dataclass(frozen=True)
 class ResourceScope:
     """Defines a specific resource/domain that an operation scopes to."""
     domain: str
     capabilities: frozenset[str] = frozenset()
     sink_destinations: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class ServiceSinkPolicy:
+    """One executable, operation-specific service destination grant."""
+
+    operation: str
+    adapter: str
+    destination: str
 
 
 @dataclass(frozen=True)
@@ -149,6 +184,7 @@ class ServicePrincipal:
     capabilities: tuple[str, ...] = ()
     readable_domains: tuple[str, ...] = ()
     sink_destinations: tuple[str, ...] = ()
+    sink_policies: tuple[ServiceSinkPolicy, ...] = ()
     creation_path: str | None = None
 
     def can_read_domain(self, domain: str) -> bool:
@@ -159,6 +195,244 @@ class ServicePrincipal:
 
     def has_capability(self, capability: str) -> bool:
         return capability in self.capabilities
+
+    def sink_policy_for(self, operation: str) -> ServiceSinkPolicy | None:
+        return next(
+            (policy for policy in self.sink_policies if policy.operation == operation),
+            None,
+        )
+
+
+def _configured_file_roots() -> list[Path]:
+    """Return the same roots exposed by the live file-tool backend."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    # Import lazily: config imports this module while defining Config. Reuse its
+    # parser rather than maintaining a second env syntax/validation policy here.
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home)
+    )
+    return [Path(home), *(Path(path) for path, _mode in extra_roots)]
+
+
+def _configured_file_write_roots() -> list[Path]:
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home)
+    )
+    return [Path(home), *(Path(path) for path, mode in extra_roots if mode == "rw")]
+
+
+def _target_within_configured_roots(target: str, _destination: str) -> bool:
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    try:
+        resolve_within_roots(_configured_file_roots(), target)
+    except (OSError, PathOutsideHomeError):
+        return False
+    return True
+
+
+def _target_within_configured_write_roots(target: str, _destination: str) -> bool:
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    try:
+        resolve_within_roots(_configured_file_write_roots(), target)
+    except (OSError, PathOutsideHomeError):
+        return False
+    return True
+
+
+_SHELL_CONTROL_CHARACTERS = frozenset(";|&`$><{}[],*?~\n\r")
+
+
+def _arguments_match_allowlist(
+    arguments: list[str],
+    *,
+    exact_options: frozenset[str],
+    option_prefixes: tuple[str, ...] = (),
+) -> bool:
+    """Reject every option not explicitly admitted by a command profile.
+
+    Operands remain available after ``--``. An option-looking operand before
+    that marker is rejected rather than guessed at; this keeps future binary
+    flags from silently widening a trusted service's authority.
+    """
+    options_ended = False
+    for argument in arguments:
+        if options_ended:
+            continue
+        if argument == "--":
+            options_ended = True
+            continue
+        if not argument.startswith("-") or argument == "-":
+            continue
+        if argument in exact_options or argument.startswith(option_prefixes):
+            continue
+        return False
+    return True
+
+
+def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
+    """Validate an argv against the scheduler/poller read-only profile."""
+    # Do not accept ``/tmp/git`` merely because its basename is allow-listed.
+    # The login shell may resolve bare names through its operator-controlled PATH,
+    # but a model-supplied path must never select an arbitrary executable.
+    command = argv[0]
+    arguments = argv[1:]
+
+    if command == "pwd":
+        return set(arguments) <= {"-L", "-P"}
+    if command == "ls":
+        return _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "-1", "-A", "-a", "-d", "-F", "-h", "-l", "-la", "-al",
+                "-lh", "-hl", "--all", "--almost-all", "--directory",
+                "--classify", "--human-readable",
+            }),
+            option_prefixes=("--color=",),
+        )
+    if command == "wc":
+        return _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "-c", "-l", "-L", "-m", "-w", "--bytes", "--chars",
+                "--lines", "--max-line-length", "--words",
+            }),
+        )
+    if command == "grep":
+        return _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "-E", "-F", "-H", "-h", "-i", "-l", "-n", "-q", "-s",
+                "-v", "-w", "-x", "--extended-regexp", "--fixed-strings",
+                "--files-with-matches", "--ignore-case", "--line-number",
+                "--no-messages", "--quiet", "--recursive", "--invert-match",
+                "--with-filename", "--no-filename", "--word-regexp",
+                "--line-regexp",
+            }),
+            option_prefixes=("--exclude=", "--include=", "--exclude-dir="),
+        )
+    if command == "jq":
+        return _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "-C", "-M", "-R", "-S", "-c", "-e", "-j", "-r", "-s",
+                "--ascii-output", "--compact-output", "--exit-status",
+                "--join-output", "--monochrome-output", "--null-input",
+                "--raw-input", "--raw-output", "--slurp", "--sort-keys",
+            }),
+        )
+    if command == "rg":
+        # ripgrep's config file can inject --pre. Require --no-config in the
+        # command itself so the allowlist is independent of ambient process env.
+        if not arguments or arguments[0] != "--no-config":
+            return False
+        return _arguments_match_allowlist(
+            arguments[1:],
+            exact_options=frozenset({
+                "-F", "-H", "-L", "-S", "-g", "-h", "-i", "-l", "-n",
+                "-s", "-u", "-v", "-w", "--case-sensitive", "--files",
+                "--files-with-matches", "--fixed-strings", "--glob", "--hidden",
+                "--ignore-case", "--line-number", "--no-heading", "--no-ignore",
+                "--smart-case", "--type", "--type-not", "--word-regexp",
+            }),
+        )
+    if command != "git" or not arguments:
+        return False
+
+    subcommand = arguments[0]
+    subcommand_arguments = arguments[1:]
+    if subcommand == "status":
+        return _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset({
+                "-b", "-s", "--ahead-behind", "--branch", "--ignore-submodules",
+                "--long", "--no-ahead-behind", "--porcelain", "--short",
+                "--show-stash", "--untracked-files", "--verbose",
+            }),
+            option_prefixes=("--ignore-submodules=", "--porcelain=", "--untracked-files="),
+        )
+    if subcommand not in {"diff", "log", "show"}:
+        return False
+
+    # These commands can invoke repository-configured helpers unless both
+    # controls are explicit. Requiring them makes the argv safe independently
+    # of .gitconfig/.gitattributes in the inspected checkout.
+    required_safety_options = {"--no-ext-diff", "--no-textconv"}
+    if not required_safety_options.issubset(subcommand_arguments):
+        return False
+    return _arguments_match_allowlist(
+        subcommand_arguments,
+        exact_options=frozenset({
+            "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+            "--exit-code", "--full-index", "--name-only", "--name-status",
+            "--no-color", "--no-ext-diff", "--no-merges", "--no-patch",
+            "--no-textconv", "--oneline", "--quiet", "--raw", "--stat",
+            "--staged",
+        }),
+        option_prefixes=("-U", "--max-count=", "--since=", "--until=", "--unified="),
+    )
+
+
+def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
+    """Return the exact argv admitted by a trusted service shell profile.
+
+    The returned argv is both the authorization artifact and the execution
+    artifact. Callers must exec it directly with ``shell=False``; handing the
+    original string to a shell would reintroduce an expansion layer the profile
+    did not validate.
+    """
+    if any(character in target for character in _SHELL_CONTROL_CHARACTERS):
+        return None
+    try:
+        argv = shlex.split(target)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+
+    allowed = False
+    if destination == "scheduler_read_only":
+        allowed = _target_matches_read_only_shell_command(argv)
+    elif destination == "upgrade_workspace":
+        allowed = _target_matches_read_only_shell_command(argv) or (
+            argv[0] == "uv"
+            and argv[1:] in (["lock"], ["sync"])
+        )
+    return argv if allowed else None
+
+
+def _target_matches_shell_profile(target: str, destination: str) -> bool:
+    """Authorization adapter for the service shell profile."""
+    return parse_service_shell_argv(target, destination) is not None
+
+
+_SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
+    "configured_file_roots": _target_within_configured_write_roots,
+    "shell_profile": _target_matches_shell_profile,
+    "spawn_workspace": _target_within_configured_roots,
+}
+
+_ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
+    SinkCategory.SHELL_PROCESS: "shell_process",
+    SinkCategory.SPAWN: "spawn_process",
+    SinkCategory.FILE: "filesystem",
+    SinkCategory.NOTIFICATION: "notification",
+    SinkCategory.HTTP_WEBHOOK: "network",
+    SinkCategory.NETWORK: "network",
+    SinkCategory.EXTERNAL_MCP: "external_mcp",
+}
 
 
 class SinkGate:
@@ -189,6 +463,7 @@ class SinkGate:
         auth_context: Any,
         *,
         enforce: bool = False,
+        sink_category: SinkCategory | None = None,
     ) -> "ToolAuthorization":
         """Check if IFC labels permit flow to the given sink.
 
@@ -215,7 +490,7 @@ class SinkGate:
                 is_shadow_decision=not enforce,
             )
 
-        sink_category = get_sink_category(tool_name)
+        sink_category = sink_category or get_sink_category(tool_name)
         if sink_category == SinkCategory.UNKNOWN:
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -228,39 +503,6 @@ class SinkGate:
             )
 
         service = get_trusted_service_from_auth_context(auth_context)
-        service_sink = {
-            SinkCategory.SHELL_PROCESS: "shell_process",
-            SinkCategory.SPAWN: "spawn_process",
-            SinkCategory.FILE: "filesystem",
-            SinkCategory.NOTIFICATION: "notification",
-            SinkCategory.HTTP_WEBHOOK: "network",
-            SinkCategory.NETWORK: "network",
-            SinkCategory.EXTERNAL_MCP: "external_mcp",
-        }.get(sink_category)
-        if (
-            service is not None
-            and service_sink is not None
-            and service.can_write_sink(service_sink)
-            # Poller payloads contain attacker-controlled external content, so
-            # their service authority must not bypass IFC on active sinks.
-            and not (
-                "poller_payload" in service.readable_domains
-                and sink_category in {
-                    SinkCategory.SHELL_PROCESS,
-                    SinkCategory.SPAWN,
-                    SinkCategory.FILE,
-                }
-            )
-        ):
-            return ToolAuthorization(
-                tool_name=tool_name,
-                decision=OperationDecision.OPEN,
-                allowed=True,
-                reason="ifc_service_sink_allowed",
-                service_principal=service,
-                enforcement_enabled=enforce,
-            )
-
         if not target:
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -272,6 +514,51 @@ class SinkGate:
                 is_shadow_decision=not enforce,
             )
 
+        service_policy: ServiceSinkPolicy | None = None
+        if service is not None and sink_category in {
+            SinkCategory.SHELL_PROCESS,
+            SinkCategory.SPAWN,
+            SinkCategory.FILE,
+            SinkCategory.NOTIFICATION,
+            SinkCategory.HTTP_WEBHOOK,
+            SinkCategory.NETWORK,
+            SinkCategory.EXTERNAL_MCP,
+        }:
+            # Preserve #906's fail-closed treatment and decision reason before
+            # considering any concrete poller destination.
+            if "poller_payload" in service.readable_domains and sink_category in {
+                SinkCategory.SHELL_PROCESS,
+                SinkCategory.SPAWN,
+                SinkCategory.FILE,
+            }:
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason=f"ifc_label_blocked:{sink_category.value}",
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                )
+            service_policy = service.sink_policy_for(tool_name)
+            adapter = (
+                _SERVICE_SINK_ADAPTERS.get(service_policy.adapter)
+                if service_policy is not None
+                else None
+            )
+            if adapter is None or not adapter(target, service_policy.destination):
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason="service_sink_destination_denied",
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                )
+
         if not ifc_labels.labels:
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -282,7 +569,11 @@ class SinkGate:
             )
 
         allowed_sinks = cls._get_allowed_sinks(
-            sink_category, auth_context, ifc_labels=ifc_labels,
+            sink_category,
+            auth_context,
+            ifc_labels=ifc_labels,
+            service_policy=service_policy,
+            target=target,
         )
         effective_target = (
             ChannelResourceAdapter._resolve_channel(target)
@@ -320,13 +611,38 @@ class SinkGate:
         auth_context: Any,
         *,
         ifc_labels: Any,
+        service_policy: ServiceSinkPolicy | None = None,
+        target: str | None = None,
     ) -> frozenset[str]:
         """Return concrete destinations compatible with every current label.
 
         Ordinary admin authority deliberately does not widen this set. Admins
         must use the distinct audited declassification action before egress.
         """
-        if category != SinkCategory.SAME_CHANNEL or auth_context is None:
+        if auth_context is None:
+            return frozenset()
+
+        service = get_trusted_service_from_auth_context(auth_context)
+        if service is not None and service_policy is not None and target is not None:
+            # Poller payloads remain attacker-controlled external content (#906).
+            if "poller_payload" in service.readable_domains and category in {
+                SinkCategory.SHELL_PROCESS,
+                SinkCategory.SPAWN,
+                SinkCategory.FILE,
+            }:
+                return frozenset()
+            source_channels = getattr(ifc_labels, "source_channels", None)
+            service_channel = getattr(auth_context, "channel_id", None)
+            if (
+                isinstance(source_channels, frozenset)
+                and source_channels
+                and service_channel
+                and source_channels == frozenset({service_channel})
+            ):
+                return frozenset({target})
+            return frozenset()
+
+        if category != SinkCategory.SAME_CHANNEL:
             return frozenset()
 
         triggering_channel = getattr(auth_context, "channel_id", None)
@@ -336,17 +652,36 @@ class SinkGate:
         if not resolved_triggering:
             return frozenset()
 
-        source_channels = getattr(ifc_labels, "source_channels", None)
-        if not isinstance(source_channels, frozenset) or not source_channels:
+        canonical_principal = getattr(auth_context, "canonical_principal", None)
+        service = get_trusted_service_from_auth_context(auth_context)
+        service_source_principal = (
+            f"service:{service.canonical}" if service is not None else None
+        )
+        domain = getattr(auth_context, "domain", None)
+        resource_id = getattr(auth_context, "resource_id", None)
+        bridge_instance = getattr(auth_context, "bridge_instance", None)
+        sources = getattr(ifc_labels, "sources", None)
+        effective_principal = service_source_principal or canonical_principal
+        if not all((effective_principal, domain, resource_id, bridge_instance)):
             return frozenset()
-        resolved_sources = {
-            ChannelResourceAdapter._resolve_channel(channel)
-            for channel in source_channels
-            if channel
-        }
-        if not resolved_sources or None in resolved_sources:
+        if not isinstance(sources, frozenset) or not sources:
             return frozenset()
-        if resolved_sources != {resolved_triggering}:
+
+        for source in sources:
+            if not getattr(source, "is_complete", False):
+                return frozenset()
+            if effective_principal not in source.authorized_principals:
+                return frozenset()
+            if (
+                getattr(source, "source_kind", "channel") == "channel"
+                and source.principal != effective_principal
+            ):
+                return frozenset()
+            if source.domain != domain or source.bridge_instance != bridge_instance:
+                return frozenset()
+            if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
+                return frozenset()
+        if ChannelResourceAdapter._resolve_channel(resource_id) != resolved_triggering:
             return frozenset()
 
         return frozenset({resolved_triggering})
@@ -356,6 +691,9 @@ def audit_declassification(
     labels: Any,
     declassification_reason: str,
     auth_context: Any,
+    *,
+    destination: str,
+    policy_version: str = IFC_POLICY_VERSION,
 ) -> Any:
     """Audit admin declassification of IFC labels (chainlink #871).
 
@@ -380,18 +718,61 @@ def audit_declassification(
         roles = getattr(auth_context, "roles", ()) or ()
         is_admin = "admin" in roles
 
-    if not is_admin:
+    principal = getattr(auth_context, "principal", None)
+    canonical_principal = getattr(auth_context, "canonical_principal", None)
+    if (
+        not is_admin
+        or not isinstance(principal, str) or not principal.strip()
+        or not isinstance(canonical_principal, str) or not canonical_principal.strip()
+        or not isinstance(declassification_reason, str) or not declassification_reason.strip()
+        or not isinstance(destination, str) or not destination.strip()
+        or not isinstance(policy_version, str) or not policy_version.strip()
+    ):
         return labels
 
-    log.info(
-        "ifc_declassification",
-        reason=declassification_reason,
-        principal=getattr(auth_context, "principal", None),
-    )
+    source_labels = [
+        {
+            "principal": source.principal,
+            "domain": source.domain,
+            "resource_id": source.resource_id,
+            "bridge_instance": source.bridge_instance,
+            "sensitivity": source.sensitivity,
+            "authorized_principals": sorted(source.authorized_principals),
+            "source_kind": source.source_kind,
+        }
+        for source in sorted(
+            labels.sources,
+            key=lambda item: (
+                str(item.domain), str(item.resource_id), str(item.principal),
+                str(item.sensitivity),
+            ),
+        )
+    ]
+    try:
+        from .event_logger import log_durable_event_sync
+
+        log_durable_event_sync(
+            "ifc_declassification",
+            source_labels=source_labels,
+            labels=sorted(labels.labels),
+            authenticated_admin={
+                "principal": principal,
+                "canonical_principal": canonical_principal,
+                "roles": sorted(getattr(auth_context, "roles", ()) or ()),
+            },
+            reason=declassification_reason.strip(),
+            destination=destination,
+            policy_version=policy_version,
+            outcome="approved",
+        )
+    except Exception as exc:  # fail closed without breaking the admin action caller
+        log.warning("ifc declassification audit failed: %s", exc)
+        return labels
 
     return InformationFlowLabels(
         labels=frozenset(),
         source_channels=labels.source_channels,
+        sources=labels.sources,
         created_at=labels.created_at,
     )
 
@@ -548,17 +929,9 @@ class OperationCatalog:
     """
 
     _OPEN_OPERATIONS: frozenset[str] = frozenset({
-        "list_channels",
-        "list_schedules",
         "commitment_list",
-        "memory_store",
         "memory_query",
         "memory_get",
-        "saga_feedback",
-        "saga_mark_contributions",
-        "saga_end_session",
-        "saga_record_skill_learning",
-        "bash_jobs_list",
         "write_todos",
         "defer_injected_message",
         "commitment_complete",
@@ -567,6 +940,8 @@ class OperationCatalog:
     })
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
+        "list_channels",
+        "list_schedules",
         "add_schedule",
         "set_schedule_priority",
         "remove_schedule",
@@ -578,11 +953,17 @@ class OperationCatalog:
         "worklink_run",
         "shell_exec",
         "bash_async",
+        "bash_jobs_list",
         "bash_job_output",
         "spawn_claude_code",
         "spawn_codex",
         "spawn_open_code",
         "task",
+        "memory_store",
+        "saga_feedback",
+        "saga_mark_contributions",
+        "saga_end_session",
+        "saga_record_skill_learning",
         "saga_forget",
         "write_file",
         "edit_file",
@@ -601,6 +982,15 @@ class OperationCatalog:
         "rebuild_index",
         "get_turn",
         "mimir_get_turn",
+    })
+
+    # Global rows from these operations contain protected identities,
+    # configuration, or process metadata and must never become OPEN.
+    _PROTECTED_METADATA_OPERATIONS: frozenset[str] = frozenset({
+        "list_channels",
+        "list_schedules",
+        "bash_jobs_list",
+        "bash_job_output",
     })
 
     _ADMIN_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset({
@@ -766,6 +1156,15 @@ class MCPResourceAdapter:
             )
             return OperationDecision.ADMIN_REQUIRED
 
+        classification = getattr(provenance, "classification", "")
+        if classification:
+            try:
+                return OperationDecision(classification)
+            except ValueError:
+                return OperationDecision.ADMIN_REQUIRED
+
+        # Compatibility for pre-policy callers. Production approvals always
+        # carry classification and never authorize resources through this path.
         try:
             decision = adapter.classify(tool_name, context)
         except Exception:
@@ -784,6 +1183,140 @@ class MCPResourceAdapter:
             )
             return OperationDecision.ADMIN_REQUIRED
         return decision
+
+    @classmethod
+    def authorize_call(
+        cls,
+        tool_name: str,
+        tool: Any,
+        arguments: dict[str, Any] | None,
+        context: Any | None,
+        *,
+        enforce: bool,
+        ifc_labels: Any = None,
+    ) -> "ToolAuthorization":
+        """Execute the provenance-bound adapter and IFC gate on one invocation."""
+        from .mcp_client import (
+            MCPAuthorizationRequest,
+            MCPAuthorizationResult,
+            get_tool_provenance,
+        )
+
+        provenance = get_tool_provenance(tool) if tool is not None else None
+        decision = OperationDecision.ADMIN_REQUIRED
+        reason = "mcp_missing_provenance"
+        if provenance is not None and provenance.is_tombstoned:
+            reason = "mcp_drift_detected"
+        elif provenance is not None:
+            try:
+                decision = OperationDecision(provenance.classification)
+            except ValueError:
+                reason = "mcp_unclassified"
+            else:
+                adapter = cls._get_registered_adapter(provenance)
+                if adapter is None:
+                    decision = OperationDecision.ADMIN_REQUIRED
+                    reason = "mcp_missing_adapter"
+                elif arguments is None:
+                    decision = OperationDecision.ADMIN_REQUIRED
+                    reason = "mcp_malformed_arguments"
+                else:
+                    try:
+                        flow_direction = ToolFlowDirection(adapter.flow_direction)
+                    except ValueError:
+                        flow_direction = ToolFlowDirection.UNKNOWN
+                    if flow_direction is ToolFlowDirection.UNKNOWN:
+                        decision = OperationDecision.ADMIN_REQUIRED
+                        reason = "mcp_unknown_flow_direction"
+                        adapter = None
+                if adapter is not None and arguments is not None:
+                    try:
+                        result = adapter.classify(MCPAuthorizationRequest(
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            auth_context=context,
+                            provenance=provenance,
+                        ))
+                    except Exception:
+                        log.exception(
+                            "MCP adapter %s failed while authorizing %s",
+                            provenance.adapter_name,
+                            tool_name,
+                        )
+                        decision = OperationDecision.ADMIN_REQUIRED
+                        reason = "mcp_adapter_exception"
+                    else:
+                        if not isinstance(result, MCPAuthorizationResult):
+                            decision = OperationDecision.ADMIN_REQUIRED
+                            reason = "mcp_invalid_adapter_result"
+                        elif result.decision is not decision:
+                            decision = OperationDecision.ADMIN_REQUIRED
+                            reason = "mcp_adapter_decision_mismatch"
+                        elif result.allowed:
+                            expected_source = flow_direction in {
+                                ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH,
+                            }
+                            expected_sink = flow_direction in {
+                                ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
+                            }
+                            if (
+                                bool(result.source_resources) is not expected_source
+                                or bool(result.sink_resources) is not expected_sink
+                            ):
+                                decision = OperationDecision.ADMIN_REQUIRED
+                                reason = "mcp_flow_metadata_mismatch"
+                                result = None
+                        if isinstance(result, MCPAuthorizationResult) and result.allowed and decision is not OperationDecision.ADMIN_REQUIRED:
+                            if ifc_labels is None and context is not None:
+                                ifc_labels = getattr(context, "ifc_labels", None)
+                            sink_check = None
+                            if result.sink_resources:
+                                sink_check = SinkGate.check_sink_flow(
+                                    tool_name,
+                                    ",".join(result.sink_resources),
+                                    ifc_labels,
+                                    context,
+                                    enforce=enforce,
+                                    sink_category=SinkCategory.EXTERNAL_MCP,
+                                )
+                            if sink_check is not None and not sink_check.allowed:
+                                return sink_check
+                            return ToolAuthorization(
+                                tool_name=tool_name,
+                                decision=decision,
+                                allowed=True,
+                                reason=(
+                                    sink_check.reason
+                                    if sink_check is not None and sink_check.is_shadow_decision
+                                    else None
+                                ),
+                                enforcement_enabled=enforce,
+                                is_shadow_decision=(
+                                    sink_check.is_shadow_decision if sink_check is not None else False
+                                ),
+                                protected_source_resources=result.source_resources,
+                                flow_direction=flow_direction,
+                            )
+                        elif isinstance(result, MCPAuthorizationResult) and not result.allowed:
+                            reason = result.reason or "mcp_resource_denied"
+
+        is_admin = decision is OperationDecision.ADMIN_REQUIRED
+        admin = context is not None and "admin" in (getattr(context, "roles", ()) or ())
+        hard_failure = reason in {
+            "mcp_unknown_flow_direction",
+            "mcp_flow_metadata_mismatch",
+        }
+        denied_by_policy = not admin
+        allowed = (admin and not hard_failure) or not enforce
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=decision,
+            allowed=allowed,
+            reason=None if admin and not hard_failure else reason,
+            required_tier=AccessTier.ADMIN if is_admin else AccessTier.USER,
+            enforcement_enabled=enforce,
+            is_shadow_decision=not enforce and denied_by_policy,
+        )
 
     @staticmethod
     def _get_registered_adapter(provenance: Any) -> Any | None:
@@ -909,6 +1442,10 @@ class ToolAuthorization:
     required_tier: AccessTier = AccessTier.USER
     enforcement_enabled: bool = False
     is_shadow_decision: bool = False
+    # ``None`` means provenance is unknown; ``()`` authoritatively classifies
+    # the call as not reading a protected MCP source.
+    protected_source_resources: tuple[str, ...] | None = None
+    flow_direction: ToolFlowDirection = ToolFlowDirection.UNKNOWN
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return fields for audit logging."""
@@ -1056,6 +1593,8 @@ class ToolRegistry:
         enforce: bool = False,
         target_channel: str | None = None,
         ifc_labels: Any = None,
+        mcp_tool: Any = None,
+        arguments: dict[str, Any] | None = None,
     ) -> ToolAuthorization:
         """Authorize a tool call using the operation catalog.
 
@@ -1070,6 +1609,33 @@ class ToolRegistry:
         The ifc_labels parameter enables information flow control sink gate
         checks (chainlink #871).
         """
+        if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX) and mcp_tool is not None:
+            auth = MCPResourceAdapter.authorize_call(
+                tool_name,
+                mcp_tool,
+                arguments,
+                auth_context,
+                enforce=enforce,
+                ifc_labels=ifc_labels,
+            )
+            if auth.is_shadow_decision:
+                self._emit_shadow_decision(auth)
+            return auth
+        if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
+            auth = ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="mcp_unknown_flow_direction",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+            if auth.is_shadow_decision:
+                self._emit_shadow_decision(auth)
+            return auth
+
+        flow_direction = get_tool_flow_direction(tool_name)
         sink_category = get_sink_category(tool_name)
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)
@@ -1083,11 +1649,10 @@ class ToolRegistry:
         service_capability_denied = (
             preliminary_service is not None
             and preliminary_decision == OperationDecision.ADMIN_REQUIRED
-            and not preliminary_service.has_capability(tool_name)
+            and not service_can_invoke_operation(preliminary_service, tool_name)
         )
         service_allowed_preliminary = (
-            preliminary_service is not None
-            and preliminary_service.has_capability(tool_name)
+            service_can_invoke_operation(preliminary_service, tool_name)
         )
         preliminary_admin_denied = (
             preliminary_decision == OperationDecision.ADMIN_REQUIRED
@@ -1109,8 +1674,11 @@ class ToolRegistry:
             and auth_context is not None
         ):
             sink_target = getattr(auth_context, "channel_id", None)
-        is_ifc_sink = sink_category != SinkCategory.UNKNOWN or (
+        is_ifc_sink = flow_direction in {
+            ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
+        } or (
             ifc_labels is not None
+            and flow_direction is ToolFlowDirection.UNKNOWN
             and preliminary_decision == OperationDecision.UNKNOWN
             and not service_allowed_preliminary
         )
@@ -1141,8 +1709,7 @@ class ToolRegistry:
         reason = None
         is_shadow = False
         service_allowed = (
-            service_principal is not None
-            and service_principal.has_capability(tool_name)
+            service_can_invoke_operation(service_principal, tool_name)
         )
 
         if decision == OperationDecision.OPEN:
@@ -1168,6 +1735,7 @@ class ToolRegistry:
                     auth_context,
                     enforce=enforce,
                 )
+                channel_auth.flow_direction = flow_direction
                 return channel_auth
             required_tier = AccessTier.ADMIN
             if enforce:
@@ -1200,12 +1768,122 @@ class ToolRegistry:
             required_tier=required_tier,
             enforcement_enabled=enforce,
             is_shadow_decision=is_shadow,
+            flow_direction=flow_direction,
         )
 
         if is_shadow:
             self._emit_shadow_decision(auth)
 
         return auth
+
+
+_PROTECTED_RESULT_DOMAINS: dict[str, str] = {
+    "list_channels": "channel_metadata",
+    "list_schedules": "schedule_metadata",
+    "bash_jobs_list": "shell_jobs",
+    "bash_job_output": "shell_jobs",
+    "read_file": "filesystem",
+    "aread": "filesystem",
+    "ls": "filesystem",
+    "als": "filesystem",
+    "glob": "filesystem",
+    "aglob": "filesystem",
+    "grep": "filesystem",
+    "agrep": "filesystem",
+    "download_files": "filesystem",
+    "adownload_files": "filesystem",
+    "Read": "filesystem",
+    "Glob": "filesystem",
+    "Grep": "filesystem",
+    "file_search": "filesystem",
+    "get_turn": "turn_history",
+    "mimir_get_turn": "turn_history",
+    "memory_query": "saga",
+    "memory_get": "saga",
+    "commitment_list": "commitments",
+}
+
+
+def classify_protected_result(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+    auth_context: "AuthContext | None",
+    authorization: ToolAuthorization,
+) -> "InformationFlowLabels | None":
+    """Return server-authoritative labels for content a protected call may expose.
+
+    The contract is based only on the authorized operation and validated
+    arguments. Tool success text, model assertions, and error wording cannot
+    downgrade it. Unknown provenance is intentionally incomplete and therefore
+    fails closed at every egress gate.
+    """
+    from .models import InformationFlowLabels, SourceLabel
+
+    args = arguments or {}
+    if tool_name == "fetch_channel_history":
+        resource = args.get("channel_id") or getattr(auth_context, "channel_id", None)
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        source = SourceLabel(
+            principal=principal,
+            domain=getattr(auth_context, "domain", None),
+            resource_id=ChannelResourceAdapter._resolve_channel(resource),
+            bridge_instance=getattr(auth_context, "bridge_instance", None),
+            sensitivity="private",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            source_kind="channel",
+        )
+        return InformationFlowLabels().with_source(source)
+
+    if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
+        resources = authorization.protected_source_resources
+        if resources == ():
+            return None
+        principal = getattr(auth_context, "canonical_principal", None)
+        labels = InformationFlowLabels()
+        for resource in resources or ("unknown",):
+            labels = labels.with_source(SourceLabel(
+                principal=principal if resources is not None else None,
+                domain="mcp",
+                resource_id=resource,
+                bridge_instance=tool_name.split("_", 2)[1] if "_" in tool_name else None,
+                sensitivity="internal",
+                authorized_principals=(
+                    frozenset({principal}) if principal and resources is not None else frozenset()
+                ),
+                source_kind="mcp",
+            ))
+        return labels
+
+    domain = _PROTECTED_RESULT_DOMAINS.get(tool_name)
+    if domain is None:
+        # Native aliases may be namespaced by a tool server. Do not apply this
+        # suffix rule to MCP calls, which are classified above from provenance.
+        for candidate, candidate_domain in _PROTECTED_RESULT_DOMAINS.items():
+            if tool_name.endswith(f"__{candidate}"):
+                domain = candidate_domain
+                break
+    if domain is None:
+        return None
+
+    resource = next(
+        (
+            args.get(key)
+            for key in ("path", "file_path", "query", "turn_id", "atom_id", "job_id")
+            if isinstance(args.get(key), str) and args.get(key)
+        ),
+        "unknown",
+    )
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal=None,
+        domain=domain,
+        resource_id=str(resource),
+        bridge_instance=None,
+        sensitivity="internal",
+        authorized_principals=frozenset(),
+        source_kind="protected_tool",
+    ))
 
 
 _global_tool_registry = ToolRegistry()
@@ -1225,6 +1903,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             capabilities=(
                 "shell_exec",
                 "bash_async",
+                "bash_jobs_list",
+                "bash_job_output",
                 "spawn_claude_code",
                 "spawn_codex",
                 "spawn_open_code",
@@ -1248,7 +1928,12 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "get_turn",
                 "mimir_get_turn",
             ),
-            readable_domains=("configured_inputs", "filesystem", "turn_history"),
+            readable_domains=(
+                "configured_inputs",
+                "filesystem",
+                "turn_history",
+                "shell_jobs",
+            ),
             sink_destinations=(
                 "configured_channel",
                 "filesystem",
@@ -1257,6 +1942,15 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "proposal",
                 "saga",
                 "worklink",
+            ),
+            sink_policies=(
+                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("shell_exec", "shell_profile", "scheduler_read_only"),
+                ServiceSinkPolicy("bash_async", "shell_profile", "scheduler_read_only"),
+                ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
             ),
             creation_path="mimir.scheduler.Scheduler._fire_job",
         ),
@@ -1288,8 +1982,14 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "get_turn",
                 "mimir_get_turn",
                 "send_message",
+                "list_channels",
             ),
-            readable_domains=("poller_payload", "filesystem", "turn_history"),
+            readable_domains=(
+                "poller_payload",
+                "filesystem",
+                "turn_history",
+                "channel_metadata",
+            ),
             sink_destinations=(
                 "configured_channel",
                 "filesystem",
@@ -1298,6 +1998,15 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "proposal",
                 "worklink",
                 "message",
+            ),
+            sink_policies=(
+                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("shell_exec", "shell_profile", "scheduler_read_only"),
+                ServiceSinkPolicy("bash_async", "shell_profile", "scheduler_read_only"),
+                ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
             ),
             creation_path="mimir.pollers.run_poller",
         ),
@@ -1326,6 +2035,10 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             ),
             readable_domains=("session", "saga", "filesystem", "turn_history"),
             sink_destinations=("session_boundary", "saga", "filesystem"),
+            sink_policies=(
+                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+            ),
             creation_path="mimir.server._on_session_idle",
         ),
         ServicePrincipal(
@@ -1341,6 +2054,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "abandon_proposal",
                 "add_schedule",
                 "set_schedule_priority",
+                "list_schedules",
                 "read_file",
                 "aread",
                 "ls",
@@ -1351,7 +2065,12 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "agrep",
                 "send_message",
             ),
-            readable_domains=("defaults", "proposal", "filesystem"),
+            readable_domains=(
+                "defaults",
+                "proposal",
+                "filesystem",
+                "schedule_metadata",
+            ),
             sink_destinations=(
                 "operator_alert",
                 "filesystem",
@@ -1359,6 +2078,12 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "proposal",
                 "scheduler",
                 "message",
+            ),
+            sink_policies=(
+                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("shell_exec", "shell_profile", "upgrade_workspace"),
+                ServiceSinkPolicy("bash_async", "shell_profile", "upgrade_workspace"),
             ),
             creation_path="mimir.defaults_upgrade.enqueue_upgrade_prompt_turns",
         ),
@@ -1381,6 +2106,10 @@ _REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset({
 
 # Executable capabilities and information-flow metadata are one policy.
 _OPERATION_READABLE_DOMAIN: dict[str, str] = {
+    "list_channels": "channel_metadata",
+    "list_schedules": "schedule_metadata",
+    "bash_jobs_list": "shell_jobs",
+    "bash_job_output": "shell_jobs",
     "read_file": "filesystem",
     "aread": "filesystem",
     "ls": "filesystem",
@@ -1418,6 +2147,15 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "worklink_run": "worklink",
 }
 
+_SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset({
+    "memory_store",
+    "saga_feedback",
+    "saga_mark_contributions",
+    "saga_end_session",
+    "saga_record_skill_learning",
+    "saga_forget",
+})
+
 
 class CapabilityMatrixError(Exception):
     """Raised when enforcement is requested with an incomplete matrix."""
@@ -1429,6 +2167,17 @@ class ProviderEnforcementCompatibilityError(Exception):
 
 def _capability_matrix_errors() -> list[str]:
     errors: list[str] = []
+    for operation in sorted(_SAGA_MUTATION_OPERATIONS):
+        if operation not in _OPERATION_SINK_DESTINATION:
+            errors.append(
+                f"SAGA mutation '{operation}' has no sink destination mapping"
+            )
+        if operation in OperationCatalog._OPEN_OPERATIONS:
+            errors.append(f"SAGA mutation '{operation}' must not be cataloged OPEN")
+        if operation not in OperationCatalog._ADMIN_REQUIRED_OPERATIONS:
+            errors.append(
+                f"SAGA mutation '{operation}' must be cataloged ADMIN_REQUIRED"
+            )
     for trigger in sorted(_REQUIRED_SERVICE_PRINCIPALS):
         principal = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
         if principal is None:
@@ -1457,6 +2206,37 @@ def _capability_matrix_errors() -> list[str]:
 
         readable_domains = set(principal.readable_domains)
         sink_destinations = set(principal.sink_destinations)
+        policies_by_operation = {policy.operation: policy for policy in principal.sink_policies}
+        if len(policies_by_operation) != len(principal.sink_policies):
+            errors.append(
+                f"Service principal '{principal.canonical}' has duplicate sink policies"
+            )
+        for policy in principal.sink_policies:
+            if policy.operation not in principal.capabilities:
+                errors.append(
+                    f"Service principal '{principal.canonical}' sink policy "
+                    f"'{policy.operation}' has no matching capability"
+                )
+            if policy.adapter not in _SERVICE_SINK_ADAPTERS:
+                errors.append(
+                    f"Service principal '{principal.canonical}' sink policy "
+                    f"'{policy.operation}' has no executable destination adapter "
+                    f"'{policy.adapter}'"
+                )
+        policy_sink_destinations = {
+            _ACTIVE_SERVICE_SINK_DESTINATIONS[category]
+            for policy in principal.sink_policies
+            if (category := get_sink_category(policy.operation))
+            in _ACTIVE_SERVICE_SINK_DESTINATIONS
+        }
+        for sink_destination in sorted(
+            sink_destinations & set(_ACTIVE_SERVICE_SINK_DESTINATIONS.values())
+        ):
+            if sink_destination not in policy_sink_destinations:
+                errors.append(
+                    f"Service principal '{principal.canonical}' sink destination "
+                    f"'{sink_destination}' has no executable destination policy"
+                )
         for operation in sorted(set(principal.capabilities)):
             required_domain = _OPERATION_READABLE_DOMAIN.get(operation)
             if required_domain and required_domain not in readable_domains:
@@ -1469,6 +2249,19 @@ def _capability_matrix_errors() -> list[str]:
                 errors.append(
                     f"Service principal '{principal.canonical}' capability "
                     f"'{operation}' requires sink destination '{required_sink}'"
+                )
+            if get_sink_category(operation) in {
+                SinkCategory.SHELL_PROCESS,
+                SinkCategory.SPAWN,
+                SinkCategory.FILE,
+                SinkCategory.NOTIFICATION,
+                SinkCategory.HTTP_WEBHOOK,
+                SinkCategory.NETWORK,
+                SinkCategory.EXTERNAL_MCP,
+            } and operation not in policies_by_operation:
+                errors.append(
+                    f"Service principal '{principal.canonical}' capability "
+                    f"'{operation}' has no executable destination policy"
                 )
     return errors
 
@@ -1541,6 +2334,14 @@ def get_capability_matrix_report() -> dict[str, dict[str, Any]]:
             "capabilities": list(principal.capabilities),
             "readable_domains": list(principal.readable_domains),
             "sink_destinations": list(principal.sink_destinations),
+            "sink_policies": [
+                {
+                    "operation": policy.operation,
+                    "adapter": policy.adapter,
+                    "destination": policy.destination,
+                }
+                for policy in principal.sink_policies
+            ],
             "creation_path": principal.creation_path,
         }
     return report
@@ -1588,16 +2389,30 @@ def is_trusted_service(auth_context: Any) -> bool:
     return get_trusted_service_from_auth_context(auth_context) is not None
 
 
-def can_write_saga(auth_context: Any) -> bool:
-    """Check if the auth context can write to SAGA (memory_store, saga_end_session).
+def service_can_invoke_operation(
+    service: ServicePrincipal | None,
+    operation: str,
+) -> bool:
+    """Check an exact service capability and its declared flow constraints."""
+    if service is None or not service.has_capability(operation):
+        return False
+    required_domain = _OPERATION_READABLE_DOMAIN.get(operation)
+    if required_domain and not service.can_read_domain(required_domain):
+        return False
+    required_sink = _OPERATION_SINK_DESTINATION.get(operation)
+    if required_sink and not service.can_write_sink(required_sink):
+        return False
+    return True
 
-    Writes are allowed for:
-    - Admin users
-    - Trusted service principals
 
-    Regular users cannot write to shared memory.
-    """
-    return is_admin(auth_context) or is_trusted_service(auth_context)
+def can_write_saga(auth_context: Any, operation: str) -> bool:
+    """Authorize one canonical SAGA mutation for an admin or service."""
+    if operation not in _SAGA_MUTATION_OPERATIONS:
+        return False
+    if is_admin(auth_context):
+        return True
+    service = get_trusted_service_from_auth_context(auth_context)
+    return service_can_invoke_operation(service, operation)
 
 
 def get_provenance_from_auth_context(
@@ -1784,7 +2599,7 @@ def create_auth_context(
     from .models import AuthContext, TurnInteractivity
 
     author = event.author
-    canonical = None
+    canonical = author
     roles: tuple[str, ...] = ()
     is_service = False
 
@@ -1806,6 +2621,26 @@ def create_auth_context(
     ):
         canonical = registered_service.canonical
         is_service = True
+
+    canonical_resource = event.channel_id
+    if resolver is not None:
+        canonical_resource = resolver.resolve_channel(event.channel_id)
+    extra = event.extra if isinstance(event.extra, dict) else {}
+    visibility = extra.get("channel_visibility")
+    domain = (
+        f"channel:{visibility}"
+        if isinstance(visibility, str) and visibility
+        else "channel"
+    )
+    bridge_instance = extra.get("bridge_instance")
+    if not isinstance(bridge_instance, str) or not bridge_instance:
+        bridge_instance = event.source
+    if (
+        (not isinstance(bridge_instance, str) or not bridge_instance)
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+    ):
+        bridge_instance = f"service:{registered_service.canonical}"
 
     return AuthContext(
         principal=author,
@@ -1831,4 +2666,7 @@ def create_auth_context(
             else None
         ),
         ifc_labels=ifc_labels,
+        domain=domain,
+        resource_id=canonical_resource,
+        bridge_instance=bridge_instance,
     )

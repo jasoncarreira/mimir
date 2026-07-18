@@ -142,26 +142,37 @@ async def test_concurrent_memory_writes_keep_runtime_owned_provenance(
 
 
 @pytest.mark.parametrize(
-    ("trigger", "expected_owner"),
-    [
-        ("scheduled_tick", "service:scheduler"),
-        ("poller", "service:poller"),
-        ("saga_session_end", "service:synthesis"),
-        ("upgrade", "service:system"),
-    ],
+    "trigger",
+    ["scheduled_tick", "poller", "upgrade"],
 )
 @pytest.mark.asyncio
-async def test_real_service_event_contexts_are_accepted_for_memory_store(
-    trigger: str, expected_owner: str, write_store: _WriteStore,
+async def test_service_without_memory_store_capability_is_denied(
+    trigger: str, write_store: _WriteStore,
 ) -> None:
     context = _service_context(trigger, f"{trigger}:owned")
     out = await memory_store.ainvoke({
         "content": trigger, "stream": "episodic",
         "runtime": _runtime(context, f"{trigger}-store"),
     })
+
+    assert "write access denied" in out
+    assert write_store.atom_calls == []
+
+
+@pytest.mark.asyncio
+async def test_synthesis_memory_store_preserves_service_provenance(
+    write_store: _WriteStore,
+) -> None:
+    trigger = "saga_session_end"
+    context = _service_context(trigger, f"{trigger}:owned")
+    out = await memory_store.ainvoke({
+        "content": trigger, "stream": "episodic",
+        "runtime": _runtime(context, f"{trigger}-store"),
+    })
+
     assert "stored" in out
     call = write_store.atom_calls[-1]
-    assert call["owner_principal"] == expected_owner
+    assert call["owner_principal"] == "service:synthesis"
     assert call["origin_channel"] == f"{trigger}:owned"
     assert call["visibility"] == "service"
 

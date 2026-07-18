@@ -83,7 +83,7 @@ async def memory_store(
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
-    if not can_write_saga(auth_context):
+    if not can_write_saga(auth_context, "memory_store"):
         return (
             "memory_store failed: write access denied. "
             "Shared-memory writes require server-provided admin or trusted-service authority."

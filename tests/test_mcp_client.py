@@ -406,9 +406,7 @@ async def test_manager_starts_servers_and_bridges_tools(
 
 
 @pytest.mark.asyncio
-async def test_manager_skips_collisions(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Same server name registered twice (operator misconfig) → second
-    # set's tools all collide and get dropped with a warning.
+async def test_manager_rejects_duplicate_derived_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     from mimir.mcp_client import MCPManager, MCPServerConfig
 
     mgr = MCPManager()
@@ -417,8 +415,8 @@ async def test_manager_skips_collisions(monkeypatch: pytest.MonkeyPatch) -> None
     sessions = {"dup": _FakeSession([_FakeMCPTool("ping")])}
     # _connect is called twice but both go through the same fake session
     _patch_connect(monkeypatch, sessions)
-    tools = await mgr.start_servers([cfg_a, cfg_b])
-    assert [t.name for t in tools] == ["mcp_dup_ping"]
+    with pytest.raises(ValueError, match="duplicate MCP server_config_id"):
+        await mgr.start_servers([cfg_a, cfg_b])
 
 
 @pytest.mark.asyncio
@@ -592,7 +590,7 @@ class TestMCPProvenance:
         assert provenance.schema_digest != ""
         assert provenance.is_tombstoned is False
 
-    def test_provenance_config_digest_excludes_secrets(self) -> None:
+    def test_provenance_config_digest_includes_secret_key_not_value(self) -> None:
         from mimir.mcp_client import MCPServerConfig, _canonical_config_digest
 
         config_with_secret = MCPServerConfig(
@@ -609,7 +607,15 @@ class TestMCPProvenance:
         )
         digest_with = _canonical_config_digest(config_with_secret)
         digest_without = _canonical_config_digest(config_without_secret)
-        assert digest_with == digest_without
+        assert digest_with != digest_without
+
+        rotated = MCPServerConfig(
+            name="github",
+            command="uvx",
+            args=["mcp-server-github"],
+            env={"GITHUB_TOKEN": "rotated-secret"},
+        )
+        assert _canonical_config_digest(rotated) == digest_with
 
     def test_provenance_schema_digest(self) -> None:
         from mimir.mcp_client import _schema_digest
@@ -688,6 +694,154 @@ class TestMCPProvenance:
         )
         assert drifted.is_tombstoned is True
 
+    def test_secret_rotation_is_stable_but_reference_and_key_changes_drift(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.mcp_client import MCPServerConfig, _canonical_config_digest
+
+        monkeypatch.setenv("GMAIL_TOKEN", "first-secret")
+        original = MCPServerConfig.from_dict({
+            "name": "mail", "command": "mail-mcp",
+            "env": {"AUTH_TOKEN": "Bearer ${GMAIL_TOKEN}"},
+        })
+        monkeypatch.setenv("GMAIL_TOKEN", "rotated-secret")
+        rotated = MCPServerConfig.from_dict({
+            "name": "mail", "command": "mail-mcp",
+            "env": {"AUTH_TOKEN": "Bearer ${GMAIL_TOKEN}"},
+        })
+        changed_ref = MCPServerConfig.from_dict({
+            "name": "mail", "command": "mail-mcp",
+            "env": {"AUTH_TOKEN": "Bearer ${OTHER_TOKEN}"},
+        })
+        changed_key = MCPServerConfig.from_dict({
+            "name": "mail", "command": "mail-mcp",
+            "env": {"CREDENTIAL": "Bearer ${GMAIL_TOKEN}"},
+        })
+
+        digest = _canonical_config_digest(original)
+        assert _canonical_config_digest(rotated) == digest
+        assert _canonical_config_digest(changed_ref) != digest
+        assert _canonical_config_digest(changed_key) != digest
+        assert "first-secret" not in json.dumps(original.env_identity)
+
+    def test_derived_server_and_tool_ids_are_stable(self) -> None:
+        from mimir.mcp_client import MCPProvenance, MCPServerConfig
+
+        first_config = MCPServerConfig(name="mail", command="mail-mcp", args=[])
+        second_config = MCPServerConfig(name="mail", command="mail-mcp", args=[])
+        first = MCPProvenance.create(first_config, "send", {})
+        second = MCPProvenance.create(second_config, "send", {})
+
+        assert first_config.server_config_id == second_config.server_config_id
+        assert first.server_config_id == second.server_config_id
+        assert first.tool_id == second.tool_id
+
+
+class TestMCPDurableIdentity:
+    @pytest.mark.asyncio
+    async def test_ambiguous_display_name_collision_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.mcp_client import MCPManager, MCPServerConfig
+
+        configs = [
+            MCPServerConfig(name="a_b", command="x", args=[], server_config_id="server-ab"),
+            MCPServerConfig(name="a", command="y", args=[], server_config_id="server-a"),
+        ]
+        _patch_connect(monkeypatch, {
+            "a_b": _FakeSession([_FakeMCPTool("c")]),
+            "a": _FakeSession([_FakeMCPTool("b_c")]),
+        })
+
+        with pytest.raises(ValueError, match="display-name collision"):
+            await MCPManager().start_servers(configs)
+
+    @pytest.mark.asyncio
+    async def test_duplicate_explicit_id_fails_before_connect(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.mcp_client import MCPManager, MCPServerConfig
+
+        called = False
+
+        async def connect(*_args):  # type: ignore[no-untyped-def]
+            nonlocal called
+            called = True
+
+        monkeypatch.setattr(MCPManager, "_connect", connect)
+        configs = [
+            MCPServerConfig(name="one", command="x", args=[], server_config_id="shared"),
+            MCPServerConfig(name="two", command="y", args=[], server_config_id="shared"),
+        ]
+        with pytest.raises(ValueError, match="duplicate MCP server_config_id"):
+            await MCPManager().start_servers(configs)
+        assert called is False
+
+    @pytest.mark.asyncio
+    async def test_restart_persists_identity_and_tombstones_removed_tool(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        from mimir.mcp_client import MCPManager, MCPServerConfig, get_tool_provenance
+
+        path = tmp_path / "mcp-policy.json"
+        config = MCPServerConfig(
+            name="mail", command="mail-mcp", args=[], server_config_id="mail-production",
+        )
+        sessions = {"mail": _FakeSession([_FakeMCPTool("send"), _FakeMCPTool("draft")])}
+        _patch_connect(monkeypatch, sessions)
+        first_tools = await MCPManager(policy_store_path=path).start_servers([config])
+        first_ids = {
+            get_tool_provenance(tool).original_tool_name: get_tool_provenance(tool).tool_id
+            for tool in first_tools
+        }
+
+        sessions["mail"] = _FakeSession([_FakeMCPTool("send")])
+        second_manager = MCPManager(policy_store_path=path)
+        second_tools = await second_manager.start_servers([config])
+        second = get_tool_provenance(second_tools[0])
+        assert second is not None
+        assert second.tool_id == first_ids["send"]
+        assert second_manager.policy_records[first_ids["draft"]]["is_tombstoned"] is True
+        assert second_manager.policy_records[first_ids["draft"]]["original_tool_name"] == "draft"
+
+    @pytest.mark.asyncio
+    async def test_policy_store_never_contains_expanded_secret(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        from mimir.mcp_client import MCPManager, MCPServerConfig
+
+        monkeypatch.setenv("GMAIL_TOKEN", "expanded-super-secret")
+        config = MCPServerConfig.from_dict({
+            "name": "mail", "command": "mail-mcp",
+            "env": {"AUTH_TOKEN": "${GMAIL_TOKEN}"},
+        })
+        path = tmp_path / "mcp-policy.json"
+        _patch_connect(monkeypatch, {"mail": _FakeSession([_FakeMCPTool("send")])})
+
+        await MCPManager(policy_store_path=path).start_servers([config])
+
+        persisted = path.read_text(encoding="utf-8")
+        assert "expanded-super-secret" not in persisted
+
+    @pytest.mark.asyncio
+    async def test_persisted_endpoint_mismatch_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        from mimir.mcp_client import MCPManager, MCPServerConfig
+
+        path = tmp_path / "mcp-policy.json"
+        original = MCPServerConfig(
+            name="mail", command="mail-mcp", args=[], server_config_id="shared-id",
+        )
+        _patch_connect(monkeypatch, {"mail": _FakeSession([_FakeMCPTool("send")])})
+        await MCPManager(policy_store_path=path).start_servers([original])
+
+        changed = MCPServerConfig(
+            name="calendar", command="calendar-mcp", args=[], server_config_id="shared-id",
+        )
+        with pytest.raises(ValueError, match="endpoint mismatch"):
+            await MCPManager(policy_store_path=path).start_servers([changed])
+
 
 class TestMCPAdapterRegistry:
     """Tests for MCP adapter registry."""
@@ -720,6 +874,22 @@ class TestMCPAdapterRegistry:
 
         assert get_mcp_adapter_info("nonexistent") is None
 
+    @pytest.mark.parametrize(
+        ("source", "sink", "expected"),
+        [(True, False, "source"), (False, True, "sink"),
+         (True, True, "both"), (False, False, "neither")],
+    )
+    def test_config_preserves_explicit_flow_direction(
+        self, source: bool, sink: bool, expected: str,
+    ) -> None:
+        from mimir.mcp_client import MCPAdapterConfig
+
+        adapter = MCPAdapterConfig.from_dict({
+            "name": "policy", "version": "v1", "policy_version": "p1",
+            "source": source, "sink": sink,
+        })
+        assert adapter.flow_direction == expected
+
 
 class TestMCPResourceAdapter:
     """Tests for MCP authorization (chainlink #870)."""
@@ -749,6 +919,56 @@ class TestMCPResourceAdapter:
 
         decision = MCPResourceAdapter.get_decision("mcp_github_ping", None)
         assert decision == OperationDecision.ADMIN_REQUIRED
+
+    def test_missing_flow_direction_fails_closed_before_classifier(self) -> None:
+        from mimir.access_control import ToolRegistry
+        from mimir.mcp_client import (
+            MCPAuthorizationResult,
+            MCPProvenance,
+            MCPServerConfig,
+            _bridge_mcp_tool,
+            register_mcp_adapter,
+        )
+        from mimir.models import AuthContext
+
+        called = False
+
+        def classifier(request):  # type: ignore[no-untyped-def]
+            nonlocal called
+            called = True
+            return MCPAuthorizationResult(
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True,
+                source_resources=("repo-1",),
+            )
+
+        config = MCPServerConfig(name="github", command="x", args=[])
+        provenance = replace(
+            MCPProvenance.create(config, "get_repository", {}),
+            classification="resource_scoped",
+            adapter_name="github-policy",
+            adapter_version="v1",
+            policy_version="p1",
+        )
+        register_mcp_adapter("github-policy", "v1", "p1", classifier)
+        tool = _bridge_mcp_tool(
+            server_name="github", tool_name="get_repository", description="",
+            input_schema={}, session=object(), provenance=provenance,
+        )
+        context = AuthContext(
+            principal="alice", canonical_principal="alice", roles=("admin",),
+            event_ingress="bridge", trigger="user_message", channel_id="ch-1",
+            interactivity=None, enforcement_enabled=True,
+        )
+
+        authorization = ToolRegistry().authorize_tool(
+            tool.name, context, enforce=True, mcp_tool=tool,
+            arguments={"repository": "repo-1"},
+        )
+
+        assert authorization.allowed is False
+        assert authorization.reason == "mcp_unknown_flow_direction"
+        assert called is False
 
     def test_non_mcp_tool_passes_through(self) -> None:
         from mimir.access_control import MCPResourceAdapter
@@ -882,7 +1102,7 @@ class TestMCPResourceAdapter:
 
         assert authorization.decision == OperationDecision.ADMIN_REQUIRED
         assert authorization.allowed is False
-        assert authorization.reason == "admin_required"
+        assert authorization.reason == "mcp_unknown_flow_direction"
 
     def test_mcp_tool_with_tombstoned_provenance_requires_admin(self) -> None:
         from mimir.access_control import (
@@ -1136,3 +1356,272 @@ class TestWrapperMetadataLoss:
         config = MCPServerConfig(name="test", command="x", args=[])
         result = check_tool_drift(FakeTool(), config, "ping", {})
         assert result is None
+
+
+class TestProductionMCPPolicyWiring:
+    """Durable policy is applied by the same manager path production uses."""
+
+    @staticmethod
+    def _config(*, schema: dict | None = None) -> MCPServerConfig:
+        from mimir.mcp_client import _canonical_config_digest, _schema_digest
+
+        schema = schema or {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repository": {"type": "string"},
+            },
+            "required": ["owner", "repository"],
+        }
+        base = MCPServerConfig(name="github", command="x", args=[])
+        return MCPServerConfig.from_dict({
+            "name": "github",
+            "command": "x",
+            "server_config_id": "github-production",
+            "policy_version": "policy-v1",
+            "adapters": [{
+                "name": "github-owner",
+                "version": "adapter-v1",
+                "policy_version": "policy-v1",
+                "owner_argument": "owner",
+                "resource_argument": "repository",
+                "source": True,
+            }],
+            "tool_policies": [{
+                "tool_name": "get_repository",
+                "classification": "resource_scoped",
+                "adapter_name": "github-owner",
+                "adapter_version": "adapter-v1",
+                "approval_version": "approval-v1",
+                "policy_version": "policy-v1",
+                "config_digest": _canonical_config_digest(base),
+                "schema_digest": _schema_digest(schema),
+            }],
+        })
+
+    @pytest.mark.asyncio
+    async def test_manager_applies_policy_and_preserves_identity_on_restart(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from contextlib import AsyncExitStack
+        from mimir.mcp_client import (
+            MCPConnection,
+            MCPManager,
+            clear_mcp_adapter_registry,
+            get_tool_provenance,
+        )
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repository": {"type": "string"},
+            },
+            "required": ["owner", "repository"],
+        }
+
+        class Tool:
+            name = "get_repository"
+            description = ""
+            inputSchema = schema
+
+        class Session:
+            async def list_tools(self):  # type: ignore[no-untyped-def]
+                return type("Result", (), {"tools": [Tool()]})()
+
+        async def connect(_manager, config):  # type: ignore[no-untyped-def]
+            return MCPConnection(config, Session(), AsyncExitStack())
+
+        clear_mcp_adapter_registry()
+        monkeypatch.setattr(MCPManager, "_connect", connect)
+        config = self._config(schema=schema)
+        first = await MCPManager().start_servers([config])
+        second = await MCPManager().start_servers([config])
+
+        first_provenance = get_tool_provenance(first[0])
+        second_provenance = get_tool_provenance(second[0])
+        assert first_provenance is not None
+        assert second_provenance is not None
+        assert first_provenance.server_config_id == "github-production"
+        assert second_provenance.server_config_id == first_provenance.server_config_id
+        assert first_provenance.classification == "resource_scoped"
+        assert first_provenance.is_tombstoned is False
+        assert getattr(first[0], "mcp_provenance") is first_provenance
+
+        from mimir.mcp_client import clear_provenance_registry
+
+        clear_provenance_registry()
+        assert get_tool_provenance(first[0]) is first_provenance
+
+    @pytest.mark.asyncio
+    async def test_discovery_marks_schema_drift_stale(self) -> None:
+        from contextlib import AsyncExitStack
+        from mimir.mcp_client import MCPConnection, get_tool_provenance, validate_mcp_policy
+
+        approved_schema = {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repository": {"type": "string"},
+            },
+            "required": ["owner", "repository"],
+        }
+        changed_schema = {**approved_schema, "required": ["repository"]}
+
+        class Tool:
+            name = "get_repository"
+            description = ""
+            inputSchema = changed_schema
+
+        class Session:
+            async def list_tools(self):  # type: ignore[no-untyped-def]
+                return type("Result", (), {"tools": [Tool()]})()
+
+        tools = await MCPConnection(
+            self._config(schema=approved_schema), Session(), AsyncExitStack()
+        ).discover_tools()
+        provenance = get_tool_provenance(tools[0])
+        assert provenance is not None and provenance.is_tombstoned
+        assert validate_mcp_policy(tools)[0]["reason"] == "drift"
+
+    @pytest.mark.parametrize(
+        ("arguments", "allowed", "reason"),
+        [
+            ({"owner": "alice", "repository": "repo-1"}, True, None),
+            ({"owner": "bob", "repository": "repo-1"}, False, "mcp_wrong_owner"),
+            ({"owner": "alice", "repository": "*"}, False, "mcp_resource_wildcard"),
+            ({"owner": "alice", "repository": "secrets/*"}, False, "mcp_resource_wildcard"),
+            ({"owner": "alice", "repository": ["a", "b"]}, False, "mcp_resource_unknown"),
+            ({"owner": "alice"}, False, "mcp_resource_unknown"),
+        ],
+    )
+    def test_argument_resource_authorization(
+        self, arguments: dict, allowed: bool, reason: str | None,
+    ) -> None:
+        from mimir.access_control import ToolRegistry
+        from mimir.mcp_client import (
+            MCPProvenance,
+            _bridge_mcp_tool,
+            clear_mcp_adapter_registry,
+            register_configured_mcp_adapters,
+        )
+        from mimir.models import AuthContext, InformationFlowLabels
+
+        config = self._config()
+        register_configured_mcp_adapters([config])
+        policy = config.tool_policies[0]
+        provenance = replace(
+            MCPProvenance.create(
+                config, "get_repository", {
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string"},
+                        "repository": {"type": "string"},
+                    },
+                    "required": ["owner", "repository"],
+                },
+                server_config_id=config.server_config_id,
+            ),
+            classification=policy.classification,
+            adapter_name=policy.adapter_name,
+            adapter_version=policy.adapter_version,
+            approval_version=policy.approval_version,
+            policy_version=policy.policy_version,
+        )
+        tool = _bridge_mcp_tool(
+            server_name="github",
+            tool_name="get_repository",
+            description="",
+            input_schema={},
+            session=object(),
+            provenance=provenance,
+        )
+        context = AuthContext(
+            principal="alice",
+            canonical_principal="alice",
+            roles=("user",),
+            event_ingress="bridge",
+            trigger="user_message",
+            channel_id="ch-1",
+            interactivity=None,
+            enforcement_enabled=True,
+        )
+        authorization = ToolRegistry().authorize_tool(
+            tool.name,
+            context,
+            enforce=True,
+            mcp_tool=tool,
+            arguments=arguments,
+            ifc_labels=InformationFlowLabels(),
+        )
+        assert authorization.allowed is allowed
+        assert authorization.reason == reason
+        clear_mcp_adapter_registry()
+
+    def test_missing_adapter_and_exception_fail_closed(self) -> None:
+        from mimir.access_control import ToolRegistry
+        from mimir.mcp_client import (
+            MCPProvenance,
+            _bridge_mcp_tool,
+            clear_mcp_adapter_registry,
+            register_mcp_adapter,
+        )
+        from mimir.models import AuthContext
+
+        config = self._config()
+        policy = config.tool_policies[0]
+        provenance = replace(
+            MCPProvenance.create(config, "get_repository", {}, server_config_id=config.server_config_id),
+            classification=policy.classification,
+            adapter_name=policy.adapter_name,
+            adapter_version=policy.adapter_version,
+            approval_version=policy.approval_version,
+            policy_version=policy.policy_version,
+        )
+        tool = _bridge_mcp_tool(
+            server_name="github", tool_name="get_repository", description="",
+            input_schema={}, session=object(), provenance=provenance,
+        )
+        context = AuthContext(
+            principal="alice", canonical_principal="alice", roles=("user",),
+            event_ingress="bridge", trigger="user_message", channel_id="ch-1",
+            interactivity=None, enforcement_enabled=True,
+        )
+        clear_mcp_adapter_registry()
+        missing = ToolRegistry().authorize_tool(
+            tool.name, context, enforce=True, mcp_tool=tool,
+            arguments={"owner": "alice", "repository": "repo-1"},
+        )
+        assert missing.reason == "mcp_missing_adapter"
+        assert missing.allowed is False
+
+        shadow_missing = ToolRegistry().authorize_tool(
+            tool.name, context, enforce=False, mcp_tool=tool,
+            arguments={"owner": "alice", "repository": "repo-1"},
+        )
+        assert shadow_missing.allowed is True
+        assert shadow_missing.is_shadow_decision is True
+        assert shadow_missing.reason == "mcp_missing_adapter"
+
+        def explode(_request):  # type: ignore[no-untyped-def]
+            raise RuntimeError("secret must not authorize")
+
+        register_mcp_adapter(
+            "github-owner", "adapter-v1", "policy-v1", explode,
+            flow_direction="source",
+        )
+        failed = ToolRegistry().authorize_tool(
+            tool.name, context, enforce=True, mcp_tool=tool,
+            arguments={"owner": "alice", "repository": "repo-1"},
+        )
+        assert failed.reason == "mcp_adapter_exception"
+        assert failed.allowed is False
+
+        shadow_failed = ToolRegistry().authorize_tool(
+            tool.name, context, enforce=False, mcp_tool=tool,
+            arguments={"owner": "alice", "repository": "repo-1"},
+        )
+        assert shadow_failed.allowed is True
+        assert shadow_failed.is_shadow_decision is True
+        assert shadow_failed.reason == "mcp_adapter_exception"
+        clear_mcp_adapter_registry()

@@ -33,10 +33,75 @@ from mimir.server import (
     _is_auth_exempt,
     _make_auth_middleware,
     _safe_str_eq,
+    _start_mcp_servers,
     _handle_health,
     _handle_event,
     _handle_root,
 )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MCP production startup wiring
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_start_mcp_servers_publishes_tools_and_policy_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from mimir.mcp_client import MCPProvenance, MCPServerConfig
+
+    config = MCPServerConfig(
+        name="demo",
+        command="demo-server",
+        args=[],
+        server_config_id="demo-production",
+        policy_version="policy-v2",
+    )
+    provenance = replace(
+        MCPProvenance.create(
+            config,
+            "read_item",
+            {},
+            server_config_id=config.server_config_id,
+        ),
+        classification="resource_scoped",
+        adapter_name="demo-owner",
+        adapter_version="adapter-v1",
+        approval_version="approval-v1",
+        policy_version="policy-v1",
+    )
+    tool = SimpleNamespace(name="mcp_demo_read_item", mcp_provenance=provenance)
+    manager = MagicMock()
+    manager.start_servers = AsyncMock(return_value=[tool])
+    manager.shutdown = AsyncMock()
+    published: list[Any] = []
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    monkeypatch.setattr("mimir.mcp_client.MCPManager", lambda: manager)
+    monkeypatch.setattr("mimir.tools.set_mcp_tools", lambda tools: published.extend(tools))
+
+    async def capture(kind: str, **fields: Any) -> None:
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.server.log_event", capture)
+    app = web.Application()
+
+    await _start_mcp_servers(app, [config])
+
+    manager.start_servers.assert_awaited_once_with([config])
+    assert published == [tool]
+    assert app["mcp_manager"] is manager
+    assert events[0] == (
+        "mcp_servers_ready",
+        {"count": 1, "tool_names": ["mcp_demo_read_item"]},
+    )
+    attention = next(fields for kind, fields in events if kind == "mcp_policy_attention_required")
+    assert attention["count"] >= 1
+    assert any(issue.get("actual_policy") == "policy-v1" for issue in attention["issues"])
 
 
 # ──────────────────────────────────────────────────────────────────────────────

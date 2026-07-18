@@ -362,10 +362,12 @@ class _ServicePrincipalToolProbeAgent(_FakeAgent):
 
         ctx = get_current_turn()
         assert ctx is not None
+        sink_target = "git status" if self.tool_name == "shell_exec" else None
         auth = get_tool_registry().authorize_tool(
             self.tool_name,
             ctx.auth_context,
             enforce=True,
+            target_channel=sink_target,
         )
         self.observed_principal = (
             auth.service_principal.canonical if auth.service_principal else None
@@ -381,7 +383,11 @@ class _ServicePrincipalToolProbeAgent(_FakeAgent):
             ToolCallRequest(
                 tool_call={
                     "name": self.tool_name,
-                    "args": {},
+                    "args": (
+                        {"command": sink_target}
+                        if self.tool_name == "shell_exec"
+                        else {}
+                    ),
                     "id": "tc-service-principal",
                     "type": "tool_call",
                 },
@@ -1384,6 +1390,8 @@ async def test_run_turn_injects_chat_skill_prompt_block_from_injected_registry(
         trigger="user_message",
         channel_id="ch-1",
         content="/memory remember this",
+        author="test-user",
+        source="test",
         extra={
             CHAT_SKILL_EXTRA_KEY: asdict(
                 ChatSkillInvocation(
@@ -1430,6 +1438,8 @@ async def test_run_turn_chat_skill_without_injected_registry_notifies_and_skips_
         trigger="user_message",
         channel_id="ch-1",
         content="/memory remember this",
+        author="test-user",
+        source="test",
         extra={
             CHAT_SKILL_EXTRA_KEY: asdict(
                 ChatSkillInvocation(
@@ -1493,6 +1503,8 @@ async def test_run_turn_chat_skill_runtime_failure_notifies_and_logs(
         trigger="user_message",
         channel_id="ch-1",
         content="/memory remember this",
+        author="test-user",
+        source="test",
         extra={
             CHAT_SKILL_EXTRA_KEY: asdict(
                 ChatSkillInvocation(
@@ -1551,6 +1563,8 @@ async def test_run_turn_chat_skill_early_exception_notifies_and_logs(
         trigger="user_message",
         channel_id="ch-1",
         content="/memory remember this",
+        author="test-user",
+        source="test",
         extra={
             CHAT_SKILL_EXTRA_KEY: asdict(
                 ChatSkillInvocation(
@@ -1827,7 +1841,10 @@ async def test_run_turn_auto_delivers_final_text_when_enabled(tmp_path: Path):
     agent._config.auto_deliver_final_text_channels = ("ch-",)
     agent._config.resend_nudge_channels = ("ch-",)
 
-    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="hi",
+        author="test-user", source="test",
+    )
     record = await agent.run_turn(event)
 
     assert record.error is None
@@ -1862,7 +1879,10 @@ async def test_run_turn_auto_deliver_strips_actions_and_dispatches_react(
     agent._channels = registry  # type: ignore[attr-defined]
     agent._config.auto_deliver_final_text_channels = ("ch-",)
 
-    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="hi",
+        author="test-user", source="test",
+    )
     record = await agent.run_turn(event)
 
     assert record.error is None
@@ -1898,6 +1918,8 @@ async def test_run_turn_auto_deliver_actions_only_posts_no_blank_and_reacts(
         channel_id="ch-1",
         content="hi",
         source_id="incoming-1",
+        author="test-user",
+        source="test",
     )
     record = await agent.run_turn(event)
 
@@ -1928,7 +1950,10 @@ async def test_run_turn_auto_deliver_react_failure_is_best_effort(tmp_path: Path
     agent._channels = registry  # type: ignore[attr-defined]
     agent._config.auto_deliver_final_text_channels = ("ch-",)
 
-    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="hi",
+        author="test-user", source="test",
+    )
     record = await agent.run_turn(event)
 
     assert record.error is None
@@ -3574,10 +3599,21 @@ async def test_no_deliver_notice_when_unset_on_early_crash(
 
 
 def _ifc_for_channel(channel_id: str, *, trigger: str = "user_message"):
+    from mimir.models import SourceLabel
+
+    bridge_instance = channel_id.split("-", 1)[0]
     return {
         "ifc_labels": InformationFlowLabels(
             labels=frozenset({"private"}),
             source_channels=frozenset({channel_id}),
+            sources=frozenset({SourceLabel(
+                principal="test-user",
+                domain="channel",
+                resource_id=channel_id,
+                bridge_instance=bridge_instance,
+                sensitivity="private",
+                authorized_principals=frozenset({"test-user"}),
+            )}),
         ),
         "auth_context": AuthContext(
             principal="test-user",
@@ -3588,6 +3624,9 @@ def _ifc_for_channel(channel_id: str, *, trigger: str = "user_message"):
             channel_id=channel_id,
             interactivity=TurnInteractivity.INTERACTIVE,
             enforcement_enabled=True,
+            domain="channel",
+            resource_id=channel_id,
+            bridge_instance=bridge_instance,
         ),
     }
 

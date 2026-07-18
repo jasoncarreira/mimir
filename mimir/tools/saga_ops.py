@@ -132,7 +132,7 @@ async def saga_feedback(
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
-    if not can_write_saga(auth_context):
+    if not can_write_saga(auth_context, "saga_feedback"):
         return (
             "saga_feedback failed: write access denied. "
             "Feedback requires server-provided admin or trusted-service authority."
@@ -184,7 +184,7 @@ async def saga_mark_contributions(
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
-    if not can_write_saga(auth_context):
+    if not can_write_saga(auth_context, "saga_mark_contributions"):
         return (
             "saga_mark_contributions failed: write access denied. "
             "Contribution credit requires server-provided admin or trusted-service authority."
@@ -253,7 +253,7 @@ async def saga_end_session(
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
-    if not can_write_saga(auth_context):
+    if not can_write_saga(auth_context, "saga_end_session"):
         return (
             "saga_end_session failed: write access denied. "
             "Session writes require server-provided admin or trusted-service authority."
@@ -336,7 +336,7 @@ async def saga_forget(
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
-    if not can_write_saga(auth_context):
+    if not can_write_saga(auth_context, "saga_forget"):
         return (
             "saga_forget failed: write access denied. "
             "Forget operations require server-provided admin or trusted-service authority."
@@ -411,7 +411,7 @@ async def saga_record_skill_learning(
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
-    if not can_write_saga(auth_context):
+    if not can_write_saga(auth_context, "saga_record_skill_learning"):
         return (
             "saga_record_skill_learning failed: write access denied. "
             "Skill-learning writes require server-provided admin or trusted-service authority."

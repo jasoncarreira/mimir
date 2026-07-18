@@ -15,13 +15,11 @@ output rather than having to poll ``bash_jobs_list``.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
-from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Annotated, Any, Callable, Optional
 
-from langchain_core.tools import tool
+from langchain_core.tools import InjectedToolArg, tool
 
 from ..shell_jobs import (
     SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES,
@@ -216,12 +214,14 @@ def set_shell_job_registry(
 async def bash_async(
     command: str,
     session_id: Optional[str] = None,
+    mimir_direct_argv: Annotated[Optional[list[str]], InjectedToolArg] = None,
 ) -> str:
     """Args:
         command: The shell command to spawn. Runs via ``bash -lc`` so
             PATH and login env are loaded.
         session_id: Optional saga session id, threaded onto the
             completion event so it routes back to the right channel.
+        mimir_direct_argv: Server-injected exact argv for trusted-service calls.
     """
     if _REGISTRY is None:
         return "bash_async failed: no shell-job registry configured"
@@ -306,12 +306,22 @@ async def bash_async(
                 )
 
     try:
-        from ._shell_env import login_shell_command
+        from ._shell_env import direct_exec_env, login_shell_command
+        argv = (
+            mimir_direct_argv
+            if mimir_direct_argv is not None
+            else ["bash", "-lc", login_shell_command(command)]
+        )
+        spawn_kwargs: dict[str, Any] = {
+            "argv": argv,
+            "channel_id": channel_id,
+            "on_complete": _ON_COMPLETE,
+        }
+        if mimir_direct_argv is not None:
+            spawn_kwargs["env_overlay"] = direct_exec_env()
         job = _REGISTRY.spawn(
             command,  # original (clean) command recorded for display
-            argv=["bash", "-lc", login_shell_command(command)],
-            channel_id=channel_id,
-            on_complete=_ON_COMPLETE,
+            **spawn_kwargs,
         )
         job.ifc_labels = getattr(ctx, "ifc_labels", None)
     except Exception as exc:  # noqa: BLE001

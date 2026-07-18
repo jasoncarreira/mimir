@@ -16,8 +16,10 @@ from mimir.access_control import (
     ToolRegistry,
     get_service_principal,
 )
-from mimir.models import AuthContext, InformationFlowLabels
+from mimir.models import AuthContext, InformationFlowLabels, SourceLabel
 from mimir.tools import budget_gate
+from mimir.tools.extra import shell_exec
+from mimir.tools.shell_async import bash_async
 
 
 _OLD_ADMIN_TOOLS = {
@@ -42,14 +44,14 @@ _OLD_ADMIN_TOOLS = {
 }
 
 _NEWLY_CATALOGED_TOOLS = {
-    "memory_store": OperationDecision.OPEN,
+    "memory_store": OperationDecision.ADMIN_REQUIRED,
     "memory_query": OperationDecision.OPEN,
     "memory_get": OperationDecision.OPEN,
-    "saga_feedback": OperationDecision.OPEN,
-    "saga_mark_contributions": OperationDecision.OPEN,
-    "saga_end_session": OperationDecision.OPEN,
-    "saga_record_skill_learning": OperationDecision.OPEN,
-    "bash_jobs_list": OperationDecision.OPEN,
+    "saga_feedback": OperationDecision.ADMIN_REQUIRED,
+    "saga_mark_contributions": OperationDecision.ADMIN_REQUIRED,
+    "saga_end_session": OperationDecision.ADMIN_REQUIRED,
+    "saga_record_skill_learning": OperationDecision.ADMIN_REQUIRED,
+    "bash_jobs_list": OperationDecision.ADMIN_REQUIRED,
     "bash_job_output": OperationDecision.ADMIN_REQUIRED,
     "write_todos": OperationDecision.OPEN,
     "defer_injected_message": OperationDecision.OPEN,
@@ -79,10 +81,26 @@ def _auth_context(
 
 
 def _service_labels(event) -> InformationFlowLabels:
+    principal = f"service:{event.service_principal}" if event.service_principal else None
     return InformationFlowLabels(
         labels=frozenset({"internal"}),
         source_channels=frozenset({event.channel_id}) if event.channel_id else frozenset(),
+        sources=frozenset({SourceLabel(
+            principal=principal,
+            domain="channel",
+            resource_id=event.channel_id,
+            bridge_instance=event.source,
+            sensitivity="internal",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+        )}),
     )
+
+
+@pytest.mark.parametrize("shell_tool", [shell_exec, bash_async])
+def test_direct_argv_is_hidden_from_model_tool_schema(shell_tool) -> None:
+    properties = shell_tool.tool_call_schema.model_json_schema()["properties"]
+
+    assert "mimir_direct_argv" not in properties
 
 
 def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
@@ -91,6 +109,19 @@ def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
     assert _OLD_ADMIN_TOOLS <= catalog._ADMIN_REQUIRED_OPERATIONS
     assert catalog.get_decision("mcp__mimir__shell_exec") == OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("mcp_mimir_shell_exec") == OperationDecision.ADMIN_REQUIRED
+
+
+def test_open_catalog_excludes_protected_global_metadata() -> None:
+    catalog = OperationCatalog()
+
+    assert not (
+        catalog._OPEN_OPERATIONS & catalog._PROTECTED_METADATA_OPERATIONS
+    )
+    assert catalog._PROTECTED_METADATA_OPERATIONS <= catalog._ADMIN_REQUIRED_OPERATIONS
+    assert {
+        catalog.get_decision("bash_jobs_list"),
+        catalog.get_decision("bash_job_output"),
+    } == {OperationDecision.ADMIN_REQUIRED}
 
 
 @pytest.mark.parametrize(
@@ -114,6 +145,8 @@ def test_factory_operations_are_cataloged_as_admin_required(operation: str) -> N
 @pytest.mark.parametrize("operation", ["spawn_open_code", "task"])
 def test_scheduler_service_principal_can_invoke_factory_operations(
     operation: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.access_control import create_auth_context
     from mimir.models import AgentEvent
@@ -127,7 +160,13 @@ def test_scheduler_service_principal_can_invoke_factory_operations(
         event, enforce=True, ifc_labels=_service_labels(event),
     )
 
-    decision = ToolRegistry().authorize_tool(operation, auth, enforce=True)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    decision = ToolRegistry().authorize_tool(
+        operation,
+        auth,
+        enforce=True,
+        target_channel=str(tmp_path) if operation == "spawn_open_code" else None,
+    )
 
     assert decision.allowed is True
     assert decision.decision == OperationDecision.ADMIN_REQUIRED
@@ -311,7 +350,9 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
         allowed_operation,
         ctx,
         enforce=True,
-        target_channel=f"{trigger}:target",
+        target_channel=(
+            "git status" if allowed_operation == "shell_exec" else f"{trigger}:target"
+        ),
     )
     denied = registry.authorize_tool(denied_operation, ctx, enforce=True)
 
@@ -338,17 +379,23 @@ def test_service_authorization_is_stable_under_inventory_mutation_and_surface_wi
     )
     scheduler = create_auth_context(event, enforce=True, ifc_labels=_service_labels(event))
 
-    before = registry.authorize_tool("shell_exec", scheduler, enforce=True)
+    before = registry.authorize_tool(
+        "shell_exec", scheduler, enforce=True, target_channel="git status"
+    )
     registry.register_runtime_tools(
         [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
     )
-    with_full_surface = registry.authorize_tool("shell_exec", scheduler, enforce=True)
+    with_full_surface = registry.authorize_tool(
+        "shell_exec", scheduler, enforce=True, target_channel="git status"
+    )
     denied_with_full_surface = registry.authorize_tool(
         "request_mimir_update", scheduler, enforce=True
     )
     registry.clear()
     registry.register_runtime_tools([SimpleNamespace(name="send_message")])
-    with_narrow_surface = registry.authorize_tool("shell_exec", scheduler, enforce=True)
+    with_narrow_surface = registry.authorize_tool(
+        "shell_exec", scheduler, enforce=True, target_channel="git status"
+    )
     denied_with_narrow_surface = registry.authorize_tool(
         "request_mimir_update", scheduler, enforce=True
     )
@@ -430,6 +477,92 @@ def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
     finally:
         _TRUSTED_SERVICE_PRINCIPALS.clear()
         _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+
+
+def test_capability_matrix_rejects_saga_mutation_without_sink_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    sinks = access_control._OPERATION_SINK_DESTINATION.copy()
+    sinks.pop("memory_store")
+    monkeypatch.setattr(access_control, "_OPERATION_SINK_DESTINATION", sinks)
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert "SAGA mutation 'memory_store' has no sink destination mapping" in errors
+
+
+def test_capability_matrix_rejects_open_saga_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    monkeypatch.setattr(
+        access_control.OperationCatalog,
+        "_OPEN_OPERATIONS",
+        access_control.OperationCatalog._OPEN_OPERATIONS | {"memory_store"},
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert "SAGA mutation 'memory_store' must not be cataloged OPEN" in errors
+
+
+def test_capability_matrix_rejects_service_sink_without_executable_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+    from dataclasses import replace
+
+    scheduler = access_control._TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
+    monkeypatch.setitem(
+        access_control._TRUSTED_SERVICE_PRINCIPALS,
+        "scheduled_tick",
+        replace(
+            scheduler,
+            sink_policies=tuple(
+                policy
+                for policy in scheduler.sink_policies
+                if policy.operation != "shell_exec"
+            ),
+        ),
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert any(
+        "shell_exec' has no executable destination policy" in error
+        for error in errors
+    )
+
+
+def test_capability_matrix_rejects_unbacked_sink_category_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+    from dataclasses import replace
+
+    synthesis = access_control._TRUSTED_SERVICE_PRINCIPALS["saga_session_end"]
+    monkeypatch.setitem(
+        access_control._TRUSTED_SERVICE_PRINCIPALS,
+        "saga_session_end",
+        replace(
+            synthesis,
+            sink_destinations=synthesis.sink_destinations + ("network",),
+        ),
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert any(
+        "sink destination 'network' has no executable destination policy" in error
+        for error in errors
+    )
 
 
 @pytest.mark.parametrize("fail_closed", [True, False])
@@ -582,6 +715,7 @@ def test_scheduler_principal_has_required_capabilities_for_heartbeat() -> None:
     - Checks drift by reading files
     - Reads backlog files
     - Uses shell for jq analysis (shell_exec, bash_async)
+    - Inspects async shell job status/output
     - Writes/edits files (write_file, edit_file)
     """
     scheduler = get_service_principal("scheduled_tick")
@@ -589,7 +723,7 @@ def test_scheduler_principal_has_required_capabilities_for_heartbeat() -> None:
 
     read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn"}
     write_ops = {"write_file", "edit_file"}
-    shell_ops = {"shell_exec", "bash_async"}
+    shell_ops = {"shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"}
     spawn_ops = {"spawn_claude_code", "spawn_codex"}
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
     saga_ops = {"saga_forget"}
@@ -612,6 +746,7 @@ def test_poller_principal_has_required_capabilities() -> None:
     - Uses shell for analysis (shell_exec, bash_async)
     - Writes results (write_file, edit_file)
     - Sends messages to channels (send_message)
+    - Resolves configured channel and DM destinations (list_channels)
     """
     poller = get_service_principal("poller")
     assert poller is not None
@@ -621,7 +756,7 @@ def test_poller_principal_has_required_capabilities() -> None:
     shell_ops = {"shell_exec", "bash_async"}
     spawn_ops = {"spawn_claude_code", "spawn_codex"}
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
-    message_ops = {"send_message"}
+    message_ops = {"send_message", "list_channels"}
     worklink_ops = {"worklink_run"}
 
     all_expected = read_ops | write_ops | shell_ops | spawn_ops | proposal_ops | message_ops | worklink_ops
@@ -684,6 +819,7 @@ def test_system_principal_has_required_capabilities_for_upgrade() -> None:
     - Submits proposals (submit_proposal)
     - Sends operator notifications (send_message)
     - Manages schedules (add_schedule, set_schedule_priority)
+    - Lists schedules before and after migration changes (list_schedules)
     """
     system = get_service_principal("upgrade")
     assert system is not None
@@ -692,7 +828,7 @@ def test_system_principal_has_required_capabilities_for_upgrade() -> None:
     write_ops = {"write_file", "edit_file"}
     shell_ops = {"shell_exec", "bash_async"}
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
-    schedule_ops = {"add_schedule", "set_schedule_priority"}
+    schedule_ops = {"add_schedule", "set_schedule_priority", "list_schedules"}
     message_ops = {"send_message"}
 
     all_expected = read_ops | write_ops | shell_ops | proposal_ops | schedule_ops | message_ops
@@ -741,9 +877,15 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
             trigger=trigger,
             channel_id=f"{trigger}:test",
             service_principal=service_principals.get(trigger),
+            source=trigger,
         )
         ctx = create_auth_context(event, enforce=True, ifc_labels=_service_labels(event))
-        result = registry.authorize_tool(operation, ctx, enforce=True)
+        result = registry.authorize_tool(
+            operation,
+            ctx,
+            enforce=True,
+            target_channel="git status" if operation == "shell_exec" else None,
+        )
 
         if should_allow:
             assert result.allowed is True, f"{trigger} should allow {operation}"
@@ -773,7 +915,9 @@ def test_service_authorization_requires_two_factor_validation() -> None:
         service_principal="scheduler",
     )
     ctx_correct = create_auth_context(event_correct, enforce=True, ifc_labels=_service_labels(event_correct))
-    result_correct = registry.authorize_tool("shell_exec", ctx_correct, enforce=True)
+    result_correct = registry.authorize_tool(
+        "shell_exec", ctx_correct, enforce=True, target_channel="git status"
+    )
     assert result_correct.allowed is True, "Correctly-stamped service should get capabilities"
     assert result_correct.service_principal is not None
     assert result_correct.service_principal.canonical == "scheduler"
