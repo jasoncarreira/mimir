@@ -697,7 +697,7 @@ def test_build_vocab_block_seed_only_on_cold_db(conn):
     path. The non-empty seed guarantees the LLM always sees a canonical
     set, not an empty hint."""
     from mimir.saga.synthesize import build_vocab_block
-    block = build_vocab_block(conn)
+    block = build_vocab_block(conn, owner_principal="legacy_admin")
     # Seed predicates surface as bare names (no counts).
     assert "prefers" in block
     assert "lives_in" in block
@@ -733,7 +733,7 @@ def test_build_vocab_block_surfaces_db_top_n_with_counts(conn):
     store_triples(conn, [
         {"subject": "ACME", "predicate": "employs", "object": "engineers"},
     ], source_atom_id="obs1")
-    block = build_vocab_block(conn)
+    block = build_vocab_block(conn, owner_principal="legacy_admin")
     # DB-derived predicates carry parenthesized counts.
     assert "manufactures (3)" in block
     assert "employs (1)" in block
@@ -750,6 +750,32 @@ def test_build_vocab_block_includes_extra_subjects(conn):
     block = build_vocab_block(conn, extra_subjects=["MyCompany", "MyTeam"])
     assert "MyCompany" in block
     assert "MyTeam" in block
+
+
+def test_build_vocab_block_excludes_other_owner_vocabulary(conn):
+    from mimir.saga.synthesize import build_vocab_block
+
+    _seed_atom(
+        conn, "alice-obs", "alice", owner="alice", domain="channel:private",
+        visibility="private", provenance={"source": "alice"},
+    )
+    _seed_atom(
+        conn, "bob-obs", "bob", owner="bob", domain="channel:private",
+        visibility="private", provenance={"source": "bob"},
+    )
+    store_triples(conn, [
+        {"subject": "AliceProject", "predicate": "alice_secret_relation", "object": "x"},
+    ], source_atom_id="alice-obs", evidence_ids=["alice-obs"])
+    store_triples(conn, [
+        {"subject": "BobProject", "predicate": "bob_secret_relation", "object": "y"},
+    ], source_atom_id="bob-obs", evidence_ids=["bob-obs"])
+
+    block = build_vocab_block(conn, owner_principal="alice")
+
+    assert "AliceProject (1)" in block
+    assert "alice_secret_relation (1)" in block
+    assert "BobProject" not in block
+    assert "bob_secret_relation" not in block
 
 
 def test_build_vocab_block_dedupes_extras_against_seed(conn):

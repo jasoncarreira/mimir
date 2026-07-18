@@ -263,6 +263,16 @@ def test_resource_scoped_operation_is_gated_by_live_path() -> None:
         catalog.disable_shadow_logging()
 
 
+@pytest.mark.parametrize("operation", ["memory_store", "shell_exec"])
+def test_register_operation_refuses_protected_downgrade(operation: str) -> None:
+    catalog = OperationCatalog()
+
+    with pytest.raises(ValueError, match="cannot downgrade protected operation"):
+        catalog.register_operation(operation, OperationDecision.OPEN)
+
+    assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
+
+
 def test_runtime_inventory_replaced_from_final_model_surface() -> None:
     registry = ToolRegistry()
     registry.register_tool("stale")
@@ -537,6 +547,23 @@ def test_capability_matrix_rejects_open_saga_mutation(
         access_control.OperationCatalog,
         "_OPEN_OPERATIONS",
         access_control.OperationCatalog._OPEN_OPERATIONS | {"memory_store"},
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert "SAGA mutation 'memory_store' must not be cataloged OPEN" in errors
+
+
+def test_capability_matrix_rejects_custom_saga_mutation_downgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    monkeypatch.setitem(
+        access_control._global_operation_catalog._custom_decisions,
+        "memory_store",
+        OperationDecision.OPEN,
     )
 
     is_complete, errors = access_control.check_capability_matrix_complete()

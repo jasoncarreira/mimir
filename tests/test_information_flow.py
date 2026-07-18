@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from mimir.access_control import (
+    SinkCategory,
     SinkGate,
     ToolRegistry,
     audit_declassification,
@@ -443,6 +444,10 @@ def test_service_principal_cannot_bypass_incompatible_sink_labels():
         ("shell_exec", "printf untrusted", "shell_process"),
         ("spawn_codex", "untrusted task", "spawn"),
         ("write_file", "/tmp/untrusted", "file"),
+        ("ntfy_send", "alerts", "notification"),
+        ("webhook", "https://example.invalid/hook", "http_webhook"),
+        ("fetch_url", "https://example.invalid", "network"),
+        ("external_tool", "external-server", "external_mcp"),
     ],
 )
 def test_poller_payload_cannot_bypass_active_sink_ifc(
@@ -468,10 +473,43 @@ def test_poller_payload_cannot_bypass_active_sink_ifc(
         _labels(sources=frozenset({"poller:external"})),
         poller,
         enforce=True,
+        sink_category=(
+            SinkCategory.EXTERNAL_MCP if sink_category == "external_mcp" else None
+        ),
     )
 
     assert decision.allowed is False
     assert decision.reason == f"ifc_label_blocked:{sink_category}"
+
+
+def test_visibility_qualified_service_source_is_bound_to_triggering_channel():
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        service_principal="scheduler",
+        extra={"channel_visibility": "private"},
+    )
+    auth = create_auth_context(event, enforce=True)
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({event.channel_id}),
+        sources=frozenset({SourceLabel(
+            principal="service:scheduler",
+            domain="channel:private",
+            resource_id="scheduler:other",
+            bridge_instance="service:scheduler",
+            sensitivity="private",
+            authorized_principals=frozenset({"service:scheduler"}),
+            source_kind="service",
+        )}),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "send_message", event.channel_id, labels, auth, enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
 
 
 @pytest.mark.parametrize(
