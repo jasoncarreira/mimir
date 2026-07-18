@@ -39,7 +39,7 @@ from ..jsonl_snapshot import (
     iter_snapshot_or_tail,
     iter_window_records,
 )
-from ..models import AuthContext, InformationFlowLabels, PromptBlock
+from ..models import AuthContext, InformationFlowLabels, PromptBlock, SourceLabel
 
 # --- Sub-module imports + backward-compat re-exports ---
 from ._models import (  # noqa: F401
@@ -548,19 +548,21 @@ class FeedbackLog:
         content = self.recent_block(auth_context=auth_context)
         if not content:
             return None
-        labels = InformationFlowLabels(labels=frozenset({"private"}))
-        labels = labels.with_source("domain", "feedback")
+        labels = InformationFlowLabels()
+        requester = auth_context.canonical_principal or auth_context.principal
         for resource, records in (("events", events), ("turns", turns)):
-            if records:
-                labels = labels.with_source("resource", resource)
             for record in records:
-                channel = record.get("channel_id")
-                principal = _record_source_principal(record, auth_context)
-                labels = labels.with_channel(channel if isinstance(channel, str) and channel else "unknown")
-                labels = labels.with_source("principal", principal or "unknown")
+                principal = _record_source_principal(record, auth_context) or requester
                 bridge = record.get("bridge") or record.get("source")
-                if isinstance(bridge, str) and bridge:
-                    labels = labels.with_source("bridge", bridge)
+                labels = labels.with_source(SourceLabel(
+                    principal=principal,
+                    domain="feedback",
+                    resource_id=f"{resource}:{record.get('id') or record.get('turn_id') or record.get('timestamp') or record.get('ts')}",
+                    bridge_instance=(bridge if isinstance(bridge, str) and bridge else auth_context.bridge_instance),
+                    sensitivity="private",
+                    authorized_principals=(frozenset({requester}) if requester else frozenset()),
+                    source_kind="protected_prompt",
+                ))
         return PromptBlock(content=content, labels=labels)
 
 

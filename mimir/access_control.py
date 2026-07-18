@@ -672,14 +672,26 @@ class SinkGate:
                 return frozenset()
             if effective_principal not in source.authorized_principals:
                 return frozenset()
-            if (
-                getattr(source, "source_kind", "channel") == "channel"
-                and source.principal != effective_principal
-            ):
-                return frozenset()
-            if source.domain != domain or source.bridge_instance != bridge_instance:
-                return frozenset()
-            if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
+            source_kind = getattr(source, "source_kind", "channel")
+            if source_kind == "channel":
+                if source.principal != effective_principal:
+                    return frozenset()
+                if source.domain != domain or source.bridge_instance != bridge_instance:
+                    return frozenset()
+                if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
+                    return frozenset()
+            elif source_kind == "service":
+                # Trusted service/derived data retains its input ACL. It may
+                # return only to the triggering channel when the effective
+                # destination principal remains in that intersection.
+                if source.domain == "channel":
+                    if source.bridge_instance != bridge_instance:
+                        return frozenset()
+                    if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
+                        return frozenset()
+            elif source_kind != "protected_prompt":
+                # Other derived/tool sources require their own destination adapter;
+                # an ACL alone must not silently widen arbitrary provenance kinds.
                 return frozenset()
         if ChannelResourceAdapter._resolve_channel(resource_id) != resolved_triggering:
             return frozenset()

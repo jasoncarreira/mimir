@@ -311,7 +311,7 @@ def recent_session_boundaries(
         rows = conn.execute(f"""
             SELECT id, channel_id, ended_at, reflected_at, summary,
                    topics_discussed, decisions_made, unfinished,
-                   emotional_state, closed_since
+                   emotional_state, closed_since, owner_principal
             FROM sessions
             WHERE {auth_where}
               AND channel_id = ?
@@ -322,7 +322,7 @@ def recent_session_boundaries(
         rows = conn.execute(f"""
             SELECT id, channel_id, ended_at, reflected_at, summary,
                    topics_discussed, decisions_made, unfinished,
-                   emotional_state, closed_since
+                   emotional_state, closed_since, owner_principal
             FROM sessions
             WHERE {auth_where}
               AND reflected_at IS NOT NULL
@@ -333,7 +333,7 @@ def recent_session_boundaries(
     for r in rows:
         (sid, ch, ended_at, reflected_at, summary,
          topics_json, decisions_json, unfinished_json,
-         emotional_state, closed_since_json) = r
+         emotional_state, closed_since_json, owner_principal) = r
 
         topics = _parse_json_list(topics_json)
         decisions = _parse_json_list(decisions_json)
@@ -372,6 +372,7 @@ def recent_session_boundaries(
             # Channel: both spellings populated.
             "channel_id": ch,
             "channel": ch,
+            "owner_principal": owner_principal,
             # Rendered + raw content. ``summary`` MUST be at the top level
             # — render_session_summaries reads it there, not from metadata.
             "content": content,

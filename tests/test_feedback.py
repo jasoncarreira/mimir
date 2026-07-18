@@ -158,8 +158,8 @@ def test_prompt_feedback_is_owner_and_channel_scoped_before_rendering(tmp_path: 
     assert "BOB-OWN" in block.content
     assert "ALICE-SECRET" not in block.content
     assert "BOB-OTHER-CHANNEL" not in block.content
-    assert block.labels.source_principals == frozenset({"bob"})
-    assert block.labels.source_channels == frozenset({"shared"})
+    assert {source.principal for source in block.labels.sources} == {"bob"}
+    assert all(source.domain == "feedback" for source in block.labels.sources)
 
 
 # ---- Window cutoff -------------------------------------------------------

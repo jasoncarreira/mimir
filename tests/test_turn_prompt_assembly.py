@@ -33,6 +33,7 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     PromptBlock,
+    SourceLabel,
     TurnContext,
 )
 from mimir.saga.client import SagaStore
@@ -73,24 +74,29 @@ def _make_ctx(event: AgentEvent, saga_session_id: str | None = None) -> TurnCont
         started_at=time.monotonic(),
         saga_session_id=saga_session_id,
         auth_context=auth_context,
-        ifc_labels=InformationFlowLabels(
-            source_channels=frozenset({event.channel_id}) if event.channel_id else frozenset(),
-            source_principals=frozenset({event.author}) if event.author else frozenset(),
-            source_domains=frozenset({"ingress"}),
-        ),
+        ifc_labels=InformationFlowLabels().with_source(SourceLabel(
+            principal=event.author,
+            domain="channel",
+            resource_id=event.channel_id,
+            bridge_instance=event.source or "test",
+            sensitivity="private",
+            authorized_principals=(frozenset({event.author}) if event.author else frozenset()),
+        )),
     )
 
 
 def _block(content: str) -> PromptBlock:
     return PromptBlock(
         content,
-        InformationFlowLabels(
-            labels=frozenset({"private"}),
-            source_channels=frozenset({"ch-cover"}),
-            source_principals=frozenset({"operator"}),
-            source_domains=frozenset({"test"}),
-            source_resources=frozenset({"test:block"}),
-        ),
+        InformationFlowLabels().with_source(SourceLabel(
+            principal="operator",
+            domain="test",
+            resource_id="test:block",
+            bridge_instance="test",
+            sensitivity="private",
+            authorized_principals=frozenset({"operator"}),
+            source_kind="protected_prompt",
+        )),
     )
 
 
