@@ -443,7 +443,9 @@ def test_service_principal_cannot_bypass_incompatible_sink_labels():
     [
         ("shell_exec", "printf untrusted", "shell_process"),
         ("spawn_codex", "untrusted task", "spawn"),
+        ("worklink_run", "/operator/worklink", "spawn"),
         ("write_file", "/tmp/untrusted", "file"),
+        ("submit_proposal", "proposal", "proposal"),
         ("ntfy_send", "alerts", "notification"),
         ("webhook", "https://example.invalid/hook", "http_webhook"),
         ("fetch_url", "https://example.invalid", "network"),
@@ -510,6 +512,53 @@ def test_visibility_qualified_service_source_is_bound_to_triggering_channel():
 
     assert decision.allowed is False
     assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "sink_category"),
+    [
+        ("memory_store", SinkCategory.SAGA),
+        ("add_schedule", SinkCategory.SCHEDULER),
+    ],
+)
+def test_persistent_writes_are_ifc_gated_not_merely_admin_gated(
+    tool_name: str,
+    sink_category: SinkCategory,
+):
+    decision = ToolRegistry().authorize_tool(
+        tool_name,
+        _auth(roles=("admin",)),
+        enforce=True,
+        ifc_labels=_labels(),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == f"ifc_label_blocked:{sink_category.value}"
+
+
+def test_same_scope_synthesis_write_remains_allowed():
+    channel = "saga:session-end"
+    synthesis = AuthContext(
+        principal="service:synthesis",
+        canonical_principal="synthesis",
+        roles=("service",),
+        event_ingress=None,
+        trigger="saga_session_end",
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "memory_store",
+        synthesis,
+        enforce=True,
+        ifc_labels=_labels(channel, sources=frozenset({channel})),
+    )
+
+    assert decision.allowed is True
+    assert decision.reason is None
 
 
 @pytest.mark.parametrize(
