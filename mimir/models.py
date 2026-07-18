@@ -134,6 +134,69 @@ class AgentEvent:
     # propagated from a trusted TurnContext; generic ingress must not accept a
     # client assertion as a declassification or authority signal.
     ifc_labels: "InformationFlowLabels | None" = None
+    # ACL accumulated from the authoritative turns in a completed channel
+    # session. Only the server-owned synthesis constructor sets this carrier.
+    source_session_acl: "SessionACL | None" = None
+
+
+@dataclass(frozen=True)
+class SessionACL:
+    """Immutable, monotonically intersected ACL for synthesis outputs."""
+
+    owner_principal: str = "legacy_admin"
+    origin_channel: str | None = None
+    origin_domain: str | None = None
+    visibility: str = "legacy_admin"
+    provenance_complete: bool = False
+
+    @classmethod
+    def from_auth_context(
+        cls,
+        auth_context: "AuthContext | None",
+        *,
+        origin_domain: str | None,
+        visibility: str,
+    ) -> "SessionACL":
+        if auth_context is None:
+            return cls()
+        owner = auth_context.canonical_principal or auth_context.principal
+        channel = auth_context.channel_id
+        if not owner or not channel or not origin_domain:
+            return cls()
+        if auth_context.is_service:
+            owner = f"service:{owner}"
+            visibility = "service"
+        if visibility not in {"public", "private", "service"}:
+            return cls()
+        return cls(
+            owner_principal=owner,
+            origin_channel=channel,
+            origin_domain=origin_domain,
+            visibility=visibility,
+            provenance_complete=True,
+        )
+
+    def intersect(self, other: "SessionACL") -> "SessionACL":
+        """Return a no-wider ACL; ambiguous provenance permanently fails closed."""
+        if not self.provenance_complete or not other.provenance_complete:
+            return SessionACL()
+        if (
+            self.owner_principal != other.owner_principal
+            or self.origin_channel != other.origin_channel
+            or self.origin_domain != other.origin_domain
+        ):
+            return SessionACL()
+        rank = {"public": 0, "private": 1, "service": 2, "legacy_admin": 3}
+        visibility = max(
+            (self.visibility, other.visibility), key=lambda value: rank.get(value, 3)
+        )
+        return SessionACL(
+            owner_principal=self.owner_principal,
+            origin_channel=self.origin_channel,
+            origin_domain=self.origin_domain,
+            visibility=visibility,
+            provenance_complete=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -167,6 +230,9 @@ class AuthContext:
     is_service: bool = False
     enforcement_enabled: bool = False
     ifc_labels: "InformationFlowLabels | None" = None
+    # Resource ACL for outputs derived by a trusted synthesis turn. This does
+    # not grant execution authority; it only attenuates durable output scope.
+    source_session_acl: SessionACL | None = None
 
 
 @dataclass

@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from mimir.session_boundary_log import render_session_summaries
 
 
@@ -69,6 +71,54 @@ def test_render_handles_missing_fields_gracefully():
     assert "no metadata here" in out
     # Channel placeholder + no timestamp prefix.
     assert "(-)" in out
+
+
+@pytest.mark.asyncio
+async def test_synthesized_private_boundary_is_readable_only_by_source_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.models import AuthContext
+    from mimir.saga.client import SagaStore
+
+    class _Provider:
+        def embed(self, text: str, *, input_type: str = "passage") -> list[float]:
+            return [1.0, 0.0, 0.0, 0.0]
+
+        def dimensions(self) -> int:
+            return 4
+
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: _Provider())
+    store = SagaStore(db_path=tmp_path / "saga.db")
+    await store.end_session(
+        "session-alice",
+        "Alice's private synthesis",
+        channel_id="discord-dm",
+        owner_principal="alice",
+        origin_channel="discord-dm",
+        origin_domain="discord",
+        visibility="private",
+        provenance={"created_by": "alice", "derived_by": "service:synthesis"},
+    )
+
+    def _auth(owner: str) -> AuthContext:
+        return AuthContext(
+            principal=owner,
+            canonical_principal=owner,
+            roles=("user",),
+            event_ingress="discord",
+            trigger="user_message",
+            channel_id="discord-dm",
+            interactivity=None,
+        )
+
+    own = await store.recent_session_boundaries(
+        channel_id="discord-dm", auth_context=_auth("alice")
+    )
+    unrelated = await store.recent_session_boundaries(
+        channel_id="discord-dm", auth_context=_auth("bob")
+    )
+    assert [row["session_id"] for row in own] == ["session-alice"]
+    assert unrelated == []
 
 
 # ---- prompt assembly integration ---------------------------------------

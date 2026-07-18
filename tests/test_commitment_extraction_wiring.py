@@ -36,7 +36,7 @@ from mimir.commitments.models import CommitmentRecord
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
-from mimir.models import AgentEvent, TurnContext, TurnRecord
+from mimir.models import AgentEvent, AuthContext, SessionACL, TurnContext, TurnRecord
 from mimir.turn_hooks import CommitmentExtractionHook
 from mimir.turn_logger import TurnLogger
 
@@ -255,6 +255,49 @@ async def test_added_emits_commitments_extracted(
     # Verify the record actually landed in the store.
     state = agent._commitments.current_state()
     assert any(r.dedupe_key == "net-new-1" for r in state.values())
+
+
+@pytest.mark.asyncio
+async def test_commitment_extraction_inherits_source_session_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path)
+    from mimir.commitments.extractor import MIN_OUTPUT_LEN
+
+    async def _extract_one(*args: Any, **kwargs: Any) -> list[CommitmentRecord]:
+        return [_make_commitment_record(dedupe_key="owner-acl")]
+
+    monkeypatch.setattr(
+        "mimir.commitments.extractor.extract_commitments", _extract_one,
+    )
+    event = AgentEvent(trigger="saga_session_end", channel_id="ch-1")
+    ctx = _make_ctx(event, saga_session_id="sess-1")
+    ctx.auth_context = AuthContext(
+        principal=None,
+        canonical_principal="synthesis",
+        roles=(),
+        event_ingress=None,
+        trigger="saga_session_end",
+        channel_id="ch-1",
+        interactivity=None,
+        is_service=True,
+        source_session_acl=SessionACL(
+            owner_principal="alice",
+            origin_channel="ch-1",
+            origin_domain="discord",
+            visibility="private",
+            provenance_complete=True,
+        ),
+    )
+    await _fire_extraction(
+        agent, ctx, event, _make_record("x" * (MIN_OUTPUT_LEN + 100))
+    )
+
+    rec = next(iter(agent._commitments.current_state().values()))
+    assert rec.owner_principal == "alice"
+    assert rec.originating_channel == "ch-1"
+    assert rec.visibility == "private"
+    assert rec.service_name is None
 
 
 @pytest.mark.asyncio

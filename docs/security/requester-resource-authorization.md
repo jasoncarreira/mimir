@@ -158,6 +158,8 @@ Commitment ownership is assigned to the authenticated requester when extracted f
 
 Raw SAGA atoms inherit the authenticated principal and authoritative originating channel. Session summaries inherit that session's owner/domain. Derived observations and triples receive the intersection of all source ACLs; mixed-owner or missing-source provenance that cannot form a safe intersection becomes service/admin-only. Feedback, deletion, and forgetting require authority over every affected source/derived object. Cross-principal synthesis may compute as an admitted service principal but cannot widen the resulting ACL.
 
+Channel sessions maintain that inheritance as a frozen, monotonic accumulator built only from server-created inbound authorization contexts. The synthesis service may use its own authority to read and compute, but both the session-summary writer and commitment extraction consume the accumulated source ACL from the server carrier. A change in owner or domain, or any missing authoritative provenance, irreversibly collapses the accumulator to legacy/admin-only for that session; model arguments and synthesized identity cannot replace it.
+
 ## External MCP tools
 
 External tool authorization keys on stable provenance, not the LangChain display name alone. A versioned provenance record contains:

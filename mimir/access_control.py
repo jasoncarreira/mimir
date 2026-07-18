@@ -1822,5 +1822,13 @@ def create_auth_context(
         policy_version=policy_version,
         is_service=is_service,
         enforcement_enabled=enforce,
+        source_session_acl=(
+            event.source_session_acl
+            if registered_service is not None
+            and event.trigger == "saga_session_end"
+            and event.service_principal == registered_service.canonical
+            and event_ingress is None
+            else None
+        ),
         ifc_labels=ifc_labels,
     )
