@@ -364,14 +364,6 @@ def _get_current_turn_context() -> Any:
     return get_current_turn()
 
 
-def _get_ifc_labels_from_context() -> Any:
-    """Get IFC labels from the active TurnContext."""
-    ctx = _get_current_turn_context()
-    if ctx is not None:
-        return getattr(ctx, "ifc_labels", None)
-    return None
-
-
 def _current_ifc_labels(auth_context: AuthContext | None) -> Any:
     """Read live labels from this exact request, including fork-visible updates."""
     active_ctx = _get_current_turn_context()

@@ -918,7 +918,7 @@ async def test_activity_panel_post_and_detailed_edit_use_live_labels_and_fail_cl
             "channel_id": "slack-C1",
             "tool_name": "read_file",
             "content": "protected preview",
-            "_ifc_labels": _labels(sources=frozenset({"slack-C-private"})),
+            "_ifc_labels": compatible,
             "_auth_context": auth,
         }
     )
