@@ -6,16 +6,100 @@ from deepagents.backends import StateBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.subagents import _build_task_tool
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import Runnable, RunnableLambda
 from langchain.tools import ToolRuntime
 import pytest
 
+from mimir._deepagents_subagent_auth import (
+    _AuthContextRunnable,
+    _create_auth_context_runnable,
+    _wrap_task_tool,
+)
+from mimir.models import AuthContext, InformationFlowLabels
 from mimir.subagents import (
     CriticFinding,
     CriticFindings,
     build_mimir_subagents,
     readonly_filesystem_permissions,
 )
+from mimir.tools.budget_gate import _authorize_tool_call
+
+
+class _AuthorizingSubagent(Runnable):
+    def __init__(self) -> None:
+        self.contexts: list[AuthContext | None] = []
+
+    def _result(self, context: AuthContext | None) -> dict:
+        self.contexts.append(context)
+        authorization, denial = _authorize_tool_call("add_schedule", context)
+        return {
+            "messages": [
+                AIMessage(
+                    content=json.dumps(
+                        {"allowed": authorization.allowed, "denial": denial}
+                    )
+                )
+            ]
+        }
+
+    def invoke(self, input, config=None, *, context=None, **kwargs):
+        return self._result(context)
+
+    async def ainvoke(self, input, config=None, *, context=None, **kwargs):
+        return self._result(context)
+
+
+def _auth_context(*, roles: tuple[str, ...], enforce: bool) -> AuthContext:
+    return AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=roles,
+        event_ingress="bridge",
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=enforce,
+        ifc_labels=InformationFlowLabels(),
+    )
+
+
+def _auth_task_tool(runnable: Runnable):
+    return _wrap_task_tool(
+        _build_task_tool(
+            [
+                {
+                    "name": "general-purpose",
+                    "description": "authorization test child",
+                    "runnable": _AuthContextRunnable(runnable),
+                }
+            ]
+        )
+    )
+
+
+def _task_runtime(context) -> ToolRuntime:
+    return ToolRuntime(
+        state={"messages": [HumanMessage(content="parent prompt")]},
+        context=context,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="toolu-auth",
+        store=None,
+    )
+
+
+def test_declarative_subagent_graph_uses_auth_context_schema() -> None:
+    sentinel = RunnableLambda(lambda state: state)
+    seen_kwargs = {}
+
+    def create_agent(*args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return sentinel
+
+    wrapped = _create_auth_context_runnable(create_agent, "model", tools=[])
+
+    assert isinstance(wrapped, _AuthContextRunnable)
+    assert seen_kwargs["context_schema"] is AuthContext
 
 
 def test_build_mimir_subagents_registers_structured_critic_without_replacing_gp() -> None:
@@ -310,3 +394,80 @@ def test_task_tool_validation_failure_surfaces_instead_of_falling_back_to_prose(
             subagent_type="critic-structured",
             runtime=runtime,
         )
+
+
+def test_task_subagent_authorizes_with_exact_parent_admin_carrier() -> None:
+    child = _AuthorizingSubagent()
+    tool = _auth_task_tool(child)
+    parent_auth = _auth_context(roles=("admin",), enforce=True)
+
+    result = tool.func(
+        description="run an admin operation",
+        subagent_type="general-purpose",
+        runtime=_task_runtime(parent_auth),
+    )
+
+    payload = json.loads(result.update["messages"][0].content)
+    assert child.contexts == [parent_auth]
+    assert child.contexts[0] is parent_auth
+    assert payload == {"allowed": True, "denial": None}
+
+
+@pytest.mark.asyncio
+async def test_atask_subagent_denies_non_admin_parent_under_enforcement() -> None:
+    child = _AuthorizingSubagent()
+    tool = _auth_task_tool(child)
+    parent_auth = _auth_context(roles=("user",), enforce=True)
+
+    result = await tool.coroutine(
+        description="run an admin operation",
+        subagent_type="general-purpose",
+        runtime=_task_runtime(parent_auth),
+    )
+
+    payload = json.loads(result.update["messages"][0].content)
+    assert child.contexts[0] is parent_auth
+    assert payload["allowed"] is False
+    assert "requires an admin identity" in payload["denial"]
+
+
+def test_task_subagent_uses_frozen_parent_enforcement_not_live_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child = _AuthorizingSubagent()
+    tool = _auth_task_tool(child)
+    parent_auth = _auth_context(roles=("user",), enforce=False)
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+
+    result = tool.func(
+        description="run an admin operation",
+        subagent_type="general-purpose",
+        runtime=_task_runtime(parent_auth),
+    )
+
+    payload = json.loads(result.update["messages"][0].content)
+    assert child.contexts[0] is parent_auth
+    assert payload == {"allowed": True, "denial": None}
+
+
+def test_task_subagent_rejects_model_supplied_auth_context_lookalike(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ForgedContext:
+        roles = ("admin",)
+        enforcement_enabled = False
+
+    child = _AuthorizingSubagent()
+    tool = _auth_task_tool(child)
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+
+    result = tool.func(
+        description="run an admin operation",
+        subagent_type="general-purpose",
+        runtime=_task_runtime(ForgedContext()),
+    )
+
+    payload = json.loads(result.update["messages"][0].content)
+    assert child.contexts == [None]
+    assert payload["allowed"] is False
+    assert "missing_auth_context" in payload["denial"]
