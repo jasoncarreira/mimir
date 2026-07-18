@@ -21,6 +21,7 @@ deployments don't pay the dep cost.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -231,6 +232,7 @@ class SlackBridge(Bridge):
     respond_to_bots: bool = False
     attachments_dir: Path | None = None
     attachments_max_bytes: int | None = None
+    bridge_instance: str | None = None
     _app: Any | None = field(default=None, init=False, repr=False)
     _handler: Any | None = field(default=None, init=False, repr=False)
     _runner: asyncio.Task | None = field(default=None, init=False, repr=False)
@@ -966,6 +968,9 @@ class SlackBridge(Bridge):
             source="slack",
             attachment_names=attachment_paths,
             extra={
+                "bridge_instance": self.bridge_instance or (
+                    "slack:" + hashlib.sha256(self.bot_token.encode()).hexdigest()[:16]
+                ),
                 "channel_conversation_type": "dm" if is_dm else "multi_user",
                 "channel_visibility": "private" if is_dm else "public",
                 "thread_ts": event.get("thread_ts"),

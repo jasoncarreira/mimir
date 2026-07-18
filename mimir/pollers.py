@@ -82,7 +82,7 @@ from typing import Any, Awaitable, Callable
 
 from .billing import normalize_priority
 from .event_logger import log_event, get_events_path
-from .models import AgentEvent
+from .models import AgentEvent, InformationFlowLabels, SourceLabel
 from .redaction import redact_text
 from . import poller_recovery
 from .poller_budget import (
@@ -1723,14 +1723,28 @@ async def run_poller(
         }
         if poller.deliver:  # chainlink #508 — raw value; resolved at turn time
             extra["deliver"] = poller.deliver
+        channel_id = poller.channel_id()
+        service_principal = "service:poller"
         event = AgentEvent(
             trigger="poller",
-            channel_id=poller.channel_id(),
+            channel_id=channel_id,
             service_principal="poller",
             content=content,
             source="poller",
             source_id=f"{POLLER_CHANNEL_PREFIX}{poller.name}:{fire_ts_ms}:batch:{batch_idx}",
             extra=extra,
+            # Stamp provenance before recovery stashes the event. Retries now
+            # round-trip the exact service label instead of rebuilding it from
+            # ambient state after a failed turn.
+            ifc_labels=InformationFlowLabels().with_source(SourceLabel(
+                principal=service_principal,
+                domain="channel",
+                resource_id=channel_id,
+                bridge_instance="poller",
+                sensitivity="internal",
+                authorized_principals=frozenset({service_principal}),
+                source_kind="service",
+            )),
         )
         try:
             accepted = await enqueue(event)

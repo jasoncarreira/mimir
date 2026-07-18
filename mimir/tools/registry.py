@@ -1474,6 +1474,9 @@ async def commitment_list(
         # Filter in the store before any record text enters the tool result.
         all_items = store.list(
             actor_principal=actor_principal,
+            # Services need store policy evaluation rather than a caller-side
+            # owner filter so service-visibility opt-in is checked centrally.
+            # The store still enforces exact ownership for every rendered row.
             owner_principal=None if actor_is_admin or actor_is_service else actor_principal,
             include_service=actor_is_admin or actor_is_service,
             actor_is_admin=actor_is_admin,

@@ -223,11 +223,18 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 
 ## Access control & authz
 
+See the [authorization reference](authorization.md) for the requester-resource
+model, trusted-service matrix, resource and IFC layers, extension obligations,
+and the shadow-first enablement runbook. Human roles are canonical-level policy
+in `<MIMIR_HOME>/state/identities.yaml`: `user` admits normal inbound use and
+`admin` admits admin-required operations. Generic `/event` API credentials
+authenticate transport only; they do not create a named requester.
+
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `MIMIR_ACCESS_CONTROL_ENFORCED` | bool | `false` | Enforce the allow/deny policy (reject unknown/non-allowlisted authors); also gates the admin-sensitive tool path. Startup rejects this setting when `MIMIR_MODEL_SPEC` uses `claude-code:` because that subprocess provider cannot carry the server-created per-turn authorization context. Use `anthropic:`, `openai:`, or `codex-plus:`, or leave enforcement disabled. |
-| `MIMIR_CROSS_PLATFORM_PULL` | bool | `true` | Identity reconciliation cross-platform pull. `false` = strict per-platform isolation. |
-| `MIMIR_UNAUTHORIZED_USER_BEHAVIOR` | enum | `ignore` | Unauthorized bridge users: `ignore` (log only) or `prompt-to-pair`. |
+| `MIMIR_CROSS_PLATFORM_PULL` | bool | `true` | Cross-platform recent-context pull. `false` stops canonical cross-platform history matching, but does not isolate authorization roles: aliases still share their canonical identity's access metadata. |
+| `MIMIR_UNAUTHORIZED_USER_BEHAVIOR` | enum | `ignore` | Controls the extra `inbound_pairing_prompted` event for enforced public/shared-channel denials: `ignore` or `prompt-to-pair`. All enforced denials may still create a pending pairing and notify the operator; this setting sends no public reply. |
 | `MIMIR_OPERATOR_ALERT_CHANNEL` | str | `""` | Channel id for high-priority operator alerts. Empty = inactive. |
 | `MIMIR_PAIRING_PENDING_MAX` | int | `100` | Max pending pairing requests retained. |
 | `MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS` | float | `1.0` | Coalesce window for operator pairing-notification digests. |

@@ -145,7 +145,11 @@ See **[docs/configuration.md](./docs/configuration.md)** for the complete
 reference of every environment variable mimir reads — types, defaults, and what
 each does, including the opt-in feature flags (auto-deliver, activity panel,
 mid-turn injection, …) that are easy to miss. `.env.example` is a copy-paste
-starter covering the common ones.
+starter covering the common ones. See the
+**[authorization reference](./docs/authorization.md)** for identity roles,
+requester-resource decisions, trusted services, IFC, and the shadow-first
+enablement runbook. Authorization enforcement is default-off and is incompatible
+with the default `claude-code:` subprocess provider.
 
 ## Web UI
 
@@ -346,7 +350,9 @@ If you're orienting yourself in the codebase:
    reference)
 4. **[docs/configuration.md](./docs/configuration.md)** — the complete
    environment-variable reference (every flag, default, and what it does)
-5. **[docs/](./docs/)** — additional architectural notes, including the
+5. **[docs/authorization.md](./docs/authorization.md)** — requester-resource
+   authorization, trusted services, ownership/IFC, extension, and enablement
+6. **[docs/](./docs/)** — additional architectural notes, including the
    [Recent activity context](./docs/recent-activity-context.md) privacy and
    cross-channel scoping contract (`docs/internal/` holds historical process
    docs that may help when archeology is needed but aren't part of the public

@@ -1,6 +1,11 @@
 # Requester/resource authorization policy
 
-Status: decision artifact for Chainlink #854/#856. This document defines the security contract that implementation slices must preserve. It does not enable multi-user ingress or change the single-operator default.
+Status: historical decision and adversarial-review artifact for Chainlink
+#854/#856. The code-accurate operator and contributor reference is
+[`docs/authorization.md`](../authorization.md). This artifact does not enable
+multi-user ingress or change the single-operator default; where historical
+implementation/status notes below differ from the reference and current code,
+the reference and code control.
 
 ## Frame decision
 
@@ -293,22 +298,15 @@ multi-user ingress stays disabled. The MCP provenance/classification substrate
 must remain the authority source if/when #855 is implemented; UI-supplied names
 alone cannot confer authority.
 
-### Enforcement-enablement blocker: trusted service recall
+### Historical enforcement-enablement blocker: trusted service recall
 
-Enforcement is **not ready** because trusted service-triggered turns
-(`scheduled_tick`, `poller`, `saga_session_end`, and `upgrade`) currently derive
-SAGA read scope from owned/public rows plus their configured
-`readable_domains`. Most existing SAGA data is migrated as
-`legacy_admin`/admin-owned, so those turns cannot recall it under enforcement
-and would become memory-blind even though parts of their tool capability matrix
-are admitted.
-
-A broad policy allowing every trusted service to read all `service` and
-`legacy_admin` memory was considered but is **not adopted here**. It may be too
-broad once services are partitioned. Enforcement must remain off until a
-narrow, reviewed service-recall policy and migration strategy preserve required
-autonomous recall without granting unrelated services each other's memory.
-Passing capability-matrix preflight does not resolve this data-plane blocker.
+This specific blocker was superseded by #897: the current
+`mimir/saga/ownership.py` gives exact trusted platform/maintenance services broad
+internal read scope without granting admin or mutation authority, while derived
+ACLs and IFC constrain outputs. Enforcement remains default-off and gated on the
+remaining adversarial-review rounds; follow the current
+[enablement runbook](../authorization.md#enablement-runbook), not this historical
+status section.
 
 ## Out of scope for #856
 

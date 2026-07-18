@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,17 @@ def __getattr__(name: str):
 DEBOUNCE_SECONDS = 60.0
 PUSH_TIMEOUT_SECONDS = 30.0
 COMMAND_TIMEOUT_SECONDS = 10.0
+# Short, bounded retries for cross-process Git index contention (#880). The
+# process-local per-home lock remains the primary serialization mechanism; this
+# only covers writers that cannot participate in that lock. Tests monkeypatch
+# both the schedule and jitter.
+INDEX_LOCK_RETRY_DELAYS: tuple[float, ...] = (0.05, 0.15, 0.35)
+INDEX_LOCK_RETRY_JITTER_SECONDS = 0.025
+_INDEX_TOUCHING_SUBCOMMANDS = frozenset({"add", "commit", "fetch", "pull", "reset"})
+_INDEX_LOCK_COLLISION_MARKERS = (
+    "file exists",
+    "another git process",
+)
 
 
 def _home_key(home: Path) -> str:
@@ -148,12 +160,16 @@ class GitError(RuntimeError):
         stderr: str,
         cmd: tuple[str, ...],
         stdout: str = "",
+        attempts: int = 1,
     ) -> None:
+        attempt_suffix = f" after {attempts} attempts" if attempts > 1 else ""
         super().__init__(
-            f"git {' '.join(cmd)} failed (rc={returncode}): {stderr.strip()}"
+            f"git {' '.join(cmd)} failed (rc={returncode}){attempt_suffix}: "
+            f"{stderr.strip()}"
         )
         self.returncode = returncode
         self.stderr = stderr
+        self.attempts = attempts
         # git writes "nothing to commit, working tree clean" (and the
         # "no changes added to commit" hint) to STDOUT, not stderr — so
         # callers discriminating the soft "nothing to commit" path must
@@ -170,17 +186,28 @@ class GitResult:
     stderr: str
 
 
-async def _git(
+def _is_index_lock_collision(
+    *, returncode: int, stderr: str, args: tuple[str, ...]
+) -> bool:
+    """Return whether this is the narrow retryable Git index-lock shape.
+
+    Require rc=128, an index-touching subcommand, and lock-specific stderr so
+    auth, network, hook, and merge/rebase failures retain their existing paths.
+    """
+    if returncode != 128 or not args or args[0] not in _INDEX_TOUCHING_SUBCOMMANDS:
+        return False
+    error = stderr.casefold()
+    return "index.lock" in error and any(
+        marker in error for marker in _INDEX_LOCK_COLLISION_MARKERS
+    )
+
+
+async def _git_once(
     *args: str,
     cwd: Path,
-    timeout: float = COMMAND_TIMEOUT_SECONDS,
+    timeout: float,
 ) -> GitResult:
-    """Run ``git <args>`` under ``cwd`` and return (stdout, stderr).
-
-    Raises ``GitError`` on non-zero exit or ``asyncio.TimeoutError`` on
-    timeout. Used for every git invocation in this module so retry/timeout
-    behaviour is uniform.
-    """
+    """Run one bounded ``git`` attempt."""
     proc = await asyncio.create_subprocess_exec(
         "git",
         *args,
@@ -205,6 +232,46 @@ async def _git(
     if proc.returncode != 0:
         raise GitError(proc.returncode or -1, stderr, args, stdout=stdout)
     return GitResult(stdout=stdout, stderr=stderr)
+
+
+async def _git(
+    *args: str,
+    cwd: Path,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
+) -> GitResult:
+    """Run ``git <args>`` with bounded index-lock collision retries.
+
+    Raises ``GitError`` on non-zero exit or ``asyncio.TimeoutError`` on
+    timeout. Only rc=128 index-lock collisions on index-touching commands are
+    retried; every other failure is raised immediately. This helper never
+    deletes ``index.lock``: stale-lock removal remains an operator-approved
+    recovery action because an mtime/process-name probe cannot prove ownership.
+    """
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            return await _git_once(*args, cwd=cwd, timeout=timeout)
+        except GitError as exc:
+            retryable = _is_index_lock_collision(
+                returncode=exc.returncode,
+                stderr=exc.stderr,
+                args=args,
+            )
+            if not retryable or attempts > len(INDEX_LOCK_RETRY_DELAYS):
+                if retryable and attempts > 1:
+                    raise GitError(
+                        exc.returncode,
+                        exc.stderr,
+                        exc.cmd,
+                        stdout=exc.stdout,
+                        attempts=attempts,
+                    ) from exc
+                raise
+            delay = INDEX_LOCK_RETRY_DELAYS[attempts - 1]
+            if INDEX_LOCK_RETRY_JITTER_SECONDS > 0:
+                delay += random.uniform(0.0, INDEX_LOCK_RETRY_JITTER_SECONDS)
+            await asyncio.sleep(delay)
 
 
 def _schedule_push_retry_locked(
@@ -338,7 +405,11 @@ async def _stage_and_commit(*, turn_id: str, trigger: str, home: Path) -> bool:
         await _git("add", "-A", cwd=home)
     except (GitError, asyncio.TimeoutError, OSError) as exc:
         await log_event(
-            "git_commit_failed", stage="add", turn_id=turn_id, error=_short_err(exc),
+            "git_commit_failed",
+            stage="add",
+            turn_id=turn_id,
+            error=_short_err(exc),
+            attempts=getattr(exc, "attempts", 1),
         )
         return False
 
@@ -372,12 +443,20 @@ async def _stage_and_commit(*, turn_id: str, trigger: str, home: Path) -> bool:
         ):
             return False
         await log_event(
-            "git_commit_failed", stage="commit", turn_id=turn_id, error=_short_err(exc),
+            "git_commit_failed",
+            stage="commit",
+            turn_id=turn_id,
+            error=_short_err(exc),
+            attempts=getattr(exc, "attempts", 1),
         )
         return False
     except (asyncio.TimeoutError, OSError) as exc:
         await log_event(
-            "git_commit_failed", stage="commit", turn_id=turn_id, error=_short_err(exc),
+            "git_commit_failed",
+            stage="commit",
+            turn_id=turn_id,
+            error=_short_err(exc),
+            attempts=getattr(exc, "attempts", 1),
         )
         return False
     return True

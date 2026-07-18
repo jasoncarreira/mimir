@@ -47,7 +47,14 @@ from langgraph.types import Command
 
 from ..models import AuthContext
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
-from ..access_control import OperationDecision, get_tool_registry
+from ..access_control import (
+    OperationDecision,
+    ToolAuthorization,
+    classify_protected_result,
+    get_tool_registry,
+    get_trusted_service_from_auth_context,
+    parse_service_shell_argv,
+)
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
 log = logging.getLogger(__name__)
@@ -250,11 +257,11 @@ def _tool_call_id(request: ToolCallRequest) -> str:
     return str(tc.get("id") or "")
 
 
-def _extract_channel_from_args(
+def _extract_sink_target(
     request: ToolCallRequest,
     auth_context: AuthContext | None = None,
 ) -> str | None:
-    """Return the effective channel target for authorization.
+    """Return the concrete operation destination for sink authorization.
 
     Channel tools default an omitted/empty ``channel_id`` to the current turn's
     channel. Mirror that server-owned resolution here so the gate authorizes an
@@ -262,10 +269,84 @@ def _extract_channel_from_args(
     """
     tc = getattr(request, "tool_call", None) or {}
     args = tc.get("args") or {}
-    explicit_channel = args.get("channel_id")
-    if explicit_channel:
-        return explicit_channel
-    return auth_context.channel_id if auth_context is not None else None
+    tool_name = _tool_name_from_request(request)
+    if tool_name in {"send_message", "react", "fetch_channel_history"}:
+        explicit_channel = args.get("channel_id")
+        if explicit_channel:
+            return str(explicit_channel)
+        return auth_context.channel_id if auth_context is not None else None
+    if tool_name in {"write_file", "edit_file"}:
+        target = args.get("file_path") or args.get("path")
+    elif tool_name in {"shell_exec", "bash_async"}:
+        target = args.get("command")
+    elif tool_name in {"spawn_claude_code", "spawn_codex", "spawn_open_code"}:
+        target = args.get("cwd") or os.environ.get("MIMIR_HOME")
+    elif tool_name in {"fetch_url", "http_request", "webhook"}:
+        target = args.get("url")
+    elif tool_name.startswith("mcp_"):
+        target = tool_name
+    else:
+        target = args.get("target") or args.get("destination")
+    return str(target) if target else None
+
+
+# Compatibility alias for callers that only exercise channel operations.
+_extract_channel_from_args = _extract_sink_target
+
+
+def _request_for_authorized_execution(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+) -> ToolCallRequest:
+    """Bind trusted-service shell execution to the argv authorization checked.
+
+    Ordinary user/admin shell tools keep their documented full-shell surface.
+    A trusted service receives only the direct argv admitted by its operation-
+    specific sink policy; the handler never sees the original command string.
+    """
+    if tool_name not in {"shell_exec", "bash_async"}:
+        return request
+    args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
+    # Never trust a model-supplied internal execution override. Ordinary calls
+    # discard it; trusted-service calls below replace it with server-parsed argv.
+    had_model_override = "mimir_direct_argv" in args
+    args.pop("mimir_direct_argv", None)
+    sanitized_request = (
+        request.override(tool_call={**request.tool_call, "args": args})
+        if had_model_override
+        else request
+    )
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for(tool_name) if service is not None else None
+    if policy is None or policy.adapter != "shell_profile":
+        return sanitized_request
+    target = args.get("command")
+    if not isinstance(target, str):
+        return sanitized_request
+    argv = parse_service_shell_argv(target, policy.destination)
+    if argv is None:
+        return sanitized_request
+    args["mimir_direct_argv"] = argv
+    tool_call = {**request.tool_call, "args": args}
+    return request.override(tool_call=tool_call)
+
+
+def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
+    """Validate and normalize the concrete call arguments before authz."""
+    tool_call = getattr(request, "tool_call", None) or {}
+    arguments = tool_call.get("args", {})
+    if not isinstance(arguments, dict):
+        return None
+    tool = getattr(request, "tool", None)
+    schema = getattr(tool, "args_schema", None)
+    if schema is None:
+        return dict(arguments)
+    try:
+        validated = schema.model_validate(arguments)
+    except Exception:
+        return None
+    return validated.model_dump(exclude_unset=False)
 
 
 _IFC_DELEGATION_TOOLS = frozenset({
@@ -289,6 +370,54 @@ def _get_ifc_labels_from_context() -> Any:
     if ctx is not None:
         return getattr(ctx, "ifc_labels", None)
     return None
+
+
+def _current_ifc_labels(auth_context: AuthContext | None) -> Any:
+    """Read live labels from this exact request, including fork-visible updates."""
+    active_ctx = _get_current_turn_context()
+    if (
+        active_ctx is not None
+        and auth_context is not None
+        and getattr(active_ctx, "auth_context", None) is not None
+        and active_ctx.auth_context.ifc_state is auth_context.ifc_state
+    ):
+        labels = getattr(active_ctx, "ifc_labels", None)
+        if labels is not None:
+            return labels
+    if auth_context is None:
+        return None
+    return auth_context.ifc_state.current(auth_context.ifc_labels)
+
+
+def _merge_result_labels(auth_context: AuthContext | None, added: Any) -> None:
+    """Monotonically taint the exact turn and rebind harness egress."""
+    if auth_context is None or added is None:
+        return
+    merged = auth_context.ifc_state.merge(added, fallback=auth_context.ifc_labels)
+    active_ctx = _get_current_turn_context()
+    if active_ctx is None:
+        return
+    active_auth = getattr(active_ctx, "auth_context", None)
+    if active_auth is not None and active_auth.ifc_state is not auth_context.ifc_state:
+        return
+    from dataclasses import replace
+
+    active_ctx.ifc_labels = merged
+    active_ctx.auth_context = replace(active_auth or auth_context, ifc_labels=merged)
+    emitter = getattr(active_ctx, "turn_event_emitter", None)
+    if emitter is not None:
+        emitter.bind_information_flow(merged, active_ctx.auth_context)
+
+
+def _result_labels_for_call(
+    tool_name: str,
+    request: ToolCallRequest,
+    auth_context: AuthContext | None,
+    authorization: ToolAuthorization,
+) -> Any:
+    return classify_protected_result(
+        tool_name, _validated_arguments(request), auth_context, authorization,
+    )
 
 
 def _is_admin_sensitive_tool(
@@ -378,14 +507,42 @@ def _check_admin_authorized(
     ctx: Any | None = None,
     target_channel: str | None = None,
     ifc_labels: Any = None,
+    mcp_tool: Any = None,
+    arguments: dict[str, Any] | None = None,
 ) -> str | None:
+    _, denial = _authorize_tool_call(
+        tool_name,
+        ctx,
+        target_channel,
+        ifc_labels,
+        mcp_tool,
+        arguments,
+    )
+    return denial
+
+
+def _authorize_tool_call(
+    tool_name: str,
+    ctx: Any | None = None,
+    target_channel: str | None = None,
+    ifc_labels: Any = None,
+    mcp_tool: Any = None,
+    arguments: dict[str, Any] | None = None,
+) -> tuple[ToolAuthorization, str | None]:
+    """Return the exact authorization and any middleware denial text."""
     enforce = (
         bool(getattr(ctx, "enforcement_enabled", False))
         if ctx is not None
         else _env_access_control_enforced()
     )
     auth = get_tool_registry().authorize_tool(
-        tool_name, ctx, enforce=enforce, target_channel=target_channel, ifc_labels=ifc_labels
+        tool_name,
+        ctx,
+        enforce=enforce,
+        target_channel=target_channel,
+        ifc_labels=ifc_labels,
+        mcp_tool=mcp_tool,
+        arguments=arguments,
     )
     # Generic HTTP credentials authenticate transport only.  Check operation
     # class before compatibility-mode shadow allowances: resource-scoped and
@@ -395,7 +552,7 @@ def _check_admin_authorized(
         and _turn_has_http_event_ingress(ctx)
         and auth.decision is not OperationDecision.OPEN
     ):
-        return _deny_admin_tool(
+        return auth, _deny_admin_tool(
             tool_name,
             _HTTP_EVENT_ADMIN_DENIAL_REASON,
             ctx=ctx,
@@ -404,10 +561,10 @@ def _check_admin_authorized(
 
     privileged = auth.required_tier.value == "admin" or not auth.allowed
     if not privileged:
-        return None
+        return auth, None
 
     if ctx is None and enforce:
-        return _deny_admin_tool(
+        return auth, _deny_admin_tool(
             tool_name,
             "missing_auth_context",
             ctx=None,
@@ -415,8 +572,8 @@ def _check_admin_authorized(
         )
 
     if auth.allowed:
-        return None
-    return _deny_admin_tool(
+        return auth, None
+    return auth, _deny_admin_tool(
         tool_name,
         auth.reason or "admin_required",
         ctx=ctx,
@@ -515,13 +672,17 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
-        target_channel = _extract_channel_from_args(request, auth_context)
-        ifc_labels = _get_ifc_labels_from_context()
-        if ifc_labels is None and auth_context is not None:
-            ifc_labels = getattr(auth_context, "ifc_labels", None)
+        target_channel = _extract_sink_target(request, auth_context)
+        ifc_labels = _current_ifc_labels(auth_context)
+        validated_arguments = _validated_arguments(request)
 
-        admin_denial = _check_admin_authorized(
-            tool_name, auth_context, target_channel, ifc_labels
+        authorization, admin_denial = _authorize_tool_call(
+            tool_name,
+            auth_context,
+            target_channel,
+            ifc_labels,
+            getattr(request, "tool", None),
+            validated_arguments,
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
@@ -531,6 +692,9 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
+        result_labels = _result_labels_for_call(
+            tool_name, request, auth_context, authorization,
+        )
 
         # Delegation inherits the current turn's monotonic IFC carrier. Built-in
         # subagents execute under this same context; detached spawn/async tools
@@ -539,11 +703,13 @@ class BudgetGateMiddleware(AgentMiddleware):
         if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
             from ..agent import _propagate_ifc_labels
 
-            active_ctx.ifc_labels = _propagate_ifc_labels(
+            propagated = _propagate_ifc_labels(
                 active_ctx.ifc_labels,
                 getattr(auth_context, "channel_id", None),
                 auth_context,
+                derived_by=tool_name,
             )
+            _merge_result_labels(auth_context, propagated)
 
         # Destructive-action guardrail (chainlink #259): an accident
         # deterrent against force-push-to-main/master, NOT a security
@@ -574,9 +740,13 @@ class BudgetGateMiddleware(AgentMiddleware):
                 status="error",
             )
         started = time.monotonic()
+        execution_request = _request_for_authorized_execution(
+            request, tool_name, auth_context,
+        )
         try:
-            result = handler(request)
+            result = handler(execution_request)
         except Exception as exc:
+            _merge_result_labels(auth_context, result_labels)
             _emit_tool_call_sync(
                 tool_name,
                 ok=False,
@@ -584,6 +754,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 error=str(exc),
             )
             raise
+        _merge_result_labels(auth_context, result_labels)
         duration_ms = (time.monotonic() - started) * 1000.0
         is_error = _result_is_error(result)
         _emit_tool_call_sync(
@@ -601,13 +772,17 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
-        target_channel = _extract_channel_from_args(request, auth_context)
-        ifc_labels = _get_ifc_labels_from_context()
-        if ifc_labels is None and auth_context is not None:
-            ifc_labels = getattr(auth_context, "ifc_labels", None)
+        target_channel = _extract_sink_target(request, auth_context)
+        ifc_labels = _current_ifc_labels(auth_context)
+        validated_arguments = _validated_arguments(request)
 
-        admin_denial = _check_admin_authorized(
-            tool_name, auth_context, target_channel, ifc_labels
+        authorization, admin_denial = _authorize_tool_call(
+            tool_name,
+            auth_context,
+            target_channel,
+            ifc_labels,
+            getattr(request, "tool", None),
+            validated_arguments,
         )
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
@@ -617,6 +792,9 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
+        result_labels = _result_labels_for_call(
+            tool_name, request, auth_context, authorization,
+        )
 
         # Delegation inherits the current turn's monotonic IFC carrier. Built-in
         # subagents execute under this same context; detached spawn/async tools
@@ -625,11 +803,13 @@ class BudgetGateMiddleware(AgentMiddleware):
         if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
             from ..agent import _propagate_ifc_labels
 
-            active_ctx.ifc_labels = _propagate_ifc_labels(
+            propagated = _propagate_ifc_labels(
                 active_ctx.ifc_labels,
                 getattr(auth_context, "channel_id", None),
                 auth_context,
+                derived_by=tool_name,
             )
+            _merge_result_labels(auth_context, propagated)
 
         # Destructive-action guardrail (chainlink #259): an accident
         # deterrent against force-push-to-main/master, NOT a security
@@ -660,9 +840,13 @@ class BudgetGateMiddleware(AgentMiddleware):
                 status="error",
             )
         started = time.monotonic()
+        execution_request = _request_for_authorized_execution(
+            request, tool_name, auth_context,
+        )
         try:
-            result = await handler(request)
+            result = await handler(execution_request)
         except Exception as exc:
+            _merge_result_labels(auth_context, result_labels)
             _emit_tool_call_sync(
                 tool_name,
                 ok=False,
@@ -670,6 +854,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 error=str(exc),
             )
             raise
+        _merge_result_labels(auth_context, result_labels)
         duration_ms = (time.monotonic() - started) * 1000.0
         is_error = _result_is_error(result)
         _emit_tool_call_sync(

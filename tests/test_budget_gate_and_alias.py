@@ -21,6 +21,7 @@ These tests exercise the middleware via two surfaces:
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import time
 from pathlib import Path
@@ -33,7 +34,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
-from mimir.models import AuthContext, InformationFlowLabels, TurnContext
+from mimir.models import AuthContext, InformationFlowLabels, SourceLabel, TurnContext
 from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
@@ -56,17 +57,255 @@ def _make_request(
     tool_name: str = "fake_tool",
     tool_call_id: str = "tc-1",
     auth_context: AuthContext | None = None,
+    args: dict[str, Any] | None = None,
 ) -> ToolCallRequest:
     """Build a request with the exact frozen carrier LangGraph supplies."""
     if auth_context is None:
         turn = get_current_turn()
         auth_context = getattr(turn, "auth_context", None) if turn is not None else None
     return ToolCallRequest(
-        tool_call={"name": tool_name, "args": {}, "id": tool_call_id, "type": "tool_call"},
+        tool_call={
+            "name": tool_name,
+            "args": args or {},
+            "id": tool_call_id,
+            "type": "tool_call",
+        },
         tool=None,
         state=None,
         runtime=Runtime(context=auth_context),
     )
+
+
+@pytest.mark.asyncio
+async def test_mcp_resource_adapter_runs_before_remote_handler() -> None:
+    from dataclasses import replace
+
+    from mimir.mcp_client import (
+        MCPAdapterConfig,
+        MCPProvenance,
+        MCPServerConfig,
+        _bridge_mcp_tool,
+        clear_mcp_adapter_registry,
+        register_configured_mcp_adapters,
+    )
+
+    config = MCPServerConfig(
+        name="github",
+        command="x",
+        args=[],
+        server_config_id="github-production",
+        policy_version="policy-v1",
+        adapters=(MCPAdapterConfig(
+            name="github-owner",
+            version="adapter-v1",
+            policy_version="policy-v1",
+            resource_argument="repository",
+            owner_argument="owner",
+            source=True,
+        ),),
+    )
+    provenance = replace(
+        MCPProvenance.create(
+            config,
+            "get_repository",
+            {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repository": {"type": "string"},
+                },
+                "required": ["owner", "repository"],
+            },
+            server_config_id=config.server_config_id,
+        ),
+        classification="resource_scoped",
+        adapter_name="github-owner",
+        adapter_version="adapter-v1",
+        approval_version="approval-v1",
+        policy_version="policy-v1",
+    )
+    tool = _bridge_mcp_tool(
+        server_name="github",
+        tool_name="get_repository",
+        description="",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repository": {"type": "string"},
+            },
+            "required": ["owner", "repository"],
+        },
+        session=object(),
+        provenance=provenance,
+    )
+    context = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress="bridge",
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+    handler_calls = 0
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    def request(call_id: str, arguments: dict[str, Any]) -> ToolCallRequest:
+        return ToolCallRequest(
+            tool_call={
+                "name": tool.name,
+                "args": arguments,
+                "id": call_id,
+                "type": "tool_call",
+            },
+            tool=tool,
+            state=None,
+            runtime=Runtime(context=context),
+        )
+
+    clear_mcp_adapter_registry()
+    register_configured_mcp_adapters([config])
+    middleware = BudgetGateMiddleware()
+    turn = _make_ctx()
+    turn.auth_context = context
+    turn.ifc_labels = InformationFlowLabels()
+    token = set_current_turn(turn)
+    try:
+        valid = await middleware.awrap_tool_call(
+            request("valid", {"owner": "alice", "repository": "repo-1"}),
+            handler,
+        )
+        wrong_owner = await middleware.awrap_tool_call(
+            request("wrong", {"owner": "bob", "repository": "repo-1"}),
+            handler,
+        )
+        malformed = await middleware.awrap_tool_call(
+            request("malformed", {"owner": "alice", "repository": ["repo-1"]}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+        clear_mcp_adapter_registry()
+
+    assert valid.content == "ok"
+    assert wrong_owner.status == "error"
+    assert "mcp_wrong_owner" in str(wrong_owner.content)
+    assert malformed.status == "error"
+    assert "mcp_malformed_arguments" in str(malformed.content)
+    assert handler_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_resource_adapter_still_enforces_external_sink_ifc() -> None:
+    from dataclasses import replace
+
+    from mimir.mcp_client import (
+        MCPAdapterConfig,
+        MCPProvenance,
+        MCPServerConfig,
+        _bridge_mcp_tool,
+        clear_mcp_adapter_registry,
+        register_configured_mcp_adapters,
+    )
+
+    config = MCPServerConfig(
+        name="github",
+        command="x",
+        args=[],
+        server_config_id="github-production",
+        policy_version="policy-v1",
+        adapters=(MCPAdapterConfig(
+            name="github-owner",
+            version="adapter-v1",
+            policy_version="policy-v1",
+            resource_argument="repository",
+            owner_argument="owner",
+            source=True,
+            sink=True,
+        ),),
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string"},
+            "repository": {"type": "string"},
+        },
+        "required": ["owner", "repository"],
+    }
+    provenance = replace(
+        MCPProvenance.create(
+            config,
+            "update_repository",
+            input_schema,
+            server_config_id=config.server_config_id,
+        ),
+        classification="resource_scoped",
+        adapter_name="github-owner",
+        adapter_version="adapter-v1",
+        approval_version="approval-v1",
+        policy_version="policy-v1",
+    )
+    tool = _bridge_mcp_tool(
+        server_name="github",
+        tool_name="update_repository",
+        description="",
+        input_schema=input_schema,
+        session=object(),
+        provenance=provenance,
+    )
+    context = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress="bridge",
+        trigger="user_message",
+        channel_id="untrusted-channel",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+    turn = _make_ctx()
+    turn.auth_context = context
+    turn.ifc_labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"untrusted-channel"}),
+    )
+    handler_calls = 0
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    request = ToolCallRequest(
+        tool_call={
+            "name": tool.name,
+            "args": {"owner": "alice", "repository": "repo-1"},
+            "id": "tainted",
+            "type": "tool_call",
+        },
+        tool=tool,
+        state=None,
+        runtime=Runtime(context=context),
+    )
+
+    clear_mcp_adapter_registry()
+    register_configured_mcp_adapters([config])
+    token = set_current_turn(turn)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+    finally:
+        reset_current_turn(token)
+        clear_mcp_adapter_registry()
+
+    assert result.status == "error"
+    assert "ifc_label_blocked:external_mcp" in str(result.content)
+    assert handler_calls == 0
 
 
 def _ifc_labels(
@@ -74,10 +313,41 @@ def _ifc_labels(
     *,
     sources: frozenset[str] | None = None,
 ) -> InformationFlowLabels:
+    channels = sources if sources is not None else frozenset({channel})
     return InformationFlowLabels(
         labels=frozenset({"private"}),
-        source_channels=sources if sources is not None else frozenset({channel}),
+        source_channels=channels,
+        sources=frozenset(SourceLabel(
+            principal="user-1", domain="channel", resource_id=source,
+            bridge_instance="test", sensitivity="private",
+            authorized_principals=frozenset({"user-1"}),
+        ) for source in channels),
     )
+
+
+def _ifc_auth(*, roles: tuple[str, ...] = ("admin",)) -> AuthContext:
+    labels = _ifc_labels()
+    return AuthContext(
+        principal="slack-U1",
+        canonical_principal="user-1",
+        roles=roles,
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=True,
+        ifc_labels=labels,
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+    )
+
+
+def _ifc_turn(auth: AuthContext) -> TurnContext:
+    ctx = _make_ctx()
+    ctx.auth_context = auth
+    ctx.ifc_labels = auth.ifc_labels
+    return ctx
 
 
 def _attach_auth(ctx: TurnContext, resolver: IdentityResolver | None = None) -> None:
@@ -95,6 +365,9 @@ def _attach_auth(ctx: TurnContext, resolver: IdentityResolver | None = None) -> 
         channel_id=ctx.channel_id,
         interactivity=None,
         enforcement_enabled=ctx.access_control_enforced,
+        domain="channel",
+        resource_id=ctx.channel_id,
+        bridge_instance="test",
     )
 
 
@@ -257,6 +530,9 @@ async def test_forked_task_uses_auth_context_ifc_labels_when_contextvar_is_unset
         interactivity=None,
         enforcement_enabled=True,
         ifc_labels=_ifc_labels(),
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
     )
     handler_calls: list[ToolCallRequest] = []
 
@@ -378,6 +654,146 @@ def test_middleware_sync_wrap_passes_through_under_budget():
     assert out.content == "ok"
     assert len(handler_calls) == 1
     assert ctx.tool_call_count == 1
+
+
+def test_sync_protected_read_taints_live_turn_before_harness_egress():
+    from mimir.agent import Agent
+
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+
+    def handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="protected file", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = middleware.wrap_tool_call(
+            _make_request("read_file", "read-sync", auth, {"path": "/private/data"}),
+            handler,
+        )
+        allowed = Agent._harness_sink_allowed(ctx, "ch-1", "harness_auto_deliver")
+    finally:
+        reset_current_turn(token)
+
+    assert result.content == "protected file"
+    assert any(source.domain == "filesystem" for source in ctx.ifc_labels.sources)
+    assert allowed is False
+
+
+@pytest.mark.asyncio
+async def test_async_partial_error_taints_and_blocks_next_same_channel_send():
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+
+    async def partial(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="partial protected output before failure",
+            tool_call_id=req.tool_call["id"],
+            status="error",
+        )
+
+    send_calls = 0
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        nonlocal send_calls
+        send_calls += 1
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        partial_result = await middleware.awrap_tool_call(
+            _make_request("memory_get", "partial", auth, {"atom_id": "other-user"}),
+            partial,
+        )
+        denied = await middleware.awrap_tool_call(
+            _make_request("send_message", "send", auth, {"channel_id": "ch-1"}),
+            send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert partial_result.status == "error"
+    assert any(source.domain == "saga" for source in ctx.ifc_labels.sources)
+    assert denied.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(denied.content)
+    assert send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_same_channel_history_reply_succeeds_and_public_tool_does_not_overtaint():
+    auth = _ifc_auth(roles=())
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request("write_todos", "public", auth), handler,
+        )
+        before = ctx.ifc_labels
+        await middleware.awrap_tool_call(
+            _make_request(
+                "fetch_channel_history", "history", auth, {"channel_id": "ch-1"},
+            ),
+            handler,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert before == auth.ifc_labels
+    assert reply.status != "error"
+    assert all(source.domain == "channel" for source in ctx.ifc_labels.sources)
+
+
+@pytest.mark.asyncio
+async def test_result_taint_is_fork_visible_and_isolated_between_concurrent_turns():
+    middleware = BudgetGateMiddleware()
+    protected_auth = _ifc_auth()
+    public_auth = _ifc_auth(roles=())
+    protected_ctx = _ifc_turn(protected_auth)
+    public_ctx = _ifc_turn(public_auth)
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        await asyncio.sleep(0)
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
+    async def invoke(ctx: TurnContext, request: ToolCallRequest) -> None:
+        token = set_current_turn(ctx)
+        try:
+            await middleware.awrap_tool_call(request, handler)
+        finally:
+            reset_current_turn(token)
+
+    await asyncio.gather(
+        invoke(
+            protected_ctx,
+            _make_request("get_turn", "protected-turn", protected_auth, {"turn_id": "t0"}),
+        ),
+        invoke(public_ctx, _make_request("write_todos", "public-turn", public_auth)),
+    )
+
+    assert any(source.domain == "turn_history" for source in protected_ctx.ifc_labels.sources)
+    assert not any(source.domain == "turn_history" for source in public_ctx.ifc_labels.sources)
+
+    # No ContextVar: the original frozen request carrier still sees post-read taint.
+    async def should_not_send(req: ToolCallRequest) -> ToolMessage:
+        raise AssertionError("forked incompatible sink executed")
+
+    denied = await middleware.awrap_tool_call(
+        _make_request("send_message", "forked-send", protected_auth, {"channel_id": "ch-1"}),
+        should_not_send,
+    )
+    assert denied.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(denied.content)
 
 
 def test_middleware_sync_wrap_refuses_at_cap():
@@ -723,7 +1139,7 @@ async def test_admin_sensitive_tool_allowed_via_canonical_discord_alias(
 
 
 @pytest.mark.asyncio
-async def test_read_only_tool_remains_available_to_non_admin(tmp_path: Path) -> None:
+async def test_protected_metadata_tool_is_denied_to_non_admin(tmp_path: Path) -> None:
     resolver = _resolver(
         tmp_path,
         """
@@ -744,7 +1160,7 @@ async def test_read_only_tool_remains_available_to_non_admin(tmp_path: Path) -> 
     async def handler(req: ToolCallRequest) -> ToolMessage:
         nonlocal handler_calls
         handler_calls += 1
-        return ToolMessage(content="listed", tool_call_id=req.tool_call["id"])
+        return ToolMessage(content="protected-schedule", tool_call_id=req.tool_call["id"])
 
     token = set_current_turn(ctx)
     try:
@@ -753,8 +1169,9 @@ async def test_read_only_tool_remains_available_to_non_admin(tmp_path: Path) -> 
         reset_current_turn(token)
 
     assert isinstance(out, ToolMessage)
-    assert out.content == "listed"
-    assert handler_calls == 1
+    assert out.status == "error"
+    assert "protected-schedule" not in str(out.content)
+    assert handler_calls == 0
 
 
 @pytest.mark.asyncio
@@ -920,7 +1337,7 @@ async def test_admin_gate_denies_sensitive_tool_when_enforced_context_missing(
 
 
 @pytest.mark.asyncio
-async def test_admin_gate_missing_context_still_allows_non_admin_tools_when_enforced(
+async def test_admin_gate_missing_context_denies_protected_metadata_when_enforced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
@@ -930,13 +1347,15 @@ async def test_admin_gate_missing_context_still_allows_non_admin_tools_when_enfo
     async def handler(req: ToolCallRequest) -> ToolMessage:
         nonlocal handler_calls
         handler_calls += 1
-        return ToolMessage(content="listed", tool_call_id=req.tool_call["id"])
+        return ToolMessage(content="protected-schedule", tool_call_id=req.tool_call["id"])
 
     out = await mw.awrap_tool_call(_make_request("list_schedules", "id-read"), handler)
 
     assert isinstance(out, ToolMessage)
-    assert out.content == "listed"
-    assert handler_calls == 1
+    assert out.status == "error"
+    assert "missing_auth_context" in str(out.content)
+    assert "protected-schedule" not in str(out.content)
+    assert handler_calls == 0
 
 
 @pytest.mark.asyncio
