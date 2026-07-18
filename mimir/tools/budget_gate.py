@@ -310,9 +310,12 @@ def _request_for_authorized_execution(
     args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
     # Never trust a model-supplied internal execution override. Ordinary calls
     # discard it; trusted-service calls below replace it with server-parsed argv.
+    had_model_override = "mimir_direct_argv" in args
     args.pop("mimir_direct_argv", None)
-    sanitized_request = request.override(
-        tool_call={**request.tool_call, "args": args},
+    sanitized_request = (
+        request.override(tool_call={**request.tool_call, "args": args})
+        if had_model_override
+        else request
     )
     service = get_trusted_service_from_auth_context(auth_context)
     policy = service.sink_policy_for(tool_name) if service is not None else None
