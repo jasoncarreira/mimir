@@ -80,6 +80,7 @@ def cluster_by_similarity(
     atoms: list[dict],
     *,
     threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    scope_acl: bool = False,
 ) -> list[list[dict]]:
     """Greedy single-pass agglomerative clustering.
 
@@ -101,26 +102,39 @@ def cluster_by_similarity(
     atom_ids = [a["id"] for a in atoms]
     placeholders = ",".join(["?"] * len(atom_ids))
     rows = conn.execute(
-        f"SELECT atom_id, vec, dim FROM embeddings WHERE atom_id IN ({placeholders})",
+        f"SELECT e.atom_id, e.vec, e.dim, a.owner_principal, "
+        f"a.origin_domain, a.visibility "
+        f"FROM embeddings e JOIN atoms a ON a.id = e.atom_id "
+        f"WHERE e.atom_id IN ({placeholders})",
         atom_ids,
     ).fetchall()
     vec_by_atom: dict[str, list[float]] = {}
-    for atom_id, vec_bytes, dim in rows:
+    acl_by_atom: dict[str, tuple[str, str | None, str]] = {}
+    for atom_id, vec_bytes, dim, owner, domain, visibility in rows:
+        # Missing ownership data cannot establish a safe cluster boundary.
+        if scope_acl and (not owner or not visibility):
+            continue
         try:
             vec_by_atom[atom_id] = _unpack_vec(vec_bytes, dim)
+            if owner and visibility:
+                acl_by_atom[atom_id] = (owner, domain, visibility)
         except struct.error:
             continue  # malformed; skip atom
 
     # Greedy single-pass.
     cluster_atoms: list[list[dict]] = []
     cluster_vecs: list[list[list[float]]] = []
+    cluster_acls: list[tuple[str, str | None, str]] = []
     for atom in atoms:
         vec = vec_by_atom.get(atom["id"])
-        if vec is None:
-            continue  # no embedding; can't cluster
+        acl = acl_by_atom.get(atom["id"])
+        if vec is None or (scope_acl and acl is None):
+            continue  # no embedding/ACL; can't safely cluster
         best_idx = -1
         best_sim = -1.0
         for i, vecs in enumerate(cluster_vecs):
+            if scope_acl and cluster_acls[i] != acl:
+                continue
             sim = _mean_cosine(vec, vecs)
             if sim > best_sim:
                 best_sim = sim
@@ -131,12 +145,15 @@ def cluster_by_similarity(
         else:
             cluster_atoms.append([atom])
             cluster_vecs.append([vec])
+            cluster_acls.append(acl or ("", None, ""))
     return cluster_atoms
 
 
 def make_default_cluster_fn(
     conn: sqlite3.Connection,
     threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    *,
+    scope_acl: bool = False,
 ) -> Callable[[list[dict]], list[list[dict]]]:
     """Bind a clusterer to a specific connection + threshold.
     Returns a callable matching reflect.ClusterFn (atoms → clusters).
@@ -147,5 +164,7 @@ def make_default_cluster_fn(
         reflect(conn, sid, ..., cluster_fn=make_default_cluster_fn(conn))
     """
     def _fn(atoms: list[dict]) -> list[list[dict]]:
-        return cluster_by_similarity(conn, atoms, threshold=threshold)
+        return cluster_by_similarity(
+            conn, atoms, threshold=threshold, scope_acl=scope_acl,
+        )
     return _fn
