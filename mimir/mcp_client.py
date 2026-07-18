@@ -290,6 +290,19 @@ class MCPAdapterConfig:
     owner_argument: str = ""
     source: bool = False
     sink: bool = False
+    direction: str = ""
+
+    @property
+    def flow_direction(self) -> str:
+        if self.direction:
+            return self.direction
+        if self.source and self.sink:
+            return "both"
+        if self.source:
+            return "source"
+        if self.sink:
+            return "sink"
+        return "unknown"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MCPAdapterConfig":
@@ -299,6 +312,13 @@ class MCPAdapterConfig:
                     return str(data[name]).strip()
             return ""
 
+        direction = value("direction", "flow", "flow_direction", "flowDirection").lower()
+        if not direction and ("source" in data or "sink" in data):
+            source = bool(data.get("source", False))
+            sink = bool(data.get("sink", False))
+            direction = "both" if source and sink else "source" if source else "sink" if sink else "neither"
+        if direction and direction not in {"source", "sink", "both", "neither"}:
+            raise ValueError(f"invalid MCP adapter flow direction: {direction}")
         adapter = cls(
             name=value("name", "id", "adapter_name", "adapterName"),
             version=value("version", "adapter_version", "adapterVersion"),
@@ -307,6 +327,7 @@ class MCPAdapterConfig:
             owner_argument=value("owner_argument", "ownerArgument"),
             source=bool(data.get("source", False)),
             sink=bool(data.get("sink", False)),
+            direction=direction,
         )
         if not adapter.name or not adapter.version or not adapter.policy_version:
             raise ValueError("MCP adapter requires name, version, and policy_version")
@@ -1005,6 +1026,7 @@ class MCPAdapterRegistration:
     version: str
     policy_version: str
     classify: MCPAdapterClassifier
+    flow_direction: str = "unknown"
 
 
 def register_mcp_adapter(
@@ -1012,14 +1034,19 @@ def register_mcp_adapter(
     adapter_version: str,
     policy_version: str,
     classify: MCPAdapterClassifier,
+    *,
+    flow_direction: str = "unknown",
 ) -> None:
     """Register a classifier for MCP tools carrying ``adapter_name`` provenance."""
     if not callable(classify):
         raise TypeError("MCP adapter classifier must be callable")
+    if flow_direction not in {"source", "sink", "both", "neither", "unknown"}:
+        raise ValueError(f"invalid MCP adapter flow direction: {flow_direction}")
     _global_mcp_adapter_registry[adapter_name] = MCPAdapterRegistration(
         version=adapter_version,
         policy_version=policy_version,
         classify=classify,
+        flow_direction=flow_direction,
     )
 
 
@@ -1069,12 +1096,13 @@ def _configured_resource_classifier(
         if owner.strip() != principal:
             return MCPAuthorizationResult(decision=decision, allowed=False, reason="mcp_wrong_owner")
         resources = (resource,)
+        flow_direction = config.flow_direction
         return MCPAuthorizationResult(
             decision=decision,
             allowed=True,
             resources=resources,
-            source_resources=resources if config.source else (),
-            sink_resources=resources if config.sink else (),
+            source_resources=resources if flow_direction in {"source", "both"} else (),
+            sink_resources=resources if flow_direction in {"sink", "both"} else (),
         )
     return classify
 
@@ -1097,6 +1125,7 @@ def register_configured_mcp_adapters(configs: list[MCPServerConfig]) -> None:
                 adapter.version,
                 adapter.policy_version,
                 _configured_resource_classifier(adapter),
+                flow_direction=adapter.flow_direction,
             )
 
 

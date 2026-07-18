@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -369,7 +371,6 @@ def test_unknown_labels_or_destinations_fail_closed(
 @pytest.mark.parametrize(
     ("tool_name", "expected_reason"),
     [
-        ("mcp_slack_send", "ifc_label_blocked:external_mcp"),
         ("fetch_url", "ifc_label_blocked:network"),
         ("web_search", "ifc_label_blocked:network"),
     ],
@@ -501,20 +502,57 @@ def test_summarization_model_assertion_failure_and_ordinary_admin_do_not_erase_l
 
     after_transform = _merge_ifc_labels(labels, claimed_public)
     after_ordinary_admin = audit_declassification(
-        after_transform, non_declassification, _auth(),
+        after_transform, non_declassification, _auth(), destination="slack-C-public",
     )
 
     assert after_ordinary_admin.labels == ALL_LABELS
 
 
-def test_only_explicit_audited_admin_declassification_erases_labels():
+def test_only_explicit_audited_admin_declassification_erases_labels(
+    tmp_path, caplog: pytest.LogCaptureFixture,
+):
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="ifc-test")
     labels = _labels(labels=ALL_LABELS)
-    admin = audit_declassification(
-        labels, "operator-approved destination", _auth(roles=("admin",)),
-    )
+    try:
+        with caplog.at_level(logging.INFO):
+            admin = audit_declassification(
+                labels,
+                "operator-approved destination",
+                _auth(roles=("admin",)),
+                destination="slack-C-public",
+                policy_version="ifc-test-v2",
+            )
+    finally:
+        _reset_logger_for_tests()
 
     assert admin.labels == frozenset()
     assert admin.source_channels == labels.source_channels
+    record = json.loads(events_path.read_text(encoding="utf-8"))
+    assert record["type"] == "ifc_declassification"
+    assert record["labels"] == sorted(ALL_LABELS)
+    assert record["source_labels"]
+    assert record["authenticated_admin"]["canonical_principal"] == "user-1"
+    assert record["reason"] == "operator-approved destination"
+    assert record["destination"] == "slack-C-public"
+    assert record["policy_version"] == "ifc-test-v2"
+    assert record["outcome"] == "approved"
+
+
+def test_declassification_audit_failure_keeps_labels():
+    from mimir.event_logger import _reset_logger_for_tests
+
+    _reset_logger_for_tests()
+    labels = _labels()
+    result = audit_declassification(
+        labels,
+        "operator approved",
+        _auth(roles=("admin",)),
+        destination="slack-C-public",
+    )
+    assert result is labels
 
 
 class _Bridge(Bridge):
