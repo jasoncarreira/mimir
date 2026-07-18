@@ -1509,6 +1509,9 @@ class Agent:
                 )
 
             from .subagents import build_mimir_subagents
+            from ._deepagents_subagent_auth import install_subagent_auth_context_patch
+
+            install_subagent_auth_context_patch()
 
             self._agent = create_deep_agent(
                 model=self._agent_model,
