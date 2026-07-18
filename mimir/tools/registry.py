@@ -2010,6 +2010,66 @@ def _confined_artifact_base(artifact_root: str, home: str | Path) -> Path:
     return base
 
 
+def _write_run_artifacts_confined(
+    home: str | Path,
+    artifact_base: Path,
+    run_id: str,
+    files: dict[str, str],
+) -> Path:
+    """Create ``<artifact_base>/.factory/runs/<run_id>/`` and write ``files``
+    into it without ever following a symlink.
+
+    ``_confined_artifact_base`` validates the root BEFORE the spawn, but the
+    untrusted subprocess runs between that check and these writes and can plant
+    a symlink at a predictable path component (``.factory`` / ``runs``) so a
+    later ``Path.mkdir``/``write_text`` would escape the home — a TOCTOU that a
+    single pre-spawn ``resolve()`` cannot close. Walk from the trusted
+    (already-resolved, confined) home directory fd, creating and re-opening each
+    component with ``O_NOFOLLOW`` (openat semantics), and write each file with
+    ``O_NOFOLLOW | O_CREAT | O_EXCL``. A symlink planted at any component is
+    rejected (``OSError``) rather than followed, so the writes cannot leave the
+    home. ``run_id`` is unpredictable to the subprocess, so the run dir and its
+    files cannot be pre-planted. Returns the lexical run-dir path on success;
+    raises ``OSError`` if any component is a symlink or a write fails.
+    """
+    home_resolved = Path(home).expanduser().resolve()
+    rel_parts = artifact_base.relative_to(home_resolved).parts
+    components = [*rel_parts, ".factory", "runs", run_id]
+    # Anchor on the trusted, fully-resolved home (resolve() leaves no symlinks
+    # in it); every child below is opened O_NOFOLLOW.
+    opened: list[int] = [os.open(home_resolved, os.O_RDONLY | os.O_DIRECTORY)]
+    try:
+        for part in components:
+            try:
+                os.mkdir(part, 0o700, dir_fd=opened[-1])
+            except FileExistsError:
+                pass
+            opened.append(
+                os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=opened[-1],
+                )
+            )
+        run_fd = opened[-1]
+        for name, content in files.items():
+            fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=run_fd,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+    finally:
+        for fd in opened:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return artifact_base / ".factory" / "runs" / run_id
+
+
 @tool
 async def spawn_open_code(
     prompt: str,
@@ -2147,33 +2207,41 @@ async def spawn_open_code(
 
     artifact_dir: Optional[Path] = None
     if artifact_base is not None:
+        manifest = json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "launcher": "mimir.spawn_open_code",
+                "name": name,
+                "cwd": str(cwd_path) if cwd_path else None,
+                "model": model,
+                "agent": agent,
+                "status": status,
+                "exit_code": returncode,
+                "started_at": started.isoformat(),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
         try:
-            artifact_dir = artifact_base / ".factory" / "runs" / run_id
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            (artifact_dir / "prompt.md").write_text(prompt, encoding="utf-8")
-            (artifact_dir / "stdout.txt").write_text(stdout, encoding="utf-8")
-            (artifact_dir / "stderr.txt").write_text(stderr, encoding="utf-8")
-            (artifact_dir / "manifest.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "run_id": run_id,
-                        "launcher": "mimir.spawn_open_code",
-                        "name": name,
-                        "cwd": str(cwd_path) if cwd_path else None,
-                        "model": model,
-                        "agent": agent,
-                        "status": status,
-                        "exit_code": returncode,
-                        "started_at": started.isoformat(),
-                        "finished_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
+            # Symlink-safe: the untrusted subprocess has already run and may have
+            # planted a symlink at the predictable .factory/runs prefix, so the
+            # writes go through openat + O_NOFOLLOW rather than Path.mkdir /
+            # write_text (which would follow it out of the home). A rejected
+            # symlink / write failure simply skips artifacts (best-effort).
+            artifact_dir = _write_run_artifacts_confined(
+                home,
+                artifact_base,
+                run_id,
+                {
+                    "prompt.md": prompt,
+                    "stdout.txt": stdout,
+                    "stderr.txt": stderr,
+                    "manifest.json": manifest,
+                },
             )
         except OSError:
-            pass  # artifacts are best-effort; the structured return is primary
+            artifact_dir = None  # artifacts are best-effort; structured return is primary
 
     if status == "spawn_failed":
         stderr = "'opencode' CLI not on PATH"
