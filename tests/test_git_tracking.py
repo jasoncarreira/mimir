@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -528,6 +527,186 @@ async def test_debounce_reset_cancels_prior_task(
 
 
 # ─── error paths ────────────────────────────────────────────────────
+
+
+_INDEX_LOCK_ERROR = (
+    "fatal: Unable to create '/tmp/home/.git/index.lock': File exists.\n"
+    "Another git process seems to be running in this repository."
+)
+
+
+@pytest.mark.asyncio
+async def test_git_retries_transient_index_lock_collision(
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#880: a cross-process lock collision can clear during bounded backoff."""
+    real_git_once = git_tracking._git_once
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def transient_once(*args: str, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise git_tracking.GitError(128, _INDEX_LOCK_ERROR, args)
+        return await real_git_once(*args, **kwargs)
+
+    async def no_wait(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(git_tracking, "_git_once", transient_once)
+    monkeypatch.setattr(git_tracking.asyncio, "sleep", no_wait)
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
+
+    result = await git_tracking._git("add", "-A", cwd=home_repo)
+
+    assert isinstance(result, git_tracking.GitResult)
+    assert attempts == 2
+    assert sleeps == [git_tracking.INDEX_LOCK_RETRY_DELAYS[0]]
+
+
+@pytest.mark.asyncio
+async def test_commit_succeeds_after_real_index_lock_is_released(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real Git collision clears during backoff and the turn commit lands."""
+    lock_path = home_repo / ".git" / "index.lock"
+    lock_path.write_bytes(b"")
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "eventual.md").write_text("eventual\n")
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_DELAYS", (0.05, 0.05))
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
+    real_git_once = git_tracking._git_once
+    first_add_collision = asyncio.Event()
+    add_attempts = 0
+
+    async def observe_real_git(*args: str, **kwargs: Any) -> Any:
+        nonlocal add_attempts
+        if args and args[0] == "add":
+            add_attempts += 1
+        try:
+            return await real_git_once(*args, **kwargs)
+        except git_tracking.GitError:
+            if args and args[0] == "add":
+                first_add_collision.set()
+            raise
+
+    async def release_lock() -> None:
+        await first_add_collision.wait()
+        lock_path.unlink()
+
+    monkeypatch.setattr(git_tracking, "_git_once", observe_real_git)
+    releaser = asyncio.create_task(release_lock())
+    await git_tracking.commit_turn_changes(
+        turn_id="t-eventual",
+        trigger="user_message",
+        home=home_repo,
+        enabled=True,
+    )
+    await releaser
+
+    assert add_attempts >= 2
+    message = subprocess.run(
+        ["git", "log", "-1", "--format=%B"],
+        cwd=home_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "turn t-eventual (user_message)" in message
+    assert not [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_commit_failed"
+    ]
+    if git_tracking._pending_push_task is not None:
+        git_tracking._pending_push_task.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args", "stderr"),
+    [
+        (("fetch", "origin", "main"), "fatal: Authentication failed"),
+        (("add", "-A"), "fatal: Unable to create '.git/index.lock': Permission denied"),
+        (("add", "-A"), "fatal: Unable to create '.git/index.lock': No space left on device"),
+        (("status", "--porcelain"), _INDEX_LOCK_ERROR),
+    ],
+)
+async def test_git_does_not_retry_non_collision_failure(
+    home_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
+    stderr: str,
+) -> None:
+    """Auth, permissions, disk, and read-only-command failures remain immediate."""
+    attempts = 0
+
+    async def failure(*call_args: str, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        raise git_tracking.GitError(128, stderr, call_args)
+
+    monkeypatch.setattr(git_tracking, "_git_once", failure)
+
+    with pytest.raises(git_tracking.GitError) as exc_info:
+        await git_tracking._git(*args, cwd=home_repo)
+
+    assert attempts == 1
+    assert exc_info.value.attempts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subcommand", ["add", "commit", "fetch", "pull", "reset"])
+async def test_git_retry_scope_covers_index_touching_commands(
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch, subcommand: str,
+) -> None:
+    attempts = 0
+
+    async def collision_then_success(*args: str, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise git_tracking.GitError(128, _INDEX_LOCK_ERROR, args)
+        return git_tracking.GitResult(stdout="", stderr="")
+
+    monkeypatch.setattr(git_tracking, "_git_once", collision_then_success)
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_DELAYS", (0.0,))
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
+
+    await git_tracking._git(subcommand, cwd=home_repo)
+
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_exhausted_index_lock_retries_report_attempts_without_deleting_lock(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent lock fails closed and leaves the lock untouched."""
+    lock_path = home_repo / ".git" / "index.lock"
+    lock_path.write_bytes(b"")
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_DELAYS", (0.0, 0.0))
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "blocked.md").write_text("blocked\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t-index-lock",
+        trigger="user_message",
+        home=home_repo,
+        enabled=True,
+    )
+
+    failures = [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_commit_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["stage"] == "add"
+    assert failures[0]["attempts"] == 3
+    assert "after 3 attempts" in failures[0]["error"]
+    assert lock_path.exists()
+    assert git_tracking._pending_push_task is None
 
 
 @pytest.mark.asyncio
