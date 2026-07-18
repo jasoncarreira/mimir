@@ -732,6 +732,70 @@ async def test_consolidate_removes_dedup_tombstoned_from_faiss_index(
 
 
 @pytest.mark.asyncio
+async def test_consolidate_dedup_isolates_owner_metadata_and_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Near-duplicates owned by different principals never affect each other."""
+    import json
+
+    from mimir.saga.client import SagaStore
+    from mimir.saga.mark_access import AccessEvent, mark_access
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "owner-scoped.saga.db", embedding_dim=4)
+    alice = await store.store(
+        content="Alice private deployment note",
+        metadata={"tags": ["alice-tag"]},
+        owner_principal="alice",
+        origin_domain="tenant-a",
+        visibility="private",
+    )
+    bob = await store.store(
+        content="Bob private deployment note",
+        metadata={"tags": ["bob-tag"]},
+        owner_principal="bob",
+        origin_domain="tenant-b",
+        visibility="private",
+    )
+    alice_id = alice["atom_id"]
+    bob_id = bob["atom_id"]
+    conn = store._ensure_conn()
+    conn.execute("UPDATE atoms SET topics = ? WHERE id = ?", ('["alice-topic"]', alice_id))
+    conn.execute("UPDATE atoms SET topics = ? WHERE id = ?", ('["bob-topic"]', bob_id))
+    mark_access(conn, [AccessEvent(atom_id=bob_id, source="retrieval")])
+    conn.commit()
+
+    before_events = dict(conn.execute(
+        "SELECT atom_id, COUNT(*) FROM access_events "
+        "WHERE atom_id IN (?, ?) GROUP BY atom_id",
+        (alice_id, bob_id),
+    ).fetchall())
+
+    result = await store.consolidate(dedup_first=True, min_cluster_size=99)
+
+    assert result["dedup"]["candidates_scanned"] == 2
+    assert result["dedup"]["duplicates_tombstoned"] == []
+    rows = conn.execute(
+        "SELECT id, tombstoned, topics, metadata FROM atoms WHERE id IN (?, ?)",
+        (alice_id, bob_id),
+    ).fetchall()
+    by_id = {row[0]: row for row in rows}
+    assert by_id[alice_id][1] == 0
+    assert by_id[bob_id][1] == 0
+    assert json.loads(by_id[alice_id][2]) == ["alice-topic"]
+    assert json.loads(by_id[bob_id][2]) == ["bob-topic"]
+    assert json.loads(by_id[alice_id][3])["tags"] == ["alice-tag"]
+    assert json.loads(by_id[bob_id][3])["tags"] == ["bob-tag"]
+    after_events = dict(conn.execute(
+        "SELECT atom_id, COUNT(*) FROM access_events "
+        "WHERE atom_id IN (?, ?) GROUP BY atom_id",
+        (alice_id, bob_id),
+    ).fetchall())
+    assert after_events == before_events
+
+
+@pytest.mark.asyncio
 async def test_consolidate_keeps_rollback_branch_live_atom_in_faiss_index(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
