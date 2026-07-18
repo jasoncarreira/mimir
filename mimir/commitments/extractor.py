@@ -37,7 +37,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .models import (
     CommitmentKind,
@@ -46,6 +46,9 @@ from .models import (
     make_commitment_id,
     make_dedupe_key,
 )
+
+if TYPE_CHECKING:
+    from mimir.models import SessionACL
 
 log = logging.getLogger(__name__)
 
@@ -211,6 +214,33 @@ def _parse_extraction_json(raw: str) -> dict[str, Any] | None:
 
 _VALID_KINDS = {k.value for k in CommitmentKind}
 _VALID_SENSITIVITIES = {s.value for s in CommitmentSensitivity}
+
+
+def assign_extraction_acl(
+    record: CommitmentRecord,
+    source_acl: "SessionACL | None",
+    *,
+    service_name: str,
+) -> None:
+    """Stamp authoritative source ownership, then compute owner-scoped dedupe."""
+    if source_acl is not None and source_acl.provenance_complete:
+        record.owner_principal = source_acl.owner_principal
+        record.originating_channel = source_acl.origin_channel
+        record.origin_domain = source_acl.origin_domain
+        record.visibility = source_acl.visibility
+    else:
+        record.owner_principal = "legacy_admin"
+        record.originating_channel = None
+        record.origin_domain = None
+        record.visibility = "service"
+    record.service_name = service_name
+    record.dedupe_key = make_dedupe_key(
+        channel_id=record.channel_id,
+        text=record.text,
+        due_window_start_unix=record.due_window_start_unix,
+        recipient_identity=record.recipient_identity,
+        owner_principal=record.owner_principal,
+    )
 
 
 def _coerce_to_record(

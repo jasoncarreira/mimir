@@ -37,7 +37,7 @@ from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
 from mimir.access_control import create_auth_context
-from mimir.models import AgentEvent, SessionACL, TurnContext, TurnRecord
+from mimir.models import AgentEvent, AuthContext, SessionACL, TurnContext, TurnRecord
 from mimir.turn_hooks import CommitmentExtractionHook
 from mimir.turn_logger import TurnLogger
 
@@ -255,7 +255,8 @@ async def test_added_emits_commitments_extracted(
     assert persisted["skipped_dedupe"] == 0
     # Verify the record actually landed in the store.
     state = agent._commitments.current_state()
-    added = next(r for r in state.values() if r.dedupe_key == "net-new-1")
+    added = state["c-test"]
+    assert added.dedupe_key != "net-new-1"
     assert added.owner_principal == "legacy_admin"
     assert added.visibility == "service"
     assert added.service_name == "synthesis"
@@ -302,8 +303,77 @@ async def test_commitment_extraction_inherits_source_session_acl(
     rec = next(iter(agent._commitments.current_state().values()))
     assert rec.owner_principal == "alice"
     assert rec.originating_channel == "ch-1"
+    assert rec.origin_domain == "discord"
     assert rec.visibility == "private"
-    assert rec.service_name is None
+    assert rec.service_name == "synthesis"
+
+
+@pytest.mark.asyncio
+async def test_extracted_private_commitment_is_owner_scoped_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two users cannot dedupe, read, or mutate each other's extraction."""
+    agent = _make_agent(tmp_path)
+    from mimir.commitments.extractor import MIN_OUTPUT_LEN
+
+    extracted_count = 0
+
+    async def _extract(*args: Any, **kwargs: Any) -> list[CommitmentRecord]:
+        nonlocal extracted_count
+        extracted_count += 1
+        record = _make_commitment_record()
+        record.id = f"c-owner-{extracted_count}"
+        record.channel_id = "ch-shared"
+        return [record]
+
+    async def _ignore(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("mimir.commitments.extractor.extract_commitments", _extract)
+    monkeypatch.setattr("mimir.turn_hooks.log_event", _ignore)
+
+    for owner in ("user:alice", "user:bob"):
+        event = AgentEvent(
+            trigger="saga_session_end", channel_id="ch-shared",
+            service_principal="synthesis",
+            source_session_acl=SessionACL(
+                owner_principal=owner, origin_channel="ch-shared",
+                origin_domain="discord", visibility="private",
+                provenance_complete=True,
+            ),
+        )
+        ctx = _make_ctx(event, saga_session_id=f"session-{owner}")
+        ctx.auth_context = create_auth_context(event, enforce=True)
+        await _fire_extraction(
+            agent, ctx, event, _make_record("x" * (MIN_OUTPUT_LEN + 10)),
+        )
+
+    records = list(agent._commitments.current_state().values())
+    assert len(records) == 2
+    assert len({record.dedupe_key for record in records}) == 2
+    alice_record = next(r for r in records if r.owner_principal == "user:alice")
+    alice_auth = AuthContext(
+        principal="user:alice", canonical_principal="user:alice", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="ch-shared",
+        interactivity=None, enforcement_enabled=True,
+    )
+    bob_auth = AuthContext(
+        principal="user:bob", canonical_principal="user:bob", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="ch-shared",
+        interactivity=None, enforcement_enabled=True,
+    )
+    assert alice_record.id in agent._assemble_commitments_block(
+        "ch-shared", alice_auth,
+    ).content
+    bob_block = agent._assemble_commitments_block("ch-shared", bob_auth)
+    assert bob_block is not None
+    assert alice_record.id not in bob_block.content
+    assert await agent._commitments.complete(
+        alice_record.id, actor_principal="user:bob",
+    ) is False
+    assert await agent._commitments.complete(
+        alice_record.id, actor_principal="user:alice",
+    ) is True
 
 
 @pytest.mark.asyncio
@@ -317,7 +387,10 @@ async def test_all_dedupe_skipped_emits_no_op_all_dedupe(
     from mimir.commitments.extractor import MIN_OUTPUT_LEN
 
     # Pre-load the store with a record carrying dedupe_key="dup-key".
-    seed = _make_commitment_record(dedupe_key="dup-key")
+    seed = CommitmentRecord(
+        id="c-seed", text="same commitment as before", channel_id="ch-1",
+        owner_principal="legacy_admin", visibility="service",
+    )
     await agent._commitments.add(seed)
 
     events: list[tuple[str, dict]] = []
@@ -560,10 +633,10 @@ async def test_store_add_raises_does_not_stop_remaining_records(
 
     # The second record landed; the first did not.
     state = agent._commitments.current_state()
-    assert any(r.dedupe_key == "ok-key" for r in state.values()), (
+    assert "c-ok" in state, (
         "rec_ok must land in store after rec_boom's add raised"
     )
-    assert not any(r.dedupe_key == "boom-key" for r in state.values()), (
+    assert "c-boom" not in state, (
         "rec_boom must NOT land in store — its add raised"
     )
 

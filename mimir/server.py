@@ -892,7 +892,16 @@ def build_app(config: Config) -> web.Application:
     # always None and every commitment tool returned the "no store"
     # error. Build once, hand to Agent + the tool registry.
     from .commitments import CommitmentsStore
-    commitments_store = CommitmentsStore(path=config.commitments_log)
+    commitments_store = CommitmentsStore(
+        path=config.commitments_log,
+        provenance_db_path=_db_path,
+    )
+    migrated_commitments = commitments_store.migrate_ownership()
+    if migrated_commitments:
+        log.info(
+            "backfilled ownership for %d commitment records",
+            migrated_commitments,
+        )
 
     # chainlink #583 slice 1: one live turn-event bus shared by the agent
     # (producer) and the web SSE layer (consumer) so the dashboard character

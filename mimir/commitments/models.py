@@ -177,6 +177,7 @@ class CommitmentRecord:
       the resolved principal identifier. Does NOT grant mutation authority.
     - ``originating_channel``: the channel where the commitment originated.
       May differ from ``channel_id`` for migrated/replayed records.
+    - ``origin_domain``: authoritative bridge/domain of the source session.
     - ``visibility``: commitment visibility level (public/service/private).
       Controls access patterns; service visibility for legacy/ambiguous.
     - ``service_name``: name of service if service-owned commitment.
@@ -203,6 +204,7 @@ class CommitmentRecord:
     owner_principal: str | None = None
     recipient_principal: str | None = None
     originating_channel: str | None = None
+    origin_domain: str | None = None
     visibility: str = CommitmentVisibility.PUBLIC.value
     service_name: str | None = None
     suggested_reminder: str = ""

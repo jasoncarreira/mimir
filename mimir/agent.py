@@ -3523,16 +3523,12 @@ class Agent:
             records = self._commitments.list(
                 channel_id=channel_id,
                 include_unbound=_is_prompt_operator(auth_context),
-                actor_principal=(
-                    auth_context.canonical_principal or auth_context.principal
-                ),
                 owner_principal=(
                     None
                     if _is_prompt_operator(auth_context)
                     else auth_context.canonical_principal or auth_context.principal
                 ),
-                actor_is_admin="admin" in auth_context.roles,
-                include_service=auth_context.is_service,
+                auth_context=auth_context,
             )
             content = render_commitments_block(records)
             if not content:
