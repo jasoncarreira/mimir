@@ -243,13 +243,20 @@ def _target_within_configured_roots(target: str, _destination: str) -> bool:
 
 
 def _target_within_configured_write_roots(target: str, _destination: str) -> bool:
-    from ._paths import PathOutsideHomeError, resolve_within_roots
+    from ._paths import PathOutsideHomeError
 
     try:
-        resolve_within_roots(_configured_file_write_roots(), target)
+        resolve_configured_write_target(target)
     except (OSError, PathOutsideHomeError):
         return False
     return True
+
+
+def resolve_configured_write_target(target: str) -> Path:
+    """Resolve a write sink exactly as the configured-roots adapter does."""
+    from ._paths import resolve_within_roots
+
+    return resolve_within_roots(_configured_file_write_roots(), target)
 
 
 _SHELL_CONTROL_CHARACTERS = frozenset(";|&`$><{}[],*?~\n\r")
@@ -421,7 +428,7 @@ def _target_matches_shell_profile(target: str, destination: str) -> bool:
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "configured_file_roots": _target_within_configured_write_roots,
     "shell_profile": _target_matches_shell_profile,
-    "spawn_workspace": _target_within_configured_roots,
+    "spawn_workspace": _target_within_configured_write_roots,
 }
 
 _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
@@ -2148,6 +2155,7 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "bash_async": "shell_process",
     "spawn_claude_code": "spawn_process",
     "spawn_codex": "spawn_process",
+    "spawn_open_code": "spawn_process",
     "open_proposal": "proposal",
     "submit_proposal": "proposal",
     "abandon_proposal": "proposal",
