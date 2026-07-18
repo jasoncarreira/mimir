@@ -722,6 +722,40 @@ async def test_async_partial_error_taints_and_blocks_next_same_channel_send():
 
 
 @pytest.mark.asyncio
+async def test_state_only_fork_taint_blocks_first_send_with_stale_active_turn_labels():
+    auth = _ifc_auth(roles=())
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    send_calls = 0
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        nonlocal send_calls
+        send_calls += 1
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        allowed = await middleware.awrap_tool_call(
+            _make_request("send_message", "before-fork", auth, {"channel_id": "ch-1"}),
+            send,
+        )
+        # Mirrors a detached result merge with no _current_turn to rebind ctx.
+        auth.ifc_state.merge(_ifc_labels(sources=frozenset({"ch-private"})))
+        denied = await middleware.awrap_tool_call(
+            _make_request("send_message", "after-fork", auth, {"channel_id": "ch-1"}),
+            send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert allowed.status != "error"
+    assert denied.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(denied.content)
+    assert send_calls == 1
+    assert ctx.ifc_labels is auth.ifc_labels
+
+
+@pytest.mark.asyncio
 async def test_same_channel_history_reply_succeeds_and_public_tool_does_not_overtaint():
     auth = _ifc_auth(roles=())
     ctx = _ifc_turn(auth)

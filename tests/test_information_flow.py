@@ -850,14 +850,16 @@ class _Channels:
 @pytest.mark.asyncio
 async def test_preloaded_private_context_blocked_at_incompatible_auto_delivery_without_tool_call():
     channels = _Channels()
+    auth = _auth("slack-C-public")
     ctx = SimpleNamespace(
-        ifc_labels=_labels(sources=frozenset({"slack-C-private"})),
-        auth_context=_auth("slack-C-public"),
+        ifc_labels=_labels("slack-C-public"),
+        auth_context=auth,
         delivered_channel_ids=set(),
         send_message_count=0,
         turn_event_emitter=None,
         last_assistant_message_id=None,
     )
+    auth.ifc_state.merge(_labels(sources=frozenset({"slack-C-private"})))
     agent = SimpleNamespace(
         _config=SimpleNamespace(auto_deliver_final_text_channels=("slack-",)),
         _channels=channels,
@@ -903,6 +905,11 @@ async def test_activity_panel_post_and_detailed_edit_use_live_labels_and_fail_cl
             "_auth_context": auth,
         }
     )
+    assert len(bridge.sends) == 1
+
+    # A detached tool result can update only the shared monotonic state while
+    # the panel model and subsequent event still carry the pre-fork labels.
+    auth.ifc_state.merge(_labels(sources=frozenset({"slack-C-private"})))
     await panel.handle_event(
         {
             "type": "tool_result",
@@ -911,12 +918,11 @@ async def test_activity_panel_post_and_detailed_edit_use_live_labels_and_fail_cl
             "channel_id": "slack-C1",
             "tool_name": "read_file",
             "content": "protected preview",
-            "_ifc_labels": _labels(sources=frozenset({"slack-C-private"})),
+            "_ifc_labels": compatible,
             "_auth_context": auth,
         }
     )
 
-    assert len(bridge.sends) == 1
     assert bridge.edits == []
 
 
