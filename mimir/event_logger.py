@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -84,7 +85,9 @@ class EventLogger:
             self._dir_ready = False
             log.warning("events.jsonl mkdir failed: %s", exc)
 
-    def _append_record_sync(self, record: dict[str, Any]) -> None:
+    def _append_record_sync(
+        self, record: dict[str, Any], *, durable: bool = False,
+    ) -> None:
         """Append a pre-built record using synchronous file IO.
 
         Called from ``log_sync`` directly and from ``log`` via
@@ -97,6 +100,9 @@ class EventLogger:
                 try:
                     with self._path.open("a", encoding="utf-8") as f:
                         f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
+                        if durable:
+                            f.flush()
+                            os.fsync(f.fileno())
                     self._line_count += 1
                     return
                 except FileNotFoundError:
@@ -138,6 +144,15 @@ class EventLogger:
             # Trim deferred to the async path — see comment in log().
         except OSError as exc:
             log.warning("events.jsonl sync write failed: %s", exc)
+
+    def log_durable_sync(self, event_type: str, **payload: Any) -> None:
+        """Append and fsync a security-sensitive event.
+
+        Unlike the best-effort telemetry APIs, failures propagate so the caller
+        can refuse the state transition that depends on this audit record.
+        """
+        record = self._record(event_type, payload)
+        self._append_record_sync(record, durable=True)
 
     def _record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         rec: dict[str, Any] = {
@@ -235,6 +250,11 @@ def log_event_sync(event_type: str, **payload: Any) -> None:
     same time. Trimming is intentionally deferred — the next async
     ``log_event`` will catch up on the line-count check."""
     get_logger().log_sync(event_type, **payload)
+
+
+def log_durable_event_sync(event_type: str, **payload: Any) -> None:
+    """Durably append a structured event or raise if it was not persisted."""
+    get_logger().log_durable_sync(event_type, **payload)
 
 
 def _reset_logger_for_tests() -> None:

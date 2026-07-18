@@ -16,6 +16,10 @@ from langgraph.runtime import Runtime
 from mimir.access_control import (
     ChannelResourceAdapter,
     OperationDecision,
+    SinkCategory,
+    ToolFlowDirection,
+    get_sink_category,
+    get_tool_flow_direction,
     get_operation_catalog,
     get_tool_registry,
 )
@@ -84,6 +88,8 @@ class TestChannelResourceAdapterDecision:
     def test_returns_resource_scoped_for_fetch_channel_history(self):
         decision = ChannelResourceAdapter.get_decision("fetch_channel_history", None)
         assert decision == OperationDecision.RESOURCE_SCOPED
+        assert get_tool_flow_direction("fetch_channel_history") is ToolFlowDirection.SOURCE
+        assert get_sink_category("fetch_channel_history") is SinkCategory.UNKNOWN
 
     def test_returns_none_for_non_channel_operation(self):
         decision = ChannelResourceAdapter.get_decision("shell_exec", None)

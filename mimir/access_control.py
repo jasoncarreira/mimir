@@ -92,10 +92,19 @@ class SinkCategory(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ToolFlowDirection(StrEnum):
+    """Whether a tool reads protected data, emits data, does both, or neither."""
+
+    SOURCE = "source"
+    SINK = "sink"
+    BOTH = "both"
+    NEITHER = "neither"
+    UNKNOWN = "unknown"
+
+
 _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "send_message": SinkCategory.SAME_CHANNEL,
     "react": SinkCategory.SAME_CHANNEL,
-    "fetch_channel_history": SinkCategory.SAME_CHANNEL,
     # Harness-owned egress paths bypass model tool middleware, so they are
     # named explicitly and checked at their final send/edit boundary.
     "harness_auto_deliver": SinkCategory.SAME_CHANNEL,
@@ -115,8 +124,14 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "ntfy_send": SinkCategory.NOTIFICATION,
     "write_file": SinkCategory.FILE,
     "edit_file": SinkCategory.FILE,
-    "mcp_": SinkCategory.EXTERNAL_MCP,
 }
+
+_TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
+    **{name: ToolFlowDirection.SINK for name in _SINK_CATEGORY_MAP},
+    "fetch_channel_history": ToolFlowDirection.SOURCE,
+}
+
+IFC_POLICY_VERSION = "ifc-v1"
 
 
 def get_sink_category(tool_name: str) -> SinkCategory:
@@ -129,6 +144,14 @@ def get_sink_category(tool_name: str) -> SinkCategory:
         if tool_name.startswith(prefix):
             return category
     return SinkCategory.UNKNOWN
+
+
+def get_tool_flow_direction(tool_name: str) -> ToolFlowDirection:
+    """Return explicit native-tool flow metadata without name-prefix inference."""
+    for prefix, direction in _TOOL_FLOW_MAP.items():
+        if tool_name.startswith(prefix):
+            return direction
+    return ToolFlowDirection.UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -440,6 +463,7 @@ class SinkGate:
         auth_context: Any,
         *,
         enforce: bool = False,
+        sink_category: SinkCategory | None = None,
     ) -> "ToolAuthorization":
         """Check if IFC labels permit flow to the given sink.
 
@@ -466,7 +490,7 @@ class SinkGate:
                 is_shadow_decision=not enforce,
             )
 
-        sink_category = get_sink_category(tool_name)
+        sink_category = sink_category or get_sink_category(tool_name)
         if sink_category == SinkCategory.UNKNOWN:
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -667,6 +691,9 @@ def audit_declassification(
     labels: Any,
     declassification_reason: str,
     auth_context: Any,
+    *,
+    destination: str,
+    policy_version: str = IFC_POLICY_VERSION,
 ) -> Any:
     """Audit admin declassification of IFC labels (chainlink #871).
 
@@ -691,14 +718,56 @@ def audit_declassification(
         roles = getattr(auth_context, "roles", ()) or ()
         is_admin = "admin" in roles
 
-    if not is_admin:
+    principal = getattr(auth_context, "principal", None)
+    canonical_principal = getattr(auth_context, "canonical_principal", None)
+    if (
+        not is_admin
+        or not isinstance(principal, str) or not principal.strip()
+        or not isinstance(canonical_principal, str) or not canonical_principal.strip()
+        or not isinstance(declassification_reason, str) or not declassification_reason.strip()
+        or not isinstance(destination, str) or not destination.strip()
+        or not isinstance(policy_version, str) or not policy_version.strip()
+    ):
         return labels
 
-    log.info(
-        "ifc_declassification",
-        reason=declassification_reason,
-        principal=getattr(auth_context, "principal", None),
-    )
+    source_labels = [
+        {
+            "principal": source.principal,
+            "domain": source.domain,
+            "resource_id": source.resource_id,
+            "bridge_instance": source.bridge_instance,
+            "sensitivity": source.sensitivity,
+            "authorized_principals": sorted(source.authorized_principals),
+            "source_kind": source.source_kind,
+        }
+        for source in sorted(
+            labels.sources,
+            key=lambda item: (
+                str(item.domain), str(item.resource_id), str(item.principal),
+                str(item.sensitivity),
+            ),
+        )
+    ]
+    try:
+        from .event_logger import log_durable_event_sync
+
+        log_durable_event_sync(
+            "ifc_declassification",
+            source_labels=source_labels,
+            labels=sorted(labels.labels),
+            authenticated_admin={
+                "principal": principal,
+                "canonical_principal": canonical_principal,
+                "roles": sorted(getattr(auth_context, "roles", ()) or ()),
+            },
+            reason=declassification_reason.strip(),
+            destination=destination,
+            policy_version=policy_version,
+            outcome="approved",
+        )
+    except Exception as exc:  # fail closed without breaking the admin action caller
+        log.warning("ifc declassification audit failed: %s", exc)
+        return labels
 
     return InformationFlowLabels(
         labels=frozenset(),
@@ -1153,6 +1222,15 @@ class MCPResourceAdapter:
                     reason = "mcp_malformed_arguments"
                 else:
                     try:
+                        flow_direction = ToolFlowDirection(adapter.flow_direction)
+                    except ValueError:
+                        flow_direction = ToolFlowDirection.UNKNOWN
+                    if flow_direction is ToolFlowDirection.UNKNOWN:
+                        decision = OperationDecision.ADMIN_REQUIRED
+                        reason = "mcp_unknown_flow_direction"
+                        adapter = None
+                if adapter is not None and arguments is not None:
+                    try:
                         result = adapter.classify(MCPAuthorizationRequest(
                             tool_name=tool_name,
                             arguments=arguments,
@@ -1175,6 +1253,20 @@ class MCPResourceAdapter:
                             decision = OperationDecision.ADMIN_REQUIRED
                             reason = "mcp_adapter_decision_mismatch"
                         elif result.allowed:
+                            expected_source = flow_direction in {
+                                ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH,
+                            }
+                            expected_sink = flow_direction in {
+                                ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
+                            }
+                            if (
+                                bool(result.source_resources) is not expected_source
+                                or bool(result.sink_resources) is not expected_sink
+                            ):
+                                decision = OperationDecision.ADMIN_REQUIRED
+                                reason = "mcp_flow_metadata_mismatch"
+                                result = None
+                        if isinstance(result, MCPAuthorizationResult) and result.allowed and decision is not OperationDecision.ADMIN_REQUIRED:
                             if ifc_labels is None and context is not None:
                                 ifc_labels = getattr(context, "ifc_labels", None)
                             sink_check = None
@@ -1185,6 +1277,7 @@ class MCPResourceAdapter:
                                     ifc_labels,
                                     context,
                                     enforce=enforce,
+                                    sink_category=SinkCategory.EXTERNAL_MCP,
                                 )
                             if sink_check is not None and not sink_check.allowed:
                                 return sink_check
@@ -1202,19 +1295,24 @@ class MCPResourceAdapter:
                                     sink_check.is_shadow_decision if sink_check is not None else False
                                 ),
                                 protected_source_resources=result.source_resources,
+                                flow_direction=flow_direction,
                             )
-                        else:
+                        elif isinstance(result, MCPAuthorizationResult) and not result.allowed:
                             reason = result.reason or "mcp_resource_denied"
 
         is_admin = decision is OperationDecision.ADMIN_REQUIRED
         admin = context is not None and "admin" in (getattr(context, "roles", ()) or ())
+        hard_failure = reason in {
+            "mcp_unknown_flow_direction",
+            "mcp_flow_metadata_mismatch",
+        }
         denied_by_policy = not admin
-        allowed = admin or not enforce
+        allowed = (admin and not hard_failure) or not enforce
         return ToolAuthorization(
             tool_name=tool_name,
             decision=decision,
             allowed=allowed,
-            reason=None if admin else reason,
+            reason=None if admin and not hard_failure else reason,
             required_tier=AccessTier.ADMIN if is_admin else AccessTier.USER,
             enforcement_enabled=enforce,
             is_shadow_decision=not enforce and denied_by_policy,
@@ -1347,6 +1445,7 @@ class ToolAuthorization:
     # ``None`` means provenance is unknown; ``()`` authoritatively classifies
     # the call as not reading a protected MCP source.
     protected_source_resources: tuple[str, ...] | None = None
+    flow_direction: ToolFlowDirection = ToolFlowDirection.UNKNOWN
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return fields for audit logging."""
@@ -1522,7 +1621,21 @@ class ToolRegistry:
             if auth.is_shadow_decision:
                 self._emit_shadow_decision(auth)
             return auth
+        if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
+            auth = ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="mcp_unknown_flow_direction",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+            if auth.is_shadow_decision:
+                self._emit_shadow_decision(auth)
+            return auth
 
+        flow_direction = get_tool_flow_direction(tool_name)
         sink_category = get_sink_category(tool_name)
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)
@@ -1561,8 +1674,11 @@ class ToolRegistry:
             and auth_context is not None
         ):
             sink_target = getattr(auth_context, "channel_id", None)
-        is_ifc_sink = sink_category != SinkCategory.UNKNOWN or (
+        is_ifc_sink = flow_direction in {
+            ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
+        } or (
             ifc_labels is not None
+            and flow_direction is ToolFlowDirection.UNKNOWN
             and preliminary_decision == OperationDecision.UNKNOWN
             and not service_allowed_preliminary
         )
@@ -1619,6 +1735,7 @@ class ToolRegistry:
                     auth_context,
                     enforce=enforce,
                 )
+                channel_auth.flow_direction = flow_direction
                 return channel_auth
             required_tier = AccessTier.ADMIN
             if enforce:
@@ -1651,6 +1768,7 @@ class ToolRegistry:
             required_tier=required_tier,
             enforcement_enabled=enforce,
             is_shadow_decision=is_shadow,
+            flow_direction=flow_direction,
         )
 
         if is_shadow:
