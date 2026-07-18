@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from .event_logger import log_event
+from .models import AuthContext, SessionACL
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class ChannelSession:
         default=None, repr=False
     )
     ended: bool = False
+    source_acl: SessionACL = field(default_factory=SessionACL)
 
 
 def _make_saga_session_id(channel_id: str) -> str:
@@ -107,18 +109,31 @@ class SessionManager:
         conversation isn't actually parked, just slow."""
         self._is_busy = is_busy
 
-    async def touch(self, channel_id: str) -> ChannelSession:
+    async def touch(
+        self,
+        channel_id: str,
+        auth_context: AuthContext | None = None,
+        *,
+        origin_domain: str | None = None,
+        visibility: str = "private",
+    ) -> ChannelSession:
         """Ensure a session exists for ``channel_id`` and reset its idle timer.
 
         Caller MUST do this before enqueueing an event so the upcoming turn's
         ``TurnContext.saga_session_id`` reflects the live session.
         """
+        inbound_acl = SessionACL.from_auth_context(
+            auth_context,
+            origin_domain=origin_domain,
+            visibility=visibility,
+        )
         async with self._lock:
             now = time.time()
             session = self._sessions.get(channel_id)
             if session is not None and not session.ended:
                 if session.idle_handle is not None:
                     session.idle_handle.cancel()
+                session.source_acl = session.source_acl.intersect(inbound_acl)
                 session.last_message_at = now
                 session.idle_handle = self._schedule_idle(session)
                 return session
@@ -128,6 +143,7 @@ class SessionManager:
                 channel_id=channel_id,
                 started_at=now,
                 last_message_at=now,
+                source_acl=inbound_acl,
             )
             new_session.idle_handle = self._schedule_idle(new_session)
             self._sessions[channel_id] = new_session

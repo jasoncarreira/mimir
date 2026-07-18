@@ -36,7 +36,8 @@ from mimir.commitments.models import CommitmentRecord
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
-from mimir.models import AgentEvent, TurnContext, TurnRecord
+from mimir.access_control import create_auth_context
+from mimir.models import AgentEvent, SessionACL, TurnContext, TurnRecord
 from mimir.turn_hooks import CommitmentExtractionHook
 from mimir.turn_logger import TurnLogger
 
@@ -254,7 +255,55 @@ async def test_added_emits_commitments_extracted(
     assert persisted["skipped_dedupe"] == 0
     # Verify the record actually landed in the store.
     state = agent._commitments.current_state()
-    assert any(r.dedupe_key == "net-new-1" for r in state.values())
+    added = next(r for r in state.values() if r.dedupe_key == "net-new-1")
+    assert added.owner_principal == "legacy_admin"
+    assert added.visibility == "service"
+    assert added.service_name == "synthesis"
+
+
+@pytest.mark.asyncio
+async def test_commitment_extraction_inherits_source_session_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path)
+    from mimir.commitments.extractor import MIN_OUTPUT_LEN
+
+    async def _extract_one(*args: Any, **kwargs: Any) -> list[CommitmentRecord]:
+        return [_make_commitment_record(dedupe_key="owner-acl")]
+
+    monkeypatch.setattr(
+        "mimir.commitments.extractor.extract_commitments", _extract_one,
+    )
+
+    async def _ignore_event(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("mimir.turn_hooks.log_event", _ignore_event)
+    source_acl = SessionACL(
+        owner_principal="alice",
+        origin_channel="ch-1",
+        origin_domain="discord",
+        visibility="private",
+        provenance_complete=True,
+    )
+    event = AgentEvent(
+        trigger="saga_session_end",
+        channel_id="ch-1",
+        service_principal="synthesis",
+        source_session_acl=source_acl,
+    )
+    ctx = _make_ctx(event, saga_session_id="sess-1")
+    ctx.auth_context = create_auth_context(event, enforce=True)
+    assert ctx.auth_context.source_session_acl == source_acl
+    await _fire_extraction(
+        agent, ctx, event, _make_record("x" * (MIN_OUTPUT_LEN + 100))
+    )
+
+    rec = next(iter(agent._commitments.current_state().values()))
+    assert rec.owner_principal == "alice"
+    assert rec.originating_channel == "ch-1"
+    assert rec.visibility == "private"
+    assert rec.service_name is None
 
 
 @pytest.mark.asyncio

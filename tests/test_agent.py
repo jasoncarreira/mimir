@@ -538,7 +538,9 @@ class _FakeSessionManager:
         self.end_now_calls: list[str] = []
         self.increment_calls: list[str] = []
 
-    async def touch(self, channel_id: str) -> _FakeChannelSession:
+    async def touch(
+        self, channel_id: str, auth_context=None, **acl_fields,
+    ) -> _FakeChannelSession:
         self.touch_calls.append(channel_id)
         sess = self._sessions.get(channel_id)
         if sess is None or sess.ended:
