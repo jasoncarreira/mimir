@@ -2663,6 +2663,10 @@ def create_auth_context(
             and event.trigger == "saga_session_end"
             and event.service_principal == registered_service.canonical
             and event_ingress is None
+            and not (
+                isinstance(event.extra, dict)
+                and event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is not None
+            )
             else None
         ),
         ifc_labels=ifc_labels,

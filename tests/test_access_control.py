@@ -20,7 +20,7 @@ from mimir.access_control import (
     create_auth_context,
 )
 from mimir.identities import IdentityResolver
-from mimir.models import AgentEvent, AuthContext, SourceLabel, TurnContext
+from mimir.models import AgentEvent, AuthContext, SessionACL, SourceLabel, TurnContext
 
 
 def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
@@ -442,6 +442,65 @@ def test_http_ingress_extra_key_blocks_service_grant() -> None:
 
     assert auth_ctx.event_ingress is not None, "HTTP ingress should be detected from extra"
     assert auth_ctx.is_service is False, "Service authority should NOT be granted for HTTP ingress"
+
+
+def _source_session_acl() -> SessionACL:
+    return SessionACL(
+        owner_principal="alice",
+        origin_channel="discord-dm",
+        origin_domain="discord",
+        visibility="private",
+        provenance_complete=True,
+    )
+
+
+def test_source_session_acl_carried_only_for_trusted_internal_synthesis() -> None:
+    acl = _source_session_acl()
+    event = AgentEvent(
+        trigger="saga_session_end",
+        channel_id="discord-dm",
+        service_principal="synthesis",
+        source_session_acl=acl,
+    )
+
+    context = create_auth_context(event, enforce=True)
+
+    assert context.is_service is True
+    assert context.source_session_acl == acl
+
+
+@pytest.mark.parametrize(
+    ("trigger", "service_principal", "extra", "event_ingress"),
+    [
+        ("scheduled_tick", "scheduler", {}, None),
+        (
+            "saga_session_end",
+            "synthesis",
+            {HTTP_EVENT_INGRESS_EXTRA_KEY: "http-api"},
+            None,
+        ),
+        ("saga_session_end", "scheduler", {}, None),
+        ("unknown_synthesis", "synthesis", {}, None),
+        ("saga_session_end", "synthesis", {}, "http-api"),
+    ],
+)
+def test_source_session_acl_rejects_untrusted_carriage(
+    trigger: str,
+    service_principal: str,
+    extra: dict[str, str],
+    event_ingress: str | None,
+) -> None:
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id="discord-dm",
+        service_principal=service_principal,
+        source_session_acl=_source_session_acl(),
+        extra=extra,
+    )
+
+    context = create_auth_context(event, enforce=True, event_ingress=event_ingress)
+
+    assert context.source_session_acl is None
 
 
 def _turn(turn_id: str, saga_session_id: str, auth_context: AuthContext) -> TurnContext:

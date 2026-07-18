@@ -561,6 +561,41 @@ class TestHandleEvent:
             "keep": "me",
         }
 
+    async def test_event_strips_client_asserted_channel_visibility(self) -> None:
+        from mimir.worklink.continuation import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "content": "publish my synthesis",
+                    "author": "alice",
+                    "source": "api",
+                    "extra": {"channel_visibility": "public", "keep": "me"},
+                },
+            )
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.extra == {
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "keep": "me",
+        }
+        from mimir.access_control import create_auth_context
+        from mimir.models import SessionACL
+
+        context = create_auth_context(event, enforce=True)
+        durable_acl = SessionACL.from_auth_context(
+            context,
+            origin_domain=event.source,
+            visibility=event.extra.get("channel_visibility", "private"),
+        )
+        assert durable_acl.visibility == "private"
+
     async def test_event_strips_forged_worklink_hint_extra(self) -> None:
         from mimir.worklink.continuation import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,

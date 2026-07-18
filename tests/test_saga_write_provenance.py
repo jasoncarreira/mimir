@@ -181,16 +181,23 @@ async def test_synthesis_memory_store_preserves_service_provenance(
 async def test_saga_end_session_uses_runtime_not_model_session_for_authority(
     write_store: _WriteStore,
 ) -> None:
-    context = replace(
-        _service_context("saga_session_end", "discord-synthesis"),
-        source_session_acl=SessionACL(
-            owner_principal="regular",
-            origin_channel="discord-synthesis",
-            origin_domain="discord",
-            visibility="private",
-            provenance_complete=True,
-        ),
+    source_acl = SessionACL(
+        owner_principal="regular",
+        origin_channel="discord-synthesis",
+        origin_domain="discord",
+        visibility="private",
+        provenance_complete=True,
     )
+    context = create_auth_context(
+        AgentEvent(
+            trigger="saga_session_end",
+            channel_id="discord-synthesis",
+            service_principal="synthesis",
+            source_session_acl=source_acl,
+        ),
+        enforce=True,
+    )
+    assert context.source_session_acl == source_acl
     out = await saga_ops.saga_end_session.ainvoke({
         "session_id": "model-provided-row-id", "summary": "done",
         "runtime": _runtime(context, "synthesis-end"),

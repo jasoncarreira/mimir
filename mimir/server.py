@@ -332,14 +332,14 @@ async def _handle_event(request: web.Request) -> web.Response:
     extra = body.get("extra")
     if extra is not None and not isinstance(extra, dict):
         return web.json_response({"error": "extra must be an object"}, status=400)
-    # chainlink #783 / #740 (security): the generic /event ingress is client-
-    # controlled, so strip server-owned chat-skill keys and Worklink
-    # continuation hint keys before constructing the AgentEvent. Otherwise a
-    # client could forge skill invocations or smuggle issue/PR/worktree hints
-    # that later look authoritative to continuation recovery paths.
-    extra = stamp_http_event_ingress_extra(
-        strip_worklink_hint_extra(strip_chat_skill_extra(extra))
-    )
+    # chainlink #783 / #740 / #926 (security): the generic /event ingress is
+    # client-controlled, so strip server-owned chat-skill keys, Worklink
+    # continuation hints, and bridge-owned visibility before constructing the
+    # AgentEvent. Otherwise a client could forge privileged metadata or
+    # declassify its synthesized durable outputs as public.
+    extra = strip_worklink_hint_extra(strip_chat_skill_extra(extra))
+    extra.pop("channel_visibility", None)
+    extra = stamp_http_event_ingress_extra(extra)
     attachment_names = body.get("attachment_names")
     if attachment_names is not None and not isinstance(attachment_names, list):
         return web.json_response(
