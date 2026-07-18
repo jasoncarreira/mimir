@@ -50,6 +50,7 @@ from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
 from ..access_control import (
     OperationDecision,
     ToolAuthorization,
+    approve_live_declassification,
     classify_protected_result,
     get_tool_registry,
     get_trusted_service_from_auth_context,
@@ -655,6 +656,37 @@ def _emit_tool_call_sync(
         _emit_event_sync("tool_error", **error_payload)
 
 
+def _execute_declassification_action(
+    request: ToolCallRequest,
+    auth_context: AuthContext | None,
+    arguments: dict[str, Any] | None,
+) -> ToolMessage:
+    arguments = arguments or {}
+    approved, outcome = approve_live_declassification(
+        auth_context,
+        sink_category=arguments.get("sink_category"),
+        destination=arguments.get("destination"),
+        reason=arguments.get("reason"),
+    )
+    content = (
+        "One-use declassification approved for the exact destination."
+        if approved
+        else f"approve_declassification denied: {outcome}"
+    )
+    _emit_tool_call_sync(
+        "approve_declassification",
+        ok=approved,
+        error=None if approved else content,
+        denied=not approved,
+    )
+    return ToolMessage(
+        content=content,
+        tool_call_id=_tool_call_id(request),
+        name="approve_declassification",
+        status="success" if approved else "error",
+    )
+
+
 def _result_is_error(result: ToolMessage | Command) -> bool:
     return isinstance(result, ToolMessage) and getattr(result, "status", None) == "error"
 
@@ -740,6 +772,19 @@ class BudgetGateMiddleware(AgentMiddleware):
                 tool_call_id=_tool_call_id(request),
                 name=tool_name,
                 status="error",
+            )
+        if tool_name == "approve_declassification":
+            denial = _check_and_increment_or_deny(tool_name)
+            if denial is not None:
+                _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
+                return ToolMessage(
+                    content=denial,
+                    tool_call_id=_tool_call_id(request),
+                    name=tool_name,
+                    status="error",
+                )
+            return _execute_declassification_action(
+                request, auth_context, validated_arguments,
             )
         result_labels = _result_labels_for_call(
             tool_name, request, auth_context, authorization,
@@ -844,6 +889,19 @@ class BudgetGateMiddleware(AgentMiddleware):
                 tool_call_id=_tool_call_id(request),
                 name=tool_name,
                 status="error",
+            )
+        if tool_name == "approve_declassification":
+            denial = _check_and_increment_or_deny(tool_name)
+            if denial is not None:
+                _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
+                return ToolMessage(
+                    content=denial,
+                    tool_call_id=_tool_call_id(request),
+                    name=tool_name,
+                    status="error",
+                )
+            return _execute_declassification_action(
+                request, auth_context, validated_arguments,
             )
         result_labels = _result_labels_for_call(
             tool_name, request, auth_context, authorization,

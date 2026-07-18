@@ -76,6 +76,87 @@ def _make_request(
     )
 
 
+def test_private_admin_can_approve_only_one_exact_file_sink_through_middleware(
+    tmp_path: Path,
+) -> None:
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"ch-1"}),
+        sources=frozenset({SourceLabel(
+            principal="user-1",
+            domain="channel",
+            resource_id="ch-1",
+            bridge_instance="test",
+            sensitivity="private",
+            authorized_principals=frozenset({"user-1"}),
+        )}),
+    )
+    auth = AuthContext(
+        principal="test-U1",
+        canonical_principal="user-1",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=True,
+        ifc_labels=labels,
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+    )
+    middleware = BudgetGateMiddleware()
+    approved_path = str(tmp_path / "approved.txt")
+    other_path = str(tmp_path / "other.txt")
+    executions: list[str] = []
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        executions.append(str(request.tool_call["args"]["file_path"]))
+        return ToolMessage(
+            content="written",
+            tool_call_id=str(request.tool_call["id"]),
+            name="write_file",
+        )
+
+    denied_before = middleware.wrap_tool_call(
+        _make_request("write_file", auth_context=auth, args={"file_path": approved_path}),
+        handler,
+    )
+    init_logger(tmp_path / "events.jsonl", session_id="ifc-middleware-test")
+    try:
+        approval = middleware.wrap_tool_call(
+            _make_request(
+                "approve_declassification",
+                tool_call_id="approval-1",
+                auth_context=auth,
+                args={
+                    "sink_category": "file",
+                    "destination": approved_path,
+                    "reason": "write this exact output",
+                },
+            ),
+            lambda _request: pytest.fail("approval handler must not receive authority"),
+        )
+        written = middleware.wrap_tool_call(
+            _make_request("write_file", auth_context=auth, args={"file_path": approved_path}),
+            handler,
+        )
+        denied_other = middleware.wrap_tool_call(
+            _make_request("write_file", auth_context=auth, args={"file_path": other_path}),
+            handler,
+        )
+    finally:
+        _reset_logger_for_tests()
+
+    assert denied_before.status == "error"
+    assert approval.status == "success"
+    assert written.status != "error"
+    assert denied_other.status == "error"
+    assert executions == [approved_path]
+
+
 @pytest.mark.asyncio
 async def test_mcp_resource_adapter_runs_before_remote_handler() -> None:
     from dataclasses import replace
@@ -1455,6 +1536,7 @@ def test_all_mimir_tools_includes_both_names(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "claude-code:foo")
     names = {t.name for t in all_mimir_tools()}
+    assert "approve_declassification" in names
     assert "mimir_get_turn" in names
     assert "get_turn" in names
 

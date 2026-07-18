@@ -174,6 +174,9 @@ class InformationFlowState:
     """Turn-local monotonic IFC state shared by frozen runtime carriers."""
 
     labels: InformationFlowLabels | None = None
+    _declassification: "DeclassificationCapability | None" = field(
+        default=None, repr=False, compare=False,
+    )
     _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def current(self, fallback: InformationFlowLabels | None = None) -> InformationFlowLabels | None:
@@ -198,8 +201,86 @@ class InformationFlowState:
                     merged = merged.with_channel(channel)
                 for source in carrier.sources:
                     merged = merged.with_source(source)
+            if current is not None and merged != current:
+                self._declassification = None
             self.labels = merged
             return merged
+
+    def approve_sink_once(
+        self,
+        *,
+        fallback: InformationFlowLabels | None,
+        sink_category: str,
+        destination: str,
+        canonical_principal: str,
+        lifetime_seconds: float,
+        durable_audit: Any,
+    ) -> bool:
+        """Durably audit and install one capability for the exact live carrier."""
+        with self._lock:
+            current = self.labels if self.labels is not None else fallback
+            if not isinstance(current, InformationFlowLabels) or not current.labels:
+                return False
+            issued_at = time.monotonic()
+            expires_at = issued_at + lifetime_seconds
+            if not durable_audit(current, issued_at, expires_at):
+                return False
+            self._declassification = DeclassificationCapability(
+                sink_category=sink_category,
+                destination=destination,
+                canonical_principal=canonical_principal,
+                labels=current.labels,
+                source_channels=current.source_channels,
+                sources=current.sources,
+                issued_at=issued_at,
+                expires_at=expires_at,
+            )
+            return True
+
+    def consume_sink_approval(
+        self,
+        *,
+        current: InformationFlowLabels,
+        sink_category: str,
+        destination: str,
+        canonical_principal: str,
+    ) -> bool:
+        """Atomically consume a matching, unexpired, one-use sink capability."""
+        with self._lock:
+            capability = self._declassification
+            if capability is None:
+                return False
+            if time.monotonic() > capability.expires_at:
+                self._declassification = None
+                return False
+            live = self.labels if self.labels is not None else current
+            matches = (
+                capability.sink_category == sink_category
+                and capability.destination == destination
+                and capability.canonical_principal == canonical_principal
+                and isinstance(live, InformationFlowLabels)
+                and capability.labels == live.labels == current.labels
+                and capability.source_channels == live.source_channels == current.source_channels
+                and capability.sources == live.sources == current.sources
+            )
+            if not matches:
+                return False
+            self._declassification = None
+            return True
+
+
+@dataclass(frozen=True)
+class DeclassificationCapability:
+    """One audited egress capability bound to a live turn and source snapshot."""
+
+    sink_category: str
+    destination: str
+    canonical_principal: str
+    labels: frozenset[str]
+    source_channels: frozenset[str]
+    sources: frozenset[SourceLabel]
+    issued_at: float
+    expires_at: float
 
 
 @dataclass

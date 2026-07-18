@@ -413,6 +413,20 @@ def reset_current_turn_interactive(token: contextvars.Token) -> None:
 # ────────────────────────────────────────────────────────────────────
 
 @tool
+def approve_declassification(
+    sink_category: str,
+    destination: str,
+    reason: str,
+) -> str:
+    """Authorize one audited egress to an exact destination for this private turn.
+
+    This admin-only action is executed by the authorization middleware against
+    the live turn carrier. Direct invocation cannot grant authority.
+    """
+    return "approve_declassification failed: missing live authorization middleware"
+
+
+@tool
 async def send_message(
     text: str,
     channel_id: Optional[str] = None,
@@ -2370,6 +2384,7 @@ def all_mimir_tools(model_spec: str | None = None) -> list:
         saga_record_skill_learning,
     )
     tools = [
+        approve_declassification,
         # Memory (read + write)
         memory_query, memory_get, memory_store,
         # Change proposals for protected files (PR-gated; never writes live).
