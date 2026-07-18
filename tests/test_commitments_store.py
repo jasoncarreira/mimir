@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from pathlib import Path
 
 import pytest
 
+from mimir.models import AuthContext
 from mimir.commitments import (
     CommitmentKind,
     CommitmentRecord,
@@ -101,6 +103,58 @@ async def test_add_and_replay_round_trips(tmp_path: Path):
     assert out.kind == CommitmentKind.AGENT_PROMISE.value
     assert out.dedupe_key  # auto-filled
     assert out.created_at_unix > 0  # auto-filled
+
+
+def test_ownerless_migration_uses_only_authoritative_session_acl(tmp_path: Path):
+    commitments_path = tmp_path / "commitments.jsonl"
+    saga_path = tmp_path / "saga.db"
+    conn = sqlite3.connect(saga_path)
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT, owner_principal TEXT, "
+        "origin_channel TEXT, origin_domain TEXT, visibility TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+        ("session-alice", "user:alice", "ch-1", "discord", "private"),
+    )
+    conn.commit()
+    conn.close()
+    records = [
+        CommitmentRecord(
+            id="c-authoritative", channel_id="ch-1", text="Alice secret",
+            saga_session_id="session-alice",
+        ),
+        CommitmentRecord(
+            id="c-unknown", channel_id="ch-2", text="Unknown secret",
+            saga_session_id="missing-session",
+        ),
+    ]
+    events = [
+        {"type": "commitment_added", "id": record.id, "record": record.to_dict()}
+        for record in records
+    ]
+    commitments_path.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n"
+    )
+
+    store = CommitmentsStore(
+        path=commitments_path, provenance_db_path=saga_path,
+    )
+    assert store.migrate_ownership() == 2
+    state = store.current_state()
+    assert state["c-authoritative"].owner_principal == "user:alice"
+    assert state["c-authoritative"].originating_channel == "ch-1"
+    assert state["c-authoritative"].origin_domain == "discord"
+    assert state["c-authoritative"].visibility == "private"
+    assert state["c-unknown"].owner_principal == "legacy_admin"
+    assert state["c-unknown"].visibility == "service"
+    assert store.list(
+        auth_context=AuthContext(
+            principal="legacy_admin", canonical_principal="legacy_admin", roles=(),
+            event_ingress=None, trigger="user_message", channel_id="ch-2",
+            interactivity=None,
+        )
+    ) == []
 
 
 @pytest.mark.asyncio

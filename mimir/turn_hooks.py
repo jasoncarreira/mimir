@@ -202,6 +202,7 @@ class CommitmentExtractionHook(TurnHook):
         from .commitments.extractor import (
             EXTRACTION_PROMPT_VERSION,
             MIN_OUTPUT_LEN,
+            assign_extraction_acl,
             extract_commitments,
         )
         from .history import SYNTHETIC_CHANNEL_PREFIXES
@@ -276,16 +277,16 @@ class CommitmentExtractionHook(TurnHook):
                 if ctx.auth_context is not None
                 else None
             )
-            if source_acl is not None and source_acl.provenance_complete:
-                rec.owner_principal = source_acl.owner_principal
-                rec.originating_channel = source_acl.origin_channel
-                rec.visibility = source_acl.visibility
-                rec.service_name = None
-            else:
-                rec.owner_principal = "legacy_admin"
-                rec.originating_channel = None
-                rec.visibility = "service"
-                rec.service_name = "synthesis"
+            service_name = "synthesis"
+            if ctx.auth_context is not None and ctx.auth_context.is_service:
+                service_name = (
+                    ctx.auth_context.canonical_principal
+                    or ctx.auth_context.principal
+                    or service_name
+                ).removeprefix("service:")
+            assign_extraction_acl(
+                rec, source_acl, service_name=service_name,
+            )
             if rec.dedupe_key in existing_keys:
                 skipped_dedupe += 1
                 continue

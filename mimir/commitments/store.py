@@ -22,10 +22,13 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from mimir.models import AuthContext
 
 from .models import (
     DEFAULT_SNOOZE_WINDOW_SECS,
@@ -105,6 +108,7 @@ class CommitmentsStore:
 
     path: Path
     terminal_retention_days: int = DEFAULT_TERMINAL_RETENTION_DAYS
+    provenance_db_path: Path | None = None
 
     def __post_init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -156,6 +160,89 @@ class CommitmentsStore:
             "record": record.to_dict(),
         })
         return record
+
+    def migrate_ownership(self) -> int:
+        """Backfill ownerless add events from authoritative SAGA sessions.
+
+        A row is trusted only when its exact ``saga_session_id`` resolves to a
+        complete ownership tuple. Missing databases, schemas, sessions, or ACL
+        columns fail closed to the reserved admin-only owner.
+        """
+        if not self.path.exists():
+            return 0
+        session_acls: dict[str, tuple[str, str, str, str]] = {}
+        if self.provenance_db_path is not None and self.provenance_db_path.is_file():
+            try:
+                conn = sqlite3.connect(
+                    f"file:{self.provenance_db_path}?mode=ro", uri=True,
+                )
+                try:
+                    rows = conn.execute(
+                        "SELECT id, owner_principal, origin_channel, "
+                        "origin_domain, visibility FROM sessions"
+                    ).fetchall()
+                finally:
+                    conn.close()
+                for session_id, owner, channel, domain, visibility in rows:
+                    if (
+                        isinstance(session_id, str)
+                        and isinstance(owner, str) and owner
+                        and owner != "legacy_admin"
+                        and isinstance(channel, str) and channel
+                        and isinstance(domain, str) and domain
+                        and visibility in {"public", "private", "service"}
+                    ):
+                        session_acls[session_id] = (
+                            owner, channel, domain, visibility,
+                        )
+            except (OSError, sqlite3.Error):
+                log.exception(
+                    "commitments: authoritative ownership lookup failed; "
+                    "ownerless rows will become admin-only"
+                )
+
+        changed = 0
+        rewritten: list[str] = []
+        with self.path.open("r", encoding="utf-8") as source:
+            for line in source:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    rewritten.append(line.rstrip("\n"))
+                    continue
+                if event.get("type") == "commitment_added":
+                    data = event.get("record")
+                    if isinstance(data, dict) and not data.get("owner_principal"):
+                        acl = session_acls.get(data.get("saga_session_id"))
+                        if acl is not None:
+                            owner, channel, domain, visibility = acl
+                            data["owner_principal"] = owner
+                            data["originating_channel"] = channel
+                            data["origin_domain"] = domain
+                            data["visibility"] = visibility
+                        else:
+                            data["owner_principal"] = "legacy_admin"
+                            data["originating_channel"] = None
+                            data["origin_domain"] = None
+                            data["visibility"] = CommitmentVisibility.SERVICE.value
+                            data["service_name"] = data.get("service_name") or "legacy"
+                        data["dedupe_key"] = make_dedupe_key(
+                            channel_id=data.get("channel_id"),
+                            text=data.get("text") or "",
+                            due_window_start_unix=data.get("due_window_start_unix"),
+                            recipient_identity=data.get("recipient_identity"),
+                            owner_principal=data["owner_principal"],
+                        )
+                        changed += 1
+                rewritten.append(json.dumps(event, ensure_ascii=True, default=str))
+        if changed:
+            tmp = self.path.with_suffix(self.path.suffix + ".ownership.tmp")
+            with tmp.open("w", encoding="utf-8") as target:
+                target.write("\n".join(rewritten) + "\n")
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(tmp, self.path)
+        return changed
 
     def _can_apply(
         self,
@@ -250,6 +337,7 @@ class CommitmentsStore:
             return True
         return (
             record.owner_principal is not None
+            and record.owner_principal != "legacy_admin"
             and actor_principal == record.owner_principal
         )
 
@@ -600,6 +688,7 @@ class CommitmentsStore:
         include_service: bool = False,
         owner_principal: str | None = None,
         actor_is_admin: bool = False,
+        auth_context: AuthContext | None = None,
     ) -> list[CommitmentRecord]:
         """Replay + filter.
 
@@ -616,6 +705,14 @@ class CommitmentsStore:
           actor is also authorized for their owner. It never grants cross-owner
           access. Default False.
         Sorted by created_at_unix ascending."""
+        if auth_context is not None:
+            if not isinstance(auth_context, AuthContext):
+                raise TypeError("commitment reads require the exact AuthContext")
+            actor_principal = (
+                auth_context.canonical_principal or auth_context.principal
+            )
+            actor_is_admin = "admin" in auth_context.roles
+            include_service = auth_context.is_service
         state = self.current_state()
         out: list[CommitmentRecord] = []
         for rec in state.values():
@@ -661,7 +758,10 @@ class CommitmentsStore:
             return True
         if actor_principal is None:
             return record.visibility == CommitmentVisibility.PUBLIC.value
-        if actor_principal != record.owner_principal:
+        if (
+            record.owner_principal == "legacy_admin"
+            or actor_principal != record.owner_principal
+        ):
             return False
         if record.visibility == CommitmentVisibility.SERVICE.value:
             return include_service
