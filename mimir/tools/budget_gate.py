@@ -39,6 +39,7 @@ import asyncio
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
@@ -290,6 +291,28 @@ def _extract_sink_target(
         from .web import DEFAULT_TAVILY_SEARCH_URL
 
         target = os.environ.get("TAVILY_SEARCH_URL", "").strip() or DEFAULT_TAVILY_SEARCH_URL
+    elif tool_name in {"add_schedule", "set_schedule_priority", "remove_schedule"}:
+        name = str(args.get("name") or "").strip()
+        target = f"scheduler:job:{name}" if name else "scheduler:jobs"
+    elif tool_name == "set_poller_overrides":
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        target = str(Path(home) / "pollers-overrides.yaml") if home else "scheduler:poller-overrides"
+    elif tool_name == "reload_pollers":
+        target = "scheduler:pollers"
+    elif tool_name in {
+        "commitment_complete", "commitment_snooze", "commitment_dismiss",
+    }:
+        commitment_id = str(args.get("commitment_id") or "").strip()
+        target = f"commitment:{commitment_id}" if commitment_id else "commitments"
+    elif tool_name == "defer_injected_message":
+        message_id = str(args.get("message_id") or "").strip()
+        target = f"injected-message:{message_id}" if message_id else "injected_messages"
+    elif tool_name == "request_mimir_update":
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        target = str(Path(home) / ".mimir" / "pending-update.flag") if home else "pending-update.flag"
+    elif tool_name == "rebuild_index":
+        scope = str(args.get("scope") or "all").strip().lower()
+        target = f"index:{scope}"
     elif tool_name.startswith("mcp_"):
         target = tool_name
     else:

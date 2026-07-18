@@ -19,7 +19,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
-from mimir.models import AuthContext, TurnContext
+from mimir.models import AuthContext, InformationFlowLabels, TurnContext
 from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import BudgetGateMiddleware
 
@@ -66,6 +66,7 @@ def _attach_auth(ctx: TurnContext, resolver: IdentityResolver | None = None) -> 
         channel_id=ctx.channel_id,
         interactivity=None,
         enforcement_enabled=ctx.access_control_enforced,
+        ifc_labels=InformationFlowLabels(),
     )
 
 

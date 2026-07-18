@@ -7,16 +7,23 @@ import logging
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+from langchain.agents.middleware import ToolCallRequest
+from langchain_core.messages import ToolMessage
+from langgraph.runtime import Runtime
 
 from mimir.access_control import (
     SinkCategory,
     SinkGate,
+    ToolFlowDirection,
     ToolRegistry,
     approve_live_declassification,
     audit_declassification,
     create_auth_context,
+    get_sink_category,
+    get_tool_flow_direction,
 )
 from mimir.agent import (
     Agent,
@@ -536,6 +543,101 @@ def test_persistent_writes_are_ifc_gated_not_merely_admin_gated(
 
     assert decision.allowed is False
     assert decision.reason == f"ifc_label_blocked:{sink_category.value}"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "sink_category"),
+    [
+        ("set_poller_overrides", SinkCategory.SCHEDULER),
+        ("reload_pollers", SinkCategory.SCHEDULER),
+        ("remove_schedule", SinkCategory.SCHEDULER),
+        ("commitment_complete", SinkCategory.SAGA),
+        ("commitment_snooze", SinkCategory.SAGA),
+        ("commitment_dismiss", SinkCategory.SAGA),
+        ("request_mimir_update", SinkCategory.FILE),
+        ("rebuild_index", SinkCategory.FILE),
+    ],
+)
+def test_inventory_omission_mutations_are_explicit_ifc_sinks(
+    tool_name: str,
+    sink_category: SinkCategory,
+) -> None:
+    assert get_tool_flow_direction(tool_name) is ToolFlowDirection.SINK
+    assert get_sink_category(tool_name) is sink_category
+
+    decision = ToolRegistry().authorize_tool(
+        tool_name,
+        _auth(roles=("admin",)),
+        enforce=True,
+        ifc_labels=_labels(),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == f"ifc_label_blocked:{sink_category.value}"
+
+
+@pytest.mark.asyncio
+async def test_tainted_poller_override_is_denied_before_handler_execution() -> None:
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth = replace(_auth(roles=("admin",)), ifc_labels=_labels())
+    request = ToolCallRequest(
+        tool_call={
+            "name": "set_poller_overrides",
+            "args": {"poller_name": "mail", "overrides": {"prompt": "tainted"}},
+            "id": "ifc-poller-override",
+            "type": "tool_call",
+        },
+        tool=None,
+        state=None,
+        runtime=Runtime(context=auth),
+    )
+    handler_calls = 0
+
+    async def handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="mutated", tool_call_id="ifc-poller-override")
+
+    result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+
+    assert handler_calls == 0
+    assert result.status == "error"
+    assert "ifc_label_blocked:scheduler" in str(result.content)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_direction"),
+    [
+        ("commitment_list", ToolFlowDirection.SOURCE),
+        ("write_todos", ToolFlowDirection.NEITHER),
+    ],
+)
+def test_non_sink_tools_have_explicit_flow_directions(
+    tool_name: str,
+    expected_direction: ToolFlowDirection,
+) -> None:
+    assert get_tool_flow_direction(tool_name) is expected_direction
+    assert get_sink_category(tool_name) is SinkCategory.UNKNOWN
+
+    with patch.object(SinkGate, "check_sink_flow") as sink_gate:
+        decision = ToolRegistry().authorize_tool(
+            tool_name,
+            _auth(),
+            enforce=True,
+            ifc_labels=_labels(),
+        )
+
+    assert decision.allowed is True
+    sink_gate.assert_not_called()
+
+
+def test_declassification_action_has_explicit_non_sink_flow_metadata() -> None:
+    assert (
+        get_tool_flow_direction("approve_declassification")
+        is ToolFlowDirection.NEITHER
+    )
+    assert get_sink_category("approve_declassification") is SinkCategory.UNKNOWN
 
 
 def test_same_scope_synthesis_write_remains_allowed():

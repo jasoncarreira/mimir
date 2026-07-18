@@ -122,6 +122,12 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "web_search": SinkCategory.NETWORK,
     "shell_exec": SinkCategory.SHELL_PROCESS,
     "bash_async": SinkCategory.SHELL_PROCESS,
+    "Bash": SinkCategory.SHELL_PROCESS,
+    "bash": SinkCategory.SHELL_PROCESS,
+    "bash_exec": SinkCategory.SHELL_PROCESS,
+    "execute": SinkCategory.SHELL_PROCESS,
+    "aexecute": SinkCategory.SHELL_PROCESS,
+    "shell": SinkCategory.SHELL_PROCESS,
     "spawn_claude_code": SinkCategory.SPAWN,
     "spawn_codex": SinkCategory.SPAWN,
     "spawn_open_code": SinkCategory.SPAWN,
@@ -129,6 +135,12 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "ntfy_send": SinkCategory.NOTIFICATION,
     "write_file": SinkCategory.FILE,
     "edit_file": SinkCategory.FILE,
+    "Write": SinkCategory.FILE,
+    "Edit": SinkCategory.FILE,
+    "download_files": SinkCategory.FILE,
+    "adownload_files": SinkCategory.FILE,
+    "rebuild_index": SinkCategory.FILE,
+    "request_mimir_update": SinkCategory.FILE,
     "memory_store": SinkCategory.SAGA,
     "saga_record_skill_learning": SinkCategory.SAGA,
     "saga_feedback": SinkCategory.SAGA,
@@ -137,14 +149,103 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "saga_end_session": SinkCategory.SAGA,
     "add_schedule": SinkCategory.SCHEDULER,
     "set_schedule_priority": SinkCategory.SCHEDULER,
+    "remove_schedule": SinkCategory.SCHEDULER,
+    "set_poller_overrides": SinkCategory.SCHEDULER,
+    "reload_pollers": SinkCategory.SCHEDULER,
+    "commitment_complete": SinkCategory.SAGA,
+    "commitment_snooze": SinkCategory.SAGA,
+    "commitment_dismiss": SinkCategory.SAGA,
+    "defer_injected_message": SinkCategory.SAGA,
     "open_proposal": SinkCategory.PROPOSAL,
     "submit_proposal": SinkCategory.PROPOSAL,
     "abandon_proposal": SinkCategory.PROPOSAL,
 }
 
 _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
-    **{name: ToolFlowDirection.SINK for name in _SINK_CATEGORY_MAP},
+    # Native model tools. This is intentionally exhaustive rather than derived
+    # from the sink map: startup checks the assembled surface against this map,
+    # so adding a tool without making an IFC decision fails closed.
+    # Declassification mutates the live authorization carrier but does not itself
+    # read protected data or emit it; the subsequent exact sink remains gated.
+    "approve_declassification": ToolFlowDirection.NEITHER,
+    "memory_query": ToolFlowDirection.SOURCE,
+    "memory_get": ToolFlowDirection.SOURCE,
+    "memory_store": ToolFlowDirection.SINK,
+    "open_proposal": ToolFlowDirection.SINK,
+    "submit_proposal": ToolFlowDirection.SINK,
+    "abandon_proposal": ToolFlowDirection.SINK,
+    "saga_feedback": ToolFlowDirection.SINK,
+    "saga_mark_contributions": ToolFlowDirection.SINK,
+    "saga_end_session": ToolFlowDirection.SINK,
+    "saga_forget": ToolFlowDirection.SINK,
+    "saga_record_skill_learning": ToolFlowDirection.SINK,
+    "file_search": ToolFlowDirection.SOURCE,
+    "rebuild_index": ToolFlowDirection.SINK,
+    "mimir_get_turn": ToolFlowDirection.SOURCE,
+    "get_turn": ToolFlowDirection.SOURCE,
+    "shell_exec": ToolFlowDirection.BOTH,
+    "bash_async": ToolFlowDirection.BOTH,
+    "bash_jobs_list": ToolFlowDirection.SOURCE,
+    "bash_job_output": ToolFlowDirection.SOURCE,
+    "send_message": ToolFlowDirection.SINK,
+    "react": ToolFlowDirection.SINK,
     "fetch_channel_history": ToolFlowDirection.SOURCE,
+    "list_channels": ToolFlowDirection.SOURCE,
+    "defer_injected_message": ToolFlowDirection.SINK,
+    "list_schedules": ToolFlowDirection.SOURCE,
+    "add_schedule": ToolFlowDirection.SINK,
+    "set_schedule_priority": ToolFlowDirection.SINK,
+    "remove_schedule": ToolFlowDirection.SINK,
+    "set_poller_overrides": ToolFlowDirection.SINK,
+    "reload_pollers": ToolFlowDirection.SINK,
+    "commitment_complete": ToolFlowDirection.SINK,
+    "commitment_snooze": ToolFlowDirection.SINK,
+    "commitment_dismiss": ToolFlowDirection.SINK,
+    "commitment_list": ToolFlowDirection.SOURCE,
+    "worklink_run": ToolFlowDirection.BOTH,
+    "request_mimir_update": ToolFlowDirection.SINK,
+    "web_search": ToolFlowDirection.BOTH,
+    "fetch_url": ToolFlowDirection.BOTH,
+    "post_message": ToolFlowDirection.SINK,
+    "webhook": ToolFlowDirection.SINK,
+    "http_request": ToolFlowDirection.BOTH,
+    "ntfy_send": ToolFlowDirection.SINK,
+    "spawn_claude_code": ToolFlowDirection.BOTH,
+    "spawn_codex": ToolFlowDirection.BOTH,
+    "spawn_open_code": ToolFlowDirection.BOTH,
+    # Deepagents model-bound built-ins and their async/compatibility aliases.
+    "read_file": ToolFlowDirection.SOURCE,
+    "aread": ToolFlowDirection.SOURCE,
+    "ls": ToolFlowDirection.SOURCE,
+    "als": ToolFlowDirection.SOURCE,
+    "glob": ToolFlowDirection.SOURCE,
+    "aglob": ToolFlowDirection.SOURCE,
+    "grep": ToolFlowDirection.SOURCE,
+    "agrep": ToolFlowDirection.SOURCE,
+    "write_file": ToolFlowDirection.SINK,
+    "edit_file": ToolFlowDirection.SINK,
+    "download_files": ToolFlowDirection.BOTH,
+    "adownload_files": ToolFlowDirection.BOTH,
+    "write_todos": ToolFlowDirection.NEITHER,
+    # Built-in subagents remain inside the current IFC carrier; delegation
+    # propagation is handled separately and is not an external sink itself.
+    "task": ToolFlowDirection.NEITHER,
+    "Bash": ToolFlowDirection.BOTH,
+    "bash": ToolFlowDirection.BOTH,
+    "bash_exec": ToolFlowDirection.BOTH,
+    "execute": ToolFlowDirection.BOTH,
+    "aexecute": ToolFlowDirection.BOTH,
+    "shell": ToolFlowDirection.BOTH,
+    "Write": ToolFlowDirection.SINK,
+    "Edit": ToolFlowDirection.SINK,
+    "Read": ToolFlowDirection.SOURCE,
+    "Glob": ToolFlowDirection.SOURCE,
+    "Grep": ToolFlowDirection.SOURCE,
+    # Harness egress is not model-bound but shares the same gate.
+    "harness_auto_deliver": ToolFlowDirection.SINK,
+    "harness_resend_nudge": ToolFlowDirection.SINK,
+    "activity_panel_post": ToolFlowDirection.SINK,
+    "activity_panel_edit": ToolFlowDirection.SINK,
 }
 
 IFC_POLICY_VERSION = "ifc-v1"
@@ -157,18 +258,12 @@ def get_sink_category(tool_name: str) -> SinkCategory:
     Unknown operations are not presumed public: doing so would make a newly
     added harness send an implicit IFC bypass until the map was updated.
     """
-    for prefix, category in _SINK_CATEGORY_MAP.items():
-        if tool_name.startswith(prefix):
-            return category
-    return SinkCategory.UNKNOWN
+    return _SINK_CATEGORY_MAP.get(tool_name, SinkCategory.UNKNOWN)
 
 
 def get_tool_flow_direction(tool_name: str) -> ToolFlowDirection:
     """Return explicit native-tool flow metadata without name-prefix inference."""
-    for prefix, direction in _TOOL_FLOW_MAP.items():
-        if tool_name.startswith(prefix):
-            return direction
-    return ToolFlowDirection.UNKNOWN
+    return _TOOL_FLOW_MAP.get(tool_name, ToolFlowDirection.UNKNOWN)
 
 
 @dataclass(frozen=True)
@@ -2331,6 +2426,15 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "abandon_proposal": "proposal",
     "add_schedule": "scheduler",
     "set_schedule_priority": "scheduler",
+    "remove_schedule": "scheduler",
+    "set_poller_overrides": "scheduler",
+    "reload_pollers": "scheduler",
+    "commitment_complete": "commitments",
+    "commitment_snooze": "commitments",
+    "commitment_dismiss": "commitments",
+    "defer_injected_message": "injected_messages",
+    "rebuild_index": "filesystem",
+    "request_mimir_update": "filesystem",
     "saga_feedback": "saga",
     "saga_mark_contributions": "saga",
     "saga_record_skill_learning": "saga",
@@ -2339,6 +2443,27 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "send_message": "message",
     "saga_end_session": "session_boundary",
     "worklink_run": "worklink",
+    "react": "message",
+    "web_search": "network",
+    "fetch_url": "network",
+    "post_message": "message",
+    "webhook": "network",
+    "http_request": "network",
+    "ntfy_send": "notification",
+    "download_files": "filesystem",
+    "adownload_files": "filesystem",
+    "Bash": "shell_process",
+    "bash": "shell_process",
+    "bash_exec": "shell_process",
+    "execute": "shell_process",
+    "aexecute": "shell_process",
+    "shell": "shell_process",
+    "Write": "filesystem",
+    "Edit": "filesystem",
+    "harness_auto_deliver": "message",
+    "harness_resend_nudge": "message",
+    "activity_panel_post": "message",
+    "activity_panel_edit": "message",
 }
 
 _SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset({
@@ -2361,6 +2486,17 @@ class ProviderEnforcementCompatibilityError(Exception):
 
 def _capability_matrix_errors() -> list[str]:
     errors: list[str] = []
+    for operation, direction in sorted(_TOOL_FLOW_MAP.items()):
+        if direction not in {ToolFlowDirection.SINK, ToolFlowDirection.BOTH}:
+            continue
+        if get_sink_category(operation) is SinkCategory.UNKNOWN:
+            errors.append(
+                f"IFC {direction.value} operation '{operation}' has no sink category"
+            )
+        if operation not in _OPERATION_SINK_DESTINATION:
+            errors.append(
+                f"IFC {direction.value} operation '{operation}' has no destination extraction"
+            )
     for operation in sorted(_OPERATION_SINK_DESTINATION):
         if get_sink_category(operation) is SinkCategory.UNKNOWN:
             errors.append(
@@ -2496,19 +2632,40 @@ def assert_capability_matrix_complete() -> None:
 
 
 def assert_model_tool_inventory_cataloged(*, model_spec: str | None = None) -> None:
-    """Raise if the assembled model-bound Mimir tool surface is uncataloged."""
+    """Raise if the assembled native model surface lacks authz or IFC metadata."""
     from .tools.registry import all_mimir_tools
 
     catalog = get_operation_catalog()
+    tools = tuple(all_mimir_tools(model_spec=model_spec))
     unknown_tools = sorted({
-        tool.name
-        for tool in all_mimir_tools(model_spec=model_spec)
+        tool.name for tool in tools
         if catalog.get_decision(tool.name) == OperationDecision.UNKNOWN
     })
+    unknown_flows = sorted({
+        tool.name for tool in tools
+        if get_tool_flow_direction(tool.name) == ToolFlowDirection.UNKNOWN
+    })
+    incomplete_sinks = sorted({
+        tool.name for tool in tools
+        if get_tool_flow_direction(tool.name) in {
+            ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
+        }
+        and (
+            get_sink_category(tool.name) == SinkCategory.UNKNOWN
+            or tool.name not in _OPERATION_SINK_DESTINATION
+        )
+    })
+    errors: list[str] = []
     if unknown_tools:
+        errors.append("UNKNOWN model-bound tools: " + ", ".join(unknown_tools))
+    if unknown_flows:
+        errors.append("model-bound tools without explicit IFC flow metadata: " + ", ".join(unknown_flows))
+    if incomplete_sinks:
+        errors.append("model-bound IFC sinks without category/destination extraction: " + ", ".join(incomplete_sinks))
+    if errors:
         raise CapabilityMatrixError(
-            "Access-control enforcement blocked by UNKNOWN model-bound tools: "
-            + ", ".join(unknown_tools)
+            "Access-control enforcement blocked by incomplete model tool inventory: "
+            + "; ".join(errors)
         )
 
 
