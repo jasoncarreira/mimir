@@ -39,6 +39,7 @@ from .run_state import (
     save_run_state,
 )
 from .worktree import WorktreeLease, cleanup_worktree, create_isolated_checkout, create_worktree
+from ..redaction import redact_text
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 _CLAIM_HEARTBEAT_INTERVAL_S = 60.0
@@ -1935,6 +1936,28 @@ def _comment_evidence(
     )
 
 
+def _staged_secret_present(worktree: Path, *, runner: Runner) -> bool:
+    """True if the staged diff adds a token-shaped secret.
+
+    The Worklink factory runs an untrusted backend and then commits, pushes,
+    and opens a PR autonomously — so a token the backend emitted into a file
+    would otherwise reach a public branch/PR with no human in the loop. Scan
+    the added lines of the staged diff and fail closed, mirroring the proposal
+    submission flow (proposals._scan_for_secrets); the pre-commit secret hook
+    is the authoritative backstop, this is the deployment-independent fast-fail.
+    ``git diff --cached -U0`` returns 0 with the diff on stdout (no
+    ``--exit-code``), so read stdout regardless of return code — a genuine git
+    error yields empty output and thus no false positive.
+    """
+    diff = runner(["git", "-C", str(worktree), "diff", "--cached", "-U0"])
+    for line in (diff.stdout or "").splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        if redact_text(line) != line:
+            return True
+    return False
+
+
 def _commit_worktree_changes(worktree: Path, issue: IssueContext, *, runner: Runner) -> None:
     add = runner(["git", "-C", str(worktree), "add", "-A"])
     if add.returncode != 0:
@@ -1942,6 +1965,13 @@ def _commit_worktree_changes(worktree: Path, issue: IssueContext, *, runner: Run
     staged = runner(["git", "-C", str(worktree), "diff", "--cached", "--quiet"])
     if staged.returncode == 0:
         raise WorklinkError("no staged Worklink changes to commit")
+    # Fail closed before commit/push/PR if the backend staged a secret-shaped
+    # token. The message must not echo the offending line (it holds the secret).
+    if _staged_secret_present(worktree, runner=runner):
+        raise WorklinkError(
+            "staged Worklink changes contain a secret-shaped token; refusing to "
+            "commit/push — remove the credential from the changes"
+        )
     commit = runner([
         "git",
         "-C",

@@ -1290,3 +1290,50 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
     handle, waited_timeout = compute.waited
     assert handle is compute.specs[0], "wait() did not receive the launch handle"
     assert waited_timeout == compute.specs[0].timeout_s
+
+
+def _commit_runner(diff_stdout: str, committed: dict) -> object:
+    """Fake runner for _commit_worktree_changes: staged changes present, with a
+    controllable `git diff --cached -U0` body; records whether commit ran."""
+    def runner(args: Sequence[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        tail = list(args)[3:]
+        if tail[:2] == ["add", "-A"]:
+            return cp(args)
+        if tail == ["diff", "--cached", "--quiet"]:
+            return cp(args, returncode=1)  # something is staged
+        if tail == ["diff", "--cached", "-U0"]:
+            return cp(args, stdout=diff_stdout)
+        if tail[:1] == ["commit"]:
+            committed["ran"] = True
+            return cp(args, stdout="[issue/441-a1 abc123] worklink\n")
+        return cp(args)
+    return runner
+
+
+def test_commit_worktree_changes_refuses_staged_secret() -> None:
+    from mimir.worklink.orchestrator import WorklinkError, _commit_worktree_changes
+
+    issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
+    secret = "ghp_" + "B" * 36
+    committed = {"ran": False}
+    runner = _commit_runner(
+        f'+++ b/config.py\n+API_TOKEN = "{secret}"\n', committed
+    )
+
+    with pytest.raises(WorklinkError, match="secret-shaped"):
+        _commit_worktree_changes(Path("/tmp/wt"), issue, runner=runner)
+    # Fail closed BEFORE the commit — nothing reaches a branch/PR.
+    assert committed["ran"] is False
+
+
+def test_commit_worktree_changes_commits_clean_diff() -> None:
+    from mimir.worklink.orchestrator import _commit_worktree_changes
+
+    issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
+    committed = {"ran": False}
+    runner = _commit_runner(
+        "+++ b/app.py\n+def hello():\n+    return 42\n", committed
+    )
+
+    _commit_worktree_changes(Path("/tmp/wt"), issue, runner=runner)
+    assert committed["ran"] is True
