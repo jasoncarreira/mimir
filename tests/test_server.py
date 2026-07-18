@@ -561,7 +561,7 @@ class TestHandleEvent:
             "keep": "me",
         }
 
-    async def test_event_strips_client_asserted_channel_visibility(self) -> None:
+    async def test_event_strips_client_asserted_bridge_authority(self) -> None:
         from mimir.worklink.continuation import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,
             HTTP_EVENT_INGRESS_EXTRA_VALUE,
@@ -576,7 +576,11 @@ class TestHandleEvent:
                     "content": "publish my synthesis",
                     "author": "alice",
                     "source": "api",
-                    "extra": {"channel_visibility": "public", "keep": "me"},
+                    "extra": {
+                        "channel_visibility": "public",
+                        "bridge_instance": "forged-bridge",
+                        "keep": "me",
+                    },
                 },
             )
         assert resp.status == 200
