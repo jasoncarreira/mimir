@@ -271,6 +271,21 @@ class CommitmentExtractionHook(TurnHook):
         added = 0
         skipped_dedupe = 0
         for rec in extracted:
+            source_acl = (
+                ctx.auth_context.source_session_acl
+                if ctx.auth_context is not None
+                else None
+            )
+            if source_acl is not None and source_acl.provenance_complete:
+                rec.owner_principal = source_acl.owner_principal
+                rec.originating_channel = source_acl.origin_channel
+                rec.visibility = source_acl.visibility
+                rec.service_name = None
+            else:
+                rec.owner_principal = "legacy_admin"
+                rec.originating_channel = None
+                rec.visibility = "service"
+                rec.service_name = "synthesis"
             if rec.dedupe_key in existing_keys:
                 skipped_dedupe += 1
                 continue

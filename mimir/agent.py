@@ -1599,7 +1599,17 @@ class Agent:
             if event.trigger == "saga_session_end":
                 saga_session_id = (event.extra or {}).get("saga_session_id")
             elif self._sessions is not None:
-                sess = await self._sessions.touch(event.channel_id)
+                channel_visibility = (
+                    event.extra.get("channel_visibility", "private")
+                    if isinstance(event.extra, Mapping)
+                    else "private"
+                )
+                sess = await self._sessions.touch(
+                    event.channel_id,
+                    initial_auth_context,
+                    origin_domain=event.source,
+                    visibility=channel_visibility,
+                )
                 saga_session_id = sess.saga_session_id
                 self._sessions.increment_turn_count(event.channel_id)
 

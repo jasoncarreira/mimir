@@ -3,12 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
 from mimir.event_logger import init_logger
+from mimir.models import AuthContext
 from mimir.session_manager import ChannelSession, SessionManager, _make_saga_session_id
+
+
+def _auth(owner: str, channel: str = "c1") -> AuthContext:
+    return AuthContext(
+        principal=owner,
+        canonical_principal=owner,
+        roles=("user",),
+        event_ingress="discord",
+        trigger="user_message",
+        channel_id=channel,
+        interactivity=None,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +43,43 @@ async def test_touch_creates_then_reuses_session():
     s2 = await mgr.touch("c1")
     assert s1 is s2
     assert s1.saga_session_id == s2.saga_session_id
+
+
+@pytest.mark.asyncio
+async def test_source_acl_is_immutable_and_monotonically_intersected():
+    mgr = SessionManager(idle_minutes=60)
+    session = await mgr.touch(
+        "c1", _auth("alice"), origin_domain="discord", visibility="public"
+    )
+    original_acl = session.source_acl
+    with pytest.raises(FrozenInstanceError):
+        original_acl.visibility = "public"  # type: ignore[misc]
+
+    session = await mgr.touch(
+        "c1", _auth("alice"), origin_domain="discord", visibility="private"
+    )
+    assert session.source_acl.owner_principal == "alice"
+    assert session.source_acl.visibility == "private"
+
+    session = await mgr.touch(
+        "c1", _auth("bob"), origin_domain="discord", visibility="public"
+    )
+    assert session.source_acl.provenance_complete is False
+    assert session.source_acl.owner_principal == "legacy_admin"
+
+    session = await mgr.touch(
+        "c1", _auth("alice"), origin_domain="discord", visibility="public"
+    )
+    assert session.source_acl.provenance_complete is False
+    assert session.source_acl.visibility == "legacy_admin"
+
+
+@pytest.mark.asyncio
+async def test_missing_source_domain_fails_session_acl_closed():
+    mgr = SessionManager(idle_minutes=60)
+    session = await mgr.touch("c1", _auth("alice"), origin_domain=None)
+    assert session.source_acl.provenance_complete is False
+    assert session.source_acl.owner_principal == "legacy_admin"
 
 
 @pytest.mark.asyncio

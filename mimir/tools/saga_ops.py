@@ -230,7 +230,6 @@ async def saga_end_session(
     from ..access_control import (
         can_write_saga,
         get_provenance_from_auth_context,
-        is_trusted_service,
     )
 
     client = _MEMORY_STATE["client"]
@@ -260,12 +259,26 @@ async def saga_end_session(
             "Session writes require server-provided admin or trusted-service authority."
         )
 
-    # The model supplies only the session row identifier. Authority and all
-    # ownership fields come from this exact invocation's server carrier.
-    channel_id = auth_context.channel_id
-    provenance = get_provenance_from_auth_context(auth_context)
-    owner_principal = provenance["created_by"]
-    visibility = "service" if is_trusted_service(auth_context) else "private"
+    # Execution authority comes from the synthesis service carrier. Resource
+    # ownership comes independently from the server-accumulated source ACL;
+    # missing or mixed provenance is permanently admin/service-only.
+    source_acl = auth_context.source_session_acl
+    if source_acl is not None and source_acl.provenance_complete:
+        channel_id = source_acl.origin_channel
+        owner_principal = source_acl.owner_principal
+        origin_domain = source_acl.origin_domain
+        visibility = source_acl.visibility
+        provenance = {
+            "created_by": owner_principal,
+            "derived_by": get_provenance_from_auth_context(auth_context).get("created_by"),
+            "source_session_acl": True,
+        }
+    else:
+        channel_id = auth_context.channel_id
+        owner_principal = "legacy_admin"
+        origin_domain = None
+        visibility = "legacy_admin"
+        provenance = {}
 
     try:
         payload = await client.end_session(
@@ -279,7 +292,7 @@ async def saga_end_session(
             channel_id=channel_id,
             owner_principal=owner_principal,
             origin_channel=channel_id,
-            origin_domain=None,
+            origin_domain=origin_domain,
             visibility=visibility,
             provenance=provenance,
         )

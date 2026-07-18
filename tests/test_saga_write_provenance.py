@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,7 @@ from langchain.tools import ToolRuntime
 
 from mimir.access_control import create_auth_context
 from mimir.identities import IdentityResolver
-from mimir.models import AgentEvent, AuthContext
+from mimir.models import AgentEvent, AuthContext, SessionACL
 from mimir.tools import saga_ops
 from mimir.tools.memory import _MEMORY_STATE
 from mimir.tools.store import memory_store
@@ -180,7 +181,23 @@ async def test_synthesis_memory_store_preserves_service_provenance(
 async def test_saga_end_session_uses_runtime_not_model_session_for_authority(
     write_store: _WriteStore,
 ) -> None:
-    context = _service_context("saga_session_end", "discord-synthesis")
+    source_acl = SessionACL(
+        owner_principal="regular",
+        origin_channel="discord-synthesis",
+        origin_domain="discord",
+        visibility="private",
+        provenance_complete=True,
+    )
+    context = create_auth_context(
+        AgentEvent(
+            trigger="saga_session_end",
+            channel_id="discord-synthesis",
+            service_principal="synthesis",
+            source_session_acl=source_acl,
+        ),
+        enforce=True,
+    )
+    assert context.source_session_acl == source_acl
     out = await saga_ops.saga_end_session.ainvoke({
         "session_id": "model-provided-row-id", "summary": "done",
         "runtime": _runtime(context, "synthesis-end"),
@@ -188,9 +205,29 @@ async def test_saga_end_session_uses_runtime_not_model_session_for_authority(
     assert "ok" in out
     call = write_store.session_calls[-1]
     assert call["session_id"] == "model-provided-row-id"
-    assert call["owner_principal"] == "service:synthesis"
+    assert call["owner_principal"] == "regular"
     assert call["origin_channel"] == "discord-synthesis"
-    assert call["visibility"] == "service"
+    assert call["origin_domain"] == "discord"
+    assert call["visibility"] == "private"
+    assert call["provenance"]["created_by"] == "regular"
+    assert call["provenance"]["derived_by"] == "service:synthesis"
+
+
+@pytest.mark.asyncio
+async def test_saga_end_session_missing_or_mixed_source_acl_fails_closed(
+    write_store: _WriteStore,
+) -> None:
+    context = _service_context("saga_session_end", "discord-synthesis")
+    out = await saga_ops.saga_end_session.ainvoke({
+        "session_id": "mixed-session", "summary": "done",
+        "runtime": _runtime(context, "mixed-end"),
+    })
+    assert "ok" in out
+    call = write_store.session_calls[-1]
+    assert call["owner_principal"] == "legacy_admin"
+    assert call["origin_domain"] is None
+    assert call["visibility"] == "legacy_admin"
+    assert call["provenance"] == {}
 
 
 @pytest.mark.asyncio
