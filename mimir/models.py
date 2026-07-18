@@ -351,6 +351,9 @@ class AuthContext:
     # Resource ACL for outputs derived by a trusted synthesis turn. This does
     # not grant execution authority; it only attenuates durable output scope.
     source_session_acl: SessionACL | None = None
+    # Server-selected SAGA resource for a synthesis turn. Model-supplied
+    # session IDs are only selectors and must match this immutable value.
+    saga_session_id: str | None = None
 
 
 @dataclass(frozen=True)

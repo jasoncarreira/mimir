@@ -18,9 +18,7 @@ Observation synthesis is NOT done here — it lives in
 cross-session evidence.
 
 Idempotency: ``reflect(session_id)`` called twice detects the existing
-sessions row and short-circuits. The lifecycle layer can re-call after
-a freshly-resolved channel_id and we backfill that column without
-re-synthesizing.
+sessions row and short-circuits without mutating its identity or contents.
 """
 
 from __future__ import annotations
@@ -45,8 +43,7 @@ BoundarySynthFn = Callable[[list[dict], dict | None], dict]
 class ReflectResult:
     session_id: str
     #: ``True`` if a new sessions row was written this call; ``False`` if
-    #: a row already existed (idempotent re-run — channel_id backfill may
-    #: still have applied but no synthesis fired).
+    #: a row already existed (idempotent re-run; no fields are changed).
     session_summary_written: bool = False
 
 
@@ -98,20 +95,6 @@ def _parse_json_list(v: str | None) -> list:
         return []
 
 
-def _existing_session_summary(
-    conn: sqlite3.Connection,
-    session_id: str,
-) -> bool:
-    """True if a sessions row with this id has already been written
-    by reflect (reflected_at IS NOT NULL means the row has structured
-    fields beyond the lifecycle-only stub)."""
-    row = conn.execute(
-        "SELECT 1 FROM sessions WHERE id = ? AND reflected_at IS NOT NULL",
-        (session_id,),
-    ).fetchone()
-    return row is not None
-
-
 def reflect(
     conn: sqlite3.Connection,
     session_id: str,
@@ -142,29 +125,6 @@ def reflect(
     Passed through to ``boundary_synth_fn`` so the synthesis can stitch
     sessions together coherently.
     """
-    # Idempotency: short-circuit if reflect has already written this
-    # session. Still backfill channel_id when a caller re-ends with a
-    # freshly-resolved channel — the dispatcher sometimes learns the
-    # channel after the first reflect call.
-    if _existing_session_summary(conn, session_id):
-        if channel_id is not None:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                conn.execute(
-                    "UPDATE sessions SET channel_id = ? "
-                    "WHERE id = ? AND (channel_id IS NULL OR channel_id != ?)",
-                    (channel_id, session_id, channel_id),
-                )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                # Non-fatal — the session row still resolves; channel_id
-                # backfill is best-effort.
-        return ReflectResult(
-            session_id=session_id,
-            session_summary_written=False,
-        )
-
     atoms = _session_atoms(conn, session_id, agent_id=agent_id)
 
     # ─── Synthesize boundary fields ───────────────────────────────
@@ -195,52 +155,55 @@ def reflect(
     # ─── Write sessions row ───────────────────────────────────────
     try:
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute("""
+        existing = conn.execute(
+            "SELECT channel_id, reflected_at, owner_principal, origin_channel, "
+            "origin_domain FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        expected_owner = owner_principal or "legacy_admin"
+        if existing is not None:
+            existing_channel, reflected_at, existing_owner, existing_origin, existing_domain = existing
+            if (
+                existing_owner != expected_owner
+                or existing_domain != origin_domain
+                or existing_channel != channel_id
+                or existing_origin != origin_channel
+            ):
+                raise PermissionError("session write denied")
+            if reflected_at is not None:
+                conn.commit()
+                return ReflectResult(
+                    session_id=session_id,
+                    session_summary_written=False,
+                )
+            conn.execute("""
+                UPDATE sessions SET
+                    ended_at = ?, summary = ?, reflected_at = ?,
+                    topics_discussed = ?, decisions_made = ?, unfinished = ?,
+                    emotional_state = ?, closed_since = ?, embedding = ?,
+                    embedding_dim = ?
+                WHERE id = ? AND reflected_at IS NULL
+            """, (
+                now, summary, now, json.dumps(topics), json.dumps(decisions),
+                json.dumps(unfinished), emotional_state, json.dumps(closed_since),
+                emb_bytes, emb_dim, session_id,
+            ))
+        else:
+            conn.execute("""
             INSERT INTO sessions
                 (id, channel_id, started_at, ended_at, summary, reflected_at,
                  topics_discussed, decisions_made, unfinished,
                  emotional_state, closed_since, embedding, embedding_dim,
                  owner_principal, origin_channel, origin_domain, visibility, provenance)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                ended_at         = excluded.ended_at,
-                -- Structured extraction fields: COALESCE(NULLIF(..., '[]'), existing)
-                -- so a re-run where LLM extraction failed ('[]') doesn't nuke the
-                -- first run's data. NULLIF treats '[]' as absent (same as NULL) so
-                -- COALESCE falls back to the existing row value.
-                summary          = COALESCE(NULLIF(excluded.summary, ''), sessions.summary),
-                reflected_at     = excluded.reflected_at,
-                topics_discussed = COALESCE(NULLIF(excluded.topics_discussed, '[]'), sessions.topics_discussed),
-                decisions_made   = COALESCE(NULLIF(excluded.decisions_made, '[]'), sessions.decisions_made),
-                unfinished       = COALESCE(NULLIF(excluded.unfinished, '[]'), sessions.unfinished),
-                emotional_state  = COALESCE(excluded.emotional_state, sessions.emotional_state),
-                closed_since     = COALESCE(NULLIF(excluded.closed_since, '[]'), sessions.closed_since),
-                embedding        = COALESCE(excluded.embedding, sessions.embedding),
-                embedding_dim    = COALESCE(excluded.embedding_dim, sessions.embedding_dim),
-                owner_principal = COALESCE(excluded.owner_principal, sessions.owner_principal),
-                origin_channel  = COALESCE(excluded.origin_channel, sessions.origin_channel),
-                origin_domain   = COALESCE(excluded.origin_domain, sessions.origin_domain),
-                visibility      = COALESCE(excluded.visibility, sessions.visibility),
-                provenance      = COALESCE(excluded.provenance, sessions.provenance)
-        """, (
-            session_id, channel_id,
-            atoms[0]["created_at"] if atoms else now,
-            now,
-            summary,
-            now,
-            json.dumps(topics),
-            json.dumps(decisions),
-            json.dumps(unfinished),
-            emotional_state,
-            json.dumps(closed_since),
-            emb_bytes,
-            emb_dim,
-            owner_principal or "legacy_admin",
-            origin_channel,
-            origin_domain,
-            visibility or "legacy_admin",
-            json.dumps(provenance or {}),
-        ))
+            """, (
+                session_id, channel_id,
+                atoms[0]["created_at"] if atoms else now,
+                now, summary, now, json.dumps(topics), json.dumps(decisions),
+                json.dumps(unfinished), emotional_state, json.dumps(closed_since),
+                emb_bytes, emb_dim, expected_owner, origin_channel, origin_domain,
+                visibility or "legacy_admin", json.dumps(provenance or {}),
+            ))
         conn.commit()
     except Exception:
         conn.rollback()

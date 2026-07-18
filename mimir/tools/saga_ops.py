@@ -258,6 +258,8 @@ async def saga_end_session(
             "saga_end_session failed: write access denied. "
             "Session writes require server-provided admin or trusted-service authority."
         )
+    if auth_context.saga_session_id != session_id:
+        return "saga_end_session failed: session write denied"
 
     # Execution authority comes from the synthesis service carrier. Resource
     # ownership comes independently from the server-accumulated source ACL;
@@ -295,6 +297,7 @@ async def saga_end_session(
             origin_domain=origin_domain,
             visibility=visibility,
             provenance=provenance,
+            auth_context=auth_context,
         )
     except Exception as exc:  # noqa: BLE001
         return f"saga_end_session failed: {exc}"

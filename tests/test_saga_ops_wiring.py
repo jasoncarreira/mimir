@@ -107,6 +107,7 @@ class _StubStore:
         origin_domain=None,
         visibility=None,
         provenance=None,
+        auth_context=None,
     ):
         if self.raise_on == "end_session":
             raise RuntimeError("end_session boom")
@@ -179,6 +180,7 @@ def turn_with_session() -> TurnContext:
         policy_version=None,
         is_service=False,
         enforcement_enabled=False,
+        saga_session_id="sess-abc",
     )
     ctx = TurnContext(
         turn_id="t-1",

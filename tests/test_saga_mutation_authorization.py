@@ -33,16 +33,23 @@ def _auth(principal: str, *, admin: bool = False) -> AuthContext:
     )
 
 
-def _service_auth(trigger: str, canonical: str) -> AuthContext:
+def _service_auth(
+    trigger: str,
+    canonical: str,
+    *,
+    channel_id: str | None = None,
+    saga_session_id: str | None = None,
+) -> AuthContext:
     return AuthContext(
         principal=canonical,
         canonical_principal=canonical,
         roles=(),
         event_ingress=None,
         trigger=trigger,
-        channel_id=None,
+        channel_id=channel_id,
         interactivity=None,
         is_service=True,
+        saga_session_id=saga_session_id,
     )
 
 
@@ -124,6 +131,138 @@ def test_saga_mutation_service_requires_declared_sink() -> None:
         assert can_write_saga(auth_context, "memory_store") is False
     finally:
         _TRUSTED_SERVICE_PRINCIPALS.pop(trigger, None)
+
+
+def _session_row(client: SagaStore, session_id: str):
+    return client._ensure_conn().execute(
+        "SELECT * FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+
+
+@pytest.mark.asyncio
+async def test_end_session_retry_is_idempotent_and_cannot_rebind(
+    client: SagaStore,
+) -> None:
+    session_id = "victim-session"
+    auth = _service_auth(
+        "saga_session_end",
+        "synthesis",
+        channel_id="victim-channel",
+        saga_session_id=session_id,
+    )
+    common = {
+        "channel_id": "victim-channel",
+        "owner_principal": "legacy_admin",
+        "origin_channel": "victim-channel",
+        "origin_domain": "saga",
+        "visibility": "legacy_admin",
+        "provenance": {},
+        "auth_context": auth,
+    }
+    first = await client.end_session(session_id, "victim summary", **common)
+    before = _session_row(client, session_id)
+
+    retry = await client.end_session(session_id, "attacker replacement", **common)
+    assert first["session_summary_written"] is True
+    assert retry["session_summary_written"] is False
+    assert _session_row(client, session_id) == before
+
+    with pytest.raises(PermissionError, match="session write denied"):
+        await client.end_session(
+            session_id,
+            "rebound summary",
+            **{
+                **common,
+                "channel_id": "attacker-channel",
+                "origin_channel": "attacker-channel",
+            },
+        )
+    assert _session_row(client, session_id) == before
+
+
+@pytest.mark.asyncio
+async def test_end_session_active_carrier_prevents_first_writer_preemption(
+    client: SagaStore,
+) -> None:
+    attacker_auth = _service_auth(
+        "saga_session_end",
+        "synthesis",
+        channel_id="attacker-channel",
+        saga_session_id="attacker-session",
+    )
+    victim_id = "not-yet-reflected-victim"
+
+    with pytest.raises(PermissionError, match="session write denied"):
+        await client.end_session(
+            victim_id,
+            "preempted summary",
+            channel_id="attacker-channel",
+            owner_principal="legacy_admin",
+            origin_channel="attacker-channel",
+            origin_domain="saga",
+            visibility="legacy_admin",
+            auth_context=attacker_auth,
+        )
+    assert _session_row(client, victim_id) is None
+
+    victim_auth = _service_auth(
+        "saga_session_end",
+        "synthesis",
+        channel_id="victim-channel",
+        saga_session_id=victim_id,
+    )
+    result = await client.end_session(
+        victim_id,
+        "legitimate summary",
+        channel_id="victim-channel",
+        owner_principal="legacy_admin",
+        origin_channel="victim-channel",
+        origin_domain="saga",
+        visibility="legacy_admin",
+        auth_context=victim_auth,
+    )
+    assert result["session_summary_written"] is True
+    assert _session_row(client, victim_id) is not None
+
+
+@pytest.mark.parametrize("origin_domain", ["discord", "slack"])
+@pytest.mark.asyncio
+async def test_end_session_accepts_inherited_user_acl_and_owner_can_read(
+    client: SagaStore,
+    origin_domain: str,
+) -> None:
+    session_id = f"{origin_domain}-user-session"
+    channel_id = f"{origin_domain}-private"
+    auth = _service_auth(
+        "saga_session_end",
+        "synthesis",
+        channel_id=channel_id,
+        saga_session_id=session_id,
+    )
+
+    result = await client.end_session(
+        session_id,
+        "user-owned summary",
+        channel_id=channel_id,
+        owner_principal="alice",
+        origin_channel=channel_id,
+        origin_domain=origin_domain,
+        visibility="private",
+        provenance={"created_by": "alice", "derived_by": "service:synthesis"},
+        auth_context=auth,
+    )
+
+    assert result["session_summary_written"] is True
+    row = client._ensure_conn().execute(
+        "SELECT owner_principal, origin_domain FROM sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    assert row == ("alice", origin_domain)
+    boundaries = await client.recent_session_boundaries(
+        channel_id=channel_id,
+        auth_context=_auth("alice"),
+    )
+    assert [boundary["session_id"] for boundary in boundaries] == [session_id]
 
 
 @pytest.fixture
