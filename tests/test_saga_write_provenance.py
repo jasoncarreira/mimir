@@ -12,6 +12,7 @@ from langchain.tools import ToolRuntime
 from mimir.access_control import create_auth_context
 from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent, AuthContext, SessionACL
+from mimir.saga.client import SagaStore
 from mimir.tools import saga_ops
 from mimir.tools.memory import _MEMORY_STATE
 from mimir.tools.store import memory_store
@@ -212,6 +213,76 @@ async def test_saga_end_session_uses_runtime_not_model_session_for_authority(
     assert call["visibility"] == "private"
     assert call["provenance"]["created_by"] == "regular"
     assert call["provenance"]["derived_by"] == "service:synthesis"
+
+
+@pytest.mark.parametrize("origin_domain", ["discord", "slack"])
+@pytest.mark.asyncio
+async def test_saga_end_session_real_store_accepts_inherited_ingress_acl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin_domain: str,
+) -> None:
+    class StubProvider:
+        def embed(self, text: str, *, input_type: str = "passage") -> list[float]:
+            return [1.0, 2.0, 3.0, 4.0]
+
+        def dimensions(self) -> int:
+            return 4
+
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: StubProvider())
+    store = SagaStore(db_path=tmp_path / "session-provenance.saga.db", embedding_dim=4)
+    previous = _MEMORY_STATE.get("client")
+    _MEMORY_STATE["client"] = store
+    try:
+        channel_id = f"{origin_domain}-synthesis"
+        session_id = f"{origin_domain}-active-session"
+        source_acl = SessionACL(
+            owner_principal="regular",
+            origin_channel=channel_id,
+            origin_domain=origin_domain,
+            visibility="private",
+            provenance_complete=True,
+        )
+        context = create_auth_context(
+            AgentEvent(
+                trigger="saga_session_end",
+                channel_id=channel_id,
+                service_principal="synthesis",
+                source_session_acl=source_acl,
+            ),
+            enforce=True,
+        )
+        context = replace(context, saga_session_id=session_id)
+
+        out = await saga_ops.saga_end_session.ainvoke({
+            "session_id": session_id,
+            "summary": "done",
+            "runtime": _runtime(context, f"{origin_domain}-real-end"),
+        })
+
+        assert "saga_end_session ok" in out
+        row = store._ensure_conn().execute(
+            "SELECT owner_principal, origin_channel, origin_domain, visibility "
+            "FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        assert tuple(row) == ("regular", channel_id, origin_domain, "private")
+        visible = await store.recent_session_boundaries(
+            channel_id=channel_id,
+            auth_context=AuthContext(
+                principal="regular",
+                canonical_principal="regular",
+                roles=("user",),
+                event_ingress=origin_domain,
+                trigger="user_message",
+                channel_id=channel_id,
+                interactivity=None,
+            ),
+        )
+        assert [boundary["session_id"] for boundary in visible] == [session_id]
+    finally:
+        _MEMORY_STATE["client"] = previous
+        await store.close()
 
 
 @pytest.mark.asyncio

@@ -225,6 +225,46 @@ async def test_end_session_active_carrier_prevents_first_writer_preemption(
     assert _session_row(client, victim_id) is not None
 
 
+@pytest.mark.parametrize("origin_domain", ["discord", "slack"])
+@pytest.mark.asyncio
+async def test_end_session_accepts_inherited_user_acl_and_owner_can_read(
+    client: SagaStore,
+    origin_domain: str,
+) -> None:
+    session_id = f"{origin_domain}-user-session"
+    channel_id = f"{origin_domain}-private"
+    auth = _service_auth(
+        "saga_session_end",
+        "synthesis",
+        channel_id=channel_id,
+        saga_session_id=session_id,
+    )
+
+    result = await client.end_session(
+        session_id,
+        "user-owned summary",
+        channel_id=channel_id,
+        owner_principal="alice",
+        origin_channel=channel_id,
+        origin_domain=origin_domain,
+        visibility="private",
+        provenance={"created_by": "alice", "derived_by": "service:synthesis"},
+        auth_context=auth,
+    )
+
+    assert result["session_summary_written"] is True
+    row = client._ensure_conn().execute(
+        "SELECT owner_principal, origin_domain FROM sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    assert row == ("alice", origin_domain)
+    boundaries = await client.recent_session_boundaries(
+        channel_id=channel_id,
+        auth_context=_auth("alice"),
+    )
+    assert [boundary["session_id"] for boundary in boundaries] == [session_id]
+
+
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SagaStore:
     class StubProvider:
