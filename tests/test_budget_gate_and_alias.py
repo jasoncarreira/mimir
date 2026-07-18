@@ -308,6 +308,131 @@ async def test_mcp_resource_adapter_still_enforces_external_sink_ifc() -> None:
     assert handler_calls == 0
 
 
+@pytest.mark.asyncio
+async def test_admin_mcp_sink_cannot_bypass_external_sink_ifc() -> None:
+    from dataclasses import replace
+
+    from mimir.access_control import OperationDecision, ToolFlowDirection, ToolRegistry
+    from mimir.mcp_client import (
+        MCPAuthorizationResult,
+        MCPProvenance,
+        MCPServerConfig,
+        _bridge_mcp_tool,
+        clear_mcp_adapter_registry,
+        register_mcp_adapter,
+    )
+
+    input_schema = {
+        "type": "object",
+        "properties": {"destination": {"type": "string"}},
+        "required": ["destination"],
+    }
+    config = MCPServerConfig(name="publisher", command="x", args=[])
+    provenance = replace(
+        MCPProvenance.create(config, "publish", input_schema),
+        classification="admin_required",
+        adapter_name="publisher-policy",
+        adapter_version="adapter-v1",
+        approval_version="approval-v1",
+        policy_version="policy-v1",
+    )
+    tool = _bridge_mcp_tool(
+        server_name="publisher",
+        tool_name="publish",
+        description="",
+        input_schema=input_schema,
+        session=object(),
+        provenance=provenance,
+    )
+    context = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("admin",),
+        event_ingress="bridge",
+        trigger="user_message",
+        channel_id="private-channel",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+    arguments = {"destination": "public-destination"}
+
+    def classify(request):  # type: ignore[no-untyped-def]
+        assert request.arguments == arguments
+        return MCPAuthorizationResult(
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+            source_resources=("private-source",),
+            sink_resources=("public-destination",),
+        )
+
+    clear_mcp_adapter_registry()
+    register_mcp_adapter(
+        "publisher-policy",
+        "adapter-v1",
+        "policy-v1",
+        classify,
+        flow_direction="both",
+    )
+    compatible = ToolRegistry().authorize_tool(
+        tool.name,
+        context,
+        enforce=True,
+        mcp_tool=tool,
+        arguments=arguments,
+        ifc_labels=InformationFlowLabels(),
+    )
+    assert compatible.allowed is True
+    assert compatible.decision is OperationDecision.ADMIN_REQUIRED
+    assert compatible.required_tier.value == "admin"
+    assert compatible.flow_direction is ToolFlowDirection.BOTH
+    assert compatible.protected_source_resources == ("private-source",)
+    assert compatible.protected_sink_resources == ("public-destination",)
+
+    handler_calls = 0
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    def request(call_id: str) -> ToolCallRequest:
+        return ToolCallRequest(
+            tool_call={
+                "name": tool.name,
+                "args": arguments,
+                "id": call_id,
+                "type": "tool_call",
+            },
+            tool=tool,
+            state=None,
+            runtime=Runtime(context=context),
+        )
+
+    turn = _make_ctx()
+    turn.auth_context = context
+    turn.ifc_labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"private-channel"}),
+    )
+    token = set_current_turn(turn)
+    try:
+        denied = await BudgetGateMiddleware().awrap_tool_call(
+            request("tainted"), handler,
+        )
+        turn.ifc_labels = InformationFlowLabels()
+        allowed = await BudgetGateMiddleware().awrap_tool_call(
+            request("untainted"), handler,
+        )
+    finally:
+        reset_current_turn(token)
+        clear_mcp_adapter_registry()
+
+    assert denied.status == "error"
+    assert "ifc_label_blocked:external_mcp" in str(denied.content)
+    assert allowed.content == "ok"
+    assert handler_calls == 1
+
+
 def _ifc_labels(
     channel: str = "ch-1",
     *,

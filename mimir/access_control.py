@@ -1298,6 +1298,9 @@ class MCPResourceAdapter:
         provenance = get_tool_provenance(tool) if tool is not None else None
         decision = OperationDecision.ADMIN_REQUIRED
         reason = "mcp_missing_provenance"
+        validated_result: MCPAuthorizationResult | None = None
+        flow_direction = ToolFlowDirection.UNKNOWN
+        sink_check: ToolAuthorization | None = None
         if provenance is not None and provenance.is_tombstoned:
             reason = "mcp_drift_detected"
         elif provenance is not None:
@@ -1359,10 +1362,9 @@ class MCPResourceAdapter:
                                 decision = OperationDecision.ADMIN_REQUIRED
                                 reason = "mcp_flow_metadata_mismatch"
                                 result = None
-                        if isinstance(result, MCPAuthorizationResult) and result.allowed and decision is not OperationDecision.ADMIN_REQUIRED:
+                        if isinstance(result, MCPAuthorizationResult) and result.allowed:
                             if ifc_labels is None and context is not None:
                                 ifc_labels = getattr(context, "ifc_labels", None)
-                            sink_check = None
                             if result.sink_resources:
                                 sink_check = SinkGate.check_sink_flow(
                                     tool_name,
@@ -1374,41 +1376,54 @@ class MCPResourceAdapter:
                                 )
                             if sink_check is not None and not sink_check.allowed:
                                 return sink_check
-                            return ToolAuthorization(
-                                tool_name=tool_name,
-                                decision=decision,
-                                allowed=True,
-                                reason=(
-                                    sink_check.reason
-                                    if sink_check is not None and sink_check.is_shadow_decision
-                                    else None
-                                ),
-                                enforcement_enabled=enforce,
-                                is_shadow_decision=(
-                                    sink_check.is_shadow_decision if sink_check is not None else False
-                                ),
-                                protected_source_resources=result.source_resources,
-                                flow_direction=flow_direction,
-                            )
+                            validated_result = result
+                            if decision is not OperationDecision.ADMIN_REQUIRED:
+                                return ToolAuthorization(
+                                    tool_name=tool_name,
+                                    decision=decision,
+                                    allowed=True,
+                                    reason=(
+                                        sink_check.reason
+                                        if sink_check is not None and sink_check.is_shadow_decision
+                                        else None
+                                    ),
+                                    enforcement_enabled=enforce,
+                                    is_shadow_decision=(
+                                        sink_check.is_shadow_decision if sink_check is not None else False
+                                    ),
+                                    protected_source_resources=result.source_resources,
+                                    protected_sink_resources=result.sink_resources,
+                                    flow_direction=flow_direction,
+                                )
+                            reason = "admin_required"
                         elif isinstance(result, MCPAuthorizationResult) and not result.allowed:
                             reason = result.reason or "mcp_resource_denied"
 
         is_admin = decision is OperationDecision.ADMIN_REQUIRED
         admin = context is not None and "admin" in (getattr(context, "roles", ()) or ())
-        hard_failure = reason in {
-            "mcp_unknown_flow_direction",
-            "mcp_flow_metadata_mismatch",
-        }
-        denied_by_policy = not admin
+        hard_failure = validated_result is None
+        denied_by_policy = hard_failure or (is_admin and not admin)
         allowed = (admin and not hard_failure) or not enforce
+        shadow_sink = sink_check is not None and sink_check.is_shadow_decision
         return ToolAuthorization(
             tool_name=tool_name,
             decision=decision,
             allowed=allowed,
-            reason=None if admin and not hard_failure else reason,
+            reason=(
+                sink_check.reason
+                if shadow_sink
+                else None if admin and not hard_failure else reason
+            ),
             required_tier=AccessTier.ADMIN if is_admin else AccessTier.USER,
             enforcement_enabled=enforce,
-            is_shadow_decision=not enforce and denied_by_policy,
+            is_shadow_decision=shadow_sink or (not enforce and denied_by_policy),
+            protected_source_resources=(
+                validated_result.source_resources if validated_result is not None else None
+            ),
+            protected_sink_resources=(
+                validated_result.sink_resources if validated_result is not None else None
+            ),
+            flow_direction=flow_direction,
         )
 
     @staticmethod
@@ -1538,6 +1553,7 @@ class ToolAuthorization:
     # ``None`` means provenance is unknown; ``()`` authoritatively classifies
     # the call as not reading a protected MCP source.
     protected_source_resources: tuple[str, ...] | None = None
+    protected_sink_resources: tuple[str, ...] | None = None
     flow_direction: ToolFlowDirection = ToolFlowDirection.UNKNOWN
 
     def as_log_fields(self) -> dict[str, Any]:
