@@ -163,14 +163,15 @@ _CANONICAL_SUBJECT_SEED = ("User", "Assistant")
 def build_vocab_block(
     conn,
     *,
+    owner_principal: str | None = None,
     top_n_predicates: int = 25,
     top_n_subjects: int = 15,
     extra_subjects: list[str] | None = None,
 ) -> str:
     """Build the P48 canonical-vocabulary block injected between TRIPLES
     rules and TEMPORAL TAGS in the rich prompt. Reads top-N predicates
-    and subjects from the live ``triples`` table by frequency, unions
-    them with the static seed, and (for subjects only) appends
+    and subjects owned by ``owner_principal`` from the live ``triples``
+    table by frequency, unions them with the static seed, and (for subjects only) appends
     operator-supplied canonical names like identities.yaml entries.
 
     Returns an empty string when there's nothing to surface (cold DB
@@ -182,11 +183,13 @@ def build_vocab_block(
     seen_preds: set[str] = set()
     seen_subjs: set[str] = set()
     try:
+        if not owner_principal:
+            raise ValueError("owner scope is required for DB vocabulary")
         rows = conn.execute(
             "SELECT predicate, COUNT(*) c FROM triples "
-            "WHERE tombstoned = 0 "
+            "WHERE tombstoned = 0 AND owner_principal = ? "
             "GROUP BY predicate ORDER BY c DESC LIMIT ?",
-            (top_n_predicates,),
+            (owner_principal, top_n_predicates),
         ).fetchall()
         for pred, cnt in rows:
             if pred and pred not in seen_preds:
@@ -194,14 +197,16 @@ def build_vocab_block(
                 seen_preds.add(pred)
         rows = conn.execute(
             "SELECT subject, COUNT(*) c FROM triples "
-            "WHERE tombstoned = 0 "
+            "WHERE tombstoned = 0 AND owner_principal = ? "
             "GROUP BY subject ORDER BY c DESC LIMIT ?",
-            (top_n_subjects,),
+            (owner_principal, top_n_subjects),
         ).fetchall()
         for subj, cnt in rows:
             if subj and subj not in seen_subjs:
                 subj_lines.append((subj, int(cnt or 0)))
                 seen_subjs.add(subj)
+    except ValueError:
+        pass
     except Exception as exc:
         # DB read failed — fall back to seed-only. Logged so it surfaces
         # in operator logs rather than producing a silent quality drop

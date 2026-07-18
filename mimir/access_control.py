@@ -537,6 +537,10 @@ class SinkGate:
                 SinkCategory.SHELL_PROCESS,
                 SinkCategory.SPAWN,
                 SinkCategory.FILE,
+                SinkCategory.NOTIFICATION,
+                SinkCategory.HTTP_WEBHOOK,
+                SinkCategory.NETWORK,
+                SinkCategory.EXTERNAL_MCP,
             }:
                 return ToolAuthorization(
                     tool_name=tool_name,
@@ -636,6 +640,10 @@ class SinkGate:
                 SinkCategory.SHELL_PROCESS,
                 SinkCategory.SPAWN,
                 SinkCategory.FILE,
+                SinkCategory.NOTIFICATION,
+                SinkCategory.HTTP_WEBHOOK,
+                SinkCategory.NETWORK,
+                SinkCategory.EXTERNAL_MCP,
             }:
                 return frozenset()
             source_channels = getattr(ifc_labels, "source_channels", None)
@@ -691,7 +699,7 @@ class SinkGate:
                 # Trusted service/derived data retains its input ACL. It may
                 # return only to the triggering channel when the effective
                 # destination principal remains in that intersection.
-                if source.domain == "channel":
+                if source.domain.startswith("channel"):
                     if source.bridge_instance != bridge_instance:
                         return frozenset()
                     if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
@@ -1043,6 +1051,22 @@ class OperationCatalog:
         scopes: list[ResourceScope] | None = None,
     ) -> None:
         """Register a custom decision for an operation."""
+        saga_mutations = globals().get("_SAGA_MUTATION_OPERATIONS", frozenset())
+        is_admin_catalogued = (
+            name in self._ADMIN_REQUIRED_OPERATIONS
+            or name in self._ADMIN_BUILTIN_TOOL_NAMES
+            or any(
+                name.endswith(f"__{catalogued}")
+                or name.endswith(f"_{catalogued}")
+                for catalogued in self._ADMIN_REQUIRED_OPERATIONS
+            )
+        )
+        if (
+            is_admin_catalogued or name in saga_mutations
+        ) and decision != OperationDecision.ADMIN_REQUIRED:
+            raise ValueError(
+                f"cannot downgrade protected operation {name!r} from ADMIN_REQUIRED"
+            )
         self._custom_decisions[name] = decision
         if decision == OperationDecision.RESOURCE_SCOPED and scopes:
             self._resource_scoped_operations[name] = scopes
@@ -2196,9 +2220,10 @@ def _capability_matrix_errors() -> list[str]:
             errors.append(
                 f"SAGA mutation '{operation}' has no sink destination mapping"
             )
-        if operation in OperationCatalog._OPEN_OPERATIONS:
+        effective_decision = _global_operation_catalog.get_decision(operation)
+        if effective_decision == OperationDecision.OPEN:
             errors.append(f"SAGA mutation '{operation}' must not be cataloged OPEN")
-        if operation not in OperationCatalog._ADMIN_REQUIRED_OPERATIONS:
+        if effective_decision != OperationDecision.ADMIN_REQUIRED:
             errors.append(
                 f"SAGA mutation '{operation}' must be cataloged ADMIN_REQUIRED"
             )

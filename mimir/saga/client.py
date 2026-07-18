@@ -1809,26 +1809,31 @@ class SagaStore:
             )
         sem = asyncio.Semaphore(4)
 
-        # P47 / P48: build vocab_block once per run, prior_block per
-        # cluster. Both inject into the rich prompt. Empty when DB is
-        # cold or there are no priors — bench-neutral.
+        # P47 / P48: build both prompt additions per cluster. Vocabulary is
+        # owner-scoped so one cluster cannot receive another owner's names.
         from .synthesize import build_vocab_block, build_prior_block
+        from .consolidate import _compute_intersected_acl
 
-        vocab_block = await self._db_locked(  # chainlink #386
-            lambda: build_vocab_block(
-                conn,
-                extra_subjects=list(extra_canonical_subjects or []),
-            )
-        )
         prior_blocks: list[str] = []
+        vocab_blocks: list[str] = []
         for cluster in eligible:
             evidence_ids = [a["id"] for a in cluster]
-            pb = await self._db_locked(  # chainlink #386
-                lambda eids=evidence_ids: build_prior_block(conn, eids)
+            pb, vb = await self._db_locked(  # chainlink #386
+                lambda eids=evidence_ids: (
+                    build_prior_block(conn, eids),
+                    build_vocab_block(
+                        conn,
+                        owner_principal=_compute_intersected_acl(
+                            conn, eids
+                        ).owner_principal,
+                        extra_subjects=list(extra_canonical_subjects or []),
+                    ),
+                )
             )
             prior_blocks.append(pb)
+            vocab_blocks.append(vb)
 
-        async def _synth(cluster, prior_block):
+        async def _synth(cluster, prior_block, vocab_block):
             async with sem:
                 try:
                     return await self._rich_synth_fn(
@@ -1845,7 +1850,10 @@ class SagaStore:
                     }
 
         results = await asyncio.gather(
-            *[_synth(c, pb) for c, pb in zip(eligible, prior_blocks)]
+            *[
+                _synth(c, pb, vb)
+                for c, pb, vb in zip(eligible, prior_blocks, vocab_blocks)
+            ]
         )
 
         # 2b. chainlink #417: precompute ALL embeddings (each observation's
