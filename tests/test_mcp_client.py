@@ -874,6 +874,22 @@ class TestMCPAdapterRegistry:
 
         assert get_mcp_adapter_info("nonexistent") is None
 
+    @pytest.mark.parametrize(
+        ("source", "sink", "expected"),
+        [(True, False, "source"), (False, True, "sink"),
+         (True, True, "both"), (False, False, "neither")],
+    )
+    def test_config_preserves_explicit_flow_direction(
+        self, source: bool, sink: bool, expected: str,
+    ) -> None:
+        from mimir.mcp_client import MCPAdapterConfig
+
+        adapter = MCPAdapterConfig.from_dict({
+            "name": "policy", "version": "v1", "policy_version": "p1",
+            "source": source, "sink": sink,
+        })
+        assert adapter.flow_direction == expected
+
 
 class TestMCPResourceAdapter:
     """Tests for MCP authorization (chainlink #870)."""
@@ -903,6 +919,56 @@ class TestMCPResourceAdapter:
 
         decision = MCPResourceAdapter.get_decision("mcp_github_ping", None)
         assert decision == OperationDecision.ADMIN_REQUIRED
+
+    def test_missing_flow_direction_fails_closed_before_classifier(self) -> None:
+        from mimir.access_control import ToolRegistry
+        from mimir.mcp_client import (
+            MCPAuthorizationResult,
+            MCPProvenance,
+            MCPServerConfig,
+            _bridge_mcp_tool,
+            register_mcp_adapter,
+        )
+        from mimir.models import AuthContext
+
+        called = False
+
+        def classifier(request):  # type: ignore[no-untyped-def]
+            nonlocal called
+            called = True
+            return MCPAuthorizationResult(
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True,
+                source_resources=("repo-1",),
+            )
+
+        config = MCPServerConfig(name="github", command="x", args=[])
+        provenance = replace(
+            MCPProvenance.create(config, "get_repository", {}),
+            classification="resource_scoped",
+            adapter_name="github-policy",
+            adapter_version="v1",
+            policy_version="p1",
+        )
+        register_mcp_adapter("github-policy", "v1", "p1", classifier)
+        tool = _bridge_mcp_tool(
+            server_name="github", tool_name="get_repository", description="",
+            input_schema={}, session=object(), provenance=provenance,
+        )
+        context = AuthContext(
+            principal="alice", canonical_principal="alice", roles=("admin",),
+            event_ingress="bridge", trigger="user_message", channel_id="ch-1",
+            interactivity=None, enforcement_enabled=True,
+        )
+
+        authorization = ToolRegistry().authorize_tool(
+            tool.name, context, enforce=True, mcp_tool=tool,
+            arguments={"repository": "repo-1"},
+        )
+
+        assert authorization.allowed is False
+        assert authorization.reason == "mcp_unknown_flow_direction"
+        assert called is False
 
     def test_non_mcp_tool_passes_through(self) -> None:
         from mimir.access_control import MCPResourceAdapter
@@ -1036,7 +1102,7 @@ class TestMCPResourceAdapter:
 
         assert authorization.decision == OperationDecision.ADMIN_REQUIRED
         assert authorization.allowed is False
-        assert authorization.reason == "admin_required"
+        assert authorization.reason == "mcp_unknown_flow_direction"
 
     def test_mcp_tool_with_tombstoned_provenance_requires_admin(self) -> None:
         from mimir.access_control import (
@@ -1540,7 +1606,10 @@ class TestProductionMCPPolicyWiring:
         def explode(_request):  # type: ignore[no-untyped-def]
             raise RuntimeError("secret must not authorize")
 
-        register_mcp_adapter("github-owner", "adapter-v1", "policy-v1", explode)
+        register_mcp_adapter(
+            "github-owner", "adapter-v1", "policy-v1", explode,
+            flow_direction="source",
+        )
         failed = ToolRegistry().authorize_tool(
             tool.name, context, enforce=True, mcp_tool=tool,
             arguments={"owner": "alice", "repository": "repo-1"},
