@@ -206,6 +206,7 @@ def _drain(channel_id: str | None) -> list["AgentEvent"]:
                 ctx.ifc_labels = _merge_ifc_labels(ctx.ifc_labels, folded_labels)
                 if ctx.auth_context is not None:
                     from dataclasses import replace
+                    ctx.ifc_labels = ctx.auth_context.ifc_state.merge(ctx.ifc_labels)
                     ctx.auth_context = replace(ctx.auth_context, ifc_labels=ctx.ifc_labels)
                 emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
             emitter.injected_input(drained)
