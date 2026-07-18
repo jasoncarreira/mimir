@@ -142,6 +142,12 @@ def test_factory_operations_are_cataloged_as_admin_required(operation: str) -> N
     assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
 
 
+def test_spawn_open_code_declares_spawn_sink_destination() -> None:
+    from mimir.access_control import _OPERATION_SINK_DESTINATION
+
+    assert _OPERATION_SINK_DESTINATION["spawn_open_code"] == "spawn_process"
+
+
 @pytest.mark.parametrize("operation", ["spawn_open_code", "task"])
 def test_scheduler_service_principal_can_invoke_factory_operations(
     operation: str,

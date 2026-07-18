@@ -290,6 +290,20 @@ def _extract_sink_target(
     return str(target) if target else None
 
 
+def _extract_sink_targets(
+    request: ToolCallRequest,
+    auth_context: AuthContext | None = None,
+) -> list[str | None]:
+    """Return every independently writable destination in a tool call."""
+    target = _extract_sink_target(request, auth_context)
+    if _tool_name_from_request(request) != "spawn_open_code":
+        return [target]
+
+    args = (getattr(request, "tool_call", None) or {}).get("args") or {}
+    artifact_root = args.get("artifact_root")
+    return [target, str(artifact_root)] if artifact_root else [target]
+
+
 # Compatibility alias for callers that only exercise channel operations.
 _extract_channel_from_args = _extract_sink_target
 
@@ -330,6 +344,39 @@ def _request_for_authorized_execution(
     args["mimir_direct_argv"] = argv
     tool_call = {**request.tool_call, "args": args}
     return request.override(tool_call=tool_call)
+
+
+def _request_with_resolved_spawn_paths(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+) -> ToolCallRequest:
+    """Bind service spawn execution to the paths checked by authorization."""
+    if tool_name not in {"spawn_claude_code", "spawn_codex", "spawn_open_code"}:
+        return request
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for(tool_name) if service is not None else None
+    if policy is None or policy.adapter != "spawn_workspace":
+        return request
+
+    from .._paths import PathOutsideHomeError
+    from ..access_control import resolve_configured_write_target
+
+    args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
+    paths = ["cwd"]
+    if tool_name == "spawn_open_code":
+        paths.append("artifact_root")
+    try:
+        for name in paths:
+            raw_path = args.get(name)
+            if name == "cwd" and not raw_path:
+                raw_path = os.environ.get("MIMIR_HOME")
+            if raw_path:
+                args[name] = str(resolve_configured_write_target(str(raw_path)))
+    except (OSError, PathOutsideHomeError):
+        # Leave the original destination intact so the sink adapter denies it.
+        return request
+    return request.override(tool_call={**request.tool_call, "args": args})
 
 
 def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
@@ -664,18 +711,22 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
-        target_channel = _extract_sink_target(request, auth_context)
+        request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
+        target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
         validated_arguments = _validated_arguments(request)
 
-        authorization, admin_denial = _authorize_tool_call(
-            tool_name,
-            auth_context,
-            target_channel,
-            ifc_labels,
-            getattr(request, "tool", None),
-            validated_arguments,
-        )
+        for target_channel in target_channels:
+            authorization, admin_denial = _authorize_tool_call(
+                tool_name,
+                auth_context,
+                target_channel,
+                ifc_labels,
+                getattr(request, "tool", None),
+                validated_arguments,
+            )
+            if admin_denial is not None:
+                break
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
             return ToolMessage(
@@ -764,18 +815,22 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
-        target_channel = _extract_sink_target(request, auth_context)
+        request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
+        target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
         validated_arguments = _validated_arguments(request)
 
-        authorization, admin_denial = _authorize_tool_call(
-            tool_name,
-            auth_context,
-            target_channel,
-            ifc_labels,
-            getattr(request, "tool", None),
-            validated_arguments,
-        )
+        for target_channel in target_channels:
+            authorization, admin_denial = _authorize_tool_call(
+                tool_name,
+                auth_context,
+                target_channel,
+                ifc_labels,
+                getattr(request, "tool", None),
+                validated_arguments,
+            )
+            if admin_denial is not None:
+                break
         if admin_denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
             return ToolMessage(
