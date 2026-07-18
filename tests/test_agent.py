@@ -362,10 +362,12 @@ class _ServicePrincipalToolProbeAgent(_FakeAgent):
 
         ctx = get_current_turn()
         assert ctx is not None
+        sink_target = "git status" if self.tool_name == "shell_exec" else None
         auth = get_tool_registry().authorize_tool(
             self.tool_name,
             ctx.auth_context,
             enforce=True,
+            target_channel=sink_target,
         )
         self.observed_principal = (
             auth.service_principal.canonical if auth.service_principal else None
@@ -381,7 +383,11 @@ class _ServicePrincipalToolProbeAgent(_FakeAgent):
             ToolCallRequest(
                 tool_call={
                     "name": self.tool_name,
-                    "args": {},
+                    "args": (
+                        {"command": sink_target}
+                        if self.tool_name == "shell_exec"
+                        else {}
+                    ),
                     "id": "tc-service-principal",
                     "type": "tool_call",
                 },
