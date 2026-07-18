@@ -52,6 +52,8 @@ from ..access_control import (
     ToolAuthorization,
     classify_protected_result,
     get_tool_registry,
+    get_trusted_service_from_auth_context,
+    parse_service_shell_argv,
 )
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
@@ -290,6 +292,41 @@ def _extract_sink_target(
 
 # Compatibility alias for callers that only exercise channel operations.
 _extract_channel_from_args = _extract_sink_target
+
+
+def _request_for_authorized_execution(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+) -> ToolCallRequest:
+    """Bind trusted-service shell execution to the argv authorization checked.
+
+    Ordinary user/admin shell tools keep their documented full-shell surface.
+    A trusted service receives only the direct argv admitted by its operation-
+    specific sink policy; the handler never sees the original command string.
+    """
+    if tool_name not in {"shell_exec", "bash_async"}:
+        return request
+    args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
+    # Never trust a model-supplied internal execution override. Ordinary calls
+    # discard it; trusted-service calls below replace it with server-parsed argv.
+    args.pop("mimir_direct_argv", None)
+    sanitized_request = request.override(
+        tool_call={**request.tool_call, "args": args},
+    )
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for(tool_name) if service is not None else None
+    if policy is None or policy.adapter != "shell_profile":
+        return sanitized_request
+    target = args.get("command")
+    if not isinstance(target, str):
+        return sanitized_request
+    argv = parse_service_shell_argv(target, policy.destination)
+    if argv is None:
+        return sanitized_request
+    args["mimir_direct_argv"] = argv
+    tool_call = {**request.tool_call, "args": args}
+    return request.override(tool_call=tool_call)
 
 
 def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
@@ -700,8 +737,11 @@ class BudgetGateMiddleware(AgentMiddleware):
                 status="error",
             )
         started = time.monotonic()
+        execution_request = _request_for_authorized_execution(
+            request, tool_name, auth_context,
+        )
         try:
-            result = handler(request)
+            result = handler(execution_request)
         except Exception as exc:
             _merge_result_labels(auth_context, result_labels)
             _emit_tool_call_sync(
@@ -797,8 +837,11 @@ class BudgetGateMiddleware(AgentMiddleware):
                 status="error",
             )
         started = time.monotonic()
+        execution_request = _request_for_authorized_execution(
+            request, tool_name, auth_context,
+        )
         try:
-            result = await handler(request)
+            result = await handler(execution_request)
         except Exception as exc:
             _merge_result_labels(auth_context, result_labels)
             _emit_tool_call_sync(

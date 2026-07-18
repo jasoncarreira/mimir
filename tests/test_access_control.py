@@ -1104,6 +1104,14 @@ async def test_concurrent_turns_keep_authority_and_ifc_scope_isolated(
         "git log --no-ext-diff --no-textconv --format=format:pwned --output=/tmp/.bash_profile",
         "git diff --no-ext-diff --no-textconv --no-index /etc/passwd /tmp/copy",
         "rg --no-config --pre=touch /tmp/pwned pattern .",
+        "rg pattern .",
+        "git log --oneline",
+        "git diff --no-ext-diff --no-textconv {--output=/tmp/OUT,HEAD} {--format=format:ATTACKER_%H,HEAD}",
+        "git diff --no-ext-diff --no-textconv *",
+        "git diff --no-ext-diff --no-textconv ?",
+        "git diff --no-ext-diff --no-textconv [a-z]",
+        "git diff --no-ext-diff --no-textconv ~",
+        "git log --no-ext-diff --no-textconv --pretty=oneline",
     ],
 )
 async def test_service_shell_bypass_denied_through_live_middleware(
@@ -1151,6 +1159,54 @@ async def test_service_shell_bypass_denied_through_live_middleware(
     assert result.status == "error"
     assert "service_sink_destination_denied" in str(result.content)
     assert handler_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_service_shell_executes_the_exact_authorized_argv() -> None:
+    """The shell profile's parsed argv, not the model string, reaches the handler."""
+    from langchain_core.messages import ToolMessage
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    ctx = _turn("turn-scheduler", "saga-scheduler", auth_context)
+    ctx.ifc_labels = labels
+    seen_args: dict[str, object] = {}
+
+    async def handler(request):
+        seen_args.update(request.tool_call["args"])
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="shell_exec",
+                args={
+                    "command": "git log --no-ext-diff --no-textconv --oneline",
+                    "mimir_direct_argv": ["sh", "-c", "touch /tmp/forged"],
+                },
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status != "error"
+    assert seen_args["command"] == "git log --no-ext-diff --no-textconv --oneline"
+    assert seen_args["mimir_direct_argv"] == [
+        "git", "log", "--no-ext-diff", "--no-textconv", "--oneline",
+    ]
 
 
 @pytest.mark.asyncio

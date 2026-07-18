@@ -229,7 +229,7 @@ def _target_within_configured_write_roots(target: str, _destination: str) -> boo
     return True
 
 
-_SHELL_CONTROL_CHARACTERS = frozenset(";|&`$><\n\r")
+_SHELL_CONTROL_CHARACTERS = frozenset(";|&`$><{}[],*?~\n\r")
 
 
 def _arguments_match_allowlist(
@@ -362,31 +362,37 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
     )
 
 
-def _target_matches_shell_profile(target: str, destination: str) -> bool:
-    """Admit one command in the service's strict per-command argv profile.
+def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
+    """Return the exact argv admitted by a trusted service shell profile.
 
-    The service shell tools run through ``bash -lc``, so validating only argv[0]
-    and argv[1] is not a security boundary: later flags can write files, execute
-    helpers, or make a nominally read-only command read arbitrary sources. Reject
-    shell grammar first, then require every binary option to be allow-listed.
+    The returned argv is both the authorization artifact and the execution
+    artifact. Callers must exec it directly with ``shell=False``; handing the
+    original string to a shell would reintroduce an expansion layer the profile
+    did not validate.
     """
     if any(character in target for character in _SHELL_CONTROL_CHARACTERS):
-        return False
+        return None
     try:
         argv = shlex.split(target)
     except ValueError:
-        return False
+        return None
     if not argv:
-        return False
+        return None
 
+    allowed = False
     if destination == "scheduler_read_only":
-        return _target_matches_read_only_shell_command(argv)
-    if destination == "upgrade_workspace":
-        return _target_matches_read_only_shell_command(argv) or (
+        allowed = _target_matches_read_only_shell_command(argv)
+    elif destination == "upgrade_workspace":
+        allowed = _target_matches_read_only_shell_command(argv) or (
             argv[0] == "uv"
             and argv[1:] in (["lock"], ["sync"])
         )
-    return False
+    return argv if allowed else None
+
+
+def _target_matches_shell_profile(target: str, destination: str) -> bool:
+    """Authorization adapter for the service shell profile."""
+    return parse_service_shell_argv(target, destination) is not None
 
 
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {

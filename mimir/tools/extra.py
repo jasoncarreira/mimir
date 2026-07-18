@@ -309,7 +309,7 @@ def _cd_target(command: str, cwd: Path | None) -> Path | None:
 
 
 @tool
-def shell_exec(command: str) -> str:
+def shell_exec(command: str, mimir_direct_argv: list[str] | None = None) -> str:
     """Execute a shell command and return stdout + stderr + exit code.
 
     Runs the command through ``bash -lc`` (a real login shell), so shell
@@ -328,7 +328,10 @@ def shell_exec(command: str) -> str:
     for the agent (shell-wrapper fix, 2026-06).
 
     Args:
-        command: The full shell command line (run via ``bash -lc``).
+        command: The full shell command line (run via ``bash -lc`` for user/admin calls).
+        mimir_direct_argv: Server-injected exact argv for trusted-service calls.
+            This is never a model authority surface: middleware replaces it after
+            authorizing the original command.
 
     Returns:
         Formatted block: stdout, stderr, exit code.
@@ -337,17 +340,24 @@ def shell_exec(command: str) -> str:
         return "shell_exec failed: command is required"
     cwd = _effective_shell_cwd()
     try:
-        from ._shell_env import login_shell_command
-        proc = subprocess.run(  # noqa: S603 — shell exec by design; trusted container (#226), guard middleware screens the command
-            ["bash", "-lc", login_shell_command(command)],
+        from ._shell_env import direct_exec_env, login_shell_command
+        argv = (
+            mimir_direct_argv
+            if mimir_direct_argv is not None
+            else ["bash", "-lc", login_shell_command(command)]
+        )
+        proc = subprocess.run(  # noqa: S603 — argv is either the trusted shell wrapper or server-authorized direct argv
+            argv,
             capture_output=True,
             timeout=_SHELL_STATE["timeout_s"],
             cwd=cwd,
+            env=direct_exec_env() if mimir_direct_argv is not None else None,
         )
     except subprocess.TimeoutExpired:
         return f"shell_exec timed out after {_SHELL_STATE['timeout_s']}s"
     except FileNotFoundError as exc:
-        return f"shell_exec failed: bash not found: {exc}"
+        executable = mimir_direct_argv[0] if mimir_direct_argv else "bash"
+        return f"shell_exec failed: executable {executable!r} not found: {exc}"
 
     parts = [f"exit={proc.returncode}"]
     stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
