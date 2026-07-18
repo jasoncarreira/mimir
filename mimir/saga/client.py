@@ -1623,7 +1623,12 @@ class SagaStore:
             "threshold": None,
         }
         if dedup_first:
-            from .dedup import dedup_pass, DEFAULT_DEDUP_THRESHOLD
+            from .dedup import (
+                DEFAULT_DEDUP_THRESHOLD,
+                DedupResult,
+                dedup_pass,
+                distinct_dedup_scopes,
+            )
             from .embeddings import resolve_auto_threshold
             from ._config_io import get_config
 
@@ -1648,21 +1653,50 @@ class SagaStore:
             dedup_cluster_fn = make_default_cluster_fn(
                 conn,
                 threshold=effective_dedup_threshold,
+                scope_acl=True,
             )
 
-            def _do_dedup():
-                return dedup_pass(
-                    conn,
-                    cluster_fn=dedup_cluster_fn,
-                    agent_id=self._agent_id,
-                    lookback_days=lookback_days,
-                    min_cluster_size=2,
-                    dry_run=dry_run,
-                    max_clusters=dedup_max_clusters,
-                    reference_date=reference_date,
+            scopes = await self._db_locked(
+                lambda: distinct_dedup_scopes(conn, agent_id=self._agent_id)
+            )
+            dedup_result = DedupResult()
+            for owner, domain, scope_visibility in scopes:
+                remaining = (
+                    None
+                    if dedup_max_clusters is None
+                    else dedup_max_clusters - len(dedup_result.canonicals_kept)
                 )
+                if remaining is not None and remaining <= 0:
+                    break
 
-            dedup_result = await self._write_locked(_do_dedup)
+                def _do_dedup(
+                    owner=owner,
+                    domain=domain,
+                    scope_visibility=scope_visibility,
+                    remaining=remaining,
+                ):
+                    return dedup_pass(
+                        conn,
+                        cluster_fn=dedup_cluster_fn,
+                        agent_id=self._agent_id,
+                        owner_principal=owner,
+                        origin_domain=domain,
+                        visibility=scope_visibility,
+                        lookback_days=lookback_days,
+                        min_cluster_size=2,
+                        dry_run=dry_run,
+                        max_clusters=remaining,
+                        reference_date=reference_date,
+                    )
+
+                scoped_result = await self._write_locked(_do_dedup)
+                dedup_result.candidates_scanned += scoped_result.candidates_scanned
+                dedup_result.clusters_formed += scoped_result.clusters_formed
+                dedup_result.canonicals_kept.extend(scoped_result.canonicals_kept)
+                dedup_result.duplicates_tombstoned.extend(
+                    scoped_result.duplicates_tombstoned
+                )
+                dedup_result.merges.update(scoped_result.merges)
             dedup_payload = {
                 "candidates_scanned": dedup_result.candidates_scanned,
                 "clusters_formed": dedup_result.clusters_formed,
@@ -2154,7 +2188,12 @@ class SagaStore:
         """
         from .consolidate import distinct_skill_scopes
         from .cluster import make_default_cluster_fn
-        from .dedup import dedup_pass, DEFAULT_DEDUP_THRESHOLD
+        from .dedup import (
+            DEFAULT_DEDUP_THRESHOLD,
+            DedupResult,
+            dedup_pass,
+            distinct_dedup_scopes,
+        )
         from .embeddings import resolve_auto_threshold
         from ._config_io import get_config
 
@@ -2193,23 +2232,55 @@ class SagaStore:
         cluster_fn = make_default_cluster_fn(
             conn,
             threshold=effective_threshold,
+            scope_acl=True,
         )
 
         for skill in skills:
-
-            def _do_dedup(skill=skill):
-                return dedup_pass(
-                    conn,
-                    cluster_fn=cluster_fn,
-                    agent_id=self._agent_id,
-                    lookback_days=lookback_days,
-                    min_cluster_size=min_cluster_size,
-                    dry_run=dry_run,
-                    max_clusters=dedup_max_clusters,
-                    skill_scope=skill,
+            scopes = await self._db_locked(
+                lambda skill=skill: distinct_dedup_scopes(
+                    conn, agent_id=self._agent_id, skill_scope=skill,
                 )
+            )
+            res = DedupResult()
+            for owner, domain, scope_visibility in scopes:
+                remaining = (
+                    None
+                    if dedup_max_clusters is None
+                    else dedup_max_clusters - len(res.canonicals_kept)
+                )
+                if remaining is not None and remaining <= 0:
+                    break
 
-            res = await self._write_locked(_do_dedup)
+                def _do_dedup(
+                    skill=skill,
+                    owner=owner,
+                    domain=domain,
+                    scope_visibility=scope_visibility,
+                    remaining=remaining,
+                ):
+                    return dedup_pass(
+                        conn,
+                        cluster_fn=cluster_fn,
+                        agent_id=self._agent_id,
+                        owner_principal=owner,
+                        origin_domain=domain,
+                        visibility=scope_visibility,
+                        lookback_days=lookback_days,
+                        min_cluster_size=min_cluster_size,
+                        dry_run=dry_run,
+                        max_clusters=remaining,
+                        skill_scope=skill,
+                    )
+
+                scoped_result = await self._write_locked(_do_dedup)
+                res.candidates_scanned += scoped_result.candidates_scanned
+                res.clusters_formed += scoped_result.clusters_formed
+                res.canonicals_kept.extend(scoped_result.canonicals_kept)
+                res.duplicates_tombstoned.extend(
+                    scoped_result.duplicates_tombstoned
+                )
+                res.merges.update(scoped_result.merges)
+
             # chainlink #425: mirror the #390 fix here — the general
             # consolidate() removes dedup-tombstoned raws from the FAISS
             # index, but this per-skill pass didn't, so a skill's merged
