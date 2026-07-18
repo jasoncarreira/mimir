@@ -944,6 +944,46 @@ async def test_turn_logger_writes_appendable_jsonl(tmp_path: Path):
     assert first["events"][0]["type"] == "reasoning"
 
 
+async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
+    # turns.jsonl is a durable log; mirror events.jsonl and scrub token-shaped
+    # secrets so a token a tool/subprocess emitted (in input/output/tool args)
+    # doesn't land cleartext in the turn log.
+    path = tmp_path / "turns.jsonl"
+    log = TurnLogger(path)
+    secret = "ghp_" + "A" * 36
+    record = TurnRecord(
+        ts="2026-05-15T12:00:00Z",
+        turn_id="0123456789abcdef",         # make_turn_id() shape (16 hex)
+        session_id="1721340000-a1b2c3d4",   # make_process_session_id() shape
+        saga_session_id=None,
+        trigger="user_message",
+        channel_id="web-alice",
+        input=f"my key is {secret}",
+        output=f"saved token={secret}",
+        events=[{"type": "tool_result", "content": f"export API_KEY={secret}"}],
+        total_cost_usd=0.0123,
+        duration_ms=42,
+    )
+    await log.write(record)
+    line = path.read_text().splitlines()[0]
+    rec = json.loads(line)
+
+    # The secret is masked everywhere it appeared (input, output, tool args).
+    assert secret not in line
+    assert "[REDACTED]" in rec["input"]
+    assert "[REDACTED]" in rec["output"]
+    assert "[REDACTED]" in rec["events"][0]["content"]
+
+    # Redaction is prefix/shape-anchored, so IDs, structure, and numeric
+    # usage/cost fields are untouched (readers key on these).
+    assert rec["turn_id"] == "0123456789abcdef"
+    assert rec["session_id"] == "1721340000-a1b2c3d4"
+    assert rec["channel_id"] == "web-alice"
+    assert rec["events"][0]["type"] == "tool_result"
+    assert rec["total_cost_usd"] == 0.0123
+    assert rec["seq"] == 1
+
+
 def _seq_record(turn_id: str) -> TurnRecord:
     return TurnRecord(
         ts="2026-05-15T12:00:00Z",
