@@ -31,6 +31,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from ._jsonl_tail import _tail_lines, count_lines_chunked
 from .models import TurnRecord
+from .redaction import redact_payload
 
 log = logging.getLogger(__name__)
 
@@ -620,10 +621,30 @@ class TurnLogger:
         async with self._lock:
             await self._write(record)
 
+    @staticmethod
+    def _serialize(record: TurnRecord) -> str:
+        """Serialize a turn record for the durable log, redacting secrets.
+
+        Mirrors ``events.jsonl`` (event_logger._record), which runs
+        ``redact_payload`` over its payload so token-shaped credentials a
+        subprocess/tool emitted don't land cleartext in the durable log.
+        ``turns.jsonl`` records carry the same class of content (tool args,
+        subprocess output, model reasoning) yet were written raw — the very
+        gap ``redaction`` was built to close (its module docstring names
+        ``turns.jsonl`` explicitly). ``redact_payload`` masks only
+        prefix/shape-anchored token values, so IDs (``turn_id``,
+        ``session_id``, saga atom ids) and numeric usage/cost fields are
+        untouched. Runs in a worker thread (see caller) because it walks the
+        whole record building a redacted copy.
+        """
+        return json.dumps(
+            redact_payload(asdict(record)), ensure_ascii=True, default=str
+        )
+
     async def _write(self, record: TurnRecord) -> None:
         self._seq += 1
         record.seq = self._seq
-        line = json.dumps(asdict(record), ensure_ascii=True, default=str)
+        line = await asyncio.to_thread(self._serialize, record)
         try:
             await asyncio.to_thread(self._append_line, line)
             self._line_count += 1
