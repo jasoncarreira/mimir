@@ -2724,28 +2724,54 @@ def assert_capability_matrix_complete() -> None:
         )
 
 
+def _deepagents_builtin_tool_names() -> tuple[str, ...]:
+    """Return the tools injected by the DeepAgents middleware stack."""
+    from deepagents.backends import StateBackend
+    from deepagents.middleware import FilesystemMiddleware, SubAgentMiddleware
+    from langchain.agents.middleware import TodoListMiddleware
+    from langchain_core.runnables import RunnableLambda
+
+    backend = StateBackend()
+    middleware = (
+        TodoListMiddleware(),
+        FilesystemMiddleware(backend=backend),
+        SubAgentMiddleware(
+            backend=backend,
+            subagents=[{
+                "name": "inventory-assertion",
+                "description": "Inventory assertion placeholder.",
+                "runnable": RunnableLambda(lambda state: state),
+            }],
+        ),
+    )
+    return tuple(tool.name for item in middleware for tool in item.tools)
+
+
 def assert_model_tool_inventory_cataloged(*, model_spec: str | None = None) -> None:
-    """Raise if the assembled native model surface lacks authz or IFC metadata."""
+    """Raise if the assembled model surface lacks authz or IFC metadata."""
     from .tools.registry import all_mimir_tools
 
     catalog = get_operation_catalog()
-    tools = tuple(all_mimir_tools(model_spec=model_spec))
+    tool_names = {
+        *(tool.name for tool in all_mimir_tools(model_spec=model_spec)),
+        *_deepagents_builtin_tool_names(),
+    }
     unknown_tools = sorted({
-        tool.name for tool in tools
-        if catalog.get_decision(tool.name) == OperationDecision.UNKNOWN
+        tool_name for tool_name in tool_names
+        if catalog.get_decision(tool_name) == OperationDecision.UNKNOWN
     })
     unknown_flows = sorted({
-        tool.name for tool in tools
-        if get_tool_flow_direction(tool.name) == ToolFlowDirection.UNKNOWN
+        tool_name for tool_name in tool_names
+        if get_tool_flow_direction(tool_name) == ToolFlowDirection.UNKNOWN
     })
     incomplete_sinks = sorted({
-        tool.name for tool in tools
-        if get_tool_flow_direction(tool.name) in {
+        tool_name for tool_name in tool_names
+        if get_tool_flow_direction(tool_name) in {
             ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
         }
         and (
-            get_sink_category(tool.name) == SinkCategory.UNKNOWN
-            or tool.name not in _OPERATION_SINK_DESTINATION
+            get_sink_category(tool_name) == SinkCategory.UNKNOWN
+            or tool_name not in _OPERATION_SINK_DESTINATION
         )
     })
     errors: list[str] = []
