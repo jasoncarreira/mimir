@@ -48,6 +48,42 @@ def _event(author: str | None) -> AgentEvent:
     )
 
 
+def test_inventory_assertion_rejects_uncataloged_deepagents_builtin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    monkeypatch.setattr(
+        access_control,
+        "_deepagents_builtin_tool_names",
+        lambda: ("synthetic_deepagents_builtin",),
+    )
+
+    with pytest.raises(
+        access_control.CapabilityMatrixError,
+        match="UNKNOWN model-bound tools: synthetic_deepagents_builtin",
+    ):
+        access_control.assert_model_tool_inventory_cataloged(model_spec="openai:test")
+
+
+def test_inventory_assertion_rejects_uncataloged_registered_mcp_tool() -> None:
+    from mimir.access_control import (
+        CapabilityMatrixError,
+        assert_model_tool_inventory_cataloged,
+    )
+    from mimir.tools.mcp import clear_mcp_tools, set_mcp_tools
+
+    set_mcp_tools([SimpleNamespace(name="mcp_synthetic_uncataloged")])
+    try:
+        with pytest.raises(
+            CapabilityMatrixError,
+            match="without explicit IFC flow metadata: mcp_synthetic_uncataloged",
+        ):
+            assert_model_tool_inventory_cataloged(model_spec="openai:test")
+    finally:
+        clear_mcp_tools()
+
+
 def test_inbound_allows_allowlisted_user_when_enforced(tmp_path: Path) -> None:
     resolver = _resolver(
         tmp_path,

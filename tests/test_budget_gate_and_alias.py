@@ -1779,6 +1779,36 @@ async def test_admin_gate_denies_sensitive_tool_when_enforced_context_missing(
     }) in captured
 
 
+def test_enforced_missing_context_mcp_call_denies_without_startup_assertion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+
+    def fail_if_called(*args: Any, **kwargs: Any) -> bool:
+        raise AssertionError("startup completeness assertion reached the hot path")
+
+    monkeypatch.setattr(
+        "mimir.access_control.resolve_access_control_enforcement",
+        fail_if_called,
+    )
+    handler_calls = 0
+
+    def handler(req: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+    out = BudgetGateMiddleware().wrap_tool_call(
+        _make_request("mcp_synthetic_uncataloged", "id-mcp-missing-ctx"),
+        handler,
+    )
+
+    assert isinstance(out, ToolMessage)
+    assert out.status == "error"
+    assert "missing_auth_context" in str(out.content)
+    assert handler_calls == 0
+
+
 @pytest.mark.asyncio
 async def test_admin_gate_missing_context_denies_protected_metadata_when_enforced(
     monkeypatch: pytest.MonkeyPatch,
