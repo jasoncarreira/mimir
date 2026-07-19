@@ -173,9 +173,9 @@ Two **independent** inputs decide what a turn may do:
      untrusted issues to us (operator decision). Declared per trigger like any
      other trust source.
    - **`fetch_url` from an operator-approved URL** (heartbeat) → the allowlist is
-     **egress authorization only** (which hosts may be fetched); the fetched
-     **content stays untrusted** (§5.4). Approving a host is not vouching for its
-     bytes.
+     **egress authorization only** (which exact URLs may be fetched); the fetched
+     **content stays untrusted** (§5.4). Approving an exact URL is not vouching for
+     its bytes.
    - Everything else ingested from outside → **untrusted**.
 
 The gate is the **2×2 of content-trust × sink blast-radius** (§3): *trusted →
@@ -433,7 +433,7 @@ The taint continues to gate *code/shell/action* sinks in all cases. By trigger:
   their own subprocess; the capability is simply not in their set).
 - **Heartbeat:** `fetch_url` allowed against an **operator-approved allowlist** —
   authorization to reach those destinations, **not** a trust signal for the
-  response (mimir: approving a host authorizes the request, not the bytes).
+  response (mimir: approving an exact URL authorizes the request, not the bytes).
   **Fetched content stays untrusted** — it can drive scoped sinks (save state /
   wiki / memory, provenance-tagged) but not code/shell. The heartbeat fetches its
   approved URLs freely.
