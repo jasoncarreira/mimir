@@ -107,11 +107,13 @@ For each repo in `GITHUB_REPOS`:
   above: reviews ON your PRs are otherwise edge-triggered only, so a turn that
   reads a request-changes review without pushing fixes loses the work signal
   when the cursor advances. Each poll, your open PRs whose latest substantive
-  review per reviewer is `CHANGES_REQUESTED` **and** whose head commit predates
-  that review fire ONE reminder per `(pr, head_sha)` — pushing fixes (head
-  newer than the review) silences it without a re-review; a new blocking
-  review newer than your new head is a new state and reminds once more. No
-  re-emit loop, no give-up signal: one reminder per stale state.
+  review per reviewer is `CHANGES_REQUESTED` **and** whose reviewed diff has
+  not materially changed are reminded on an elapsed-time cadence (60 minutes
+  by default). Polls before the interval expires do not refresh the timestamp.
+  A substantive fix, later approval clearing all blocking reviews, or PR
+  close/merge stops reminders; a content-free rebase with the same patch does
+  not. This is bounded at-least-once prompting, not an outcome acknowledgement,
+  remediation lease, or exactly-once execution.
 
 Issue / PR / comment / review detection is filtered by `created_at > cursor`
 and (when set) `user.login != MIMIR_GITHUB_SELF_LOGIN`. Push + review-request
@@ -141,7 +143,7 @@ Polling 1 repo every 15 min @ 4 endpoints = ~16 calls/hr/repo. For a 5-repo watc
 
 Persists at `<home>/state/pollers/github-activity/cursor.json` (the framework-injected `STATE_DIR`). Survives container rebuilds. First run looks back 1 hour to bound the backfill burst.
 
-The `pr_changes_requested` key maps `{repo: {pr_number: head_sha}}` — the own-PR stale states already reminded about (chainlink #449), rebuilt from the live snapshot each poll so closed/unblocked PRs drop out.
+The `pr_changes_requested` key maps `{repo: {pr_number: {"head_sha": sha, "last_reminded_at": ISO-8601 UTC timestamp}}}`. It tracks unresolved own-PR stale states and enforces the elapsed reminder floor while the live snapshot remains semantically blocked. Closed, unblocked, or substantively changed PRs drop out. Pre-cadence bare-string values (`{pr_number: head_sha}`) migrate quietly on their first successful observation with `last_reminded_at` set to that poll's time, so they wait one full interval before becoming eligible.
 
 The `pr_review_requests` key maps `{repo: {pr_number: attempts}}` — `attempts` counts `pr_review_requested` emits while you stayed requested (chainlink #299; a dormant PR that gave up parks at `cap + 1`). The pre-#299 bare-list format (`{repo: [pr_number, ...]}`) migrates automatically on first load.
 

@@ -89,6 +89,11 @@ BODY_PREVIEW_CHARS = 300
 # signal fires.
 REVIEW_REQUEST_MAX_ATTEMPTS = 3
 
+# Unresolved review feedback is re-reminded on elapsed time rather than poll
+# count. A dropped remediation turn can therefore delay, but not permanently
+# consume, the signal without making normal 15-minute polls noisy.
+CHANGES_REQUESTED_REMINDER_INTERVAL = timedelta(minutes=60)
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -924,8 +929,11 @@ def _check_own_changes_requested(
     repo: str,
     token: str,
     me: str,
-    prior: dict[str, str],
-) -> tuple[int, dict[str, str]]:
+    prior: dict[str, object],
+    *,
+    now: datetime | None = None,
+    reminder_interval: timedelta = CHANGES_REQUESTED_REMINDER_INTERVAL,
+) -> tuple[int, dict[str, object]]:
     """State-reconciling reminder for the agent's OWN open PRs stuck at
     CHANGES_REQUESTED (chainlink #449).
 
@@ -941,16 +949,15 @@ def _check_own_changes_requested(
     that review) is the authoritative "fixes still owed" signal, so it
     is re-derived from the live snapshot each poll.
 
-    Dedupe contract: at most ONE ``pr_changes_requested_stale`` event
-    per ``(pr, head_sha)`` — ``prior`` maps ``pr_key -> head_sha`` of
-    the state already reminded about. Unlike the review-request wedge
-    guard there is no re-emit loop: one reminder per stale state, a
-    new head sha (fixes pushed, CHANGES_REQUESTED again after
-    re-review) is a NEW state and reminds once more. Cleanup is the
-    same rebuild-on-every-poll model as the sibling cursors: closed /
-    merged / no-longer-blocked PRs drop out because they are never
-    copied into the returned dict, so a fresh changes-requested cycle
-    later starts clean.
+    Reminder contract: ``prior`` maps each PR key to ``head_sha`` plus
+    ``last_reminded_at``. An unresolved stale state re-emits only after
+    ``reminder_interval`` has elapsed. The head is observational rather
+    than the resolution key: a content-free rebase carries the existing
+    reminder timestamp forward, while the reviewed-diff check below drops
+    a substantive fix. Legacy bare-sha entries migrate quietly with
+    ``last_reminded_at=now`` so deployment does not produce a reminder
+    storm. Cleanup remains rebuild-on-every-poll: closed, merged, fixed,
+    and no-longer-blocked PRs are not copied into the returned dict.
 
     "No commits since the review" matters: right after the agent
     pushes fixes the PR's review decision STAYS CHANGES_REQUESTED
@@ -966,6 +973,11 @@ def _check_own_changes_requested(
     """
     if not me:
         return 0, {}
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    observed_at = observed_at.astimezone(timezone.utc)
+    observed_at_iso = observed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
     data = _gh_api(
         f"repos/{repo}/pulls?state=open&sort=created&direction=desc&per_page=100",
         token,
@@ -973,7 +985,7 @@ def _check_own_changes_requested(
     if not isinstance(data, list):
         return 0, dict(prior)
     count = 0
-    new: dict[str, str] = {}
+    new: dict[str, object] = {}
     for pr in data:
         if (pr.get("user") or {}).get("login") != me:
             continue
@@ -1013,12 +1025,9 @@ def _check_own_changes_requested(
         }
         if not blocking:
             continue  # not blocked — entry drops; a later CR cycle starts fresh
-        if prior.get(key) == head_sha:
-            new[key] = head_sha  # already reminded for exactly this state
-            continue
         # Stale only when no commits landed after the newest blocking
         # review. An unknown head-commit date (API hiccup) counts as
-        # stale — the per-sha dedupe caps the cost at one reminder.
+        # stale; the elapsed-time floor bounds reminders during hiccups.
         newest_block_ts, newest_block_sha = max(
             blocking.values(), key=lambda item: item[0],
         )
@@ -1029,6 +1038,48 @@ def _check_own_changes_requested(
             )
             if changed is not False:
                 continue
+
+        prior_entry = prior.get(key)
+        if isinstance(prior_entry, str):
+            # Pre-cadence cursor. Treat its prior one-shot reminder as if it
+            # happened now; only a full interval after migration may re-fire.
+            new[key] = {
+                "head_sha": head_sha,
+                "last_reminded_at": observed_at_iso,
+            }
+            continue
+
+        last_reminded_at = ""
+        last_reminded: datetime | None = None
+        if isinstance(prior_entry, dict):
+            value = prior_entry.get("last_reminded_at")
+            if isinstance(value, str):
+                last_reminded_at = value
+                try:
+                    last_reminded = datetime.fromisoformat(
+                        value.replace("Z", "+00:00")
+                    )
+                    if last_reminded.tzinfo is None:
+                        last_reminded = last_reminded.replace(tzinfo=timezone.utc)
+                    last_reminded = last_reminded.astimezone(timezone.utc)
+                except ValueError:
+                    last_reminded = None
+
+        if last_reminded is not None and observed_at - last_reminded < reminder_interval:
+            new[key] = {
+                "head_sha": head_sha,
+                "last_reminded_at": last_reminded_at,
+            }
+            continue
+        if key in prior and last_reminded is None:
+            # Quietly repair malformed structured state just like a legacy
+            # entry rather than turning cursor corruption into an emit storm.
+            new[key] = {
+                "head_sha": head_sha,
+                "last_reminded_at": observed_at_iso,
+            }
+            continue
+
         title = pr.get("title", "")
         url = pr.get("html_url", "")
         reviewers = ", ".join(f"@{login}" for login in sorted(blocking))
@@ -1049,7 +1100,10 @@ def _check_own_changes_requested(
             reviewers=sorted(blocking),
         )
         count += 1
-        new[key] = head_sha
+        new[key] = {
+            "head_sha": head_sha,
+            "last_reminded_at": observed_at_iso,
+        }
     return count, new
 
 
@@ -1184,10 +1238,10 @@ def main() -> None:
     rr_all: dict = cursor.get("pr_review_requests", {}) or {}
     new_rr_all: dict[str, dict[str, int]] = {}
     # Changes-requested reconciliation cursor (chainlink #449):
-    # ``{repo: {pr_key: head_sha}}`` — the own-PR states already
-    # reminded about, deduped per (pr, head_sha).
+    # ``{repo: {pr_key: {head_sha, last_reminded_at}}}`` — unresolved
+    # own-PR states, rate-limited by elapsed time between reminders.
     cr_all: dict = cursor.get("pr_changes_requested", {}) or {}
-    new_cr_all: dict[str, dict[str, str]] = {}
+    new_cr_all: dict[str, dict[str, object]] = {}
 
     total = 0
     for repo in repos:
