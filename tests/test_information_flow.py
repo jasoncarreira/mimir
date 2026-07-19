@@ -402,6 +402,51 @@ def test_private_turn_is_blocked_from_external_egress_tools(
     assert decision.reason == expected_reason
 
 
+@pytest.mark.parametrize("trigger", ["user_message", "poller", "scheduled_tick"])
+def test_spoofed_service_trigger_cannot_bypass_open_network_sink_gate(
+    trigger: str,
+):
+    decision = ToolRegistry().authorize_tool(
+        "fetch_url",
+        replace(_auth(roles=("user",)), trigger=trigger),
+        enforce=True,
+        target_channel="https://external.example",
+        ifc_labels=_labels(),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:network"
+
+
+def test_resolved_service_keeps_network_sink_policy_behavior():
+    scheduler = AuthContext(
+        principal="service:scheduler",
+        canonical_principal="scheduler",
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "fetch_url",
+        scheduler,
+        enforce=True,
+        target_channel="https://external.example",
+        ifc_labels=_labels(
+            channel="scheduler:heartbeat",
+            principal="service:scheduler",
+            bridge_instance="service:scheduler",
+        ),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
 def test_unknown_sink_category_reaches_fail_closed_gate_from_authorization():
     decision = ToolRegistry().authorize_tool(
         "future_egress_tool",
