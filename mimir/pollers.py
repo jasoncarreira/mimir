@@ -330,22 +330,17 @@ def _github_author_is_trusted(repo: Any, author: Any, token: str) -> bool:
         return False
     escaped_repo = "/".join(urllib.parse.quote(value, safe="") for value in parts)
     escaped_author = urllib.parse.quote(author, safe="")
-    permission = _github_api_attestation(
-        f"repos/{escaped_repo}/collaborators/{escaped_author}/permission", token,
+    # The permission endpoint reports ``read`` for any user on a public repo,
+    # including non-collaborators.  The collaborator-existence endpoint keeps
+    # those cases distinct: 204 means collaborator, 404 means not one.
+    collaborator = _github_api_attestation(
+        f"repos/{escaped_repo}/collaborators/{escaped_author}", token,
     )
-    if permission is None:
+    if collaborator is None:
         return False
-    if permission[0] == 200:
-        if not isinstance(permission[1], dict):
-            return False
-        resolved_permission = permission[1].get("permission")
-        if resolved_permission in {
-            "read", "triage", "write", "maintain", "admin",
-        }:
-            return True
-        if resolved_permission != "none":
-            return False
-    elif permission[0] != 404:
+    if collaborator[0] == 204:
+        return True
+    if collaborator[0] != 404:
         return False
 
     membership = _github_api_attestation(

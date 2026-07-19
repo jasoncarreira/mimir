@@ -661,12 +661,11 @@ print(json.dumps({
 
 
 @pytest.mark.parametrize(
-    ("permission", "membership", "expected"),
+    ("collaborator", "membership", "expected"),
     [
-        ((200, {"permission": "read"}), None, True),
-        ((200, {"permission": "write"}), None, True),
-        ((200, {"permission": "none"}), (200, {"state": "active"}), True),
-        ((200, {"permission": "none"}), (404, None), False),
+        ((204, None), None, True),
+        ((404, None), (200, {"state": "active"}), True),
+        ((404, None), (404, None), False),
         (None, None, False),
         (None, (200, {"state": "active"}), False),
         ((403, {"message": "rate limited"}), (200, {"state": "active"}), False),
@@ -674,7 +673,7 @@ print(json.dumps({
 )
 def test_github_author_trust_is_server_attested_and_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
-    permission: object,
+    collaborator: object,
     membership: object,
     expected: bool,
 ) -> None:
@@ -682,12 +681,34 @@ def test_github_author_trust_is_server_attested_and_fail_closed(
 
     def fake_api(endpoint: str, _token: str):
         calls.append(endpoint)
-        return membership if endpoint.startswith("orgs/") else permission
+        return membership if endpoint.startswith("orgs/") else collaborator
 
     monkeypatch.setattr("mimir.pollers._github_api_attestation", fake_api)
 
     assert _github_author_is_trusted("acme/widget", "alice", "server-token") is expected
-    assert calls[0] == "repos/acme/widget/collaborators/alice/permission"
+    assert calls[0] == "repos/acme/widget/collaborators/alice"
+
+
+def test_github_public_read_permission_does_not_establish_collaborator_trust(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_api(endpoint: str, _token: str):
+        calls.append(endpoint)
+        if endpoint.startswith("orgs/"):
+            return (404, None)
+        # The collaborator-existence endpoint is authoritative. An arbitrary
+        # public-repo reader is not a collaborator and therefore returns 404.
+        return (404, None)
+
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", fake_api)
+
+    assert _github_author_is_trusted("acme/public-repo", "random-reader", "token") is False
+    assert calls == [
+        "repos/acme/public-repo/collaborators/random-reader",
+        "orgs/acme/memberships/random-reader",
+    ]
 
 
 @pytest.mark.asyncio

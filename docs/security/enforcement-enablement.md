@@ -161,8 +161,8 @@ Two **independent** inputs decide what a turn may do:
    forge**, *not* from the fact that a trusted party started the turn:
    - **Internal trigger** (heartbeat, session-boundary, operator's own typed
      input) → **trusted**.
-   - **GitHub content** → trusted iff the author is a **repo collaborator, org
-     member, or has write access** (GitHub's own permission graph — operator-
+   - **GitHub content** → trusted iff the author is a **repo collaborator or org
+     member** (GitHub's own relationship graph — operator-
      controlled, un-forgeable by a PR). Such a contributor's issue/PR is trusted
      **as a whole**, including material it embeds/quotes or is built on top of —
      we trust the contributor not to introduce malicious content (operator
@@ -215,7 +215,7 @@ confidentiality emptiness and never an informational recall.
 | Trigger | Capability set (the ceiling) | Trust / gating |
 |---|---|---|
 | **Operator / user turn** | full (subject to admin tier) | operator's typed input is trusted; untrusted content read mid-turn is tainted → can't drive Unbounded sinks without one-use approval |
-| **GitHub poller** | `worklink_run` (worktree + reviewed PR), scoped file/edit, read-only shell, `send_message` | **known contributor** (collaborator / org / write) → trusted → full code-work; **unknown author, or any comment by a non-contributor** → untrusted → **notify the operator only**, no autonomous action (operator then directs the agent) |
+| **GitHub poller** | `worklink_run` (worktree + reviewed PR), scoped file/edit, read-only shell, `send_message` | **known contributor** (collaborator / org member) → trusted → full code-work; **unknown author, or any comment by a non-contributor** → untrusted → **notify the operator only**, no autonomous action (operator then directs the agent) |
 | **Research / RSS poller** | write memory (create atom + feedback/credit), scoped state file, scoped wiki, `send_message` — **no `fetch_url`, no `spawn`** | ingested web content is untrusted, but the capability set contains **no Unbounded sink**, so it is safe regardless — no per-author gating needed |
 | **Heartbeat** | near-full incl. `fetch_url` from a **config-fixed approved-URL set** | internally triggered → trusted. A **deterministic** fetch of its config-fixed exact-URL set (any subset, repeatedly) is taint-independent — a prior fetch's untrusted content doesn't lock it out; **model-chosen** fetches instead fall under the turn-taint gate. Fetched **content stays untrusted**: drives scoped sinks (save state / wiki / memory) but not code/shell; non-approved destinations blocked; redirects re-checked per hop. Allowlist = exact URLs, not host wildcards (§5.4) |
 | **Session-boundary turn** | session-boundary writes | internal → trusted |
@@ -544,7 +544,7 @@ is allowed.
   a manifest cannot self-grant or mutate its own authority (§5.1).
 - **Content trust → derived from source identity, not turn ownership** (§4).
   This is the integrity model and it supersedes the earlier "operator-trust"
-  framing. Anchors: the GitHub permission graph (collaborator / org / write),
+  framing. Anchors: the GitHub relationship graph (collaborator / org member),
   the operator-approved URL list, and internal triggers. mimir's position — that
   integrity is an *enablement prerequisite*, not a multi-user-someday concern —
   is adopted: the confused-deputy case is closed **now**, single-operator
