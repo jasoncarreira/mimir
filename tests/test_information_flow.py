@@ -524,6 +524,40 @@ def test_visibility_qualified_service_source_is_bound_to_triggering_channel():
 
 
 @pytest.mark.parametrize(
+    ("source_resource", "expected_allowed"),
+    [
+        ("slack-C-other", False),
+        ("slack-C1", True),
+    ],
+)
+def test_protected_prompt_source_is_bound_to_triggering_channel(
+    source_resource: str,
+    expected_allowed: bool,
+):
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        sources=frozenset({SourceLabel(
+            principal="user-2",
+            domain="recent_activity",
+            resource_id=source_resource,
+            bridge_instance="slack",
+            sensitivity="private",
+            authorized_principals=frozenset({"user-1"}),
+            source_kind="protected_prompt",
+        )}),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+
+    assert decision.allowed is expected_allowed
+    assert decision.reason == (
+        "ifc_allowed" if expected_allowed else "ifc_label_blocked:same_channel"
+    )
+
+
+@pytest.mark.parametrize(
     ("tool_name", "sink_category"),
     [
         ("memory_store", SinkCategory.SAGA),

@@ -224,7 +224,7 @@ def _prompt_source_labels(
     return InformationFlowLabels().with_source(SourceLabel(
         principal=owner,
         domain=domain,
-        resource_id=resource or target_channel,
+        resource_id=target_channel or resource,
         bridge_instance=bridge_instance,
         sensitivity="private",
         authorized_principals=acl,
