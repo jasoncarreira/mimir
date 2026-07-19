@@ -1,12 +1,14 @@
 # Enforcement enablement: sink classification and poller capabilities
 
-**Status:** DRAFT — revision 7. Incorporates mimir review rounds 1–5 (spawn and
+**Status:** DRAFT — revision 8. Incorporates mimir review rounds 1–6 (spawn and
 `worklink_run` are not process-confined; the "scoped" file root is actually the
 whole home; the `SAGA` category is too broad; integrity is an enablement
 prerequisite; approved-URL authorizes the request, not the response bytes;
 destination-allowlisting alone is insufficient for payload-bearing network sinks;
 even exact-URL fetch leaks via invocation-pattern/redirects unless dispatch is
-trusted-deterministic) and the operator's decisions (per-trigger policy;
+trusted-deterministic; integrity is a distinct axis needing its own executable
+representation, not the confidentiality `ifc_state`) and the operator's decisions
+(per-trigger policy;
 approved-URL = egress-only; trust the contributor / JIRA instance wholesale;
 provenance schema; auto-recall must never handcuff a user turn; a heartbeat may
 fetch its config-fixed approved URLs freely; enforcement-aware prompt guidance is
@@ -182,6 +184,20 @@ turn because a trusted party started it," which does **not** survive the
 confused-deputy case — untrusted content (an issue body, a web page, a comment)
 folded into a trusted turn and then driving an action.
 
+**Integrity is a distinct axis and needs its own executable representation — it is
+NOT the existing `ifc_state`.** `ifc_state` today carries *confidentiality* labels
+and ACLs, and it is **never "clean"**: every turn stamps its own `{private}`
+confidentiality label at ingress, so "IFC empty/clean" is meaningless as an
+integrity signal (mimir round 6). Represent integrity as a **new field on
+`SourceLabel`** — `integrity: trusted | untrusted`, set from the trust rules above
+at ingest. `ifc_state` already *accumulates* sources across the turn, so it is the
+right vehicle; the **gate checks whether any accumulated source has
+`integrity == untrusted`** — the turn's own trusted operator/config sources never
+trip it, and an untrusted ingest (a fetched page, an unknown-author issue) does.
+Wherever this doc says "untrusted taint" / "the turn-taint gate," that is the test
+— *any untrusted-integrity source ingested this turn* — **not** confidentiality
+emptiness.
+
 ### Per-trigger policy
 
 | Trigger | Capability set (the ceiling) | Trust / gating |
@@ -337,15 +353,17 @@ on the request payload. Two sink shapes (mimir round 4):
      the payload is server-supplied / config-derived — a heartbeat's configured
      search query, a fixed template — it is trusted by construction. Prefer this
      for autonomous payload-bearing egress: fill the payload from trusted config,
-     don't let the trigger emit it free-form. (This is also *why* exact-URL
-     `fetch_url` is fully safe — the payload **is** the config-fixed URL.)
-  2. **Model-emitted payload → the existing turn-taint gate.** A free-form
-     model-composed payload can't be proven clean, so it conservatively inherits
-     the turn's taint: allowed only if the turn has ingested no untrusted content
-     this turn (`ifc_state` clean), else blocked / one-use declassify. This is the
-     **same `ifc_state` gate the action sinks use** — payload-bearing sinks join
-     the action tier for model-emitted payloads; there is no separate per-payload
-     machinery.
+     don't let the trigger emit it free-form. (This is *why* exact-URL `fetch_url`
+     removes the data-in-URL vector — the payload **is** the config-fixed URL;
+     exact URLs still need trusted-deterministic dispatch + per-hop redirect checks
+     for the invocation-pattern channel, per the URL-is-destination bullet above.)
+  2. **Model-emitted payload → the integrity gate.** A free-form model-composed
+     payload can't be proven clean, so it conservatively inherits the turn's
+     **integrity** state: allowed only if the turn has ingested **no
+     untrusted-integrity source** this turn (per §4 — *not* "IFC empty", which is
+     never true), else blocked / one-use declassify. This is the **same
+     integrity gate the action sinks use** — payload-bearing sinks join the action
+     tier for model-emitted payloads; there is no separate per-payload machinery.
 
   So the only thing gated is a *model-composed* payload on a turn that has
   *already ingested* untrusted content — exactly the confused-deputy exfil. A
@@ -552,20 +570,27 @@ masked-check-verified):
    for heartbeat/session-boundary; named capabilities validated against the tier
    table; narrow per-trigger roots from immutable operator config (not the global
    file-tool roots); manifest cannot self-grant/mutate its authority.
-2. **Trust derivation** (§4): resolve content integrity from source identity —
-   GitHub permission graph (collaborator/org/write), pointed-at JIRA instance,
-   internal triggers — everything else untrusted; wholesale for trusted sources.
-3. **`_get_allowed_sinks` → tier + trust gate** (§3, §5.2): replace the `#906`
-   blanket poller block with the 2×2 (trust × blast-radius) deferring to
-   containment policy; keep unbounded/exfil hard-blocked; add the Code-execution
+2. **Integrity axis + trust derivation** (§4): add an `integrity: trusted |
+   untrusted` field to `SourceLabel`, set from source identity at ingest (GitHub
+   permission graph, pointed-at JIRA instance, internal triggers → trusted;
+   everything else untrusted; wholesale for trusted sources). The turn's integrity
+   state = *any accumulated source with `integrity == untrusted`* — a **distinct
+   axis from the confidentiality labels `ifc_state` already carries** (which is
+   never empty), even though it rides the same source-accumulation.
+3. **`_get_allowed_sinks` → tier + integrity gate** (§3, §5.2): replace the `#906`
+   blanket poller block with the 2×2 (integrity × blast-radius) deferring to
+   containment policy; the gate tests "any untrusted-integrity source ingested",
+   not IFC emptiness; keep unbounded/exfil hard-blocked; add the Code-execution
    tier (worklink_run trusted-only; spawn_* blocked pending an isolation contract).
 4. **Provenance schema + informational recall** (§5.3): `integrity`/`origin_trigger`/
    `origin_ref` immutable columns; render provenance on recall (grouped by trust)
    **without** tainting; enforcement taint from active ingests only.
-5. **Network egress boundary** (§5.4): destination allowlist (**exact URLs** for
-   the URL-is-destination case → taint-independent) **plus a payload-integrity
-   gate for payload-bearing sinks** (`web_search`/`webhook`/MCP/child-process:
-   untrusted-derived payload blocked/declassify); pollers no `fetch_url`; user
+5. **Network egress boundary** (§5.4): destination allowlist of **exact URLs**;
+   URL-is-destination is taint-independent **only under trusted-deterministic
+   dispatch** (config-fixed set/order) with **per-hop redirect checks** —
+   model-chosen fetches fall to the integrity gate; **payload-bearing sinks**
+   (`web_search`/`webhook`/MCP/child-process) allow config/server-derived payloads
+   and integrity-gate model-emitted ones; pollers no `fetch_url`; user
    ask-on-first-use; one boundary covering child processes (task-level egress).
 6. **opencode file-permission** for worklink (§5.5): set `external_directory` deny
    + restrict `bash`; verify `shell.sandbox` against our opencode version.
