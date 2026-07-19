@@ -1,14 +1,15 @@
 # Enforcement enablement: sink classification and poller capabilities
 
-**Status:** DRAFT — revision 4. Incorporates mimir review rounds 1–3 (spawn and
+**Status:** DRAFT — revision 5. Incorporates mimir review rounds 1–4 (spawn and
 `worklink_run` are not process-confined; the "scoped" file root is actually the
 whole home; the `SAGA` category is too broad; integrity is an enablement
-prerequisite; approved-URL authorizes the request, not the response bytes) and
-the operator's decisions (per-trigger policy; approved-URL = egress-only;
+prerequisite; approved-URL authorizes the request, not the response bytes;
+destination-allowlisting alone is insufficient for payload-bearing network sinks)
+and the operator's decisions (per-trigger policy; approved-URL = egress-only;
 trust the contributor / JIRA instance wholesale; provenance schema; auto-recall
-must never handcuff a user turn; future isolation must run in docker **and** AWS
-ECS/Fargate → no bubblewrap). The open design questions from rev 3 are now
-resolved (§6).
+must never handcuff a user turn; a heartbeat may fetch its approved URLs freely;
+future isolation must run in docker **and** AWS ECS/Fargate → no bubblewrap). The
+open design questions from rev 3 are resolved (§6).
 **Date:** 2026-07-19.
 **Context:** written after a whole-`access_control` adversarial review (5 parallel
 reviewers, findings verified with runtime repros). It proposes the model that
@@ -290,13 +291,26 @@ the blast radius.
 `fetch_url` / `web_search` / webhooks / `EXTERNAL_MCP` are where "let the agent
 act" and "let data leak out" are the same action.
 
-**Network egress is gated by the destination allowlist, independent of the turn's
-taint.** A request to an approved destination is allowed regardless of what the
-turn has ingested; a request to a non-approved destination is blocked. That means
-the taint gates *code/shell/action* sinks, not egress-to-an-already-approved
-destination — so a heartbeat can fetch **all** its approved URLs, repeatedly and
-in any order, without a prior fetch's untrusted content locking it out (this is
-the intended behavior, not a hole). By trigger:
+Network egress needs the destination allowlist **plus**, for some sinks, a check
+on the request payload. Two sink shapes (mimir round 4):
+
+- **URL-is-the-destination** — `fetch_url` with an **exact-URL** allowlist. The
+  destination *is* the payload-carrier, so allowlisting exact URLs both authorizes
+  and bounds it: egress is **destination-gated and taint-independent**. A heartbeat
+  fetches **all** its approved URLs, repeatedly and in any order, without a prior
+  fetch's untrusted content locking it out (intended, not a hole).
+- **Payload-bearing** — `web_search` (query), `webhook` (body), external MCP
+  (args), and any child-process request. Here the destination is a *fixed/approved
+  endpoint* (e.g. `_extract_sink_target` returns the Tavily search URL, not the
+  query), while the **model-controlled payload is separate content that can carry
+  data out to that approved destination**. Destination-allowlisting is necessary
+  but **not sufficient**; egress must **also gate on payload integrity**: a payload
+  from the trigger's own trusted logic (a heartbeat's configured query) is allowed;
+  a payload **derived from untrusted turn content** (e.g. a query built from a
+  prior fetch's bytes) is blocked / needs a one-use declassify. That is precisely
+  the confused-deputy exfil, and gating it does not touch the trusted-query case.
+
+The taint continues to gate *code/shell/action* sinks in all cases. By trigger:
 
 - **GitHub / research pollers:** no `fetch_url` capability at all (they fetch via
   their own subprocess; the capability is simply not in their set).
@@ -382,12 +396,15 @@ for the current enablement.
   integrity is an *enablement prerequisite*, not a multi-user-someday concern —
   is adopted: the confused-deputy case is closed **now**, single-operator
   included.
-- **Network egress → §5.4**: gated by the **destination allowlist, independent of
-  turn taint** — so a heartbeat fetches all its approved URLs freely (a prior
-  fetch's untrusted content doesn't lock it out). Allowlist = **exact URLs /
-  templates, not host wildcards** (closes exfil-via-approved-host). Pollers have
-  no `fetch_url`; user turns ask-on-first-use per host; one **uniform egress
-  boundary including child processes**, not a per-tool special case.
+- **Network egress → §5.4**: two sink shapes. **URL-is-destination** (`fetch_url`
+  with an **exact-URL** allowlist) is destination-gated and taint-independent — a
+  heartbeat fetches all its approved URLs freely. **Payload-bearing** sinks
+  (`web_search` query, `webhook` body, external MCP args, child-process requests)
+  send model-controlled content to a fixed approved endpoint, so they need
+  destination-allowlisting **plus a payload-integrity gate** (trusted payload
+  allowed; untrusted-derived payload blocked/declassify). Pollers have no
+  `fetch_url`; user turns ask-on-first-use; one **uniform egress boundary
+  including child processes**.
 - **Memory tier → scoped ops, not the whole category** (§5.3): create-atom +
   feedback/credit, provenance-tagged; no `saga_forget` / session-boundary.
 - **Provenance schema + recall → §5.3**: `integrity`/`origin_trigger`/`origin_ref`
@@ -476,9 +493,11 @@ masked-check-verified):
 4. **Provenance schema + informational recall** (§5.3): `integrity`/`origin_trigger`/
    `origin_ref` immutable columns; render provenance on recall (grouped by trust)
    **without** tainting; enforcement taint from active ingests only.
-5. **Network egress boundary** (§5.4): pollers no `fetch_url`; heartbeat
-   approved-URL = egress-only (content untrusted); user ask-on-first-use per host;
-   one boundary covering child processes (task-level egress control).
+5. **Network egress boundary** (§5.4): destination allowlist (**exact URLs** for
+   the URL-is-destination case → taint-independent) **plus a payload-integrity
+   gate for payload-bearing sinks** (`web_search`/`webhook`/MCP/child-process:
+   untrusted-derived payload blocked/declassify); pollers no `fetch_url`; user
+   ask-on-first-use; one boundary covering child processes (task-level egress).
 6. **opencode file-permission** for worklink (§5.5): set `external_directory` deny
    + restrict `bash`; verify `shell.sandbox` against our opencode version.
 7. **Enable-time verification**: land the §7 blockers still open (#922 write-shell
