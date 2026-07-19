@@ -433,7 +433,7 @@ def _check_issues(repo: str, since: str, token: str, me: str) -> int:
             prompt_parts.append(body)
         prompt_parts.append(url)
         _emit("\n".join(prompt_parts), event_type="issue_opened",
-              repo=repo, number=number, url=url)
+              repo=repo, number=number, url=url, author=author)
         count += 1
     return count
 
@@ -462,7 +462,7 @@ def _check_prs(repo: str, since: str, token: str, me: str) -> int:
             prompt_parts.append(body)
         prompt_parts.append(url)
         _emit("\n".join(prompt_parts), event_type="pr_opened",
-              repo=repo, number=number, url=url,
+              repo=repo, number=number, url=url, author=author,
               head_sha=(pr.get("head") or {}).get("sha"))
         count += 1
     return count
@@ -495,7 +495,7 @@ def _check_issue_comments(repo: str, since: str, token: str, me: str) -> int:
             f"New comment on {repo} #{issue_num} by @{author}: {body}\n{url}"
         )
         _emit(prompt, event_type="issue_comment",
-              repo=repo, number=issue_num, url=url)
+              repo=repo, number=issue_num, url=url, author=author)
         count += 1
     return count
 
@@ -530,7 +530,7 @@ def _check_pr_review_comments(repo: str, since: str, token: str, me: str) -> int
             f"by @{author}{location}: {body}\n{url}"
         )
         _emit(prompt, event_type="pr_review_comment",
-              repo=repo, number=pr_num, url=url, path=path)
+              repo=repo, number=pr_num, url=url, path=path, author=author)
         count += 1
     return count
 
@@ -683,6 +683,7 @@ def _check_pr_pushes(
                     previous_head=prev_sha,
                     new_head=current_sha,
                     head_sha=current_sha,
+                    author=pr_author,
                 )
                 count += 1
                 new_heads[key] = current_sha
@@ -1098,6 +1099,7 @@ def _check_own_changes_requested(
             url=url,
             head=head_sha,
             reviewers=sorted(blocking),
+            author=(pr.get("user") or {}).get("login"),
         )
         count += 1
         new[key] = {
@@ -1156,7 +1158,8 @@ def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
                 prompt += f"\n{body}"
             prompt += f"\n{url}"
             _emit(prompt, event_type="pr_review",
-                  repo=repo, number=pr_number, url=url, state=state)
+                  repo=repo, number=pr_number, url=url, state=state,
+                  author=author)
             count += 1
     return count
 

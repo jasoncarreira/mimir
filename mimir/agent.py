@@ -73,6 +73,8 @@ from .models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    Integrity,
+    IntegrityEffect,
     PromptBlock,
     SourceLabel,
     TurnInteractivity,
@@ -230,6 +232,8 @@ def _prompt_source_labels(
         sensitivity="private",
         authorized_principals=acl,
         source_kind=source_kind,
+        integrity=Integrity.UNTRUSTED,
+        integrity_effect=IntegrityEffect.INFORMATIONAL,
     ))
 
 
@@ -345,6 +349,27 @@ def _initialize_ifc_labels(
         "saga_session_end", "scheduled_tick", "poller",
     ):
         sensitivity = "internal"
+    integrity = Integrity.UNTRUSTED
+    if (
+        registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and event.trigger in ("scheduled_tick", "saga_session_end")
+    ) or (
+        event.trigger == "user_message"
+        and bool(event.author)
+        and event.source not in ("api", "http")
+    ):
+        integrity = Integrity.TRUSTED
+    elif event.trigger == "poller" and event.ifc_labels is not None:
+        # Poller content is classified by the framework before enqueue. The
+        # service stamp makes this carrier server-owned; public HTTP ingress
+        # cannot provide either the stamp or ifc_labels.
+        if event.ifc_labels.sources and all(
+            source.integrity == Integrity.TRUSTED
+            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+            for source in event.ifc_labels.sources
+        ):
+            integrity = Integrity.TRUSTED
     labels = labels.with_source(SourceLabel(
         principal=canonical_principal,
         domain=domain,
@@ -355,6 +380,8 @@ def _initialize_ifc_labels(
             frozenset({canonical_principal}) if canonical_principal else frozenset()
         ),
         source_kind=source_kind,
+        integrity=integrity,
+        integrity_effect=IntegrityEffect.ACTIVE_INGEST,
     ))
 
     for attachment in attachments or event.attachment_names:

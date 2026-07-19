@@ -36,6 +36,20 @@ class FlowLabel(StrEnum):
     PUBLIC = "public"
 
 
+class Integrity(StrEnum):
+    """Server-derived trust classification for ingested content."""
+
+    TRUSTED = "trusted"
+    UNTRUSTED = "untrusted"
+
+
+class IntegrityEffect(StrEnum):
+    """Whether a source participates in the current turn's integrity gate."""
+
+    ACTIVE_INGEST = "active_ingest"
+    INFORMATIONAL = "informational"
+
+
 @dataclass(frozen=True)
 class SourceLabel:
     """Server-authoritative provenance for one protected input.
@@ -52,6 +66,16 @@ class SourceLabel:
     sensitivity: str
     authorized_principals: frozenset[str] = frozenset()
     source_kind: str = "channel"
+    integrity: str = Integrity.UNTRUSTED
+    integrity_effect: str = IntegrityEffect.ACTIVE_INGEST
+
+    def __post_init__(self) -> None:
+        if self.integrity not in Integrity._value2member_map_:
+            raise ValueError(f"invalid source integrity: {self.integrity!r}")
+        if self.integrity_effect not in IntegrityEffect._value2member_map_:
+            raise ValueError(
+                f"invalid source integrity effect: {self.integrity_effect!r}"
+            )
 
     @property
     def is_complete(self) -> bool:
@@ -76,13 +100,27 @@ class SourceLabel:
         sensitivity: str,
         source_kind: str = "service",
     ) -> "SourceLabel":
-        """Create service-derived provenance with the inputs' intersected ACL."""
+        """Create service-derived provenance without attenuating input trust."""
         acl: frozenset[str] = frozenset()
         if inputs and all(source.is_complete for source in inputs):
             iterator = iter(inputs)
             acl = next(iterator).authorized_principals
             for source in iterator:
                 acl &= source.authorized_principals
+        integrity = (
+            Integrity.TRUSTED
+            if inputs and all(source.integrity == Integrity.TRUSTED for source in inputs)
+            else Integrity.UNTRUSTED
+        )
+        integrity_effect = (
+            IntegrityEffect.INFORMATIONAL
+            if inputs
+            and all(
+                source.integrity_effect == IntegrityEffect.INFORMATIONAL
+                for source in inputs
+            )
+            else IntegrityEffect.ACTIVE_INGEST
+        )
         return cls(
             principal=principal,
             domain=domain,
@@ -91,6 +129,8 @@ class SourceLabel:
             sensitivity=sensitivity,
             authorized_principals=acl,
             source_kind=source_kind,
+            integrity=integrity,
+            integrity_effect=integrity_effect,
         )
 
 
@@ -152,6 +192,15 @@ class InformationFlowLabels:
             created_at=self.created_at,
         )
 
+    @property
+    def has_untrusted_active_ingest(self) -> bool:
+        """Return the exact integrity-gate predicate for accumulated sources."""
+        return any(
+            source.integrity == Integrity.UNTRUSTED
+            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+            for source in self.sources
+        )
+
     def can_flow_to(self, sink: str, allowed_sinks: frozenset[str]) -> bool:
         """Check if labels permit flow to the given sink.
 
@@ -182,6 +231,17 @@ class InformationFlowState:
     def current(self, fallback: InformationFlowLabels | None = None) -> InformationFlowLabels | None:
         with self._lock:
             return self.labels if self.labels is not None else fallback
+
+    def has_untrusted_active_ingest(
+        self, fallback: InformationFlowLabels | None = None,
+    ) -> bool:
+        """Evaluate the integrity predicate against the lock-protected live carrier."""
+        with self._lock:
+            current = self.labels if self.labels is not None else fallback
+            return bool(
+                isinstance(current, InformationFlowLabels)
+                and current.has_untrusted_active_ingest
+            )
 
     def merge(
         self,

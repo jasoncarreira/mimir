@@ -1181,6 +1181,8 @@ def approve_live_declassification(
                 "sensitivity": source.sensitivity,
                 "authorized_principals": sorted(source.authorized_principals),
                 "source_kind": source.source_kind,
+                "integrity": source.integrity,
+                "integrity_effect": source.integrity_effect,
             }
             for source in sorted(
                 labels.sources,
@@ -2363,6 +2365,8 @@ def protected_result_source(
         sensitivity=sensitivity,
         authorized_principals=frozenset(acl),
         source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
     )
 
 
@@ -2388,6 +2392,8 @@ def _incomplete_protected_result(
         sensitivity="internal",
         authorized_principals=frozenset(),
         source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
     ))
 
 
@@ -2424,6 +2430,8 @@ def classify_protected_result(
             sensitivity="private",
             authorized_principals=frozenset({principal}) if principal else frozenset(),
             source_kind="channel",
+            integrity="untrusted",
+            integrity_effect="active_ingest",
         )
         return InformationFlowLabels().with_source(source)
 
@@ -2444,6 +2452,8 @@ def classify_protected_result(
                     frozenset({principal}) if principal and resources is not None else frozenset()
                 ),
                 source_kind="mcp",
+                integrity="untrusted",
+                integrity_effect="active_ingest",
             ))
         return labels
 
