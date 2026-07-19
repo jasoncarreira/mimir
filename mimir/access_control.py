@@ -367,6 +367,15 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "ntfy_send": CapabilityTier.UNBOUNDED,
 }
 
+# Built-in services predate manifest-declarable trigger authority. Keep their
+# explicitly declared, review-bounded proposal workflow classified without
+# making those capabilities grantable to custom trigger manifests.
+_LEGACY_SERVICE_SINK_TIERS: dict[str, CapabilityTier] = {
+    "open_proposal": CapabilityTier.SCOPE_CONTAINED,
+    "submit_proposal": CapabilityTier.SCOPE_CONTAINED,
+    "abandon_proposal": CapabilityTier.SCOPE_CONTAINED,
+}
+
 TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
     "research": frozenset({
         "write_file", "edit_file", "read_file", "aread", "ls", "als",
@@ -786,6 +795,33 @@ class SinkGate:
         # Retained for API stability; the resolver is not used by check_sink_flow.
         cls._global_resolver = resolver
 
+    @staticmethod
+    def _service_tier_allows(
+        tool_name: str,
+        ifc_labels: Any,
+        auth_context: Any,
+        service: ServicePrincipal,
+    ) -> bool:
+        """Apply the integrity axis to one exact declared service capability."""
+        if not service.has_capability(tool_name):
+            return False
+        capability_tier = TRIGGER_CAPABILITY_TIERS.get(
+            tool_name,
+            _LEGACY_SERVICE_SINK_TIERS.get(tool_name, CapabilityTier.UNBOUNDED),
+        )
+        state = getattr(auth_context, "ifc_state", None)
+        has_untrusted_active_ingest = (
+            state.has_untrusted_active_ingest(ifc_labels)
+            if state is not None
+            and callable(getattr(state, "has_untrusted_active_ingest", None))
+            else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
+        )
+        if capability_tier is CapabilityTier.CODE_EXECUTION:
+            return tool_name == "worklink_run" and not has_untrusted_active_ingest
+        if capability_tier is CapabilityTier.UNBOUNDED:
+            return not has_untrusted_active_ingest
+        return True
+
     @classmethod
     def check_sink_flow(
         cls,
@@ -874,13 +910,8 @@ class SinkGate:
             SinkCategory.NETWORK,
             SinkCategory.EXTERNAL_MCP,
         }:
-            capability_tier = TRIGGER_CAPABILITY_TIERS.get(tool_name)
-            # Poller authority can use contained sinks after exact argument-level
-            # validation. Code execution and unbounded egress remain blocked here;
-            # integrity-aware widening is owned by the gate chainlink.
-            if (
-                "poller_payload" in service.readable_domains
-                and capability_tier in {CapabilityTier.CODE_EXECUTION, CapabilityTier.UNBOUNDED}
+            if not cls._service_tier_allows(
+                tool_name, ifc_labels, auth_context, service,
             ):
                 return ToolAuthorization(
                     tool_name=tool_name,
@@ -920,6 +951,7 @@ class SinkGate:
             )
 
         allowed_sinks = cls._get_allowed_sinks(
+            tool_name,
             sink_category,
             auth_context,
             ifc_labels=ifc_labels,
@@ -980,6 +1012,7 @@ class SinkGate:
     @classmethod
     def _get_allowed_sinks(
         cls,
+        tool_name: str,
         category: SinkCategory,
         auth_context: Any,
         *,
@@ -996,22 +1029,22 @@ class SinkGate:
             return frozenset()
 
         service = get_trusted_service_from_auth_context(auth_context)
+        is_triggering_channel_reply = (
+            service is not None
+            and category is SinkCategory.SAME_CHANNEL
+            and service_policy is None
+        )
+        if service is not None and not is_triggering_channel_reply:
+            if not cls._service_tier_allows(
+                tool_name, ifc_labels, auth_context, service,
+            ):
+                return frozenset()
+
         if service is not None and target is not None and category in {
             SinkCategory.SAGA,
             SinkCategory.SCHEDULER,
             SinkCategory.PROPOSAL,
         }:
-            capability_tier = TRIGGER_CAPABILITY_TIERS.get(
-                next((op for op in service.capabilities if get_sink_category(op) == category), "")
-            )
-            if (
-                "poller_payload" in service.readable_domains
-                and capability_tier not in {
-                    CapabilityTier.SCOPE_CONTAINED,
-                    CapabilityTier.SCOPED_WITH_PROVENANCE,
-                }
-            ):
-                return frozenset()
             source_channels = getattr(ifc_labels, "source_channels", None)
             service_channel = getattr(auth_context, "channel_id", None)
             if (
