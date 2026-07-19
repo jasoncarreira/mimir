@@ -959,7 +959,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     permission = json.loads(calls[0]["kwargs"]["env"]["OPENCODE_PERMISSION"])
     assert permission == {
         "external_directory": {"/**": "deny"},
-        "bash": {"*": "deny", "git *": "allow", "uv *": "allow", "env *": "allow"},
+        "bash": {"*": "deny", "git *": "allow", "uv *": "allow"},
     }
     assert result.transcript_path is not None
     assert result.transcript_path.parent == transcript_root

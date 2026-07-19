@@ -704,7 +704,7 @@ defaults:
   compute_backend: local_subprocess  # the only built-in compute substrate (#832)
   timeout_s: 1800
   priority: normal
-  test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
+  test_command: "uv run pytest -q"
   base_branch: main          # worktrees cut from + PRs target this branch
 
 backends:
@@ -715,10 +715,10 @@ backends:
     bin: claude
   opencode:
     bin: opencode
-    # Replaces the built-in Mimir-repo list: ["git *", "uv *", "env *"].
+    # Replaces the built-in Mimir-repo list: ["git *", "uv *"].
     # OpenCode evaluates the last matching pattern. Worklink always installs a
     # leading "*": deny rule, then these grants; "*" itself is rejected.
-    bash_allowlist: ["git *", "uv *", "env *"]
+    bash_allowlist: ["git *", "uv *"]
     args: ["-p", "--output-format", "json"]
 ```
 
@@ -746,7 +746,7 @@ worktree, evidence bundle, branch, or PR.
 cd /workspace/mimir
 uv run mimir worklink run <issue-id> \
   --home /mimir-home \
-  --test-command 'env -u MIMIR_MODEL_SPEC uv run pytest -q <focused-tests> --tb=short'
+  --test-command 'uv run pytest -q <focused-tests> --tb=short'
 ```
 
 Expected success output is shaped like:
@@ -831,7 +831,7 @@ defaults:
   allow_autonomous_local_subprocess: false  # autonomy policy (#460, #832): autonomous dispatch
                             # refuses the unsandboxed local_subprocess substrate unless this
                             # is true. The operator CLI is never gated. See §6.5.
-  test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
+  test_command: "uv run pytest -q"
   max_review_retries: 3             # reviewer-requested rebuild attempts before blocking a leaf
   # Retained-but-INERT since #830 (integrated-epic runner removed). These parse
   # for back-compat but no code consumes them; safe to omit:

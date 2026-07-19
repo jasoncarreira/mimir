@@ -13,7 +13,7 @@ from ..compute import ComputeResult, WorkSpec
 from .base import Caps, RawResult, WorkOrder, blocked_reason_from_output
 
 
-DEFAULT_BASH_ALLOWLIST: tuple[str, ...] = ("git *", "uv *", "env *")
+DEFAULT_BASH_ALLOWLIST: tuple[str, ...] = ("git *", "uv *")
 
 
 @dataclass(frozen=True)

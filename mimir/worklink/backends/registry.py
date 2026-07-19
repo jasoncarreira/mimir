@@ -68,7 +68,7 @@ class WorklinkDefaults:
     backend: str = "codex"
     timeout_s: int = 1800
     priority: str = "normal"
-    test_command: str = "env -u MIMIR_MODEL_SPEC uv run pytest -q"
+    test_command: str = "uv run pytest -q"
     backend_by_category: Mapping[str, str] = field(default_factory=dict)
     compute_backend: str = "local_subprocess"
     # Branch that attempt worktrees are cut from and that leaf PRs target. Point

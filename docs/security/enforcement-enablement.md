@@ -484,7 +484,9 @@ runtime a final `OPENCODE_PERMISSION` override containing
 `external_directory: {"/**": "deny"}` and `bash: {"*": "deny", ...allowlist}`.
 The allowlist is operator-configurable at
 `backends.opencode.bash_allowlist`; its Mimir-repository default permits the
-needed `git *`, `uv *`, and `env *` command families. OpenCode evaluates the
+needed `git *` and `uv *` command families. Pure command launchers such as
+`env *` are deliberately excluded because they would bypass the allowlist.
+OpenCode evaluates the
 last matching permission rule, so Worklink emits the catch-all denial first and
 the explicit grants after it. It rejects a catch-all allow entry. Denials become
 tool errors captured in the headless run/transcript; there is no `ask` rule that
