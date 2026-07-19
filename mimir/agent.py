@@ -1543,6 +1543,10 @@ class Agent:
                 # injection (it's order-robust regardless — it only augments
                 # successful read_file results on a <skill>/SKILL.md path).
                 from .tools.skill_memory_inject import SkillMemoryInjectionMiddleware
+                # Fetched web bodies become active model context through the
+                # built-in read_file tool. Add a provenance-bound reminder at
+                # that ingestion point, independently of access-control mode.
+                from .tools.fetched_content_inject import FetchedContentReminderMiddleware
                 # chainlink #376 (PR 1): folds queued mid-turn user messages into
                 # the running turn at each model-call boundary. Ordered LAST so
                 # the fold-in is additive and never bypasses the budget gate.
@@ -1558,6 +1562,7 @@ class Agent:
                 self._agent_middleware = (
                     IterationGateMiddleware(),
                     BudgetGateMiddleware(),
+                    FetchedContentReminderMiddleware(self._config.home),
                     SkillMemoryInjectionMiddleware(),
                     MidTurnInjectionMiddleware(),
                 )
@@ -1574,7 +1579,7 @@ class Agent:
                 backend=self._backend,
                 skills=skill_sources or None,
                 middleware=self._agent_middleware,
-                subagents=build_mimir_subagents(),
+                subagents=build_mimir_subagents(home=self._config.home),
                 context_schema=AuthContext,
             )
             self._cached_system_prompt = system_prompt

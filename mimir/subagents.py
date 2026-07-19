@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Literal
 
 from deepagents.middleware.filesystem import FilesystemPermission
@@ -11,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mimir.structured_output_retry import StructuredOutputRetryMiddleware
 from mimir.tools.budget_gate import BudgetGateMiddleware
+from mimir.tools.fetched_content_inject import FetchedContentReminderMiddleware
 
 
 _SEVERITY_SYNONYMS = {
@@ -178,7 +180,7 @@ def readonly_filesystem_permissions() -> list[FilesystemPermission]:
     return [FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")]
 
 
-def build_mimir_subagents() -> list[dict]:
+def build_mimir_subagents(*, home: Path | None = None) -> list[dict]:
     """Build explicit Mimir subagent specs for ``create_deep_agent``.
 
     Both child agents explicitly carry the authorization/budget gate because
@@ -187,10 +189,11 @@ def build_mimir_subagents() -> list[dict]:
     auto-added equivalent while preserving its standard prompt and tool inheritance.
     """
 
+    ingestion_middleware = [FetchedContentReminderMiddleware(home)] if home else []
     return [
         {
             **GENERAL_PURPOSE_SUBAGENT,
-            "middleware": [BudgetGateMiddleware()],
+            "middleware": [BudgetGateMiddleware(), *ingestion_middleware],
         },
         {
             "name": "critic-structured",
@@ -208,6 +211,7 @@ def build_mimir_subagents() -> list[dict]:
             "permissions": readonly_filesystem_permissions(),
             "middleware": [
                 BudgetGateMiddleware(),
+                *ingestion_middleware,
                 StructuredOutputRetryMiddleware(),
             ],
             "response_format": CriticFindings,
