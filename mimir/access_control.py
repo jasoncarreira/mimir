@@ -1949,12 +1949,6 @@ class ToolRegistry:
                 (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
             )
         )
-        trigger = getattr(auth_context, "trigger", None) if auth_context else None
-        attempted_service = (
-            trigger is not None
-            and trigger in _TRUSTED_SERVICE_PRINCIPALS
-            and preliminary_service is None
-        )
         sink_target = target_channel
         if (
             sink_category == SinkCategory.SAME_CHANNEL
@@ -1975,7 +1969,6 @@ class ToolRegistry:
         if (
             is_ifc_sink
             and not service_capability_denied
-            and not attempted_service
         ):
             sink_check = SinkGate.check_sink_flow(
                 tool_name,
