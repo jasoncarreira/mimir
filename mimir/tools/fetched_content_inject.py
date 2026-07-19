@@ -54,6 +54,8 @@ class FetchedContentReminderMiddleware(AgentMiddleware):
             cache = (home / "attachments" / "fetch-cache").resolve(strict=True)
 
             # Match the home backend's handling of virtual and home-absolute paths.
+            # The fetch cache is always rooted under home, so extra CompositeBackend
+            # routes cannot change which physical tree this classifier targets.
             path = requested_path
             home_text = str(home).rstrip("/")
             if path == home_text:
@@ -62,7 +64,18 @@ class FetchedContentReminderMiddleware(AgentMiddleware):
                 path = "/" + path[len(home_text) + 1 :]
             target = (home / path.lstrip("/")).resolve(strict=True)
             target.relative_to(cache)
-            return target.is_file() and not target.name.endswith(".meta.json")
+
+            # A URL can legitimately produce a body named ``*.meta.json``. Treat a
+            # cache entry as the server-written sidecar only when its corresponding
+            # body exists; suffix-only exclusion lets an attacker suppress the
+            # reminder by choosing that URL basename.
+            is_sidecar = target.name.endswith(".meta.json") and target.with_name(
+                target.name.removesuffix(".meta.json")
+            ).is_file()
+            # Known residual: shell/process reads do not pass through this
+            # read_file middleware. This is ergonomic defense in depth, not a
+            # security boundary.
+            return target.is_file() and not is_sidecar
         except (OSError, RuntimeError, ValueError):
             return False
 

@@ -156,16 +156,19 @@ def _patch_safe_open(monkeypatch: pytest.MonkeyPatch, response_factory) -> None:
     monkeypatch.setattr(web_tools_mod, "_validate_fetch_url", lambda url: None)
 
 
-async def _drive_fetch_url(tmp_path: Path, body: bytes) -> dict[str, Any]:
+async def _drive_fetch_url(
+    tmp_path: Path,
+    body: bytes,
+    *,
+    url: str = "https://example.com/foo.html",
+) -> dict[str, Any]:
     """Helper: call the underlying coroutine of fetch_url and return the parsed meta dict.
 
     langchain @tool wraps the function so we invoke ``.afunc`` directly.
     """
     web_tools_mod.set_home(tmp_path)
     (tmp_path / "attachments").mkdir(exist_ok=True)
-    yaml_str = await web_tools_mod.fetch_url.ainvoke(
-        {"url": "https://example.com/foo.html"}
-    )
+    yaml_str = await web_tools_mod.fetch_url.ainvoke({"url": url})
     import yaml as _yaml
     return _yaml.safe_load(yaml_str)
 
@@ -208,7 +211,13 @@ async def _read_with_reminder(home: Path, file_path: str) -> str:
     middleware = FetchedContentReminderMiddleware(home)
 
     async def handler(_request: ToolCallRequest) -> ToolMessage:
-        target = home / file_path.lstrip("/")
+        home_text = str(home).rstrip("/")
+        if file_path == home_text:
+            target = home
+        elif file_path.startswith(home_text + "/"):
+            target = Path(file_path)
+        else:
+            target = home / file_path.lstrip("/")
         return ToolMessage(
             content=target.read_text(),
             name="read_file",
@@ -232,6 +241,62 @@ async def test_fetch_url_body_read_receives_untrusted_external_reminder(
     meta = await _drive_fetch_url(tmp_path, body)
 
     content = await _read_with_reminder(tmp_path, meta["file_path"])
+
+    assert content.startswith(FETCHED_CONTENT_REMINDER)
+    assert body.decode() in content
+
+
+@pytest.mark.asyncio
+async def test_fetched_body_named_meta_json_still_receives_reminder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = b"Attacker-controlled content."
+    _patch_safe_open(monkeypatch, lambda: _FakeResponse(body))
+    meta = await _drive_fetch_url(
+        tmp_path,
+        body,
+        url="https://example.com/attacker.meta.json",
+    )
+
+    assert meta["file_path"].endswith("-attacker.meta.json")
+    content = await _read_with_reminder(tmp_path, meta["file_path"])
+
+    assert content.startswith(FETCHED_CONTENT_REMINDER)
+    assert body.decode() in content
+
+
+@pytest.mark.asyncio
+async def test_fetch_metadata_sidecar_does_not_receive_reminder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_safe_open(monkeypatch, lambda: _FakeResponse(b"body"))
+    meta = await _drive_fetch_url(tmp_path, b"body")
+
+    content = await _read_with_reminder(tmp_path, meta["metadata_path"])
+
+    assert not content.startswith(FETCHED_CONTENT_REMINDER)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path_kind", ["home_absolute", "symlink"])
+async def test_resolved_fetch_body_paths_receive_reminder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path_kind: str,
+) -> None:
+    body = b"Fetched content."
+    _patch_safe_open(monkeypatch, lambda: _FakeResponse(body))
+    meta = await _drive_fetch_url(tmp_path, body)
+    body_path = tmp_path / meta["file_path"].lstrip("/")
+    if path_kind == "home_absolute":
+        requested_path = str(body_path)
+    else:
+        link = tmp_path / "scratch" / "fetched-link"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(body_path)
+        requested_path = "/scratch/fetched-link"
+
+    content = await _read_with_reminder(tmp_path, requested_path)
 
     assert content.startswith(FETCHED_CONTENT_REMINDER)
     assert body.decode() in content
