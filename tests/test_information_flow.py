@@ -15,6 +15,9 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir.access_control import (
+    CapabilityTier,
+    ServicePrincipal,
+    ServiceSinkPolicy,
     SinkCategory,
     SinkGate,
     ToolFlowDirection,
@@ -531,7 +534,7 @@ def test_resolved_service_keeps_network_sink_policy_behavior():
     )
 
     assert decision.allowed is False
-    assert decision.reason == "service_sink_destination_denied"
+    assert decision.reason == "ifc_label_blocked:network"
 
 
 def test_unknown_sink_category_reaches_fail_closed_gate_from_authorization():
@@ -623,6 +626,154 @@ def test_poller_payload_cannot_bypass_active_sink_ifc(
 
     assert decision.allowed is False
     assert decision.reason == f"ifc_label_blocked:{sink_category}"
+
+
+def _trigger_service_context(
+    service: ServicePrincipal,
+    *,
+    integrity: str,
+    integrity_effect: str = "active_ingest",
+) -> tuple[AuthContext, InformationFlowLabels]:
+    channel = "poller:tier-gate"
+    principal = f"service:{service.canonical}"
+    auth = AuthContext(
+        principal=principal,
+        canonical_principal=service.canonical,
+        roles=("service",),
+        event_ingress=None,
+        trigger=service.trigger,
+        channel_id=channel,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+        service_authority=service,
+    )
+    labels = InformationFlowLabels().with_channel(channel).with_source(SourceLabel(
+        principal=principal,
+        domain="channel",
+        resource_id=channel,
+        bridge_instance="poller",
+        sensitivity="internal",
+        authorized_principals=frozenset({principal}),
+        source_kind="service",
+        integrity=integrity,
+        integrity_effect=integrity_effect,
+    ))
+    return auth, labels
+
+
+@pytest.mark.parametrize(
+    ("integrity", "integrity_effect", "expected"),
+    [
+        ("trusted", "active_ingest", True),
+        ("untrusted", "informational", True),
+        ("untrusted", "active_ingest", False),
+    ],
+)
+def test_worklink_integrity_gate_uses_only_untrusted_active_ingest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    integrity: str,
+    integrity_effect: str,
+    expected: bool,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    service = ServicePrincipal(
+        canonical="poller:tier-gate",
+        trigger="poller",
+        capabilities=("worklink_run",),
+        readable_domains=("poller_payload",),
+        sink_policies=(ServiceSinkPolicy(
+            "worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO",
+        ),),
+        capability_tier=CapabilityTier.CODE_EXECUTION,
+    )
+    auth, labels = _trigger_service_context(
+        service, integrity=integrity, integrity_effect=integrity_effect,
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "worklink_run", str(repo), labels, auth, enforce=True,
+    )
+
+    assert decision.allowed is expected
+
+
+def test_generic_spawn_is_blocked_even_for_trusted_trigger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    service = ServicePrincipal(
+        canonical="poller:tier-gate",
+        trigger="poller",
+        capabilities=("spawn_codex",),
+        readable_domains=("poller_payload",),
+        sink_policies=(ServiceSinkPolicy(
+            "spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+        ),),
+        capability_tier=CapabilityTier.CODE_EXECUTION,
+    )
+    auth, labels = _trigger_service_context(service, integrity="trusted")
+
+    decision = SinkGate.check_sink_flow(
+        "spawn_codex", str(tmp_path), labels, auth, enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:spawn"
+
+
+def test_poller_unbounded_sink_requires_trusted_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = "https://approved.example/fixed"
+    monkeypatch.setenv("MIMIR_HEARTBEAT_APPROVED_URLS", destination)
+    service = ServicePrincipal(
+        canonical="poller:tier-gate",
+        trigger="poller",
+        capabilities=("fetch_url",),
+        readable_domains=("poller_payload",),
+        sink_policies=(ServiceSinkPolicy(
+            "fetch_url", "approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS",
+        ),),
+        capability_tier=CapabilityTier.UNBOUNDED,
+    )
+    trusted_auth, trusted_labels = _trigger_service_context(service, integrity="trusted")
+    untrusted_auth, untrusted_labels = _trigger_service_context(service, integrity="untrusted")
+
+    trusted = SinkGate.check_sink_flow(
+        "fetch_url", destination, trusted_labels, trusted_auth, enforce=True,
+    )
+    untrusted = SinkGate.check_sink_flow(
+        "fetch_url", destination, untrusted_labels, untrusted_auth, enforce=True,
+    )
+
+    assert trusted.allowed is True
+    assert untrusted.allowed is False
+
+
+def test_trigger_sink_must_be_exact_declared_capability() -> None:
+    service = ServicePrincipal(
+        canonical="poller:tier-gate",
+        trigger="poller",
+        capabilities=("saga_feedback",),
+        readable_domains=("poller_payload",),
+        capability_tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+    )
+    auth, labels = _trigger_service_context(service, integrity="untrusted")
+
+    declared = SinkGate.check_sink_flow(
+        "saga_feedback", "saga", labels, auth, enforce=True,
+    )
+    undeclared = SinkGate.check_sink_flow(
+        "memory_store", "saga", labels, auth, enforce=True,
+    )
+
+    assert declared.allowed is True
+    assert undeclared.allowed is False
 
 
 def test_visibility_qualified_service_source_is_bound_to_triggering_channel():

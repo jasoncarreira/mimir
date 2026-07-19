@@ -182,9 +182,13 @@ def test_spawn_open_code_declares_spawn_sink_destination() -> None:
     assert _OPERATION_SINK_DESTINATION["spawn_open_code"] == "spawn_process"
 
 
-@pytest.mark.parametrize("operation", ["spawn_open_code", "task"])
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [("spawn_open_code", False), ("task", True)],
+)
 def test_scheduler_service_principal_can_invoke_factory_operations(
     operation: str,
+    expected: bool,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -208,9 +212,9 @@ def test_scheduler_service_principal_can_invoke_factory_operations(
         target_channel=str(tmp_path) if operation == "spawn_open_code" else None,
     )
 
-    assert decision.allowed is True
+    assert decision.allowed is expected
     assert decision.decision == OperationDecision.ADMIN_REQUIRED
-    assert decision.reason is None
+    assert decision.reason == (None if expected else "ifc_label_blocked:spawn")
     assert decision.service_principal is get_service_principal("scheduled_tick")
 
 

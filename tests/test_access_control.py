@@ -1349,16 +1349,22 @@ async def test_service_shell_executes_the_exact_authorized_argv() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("args_factory", "allowed"),
+    ("args_factory", "expected_reason"),
     [
-        (lambda _home, _readonly, _outside: {"cwd": ".", "artifact_root": "artifacts"}, True),
-        (lambda _home, readonly, _outside: {"cwd": str(readonly)}, False),
+        (
+            lambda _home, _readonly, _outside: {"cwd": ".", "artifact_root": "artifacts"},
+            "ifc_label_blocked:spawn",
+        ),
+        (
+            lambda _home, readonly, _outside: {"cwd": str(readonly)},
+            "ifc_label_blocked:spawn",
+        ),
         (
             lambda home, _readonly, outside: {
                 "cwd": str(home),
                 "artifact_root": str(outside),
             },
-            False,
+            "ifc_label_blocked:spawn",
         ),
     ],
     ids=["write-root", "read-only-cwd", "outside-artifact-root"],
@@ -1367,7 +1373,7 @@ async def test_service_spawn_destinations_are_confined_to_write_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     args_factory,
-    allowed: bool,
+    expected_reason: str,
 ) -> None:
     from langchain_core.messages import ToolMessage
     from mimir.models import InformationFlowLabels
@@ -1408,14 +1414,9 @@ async def test_service_spawn_destinations_are_confined_to_write_roots(
         handler,
     )
 
-    if allowed:
-        assert result.status != "error"
-        assert seen_args["cwd"] == str(home.resolve())
-        assert seen_args["artifact_root"] == str((home / "artifacts").resolve())
-    else:
-        assert result.status == "error"
-        assert "service_sink_destination_denied" in str(result.content)
-        assert seen_args == {}
+    assert result.status == "error"
+    assert expected_reason in str(result.content)
+    assert seen_args == {}
 
 
 @pytest.mark.asyncio
